@@ -87,6 +87,7 @@ impl Install {
             .env_clear()
             .current_dir(&self.root)
             .env("HOME", self.root.join("home"))
+            .env("CODEX_HOME", self.root.join("codex-home"))
             .env("XDG_CONFIG_HOME", self.root.join("xdg-config"))
             .env("XDG_DATA_HOME", self.root.join("xdg-data"))
             .env("XDG_STATE_HOME", self.root.join("xdg-state"))
@@ -187,55 +188,16 @@ impl Drop for Install {
     }
 }
 
-/// A foreground Gateway in a private process group. Its synthetic Codex child
-/// has a separate private group and is cleaned up through Gateway shutdown.
+/// A foreground Gateway in a private process group. It owns no daemon process.
 struct ForegroundGateway {
     child: std::process::Child,
-    codex_pid: PathBuf,
-    stubborn: bool,
-    #[cfg(target_os = "linux")]
-    codex_fd: Option<std::os::fd::OwnedFd>,
+    root: PathBuf,
 }
 
 impl ForegroundGateway {
-    fn capture_codex(&mut self) {
-        #[cfg(target_os = "linux")]
-        {
-            if self.codex_fd.is_some() || self.child.try_wait().ok().flatten().is_some() {
-                return;
-            }
-            let Some(pid) = fs::read_to_string(&self.codex_pid)
-                .ok()
-                .and_then(|pid| pid.parse::<u32>().ok())
-            else {
-                return;
-            };
-            let identity = || {
-                let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-                let fields: Vec<_> = stat[stat.rfind(')')? + 2..].split_whitespace().collect();
-                Some((
-                    fields.get(1)?.parse::<u32>().ok()?,
-                    fields.get(19)?.parse::<u64>().ok()?,
-                ))
-            };
-            let Some(before) = identity().filter(|(parent, _)| *parent == self.child.id()) else {
-                return;
-            };
-            // SAFETY: scalar syscall arguments; a successful result is a fresh fd.
-            let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) } as i32;
-            if fd >= 0 {
-                // SAFETY: the fresh descriptor has not been adopted elsewhere.
-                let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
-                if identity() == Some(before) {
-                    self.codex_fd = Some(fd);
-                }
-            }
-        }
-    }
-
     fn wait_listening(&mut self) {
         let deadline = Instant::now() + Duration::from_secs(8);
-        while !fs::read_to_string(self.codex_pid.with_file_name("foreground.out"))
+        while !fs::read_to_string(self.root.join("foreground.out"))
             .unwrap_or_default()
             .contains("terminal gateway listening on")
         {
@@ -252,15 +214,13 @@ impl ForegroundGateway {
     }
 
     fn stop(&mut self) {
-        self.capture_codex();
         let started = Instant::now();
+        // SAFETY: this is the directly owned, unreaped fixture child.
         assert_eq!(
             unsafe { libc::kill(self.child.id() as libc::pid_t, libc::SIGTERM) },
             0
         );
-        // Normal EOF must remain prompt. Only the deliberately hung fixture
-        // consumes the 46s upstream grace plus bounded forced cleanup.
-        let deadline = started + Duration::from_secs(if self.stubborn { 50 } else { 5 });
+        let deadline = started + Duration::from_secs(5);
         let status = loop {
             if let Some(status) = self.child.try_wait().unwrap() {
                 break status;
@@ -271,62 +231,21 @@ impl ForegroundGateway {
             );
             std::thread::sleep(Duration::from_millis(20));
         };
-        if self.stubborn {
-            assert!(
-                started.elapsed() >= Duration::from_secs(45),
-                "stubborn cleanup was forced before upstream's watchdog window"
-            );
-        }
-        #[cfg(target_os = "linux")]
         assert!(status.success());
-        #[cfg(not(target_os = "linux"))]
-        if self.stubborn {
-            // Non-pidfd platforms deliberately refuse descendant signals and
-            // report the unverified forced cleanup through the server result.
-            assert!(!status.success());
-            assert!(
-                fs::read_to_string(self.codex_pid.with_file_name("foreground.err"))
-                    .unwrap()
-                    .contains("cleanup could not be verified")
-            );
-        } else {
-            assert!(status.success());
-        }
-        eprintln!(
-            "synthetic Codex shutdown stubborn={}: {:?}",
-            self.stubborn,
-            started.elapsed()
-        );
+        eprintln!("shared Codex connection shutdown: {:?}", started.elapsed());
     }
 }
 
 impl Drop for ForegroundGateway {
     fn drop(&mut self) {
-        self.capture_codex();
-        let group = self.child.id() as libc::pid_t;
         if self.child.try_wait().ok().flatten().is_none() {
-            // Let the production ownership supervisor collect its separate
-            // private child even when an assertion unwinds the fixture.
+            // SAFETY: signal only the directly owned, unreaped fixture child.
             unsafe {
-                libc::kill(group, libc::SIGTERM);
+                libc::kill(self.child.id() as libc::pid_t, libc::SIGTERM);
             }
-            let deadline = Instant::now() + Duration::from_secs(if self.stubborn { 50 } else { 6 });
+            let deadline = Instant::now() + Duration::from_secs(6);
             while self.child.try_wait().ok().flatten().is_none() && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(20));
-            }
-        }
-        #[cfg(target_os = "linux")]
-        if let Some(fd) = &self.codex_fd {
-            // SAFETY: the descriptor targets the verified original fixture
-            // incarnation even if its PID was reaped/reused while unwinding.
-            unsafe {
-                libc::syscall(
-                    libc::SYS_pidfd_send_signal,
-                    fd.as_raw_fd(),
-                    libc::SIGKILL,
-                    std::ptr::null::<libc::siginfo_t>(),
-                    0,
-                );
             }
         }
         if self.child.try_wait().ok().flatten().is_none() {
@@ -338,21 +257,23 @@ impl Drop for ForegroundGateway {
 
 fn configure_fake_codex(install: &Install, master_enabled: bool) -> PathBuf {
     let executable = install.root.join("bin/fake-codex");
-    fs::write(&executable,r#"#!/bin/sh
+    fs::write(
+        &executable,
+        r#"#!/bin/sh
 [ "$1" = --fixture-ready ] && exit 0
 printf '%s' "$$" > "$FAKE_CODEX_PID"
-printf '%s\n' "$@" > "$FAKE_CODEX_ARGV"
-while IFS= read -r line; do
-    id=${line#*'"id":'}; id=${id%%,*}; id=${id%%\}*}
-    case "$line" in
-        *'"method":"initialize"'*) printf '{"id":%s,"result":{"userAgent":"codex_cli_rs/0.162.1 (synthetic fixture)","codexHome":"/synthetic/codex-home","platformFamily":"unix","platformOs":"synthetic"}}\n' "$id" ;;
-        *'"method":"account/read"'*) printf '{"id":%s,"result":{"account":null,"requiresOpenaiAuth":false}}\n' "$id"; printf 'ready' > "$FAKE_CODEX_READY" ;;
-        *'"method":"model/list"'*) printf '{"id":%s,"result":{"data":[],"nextCursor":null}}\n' "$id" ;;
-        *'"method":"config/read"'*) printf '{"id":%s,"result":{"config":{"model_provider":null}}}\n' "$id" ;;
-    esac
+printf '%s\n' "$@" >> "$FAKE_CODEX_ARGV"
+[ "$*" = 'app-server daemon start' ] || exit 1
+# The test owns the synthetic daemon, not this short-lived official CLI stand-in.
+i=0
+while [ ! -e "$FAKE_CODEX_SOCKET_READY" ]; do
+    [ "$i" -lt 100 ] || exit 1
+    sleep 0.05
+    i=$((i + 1))
 done
-if [ "$FAKE_CODEX_STUBBORN" = true ]; then while :; do :; done; fi
-"#).unwrap();
+"#,
+    )
+    .unwrap();
     fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
     // Side-effect-free readiness addresses only a fake immutable script's
     // pre-exec ETXTBSY; it is not a retry of upstream agent work.
@@ -381,36 +302,144 @@ if [ "$FAKE_CODEX_STUBBORN" = true ]; then while :; do :; done; fi
     executable
 }
 
-fn foreground_gateway(install: &Install, stubborn: bool) -> ForegroundGateway {
+fn foreground_gateway(install: &Install) -> ForegroundGateway {
     use std::os::unix::process::CommandExt as _;
-    let codex_pid = install.root.join("fake-codex.pid");
     let mut command = install.command(&["run"]);
     command
         .process_group(0)
-        .env("FAKE_CODEX_PID", &codex_pid)
+        .env("FAKE_CODEX_PID", install.root.join("fake-codex.pid"))
         .env("FAKE_CODEX_ARGV", install.root.join("fake-codex.argv"))
-        .env("FAKE_CODEX_READY", install.root.join("fake-codex.ready"))
         .env(
-            "FAKE_CODEX_STUBBORN",
-            if stubborn { "true" } else { "false" },
+            "FAKE_CODEX_SOCKET_READY",
+            install.root.join("fake-codex.socket-ready"),
         )
         .stdout(fs::File::create(install.root.join("foreground.out")).unwrap())
         .stderr(fs::File::create(install.root.join("foreground.err")).unwrap());
     ForegroundGateway {
         child: command.spawn().unwrap(),
-        codex_pid,
-        stubborn,
-        #[cfg(target_os = "linux")]
-        codex_fd: None,
+        root: install.root.clone(),
     }
 }
 
-#[test]
-fn codex_private_fake_child_is_started_from_config_and_reaped_on_sigterm() {
-    for stubborn in [false, true] {
+/// Emulates the daemon outside Gateway ownership. Only its unique socket is
+/// created/removed; the official per-UID directory and other daemons are untouched.
+struct SharedCodexDaemon {
+    socket: PathBuf,
+    task: tokio::task::JoinHandle<()>,
+    requests: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    disconnected: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl SharedCodexDaemon {
+    fn new(install: &Install) -> Self {
+        use futures::{SinkExt as _, StreamExt as _};
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::os::unix::fs::{symlink, DirBuilderExt as _, MetadataExt as _};
+        use std::sync::{atomic::Ordering, Arc, Mutex};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let home = install.root.join("codex-home");
+        let parent = home.join("app-server-control");
+        fs::create_dir_all(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+        let home = fs::canonicalize(home).unwrap();
+        let alias = fs::canonicalize(parent)
+            .unwrap()
+            .join("app-server-control.sock");
+        // Production requires this official root, irrespective of TMPDIR.
+        let uid = unsafe { libc::geteuid() };
+        let directory = fs::canonicalize("/tmp")
+            .unwrap()
+            .join(format!("codex-daemon-{uid}"));
+        match fs::DirBuilder::new().mode(0o700).create(&directory) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => panic!("cannot create daemon socket directory: {error}"),
+        }
+        let metadata = fs::symlink_metadata(&directory).unwrap();
+        assert!(metadata.is_dir() && !metadata.file_type().is_symlink());
+        assert_eq!(metadata.uid(), uid);
+        assert_eq!(metadata.mode() & 0o777, 0o700);
+        let socket = directory.join(hex::encode(Sha256::digest(alias.as_os_str().as_bytes())));
+        assert!(!socket.exists(), "fixture socket must be unique");
+        let path = socket.clone();
+        let root = install.root.clone();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let seen = requests.clone();
+        let disconnected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let closed = disconnected.clone();
+        let task = tokio::spawn(async move {
+            // No alias exists until the real Gateway invokes daemon start.
+            while !root.join("fake-codex.argv").exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let listener = tokio::net::UnixListener::bind(&path).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+            symlink(&path, &alias).unwrap();
+            fs::write(root.join("fake-codex.socket-ready"), "ready").unwrap();
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+                while let Some(Ok(Message::Text(text))) = ws.next().await {
+                    let request: serde_json::Value = serde_json::from_str(&text).unwrap();
+                    seen.lock().unwrap().push(request.clone());
+                    let Some(id) = request.get("id") else {
+                        continue;
+                    };
+                    let result = match request["method"].as_str().unwrap() {
+                        "initialize" => {
+                            json!({"userAgent":"codex_cli_rs/0.162.1 (synthetic fixture)","codexHome":home})
+                        }
+                        "account/read" => json!({"account":null,"requiresOpenaiAuth":false}),
+                        "config/read" => json!({"config":{"model_provider":null}}),
+                        "skills/list" => json!({"data":[]}),
+                        "model/list" | "thread/list" | "thread/loaded/list" => {
+                            json!({"data":[],"nextCursor":null})
+                        }
+                        method => panic!("unexpected lifecycle RPC: {method}"),
+                    };
+                    if ws
+                        .send(Message::Text(
+                            json!({"id":id,"result":result}).to_string().into(),
+                        ))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                    if request["method"] == "account/read" {
+                        fs::write(root.join("fake-codex.ready"), "ready").unwrap();
+                    }
+                }
+                closed.store(true, Ordering::Release);
+            }
+        });
+        Self {
+            socket,
+            task,
+            requests,
+            disconnected,
+        }
+    }
+}
+
+impl Drop for SharedCodexDaemon {
+    fn drop(&mut self) {
+        self.task.abort();
+        let _ = fs::remove_file(&self.socket);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn codex_shared_daemon_starts_from_config_and_survives_gateway_sigterm() {
+    use futures::{SinkExt as _, StreamExt as _};
+    use std::sync::atomic::Ordering;
+    use tokio_tungstenite::tungstenite::Message;
+
+    for use_path_defaults in [false, true] {
         let install = Install::new();
         let executable = configure_fake_codex(&install, true);
-        if stubborn {
+        if use_path_defaults {
             // Both omitted blocks default on, and normal PATH selects only
             // this immutable fixture, never an ambient installed Codex.
             let path_binary = install.root.join("bin/codex");
@@ -423,10 +452,15 @@ fn codex_private_fake_child_is_started_from_config_and_reaped_on_sigterm() {
             config.as_object_mut().unwrap().remove("agent_runtime");
             fs::write(path, serde_json::to_vec(&config).unwrap()).unwrap();
         }
-        let mut gateway = foreground_gateway(&install, stubborn);
+        let daemon = SharedCodexDaemon::new(&install);
+        let mut gateway = foreground_gateway(&install);
         let deadline = Instant::now() + Duration::from_secs(8);
-        while !install.root.join("fake-codex.ready").exists() {
-            gateway.capture_codex();
+        while !install.root.join("fake-codex.ready").exists()
+            || !fs::read_to_string(install.root.join("foreground.err"))
+                .unwrap_or_default()
+                .contains("adopted the running Codex daemon")
+        {
+            assert!(!daemon.task.is_finished(), "synthetic daemon failed");
             assert!(
                 gateway.child.try_wait().unwrap().is_none(),
                 "Gateway exited before fake Codex readiness"
@@ -436,34 +470,82 @@ fn codex_private_fake_child_is_started_from_config_and_reaped_on_sigterm() {
                 "fake Codex was not initialized: {}",
                 fs::read_to_string(install.root.join("foreground.err")).unwrap_or_default()
             );
-            std::thread::sleep(Duration::from_millis(20));
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        let codex_pid: libc::pid_t = fs::read_to_string(&gateway.codex_pid)
-            .unwrap()
-            .parse()
-            .unwrap();
-        gateway.capture_codex();
+        gateway.wait_listening();
         assert_eq!(
             fs::read_to_string(install.root.join("fake-codex.argv")).unwrap(),
-            "app-server\n--listen\nstdio://\n"
+            "app-server\ndaemon\nstart\n"
         );
-        assert_eq!(unsafe { libc::getpgid(codex_pid) }, codex_pid);
-        assert_ne!(codex_pid, gateway.child.id() as libc::pid_t);
         gateway.stop();
-        assert_eq!(
-            unsafe { libc::kill(codex_pid, 0) },
-            -1,
-            "private fake child survived Gateway shutdown"
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !daemon.disconnected.load(Ordering::Acquire) {
+                assert!(!daemon.task.is_finished(), "synthetic daemon failed");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("Gateway must close its shared connection");
+        let methods: Vec<_> = daemon
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|r| r["method"].as_str().unwrap().to_owned())
+            .collect();
+        assert!(methods.iter().any(|m| m == "initialize"));
+        assert!(methods.iter().any(|m| m == "initialized"));
+        assert!(methods.iter().any(|m| m == "account/read"));
+        eprintln!("shared daemon RPCs before disconnect: {methods:?}");
+        assert!(
+            methods.iter().all(|m| matches!(
+                m.as_str(),
+                "initialize"
+                    | "initialized"
+                    | "account/read"
+                    | "config/read"
+                    | "model/list"
+                    | "skills/list"
+                    | "thread/list"
+                    | "thread/loaded/list"
+            )),
+            "shutdown must not send daemon or thread mutations: {methods:?}"
         );
+        // A fresh client must still get a real reply after Gateway has exited.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let stream = tokio::net::UnixStream::connect(&daemon.socket)
+                .await
+                .unwrap();
+            let (mut ws, _) = tokio_tungstenite::client_async("ws://localhost/rpc", stream)
+                .await
+                .unwrap();
+            ws.send(Message::Text(
+                json!({"id":99,"method":"initialize","params":{}})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+            let reply = ws.next().await.unwrap().unwrap().into_text().unwrap();
+            let reply: serde_json::Value = serde_json::from_str(&reply).unwrap();
+            assert_eq!(reply["id"], 99);
+            assert_eq!(
+                reply["result"]["codexHome"],
+                json!(fs::canonicalize(install.root.join("codex-home")).unwrap())
+            );
+        })
+        .await
+        .expect("shared daemon must remain responsive after Gateway shutdown");
         assert_eq!(
-            std::io::Error::last_os_error().raw_os_error(),
-            Some(libc::ESRCH)
+            fs::read_to_string(install.root.join("fake-codex.argv")).unwrap(),
+            "app-server\ndaemon\nstart\n",
+            "shutdown must not invoke daemon stop/restart"
         );
     }
 }
 
 #[test]
-fn codex_master_off_cli_and_bind_failure_never_start_the_configured_fake_child() {
+fn codex_master_off_cli_and_bind_failure_never_start_the_configured_daemon() {
     let install = Install::new();
     configure_fake_codex(&install, false);
     let list = install.ok(&["agent", "--json"]);
@@ -488,7 +570,7 @@ fn codex_master_off_cli_and_bind_failure_never_start_the_configured_fake_child()
 }
 
 #[test]
-fn codex_explicit_disable_and_master_off_reach_the_running_server_without_child_startup() {
+fn codex_explicit_disable_and_master_off_reach_the_running_server_without_daemon_startup() {
     for master_off in [true, false] {
         let install = Install::new();
         configure_fake_codex(&install, !master_off);
@@ -499,10 +581,10 @@ fn codex_explicit_disable_and_master_off_reach_the_running_server_without_child_
             config["codex"]["enabled"] = json!(false);
             fs::write(path, serde_json::to_vec(&config).unwrap()).unwrap();
         }
-        let mut gateway = foreground_gateway(&install, false);
+        let mut gateway = foreground_gateway(&install);
         gateway.wait_listening();
         gateway.stop();
-        assert!(!gateway.codex_pid.exists());
+        assert!(!install.root.join("fake-codex.pid").exists());
         assert!(!install.root.join("fake-codex.argv").exists());
     }
 }

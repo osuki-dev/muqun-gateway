@@ -299,7 +299,8 @@ impl CodexState {
         } else if self.config.resolve_binary().is_err() {
             info.status = AgentAvailability::NotInstalled;
             info.reason = Some(
-                "Install/configure Codex 0.162.1 or newer on this host, or disable codex.enabled".into(),
+                "Install/configure Codex 0.162.1 or newer on this host, or disable codex.enabled"
+                    .into(),
             );
         } else {
             // CLI discovery is read-only: it must not spawn an agent merely to
