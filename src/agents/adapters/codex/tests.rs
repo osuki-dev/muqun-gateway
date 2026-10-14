@@ -16,6 +16,19 @@ pub(crate) fn golden() -> Value {
 }
 
 #[test]
+fn codex_0_162_1_and_newer_are_accepted() {
+    assert!(accepts_server_version(
+        "codex_cli_rs/0.162.1 (synthetic fixture)"
+    ));
+    assert!(accepts_server_version("codex-tui/0.162.1"));
+    assert!(accepts_server_version("codex_cli_rs/0.163.0"));
+    assert!(accepts_server_version("codex_cli_rs/1.0.0"));
+    assert!(!accepts_server_version("codex_cli_rs/0.162.0"));
+    assert!(!accepts_server_version("codex_cli_rs/0.161.9"));
+    assert!(!accepts_server_version("codex_cli_rs"));
+}
+
+#[test]
 fn user_images_survive_native_item_mapping_without_becoming_prompt_text() {
     // Published v0.162.1 UserInput variants. The data URI is a synthetic
     // one-pixel PNG; no real user transcript or local image is retained.

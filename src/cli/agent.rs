@@ -131,7 +131,7 @@ pub(crate) async fn run_agent_command(
             }
             SetupAgent::Opencode => setup_opencode().await?,
             SetupAgent::Codex => {
-                println!("Codex support is enabled by default. Configure Codex 0.162.1 and its authentication on this host yourself. The running Gateway owns a private app-server child; it does not change terminal Codex sessions, permission policy or credential files.");
+                println!("Codex support is enabled by default. Install Codex 0.162.1 or newer and sign in on this host yourself. A running Gateway starts or joins the one shared Codex daemon; a Codex you open later uses that same socket and the same threads. It does not change permission policy or credential files.");
                 println!("Set codex.enabled=false to disable it; codex.binary may name an absolute executable. This command does not start Codex, install packages, log in or restart the Gateway.");
             }
         },
@@ -275,12 +275,12 @@ pub(crate) fn next_step(id: &str, status: &AgentAvailability) -> Option<&'static
             "configure Codex authentication on this host; Gateway will not log in for you"
         }
         (NotInstalled, "codex") => {
-            "install Codex 0.162.1 yourself, set codex.binary, or disable codex.enabled"
+            "install Codex 0.162.1 or newer yourself, set codex.binary, or disable codex.enabled"
         }
         (Offline, "codex") => {
             "check Codex configuration on this host; failed prompts are never automatically retried"
         }
-        (Unsupported, "codex") => "use Codex 0.162.1 or upgrade Gateway protocol support",
+        (Unsupported, "codex") => "use Codex 0.162.1 or newer, or upgrade Gateway protocol support",
         (Offline, "opencode") => "opencode service start",
         (Offline | NotInstalled, "deepseek") => DSH_START,
         (Offline, "t3") => "open T3 Code, or run `t3 service install`",

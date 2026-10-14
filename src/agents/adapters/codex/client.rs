@@ -417,10 +417,10 @@ impl CodexClient {
         let agent = response["userAgent"]
             .as_str()
             .ok_or_else(|| AgentError::Protocol("invalid Codex initialize response".into()))?;
-        if !agent.split(['/', ' ', '(']).any(|s| s == super::VERSION) {
+        if !super::accepts_server_version(agent) {
             self.stop();
             return Err(AgentError::Unsupported(
-                "Codex app-server version; expected 0.162.1".into(),
+                "Codex app-server version; expected 0.162.1 or newer".into(),
             ));
         }
         let actual = response["codexHome"]

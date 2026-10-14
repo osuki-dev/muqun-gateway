@@ -396,11 +396,13 @@ from other processes or shell commands running as that same user.
 
 ### The Codex service agent
 
-Codex support is **on by default**. Gateway uses the existing `codex` on `PATH`
-and its existing CLI login/configuration to run one private
-`codex app-server --listen stdio://` child. It never installs Codex or logs you
-in automatically. Missing installation or authentication does not block other
-agents. The supported baseline is Codex **0.162.1**.
+Codex support is **on by default**. At boot Gateway starts the one shared
+daemon with `codex app-server daemon start` when its socket is absent, or
+attaches if Codex already started it. A terminal Codex opened later joins that
+same socket and the same threads. Gateway does not start a second private
+server, and it never stops or restarts the daemon. It never installs Codex or
+logs you in automatically. A missing installation or authentication does not
+block other agents. Codex **0.162.1 or newer** is accepted. The protocol was checked against 0.162.1.
 
 To turn it off in `config.json`:
 

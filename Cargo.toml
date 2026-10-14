@@ -1,6 +1,6 @@
 [package]
 name = "muqun-gateway"
-version = "0.13.0"
+version = "0.14.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "Token-protected mobile gateway for Herdr and tmux terminal workspaces."

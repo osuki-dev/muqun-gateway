@@ -41,15 +41,16 @@ origin `adopted` and endpoint `unix://shared-codex-app-server`, without exposing
 its host path. `codex_shared_daemon_v1` and the agent's `sharedDaemon` feature
 advertise this support (Unix only). Existing Gateway authentication is unchanged.
 
-When no compatible verified daemon is available, Gateway starts its existing
-private child with fixed argv `codex app-server --listen stdio://`, reporting
-origin `spawned` and endpoint `stdio://private-codex-app-server`. It does not
-migrate threads between transports or replace a healthy private connection
-when a daemon later appears. No remote-dispatch bypass flags, trust edits, global config
-writes, credential-file reads/copies, browser login or package installation are
-performed. The child inherits normal upstream configuration and authentication;
-Gateway never supplies a silent replacement CODEX_HOME. `agent setup codex`
-explains setup without launching Codex or authentication.
+When no compatible verified daemon is available, Gateway runs
+`codex app-server daemon start` once. That official command starts the shared
+daemon if the socket is absent and leaves an already-running daemon unchanged,
+so a Codex opened later in a terminal joins the same socket and the same
+threads. Gateway does not start a private `codex app-server`, and it never
+stops or restarts the daemon. A dropped connection is adopted again on the
+next pass. No remote-dispatch bypass flags, trust edits, global config writes,
+credential-file reads/copies, browser login or package installation are
+performed. Gateway never supplies a silent replacement CODEX_HOME.
+`agent setup codex` explains setup without launching Codex or authentication.
 
 ## Readiness and transport
 
@@ -57,7 +58,7 @@ Both JSONL stdio and Unix WebSocket clients perform `initialize`, `initialized`,
 `account/read` with `refreshToken: false`. Initialization declares
 `experimentalApi: false`, `requestAttestation: false` and
 `explicitGatewayOauth: true`; no experimental client requests are sent. The
-returned user agent must identify version 0.162.1. No ordinary RPC is admitted
+returned user agent must be version 0.162.1 or newer. No ordinary RPC is admitted
 before authentication/readiness. The private child also reads its effective
 provider selection before becoming ready, retaining only necessary selection
 fields. `requiresOpenaiAuth: true` with a null account

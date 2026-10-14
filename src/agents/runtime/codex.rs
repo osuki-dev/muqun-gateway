@@ -1,5 +1,6 @@
-//! Prefer the verified existing shared daemon; retain an owned stdio fallback.
-//! Never start/restart the daemon, log in, or write global configuration.
+//! Adopt the one shared Codex daemon, starting it when the socket is absent.
+//! Never start a private app-server, restart or stop the daemon, log in, or
+//! write global configuration.
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -82,6 +83,37 @@ pub(super) struct CodexState {
     shutdown: tokio_util::sync::CancellationToken,
 }
 
+/// Start the official shared daemon when its socket is absent.
+/// `codex app-server daemon start` leaves an already-running daemon unchanged.
+#[cfg(not(test))]
+async fn ensure_shared_daemon(config: &CodexConfig) -> Result<(), AgentError> {
+    let mut command = tokio::process::Command::new(config.resolve_binary()?);
+    command
+        .args(["app-server", "daemon", "start"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(false);
+    let status = tokio::time::timeout(Duration::from_secs(60), command.status())
+        .await
+        .map_err(|_| AgentError::NotAvailable("Codex shared daemon start timed out".into()))?
+        .map_err(|err| {
+            AgentError::NotAvailable(format!("Codex shared daemon could not start: {err}"))
+        })?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(AgentError::NotAvailable(
+            "Codex shared daemon did not start".into(),
+        ))
+    }
+}
+
+#[cfg(test)]
+async fn ensure_shared_daemon(_config: &CodexConfig) -> Result<(), AgentError> {
+    Ok(())
+}
+
 impl CodexState {
     pub(super) fn new(config: CodexConfig) -> Self {
         Self {
@@ -122,85 +154,73 @@ impl CodexState {
         }
         // Adopting the daemon owns only a connection. No ChildExit/process ledger
         // exists for it, so shutdown cannot signal or reap the user's daemon.
-        let shared = tokio::select! {
-            biased;
-            _ = self.shutdown.cancelled() => return false,
-            result = crate::agents::adapters::codex::daemon::connect_existing() => result,
-        };
-        match shared {
-            Ok(Some((client, events))) => {
-                if self.shutdown.is_cancelled() {
-                    client.stop();
+        // One start attempt if the socket is absent, then connect to that same socket.
+        for attempt in 0..2 {
+            if self.shutdown.is_cancelled() {
+                return false;
+            }
+            let shared = tokio::select! {
+                biased;
+                _ = self.shutdown.cancelled() => return false,
+                result = crate::agents::adapters::codex::daemon::connect_existing() => result,
+            };
+            match shared {
+                Ok(Some((client, events))) => {
+                    if self.shutdown.is_cancelled() {
+                        client.stop();
+                        return false;
+                    }
+                    *self.failure.lock().await = None;
+                    *self.retry_at.lock().await = None;
+                    tracing::info!("adopted the running Codex daemon");
+                    runtime
+                        .install(
+                            "codex",
+                            AgentManager::connect_codex_recoverable(
+                                client,
+                                events,
+                                runtime.events_tx.clone(),
+                                runtime.terminal_runtime.get().cloned(),
+                                runtime.native_codex_sessions.get().cloned(),
+                            ),
+                            AgentOrigin::Adopted,
+                        )
+                        .await;
+                    return true;
+                }
+                Ok(None) if attempt == 0 => {
+                    // Boot has no terminal yet. Start the official shared daemon
+                    // once; a later Codex joins this socket instead of a second one.
+                    tracing::info!("starting the Codex shared daemon");
+                    if let Err(error) = ensure_shared_daemon(&self.config).await {
+                        tracing::warn!(%error, "Codex shared daemon was not started");
+                        self.failed(error).await;
+                        return false;
+                    }
+                }
+                Ok(None) => {
+                    self.waiting_for_daemon().await;
                     return false;
                 }
-                *self.failure.lock().await = None;
-                *self.retry_at.lock().await = None;
-                runtime
-                    .install(
-                        "codex",
-                        AgentManager::connect_codex_recoverable(
-                            client,
-                            events,
-                            runtime.events_tx.clone(),
-                            runtime.terminal_runtime.get().cloned(),
-                            runtime.native_codex_sessions.get().cloned(),
-                        ),
-                        AgentOrigin::Adopted,
-                    )
-                    .await;
-                return true;
-            }
-            Ok(None) => {}
-            Err(error) => {
-                tracing::debug!(%error, "Codex shared daemon unavailable; using private fallback")
-            }
-        }
-        if self.shutdown.is_cancelled() {
-            return false;
-        }
-        match launch(&self.config).await {
-            Ok((client, events, child)) => {
-                let initialized = tokio::select! {
-                    biased;
-                    _ = self.shutdown.cancelled() => Err(AgentError::NotAvailable("Codex runtime is shutting down".into())),
-                    result = client.initialize() => result,
-                };
-                if let Err(err) = initialized {
-                    self.stop_failed_start(&client, &child, err).await;
+                Err(error) => {
+                    tracing::warn!(%error, "Codex shared daemon was not adopted");
+                    *self.failure.lock().await = Some(error);
+                    *self.retry_at.lock().await = None;
                     return false;
                 }
-                if self.shutdown.is_cancelled() {
-                    self.stop_failed_start(
-                        &client,
-                        &child,
-                        AgentError::NotAvailable("Codex runtime is shutting down".into()),
-                    )
-                    .await;
-                    return false;
-                }
-                *self.child.lock().await = Some(child);
-                *self.failure.lock().await = None;
-                *self.retry_at.lock().await = None;
-                runtime
-                    .install(
-                        "codex",
-                        AgentManager::connect_codex_recoverable(
-                            client,
-                            events,
-                            runtime.events_tx.clone(),
-                            runtime.terminal_runtime.get().cloned(),
-                            runtime.native_codex_sessions.get().cloned(),
-                        ),
-                        AgentOrigin::Spawned,
-                    )
-                    .await;
-                true
-            }
-            Err(err) => {
-                self.failed(err).await;
-                false
             }
         }
+        self.waiting_for_daemon().await;
+        false
+    }
+
+    /// Remember that Codex is absent without backing off. A later socket must
+    /// be noticed on the next supervision pass, not after a spawn retry.
+    async fn waiting_for_daemon(&self) {
+        *self.failure.lock().await = Some(AgentError::NotAvailable(
+            "Codex shared daemon is not running".into(),
+        ));
+        *self.retry_at.lock().await = None;
     }
 
     async fn failed(&self, err: AgentError) {
@@ -279,7 +299,7 @@ impl CodexState {
         } else if self.config.resolve_binary().is_err() {
             info.status = AgentAvailability::NotInstalled;
             info.reason = Some(
-                "Install/configure Codex 0.162.1 on this host, or disable codex.enabled".into(),
+                "Install/configure Codex 0.162.1 or newer on this host, or disable codex.enabled".into(),
             );
         } else {
             // CLI discovery is read-only: it must not spawn an agent merely to
@@ -425,22 +445,8 @@ impl ChildExit {
     }
 }
 
-#[cfg(not(test))]
-async fn launch(config: &CodexConfig) -> Result<ChildConnection, AgentError> {
-    let mut command = tokio::process::Command::new(config.resolve_binary()?);
-    command.args(["app-server", "--listen", "stdio://"]);
-    start_child(command).await
-}
-
-#[cfg(test)]
-async fn launch(_config: &CodexConfig) -> Result<ChildConnection, AgentError> {
-    Err(AgentError::NotAvailable(
-        "real Codex process startup is prohibited in tests".into(),
-    ))
-}
-
-/// Owns and reaps exactly the child supplied here. Tests supply only an
-/// explicit fake executable; production supplies fixed Codex app-server argv.
+/// Owns and reaps exactly the child supplied here. Production no longer starts
+/// one; tests supply an explicit fake executable for shutdown coverage.
 async fn start_child(command: tokio::process::Command) -> Result<ChildConnection, AgentError> {
     start_child_with_tracking(
         command,
