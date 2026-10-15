@@ -3333,6 +3333,9 @@ mod tests {
                 "model/list" => {
                     crate::agents::adapters::codex::tests::golden()["modelList"].clone()
                 }
+                // Catalog reads skills/list after models. An empty list is a
+                // real answer; it must not be treated as an unexpected mutation.
+                "skills/list" => serde_json::json!({"data": []}),
                 other => panic!("unexpected discovery mutation {other}"),
             }
         })

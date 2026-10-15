@@ -216,6 +216,83 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn shared_prompt_delivery_does_not_relock_mutations_and_keeps_turn_serialization() {
+        use crate::agents::ports::agent::AgentError;
+
+        const ID: &str = "00000000-0000-4000-8000-000000000021";
+        let turns = Arc::new(AtomicU64::new(0));
+        let accepted = turns.clone();
+        let fixture = Fixture::new(move |request| match request["method"].as_str().unwrap() {
+            "thread/start" | "thread/read" => {
+                json!({"thread":{"id":ID,"historyMode":"paginated","status":{"type":"idle"}}})
+            }
+            "turn/start" => {
+                let n = accepted.fetch_add(1, Ordering::Relaxed) + 1;
+                json!({"turn":{"id":format!("turn-{n}"),"status":"inProgress"}})
+            }
+            "turn/steer" => json!({"turnId":request["params"]["expectedTurnId"]}),
+            other => panic!("prompt delivery must not call {other}"),
+        })
+        .await;
+        let driver = CodexDriver::new(fixture.client.clone());
+        driver.create_session(None, None, None).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            driver
+                .send_prompt(ID, "First prompt", &[], None)
+                .await
+                .unwrap();
+            driver
+                .send_prompt(ID, "Steer the current turn", &[], Some("steer"))
+                .await
+                .unwrap();
+            assert!(matches!(
+                driver
+                    .send_prompt(ID, "Not a new turn while busy", &[], None)
+                    .await,
+                Err(AgentError::InvalidRequest(_))
+            ));
+            fixture
+                .send
+                .send(json!({"method":"turn/completed","params":{
+                    "threadId":ID,"turn":{"id":"turn-1","status":"completed"}
+                }}))
+                .await
+                .unwrap();
+            while fixture.client.active_turn(ID).is_some() {
+                tokio::task::yield_now().await;
+            }
+            let (left, right) = tokio::join!(
+                driver.send_prompt(ID, "Follow-up A", &[], None),
+                driver.send_prompt(ID, "Follow-up B", &[], None),
+            );
+            assert!(matches!(
+                (&left, &right),
+                (Ok(()), Err(AgentError::InvalidRequest(_)))
+                    | (Err(AgentError::InvalidRequest(_)), Ok(()))
+            ));
+        })
+        .await
+        .expect("prompt delivery must finish without acquiring its mutation lock twice");
+        assert_eq!(turns.load(Ordering::Relaxed), 2);
+        let requests = locked(&fixture.requests);
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|r| r["method"] == "turn/start")
+                .count(),
+            2
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|r| r["method"] == "turn/steer")
+                .count(),
+            1
+        );
+        assert!(!requests.iter().any(|r| r["method"] == "thread/resume"));
+    }
+
+    #[tokio::test]
     async fn native_recovery_restores_only_selected_recorded_session_without_replaying_a_turn() {
         const ID: &str = "00000000-0000-4000-8000-000000000011";
         let fixture = Fixture::new(|request| {
