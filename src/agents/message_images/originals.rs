@@ -689,11 +689,11 @@ async fn original_response(
                 .get("if-range")
                 .is_some_and(|value| value.as_bytes().starts_with(b"W/")))
     {
-            return Err(api_error(
-                StatusCode::PRECONDITION_FAILED,
-                "image_version_precondition_failed",
-                "original version precondition failed",
-            ));
+        return Err(api_error(
+            StatusCode::PRECONDITION_FAILED,
+            "image_version_precondition_failed",
+            "original version precondition failed",
+        ));
     }
     let not_modified = headers
         .get("if-none-match")
@@ -1223,7 +1223,7 @@ mod tests {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt as _;
-                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0)).unwrap();
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
                 assert!(content(
                     State(state.clone()),
                     RoutePath((asset.asset_id.clone(), "original".into())),

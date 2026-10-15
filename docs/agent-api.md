@@ -1092,10 +1092,13 @@ multipart original bytes. This lazily acquires a fixed original and returns:
 ```
 
 The digest identifies the **complete fixed bytes acquired**, not an asserted
-instantaneous atomic view of a concurrently written source file. First acquisition
-opens the source through the existing authorization/inode fence, streams to a
-private temporary original while hashing, checks size/source metadata, syncs and
-publishes complete data atomically without replacing any prior digest object.
+instantaneous atomic view of a concurrently written source file. Cold acquisition
+first streams/hashes the existing authorized handle without temporary disk,
+then verifies a matching complete digest object if one is already stored. Such
+reuse does not count as a new copy, even after registration loss or at capacity.
+Only a missing object reserves the full staging byte/file capacity, rewinds the
+same handle, copies and hashes again, checks both digests/size/source identity,
+syncs and atomically publishes without replacing any prior digest object.
 Detected source change or I/O failure does not publish a partial original.
 Existing immutable Gateway inline/upload originals are reused without another
 permanent copy. No whole-file buffer, per-range whole-file hash or new database.
