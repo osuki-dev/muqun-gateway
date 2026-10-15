@@ -236,7 +236,81 @@ pub struct MemoryMirror {
     agent_id: Arc<str>,
 }
 
+/// One existing session incarnation and removal boundary, captured before a
+/// delivered-input HTTP read. Ordinary assistant deltas do not invalidate it.
+pub(crate) struct DeliveredInputRevision {
+    incarnation: Arc<tokio::sync::Mutex<()>>,
+    removal_generation: u64,
+}
+
 impl MemoryMirror {
+    pub(crate) async fn delivered_input_revision(
+        &self,
+        asid: &AgentSessionId,
+    ) -> Option<DeliveredInputRevision> {
+        let sessions = self.sessions.read().await;
+        let state = sessions.get(asid).filter(|state| !state.info.deleted)?;
+        Some(DeliveredInputRevision {
+            incarnation: state.history_gate.clone(),
+            removal_generation: state.history_removal_generation,
+        })
+    }
+
+    /// Accept the canonical row and remove its receipt under the same write
+    /// lock as deletion/eviction. Never create an entry for an obsolete read.
+    /// Publication is synchronous under that lock so HTTP removal cannot
+    /// overtake the accepted events either.
+    pub(crate) async fn commit_delivered_input(
+        &self,
+        asid: &AgentSessionId,
+        revision: &DeliveredInputRevision,
+        inbox_id: &str,
+        items: Vec<TimelineItem>,
+        publish: impl FnOnce(&[AgentDomainEvent]),
+    ) -> bool {
+        let mut sessions = self.sessions.write().await;
+        let Some(state) = sessions.get_mut(asid) else {
+            return false;
+        };
+        if state.info.deleted
+            || !Arc::ptr_eq(&revision.incarnation, &state.history_gate)
+            || revision.removal_generation != state.history_removal_generation
+        {
+            return false;
+        }
+        let mut events = Vec::new();
+        if !items.is_empty() {
+            let seq = state.next_seq();
+            let mut updated = Vec::new();
+            for mut item in items {
+                item.seq = seq;
+                if let AgentPart::Tool(ref mut call) = item.part {
+                    truncate_tool_output(call);
+                }
+                state.insert_item(item.clone());
+                updated.push(item);
+            }
+            events.push(AgentDomainEvent::TimelineUpsert {
+                asid: asid.clone(),
+                items: updated,
+                seq,
+            });
+        }
+        state
+            .inbox
+            .retain(|item| item.get("id").and_then(serde_json::Value::as_str) != Some(inbox_id));
+        events.push(AgentDomainEvent::InboxChanged {
+            asid: asid.clone(),
+            items: state.inbox.clone(),
+            seq: state.next_seq(),
+        });
+        for event in &events {
+            state.push_event(event.clone());
+        }
+        publish(&events);
+        true
+    }
+
     /// Return the exact bounded, revision-stamped event retained for replay.
     /// Live publishers must not resend the caller's unstamped input rows.
     pub(crate) async fn record_timeline_upsert(

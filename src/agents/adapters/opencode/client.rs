@@ -398,6 +398,24 @@ impl OpencodeClient {
         self.get_plain(&format!("/api/session/{id}")).await
     }
 
+    /// V2 delivered inbox IDs are the projected message IDs. This global
+    /// Session-ID route takes no location: native Session.message compares the
+    /// stored owning sessionID before returning data. Never use a queue preview.
+    pub async fn get_message(
+        &self,
+        session_id: &str,
+        message_id: &str,
+    ) -> Result<Value, AgentError> {
+        let response = self
+            .get_plain(&format!("/api/session/{session_id}/message/{message_id}"))
+            .await?;
+        response
+            .get("data")
+            .filter(|message| message.get("id").and_then(Value::as_str) == Some(message_id))
+            .cloned()
+            .ok_or_else(|| AgentError::Protocol("Delivered message identity mismatch".into()))
+    }
+
     pub async fn get_messages(
         &self,
         session_id: &str,
