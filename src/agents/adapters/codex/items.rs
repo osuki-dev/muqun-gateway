@@ -572,21 +572,224 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn image_generation_invalid_inline_has_no_authenticated_original_download() {
+        use axum::extract::{Path as RoutePath, State};
+        use axum::http::{HeaderMap, StatusCode};
+        use base64::Engine as _;
+        use sha2::Digest as _;
+        for result in [
+            "not an image".to_owned(),
+            "A".repeat(crate::agents::attachment_images::MAX_IMAGE_BYTES * 2),
+            base64::engine::general_purpose::STANDARD.encode(b"not PNG bytes"),
+            format!("{TEST_IMAGE}!"),
+        ] {
+            let workspace = ImageWorkspace::new();
+            let state = crate::test_state("admin", vec![crate::test_device("d1", "token")]);
+            let mut rows = mapper::item(
+                "thread",
+                "turn",
+                &json!({"type":"imageGeneration","id":"bad-inline","status":"completed","result":result}),
+                0,
+            );
+            crate::agents::message_images::attach_to_items(
+                &state,
+                "thread",
+                workspace.0.to_str(),
+                &mut rows,
+            )
+            .await;
+            let mut ids = rows
+                .iter()
+                .flat_map(|row| row.image_assets.iter().flatten())
+                .filter(|asset| !asset.asset_id.is_empty())
+                .map(|asset| asset.asset_id.clone())
+                .collect::<Vec<_>>();
+            // Also probe the exact content-addressed id the non-PNG payload
+            // would receive if wrongly admitted as a generic original file.
+            if let Ok(decoded) =
+                base64::engine::general_purpose::STANDARD.decode(result.trim_end_matches('!'))
+            {
+                let hash = hex::encode(sha2::Sha256::digest(&decoded));
+                let root = std::fs::canonicalize(crate::state_dir().unwrap())
+                    .unwrap()
+                    .join("message-images/originals");
+                let extension = if result.starts_with("iVBOR") {
+                    "png"
+                } else {
+                    "bin"
+                };
+                let path = root.join(format!("{hash}.{extension}"));
+                ids.push(format!(
+                    "ai_{}",
+                    hex::encode(sha2::Sha256::digest(
+                        format!("thread\n{}", path.display()).as_bytes()
+                    ))
+                ));
+            }
+            for id in ids {
+                assert_eq!(
+                    crate::agents::message_images::image_content(
+                        State(state.clone()),
+                        RoutePath((id.clone(), "download".into())),
+                        HeaderMap::new()
+                    )
+                    .await
+                    .unwrap_err()
+                    .0,
+                    StatusCode::UNAUTHORIZED
+                );
+                let result = crate::agents::message_images::image_content(
+                    State(state.clone()),
+                    RoutePath((id, "download".into())),
+                    crate::bearer_headers("token"),
+                )
+                .await;
+                assert!(
+                    matches!(result, Err((StatusCode::NOT_FOUND, _))),
+                    "invalid generated result acquired an authenticated downloadable original"
+                );
+            }
+            assert!(rows
+                .iter()
+                .flat_map(|row| row.image_assets.iter().flatten())
+                .all(|asset| asset.unavailable_reason.is_some()
+                    && asset.url.is_empty()
+                    && asset.download_url.is_none()
+                    && asset.version_url.is_none()));
+            if result.ends_with('!') {
+                let assets = rows
+                    .iter()
+                    .flat_map(|row| row.image_assets.iter().flatten())
+                    .collect::<Vec<_>>();
+                assert_eq!(assets.len(), 1);
+                assert_eq!(
+                    assets[0].unavailable_reason.as_deref(),
+                    Some("invalid_inline_encoding")
+                );
+                // Failure metadata does not duplicate inline bytes; the typed
+                // source, not UI text/output, retains the failed original.
+                assert!(assets[0].src.is_empty());
+                let AgentPart::Tool(call) = &rows[0].part else {
+                    panic!("expected generated image tool");
+                };
+                assert_eq!(
+                    call.content.as_ref().unwrap()[0]["uri"],
+                    format!("data:image/png;base64,{result}")
+                );
+            }
+            for row in &rows {
+                if let AgentPart::Tool(call) = &row.part {
+                    assert!(call.output.is_none());
+                    assert!(call.metadata.as_ref().unwrap().get("result").is_none());
+                    if let Some(content) = &call.content {
+                        for entry in content.as_array().unwrap() {
+                            if entry["type"] == "text" {
+                                assert!(entry["text"].as_str().unwrap().contains("unavailable"));
+                                assert!(entry["text"].as_str().unwrap().len() < 256);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn image_generation_inline_original_survives_terminal_size_limit_and_downloads_exact_bytes(
+    ) {
+        use axum::extract::{Path as RoutePath, State};
+        use axum::http::{HeaderMap, StatusCode};
+        use base64::Engine as _;
+        for large in [false, true] {
+            let mut bytes = base64::engine::general_purpose::STANDARD
+                .decode(TEST_IMAGE)
+                .unwrap();
+            if large {
+                bytes.resize(crate::agents::attachment_images::MAX_IMAGE_BYTES + 1, 0);
+            }
+            let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+            let state = crate::test_state("admin", vec![crate::test_device("d1", "token")]);
+            let mut rows = mapper::item(
+                "thread",
+                "turn",
+                &json!({"type":"imageGeneration","id":"inline","result":encoded,"status":"completed"}),
+                0,
+            );
+            crate::agents::message_images::attach_to_items(&state, "thread", None, &mut rows).await;
+            let assets = rows
+                .iter()
+                .flat_map(|row| row.image_assets.iter().flatten())
+                .collect::<Vec<_>>();
+            assert_eq!(assets.len(), 1);
+            let asset = assets[0];
+            assert!(asset.unavailable_reason.is_none());
+            assert_eq!(asset.mime, "image/png");
+            assert_eq!(asset.size, Some(bytes.len() as u64));
+            let AgentPart::Tool(call) = &rows[0].part else {
+                panic!("expected generated image tool");
+            };
+            assert!(call.output.is_none());
+            assert!(call.metadata.as_ref().unwrap().get("result").is_none());
+            assert_eq!(call.content.as_ref().unwrap()[0]["uri"], asset.url);
+            assert_eq!(
+                crate::agents::message_images::image_content(
+                    State(state.clone()),
+                    RoutePath((asset.asset_id.clone(), "download".into())),
+                    HeaderMap::new()
+                )
+                .await
+                .unwrap_err()
+                .0,
+                StatusCode::UNAUTHORIZED
+            );
+            let response = crate::agents::message_images::image_content(
+                State(state),
+                RoutePath((asset.asset_id.clone(), "download".into())),
+                crate::bearer_headers("token"),
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let downloaded = axum::body::to_bytes(response.into_body(), bytes.len() + 1)
+                .await
+                .unwrap();
+            assert_eq!(downloaded.as_ref(), bytes);
+        }
+    }
+
+    #[tokio::test]
     async fn image_generation_paths_do_not_bypass_canonical_session_fence() {
+        use axum::extract::{Path as RoutePath, State};
+        use axum::http::{HeaderMap, StatusCode};
+        use sha2::Digest as _;
         let workspace = ImageWorkspace::new();
         let outside = ImageWorkspace::new();
         let path = outside.image("outside.png");
-        let state = crate::test_state("admin", vec![]);
-        for value in [
+        let state = crate::test_state("admin", vec![crate::test_device("d1", "token")]);
+        let traversal = format!(
+            "Saved to: file://{}/generated_images/%2e%2e/%2e%2e/{}/generated_images/outside.png",
+            workspace.0.display(),
+            outside.0.file_name().unwrap().to_str().unwrap()
+        );
+        let mut values = vec![
             json!({"savedPath":path}),
             json!({"savedPath":"relative.png"}),
             json!({"savedPath":"https://example.invalid/image.png"}),
             json!({"result":"Saved to: file://example.invalid/image.png"}),
-        ] {
+            json!({"result":traversal}),
+        ];
+        #[cfg(unix)]
+        {
+            let link = workspace.0.join("generated_images/escape.png");
+            std::os::unix::fs::symlink(&path, &link).unwrap();
+            values.push(json!({"savedPath":link}));
+        }
+        for value in values {
             let mut value = value;
             value["type"] = json!("imageGeneration");
             value["id"] = json!("img");
             let mut rows = mapper::item("thread", "turn", &value, 0);
+            let raw_parts = rows.iter().map(|row| row.part.clone()).collect::<Vec<_>>();
             crate::agents::message_images::attach_to_items(
                 &state,
                 "thread",
@@ -595,10 +798,69 @@ mod tests {
             )
             .await;
             assert!(rows.iter().all(|row| row.image_assets.is_none()));
+            assert_eq!(
+                rows.iter().map(|row| row.part.clone()).collect::<Vec<_>>(),
+                raw_parts
+            );
+            assert!(!serde_json::to_string(&rows).unwrap().contains(TEST_IMAGE));
             assert!(state
                 .message_images
                 .served(&crate::asset_id(&path))
                 .is_none());
+            let legacy = crate::asset_id(&path);
+            assert_eq!(
+                crate::platform::assets::asset_download(
+                    State(state.clone()),
+                    RoutePath(legacy.clone()),
+                    HeaderMap::new()
+                )
+                .await
+                .unwrap_err()
+                .0,
+                StatusCode::UNAUTHORIZED
+            );
+            assert_eq!(
+                crate::platform::assets::asset_download(
+                    State(state.clone()),
+                    RoutePath(legacy),
+                    crate::bearer_headers("token")
+                )
+                .await
+                .unwrap_err()
+                .0,
+                StatusCode::NOT_FOUND
+            );
+            let scoped = format!(
+                "ai_{}",
+                hex::encode(sha2::Sha256::digest(
+                    format!("thread\n{}", path.display()).as_bytes()
+                ))
+            );
+            assert!(state.message_images.served(&scoped).is_none());
+            for variant in ["original", "download", "version"] {
+                assert_eq!(
+                    crate::agents::message_images::image_content(
+                        State(state.clone()),
+                        RoutePath((scoped.clone(), variant.into())),
+                        HeaderMap::new()
+                    )
+                    .await
+                    .unwrap_err()
+                    .0,
+                    StatusCode::UNAUTHORIZED
+                );
+                assert_eq!(
+                    crate::agents::message_images::image_content(
+                        State(state.clone()),
+                        RoutePath((scoped.clone(), variant.into())),
+                        crate::bearer_headers("token")
+                    )
+                    .await
+                    .unwrap_err()
+                    .0,
+                    StatusCode::NOT_FOUND
+                );
+            }
         }
     }
     #[test]

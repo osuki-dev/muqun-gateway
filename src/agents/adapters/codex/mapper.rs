@@ -233,9 +233,20 @@ pub fn item(thread: &str, turn: &str, value: &Value, at_ms: u64) -> Vec<Timeline
                 if let (AgentPart::Tool(call), Some(encoded)) =
                     (&mut part, value["result"].as_str())
                 {
-                    // A saved-path projection has no inline content. Preserve
-                    // that original; only rescue an explicit inline fallback.
-                    if call.content.is_some() {
+                    // A saved-path projection has no inline content. Rescue
+                    // only PNG-looking generated results, not unavailable text
+                    // or arbitrary base64 (which generic originals may serve as
+                    // non-image files). Check a fixed prefix here; blocking
+                    // egress still validates the complete encoding. Do not apply
+                    // the terminal inline size limit to legitimate originals.
+                    use base64::Engine as _;
+                    let png = encoded
+                        .get(..12)
+                        .and_then(|head| {
+                            base64::engine::general_purpose::STANDARD.decode(head).ok()
+                        })
+                        .is_some_and(|head| head.starts_with(b"\x89PNG\r\n\x1a\n"));
+                    if call.content.is_some() && png {
                         let mut budget =
                             crate::agents::attachment_images::MAX_REFERENCE_RESPONSE_BYTES;
                         if let Some(uri) = crate::agents::attachment_images::inline_reference(
