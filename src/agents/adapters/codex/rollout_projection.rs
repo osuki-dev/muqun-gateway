@@ -108,6 +108,7 @@ pub(crate) async fn canonical_items(
     driver: &CodexDriver,
     thread: &str,
     targets: &[ItemTarget],
+    deadline: tokio::time::Instant,
 ) -> Result<Vec<TimelineItem>, AgentError> {
     if targets.len() > MAX_TARGETS {
         return Err(invalid());
@@ -132,7 +133,7 @@ pub(crate) async fn canonical_items(
         let mut rows = Vec::new();
         while !wanted.is_empty() {
             calls += 1;
-            if calls > MAX_CALLS {
+            if calls > MAX_CALLS || bytes >= MAX_BYTES || tokio::time::Instant::now() >= deadline {
                 return Err(invalid());
             }
             let mut params =
@@ -140,10 +141,17 @@ pub(crate) async fn canonical_items(
             if let Some(cursor) = &cursor {
                 params["cursor"] = json!(cursor);
             }
-            let (page, size) = driver
-                .client()
-                .call_sized("thread/items/list", params)
-                .await?;
+            let (page, size) = tokio::time::timeout_at(
+                deadline,
+                driver.client().call_sized_budgeted(
+                    "thread/items/list",
+                    params,
+                    deadline,
+                    MAX_BYTES - bytes,
+                ),
+            )
+            .await
+            .map_err(|_| invalid())??;
             bytes = bytes
                 .checked_add(size)
                 .filter(|total| *total <= MAX_BYTES)
@@ -236,6 +244,7 @@ mod tests {
                     item: "new".into(),
                 },
             ],
+            tokio::time::Instant::now() + std::time::Duration::from_secs(5),
         )
         .await
         .unwrap();

@@ -32,6 +32,12 @@ use crate::{
     sniff_asset_type, ApiResult, AppState, AssetEntry, AssetKind,
 };
 
+mod originals;
+mod previews;
+mod versions;
+pub(crate) use originals::content as image_content;
+pub(crate) use originals::version_content as image_version_content;
+
 /// How many served images are remembered. Old entries fall off; the next read
 /// of the timeline that names them puts them back.
 const MAX_SERVED_IMAGES: usize = 4096;
@@ -88,7 +94,7 @@ impl MessageImages {
         Some(root)
     }
 
-    fn remember_served(&self, id: &str, image: ServedImage) {
+    pub(super) fn remember_served(&self, id: &str, image: ServedImage) {
         let Ok(mut inner) = self.inner.lock() else {
             return;
         };
@@ -110,7 +116,11 @@ impl MessageImages {
                 continue;
             };
             let assets = self.resolve_text(root, text);
-            item.image_assets = (!assets.is_empty()).then_some(assets);
+            if !assets.is_empty() {
+                let existing = item.image_assets.get_or_insert_default();
+                existing.retain(|old| !assets.iter().any(|asset| asset.src == old.src));
+                existing.extend(assets);
+            }
         }
     }
 
@@ -138,14 +148,23 @@ impl MessageImages {
             } else {
                 (None, None)
             };
+            let size = std::fs::metadata(&path).ok().map(|metadata| metadata.len());
             self.remember_served(&id, ServedImage { path, root: fence });
             assets.push(MessageImageAsset {
                 src,
                 url: format!("/api/assets/{id}/content"),
-                asset_id: id,
+                asset_id: id.clone(),
                 mime: kind.mime.to_owned(),
                 width,
                 height,
+                thumbnail_url: (kind.kind == AssetKind::Image)
+                    .then(|| format!("/api/agent-images/{id}/thumbnail")),
+                preview_url: (kind.kind == AssetKind::Image)
+                    .then(|| format!("/api/agent-images/{id}/preview")),
+                download_url: Some(format!("/api/agent-images/{id}/download")),
+                version_url: Some(format!("/api/agent-images/{id}/version")),
+                size,
+                unavailable_reason: None,
             });
         }
         assets
@@ -261,8 +280,15 @@ async fn resolve_agent_file(
         tab_id: None,
         pane_id: None,
     };
+    let mut asset = asset_json(&entry, kind);
+    if kind.kind == AssetKind::Image {
+        asset["thumbnail_url"] = format!("/api/agent-images/{}/thumbnail", entry.id).into();
+        asset["preview_url"] = format!("/api/agent-images/{}/preview", entry.id).into();
+    }
+    asset["download_url"] = format!("/api/agent-images/{}/download", entry.id).into();
+    asset["version_url"] = format!("/api/agent-images/{}/version", entry.id).into();
     Ok(axum::Json(content_envelope(
-        serde_json::json!({ "asset": asset_json(&entry, kind) }),
+        serde_json::json!({ "asset": asset }),
     )))
 }
 
@@ -274,24 +300,11 @@ pub(crate) async fn attach_to_items(
     directory: Option<&str>,
     items: &mut [TimelineItem],
 ) {
-    if items.iter().any(|item| item.attachments.is_some())
-        && state
-            .agent_runtime
-            .manager_for_session(asid)
-            .await
-            .is_some_and(|manager| manager.agent().kind() == "codex")
-    {
-        let mut owned = items.to_vec();
-        if let Ok(exported) = tokio::task::spawn_blocking(move || {
-            super::attachment_images::export_native(&mut owned);
-            owned
-        })
-        .await
-        {
-            items.clone_from_slice(&exported);
-        }
-    }
-    if !items.iter().any(may_embed_image) {
+    let needs_files = items.iter().any(|item| {
+        item.attachments.is_some()
+            || matches!(&item.part, AgentPart::Tool(call) if call.content.is_some())
+    });
+    if !needs_files && !items.iter().any(may_embed_image) {
         return;
     }
     let root = match directory {
@@ -302,9 +315,14 @@ pub(crate) async fn attach_to_items(
         Some(root) => root,
         None => match session_root(state, asid).await {
             Some(root) => root,
-            None => return,
+            None => {
+                // Inline originals do not need a workspace. Host paths do.
+                originals::attach(state, asid, None, items).await;
+                return;
+            }
         },
     };
+    originals::attach(state, asid, Some(root.clone()), items).await;
     state.message_images.attach(&root, items);
 }
 

@@ -218,7 +218,38 @@ pub fn item(thread: &str, turn: &str, value: &Value, at_ms: u64) -> Vec<Timeline
     parts
         .into_iter()
         .enumerate()
-        .map(|(ordinal, (id, part))| {
+        .map(|(ordinal, (id, mut part))| {
+            // Pinned rust-v0.162.1 ThreadItem: imageView { id, path:
+            // LegacyAppPathString }. Structural evidence, not a tool-name guess.
+            // Egress still authorizes the path and sniffs the actual MIME.
+            if value["type"] == "imageView" {
+                if let (AgentPart::Tool(call), Some(path)) = (&mut part, value["path"].as_str()) {
+                    call.content = Some(serde_json::json!([
+                        {"type":"file", "uri":path, "mime":"application/octet-stream"}
+                    ]));
+                }
+            }
+            if value["type"] == "imageGeneration" {
+                if let (AgentPart::Tool(call), Some(encoded)) =
+                    (&mut part, value["result"].as_str())
+                {
+                    // A saved-path projection has no inline content. Preserve
+                    // that original; only rescue an explicit inline fallback.
+                    if call.content.is_some() {
+                        let mut budget =
+                            crate::agents::attachment_images::MAX_REFERENCE_RESPONSE_BYTES;
+                        if let Some(uri) = crate::agents::attachment_images::inline_reference(
+                            "image/png",
+                            encoded,
+                            &mut budget,
+                        ) {
+                            call.content = Some(serde_json::json!([
+                                {"type":"file", "uri":uri, "mime":"image/png"}
+                            ]));
+                        }
+                    }
+                }
+            }
             let ordinal = if matches!(part, AgentPart::Reasoning { .. }) {
                 id.rsplit_once(":r")
                     .and_then(|(_, n)| n.parse().ok())

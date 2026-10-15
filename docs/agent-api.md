@@ -969,6 +969,172 @@ A phone cannot hand a local file to an agent that runs on the gateway's host, so
 the file is uploaded first and then referred to by path. Both routes are on the
 gateway proper rather than under `/api/agent-*`; both require a paired device.
 
+### Agent image previews (additive `agent_image_previews_v1`)
+
+Timeline `attachments[]` and typed tool `content[].uri` use authenticated,
+Gateway-relative **original** URLs for admitted inline/local files. No thumbnail
+replaces an existing original URL. Text and tool inputs remain verbatim. The
+optional `image_assets` entries match attachment/content URLs through `src`:
+
+```json
+{
+  "src": "/api/agent-images/ai_…/original",
+  "asset_id": "ai_…",
+  "url": "/api/agent-images/ai_…/original",
+  "mime": "image/png",
+  "width": 1200,
+  "height": 800,
+  "size": 1234567,
+  "thumbnail_url": "/api/agent-images/ai_…/thumbnail",
+  "preview_url": "/api/agent-images/ai_…/preview",
+  "download_url": "/api/agent-images/ai_…/download",
+  "version_url": "/api/agent-images/ai_…/version"
+}
+```
+
+Minimal new-App consumption: negotiate `agent_image_previews_v1`; match `src`
+exactly and check actual `mime` (entries may be files/PDFs, not all bitmaps).
+Use `thumbnail_url` only in the timeline list, `preview_url` when opening an
+image, and `download_url` (or original `url`) for save/download. Fall back to
+original bytes via `download_url` on a 415 preview failure; this is also usable
+for viewing, regardless of attachment disposition. Legacy text/file-asset `url`
+can still name the old size-limited asset endpoint, so use the new download URL
+for large originals. Never save a thumbnail. Missing optional
+fields retain legacy behavior. No `agent_message_display_v1` or gallery redesign
+is required. Older Apps receive original attachment bytes, not implicit smaller
+replacements; they do not gain thumbnail bandwidth savings until updated.
+
+`size` is the original file length, not a derivative estimate. An optional
+`unavailable_reason` marks a failed reference/encoding/storage resolution:
+**skip that entry for URL/image rendering**. Its `url` and `asset_id` are empty,
+and no download/preview URL is fabricated. The original attachment/content string
+remains unchanged so source information is not silently deleted. Reasons include
+`attachment_name_only` (display label, never a filesystem path),
+`original_storage_unavailable`, `invalid_inline_encoding`, and
+`reference_not_authorized_or_unavailable`. For an unavailable inline source the
+error entry's `src` is empty to avoid copying its entire base64 payload again;
+the raw source occurs only in the existing attachment/content field. Such an
+entry is explicitly **not** a claim that an authorized original URL exists.
+
+`GET /api/agent-sessions/{asid}/file-asset?uri=…` retains its original contract
+and adds these same optional preview/download URLs to `data.asset`.
+
+`GET /api/agent-images/{id}/{variant}` accepts only `original`, `download`,
+`thumbnail`, or `preview`. All require an existing paired App device and the
+normal encrypted transport when required by pairing; URLs contain no credentials.
+Each read re-opens an already registered canonical regular file inside its
+server-owned fence (session directory, existing generated-images fence, or
+Gateway upload/original storage), including cache hits. No arbitrary path query
+exists. IDs are bounded in-memory registrations; refresh the timeline/file-asset
+after a Gateway restart or registration eviction. Pairing is owner-wide, not a
+per-session user ACL; no new session bearer/capability tokens are issued.
+
+Original reads have no preview-size cutoff: they stream from an authorized open
+file handle in 64 KiB chunks. They include weak metadata ETag, private/no-store,
+single byte Range support (206/416), and If-None-Match (304). Per HTTP semantics
+a weak If-Range cannot establish a strong content match and returns full 200.
+These legacy unversioned URLs expose no strong original version conditional;
+the derivative's strong WebP ETag is not an original version. Weak metadata ETags
+detect changes but do not promise a fixed snapshot across separate range
+requests. Consistent multipart originals use the additive version API below.
+A source changed during reading aborts the body rather than reporting a complete
+successful snapshot. Download differs only by attachment disposition. Existing
+`/api/assets/*` and `/api/uploads/*` size/retention/download behavior is unchanged.
+Inline image originals are immutable private digest-named files; generated host
+originals remain in place. The derivative sweeper never deletes originals.
+Inline originals decode to disk in small base64 blocks, not a whole-image byte
+allocation, and do not disappear when optional preview budgets are exhausted.
+Attachment arrays are not silently truncated at 16/32 entries.
+
+The existing encrypted transport still buffers each sealed response (roughly
+32 MiB plaintext maximum); it is not a streaming encryption protocol. Large
+original consumers must use bounded standard ranges, for example 8 MiB each,
+using `size` or a small encrypted GET range's Content-Range total. Authenticate
+the complete AEAD response, check each requested interval/returned length/total
+and validator, and abort/restart assembly when they differ. Do not use weak
+If-Range, and never append a 200 fallback as if it were a partial response.
+Do not rely on an encrypted HEAD response body for authenticated metadata. A
+full large response over that transport is not currently supported. Never
+downgrade or disable required pairing encryption to bypass that constraint.
+The original route itself supports full streaming reads over the existing
+authorized transport mode and bounded encrypted range reads; App range-save
+consumption must be verified separately before claiming large-file acceptance.
+
+Derivatives are lazy, lossless WebP: thumbnail longest edge 384 (1 MiB output
+cap), preview longest edge 1600 (4 MiB cap), no upscaling. Only static PNG/JPEG/
+WebP is decoded. Sources over 25 MiB, GIF/APNG/animated WebP/HEIC, malformed content, over 8 million
+pixels or 16384 per dimension, a decoded-buffer allowance over 64 MiB, and failed
+cache/encoding operations return 415 `image_preview_unavailable`, not an original
+disguised as WebP. Originals remain accessible where authorized. Work uses at
+most two blocking workers, with one serialized cache/encode transaction; the
+versioned source-digest/size cache is bounded at 64 MiB/256 derivative files.
+
+This normalization occurs **after** provider decoding. It does not by itself
+repair an upstream Codex WebSocket frame that fails before decoding.
+
+#### Fixed original downloads (`agent_image_versions_v1`)
+
+Successful image/file descriptors additionally offer optional `version_url`.
+Negotiate `agent_image_versions_v1`, then GET that URL **before** requesting
+multipart original bytes. This lazily acquires a fixed original and returns:
+
+```json
+{ "data": { "asset": {
+  "id": "ai_…",
+  "version": "<64 lowercase SHA256 hex characters>",
+  "etag": "\"sha256-<same hex>\"",
+  "size": 34603008,
+  "mime": "image/png",
+  "name": "source.png",
+  "url": "/api/agent-images/ai_…/original/<version>",
+  "download_url": "/api/agent-images/ai_…/download/<version>"
+} } }
+```
+
+The digest identifies the **complete fixed bytes acquired**, not an asserted
+instantaneous atomic view of a concurrently written source file. First acquisition
+opens the source through the existing authorization/inode fence, streams to a
+private temporary original while hashing, checks size/source metadata, syncs and
+publishes complete data atomically without replacing any prior digest object.
+Detected source change or I/O failure does not publish a partial original.
+Existing immutable Gateway inline/upload originals are reused without another
+permanent copy. No whole-file buffer, per-range whole-file hash or new database.
+
+Use the returned versioned `download_url`/`url` with standard bounded ranges
+(e.g. 8 MiB) and the descriptor's exact strong `If-Match`. Each 206 must pass
+complete AEAD authentication and match the expected strong ETag, requested
+Content-Range interval, total and body length. The original source may change
+inside its fence after part zero: that version URI still reads the acquired
+fixed bytes, never silently switches to the changed source. Reacquiring a
+descriptor may yield a different digest/URI. Do not combine those versions.
+
+Wrong/weak `If-Match` is **412**; weak `If-Range` on the versioned route is also
+rejected with 412. Prefer If-Match only. A mismatched strong If-Range can yield
+full **200** by HTTP semantics: never append it as a partial segment. The old
+unversioned URL/weak ETag semantics remain unchanged for older Apps.
+
+Unknown/expired version registration or a changed fixed object is **409**:
+stop assembly, refresh the descriptor and restart unless the same digest/size
+is re-established. Authorization/expiry is rechecked, including the original
+source fence; a removed/escaped original reference can still return 404. A
+version digest is not a credential and cannot access another asset's versions.
+Uploads retain their existing 48-hour retention. In-memory registrations are
+bounded at 256 and reset on restart/eviction; disk originals are not deleted by
+registration eviction.
+
+Additional local-version copies have a fixed **1 GiB / 4096-file original-store
+admission budget** (including existing regular files/staging). Already preserved
+inline/upload originals and existing versions remain usable; existing inline
+original retention is unchanged. Capacity failure returns **507** before a
+new version is promised; it never deletes a source or unique original to make
+room. Stored originals have no new automatic destructive expiry. Storage failure
+is 503, source change/conflict is 409. These are explicit failures, not fake
+download URLs. Snapshot acquisition is singleflight inside the existing bounded
+blocking admission; no extra service, queue or configurable transform system.
+
+The shared sealed-response collector remains bounded, not streaming encryption;
+versioned clients must still use small authenticated ranges for large files.
+
 ### `POST /api/uploads`
 
 `multipart/form-data` with one `file` field. The type is decided by sniffing the

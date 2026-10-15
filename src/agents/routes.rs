@@ -350,6 +350,14 @@ pub fn mount(router: Router<AppState>) -> Router<AppState> {
             "/api/agent-sessions/{asid}/file-asset",
             get(message_images::file_asset),
         )
+        .route(
+            "/api/agent-images/{id}/{variant}",
+            get(message_images::image_content),
+        )
+        .route(
+            "/api/agent-images/{id}/{variant}/{version}",
+            get(message_images::image_version_content),
+        )
         // Standalone independent OpenCode agent routes (no tmux / herdr session required)
         .route(
             "/api/agent-sessions",

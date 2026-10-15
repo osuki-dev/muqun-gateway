@@ -28,10 +28,12 @@ futures = { version = "0.3.32", default-features = false, features = ["std"] }
 hkdf = "0.13.0"
 hmac = "0.13.0"
 indexmap = { version = "2.14.2", features = ["serde"] }
+# Authorized original-preserving image derivatives; no all-format/rayon/native codecs.
+image = { version = "=0.25.8", default-features = false, features = ["png", "jpeg", "webp"] }
 libc = "0.2.178"
 # Default features pull in the `image` crate -- a full image decoder, and the
-# largest attack surface in this dependency tree -- for a renderer this gateway
-# never calls. The QR code is rendered to unicode half-blocks by the core crate.
+# a broad codec attack surface -- for a QR renderer this gateway never calls.
+# The separate image dependency above intentionally enables only three codecs.
 qrcode = { version = "0.14.1", default-features = false }
 reqwest = { version = "0.12.24", default-features = false, features = ["json", "rustls-tls", "stream"] }
 serde = { version = "1.0.228", features = ["derive"] }

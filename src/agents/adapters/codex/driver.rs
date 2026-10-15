@@ -61,11 +61,11 @@ struct HistoryPage {
     revision: u64,
     started: bool,
     cursor: Option<String>,
-    /// One raw page (or bounded legacy response), oldest first. Keep raw items rather than expanding a
-    /// 100-item reasoning page into up to 102,400 cached timeline rows.
+    /// Raw page while preparing, oldest first. Shared pages are projected once
+    /// before publication; private stdio keeps its existing one-item expansion.
     pending: Vec<Value>,
-    /// Older mapped prefix left in the newest partially consumed item.
-    remaining: Option<usize>,
+    /// Older mapped prefix, without retaining/remapping a large raw image item.
+    remaining: Vec<TimelineItem>,
     seen: HashSet<String>,
     retained_bytes: usize,
 }
@@ -529,9 +529,10 @@ impl CodexDriver {
             .filter(|id| !order.contains_key(&key(id)))
             .collect();
         if order.len() + new_ids.len() > 8192 {
-            self.client.stop();
-            return Err(AgentError::NotAvailable(
-                "Codex item-order capacity exhausted; resync required".into(),
+            // A historical page failing local retention is not a control/live
+            // transport failure. Leave the old order/cursor and primary intact.
+            return Err(AgentError::RequestFailed(
+                "Codex history item-order capacity exhausted; page not consumed".into(),
             ));
         }
         // Preserve a shared anchor when a larger or newer tail is requested.
@@ -782,7 +783,8 @@ impl CodexDriver {
         let mut seen = HashSet::new();
         let mut items = vec![];
         let mut retained_bytes = 0usize;
-        for _ in 0..16 {
+        let mut read_rows = 0usize;
+        for _ in 0..super::budget::MAX_PAGES {
             if self.client.subscription_revision(id) != Some(ownership)
                 || self.client.active_turn(id).as_deref() != Some(&turn)
             {
@@ -818,6 +820,12 @@ impl CodexDriver {
                 .ok_or_else(|| {
                     AgentError::Protocol("invalid Codex question recovery page".into())
                 })?;
+            read_rows += rows.len();
+            if read_rows > 1600 {
+                return Err(AgentError::RequestFailed(
+                    "Codex question recovery budget exhausted".into(),
+                ));
+            }
             for row in rows {
                 if row["turnId"] != turn || row["item"]["id"].as_str().is_none() {
                     return Err(AgentError::Protocol(
@@ -1106,7 +1114,7 @@ impl CodexDriver {
         id: &str,
         mut page: HistoryPage,
     ) -> Result<(), AgentError> {
-        page.retained_bytes = serde_json::to_vec(&(&page.pending, &page.seen))
+        page.retained_bytes = serde_json::to_vec(&(&page.pending, &page.remaining, &page.seen))
             .map_err(|_| AgentError::Protocol("invalid Codex history state".into()))?
             .len();
         let bytes = history
@@ -1158,12 +1166,26 @@ impl CodexDriver {
     ) -> Result<Vec<TimelineItem>, AgentError> {
         let mut items = Vec::new();
         while items.len() < limit {
+            if !state.remaining.is_empty() {
+                let start = state.remaining.len().saturating_sub(limit - items.len());
+                items.extend(state.remaining.drain(start..));
+                continue;
+            }
             if state.pending.is_empty() {
                 if state.started && state.cursor.is_none() {
                     break;
                 }
+                // A short, nonempty page is not EOF. Preserve the real cursor
+                // and publish complete items rather than repeatedly rejecting
+                // a large historical window at the next bounded read.
+                if !items.is_empty()
+                    && self.client.is_shared()
+                    && !budget.can_read_complete_history_item()
+                {
+                    break;
+                }
                 let page_limit = (limit - items.len()).min(100);
-                let page = budget.call(&self.client, "thread/items/list", json!({
+                let mut page = budget.call(&self.client, "thread/items/list", json!({
                     "threadId":id,"limit":page_limit,"sortDirection":"desc","cursor":state.cursor
                 })).await?;
                 let data = page["data"]
@@ -1207,33 +1229,39 @@ impl CodexDriver {
                 for (turn, ids) in ids_by_turn {
                     self.set_history_order_at(id, &turn, &ids, state.started)?;
                 }
-                state.pending = data.iter().rev().cloned().collect();
+                state.pending = page["data"]
+                    .as_array_mut()
+                    .expect("validated item page")
+                    .drain(..)
+                    .rev()
+                    .collect();
                 state.cursor = next;
                 state.started = true;
                 if state.pending.is_empty() {
                     break;
                 }
             }
-            let row = state.pending.last().expect("nonempty history page");
-            let turn = mapper::string(row, "turnId")?;
-            let mut mapped = self.ordered_items(
-                id,
-                &turn,
-                &row["item"],
-                row["startedAtMs"]
-                    .as_u64()
-                    .or_else(|| row["completedAtMs"].as_u64())
-                    .unwrap_or(0),
-            )?;
-            mapped.truncate(state.remaining.unwrap_or(mapped.len()));
-            let take = mapped.len().min(limit - items.len());
-            let remaining = mapped.len() - take;
-            items.extend(mapped.drain(remaining..));
-            if remaining == 0 {
-                state.pending.pop();
-                state.remaining = None;
+            // Project the accepted page once and release all raw image bodies.
+            // A row-limited window retains only the mapped older prefix, not a
+            // giant item or the other raw images adjacent to it in this page.
+            let pending = if self.client.is_shared() {
+                std::mem::take(&mut state.pending)
             } else {
-                state.remaining = Some(remaining);
+                vec![state.pending.pop().expect("nonempty history page")]
+            };
+            for row in pending {
+                let turn = mapper::string(&row, "turnId")?;
+                state.remaining.extend(
+                    self.ordered_items(
+                        id,
+                        &turn,
+                        &row["item"],
+                        row["startedAtMs"]
+                            .as_u64()
+                            .or_else(|| row["completedAtMs"].as_u64())
+                            .unwrap_or(0),
+                    )?,
+                );
             }
         }
         items.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
@@ -1937,7 +1965,11 @@ impl AgentPort for CodexDriver {
             else {
                 return Ok(Vec::new());
             };
-            if page.started && page.cursor.is_none() && page.pending.is_empty() {
+            if page.started
+                && page.cursor.is_none()
+                && page.pending.is_empty()
+                && page.remaining.is_empty()
+            {
                 return Ok(Vec::new());
             }
             let expected = Some(page.revision);
@@ -2586,6 +2618,10 @@ mod history_tests {
             .set_history_order_at("thread", "turn", &["new".into()], true)
             .is_err());
         assert_eq!(driver.order.lock().unwrap().len(), 8192);
+        assert!(
+            fixture.client.is_ready(),
+            "history cache exhaustion must not stop the primary"
+        );
     }
 
     #[test]

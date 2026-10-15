@@ -1,4 +1,4 @@
-use crate::agents::attachment_images::{image_uri, MAX_IMAGE_BYTES, MAX_RESPONSE_IMAGE_BYTES};
+use crate::agents::attachment_images::{inline_reference, MAX_REFERENCE_RESPONSE_BYTES};
 use crate::agents::domain::{
     part_item_id, push_input_partial, reasoning_item_id, text_item_id, tool_item_id,
     AgentErrorInfo, AgentPart, AgentProject, AgentSessionId, AgentSessionInfo, AgentSessionStatus,
@@ -289,43 +289,38 @@ fn is_duplicate_tool_text(text: &str, prev_item: Option<&TimelineItem>) -> bool 
 
 fn inline_image_attachment(file: &Value, budget: &mut usize) -> Option<String> {
     // V2 Prompt.FileAttachment carries raw base64, not a V1 FilePart URL.
-    // Only this explicit inline branch can reach image_uri: never read a host
+    // Only this explicit inline branch can reach inline_reference: never read a host
     // path or fetch a URL while mapping OpenCode messages.
     if file.pointer("/source/type").and_then(Value::as_str) != Some("inline") {
         return None;
     }
-    let mime = file.get("mime").and_then(Value::as_str)?;
-    if !matches!(
-        mime,
-        "image/png" | "image/jpeg" | "image/gif" | "image/webp" | "image/heic"
-    ) {
-        return None;
-    }
+    let mime = file
+        .get("mime")
+        .and_then(Value::as_str)
+        .unwrap_or("application/octet-stream");
     let encoded = file.get("data").and_then(Value::as_str)?;
-    // Bound the temporary URI allocation before the shared helper charges
-    // decoding attempts (including failures) against the response allowance.
-    if encoded.len() > MAX_IMAGE_BYTES.div_ceil(3) * 4 {
-        return None;
-    }
-    if encoded.len() > *budget {
-        *budget = 0;
-        return None;
-    }
-    let header = format!("data:{mime};base64,");
-    let uri = image_uri(&format!("{header}{encoded}"), budget)?;
-    // The helper sniffs content. A false MIME declaration remains a normal
-    // attachment fallback, not a successfully exported image.
-    uri.starts_with(&header).then_some(uri)
+    inline_reference(mime, encoded, budget)
 }
 
-fn message_attachments(msg: &Value, budget: &mut usize) -> Option<Vec<String>> {
-    let files = msg
+fn message_attachments(
+    msg: &Value,
+    budget: &mut usize,
+) -> (
+    Option<Vec<String>>,
+    Option<Vec<crate::agents::domain::MessageImageAsset>>,
+) {
+    let Some(files) = msg
         .get("files")
         .or_else(|| msg.get("attachments"))
-        .and_then(Value::as_array)?;
+        .and_then(Value::as_array)
+    else {
+        return (None, None);
+    };
     let mut attachments = Vec::new();
+    let mut labels = Vec::new();
     // Match the existing native image export's per-message attachment limit.
-    for file in files.iter().take(16) {
+    for file in files {
+        let mut name_only = false;
         let attachment = if let Some(source) = file.as_str() {
             Some(source.to_string())
         } else {
@@ -335,18 +330,30 @@ fn message_attachments(msg: &Value, budget: &mut usize) -> Option<Vec<String>> {
             inline.or_else(|| {
                 file.get("uri")
                     .or_else(|| file.pointer("/source/uri"))
-                    .or_else(|| file.get("name"))
                     .and_then(Value::as_str)
                     .map(str::to_string)
+                    .or_else(|| {
+                        name_only = true;
+                        file.get("name").and_then(Value::as_str).map(str::to_string)
+                    })
             })
         };
         if let Some(attachment) = attachment {
             if !attachments.contains(&attachment) {
+                if name_only {
+                    labels.push(crate::agents::domain::MessageImageAsset::unavailable(
+                        &attachment,
+                        "attachment_name_only",
+                    ));
+                }
                 attachments.push(attachment);
             }
         }
     }
-    (!attachments.is_empty()).then_some(attachments)
+    (
+        (!attachments.is_empty()).then_some(attachments),
+        (!labels.is_empty()).then_some(labels),
+    )
 }
 
 /// Turn OpenCode's flat list of typed messages into timeline items.
@@ -358,7 +365,7 @@ fn message_attachments(msg: &Value, budget: &mut usize) -> Option<Vec<String>> {
 pub fn map_messages_to_timeline(messages: &[Value], asid: &AgentSessionId) -> Vec<TimelineItem> {
     let mut items: Vec<TimelineItem> = Vec::new();
     let mut seq = 1u64;
-    let mut image_budget = MAX_RESPONSE_IMAGE_BYTES;
+    let mut image_budget = MAX_REFERENCE_RESPONSE_BYTES;
 
     // The list arrives in the order the caller asked for (`order=asc`); the
     // gateway does not re-derive it from timestamps.
@@ -380,7 +387,7 @@ pub fn map_messages_to_timeline(messages: &[Value], asid: &AgentSessionId) -> Ve
 
 /// One message, expanded into the rows it contributes.
 pub fn map_message(msg: &Value, asid: &AgentSessionId) -> Vec<TimelineItem> {
-    let mut image_budget = MAX_RESPONSE_IMAGE_BYTES;
+    let mut image_budget = MAX_REFERENCE_RESPONSE_BYTES;
     map_message_with_budget(msg, asid, &mut image_budget)
 }
 
@@ -408,7 +415,7 @@ fn map_message_with_budget(
     };
 
     let mut out: Vec<TimelineItem> = Vec::new();
-    let mut attachments = message_attachments(msg, image_budget);
+    let (mut attachments, mut attachment_assets) = message_attachments(msg, image_budget);
     macro_rules! push {
         ($id:expr, $ordinal:expr, $part:expr, $attachments:expr $(,)?) => {
             out.push(TimelineItem {
@@ -420,7 +427,7 @@ fn map_message_with_budget(
                 updated_ms,
                 ordinal: $ordinal,
                 attachments: $attachments,
-                image_assets: None,
+                image_assets: attachment_assets.take(),
             })
         };
     }
@@ -1980,7 +1987,7 @@ mod tests {
         let expected = vec![
             format!("data:image/png;base64,{INLINE_PNG}"),
             format!("data:image/gif;base64,{gif}"),
-            "notes.txt".into(),
+            "data:text/plain;base64,aGVsbG8=".into(),
         ];
         for text in ["", "Look at these"] {
             let msg = json!({
@@ -2014,7 +2021,7 @@ mod tests {
     }
 
     #[test]
-    fn test_map_messages_bad_inline_images_fall_back_without_promoting_other_roles() {
+    fn test_map_messages_inline_sources_are_preserved_without_promoting_other_roles() {
         let asid = AgentSessionId("ses_inline".into());
         let mut cases = vec![
             json!({"data": "!!!!", "mime": "image/png", "source": {"type": "inline"}}),
@@ -2036,7 +2043,26 @@ mod tests {
                 "files": [file], "time": {"created": 1000}});
             let timeline = map_message(&msg, &asid);
             assert_eq!(timeline.len(), 1);
-            assert_eq!(timeline[0].attachments, Some(vec!["clipboard".into()]));
+            if file.pointer("/source/type").and_then(Value::as_str) == Some("inline")
+                && file["data"].is_string()
+            {
+                let mime = file["mime"].as_str().unwrap_or("application/octet-stream");
+                assert_eq!(
+                    timeline[0].attachments,
+                    Some(vec![format!(
+                        "data:{mime};base64,{}",
+                        file["data"].as_str().unwrap()
+                    )])
+                );
+            } else {
+                assert_eq!(timeline[0].attachments, Some(vec!["clipboard".into()]));
+                assert_eq!(
+                    timeline[0].image_assets.as_ref().unwrap()[0]
+                        .unavailable_reason
+                        .as_deref(),
+                    Some("attachment_name_only")
+                );
+            }
         }
         for role in ["synthetic", "system", "assistant"] {
             let msg = json!({"id": "msg_other", "type": role, "text": "Not user input",
@@ -2048,7 +2074,10 @@ mod tests {
         }
         let unnamed = json!({"id": "msg_bad", "type": "user", "text": "Still readable",
             "files": [{"data": "!!!!", "mime": "image/png", "source": {"type": "inline"}}]});
-        assert!(map_message(&unnamed, &asid)[0].attachments.is_none());
+        assert_eq!(
+            map_message(&unnamed, &asid)[0].attachments,
+            Some(vec!["data:image/png;base64,!!!!".into()])
+        );
     }
 
     #[test]
@@ -2082,12 +2111,14 @@ mod tests {
     }
 
     #[test]
-    fn test_map_messages_inline_image_size_count_and_shared_work_budget() {
+    fn test_map_messages_preview_allowances_do_not_discard_original_references() {
+        use crate::agents::attachment_images::MAX_PREVIEW_SOURCE_BYTES;
         use base64::Engine as _;
         let asid = AgentSessionId("ses_budget".into());
         // Deliberately only exercise the existing magic-sniff boundary, not a
-        // pixel decoder. This allocation matches the helper's 2 MiB ceiling.
-        let mut bytes = vec![0; MAX_IMAGE_BYTES];
+        // pixel decoder. Original references must survive preview byte/work
+        // allowances; terminal inline-image export retains its 2 MiB policy.
+        let mut bytes = vec![0; MAX_PREVIEW_SOURCE_BYTES];
         bytes[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
         let large = base64::engine::general_purpose::STANDARD.encode(&bytes);
         let message = |id: &str, data: &str| {
@@ -2105,10 +2136,11 @@ mod tests {
             let mut oversized = bytes.clone();
             oversized.extend(vec![0; excess]);
             let encoded = base64::engine::general_purpose::STANDARD.encode(oversized);
-            assert_eq!(
-                map_message(&message("oversized", &encoded), &asid)[0].attachments,
-                Some(vec!["clipboard".into()])
-            );
+            assert!(map_message(&message("oversized", &encoded), &asid)[0]
+                .attachments
+                .as_ref()
+                .unwrap()[0]
+                .starts_with("data:image/png;base64,"));
         }
         let history = map_messages_to_timeline(
             &[
@@ -2125,9 +2157,9 @@ mod tests {
             .flat_map(|item| item.attachments.iter().flatten())
             .filter(|uri| uri.starts_with("data:image/"))
             .collect();
-        assert_eq!(exported.len(), 2);
-        assert!(exported.iter().map(|uri| uri.len()).sum::<usize>() <= MAX_RESPONSE_IMAGE_BYTES);
-        assert_eq!(history[3].attachments, Some(vec!["clipboard".into()]));
+        assert_eq!(exported.len(), 4);
+        assert!(exported.iter().map(|uri| uri.len()).sum::<usize>() > MAX_REFERENCE_RESPONSE_BYTES);
+        assert!(history[3].attachments.as_ref().unwrap()[0].starts_with("data:image/png;base64,"));
 
         let invalid = "!".repeat(large.len());
         let history = map_messages_to_timeline(
@@ -2139,9 +2171,11 @@ mod tests {
             ],
             &asid,
         );
-        assert!(history
+        assert!(history[..3]
             .iter()
-            .all(|item| item.attachments == Some(vec!["clipboard".into()])));
+            .all(|item| item.attachments.as_ref().unwrap()[0]
+                == format!("data:image/png;base64,{invalid}")));
+        assert!(history[3].attachments.as_ref().unwrap()[0].starts_with("data:image/png;base64,"));
 
         let count = json!({"id": "count", "type": "user", "text": "Files",
             "files": (0..17).map(|i| json!({"name": format!("file{i}")})).collect::<Vec<_>>()});
@@ -2151,7 +2185,7 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .len(),
-            16
+            17
         );
     }
 

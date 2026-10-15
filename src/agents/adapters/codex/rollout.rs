@@ -192,7 +192,8 @@ impl Rollouts {
             entry.healthy?;
             (entry.tail.clone(), entry.binding.clone(), entry.generation)
         };
-        let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let result = tokio::time::timeout_at(deadline, async {
             let before = driver.runtime(id, true).await.ok_or_else(unavailable)?;
             if before.source != RuntimeSource::Terminal
                 || before.terminal.as_ref() != Some(&binding)
@@ -217,7 +218,7 @@ impl Rollouts {
             .await
             .map_err(|_| unavailable())??;
             let signals = Signals::parse(id, batch.records)?;
-            let items = canonical_items(driver, id, &signals.items).await?;
+            let items = canonical_items(driver, id, &signals.items, deadline).await?;
             let after = driver.runtime(id, true).await.ok_or_else(unavailable)?;
             if after.source != RuntimeSource::Terminal || after.terminal.as_ref() != Some(&binding)
             {
@@ -301,7 +302,14 @@ mod tests {
             }
         }
         let suffix = &targets[targets.len().saturating_sub(3)..];
-        let items = canonical_items(&driver, &id, suffix).await.unwrap();
+        let items = canonical_items(
+            &driver,
+            &id,
+            suffix,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
         println!("provider_not_loaded={} initial_records={} signalled_items={} canonical_rows={} observed_usage={}", metadata["status"]["type"] == "notLoaded", initial_records,targets.len(),items.len(),usage);
         let mut appended = 0;
         for _ in 0..3 {
@@ -309,7 +317,14 @@ mod tests {
             let batch = tail.poll().unwrap();
             appended += batch.records.len();
             let signals = Signals::parse(&id, batch.records).unwrap();
-            let _ = canonical_items(&driver, &id, &signals.items).await.unwrap();
+            let _ = canonical_items(
+                &driver,
+                &id,
+                &signals.items,
+                tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
         }
         assert_eq!(
             driver.read_thread(&id).await.unwrap()["path"],

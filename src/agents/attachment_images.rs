@@ -1,6 +1,6 @@
-//! Export only typed producer image attachments, never paths found in prose.
-//! The authenticated transcript carries the bytes, so there is no reusable
-//! filesystem URL or new file-read API. Keep reads and output bounded.
+//! Bounded producer-image helpers. Terminal history retains its small inline
+//! export policy. Service messages admit typed inline references separately;
+//! message_images normalizes those to authorized original URLs at egress.
 use std::io::Read;
 use std::path::Path;
 
@@ -8,9 +8,40 @@ use base64::Engine as _;
 
 pub(crate) const MAX_IMAGE_BYTES: usize = 2 * 1024 * 1024;
 pub(crate) const MAX_RESPONSE_IMAGE_BYTES: usize = 8 * 1024 * 1024;
+/// Service timelines admit references separately from the terminal's bounded
+/// inline-image export. Full decode/persistence happens at blocking egress.
+pub(crate) const MAX_PREVIEW_SOURCE_BYTES: usize = 25 * 1024 * 1024;
+pub(crate) const MAX_REFERENCE_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 // Covers every sniffed image data-URI header and one bounded read lookahead.
 // Charge attempts too: invalid inputs must not bypass the shared work limit.
 const IMAGE_ATTEMPT_BYTES: usize = 32;
+
+pub(crate) fn inline_reference(mime: &str, encoded: &str, budget: &mut usize) -> Option<String> {
+    // Accounting is advisory for optional previews, never grounds to erase an
+    // original reference. Full originals are decoded to disk in small chunks.
+    *budget = budget.saturating_sub(encoded.len().saturating_add(IMAGE_ATTEMPT_BYTES));
+    // This retains producer content, not an image classification. Actual MIME
+    // and encoding validation belong to blocking egress; even invalid content
+    // must retain its source with an explicit failure, not turn into a label.
+    let token = |part: &str| {
+        !part.is_empty()
+            && part
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'+' | b'.'))
+    };
+    let safe = mime.len() <= 128
+        && mime
+            .split_once('/')
+            .is_some_and(|(kind, subtype)| token(kind) && token(subtype));
+    // A bad declaration cannot discard valid producer bytes or inject header
+    // syntax. Egress sniffs the decoded file; octet-stream grants no image trust.
+    let mime = if safe {
+        mime
+    } else {
+        "application/octet-stream"
+    };
+    Some(format!("data:{mime};base64,{encoded}"))
+}
 
 fn reserve(budget: &mut usize, bytes: usize) -> Option<()> {
     match budget.checked_sub(bytes) {
@@ -82,32 +113,6 @@ pub(crate) fn image_uri(source: &str, budget: &mut usize) -> Option<String> {
     }
     let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
     Some(format!("data:{};base64,{encoded}", kind.mime))
-}
-
-/// Native Codex's mapper fills `attachments` only from image/localImage input
-/// variants. The caller checks the owning adapter before calling this helper.
-pub(crate) fn export_native(items: &mut [crate::agents::domain::TimelineItem]) {
-    let mut budget = MAX_RESPONSE_IMAGE_BYTES;
-    for item in items {
-        if item.role != crate::agents::domain::TimelineRole::User {
-            continue;
-        }
-        if let Some(sources) = item.attachments.take() {
-            let exported: Vec<_> = sources
-                .into_iter()
-                .take(16)
-                .filter_map(|source| {
-                    if source.starts_with("https://") || source.starts_with("http://") {
-                        // Already-renderable producer URLs require no host read.
-                        Some(source)
-                    } else {
-                        image_uri(&source, &mut budget)
-                    }
-                })
-                .collect();
-            item.attachments = (!exported.is_empty()).then_some(exported);
-        }
-    }
 }
 
 #[cfg(test)]
