@@ -219,9 +219,11 @@ and `version` removed from every agent.
   | `unconfigured` (t3: no bearer, or a refused one) | `muqun-gateway agent setup t3` |
   | `unconfigured` (codex: readiness unchecked or authentication missing) | configure the existing Codex CLI login on the host; `muqun-gateway agent setup codex` explains setup without starting it |
   | `disabled` | `muqun-gateway agent setup t3` / `muqun-gateway agent setup deepseek`; for OpenCode or Codex, set the corresponding `enabled` key; check `agent_runtime.enabled` for the master switch |
-  | `offline` | the agent's own start command: `opencode service start`, `bunx @deepseek-ai/dsh web --no-open`, or "open T3 Code, or run `t3 service install`" |
+  | `offline` | the agent's own start command: `opencode service start`, or "open T3 Code, or run `t3 service install`" |
+  | `offline` (deepseek) | Gateway starts or joins DeepSeek Harness; run `muqun-gateway agent setup deepseek` for the manual command (`dsh`, otherwise `bunx`, otherwise `npx --yes`, still `web --no-open`, host and port from `deepseek.endpoint` or `http://127.0.0.1:3080`) |
   | `offline` (codex) | check the host's Codex configuration; failed prompts are never automatically retried |
-  | `not_installed` | install OpenCode 2 (or set `opencode.enabled` to false) / T3 Code / Codex 0.162.1 (or set `codex.enabled` to false); for DeepSeek, `bunx @deepseek-ai/dsh web --no-open` |
+  | `not_installed` | install OpenCode 2 (or set `opencode.enabled` to false) / T3 Code / Codex 0.162.1 (or set `codex.enabled` to false) |
+  | `not_installed` (deepseek) | install `dsh`, or have `bunx` or `npx` on PATH; a missing runner does not stop the gateway, and status does not download or start the harness |
   | `unsupported` | check the protocol/version baseline and Gateway compatibility |
 - `reason` is a one-line, human-readable explanation, present only when the
   status alone does not say why (for example, an unsupported T3 descriptor

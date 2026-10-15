@@ -123,7 +123,9 @@ pub(crate) struct Config {
     /// owner asked for; `{"autostart": false}` leaves that to them.
     #[serde(default, skip_serializing_if = "is_default_opencode")]
     pub(crate) opencode: agents::OpencodeConfig,
-    /// Configuration for the DeepSeek agent adapter
+    /// DeepSeek Harness. Off unless `enabled` or `endpoint` is set. `autostart`
+    /// defaults to true, matching OpenCode, but a missing key does not start a
+    /// process until DeepSeek is enabled.
     #[serde(default, skip_serializing_if = "is_default_deepseek")]
     pub(crate) deepseek: agents::DeepseekConfig,
     /// The T3 Code agent adapter: off unless `enabled` or `url` is set.
@@ -286,7 +288,11 @@ pub(crate) fn is_default_opencode(config: &agents::OpencodeConfig) -> bool {
 }
 
 pub(crate) fn is_default_deepseek(config: &agents::DeepseekConfig) -> bool {
-    !config.enabled && config.endpoint.is_none() && config.token.is_none()
+    !config.enabled
+        && config.autostart
+        && config.endpoint.is_none()
+        && config.token.is_none()
+        && config.secret.is_none()
 }
 
 pub(crate) fn is_default_t3(config: &agents::T3Config) -> bool {
