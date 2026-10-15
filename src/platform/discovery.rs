@@ -606,6 +606,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn timeline_earlier_discovery_declares_only_the_implementing_adapter() {
+        let state = crate::test_state("admin", Vec::new());
+        let discovery = build_discovery(&state, false, true).await;
+        assert!(discovery["capabilities"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("agent_timeline_earlier_v1")));
+        let agents = discovery["planes"]["agents"]["agents"].as_array().unwrap();
+        for (id, supported) in [
+            ("opencode", false),
+            ("deepseek", false),
+            ("t3", false),
+            ("codex", true),
+        ] {
+            let agent = agents.iter().find(|agent| agent["id"] == id).unwrap();
+            assert_eq!(agent["features"]["timelineEarlier"], supported, "{id}");
+            assert!(agent["features"].get("timeline_earlier").is_none());
+            assert!(agent["features"].get("extra").is_none());
+        }
+    }
+
+    #[tokio::test]
     async fn captured_segments_and_push_ownership_are_discovered_in_both_storage_modes() {
         for storage in [
             crate::platform::config::HistoryStorage::Memory,

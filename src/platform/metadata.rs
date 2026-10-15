@@ -59,6 +59,8 @@ pub(crate) const API_CAPABILITIES: &[&str] = &[
     "agent_discovery",
     "agent_spawn",
     "agent_timeline",
+    // Older timeline pages; adapter support is separately declared per agent.
+    "agent_timeline_earlier_v1",
     "agent_vcs",
     // `vcs/files`, `vcs/file` and `vcs/discard` on an agent session: git in
     // the session's directory, for every agent.

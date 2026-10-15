@@ -465,6 +465,10 @@ pub fn mount(router: Router<AppState>) -> Router<AppState> {
             "/api/agent-sessions/{asid}/timeline",
             get(get_agent_session_timeline_global),
         )
+        .route(
+            "/api/agent-sessions/{asid}/timeline/earlier",
+            post(load_earlier_timeline_global),
+        )
         .route("/api/agent-sessions/{asid}/mode", post(switch_mode_global))
         .route("/api/agent-files", get(find_agent_files_root_global))
         .route(
@@ -542,6 +546,10 @@ pub fn mount(router: Router<AppState>) -> Router<AppState> {
         .route(
             "/api/sessions/{session_id}/agent-sessions/{asid}/timeline",
             get(get_agent_session_timeline_legacy),
+        )
+        .route(
+            "/api/sessions/{session_id}/agent-sessions/{asid}/timeline/earlier",
+            post(load_earlier_timeline_legacy),
         )
         .route(
             "/api/sessions/{session_id}/agent-sessions/{asid}/mode",
@@ -871,6 +879,45 @@ async fn do_get_agent_session_events(
             "Requested events are no longer in the ring buffer; re-fetch the snapshot",
         )),
     }
+}
+
+async fn load_earlier_timeline_global(
+    State(state): State<AppState>,
+    Path(asid): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    do_load_earlier_timeline(&state, &asid, &headers).await
+}
+
+async fn load_earlier_timeline_legacy(
+    State(state): State<AppState>,
+    Path((_, asid)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    do_load_earlier_timeline(&state, &asid, &headers).await
+}
+
+async fn do_load_earlier_timeline(
+    state: &AppState,
+    asid: &str,
+    headers: &HeaderMap,
+) -> ApiResult<Json<Value>> {
+    require_device(state, headers)?;
+    let manager = session_manager_or_err(state, asid).await?;
+    let mut items = manager
+        .sessions()
+        .load_earlier_timeline(&AgentSessionId(asid.to_string()))
+        .await
+        .map_err(agent_error)?;
+    // Filtering internal plumbing must not turn a consumed page into a false
+    // end-of-history signal. Only the adapter knows whether it returned rows.
+    let exhausted = items.is_empty();
+    hide_in_items(&mut items, for_session(state, asid).await);
+    message_images::attach_to_items(state, asid, None, &mut items).await;
+    Ok(Json(content_envelope(json!({
+        "items": items,
+        "exhausted": exhausted,
+    }))))
 }
 
 async fn do_get_agent_session_timeline(
@@ -3571,6 +3618,113 @@ mod tests {
             state.agent_runtime.attach_for_test(agent.manager()).await;
         }
         state
+    }
+
+    #[tokio::test]
+    async fn timeline_earlier_route_authenticates_and_refuses_unsupported_adapters() {
+        let state = state_with(vec![
+            FakeAgent::new("opencode").with_sessions(&[("owned", 1)])
+        ])
+        .await;
+        for (headers, expected) in [
+            (HeaderMap::new(), StatusCode::UNAUTHORIZED),
+            (
+                crate::test_support::bearer_headers("wrong"),
+                StatusCode::FORBIDDEN,
+            ),
+        ] {
+            assert_eq!(
+                do_load_earlier_timeline(&state, "owned", &headers)
+                    .await
+                    .unwrap_err()
+                    .0,
+                expected
+            );
+        }
+        let refusal = do_load_earlier_timeline(&state, "owned", &device_headers())
+            .await
+            .unwrap_err();
+        assert_eq!(refusal.0, StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(
+            crate::test_support::error_body(&refusal)["error"]["code"],
+            "feature_unsupported"
+        );
+    }
+
+    #[tokio::test]
+    async fn timeline_earlier_route_uses_codex_owner_and_retains_bounded_rows_in_snapshot() {
+        use crate::agents::adapters::codex::{
+            tests::{golden, Fixture},
+            CodexDriver,
+        };
+        use crate::agents::ports::agent::AgentPort;
+        use std::sync::Arc;
+        let mut fixture = Fixture::new(|r| match r["method"].as_str().unwrap() {
+            "thread/read" => json!({"thread":golden()["thread"]}),
+            "thread/items/list" => {
+                let offset = r["params"]["cursor"].as_str().map(|s|s.parse::<usize>().unwrap()).unwrap_or(0);
+                let end = (offset+r["params"]["limit"].as_u64().unwrap() as usize).min(181);
+                let rows: Vec<_> = (offset..end).map(|n| {
+                    let item = if n == 180 {
+                        json!({"type":"dynamicToolCall","id":"hidden","tool":"muqun.tasks.list","arguments":{},"status":"completed"})
+                    } else {
+                        json!({"type":"agentMessage","id":format!("item-{}",181-n),"text":"synthetic"})
+                    };
+                    json!({"turnId":"turn","item":item})
+                }).collect();
+                json!({"data":rows,"nextCursor":if end<181 {json!(end.to_string())} else {Value::Null}})
+            },
+            _ => panic!("unexpected route fixture RPC"),
+        }).await;
+        fixture.ready().await;
+        let driver = Arc::new(CodexDriver::new(fixture.client.clone()));
+        let id = golden()["thread"]["id"].as_str().unwrap().to_owned();
+        let tail = driver.get_timeline(&id, 100).await.unwrap();
+        let state = state_with(vec![FakeAgent::new("opencode")]).await;
+        let manager = Arc::new(crate::agents::manager::AgentManager::for_test(driver));
+        manager
+            .mirror()
+            .update_session(
+                crate::agents::adapters::codex::mapper::session(&golden()["thread"]).unwrap(),
+            )
+            .await;
+        manager
+            .mirror()
+            .upsert_timeline_items(&AgentSessionId(id.clone()), tail.clone())
+            .await;
+        let held_tail = manager
+            .mirror()
+            .get_snapshot(&AgentSessionId(id.clone()))
+            .await
+            .unwrap()
+            .timeline;
+        state.agent_runtime.attach_for_test(manager.clone()).await;
+        let Json(first) = do_load_earlier_timeline(&state, &id, &device_headers())
+            .await
+            .unwrap();
+        assert_eq!(first["data"]["items"].as_array().unwrap().len(), 80);
+        assert_eq!(first["data"]["exhausted"], false);
+        let Json(last) = do_load_earlier_timeline(&state, &id, &device_headers())
+            .await
+            .unwrap();
+        assert_eq!(
+            last["data"]["items"],
+            json!([]),
+            "internal tool row is filtered"
+        );
+        assert_eq!(last["data"]["exhausted"], false);
+        let Json(end) = do_load_earlier_timeline(&state, &id, &device_headers())
+            .await
+            .unwrap();
+        assert_eq!(end["data"]["items"], json!([]));
+        assert_eq!(end["data"]["exhausted"], true);
+        let snapshot = manager
+            .mirror()
+            .get_snapshot(&AgentSessionId(id))
+            .await
+            .unwrap();
+        assert_eq!(snapshot.timeline.len(), 181);
+        assert_eq!(&snapshot.timeline[81..], &held_tail);
     }
 
     #[tokio::test]

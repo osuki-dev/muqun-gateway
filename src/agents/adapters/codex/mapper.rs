@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use serde_json::Value;
 
 use crate::agents::domain::*;
@@ -448,4 +450,198 @@ pub fn catalog(response: &Value, provider: &str) -> Result<AgentCatalog, AgentEr
         }
     }
     Ok(catalog)
+}
+
+/// The only catalog command backed by a stable app-server operation.
+pub fn is_compact_command(name: &str) -> bool {
+    name.trim()
+        .strip_prefix('/')
+        .unwrap_or(name.trim())
+        .eq_ignore_ascii_case("compact")
+}
+
+/// Downloaded TUI command rows are descriptions, not executable RPCs.
+/// Expose only native compaction, which accepts no prompt or arguments.
+pub fn commands_from_catalog(
+    commands: &[crate::command_catalog::CatalogCommand],
+) -> Vec<CommandInfo> {
+    commands
+        .iter()
+        .filter(|command| is_compact_command(&command.name))
+        .map(|command| CommandInfo {
+            name: command.name.clone(),
+            description: Some(command.description.clone()),
+            mode: None,
+            template: None,
+        })
+        .collect()
+}
+
+/// Map a Codex `skills/list` result into catalog skills.
+///
+/// `Ok` means the host provided the list, even when it is empty. `Err` means
+/// the payload is not that list — a model page and a slash-command catalog
+/// both fail here, so neither is turned into skills. `slash` is true only when
+/// the user can invoke the skill by name (`enabled`); otherwise it is false.
+pub fn map_skills(response: &Value) -> Result<Vec<SkillInfo>, AgentError> {
+    let groups = response
+        .get("data")
+        .and_then(Value::as_array)
+        .ok_or_else(|| AgentError::Protocol("invalid Codex skills list".into()))?;
+    let mut skills: Vec<SkillInfo> = Vec::new();
+    let mut index_by_id: HashMap<String, usize> = HashMap::new();
+    for group in groups {
+        let rows = group
+            .get("skills")
+            .and_then(Value::as_array)
+            .ok_or_else(|| AgentError::Protocol("invalid Codex skills list".into()))?;
+        for row in rows {
+            let Some(skill) = skill_from_metadata(row) else {
+                continue;
+            };
+            let key = skill.id.to_ascii_lowercase();
+            if let Some(&existing) = index_by_id.get(&key) {
+                // A skill enabled in one directory wins over a disabled copy.
+                if !skills[existing].slash && skill.slash {
+                    skills[existing] = skill;
+                }
+                continue;
+            }
+            index_by_id.insert(key, skills.len());
+            skills.push(skill);
+        }
+    }
+    Ok(skills)
+}
+
+fn skill_from_metadata(row: &Value) -> Option<SkillInfo> {
+    let id = row
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())?;
+    let enabled = row.get("enabled").and_then(Value::as_bool).unwrap_or(false);
+    let name = row
+        .pointer("/interface/displayName")
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
+        .unwrap_or(id);
+    let description = row
+        .pointer("/interface/shortDescription")
+        .and_then(Value::as_str)
+        .or_else(|| row.get("shortDescription").and_then(Value::as_str))
+        .or_else(|| row.get("description").and_then(Value::as_str))
+        .unwrap_or("");
+    Some(SkillInfo {
+        id: id.to_string(),
+        name: name.to_string(),
+        description: description.to_string(),
+        slash: enabled,
+        autoinvoke: false,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{commands_from_catalog, map_skills};
+    use crate::command_catalog::CatalogCommand;
+    use serde_json::json;
+
+    #[test]
+    fn command_catalog_rows_keep_their_names_and_descriptions() {
+        let rows = commands_from_catalog(&[CatalogCommand {
+            name: "/compact".into(),
+            description: "Summarize the conversation".into(),
+            args_hint: None,
+        }]);
+        assert_eq!(rows[0].name, "/compact");
+        assert_eq!(
+            rows[0].description.as_deref(),
+            Some("Summarize the conversation")
+        );
+        assert!(rows[0].template.is_none());
+    }
+
+    #[test]
+    fn command_catalog_excludes_tui_and_prompt_only_commands() {
+        let commands: Vec<_> = ["/new", "/export", "/compact", "/prompts:custom", "/commit"]
+            .into_iter()
+            .map(|name| CatalogCommand {
+                name: name.into(),
+                description: "Synthetic command".into(),
+                args_hint: Some("instructions".into()),
+            })
+            .collect();
+        let rows = commands_from_catalog(&commands);
+        assert_eq!(rows.len(), 1, "only native compaction is implemented");
+        assert_eq!(rows[0].name, "/compact");
+        assert!(
+            rows[0].template.is_none(),
+            "native compact takes no arguments"
+        );
+        assert!(commands_from_catalog(&commands[..2]).is_empty());
+        assert!(commands_from_catalog(&[]).is_empty());
+    }
+
+    #[test]
+    fn skills_list_maps_name_and_marks_only_enabled_skills_as_invocable() {
+        let skills = map_skills(&json!({
+            "data": [{
+                "cwd": "/synthetic",
+                "errors": [],
+                "skills": [
+                    {
+                        "name": "commit",
+                        "description": "Write a commit message",
+                        "interface": {
+                            "displayName": "Commit message",
+                            "shortDescription": "Draft the message"
+                        },
+                        "path": "/synthetic/skills/commit/SKILL.md",
+                        "scope": "user",
+                        "enabled": true
+                    },
+                    {
+                        "name": "pdf",
+                        "description": "Read PDFs",
+                        "enabled": false,
+                        "path": "/synthetic/skills/pdf/SKILL.md",
+                        "scope": "user"
+                    },
+                    {
+                        "name": "pdf",
+                        "description": "Read PDFs",
+                        "enabled": true,
+                        "path": "/synthetic/repo/.codex/skills/pdf/SKILL.md",
+                        "scope": "repo"
+                    }
+                ]
+            }]
+        }))
+        .expect("a skills list");
+        assert_eq!(skills.len(), 2);
+        assert_eq!(skills[0].id, "commit");
+        assert_eq!(skills[0].name, "Commit message");
+        assert_eq!(skills[0].description, "Draft the message");
+        assert!(skills[0].slash);
+        assert!(!skills[0].autoinvoke);
+        // The disabled copy is replaced by the enabled one of the same name.
+        assert_eq!(skills[1].id, "pdf");
+        assert!(skills[1].slash);
+        assert_eq!(skills[1].description, "Read PDFs");
+    }
+
+    #[test]
+    fn an_empty_skills_list_is_provided_and_other_catalogs_are_not_skills() {
+        assert!(map_skills(&json!({"data": []})).unwrap().is_empty());
+        assert!(
+            map_skills(&json!({"commands": [{"name": "/compact", "description": "Summarize"}]}))
+                .is_err(),
+            "a slash-command catalog is commands, not skills"
+        );
+        assert!(
+            map_skills(&json!({"data": [{"model": "fixture-model", "displayName": "Fixture"}]}))
+                .is_err(),
+            "a model page is not a skills list"
+        );
+    }
 }

@@ -42,6 +42,7 @@ fn agents_plane_schema() -> Value {
                                 "backgroundShells": { "type": "boolean" },
                                 "attachments": { "type": "boolean" },
                                 "sessionPagination": { "type": "boolean", "description": "This provider supports GET /api/agent-sessions/page; absent or false means use the legacy array list" },
+                                "timelineEarlier": { "type": "boolean", "description": "This provider supports POST /api/agent-sessions/{asid}/timeline/earlier; require agent_timeline_earlier_v1 too. Absent or false means unsupported" },
                                 "attachmentsByPath": { "type": "boolean", "description": "Attachments reach the agent as host paths appended to the prompt text (the agent reads them with its own tools) rather than as native file parts" }
                             }
                         },
@@ -803,6 +804,28 @@ pub fn openapi_spec() -> Value {
     spec["paths"]["/api/sessions/{sessionId}/panes/{paneId}/lazygit"] = lazygit_endpoints();
     spec["paths"]["/api/agent-sessions/{asid}/audio-asset"] = audio_asset_endpoint();
     spec["paths"]["/api/agent-sessions/page"] = session_page_endpoint();
+    spec["paths"]["/api/agent-sessions/{asid}/timeline/earlier"] = json!({"post": {
+        "summary": "Read the next older timeline batch for the session owner",
+        "description": "Requires a paired App device and both agent_timeline_earlier_v1 and owning-provider features.timelineEarlier true. No body or client cursor. Load the selected snapshot first; merge rows by stable ID and (message_id, ordinal), preserving the viewport. At most 80 mapped rows. exhausted is true only on an empty adapter batch; filtering may produce an empty visible items array with exhausted false. State is provider/session scoped; serialize client pulls and do not automatically retry an ambiguously completed POST. Failed/cancelled provider reads preserve the cursor; successful explicit snapshot refresh resets the newest-tail boundary. See docs/agent-api.md.",
+        "parameters": [{"name":"asid","in":"path","required":true,"schema":{"type":"string"}}],
+        "responses": {
+            "200": {"description":"Content envelope containing data.items and data.exhausted", "content":{"application/json":{"schema":{
+                "type":"object", "required":["schema_version","capabilities","data"], "properties":{
+                    "schema_version":{"const":CONTENT_SCHEMA_VERSION}, "capabilities":{"type":"object"},
+                    "data":{"type":"object","required":["items","exhausted"],"properties":{
+                        "items":{"type":"array","maxItems":80,"items":{"type":"object"}},
+                        "exhausted":{"type":"boolean"}
+                    }}
+                }
+            }}}},
+            "401":{"description":"Missing authentication"},
+            "403":{"description":"Invalid device credential or forbidden peer"},
+            "404":{"description":"Session not found"},
+            "501":{"description":"feature_unsupported: the owning adapter does not implement earlier timeline pages"},
+            "502":{"description":"agent_error: provider or bounded history traversal failed; cursor not consumed"},
+            "503":{"description":"agent_unavailable"}
+        }
+    }});
     spec["paths"]["/api/agent-sessions/{asid}/file-asset"] = json!({"get": {
         "summary": "Resolve a local file output inside an agent session",
         "description": "Requires device authentication and agent_file_assets capability. Resolves audio, video, images, documents and binary files inside the server-owned directory. Web URLs, path escapes and symlinks outside the root are refused. Returns data.asset metadata with an opaque id.",
@@ -2293,6 +2316,22 @@ fn lazygit_endpoints() -> Value {
 #[cfg(test)]
 mod history_contract_tests {
     use super::*;
+
+    #[test]
+    fn timeline_earlier_spec_has_explicit_gates_bounded_rows_and_unsupported_error() {
+        let spec = openapi_spec();
+        let post = &spec["paths"]["/api/agent-sessions/{asid}/timeline/earlier"]["post"];
+        let description = post["description"].as_str().unwrap();
+        assert!(description.contains("agent_timeline_earlier_v1"));
+        assert!(description.contains("features.timelineEarlier true"));
+        assert!(post.get("requestBody").is_none());
+        let data = &post["responses"]["200"]["content"]["application/json"]["schema"]["properties"]
+            ["data"];
+        assert_eq!(data["required"], json!(["items", "exhausted"]));
+        assert_eq!(data["properties"]["items"]["maxItems"], 80);
+        assert!(post["responses"].get("501").is_some());
+        assert!(crate::API_CAPABILITIES.contains(&"agent_timeline_earlier_v1"));
+    }
 
     #[test]
     fn session_page_spec_has_selected_scope_limits_and_nested_null_cursors() {

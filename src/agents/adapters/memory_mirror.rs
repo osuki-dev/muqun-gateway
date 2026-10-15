@@ -396,6 +396,7 @@ impl MemoryMirror {
 
     /// Merge one bounded initial history read without replacing newer live rows.
     /// The gate identity fences eviction/recreation while the provider was read.
+    #[cfg(test)]
     pub(crate) async fn initialize_history(
         &self,
         asid: &AgentSessionId,
@@ -403,18 +404,36 @@ impl MemoryMirror {
         before_read: (u64, u64),
         items: Vec<TimelineItem>,
     ) -> bool {
+        self.initialize_prepared_history(asid, gate, before_read, items, None)
+            .await
+            .expect("stateless history acceptance cannot fail")
+    }
+
+    pub(crate) async fn initialize_prepared_history(
+        &self,
+        asid: &AgentSessionId,
+        gate: &Arc<tokio::sync::Mutex<()>>,
+        before_read: (u64, u64),
+        items: Vec<TimelineItem>,
+        commit: Option<crate::agents::ports::agent::TimelineCommit<'_>>,
+    ) -> Result<bool, crate::agents::ports::agent::AgentError> {
         let mut sessions = self.sessions.write().await;
         let Some(state) = sessions.get_mut(asid) else {
-            return false;
+            return Ok(false);
         };
         if !Arc::ptr_eq(gate, &state.history_gate) {
-            return false;
+            return Ok(false);
         }
         if state.history_initialized {
-            return true;
+            return Ok(true);
         }
         if state.history_removal_generation != before_read.1 {
-            return false;
+            return Ok(false);
+        }
+        // Both fences have passed. The adapter's one-shot synchronous commit
+        // and mirror acceptance share this write lock and one uncancellable poll.
+        if let Some(commit) = commit {
+            commit()?;
         }
         let mut accepted: Vec<_> = items
             .into_iter()
@@ -441,7 +460,7 @@ impl MemoryMirror {
             });
         }
         state.history_initialized = true;
-        true
+        Ok(true)
     }
 
     /// Upstream metadata cannot erase read markers the Gateway owns.
@@ -1269,15 +1288,54 @@ impl MemoryMirror {
 
     /// Commit an explicitly requested provider read only if no newer event won.
     /// Invalidate older replay cursors; never broadcast replacement transcript rows.
+    #[cfg(test)]
     pub(crate) async fn refresh_snapshot(
+        &self,
+        snapshot: crate::agents::ports::mirror::AgentSessionSnapshot,
+        expected: Option<u64>,
+    ) -> Option<crate::agents::ports::mirror::AgentSessionSnapshot> {
+        self.refresh_prepared_snapshot(snapshot, expected, None, None)
+            .await
+            .expect("stateless snapshot acceptance cannot fail")
+    }
+
+    /// Capture sequence and incarnation together, fencing same-seq recreation.
+    pub(crate) async fn snapshot_read_revision(
+        &self,
+        asid: &AgentSessionId,
+    ) -> (Option<u64>, Option<Arc<tokio::sync::Mutex<()>>>) {
+        let sessions = self.sessions.read().await;
+        match sessions.get(asid) {
+            Some(state) => (Some(state.current_seq), Some(state.history_gate.clone())),
+            None => (None, None),
+        }
+    }
+
+    pub(crate) async fn refresh_prepared_snapshot(
         &self,
         mut snapshot: crate::agents::ports::mirror::AgentSessionSnapshot,
         expected: Option<u64>,
-    ) -> Option<crate::agents::ports::mirror::AgentSessionSnapshot> {
+        incarnation: Option<Arc<tokio::sync::Mutex<()>>>,
+        commit: Option<crate::agents::ports::agent::TimelineCommit<'_>>,
+    ) -> Result<
+        Option<crate::agents::ports::mirror::AgentSessionSnapshot>,
+        crate::agents::ports::agent::AgentError,
+    > {
         let mut sessions = self.sessions.write().await;
         let asid = snapshot.info.asid.clone();
-        if sessions.get(&asid).map(|s| s.current_seq) != expected {
-            return None;
+        if sessions.get(&asid).map(|s| s.current_seq) != expected
+            || incarnation.as_ref().is_some_and(|gate| {
+                sessions
+                    .get(&asid)
+                    .is_none_or(|state| !Arc::ptr_eq(gate, &state.history_gate))
+            })
+        {
+            return Ok(None);
+        }
+        // No await after this commit: a rejected adapter token cannot alter the
+        // mirror, and cancellation cannot split pagination from accepted rows.
+        if let Some(commit) = commit {
+            commit()?;
         }
         if let Some(previous) = sessions.get(&asid) {
             snapshot.info.time_viewed = previous.info.time_viewed;
@@ -1306,7 +1364,7 @@ impl MemoryMirror {
         state.event_log.clear();
         state.event_log_bytes = 0;
         state.replay_floor = snapshot.seq;
-        Some(snapshot)
+        Ok(Some(snapshot))
     }
 
     /// The session's info as held, without the rest of its snapshot.

@@ -204,6 +204,7 @@ fn read_only_request(method: &str, params: &Value) -> bool {
         method,
         "config/read"
             | "model/list"
+            | "skills/list"
             | "thread/list"
             | "thread/read"
             | "thread/loaded/list"

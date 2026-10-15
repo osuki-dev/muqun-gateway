@@ -253,6 +253,7 @@ and `version` removed from every agent.
 | `backgroundShells` | The `/api/agent-shells` routes list, read and kill the agent's background shells. |
 | `attachments` | A prompt may carry `attachments`; when false the agent answers `501 feature_unsupported`. |
 | `attachmentsByPath` | The agent has no native attachment API: the gateway lists the attachments as host paths at the end of the prompt text and the agent opens them with its own tools. Only uploads are accepted (see [`POST …/prompt`](#post-apiagent-sessionsasidprompt)). |
+| `timelineEarlier` | `POST …/timeline/earlier` pages older timeline rows after the selected snapshot. Requires global `agent_timeline_earlier_v1` too; absent or false means unsupported. |
 
   The App renders agent-specific UI from these flags alone, never from the
   agent's `kind`. The base flags above are always present (booleans, never omitted).
@@ -287,6 +288,7 @@ and `version` removed from every agent.
   | `attachments` | yes | yes | yes | yes |
   | `attachmentsByPath` | no | yes | yes | yes |
   | `sessionPagination` | yes | no | no | yes (forward only) |
+  | `timelineEarlier` | no | no | no | yes |
 
   `t3` is `name: "T3 Code"`; its `version` is the T3 server version, its
   `models[]` are every model of the providers T3 has ready (Claude Code,
@@ -593,6 +595,55 @@ Returns `AgentSessionSnapshot`:
 prompt raised while the event stream was down is not lost. `timeline` is ordered
 by `(message_id, ordinal)`.
 
+### `POST /api/agent-sessions/{asid}/timeline/earlier`
+
+Gate remote history pulls on **both** global capability
+`agent_timeline_earlier_v1` and the owning provider's
+`planes.agents.agents[].features.timelineEarlier === true`. Never infer support
+from a Gateway version or agent name. Currently only Codex implements it; other
+adapters return `501 feature_unsupported`, not successful exhaustion.
+
+No request body or client cursor. Load the selected session snapshot first, then
+request one earlier batch at a time. The existing content envelope carries
+`data: {"items": [TimelineItem], "exhausted": false}`. A batch contains at most
+**80 mapped rows**, oldest first; one native reasoning item can span batches.
+Merge by stable row ID and `(message_id, ordinal)`, preserving the current viewport
+and existing tail. Historical driver rows retain the existing `seq: 0` semantics;
+the mirror records its own upsert sequence as before. This is not an SSE replay
+cursor. The legacy session-prefixed alias has the same contract.
+
+`exhausted: true` means the adapter returned an empty batch. A final nonempty batch
+can therefore still say false; the following pull confirms the end. Filtering
+internal plumbing can yield `items: []` with `exhausted: false`; continue later,
+do not infer the end from the visible array alone.
+
+State belongs to the provider/session in this Gateway process, not a particular
+App: concurrent requests consume successive disjoint batches. Apps must serialize
+their own pulls and must not automatically retry a POST whose successful reply
+may have been lost. Failed or cancelled provider reads do not consume a batch;
+successful canonical snapshot acceptance reestablishes the newest-tail boundary.
+A provider tail is prepared first. Initial history validates session incarnation
+and removal generation while preserving newer live rows; explicit refresh also
+requires an unchanged mirror sequence. Pagination state and mirror rows are
+accepted synchronously after the mirror fences and adapter revision check pass.
+Failed or cancelled preparation, a newer event during refresh, or
+concurrent earlier-page progress discards the candidate without resetting or
+restoring shared cursor state. Cached snapshots do not reset pagination. There
+are at most four pending Codex tail candidates; dropping one releases its slot.
+This acceptance boundary covers pagination and transcript rows, not rollback of
+all driver state: sampled usage may update during preparation. Initial pending
+request catch-up can still be cancelled after rows and pagination are accepted
+together; it does not undo that accepted history.
+On restart/refetch, merge repeated IDs rather than duplicating rows.
+
+Codex retains only a raw residual page (or a bounded legacy response), plus an
+item's remaining mapped-prefix boundary. History reads are serialized per provider
+and use the existing traversal deadline/page/byte/row budgets. Retention is bounded
+to 4096 sessions and 32 MiB of serialized residual/cursor state; exhaustion returns
+an error without eviction or cursor consumption. Ordering uses a checked `u64`
+prefix allocation without renumbering displayed rows; exhausted ordering capacity
+or contradictory anchors return an explicit error, never a fabricated partial end.
+
 ### `GET /api/agent-sessions/{asid}/children`
 
 Same response as the list route, filtered to this session's children. Accepts
@@ -725,6 +776,14 @@ No body → `{"interrupted": true}`. Status goes to `interrupted`.
 
 A slash command from the catalog's `commands`. A leading `/` on `name` is
 stripped; `arguments` fills `$ARGUMENTS`. Returns `{"submitted": true}`.
+
+Codex exposes only `/compact` from its downloaded command catalog, backed by
+`thread/compact/start` on an owned, idle session. It takes no arguments or
+`delivery` override. Missing/invalid catalogs, or catalogs with no supported
+rows, leave `commands` empty and `slashCommands` false. Other Codex commands
+(including `/new`, `/export` and custom prompt names) are rejected by the
+Gateway, never sent as model prompts. Skills still use the separate `/skill`
+endpoint with native skill input.
 
 ### `POST /api/agent-sessions/{asid}/skill`
 

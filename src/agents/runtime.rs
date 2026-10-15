@@ -1811,6 +1811,7 @@ fn deepseek_features(
             ("sessionDelete".into(), serde_json::json!(false)),
             ("sessionFork".into(), serde_json::json!(true)),
             ("sessionPagination".into(), serde_json::Value::Bool(false)),
+            ("timelineEarlier".into(), serde_json::json!(false)),
         ]),
     }
 }
@@ -1837,6 +1838,7 @@ fn opencode_features(
         attachments_by_path: false,
         extra: std::collections::BTreeMap::from([
             ("sessionPagination".into(), serde_json::json!(true)),
+            ("timelineEarlier".into(), serde_json::json!(false)),
             ("sessionRename".into(), serde_json::json!(true)),
             ("sessionDelete".into(), serde_json::json!(true)),
             ("sessionFork".into(), serde_json::json!(false)),

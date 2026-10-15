@@ -192,8 +192,32 @@ into timeline order until the requested **mapped** tail is satisfied or verified
 history end, including pages of unmapped items;
 `legacy` threads use `thread/read` with `includeTurns: true`. Legacy reads are
 bounded by the transport frame limit and fail instead of clipping a JSON body.
-The neutral history API returns the requested tail, at most 2,000 rows; it does
-not expose an invented history cursor. Unknown storage modes are Unsupported.
+The neutral history API returns the requested tail, at most 2,000 mapped rows;
+it does not expose an invented history cursor. `timelineEarlier: true`, together
+with Gateway capability `agent_timeline_earlier_v1`, declares the stateful older
+page endpoint (80 mapped rows per HTTP batch). A raw residual page and an item-local
+mapped-prefix boundary retain reasoning rows split at a batch boundary, so no rows
+are clipped when one native item expands beyond the requested limit. Legacy reads
+retain their bounded raw response for the same older-row operation. Successful
+snapshot acceptance resets that session's boundary; failure/cancellation does not
+consume it. Canonical tail reads prepare a candidate with a one-shot synchronous
+commit. Initial history fences incarnation/removal generation and preserves newer
+live rows; refresh additionally requires an unchanged mirror sequence. The mirror
+invokes the commit under its write lock, then accepts rows without another await.
+A monotonic adapter revision, captured before metadata/rollout I/O, rejects stale
+candidates if earlier-page progress or another
+accepted tail won; candidates never roll back shared state. All async rollout and
+usage preparation finishes before the commit, and direct tail reads have no
+cancellable await after final publication. Four caller-owned prepared leases bound
+pending candidates and release on rejection/cancellation, without a token cache.
+This is pagination/transcript acceptance, not a general transaction over usage or
+all adapter state. Usage sampling may update its cache before acceptance; initial
+pending-request catch-up can be cancelled after mirror rows and pagination have
+already been accepted together.
+Tail and earlier page reads serialize; residual/cursor retention is bounded to 4096
+sessions and 32 MiB globally within this adapter, with explicit errors rather than
+silent eviction. Checked prefix positions insert older same-turn items before the
+displayed tail without renumbering stable anchors. Unknown storage modes are Unsupported.
 Traversals share a 20-second total deadline, 128-page, 20,000-raw-row and 32-MiB
 actual-response-body budget, in addition to the 4-MiB frame bound. Malformed
 pages/cursors, cursor cycles, RPC errors or exhausted budgets return errors, not
