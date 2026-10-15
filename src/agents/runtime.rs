@@ -1089,7 +1089,7 @@ impl AgentRuntime {
             if self.stream_down().await {
                 tracing::warn!(
                     wait_s = stream_loss_wait.as_secs(),
-                    "opencode event stream is down, re-discovering"
+                    "primary agent event stream is down, re-discovering"
                 );
                 if !stream_loss_wait.is_zero() {
                     tokio::time::sleep(*stream_loss_wait).await;

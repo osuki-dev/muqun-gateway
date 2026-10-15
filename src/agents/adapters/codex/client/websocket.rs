@@ -4,6 +4,56 @@ use futures::{SinkExt, StreamExt};
 use tokio::net::UnixStream;
 use tokio_tungstenite::{tungstenite::Message, WebSocketStream};
 
+fn socket_error_reason(
+    state: &State,
+    phase: &'static str,
+    error: &tokio_tungstenite::tungstenite::Error,
+) -> &'static str {
+    use tokio_tungstenite::tungstenite::{error::CapacityError, Error};
+    // Error Display/Debug can include frame contents or close text. Only fixed
+    // categories, numeric bounds and OS error kinds may enter the journal.
+    match error {
+        Error::Capacity(CapacityError::MessageTooLong { size, max_size }) => {
+            tracing::warn!(connection = %state.generation, phase, frame_bytes = size, limit_bytes = max_size,
+                "Codex WebSocket size limit exceeded");
+            "websocket_size_limit"
+        }
+        Error::Io(error) => {
+            tracing::warn!(connection = %state.generation, phase, io_kind = ?error.kind(),
+                "Codex WebSocket I/O failed");
+            "websocket_io_error"
+        }
+        Error::ConnectionClosed | Error::AlreadyClosed => "websocket_closed",
+        Error::Protocol(
+            tokio_tungstenite::tungstenite::error::ProtocolError::ResetWithoutClosingHandshake,
+        ) => "websocket_peer_eof_without_close",
+        Error::Protocol(_) => "websocket_protocol_error",
+        Error::Utf8(_) => "websocket_utf8_error",
+        _ => "websocket_other_error",
+    }
+}
+
+fn router_error_reason(error: &AgentError) -> &'static str {
+    // Match fixed local invariants, never print arbitrary error text.
+    match error {
+        AgentError::Protocol(message) => match message.as_str() {
+            "invalid Codex request id" => "rpc_router_invalid_callback_id",
+            "Codex server request capacity or duplicate id" => {
+                "rpc_router_callback_capacity_or_duplicate"
+            }
+            "Codex lifecycle completed-turn capacity exhausted" => "rpc_router_lifecycle_capacity",
+            "Codex completed-turn capacity exhausted" => "rpc_router_completed_capacity",
+            "invalid Codex RPC response envelope" => "rpc_router_invalid_response_envelope",
+            "Codex attach response missing identity" => "rpc_router_missing_attach_identity",
+            "Codex rejoin identity mismatch" => "rpc_router_rejoin_identity_mismatch",
+            "Codex subscription capacity exhausted" => "rpc_router_subscription_capacity",
+            "invalid Codex RPC envelope" => "rpc_router_invalid_envelope",
+            _ => "rpc_router_protocol_error",
+        },
+        _ => "rpc_router_error",
+    }
+}
+
 impl CodexClient {
     pub(crate) fn from_websocket(
         mut socket: WebSocketStream<UnixStream>,
@@ -24,52 +74,85 @@ impl CodexClient {
             lifecycle_completed_turns: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
             ready: AtomicBool::new(false),
+            disconnect_reason: std::sync::OnceLock::new(),
             cancel: CancellationToken::new(),
             events,
         });
         let pump = state.clone();
         tokio::spawn(async move {
-            loop {
+            let reason = loop {
                 tokio::select! {
                     biased;
-                    _ = pump.cancel.cancelled() => break,
+                    _ = pump.cancel.cancelled() => break "connection_cancelled",
                     packet = writes.recv() => {
-                        let Some(packet) = packet else { break; };
+                        let Some(packet) = packet else { break "outgoing_queue_closed"; };
                         // The stdio encoder adds a newline; WebSocket carries one JSON message.
                         let mut text = String::from_utf8(packet.bytes).expect("JSON is UTF-8");
                         text.pop();
                         let result = tokio::select! {
                             biased;
-                            _ = pump.cancel.cancelled() => Err(disconnected()),
+                            _ = pump.cancel.cancelled() => Err("connection_cancelled"),
                             result = tokio::time::timeout(REQUEST_TIMEOUT, socket.send(Message::Text(text.into()))) => {
-                                result.ok().and_then(Result::ok).map_or_else(|| Err(disconnected()), |_| Ok(()))
+                                match result {
+                                    Ok(Ok(())) => Ok(()),
+                                    Ok(Err(error)) => Err(socket_error_reason(&pump, "send", &error)),
+                                    Err(_) => Err("websocket_send_deadline"),
+                                }
                             }
                         };
-                        let failed = result.is_err();
-                        let _ = packet.done.send(result);
-                        if failed { break; }
+                        if let Err(reason) = result {
+                            // Record the real I/O cause before waking a writer
+                            // whose mutation guard also fences a failed send.
+                            pump.stop_reason(reason);
+                            let _ = packet.done.send(Err(disconnected()));
+                            break reason;
+                        }
+                        let _ = packet.done.send(Ok(()));
                     }
                     frame = socket.next() => {
                         match frame {
                             Some(Ok(Message::Text(text))) if text.len() <= MAX_FRAME_BYTES => {
-                                let Ok(value) = serde_json::from_str(&text) else { break; };
-                                if route_frame(&pump, value, text.len()).is_err() { break; }
+                                let Ok(value) = serde_json::from_str(&text) else {
+                                    tracing::warn!(connection = %pump.generation, frame_bytes = text.len(), "Codex WebSocket invalid JSON");
+                                    break "websocket_invalid_json";
+                                };
+                                if let Err(error) = route_frame(&pump, value, text.len()) {
+                                    let reason = router_error_reason(&error);
+                                    tracing::warn!(connection = %pump.generation, frame_bytes = text.len(), reason, "Codex RPC frame rejected by router");
+                                    break reason;
+                                }
+                            }
+                            Some(Ok(Message::Text(text))) => {
+                                tracing::warn!(connection = %pump.generation, frame_bytes = text.len(), limit_bytes = MAX_FRAME_BYTES,
+                                    "Codex WebSocket size limit exceeded");
+                                break "websocket_size_limit";
                             }
                             Some(Ok(Message::Ping(_))) => {
                                 // tungstenite queues the matching pong while reading.
                                 let result = tokio::select! {
-                                    _ = pump.cancel.cancelled() => break,
+                                    _ = pump.cancel.cancelled() => break "connection_cancelled",
                                     result = tokio::time::timeout(REQUEST_TIMEOUT, socket.flush()) => result,
                                 };
-                                if !matches!(result, Ok(Ok(()))) { break; }
+                                match result {
+                                    Ok(Ok(())) => {},
+                                    Ok(Err(error)) => break socket_error_reason(&pump, "pong_flush", &error),
+                                    Err(_) => break "websocket_pong_deadline",
+                                }
                             }
                             Some(Ok(Message::Pong(_))) => {}
-                            _ => break,
+                            Some(Ok(Message::Close(close))) => {
+                                let close_code = close.as_ref().map(|frame| u16::from(frame.code));
+                                tracing::warn!(connection = %pump.generation, ?close_code, "Codex WebSocket peer closed");
+                                break "websocket_peer_close";
+                            }
+                            Some(Ok(_)) => break "websocket_unexpected_frame",
+                            Some(Err(error)) => break socket_error_reason(&pump, "receive", &error),
+                            None => break "websocket_eof",
                         }
                     }
                 }
-            }
-            pump.stop();
+            };
+            pump.stop_reason(reason);
             let _ = pump.events.try_send(CodexEvent::Disconnected);
             // No daemon shutdown RPC, signal, unsubscribe, or lifecycle command.
         });
@@ -96,6 +179,232 @@ pub(crate) mod tests {
     use crate::agents::adapters::codex::CodexDriver;
     use crate::agents::domain::RuntimeSource;
     use crate::agents::ports::agent::AgentPort;
+
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for Capture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            locked(&self.0).extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    async fn diagnostic_peer() -> (
+        Arc<CodexClient>,
+        mpsc::Receiver<CodexEvent>,
+        WebSocketStream<UnixStream>,
+    ) {
+        use tokio_tungstenite::tungstenite::protocol::{Role, WebSocketConfig};
+        let (left, right) = UnixStream::pair().unwrap();
+        let config = WebSocketConfig::default()
+            .max_frame_size(Some(MAX_FRAME_BYTES))
+            .max_message_size(Some(MAX_FRAME_BYTES));
+        let socket = WebSocketStream::from_raw_socket(left, Role::Client, Some(config)).await;
+        let server = WebSocketStream::from_raw_socket(right, Role::Server, None).await;
+        let (client, events) = CodexClient::from_websocket(
+            socket,
+            "/synthetic/home".into(),
+            "/synthetic/socket".into(),
+        );
+        // Isolated framing diagnostics, not an actual daemon/auth handshake.
+        client.state.ready.store(true, Ordering::Release);
+        (client, events, server)
+    }
+
+    #[tokio::test]
+    async fn shared_disconnect_diagnostics_classify_frames_and_redact_payloads() {
+        use tokio_tungstenite::tungstenite::protocol::{frame::coding::CloseCode, CloseFrame};
+        let _interest_guard = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+        let capture = Capture::default();
+        let writer = capture.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(move || writer.clone())
+            .finish();
+        let _capture = tracing::subscriber::set_default(subscriber);
+        const SECRET: &str = "PRIVATE_MESSAGE_BASE64_TOKEN_CLOSE_TEXT";
+        for (message, expected) in [
+            (
+                Message::Text(format!("not-json-{SECRET}").into()),
+                "websocket_invalid_json",
+            ),
+            (
+                Message::Text(
+                    json!({"id":1,"error":{"code":"invalid","message":SECRET}})
+                        .to_string()
+                        .into(),
+                ),
+                "rpc_router_invalid_response_envelope",
+            ),
+            (
+                Message::Text("x".repeat(MAX_FRAME_BYTES + 1).into()),
+                "websocket_size_limit",
+            ),
+            (
+                Message::Binary(SECRET.as_bytes().to_vec().into()),
+                "websocket_unexpected_frame",
+            ),
+            (
+                Message::Close(Some(CloseFrame {
+                    code: CloseCode::Normal,
+                    reason: SECRET.into(),
+                })),
+                "websocket_peer_close",
+            ),
+        ] {
+            let (client, _events, mut server) = diagnostic_peer().await;
+            // A peer can observe the close while writing an over-limit frame.
+            let _ = server.send(message).await;
+            tokio::time::timeout(Duration::from_secs(2), client.cancel_token().cancelled())
+                .await
+                .unwrap();
+            assert_eq!(client.state.disconnect_reason.get(), Some(&expected));
+            assert!(!client.is_ready());
+            assert!(client
+                .call("thread/list", json!({"limit":1}))
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("no longer ready"));
+            client.stop();
+            assert_eq!(
+                client.state.disconnect_reason.get(),
+                Some(&expected),
+                "cleanup must not replace first cause"
+            );
+        }
+        let log = String::from_utf8(locked(&capture.0).clone()).unwrap();
+        for category in [
+            "websocket_invalid_json",
+            "rpc_router_invalid_response_envelope",
+            "websocket_size_limit",
+            "websocket_unexpected_frame",
+            "websocket_peer_close",
+        ] {
+            assert!(
+                log.contains(category),
+                "missing diagnostic category {category}"
+            );
+        }
+        assert!(log.contains("frame_bytes="));
+        assert!(log.contains("limit_bytes=4194304"));
+        assert!(log.contains("close_code=Some(1000)"));
+        assert!(!log.contains(SECRET));
+    }
+
+    #[tokio::test]
+    async fn shared_disconnect_diagnostics_keep_read_cancellation_and_mutation_fences() {
+        let (client, _events, mut server) = diagnostic_peer().await;
+        let pending = tokio::spawn({
+            let client = client.clone();
+            async move { client.call("thread/list", json!({"limit":1})).await }
+        });
+        assert!(server.next().await.unwrap().unwrap().is_text());
+        pending.abort();
+        assert!(pending.await.unwrap_err().is_cancelled());
+        assert!(client.is_ready());
+        assert!(client.state.disconnect_reason.get().is_none());
+        assert_eq!(locked(&client.state.pending).len(), 1);
+        server
+            .send(Message::Text(
+                json!({"id":1,"result":{"data":[],"nextCursor":null}})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !locked(&client.state.pending).is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(client.is_ready());
+        let pending = tokio::spawn({
+            let client = client.clone();
+            async move {
+                client
+                    .call("thread/resume", json!({"threadId":"synthetic"}))
+                    .await
+            }
+        });
+        assert!(server.next().await.unwrap().unwrap().is_text());
+        pending.abort();
+        assert!(pending.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            client.state.disconnect_reason.get(),
+            Some(&"mutation_caller_cancelled")
+        );
+        assert!(!client.is_ready());
+    }
+
+    #[tokio::test]
+    async fn shared_disconnect_diagnostics_distinguish_deadline_from_socket_errors() {
+        let (mut client, _events, mut server) = diagnostic_peer().await;
+        Arc::get_mut(&mut client).unwrap().timeout = Duration::from_millis(30);
+        let (result, frame) = tokio::join!(
+            client.call("thread/resume", json!({"threadId":"synthetic"})),
+            server.next()
+        );
+        assert!(frame.unwrap().unwrap().is_text());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("outcome unknown; not retried"));
+        assert_eq!(
+            client.state.disconnect_reason.get(),
+            Some(&"mutation_response_deadline")
+        );
+        let (mut client, _events, mut server) = diagnostic_peer().await;
+        Arc::get_mut(&mut client).unwrap().timeout = Duration::from_millis(30);
+        let (result, frame) = tokio::join!(
+            client.call("thread/list", json!({"limit":1})),
+            server.next()
+        );
+        assert!(frame.unwrap().unwrap().is_text());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("read deadline exceeded; not retried"));
+        assert!(client.is_ready());
+        assert!(client.state.disconnect_reason.get().is_none());
+        let (client, _events, _server) = diagnostic_peer().await;
+        let error = tokio_tungstenite::tungstenite::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "PRIVATE_IO_ERROR",
+        ));
+        assert_eq!(
+            socket_error_reason(&client.state, "send", &error),
+            "websocket_io_error"
+        );
+        assert_eq!(diagnostic_method("PRIVATE_UNKNOWN_METHOD"), "other");
+        client.stop();
+    }
+
+    #[tokio::test]
+    async fn shared_disconnect_diagnostics_distinguish_backlog_from_consumer_close() {
+        let (client, _events, _server) = diagnostic_peer().await;
+        for _ in 0..QUEUE_SIZE {
+            client.state.emit(CodexEvent::Disconnected).unwrap();
+        }
+        assert!(client.state.emit(CodexEvent::Disconnected).is_err());
+        assert_eq!(
+            client.state.disconnect_reason.get(),
+            Some(&"event_queue_overflow")
+        );
+        let (client, events, _server) = diagnostic_peer().await;
+        drop(events);
+        assert!(client.state.emit(CodexEvent::Disconnected).is_err());
+        assert_eq!(
+            client.state.disconnect_reason.get(),
+            Some(&"event_consumer_closed")
+        );
+    }
 
     pub(crate) struct Fixture {
         pub(crate) client: Arc<CodexClient>,

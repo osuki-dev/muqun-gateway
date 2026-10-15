@@ -69,6 +69,7 @@ type Reply = oneshot::Sender<Result<(Value, usize), AgentError>>;
 
 struct Pending {
     reply: Reply,
+    diagnostic_method: &'static str,
     turn_thread: Option<String>,
     selection_config: bool,
     attaches_thread: bool,
@@ -88,6 +89,7 @@ struct State {
     lifecycle_completed_turns: Mutex<HashMap<String, String>>,
     next_id: AtomicU64,
     ready: AtomicBool,
+    disconnect_reason: std::sync::OnceLock<&'static str>,
     cancel: CancellationToken,
     events: mpsc::Sender<CodexEvent>,
 }
@@ -106,7 +108,37 @@ impl State {
     fn request_id(&self, id: &Value) -> Option<String> {
         request_key(id).map(|key| format!("{}:{}", self.generation, hex::encode(key.as_bytes())))
     }
+    #[track_caller]
     fn stop(&self) {
+        self.stop_reason("local_stop");
+    }
+
+    #[track_caller]
+    fn stop_reason(&self, reason: &'static str) {
+        self.stop_request(reason, None, "none");
+    }
+
+    #[track_caller]
+    fn stop_request(&self, reason: &'static str, rpc_id: Option<u64>, method: &'static str) {
+        // One first-cause record per connection, before cancellation wakes other
+        // owners. Never log params, upstream errors or native callback ids.
+        if self.disconnect_reason.set(reason).is_ok() {
+            let pending = locked(&self.pending);
+            let inflight: Vec<_> = pending
+                .iter()
+                .map(|(id, request)| (*id, request.diagnostic_method))
+                .collect();
+            tracing::warn!(
+                connection = %self.generation,
+                shared = self.shared,
+                reason,
+                ?rpc_id,
+                method,
+                ?inflight,
+                source = %std::panic::Location::caller(),
+                "Codex connection stopped; requests are not retried"
+            );
+        }
         self.ready.store(false, Ordering::Release);
         self.cancel.cancel();
         for (_, pending) in locked(&self.pending).drain() {
@@ -123,9 +155,12 @@ impl State {
         if self.cancel.is_cancelled() {
             return Err(disconnected());
         }
-        if self.events.try_send(event).is_err() {
+        if let Err(error) = self.events.try_send(event) {
             // Never skip a delta or approval while claiming a connected stream.
-            self.stop();
+            self.stop_reason(match error {
+                mpsc::error::TrySendError::Full(_) => "event_queue_overflow",
+                mpsc::error::TrySendError::Closed(_) => "event_consumer_closed",
+            });
             return Err(AgentError::NotAvailable(
                 "Codex event backlog overflow; resync required".into(),
             ));
@@ -155,18 +190,24 @@ struct WriteGuard {
     state: Arc<State>,
     finished: bool,
     fence_on_cancel: bool,
+    deadline: tokio::time::Instant,
 }
 impl Drop for WriteGuard {
     fn drop(&mut self) {
         if !self.finished && self.fence_on_cancel {
-            self.state.stop();
+            self.state
+                .stop_reason(if tokio::time::Instant::now() >= self.deadline {
+                    "mutation_write_deadline"
+                } else {
+                    "mutation_write_cancelled"
+                });
         }
     }
 }
 
 impl Drop for CodexClient {
     fn drop(&mut self) {
-        self.state.stop();
+        self.state.stop_reason("last_client_dropped");
     }
 }
 
@@ -175,6 +216,7 @@ struct PendingGuard {
     id: u64,
     fence_on_cancel: bool,
     enqueued: AtomicBool,
+    diagnostic_method: &'static str,
 }
 impl Drop for PendingGuard {
     fn drop(&mut self) {
@@ -189,7 +231,11 @@ impl Drop for PendingGuard {
         if unfinished && self.fence_on_cancel {
             // Caller cancellation after a write is also ambiguous. Do not keep
             // accepting prompts while an unacknowledged mutation may run.
-            self.state.stop();
+            self.state.stop_request(
+                "mutation_caller_cancelled",
+                Some(self.id),
+                self.diagnostic_method,
+            );
         }
     }
 }
@@ -211,6 +257,33 @@ fn read_only_request(method: &str, params: &Value) -> bool {
             | "thread/turns/list"
             | "thread/items/list"
     ) || (method == "account/read" && params["refreshToken"] == false)
+}
+
+// Unknown input is never a log field, even when it is used as an RPC method.
+fn diagnostic_method(method: &str) -> &'static str {
+    match method {
+        "initialize" => "initialize",
+        "initialized" => "initialized",
+        "account/read" => "account/read",
+        "config/read" => "config/read",
+        "model/list" => "model/list",
+        "skills/list" => "skills/list",
+        "thread/list" => "thread/list",
+        "thread/read" => "thread/read",
+        "thread/loaded/list" => "thread/loaded/list",
+        "thread/turns/list" => "thread/turns/list",
+        "thread/items/list" => "thread/items/list",
+        "thread/start" => "thread/start",
+        "thread/resume" => "thread/resume",
+        "thread/fork" => "thread/fork",
+        "thread/name/set" => "thread/name/set",
+        "thread/delete" => "thread/delete",
+        "thread/compact/start" => "thread/compact/start",
+        "turn/start" => "turn/start",
+        "turn/steer" => "turn/steer",
+        "turn/interrupt" => "turn/interrupt",
+        _ => "other",
+    }
 }
 
 impl CodexClient {
@@ -270,6 +343,7 @@ impl CodexClient {
             lifecycle_completed_turns: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
             ready: AtomicBool::new(false),
+            disconnect_reason: std::sync::OnceLock::new(),
             cancel: CancellationToken::new(),
             events,
         });
@@ -406,6 +480,7 @@ impl CodexClient {
     pub fn cancel_token(&self) -> CancellationToken {
         self.state.cancel.clone()
     }
+    #[track_caller]
     pub fn stop(&self) {
         self.state.stop();
     }
@@ -538,6 +613,7 @@ impl CodexClient {
                 id,
                 Pending {
                     reply,
+                    diagnostic_method: diagnostic_method(method),
                     selection_config: method == "config/read",
                     attach_expected: (method == "thread/resume")
                         .then(|| params["threadId"].as_str().unwrap_or("").to_owned()),
@@ -558,6 +634,7 @@ impl CodexClient {
             id,
             fence_on_cancel,
             enqueued: AtomicBool::new(false),
+            diagnostic_method: diagnostic_method(method),
         };
         let deadline = tokio::time::Instant::now() + self.timeout;
         tokio::time::timeout_at(
@@ -566,6 +643,7 @@ impl CodexClient {
                 json!({"id":id,"method":method,"params":params}),
                 fence_on_cancel,
                 Some(&_guard.enqueued),
+                deadline,
             ),
         )
         .await
@@ -575,13 +653,19 @@ impl CodexClient {
             Ok(Err(_)) => Err(disconnected()),
             Err(_) => {
                 if !fence_on_cancel {
+                    tracing::warn!(connection = %self.state.generation, rpc_id = id,
+                        method = diagnostic_method(method), "Codex read deadline exceeded; connection retained; not retried");
                     return Err(AgentError::RequestFailed(
                         "Codex read deadline exceeded; not retried".into(),
                     ));
                 }
                 // A mutation may have been accepted. Close this connection;
                 // do not submit it again or allow further work to race it.
-                self.stop();
+                self.state.stop_request(
+                    "mutation_response_deadline",
+                    Some(id),
+                    diagnostic_method(method),
+                );
                 Err(AgentError::RequestFailed(
                     "Codex request deadline exceeded; outcome unknown; not retried".into(),
                 ))
@@ -590,7 +674,13 @@ impl CodexClient {
     }
 
     async fn write(&self, value: Value) -> Result<(), AgentError> {
-        self.write_guarded(value, true, None).await
+        self.write_guarded(
+            value,
+            true,
+            None,
+            tokio::time::Instant::now() + self.timeout,
+        )
+        .await
     }
 
     async fn write_guarded(
@@ -598,6 +688,7 @@ impl CodexClient {
         value: Value,
         fence_on_cancel: bool,
         enqueued: Option<&AtomicBool>,
+        deadline: tokio::time::Instant,
     ) -> Result<(), AgentError> {
         let mut bytes = serde_json::to_vec(&value)
             .map_err(|_| AgentError::Protocol("invalid Codex request".into()))?;
@@ -612,8 +703,8 @@ impl CodexClient {
             state: self.state.clone(),
             finished: false,
             fence_on_cancel,
+            deadline,
         };
-        let deadline = tokio::time::Instant::now() + self.timeout;
         tokio::select! {
             biased;
             _ = self.state.cancel.cancelled() => return Err(disconnected()),
