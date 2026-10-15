@@ -655,7 +655,7 @@ mod tests {
                 .unwrap()
                 .object
                 .path,
-            path
+            std::fs::canonicalize(&path).unwrap()
         );
         let invented = format!(
             "/api/agent-images/{upload_id}/download/{}",
