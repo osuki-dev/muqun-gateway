@@ -37,6 +37,7 @@ fn router_error_reason(error: &AgentError) -> &'static str {
     // Match fixed local invariants, never print arbitrary error text.
     match error {
         AgentError::Protocol(message) => match message.as_str() {
+            "Codex response exceeds allowed frame limit" => "rpc_router_frame_limit",
             "invalid Codex request id" => "rpc_router_invalid_callback_id",
             "Codex server request capacity or duplicate id" => {
                 "rpc_router_callback_capacity_or_duplicate"
@@ -111,7 +112,14 @@ impl CodexClient {
                     }
                     frame = socket.next() => {
                         match frame {
-                            Some(Ok(Message::Text(text))) if text.len() <= MAX_FRAME_BYTES => {
+                            Some(Ok(Message::Text(text))) if text.len() <= MAX_SHARED_READ_FRAME_BYTES => {
+                                // Keep the small-frame fail-fast path unless an
+                                // image-bearing item-page read is actually pending.
+                                if text.len() > MAX_FRAME_BYTES && !locked(&pump.pending).values().any(|pending| pending.diagnostic_method == "thread/items/list") {
+                                    tracing::warn!(connection = %pump.generation, frame_bytes = text.len(), limit_bytes = MAX_FRAME_BYTES,
+                                        "Codex WebSocket size limit exceeded");
+                                    break "websocket_size_limit";
+                                }
                                 let Ok(value) = serde_json::from_str(&text) else {
                                     tracing::warn!(connection = %pump.generation, frame_bytes = text.len(), "Codex WebSocket invalid JSON");
                                     break "websocket_invalid_json";
@@ -123,7 +131,7 @@ impl CodexClient {
                                 }
                             }
                             Some(Ok(Message::Text(text))) => {
-                                tracing::warn!(connection = %pump.generation, frame_bytes = text.len(), limit_bytes = MAX_FRAME_BYTES,
+                                tracing::warn!(connection = %pump.generation, frame_bytes = text.len(), limit_bytes = MAX_SHARED_READ_FRAME_BYTES,
                                     "Codex WebSocket size limit exceeded");
                                 break "websocket_size_limit";
                             }
@@ -200,8 +208,8 @@ pub(crate) mod tests {
         use tokio_tungstenite::tungstenite::protocol::{Role, WebSocketConfig};
         let (left, right) = UnixStream::pair().unwrap();
         let config = WebSocketConfig::default()
-            .max_frame_size(Some(MAX_FRAME_BYTES))
-            .max_message_size(Some(MAX_FRAME_BYTES));
+            .max_frame_size(Some(MAX_SHARED_READ_FRAME_BYTES))
+            .max_message_size(Some(MAX_SHARED_READ_FRAME_BYTES));
         let socket = WebSocketStream::from_raw_socket(left, Role::Client, Some(config)).await;
         let server = WebSocketStream::from_raw_socket(right, Role::Server, None).await;
         let (client, events) = CodexClient::from_websocket(
@@ -522,6 +530,43 @@ pub(crate) mod tests {
             &[],
         )));
         driver
+    }
+
+    #[tokio::test]
+    async fn shared_image_history_page_over_four_mib_keeps_connection_and_projection() {
+        const ID: &str = "00000000-0000-4000-8000-000000000031";
+        let fixture = Fixture::new(|request| match request["method"].as_str().unwrap() {
+            "thread/read" => json!({"thread":{"id":ID,"historyMode":"paginated","status":{"type":"notLoaded"}}}),
+            "thread/items/list" => json!({"data":(0..3).map(|n| json!({
+                "turnId":"synthetic-turn", "item":{"type":"imageGeneration","id":format!("image-{n}"),
+                "status":"completed","revisedPrompt":"synthetic image","savedPath":"/synthetic/cat.png",
+                "result":"A".repeat(2_670_000)}
+            })).collect::<Vec<_>>(),"nextCursor":null}),
+            "thread/list" => json!({"data":[],"nextCursor":null}),
+            other => panic!("unexpected RPC {other}"),
+        }).await;
+        let driver = CodexDriver::new(fixture.client.clone());
+        let timeline = driver.get_timeline(ID, 100).await.unwrap();
+        assert_eq!(
+            timeline.len(),
+            6,
+            "three tools and three saved-file previews"
+        );
+        let projected = serde_json::to_string(&timeline).unwrap();
+        assert!(projected.len() < 16 * 1024);
+        assert!(
+            !projected.contains(&"A".repeat(256)),
+            "base64 must not leak into projected tool metadata"
+        );
+        assert!(fixture.client.is_ready());
+        fixture
+            .client
+            .call("thread/list", json!({"limit":1}))
+            .await
+            .unwrap();
+        assert!(!locked(&fixture.requests)
+            .iter()
+            .any(|r| matches!(r["method"].as_str(), Some("thread/resume" | "turn/start"))));
     }
 
     #[tokio::test]

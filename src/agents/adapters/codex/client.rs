@@ -13,6 +13,10 @@ use tokio_util::sync::CancellationToken;
 use crate::agents::ports::agent::AgentError;
 
 pub const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
+// A stored item page can aggregate several multi-MiB image results. Match the
+// existing traversal byte budget, not the outbound/text-row bound. Only a
+// correlated shared thread/items/list result may use this larger wire budget.
+pub(crate) const MAX_SHARED_READ_FRAME_BYTES: usize = 32 * 1024 * 1024;
 const MAX_PENDING: usize = 32;
 const MAX_SERVER_REQUEST_BYTES: usize = 8 * 1024 * 1024;
 const QUEUE_SIZE: usize = 16;
@@ -859,6 +863,25 @@ async fn read_frames<R: AsyncRead + Unpin>(mut reader: R, state: Arc<State>) {
 fn route_frame(state: &State, value: Value, frame_bytes: usize) -> Result<(), AgentError> {
     if state.cancel.is_cancelled() {
         return Err(disconnected());
+    }
+    if frame_bytes > MAX_FRAME_BYTES {
+        let item_page = state.shared
+            && frame_bytes <= MAX_SHARED_READ_FRAME_BYTES
+            && value.get("method").is_none()
+            && value.get("error").is_none()
+            && value["result"]["data"]
+                .as_array()
+                .is_some_and(|rows| rows.len() <= 100)
+            && value["id"].as_u64().is_some_and(|id| {
+                locked(&state.pending)
+                    .get(&id)
+                    .is_some_and(|pending| pending.diagnostic_method == "thread/items/list")
+            });
+        if !item_page {
+            return Err(AgentError::Protocol(
+                "Codex response exceeds allowed frame limit".into(),
+            ));
+        }
     }
     if let Some(method) = value["method"].as_str() {
         let params = value.get("params").cloned().unwrap_or(Value::Null);

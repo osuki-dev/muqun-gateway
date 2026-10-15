@@ -74,7 +74,12 @@ decoding. A malformed envelope, malformed JSON, oversized frame, event overload
 or lost connection closes the connection and requests resynchronization rather
 than silently skipping/truncating transcript data.
 
-Bounds: 4 MiB per inbound/outbound frame or streamed text/output row, 32
+Bounds: 4 MiB per ordinary inbound/outbound frame or streamed text/output row.
+Shared transport accepts a successful `thread/items/list` reply up to 32 MiB only
+when its numeric ID matches a pending item-list request and its data contains at
+most 100 rows. The decoder's 32-MiB wire ceiling is not a total heap-memory bound;
+other oversized envelopes can be buffered before correlation rejects them.
+Outbound frames and all other accepted inbound frames retain the 4-MiB limit. There are 32
 pending RPCs/server callbacks (callbacks also share an 8 MiB payload bound),
 32 scheduled metadata-read workers,
 16 queued events, 4,096 explicitly loaded
@@ -219,7 +224,8 @@ sessions and 32 MiB globally within this adapter, with explicit errors rather th
 silent eviction. Checked prefix positions insert older same-turn items before the
 displayed tail without renumbering stable anchors. Unknown storage modes are Unsupported.
 Traversals share a 20-second total deadline, 128-page, 20,000-raw-row and 32-MiB
-actual-response-body budget, in addition to the 4-MiB frame bound. Malformed
+actual-response-body budget. The shared item-page reply exception above permits
+one correlated page up to that byte budget; other frames remain limited to 4 MiB. Malformed
 pages/cursors, cursor cycles, RPC errors or exhausted budgets return errors, not
 partial inventories or an unsatisfied history tail advertised as complete.
 
@@ -431,8 +437,9 @@ questions from the exact currently active turn. Paginated storage uses
 `thread/items/list` filtered by `turnId`; legacy storage uses a single
 `thread/turns/list` page with `itemsView: full`, requiring the returned active turn
 identity to match. Recovery is bounded to 1,600 items, 16 pages, 1 MiB of retained
-question/reply items, and the existing 20-second/32-MiB traversal and 4-MiB frame
-limits. It publishes no partial result. Committed answer envelopes are applied before
+question/reply items, and the existing 20-second/32-MiB traversal and transport
+frame limits (including the correlated shared item-page exception above).
+It publishes no partial result. Committed answer envelopes are applied before
 question forms; bounded answer identities also prevent a concurrent TUI answer from
 being resurrected by recovery. Turn changes, completion, disconnect, or an unload/rejoin
 of the same thread fence the result. Explicit interrupt and prompt control do not wait

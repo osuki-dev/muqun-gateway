@@ -112,8 +112,8 @@ pub(crate) async fn connect_at(home: &Path) -> Result<Option<Connection>, AgentE
             return Err(unavailable("Codex daemon peer identity mismatch"));
         }
         let config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
-            .max_frame_size(Some(super::client::MAX_FRAME_BYTES))
-            .max_message_size(Some(super::client::MAX_FRAME_BYTES));
+            .max_frame_size(Some(super::client::MAX_SHARED_READ_FRAME_BYTES))
+            .max_message_size(Some(super::client::MAX_SHARED_READ_FRAME_BYTES));
         let (socket, _) =
             tokio_tungstenite::client_async_with_config("ws://localhost/rpc", stream, Some(config))
                 .await
