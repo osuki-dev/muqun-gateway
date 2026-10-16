@@ -528,6 +528,17 @@ path/query, with the initiating request nonce appended for replies. Responses
 use the authenticated request revision. SSE/WebSocket record keys and counters
 remain unchanged; their opening request uses the negotiated envelope.
 
+A sealed request body cannot be authenticated before it is read: the token is
+inside the envelope, and the clear headers carry only a device id anyone on
+the path can copy. The pre-authentication read of a large sealed body is
+therefore *bounded* rather than prevented (`server::preauth_sealed_permit`,
+`GatedBody`): its own small budgets per route (uploads; prompt/command/task),
+a per-address count (IPv4 per address, IPv6 per /64), one read per clear
+device id, a minimum throughput and a deadline, with the request moving to the
+main pool and the device's slot only once the envelope has opened and the
+device is verified. This is the accepted residual: authenticating earlier
+needs a header MAC in a future envelope revision (v3), which is deferred.
+
 An envelope that authenticates but whose timestamp is outside the five-minute
 window is refused as `403 clock_skew` with `error.server_time_ms`, on the
 request path, at replay admission and on a QR pairing claim; an envelope that

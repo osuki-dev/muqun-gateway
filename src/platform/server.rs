@@ -426,16 +426,26 @@ static LARGE_BODIES_BY_IP: std::sync::LazyLock<std::sync::Mutex<HashMap<std::net
 
 /// The sealed path has to read a body before its envelope can be opened,
 /// so that read is made on a clear device header alone. It draws from its
-/// own small budget, never from the pool above: four such reads at once in
-/// all, two per peer IP address. Once the envelope has opened and the
-/// device is verified, the request moves to the pool and the device's slot.
+/// own small budgets, never from the pool above: one budget for the uploads
+/// route and one for the prompt, command and task routes, so a stranger
+/// filling one does not starve the other -- four reads at once in each, two
+/// per peer address, and one per clear device id. Once the envelope has
+/// opened and the device is verified, the request moves to the pool and
+/// the device's slot.
 const PREAUTH_SEALED_PERMITS: usize = 4;
 const MAX_PREAUTH_SEALED_PER_IP: usize = 2;
-static PREAUTH_SEALED: tokio::sync::Semaphore =
+static PREAUTH_SEALED_UPLOADS: tokio::sync::Semaphore =
     tokio::sync::Semaphore::const_new(PREAUTH_SEALED_PERMITS);
-static PREAUTH_SEALED_BY_IP: std::sync::LazyLock<
-    std::sync::Mutex<HashMap<std::net::IpAddr, usize>>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+static PREAUTH_SEALED_PROMPTS: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(PREAUTH_SEALED_PERMITS);
+static PREAUTH_UPLOADS_BY_IP: IpCounts =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+static PREAUTH_PROMPTS_BY_IP: IpCounts =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+/// The clear device ids with a pre-authentication read in flight: one each.
+static PREAUTH_SEALED_BY_DEVICE: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<String>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
 
 /// The longest any large body may take to arrive in all.
 const LARGE_BODY_READ_TIMEOUT: Duration = Duration::from_secs(180);
@@ -472,22 +482,38 @@ impl Drop for LargeBodyPlace {
     }
 }
 
-/// A pre-authentication sealed read's place: a permit of the small budget
-/// and its count against the peer IP.
+/// A pre-authentication sealed read's place: a permit of its route's
+/// budget, its count against the peer address and the clear device id.
 struct PreauthPlace {
     _permit: tokio::sync::SemaphorePermit<'static>,
+    by_ip: &'static IpCounts,
     ip: Option<std::net::IpAddr>,
+    device_id: String,
 }
 
 impl Drop for PreauthPlace {
     fn drop(&mut self) {
         if let Some(ip) = self.ip {
-            release_count(&PREAUTH_SEALED_BY_IP, ip);
+            release_count(self.by_ip, ip);
+        }
+        if let Ok(mut devices) = PREAUTH_SEALED_BY_DEVICE.lock() {
+            devices.remove(&self.device_id);
         }
     }
 }
 
 type IpCounts = std::sync::LazyLock<std::sync::Mutex<HashMap<std::net::IpAddr, usize>>>;
+
+/// The address a peer is counted under: the IPv4 address itself, or the
+/// /64 of an IPv6 address, which is what one subscriber holds.
+fn counted_address(ip: std::net::IpAddr) -> std::net::IpAddr {
+    match ip {
+        std::net::IpAddr::V4(_) => ip,
+        std::net::IpAddr::V6(v6) => {
+            std::net::IpAddr::V6(std::net::Ipv6Addr::from(u128::from(v6) & (u128::MAX << 64)))
+        }
+    }
+}
 
 /// Count `ip` in `counts` unless it already stands at `max`.
 fn take_count(counts: &IpCounts, ip: Option<std::net::IpAddr>, max: usize) -> bool {
@@ -524,35 +550,57 @@ fn busy() -> (StatusCode, Json<serde_json::Value>) {
     )
 }
 
-/// The per-device slot of a connection: the device id with the IP address
-/// the request came in from (`ConnectInfo`; the test harness has none).
+/// The per-device slot of a connection: the device id with the address
+/// the request came in from (`ConnectInfo`, as [`counted_address`] counts
+/// it; the test harness has none).
 fn slot_key(device_id: &str, peer: Option<&SocketAddr>) -> String {
     match peer {
-        Some(peer) => format!("{device_id}@{}", peer.ip()),
+        Some(peer) => format!("{device_id}@{}", counted_address(peer.ip())),
         None => device_id.to_owned(),
     }
 }
 
 /// A place for the pre-authentication read of a sealed body of up to
-/// `plaintext_limit` bytes from `peer`, or `None` when the route takes
-/// only the ordinary limit. From the small budget, never the pool. `Err`:
-/// that budget is spent, in all or for this address.
+/// `plaintext_limit` bytes from `peer`, naming the clear `device_id`, or
+/// `None` when the route takes only the ordinary limit. From the route's
+/// small budget, never the pool. `Err`: that budget is spent, in all, for
+/// this address, or for this device id.
 pub(crate) fn preauth_sealed_permit(
     plaintext_limit: usize,
     peer: Option<&SocketAddr>,
+    device_id: &str,
 ) -> Result<Option<LargeBodyPermit>, (StatusCode, Json<serde_json::Value>)> {
     if plaintext_limit <= MAX_REQUEST_BODY_BYTES {
         return Ok(None);
     }
-    let permit = PREAUTH_SEALED.try_acquire().map_err(|_| busy())?;
-    let ip = peer.map(SocketAddr::ip);
-    if !take_count(&PREAUTH_SEALED_BY_IP, ip, MAX_PREAUTH_SEALED_PER_IP) {
+    let (budget, by_ip): (&'static tokio::sync::Semaphore, &'static IpCounts) =
+        if plaintext_limit > 25 * 1024 * 1024 {
+            (&PREAUTH_SEALED_UPLOADS, &PREAUTH_UPLOADS_BY_IP)
+        } else {
+            (&PREAUTH_SEALED_PROMPTS, &PREAUTH_PROMPTS_BY_IP)
+        };
+    // The permit is dropped with `permit` on every refusal below.
+    let permit = budget.try_acquire().map_err(|_| busy())?;
+    let ip = peer.map(|peer| counted_address(peer.ip()));
+    if !take_count(by_ip, ip, MAX_PREAUTH_SEALED_PER_IP) {
+        return Err(busy());
+    }
+    let taken = PREAUTH_SEALED_BY_DEVICE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(device_id.to_owned());
+    if !taken {
+        if let Some(ip) = ip {
+            release_count(by_ip, ip);
+        }
         return Err(busy());
     }
     Ok(Some(LargeBodyPermit {
         _place: std::sync::Arc::new(PreauthPlace {
             _permit: permit,
+            by_ip,
             ip,
+            device_id: device_id.to_owned(),
         }),
     }))
 }
@@ -580,7 +628,7 @@ pub(crate) fn large_body_permit(
     };
     // The pool permit is dropped with `permit` on every refusal below.
     let permit = gate.try_acquire().map_err(|_| busy())?;
-    let ip = peer.map(SocketAddr::ip);
+    let ip = peer.map(|peer| counted_address(peer.ip()));
     if !take_count(&LARGE_BODIES_BY_IP, ip, MAX_LARGE_BODIES_PER_IP) {
         return Err(busy());
     }
@@ -936,7 +984,7 @@ pub(crate) async fn decrypt_transport_request(
     let peer = peer_of(&parts.extensions);
     // Not the pool: the small pre-authentication budget, until the envelope
     // has opened and the device is verified below.
-    let preauth = preauth_sealed_permit(plaintext_limit, peer.as_ref())?;
+    let preauth = preauth_sealed_permit(plaintext_limit, peer.as_ref(), device_id)?;
     let large = preauth.is_some();
     let body = gated_body(body, preauth);
     let read = to_bytes(body, sealed_body_ceiling(plaintext_limit));
