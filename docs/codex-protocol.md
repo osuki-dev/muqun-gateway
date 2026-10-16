@@ -423,9 +423,10 @@ acknowledgement: the result is reported unknown/error, **not resubmitted**.
 
 Per-provider flags declare only the implemented features. File-restoring revert
 and staged revert remain false: Codex's transcript-only `thread/revert` does
-not restore workspace files. Worktrees, modes, skills, inbox, slash commands,
-compaction, background shells, durable instructions and runtime MCP injection
-remain unsupported.
+not restore workspace files. Compaction is supported through the stable
+`thread/compact/start`, for owned native idle sessions only (see
+`codex-capabilities.md`). Worktrees, modes, inbox, background shells,
+durable instructions and runtime MCP injection remain unsupported.
 
 ## Acceptance evidence and limits
 

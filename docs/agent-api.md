@@ -285,12 +285,12 @@ and `version` removed from every agent.
   | `modes` | yes | yes (presets) | no | no |
   | `skills` | yes | no | no | no |
   | `slashCommands` | yes | no | no | no |
-  | `compaction` | yes | no | no | no |
+  | `compaction` | yes | no | no | yes (owned native idle sessions) |
   | `backgroundShells` | yes | no | no | no |
   | `attachments` | yes | yes | yes | yes |
   | `attachmentsByPath` | no | yes | yes | yes |
   | `sessionPagination` | yes | no | no | yes (forward only) |
-  | `timelineEarlier` | no | no | no | yes |
+  | `timelineEarlier` | yes | yes | no | yes |
 
   `t3` is `name: "T3 Code"`; its `version` is the T3 server version, its
   `models[]` are every model of the providers T3 has ready (Claude Code,
@@ -609,7 +609,8 @@ OpenCode's message route takes `limit` and `order` and no cursor, so each
 earlier batch is read as the newest `held + 80` messages (bounded to 2,000
 messages and 8 MiB per read) and cut at the oldest message already delivered;
 a read that answers fewer than asked is the end. A session whose history
-changed under the cursor answers `503` (`agent_unavailable`): refresh it.
+changed under the cursor answers `409 history_cursor_lost` (below): read the
+snapshot again.
 
 DeepSeek pages `session/page` backwards under the frozen `asOfSeq` cut the
 snapshot was read under: opening reads the newest hundred messages within a
@@ -668,7 +669,9 @@ or contradictory anchors return an explicit error, never a fabricated partial en
 
 Same response as the list route, filtered to this session's children. Accepts
 the same `limit` / `order` / `search` / `cursor`. Every adapter honours the
-parent filter; DeepSeek and T3 have no sub-agent sessions, so they list none.
+parent filter. DeepSeek has no sub-agent sessions and lists none; T3 lists a
+thread's subagent threads on protocol 2 (their `parent_id` is the parent
+thread) and none on protocol 1.
 
 ### `GET /api/agent-sessions/{asid}/descendants`
 
