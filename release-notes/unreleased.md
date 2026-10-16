@@ -2,6 +2,11 @@
 
 ## Changes and fixes
 
+- Twelve pairing requests per ten minutes (was six), so an owner pairing
+  several devices again after turning encryption on is not stopped by
+  "too many pairing requests". The eight wrong-code lockout per code is
+  unchanged.
+
 - **A Codex task from the phone can be a ledger task.** `POST /api/tasks`
   took `agent_id: "codex"` as a terminal pane only, so the app opened native
   Codex sessions directly and the Home card could show only a transient

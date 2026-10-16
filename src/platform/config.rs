@@ -452,7 +452,12 @@ pub(crate) const MAX_PAIRING_CODE_ATTEMPTS: u8 = 8;
 
 pub(crate) const PAIRING_RATE_LIMIT_WINDOW_MS: u128 = 10 * 60 * 1000;
 
-pub(crate) const MAX_PAIRING_REQUESTS_PER_WINDOW: usize = 6;
+/// Pairing requests per window. Twelve: an owner pairing their devices again
+/// after `required` transport refused the key-less ones (an emulator or two,
+/// a phone, a linked computer) must not run into "too many pairing
+/// requests" halfway. Online code guessing is bounded separately by the
+/// eight-attempt lockout on each code (`MAX_PAIRING_CODE_ATTEMPTS`).
+pub(crate) const MAX_PAIRING_REQUESTS_PER_WINDOW: usize = 12;
 
 pub(crate) const MAX_SEND_KEYS: usize = 32;
 
