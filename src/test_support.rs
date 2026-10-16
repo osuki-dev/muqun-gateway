@@ -900,6 +900,27 @@ pub(crate) fn liveness_session(id: &str, backend: BackendKind) -> SessionConfig 
     }
 }
 
+/// `pairing.json` in the test config directory, written once per process:
+/// what the pairing routes seal a QR-style claim with. Answers its current
+/// transport key (the routes rotate it after a sealed claim).
+pub(crate) fn test_pairing_transport_key() -> String {
+    let path = config_dir().unwrap().join(PAIRING_FILE);
+    if !path.exists() {
+        let pairing = PairingFile {
+            payload: PairingPayload {
+                kind: "muqun-gateway".into(),
+                server_id: "server-1".into(),
+                label: "test".into(),
+                url: "http://127.0.0.1:23100".into(),
+                token: "admin".into(),
+                transport_key: generate_token(),
+            },
+        };
+        write_secret_file(&path, &serde_json::to_vec(&pairing).unwrap()).unwrap();
+    }
+    read_pairing_file().unwrap().payload.transport_key
+}
+
 pub(crate) fn write_test_install(dir: &std::path::Path, server_id: &str, token: &str) {
     std::fs::create_dir_all(dir).unwrap();
     let mut config = test_config(token);

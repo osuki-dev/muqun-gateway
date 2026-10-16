@@ -2,6 +2,18 @@
 
 ## Changes and fixes
 
+- **Linking two computers no longer sends the pairing code in the clear.**
+  `POST /api/pair/pending` answers `pairing_key` (the pairing transport key the
+  QR carries) on a `required` gateway; the app passes it to `POST /api/peers`
+  as `pairing_key`, and the linking gateway seals its claim exactly as a phone
+  that scanned the QR does, taking only an answer sealed under that key and
+  bound to its claim. Before, the claim carried `request_id` and `code` in
+  plain JSON and the answer was sealed under a key derived from both, which a
+  listener on an `http://` link could open; a plaintext answer was accepted
+  too. A link without the key (an older app, `muqun-gateway peers link`) keeps
+  the code-sealed answer but refuses one in the clear from a gateway that said
+  `required` of itself (`peer_refused`, reason `claim_unsealed`).
+
 - **`transport_encryption: required` now applies to every device.** A device
   paired while the setting was `disabled` has no transport key. It was still
   served in cleartext on its bearer token alone, indefinitely, on a gateway

@@ -40,7 +40,10 @@ pub(crate) enum PeerError {
     NoAnswer(String),
     /// The peer no longer knows this gateway's token: the link is gone.
     Unauthorized,
-    /// It answered with a refusal.
+    /// It answered with a refusal. Also a claim answer this gateway refuses
+    /// to take: `claim_unsealed` (in the clear where it had to be sealed)
+    /// and `claim_not_opened` (sealed, but not under the pairing key), with
+    /// the HTTP status the answer came with.
     Refused { status: u16, code: String },
 }
 
@@ -56,6 +59,7 @@ impl std::fmt::Display for PeerError {
 }
 
 /// What `/api/pair/claim` hands a newly paired device.
+#[derive(Debug)]
 pub(crate) struct Claimed {
     pub server_id: String,
     #[allow(dead_code)] // the name a link defaults to once the reconciler omits one
@@ -135,14 +139,22 @@ async fn body_of(mut response: reqwest::Response) -> Result<Value, PeerError> {
     serde_json::from_slice(&bytes).map_err(|_| PeerError::Unreachable("not a gateway".into()))
 }
 
+/// What `POST /api/pair/request` answered: B's label, and whether B runs
+/// `transport_encryption: required` -- then its claim answer is sealed, and
+/// one in the clear is not B's (`claim` refuses it).
+pub(crate) struct PairingOffer {
+    pub label: String,
+    pub transport_required: bool,
+}
+
 /// `POST {url}/api/pair/request` as a gateway device: B shows the code its
-/// owner then reads off `muqun-gateway manage`. Answers B's label.
+/// owner then reads off `muqun-gateway manage`. Answers B's label and mode.
 pub(crate) async fn request_pairing(
     url: &str,
     request_id: &str,
     device_name: &str,
     server_id: &str,
-) -> Result<String, PeerError> {
+) -> Result<PairingOffer, PeerError> {
     let response = http()
         .post(format!("{url}/api/pair/request"))
         .json(&json!({
@@ -159,17 +171,61 @@ pub(crate) async fn request_pairing(
     if !status.is_success() {
         return Err(refused(status.as_u16(), &body));
     }
-    string(&body["server_label"])
+    Ok(PairingOffer {
+        label: string(&body["server_label"])?,
+        transport_required: body["transport_encryption"].as_str() == Some("required"),
+    })
 }
 
-/// `POST {url}/api/pair/claim`. A gateway in `required` mode seals a claim it
-/// was sent in the clear with key material from the code itself
-/// (`code_pairing_material`), which is how a phone that typed the code
-/// opens it too.
-pub(crate) async fn claim(url: &str, request_id: &str, code: &str) -> Result<Claimed, PeerError> {
+/// `POST {url}/api/pair/claim`.
+///
+/// With `pairing_key` -- B's current pairing transport key, which its owner
+/// read off B's `POST /api/pair/pending` answer and handed over with the code
+/// -- the claim is sealed exactly as a phone that scanned B's QR seals it
+/// (`Direction::PairingRequest`, AAD `POST /api/pair/claim`, envelope
+/// version 1), and the answer has to be sealed under the same key and bound
+/// to the request nonce. Neither the code nor the credentials cross the
+/// wire in the clear, and nothing B could answer unsealed is taken.
+///
+/// Without it (an older app, or `muqun-gateway peers link`), a gateway in
+/// `required` mode seals the answer with key material from the code itself
+/// (`code_pairing_material`), which is how a phone that typed the code opens
+/// it too. `transport_required` is what B's `POST /api/pair/request` said
+/// of itself: then an answer in the clear is refused as `claim_unsealed`.
+pub(crate) async fn claim(
+    url: &str,
+    request_id: &str,
+    code: &str,
+    pairing_key: Option<&str>,
+    transport_required: bool,
+) -> Result<Claimed, PeerError> {
+    let claim = json!({ "request_id": request_id, "code": code });
+    let pairing_material = pairing_key
+        .map(|key| {
+            transport::decode_key(key)
+                .ok()
+                .filter(|material| material.len() == 32)
+                .ok_or_else(|| PeerError::Unreachable("invalid pairing key".into()))
+        })
+        .transpose()?;
+    let wire = match &pairing_material {
+        Some(material) => serde_json::to_value(
+            transport::seal(
+                material,
+                transport::Direction::PairingRequest,
+                CLAIM_AAD,
+                claim.to_string().as_bytes(),
+                now_unix_ms(),
+            )
+            .map_err(|_| PeerError::Unreachable("claim could not be sealed".into()))?,
+        )
+        .map_err(|_| PeerError::Unreachable("claim".into()))?,
+        None => claim,
+    };
+    let request_nonce = wire["nonce"].as_str().map(str::to_owned);
     let response = http()
         .post(format!("{url}/api/pair/claim"))
-        .json(&json!({ "request_id": request_id, "code": code }))
+        .json(&wire)
         .send()
         .await
         .map_err(unreachable)?;
@@ -178,27 +234,53 @@ pub(crate) async fn claim(url: &str, request_id: &str, code: &str) -> Result<Cla
     if !status.is_success() {
         return Err(refused(status.as_u16(), &body));
     }
-    let body = if body.get("ciphertext").is_some() {
-        let envelope: transport::Envelope = serde_json::from_value(body)
-            .map_err(|_| PeerError::Unreachable("not a gateway".into()))?;
-        let (code, request_id) = (code.trim().to_ascii_uppercase(), request_id.to_owned());
-        let material =
-            tokio::task::spawn_blocking(move || code_pairing_material(&code, &request_id))
-                .await
+    let unsealed = |code: &str| PeerError::Refused {
+        status: status.as_u16(),
+        code: code.into(),
+    };
+    let sealed = body.get("ciphertext").is_some();
+    let body = match (pairing_material, request_nonce) {
+        (Some(material), Some(request_nonce)) => {
+            if !sealed {
+                return Err(unsealed("claim_unsealed"));
+            }
+            let envelope: transport::Envelope = serde_json::from_value(body)
+                .map_err(|_| PeerError::Unreachable("not a gateway".into()))?;
+            let aad = [CLAIM_AAD, b"\n", request_nonce.as_bytes()].concat();
+            let plaintext = transport::open(
+                &material,
+                transport::Direction::PairingResponse,
+                &aad,
+                &envelope,
+                now_unix_ms(),
+            )
+            .map_err(|_| unsealed("claim_not_opened"))?;
+            serde_json::from_slice(&plaintext)
                 .map_err(|_| PeerError::Unreachable("claim".into()))?
-                .map_err(|_| PeerError::Unreachable("claim".into()))?;
-        let aad = [CLAIM_AAD, b"\ncode-pairing\n"].concat();
-        let plaintext = transport::open(
-            &material,
-            transport::Direction::PairingResponse,
-            &aad,
-            &envelope,
-            now_unix_ms(),
-        )
-        .map_err(|_| PeerError::Unreachable("claim answer did not open".into()))?;
-        serde_json::from_slice(&plaintext).map_err(|_| PeerError::Unreachable("claim".into()))?
-    } else {
-        body
+        }
+        _ if sealed => {
+            let envelope: transport::Envelope = serde_json::from_value(body)
+                .map_err(|_| PeerError::Unreachable("not a gateway".into()))?;
+            let (code, request_id) = (code.trim().to_ascii_uppercase(), request_id.to_owned());
+            let material =
+                tokio::task::spawn_blocking(move || code_pairing_material(&code, &request_id))
+                    .await
+                    .map_err(|_| PeerError::Unreachable("claim".into()))?
+                    .map_err(|_| PeerError::Unreachable("claim".into()))?;
+            let aad = [CLAIM_AAD, b"\ncode-pairing\n"].concat();
+            let plaintext = transport::open(
+                &material,
+                transport::Direction::PairingResponse,
+                &aad,
+                &envelope,
+                now_unix_ms(),
+            )
+            .map_err(|_| unsealed("claim_not_opened"))?;
+            serde_json::from_slice(&plaintext)
+                .map_err(|_| PeerError::Unreachable("claim".into()))?
+        }
+        _ if transport_required => return Err(unsealed("claim_unsealed")),
+        _ => body,
     };
     Ok(Claimed {
         server_id: string(&body["server_id"])?,
@@ -922,13 +1004,15 @@ mod tests {
         .await;
         let named_http = url.replace("127.0.0.1", "localhost");
         assert_ne!(url, named_http);
-        assert_eq!(
-            request_pairing(&named_http, "fixture-request", "fixture", "fixture-id")
-                .await
-                .unwrap(),
-            "fixture"
+        let offer = request_pairing(&named_http, "fixture-request", "fixture", "fixture-id")
+            .await
+            .unwrap();
+        assert_eq!(offer.label, "fixture");
+        assert!(
+            !offer.transport_required,
+            "an answer that names no mode cannot demand a sealed claim answer"
         );
-        let claimed = claim(&named_http, "fixture-request", "2345-6789")
+        let claimed = claim(&named_http, "fixture-request", "2345-6789", None, false)
             .await
             .unwrap();
         assert_eq!(claimed.device_id, "fixture-device");
@@ -975,10 +1059,158 @@ mod tests {
             Err(PeerError::Refused { status: 307, .. })
         ));
         assert!(matches!(
-            claim(&url, "fixture-request", "2345-6789").await,
+            claim(&url, "fixture-request", "2345-6789", None, false).await,
             Err(PeerError::Refused { status: 307, .. })
         ));
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// A peer's claim answer, as `pair_claim` seals it for a QR-style claim:
+    /// under the pairing key, bound to the claim's nonce.
+    fn sealed_claim_answer(material: &[u8], request_nonce: &str, answer: &Value) -> Value {
+        let aad = [CLAIM_AAD, b"\n", request_nonce.as_bytes()].concat();
+        serde_json::to_value(
+            transport::seal(
+                material,
+                transport::Direction::PairingResponse,
+                &aad,
+                answer.to_string().as_bytes(),
+                now_unix_ms(),
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    /// With the peer's pairing key in hand, the claim goes out sealed as a
+    /// phone's QR claim does -- the code never crosses in the clear -- and
+    /// only an answer sealed under that key and bound to this claim's nonce
+    /// is taken. An answer in the clear, or one sealed to another nonce (a
+    /// replay, or a stranger's), is a refusal, whatever it says.
+    #[tokio::test]
+    async fn a_claim_with_the_pairing_key_is_sealed_and_takes_only_a_sealed_answer() {
+        let pairing_key = generate_token();
+        let material = transport::decode_key(&pairing_key).unwrap();
+        let answer = json!({
+            "server_id": "fixture-peer", "label": "fixture",
+            "token": "fixture-token", "device_id": "fixture-device",
+            "transport_key": generate_token(),
+        });
+        // What the fake peer answers next: how it seals, if at all.
+        #[derive(Clone, Copy)]
+        enum Answer {
+            Sealed,
+            Plain,
+            OtherNonce,
+        }
+        let mode = std::sync::Arc::new(std::sync::Mutex::new(Answer::Sealed));
+        let opened = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let url = {
+            let (mode, opened, answer) = (mode.clone(), opened.clone(), answer.clone());
+            let material = material.clone();
+            serve(axum::Router::new().fallback(axum::routing::post(
+                move |axum::Json(wire): axum::Json<Value>| {
+                    let (mode, opened, answer, material) = (
+                        mode.clone(),
+                        opened.clone(),
+                        answer.clone(),
+                        material.clone(),
+                    );
+                    async move {
+                        // Sealed on the wire: no code and no request id in sight.
+                        assert!(wire.get("code").is_none(), "{wire}");
+                        let envelope: transport::Envelope = serde_json::from_value(wire).unwrap();
+                        let plaintext = transport::open(
+                            &material,
+                            transport::Direction::PairingRequest,
+                            CLAIM_AAD,
+                            &envelope,
+                            now_unix_ms(),
+                        )
+                        .expect("the claim opens under the pairing key");
+                        opened
+                            .lock()
+                            .unwrap()
+                            .push(serde_json::from_slice(&plaintext).unwrap());
+                        let mode = *mode.lock().unwrap();
+                        axum::Json(match mode {
+                            Answer::Sealed => {
+                                sealed_claim_answer(&material, &envelope.nonce, &answer)
+                            }
+                            Answer::Plain => answer,
+                            Answer::OtherNonce => {
+                                sealed_claim_answer(&material, "AAAAAAAAAAAAAAAA", &answer)
+                            }
+                        })
+                    }
+                },
+            )))
+            .await
+        };
+
+        let claimed = claim(&url, "mint-1", "2345-6789", Some(&pairing_key), false)
+            .await
+            .unwrap();
+        assert_eq!(claimed.device_id, "fixture-device");
+        assert_eq!(claimed.token, "fixture-token");
+        assert_eq!(
+            *opened.lock().unwrap(),
+            vec![json!({ "request_id": "mint-1", "code": "2345-6789" })]
+        );
+
+        for (answer_mode, code) in [
+            (Answer::Plain, "claim_unsealed"),
+            (Answer::OtherNonce, "claim_not_opened"),
+        ] {
+            *mode.lock().unwrap() = answer_mode;
+            let refused = claim(&url, "mint-1", "2345-6789", Some(&pairing_key), false)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                refused,
+                PeerError::Refused {
+                    status: 200,
+                    code: code.into()
+                }
+            );
+        }
+        // A key that is not one is refused before anything is sent.
+        assert!(matches!(
+            claim(&url, "mint-1", "2345-6789", Some("not-a-key"), false).await,
+            Err(PeerError::Unreachable(_))
+        ));
+        assert_eq!(opened.lock().unwrap().len(), 3);
+    }
+
+    /// Without the pairing key (an older app, `peers link`), a peer that said
+    /// `required` of itself seals its answer under the code; one that arrives
+    /// in the clear is not that peer's and is refused. A peer that said
+    /// `disabled` answers in the clear, and that is taken as it always was.
+    #[tokio::test]
+    async fn without_the_pairing_key_a_required_peer_may_not_answer_in_the_clear() {
+        let url = serve(axum::Router::new().fallback(axum::routing::post(|| async {
+            axum::Json(json!({
+                "server_id": "fixture-peer", "label": "fixture",
+                "token": "fixture-token", "device_id": "fixture-device",
+            }))
+        })))
+        .await;
+        assert_eq!(
+            claim(&url, "mint-1", "2345-6789", None, true)
+                .await
+                .unwrap_err(),
+            PeerError::Refused {
+                status: 200,
+                code: "claim_unsealed".into()
+            }
+        );
+        assert_eq!(
+            claim(&url, "mint-1", "2345-6789", None, false)
+                .await
+                .unwrap()
+                .device_id,
+            "fixture-device"
+        );
     }
 
     /// A task the peer opened on `state`, as if through `POST /api/tasks`.

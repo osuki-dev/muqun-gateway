@@ -79,6 +79,10 @@ fn refusal_reason(code: &str) -> &'static str {
         "invalid_pairing_code" => "invalid_pairing_code",
         "pairing_not_requested" => "pairing_not_requested",
         "invalid_token" => "invalid_token",
+        // Its claim answer was not sealed as it had to be (in the clear, or
+        // not under the pairing key): nothing was kept.
+        "claim_unsealed" => "claim_unsealed",
+        "claim_not_opened" => "claim_not_opened",
         _ => "refused",
     }
 }
@@ -129,6 +133,18 @@ struct LinkBody {
     name: String,
     request_id: String,
     code: String,
+    /// `pairing_key` from the other computer's `POST /api/pair/pending`
+    /// answer (present when it runs `transport_encryption: required`): the
+    /// claim is sealed with it, as a phone seals a claim after scanning the
+    /// QR. An older app omits it and the claim goes out in the clear,
+    /// answered sealed under the code alone.
+    #[serde(default)]
+    pairing_key: Option<String>,
+    /// What the other computer's `POST /api/pair/request` said of itself
+    /// (`muqun-gateway peers link`): `required` means a claim answer in the
+    /// clear is refused.
+    #[serde(default)]
+    transport_encryption: Option<String>,
 }
 
 /// `POST /api/peers`: pair with the gateway at `url` through the code it
@@ -147,6 +163,9 @@ async fn link(
         || !valid_request_id(&body.request_id)
         || code.is_empty()
         || code.chars().count() > MAX_CODE_CHARS
+        || body.pairing_key.as_deref().is_some_and(|key| {
+            !crate::transport::decode_key(key).is_ok_and(|material| material.len() == 32)
+        })
     {
         return Err(invalid_request());
     }
@@ -157,6 +176,8 @@ async fn link(
         name: body.name,
         request_id: body.request_id,
         code: code.to_owned(),
+        pairing_key: body.pairing_key,
+        transport_required: body.transport_encryption.as_deref() == Some("required"),
     };
     let peer = state
         .peers
@@ -356,14 +377,19 @@ mod tests {
     }
 
     /// The whole §5.1 flow on two in-process gateways: the introducer mints
-    /// a code on mini, hands it to coding, coding pairs itself with mini as a
-    /// gateway device (mini runs `transport_encryption: required`, so every
-    /// call after the claim is sealed), lists it, turns its own switch, and
+    /// a code on mini, hands it to coding with mini's pairing key, coding
+    /// pairs itself with mini as a gateway device through a sealed claim
+    /// (mini runs `transport_encryption: required`, so the claim, its answer
+    /// and every call after are sealed), lists it, turns its own switch, and
     /// unlinks it, which revokes coding's token on mini.
     #[tokio::test]
     async fn a_gateway_links_to_another_through_a_pairing_code_and_unlinks() {
         let herdr = FakeHerdr::start(vec!["$ "], None);
-        let mini = named(output_state(&herdr), "srv-mini", "mini");
+        crate::test_support::test_pairing_transport_key();
+        let mut mini = named(output_state(&herdr), "srv-mini", "mini");
+        // The introducer is the admin token here: mini's phone device holds no
+        // transport key, so in `required` mode it would be told to pair again.
+        mini.config.transport_encryption = crate::TransportEncryptionMode::Required;
         // Exercise new links and their sealed traffic over an HTTP hostname.
         let url = serve(peer_router(mini.clone()))
             .await
@@ -413,15 +439,27 @@ mod tests {
                 json!("peer_name_taken"),
             ),
         ] {
+            // Mini's introducer is the admin token (see above); other's phone
+            // may mint, as a phone does.
+            let minter = if std::ptr::eq(target, &mini) {
+                "admin"
+            } else {
+                "token"
+            };
             let (status, minted) = call(
                 target,
                 "POST",
                 "/api/pair/pending",
-                "token",
+                minter,
                 Some(json!({ "device_name": "coding", "kind": "gateway", "server_id": "srv-coding" })),
             )
             .await;
             assert_eq!(status, StatusCode::OK, "{minted}");
+            assert_eq!(
+                minted.get("pairing_key").is_some(),
+                std::ptr::eq(target, &mini),
+                "the pairing key comes with a `required` gateway's code: {minted}"
+            );
             let (status, peer) = call(
                 &coding,
                 "POST",
@@ -430,6 +468,7 @@ mod tests {
                 Some(json!({
                     "url": at, "name": name,
                     "request_id": minted["request_id"], "code": minted["code"],
+                    "pairing_key": minted["pairing_key"],
                 })),
             )
             .await;
@@ -448,7 +487,7 @@ mod tests {
                     minted["request_id"].as_str().unwrap()
                 );
                 for expected in [StatusCode::OK, StatusCode::NOT_FOUND] {
-                    let (status, _) = call(target, "DELETE", &cancel, "token", None).await;
+                    let (status, _) = call(target, "DELETE", &cancel, minter, None).await;
                     assert_eq!(status, expected, "cancel the unclaimed code");
                 }
             }
@@ -476,8 +515,19 @@ mod tests {
                 .lock()
                 .unwrap()
                 .iter()
-                .any(|device| device.server_id.as_deref() == Some("srv-coding")),
-            "the phone said whose login it is"
+                .any(|device| device.server_id.as_deref() == Some("srv-coding")
+                    && device.transport_key.is_some()),
+            "the phone said whose login it is, and the login is sealed"
+        );
+        assert!(
+            coding
+                .peers
+                .get(&mini_id)
+                .await
+                .unwrap()
+                .transport_key
+                .is_some(),
+            "coding speaks to mini sealed from here on"
         );
         assert!(
             gateways(&other).is_empty(),
@@ -684,7 +734,7 @@ mod tests {
             &mini,
             "POST",
             "/api/pair/pending",
-            "token",
+            "admin",
             Some(json!({ "device_name": "coding", "kind": "gateway", "server_id": "srv-coding" })),
         )
         .await;
@@ -697,6 +747,7 @@ mod tests {
             Some(json!({
                 "url": url, "name": "Mac Mini",
                 "request_id": minted["request_id"], "code": minted["code"],
+                "pairing_key": minted["pairing_key"],
             })),
         )
         .await;

@@ -67,12 +67,13 @@ pub(crate) async fn run(command: PeersCommand) -> anyhow::Result<()> {
                 );
             }
             let request_id = format!("peer-{}", uuid::Uuid::new_v4());
-            let label =
+            let offer =
                 peer_client::request_pairing(&url, &request_id, &config.label, &config.server_id)
                     .await
                     .map_err(|error| {
                         anyhow::anyhow!("{url} did not take the pairing request: {error}")
                     })?;
+            let label = offer.label;
             // Its own label is this computer's too: another name is asked for
             // here, before the code, so the same pending pairing is claimed.
             let mut name = name.unwrap_or_else(|| label.clone());
@@ -95,11 +96,14 @@ pub(crate) async fn run(command: PeersCommand) -> anyhow::Result<()> {
             std::io::stdin()
                 .read_line(&mut code)
                 .context("failed to read the code")?;
+            // What the other computer said of its transport: in `required`
+            // mode its claim answer is sealed, and one in the clear is refused.
             let body = json!({
                 "url": url,
                 "name": name,
                 "request_id": request_id,
                 "code": code.trim(),
+                "transport_encryption": if offer.transport_required { "required" } else { "disabled" },
             });
             let (status, value) = admin_request_with_timeouts(
                 &config,

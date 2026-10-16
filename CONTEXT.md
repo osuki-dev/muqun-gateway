@@ -436,7 +436,14 @@ Without the QR's pairing key, the manual claim sends `code` and `request_id`
 without an application encryption envelope. A response key derived from those
 values cannot protect credentials from passive capture of both legs on an
 unprotected link. Use the QR key, a verified protected tunnel, or HTTPS where
-available.
+available. A gateway linking to another (`POST /api/peers`) gets that key
+from the mint: `POST /api/pair/pending` answers `pairing_key` in `required`
+mode, the phone hands it over with the code, and `peer_client::claim` seals
+the claim as the phone's QR claim is sealed and takes only an answer sealed
+under that key and bound to the claim's nonce (`claim_unsealed`,
+`claim_not_opened`). Without the key (an older app, `muqun-gateway peers
+link`), the code-sealed answer is kept, but an answer in the clear from a
+gateway that said `required` of itself is refused.
 
 Agents the gateway launches for remote dispatch (`POST …/tasks`, `POST …/spawn`,
 and a terminal-agent delegation through `POST /api/tasks` or `tasks.delegate`)

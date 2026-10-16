@@ -18,7 +18,8 @@ use super::transport;
 use crate::platform::http::bearer_token;
 use crate::platform::store::persist_devices_before_publish;
 use crate::{
-    api_error, generate_pairing_code, generate_token, lock_devices, now_unix_ms,
+    api_error, ensure_pairing_transport_key, generate_pairing_code, generate_token, lock_devices,
+    now_unix_ms,
     platform::http::{peer_forbidden, require_device_or_peer},
     platform::i18n::{self, Locale},
     read_pairing_file, require_admin, require_device, require_pairing_manager,
@@ -675,8 +676,12 @@ pub(crate) struct MintCodeBody {
 /// `POST /api/pair/pending`: a pending pairing made on the owner's behalf,
 /// for a device that is not in front of this computer's screen -- another
 /// gateway the phone (or `muqun-gateway peers link`) is linking. The answer
-/// carries what `/api/pair/claim` takes. The owner's phone holds no admin
-/// token, so an app device may ask too; another gateway may not.
+/// carries what `/api/pair/claim` takes and, in `required` mode, the
+/// `pairing_key` the QR carries, so the claimant can seal its claim exactly
+/// as a phone that scanned the QR does instead of sending the code in the
+/// clear and reading an answer sealed only under that code. The owner's
+/// phone holds no admin token, so an app device may ask too; another
+/// gateway may not.
 pub(crate) async fn mint_pairing_code(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -725,6 +730,21 @@ pub(crate) async fn mint_pairing_code(
         ));
     }
     record_pairing_request(&state, now)?;
+    let pairing_key = (state.config.transport_encryption == TransportEncryptionMode::Required)
+        .then(|| {
+            ensure_pairing_transport_key()
+                .and_then(|()| read_pairing_file())
+                .map(|pairing| pairing.payload.transport_key)
+                .map_err(|err| {
+                    tracing::warn!("failed to read the pairing transport key: {err:#}");
+                    api_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "pairing_transport_unavailable",
+                        "encrypted pairing is unavailable",
+                    )
+                })
+        })
+        .transpose()?;
     let code = generate_pairing_code();
     let request_id = format!("mint-{}", uuid::Uuid::new_v4());
     *pending = Some(PendingPairing {
@@ -739,11 +759,15 @@ pub(crate) async fn mint_pairing_code(
         failed_attempts: 0,
         minted_by: Some(minter),
     });
-    Ok(Json(json!({
+    let mut minted = json!({
         "request_id": request_id,
         "code": code,
         "expires_in_ms": MINTED_CODE_TTL_MS,
-    })))
+    });
+    if let Some(pairing_key) = pairing_key {
+        minted["pairing_key"] = Value::String(pairing_key);
+    }
+    Ok(Json(minted))
 }
 
 /// How long a minted code lives. The other gateway claims it within a
@@ -1374,6 +1398,105 @@ mod tests {
         assert!(payload["device_id"].as_str().is_some());
         let transport_key = payload["transport_key"].as_str().unwrap();
         assert!(transport::decode_key(transport_key).is_ok_and(|key| key.len() == 32));
+    }
+
+    /// The mint hands the owner's phone what the QR carries -- this gateway's
+    /// current pairing transport key -- in `required` mode only, so the
+    /// linking gateway can seal its claim exactly as a phone that scanned the
+    /// QR does. With it, `pair_claim` takes the sealed claim from a
+    /// gateway-kind claimant through the QR branch: the answer is sealed under
+    /// the same key, bound to the claim's nonce, and the key is rotated after.
+    #[tokio::test]
+    async fn a_minted_code_carries_the_pairing_key_and_a_gateway_claims_it_sealed() {
+        let before = test_pairing_transport_key();
+        let mut state = required_test_state("admin-token", vec![]);
+        let (status, minted) = mint(&state, "Coding").await;
+        assert_eq!(status, StatusCode::OK, "{minted}");
+        assert_eq!(
+            minted["pairing_key"].as_str(),
+            Some(before.as_str()),
+            "the key the QR carries, as the file holds it now: {minted}"
+        );
+        let material = transport::decode_key(&before).unwrap();
+
+        // The claim as `peer_client::claim` sends it: sealed, the request nonce
+        // being what the answer is bound to.
+        let claim = json!({ "request_id": minted["request_id"], "code": minted["code"] });
+        let envelope = transport::seal(
+            &material,
+            transport::Direction::PairingRequest,
+            b"POST /api/pair/claim",
+            claim.to_string().as_bytes(),
+            now_unix_ms(),
+        )
+        .unwrap();
+        let request_nonce = envelope.nonce.clone();
+        let response = pair_claim(
+            State(state.clone()),
+            Json(serde_json::to_value(&envelope).unwrap()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let answer: transport::Envelope = serde_json::from_slice(&body).unwrap();
+        let aad = format!("POST /api/pair/claim\n{request_nonce}");
+        let plaintext = transport::open(
+            &material,
+            transport::Direction::PairingResponse,
+            aad.as_bytes(),
+            &answer,
+            now_unix_ms(),
+        )
+        .expect("the answer is sealed under the pairing key, to this claim");
+        let payload: Value = serde_json::from_slice(&plaintext).unwrap();
+        assert_eq!(payload["transport"], "muqun-aes-256-gcm-v1");
+        assert!(transport::decode_key(payload["transport_key"].as_str().unwrap()).is_ok());
+        {
+            let devices = state.devices.lock().unwrap();
+            let device = devices
+                .iter()
+                .find(|device| device.id == payload["device_id"])
+                .expect("the claimant is enrolled");
+            assert_eq!(device.kind, DeviceKind::Gateway);
+            assert_eq!(device.name, "Coding");
+            assert!(device.transport_key.is_some());
+        }
+        assert_ne!(
+            test_pairing_transport_key(),
+            before,
+            "a sealed claim spends the pairing key, as a QR claim does"
+        );
+        // The next mint carries the rotated key, never a spent one.
+        let (_, minted) = mint(&state, "Coding").await;
+        assert_eq!(minted["pairing_key"], test_pairing_transport_key());
+
+        // No key in `disabled` mode: there is nothing to seal with.
+        *state.pending_pairing.lock().unwrap() = None;
+        state.config.transport_encryption = TransportEncryptionMode::Disabled;
+        let (status, minted) = mint(&state, "Coding").await;
+        assert_eq!(status, StatusCode::OK, "{minted}");
+        assert!(minted.get("pairing_key").is_none(), "{minted}");
+    }
+
+    /// `POST /api/pair/pending` with the admin token: `(status, body)`.
+    async fn mint(state: &AppState, device_name: &str) -> (StatusCode, Value) {
+        match mint_pairing_code(
+            State(state.clone()),
+            bearer_headers("admin-token"),
+            Ok(Json(MintCodeBody {
+                device_name: device_name.into(),
+                kind: DeviceKind::Gateway,
+                server_id: Some("srv-coding".into()),
+            })),
+        )
+        .await
+        {
+            Ok(Json(body)) => (StatusCode::OK, body),
+            Err((status, Json(body))) => (status, body),
+        }
     }
 
     #[tokio::test]

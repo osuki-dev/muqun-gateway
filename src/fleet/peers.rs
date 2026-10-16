@@ -223,6 +223,12 @@ pub(crate) struct LinkRequest {
     pub name: String,
     pub request_id: String,
     pub code: String,
+    /// The peer's pairing transport key, from its `POST /api/pair/pending`
+    /// answer: the claim is sealed with it (`peer_client::claim`).
+    pub pairing_key: Option<String>,
+    /// The peer said `transport_encryption: required` of itself: a claim
+    /// answer in the clear is not taken.
+    pub transport_required: bool,
 }
 
 #[derive(Debug)]
@@ -730,13 +736,19 @@ impl PeerService {
     /// out (best effort), so a failed link leaves nothing behind on either side.
     pub(crate) async fn link(&self, own_id: &str, request: LinkRequest) -> Result<Peer, LinkError> {
         let url = request.url.trim_end_matches('/').to_owned();
-        let claimed = peer_client::claim(&url, &request.request_id, &request.code)
-            .await
-            .map_err(|error| match error {
-                PeerError::Unreachable(_) | PeerError::NoAnswer(_) => LinkError::Unreachable,
-                PeerError::Unauthorized => LinkError::Refused("invalid_pairing_code".into()),
-                PeerError::Refused { code, .. } => LinkError::Refused(code),
-            })?;
+        let claimed = peer_client::claim(
+            &url,
+            &request.request_id,
+            &request.code,
+            request.pairing_key.as_deref(),
+            request.transport_required,
+        )
+        .await
+        .map_err(|error| match error {
+            PeerError::Unreachable(_) | PeerError::NoAnswer(_) => LinkError::Unreachable,
+            PeerError::Unauthorized => LinkError::Refused("invalid_pairing_code".into()),
+            PeerError::Refused { code, .. } => LinkError::Refused(code),
+        })?;
         let now = now_ms();
         let peer = Peer {
             peer_id: format!("peer-{}", uuid::Uuid::new_v4()),
