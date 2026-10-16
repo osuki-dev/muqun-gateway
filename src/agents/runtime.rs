@@ -548,10 +548,14 @@ impl AgentRuntime {
                 return Some(m);
             }
         }
-        for (agent_id, manager) in self.attached_in_order().await {
-            let owns =
-                tokio::time::timeout(SESSION_LOOKUP_TIMEOUT, manager.agent().get_session(asid))
-                    .await;
+        // Probed at once, each under its own timeout; the first owner in
+        // preference order is chosen, as the serial walk chose it.
+        let attached = self.attached_in_order().await;
+        let owns = futures::future::join_all(attached.iter().map(|(_, manager)| {
+            tokio::time::timeout(SESSION_LOOKUP_TIMEOUT, manager.agent().get_session(asid))
+        }))
+        .await;
+        for ((agent_id, manager), owns) in attached.into_iter().zip(owns) {
             if matches!(owns, Ok(Ok(_))) {
                 self.record_session_route(asid, &agent_id).await;
                 return Some(manager);

@@ -704,8 +704,15 @@ async fn do_list_agent_sessions(
     let mut any_success = false;
     let mut last_err = None;
 
-    for manager in &all_managers {
-        match manager.sessions().list_sessions(query).await {
+    // Asked at once: one slow agent must not hold the others' lists back.
+    let lists = futures::future::join_all(
+        all_managers
+            .iter()
+            .map(|manager| manager.sessions().list_sessions(query)),
+    )
+    .await;
+    for (manager, list) in all_managers.iter().zip(lists) {
+        match list {
             Ok(list) => {
                 any_success = true;
                 for s in &list {
@@ -1627,59 +1634,59 @@ pub async fn get_global_agent_catalog(
     let mut merged_commands = Vec::new();
     let mut primary_defaults = None;
 
-    for manager in &all_managers {
-        if let Ok(cat) = manager
-            .sessions()
-            .get_catalog(query.directory.as_deref())
-            .await
-        {
-            if primary_defaults.is_none() {
-                primary_defaults = Some(cat.defaults);
-            }
-            for m in cat.models {
-                if !merged_models
-                    .iter()
-                    .any(|existing: &crate::agents::domain::ModelInfo| {
-                        existing.id == m.id && existing.provider_id == m.provider_id
-                    })
-                {
-                    merged_models.push(m);
-                }
-            }
-            for a in cat.modes {
-                if !merged_modes
-                    .iter()
-                    .any(|existing: &crate::agents::domain::ModeInfo| existing.id == a.id)
-                {
-                    merged_modes.push(a);
-                }
-            }
-            for p in cat.providers {
-                if !merged_providers
-                    .iter()
-                    .any(|existing: &crate::agents::domain::ProviderInfo| existing.id == p.id)
-                {
-                    merged_providers.push(p);
-                }
-            }
-            for s in cat.skills {
-                if !merged_skills
-                    .iter()
-                    .any(|existing: &crate::agents::domain::SkillInfo| existing.id == s.id)
-                {
-                    merged_skills.push(s);
-                }
-            }
-            for c in cat.commands {
-                if !merged_commands
-                    .iter()
-                    .any(|existing: &crate::agents::domain::CommandInfo| existing.name == c.name)
-                {
-                    merged_commands.push(c);
-                }
-            }
-            merged_mcp.extend(cat.mcp);
+    let catalogs = futures::future::join_all(
+        all_managers
+            .iter()
+            .map(|manager| manager.sessions().get_catalog(query.directory.as_deref())),
+    )
+    .await;
+    for cat in catalogs.into_iter().flatten() {
+        if primary_defaults.is_none() {
+            primary_defaults = Some(cat.defaults);
         }
+        for m in cat.models {
+            if !merged_models
+                .iter()
+                .any(|existing: &crate::agents::domain::ModelInfo| {
+                    existing.id == m.id && existing.provider_id == m.provider_id
+                })
+            {
+                merged_models.push(m);
+            }
+        }
+        for a in cat.modes {
+            if !merged_modes
+                .iter()
+                .any(|existing: &crate::agents::domain::ModeInfo| existing.id == a.id)
+            {
+                merged_modes.push(a);
+            }
+        }
+        for p in cat.providers {
+            if !merged_providers
+                .iter()
+                .any(|existing: &crate::agents::domain::ProviderInfo| existing.id == p.id)
+            {
+                merged_providers.push(p);
+            }
+        }
+        for s in cat.skills {
+            if !merged_skills
+                .iter()
+                .any(|existing: &crate::agents::domain::SkillInfo| existing.id == s.id)
+            {
+                merged_skills.push(s);
+            }
+        }
+        for c in cat.commands {
+            if !merged_commands
+                .iter()
+                .any(|existing: &crate::agents::domain::CommandInfo| existing.name == c.name)
+            {
+                merged_commands.push(c);
+            }
+        }
+        merged_mcp.extend(cat.mcp);
     }
 
     let catalog = crate::agents::domain::AgentCatalog {
