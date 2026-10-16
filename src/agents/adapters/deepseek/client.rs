@@ -157,6 +157,20 @@ impl DeepseekClient {
         method: &str,
         args: Value,
     ) -> Result<Value, AgentError> {
+        self.call_remote_capped(namespace, method, args, MAX_RESPONSE_BYTES)
+            .await
+    }
+
+    /// `call_remote` with its own response cap, for the one answer that
+    /// grows with the owner's use (`session/list`) and must not be refused
+    /// whole once it passes the ordinary cap.
+    async fn call_remote_capped(
+        &self,
+        namespace: &str,
+        method: &str,
+        args: Value,
+        response_cap: usize,
+    ) -> Result<Value, AgentError> {
         let url = format!("{}/api/{namespace}/{method}", self.endpoint.url);
         let rpc_id = format!("req_{}", Uuid::new_v4().simple());
         let full_method = format!("{namespace}/{method}");
@@ -209,7 +223,7 @@ impl DeepseekClient {
             )));
         }
 
-        let bytes = read_capped(resp, MAX_RESPONSE_BYTES).await.map_err(|e| {
+        let bytes = read_capped(resp, response_cap).await.map_err(|e| {
             tracing::warn!(target: "deepseek", "{full_method}: reading response failed: {e}");
             match e {
                 ReadError::TooLarge => {
@@ -264,12 +278,21 @@ impl DeepseekClient {
         }
     }
 
-    /// List sessions from session-controller: `session/list`
+    /// The most a `session/list` answer may weigh: it names every session
+    /// the owner ever had, so it outgrows the ordinary response cap long
+    /// before any one of them does.
+    const SESSION_LIST_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+    /// List sessions from session-controller: `session/list`. The whole
+    /// list; the query's directory, search, order and limit are applied by
+    /// the driver, as the T3 adapter applies them.
     pub async fn list_sessions(&self, _query: &SessionQuery) -> Result<Vec<Value>, AgentError> {
         let args = json!({
             "_request": {}
         });
-        let result = self.call_remote("session", "list", args).await?;
+        let result = self
+            .call_remote_capped("session", "list", args, Self::SESSION_LIST_MAX_BYTES)
+            .await?;
         if let Some(items) = result.get("items").and_then(Value::as_array) {
             Ok(items.clone())
         } else if let Some(items) = result.get("sessions").and_then(Value::as_array) {
@@ -289,7 +312,18 @@ impl DeepseekClient {
         agent_preset: Option<&str>,
     ) -> Result<String, AgentError> {
         let session_id = format!("session-{}", Uuid::new_v4());
-        let cwd = directory.unwrap_or(".");
+        // Without a directory the session works in the owner's home, never
+        // in whatever directory the gateway process happens to run from.
+        let home = dirs::home_dir();
+        let cwd = match directory {
+            Some(directory) => directory,
+            None => home
+                .as_deref()
+                .and_then(std::path::Path::to_str)
+                .ok_or_else(|| {
+                    AgentError::InvalidRequest("a working directory is required".into())
+                })?,
+        };
         let mut req_body = json!({
             "sessionId": session_id,
             "cwd": cwd,

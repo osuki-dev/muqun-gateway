@@ -170,11 +170,36 @@ impl AgentPort for DeepseekDriver {
     ) -> AgentFuture<'a, Vec<AgentSessionInfo>> {
         Box::pin(async move {
             let raw_sessions = self.client.list_sessions(query).await?;
-            let sessions: Vec<AgentSessionInfo> = raw_sessions
+            // The query is applied here, as the T3 adapter applies it:
+            // `session/list` takes none of it.
+            let mut sessions: Vec<AgentSessionInfo> = raw_sessions
                 .iter()
                 .filter_map(mapper::map_session)
                 .filter(|s| query.keeps_parent(s.parent_id.as_deref()))
                 .collect();
+            if let Some(dir) = query.directory.as_deref().map(|d| d.trim_end_matches('/')) {
+                sessions.retain(|s| {
+                    s.directory
+                        .as_deref()
+                        .is_some_and(|d| d.trim_end_matches('/') == dir)
+                });
+            }
+            if let Some(needle) = query
+                .search
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_lowercase)
+            {
+                sessions.retain(|s| s.title.to_lowercase().contains(&needle));
+            }
+            sessions.sort_by_key(|s| std::cmp::Reverse(s.updated_ms));
+            if query.order.as_deref() == Some("asc") {
+                sessions.reverse();
+            }
+            if let Some(limit) = query.limit {
+                sessions.truncate(limit);
+            }
             Ok(sessions)
         })
     }
@@ -400,9 +425,14 @@ impl AgentPort for DeepseekDriver {
         session_id: &'a str,
         request_id: &'a str,
         decision: PermissionDecision,
-        _message: Option<&'a str>,
+        message: Option<&'a str>,
     ) -> AgentFuture<'a, ()> {
         Box::pin(async move {
+            // The approval reply carries no text: a reason the user wrote
+            // would be dropped on the floor, so it is refused instead.
+            if message.is_some_and(|value| !value.trim().is_empty()) {
+                return Err(AgentError::Unsupported("approval reason".into()));
+            }
             let interactions = DeepseekInteractions::for_endpoint(&self.client.endpoint.url);
             let Some(pending) = interactions.approval(request_id) else {
                 return Err(AgentError::SessionNotFound(
@@ -482,12 +512,14 @@ impl AgentPort for DeepseekDriver {
         })
     }
 
+    /// DeepSeek Harness has no diff query: said so, never an empty diff the
+    /// app would show as "nothing changed".
     fn get_vcs_diff<'a>(
         &'a self,
         _session_id: &'a str,
         _mode: &'a str,
     ) -> AgentFuture<'a, Vec<FileDiffItem>> {
-        Box::pin(async move { Ok(vec![]) })
+        Box::pin(async { Err(AgentError::Unsupported("vcs diff".into())) })
     }
 
     /// DeepSeek Harness has no query for pending approvals: they exist only as
