@@ -212,6 +212,9 @@ pub(crate) struct DelegateRequest {
     /// asset references or file paths on this computer): handed to a
     /// session agent with its first prompt.
     pub attachments: Vec<String>,
+    /// `delivery: "session"`: an agent that is both a terminal agent and a
+    /// session agent (Codex) opens a native agent session, never a pane.
+    pub session_delivery: bool,
 }
 
 /// Who asked for a task, as a task view shows it.
@@ -1196,7 +1199,7 @@ impl TaskService {
             }
         }
         if let Some(kind) = request.agent_id.as_deref() {
-            if runs_in_pane(state, kind).await {
+            if !request.session_delivery && runs_in_pane(state, kind).await {
                 if !request.attachments.is_empty() {
                     return Err(TaskError::AttachmentsUnsupported);
                 }
@@ -3568,6 +3571,7 @@ mod tests {
 
     fn request(machine: Option<&str>) -> DelegateRequest {
         DelegateRequest {
+            session_delivery: false,
             goal: "fix the build".into(),
             cwd: Some("/work".into()),
             agent_id: None,

@@ -2,6 +2,15 @@
 
 ## Changes and fixes
 
+- **A Codex task from the phone can be a ledger task.** `POST /api/tasks`
+  took `agent_id: "codex"` as a terminal pane only, so the app opened native
+  Codex sessions directly and the Home card could show only a transient
+  local row. With `delivery: "session"` (capability
+  `task_ledger_codex_session`) the task opens on the native Codex adapter,
+  bound to an agent session with its `asid`, like an OpenCode delegation;
+  without an enabled native Codex adapter it is `400 invalid_request`.
+  Absent, nothing changes.
+
 - A phone whose clock is off by more than five minutes now reads
   `403 clock_skew` with `error.server_time_ms` instead of the generic
   `invalid_envelope`, so the app can say by how much. Only an envelope that

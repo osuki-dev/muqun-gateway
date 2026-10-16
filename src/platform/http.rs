@@ -31,6 +31,8 @@ pub(crate) fn content_envelope(data: Value) -> Value {
             // `GET /api/agent-sessions/{asid}/descendants` lists a session's
             // whole subtree in one answer (`agents::routes`).
             "session_descendants": true,
+            // `POST /api/tasks` takes `delivery: "session"` (`tasks::routes`).
+            "task_ledger_codex_session": true,
         },
         "data": data,
     })

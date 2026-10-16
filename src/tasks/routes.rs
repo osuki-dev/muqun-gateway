@@ -201,6 +201,11 @@ struct CreateBody {
     /// handle (1..=45, default 30).
     #[serde(default)]
     timeout_s: Option<u64>,
+    /// `"session"`: open the task on the named agent's native session
+    /// adapter (Codex), bound to an agent session, instead of in a pane.
+    /// Absent or `"pane"`: as before. Capability `task_ledger_codex_session`.
+    #[serde(default)]
+    delivery: Option<String>,
 }
 
 /// How many attachments one task's goal may carry.
@@ -323,7 +328,13 @@ impl CreateBody {
         // task opens at home, as if nothing were remembered. Only a directory
         // the device asked for by name is refused when it is missing.
         let remembered = default_cwd.filter(|dir| std::path::Path::new(dir).is_dir());
+        let session_delivery = match self.delivery.as_deref() {
+            None | Some("pane") => false,
+            Some("session") => true,
+            Some(_) => return Err(invalid_request()),
+        };
         Ok(DelegateRequest {
+            session_delivery,
             goal: self.goal,
             cwd: requested_directory(self.cwd.as_deref().or(remembered))?,
             agent_id: self.agent_id,
@@ -390,6 +401,17 @@ async fn create(
         None
     };
     let request = body.request(previous_cwd.as_deref(), &state.peers.names())?;
+    // Session delivery needs a session adapter of that kind: for Codex, the
+    // native adapter (`codex.enabled`). Refused before anything is made.
+    if request.session_delivery {
+        let kind = request.agent_id.as_deref().unwrap_or_default();
+        if kind.is_empty() || state.agent_runtime.manager_for_agent(kind).await.is_none() {
+            return Err(refused(
+                "invalid_request",
+                "delivery \"session\" needs an enabled session agent of that kind",
+            ));
+        }
+    }
     // Named from the device record the token belongs to, never from the
     // body: another computer cannot pass itself off as a third (§10.5).
     let by = Requested {
@@ -886,6 +908,44 @@ mod tests {
             crate::test_support::FakeAgent::new("opencode").with_sessions(&[("opencode_new", 1)]);
         state.agent_runtime.attach_for_test(agent.manager()).await;
         state
+    }
+
+    /// `delivery: "session"` opens a Codex task on the native adapter, bound
+    /// to an agent session and answered with its `asid`, where the same body
+    /// without it starts a pane; without an enabled session agent of that
+    /// kind it is refused before anything is made.
+    #[tokio::test]
+    async fn session_delivery_opens_codex_on_its_native_adapter_or_is_refused() {
+        let state = state();
+        let dir = std::env::temp_dir().canonicalize().unwrap();
+        let body = json!({ "goal": "g", "cwd": dir, "agent_id": "codex", "delivery": "session" });
+        let (status, refusal) = send(&state, "POST", "/api/tasks", Some(body.clone()), true).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{refusal}");
+        assert_eq!(refusal["error"]["code"], "invalid_request");
+        let (_, listed) = call(&state, "GET", "/api/tasks").await;
+        assert_eq!(listed["tasks"], json!([]));
+
+        let agent = crate::test_support::FakeAgent::new("codex").with_sessions(&[("codex_new", 1)]);
+        let prompts = agent.prompts.clone();
+        state.agent_runtime.attach_for_test(agent.manager()).await;
+        let (status, task) = send(&state, "POST", "/api/tasks", Some(body), true).await;
+        assert_eq!(status, StatusCode::OK, "{task}");
+        assert_eq!(task["asid"], "codex_new");
+        assert!(task.get("pane_id").is_none(), "{task}");
+        assert_eq!(
+            task["binding"],
+            json!({ "kind": "agent_session", "agent_id": "codex", "asid": "codex_new" })
+        );
+        assert_eq!(*prompts.lock().unwrap(), vec!["g".to_string()]);
+        let (status, refusal) = send(
+            &state,
+            "POST",
+            "/api/tasks",
+            Some(json!({ "goal": "g", "agent_id": "codex", "delivery": "carrier-pigeon" })),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{refusal}");
     }
 
     #[tokio::test]

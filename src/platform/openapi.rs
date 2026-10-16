@@ -1853,6 +1853,7 @@ fn content_envelope_schema(data: Value) -> Value {
                     ("composer", "boolean"),
                     ("message_image_assets", "boolean"),
                     ("session_descendants", "boolean"),
+                    ("task_ledger_codex_session", "boolean"),
                 ],
                 &[
                     "parts",
@@ -1861,6 +1862,7 @@ fn content_envelope_schema(data: Value) -> Value {
                     "composer",
                     "message_image_assets",
                     "session_descendants",
+                    "task_ledger_codex_session",
                 ],
             ),
             "data": data
