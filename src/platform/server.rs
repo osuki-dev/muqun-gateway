@@ -398,6 +398,54 @@ pub(crate) const fn sealed_body_ceiling(plaintext: usize) -> usize {
 
 /// The plaintext a route is allowed to carry, matching what the router's own
 /// body limits allow it in the clear.
+/// How many bodies above the ordinary 128 KiB limit may be in memory at
+/// once, process-wide: two of the biggest kind (an upload, up to 64 MiB
+/// plus its sealed envelope) and eight of the rest (a prompt, up to 1 MiB).
+/// A body is buffered whole, so without this the peak was one body per open
+/// connection; past the permits the answer is `503 busy`, before the read.
+const HUGE_BODY_PERMITS: usize = 2;
+const LARGE_BODY_PERMITS: usize = 8;
+
+static HUGE_BODIES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(HUGE_BODY_PERMITS);
+static LARGE_BODIES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(LARGE_BODY_PERMITS);
+
+/// A place among the large bodies in flight, held in the request's
+/// extensions for as long as the request lives: the permit is never read,
+/// only dropped with the request.
+#[derive(Clone)]
+pub(crate) struct LargeBodyPermit {
+    _permit: std::sync::Arc<tokio::sync::SemaphorePermit<'static>>,
+}
+
+/// A permit for a body of up to `plaintext_limit` bytes on this route, or
+/// `None` when the route takes only the ordinary limit. `Err`: the permits
+/// are spent.
+pub(crate) fn large_body_permit(
+    plaintext_limit: usize,
+) -> Result<Option<LargeBodyPermit>, (StatusCode, Json<serde_json::Value>)> {
+    if plaintext_limit <= MAX_REQUEST_BODY_BYTES {
+        return Ok(None);
+    }
+    let gate = if plaintext_limit > 25 * 1024 * 1024 {
+        &HUGE_BODIES
+    } else {
+        &LARGE_BODIES
+    };
+    gate.try_acquire()
+        .map(|permit| {
+            Some(LargeBodyPermit {
+                _permit: std::sync::Arc::new(permit),
+            })
+        })
+        .map_err(|_| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "busy",
+                "too many large requests are in flight; try again in a moment",
+            )
+        })
+}
+
 pub(crate) fn plaintext_body_limit(path: &str) -> usize {
     if path == UPLOADS_PATH {
         MAX_VIDEO_UPLOAD_BYTES
@@ -424,9 +472,24 @@ pub(crate) async fn large_body_after_auth(
     request: Request<Body>,
     next: Next,
 ) -> Response {
-    if crate::platform::config::takes_large_body(request.uri().path()) {
+    let mut request = request;
+    let path = request.uri().path();
+    let plaintext_limit = plaintext_body_limit(path);
+    if plaintext_limit > MAX_REQUEST_BODY_BYTES {
         if let Err(refusal) = require_device_or_peer(&state, request.headers()) {
             return refusal.into_response();
+        }
+        // A sealed request already holds its place from the decryption
+        // path; a cleartext one takes it here, past authentication and
+        // before any extractor reads the body.
+        if request.extensions().get::<LargeBodyPermit>().is_none() {
+            match large_body_permit(plaintext_limit) {
+                Ok(Some(permit)) => {
+                    request.extensions_mut().insert(permit);
+                }
+                Ok(None) => {}
+                Err(refusal) => return refusal.into_response(),
+            }
         }
     }
     next.run(request).await
@@ -597,19 +660,21 @@ pub(crate) async fn decrypt_transport_request(
             .map_or(parts.uri.path(), |value| value.as_str())
     );
     // Sized to the route, because this read happens outside the router's own
-    // body limits and is therefore the only thing bounding them.
-    let body_bytes = to_bytes(
-        body,
-        sealed_body_ceiling(plaintext_body_limit(parts.uri.path())),
-    )
-    .await
-    .map_err(|_| {
-        api_error(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "body_too_large",
-            "the request body is too large",
-        )
-    })?;
+    // body limits and is therefore the only thing bounding them. A large one
+    // takes its place among the large bodies in flight first, or is refused
+    // before a byte of it is read; the device header above already narrowed
+    // this pre-authentication read to a paired device id holding a key.
+    let plaintext_limit = plaintext_body_limit(parts.uri.path());
+    let permit = large_body_permit(plaintext_limit)?;
+    let body_bytes = to_bytes(body, sealed_body_ceiling(plaintext_limit))
+        .await
+        .map_err(|_| {
+            api_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "body_too_large",
+                "the request body is too large",
+            )
+        })?;
     let envelope_bytes = match parts.headers.get(TRANSPORT_ENVELOPE_HEADER) {
         Some(value) => transport::decode_key(value.to_str().unwrap_or_default()).map_err(|_| {
             api_error(
@@ -713,6 +778,11 @@ pub(crate) async fn decrypt_transport_request(
         request_nonce: envelope.nonce.clone(),
         transport_version: envelope.version,
     });
+    if let Some(permit) = permit {
+        // Lives as long as the request: the opened body is in memory until
+        // the handler is done with it.
+        parts.extensions.insert(permit);
+    }
     Ok((
         Request::from_parts(parts, Body::from(body)),
         material,

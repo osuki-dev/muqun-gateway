@@ -2,6 +2,12 @@
 
 ## Changes and fixes
 
+- Large request bodies are bounded in number as well as size: two bodies
+  over 25 MiB (uploads) and eight of the rest (prompts, commands, tasks) may
+  be in memory at once, process-wide; past that the answer is `503 busy`
+  before any byte is read. A sealed body is read only for a paired device
+  id that holds a transport key, and fully authenticated once opened.
+
 - **Screen recordings can be attached.** `POST /api/uploads` accepts MP4 and
   QuickTime video (the same `ftyp` brands the asset preview plays) up to
   64 MiB; every other type keeps its 25 MiB. `GET /api/discovery` carries
