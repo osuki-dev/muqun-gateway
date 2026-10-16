@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::future::IntoFuture as _;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::Context as _;
 use axum::body::{to_bytes, Body};
@@ -408,42 +409,129 @@ const LARGE_BODY_PERMITS: usize = 8;
 
 static HUGE_BODIES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(HUGE_BODY_PERMITS);
 static LARGE_BODIES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(LARGE_BODY_PERMITS);
+/// The devices with a large body in flight: one each, on top of the pool.
+static DEVICES_WITH_LARGE_BODIES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<String>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+/// A large body that makes no progress for this long is dropped, and its
+/// place given up: a stalled connection must not hold a permit.
+const LARGE_BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+/// The longest the sealed read of one large body may take in all.
+const LARGE_BODY_READ_TIMEOUT: Duration = Duration::from_secs(180);
 
-/// A place among the large bodies in flight, held in the request's
-/// extensions for as long as the request lives: the permit is never read,
-/// only dropped with the request.
+/// A place among the large bodies in flight, for one identified device.
+/// Owned by the body it admits ([`GatedBody`]): released when that body is
+/// fully consumed or dropped, never earlier.
 #[derive(Clone)]
 pub(crate) struct LargeBodyPermit {
-    _permit: std::sync::Arc<tokio::sync::SemaphorePermit<'static>>,
+    /// Held, never read: dropping the last clone gives the place back.
+    _place: std::sync::Arc<LargeBodyPlace>,
 }
 
-/// A permit for a body of up to `plaintext_limit` bytes on this route, or
-/// `None` when the route takes only the ordinary limit. `Err`: the permits
-/// are spent.
+struct LargeBodyPlace {
+    _permit: tokio::sync::SemaphorePermit<'static>,
+    device_id: String,
+}
+
+impl Drop for LargeBodyPlace {
+    fn drop(&mut self) {
+        if let Ok(mut devices) = DEVICES_WITH_LARGE_BODIES.lock() {
+            devices.remove(&self.device_id);
+        }
+    }
+}
+
+/// A permit for a body of up to `plaintext_limit` bytes on this route from
+/// `device_id`, or `None` when the route takes only the ordinary limit.
+/// Taken only for an identified device -- a paired record that holds a
+/// transport key on the sealed path, a caller `require_device_or_peer` let
+/// through on the cleartext one -- so no unidentified connection ever holds
+/// a place. `Err`: the pool is spent, or this device already has one.
 pub(crate) fn large_body_permit(
     plaintext_limit: usize,
+    device_id: &str,
 ) -> Result<Option<LargeBodyPermit>, (StatusCode, Json<serde_json::Value>)> {
     if plaintext_limit <= MAX_REQUEST_BODY_BYTES {
         return Ok(None);
     }
+    let busy = || {
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "busy",
+            "too many large requests are in flight; try again in a moment",
+        )
+    };
     let gate = if plaintext_limit > 25 * 1024 * 1024 {
         &HUGE_BODIES
     } else {
         &LARGE_BODIES
     };
-    gate.try_acquire()
-        .map(|permit| {
-            Some(LargeBodyPermit {
-                _permit: std::sync::Arc::new(permit),
-            })
-        })
-        .map_err(|_| {
-            api_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "busy",
-                "too many large requests are in flight; try again in a moment",
-            )
-        })
+    {
+        let mut devices = DEVICES_WITH_LARGE_BODIES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !devices.insert(device_id.to_owned()) {
+            return Err(busy());
+        }
+    }
+    match gate.try_acquire() {
+        Ok(permit) => Ok(Some(LargeBodyPermit {
+            _place: std::sync::Arc::new(LargeBodyPlace {
+                _permit: permit,
+                device_id: device_id.to_owned(),
+            }),
+        })),
+        Err(_) => {
+            if let Ok(mut devices) = DEVICES_WITH_LARGE_BODIES.lock() {
+                devices.remove(device_id);
+            }
+            Err(busy())
+        }
+    }
+}
+
+/// `body` with `permit` bound to it: the place is given up when the body
+/// is fully consumed or dropped, and a body that stalls for
+/// [`LARGE_BODY_IDLE_TIMEOUT`] ends in an error, giving it up too.
+pub(crate) fn gated_body(body: Body, permit: Option<LargeBodyPermit>) -> Body {
+    match permit {
+        Some(permit) => Body::from_stream(GatedBody {
+            inner: body.into_data_stream(),
+            idle: Box::pin(tokio::time::sleep(LARGE_BODY_IDLE_TIMEOUT)),
+            _permit: permit,
+        }),
+        None => body,
+    }
+}
+
+struct GatedBody {
+    inner: axum::body::BodyDataStream,
+    idle: std::pin::Pin<Box<tokio::time::Sleep>>,
+    _permit: LargeBodyPermit,
+}
+
+impl futures::Stream for GatedBody {
+    type Item = Result<axum::body::Bytes, axum::BoxError>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        use std::future::Future as _;
+        use std::task::Poll;
+        match std::pin::Pin::new(&mut self.inner).poll_next(cx) {
+            Poll::Ready(next) => {
+                self.idle
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + LARGE_BODY_IDLE_TIMEOUT);
+                Poll::Ready(next.map(|frame| frame.map_err(Into::into)))
+            }
+            Poll::Pending => match self.idle.as_mut().poll(cx) {
+                Poll::Ready(()) => Poll::Ready(Some(Err("the request body stalled".into()))),
+                Poll::Pending => Poll::Pending,
+            },
+        }
+    }
 }
 
 pub(crate) fn plaintext_body_limit(path: &str) -> usize {
@@ -472,27 +560,32 @@ pub(crate) async fn large_body_after_auth(
     request: Request<Body>,
     next: Next,
 ) -> Response {
-    let mut request = request;
-    let path = request.uri().path();
-    let plaintext_limit = plaintext_body_limit(path);
-    if plaintext_limit > MAX_REQUEST_BODY_BYTES {
-        if let Err(refusal) = require_device_or_peer(&state, request.headers()) {
-            return refusal.into_response();
-        }
-        // A sealed request already holds its place from the decryption
-        // path; a cleartext one takes it here, past authentication and
-        // before any extractor reads the body.
-        if request.extensions().get::<LargeBodyPermit>().is_none() {
-            match large_body_permit(plaintext_limit) {
-                Ok(Some(permit)) => {
-                    request.extensions_mut().insert(permit);
-                }
-                Ok(None) => {}
-                Err(refusal) => return refusal.into_response(),
-            }
-        }
+    let plaintext_limit = plaintext_body_limit(request.uri().path());
+    if plaintext_limit <= MAX_REQUEST_BODY_BYTES {
+        return next.run(request).await;
     }
-    next.run(request).await
+    let caller = match require_device_or_peer(&state, request.headers()) {
+        Ok(caller) => caller,
+        Err(refusal) => return refusal.into_response(),
+    };
+    // A sealed request holds its place from the decryption path, bound to
+    // its opened body; a cleartext one takes it here, past authentication,
+    // bound to the body the handler is about to read, so it is given up
+    // only when that body is consumed or dropped.
+    if request
+        .extensions()
+        .get::<EncryptedStreamContext>()
+        .is_some()
+    {
+        return next.run(request).await;
+    }
+    let permit = match large_body_permit(plaintext_limit, &caller.device_id) {
+        Ok(permit) => permit,
+        Err(refusal) => return refusal.into_response(),
+    };
+    let (parts, body) = request.into_parts();
+    next.run(Request::from_parts(parts, gated_body(body, permit)))
+        .await
 }
 
 #[derive(Serialize, Deserialize)]
@@ -661,20 +754,34 @@ pub(crate) async fn decrypt_transport_request(
     );
     // Sized to the route, because this read happens outside the router's own
     // body limits and is therefore the only thing bounding them. A large one
-    // takes its place among the large bodies in flight first, or is refused
-    // before a byte of it is read; the device header above already narrowed
-    // this pre-authentication read to a paired device id holding a key.
+    // takes its place among the large bodies in flight first -- for this
+    // device, which the header above showed to be a paired record holding a
+    // key -- or is refused before a byte of it is read, and the read is
+    // bounded in time as well as size so a stalled connection gives the
+    // place back.
     let plaintext_limit = plaintext_body_limit(parts.uri.path());
-    let permit = large_body_permit(plaintext_limit)?;
-    let body_bytes = to_bytes(body, sealed_body_ceiling(plaintext_limit))
-        .await
-        .map_err(|_| {
-            api_error(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "body_too_large",
-                "the request body is too large",
-            )
-        })?;
+    let permit = large_body_permit(plaintext_limit, device_id)?;
+    let body = gated_body(body, permit.clone());
+    let read = to_bytes(body, sealed_body_ceiling(plaintext_limit));
+    let body_bytes = match permit {
+        Some(_) => tokio::time::timeout(LARGE_BODY_READ_TIMEOUT, read)
+            .await
+            .map_err(|_| {
+                api_error(
+                    StatusCode::REQUEST_TIMEOUT,
+                    "body_timeout",
+                    "the request body was not received in time",
+                )
+            })?,
+        None => read.await,
+    }
+    .map_err(|_| {
+        api_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "body_too_large",
+            "the request body is too large",
+        )
+    })?;
     let envelope_bytes = match parts.headers.get(TRANSPORT_ENVELOPE_HEADER) {
         Some(value) => transport::decode_key(value.to_str().unwrap_or_default()).map_err(|_| {
             api_error(
@@ -778,13 +885,9 @@ pub(crate) async fn decrypt_transport_request(
         request_nonce: envelope.nonce.clone(),
         transport_version: envelope.version,
     });
-    if let Some(permit) = permit {
-        // Lives as long as the request: the opened body is in memory until
-        // the handler is done with it.
-        parts.extensions.insert(permit);
-    }
+    // The opened body keeps the place until the handler has consumed it.
     Ok((
-        Request::from_parts(parts, Body::from(body)),
+        Request::from_parts(parts, gated_body(Body::from(body), permit)),
         material,
         aad,
         envelope.nonce,
