@@ -4562,7 +4562,7 @@ mod tests {
             .0;
         assert_eq!(health["generation"], generation.as_str());
         let discovery =
-            crate::platform::routes::api_discovery(State(state.clone()), HeaderMap::new())
+            crate::platform::routes::api_discovery(State(state.clone()), bearer_headers("token"))
                 .await
                 .unwrap()
                 .0;

@@ -162,8 +162,10 @@ Agent discovery is on `GET /api/discovery` and `GET /api/capabilities`
 wrapped in the envelope: the top level is `{"ok", "gatewayVersion",
 "apiVersion", "apiMajor", "platform", "serverId", "label", "planes",
 "transports", "capabilities"}`; `transports` is described under "WebSocket
-events" below. An unauthenticated caller gets the same body with `endpoint`
-and `version` removed from every agent.
+events" below. Both routes require a paired device (of either kind) or the
+admin token, like `/health`: a caller with no credential is `401`, a wrong one
+`403`. Nothing in the document is served unauthenticated -- it names the
+computer's id, label, version and configuration.
 
 ```json
 {
@@ -1936,7 +1938,7 @@ HTTP, and the SSE stream is unchanged and remains the fallback.
 
 **Feature gate.** `ws_events` in the flat `capabilities` array (`/health`,
 `/api/capabilities`, `/api/discovery`), and in the `/api/discovery` body at
-top level beside `planes`, shown to every caller (it is not sensitive):
+top level beside `planes`, shown to every paired caller:
 
 ```json
 "transports": { "websocket": { "path": "/api/ws", "protocol": 1 } }

@@ -2,6 +2,14 @@
 
 ## Changes and fixes
 
+- **`GET /api/discovery` and `GET /api/capabilities` require a credential.**
+  They answered anyone on the network with the computer's id, label,
+  version, generation, every capability and the agent configuration (agent
+  endpoints and versions blanked). Like `/health`, they now take a paired
+  device, a linked gateway's token, or the admin token (the `manage` TUI);
+  no credential is `401`. No flow read them unauthenticated: the app sends
+  its bearer, a linked gateway its token, `manage` the admin token.
+
 - Large request bodies are bounded in number as well as size: two bodies
   over 25 MiB (uploads) and eight of the rest (prompts, commands, tasks) may
   be in memory at once, process-wide; past that the answer is `503 busy`
