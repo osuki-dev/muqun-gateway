@@ -442,7 +442,9 @@ static PREAUTH_UPLOADS_BY_IP: IpCounts =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 static PREAUTH_PROMPTS_BY_IP: IpCounts =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
-/// The clear device ids with a pre-authentication read in flight: one each.
+/// The `device id @ address` keys with a pre-authentication read in flight,
+/// one each -- never the clear id alone, which anyone on the path can copy
+/// and would make an exclusive slot a targeted lockout.
 static PREAUTH_SEALED_BY_DEVICE: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashSet<String>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
@@ -483,12 +485,13 @@ impl Drop for LargeBodyPlace {
 }
 
 /// A pre-authentication sealed read's place: a permit of its route's
-/// budget, its count against the peer address and the clear device id.
+/// budget, its count against the peer address and its `device id @
+/// address` key.
 struct PreauthPlace {
     _permit: tokio::sync::SemaphorePermit<'static>,
     by_ip: &'static IpCounts,
     ip: Option<std::net::IpAddr>,
-    device_id: String,
+    device_key: String,
 }
 
 impl Drop for PreauthPlace {
@@ -497,22 +500,38 @@ impl Drop for PreauthPlace {
             release_count(self.by_ip, ip);
         }
         if let Ok(mut devices) = PREAUTH_SEALED_BY_DEVICE.lock() {
-            devices.remove(&self.device_id);
+            devices.remove(&self.device_key);
         }
     }
 }
 
 type IpCounts = std::sync::LazyLock<std::sync::Mutex<HashMap<std::net::IpAddr, usize>>>;
 
-/// The address a peer is counted under: the IPv4 address itself, or the
-/// /64 of an IPv6 address, which is what one subscriber holds.
+/// The address a peer is counted under: an IPv4 address itself; an IPv6
+/// address that carries an IPv4 one -- IPv4-mapped `::ffff:a.b.c.d` (what a
+/// dual-stack listener reports for every IPv4 client), IPv4-compatible
+/// `::a.b.c.d`, NAT64 `64:ff9b::a.b.c.d` -- by that IPv4 address; and a
+/// native IPv6 address by its /64, which is what one subscriber holds. The
+/// mask is applied only to native IPv6: masking a mapped address would
+/// collapse every IPv4 client into one bucket and make the limits global.
 fn counted_address(ip: std::net::IpAddr) -> std::net::IpAddr {
-    match ip {
-        std::net::IpAddr::V4(_) => ip,
-        std::net::IpAddr::V6(v6) => {
-            std::net::IpAddr::V6(std::net::Ipv6Addr::from(u128::from(v6) & (u128::MAX << 64)))
-        }
+    let std::net::IpAddr::V6(v6) = ip else {
+        return ip;
+    };
+    if let Some(v4) = v6.to_ipv4_mapped() {
+        return std::net::IpAddr::V4(v4);
     }
+    let segments = v6.segments();
+    let embedded = |hi: u16, lo: u16| std::net::Ipv4Addr::from(((hi as u32) << 16) | lo as u32);
+    // IPv4-compatible: 96 zero bits then the address (but not `::`/`::1`).
+    if segments[..6] == [0; 6] && !v6.is_unspecified() && !v6.is_loopback() {
+        return std::net::IpAddr::V4(embedded(segments[6], segments[7]));
+    }
+    // NAT64 well-known prefix 64:ff9b::/96.
+    if segments[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
+        return std::net::IpAddr::V4(embedded(segments[6], segments[7]));
+    }
+    std::net::IpAddr::V6(std::net::Ipv6Addr::from(u128::from(v6) & (u128::MAX << 64)))
 }
 
 /// Count `ip` in `counts` unless it already stands at `max`.
@@ -585,10 +604,11 @@ pub(crate) fn preauth_sealed_permit(
     if !take_count(by_ip, ip, MAX_PREAUTH_SEALED_PER_IP) {
         return Err(busy());
     }
+    let device_key = slot_key(device_id, peer);
     let taken = PREAUTH_SEALED_BY_DEVICE
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .insert(device_id.to_owned());
+        .insert(device_key.clone());
     if !taken {
         if let Some(ip) = ip {
             release_count(by_ip, ip);
@@ -600,7 +620,7 @@ pub(crate) fn preauth_sealed_permit(
             _permit: permit,
             by_ip,
             ip,
-            device_id: device_id.to_owned(),
+            device_key,
         }),
     }))
 }
@@ -1654,6 +1674,39 @@ fn cgroup_stat_mb(key: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use crate::*;
+
+    /// What a dual-stack listener reports for an IPv4 client is the mapped
+    /// `::ffff:a.b.c.d`; masking it to a /64 like native IPv6 would put every
+    /// IPv4 client in one bucket and make the per-address limits global.
+    /// Mapped, compatible and NAT64 addresses count as their IPv4; native
+    /// IPv6 counts by its /64.
+    #[test]
+    fn ipv4_clients_behind_a_dual_stack_listener_are_counted_apart() {
+        use std::net::IpAddr;
+        let counted = |text: &str| super::counted_address(text.parse::<IpAddr>().unwrap());
+        assert_eq!(
+            counted("::ffff:10.0.0.7"),
+            "10.0.0.7".parse::<IpAddr>().unwrap()
+        );
+        assert_ne!(counted("::ffff:10.0.0.7"), counted("::ffff:10.0.0.8"));
+        assert_eq!(counted("::10.0.0.7"), "10.0.0.7".parse::<IpAddr>().unwrap());
+        assert_eq!(
+            counted("64:ff9b::10.0.0.7"),
+            "10.0.0.7".parse::<IpAddr>().unwrap()
+        );
+        assert_eq!(counted("10.0.0.7"), "10.0.0.7".parse::<IpAddr>().unwrap());
+        assert_eq!(
+            counted("2001:db8:1:2:aaaa::1"),
+            counted("2001:db8:1:2:bbbb::2"),
+            "one /64 is one subscriber"
+        );
+        assert_ne!(counted("2001:db8:1:2::1"), counted("2001:db8:1:3::1"));
+        assert_eq!(
+            counted("::1"),
+            "::".parse::<IpAddr>().unwrap(),
+            "loopback is native, masked"
+        );
+    }
 
     /// The larger body of a prompt route is reachable only past
     /// authentication, whatever the transport header says: an unknown
