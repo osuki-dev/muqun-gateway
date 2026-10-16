@@ -1,4 +1,5 @@
 use reqwest::Client;
+use serde::Deserialize;
 use std::time::Duration;
 
 /// The connection details for a DeepSeek Harness service instance.
@@ -66,7 +67,7 @@ impl DeepseekEndpoint {
     }
 
     /// Check that a DeepSeek Harness answers RPC with our credentials: a 2xx
-    /// whose body is a Typert `server-response` envelope. Anything else
+    /// whose body is a successful Typert model-catalog result. Anything else
     /// (401/403 included) means we cannot use the service.
     pub async fn probe_healthy(&self, client: &Client) -> bool {
         let probe_url = format!("{}/api/session/modelCatalog", self.url);
@@ -93,14 +94,13 @@ impl DeepseekEndpoint {
         let Ok(bytes) = super::client::read_capped(resp, 64 * 1024).await else {
             return false;
         };
-        serde_json::from_slice::<serde_json::Value>(&bytes)
-            .ok()
-            .and_then(|v| {
-                v.get("type")
-                    .and_then(|t| t.as_str())
-                    .map(|t| t == "server-response")
-            })
-            .unwrap_or(false)
+        serde_json::from_slice::<CatalogProbeResponse>(&bytes).is_ok_and(|response| {
+            response.kind == "server-response"
+                && response.rpc_id == "probe"
+                && response.result.ok
+                && !response.result.value.default.provider.is_empty()
+                && !response.result.value.default.model.is_empty()
+        })
     }
 
     /// An endpoint for `url` with the configured `token`/`secret`, each
@@ -146,6 +146,40 @@ impl DeepseekEndpoint {
         }
         None
     }
+}
+
+// Minimal published rc.2 ModelCatalog boundary: validate the result rather
+// than treating an authentication/RPC error in a 200 envelope as readiness.
+#[derive(Deserialize)]
+struct CatalogProbeResponse {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(rename = "rpcId")]
+    rpc_id: String,
+    result: CatalogProbeResult,
+}
+
+#[derive(Deserialize)]
+struct CatalogProbeResult {
+    ok: bool,
+    value: ProbeCatalog,
+}
+
+#[derive(Deserialize)]
+struct ProbeCatalog {
+    default: ProbeModel,
+    #[serde(rename = "routableProviders")]
+    _routable_providers: Vec<String>,
+    #[serde(rename = "groups")]
+    _groups: Vec<serde_json::Value>,
+    #[serde(rename = "failures")]
+    _failures: Vec<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+struct ProbeModel {
+    provider: String,
+    model: String,
 }
 
 /// `token` and `secret` as given, else from `DEEPSEEK_HARNESS_*`, else from
@@ -232,8 +266,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn probe_accepts_only_2xx_server_response() {
-        assert!(probe(200, r#"{"type":"server-response","rpcId":"probe"}"#).await);
+    async fn probe_accepts_only_successful_model_catalog() {
+        let valid = r#"{"type":"server-response","rpcId":"probe","result":{"ok":true,"value":{"default":{"provider":"deepseek","model":"deepseek-chat"},"routableProviders":[],"groups":[],"failures":[]}}}"#;
+        assert!(probe(200, valid).await);
+        assert!(!probe(200, &valid.replace("\"ok\":true", "\"ok\":false")).await);
+        assert!(
+            !probe(
+                200,
+                &valid.replace("\"rpcId\":\"probe\"", "\"rpcId\":\"other\"")
+            )
+            .await
+        );
+        assert!(!probe(200, r#"{"type":"server-response","rpcId":"probe"}"#).await);
+        assert!(
+            !probe(
+                200,
+                r#"{"type":"server-response","rpcId":"probe","result":{"ok":true,"value":{}}}"#
+            )
+            .await
+        );
+        assert!(!probe(200, r#"{"type":"server-response","rpcId":"probe","result":{"ok":false,"error":{"code":"gateway/unauthorized"}}}"#).await);
         assert!(!probe(200, "<html>hello</html>").await);
         assert!(!probe(200, r#"{"type":"other"}"#).await);
         assert!(!probe(401, r#"{"type":"server-response"}"#).await);

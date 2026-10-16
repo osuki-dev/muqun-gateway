@@ -27,7 +27,16 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use crate::agents::domain::{AgentDomainEvent, AgentPart, MessageImageAsset, TimelineItem};
-use crate::{asset_id, read_asset_head, sniff_asset_type, AppState, AssetKind};
+use crate::{
+    api_error, asset_id, asset_json, content_envelope, read_asset_head, require_device,
+    sniff_asset_type, ApiResult, AppState, AssetEntry, AssetKind,
+};
+
+mod originals;
+mod previews;
+mod versions;
+pub(crate) use originals::content as image_content;
+pub(crate) use originals::version_content as image_version_content;
 
 /// How many served images are remembered. Old entries fall off; the next read
 /// of the timeline that names them puts them back.
@@ -85,7 +94,7 @@ impl MessageImages {
         Some(root)
     }
 
-    fn remember_served(&self, id: &str, image: ServedImage) {
+    pub(super) fn remember_served(&self, id: &str, image: ServedImage) {
         let Ok(mut inner) = self.inner.lock() else {
             return;
         };
@@ -107,14 +116,24 @@ impl MessageImages {
                 continue;
             };
             let assets = self.resolve_text(root, text);
-            item.image_assets = (!assets.is_empty()).then_some(assets);
+            if !assets.is_empty() {
+                let existing = item.image_assets.get_or_insert_default();
+                existing.retain(|old| !assets.iter().any(|asset| asset.src == old.src));
+                existing.extend(assets);
+            }
         }
     }
 
     fn resolve_text(&self, root: &Path, text: &str) -> Vec<MessageImageAsset> {
         let mut assets = Vec::new();
-        for src in image_sources(text).into_iter().take(MAX_IMAGES_PER_PART) {
-            let Some(path) = resolve_image_path(&src, root) else {
+        let mut sources = image_sources(text);
+        for src in file_uris(text) {
+            if !sources.iter().any(|have| have == &src) {
+                sources.push(src);
+            }
+        }
+        for src in sources.into_iter().take(MAX_IMAGES_PER_PART) {
+            let Some((path, fence)) = hosted_file(&src, root) else {
                 continue;
             };
             let head = read_asset_head(&path);
@@ -123,25 +142,29 @@ impl MessageImages {
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_default();
             let kind = sniff_asset_type(&head, &name);
-            if kind.kind != AssetKind::Image {
-                continue;
-            }
             let id = asset_id(&path);
-            let (width, height) = image_dimensions(&head).unzip();
-            self.remember_served(
-                &id,
-                ServedImage {
-                    path,
-                    root: root.to_path_buf(),
-                },
-            );
+            let (width, height) = if kind.kind == AssetKind::Image {
+                image_dimensions(&head).unzip()
+            } else {
+                (None, None)
+            };
+            let size = std::fs::metadata(&path).ok().map(|metadata| metadata.len());
+            self.remember_served(&id, ServedImage { path, root: fence });
             assets.push(MessageImageAsset {
                 src,
                 url: format!("/api/assets/{id}/content"),
-                asset_id: id,
+                asset_id: id.clone(),
                 mime: kind.mime.to_owned(),
                 width,
                 height,
+                thumbnail_url: (kind.kind == AssetKind::Image)
+                    .then(|| format!("/api/agent-images/{id}/thumbnail")),
+                preview_url: (kind.kind == AssetKind::Image)
+                    .then(|| format!("/api/agent-images/{id}/preview")),
+                download_url: Some(format!("/api/agent-images/{id}/download")),
+                version_url: Some(format!("/api/agent-images/{id}/version")),
+                size,
+                unavailable_reason: None,
             });
         }
         assets
@@ -152,7 +175,8 @@ impl MessageImages {
 /// keeps every streamed delta of ordinary prose off the filesystem.
 fn may_embed_image(item: &TimelineItem) -> bool {
     matches!(&item.part, AgentPart::Text { text }
-        if text.contains("![") || text.to_ascii_lowercase().contains("<img"))
+        if text.contains("![") || text.to_ascii_lowercase().contains("<img")
+            || text.contains("file://"))
 }
 
 /// A session's directory as an image fence: it has to exist, be a directory,
@@ -178,6 +202,96 @@ async fn session_root(state: &AppState, asid: &str) -> Option<PathBuf> {
         .remember_root(asid, Some(directory.as_str()))
 }
 
+#[derive(serde::Deserialize)]
+pub(crate) struct AudioAssetQuery {
+    pub(crate) uri: String,
+}
+
+/// Resolve tool audio against the agent-owned directory, never a client root.
+/// The content endpoint authenticates, bounds and fences the subsequent read.
+pub(crate) async fn audio_asset(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    axum::extract::Path(asid): axum::extract::Path<String>,
+    axum::extract::Query(query): axum::extract::Query<AudioAssetQuery>,
+    headers: axum::http::HeaderMap,
+) -> ApiResult<axum::Json<serde_json::Value>> {
+    resolve_agent_file(state, asid, query, headers, Some(AssetKind::Audio)).await
+}
+
+pub(crate) async fn file_asset(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    axum::extract::Path(asid): axum::extract::Path<String>,
+    axum::extract::Query(query): axum::extract::Query<AudioAssetQuery>,
+    headers: axum::http::HeaderMap,
+) -> ApiResult<axum::Json<serde_json::Value>> {
+    resolve_agent_file(state, asid, query, headers, None).await
+}
+
+async fn resolve_agent_file(
+    state: AppState,
+    asid: String,
+    query: AudioAssetQuery,
+    headers: axum::http::HeaderMap,
+    expected: Option<AssetKind>,
+) -> ApiResult<axum::Json<serde_json::Value>> {
+    require_device(&state, &headers)?;
+    let not_found = || {
+        api_error(
+            axum::http::StatusCode::NOT_FOUND,
+            "audio_not_found",
+            "audio output is unavailable inside this session",
+        )
+    };
+    if query.uri.len() > 8192 {
+        return Err(not_found());
+    }
+    let root = session_root(&state, &asid).await.ok_or_else(not_found)?;
+    let owned_root = root.clone();
+    let resolved = tokio::task::spawn_blocking(move || {
+        let (path, fence) = hosted_file(&query.uri, &owned_root)?;
+        let name = path.file_name()?.to_string_lossy().into_owned();
+        let kind = sniff_asset_type(&read_asset_head(&path), &name);
+        if expected.is_some_and(|expected| kind.kind != expected) {
+            return None;
+        }
+        let metadata = std::fs::metadata(&path).ok()?;
+        Some((path, fence, name, kind, metadata.len()))
+    })
+    .await
+    .unwrap_or_default();
+    let (path, fence, name, kind, size) = resolved.ok_or_else(not_found)?;
+    let id = asset_id(&path);
+    state.message_images.remember_served(
+        &id,
+        ServedImage {
+            path: path.clone(),
+            root: fence.clone(),
+        },
+    );
+    let entry = AssetEntry {
+        id,
+        path,
+        name,
+        size,
+        modified_unix_ms: 0,
+        root: fence,
+        session_id: String::new(),
+        workspace_id: None,
+        tab_id: None,
+        pane_id: None,
+    };
+    let mut asset = asset_json(&entry, kind);
+    if kind.kind == AssetKind::Image {
+        asset["thumbnail_url"] = format!("/api/agent-images/{}/thumbnail", entry.id).into();
+        asset["preview_url"] = format!("/api/agent-images/{}/preview", entry.id).into();
+    }
+    asset["download_url"] = format!("/api/agent-images/{}/download", entry.id).into();
+    asset["version_url"] = format!("/api/agent-images/{}/version", entry.id).into();
+    Ok(axum::Json(content_envelope(
+        serde_json::json!({ "asset": asset }),
+    )))
+}
+
 /// Attach `image_assets` to items of one session. `directory` is used when the
 /// caller already holds the session's info.
 pub(crate) async fn attach_to_items(
@@ -186,7 +300,11 @@ pub(crate) async fn attach_to_items(
     directory: Option<&str>,
     items: &mut [TimelineItem],
 ) {
-    if !items.iter().any(may_embed_image) {
+    let needs_files = items.iter().any(|item| {
+        item.attachments.is_some()
+            || matches!(&item.part, AgentPart::Tool(call) if call.content.is_some())
+    });
+    if !needs_files && !items.iter().any(may_embed_image) {
         return;
     }
     let root = match directory {
@@ -197,9 +315,14 @@ pub(crate) async fn attach_to_items(
         Some(root) => root,
         None => match session_root(state, asid).await {
             Some(root) => root,
-            None => return,
+            None => {
+                // Inline originals do not need a workspace. Host paths do.
+                originals::attach(state, asid, None, items).await;
+                return;
+            }
         },
     };
+    originals::attach(state, asid, Some(root.clone()), items).await;
     state.message_images.attach(&root, items);
 }
 
@@ -227,6 +350,16 @@ pub(crate) async fn attach_to_event(state: &AppState, event: &mut AgentDomainEve
 /// skipped -- an image written there is shown as code, not loaded.
 pub(crate) fn image_sources(markdown: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
+    for_each_prose_segment(markdown, |segment| {
+        markdown_image_sources(segment, &mut out);
+        html_image_sources(segment, &mut out);
+    });
+    let mut seen = std::collections::HashSet::new();
+    out.retain(|src| seen.insert(src.clone()));
+    out
+}
+
+fn for_each_prose_segment(markdown: &str, mut visit: impl FnMut(&str)) {
     let mut fence: Option<(u8, usize)> = None;
     for line in markdown.lines() {
         if let Some((marker, count, rest)) = fence_marker(line) {
@@ -248,13 +381,9 @@ pub(crate) fn image_sources(markdown: &str) -> Vec<String> {
             continue;
         }
         for segment in prose_segments(line) {
-            markdown_image_sources(segment, &mut out);
-            html_image_sources(segment, &mut out);
+            visit(segment);
         }
     }
-    let mut seen = std::collections::HashSet::new();
-    out.retain(|src| seen.insert(src.clone()));
-    out
 }
 
 /// A fence line: up to three spaces, then three or more backticks or tildes.
@@ -422,6 +551,77 @@ fn html_image_sources(text: &str, out: &mut Vec<String>) {
 // ---------------------------------------------------------------------------
 // Resolving one source.
 
+/// A file the session may be shown: inside its own directory, or a file Codex
+/// saved under `~/.codex/generated_images`. The second fence is that
+/// directory, not the workspace, so a later read still refuses a path that
+/// has been swapped out of it.
+pub(crate) fn hosted_file(src: &str, session_root: &Path) -> Option<(PathBuf, PathBuf)> {
+    let mut fences = vec![session_root.to_path_buf()];
+    if let Some(generated) = generated_images_root() {
+        if fences.iter().all(|fence| fence != &generated) {
+            fences.push(generated);
+        }
+    }
+    fences.into_iter().find_map(|fence| {
+        let path = resolve_image_path(src, &fence)?;
+        Some((path, fence))
+    })
+}
+
+fn generated_images_root() -> Option<PathBuf> {
+    let home = dirs::home_dir()?;
+    image_root(home.join(".codex").join("generated_images").to_str()?)
+}
+
+/// `file://` paths written in prose, such as `Saved to: file:///…/page.pdf`.
+/// Balanced path parentheses are retained; unmatched closing parentheses and
+/// sentence punctuation delimit prose. Encode literal punctuation in filenames
+/// with `%XX` to distinguish it from the surrounding sentence.
+fn file_uris(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for_each_prose_segment(text, |segment| {
+        let mut rest = segment;
+        while let Some(index) = rest.find("file://") {
+            let after = &rest[index + "file://".len()..];
+            let mut parens = 0usize;
+            let mut end = after.len();
+            for (at, c) in after.char_indices() {
+                if c.is_whitespace()
+                    || matches!(
+                        c,
+                        ']' | '"'
+                            | '\''
+                            | '>'
+                            | '。'
+                            | '，'
+                            | '；'
+                            | '：'
+                            | '！'
+                            | '？'
+                            | '）'
+                            | '】'
+                    )
+                    || (c == ')' && parens == 0)
+                {
+                    end = at;
+                    break;
+                }
+                match c {
+                    '(' => parens += 1,
+                    ')' => parens -= 1,
+                    _ => {}
+                }
+            }
+            let path = after[..end].trim_end_matches(['.', ',', ';', ':', '!', '?']);
+            if path.starts_with('/') && !path.chars().any(char::is_control) {
+                out.push(format!("file://{path}"));
+            }
+            rest = &after[end..];
+        }
+    });
+    out
+}
+
 /// The file an image source names, if it is a regular file strictly inside
 /// `root` (which must already be canonical). Relative sources are read against
 /// `root`; `file://` URLs and absolute paths as they are; `~/` against the
@@ -555,6 +755,207 @@ pub(crate) fn image_dimensions(head: &[u8]) -> Option<(u32, u32)> {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn agent_audio_is_authenticated_fenced_and_served_by_opaque_id() {
+        use crate::{asset_content, bearer_headers, test_device, test_state};
+        use axum::extract::{Path as RoutePath, Query, State};
+        use axum::http::{HeaderMap, StatusCode};
+        let (scratch, root) = workspace();
+        let bytes = b"RIFF\x24\x00\x00\x00WAVEfmt ";
+        std::fs::write(root.join("out/sample.wav"), bytes).unwrap();
+        std::fs::write(scratch.path().join("outside.wav"), bytes).unwrap();
+        let state = test_state("admin", vec![test_device("d1", "token")]);
+        state
+            .message_images
+            .remember_root("agent-audio", root.to_str());
+        let query = || {
+            Query(AudioAssetQuery {
+                uri: "out/sample.wav".into(),
+            })
+        };
+        assert_eq!(
+            audio_asset(
+                State(state.clone()),
+                RoutePath("agent-audio".into()),
+                query(),
+                HeaderMap::new()
+            )
+            .await
+            .unwrap_err()
+            .0,
+            StatusCode::UNAUTHORIZED
+        );
+        let response = audio_asset(
+            State(state.clone()),
+            RoutePath("agent-audio".into()),
+            query(),
+            bearer_headers("token"),
+        )
+        .await
+        .unwrap();
+        let asset = &response.0["data"]["asset"];
+        assert_eq!(asset["kind"], "audio");
+        assert_eq!(asset["mime"], "audio/wav");
+        let id = asset["id"].as_str().unwrap();
+        let content = asset_content(
+            State(state.clone()),
+            RoutePath(id.to_owned()),
+            bearer_headers("token"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            axum::body::to_bytes(content.into_body(), 1024)
+                .await
+                .unwrap()
+                .as_ref(),
+            bytes
+        );
+        for uri in [
+            "../outside.wav",
+            "https://example.invalid/audio.wav",
+            "out/flow.png",
+        ] {
+            assert_eq!(
+                audio_asset(
+                    State(state.clone()),
+                    RoutePath("agent-audio".into()),
+                    Query(AudioAssetQuery { uri: uri.into() }),
+                    bearer_headers("token")
+                )
+                .await
+                .unwrap_err()
+                .0,
+                StatusCode::NOT_FOUND
+            );
+        }
+        #[cfg(unix)]
+        {
+            std::fs::remove_file(root.join("out/sample.wav")).unwrap();
+            std::os::unix::fs::symlink(
+                scratch.path().join("outside.wav"),
+                root.join("out/sample.wav"),
+            )
+            .unwrap();
+            assert_eq!(
+                asset_content(
+                    State(state),
+                    RoutePath(id.to_owned()),
+                    bearer_headers("token")
+                )
+                .await
+                .unwrap_err()
+                .0,
+                StatusCode::NOT_FOUND
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn file_outputs_resolve_video_and_download_binary_without_widening_the_root() {
+        use crate::platform::assets::{asset_content, asset_download};
+        use crate::{bearer_headers, test_device, test_state};
+        use axum::extract::{Path as RoutePath, Query, State};
+        use axum::http::{HeaderMap, StatusCode};
+        let (scratch, root) = workspace();
+        let video = b"\x00\x00\x00\x20ftypisom\x00\x00\x00\x00";
+        let binary = b"\x00\xff\x00\xff";
+        std::fs::write(root.join("out/clip.mp4"), video).unwrap();
+        std::fs::write(root.join("out/archive.bin"), binary).unwrap();
+        std::fs::write(scratch.path().join("outside.bin"), binary).unwrap();
+        let state = test_state("admin", vec![test_device("d1", "token")]);
+        state
+            .message_images
+            .remember_root("agent-files", root.to_str());
+        for (uri, kind, bytes) in [
+            ("out/clip.mp4", "video", video.as_slice()),
+            ("out/archive.bin", "binary", binary.as_slice()),
+        ] {
+            let response = file_asset(
+                State(state.clone()),
+                RoutePath("agent-files".into()),
+                Query(AudioAssetQuery { uri: uri.into() }),
+                bearer_headers("token"),
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.0["data"]["asset"]["kind"], kind);
+            let id = response.0["data"]["asset"]["id"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            assert_eq!(
+                asset_download(
+                    State(state.clone()),
+                    RoutePath(id.clone()),
+                    HeaderMap::new()
+                )
+                .await
+                .unwrap_err()
+                .0,
+                StatusCode::UNAUTHORIZED
+            );
+            let download = asset_download(
+                State(state.clone()),
+                RoutePath(id.clone()),
+                bearer_headers("token"),
+            )
+            .await
+            .unwrap();
+            assert!(download.headers()["content-disposition"]
+                .to_str()
+                .unwrap()
+                .starts_with("attachment;"));
+            assert_eq!(
+                axum::body::to_bytes(download.into_body(), 1024)
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                bytes
+            );
+            if kind == "binary" {
+                assert_eq!(
+                    asset_content(
+                        State(state.clone()),
+                        RoutePath(id.clone()),
+                        bearer_headers("token")
+                    )
+                    .await
+                    .unwrap()
+                    .status(),
+                    StatusCode::UNSUPPORTED_MEDIA_TYPE
+                );
+            }
+            #[cfg(unix)]
+            {
+                std::fs::remove_file(root.join(uri)).unwrap();
+                std::os::unix::fs::symlink(scratch.path().join("outside.bin"), root.join(uri))
+                    .unwrap();
+                assert_eq!(
+                    asset_download(State(state.clone()), RoutePath(id), bearer_headers("token"))
+                        .await
+                        .unwrap_err()
+                        .0,
+                    StatusCode::NOT_FOUND
+                );
+            }
+        }
+        for uri in ["../outside.bin", "https://example.invalid/archive.bin"] {
+            assert_eq!(
+                file_asset(
+                    State(state.clone()),
+                    RoutePath("agent-files".into()),
+                    Query(AudioAssetQuery { uri: uri.into() }),
+                    bearer_headers("token")
+                )
+                .await
+                .unwrap_err()
+                .0,
+                StatusCode::NOT_FOUND
+            );
+        }
+    }
+
     static SCRATCH: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
     struct Scratch(PathBuf);
@@ -619,6 +1020,43 @@ mod tests {
         items.remove(0).image_assets.unwrap_or_default()
     }
 
+    #[tokio::test]
+    async fn bare_file_image_passes_the_attachment_gate_without_changing_text() {
+        let (_scratch, root) = workspace();
+        let state = crate::test_state("admin", vec![]);
+        let flow = root.join("out/flow.png");
+        let uri = format!("file://{}", flow.display());
+        for text in [&uri, &format!("Saved to: {uri}")] {
+            let mut items = vec![item(text)];
+            attach_to_items(&state, "bare-image", root.to_str(), &mut items).await;
+            let assets = items[0]
+                .image_assets
+                .as_ref()
+                .expect("bare file image asset");
+            assert_eq!(assets.len(), 1);
+            assert_eq!(assets[0].src, uri);
+            assert_eq!(assets[0].asset_id, asset_id(&flow));
+            assert_eq!(assets[0].mime, "image/png");
+            assert_eq!((assets[0].width, assets[0].height), (Some(640), Some(480)));
+            assert!(matches!(&items[0].part, AgentPart::Text { text: t } if t == text));
+            let served = state.message_images.served(&assets[0].asset_id).unwrap();
+            assert_eq!(served.path, flow);
+            assert_eq!(served.root, root);
+        }
+        for (text, expected) in [
+            ("![flow](out/flow.png)", true),
+            ("<IMG SRC='out/flow.png'>", true),
+            ("`![flow](out/flow.png)`", false),
+            ("```md\n![flow](out/flow.png)\n```", false),
+            ("ordinary prose and out/flow.png", false),
+            ("https://example.invalid/flow.png", false),
+        ] {
+            let mut items = vec![item(text)];
+            attach_to_items(&state, "bare-image", root.to_str(), &mut items).await;
+            assert_eq!(items[0].image_assets.is_some(), expected, "{text}");
+        }
+    }
+
     #[test]
     fn finds_markdown_and_html_sources_outside_code() {
         let text = "intro ![a](./x.png) and ![b c](<my file.png> \"title\")\n\
@@ -638,6 +1076,67 @@ mod tests {
                 "upper.png"
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn bare_file_uris_in_code_do_not_register_assets() {
+        let (_scratch, root) = workspace();
+        let uri = format!("file://{}", root.join("notes.md").display());
+        for text in [
+            format!("`{uri}`"),
+            format!("``{uri}``"),
+            format!("```text\n{uri}\n```"),
+            format!("~~~\n{uri}\n~~~"),
+            format!("```\n![flow](out/flow.png) {uri}\n```"),
+        ] {
+            let state = crate::test_state("admin", vec![]);
+            let mut items = vec![item(&text)];
+            attach_to_items(&state, "code-files", root.to_str(), &mut items).await;
+            assert!(items[0].image_assets.is_none(), "{text}");
+            assert!(state
+                .message_images
+                .served(&asset_id(&root.join("notes.md")))
+                .is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn prose_uri_boundaries_preserve_parentheses_and_percent_escapes() {
+        let (scratch, root) = workspace();
+        std::fs::write(root.join("out/plot(1).png"), png(12, 34)).unwrap();
+        let flow = format!("file://{}", root.join("out/flow.png").display());
+        let plot = format!("file://{}", root.join("out/plot(1).png").display());
+        let escaped = plot.replace('(', "%28").replace(')', "%29");
+        let cjk =
+            format!("file://{}", root.join("图 表/深色 流程.png").display()).replace(' ', "%20");
+        let state = crate::test_state("admin", vec![]);
+        for (text, expected) in [
+            (plot.clone(), plot.clone()),
+            (format!("Saved to: ({plot})."), plot.clone()),
+            (format!("Saved to: {flow}."), flow.clone()),
+            (format!("图片：{flow}。"), flow.clone()),
+            (format!("图片：{flow}，完成。"), flow.clone()),
+            (format!("Saved to: <{escaped}>."), escaped.clone()),
+            (format!("图片：{cjk}。"), cjk.clone()),
+        ] {
+            let mut items = vec![item(&text)];
+            attach_to_items(&state, "uri-boundaries", root.to_str(), &mut items).await;
+            let assets = items[0].image_assets.as_ref().expect("prose URI asset");
+            assert_eq!(assets.len(), 1, "{text}");
+            assert_eq!(assets[0].src, expected, "{text}");
+            assert_eq!(assets[0].mime, "image/png");
+            assert!(matches!(&items[0].part, AgentPart::Text { text: t } if t == &text));
+        }
+        for uri in [
+            format!("file://{}/%2e%2e/outside.png。", root.display()),
+            format!("file://{}。", scratch.path().join("outside.png").display()),
+            format!("{flow}%ZZ。"),
+            "file://example.invalid/flow.png。".into(),
+        ] {
+            let mut items = vec![item(&uri)];
+            attach_to_items(&state, "uri-boundaries", root.to_str(), &mut items).await;
+            assert!(items[0].image_assets.is_none(), "{uri}");
+        }
     }
 
     #[test]
@@ -720,15 +1219,104 @@ mod tests {
         );
         let assets = attached(&root, &text);
         let id = asset_id(&flow);
-        assert_eq!(assets.len(), 3);
-        assert_eq!(assets[0].src, "./out/flow.png");
-        assert_eq!(assets[1].src, format!("file://{}", flow.display()));
-        assert_eq!(assets[2].src, "out/flow.png");
-        for asset in &assets {
+        assert_eq!(
+            assets
+                .iter()
+                .map(|asset| asset.src.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "./out/flow.png",
+                &format!("file://{}", flow.display()),
+                "notes.md",
+                "out/flow.png",
+            ]
+        );
+        // Local file outputs are now mapped too, not just image files.
+        let notes = &assets[2];
+        let notes_id = asset_id(&root.join("notes.md"));
+        assert_eq!(notes.asset_id, notes_id);
+        assert_eq!(notes.url, format!("/api/assets/{notes_id}/content"));
+        assert_eq!(notes.mime, "text/markdown; charset=utf-8");
+        assert_eq!((notes.width, notes.height), (None, None));
+        for asset in assets.iter().filter(|asset| asset.src != "notes.md") {
             assert_eq!(asset.asset_id, id);
             assert_eq!(asset.url, format!("/api/assets/{id}/content"));
             assert_eq!(asset.mime, "image/png");
             assert_eq!((asset.width, asset.height), (Some(640), Some(480)));
+        }
+    }
+
+    #[tokio::test]
+    async fn prose_file_outputs_are_fenced_authenticated_and_rechecked_on_download() {
+        use crate::platform::assets::asset_download;
+        use crate::{bearer_headers, test_device, test_state};
+        use axum::extract::{Path as RoutePath, State};
+        use axum::http::{HeaderMap, StatusCode};
+
+        let (scratch, root) = workspace();
+        let notes = root.join("notes.md");
+        let uri = format!("file://{}", notes.display());
+        let outside = scratch.path().join("outside.png");
+        let state = test_state("admin", vec![test_device("d1", "token")]);
+        let text = format!(
+            "Saved to: {uri}\nAgain: {uri}\nOutside: file://{}\n\
+             Traversal: file://{}/../outside.png\nDirectory: file://{}\n\
+             Remote: file://example.invalid/notes.md\n\
+             Missing: file://{}/missing.md\nMalformed: {uri}%ZZ",
+            outside.display(),
+            root.display(),
+            root.display(),
+            root.display(),
+        );
+        let mut items = vec![item(&text)];
+        attach_to_items(&state, "prose-files", root.to_str(), &mut items).await;
+        let assets = items[0].image_assets.as_ref().unwrap();
+        assert_eq!(assets.len(), 1);
+        assert_eq!(assets[0].src, uri);
+        assert_eq!(assets[0].mime, "text/markdown; charset=utf-8");
+        assert_eq!((assets[0].width, assets[0].height), (None, None));
+        let id = assets[0].asset_id.clone();
+        let served = state.message_images.served(&id).unwrap();
+        assert_eq!(served.path, notes);
+        assert_eq!(served.root, root);
+        assert!(state.message_images.served(&asset_id(&outside)).is_none());
+        assert_eq!(
+            asset_download(
+                State(state.clone()),
+                RoutePath(id.clone()),
+                HeaderMap::new()
+            )
+            .await
+            .unwrap_err()
+            .0,
+            StatusCode::UNAUTHORIZED
+        );
+        let response = asset_download(
+            State(state.clone()),
+            RoutePath(id.clone()),
+            bearer_headers("token"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap()
+                .as_ref(),
+            b"# not an image\n"
+        );
+        #[cfg(unix)]
+        {
+            std::fs::remove_file(&notes).unwrap();
+            std::os::unix::fs::symlink(&outside, &notes).unwrap();
+            assert!(attached(&root, &uri).is_empty());
+            assert_eq!(
+                asset_download(State(state), RoutePath(id), bearer_headers("token"))
+                    .await
+                    .unwrap_err()
+                    .0,
+                StatusCode::NOT_FOUND
+            );
         }
     }
 

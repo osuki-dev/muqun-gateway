@@ -37,9 +37,14 @@ use tokio::io::AsyncReadExt as _;
 use tokio::process::Command;
 
 /// One git process gets this long. A status on a large checkout is tens of
-/// milliseconds; a diff of one file is less. Five seconds is "the disk is
-/// asleep", not "the repository is big".
-pub const GIT_TIMEOUT: Duration = Duration::from_secs(5);
+/// milliseconds warm; cold, on a big checkout on a disk that was asleep, it
+/// has been seen to take seconds, and a status or file list that times out
+/// is a blank diff screen. Fifteen seconds, and `run` tries once more on a
+/// timeout.
+pub const GIT_TIMEOUT: Duration = Duration::from_secs(15);
+/// One file's patch is a smaller job and is read a page at a time: it keeps
+/// the shorter bound, so a paged read never holds the phone for long.
+pub const PATCH_TIMEOUT: Duration = Duration::from_secs(5);
 /// Stdout is read up to here and the process is then killed. A single file's
 /// patch that is bigger than this is not read on a phone.
 pub const MAX_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
@@ -366,7 +371,7 @@ pub async fn file_patch(
         args.push(old);
     }
 
-    let mut text = match run(toplevel, &args, &[0, 1]).await {
+    let mut text = match run_with(toplevel, &args, &[0, 1], PATCH_TIMEOUT).await {
         Ok(output) => String::from_utf8_lossy(&output.stdout).into_owned(),
         // An unborn branch has no HEAD; the file is then new by definition.
         Err(GitError::Failed(_)) if side == PatchSide::WorkingTreeVsHead => String::new(),
@@ -374,12 +379,18 @@ pub async fn file_patch(
     };
 
     if text.is_empty() && side == PatchSide::WorkingTreeVsHead {
-        let tracked = run(toplevel, &["ls-files", "-z", "--", &relative_str], &[0]).await?;
+        let tracked = run_with(
+            toplevel,
+            &["ls-files", "-z", "--", &relative_str],
+            &[0],
+            PATCH_TIMEOUT,
+        )
+        .await?;
         if tracked.stdout.is_empty() {
             let Some(_) = untracked_file_inside(toplevel, &relative) else {
                 return Ok(None);
             };
-            let output = run(
+            let output = run_with(
                 toplevel,
                 &[
                     "diff",
@@ -393,6 +404,7 @@ pub async fn file_patch(
                     &relative_str,
                 ],
                 &[0, 1],
+                PATCH_TIMEOUT,
             )
             .await?;
             text = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -606,7 +618,9 @@ pub async fn repository_root(cwd: &Path) -> Result<Option<PathBuf>, GitError> {
     match run(cwd, &["rev-parse", "--show-toplevel"], &[0]).await {
         Ok(output) => {
             let text = String::from_utf8_lossy(&output.stdout);
-            let line = text.lines().next().unwrap_or("").trim();
+            // Git terminates this path with one newline; whitespace within
+            // the path belongs to the directory, including other newlines.
+            let line = text.strip_suffix('\n').unwrap_or(&text);
             if line.is_empty() {
                 return Ok(None);
             }
@@ -616,6 +630,101 @@ pub async fn repository_root(cwd: &Path) -> Result<Option<PathBuf>, GitError> {
         Err(GitError::Failed(_)) => Ok(None),
         Err(err) => Err(err),
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct Worktree {
+    pub path: PathBuf,
+    pub branch: Option<String>,
+    pub head: Option<String>,
+    pub detached: bool,
+}
+
+impl Worktree {
+    pub fn to_json(&self) -> Value {
+        json!({ "path": self.path, "branch": self.branch, "head": self.head, "detached": self.detached })
+    }
+}
+
+/// Git's authoritative inventory, NUL-delimited so unusual path names survive.
+/// Missing, bare or replaced checkouts are omitted. Every accepted checkout
+/// must still point at this repository's canonical common directory.
+pub async fn worktrees(toplevel: &Path) -> Result<Vec<Worktree>, GitError> {
+    tokio::time::timeout(GIT_TIMEOUT, read_worktrees(toplevel))
+        .await
+        .map_err(|_| GitError::Timeout)?
+}
+
+async fn read_worktrees(toplevel: &Path) -> Result<Vec<Worktree>, GitError> {
+    let common = common_directory(toplevel).await?;
+    let output = run(toplevel, &["worktree", "list", "--porcelain", "-z"], &[0]).await?;
+    if output.capped {
+        return Err(GitError::Failed(
+            "worktree inventory exceeded its output limit".into(),
+        ));
+    }
+    let mut entries = Vec::new();
+    let mut entry: Option<Worktree> = None;
+    let mut bare = false;
+    for field in output.stdout.split(|byte| *byte == 0) {
+        if field.is_empty() {
+            if let Some(mut candidate) = entry.take() {
+                if !bare {
+                    if let Ok(path) = std::fs::canonicalize(&candidate.path) {
+                        if path.is_dir()
+                            && common_directory(&path).await.ok().as_ref() == Some(&common)
+                            && repository_root(&path).await?.as_ref() == Some(&path)
+                        {
+                            candidate.path = path;
+                            entries.push(candidate);
+                        }
+                    }
+                }
+            }
+            bare = false;
+            continue;
+        }
+        let field = std::str::from_utf8(field)
+            .map_err(|_| GitError::Failed("worktree inventory is not UTF-8".into()))?;
+        if let Some(path) = field.strip_prefix("worktree ") {
+            if entries.len() >= 128 {
+                return Err(GitError::Failed(
+                    "worktree inventory exceeded its entry limit".into(),
+                ));
+            }
+            entry = Some(Worktree {
+                path: path.into(),
+                branch: None,
+                head: None,
+                detached: false,
+            });
+        } else if let Some(candidate) = entry.as_mut() {
+            if let Some(head) = field.strip_prefix("HEAD ") {
+                candidate.head = (!head.bytes().all(|byte| byte == b'0')).then(|| head.to_owned());
+            } else if let Some(branch) = field.strip_prefix("branch ") {
+                candidate.branch =
+                    Some(branch.strip_prefix("refs/heads/").unwrap_or(branch).into());
+            } else if field == "detached" {
+                candidate.detached = true;
+            } else if field == "bare" {
+                bare = true;
+            }
+        }
+    }
+    Ok(entries)
+}
+
+async fn common_directory(toplevel: &Path) -> Result<PathBuf, GitError> {
+    let output = run(
+        toplevel,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        &[0],
+    )
+    .await?;
+    let text = std::str::from_utf8(&output.stdout)
+        .map_err(|_| GitError::Failed("git common directory is not UTF-8".into()))?;
+    let path = text.strip_suffix('\n').unwrap_or(text);
+    std::fs::canonicalize(path).map_err(|err| GitError::Failed(err.to_string()))
 }
 
 /// What changed, for an agent session's checkout. Numstat only, so it stays
@@ -1409,14 +1518,18 @@ fn command(cwd: &Path) -> Command {
     // `GIT_CONFIG_*` would smuggle settings past the `-c` flags above. The
     // terminal multiplexer variables are dropped so a hook cannot tell it is
     // running under one.
-    scrub_env(&mut cmd, std::env::vars_os().map(|(name, _)| name));
+    scrub_git_env(cmd.as_std_mut());
     cmd
 }
 
 /// Remove every inherited `GIT_*` variable, then set the few git settings
-/// the gateway relies on. `inherited` is the parent's environment, passed in
-/// so a test can hand over a synthetic one.
-fn scrub_env(cmd: &mut Command, inherited: impl Iterator<Item = OsString>) {
+/// the gateway relies on.
+pub(crate) fn scrub_git_env(cmd: &mut std::process::Command) {
+    scrub_env(cmd, std::env::vars_os().map(|(name, _)| name));
+}
+
+// Accept a synthetic parent environment for tests without global mutation.
+fn scrub_env(cmd: &mut std::process::Command, inherited: impl Iterator<Item = OsString>) {
     for name in inherited.filter(|name| name.as_encoded_bytes().starts_with(b"GIT_")) {
         cmd.env_remove(name);
     }
@@ -1442,7 +1555,29 @@ fn scrub_env(cmd: &mut Command, inherited: impl Iterator<Item = OsString>) {
 ///
 /// `ok_codes` is which exit codes count as success: `diff --no-index` exits 1
 /// when the files differ, which is the answer being asked for.
+/// A status, list or lookup under [`GIT_TIMEOUT`], tried once more when it
+/// timed out. A loop with one await point, not two awaits: the second
+/// future would otherwise be laid out beside the first in every caller,
+/// and `changed_files` has enough call sites to overflow a thread's stack.
+/// One file's patch uses `run_with` directly under [`PATCH_TIMEOUT`] and
+/// is not retried.
 async fn run(cwd: &Path, args: &[&str], ok_codes: &[i32]) -> Result<Output, GitError> {
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        match run_with(cwd, args, ok_codes, GIT_TIMEOUT).await {
+            Err(GitError::Timeout) if attempts == 1 => continue,
+            other => return other,
+        }
+    }
+}
+
+async fn run_with(
+    cwd: &Path,
+    args: &[&str],
+    ok_codes: &[i32],
+    timeout: Duration,
+) -> Result<Output, GitError> {
     let mut cmd = command(cwd);
     cmd.args(args);
     let mut child = cmd.spawn().map_err(|err| match err.kind() {
@@ -1460,12 +1595,17 @@ async fn run(cwd: &Path, args: &[&str], ok_codes: &[i32]) -> Result<Output, GitE
             if read == 0 {
                 break;
             }
-            bytes.extend_from_slice(&chunk[..read]);
+            let retained = read.min(MAX_OUTPUT_BYTES - bytes.len());
+            bytes.extend_from_slice(&chunk[..retained]);
             if bytes.len() >= MAX_OUTPUT_BYTES {
+                // Kill before joining the stderr reader: git may otherwise
+                // block writing stdout forever while stderr waits for EOF.
+                let _ = child.start_kill();
                 break;
             }
         }
-        bytes
+        let status = child.wait().await;
+        (bytes, status)
     };
     let read_stderr = async {
         let mut bytes = Vec::new();
@@ -1476,28 +1616,26 @@ async fn run(cwd: &Path, args: &[&str], ok_codes: &[i32]) -> Result<Output, GitE
                 break;
             }
             if bytes.len() < MAX_STDERR_BYTES {
-                bytes.extend_from_slice(&chunk[..read]);
+                let retained = read.min(MAX_STDERR_BYTES - bytes.len());
+                bytes.extend_from_slice(&chunk[..retained]);
             }
         }
         bytes
     };
 
-    let result = tokio::time::timeout(GIT_TIMEOUT, async {
-        let (stdout, stderr) = tokio::join!(read_stdout, read_stderr);
+    let result = tokio::time::timeout(timeout, async {
+        let ((stdout, status), stderr) = tokio::join!(read_stdout, read_stderr);
         let capped = stdout.len() >= MAX_OUTPUT_BYTES;
-        if capped {
-            let _ = child.kill().await;
-        }
-        let status = child.wait().await;
         (stdout, stderr, capped, status)
     })
     .await;
 
     let (mut stdout, stderr, capped, status) = match result {
         Ok(value) => value,
-        // Dropping the future above killed the child (`kill_on_drop`).
+        // Returning drops the child and kills it (`kill_on_drop`).
         Err(_) => return Err(GitError::Timeout),
     };
+    let status = status.map_err(|err| GitError::Failed(err.to_string()))?;
     if capped {
         // Cut on a record so the caller never sees half of one: a NUL for
         // `-z` output, a newline otherwise.
@@ -1507,7 +1645,6 @@ async fn run(cwd: &Path, args: &[&str], ok_codes: &[i32]) -> Result<Output, GitE
             capped: true,
         });
     }
-    let status = status.map_err(|err| GitError::Failed(err.to_string()))?;
     let code = status.code().unwrap_or(-1);
     if !ok_codes.contains(&code) {
         return Err(GitError::Failed(format!(
@@ -1841,7 +1978,7 @@ mod tests {
         use std::ffi::OsStr;
         let mut cmd = Command::new("git");
         scrub_env(
-            &mut cmd,
+            cmd.as_std_mut(),
             [
                 "GIT_DIR",
                 "GIT_COMMON_DIR",
@@ -2184,6 +2321,50 @@ mod tests {
         git_ok(&repo, &["add", "."]);
         git_ok(&repo, &["commit", "-q", "-m", "init"]);
         repo
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stderr_flood_is_drained_with_bounded_error_output() {
+        let repo = temp_repo("stderr-cap");
+        // A test-only git alias floods stderr beyond its pipe capacity, then
+        // fails. No shell is introduced into the production command builder.
+        let error = run(
+            &repo,
+            &[
+                "-c",
+                "alias.flood=!i=0; while [ \"$i\" -lt 10000 ]; do printf 'stderr flood regression line\\n' >&2; i=$((i + 1)); done; exit 1",
+                "flood",
+            ],
+            &[0],
+        )
+        .await
+        .err()
+        .expect("alias must fail");
+        match error {
+            GitError::Failed(message) => {
+                assert!(message.contains("stderr flood regression line"));
+                assert!(message.len() <= MAX_STDERR_BYTES + "exit 1: ".len());
+            }
+            other => panic!("stderr must drain without timeout: {other:?}"),
+        }
+        std::fs::remove_dir_all(repo.parent().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn oversized_real_diff_returns_capped_without_waiting_for_timeout() {
+        let repo = temp_repo("output-cap");
+        // Many complete lines exceed the pipe buffer and the output budget.
+        let text =
+            "a long added line for the bounded git diff regression\n".repeat(MAX_OUTPUT_BYTES / 40);
+        std::fs::write(repo.join("README.md"), text).unwrap();
+        let output = run(&repo, &["diff", "--no-ext-diff", "--", "README.md"], &[0])
+            .await
+            .unwrap();
+        assert!(output.capped);
+        assert!(output.stdout.len() <= MAX_OUTPUT_BYTES);
+        assert_eq!(output.stdout.last(), Some(&b'\n'));
+        std::fs::remove_dir_all(repo.parent().unwrap()).unwrap();
     }
 
     #[tokio::test]
@@ -3067,6 +3248,166 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn paired_http_reads_only_git_linked_worktrees_of_the_panes_repository() {
+        use axum::{body::Body, http::Request};
+        use tower::ServiceExt as _;
+
+        let (root, repo) = git_test_repo("linked-worktrees");
+        let linked = root.join("linked checkout\nwith newline");
+        let detached = root.join("detached");
+        for (path, args) in [
+            (&linked, vec!["worktree", "add", "-q", "-b", "feature"]),
+            (&detached, vec!["worktree", "add", "-q", "--detach"]),
+        ] {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .arg(path)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        std::fs::write(linked.join("linked.txt"), "only in the linked checkout\n").unwrap();
+        let state = unreachable_state();
+        remember_pane_root(&state, "wA:p1", repo.join("src"));
+        let app = crate::terminal::routes::mount(axum::Router::new()).with_state(state);
+        let prefix = "/api/sessions/default/panes/wA:p1/git";
+        let request = |uri: String, token: &str| {
+            Request::builder()
+                .uri(uri)
+                .header("Authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap()
+        };
+        let refused = app
+            .clone()
+            .oneshot(request(format!("{prefix}/worktrees"), "wrong"))
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+        let listed = app
+            .clone()
+            .oneshot(request(format!("{prefix}/worktrees"), "token"))
+            .await
+            .unwrap();
+        assert_eq!(listed.status(), StatusCode::OK);
+        let body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(listed.into_body(), MAX_OUTPUT_BYTES)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["data"]["current"], json!(repo));
+        let entries = body["data"]["worktrees"].as_array().unwrap();
+        assert_eq!(entries.len(), 3);
+        assert!(entries
+            .iter()
+            .any(|entry| entry["path"] == json!(linked) && entry["branch"] == "feature"));
+        assert!(entries
+            .iter()
+            .any(|entry| entry["path"] == json!(detached) && entry["detached"] == true));
+        let query = |path: &Path| {
+            let mut url = reqwest::Url::parse("http://localhost").unwrap();
+            url.query_pairs_mut()
+                .append_pair("worktree", path.to_str().unwrap());
+            url.query().unwrap().to_owned()
+        };
+        let response = app
+            .clone()
+            .oneshot(request(
+                format!("{prefix}/status?{}", query(&linked)),
+                "token",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), MAX_OUTPUT_BYTES)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["data"]["repo"]["branch"], "feature");
+        assert_eq!(body["data"]["files"].as_array().unwrap().len(), 1);
+        assert_eq!(body["data"]["files"][0]["path"], "linked.txt");
+        let response = app
+            .clone()
+            .oneshot(request(
+                format!("{prefix}/diff?path=linked.txt&{}", query(&linked)),
+                "token",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), MAX_OUTPUT_BYTES)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(body["data"]["patch"]
+            .as_str()
+            .unwrap()
+            .contains("+only in the linked checkout"));
+        // Neither browsing nor a patch read changes either checkout.
+        assert!(std::fs::read_to_string(repo.join("src/a.ts"))
+            .unwrap()
+            .contains("const B"));
+        assert!(linked.join("linked.txt").is_file());
+        for invalid in [
+            root.clone(),
+            linked.join("src"),
+            repo.join("../repo"),
+            root.join("missing"),
+            PathBuf::from("--help"),
+        ] {
+            for endpoint in ["status?", "diff?path=linked.txt&"] {
+                let response = app
+                    .clone()
+                    .oneshot(request(
+                        format!("{prefix}/{endpoint}{}", query(&invalid)),
+                        "token",
+                    ))
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::FORBIDDEN, "{invalid:?}");
+            }
+        }
+        let unknown = app
+            .clone()
+            .oneshot(request(
+                format!(
+                    "/api/sessions/default/panes/unknown/git/status?{}",
+                    query(&linked)
+                ),
+                "token",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+        // A linked directory replaced by a symlink to another repository is
+        // no longer an inventory member, even though its old path is registered.
+        let (foreign_root, foreign_repo) = git_test_repo("foreign-worktree");
+        std::fs::remove_dir_all(&linked).unwrap();
+        std::os::unix::fs::symlink(&foreign_repo, &linked).unwrap();
+        let response = app
+            .oneshot(request(
+                format!("{prefix}/status?{}", query(&linked)),
+                "token",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(foreign_root).unwrap();
+    }
+
+    #[tokio::test]
     async fn git_status_lists_the_checkout_of_the_panes_fenced_directory() {
         let (root, repo) = git_test_repo("git-status");
         let state = unreachable_state();
@@ -3076,6 +3417,7 @@ mod tests {
         let answer = pane_git_status(
             State(state.clone()),
             ExtractPath(("default".into(), "wA:p1".into())),
+            Query(Default::default()),
             bearer_headers("token"),
         )
         .await
@@ -3106,6 +3448,7 @@ mod tests {
             pane_git_status(
                 State(state.clone()),
                 ExtractPath(("default".into(), "wA:p1".into())),
+                Query(Default::default()),
                 bearer_headers("not-a-token"),
             )
             .await
@@ -3118,6 +3461,7 @@ mod tests {
         let none = pane_git_status(
             State(state),
             ExtractPath(("default".into(), "wB:p9".into())),
+            Query(Default::default()),
             bearer_headers("token"),
         )
         .await
@@ -3136,6 +3480,7 @@ mod tests {
         remember_pane_root(&state, "wA:p1", repo.clone());
 
         let query = |path: &str| GitDiffQuery {
+            worktree: None,
             path: Some(path.into()),
             old_path: None,
             staged: None,

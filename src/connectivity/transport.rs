@@ -12,6 +12,9 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 
 pub const VERSION: u8 = 1;
+/// Authenticates envelope metadata as well as the route/payload.
+pub const VERSION_V2: u8 = 2;
+pub const SUPPORTED_VERSIONS: [u8; 2] = [VERSION, VERSION_V2];
 pub const MAX_CLOCK_SKEW_MS: u128 = 5 * 60 * 1000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -182,6 +185,20 @@ pub fn seal(
     plaintext: &[u8],
     timestamp_ms: u128,
 ) -> anyhow::Result<Envelope> {
+    seal_version(VERSION, material, direction, aad, plaintext, timestamp_ms)
+}
+
+/// Seal with the explicitly negotiated protocol. Version one is retained for
+/// old clients; it does not authenticate timestamp metadata.
+pub fn seal_version(
+    version: u8,
+    material: &[u8],
+    direction: Direction,
+    aad: &[u8],
+    plaintext: &[u8],
+    timestamp_ms: u128,
+) -> anyhow::Result<Envelope> {
+    let authenticated_aad = envelope_aad(version, timestamp_ms, aad)?;
     let key = derive_key(material, direction)?;
     let cipher = Aes256Gcm::new_from_slice(&key).expect("AES-256 key has fixed length");
     let nonce_bytes = Nonce::generate();
@@ -190,16 +207,27 @@ pub fn seal(
             &nonce_bytes,
             Payload {
                 msg: plaintext,
-                aad,
+                aad: &authenticated_aad,
             },
         )
         .map_err(|_| anyhow!("transport encryption failed"))?;
     Ok(Envelope {
-        version: VERSION,
+        version,
         timestamp_ms,
         nonce: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(nonce_bytes),
         ciphertext: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(ciphertext),
     })
+}
+
+/// Why an envelope did not open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenError {
+    /// It authenticated, but its timestamp is outside [`MAX_CLOCK_SKEW_MS`]
+    /// of now: the two clocks disagree. Said only of an envelope that did
+    /// authenticate, so the distinction reaches nobody but the key's holder.
+    Expired,
+    /// Malformed, tampered with, or sealed under another key.
+    Invalid,
 }
 
 pub fn open(
@@ -209,28 +237,64 @@ pub fn open(
     envelope: &Envelope,
     now_ms: u128,
 ) -> anyhow::Result<Vec<u8>> {
-    if envelope.version != VERSION {
-        return Err(anyhow!("unsupported transport version"));
-    }
-    if now_ms.abs_diff(envelope.timestamp_ms) > MAX_CLOCK_SKEW_MS {
-        return Err(anyhow!("transport envelope expired"));
-    }
-    let nonce = decode_key(&envelope.nonce)?;
-    if nonce.len() != 12 {
-        return Err(anyhow!("invalid transport nonce"));
-    }
-    let ciphertext = decode_key(&envelope.ciphertext)?;
-    let key = derive_key(material, direction)?;
+    open_checked(material, direction, aad, envelope, now_ms).map_err(|error| match error {
+        OpenError::Expired => anyhow!("transport envelope expired"),
+        OpenError::Invalid => anyhow!("transport authentication failed"),
+    })
+}
+
+/// [`open`], telling a stale envelope from a bad one. The ciphertext is
+/// authenticated first and the timestamp judged after, so `Expired` is
+/// never said of an envelope that did not open.
+pub fn open_checked(
+    material: &[u8],
+    direction: Direction,
+    aad: &[u8],
+    envelope: &Envelope,
+    now_ms: u128,
+) -> Result<Vec<u8>, OpenError> {
+    let authenticated_aad = envelope_aad(envelope.version, envelope.timestamp_ms, aad)
+        .map_err(|_| OpenError::Invalid)?;
+    let nonce = nonce_bytes(&envelope.nonce).map_err(|_| OpenError::Invalid)?;
+    let ciphertext = decode_key(&envelope.ciphertext).map_err(|_| OpenError::Invalid)?;
+    let key = derive_key(material, direction).map_err(|_| OpenError::Invalid)?;
     let cipher = Aes256Gcm::new_from_slice(&key).expect("AES-256 key has fixed length");
-    cipher
+    let plaintext = cipher
         .decrypt(
-            &Nonce::try_from(nonce.as_slice())?,
+            &Nonce::try_from(nonce.as_slice()).map_err(|_| OpenError::Invalid)?,
             Payload {
                 msg: &ciphertext,
-                aad,
+                aad: &authenticated_aad,
             },
         )
-        .map_err(|_| anyhow!("transport authentication failed"))
+        .map_err(|_| OpenError::Invalid)?;
+    if !timestamp_is_fresh(envelope.timestamp_ms, now_ms) {
+        return Err(OpenError::Expired);
+    }
+    Ok(plaintext)
+}
+
+pub(crate) fn timestamp_is_fresh(timestamp_ms: u128, now_ms: u128) -> bool {
+    now_ms.abs_diff(timestamp_ms) <= MAX_CLOCK_SKEW_MS
+}
+
+/// One cryptographic identity, independent of accepted Base64 spelling.
+pub(crate) fn nonce_bytes(encoded: &str) -> anyhow::Result<[u8; 12]> {
+    decode_key(encoded)?
+        .try_into()
+        .map_err(|_| anyhow!("invalid transport nonce"))
+}
+
+fn envelope_aad(version: u8, timestamp_ms: u128, aad: &[u8]) -> anyhow::Result<Vec<u8>> {
+    match version {
+        VERSION => Ok(aad.to_vec()),
+        VERSION_V2 => {
+            let mut bound = format!("muqun-transport-v2\n{timestamp_ms}\n").into_bytes();
+            bound.extend_from_slice(aad);
+            Ok(bound)
+        }
+        _ => Err(anyhow!("unsupported transport version")),
+    }
 }
 
 #[cfg(test)]
@@ -373,5 +437,121 @@ mod tests {
         .is_err());
         envelope.ciphertext.push('A');
         assert!(open(&key, Direction::Request, b"aad", &envelope, 1_000).is_err());
+    }
+}
+
+#[cfg(test)]
+mod v2_tests {
+    use super::*;
+
+    #[test]
+    fn freshness_is_inclusive_and_overflow_safe() {
+        for version in SUPPORTED_VERSIONS {
+            let key = [23; 32];
+            let envelope = seal_version(
+                version,
+                &key,
+                Direction::Request,
+                b"aad",
+                b"body",
+                1_000_000,
+            )
+            .unwrap();
+            for now in [700_000, 1_300_000] {
+                assert_eq!(
+                    open(&key, Direction::Request, b"aad", &envelope, now).unwrap(),
+                    b"body"
+                );
+            }
+            for now in [699_999, 1_300_001, u128::MAX] {
+                assert!(open(&key, Direction::Request, b"aad", &envelope, now).is_err());
+            }
+            let extreme = seal_version(
+                version,
+                &key,
+                Direction::Request,
+                b"aad",
+                b"body",
+                u128::MAX,
+            )
+            .unwrap();
+            assert!(open(&key, Direction::Request, b"aad", &extreme, 1_000_000).is_err());
+        }
+    }
+
+    #[test]
+    fn metadata_route_direction_and_ciphertext_are_authenticated() {
+        let key = [23; 32];
+        let original = seal_version(
+            2,
+            &key,
+            Direction::Request,
+            b"GET /health",
+            b"fixture",
+            1000,
+        )
+        .unwrap();
+        assert_eq!(
+            open(&key, Direction::Request, b"GET /health", &original, 1000).unwrap(),
+            b"fixture"
+        );
+        let mut changed = original.clone();
+        changed.timestamp_ms = 1001;
+        assert!(open(&key, Direction::Request, b"GET /health", &changed, 1001).is_err());
+        changed = original.clone();
+        changed.version = 1;
+        assert!(open(&key, Direction::Request, b"GET /health", &changed, 1000).is_err());
+        assert!(open(&key, Direction::Response, b"GET /health", &original, 1000).is_err());
+        assert!(open(&key, Direction::Request, b"POST /health", &original, 1000).is_err());
+        changed = original.clone();
+        changed.ciphertext.replace_range(
+            0..1,
+            if changed.ciphertext.starts_with('A') {
+                "B"
+            } else {
+                "A"
+            },
+        );
+        assert!(open(&key, Direction::Request, b"GET /health", &changed, 1000).is_err());
+        assert!(open(
+            &key,
+            Direction::Request,
+            b"GET /health",
+            &original,
+            1000 + MAX_CLOCK_SKEW_MS + 1
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn javascript_v2_fixture_opens_with_the_same_protocol() {
+        let key: Vec<u8> = (0..32).collect();
+        let envelope = Envelope {
+            version: 2,
+            timestamp_ms: 1700000000000,
+            nonce: "CwwNDg8QERITFBUW".into(),
+            ciphertext: "JjVMzuXR1pmBl4rHrkekRD_tm8rxctorFn0Uwpp3f39AzhRBTjuS-3emocypEWjn-ZAd"
+                .into(),
+        };
+        assert_eq!(
+            open(
+                &key,
+                Direction::Request,
+                b"GET /health",
+                &envelope,
+                1700000000000
+            )
+            .unwrap(),
+            br#"{"token":"fixture-token","body":""}"#
+        );
+    }
+
+    #[test]
+    fn accepted_nonce_spellings_have_one_identity() {
+        let nonce = [255; 12];
+        let url = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(nonce);
+        let standard = base64::engine::general_purpose::STANDARD.encode(nonce);
+        assert_ne!(url, standard);
+        assert_eq!(nonce_bytes(&url).unwrap(), nonce_bytes(&standard).unwrap());
     }
 }

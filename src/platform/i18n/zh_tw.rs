@@ -16,6 +16,7 @@ pub(super) const ZH_TW: &[(&str, &str)] = &[
     // -- push notifications --------------------------------------------------
     ("Agent", "代理程式"),
     ("Approval needed", "需要核准"),
+    ("Needs your input", "需要你的輸入"),
     ("Agent blocked", "代理程式等待中"),
     ("Agent done", "代理程式已完成"),
     ("{name} is waiting for your approval.", "{name} 正在等待你的核准。"),
@@ -32,6 +33,10 @@ pub(super) const ZH_TW: &[(&str, &str)] = &[
         "Herdr 沒有回傳所建立面板的 id",
     ),
     ("Herdr is unavailable", "無法連線到 Herdr"),
+    ("No terminal pane belongs to the calling process", "沒有屬於呼叫程序的終端機面板"),
+    ("Task not found", "找不到任務"),
+    ("Token expired", "token 已過期"),
+    ("Token not found", "找不到 token"),
     (
         "agent is not one this gateway offers; see GET /api/agents/catalog",
         "這個 Gateway 未提供該代理程式；請參閱 GET /api/agents/catalog",
@@ -96,6 +101,8 @@ pub(super) const ZH_TW: &[(&str, &str)] = &[
     ("invalid Authorization header", "Authorization 標頭無效"),
     ("invalid pairing code", "配對碼無效"),
     ("invalid token", "token 無效"),
+    ("the MCP endpoint answers only local callers on this machine", "MCP 端點只回應本機上的本地呼叫端"),
+    ("the assistant token store is unavailable", "助理 token 儲存區無法使用"),
     ("keys must contain 1 to 32 entries", "keys 必須包含 1 到 32 個項目"),
     ("missing Authorization header", "缺少 Authorization 標頭"),
     ("mode must be on, off, or toggle", "mode 必須是 on、off 或 toggle"),
@@ -144,6 +151,7 @@ pub(super) const ZH_TW: &[(&str, &str)] = &[
         "the pane is waiting on a different approval",
         "這個面板正在等待的是另一個核准",
     ),
+    ("the task request failed", "任務請求失敗"),
     ("the upload must be at most 25 MiB", "上傳的檔案最多 25 MiB"),
     (
         "this approval has no option with that number",
@@ -188,5 +196,54 @@ pub(super) const ZH_TW: &[(&str, &str)] = &[
     (
         "branch_name must not end with .lock",
         "branch_name 不得以 .lock 結尾",
+    ),
+    // -- tasks, lazygit and assets ------------------------------------------
+    (
+        "No terminal session is reachable on this computer",
+        "這台電腦上沒有可連線的終端機工作階段",
+    ),
+    (
+        "That agent is not available",
+        "該代理程式無法使用",
+    ),
+    (
+        "Only a paused or waiting task opened on a device can be confirmed",
+        "只有在裝置上開啟、已暫停或等待中的任務可以確認",
+    ),
+    (
+        "the agent could not start the task",
+        "代理程式無法啟動這個任務",
+    ),
+    (
+        "label must be at most 200 characters",
+        "label 最多 200 個字元",
+    ),
+    (
+        "goal must be non-empty and at most 32 KiB",
+        "goal 不能為空，且最多 32 KiB",
+    ),
+    (
+        "summary must be at most 32 KiB",
+        "summary 最多 32 KiB",
+    ),
+    (
+        "Unknown model for that agent. Use a model id from its catalog, or <provider_id>/<model_id>.",
+        "該代理程式沒有這個模型。請使用其目錄中的模型 id，或 <provider_id>/<model_id>。",
+    ),
+    (
+        "Unknown variant '{variant}' (the model offers: {offered}).",
+        "未知的 variant '{variant}'（這個模型提供：{offered}）。",
+    ),
+    (
+        "Install lazygit on the Gateway host",
+        "請在 Gateway 主機上安裝 lazygit",
+    ),
+    (
+        "The source pane is not in an accessible Git repository",
+        "來源面板不在可存取的 Git 存放庫中",
+    ),
+    (
+        "the asset exceeds its content size limit",
+        "檔案超過其內容大小上限",
     ),
 ];

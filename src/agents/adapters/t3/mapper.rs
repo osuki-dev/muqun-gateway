@@ -155,10 +155,20 @@ pub fn map_session(thread: &Value, projects: &HashMap<String, String>) -> Option
         .or_else(|| ms(thread, "createdAt"))
         .unwrap_or(0);
     let time_idle = thread.get("latestTurn").and_then(|t| ms(t, "completedAt"));
-    let title = s(thread, "title").unwrap_or("New thread").to_string();
+    // An untitled thread reads as the name it was created with; a task's
+    // title ignores it (`untitled_placeholder`).
+    let title = s(thread, "title")
+        .filter(|title| !title.trim().is_empty())
+        .unwrap_or(super::driver::NEW_THREAD_TITLE)
+        .to_string();
     Some(AgentSessionInfo {
         asid: AgentSessionId(id.to_string()),
         backend_session_id: String::new(),
+        runtime: None,
+        context_usage: None,
+        git_info: None,
+        agent_name: None,
+        agent_role: None,
         agent_id: String::new(),
         title,
         mode: None,
@@ -529,6 +539,7 @@ pub fn map_form(thread_id: &str, activity: &Value) -> Option<FormRequest> {
         })
         .collect();
     Some(FormRequest {
+        nonblocking: false,
         id: request_id.to_string(),
         asid: AgentSessionId(thread_id.to_string()),
         title: s(activity, "summary")

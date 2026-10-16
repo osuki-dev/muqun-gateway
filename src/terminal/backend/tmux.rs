@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsStr;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
@@ -13,9 +13,10 @@ use super::keys::{unknown_key, KeyBase, KeyChord, KeyboardVocabulary, NamedKey};
 use super::{
     Agent, AgentStatus, BackendActivity, BackendActivityStream, BackendError, BackendFuture,
     BackendKind, BackendMetadata, CreateTab, CreateWorkspace, OutputFormat, OutputSource, Pane,
-    PaneId, PaneOutput, PaneRange, ReadPane, SendTextMode, SplitDirection, SplitPane, StartAgent,
-    StartedAgent, Tab, TabId, TerminalBackend, Workspace, WorkspaceId,
+    PaneEnvVia, PaneId, PaneOutput, PaneRange, ReadPane, SendTextMode, SplitDirection, SplitPane,
+    StartAgent, StartedAgent, Tab, TabId, TerminalBackend, Workspace, WorkspaceId,
 };
+use crate::terminal::shell_word::shell_word;
 
 /// How often the topology poll runs when something is happening, and the
 /// ceiling it backs off to when nothing is.
@@ -128,6 +129,42 @@ impl TmuxBackend {
             .is_ok_and(|output| matches!(output.split_whitespace().last(), Some("on" | "always")))
     }
 
+    /// The running server's version, else the client's when no server is up
+    /// yet (a `new-session` that starts one runs this binary). None when
+    /// neither reads as a version.
+    async fn server_version(&self) -> Option<(u32, u32)> {
+        if let Ok(output) = self.output(["display-message", "-p", "#{version}"]).await {
+            if let Some(version) = tmux_version(&output) {
+                return Some(version);
+            }
+        }
+        let client = self.output(["-V"]).await.ok()?;
+        tmux_version(client.trim().strip_prefix("tmux ").unwrap_or(client.trim()))
+    }
+
+    /// `-e KEY=VALUE` flags for a pane creation, or none when there is no
+    /// `env` or this tmux is too old to take `-e` there -- the caller asked
+    /// [`TerminalBackend::applies_pane_env`] first and delivers the variables
+    /// another way. The version is only read when there is something to set.
+    async fn env_flags(
+        &self,
+        env: Option<&serde_json::Map<String, serde_json::Value>>,
+        via: PaneEnvVia,
+    ) -> Vec<String> {
+        let Some(env) = env.filter(|env| !env.is_empty()) else {
+            return Vec::new();
+        };
+        if self
+            .server_version()
+            .await
+            .is_none_or(|version| version < env_flag_min_version(via))
+        {
+            tracing::warn!("tmux is too old for -e on this pane; agent_env not set on it");
+            return Vec::new();
+        }
+        env_flags(Some(env))
+    }
+
     /// What tmux will do with a chord sent to this pane, in one process: the
     /// version, the server's `extended-keys`, and the key mode the program in
     /// the pane asked for.
@@ -170,16 +207,7 @@ impl TmuxBackend {
             .await
             .map_err(|_| BackendError::Unavailable)?;
         if !output.status.success() {
-            return Err(BackendError::Refused {
-                code: None,
-                // tmux diagnostics name commands and targets, never pane
-                // output. Clamp them before this crosses an adapter boundary.
-                message: String::from_utf8_lossy(&output.stderr)
-                    .trim()
-                    .chars()
-                    .take(240)
-                    .collect(),
-            });
+            return Err(refused(&output.stderr));
         }
         String::from_utf8(output.stdout).map_err(|_| BackendError::InvalidResponse("UTF-8 output"))
     }
@@ -625,11 +653,12 @@ impl TerminalBackend for TmuxBackend {
                 "#{pane_pid}",
                 "#{cursor_x}",
                 "#{cursor_y}",
+                "#{pid}",
             ]);
             let output = self
                 .list_output(["list-panes", "-a", "-F", &format])
                 .await?;
-            let rows = parse_rows(&output, 16, "pane")?;
+            let rows = parse_rows(&output, 17, "pane")?;
             let mut panes = Vec::with_capacity(rows.len());
             let mut unresolved = Vec::new();
             for fields in rows {
@@ -637,7 +666,12 @@ impl TerminalBackend for TmuxBackend {
                 // process named itself needs a second look, and this is the
                 // only place the pid and the pane are in the same hand.
                 let pid = fields[13].parse::<u32>().ok();
-                let pane = pane_from_fields(fields)?;
+                let server = fields[16].parse::<u32>().ok();
+                let mut pane = pane_from_fields(fields)?;
+                if let (Some(server), Some(root)) = (server, pid) {
+                    pane.history_identity =
+                        super::process_identity::pane_incarnation(server, root).await;
+                }
                 if pane.agent.is_none() {
                     if let Some(pid) = pid {
                         unresolved.push((panes.len(), pid));
@@ -868,6 +902,10 @@ impl TerminalBackend for TmuxBackend {
             if let Some(cwd) = &request.cwd {
                 args.extend(["-c".to_owned(), cwd.to_string_lossy().into_owned()]);
             }
+            args.extend(
+                self.env_flags(request.env.as_ref(), PaneEnvVia::Workspace)
+                    .await,
+            );
             let raw_id = self.output(&args).await?.trim().to_owned();
             validate_tmux_id(&raw_id, '$', "workspace")?;
             let id = WorkspaceId::new(raw_id);
@@ -947,6 +985,7 @@ impl TerminalBackend for TmuxBackend {
             if let Some(cwd) = &request.cwd {
                 args.extend(["-c".to_owned(), cwd.to_string_lossy().into_owned()]);
             }
+            args.extend(self.env_flags(request.env.as_ref(), PaneEnvVia::Tab).await);
             let raw_id = self.output(&args).await?.trim().to_owned();
             validate_tmux_id(&raw_id, '@', "tab")?;
             let id = TabId::new(raw_id);
@@ -1039,6 +1078,10 @@ impl TerminalBackend for TmuxBackend {
             if let Some(cwd) = &request.cwd {
                 args.extend(["-c".to_owned(), cwd.to_string_lossy().into_owned()]);
             }
+            args.extend(
+                self.env_flags(request.env.as_ref(), PaneEnvVia::Split)
+                    .await,
+            );
             let raw_id = self.output(&args).await?.trim().to_owned();
             validate_tmux_id(&raw_id, '%', "pane")?;
             self.get_pane(&PaneId::new(raw_id)).await
@@ -1126,6 +1169,21 @@ impl TerminalBackend for TmuxBackend {
         })
     }
 
+    fn applies_pane_env(&self, via: PaneEnvVia) -> BackendFuture<'_, bool> {
+        Box::pin(async move {
+            Ok(self
+                .server_version()
+                .await
+                .is_some_and(|version| version >= env_flag_min_version(via)))
+        })
+    }
+
+    /// The launch line is typed at a shell, and the start returns once the
+    /// agent is the pane's program, busy or not.
+    fn takes_launch_prompt(&self) -> bool {
+        true
+    }
+
     fn start_agent<'a>(&'a self, request: &'a StartAgent) -> BackendFuture<'a, StartedAgent> {
         Box::pin(async move {
             let executable = request
@@ -1137,11 +1195,7 @@ impl TerminalBackend for TmuxBackend {
                 })?;
             let mut argv = vec![executable.to_string_lossy().into_owned()];
             argv.extend(request.args.iter().cloned());
-            let command_line = argv
-                .iter()
-                .map(|argument| shell_word(argument))
-                .collect::<Vec<_>>()
-                .join(" ");
+            let command_line = launch_line(&request.env, &argv);
             // The shell command that launches the agent, delivered the way it
             // always has been.
             self.send_text(&request.pane_id, &command_line, SendTextMode::Paste)
@@ -1164,6 +1218,7 @@ impl TerminalBackend for TmuxBackend {
                             target: None,
                             argv: Some(argv),
                             instance_id: None,
+                            env_applied: true,
                         });
                     }
                 }
@@ -1201,6 +1256,7 @@ impl TerminalBackend for TmuxBackend {
 fn pane_from_fields(fields: Vec<String>) -> Result<Pane, BackendError> {
     let command = non_empty(&fields[10]);
     Ok(Pane {
+        history_identity: None,
         workspace_id: WorkspaceId::new(&fields[0]),
         tab_id: TabId::new(&fields[1]),
         id: PaneId::new(&fields[2]),
@@ -1236,12 +1292,14 @@ fn pane_from_fields(fields: Vec<String>) -> Result<Pane, BackendError> {
         // left of the viewport, which is exactly what the app wants.
         cursor_x: fields[14].parse().ok(),
         cursor_y: fields[15].parse().ok(),
+        shell_pid: fields[13].parse().ok(),
     })
 }
 
 fn agent_from_pane(pane: Pane) -> Option<Agent> {
     let kind = pane.agent.clone()?;
     Some(Agent {
+        conversation_id: None,
         instance_id: None,
         target: pane.id.as_str().to_owned(),
         pane_id: pane.id,
@@ -1251,14 +1309,9 @@ fn agent_from_pane(pane: Pane) -> Option<Agent> {
         kind: Some(kind),
         status: pane.agent_status,
         state_change_seq: None,
+        pending_user_input: None,
+        shell_pid: pane.shell_pid,
     })
-}
-
-/// Quote one argv value for the interactive shell running in a tmux pane.
-/// Values are data: they are always single-quoted and never interpreted as
-/// shell structure assembled by the adapter.
-fn shell_word(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 /// The argv that delivers a loaded buffer into a pane.
@@ -1323,14 +1376,25 @@ fn paste_buffer_args<'a>(buffer: &'a str, pane_id: &'a str, mode: SendTextMode) 
     args
 }
 
+/// tmux's refusal as a backend error. A target that does not exist (a pane,
+/// window or session closed since the caller saw it) is `InvalidTarget` --
+/// `404 backend_target_not_found`, so a client polling it retires it -- not
+/// a failure worth a warning. Anything else keeps tmux's own words, clamped:
+/// they name commands and targets, never pane output.
 fn refused(stderr: &[u8]) -> BackendError {
+    let message: String = String::from_utf8_lossy(stderr)
+        .trim()
+        .chars()
+        .take(240)
+        .collect();
+    for kind in ["pane", "window", "session"] {
+        if message.starts_with(&format!("can't find {kind}")) {
+            return BackendError::InvalidTarget(kind);
+        }
+    }
     BackendError::Refused {
         code: None,
-        message: String::from_utf8_lossy(stderr)
-            .trim()
-            .chars()
-            .take(240)
-            .collect(),
+        message,
     }
 }
 
@@ -1417,6 +1481,46 @@ fn survives_legacy_encoding(chord: &KeyChord) -> bool {
                 && !(without_alt.shift && without_alt.base == KeyBase::Named(Tab))
         }
     }
+}
+
+/// The first tmux whose creation command takes `-e`: 3.2 for `new-session`,
+/// 3.0 for `new-window` and `split-window`.
+fn env_flag_min_version(via: PaneEnvVia) -> (u32, u32) {
+    match via {
+        PaneEnvVia::Workspace => (3, 2),
+        PaneEnvVia::Tab | PaneEnvVia::Split => (3, 0),
+    }
+}
+
+/// `-e KEY=VALUE` for each variable. The version gate is the caller's
+/// ([`TmuxBackend::env_flags`]).
+fn env_flags(env: Option<&serde_json::Map<String, serde_json::Value>>) -> Vec<String> {
+    env.into_iter()
+        .flatten()
+        .flat_map(|(key, value)| {
+            let value = match value {
+                serde_json::Value::String(text) => text.clone(),
+                other => other.to_string(),
+            };
+            ["-e".to_owned(), format!("{key}={value}")]
+        })
+        .collect()
+}
+
+/// The line typed to launch an agent. Variables the pane was not created with
+/// ride in front as `env KEY=VALUE …`: `env` is a program, not shell syntax,
+/// so the line means the same in sh, bash, zsh and fish.
+fn launch_line(env: &BTreeMap<String, String>, argv: &[String]) -> String {
+    let mut words = Vec::with_capacity(env.len() + argv.len() + 1);
+    if !env.is_empty() {
+        words.push("env".to_owned());
+        words.extend(
+            env.iter()
+                .map(|(key, value)| shell_word(&format!("{key}={value}"))),
+        );
+    }
+    words.extend(argv.iter().map(|argument| shell_word(argument)));
+    words.join(" ")
 }
 
 /// A key name from a shortcut table, in tmux's spelling, given whether the
@@ -1891,6 +1995,30 @@ fn agents_in_listing(listing: &str, pane_pids: &[u32]) -> HashMap<u32, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_agent_launch_line_carries_env_only_when_there_is_some() {
+        let argv = ["/bin/codex".to_owned(), "-c".to_owned(), "x='y'".to_owned()];
+        assert_eq!(
+            launch_line(&BTreeMap::new(), &argv),
+            r#"'/bin/codex' '-c' 'x='\''y'\'''"#
+        );
+        let env = BTreeMap::from([
+            ("HTTPS_PROXY".to_owned(), "http://127.0.0.1:7890".to_owned()),
+            ("NO_PROXY".to_owned(), "a b".to_owned()),
+        ]);
+        assert_eq!(
+            launch_line(&env, &argv[..1]),
+            "env 'HTTPS_PROXY=http://127.0.0.1:7890' 'NO_PROXY=a b' '/bin/codex'"
+        );
+    }
+
+    #[test]
+    fn pane_env_becomes_tmux_dash_e_flags() {
+        assert!(env_flags(None).is_empty());
+        let env = serde_json::json!({ "A": "1", "B": "x=y" });
+        assert_eq!(env_flags(env.as_object()), ["-e", "A=1", "-e", "B=x=y"]);
+    }
     use tokio_stream::StreamExt as _;
 
     #[test]
@@ -1923,6 +2051,7 @@ mod tests {
         assert_eq!(pane.agent.as_deref(), Some("claude"));
         assert_eq!(pane.cursor_x, Some(17));
         assert_eq!(pane.cursor_y, Some(5));
+        assert_eq!(pane.shell_pid, Some(4242));
         assert_eq!(pane.cwd, Some(PathBuf::from("/work/project")));
         assert_eq!(pane.max_offset_from_bottom, Some(12));
         assert_eq!(pane.viewport_rows, Some(41));
@@ -2569,13 +2698,6 @@ mod tests {
     }
 
     #[test]
-    fn agent_arguments_are_shell_quoted_as_single_words() {
-        assert_eq!(shell_word("plain"), "'plain'");
-        assert_eq!(shell_word("two words"), "'two words'");
-        assert_eq!(shell_word("a'b;$(touch nope)"), "'a'\\''b;$(touch nope)'");
-    }
-
-    #[test]
     fn an_absent_tmux_server_is_an_empty_topology() {
         assert!(means_no_tmux_server(
             "no server running on /tmp/tmux-1000/default"
@@ -2596,6 +2718,20 @@ mod tests {
             "error connecting to /tmp/theirs.sock (Permission denied)"
         ));
         assert!(!means_no_tmux_server("can't find pane: %99"));
+        // A target gone since it was listed: not found, not a failure.
+        for (stderr, gone) in [
+            ("can't find pane: %32", true),
+            ("can't find window: @4", true),
+            ("can't find session: work", true),
+            ("unknown command: x", false),
+        ] {
+            let error = refused(stderr.as_bytes());
+            assert_eq!(
+                matches!(error, BackendError::InvalidTarget(_)),
+                gone,
+                "{stderr}"
+            );
+        }
     }
 
     /// The exact masking the test above documents, from the other side:
@@ -2696,6 +2832,65 @@ done
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         TmuxBackend::with_binary(path, None)
+    }
+
+    /// A tmux whose server reports `server` (empty: no server) and whose
+    /// client reports `client`.
+    #[cfg(unix)]
+    fn versioned_tmux(server: &str, client: &str) -> TmuxBackend {
+        use std::os::unix::fs::PermissionsExt as _;
+        let script = format!(
+            "#!/bin/sh\ncase \"$1\" in\n  display-message) [ -n '{server}' ] || exit 1; printf '%s\\n' '{server}' ;;\n  -V) printf 'tmux %s\\n' '{client}' ;;\nesac\n"
+        );
+        let path = crate::short_test_socket("gw-tmux-ver").with_extension("sh");
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::process::Command::new(&path)
+            .arg("-V")
+            .output()
+            .is_err()
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fake tmux never became executable"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        TmuxBackend::with_binary(path, None)
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn dash_e_is_only_used_where_this_tmux_takes_it() {
+        let env = serde_json::json!({ "HTTPS_PROXY": "http://127.0.0.1:7890" });
+        let env = env.as_object();
+        let flags = ["-e", "HTTPS_PROXY=http://127.0.0.1:7890"];
+
+        let new = versioned_tmux("3.4", "3.4");
+        for via in [PaneEnvVia::Workspace, PaneEnvVia::Tab, PaneEnvVia::Split] {
+            assert!(new.applies_pane_env(via).await.unwrap());
+            assert_eq!(new.env_flags(env, via).await, flags);
+        }
+        // Nothing to set: no flags, whatever the version.
+        assert!(new.env_flags(None, PaneEnvVia::Tab).await.is_empty());
+
+        // 3.1: windows and splits take -e, a new session does not.
+        let mid = versioned_tmux("3.1c", "3.1c");
+        assert!(!mid.applies_pane_env(PaneEnvVia::Workspace).await.unwrap());
+        assert!(mid.env_flags(env, PaneEnvVia::Workspace).await.is_empty());
+        assert!(mid.applies_pane_env(PaneEnvVia::Split).await.unwrap());
+        assert_eq!(mid.env_flags(env, PaneEnvVia::Tab).await, flags);
+
+        let old = versioned_tmux("2.9a", "2.9a");
+        assert!(!old.applies_pane_env(PaneEnvVia::Tab).await.unwrap());
+        assert!(old.env_flags(env, PaneEnvVia::Split).await.is_empty());
+
+        // No server yet: the client binary's version decides.
+        let fresh = versioned_tmux("", "3.5a");
+        assert!(fresh.applies_pane_env(PaneEnvVia::Workspace).await.unwrap());
+        let unreadable = versioned_tmux("", "master");
+        assert!(!unreadable.applies_pane_env(PaneEnvVia::Tab).await.unwrap());
     }
 
     #[cfg(unix)]
@@ -2937,6 +3132,7 @@ done
                 cwd: Some(std::env::temp_dir()),
                 label: Some("gateway-contract".into()),
                 focus: true,
+                env: None,
             })
             .await
             .unwrap();
@@ -3206,6 +3402,7 @@ done
                 cwd: Some(std::env::temp_dir()),
                 label: Some("gateway-seeded".into()),
                 focus: true,
+                env: None,
             })
             .await
             .unwrap();
@@ -3222,6 +3419,7 @@ done
                 cwd: Some(std::env::temp_dir()),
                 label: Some("gateway-late".into()),
                 focus: true,
+                env: None,
             })
             .await
             .unwrap();
@@ -3271,6 +3469,7 @@ done
                 cwd: Some(std::env::temp_dir()),
                 label: Some("gateway-nvim".into()),
                 focus: true,
+                env: None,
             })
             .await
             .unwrap();
@@ -3620,6 +3819,7 @@ done
                 cwd: Some(std::env::temp_dir()),
                 label: Some("gateway-contract".into()),
                 focus: true,
+                env: None,
             })
             .await
             .unwrap();
@@ -3639,6 +3839,7 @@ done
                 cwd: Some(std::env::temp_dir()),
                 label: Some("second".into()),
                 focus: false,
+                env: None,
             })
             .await
             .unwrap();

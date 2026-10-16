@@ -27,13 +27,14 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 pub(crate) fn test_config(token: &str) -> Config {
     Config {
+        history: Default::default(),
         server_id: "server-1".into(),
         label: "test".into(),
         autostart_backends: Vec::new(),
         listen: "127.0.0.1:23100".into(),
         public_url: "http://127.0.0.1:23100".into(),
         token_hash: hash_token(token),
-        transport_encryption: TransportEncryptionMode::Required,
+        transport_encryption: TransportEncryptionMode::Disabled,
         dev_unauthenticated: false,
         sessions: vec![SessionConfig {
             id: "default".into(),
@@ -42,16 +43,55 @@ pub(crate) fn test_config(token: &str) -> Config {
             backend: BackendKind::Herdr,
         }],
         agent_commands: BTreeMap::new(),
+        agent_launch_args: BTreeMap::new(),
+        agent_env: Default::default(),
+        agent_trust_folders: true,
         rich_agent_pushes: false,
         opencode: agents::OpencodeConfig::default(),
         deepseek: agents::DeepseekConfig::default(),
         t3: agents::T3Config::default(),
+        codex: agents::runtime::CodexConfig {
+            enabled: false,
+            binary: None,
+        },
+        agent_runtime: crate::platform::config::AgentRuntimeConfig { enabled: false },
+        store: crate::platform::config::StoreConfig::default(),
+        mcp: crate::platform::config::McpConfig::default(),
+        fleet: Default::default(),
     }
+}
+
+/// The transport key the test fixtures give a device whose token hashes to
+/// `token_hash`: derived, so a header builder that knows only the token can
+/// produce the proof the middleware would have set after opening a sealed
+/// request (`sealed_bearer_headers`).
+pub(crate) fn test_transport_key_for(token_hash: &str) -> String {
+    use sha2::{Digest as _, Sha256};
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(token_hash.as_bytes()))
+}
+
+/// `device`, paired while encryption was on: it holds the fixture transport
+/// key for its token and is served in `required` mode only with the proof
+/// `sealed_bearer_headers` carries.
+pub(crate) fn sealed(mut device: DeviceRecord) -> DeviceRecord {
+    device.transport_key = Some(test_transport_key_for(&device.token_hash));
+    device
+}
+
+/// A state in `transport_encryption: required`: `test_state` is token-only
+/// (`disabled`), the mode a device without a transport key can still be
+/// served in. Devices here need to be `sealed` and the requests to carry
+/// `sealed_bearer_headers`.
+pub(crate) fn required_test_state(admin_token: &str, devices: Vec<DeviceRecord>) -> AppState {
+    let mut state = test_state(admin_token, devices);
+    state.config.transport_encryption = TransportEncryptionMode::Required;
+    state
 }
 
 pub(crate) fn test_device(id: &str, token: &str) -> DeviceRecord {
     DeviceRecord {
         id: id.into(),
+        kind: DeviceKind::App,
         name: format!("device {id}"),
         token_hash: hash_token(token),
         transport_key: None,
@@ -59,13 +99,78 @@ pub(crate) fn test_device(id: &str, token: &str) -> DeviceRecord {
         // Fresh enough that require_device will not flush to disk.
         last_seen_unix_ms: now_unix_ms(),
         install_id: None,
+        server_id: None,
     }
+}
+
+/// A device record for another of the owner's gateways.
+pub(crate) fn test_peer_device(id: &str, token: &str) -> DeviceRecord {
+    DeviceRecord {
+        kind: DeviceKind::Gateway,
+        name: format!("gateway {id}"),
+        ..test_device(id, token)
+    }
+}
+
+/// `state` as the computer `id` named `label`.
+pub(crate) fn named(mut state: AppState, id: &str, label: &str) -> AppState {
+    state.config.server_id = id.into();
+    state.config.label = label.into();
+    state
+}
+
+/// The routes one gateway calls on another, behind the transport middleware
+/// the gateway runs.
+pub(crate) fn peer_router(state: AppState) -> Router {
+    let app = crate::platform::routes::mount(Router::new());
+    let app = crate::connectivity::routes::mount(app);
+    let app = crate::agents::ws_routes::mount(app);
+    let app = crate::fleet::routes::mount(app);
+    let app = crate::fleet::peer_routes::mount(app);
+    crate::tasks::routes::mount(app)
+        .layer(axum::middleware::from_fn(
+            crate::platform::server::envelope_compression_gate,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            crate::platform::server::encrypted_transport,
+        ))
+        .with_state(state)
+}
+
+/// `router` on a loopback port; its base URL.
+pub(crate) async fn serve(router: Router) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    format!("http://{addr}")
 }
 
 pub(crate) fn test_state(admin_token: &str, devices: Vec<DeviceRecord>) -> AppState {
     let scrollback = Arc::new(Mutex::new(scrollback::ScrollbackStore::default()));
+    let db = platform::store::sqlite::SqliteStore::open(
+        &test_state_dir().join(format!("{}.sqlite3", uuid::Uuid::new_v4())),
+        None,
+        platform::store::sqlite::ALL_MIGRATIONS,
+    )
+    .expect("the test store opens");
+    let config = test_config(admin_token);
+    let task_events = tokio::sync::broadcast::channel(crate::tasks::events::TASK_EVENT_CAPACITY).0;
+    let presence = Arc::new(crate::fleet::peers::PeerPresence::default());
+    let tasks = Arc::new(crate::tasks::service::TaskService::new(
+        Arc::new(crate::tasks::store_sqlite::SqliteTaskStore::new(db.clone())),
+        task_events.clone(),
+        config.server_id.clone(),
+        presence.clone(),
+    ));
+    let peers = Arc::new(crate::fleet::peers::PeerService::new(
+        Arc::new(crate::fleet::peers_sqlite::SqlitePeerStore::new(db.clone())),
+        &crate::platform::config::FleetConfig::default(),
+        None,
+        presence,
+    ));
     AppState {
-        config: test_config(admin_token),
+        config,
         pending_pairing: Arc::new(Mutex::new(None)),
         pairing_requests: Arc::new(Mutex::new(VecDeque::new())),
         push_tokens: Arc::new(Mutex::new(Vec::new())),
@@ -83,6 +188,12 @@ pub(crate) fn test_state(admin_token: &str, devices: Vec<DeviceRecord>) -> AppSt
         ws_connections: Arc::new(agents::ws_routes::WsRegistry::default()),
         generation: new_generation(),
         message_images: Arc::default(),
+        mcp_tokens: Arc::new(crate::mcp::tokens_sqlite::SqliteTokenStore::new(db.clone())),
+        fleet: Arc::default(),
+        peers,
+        tasks,
+        task_events,
+        db,
     }
 }
 
@@ -91,6 +202,18 @@ pub(crate) fn bearer_headers(token: &str) -> HeaderMap {
     headers.insert(
         axum::http::header::AUTHORIZATION,
         HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+    );
+    headers
+}
+
+/// What a handler sees for a `sealed` device's request once the transport
+/// middleware has opened the envelope: the bearer token and the proof header
+/// only the middleware may set.
+pub(crate) fn sealed_bearer_headers(token: &str) -> HeaderMap {
+    let mut headers = bearer_headers(token);
+    headers.insert(
+        axum::http::HeaderName::from_static(TRANSPORT_PROOF_HEADER),
+        HeaderValue::from_str(&test_transport_key_for(&hash_token(token))).unwrap(),
     );
     headers
 }
@@ -159,12 +282,14 @@ pub(crate) fn error_body(refusal: &(StatusCode, Json<Value>)) -> Value {
 pub(crate) fn device_fixture(id: &str) -> DeviceRecord {
     DeviceRecord {
         id: id.into(),
+        kind: DeviceKind::App,
         name: id.into(),
         token_hash: authority::hash_token(id),
         transport_key: None,
         paired_unix_ms: 1,
         last_seen_unix_ms: 1,
         install_id: None,
+        server_id: None,
     }
 }
 
@@ -172,12 +297,15 @@ pub(crate) fn test_pending_pairing(created_unix_ms: u128) -> Option<PendingPairi
     let code = "2345-6789".to_owned();
     Some(PendingPairing {
         request_id: "request-1".into(),
+        kind: Default::default(),
         device_name: "Muqun test".into(),
         install_id: None,
+        server_id: None,
         code_hash: hash_token(&code),
         code,
         created_unix_ms,
         failed_attempts: 0,
+        minted_by: None,
     })
 }
 
@@ -279,6 +407,40 @@ pub(crate) fn asset_test_dir(name: &str) -> PathBuf {
     // canonicalized once here: every check downstream compares canonical
     // paths, and a test must not be the one place that does not.
     std::fs::canonicalize(&dir).unwrap()
+}
+
+/// An owned private fixture directory whose canonical socket path fits sun_path.
+/// Only socket fixtures fall back to /tmp; asset fixtures keep their TMPDIR.
+pub(crate) struct TestSocket {
+    dir: PathBuf,
+    pub(crate) path: PathBuf,
+}
+
+impl TestSocket {
+    pub(crate) fn new() -> Self {
+        use std::os::unix::{ffi::OsStrExt, fs::DirBuilderExt};
+
+        // sun_path includes its terminating NUL: 104 bytes on macOS, 108 on Linux.
+        let max_bytes = if cfg!(target_os = "macos") { 103 } else { 107 };
+        let name = format!("s-{}", uuid::Uuid::new_v4().simple());
+        for base in [std::env::temp_dir(), PathBuf::from("/tmp")] {
+            let dir = base.canonicalize().unwrap().join(&name);
+            let path = dir.join("h");
+            if path.as_os_str().as_bytes().len() > max_bytes {
+                continue;
+            }
+            // create, not create_dir_all: never adopt a directory owned by another fixture.
+            std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+            return Self { dir, path };
+        }
+        panic!("no temporary directory fits the test Unix socket path");
+    }
+}
+
+impl Drop for TestSocket {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
 }
 
 pub(crate) fn test_asset_entry(path: &FsPath, root: &FsPath, modified_unix_ms: u128) -> AssetEntry {
@@ -476,7 +638,14 @@ pub(crate) fn approval_data_menu(
 /// of polls.
 pub(crate) struct FakeHerdr {
     pub(crate) socket_path: PathBuf,
+    socket: TestSocket,
+    serving: tokio::task::JoinHandle<()>,
     pub(crate) calls: Arc<Mutex<Vec<Value>>>,
+    /// What `pane.list` answers once set (entries may carry a test-only
+    /// `shell_pid` that `pane.process_info` answers with); unset, both
+    /// methods answer a bare `ok` as before.
+    panes: Arc<Mutex<Option<Value>>>,
+    agents: Arc<Mutex<Option<Value>>>,
 }
 
 impl FakeHerdr {
@@ -484,15 +653,17 @@ impl FakeHerdr {
     /// state sequence to move; `None` makes `agent.list` come back empty,
     /// which is a pane running no agent Herdr knows.
     pub(crate) fn start(screens: Vec<&str>, advance_after: Option<usize>) -> Self {
-        let socket_path = std::env::temp_dir().join(format!(
-            "herdr-submit-{}.sock",
-            uuid::Uuid::new_v4().simple()
-        ));
+        let socket = TestSocket::new();
+        let socket_path = socket.path.clone();
         let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
         let calls: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
         let recorded = Arc::clone(&calls);
+        let panes: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
+        let listed = Arc::clone(&panes);
+        let agents: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
+        let listed_agents = agents.clone();
         let screens: Vec<String> = screens.into_iter().map(str::to_owned).collect();
-        tokio::spawn(async move {
+        let serving = tokio::spawn(async move {
             let mut reads = 0usize;
             let mut enters = 0usize;
             while let Ok((stream, _)) = listener.accept().await {
@@ -503,8 +674,17 @@ impl FakeHerdr {
                 }
                 let request: Value = serde_json::from_str(&line).unwrap();
                 let method = request["method"].as_str().unwrap_or_default().to_owned();
-                let result = match method.as_str() {
-                    "pane.read" => {
+                let panes = listed.lock().unwrap().clone();
+                let result = match (method.as_str(), panes) {
+                    ("pane.list", Some(panes)) => json!({ "panes": panes }),
+                    ("pane.process_info", Some(panes)) => {
+                        let pane = panes.as_array().and_then(|all| {
+                            all.iter()
+                                .find(|p| p["pane_id"] == request["params"]["pane_id"])
+                        });
+                        json!({ "process_info": { "shell_pid": pane.map(|p| p["shell_pid"].clone()) } })
+                    }
+                    ("pane.read", _) => {
                         let screen = screens
                             .get(reads)
                             .or_else(|| screens.last())
@@ -513,7 +693,10 @@ impl FakeHerdr {
                         reads += 1;
                         json!({ "read": { "text": screen, "revision": reads } })
                     }
-                    "agent.list" => {
+                    ("agent.list", _) if listed_agents.lock().unwrap().is_some() => {
+                        json!({"agents": listed_agents.lock().unwrap().clone().unwrap()})
+                    }
+                    ("agent.list", _) => {
                         let agents = match advance_after {
                             None => json!([]),
                             Some(threshold) => {
@@ -531,11 +714,19 @@ impl FakeHerdr {
                         };
                         json!({ "agents": agents })
                     }
-                    "pane.send_keys" => {
+                    ("pane.send_keys", _) => {
                         enters += 1;
                         json!({ "ok": true })
                     }
-                    "pane.get" => json!({
+                    // One new tab with one pane, for `exec.run`.
+                    ("tab.create", _) => json!({
+                        "tab": {
+                            "tab_id": "w1:t9",
+                            "workspace_id": "w1",
+                            "active_pane_id": "w1:p9",
+                        }
+                    }),
+                    ("pane.get", _) => json!({
                         "pane": {
                             "pane_id": request["params"]["pane_id"],
                             "workspace_id": "w1",
@@ -552,7 +743,23 @@ impl FakeHerdr {
                 stream.flush().await.unwrap();
             }
         });
-        Self { socket_path, calls }
+        Self {
+            socket_path,
+            socket,
+            serving,
+            calls,
+            panes,
+            agents,
+        }
+    }
+
+    pub(crate) fn set_agents(&self, agents: Value) {
+        *self.agents.lock().unwrap() = Some(agents);
+    }
+
+    /// Answer `pane.list` (and `pane.process_info`) from `panes` from now on.
+    pub(crate) fn set_panes(&self, panes: Value) {
+        *self.panes.lock().unwrap() = Some(panes);
     }
 
     pub(crate) fn session(&self) -> SessionConfig {
@@ -607,6 +814,7 @@ pub(crate) fn repainting_screens() -> Vec<String> {
 /// live tmux server.
 pub(crate) struct FakePaneListHerdr {
     pub(crate) socket_path: PathBuf,
+    panes: Arc<Mutex<Value>>,
 }
 
 impl FakePaneListHerdr {
@@ -616,6 +824,8 @@ impl FakePaneListHerdr {
             uuid::Uuid::new_v4().simple()
         ));
         let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+        let panes = Arc::new(Mutex::new(panes));
+        let live = Arc::clone(&panes);
         tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
                 let mut reader = BufReader::new(stream);
@@ -624,18 +834,31 @@ impl FakePaneListHerdr {
                     continue;
                 }
                 let request: Value = serde_json::from_str(&line).unwrap_or_default();
-                let response = json!({
-                    "id": request["id"],
-                    "result": { "panes": panes.clone() }
-                })
-                .to_string();
+                let panes = live.lock().unwrap().clone();
+                // `pane.process_info` answers with the `shell_pid` the pane
+                // entry carries (a test-only field `pane.list` consumers ignore).
+                let result = if request["method"] == "pane.process_info" {
+                    let pane = panes.as_array().and_then(|all| {
+                        all.iter()
+                            .find(|p| p["pane_id"] == request["params"]["pane_id"])
+                    });
+                    json!({ "process_info": { "shell_pid": pane.map(|p| p["shell_pid"].clone()) } })
+                } else {
+                    json!({ "panes": panes })
+                };
+                let response = json!({ "id": request["id"], "result": result }).to_string();
                 let mut stream = reader.into_inner();
                 let _ = stream.write_all(response.as_bytes()).await;
                 let _ = stream.write_all(b"\n").await;
                 let _ = stream.flush().await;
             }
         });
-        Self { socket_path }
+        Self { socket_path, panes }
+    }
+
+    /// Replace what `pane.list` answers from now on (a pane closing).
+    pub(crate) fn set_panes(&self, panes: Value) {
+        *self.panes.lock().unwrap() = panes;
     }
 
     pub(crate) fn session(&self, id: &str) -> SessionConfig {
@@ -677,6 +900,27 @@ pub(crate) fn liveness_session(id: &str, backend: BackendKind) -> SessionConfig 
     }
 }
 
+/// `pairing.json` in the test config directory, written once per process:
+/// what the pairing routes seal a QR-style claim with. Answers its current
+/// transport key (the routes rotate it after a sealed claim).
+pub(crate) fn test_pairing_transport_key() -> String {
+    let path = config_dir().unwrap().join(PAIRING_FILE);
+    if !path.exists() {
+        let pairing = PairingFile {
+            payload: PairingPayload {
+                kind: "muqun-gateway".into(),
+                server_id: "server-1".into(),
+                label: "test".into(),
+                url: "http://127.0.0.1:23100".into(),
+                token: "admin".into(),
+                transport_key: generate_token(),
+            },
+        };
+        write_secret_file(&path, &serde_json::to_vec(&pairing).unwrap()).unwrap();
+    }
+    read_pairing_file().unwrap().payload.transport_key
+}
+
 pub(crate) fn write_test_install(dir: &std::path::Path, server_id: &str, token: &str) {
     std::fs::create_dir_all(dir).unwrap();
     let mut config = test_config(token);
@@ -705,17 +949,121 @@ pub(crate) const FAKE_AGENT_SEQ: u64 = 100;
 
 impl Drop for FakeHerdr {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.socket_path);
+        self.serving.abort();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::{ffi::OsStrExt, fs::PermissionsExt};
+
+    #[tokio::test]
+    async fn socket_fixtures_bind_and_clean_up_with_a_long_tmpdir() {
+        const CHILD: &str = "MUQUN_TEST_LONG_SOCKET_TMPDIR";
+        if std::env::var_os(CHILD).is_some() {
+            let temp = std::env::temp_dir().canonicalize().unwrap();
+            assert!(temp.as_os_str().as_bytes().len() > 108);
+            let socket = TestSocket::new();
+            let max_bytes = if cfg!(target_os = "macos") { 103 } else { 107 };
+            assert!(socket.path.as_os_str().as_bytes().len() <= max_bytes);
+            assert_eq!(socket.dir.canonicalize().unwrap(), socket.dir);
+            assert_eq!(
+                std::fs::metadata(&socket.dir).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            let second = TestSocket::new();
+            assert_ne!(socket.dir, second.dir);
+            let listener = tokio::net::UnixListener::bind(&socket.path).unwrap();
+            let client = tokio::net::UnixStream::connect(&socket.path).await.unwrap();
+            let (accepted, _) = listener.accept().await.unwrap();
+            drop((client, accepted, listener));
+            let dir = socket.dir.clone();
+            drop(socket);
+            assert!(!dir.exists());
+            assert!(
+                second.dir.exists(),
+                "cleanup must not remove another fixture"
+            );
+            let fake = FakeHerdr::start(vec!["synthetic screen"], None);
+            let fake_dir = fake.socket.dir.clone();
+            assert!(fake.socket_path.as_os_str().as_bytes().len() <= max_bytes);
+            assert_eq!(
+                read_output(&output_state(&fake), 1).await,
+                "synthetic screen"
+            );
+            drop(fake);
+            assert!(!fake_dir.exists());
+            return;
+        }
+
+        let root = asset_test_dir("long-socket-tmpdir");
+        // A symlink and multibyte component also exercise canonical byte length.
+        let long = root.join("é".repeat(60));
+        let alias = root.join("alias");
+        std::fs::create_dir(&long).unwrap();
+        std::os::unix::fs::symlink(&long, &alias).unwrap();
+        let outputs: Vec<_> = [
+            "test_support::tests::socket_fixtures_bind_and_clean_up_with_a_long_tmpdir",
+            "tasks::service::tests::terminal_start_retries_only_before_a_typed_goal_can_be_delivered",
+        ].into_iter().map(|test| {
+            ProcessCommand::new(std::env::current_exe().unwrap())
+                .args(["--exact", test, "--nocapture"])
+                .env(CHILD, "1")
+                .env("TMPDIR", &alias)
+                .output().unwrap()
+        }).collect();
+        std::fs::remove_dir_all(root).unwrap();
+        for output in outputs {
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        }
     }
 }
 
 /// An agent that answers from canned data, for route and service
-/// tests. `failing` makes every read error.
+/// tests. `failing` makes every read error. `calls` records the writes it
+/// was asked for (`create_session`, `send_prompt`, `interrupt`), and is shared
+/// so a test can read it after the agent moved into a manager.
 pub(crate) struct FakeAgent {
     pub kind: &'static str,
     pub sessions: Vec<agents::domain::AgentSessionInfo>,
     pub failing: bool,
     pub catalog: agents::domain::AgentCatalog,
+    pub timeline: Vec<agents::domain::TimelineItem>,
+    /// A session's own timeline, in place of `timeline`, by asid.
+    pub session_timelines: HashMap<String, Vec<agents::domain::TimelineItem>>,
+    /// Permission requests `get_pending_permissions` reports, per their asid.
+    /// Shared, so a test can answer them after the agent moved.
+    pub permissions: Arc<Mutex<Vec<agents::domain::PermissionRequest>>>,
+    pub calls: Arc<Mutex<Vec<String>>>,
+    /// The model each `create_session` was asked for.
+    pub created_with: Arc<Mutex<Vec<Option<agents::domain::ModelRef>>>>,
+    /// The text of every prompt sent.
+    pub prompts: Arc<Mutex<Vec<String>>>,
+    /// The attachments every prompt carried.
+    pub attached: Arc<Mutex<Vec<Vec<String>>>>,
+    /// Sessions answered the way OpenCode answers a deleted one: a plain
+    /// HTTP 404 rather than `SessionNotFound`.
+    pub http_404: Vec<String>,
+    pub session_deletion: bool,
+    /// An agent whose service takes MCP servers at runtime.
+    pub mcp: Option<Arc<Mutex<FakeMcp>>>,
+}
+
+/// A fake agent service's MCP registration.
+#[derive(Default)]
+pub(crate) struct FakeMcp {
+    pub connected: bool,
+    /// Refuse the next registrations.
+    pub refuse: bool,
+    /// How many registrations it took.
+    pub added: usize,
 }
 
 impl FakeAgent {
@@ -725,7 +1073,26 @@ impl FakeAgent {
             sessions: Vec::new(),
             failing: false,
             catalog: Default::default(),
+            timeline: Vec::new(),
+            session_timelines: HashMap::new(),
+            permissions: Arc::default(),
+            calls: Arc::default(),
+            created_with: Arc::default(),
+            prompts: Arc::default(),
+            attached: Arc::default(),
+            http_404: Vec::new(),
+            session_deletion: false,
+            mcp: None,
         }
+    }
+
+    pub fn with_timeline(mut self, timeline: Vec<agents::domain::TimelineItem>) -> Self {
+        self.timeline = timeline;
+        self
+    }
+
+    fn record(&self, call: &str) {
+        self.calls.lock().unwrap().push(call.to_string());
     }
 
     pub fn with_sessions(mut self, sessions: &[(&str, u64)]) -> Self {
@@ -733,6 +1100,25 @@ impl FakeAgent {
             .iter()
             .map(|(asid, updated_ms)| fake_session(asid, *updated_ms))
             .collect();
+        self
+    }
+
+    /// Sessions with parents: `(asid, parent, updated_ms)`. `list_sessions`
+    /// honours the parent filter as every real adapter does.
+    pub fn with_session_tree(mut self, sessions: &[(&str, Option<&str>, u64)]) -> Self {
+        self.sessions = sessions
+            .iter()
+            .map(|(asid, parent, updated_ms)| {
+                let mut session = fake_session(asid, *updated_ms);
+                session.parent_id = parent.map(str::to_owned);
+                session
+            })
+            .collect();
+        self
+    }
+
+    pub fn with_session_deletion(mut self) -> Self {
+        self.session_deletion = true;
         self
     }
 
@@ -764,6 +1150,55 @@ pub(crate) fn fake_session(asid: &str, updated_ms: u64) -> agents::domain::Agent
 }
 
 impl agents::ports::agent::AgentPort for FakeAgent {
+    fn adds_mcp_servers(&self) -> bool {
+        self.mcp.is_some()
+    }
+
+    fn mcp_server_connected<'a>(
+        &'a self,
+        _name: &'a str,
+        _directory: Option<&'a str>,
+    ) -> agents::ports::agent::AgentFuture<'a, bool> {
+        let connected = self
+            .mcp
+            .as_ref()
+            .is_some_and(|mcp| mcp.lock().unwrap().connected);
+        Box::pin(async move { Ok(connected) })
+    }
+
+    fn remove_session_instruction<'a>(
+        &'a self,
+        session_id: &'a str,
+        key: &'a str,
+    ) -> agents::ports::agent::AgentFuture<'a, ()> {
+        self.record(&format!("remove_instruction {session_id} {key}"));
+        Box::pin(async { Ok(()) })
+    }
+
+    fn add_mcp_server<'a>(
+        &'a self,
+        _name: &'a str,
+        _config: &'a serde_json::Value,
+        _directory: Option<&'a str>,
+    ) -> agents::ports::agent::AgentFuture<'a, ()> {
+        let outcome = match &self.mcp {
+            Some(mcp) => {
+                let mut mcp = mcp.lock().unwrap();
+                if mcp.refuse {
+                    Err(agents::ports::agent::AgentError::RequestFailed(
+                        "HTTP 400: Authorization Bearer secret-token".into(),
+                    ))
+                } else {
+                    mcp.connected = true;
+                    mcp.added += 1;
+                    Ok(())
+                }
+            }
+            None => self.fail(),
+        };
+        Box::pin(async move { outcome })
+    }
+
     fn kind(&self) -> &'static str {
         self.kind
     }
@@ -789,28 +1224,57 @@ impl agents::ports::agent::AgentPort for FakeAgent {
     }
     fn list_sessions<'a>(
         &'a self,
-        _query: &'a agents::domain::SessionQuery,
+        query: &'a agents::domain::SessionQuery,
     ) -> agents::ports::agent::AgentFuture<'a, Vec<agents::domain::AgentSessionInfo>> {
         Box::pin(async move {
             if self.failing {
                 return self.fail();
             }
-            Ok(self.sessions.clone())
+            self.record(&format!(
+                "list_sessions parent={}",
+                query.parent_id.as_deref().unwrap_or("-")
+            ));
+            Ok(self
+                .sessions
+                .iter()
+                .filter(|session| query.keeps_parent(session.parent_id.as_deref()))
+                .cloned()
+                .collect())
         })
     }
     fn create_session<'a>(
         &'a self,
         directory: Option<&'a str>,
-        _model: Option<&'a agents::domain::ModelRef>,
+        model: Option<&'a agents::domain::ModelRef>,
         _mode: Option<&'a str>,
     ) -> agents::ports::agent::AgentFuture<'a, agents::domain::AgentSessionInfo> {
         Box::pin(async move {
             if self.failing {
                 return self.fail();
             }
+            self.record("create_session");
+            self.created_with.lock().unwrap().push(model.cloned());
             let mut session = fake_session(&format!("{}_new", self.kind), 1);
             session.directory = directory.map(str::to_string);
             Ok(session)
+        })
+    }
+    fn fork_session<'a>(
+        &'a self,
+        session_id: &'a str,
+        message_id: Option<&'a str>,
+    ) -> agents::ports::agent::AgentFuture<'a, agents::domain::AgentSessionInfo> {
+        Box::pin(async move {
+            let mut info = self.get_session(session_id).await?;
+            if self.failing {
+                return self.fail();
+            }
+            self.record(&format!(
+                "fork_session {session_id} {}",
+                message_id.unwrap_or("whole")
+            ));
+            info.asid = agents::domain::AgentSessionId(format!("{}_fork", self.kind));
+            Ok(info)
         })
     }
     fn get_session<'a>(
@@ -818,6 +1282,11 @@ impl agents::ports::agent::AgentPort for FakeAgent {
         session_id: &'a str,
     ) -> agents::ports::agent::AgentFuture<'a, agents::domain::AgentSessionInfo> {
         Box::pin(async move {
+            if self.http_404.iter().any(|asid| asid == session_id) {
+                return Err(agents::ports::agent::AgentError::RequestFailed(
+                    "HTTP 404 Not Found: no such session".into(),
+                ));
+            }
             self.sessions
                 .iter()
                 .find(|s| s.asid.0 == session_id)
@@ -825,13 +1294,31 @@ impl agents::ports::agent::AgentPort for FakeAgent {
                 .ok_or_else(|| agents::ports::agent::AgentError::SessionNotFound(session_id.into()))
         })
     }
+    fn delete_session<'a>(
+        &'a self,
+        session_id: &'a str,
+    ) -> agents::ports::agent::AgentFuture<'a, ()> {
+        Box::pin(async move {
+            if !self.session_deletion {
+                return Err(agents::ports::agent::AgentError::Unsupported(
+                    "delete_session".into(),
+                ));
+            }
+            self.record(&format!("delete_session {session_id}"));
+            Ok(())
+        })
+    }
+
     fn send_prompt<'a>(
         &'a self,
         _session_id: &'a str,
-        _text: &'a str,
-        _attachments: &'a [String],
+        text: &'a str,
+        attachments: &'a [String],
         _delivery: Option<&'a str>,
     ) -> agents::ports::agent::AgentFuture<'a, ()> {
+        self.record("send_prompt");
+        self.prompts.lock().unwrap().push(text.to_owned());
+        self.attached.lock().unwrap().push(attachments.to_vec());
         Box::pin(async { Ok(()) })
     }
     fn revert_session<'a>(
@@ -842,6 +1329,7 @@ impl agents::ports::agent::AgentPort for FakeAgent {
         Box::pin(async { Ok(()) })
     }
     fn interrupt<'a>(&'a self, _session_id: &'a str) -> agents::ports::agent::AgentFuture<'a, ()> {
+        self.record("interrupt");
         Box::pin(async { Ok(()) })
     }
     fn switch_model<'a>(
@@ -862,9 +1350,12 @@ impl agents::ports::agent::AgentPort for FakeAgent {
         &'a self,
         _query: &'a str,
         _limit: usize,
-        _directory: Option<&'a str>,
+        directory: Option<&'a str>,
     ) -> agents::ports::agent::AgentFuture<'a, Vec<serde_json::Value>> {
-        Box::pin(async { Ok(Vec::new()) })
+        Box::pin(async move {
+            self.record(&format!("find_files:{}", directory.unwrap_or("")));
+            Ok(Vec::new())
+        })
     }
     fn reply_permission<'a>(
         &'a self,
@@ -903,9 +1394,18 @@ impl agents::ports::agent::AgentPort for FakeAgent {
     }
     fn get_pending_permissions<'a>(
         &'a self,
-        _session_id: &'a str,
+        session_id: &'a str,
     ) -> agents::ports::agent::AgentFuture<'a, Vec<agents::domain::PermissionRequest>> {
-        Box::pin(async { Ok(Vec::new()) })
+        Box::pin(async move {
+            Ok(self
+                .permissions
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|p| p.asid.0 == session_id)
+                .cloned()
+                .collect())
+        })
     }
     fn get_pending_forms<'a>(
         &'a self,
@@ -915,9 +1415,15 @@ impl agents::ports::agent::AgentPort for FakeAgent {
     }
     fn get_timeline<'a>(
         &'a self,
-        _session_id: &'a str,
+        session_id: &'a str,
         _limit: usize,
     ) -> agents::ports::agent::AgentFuture<'a, Vec<agents::domain::TimelineItem>> {
-        Box::pin(async { Ok(Vec::new()) })
+        Box::pin(async move {
+            Ok(self
+                .session_timelines
+                .get(session_id)
+                .unwrap_or(&self.timeline)
+                .clone())
+        })
     }
 }

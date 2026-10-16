@@ -1,6 +1,7 @@
 //! Terminal plane HTTP routes and event streaming: sessions, workspaces, tabs,
 //! panes, pane output/parts/git views, prompt delivery, and the SSE hub.
 
+use crate::agents::tasks;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path as FsPath, PathBuf};
 use std::pin::Pin;
@@ -27,18 +28,18 @@ use crate::platform::assets::{
 };
 use crate::platform::i18n::Locale;
 use crate::platform::vcs_routes::{self, VcsDiscardBody, VcsFileQuery, VcsFilesQuery};
+use crate::terminal::exit_marker::strip_exit_markers;
 use crate::{
     agents, api_error, approvals, backend, backend_api_error, backend_endpoint, composer,
     content_envelope, current_server_label, find_session, generate_token, git, i18n, native,
-    now_unix_ms, ordered_sessions, parts, require_device, scrollback, send_expo_push_notifications,
-    shortcuts, still_paired, tasks, terminal_backend, transport, validate_text, AgentNotice,
-    AgentPushNotice, ApiResult, AppState, BackendCreateTab, BackendCreateWorkspace,
-    BackendOutputFormat, BackendOutputSource, BackendPaneId, BackendReadPane, BackendSendTextMode,
-    BackendSplitDirection, BackendSplitPane, BackendTabId, BackendWorkspaceId,
-    EncryptedStreamContext, PushDetail, PushTokenRecord, SessionConfig, ACTIVITY_EVENT_CAPACITY,
-    APPROVAL_POLL_INTERVAL, APPROVAL_READ_LINES, MAX_OUTPUT_LINES, MAX_SEND_KEYS,
-    PARTS_DEFAULT_LINES, STREAM_DEVICE_RECHECK_INTERVAL, STREAM_OUTPUT_POLL_INTERVAL,
-    STREAM_OUTPUT_READ_TIMEOUT,
+    now_unix_ms, ordered_sessions, parts, require_device, scrollback, shortcuts, still_paired,
+    terminal_backend, transport, validate_text, AgentNotice, AgentPushNotice, ApiResult, AppState,
+    BackendCreateTab, BackendCreateWorkspace, BackendOutputFormat, BackendOutputSource,
+    BackendPaneId, BackendReadPane, BackendSendTextMode, BackendSplitDirection, BackendSplitPane,
+    BackendTabId, BackendWorkspaceId, EncryptedStreamContext, PushDetail, PushTokenRecord,
+    SessionConfig, ACTIVITY_EVENT_CAPACITY, APPROVAL_POLL_INTERVAL, APPROVAL_READ_LINES,
+    MAX_OUTPUT_LINES, MAX_SEND_KEYS, PARTS_DEFAULT_LINES, STREAM_DEVICE_RECHECK_INTERVAL,
+    STREAM_OUTPUT_POLL_INTERVAL, STREAM_OUTPUT_READ_TIMEOUT,
 };
 
 type GatewayEventStream =
@@ -82,6 +83,10 @@ pub(crate) fn mount(router: Router<AppState>) -> Router<AppState> {
         )
         .route("/api/sessions/{session_id}/panes", get(panes))
         .route(
+            "/api/sessions/{session_id}/panes/{pane_id}/lazygit",
+            get(super::lazygit::availability).post(super::lazygit::launch),
+        )
+        .route(
             "/api/sessions/{session_id}/panes/{pane_id}",
             get(pane).patch(rename_pane).delete(close_pane),
         )
@@ -110,6 +115,14 @@ pub(crate) fn mount(router: Router<AppState>) -> Router<AppState> {
             get(super::history_routes::pane_history),
         )
         .route(
+            "/api/sessions/{session_id}/panes/{pane_id}/history/segments",
+            get(super::history_routes::pane_history_segments),
+        )
+        .route(
+            "/api/history/storage",
+            get(super::history_routes::history_storage),
+        )
+        .route(
             "/api/sessions/{session_id}/panes/{pane_id}/parts",
             get(pane_parts),
         )
@@ -124,6 +137,10 @@ pub(crate) fn mount(router: Router<AppState>) -> Router<AppState> {
         .route(
             "/api/sessions/{session_id}/panes/{pane_id}/git/status",
             get(pane_git_status),
+        )
+        .route(
+            "/api/sessions/{session_id}/panes/{pane_id}/git/worktrees",
+            get(pane_git_worktrees),
         )
         .route(
             "/api/sessions/{session_id}/panes/{pane_id}/git/diff",
@@ -319,6 +336,16 @@ pub(crate) fn pane_read_text(value: &Value) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// [`strip_exit_markers`] on the text of a `pane_read` answer: the marker line
+/// `exec.run` leaves in its pane is never served.
+fn strip_read_answer(answer: &mut Value) {
+    if let Some(text) = pane_read_text(answer) {
+        if let std::borrow::Cow::Owned(stripped) = strip_exit_markers(&text) {
+            scrollback::replace_read_text(answer, &stripped);
+        }
+    }
+}
+
 /// Convert one sampled frame into the enriched `pane_updated` payload consumed
 /// by Muqun. Output content, rather than revision, is used to decide whether to
 /// emit because Herdr can expose new text before its coalesced revision advances.
@@ -338,7 +365,7 @@ pub(crate) fn stream_pane_update_payload(
                 "pane_id": pane_id,
                 "revision": frame.revision
             },
-            "output": frame.output,
+            "output": strip_exit_markers(&frame.output),
             "generation": generation
         }
     });
@@ -398,7 +425,7 @@ pub(crate) async fn enrich_pane_update(
     .ok()?
     .ok()?;
     let data = value.get_mut("data").and_then(Value::as_object_mut)?;
-    data.insert("output".into(), Value::String(read.text));
+    data.insert("output".into(), json!(strip_exit_markers(&read.text)));
     data.insert("generation".into(), json!(generation));
     serde_json::to_string(&value).ok()
 }
@@ -597,7 +624,8 @@ pub(crate) async fn events(
     let device_id = require_device(&state, &headers)?;
     // Present exactly when the request arrived through the encrypted
     // transport. From here on every event this connection emits is sealed;
-    // a device paired without a transport key keeps the plaintext stream.
+    // on a `disabled` deployment the stream stays plaintext (`required`
+    // serves no device without a transport key -- `require_device` above).
     let mut sealer = match stream_crypto {
         Some(Extension(context)) => Some(EventStreamSealer::new(&context).map_err(|_| {
             api_error(
@@ -814,7 +842,7 @@ pub(crate) async fn watch_pane_approvals(state: AppState, session: SessionConfig
         if let Some(mut store) = lock_scrollback(&state) {
             // The complete listing for this session, so it can also forget
             // the panes that have gone.
-            store.observe_listing(&session.id, &backend::compat::pane_list(panes.clone()));
+            store.observe_native_listing(&session.id, &panes);
         }
 
         // Every agent pane's screen in one request. On a socket backend this
@@ -1177,12 +1205,16 @@ pub(crate) fn spawn_agent_permission_watchers(state: AppState) {
             };
             match gates.admit(&event) {
                 Some(AgentPendingPush::Approval { asid, request }) => {
-                    let tokens = match state.push_tokens.lock() {
-                        Ok(guard) => guard.clone(),
-                        Err(_) => Vec::new(),
+                    let tokens = match crate::connectivity::push::registered_recipients(&state) {
+                        Ok(tokens) => tokens,
+                        Err(err) => {
+                            tracing::warn!("agent permission notification skipped: {err:#}");
+                            continue;
+                        }
                     };
                     if !tokens.is_empty() {
-                        let _ = send_expo_push_notifications(
+                        let _ = crate::connectivity::push::send_registered_push_notifications(
+                            &state,
                             &tokens,
                             "Approval Required".to_string(),
                             request.prompt.clone(),
@@ -1380,7 +1412,7 @@ async fn deliver_agent_form_notice(state: &AppState, asid: &str, request: &agent
 }
 
 pub(crate) async fn watch_agent_notifications(state: AppState, session: SessionConfig) {
-    let mut statuses = seed_agent_statuses(&session).await;
+    let (mut statuses, mut pending_inputs) = seed_agent_notifications(&session).await;
     let mut completions = CompletionGate::default();
     // One subscription to the session's shared hub, held for the life of the
     // process -- which is what lets a phone that is not connected still get a
@@ -1402,12 +1434,21 @@ pub(crate) async fn watch_agent_notifications(state: AppState, session: SessionC
                             .filter_map(|event| event.pointer("/data/pane_id").and_then(Value::as_str))
                             .map(str::to_owned)
                             .collect();
+                        pending_inputs.retain_present(&events);
                         for event in events {
                             if let Some(mut notification) = observe_agent_notification(
                                 &state, &session.id, &event, &mut statuses, &mut completions,
                             ) {
                                 enrich_blocked_notification(&state, &session, &mut notification).await;
                                 deliver_agent_notification(&state, notification).await;
+                            }
+                            if pending_inputs.observe(&event) {
+                                if let Some(notification) = native_input_notification(
+                                    &event, &state.config.server_id,
+                                    &current_server_label(&state.config.label), &session.id,
+                                ) {
+                                    deliver_agent_notification(&state, notification).await;
+                                }
                             }
                         }
                         for notification in completions.ready(&statuses, &present, Instant::now()) {
@@ -1564,10 +1605,10 @@ pub(crate) fn observe_agent_notification(
 /// happened to be asked for last. In the ordinary case every device shares a
 /// locale and this is exactly the single request it always was.
 pub(crate) async fn deliver_agent_notification(state: &AppState, notice: AgentPushNotice) {
-    let tokens = match state.push_tokens.lock() {
-        Ok(tokens) => tokens.clone(),
-        Err(_) => {
-            tracing::warn!("agent notification skipped: push token lock failed");
+    let tokens = match crate::connectivity::push::registered_recipients(state) {
+        Ok(tokens) => tokens,
+        Err(err) => {
+            tracing::warn!("agent notification skipped: {err:#}");
             return;
         }
     };
@@ -1577,7 +1618,8 @@ pub(crate) async fn deliver_agent_notification(state: &AppState, notice: AgentPu
     }
     for (locale, tokens) in by_locale {
         let notification = notice.render(locale);
-        if let Err(err) = send_expo_push_notifications(
+        if let Err(err) = crate::connectivity::push::send_registered_push_notifications(
+            state,
             &tokens,
             notification.title,
             notification.body,
@@ -1590,22 +1632,132 @@ pub(crate) async fn deliver_agent_notification(state: &AppState, notice: AgentPu
     }
 }
 
-pub(crate) async fn seed_agent_statuses(session: &SessionConfig) -> HashMap<String, String> {
+async fn seed_agent_notifications(
+    session: &SessionConfig,
+) -> (HashMap<String, String>, PendingUserInputGate) {
     let Ok(value) = backend_agent_list(session).await else {
-        return HashMap::new();
+        return (HashMap::new(), PendingUserInputGate::default());
     };
-    value
+    let agents: Vec<Value> = value
         .pointer("/result/agents")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
+        .cloned()
+        .collect();
+    let statuses = agents
+        .iter()
         .filter_map(|agent| {
             Some((
                 agent.get("pane_id")?.as_str()?.to_owned(),
                 agent.get("agent_status")?.as_str()?.to_ascii_lowercase(),
             ))
         })
-        .collect()
+        .collect();
+    let mut pending_inputs = PendingUserInputGate::default();
+    for agent in agents {
+        pending_inputs.observe(&agent);
+    }
+    (statuses, pending_inputs)
+}
+
+/// One reminder per observed false-to-true native question boundary, never
+/// per work-state change. Herdr exposes no question ID, so this is not a
+/// promise of one reminder per individual question.
+#[derive(Default)]
+struct PendingUserInputGate {
+    pending: HashMap<String, String>,
+}
+
+impl PendingUserInputGate {
+    fn observe(&mut self, event: &Value) -> bool {
+        let agent = event.get("data").unwrap_or(event);
+        let Some(instance) = agent
+            .get("instance_id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+        else {
+            return false;
+        };
+        let Some(pending) = agent.get("pending_user_input").and_then(Value::as_bool) else {
+            return false;
+        };
+        if pending {
+            let Some(pane) = agent.get("pane_id").and_then(Value::as_str) else {
+                return false;
+            };
+            let newly_pending = self
+                .pending
+                .insert(instance.to_owned(), pane.to_owned())
+                .is_none();
+            newly_pending
+                && matches!(
+                    agent.get("agent_status").and_then(Value::as_str),
+                    Some("working" | "idle")
+                )
+        } else {
+            self.pending.remove(instance);
+            false
+        }
+    }
+
+    fn retain_present(&mut self, events: &[Value]) {
+        let present: HashMap<&str, Option<&str>> = events
+            .iter()
+            .filter_map(|event| {
+                let agent = event.get("data").unwrap_or(event);
+                Some((
+                    agent.get("pane_id")?.as_str()?,
+                    agent
+                        .get("instance_id")
+                        .and_then(Value::as_str)
+                        .filter(|id| !id.is_empty()),
+                ))
+            })
+            .collect();
+        self.pending
+            .retain(|instance, pane| match present.get(pane.as_str()) {
+                // A present agent with temporarily unavailable identity cannot
+                // prove that the remembered instance exited or was replaced.
+                Some(None) => true,
+                Some(Some(current)) => *current == instance.as_str(),
+                None => false,
+            });
+    }
+}
+
+fn native_input_notification(
+    event: &Value,
+    server_id: &str,
+    server_label: &str,
+    session_id: &str,
+) -> Option<AgentPushNotice> {
+    let agent = event.get("data").unwrap_or(event);
+    let pane_id = agent.get("pane_id")?.as_str()?;
+    Some(AgentPushNotice {
+        notice: AgentNotice::AgentInputRequired,
+        server_label: server_label.to_owned(),
+        agent_name: ["display_agent", "agent"].into_iter().find_map(|key| {
+            agent
+                .get(key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+        }),
+        data: [
+            ("type".into(), json!("agent.input_required")),
+            ("url".into(), json!(format!("/servers/{server_id}"))),
+            ("server_id".into(), json!(server_id)),
+            ("session_id".into(), json!(session_id)),
+            ("pane_id".into(), json!(pane_id)),
+            ("instance_id".into(), json!(agent.get("instance_id"))),
+        ]
+        .into_iter()
+        .collect(),
+        choices: Vec::new(),
+        detail: None,
+    })
 }
 
 pub(crate) async fn backend_agent_list(session: &SessionConfig) -> Result<Value, BackendError> {
@@ -1621,21 +1773,31 @@ pub(crate) async fn backend_agent_list(session: &SessionConfig) -> Result<Value,
 pub(crate) async fn backend_agents(session: &SessionConfig) -> Result<Vec<Agent>, BackendError> {
     let terminal = terminal_backend(session);
     let mut agents = terminal.list_agents().await?;
-    for agent in agents
-        .iter_mut()
-        .filter(|agent| agent.kind.is_some() && agent.status == BackendAgentStatus::Unknown)
-    {
-        let output = terminal
-            .read_pane(&BackendReadPane {
-                pane_id: agent.pane_id.clone(),
-                source: BackendOutputSource::Visible,
-                format: BackendOutputFormat::Text,
-                lines: APPROVAL_READ_LINES,
-                start: None,
-                end: None,
-            })
-            .await;
+    // Every pane whose status the backend could not name is read at once:
+    // one read per agent, in sequence, made a snapshot with a dozen agents
+    // wait a dozen round trips.
+    let unknown: Vec<usize> = agents
+        .iter()
+        .enumerate()
+        .filter(|(_, agent)| agent.kind.is_some() && agent.status == BackendAgentStatus::Unknown)
+        .map(|(index, _)| index)
+        .collect();
+    let outputs = futures::future::join_all(unknown.iter().map(|index| {
+        let request = BackendReadPane {
+            pane_id: agents[*index].pane_id.clone(),
+            source: BackendOutputSource::Visible,
+            format: BackendOutputFormat::Text,
+            lines: APPROVAL_READ_LINES,
+            start: None,
+            end: None,
+        };
+        let terminal = &terminal;
+        async move { terminal.read_pane(&request).await }
+    }))
+    .await;
+    for (index, output) in unknown.into_iter().zip(outputs) {
         if let Ok(output) = output {
+            let agent = &mut agents[index];
             agent.status = infer_tmux_agent_status(agent.kind.as_deref(), &output.text);
         }
     }
@@ -1649,7 +1811,24 @@ pub(crate) fn infer_tmux_agent_status(agent: Option<&str>, visible: &str) -> bac
     let Some(dictionary) = parts::dictionary_for(agent) else {
         return backend::AgentStatus::Unknown;
     };
+    // A live working line wins over the input prompt drawn below it: Codex
+    // keeps `› Ask Codex to do anything` on screen while it works.
+    if visible.lines().any(is_working_line) {
+        return backend::AgentStatus::Working;
+    }
     let normalized = parts::normalize_json(visible, Some(dictionary));
+    // Claude Code shows its `esc to interrupt` footer for as long as a turn
+    // runs: without it, typed text or a finished tool row is not work.
+    if dictionary.id == "claude" {
+        let prompt = normalized
+            .iter()
+            .any(|part| part.get("type").and_then(Value::as_str) == Some("prompt"));
+        return if prompt {
+            backend::AgentStatus::Idle
+        } else {
+            backend::AgentStatus::Unknown
+        };
+    }
     match normalized
         .last()
         .and_then(|part| part.get("type"))
@@ -1659,6 +1838,16 @@ pub(crate) fn infer_tmux_agent_status(agent: Option<&str>, visible: &str) -> bac
         Some("status") | Some("tool-block") => backend::AgentStatus::Working,
         _ => backend::AgentStatus::Unknown,
     }
+}
+
+/// A line an agent draws only while it works: Codex's `• Working (25s • esc
+/// to interrupt)` and `Waiting for background terminal (…)`, and the
+/// `esc to interrupt` footer Codex and Claude Code show during a turn.
+pub(crate) fn is_working_line(line: &str) -> bool {
+    let text = line.trim_start_matches(|c: char| c.is_whitespace() || "•◦".contains(c));
+    text.starts_with("Working (")
+        || text.starts_with("Waiting for background terminal (")
+        || line.contains("esc to interrupt")
 }
 
 /// One agent status change, after the bookkeeping and before anyone decides
@@ -1848,6 +2037,7 @@ pub(crate) async fn create_workspace(
             cwd: body.cwd.map(PathBuf::from),
             label: body.label,
             focus: body.focus.unwrap_or(false),
+            env: None,
         })
         .await
         .map_err(backend_api_error)?;
@@ -1942,6 +2132,7 @@ pub(crate) async fn create_tab(
             cwd: body.cwd.map(PathBuf::from),
             label: body.label,
             focus: body.focus.unwrap_or(false),
+            env: None,
         })
         .await
         .map_err(backend_api_error)?;
@@ -2325,6 +2516,7 @@ pub(crate) async fn pane_output(
             }
         }
     }
+    strip_read_answer(&mut answer);
     stamp_read_generation(&mut answer, &state.generation);
     Ok(Json(answer))
 }
@@ -2384,6 +2576,17 @@ pub(crate) async fn pane_parts(
     // own working directory is the fence every workspace read is under.
     let (agent, root) = pane_agent_and_root(&session, &pane_id).await;
 
+    // Bind images before sampling terminal text, so a reused pane cannot mix
+    // the old screen with a newly reported producer conversation.
+    let codex_binding = if agent
+        .as_deref()
+        .is_some_and(|name| name.to_ascii_lowercase().contains("codex"))
+    {
+        crate::terminal::codex_images::snapshot_binding(&session, &pane_id).await
+    } else {
+        None
+    };
+
     // `recent_unwrapped` is the only source worth normalizing: the dictionaries
     // key off line starts, and it is the one source where a long line is one
     // line rather than however many the pane happens to be wide.
@@ -2436,13 +2639,21 @@ pub(crate) async fn pane_parts(
         }
         None => None,
     };
-    let normalized = match &native {
+    let mut normalized = match &native {
         Some(read) => read.parts.clone(),
         // The chat view hides the frozen bottom areas a Claude pane leaves in
         // its real history; the raw output routes still serve them. See
         // `parts::blank_frozen_status`.
-        None => parts::normalize_json(&parts::blank_frozen_status(&text), dictionary),
+        None => parts::normalize_json(
+            &parts::blank_frozen_status(&strip_exit_markers(&text)),
+            dictionary,
+        ),
     };
+
+    if native.is_none() && codex_binding.is_some() {
+        crate::terminal::codex_images::attach(&session, &pane_id, codex_binding, &mut normalized)
+            .await;
+    }
 
     // Reading a workspace's own skills and commands is blocking filesystem
     // work, so it runs off the async runtime like every other scan here.
@@ -2760,6 +2971,7 @@ pub(crate) async fn pane_context(
 pub(crate) async fn pane_git_status(
     State(state): State<AppState>,
     Path((session_id, pane_id)): Path<(String, String)>,
+    Query(query): Query<GitStatusQuery>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
@@ -2769,6 +2981,7 @@ pub(crate) async fn pane_git_status(
         Some(cwd) => checkout_of(&cwd).await,
         None => None,
     };
+    let checkout = selected_git_worktree(checkout, query.worktree.as_deref()).await?;
     let Some(toplevel) = checkout else {
         return Ok(Json(content_envelope(json!({
             "session_id": session_id,
@@ -2789,8 +3002,68 @@ pub(crate) async fn pane_git_status(
     }))))
 }
 
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct GitStatusQuery {
+    pub(crate) worktree: Option<String>,
+}
+
+/// A selected directory must be an exact canonical entry in this pane's Git
+/// inventory. Never accept arbitrary directories or resolve client aliases.
+pub(crate) async fn selected_git_worktree(
+    checkout: Option<PathBuf>,
+    selected: Option<&str>,
+) -> ApiResult<Option<PathBuf>> {
+    let Some(selected) = selected else {
+        return Ok(checkout);
+    };
+    let Some(checkout) = checkout else {
+        return Err(api_error(
+            StatusCode::NOT_FOUND,
+            "no_repository",
+            "this pane is not inside a git checkout",
+        ));
+    };
+    let inventory = git::worktrees(&checkout).await.map_err(git_error)?;
+    inventory
+        .into_iter()
+        .find(|entry| {
+            entry.path.as_os_str() == std::ffi::OsStr::new(selected)
+                && is_scannable_root(&entry.path)
+        })
+        .map(|entry| Some(entry.path))
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::FORBIDDEN,
+                "invalid_worktree",
+                "The selected checkout is not an available worktree of this repository",
+            )
+        })
+}
+
+pub(crate) async fn pane_git_worktrees(
+    State(state): State<AppState>,
+    Path((session_id, pane_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    require_device(&state, &headers)?;
+    let session = find_session(&state.config, &session_id)?.clone();
+    let checkout = match pane_fenced_cwd(&state, &session, &pane_id).await {
+        Some(cwd) => checkout_of(&cwd).await,
+        None => None,
+    };
+    let inventory = match checkout.as_ref() {
+        Some(checkout) => git::worktrees(checkout).await.map_err(git_error)?,
+        None => Vec::new(),
+    };
+    Ok(Json(content_envelope(json!({
+        "current": checkout,
+        "worktrees": inventory.iter().filter(|entry| is_scannable_root(&entry.path)).map(git::Worktree::to_json).collect::<Vec<_>>(),
+    }))))
+}
+
 #[derive(Debug, Deserialize)]
 pub(crate) struct GitDiffQuery {
+    pub(crate) worktree: Option<String>,
     pub(crate) path: Option<String>,
     /// The path before a rename or copy, so git sees both sides.
     pub(crate) old_path: Option<String>,
@@ -2848,6 +3121,7 @@ pub(crate) async fn pane_git_diff(
         Some(cwd) => checkout_of(&cwd).await,
         None => None,
     };
+    let checkout = selected_git_worktree(checkout, query.worktree.as_deref()).await?;
     let Some(toplevel) = checkout else {
         return Err(api_error(
             StatusCode::NOT_FOUND,
@@ -3260,6 +3534,84 @@ pub(crate) struct ZoomPaneBody {
 
 #[cfg(test)]
 mod tests {
+    fn native_question_event(instance: &str, pending: Value, status: &str) -> Value {
+        json!({ "data": {
+            "instance_id": instance, "pane_id": "w1:p1", "display_agent": "Codex",
+            "pending_user_input": pending, "agent_status": status,
+        } })
+    }
+
+    #[test]
+    fn native_question_reminder_tracks_bool_boundaries_not_work_state() {
+        let mut gate = super::PendingUserInputGate::default();
+        let working = native_question_event("one", json!(true), "working");
+        assert!(gate.observe(&working));
+        assert!(!gate.observe(&working));
+        assert!(!gate.observe(&native_question_event("one", json!(true), "idle")));
+        // Opening answer controls or covering them with an approval does not
+        // end the pending ordinary question or create a second reminder.
+        assert!(!gate.observe(&native_question_event("one", json!(true), "blocked")));
+        assert!(!gate.observe(&native_question_event("one", json!(true), "unknown")));
+        assert!(!gate.observe(&native_question_event("one", Value::Null, "unknown")));
+        assert!(!gate.observe(&working));
+        assert!(!gate.observe(&native_question_event("one", json!(false), "working")));
+        assert!(gate.observe(&working));
+        assert!(gate.observe(&native_question_event("two", json!(true), "working")));
+        gate.retain_present(&[]);
+        assert!(gate.observe(&working));
+    }
+
+    #[test]
+    fn native_question_reminder_requires_identity_bool_and_ordinary_status() {
+        let mut gate = super::PendingUserInputGate::default();
+        for event in [
+            native_question_event("", json!(true), "working"),
+            native_question_event("one", json!("true"), "working"),
+            native_question_event("one", Value::Null, "working"),
+            native_question_event("one", json!(true), "blocked"),
+            native_question_event("one", json!(true), "unknown"),
+        ] {
+            assert!(!gate.observe(&event));
+        }
+        // Ineligible display states still retain the pending fact. Returning
+        // to the main composer cannot reinterpret it as a new question.
+        assert!(gate.pending.contains_key("one"));
+        let event = native_question_event("one", json!(true), "working");
+        // Startup remembers pending attention without delivering an old reminder.
+        gate.observe(&event);
+        assert!(!gate.observe(&event));
+    }
+
+    #[test]
+    fn native_question_reminder_has_no_approval_actions_or_question_content() {
+        let event = native_question_event("one", json!(true), "working");
+        let notice = super::native_input_notification(&event, "server", "Studio", "herdr").unwrap();
+        assert_eq!(notice.notice, AgentNotice::AgentInputRequired);
+        assert!(notice.choices.is_empty());
+        assert!(notice.detail.is_none());
+        let rendered = notice.render(crate::platform::i18n::Locale::En);
+        assert_eq!(rendered.title, "Needs your input · Studio");
+        assert_eq!(rendered.body, "Codex needs your input.");
+        assert_eq!(rendered.data["type"], "agent.input_required");
+        assert_eq!(rendered.data["pane_id"], "w1:p1");
+        assert_eq!(rendered.data["instance_id"], "one");
+        assert!(!rendered.data.contains_key("options"));
+    }
+
+    #[test]
+    fn native_question_reminder_retains_unknown_identity_until_confirmed_exit_or_replacement() {
+        let mut gate = super::PendingUserInputGate::default();
+        let original = native_question_event("one", json!(true), "working");
+        assert!(gate.observe(&original));
+        gate.retain_present(&[native_question_event("", Value::Null, "unknown")]);
+        assert!(!gate.observe(&original));
+        let replacement = native_question_event("two", json!(true), "working");
+        gate.retain_present(std::slice::from_ref(&replacement));
+        assert!(!gate.pending.contains_key("one"));
+        assert!(gate.observe(&replacement));
+        gate.retain_present(&[]);
+        assert!(gate.pending.is_empty());
+    }
     use crate::agents::session_routes::native_approval_data;
     use crate::connectivity::routes::revoke_paired_device;
     use crate::*;
@@ -3521,6 +3873,7 @@ mod tests {
         let pending = |asid: &str, id: &str| AgentDomainEvent::FormPending {
             asid: AgentSessionId(asid.into()),
             request: FormRequest {
+                nonblocking: false,
                 id: id.into(),
                 asid: AgentSessionId(asid.into()),
                 title: "Which branch?".into(),
@@ -3539,6 +3892,7 @@ mod tests {
         assert!(gates.admit(&pending("ses_other", "form_1")).is_some());
 
         let resolved = AgentDomainEvent::FormResolved {
+            reason: None,
             asid: AgentSessionId("ses_child".into()),
             form_id: "form_1".into(),
             seq: 2,
@@ -3554,6 +3908,7 @@ mod tests {
         use crate::agents::{AgentSessionId, FormRequest};
         let state = test_state("admin", Vec::new());
         let request = FormRequest {
+            nonblocking: false,
             id: "form_1".into(),
             asid: AgentSessionId("ses_1".into()),
             title: "Which branch?".into(),
@@ -3634,6 +3989,7 @@ mod tests {
                 cwd: Some(std::env::temp_dir()),
                 label: Some("gateway-revoke".into()),
                 focus: true,
+                env: None,
             })
             .await
             .unwrap();
@@ -4206,7 +4562,7 @@ mod tests {
             .0;
         assert_eq!(health["generation"], generation.as_str());
         let discovery =
-            crate::platform::routes::api_discovery(State(state.clone()), HeaderMap::new())
+            crate::platform::routes::api_discovery(State(state.clone()), bearer_headers("token"))
                 .await
                 .unwrap()
                 .0;
@@ -4236,6 +4592,64 @@ mod tests {
             .unwrap()
             .0;
         assert_ne!(other_health["generation"], health["generation"]);
+    }
+
+    /// A pane `exec.run` typed into shows its exit marker line; no client
+    /// read does, raw or normalized.
+    #[tokio::test]
+    async fn exit_marker_lines_are_not_served_by_output_or_parts() {
+        let screen = "$ sh -c 'echo hi'\nhi\n\u{1f}muqun-exit:t_1:0\u{1f}\nmuqun-exit:t_1:0\n$ ";
+        let herdr = FakeHerdr::start(vec![screen], None);
+        let state = output_state(&herdr);
+
+        let text = read_output(&state, 40).await;
+        assert!(
+            text.contains("hi") && !text.contains("muqun-exit"),
+            "{text:?}"
+        );
+
+        let parts = pane_parts(
+            State(state.clone()),
+            Path(("default".into(), "wM:p1".into())),
+            Query(PartsQuery { lines: Some(40) }),
+            bearer_headers("token"),
+        )
+        .await
+        .unwrap()
+        .0
+        .to_string();
+        assert!(
+            parts.contains("hi") && !parts.contains("muqun-exit"),
+            "{parts}"
+        );
+
+        // Nor does the live stream: the polled frame and the enriched event.
+        let frame = StreamPaneFrame {
+            revision: 1,
+            output: screen.into(),
+        };
+        let polled = stream_pane_update_payload(&frame, "wM:p1", "gen").unwrap();
+        let opts = StreamOutputOpts {
+            pane: Some("wM:p1".into()),
+            lines: 40,
+            source: "recent_unwrapped".into(),
+            format: "text".into(),
+        };
+        let line = json!({ "event": "pane.updated", "data": { "pane": { "pane_id": "wM:p1", "revision": 1 } } }).to_string();
+        let backend = terminal_backend(&state.config.sessions[0]);
+        let enriched = enrich_pane_update(&line, backend.as_ref(), &opts, "gen")
+            .await
+            .unwrap();
+        for payload in [polled, enriched] {
+            let output = serde_json::from_str::<Value>(&payload).unwrap()["data"]["output"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            assert!(
+                output.contains("hi") && !output.contains("muqun-exit"),
+                "{output:?}"
+            );
+        }
     }
 
     /// And having kept them, it says so where the reader's affordance looks --
@@ -4394,6 +4808,7 @@ mod tests {
                 cwd: Some(std::env::temp_dir()),
                 label: Some("gateway-keys".into()),
                 focus: true,
+                env: None,
             })
             .await
             .unwrap();

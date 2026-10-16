@@ -5,6 +5,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use super::history_segments::SegmentPosition;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -42,6 +43,7 @@ pub(crate) struct Capture {
     /// `rows` was asked for: with `trimmed`, where its newest row is.
     pub len: usize,
     pub rows: Vec<String>,
+    pub segments: Option<Vec<SegmentPosition>>,
 }
 
 /// A pinned traversal is ephemeral even when a future adapter persists captures.
@@ -55,6 +57,7 @@ pub(crate) struct HistorySnapshot {
     pub base: u64,
     pub created: Instant,
     pub rows: Vec<String>,
+    pub segments: Option<Vec<SegmentPosition>>,
     // Tokens identify application-created intervals, never client-chosen offsets.
     pages: Vec<(Uuid, usize, usize)>,
 }
@@ -72,13 +75,36 @@ pub(crate) trait HistoryRepository: Send + Sync {
         scope: &'a HistoryScope,
         include_rows: bool,
     ) -> HistoryFuture<'a, Option<Capture>>;
+    fn capture_segments<'a>(
+        &'a self,
+        _scope: &'a HistoryScope,
+        _include_rows: bool,
+    ) -> HistoryFuture<'a, Option<Capture>> {
+        Box::pin(async { Ok(None) })
+    }
     fn find<'a>(
         &'a self,
         scope: &'a HistoryScope,
+        segmented: bool,
     ) -> HistoryFuture<'a, Option<Arc<HistorySnapshot>>>;
     fn load(&self, id: Uuid) -> HistoryFuture<'_, Option<Arc<HistorySnapshot>>>;
     fn pin(&self, snapshot: HistorySnapshot) -> HistoryFuture<'_, Arc<HistorySnapshot>>;
     fn remove(&self, id: Uuid) -> HistoryFuture<'_, ()>;
+    /// What a durable adapter holds now, from counters it keeps (never a
+    /// query on the request path); `None` for memory.
+    fn stats(&self) -> Option<StorageStats> {
+        None
+    }
+}
+
+/// A durable history store as `GET /api/history/storage` reports it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct StorageStats {
+    pub healthy: bool,
+    /// Stored checkpoints (one per pane and format).
+    pub checkpoints: u64,
+    /// The store's WAL file, in bytes, as of the last write pass.
+    pub wal_bytes: u64,
 }
 
 /// Stable application use case. Backend liveness is established before calling;
@@ -88,10 +114,40 @@ pub(crate) async fn read_page(
     scope: HistoryScope,
     before: Option<&str>,
 ) -> Result<Value, HistoryError> {
+    read_page_for(repository, scope, before, false).await
+}
+
+pub(crate) async fn read_segment_page(
+    repository: &dyn HistoryRepository,
+    scope: HistoryScope,
+    before: Option<&str>,
+) -> Result<Value, HistoryError> {
+    read_page_for(repository, scope, before, true).await
+}
+
+async fn capture(
+    repository: &dyn HistoryRepository,
+    scope: &HistoryScope,
+    include_rows: bool,
+    segmented: bool,
+) -> Result<Option<Capture>, HistoryError> {
+    if segmented {
+        repository.capture_segments(scope, include_rows).await
+    } else {
+        repository.capture(scope, include_rows).await
+    }
+}
+
+async fn read_page_for(
+    repository: &dyn HistoryRepository,
+    scope: HistoryScope,
+    before: Option<&str>,
+    segmented: bool,
+) -> Result<Value, HistoryError> {
     if let Some(cursor) = before {
         let (id, token) = parse_cursor(cursor)?;
         let snapshot = repository.load(id).await?.ok_or(HistoryError::Gone)?;
-        if snapshot.scope != scope {
+        if snapshot.scope != scope || snapshot.segments.is_some() != segmented {
             return Err(HistoryError::Mismatch);
         }
         let page = snapshot
@@ -114,17 +170,17 @@ pub(crate) async fn read_page(
     // nothing trimmed, nothing appended -- so a client restarting after a 410
     // never walks into the same stale snapshot again. One that has moved is
     // dropped here, not left to its TTL.
-    if let Some(snapshot) = repository.find(&scope).await? {
+    if let Some(snapshot) = repository.find(&scope, segmented).await? {
         if validity(repository, &scope, &snapshot, None).await? == Validity::Valid {
             return Ok(render(&snapshot, 0));
         }
         repository.remove(snapshot.id).await?;
     }
-    let Some(capture) = repository.capture(&scope, true).await? else {
-        return Ok(empty(&scope, "not_captured"));
+    let Some(capture) = capture(repository, &scope, true, segmented).await? else {
+        return Ok(empty_for(&scope, "not_captured", segmented));
     };
     if capture.rows.is_empty() {
-        return Ok(empty(&scope, "captured"));
+        return Ok(empty_for(&scope, "captured", segmented));
     }
     let snapshot = HistorySnapshot::new(scope, capture)?;
     let snapshot = repository.pin(snapshot).await?;
@@ -162,14 +218,37 @@ async fn validity(
     if snapshot.created.elapsed() >= SNAPSHOT_TTL {
         return Ok(Validity::Reset);
     }
-    let Some(capture) = repository.capture(scope, false).await? else {
+    let Some(capture) = capture(repository, scope, false, snapshot.segments.is_some()).await?
+    else {
         return Ok(Validity::Reset);
     };
     if capture.epoch != snapshot.epoch {
         return Ok(Validity::Reset);
     }
     let current = match page {
-        Some(page) => snapshot.base + snapshot.pages[page].1 as u64 >= capture.trimmed,
+        Some(page) => {
+            if let Some(segments) = &snapshot.segments {
+                let (_, start, end) = snapshot.pages[page];
+                let mut offset = 0;
+                segments.iter().all(|segment| {
+                    let from = start.max(offset);
+                    let to = end.min(offset + segment.len);
+                    let valid = from >= to
+                        || capture.segments.as_ref().is_some_and(|current| {
+                            current.iter().any(|held| {
+                                held.segment_id == segment.segment_id
+                                    && held.base <= segment.base + (from - offset) as u64
+                                    && held.base + held.len as u64
+                                        >= segment.base + (to - offset) as u64
+                            })
+                        });
+                    offset += segment.len;
+                    valid
+                })
+            } else {
+                snapshot.base + snapshot.pages[page].1 as u64 >= capture.trimmed
+            }
+        }
         None => snapshot.is_current(&capture),
     };
     Ok(if current {
@@ -212,6 +291,7 @@ impl HistorySnapshot {
             base: capture.trimmed,
             created: Instant::now(),
             rows: capture.rows,
+            segments: capture.segments,
             pages,
         })
     }
@@ -222,6 +302,7 @@ impl HistorySnapshot {
         capture.epoch == self.epoch
             && capture.trimmed == self.base
             && capture.len == self.rows.len()
+            && capture.segments == self.segments
     }
 
     /// Row text alone: the measure the live capture is capped by.
@@ -234,6 +315,10 @@ impl HistorySnapshot {
         self.rows.iter().map(String::capacity).sum::<usize>()
             + self.rows.capacity() * std::mem::size_of::<String>()
             + self.pages.capacity() * std::mem::size_of::<(Uuid, usize, usize)>()
+            + self.segments.as_ref().map_or(0, |s| {
+                s.capacity() * std::mem::size_of::<SegmentPosition>()
+                    + s.iter().map(|p| p.segment_id.capacity()).sum::<usize>()
+            })
             + self.scope.session.capacity()
             + self.scope.pane.capacity()
             + self.scope.format.capacity()
@@ -271,16 +356,44 @@ fn empty(scope: &HistoryScope, availability: &str) -> Value {
     })
 }
 
+fn empty_for(scope: &HistoryScope, availability: &str, segmented: bool) -> Value {
+    let mut answer = empty(scope, availability);
+    if segmented {
+        answer.as_object_mut().unwrap().remove("capture_epoch");
+        answer.as_object_mut().unwrap().remove("rows");
+        answer["segments"] = json!([]);
+    }
+    answer
+}
+
 fn render(snapshot: &HistorySnapshot, page: usize) -> Value {
     let (_, start, end) = snapshot.pages[page];
     let next = snapshot
         .pages
         .get(page + 1)
         .map(|(token, _, _)| format!("{}.{}", snapshot.id.simple(), token.simple()));
-    let mut answer = empty(&snapshot.scope, "captured");
+    let mut answer = empty_for(&snapshot.scope, "captured", snapshot.segments.is_some());
     answer["snapshot_id"] = json!(snapshot.id.to_string());
-    answer["capture_epoch"] = json!(snapshot.epoch.to_string());
-    answer["rows"] = json!(snapshot.rows[start..end]);
+    if let Some(segments) = &snapshot.segments {
+        let mut offset = 0;
+        let rendered: Vec<_> = segments
+            .iter()
+            .filter_map(|segment| {
+                let from = start.max(offset);
+                let to = end.min(offset + segment.len);
+                offset += segment.len;
+                (from < to).then(|| json!({
+                "segment_id": segment.segment_id, "started_at_ms": segment.started_at_ms,
+                "sealed_at_ms": segment.sealed_at_ms, "boundary_reason": segment.boundary_reason,
+                "rows": snapshot.rows[from..to]
+            }))
+            })
+            .collect();
+        answer["segments"] = json!(rendered);
+    } else {
+        answer["capture_epoch"] = json!(snapshot.epoch.to_string());
+        answer["rows"] = json!(snapshot.rows[start..end]);
+    }
     answer["row_count"] = json!(end - start);
     answer["has_more"] = json!(next.is_some());
     answer["next_before"] = json!(next);
@@ -346,12 +459,14 @@ mod tests {
                         trimmed: *self.trimmed.lock().unwrap(),
                         len: rows.len(),
                         rows: if include_rows { rows.clone() } else { vec![] },
+                        segments: None,
                     }))
             })
         }
         fn find<'a>(
             &'a self,
             scope: &'a HistoryScope,
+            _: bool,
         ) -> HistoryFuture<'a, Option<Arc<HistorySnapshot>>> {
             Box::pin(async move {
                 tokio::task::yield_now().await;

@@ -73,14 +73,18 @@ pub(crate) fn terminal_backend(session: &SessionConfig) -> Box<dyn TerminalBacke
     }
 }
 
-pub(crate) fn backend_api_error(error: BackendError) -> (StatusCode, Json<Value>) {
-    if let BackendError::KeyUnsupported(message) = &error {
+/// The status, wire code and caller-safe message a backend error answers
+/// with. Every message but [`BackendError::KeyUnsupported`]'s is fixed text:
+/// adapter diagnostics may name a local socket or tmux target, and those stay
+/// in the host log (see [`backend_api_error`]).
+pub(crate) fn backend_api_parts(error: &BackendError) -> (StatusCode, &'static str, &str) {
+    match error {
         // The one backend error whose message is written for the caller: it
         // names the key the caller sent and, on tmux, the setting that would
         // let it through. Nothing in it is local to this host.
-        return api_error(StatusCode::BAD_REQUEST, "key_unsupported", message);
-    }
-    let (status, code, message) = match &error {
+        BackendError::KeyUnsupported(message) => {
+            (StatusCode::BAD_REQUEST, "key_unsupported", message)
+        }
         BackendError::InvalidTarget(_) => (
             StatusCode::NOT_FOUND,
             "backend_target_not_found",
@@ -93,15 +97,20 @@ pub(crate) fn backend_api_error(error: BackendError) -> (StatusCode, Json<Value>
         ),
         BackendError::InvalidResponse(_)
         | BackendError::Refused { .. }
-        | BackendError::Unsupported(_)
-        | BackendError::KeyUnsupported(_) => (
+        | BackendError::Unsupported(_) => (
             StatusCode::BAD_GATEWAY,
             "backend_error",
             "terminal backend request failed",
         ),
-    };
-    // Adapter diagnostics may name a local socket or tmux target. Keep them in
-    // the host log and return only a stable, non-sensitive API error.
-    tracing::warn!("terminal backend request failed: {error}");
+    }
+}
+
+pub(crate) fn backend_api_error(error: BackendError) -> (StatusCode, Json<Value>) {
+    let (status, code, message) = backend_api_parts(&error);
+    if !matches!(error, BackendError::KeyUnsupported(_)) {
+        // Adapter diagnostics may name a local socket or tmux target. Keep them
+        // in the host log and return only a stable, non-sensitive API error.
+        tracing::warn!("terminal backend request failed: {error}");
+    }
     api_error(status, code, message)
 }

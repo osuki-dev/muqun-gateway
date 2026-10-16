@@ -47,27 +47,50 @@ pub(crate) const API_CAPABILITIES: &[&str] = &[
     "agent_models",
     "agent_permissions",
     "agent_sessions",
+    // Single-provider session pages; support is separately declared per agent.
+    "agent_session_pages_v1",
+    "agent_session_fork_v1",
+    "agent_session_runtime_v1",
+    "codex_shared_daemon_v1",
+    "codex_shared_task_start_v1",
+    "agent_session_refresh_v1",
+    "agent_session_delete_scoped",
     "capabilities_discovery",
     "agent_discovery",
     "agent_spawn",
     "agent_timeline",
+    // Older timeline pages; adapter support is separately declared per agent.
+    "agent_timeline_earlier_v1",
     "agent_vcs",
     // `vcs/files`, `vcs/file` and `vcs/discard` on an agent session: git in
     // the session's directory, for every agent.
     "agent_vcs_files",
     "assets",
+    "agent_audio_assets",
+    "agent_file_assets",
+    "agent_image_previews_v1",
+    "agent_image_versions_v1",
+    "asset_download",
     "device_revocation",
     "file_uploads",
     "git_diff",
+    "git_worktrees",
+    "pane_lazygit",
+    "pane_lazygit_worktree",
     "one_time_pairing_codes",
     "pane_context",
     "pane_approvals",
+    // Optional native ordinary-question attention; never inferred from status or text here.
+    "terminal_pending_user_input",
     "pane_composer",
     "pane_file_search",
     "pane_interrupt",
     "pane_output_ansi",
     "pane_captured_history",
+    // Segment-aware captured pagination in both memory and SQLite storage modes.
+    "pane_captured_history_segments_v1",
     "pane_parts",
+    "codex_transcript_images_v1",
     "pane_parts_native",
     "pane_shortcuts",
     // The same three Changes routes on a terminal pane, in its cwd.
@@ -76,6 +99,8 @@ pub(crate) const API_CAPABILITIES: &[&str] = &[
     "per_device_tokens",
     "push_notifications",
     "push_token_revocation",
+    // Push delivery requires an authenticated registration owned by a paired app.
+    "push_token_owner_binding_v1",
     "recent_cwds",
     // `GET /api/sessions/{id}/snapshot`, whose `agents` array is the same one
     // `GET .../agents` answers with -- `instance_id` and `target` included --
@@ -96,6 +121,55 @@ pub(crate) const API_CAPABILITIES: &[&str] = &[
     // any number of sessions. Also announced as `transports.websocket` in
     // `/api/discovery`. The per-session SSE stream stays the fallback.
     "ws_events",
+    // `GET /api/fleet/self`: this machine's capability manifest.
+    "fleet",
+    // `/api/tasks*` (the task ledger: delegations and command runs) and the
+    // `task.updated` frame on `/api/ws`. Not `tasks`, which is the older
+    // `POST /api/sessions/{id}/tasks` dispatch.
+    "task_ledger",
+    // `POST /api/tasks` (a device opens a delegation) and, in the same build,
+    // the task tree: `parent_task_id`, `origin`, `label`, `requested_by` and
+    // `children` on every task view and `GET /api/tasks?root=<id>`.
+    "task_ledger_create",
+    // `POST /api/tasks` and `tasks.delegate` take a terminal agent kind
+    // (`codex`, `claude`, ...) as `agent_id`: the task is bound to the pane
+    // the agent was started in (`binding.kind == "pane"` with `agent_id`)
+    // and the create answer (state `dispatching`) carries `pane_id` instead
+    // of `asid`. Such a
+    // task is `done` only on its MUQUN_TASK_DONE marker; an idle agent is
+    // `idle_unconfirmed`.
+    "task_ledger_pane",
+    // `POST /api/tasks` takes `delivery: "session" | "pane"`, routed as said
+    // or `400 invalid_request` when that agent cannot do it; each discovery
+    // entry says what it can as `ledgerDelivery`, each terminal catalog entry
+    // as `ledger_delivery`. Absent, the agent kind decides as before.
+    "task_ledger_delivery",
+    // A delegation (session or terminal agent) is `done` only on an explicit
+    // signal: the agent's `tasks.complete` MCP call, its MUQUN_TASK_DONE
+    // marker line, or the device's `POST /api/tasks/{id}/complete` (for an
+    // `idle_unconfirmed` or `waiting` task it opened). A session agent whose
+    // turn ends without one is `idle_unconfirmed`, as a terminal agent is.
+    "task_ledger_complete",
+    // `subscribe_tasks` on `/api/ws`: task views without session events.
+    "task_ws_subscription",
+    // The task view of P1's Home card: `tasks.complete` takes `outcome`
+    // (`blocked` moves a delegation to `waiting`, as the MUQUN_TASK_BLOCKED
+    // marker does); a `waiting` task's `summary` is what the user is asked;
+    // `title` is always set (label, the session's own name, or the goal's
+    // first sentence); `progress` names a tool call in words.
+    "task_outcome",
+    // Where a task the device opens without `cwd` runs: `GET
+    // /api/tasks/defaults` and the `defaults` frame on `subscribe_tasks`
+    // (`default_cwd`, named from `~`).
+    "task_defaults",
+    // Other computers of the owner: `GET/POST /api/peers`,
+    // `PATCH/DELETE /api/peers/{id}`, `POST /api/pair/pending` (a code minted for
+    // another gateway), `PUT /api/fleet/settings` (`accept_delegations`),
+    // `kind: "gateway"` devices, `tasks.delegate` with `machine`, mirror
+    // tasks (`binding.kind == "peer"`, `peer_reachable`, `peer_last_seen_ms`)
+    // and tasks another computer opened (`origin: "peer"`,
+    // `requested_by.kind == "gateway"`).
+    "fleet_peers",
 ];
 
 /// Handing a task to an agent the app did not start, and following it home.
@@ -128,6 +202,17 @@ pub(crate) const API_CAPABILITIES: &[&str] = &[
 ///    machine", not "on the session you are looking at".
 pub(crate) const AGENT_COLLABORATION_CAPABILITY: &str = "agent_collaboration";
 
+/// `/mcp` on this listener: the gateway as an MCP server for agents on this
+/// machine (loopback, assistant token). Also `transports.mcp` in discovery.
+/// Conditional on `mcp.enabled`, because switching it off removes the route.
+pub(crate) const MCP_SERVER_CAPABILITY: &str = "mcp_server";
+
+/// Captured-history checkpoints are kept on disk and recovered after a
+/// restart. Conditional on `history.storage: sqlite`, because with `memory`
+/// there is nothing to recover and an App must not offer it, and on a platform
+/// that can verify process identity, without which nothing is ever recovered.
+pub(crate) const HISTORY_CHECKPOINT_CAPABILITY: &str = "pane_captured_history_sqlite_checkpoint";
+
 /// The first Herdr that puts an opaque agent instance id on the wire.
 ///
 /// The same floor `herdr_owns_prompt_submission` uses, and not a coincidence:
@@ -155,15 +240,28 @@ pub(crate) fn session_capabilities(
     }
 }
 
-/// The gateway-wide list: the build's own capabilities, plus collaboration if
-/// at least one configured session can actually deliver it.
+/// The gateway-wide list: the build's own capabilities, plus `mcp_server`
+/// while `mcp.enabled` is true, plus the history checkpoint capability while
+/// `history.storage` is `sqlite`, plus collaboration if at least one
+/// configured session can actually deliver it.
 ///
 /// Nothing else in the list is conditional, and nothing else should become
-/// conditional without the same justification: a capability that comes and goes
+/// conditional without the same justification (both config-gated entries have
+/// it: the config switch removes the behaviour): a capability that comes and goes
 /// with a socket is a capability a client has to re-check, and every entry in
 /// [`API_CAPABILITIES`] is true for as long as this binary is running.
-pub(crate) fn gateway_capabilities(collaboration_somewhere: bool) -> Vec<&'static str> {
+pub(crate) fn gateway_capabilities(
+    collaboration_somewhere: bool,
+    mcp_enabled: bool,
+    history_checkpoints: bool,
+) -> Vec<&'static str> {
     let mut capabilities: Vec<&'static str> = API_CAPABILITIES.to_vec();
+    if mcp_enabled {
+        capabilities.push(MCP_SERVER_CAPABILITY);
+    }
+    if history_checkpoints && crate::terminal::backend::PROCESS_IDENTITY_SUPPORTED {
+        capabilities.push(HISTORY_CHECKPOINT_CAPABILITY);
+    }
     if collaboration_somewhere {
         capabilities.push(AGENT_COLLABORATION_CAPABILITY);
     }
@@ -175,10 +273,12 @@ pub(crate) fn gateway_capabilities(collaboration_somewhere: bool) -> Vec<&'stati
 ///
 /// It is a property of the device, not of the gateway: a device paired while
 /// `transport_encryption` was `disabled` holds no transport key and is
-/// authorised on its bearer token alone, and stays that way after the setting
-/// changes -- `require_device` demands the proof header from exactly the
-/// devices that have a key. So the honest answer to "is this connection
-/// encrypted at the application layer" is about the device asking.
+/// authorised on its bearer token alone. In `disabled` mode it stays that
+/// way after a sealed device is paired beside it; in `required` mode
+/// `require_device` refuses it with `426 device_repair_required` until it
+/// pairs again, and demands the proof header from every device it serves.
+/// So the honest answer to "is this connection encrypted at the application
+/// layer" is about the device asking.
 pub(crate) fn device_seals_its_transport(state: &AppState, device_id: &str) -> bool {
     state.devices.lock().is_ok_and(|devices| {
         devices
@@ -244,11 +344,18 @@ pub(crate) async fn gateway_metadata(
         "ok": true,
         "gatewayVersion": env!("CARGO_PKG_VERSION"),
         "apiVersion": GATEWAY_API_VERSION,
+        "transport_versions": crate::connectivity::transport::SUPPORTED_VERSIONS,
         "apiMajor": GATEWAY_API_MAJOR,
         "generation": &*state.generation,
         "minimumCompatibleApiVersion": "1.0.0",
         "legacyUnversionedApi": true,
-        "capabilities": gateway_capabilities(collaboration_somewhere),
+        "capabilities": gateway_capabilities(
+            collaboration_somewhere,
+            // Not when this gateway's agents cannot reach /mcp (its loopback
+            // listener could not be bound).
+            state.config.mcp.enabled && crate::mcp::serves_agents(&state.config.listen),
+            state.config.history.storage == crate::platform::config::HistoryStorage::Sqlite,
+        ),
         "planes": planes,
         "serverId": state.config.server_id,
         "label": state.config.label,
@@ -302,8 +409,15 @@ pub(crate) static SESSION_METADATA_CACHE: std::sync::OnceLock<
 
 pub(crate) async fn session_metadata(session: &SessionConfig) -> (Value, Value) {
     let cache = SESSION_METADATA_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    // Keyed by where the session's server is too: a session id reused for
+    // another socket (a config reload, or another gateway in the same
+    // process, as tests run) must not be answered for the old one.
+    let key = format!(
+        "{}\n{:?}\n{}",
+        session.id, session.backend, session.socket_path
+    );
     if let Ok(cache) = cache.lock() {
-        if let Some((seen, answer)) = cache.get(&session.id) {
+        if let Some((seen, answer)) = cache.get(&key) {
             if seen.elapsed() < SESSION_LIVENESS_TTL {
                 return answer.clone();
             }
@@ -314,10 +428,7 @@ pub(crate) async fn session_metadata(session: &SessionConfig) -> (Value, Value) 
         // Bounded by the configured sessions, which is a handful; the sweep is
         // only here so a config reload cannot leave an entry behind for ever.
         cache.retain(|_, (seen, _)| seen.elapsed() < SESSION_LIVENESS_TTL);
-        cache.insert(
-            session.id.clone(),
-            (std::time::Instant::now(), answer.clone()),
-        );
+        cache.insert(key, (std::time::Instant::now(), answer.clone()));
     }
     answer
 }
@@ -730,6 +841,7 @@ mod tests {
     #[tokio::test]
     async fn session_liveness_reports_panes_present() {
         let panes = vec![Pane {
+            history_identity: None,
             id: BackendPaneId::new("p1"),
             terminal_id: None,
             workspace_id: BackendWorkspaceId::new("w1"),
@@ -749,6 +861,7 @@ mod tests {
             alternate_on: None,
             cursor_x: None,
             cursor_y: None,
+            shell_pid: None,
         }];
         let outcome = session_liveness(
             Box::pin(async move { Ok(panes) }),
@@ -986,6 +1099,7 @@ mod tests {
                 cwd: Some(std::env::temp_dir()),
                 label: Some("gateway-sessions-live".into()),
                 focus: true,
+                env: None,
             })
             .await
             .unwrap();
@@ -1024,8 +1138,8 @@ mod tests {
     /// a gateway that does seal as one that does not.
     ///
     /// It is a property of the *device*: one paired while encryption was
-    /// disabled holds no transport key, is authorised on its bearer token
-    /// alone, and stays that way after the setting changes.
+    /// disabled holds no transport key and is authorised on its bearer token
+    /// alone (in `required` mode it is refused until it pairs again).
     #[tokio::test]
     async fn the_metadata_says_whether_this_device_actually_seals_its_requests() {
         let sealed_token = "sealed-device";
@@ -1108,12 +1222,55 @@ mod tests {
         assert!(session_capabilities(BackendKind::Herdr, false, Some("0.9.0")).is_empty());
     }
 
+    /// The checkpoint capability means "enabled": an App offers restart-surviving
+    /// history only on a gateway whose storage is `sqlite`.
+    #[tokio::test]
+    async fn the_history_checkpoint_capability_follows_the_storage_setting() {
+        assert!(!API_CAPABILITIES.contains(&HISTORY_CHECKPOINT_CAPABILITY));
+        let supported = crate::terminal::backend::PROCESS_IDENTITY_SUPPORTED;
+        assert_eq!(
+            supported,
+            cfg!(any(target_os = "linux", target_os = "macos"))
+        );
+        assert_eq!(
+            gateway_capabilities(false, false, true).contains(&HISTORY_CHECKPOINT_CAPABILITY),
+            supported,
+            "sqlite storage announces checkpoints only where identity is verifiable"
+        );
+        assert!(!gateway_capabilities(false, false, false).contains(&HISTORY_CHECKPOINT_CAPABILITY));
+        for (storage, announced) in [
+            (crate::platform::config::HistoryStorage::Memory, false),
+            (crate::platform::config::HistoryStorage::Sqlite, true),
+        ] {
+            let mut state = crate::test_state("admin", Vec::new());
+            state.config.history.storage = storage;
+            let meta = gateway_metadata(&state, false).await.unwrap();
+            for capability in [
+                "pane_captured_history",
+                "pane_captured_history_segments_v1",
+                "push_token_owner_binding_v1",
+            ] {
+                assert!(meta["capabilities"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|c| c == capability));
+            }
+            let listed = meta["capabilities"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c == HISTORY_CHECKPOINT_CAPABILITY);
+            assert_eq!(listed, announced && supported, "{storage:?}");
+        }
+    }
+
     /// The gateway-wide list is the weaker, older-app-facing claim: it says
     /// "somewhere on this machine", and it must not disturb anything else.
     #[test]
     fn the_gateway_wide_list_adds_collaboration_and_changes_nothing_else() {
-        let without = gateway_capabilities(false);
-        let with = gateway_capabilities(true);
+        let without = gateway_capabilities(false, false, false);
+        let with = gateway_capabilities(true, false, false);
 
         assert!(!without.contains(&AGENT_COLLABORATION_CAPABILITY));
         assert!(with.contains(&AGENT_COLLABORATION_CAPABILITY));

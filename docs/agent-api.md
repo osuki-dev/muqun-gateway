@@ -1,8 +1,9 @@
 # Agent API
 
 The gateway's agent surface: what the mobile app calls, what comes back, and
-what arrives on the event stream. The agents behind it are OpenCode v2.0.1 and DeepSeek; where this document
-describes OpenCode's behaviour, it is OpenCode's.
+what arrives on the event stream. The agents behind it are OpenCode, DeepSeek,
+T3 Code and Codex; where this document describes OpenCode's behaviour, it is
+OpenCode's.
 
 Every field name here is the one the code serializes — snake_case, as the
 domain types spell it — with two deliberate exceptions, both marked below:
@@ -10,6 +11,31 @@ domain types spell it — with two deliberate exceptions, both marked below:
 verbatim, so their keys stay camelCase.
 
 ## Conventions
+
+Terminal `/agents` and `/snapshot` responses advertise the optional
+`terminal_pending_user_input` capability when they can relay Herdr's native
+`pending_user_input` boolean. An exact `true` means an ordinary native question
+is pending; it can coexist with `working`, `idle`, or a focused input dialog.
+An approval overlay or temporarily unknown screen preserves previously known
+pending attention without permitting `agent.prompt`; it is independent of
+permission approval. Older Herdr versions omit the fact and are represented as
+unknown (`null`); this must not be confused with an observed `false`. Clients
+must not infer a question from `blocked`, titles, or versions.
+The fact identifies pending attention, not a question form or request ID.
+Sending an ordinary follow-up does not constitute answering the native question.
+The notification watcher remembers this boolean per opaque agent instance and
+raises `agent.input_required` on a newly observed pending boundary. Continued
+work-state changes or entering/leaving native answer/approval controls while
+pending do not repeat the reminder. Only an explicit false or disappearing
+instance clears the reminder boundary. Startup seeds
+already pending instances without replaying their old reminders. No request ID
+is available, so replacing one pending question with another without a false
+observation cannot be distinguished or announced separately.
+
+Native agent rows also relay optional `shell_pid`, observed with the agent, for
+correlating an existing pane task with its shell incarnation. Missing or invalid
+PIDs remain unknown. This field is not a substitute for opaque `instance_id`:
+another agent can start in the same shell, and the operating system can reuse PIDs.
 
 - **Auth.** Every route requires a paired device (`Authorization: Bearer
   <device token>`); a missing or malformed header is `401` and an unpaired or
@@ -95,8 +121,8 @@ verbatim, so their keys stay camelCase.
   it was before this existed, so an older app is unaffected. Absent means the
   body is the response body.
 
-- **`asid`** is the OpenCode session id (`ses_…`). The gateway does not mint
-  ids of its own.
+- **`asid`** is the owning agent's native session/thread id (for example,
+  OpenCode's `ses_…` or a Codex thread id). The gateway does not mint ids of its own.
 - **Legacy paths.** Everything under `/api/agent-*` also exists under
   `/api/sessions/{session_id}/agent-*` for the routes that had that form before;
   `session_id` is parsed and ignored. Routes added for v2 parity are on the
@@ -107,12 +133,19 @@ verbatim, so their keys stay camelCase.
 ## Agents
 
 The gateway can have more than one agent attached at once. Today the ids are
-`opencode`, `deepseek` and `t3` (T3 Code). OpenCode is preferred: when a
+`opencode`, `deepseek`, `t3` (T3 Code) and `codex`. OpenCode is preferred: when a
 request names no agent, the **primary** answers — the first attached of
-`opencode`, `deepseek`, `t3`, in that order. The primary is only that internal
+`opencode`, `deepseek`, `t3`, `codex`, in that order. The primary is only that internal
 preference order; the contract names no "active" agent. Inside an agent, a
-persona such as OpenCode's `build` or `plan` is a **mode**; T3 Code has none,
-so its `modes[]` is empty.
+persona such as OpenCode's `build` or `plan` is a **mode**; T3 Code and Codex have none,
+so their `modes[]` are empty.
+
+Discovery's App picker order is separate from implicit routing: an enabled
+Codex with status `connected` or `reachable` is listed first, followed by
+OpenCode. Other providers retain their relative order. Codex in any unavailable
+state is not promoted. This presentation preference must not override the
+App's explicit saved provider selection. Without a selection, clients should
+choose the first usable entry rather than an unavailable row.
 
 ### Feature gate
 
@@ -129,8 +162,12 @@ Agent discovery is on `GET /api/discovery` and `GET /api/capabilities`
 wrapped in the envelope: the top level is `{"ok", "gatewayVersion",
 "apiVersion", "apiMajor", "platform", "serverId", "label", "planes",
 "transports", "capabilities"}`; `transports` is described under "WebSocket
-events" below. An unauthenticated caller gets the same body with `endpoint`
-and `version` removed from every agent.
+events" below. Both routes require a paired device (of either kind) or the
+admin token, like `/health`: a caller with no credential is `401`, a wrong one
+`403`. Only the owner's app device gets the agents' `endpoint` and `version`;
+a linked gateway and the admin token get the document with those removed.
+Nothing in the document is served unauthenticated -- it names the computer's
+id, label, version and configuration.
 
 ```json
 {
@@ -167,14 +204,16 @@ and `version` removed from every agent.
 - `status` values are snake_case: `connected` (attached and answering),
   `reachable` (an endpoint answers but it is not attached), `offline`,
   `disabled`, `not_installed`, `unconfigured`, `unsupported` (the agent
-  answers but speaks a protocol this gateway cannot drive; today only `t3`
-  when its server announces an `orchestrationProtocolVersion` above 1).
+  answers but speaks a protocol this gateway cannot drive, including unknown T3
+  descriptor protocols or a Codex version outside its pinned baseline).
   `connected` and `reachable` can
   be selected: `reachable` means the gateway will attach on first use. The
   rest cannot. `muqun-gateway agent` probes the same list from a shell on the
   gateway host and prints the next step for each. It never attaches, so it
   reports reachability only: never `connected`, and `reachable` where the
-  running gateway may say `connected`. It also checks a held T3 bearer and
+  running gateway may say `connected`. Codex's shell probe checks the executable
+  only and reports readiness as unknown (`unconfigured`); the running Gateway
+  checks authentication through its private app-server. It also checks a held T3 bearer and
   reports `unconfigured` when the server refuses it.
 
   | `status` | Next step `muqun-gateway agent` prints |
@@ -182,17 +221,25 @@ and `version` removed from every agent.
   | `reachable` | none |
   | `connected` | not shown by the CLI (only the running gateway knows) |
   | `unconfigured` (t3: no bearer, or a refused one) | `muqun-gateway agent setup t3` |
-  | `disabled` | `muqun-gateway agent setup t3` / `muqun-gateway agent setup deepseek`; for OpenCode, set `opencode.enabled` |
-  | `offline` | the agent's own start command: `opencode service start`, `bunx @deepseek-ai/dsh web --no-open`, or "open T3 Code, or run `t3 service install`" |
-  | `not_installed` | install OpenCode 2 (or set `opencode.enabled` to false) / T3 Code; for DeepSeek, `bunx @deepseek-ai/dsh web --no-open` |
-  | `unsupported` (t3: newer orchestration protocol) | update muqun-gateway |
+  | `unconfigured` (codex: readiness unchecked or authentication missing) | configure the existing Codex CLI login on the host; `muqun-gateway agent setup codex` explains setup without starting it |
+  | `disabled` | `muqun-gateway agent setup t3` / `muqun-gateway agent setup deepseek`; for OpenCode or Codex, set the corresponding `enabled` key; check `agent_runtime.enabled` for the master switch |
+  | `offline` | the agent's own start command: `opencode service start`, or "open T3 Code, or run `t3 service install`" |
+  | `offline` (deepseek) | Gateway starts or joins DeepSeek Harness; run `muqun-gateway agent setup deepseek` for the manual command (`dsh`, otherwise `bunx`, otherwise `npx --yes`, still `web --no-open`, host and port from `deepseek.endpoint` or `http://127.0.0.1:3080`) |
+  | `offline` (codex) | check the host's Codex configuration; failed prompts are never automatically retried |
+  | `not_installed` | install OpenCode 2 (or set `opencode.enabled` to false) / T3 Code / Codex 0.162.1 (or set `codex.enabled` to false) |
+  | `not_installed` (deepseek) | install `dsh`, or have `bunx` or `npx` on PATH; a missing runner does not stop the gateway, and status does not download or start the harness |
+  | `unsupported` | check the protocol/version baseline and Gateway compatibility |
 - `reason` is a one-line, human-readable explanation, present only when the
-  status alone does not say why (today: with `unsupported`, e.g. "T3 server
-  speaks orchestration protocol 2; this gateway supports 1"). Show it, don't
+  status alone does not say why (for example, an unsupported T3 descriptor
+  protocol or unchecked Codex readiness). Show it, don't
   parse it.
 - `endpoint` and `version` are omitted when unknown or redacted. `models[]` and
   `modes[]` are that agent's own catalog summary; `reasoningEffortTiers` is
   omitted when empty; `modes[].description` when unset.
+- `ledgerDelivery` (per agent) lists the deliveries `POST /api/tasks` can
+  perform for that `agent_id`: `"session"` (a session adapter of that kind
+  is attached) and/or `"pane"` (a terminal launcher is known). See
+  `docs/mcp.md`, capability `task_ledger_delivery`.
 - `features` (per agent) says what the agent can do, so the App can hide
   controls rather than call and get `501 feature_unsupported`. The keys are
   camelCase (there is no snake_case spelling of them in this payload; the
@@ -202,12 +249,12 @@ and `version` removed from every agent.
 | Flag | Meaning |
 |---|---|
 | `streaming` | Live text and tool deltas arrive on the session stream. |
-| `reasoningEffort` | At least one model offers reasoning-effort variants (`reasoning_effort` on the prompt body and on catalog `variants[]`). |
-| `modelSelection` | The agent lists models a session can be pointed at. |
+| `reasoningEffort` | Reasoning-effort selection is supported; use the catalog's actual model `variants[]` to determine available choices. |
+| `modelSelection` | The agent lists selectable models; optional scope/persistence fields distinguish next-turn choices from durable session state. |
 | `toolApprovals` | The agent raises permission requests the App answers. |
 | `worktrees` | The `/api/agent-worktrees` routes work against this agent. |
-| `revert` | Stage, commit and clear revert work. |
-| `stagedRevert` | Revert is two-step (`POST …/revert/stage`, then commit). When false, staging answers `501 feature_unsupported` and the agent reverts in one step. |
+| `revert` | File-restoring revert is supported. |
+| `stagedRevert` | Revert is two-step (`POST …/revert/stage`, then commit). When false, staging answers `501 feature_unsupported`; one-step revert is available only if `revert` is true. |
 | `inbox` | Queued and steered prompts (`/inbox`, `delivery`) work. |
 | `modes` | The agent has modes (personas or presets) to pick; `mode` on create and `POST …/mode` apply. `modes[]` and the catalog's `modes` are meaningful only when true. |
 | `skills` | The catalog `skills[]` list is the agent's and skill activation works. |
@@ -216,43 +263,53 @@ and `version` removed from every agent.
 | `backgroundShells` | The `/api/agent-shells` routes list, read and kill the agent's background shells. |
 | `attachments` | A prompt may carry `attachments`; when false the agent answers `501 feature_unsupported`. |
 | `attachmentsByPath` | The agent has no native attachment API: the gateway lists the attachments as host paths at the end of the prompt text and the agent opens them with its own tools. Only uploads are accepted (see [`POST …/prompt`](#post-apiagent-sessionsasidprompt)). |
+| `timelineEarlier` | `POST …/timeline/earlier` pages older timeline rows after the selected snapshot. Requires global `agent_timeline_earlier_v1` too; absent or false means unsupported. |
 
   The App renders agent-specific UI from these flags alone, never from the
-  agent's `kind`. Every flag is always present (booleans, never omitted).
+  agent's `kind`. The base flags above are always present (booleans, never omitted).
 
   Flags reflect the agent's last probe (cached for about ten seconds).
-  Unknown extra flags may appear; ignore them.
+  Unknown extra fields may appear; ignore them. Optional fields may be booleans
+  or metadata, not necessarily booleans. Codex declares `sessionPagination`,
+  `sessionRename`, `sessionFork`, `sessionDelete` and `forms` true,
+  `mcpElicitation` false, `modelSelectionScope: "next_turn"`,
+  `modelSelectionPersistence: "gateway_until_turn_start"`, and
+  `protocolBaseline: "rust-v0.162.1"`. T3 declares
+  `orchestrationProtocols: [1, 2]`. Gate controls on capabilities, not agent names;
+  these additive declarations do not require an agent-name-specific App change.
 
   What each agent reports today:
 
-  | Flag | `opencode` | `deepseek` | `t3` |
-  |---|---|---|---|
-  | `streaming` | yes | yes | yes |
-  | `reasoningEffort` | when a model has effort variants | when a model has effort variants | no |
-  | `modelSelection` | when it lists models | when it lists models | yes |
-  | `toolApprovals` | yes | yes | yes |
-  | `worktrees` | yes | no | no |
-  | `revert` | yes | no | yes |
-  | `stagedRevert` | yes | no | no |
-  | `inbox` | yes | no | no |
-  | `modes` | yes | yes (presets) | no |
-  | `skills` | yes | no | no |
-  | `slashCommands` | yes | no | no |
-  | `compaction` | yes | no | no |
-  | `backgroundShells` | yes | no | no |
-  | `attachments` | yes | yes | yes |
-  | `attachmentsByPath` | no | yes | yes |
+  | Flag | `opencode` | `deepseek` | `t3` | `codex` |
+  |---|---|---|---|---|
+  | `streaming` | yes | yes | yes | yes |
+  | `reasoningEffort` | when a model supports reasoning or effort tiers | when a model supports reasoning or effort tiers | no | yes |
+  | `modelSelection` | when it lists models | when it lists models | yes | yes (next turn) |
+  | `toolApprovals` | yes | yes | yes | yes |
+  | `worktrees` | yes | no | no | no |
+  | `revert` | yes | no | only known protocol 1 | no |
+  | `stagedRevert` | yes | no | no | no |
+  | `inbox` | yes | no | no | no |
+  | `modes` | yes | yes (presets) | no | no |
+  | `skills` | yes | no | no | no |
+  | `slashCommands` | yes | no | no | no |
+  | `compaction` | yes | no | no | yes (owned native idle sessions) |
+  | `backgroundShells` | yes | no | no | no |
+  | `attachments` | yes | yes | yes | yes |
+  | `attachmentsByPath` | no | yes | yes | yes |
+  | `sessionPagination` | yes | no | no | yes (forward only) |
+  | `timelineEarlier` | yes | yes | no | yes |
 
   `t3` is `name: "T3 Code"`; its `version` is the T3 server version, its
   `models[]` are every model of the providers T3 has ready (Claude Code,
   Codex, …). While not attached it is `reachable` when the server answers and
   the gateway holds a credential (a bearer or an unspent pairing token) it
   will attach with, and `unconfigured` when the server answers but the
-  gateway holds no credential for it. A server announcing an
-  `orchestrationProtocolVersion` above 1 (Orchestrator V2, which accepts only
-  V2 clients) is `unsupported`: it is not attached, so no sessions or
-  streams, and an attached one is dropped if its server starts announcing
-  one. A T3 revert rolls back
+  gateway holds no credential for it. The descriptor automatically selects
+  protocol 1 or 2; omission means 1. Unknown or malformed values are unsupported,
+  not interpreted as V1. V2 uses the pinned nightly-source baseline in the
+  [T3 protocol reference](t3-protocol.md).
+  `revert` is false for V2 and unknown protocols. A protocol-1 T3 revert rolls back
   whole turns: reverting to any row of a turn removes that turn and
   everything after it (`agent.revert.changed` `committed`, then the timeline
   is re-read); there is no staged state.
@@ -287,7 +344,7 @@ Errors, for every route above that takes `agent_id`:
 
 | Status | `error.code` | When |
 |---|---|---|
-| `400` | `invalid_agent` | The id is not one this gateway knows (`opencode`, `deepseek`, `t3`). |
+| `400` | `invalid_agent` | The id is not one this gateway knows (`opencode`, `deepseek`, `t3`, `codex`). |
 | `503` | `agent_unavailable` | The id is known but not attached; the message names it (`Agent 'deepseek' is not available`). |
 
 ### Compatibility
@@ -301,6 +358,67 @@ advertised: an older gateway ignores the parameter.
 
 ---
 
+### Terminal agents launched for remote dispatch
+
+`POST /api/sessions/{id}/tasks` and `POST /api/sessions/{id}/spawn` start a
+CLI agent (Codex, Claude Code, ...) in a terminal pane. Whoever asked is on a
+phone and cannot answer an approval or a "trust this folder?" prompt in that
+pane, so these agents start with their own bypass flags by default.
+
+These terminal routes are unchanged by the Codex service adapter. An explicit
+task `agent_id: codex` still uses a pane, even when the private service adapter
+is connected. Service sessions use `/api/agent-sessions`; their permissions are
+not governed by terminal dispatch bypass flags or folder-trust edits.
+
+| Kind | Default launch arguments |
+|---|---|
+| `codex` | `--dangerously-bypass-approvals-and-sandbox -c projects={"<dir>"={trust_level="trusted"}, ...}` -- the task directory, its git checkout and, for a linked worktree, the main checkout, each only when strictly inside the user's home; left out with `"agent_trust_folders": false`. The path goes in the TOML value, not the key: Codex's `-c` splits keys on every `.`. The value replaces Codex's whole `projects` table for that run. |
+| `claude` | `--dangerously-skip-permissions` |
+| any other | none |
+
+Claude Code and Codex started this way also get the muqun MCP server on their
+launch line (`--mcp-config …`, `-c mcp_servers.muqun.…`) unless
+`mcp.inject_into_agents` is off; see [docs/mcp.md](mcp.md#host-setup). Their
+configuration files are not written for this (folder trust, below, is a
+separate write).
+
+`config.json` changes this per kind: a non-empty list replaces the defaults,
+an empty list turns them off. A task's own `agent_args` come after them.
+
+Claude Code keeps folder trust in its own config, not in a flag. Before
+`claude` starts in a directory, the gateway sets
+`projects["<dir>"].hasTrustDialogAccepted = true` in
+`$CLAUDE_CONFIG_DIR/.claude.json` (`CLAUDE_CONFIG_DIR` from `agent_env`, else
+the gateway's environment) or `~/.claude.json`. Only that key is written,
+other keys keep their values and order, and only for a directory strictly
+inside the user's home, named without `..`. It is on by default, as the
+owner's choice for agents started from their phone; `"agent_trust_folders":
+false` in `config.json` leaves that file alone and drops Codex's `-c projects=…`.
+
+```json
+{
+  "agent_launch_args": { "codex": [], "claude": ["--permission-mode", "acceptEdits"] },
+  "agent_env": { "HTTPS_PROXY": "http://127.0.0.1:7890", "HTTP_PROXY": "http://127.0.0.1:7890" }
+}
+```
+
+`agent_env` is for what the owner's interactive shell sets but the gateway's
+own environment (started by systemd or launchd) lacks -- typically a proxy,
+without which the agent fails with "Connection refused". The variables are set
+on the pane the agent starts in: tmux `-e KEY=VALUE` on `new-session` (tmux
+3.2+) and on `new-window` / `split-window` (3.0+), Herdr's `env` on
+`tab.create`, `workspace.create` and `pane.split`. When the backend cannot set
+a pane's environment -- an older tmux, or a worktree pane that Herdr's
+`worktree.create` / `worktree.open` made -- the variables go on the launch
+instead: tmux, which types the launch line itself, prefixes it with
+`env 'KEY=VALUE' ...` (so they also show in that pane's scrollback). Herdr's
+`agent.start` takes no environment, so there the task's `steps` record `env`
+as skipped. Names must be `[A-Za-z_][A-Za-z0-9_]*`; others are ignored with a
+warning naming the key. Values are never logged, but they are not secret from
+the host: `tmux -e KEY=VALUE` and the `env` prefix put them on a command line,
+which any local user can read in the process list while it runs. Put nothing
+in `agent_env` that must stay hidden from other accounts on the machine.
+
 ## Session lifecycle
 
 ### `GET /api/agent-sessions`
@@ -310,13 +428,152 @@ advertised: an older gateway ignores the parameter.
 | `directory` | Scope to a workspace directory. |
 | `parent_id` | List the children of one session. |
 | `roots` | `true` lists top-level sessions only — no subagent sessions. |
-| `limit`, `order`, `search`, `cursor` | Passed through to OpenCode. `order` is `asc` or `desc`. `limit` defaults to **50**. |
+| `limit`, `order`, `search`, `cursor` | Passed through to OpenCode. `order` is `asc` or `desc`. `limit` defaults to **50 per agent**. A `cursor` requires an explicit nonempty `agent_id`; unscoped cursors are rejected before any provider fanout. |
 | `agent_id` | Only that agent's sessions; absent merges every attached agent. See [Agents](#agents). |
 
 Returns `[AgentSessionInfo]`.
 
+This legacy array remains sorted newest `updated_ms` first, including a selected
+agent list. Aggregation and partial-provider-failure behavior are unchanged. It
+does not expose continuation cursors; use the additive page route below instead.
+
 A subagent run creates a real session whose `parent_id` is the caller's. Without
 `roots=true` those are mixed into the list.
+
+### Runtime provenance and explicit refresh
+
+The additive capability **`agent_session_runtime_v1`** permits optional `runtime`
+on session info, including snapshots, lists, creation and `agent.session.updated`.
+Currently Codex supplies it; absence preserves the existing provider contract.
+
+```json
+{"source":"terminal","interaction":"terminal","status":"working","transcript":"persisted",
+ "terminal":{"session_id":"local","pane_id":"w1:p1","instance_id":"opaque"}}
+```
+
+`source` is `native`, `terminal`, or `unobserved`. `interaction` is `native`,
+`terminal`, or `unavailable`; it is independent of status. A native source is
+observed through an accepted subscription to the connected Codex runtime (private
+or shared daemon). A terminal source is a unique
+current local Herdr observation matching the Codex conversation identity and
+provider exactly, with a complete opaque observed binding. No conversation
+identity is decoded by the App. It revalidates all three terminal binding fields
+against the existing authenticated session agent listing before navigating.
+Navigation does not send, focus, answer, or approve anything. A binding may
+remain stable when the same terminal resumes the same conversation; it does not
+claim a new process incarnation. This is sufficient for conversation-scoped
+reads and navigation, while actual process-targeting assignments require their
+existing stronger launch evidence.
+
+Terminal `status` is the observed `idle`, `working`, `blocked`, `starting`,
+`completed`, or `unknown`. Working/starting map to ordinary session `busy`, idle
+to `idle`, and the remaining terminal statuses to `unknown`. Blocked does not
+fabricate a native permission or question. Changed observations use the existing
+session-update event, polled at one-second intervals with a bounded backend read;
+these metadata events do not replace the transcript.
+
+`unobserved` keeps session status unknown. With complete inventory and no exact
+terminal binding it carries `interaction: "native", reason: "not_loaded"`:
+only an explicit user mutation may resume saved history. Incomplete inventory or
+ambiguous bindings carry `interaction: "unavailable"`, with reason
+`terminal_unavailable` or `ambiguous_terminal`. Opening, polling and refreshing
+never resume a thread. Native prompt, interrupt, model-switch and delete controls
+on an externally bound thread return `409 agent_terminal_interaction_required`
+with `error.runtime`; mutation guards reread the binding without using cached
+observations. Upstream Codex's per-thread writer lock remains the final authority.
+
+An explicitly opened same-daemon loaded conversation can rejoin that runtime and
+replay its pending requests. That accepted subscription takes precedence over a
+terminal observation. A persisted history read cannot establish that ownership
+or recreate its callbacks.
+
+Optional `runtime.transcript` is `live`, `persisted`, or `snapshot`. Native
+subscribed events are `live`. A `persisted` observation follows completed durable
+items and reported token counts for the exact terminal conversation, through
+existing typed timeline/session events. It does not provide token deltas, pending
+tool starts, or actionable approvals. The App may apply live/persisted item updates
+using its existing scroll policy; neither mode requests a history replacement or
+forces the viewport to move. `snapshot` remains explicit-refresh-only.
+
+Persisted readers use the path selected by native `thread/read`, confined beneath
+the initialized Codex home's `sessions` directory, with exact session-header
+identity and no symlink traversal. At most eight readers are retained, with four
+bounded initial preparations. Initial sampling is limited to the last 1 MiB;
+incremental reads are 256 KiB per poll with a 4 MiB record limit. Durable IDs trigger
+at most four turn-scoped native item-page reads and 2 MiB of replies per batch,
+retaining Codex's redaction and process-completion projection. Unchanged files do
+not trigger item-page reads. There are no directory scans or new file endpoints.
+Native-selected path changes, inode replacement, truncation, header/anchor changes,
+rollback, binding loss or exhausted observation budgets freeze the reader until an
+explicit refresh; retained transcript rows are not replaced automatically. Usage
+is unknown when the bounded initial sample contains no complete token-count record.
+
+The capability **`agent_session_refresh_v1`** adds `?refresh=true` to the existing
+GET session snapshot endpoint (global and legacy aliases). This is an explicit
+provider reread, bounded to the normal 100-row tail, four concurrent refreshes
+per provider, and 30 seconds. Normal snapshots remain cached. A concurrent newer
+mirror event wins: refresh fails instead of rolling it back. Successful refresh
+invalidates older replay cursors, without broadcasting replacement history.
+The App preserves its viewport and only replaces history when the reader
+explicitly requests refresh; reconnects and metadata updates do not do so.
+Existing device authentication, peer exclusion, filtering, image handling and
+ETag behavior apply to both forms of the endpoint.
+
+### `GET /api/agent-sessions/page`
+
+The global capability **`agent_session_pages_v1`** declares that this endpoint
+exists. It does not promise every provider supports pagination: check
+`planes.agents.agents[].features.sessionPagination` for the selected provider.
+Only `true` declares support (currently OpenCode and Codex); absent or `false` means
+unsupported.
+
+| Query | Meaning |
+|---|---|
+| `agent_id` | **Required**, one explicit nonempty provider ID, maximum 256 UTF-8 bytes. Never aggregates. |
+| `directory` | Optional nonempty absolute or home-relative workspace path, maximum 4096 UTF-8 bytes. Uses the list's trimming, `~` expansion and canonicalization when the directory exists. |
+| `parent_id` | Optional nonempty parent ID, maximum 256 UTF-8 bytes; literal `null` selects roots. An explicit value takes precedence over `roots`. |
+| `roots` | Optional boolean; `true` selects roots (`parent_id=null`) when no parent ID is given. |
+| `limit` | Integer **1–100**, default **50**. |
+| `order` | Only **`asc`** or **`desc`**, default **`desc`**. |
+| `search` | Optional provider search filter, maximum 4096 UTF-8 bytes. |
+| `cursor` | Optional nonempty opaque provider cursor, maximum **16384 UTF-8 bytes**. URL-encode without changing its bytes. |
+
+Control characters, empty scope values, invalid limits/order and malformed typed
+parameters are rejected with `400` before any upstream request. An unknown agent
+is `400 invalid_agent`; a known unattached agent is `503 agent_unavailable`.
+An adapter without pagination returns `501 feature_unsupported`, not an empty
+page. The selected provider's failure uses the existing `502 agent_error` mapping.
+
+Authentication, encrypted transport policy, the versioned content envelope and
+private ETag/`If-None-Match` behavior match the legacy list. The nested `data`
+is intentional, preserving the OpenCode page contract:
+
+```json
+{
+  "schema_version": "1.5.0",
+  "capabilities": { "parts": true, "assets": true, "image_upload": true, "composer": true, "message_image_assets": true, "session_descendants": true },
+  "data": {
+    "data": [{ "asid": "ses_1", "agent_id": "opencode", "title": "Example", "status": "idle", "updated_ms": 1 }],
+    "cursor": { "next": "opaque-provider-cursor", "previous": null }
+  }
+}
+```
+
+Both cursor keys are always present and explicitly **`null`** when unavailable.
+The Gateway preserves provider order and both cursors, applies its normal
+agent ownership and read-marker overlays, and records session routes without
+sorting, refetching, aggregating or following another page automatically.
+
+Codex pagination is forward-only: `cursor.next` continues in the requested
+order and `cursor.previous` is always `null`. Do not infer reverse navigation
+from its pagination flag or change the common order/cursor scope rules.
+
+Cursors are upstream values, **not locally cryptographically bound** by Gateway.
+Clients must reuse a cursor only on this selected-provider endpoint with the same
+agent, normalized directory, parent/roots filter, search, order and page size.
+**Restart pagination if any of those change**; never broadcast a provider cursor
+to every agent. Existing Apps still request fifty sessions and cannot
+automatically page. App adoption is deferred; the legacy array routes remain.
 
 ### `POST /api/agent-sessions`
 
@@ -348,16 +605,137 @@ Returns `AgentSessionSnapshot`:
 prompt raised while the event stream was down is not lost. `timeline` is ordered
 by `(message_id, ordinal)`.
 
+### `POST /api/agent-sessions/{asid}/timeline/earlier`
+
+Gate remote history pulls on **both** global capability
+`agent_timeline_earlier_v1` and the owning provider's
+`planes.agents.agents[].features.timelineEarlier === true`. Never infer support
+from a Gateway version or agent name. Codex, DeepSeek and OpenCode implement
+it; T3 returns `501 feature_unsupported`, not successful exhaustion.
+
+OpenCode's message route takes `limit` and `order` and no cursor, so each
+earlier batch is read as the newest `held + 80` messages (bounded to 2,000
+messages and 8 MiB per read) and cut at the oldest message already delivered;
+a read that answers fewer than asked is the end. A session whose history
+changed under the cursor answers `409 history_cursor_lost` (below): read the
+snapshot again.
+
+DeepSeek pages `session/page` backwards under the frozen `asOfSeq` cut the
+snapshot was read under: opening reads the newest hundred messages within a
+2 MiB budget, each earlier batch the pages below the oldest row delivered
+within 8 MiB, and a page that would exceed the budget waits for the next
+pull. A history is never refused for its size. A tool result cut from its
+call by a page boundary is joined onto the call when that older page arrives.
+
+No request body or client cursor. Load the selected session snapshot first, then
+request one earlier batch at a time. The existing content envelope carries
+`data: {"items": [TimelineItem], "exhausted": false}`. A batch contains at most
+**80 mapped rows**, oldest first; one native reasoning item can span batches.
+Merge by stable row ID and `(message_id, ordinal)`, preserving the current viewport
+and existing tail. Historical driver rows retain the existing `seq: 0` semantics;
+the mirror records its own upsert sequence as before. This is not an SSE replay
+cursor. The legacy session-prefixed alias has the same contract.
+
+`exhausted: true` means the adapter returned an empty batch. A final nonempty batch
+can therefore still say false; the following pull confirms the end. Filtering
+internal plumbing can yield `items: []` with `exhausted: false`; continue later,
+do not infer the end from the visible array alone.
+
+`409 history_cursor_lost` means the gateway holds no earlier-history cursor for
+the session: no snapshot was read in this gateway process (a restart, or the
+cursor was evicted), or the history changed under it. It is never exhaustion:
+read the snapshot again (`GET /api/agent-sessions/{asid}`) and pull on.
+
+State belongs to the provider/session in this Gateway process, not a particular
+App: concurrent requests consume successive disjoint batches. Apps must serialize
+their own pulls and must not automatically retry a POST whose successful reply
+may have been lost. Failed or cancelled provider reads do not consume a batch;
+successful canonical snapshot acceptance reestablishes the newest-tail boundary.
+A provider tail is prepared first. Initial history validates session incarnation
+and removal generation while preserving newer live rows; explicit refresh also
+requires an unchanged mirror sequence. Pagination state and mirror rows are
+accepted synchronously after the mirror fences and adapter revision check pass.
+Failed or cancelled preparation, a newer event during refresh, or
+concurrent earlier-page progress discards the candidate without resetting or
+restoring shared cursor state. Cached snapshots do not reset pagination. There
+are at most four pending Codex tail candidates; dropping one releases its slot.
+This acceptance boundary covers pagination and transcript rows, not rollback of
+all driver state: sampled usage may update during preparation. Initial pending
+request catch-up can still be cancelled after rows and pagination are accepted
+together; it does not undo that accepted history.
+On restart/refetch, merge repeated IDs rather than duplicating rows.
+
+Codex retains only a raw residual page (or a bounded legacy response), plus an
+item's remaining mapped-prefix boundary. History reads are serialized per provider
+and use the existing traversal deadline/page/byte/row budgets. Retention is bounded
+to 4096 sessions and 32 MiB of serialized residual/cursor state; exhaustion returns
+an error without eviction or cursor consumption. Ordering uses a checked `u64`
+prefix allocation without renumbering displayed rows; exhausted ordering capacity
+or contradictory anchors return an explicit error, never a fabricated partial end.
+
 ### `GET /api/agent-sessions/{asid}/children`
 
 Same response as the list route, filtered to this session's children. Accepts
 the same `limit` / `order` / `search` / `cursor`. Every adapter honours the
-parent filter; DeepSeek and T3 have no sub-agent sessions, so they list none.
+parent filter. DeepSeek has no sub-agent sessions and lists none; T3 lists a
+thread's subagent threads on protocol 2 (their `parent_id` is the parent
+thread) and none on protocol 1.
+
+### `GET /api/agent-sessions/{asid}/descendants`
+
+`/children` over every depth at once, for opening a workbench with one request
+instead of one per descendant. `capabilities.session_descendants: true` on the
+envelope says a gateway answers it. The same query as `/children` (`agent_id`,
+`limit`, `order`, `search`, `directory`; `cursor` is `400 invalid_query`, a
+cursor pages one listing and cannot page a tree), the same authorisation, and
+the same error semantics (an agent that fails is skipped while another
+answers, unless it was the one named). The answer nests the list, so the walk
+can say when it stopped short:
+
+```json
+{
+  "schema_version": "1.5.0",
+  "capabilities": { "...": true, "session_descendants": true },
+  "data": {
+    "data": [{ "asid": "ses_2", "agent_id": "opencode", "parent_id": "ses_1", "...": "..." }],
+    "truncated": true
+  }
+}
+```
+
+`data.data` is every session below `{asid}` (never `{asid}` itself), each
+shaped exactly as `/children` shapes a session, newest `updated_ms` first; a
+breadth-first walk over the adapters' children listings, at most **8 levels
+deep** and **500 sessions**. `truncated` is present, and `true`, only when one
+of those bounds cut the walk short: there are deeper or further sessions that
+were not asked for. Absent means the list is the whole subtree.
 
 ### `DELETE /api/agent-sessions/{asid}`
 
 `{"deleted": true}`. OpenCode removes the session's children too, and announces
 each one on the stream.
+
+### `DELETE /api/agents/{agent_id}/sessions/{asid}`
+
+Gate provider-scoped deletion on `agent_session_delete_scoped`, then use the
+provider and session ID captured from the selected row. The gateway verifies
+that exact attached provider owns the session before deleting it, without
+consulting a cached owner or trying another provider. Unknown providers return
+`400 invalid_agent`; unavailable providers `503 agent_unavailable`; missing
+sessions `404 session_not_found`; a mismatched session response
+`409 session_changed`; a failed ownership read `502 agent_error`. The ID must
+be 1–128 ASCII letters, digits, `-`, `_`, `.`, or `:`, and cannot be `.` or `..`;
+unsafe IDs return `400 invalid_session`. No mutation occurs on these failures.
+
+The legacy route retains its original owner lookup. Older gateways return 404
+for this distinct scoped route, even when a client cached the capability before
+a downgrade. Clients must never fall back to the legacy route for scoped deletion
+or assume that an `agent_id` query on that route constrains its owner.
+
+OpenCode, T3 and Codex implement deletion; DeepSeek returns `501 feature_unsupported`.
+Provider deletion removes the conversation according to the provider's contract;
+the gateway does not promise that active work or child processes have stopped.
+It is separate from closing a terminal pane and from removing a local Home entry.
 
 ### `POST /api/agent-sessions/{asid}/rename`
 
@@ -390,8 +768,14 @@ Marks the session read. Unread is `info.time_idle > info.time_viewed`.
 `delivery` is `steer` (run at the next step boundary) or `queue` (wait behind
 what is already queued). Returns `{"submitted": true}`.
 
-There is no model or mode field: **model and mode are session state in v2**.
-Switch first, then prompt.
+There is no model or mode field: **OpenCode model and mode are session state in
+v2**. Switch first, then prompt where the corresponding capability is supported.
+
+For Codex, switching stages an ephemeral Gateway-local next-turn model/effort
+choice. It remains pending until authoritative upstream normalization confirms
+application, and is not a durable session setting or a pre-turn model update.
+Busy threads must be interrupted first. Gateway restart loses the pending choice;
+see [Codex protocol reference](codex-protocol.md) for model/provider limits.
 
 An attachment the app uploaded is an absolute path into the gateway's upload
 directory — see [Attachments](#attachments) for how one gets there, and for the
@@ -402,7 +786,7 @@ How attachments reach the agent depends on the agent:
 
 - **`opencode`** (`attachmentsByPath: false`) takes them natively as file
   parts; absolute paths, `file://`, `https://` and `data:` URLs all work.
-- **`deepseek`** and **`t3`** (`attachmentsByPath: true`) have no file parts.
+- **`deepseek`**, **`t3`** and **`codex`** (`attachmentsByPath: true`) use host paths.
   The gateway sends the agent an empty attachment list and appends the paths
   to the prompt text instead:
 
@@ -452,6 +836,14 @@ No body → `{"interrupted": true}`. Status goes to `interrupted`.
 
 A slash command from the catalog's `commands`. A leading `/` on `name` is
 stripped; `arguments` fills `$ARGUMENTS`. Returns `{"submitted": true}`.
+
+Codex exposes only `/compact` from its downloaded command catalog, backed by
+`thread/compact/start` on an owned, idle session. It takes no arguments or
+`delivery` override. Missing/invalid catalogs, or catalogs with no supported
+rows, leave `commands` empty and `slashCommands` false. Other Codex commands
+(including `/new`, `/export` and custom prompt names) are rejected by the
+Gateway, never sent as model prompts. Skills still use the separate `/skill`
+endpoint with native skill input.
 
 ### `POST /api/agent-sessions/{asid}/skill`
 
@@ -635,15 +1027,188 @@ A phone cannot hand a local file to an agent that runs on the gateway's host, so
 the file is uploaded first and then referred to by path. Both routes are on the
 gateway proper rather than under `/api/agent-*`; both require a paired device.
 
+### Agent image previews (additive `agent_image_previews_v1`)
+
+Timeline `attachments[]` and typed tool `content[].uri` use authenticated,
+Gateway-relative **original** URLs for admitted inline/local files. No thumbnail
+replaces an existing original URL. Text and tool inputs remain verbatim. The
+optional `image_assets` entries match attachment/content URLs through `src`:
+
+```json
+{
+  "src": "/api/agent-images/ai_…/original",
+  "asset_id": "ai_…",
+  "url": "/api/agent-images/ai_…/original",
+  "mime": "image/png",
+  "width": 1200,
+  "height": 800,
+  "size": 1234567,
+  "thumbnail_url": "/api/agent-images/ai_…/thumbnail",
+  "preview_url": "/api/agent-images/ai_…/preview",
+  "download_url": "/api/agent-images/ai_…/download",
+  "version_url": "/api/agent-images/ai_…/version"
+}
+```
+
+Minimal new-App consumption: negotiate `agent_image_previews_v1`; match `src`
+exactly and check actual `mime` (entries may be files/PDFs, not all bitmaps).
+Use `thumbnail_url` only in the timeline list, `preview_url` when opening an
+image, and `download_url` (or original `url`) for save/download. Fall back to
+original bytes via `download_url` on a 415 preview failure; this is also usable
+for viewing, regardless of attachment disposition. Legacy text/file-asset `url`
+can still name the old size-limited asset endpoint, so use the new download URL
+for large originals. Never save a thumbnail. Missing optional
+fields retain legacy behavior. No `agent_message_display_v1` or gallery redesign
+is required. Older Apps receive original attachment bytes, not implicit smaller
+replacements; they do not gain thumbnail bandwidth savings until updated.
+
+`size` is the original file length, not a derivative estimate. An optional
+`unavailable_reason` marks a failed reference/encoding/storage resolution:
+**skip that entry for URL/image rendering**. Its `url` and `asset_id` are empty,
+and no download/preview URL is fabricated. The original attachment/content string
+remains unchanged so source information is not silently deleted. Reasons include
+`attachment_name_only` (display label, never a filesystem path),
+`original_storage_unavailable`, `invalid_inline_encoding`, and
+`reference_not_authorized_or_unavailable`. For an unavailable inline source the
+error entry's `src` is empty to avoid copying its entire base64 payload again;
+the raw source occurs only in the existing attachment/content field. Such an
+entry is explicitly **not** a claim that an authorized original URL exists.
+
+`GET /api/agent-sessions/{asid}/file-asset?uri=…` retains its original contract
+and adds these same optional preview/download URLs to `data.asset`.
+
+`GET /api/agent-images/{id}/{variant}` accepts only `original`, `download`,
+`thumbnail`, or `preview`. All require an existing paired App device and the
+normal encrypted transport when required by pairing; URLs contain no credentials.
+Each read re-opens an already registered canonical regular file inside its
+server-owned fence (session directory, existing generated-images fence, or
+Gateway upload/original storage), including cache hits. No arbitrary path query
+exists. IDs are bounded in-memory registrations; refresh the timeline/file-asset
+after a Gateway restart or registration eviction. Pairing is owner-wide, not a
+per-session user ACL; no new session bearer/capability tokens are issued.
+
+Original reads have no preview-size cutoff: they stream from an authorized open
+file handle in 64 KiB chunks. They include weak metadata ETag, private/no-store,
+single byte Range support (206/416), and If-None-Match (304). Per HTTP semantics
+a weak If-Range cannot establish a strong content match and returns full 200.
+These legacy unversioned URLs expose no strong original version conditional;
+the derivative's strong WebP ETag is not an original version. Weak metadata ETags
+detect changes but do not promise a fixed snapshot across separate range
+requests. Consistent multipart originals use the additive version API below.
+A source changed during reading aborts the body rather than reporting a complete
+successful snapshot. Download differs only by attachment disposition. Existing
+`/api/assets/*` and `/api/uploads/*` size/retention/download behavior is unchanged.
+Inline image originals are immutable private digest-named files; generated host
+originals remain in place. The derivative sweeper never deletes originals.
+Inline originals decode to disk in small base64 blocks, not a whole-image byte
+allocation, and do not disappear when optional preview budgets are exhausted.
+Attachment arrays are not silently truncated at 16/32 entries.
+
+The existing encrypted transport still buffers each sealed response (roughly
+32 MiB plaintext maximum); it is not a streaming encryption protocol. Large
+original consumers must use bounded standard ranges, for example 8 MiB each,
+using `size` or a small encrypted GET range's Content-Range total. Authenticate
+the complete AEAD response, check each requested interval/returned length/total
+and validator, and abort/restart assembly when they differ. Do not use weak
+If-Range, and never append a 200 fallback as if it were a partial response.
+Do not rely on an encrypted HEAD response body for authenticated metadata. A
+full large response over that transport is not currently supported. Never
+downgrade or disable required pairing encryption to bypass that constraint.
+The original route itself supports full streaming reads over the existing
+authorized transport mode and bounded encrypted range reads; App range-save
+consumption must be verified separately before claiming large-file acceptance.
+
+Derivatives are lazy, lossless WebP: thumbnail longest edge 384 (1 MiB output
+cap), preview longest edge 1600 (4 MiB cap), no upscaling. Only static PNG/JPEG/
+WebP is decoded. Sources over 25 MiB, GIF/APNG/animated WebP/HEIC, malformed content, over 8 million
+pixels or 16384 per dimension, a decoded-buffer allowance over 64 MiB, and failed
+cache/encoding operations return 415 `image_preview_unavailable`, not an original
+disguised as WebP. Originals remain accessible where authorized. Work uses at
+most two blocking workers, with one serialized cache/encode transaction; the
+versioned source-digest/size cache is bounded at 64 MiB/256 derivative files.
+
+This normalization occurs **after** provider decoding. It does not by itself
+repair an upstream Codex WebSocket frame that fails before decoding.
+
+#### Fixed original downloads (`agent_image_versions_v1`)
+
+Successful image/file descriptors additionally offer optional `version_url`.
+Negotiate `agent_image_versions_v1`, then GET that URL **before** requesting
+multipart original bytes. This lazily acquires a fixed original and returns:
+
+```json
+{ "data": { "asset": {
+  "id": "ai_…",
+  "version": "<64 lowercase SHA256 hex characters>",
+  "etag": "\"sha256-<same hex>\"",
+  "size": 34603008,
+  "mime": "image/png",
+  "name": "source.png",
+  "url": "/api/agent-images/ai_…/original/<version>",
+  "download_url": "/api/agent-images/ai_…/download/<version>"
+} } }
+```
+
+The digest identifies the **complete fixed bytes acquired**, not an asserted
+instantaneous atomic view of a concurrently written source file. Cold acquisition
+first streams/hashes the existing authorized handle without temporary disk,
+then verifies a matching complete digest object if one is already stored. Such
+reuse does not count as a new copy, even after registration loss or at capacity.
+Only a missing object reserves the full staging byte/file capacity, rewinds the
+same handle, copies and hashes again, checks both digests/size/source identity,
+syncs and atomically publishes without replacing any prior digest object.
+Detected source change or I/O failure does not publish a partial original.
+Existing immutable Gateway inline/upload originals are reused without another
+permanent copy. No whole-file buffer, per-range whole-file hash or new database.
+
+Use the returned versioned `download_url`/`url` with standard bounded ranges
+(e.g. 8 MiB) and the descriptor's exact strong `If-Match`. Each 206 must pass
+complete AEAD authentication and match the expected strong ETag, requested
+Content-Range interval, total and body length. The original source may change
+inside its fence after part zero: that version URI still reads the acquired
+fixed bytes, never silently switches to the changed source. Reacquiring a
+descriptor may yield a different digest/URI. Do not combine those versions.
+
+Wrong/weak `If-Match` is **412**; weak `If-Range` on the versioned route is also
+rejected with 412. Prefer If-Match only. A mismatched strong If-Range can yield
+full **200** by HTTP semantics: never append it as a partial segment. The old
+unversioned URL/weak ETag semantics remain unchanged for older Apps.
+
+Unknown/expired version registration or a changed fixed object is **409**:
+stop assembly, refresh the descriptor and restart unless the same digest/size
+is re-established. Authorization/expiry is rechecked, including the original
+source fence; a removed/escaped original reference can still return 404. A
+version digest is not a credential and cannot access another asset's versions.
+Uploads retain their existing 48-hour retention. In-memory registrations are
+bounded at 256 and reset on restart/eviction; disk originals are not deleted by
+registration eviction.
+
+Additional local-version copies have a fixed **1 GiB / 4096-file original-store
+admission budget** (including existing regular files/staging). Already preserved
+inline/upload originals and existing versions remain usable; existing inline
+original retention is unchanged. Capacity failure returns **507** before a
+new version is promised; it never deletes a source or unique original to make
+room. Stored originals have no new automatic destructive expiry. Storage failure
+is 503, source change/conflict is 409. These are explicit failures, not fake
+download URLs. Snapshot acquisition is singleflight inside the existing bounded
+blocking admission; no extra service, queue or configurable transform system.
+
+The shared sealed-response collector remains bounded, not streaming encryption;
+versioned clients must still use small authenticated ranges for large files.
+
 ### `POST /api/uploads`
 
 `multipart/form-data` with one `file` field. The type is decided by sniffing the
-content, never by the filename: images (png, jpeg, gif, webp, heic), PDF, the
-Office and OpenDocument containers, and low-control UTF-8 text are accepted, and
-everything else — executables and scripts first — is refused with `415`. A body
-over 25 MiB is `413`. The stored name is generated by the gateway (a UUID plus
-the extension the content earned), so nothing the client sent ever becomes a
-path.
+content, never by the filename: images (png, jpeg, gif, webp, heic), MP4 and
+QuickTime video (the `ftyp` brands the asset preview plays, with an mp4/mov/m4v
+file name), PDF, the Office and OpenDocument containers, and low-control UTF-8
+text are accepted, and everything else — executables and scripts first — is
+refused with `415`. A video may be up to 64 MiB; anything else up to 25 MiB
+(`413 upload_too_large` past it, once the content has been sniffed; a body over
+64 MiB is cut off as `413`). `GET /api/discovery` carries both numbers as
+`uploads.maxBytes` and `uploads.maxVideoBytes`, for the app to say on a `413`.
+The stored name is generated by the gateway (a UUID plus the extension the
+content earned), so nothing the client sent ever becomes a path.
 
 This route answers a bare JSON body, not the content envelope:
 
@@ -811,7 +1376,7 @@ pushes nothing until that request is resolved.
 | `session_id`, `asid` | the agent session | the agent session |
 | request id | `approval_id` | `form_id` |
 | `fingerprint` | the request id | the form id |
-| `agent_id` | — | the owning agent (`opencode`, `deepseek`, `t3`) |
+| `agent_id` | — | the owning agent (`opencode`, `deepseek`, `t3`, `codex`) |
 
 A question push reads "*name* needs your input", where *name* is the session's
 title, or the agent's name when the session has none. With `rich_agent_pushes`
@@ -865,7 +1430,7 @@ A directory that no longer exists is not this case: that is
 
 Capability `agent_vcs_files`. Three routes that ask **git** in the session's
 directory rather than the agent, so they mean the same thing for OpenCode,
-DeepSeek Harness and T3 Code. `vcs/diff` above is unchanged. Paths are
+DeepSeek Harness, T3 Code and Codex. `vcs/diff` above is unchanged. Paths are
 relative to the checkout's top level, which may be above the session's
 directory. Every git process is bounded by 5 s and 8 MB of output.
 
@@ -1006,7 +1571,7 @@ skills do. **A slash menu lists only `slash: true`**; the rest exist for the
 agent to reach for, and `autoinvoke: true` says it may do so unasked. Activate
 one with [`POST …/skill`](#post-apiagent-sessionsasidskill).
 
-`?directory=` scopes the catalog **up**, never down: the modes, commands and
+For OpenCode, `?directory=` scopes the catalog **up**, never down: the modes, commands and
 skills a project defines are added to the global ones, and a directory never
 returns fewer modes than no directory. The gateway enforces that, because
 OpenCode's `GET /api/agent` is a snapshot that fills in over roughly a second
@@ -1190,6 +1755,17 @@ ERROR refusing to start /usr/local/bin/opencode: it reports version opencode 1.1
 A version that cannot be read is allowed through — silence is not evidence of
 being old — so only a legible version below 2.0 is refused.
 
+### Configuring Codex
+
+Codex service support defaults on, including when its config block is omitted.
+It uses the existing executable on `PATH` and CLI login/configuration; Gateway
+does not install or log in. Set `codex.enabled: false` to disable it, or
+`agent_runtime.enabled: false` to disable all service agents without changing
+terminal dispatch. `muqun-gateway agent setup codex` only explains setup.
+See [Codex protocol reference](codex-protocol.md) for the stable 0.162.1 baseline,
+readiness, model scope and unsupported features. Real Codex and paired App/macOS
+acceptance remain deferred by user instruction, not passed by protocol fixtures.
+
 ### Configuring T3 Code
 
 T3 Code (`t3 serve`) is off until `config.json` asks for it. The gateway never
@@ -1305,6 +1881,56 @@ tail it cannot place.
 
 `?after=<seq>` → `{"items": [...], "status": "busy", "resync": false, "latest_seq": 42}`.
 
+### Task plumbing in the transcript
+
+Every session is served without the muqun MCP server's tool rows -- on the
+snapshot, the timeline, the event replay, the SSE stream and `/api/ws`: a
+tool row named for that server under any host's prefix (`muqun_tasks_wait`,
+`mcp__muqun__exec.run`, `muqun.fleet.list`, …), any tool it has or will
+have, in every state (pending, running, completed, failed). They are
+internal; what a person sees of a delegation is its row on Home, the
+parent's `progress` (`Waiting for mini · 3 min`) and the result line the
+gateway tells the parent session ([mcp.md](mcp.md#being-told-how-a-delegation-ended)).
+A tool of the same name with no server prefix, or another server's, stays.
+The agent's own prose is untouched.
+
+A session a task is (or was) bound to ([docs/mcp.md](mcp.md#finishing-a-delegation))
+is also served without the rest of the gateway's task plumbing, there and
+on `GET …/inbox`:
+
+- A user `text` row (or a `synthetic` row) that ends with the completion
+  instruction an older gateway sent with a goal (goals now go alone) is served
+  with the instruction cut, and is left out when it was only the instruction. Any wording the gateway has sent is recognised, by the
+  instruction's fixed opening (`When the whole task is finished, `) and its
+  closing placeholder line, never by the goal.
+- Each turn's last assistant message is served without the one marker the
+  task ledger read the turn's end from: over the message's `text` rows
+  joined, the last `MUQUN_TASK_DONE:` or `MUQUN_TASK_BLOCKED:` below any
+  restated instruction that starts a line (after bullets and markup) or
+  follows the agent's words on it, and is not a placeholder -- cut from the
+  marker to its line's end, the words before it kept -- unless it sits in a
+  code fence as rendered. Any other marker stays. A row left with nothing else is left out. While the
+  session runs a turn, a last line that can only be the start of a marker (or
+  is bare list or emphasis markup, such as `- `) is held back too, so the
+  marker never shows mid-turn. An `agent.timeline.upsert` whose rows are all
+  left with nothing arrives as `agent.timeline.removed` for them. `seq` keeps
+  counting, so a client may see a gap where a row was left out.
+- The notice OpenCode leaves for the task's per-session instruction
+  (`Instructions updated: …muqun-task`) is left out.
+- OpenCode's Code Mode plumbing is left out: an `execute` tool row (held while
+  its code is not known yet and the turn runs) whose whole code is
+  `[return] search({query: '<string>'[, limit: <integer>]})[;]` for a muqun
+  tool (a query starting `muqun`, or naming `tasks.`, `fleet.` or
+  `exec.run`) and did not fail -- anything more is the agent's own work and
+  is shown -- and the notice whose first line is "The Code Mode tool catalog
+  has changed." followed only by the catalog listing.
+- An inbox item (`GET …/inbox`, the snapshot's `inbox`,
+  `agent.inbox.changed`) is cut the same way as a user row: OpenCode holds
+  the instruction there for a moment before the turn runs.
+
+The agent's own transcript, the mirror and the task follower keep the raw text
+(the marker is read from it); the task's `summary` is still the marker's line.
+
 ### WebSocket events: `GET /api/ws`
 
 One WebSocket per device carrying the agent events of **any number of
@@ -1314,7 +1940,7 @@ HTTP, and the SSE stream is unchanged and remains the fallback.
 
 **Feature gate.** `ws_events` in the flat `capabilities` array (`/health`,
 `/api/capabilities`, `/api/discovery`), and in the `/api/discovery` body at
-top level beside `planes`, shown to every caller (it is not sensitive):
+top level beside `planes`, shown to every paired caller:
 
 ```json
 "transports": { "websocket": { "path": "/api/ws", "protocol": 1 } }
@@ -1424,9 +2050,11 @@ Server → client:
 | Frame | Meaning |
 |---|---|
 | `{"t":"hello","connection_id":"<uuid>","protocol":1,"generation":"<id>"}` | First frame, always. `generation` is the gateway instance generation (see Conventions); a client that finds it changed since its last socket is talking to a restarted gateway. Older gateways omit it. |
-| `{"t":"subscribed","asid":"ses_1"}` · `{"t":"subscribed","all":true}` | The subscription is in effect: every event published from here on reaches this socket. Start catch-up after this, not before. |
+| `{"t":"subscribed","asid":"ses_1"}` · `{"t":"subscribed","all":true}` · `{"t":"subscribed","tasks":true}` | The subscription is in effect: matching events published from here on reach this socket. Start catch-up after this, not before. |
 | `{"t":"event","asid":"ses_1","seq":12,"event":"agent.timeline.upsert","data":{…}}` | One domain event. `event` is the SSE `event:` name and `data` is the SSE `data:` payload **byte for byte**, embedded as JSON rather than as a string. `asid` and `seq` repeat the event's own (`asid` is `""` and `seq` 0 for `agent.worktree.changed` and `agent.resync`). |
-| `{"t":"resync","asid":"ses_1"}` | This socket fell behind the gateway's event backlog; refetch that session. `asid` `""` means every session. One per subscribed session, or a single `""` under `subscribe_all`. |
+| `{"t":"task","asid":null,"seq":12,"event":"task.updated","data":{…}}` | One full `TaskView` on a `subscribe_tasks` socket. |
+| `{"t":"defaults","default_cwd":"/home/user/project"}` | On a `subscribe_tasks` socket: the directory a task this device opens without `cwd` runs in (`"~"`, the home directory, when it has no usable previous one; `null` when unknown). See **Task updates** below. |
+| `{"t":"resync","asid":"ses_1"}` | This socket fell behind the gateway's event backlog; refetch that session. `asid` `""` means every session. One per subscribed session, or a single `""` under `subscribe_all`. With `"tasks":true` it is about task updates instead: refetch `GET /api/tasks`. |
 | `{"t":"pong"}` | Answer to `ping`. |
 | `{"t":"error","code":"…"}` | Sent immediately before the gateway closes the socket (close code 1008). |
 
@@ -1436,7 +2064,8 @@ Client → server:
 |---|---|
 | `{"t":"subscribe","asid":"ses_1"}` | Add a session. The id is not looked up, so subscribing to a session that does not exist yet is allowed, and a subscription survives the agent restarting. Idempotent. |
 | `{"t":"unsubscribe","asid":"ses_1"}` | Drop a session. No acknowledgement. |
-| `{"t":"subscribe_all"}` | Every session, for the life of the connection. `unsubscribe` does not narrow it; reconnect to narrow. |
+| `{"t":"subscribe_all"}` | Every session. `unsubscribe` does not narrow it; `subscribe_tasks` switches to task-only delivery. |
+| `{"t":"subscribe_tasks"}` | Task updates only. Replaces the socket's session subscriptions; a later `subscribe` or `subscribe_all` switches back to session delivery. That request's `subscribed` acknowledgement includes `"tasks":false` to report that `t:"task"` delivery ended (for example, `{"t":"subscribed","asid":"ses_1","tasks":false}` or `{"t":"subscribed","all":true,"tasks":false}`). Under `subscribe_all`, task updates still arrive as `t:"event"`. |
 | `{"t":"ping"}` | Application-level liveness; answered with `pong`. |
 
 Unknown extra fields are ignored. An unknown `t` is `unknown_type` and a
@@ -1460,6 +2089,69 @@ reach every SSE stream.
 | Sockets per gateway | 64. Past it the upgrade is `429 too_many_connections`. |
 | Server heartbeat | A WebSocket ping every 25 s; two unanswered pings drop the socket. Any client frame counts as an answer. |
 | Revocation | Checked every 5 s; a revoked device's socket is closed without an `error` frame, as its SSE stream is. |
+
+**Task updates.** A socket that sent `subscribe_all` also receives one
+`{"t":"event","asid":null,"seq":<n>,"event":"task.updated","data":<TaskView>}`
+frame for every change to a task (capability `task_ledger`; see `docs/mcp.md`),
+and one for its parent task, whose `children` counts moved, when it has one. A
+socket subscribed to individual sessions does not get them. `data` is the whole
+task, so a client keeps the newest frame per `task_id`. A socket that falls
+behind the task events gets one `{"t":"resync","asid":"","tasks":true}` frame:
+refetch `GET /api/tasks` (a client that ignores `tasks` reads it as a resync
+of every session, which also covers it). Refetch `GET /api/tasks` after a
+reconnect as well.
+
+When `task_ws_subscription` is advertised, `subscribe_tasks` receives the same
+task views with `"t":"task"`, and no
+agent-session or pane traffic. It still receives the initial `hello` and a
+`{"t":"subscribed","tasks":true}` acknowledgement. Task lag uses the same
+task resync frame.
+
+When `task_defaults` is advertised, a `subscribe_tasks` socket is also told
+where a task this device opens without `cwd` (`POST /api/tasks`) will run,
+so the app can show it before the user sends: one
+`{"t":"defaults","default_cwd":…}` frame right after the `subscribed`
+acknowledgement, another after each task resync frame, and a new one
+whenever a task the device opens changes the answer. `default_cwd` is the
+directory of the device's newest task while that is still a directory, else
+the home directory -- always named from `~` when it is under home (`"~"`,
+`"~/src/app"`), so no user name is shown; `POST /api/tasks` expands `~` in
+`cwd`. `null` only when the task store cannot be read. `GET
+/api/tasks/defaults` answers `{"default_cwd": …}` by the same rule for a
+client without the socket.
+
+**Task fields and outcomes** (capability `task_outcome`; full contract in
+`docs/mcp.md`):
+
+- `TaskView.title` (always a string): the task's `label`; else, for a session
+  delegation, the first sentence of the name the agent session gave itself
+  (an untitled session's placeholder -- its asid, `New thread`, `DeepSeek
+  Agent Session` -- or the goal restated or cut short is not used); else the goal's first sentence -- cut to 60 characters with
+  `…`, back to a word boundary when that keeps at least 30 characters. An
+  open task's follows the session's name as it changes; an ended one keeps
+  the name it had when it ended. Show it instead of the raw `goal`.
+- Agent sessions (`GET /api/agent-sessions`, …) never carry an empty
+  `title`: until the provider names one it reads as before -- OpenCode's
+  asid, `DeepSeek Agent Session`, T3's `New thread`. A task's `title` never
+  takes such a placeholder; it keeps the goal's first sentence until the
+  session is really named.
+- `tasks.complete` takes `outcome`: `done` (default) or `blocked`. A blocked
+  agent -- a missing file, an unclear request, a permission it cannot get --
+  may instead print `MUQUN_TASK_BLOCKED: <one-line reason>`, beside
+  `MUQUN_TASK_DONE: <one-line summary>`. Either moves the task to `waiting`
+  with the reason as `summary` (events carry source `tasks_complete_blocked` or
+  `marker_blocked`). It stays open: the user answers in the session or pane
+  and the agent goes on, or the device confirms or cancels it. Going idle
+  does not turn a blocked task into `idle_unconfirmed`; a new reason
+  replaces the old one.
+- The second line of a task card: `progress` while the task works, `summary`
+  once it pauses or ends (`progress` is absent then). For a `waiting` task
+  `summary` is what the user is asked -- "Needs you · <summary>": a blocked
+  agent's reason; for a pending permission request, its prompt; for a
+  question form, the last line of the agent's last message when that came
+  after the turn's last tool call (the agent asked in its own words), else
+  the form's title; for a terminal agent on a menu, the screen's last
+  meaningful line.
 
 **Catch-up is unchanged.** The socket delivers live events only. After a
 (re)connect, re-subscribe, wait for `subscribed`, then catch up each session
@@ -1532,6 +2224,15 @@ streaming path and a refetch:
 { "type": "agent.form.pending", "asid": "ses_1", "seq": 18, "request": { …FormRequest… } }
 { "type": "agent.form.resolved", "asid": "ses_1", "form_id": "frm_1", "seq": 19 }
 ```
+
+`agent.form.resolved` may include `reason: "answered" | "expired"`.
+`answered` means the reply was accepted or a matching committed reply was observed.
+`expired` is emitted only for a known unanswered, nonblocking Codex question when
+its owning live turn ends. An answer still in flight has an unknown outcome and
+receives no expiry reason. Clients may preserve an expired form's local draft in
+the ordinary composer, but must not automatically submit it. Missing or unknown
+reasons, including disconnect, unload, and stale ownership invalidation, do not
+authorize draft restoration. Older providers omit this optional field.
 
 ### `agent.compaction.changed`
 
@@ -1893,6 +2594,94 @@ answers. `custom` means a value outside `options` is allowed.
 
 ---
 
+## Linked gateways (`fleet_peers`)
+
+Another of the owner's computers is a paired device of `kind: "gateway"`
+(`GET /api/pairings` shows the kind). Its token reaches only the task routes
+(`POST /api/tasks`, `GET /api/tasks` without `root`, `GET /api/tasks/{id}`,
+`POST /api/tasks/{id}/cancel`), `subscribe_tasks` on `/api/ws`,
+`GET /api/fleet/self` and `DELETE /api/pairings/{its own id}`; everything
+else answers `403 peer_forbidden`.
+
+The owner -- an app device, or the admin token (the `muqun-gateway peers`
+CLI) -- links and manages them; a gateway token gets `403 peer_forbidden`
+on all of these:
+
+| Route | Body | Answer |
+|---|---|---|
+| `POST /api/pair/pending` (on the computer to be linked) | `{device_name, kind: "gateway", server_id?}` | `{request_id, code, expires_in_ms, pairing_key?}` for `POST /api/peers` on the other side. `pairing_key` (base64url) is present when this computer runs `transport_encryption: required`: its current pairing transport key, the one its QR carries, for the other side to seal its claim with; absent in `disabled` mode. `400 invalid_request` for any other `kind`; `409 pairing_in_progress` while another pairing is pending, `429 pairing_rate_limited`. A minted code lives one minute (`expires_in_ms: 60000`); a code a device asks for itself (`POST /api/pair/request`, shown on this computer's screen) lives five (`300000`), as `GET /api/pair/pending` reports for each: unclaimed by then (the link failed), it is neither shown by `GET /api/pair/pending` nor claimable, and a new pairing -- a phone's, or the next mint -- takes its slot. |
+| `DELETE /api/pair/pending/{request_id}` (same computer, same token that minted it) | none | `{cancelled: true}`: the minted code is gone and the slot free, for when `POST /api/peers` on the other side failed. Only the device (or the admin token) that minted it may; any other pending pairing, an expired one, or none is `404 pairing_not_found`. |
+| `GET /api/peers` | none | `{accept_delegations, peers: [{peer_id, server_id, name, url, reachable, last_seen_ms, unauthorized?}]}`; a peer not heard from for a minute is pinged first (3 s). One that answers `401`/`403` (it no longer takes this gateway's token) is kept and listed with `unauthorized: true` and `reachable: false`; a `POST /api/peers` for the same computer or under its name replaces it. |
+| `POST /api/peers` | `{url, name, request_id, code, pairing_key?, transport_encryption?, server_id?}` (`name` may not be `self`, in any case; `url` uses HTTP or HTTPS; `server_id` is the id the owner knows the other computer by, and its claim answer must say the same: `409 peer_identity_mismatch`, and what the claim enrolled is taken back) | The new peer. With `pairing_key` (the mint's), the claim is sealed exactly as a phone's QR claim is (`Direction::PairingRequest`, AAD `POST /api/pair/claim`, envelope version 1) and only an answer sealed under that key and bound to the claim's nonce is taken. Without it the claim goes in the clear and the answer is sealed under the code alone; `transport_encryption: "required"` (what the other computer's `POST /api/pair/request` said of itself) then refuses an answer in the clear. `502 peer_unreachable`; `409 name_conflict` (`name` is this computer's own label, any case; checked before the claim, so the code stays good), `409 peer_refused` (`error.reason`: `pairing_code_expired`, `invalid_pairing_code`, `pairing_not_requested`, `invalid_token`, `claim_unsealed` (the answer came in the clear where it had to be sealed), `claim_not_opened` (sealed, but not under the pairing key or not to this claim) or `refused`), `peer_conflict`, `peer_name_taken`; `400 peer_is_self`, `invalid_request` (a `pairing_key` that is not a 32-byte key included). |
+| `PATCH /api/peers/{peer_id}` | `{name?, url?}`, at least one (`name` not `self`; `url` uses HTTP or HTTPS) | The changed peer. A new `url` (its address changed) is proven first with one call carrying this link's token: `502 peer_unreachable` when nothing answers there, `409 peer_refused` when what answers does not know the link; neither keeps it. `400 invalid_request`, `409 peer_name_taken`, `409 name_conflict` (this computer's own label), `404 peer_not_found`. |
+| `DELETE /api/peers/{peer_id}` | none | `{remote_revoked, counterpart_found, counterpart_revoked}`; this gateway forgets the peer, asks it to revoke this gateway's device, and revokes the peer's own login here (below). `404 peer_not_found`. |
+| `PUT /api/fleet/settings` | `{accept_delegations}` | `{accept_delegations}`, written to `config.json` (`fleet.accept_delegations`). |
+
+Manual links accept HTTP and HTTPS URLs, including LAN and Tailscale
+addresses. Pairing requests and claims do not follow HTTP redirects.
+
+A peer's name is what `fleet.describe`/`fleet.list` show and what
+`POST /api/tasks` `mentions` must use (see
+[mcp.md](mcp.md#opening-a-task-from-the-device)). More than 8 names, or a
+name that is neither a linked computer's nor `self`, is `400
+invalid_mentions` and nothing is created; the app sends the task again,
+once, without `mentions`.
+
+`POST /api/pair/pending` takes an optional `server_id`, the claiming
+gateway's own as the owner knows it, kept on the device record the claim
+makes. `POST /api/pair/request` accepts the field and ignores it: a gateway
+asking for a code itself cannot say whose login it is, so its record carries
+none. Nothing checks the id, so it never replaces or evicts a device; its only
+use is that `DELETE /api/peers/{id}` also revokes the gateway devices here
+whose `server_id` is that peer's (its login into this computer), so one call
+unlinks both directions. The peer's own `server_id` is what its claim answer
+said unless the owner gave one to `POST /api/peers`, which the answer then has
+to match; an app that passes it keeps a remote from naming another computer's
+id and having that computer's login revoked when it is removed. A peer marked `unauthorized` after a `401`/`403`
+keeps its login here; its open mirrors fail (`reason: "peer_unlinked"`), as they do on
+`DELETE /api/peers/{id}`.
+`DELETE /api/peers/{id}` (the admin token or an app device only) answers
+`{"remote_revoked", "counterpart_found", "counterpart_revoked"}`: whether the
+peer confirmed it revoked this gateway's token, whether a login of the peer's
+was here, and whether it is revoked (found but not revoked: the device list
+could not be written). Each runs whatever the other did; the peer is forgotten
+either way, and if its row cannot be removed the `500 peer_store_failed`
+still carries the three fields.
+
+A delegation to a linked computer is a mirror here with `binding: {kind:
+"peer", peer_id, peer_server_id, remote_task_id, peer_name}`: `peer_server_id`
+is the id that computer gave for itself, which the phone knows it by, and
+`remote_task_id` is empty while a create that got no answer has not found its
+task there yet (`tasks.delegate` then carries a `note` saying so). The create
+carries a `client_ref`, which the task over there keeps and shows in its view
+(with `created_ms`), and that is how it is found.
+
+A mirror's view also carries `reason`, made when the view is (nothing
+stored), for the app to word in its own copy; the `summary` stays a plain
+line. On a `failed` mirror: `peer_unlinked` (unlinked here, or the other
+computer no longer takes this one's token), `peer_lost_task` (the other
+computer no longer has the task), `peer_not_confirmed` (a create that got no
+answer never turned up there). On an open mirror: `peer_unreachable` while
+its computer has not answered in the last 2 minutes, or went away just now (its task socket closed, a call to it failed). Absent otherwise, and on
+every task that is not a mirror. (`delegation_loop` is never a view reason:
+that delegation creates nothing; it is the MCP error code.) A task
+another computer opened here (`origin: "peer"`) can be confirmed from the phone
+like a device's; its `requested_by` is `{kind: "gateway", id, name, server_id?}`,
+where `server_id` is the id that computer gave for itself when it paired here,
+when its device record has one.
+
+At the device limit, a gateway's `POST /api/pair/claim` makes room only by
+dropping the oldest gateway device, never one of the owner's apps; with no
+gateway device to drop it answers `409 device_cap`.
+
+**Operator note:** a gateway build older than this one does not know
+`kind` and reads a gateway device as an ordinary app device, with full
+device access. After rolling a gateway back below this version, revoke its
+gateway devices (`muqun-gateway revoke <device id>`, or `manage`'s Devices
+view, where they show as `name (gateway)`).
+
+---
+
 ## Limits
 
 The mirror is a cache in front of OpenCode, not a store; anything it drops can
@@ -1921,3 +2710,31 @@ Sessions are also evicted on `session.deleted`.
 - **A title endpoint.** Auto-titling is server-side; `rename` is the only write.
 - **Credential, integration or provider-auth routes.** The user configures
   OpenCode on the host.
+
+### Optional observed session detail
+
+Providers may include `agent_name` and `agent_role` for an identified child agent,
+and `git_info: {sha?, branch?, origin_url?}` for producer-captured Git metadata.
+This Git snapshot does not replace the live directory-based Git endpoints.
+
+`context_usage: {tokens: TokensUsage | null, total_tokens: number, limit?:
+{context: number}}` is the latest reported context occupancy, distinct from
+cumulative session `tokens`. Prefer the explicitly reported `total_tokens` for
+occupancy. The token breakdown uses disjoint input, output, reasoning, cache-read,
+and cache-write counters. Missing usage, limit, or cost is unknown. Streaming
+changes arrive in the existing `agent.session.updated` event.
+
+### Nonblocking questions and scoped file mentions
+
+`FormRequest.nonblocking: true` identifies a question the agent may continue
+working through. Missing/false retains the existing blocking form semantics.
+Reply through the same `POST .../forms/:id/reply` endpoint; the answer object is
+specified by that form's fields. A nonblocking form alone never implies the
+session is blocked. `promptSteering` permits `delivery: "steer"` while running;
+it does not enable queue/inbox operations. Form handles are opaque and must not
+be reconstructed from transcript items.
+
+`GET /api/agent-sessions/:asid/files` and its legacy counterpart use the session's
+owner and recorded directory. A directory query cannot redirect a session search.
+Root `/api/agent-files` accepts optional `agent_id` plus `directory`. An explicit
+`fileMentions: false` capability disables file-mention lookup for that provider.

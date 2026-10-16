@@ -202,6 +202,8 @@ fn agent(value: &Agent) -> Value {
         "display_agent": value.display_agent.as_ref().or(value.kind.as_ref()),
         "agent_status": agent_status(value.status),
         "state_change_seq": value.state_change_seq,
+        "shell_pid": value.shell_pid,
+        "pending_user_input": value.pending_user_input,
     })
 }
 
@@ -226,6 +228,7 @@ mod tests {
     #[test]
     fn tmux_entities_keep_the_existing_mobile_envelope() {
         let response = pane_list(vec![Pane {
+            history_identity: None,
             id: PaneId::new("%9"),
             terminal_id: Some("%9".into()),
             workspace_id: WorkspaceId::new("$0"),
@@ -245,6 +248,7 @@ mod tests {
             alternate_on: Some(true),
             cursor_x: Some(3),
             cursor_y: Some(7),
+            shell_pid: None,
         }]);
 
         assert_eq!(response["result"]["type"], "pane_list");
@@ -266,6 +270,7 @@ mod tests {
     fn the_snapshots_agents_are_the_agent_list_itself() {
         let agents = vec![
             Agent {
+                conversation_id: None,
                 instance_id: Some("inst_7f3c".into()),
                 target: "herdr://agent/inst_7f3c".into(),
                 pane_id: PaneId::new("%9"),
@@ -275,10 +280,13 @@ mod tests {
                 display_agent: Some("Claude".into()),
                 status: AgentStatus::Working,
                 state_change_seq: Some(41),
+                pending_user_input: Some(true),
+                shell_pid: Some(4242),
             },
             // A tmux agent: no instance identity, and the keys are present and
             // null rather than missing, so the app reads one shape.
             Agent {
+                conversation_id: None,
                 instance_id: None,
                 target: "%12".into(),
                 pane_id: PaneId::new("%12"),
@@ -288,6 +296,8 @@ mod tests {
                 display_agent: None,
                 status: AgentStatus::Unknown,
                 state_change_seq: None,
+                pending_user_input: None,
+                shell_pid: None,
             },
         ];
 
@@ -305,6 +315,8 @@ mod tests {
         assert_eq!(first["agent"], "claude");
         assert_eq!(first["display_agent"], "Claude");
         assert_eq!(first["agent_status"], "working");
+        assert_eq!(first["pending_user_input"], true);
+        assert_eq!(first["shell_pid"], 4242);
 
         let second = &snap["result"]["agents"][1];
         assert!(
@@ -312,6 +324,13 @@ mod tests {
             "a tmux agent has no instance"
         );
         assert_eq!(second["target"], "%12");
+        assert!(second["pending_user_input"].is_null());
+        let mut resolved = agents[0].clone();
+        resolved.pending_user_input = Some(false);
+        assert_eq!(
+            agent_list(&[resolved])["result"]["agents"][0]["pending_user_input"],
+            false
+        );
         assert_eq!(
             second["display_agent"], "codex",
             "the kind stands in for a display name the backend did not give"
@@ -324,6 +343,7 @@ mod tests {
     #[test]
     fn the_snapshot_does_not_invent_agents_from_panes() {
         let pane = Pane {
+            history_identity: None,
             id: PaneId::new("%9"),
             terminal_id: Some("%9".into()),
             workspace_id: WorkspaceId::new("$0"),
@@ -343,6 +363,7 @@ mod tests {
             alternate_on: Some(false),
             cursor_x: None,
             cursor_y: None,
+            shell_pid: None,
         };
         let snap = snapshot(Vec::new(), Vec::new(), vec![pane], &[]);
         assert_eq!(snap["result"]["type"], "session_snapshot");
@@ -357,6 +378,7 @@ mod tests {
     #[test]
     fn creation_envelopes_include_the_initial_terminal() {
         let pane = Pane {
+            history_identity: None,
             id: PaneId::new("%1"),
             terminal_id: Some("%1".into()),
             workspace_id: WorkspaceId::new("$1"),
@@ -376,6 +398,7 @@ mod tests {
             alternate_on: Some(false),
             cursor_x: None,
             cursor_y: None,
+            shell_pid: None,
         };
         let tab = Tab {
             id: TabId::new("@1"),

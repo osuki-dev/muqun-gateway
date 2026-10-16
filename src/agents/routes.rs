@@ -18,6 +18,7 @@ use super::message_images;
 use super::ports::mirror::SessionMirrorPort;
 use crate::platform::git;
 use crate::platform::vcs_routes::{self, VcsDiscardBody, VcsFileQuery};
+use crate::tasks::transcript::{for_session, hide_in_event, hide_in_inbox, hide_in_items};
 use crate::terminal::routes::git_error;
 use crate::{
     api_error, content_envelope, require_device, still_paired, stream_event, validate_text,
@@ -54,14 +55,71 @@ pub struct AgentQuery {
     pub agent_id: Option<String>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+pub struct AgentSnapshotQuery {
+    #[serde(default)]
+    pub refresh: bool,
+}
+
 /// What a session list answers when the caller does not say.
 ///
 /// The app already asks for fifty; a caller that asks for nothing used to get
 /// every session the agent had ever seen. A page is the right default for a
 /// list a phone scrolls.
 const DEFAULT_SESSION_LIMIT: usize = 50;
+const MAX_SESSION_PAGE_LIMIT: usize = 100;
+const MAX_SESSION_CURSOR_BYTES: usize = 16 * 1024;
 
 impl AgentSessionsQuery {
+    fn to_page_query(&self) -> ApiResult<SessionQuery> {
+        let invalid = |message| api_error(StatusCode::BAD_REQUEST, "invalid_query", message);
+        if self
+            .agent_id
+            .as_deref()
+            .is_none_or(|id| id.trim().is_empty())
+        {
+            return Err(invalid("agent_id is required for session pagination"));
+        }
+        if self
+            .limit
+            .is_some_and(|limit| !(1..=MAX_SESSION_PAGE_LIMIT).contains(&limit))
+        {
+            return Err(invalid("limit must be between 1 and 100"));
+        }
+        if self
+            .order
+            .as_deref()
+            .is_some_and(|order| !matches!(order, "asc" | "desc"))
+        {
+            return Err(invalid("order must be asc or desc"));
+        }
+        for (value, max, nonempty) in [
+            (self.agent_id.as_deref(), 256, true),
+            (self.directory.as_deref(), 4096, true),
+            (self.parent_id.as_deref(), 256, true),
+            (self.search.as_deref(), 4096, false),
+            (self.cursor.as_deref(), MAX_SESSION_CURSOR_BYTES, true),
+        ] {
+            if value.is_some_and(|v| {
+                v.len() > max
+                    || v.chars().any(char::is_control)
+                    || (nonempty && v.trim().is_empty())
+            }) {
+                return Err(invalid(
+                    "Session query contains an invalid or oversized value",
+                ));
+            }
+        }
+        if self.directory.as_deref().is_some_and(|directory| {
+            super::directories::expand_home(directory.trim()).is_none_or(|path| !path.is_absolute())
+        }) {
+            return Err(invalid("directory must be absolute or home-relative"));
+        }
+        let mut query = self.to_session_query();
+        query.order = Some(self.order.clone().unwrap_or_else(|| "desc".into()));
+        Ok(query)
+    }
+
     fn to_session_query(&self) -> SessionQuery {
         SessionQuery {
             directory: expand_directory_param(self.directory.as_deref()),
@@ -134,6 +192,7 @@ pub struct AgentVcsDiffQuery {
 
 #[derive(Debug, Deserialize)]
 pub struct AgentFilesQuery {
+    pub agent_id: Option<String>,
     pub query: Option<String>,
     pub limit: Option<usize>,
     pub directory: Option<String>,
@@ -183,6 +242,12 @@ pub struct CreateAgentSessionBody {
     pub mode: Option<String>,
     #[serde(default)]
     pub agent_id: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ForkSessionBody {
+    pub message_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -277,18 +342,48 @@ pub struct ReplyFormBody {
 
 pub fn mount(router: Router<AppState>) -> Router<AppState> {
     super::ws_routes::mount(router)
+        .route(
+            "/api/agent-sessions/{asid}/audio-asset",
+            get(message_images::audio_asset),
+        )
+        .route(
+            "/api/agent-sessions/{asid}/file-asset",
+            get(message_images::file_asset),
+        )
+        .route(
+            "/api/agent-images/{id}/{variant}",
+            get(message_images::image_content),
+        )
+        .route(
+            "/api/agent-images/{id}/{variant}/{version}",
+            get(message_images::image_version_content),
+        )
         // Standalone independent OpenCode agent routes (no tmux / herdr session required)
         .route(
             "/api/agent-sessions",
             get(list_agent_sessions_global).post(create_agent_session_global),
         )
+        .route("/api/agent-sessions/page", get(list_agent_sessions_page))
         .route(
             "/api/agent-sessions/{asid}",
             get(get_agent_session_global).delete(delete_agent_session_global),
         )
         .route(
+            "/api/agents/{agent_id}/sessions/{asid}",
+            delete(delete_agent_session_scoped),
+        )
+        .route("/api/agent-sessions/{asid}/fork", post(fork_agent_session))
+        .route(
+            "/api/agents/{agent_id}/sessions/{asid}/fork",
+            post(fork_agent_session_scoped),
+        )
+        .route(
             "/api/agent-sessions/{asid}/children",
             get(list_agent_session_children),
+        )
+        .route(
+            "/api/agent-sessions/{asid}/descendants",
+            get(list_agent_session_descendants),
         )
         .route(
             "/api/agent-sessions/{asid}/rename",
@@ -349,7 +444,7 @@ pub fn mount(router: Router<AppState>) -> Router<AppState> {
         )
         .route(
             "/api/agent-sessions/{asid}/command",
-            post(run_agent_session_command),
+            post(run_agent_session_command).layer(large_body()),
         )
         .route("/api/agent-sessions/{asid}/inbox", get(get_agent_inbox))
         .route(
@@ -382,6 +477,10 @@ pub fn mount(router: Router<AppState>) -> Router<AppState> {
             "/api/agent-sessions/{asid}/timeline",
             get(get_agent_session_timeline_global),
         )
+        .route(
+            "/api/agent-sessions/{asid}/timeline/earlier",
+            post(load_earlier_timeline_global),
+        )
         .route("/api/agent-sessions/{asid}/mode", post(switch_mode_global))
         .route("/api/agent-files", get(find_agent_files_root_global))
         .route(
@@ -390,7 +489,7 @@ pub fn mount(router: Router<AppState>) -> Router<AppState> {
         )
         .route(
             "/api/agent-sessions/{asid}/prompt",
-            post(send_agent_prompt_global),
+            post(send_agent_prompt_global).layer(large_body()),
         )
         .route(
             "/api/agent-sessions/{asid}/interrupt",
@@ -461,6 +560,10 @@ pub fn mount(router: Router<AppState>) -> Router<AppState> {
             get(get_agent_session_timeline_legacy),
         )
         .route(
+            "/api/sessions/{session_id}/agent-sessions/{asid}/timeline/earlier",
+            post(load_earlier_timeline_legacy),
+        )
+        .route(
             "/api/sessions/{session_id}/agent-sessions/{asid}/mode",
             post(switch_mode_legacy),
         )
@@ -474,7 +577,7 @@ pub fn mount(router: Router<AppState>) -> Router<AppState> {
         )
         .route(
             "/api/sessions/{session_id}/agent-sessions/{asid}/prompt",
-            post(send_agent_prompt_legacy),
+            post(send_agent_prompt_legacy).layer(large_body()),
         )
         .route(
             "/api/sessions/{session_id}/agent-sessions/{asid}/interrupt",
@@ -588,14 +691,28 @@ async fn do_list_agent_sessions(
 ) -> ApiResult<Response> {
     require_device(state, headers)?;
 
+    if query.cursor.is_some() && agent_id.is_none_or(|id| id.trim().is_empty()) {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_query",
+            "A provider cursor requires an explicit agent_id",
+        ));
+    }
     let all_managers = managers_for_read(state, agent_id).await?;
 
     let mut sessions = Vec::new();
     let mut any_success = false;
     let mut last_err = None;
 
-    for manager in &all_managers {
-        match manager.sessions().list_sessions(query).await {
+    // Asked at once: one slow agent must not hold the others' lists back.
+    let lists = futures::future::join_all(
+        all_managers
+            .iter()
+            .map(|manager| manager.sessions().list_sessions(query)),
+    )
+    .await;
+    for (manager, list) in all_managers.iter().zip(lists) {
+        match list {
             Ok(list) => {
                 any_success = true;
                 for s in &list {
@@ -710,16 +827,37 @@ async fn do_get_agent_session(
     asid: &str,
     headers: &HeaderMap,
 ) -> ApiResult<Response> {
+    do_read_agent_session(state, asid, false, headers).await
+}
+
+async fn do_read_agent_session(
+    state: &AppState,
+    asid: &str,
+    refresh: bool,
+    headers: &HeaderMap,
+) -> ApiResult<Response> {
     require_device(state, headers)?;
-
     let manager = session_manager_or_err(state, asid).await?;
-
-    let mut snapshot = manager
-        .sessions()
-        .get_snapshot(&AgentSessionId(asid.to_string()))
-        .await
-        .map_err(|e| api_error(StatusCode::NOT_FOUND, "session_not_found", &e.to_string()))?;
+    let id = AgentSessionId(asid.to_string());
+    let mut snapshot = if refresh {
+        manager
+            .sessions()
+            .refresh_snapshot(&id)
+            .await
+            .map_err(agent_error)?
+    } else {
+        manager
+            .sessions()
+            .get_snapshot(&id)
+            .await
+            .map_err(agent_error)?
+    };
     let directory = snapshot.info.directory.clone();
+    let plumbing = for_session(state, asid).await;
+    hide_in_items(&mut snapshot.timeline, plumbing);
+    if plumbing.task {
+        hide_in_inbox(&mut snapshot.inbox);
+    }
     message_images::attach_to_items(state, asid, directory.as_deref(), &mut snapshot.timeline)
         .await;
 
@@ -747,7 +885,9 @@ async fn do_get_agent_session_events(
         .await
     {
         Some(mut events) => {
+            let plumbing = for_session(state, asid).await;
             for event in &mut events {
+                hide_in_event(event, plumbing);
                 message_images::attach_to_event(state, event).await;
             }
             Ok(Json(content_envelope(json!(events))))
@@ -758,6 +898,45 @@ async fn do_get_agent_session_events(
             "Requested events are no longer in the ring buffer; re-fetch the snapshot",
         )),
     }
+}
+
+async fn load_earlier_timeline_global(
+    State(state): State<AppState>,
+    Path(asid): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    do_load_earlier_timeline(&state, &asid, &headers).await
+}
+
+async fn load_earlier_timeline_legacy(
+    State(state): State<AppState>,
+    Path((_, asid)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    do_load_earlier_timeline(&state, &asid, &headers).await
+}
+
+async fn do_load_earlier_timeline(
+    state: &AppState,
+    asid: &str,
+    headers: &HeaderMap,
+) -> ApiResult<Json<Value>> {
+    require_device(state, headers)?;
+    let manager = session_manager_or_err(state, asid).await?;
+    let mut items = manager
+        .sessions()
+        .load_earlier_timeline(&AgentSessionId(asid.to_string()))
+        .await
+        .map_err(agent_error)?;
+    // Filtering internal plumbing must not turn a consumed page into a false
+    // end-of-history signal. Only the adapter knows whether it returned rows.
+    let exhausted = items.is_empty();
+    hide_in_items(&mut items, for_session(state, asid).await);
+    message_images::attach_to_items(state, asid, None, &mut items).await;
+    Ok(Json(content_envelope(json!({
+        "items": items,
+        "exhausted": exhausted,
+    }))))
 }
 
 async fn do_get_agent_session_timeline(
@@ -774,6 +953,7 @@ async fn do_get_agent_session_timeline(
         .mirror()
         .get_timeline_delta(&AgentSessionId(asid.to_string()), after_seq)
         .await;
+    hide_in_items(&mut items, for_session(state, asid).await);
     message_images::attach_to_items(state, asid, None, &mut items).await;
 
     let payload = json!({
@@ -805,8 +985,14 @@ async fn do_switch_mode(
     Ok(Json(content_envelope(json!({ "ok": true }))))
 }
 
+enum FileSearchScope<'a> {
+    Session(&'a str),
+    Agent(Option<&'a str>),
+}
+
 async fn do_find_agent_files(
     state: &AppState,
+    scope: FileSearchScope<'_>,
     query: &str,
     limit: usize,
     directory: Option<&str>,
@@ -814,15 +1000,40 @@ async fn do_find_agent_files(
 ) -> ApiResult<Json<Value>> {
     require_device(state, headers)?;
 
-    let Some(manager) = state.agent_runtime.manager().await else {
-        return Err(api_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "agent_unavailable",
-            "No agent is available",
-        ));
+    let (manager, directory) = match scope {
+        FileSearchScope::Session(asid) => {
+            let manager = session_manager_or_err(state, asid).await?;
+            let info = manager
+                .agent()
+                .get_session(asid)
+                .await
+                .map_err(agent_error)?;
+            let directory = info
+                .directory
+                .filter(|path| std::path::Path::new(path).is_absolute())
+                .ok_or_else(|| {
+                    api_error(
+                        StatusCode::BAD_REQUEST,
+                        "workspace_unknown",
+                        "The selected session has no workspace directory",
+                    )
+                })?;
+            (manager, Some(directory))
+        }
+        FileSearchScope::Agent(agent_id) => {
+            let manager = match agent_id {
+                Some(id) => agent_manager_or_err(state, id).await?,
+                None => state.agent_runtime.manager().await.ok_or_else(|| {
+                    api_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "agent_unavailable",
+                        "No agent is available",
+                    )
+                })?,
+            };
+            (manager, expand_directory_param(directory))
+        }
     };
-
-    let directory = expand_directory_param(directory);
     let directory = directory.as_deref();
     require_directory(directory)?;
 
@@ -830,7 +1041,7 @@ async fn do_find_agent_files(
         .agent()
         .find_files(query, limit, directory)
         .await
-        .map_err(|e| api_error(StatusCode::BAD_GATEWAY, "fs_error", &e.to_string()))?;
+        .map_err(agent_error)?;
 
     let hits: Vec<Value> = files
         .iter()
@@ -875,7 +1086,8 @@ async fn do_send_agent_prompt(
         )
         .await
         .map_err(|e| match e {
-            super::ports::agent::AgentError::InvalidRequest(_) => agent_error(e),
+            super::ports::agent::AgentError::InvalidRequest(_)
+            | super::ports::agent::AgentError::TerminalInteraction(_) => agent_error(e),
             _ => api_error(StatusCode::BAD_GATEWAY, "agent_error", &e.to_string()),
         })?;
 
@@ -917,7 +1129,10 @@ async fn do_interrupt_agent_session(
         .prompts()
         .interrupt(&AgentSessionId(asid.to_string()))
         .await
-        .map_err(|e| api_error(StatusCode::BAD_GATEWAY, "agent_error", &e.to_string()))?;
+        .map_err(|e| match e {
+            super::ports::agent::AgentError::TerminalInteraction(_) => agent_error(e),
+            _ => api_error(StatusCode::BAD_GATEWAY, "agent_error", &e.to_string()),
+        })?;
 
     Ok(Json(content_envelope(json!({ "interrupted": true }))))
 }
@@ -936,7 +1151,10 @@ async fn do_switch_agent_model(
         .sessions()
         .switch_model(&AgentSessionId(asid.to_string()), &model)
         .await
-        .map_err(|e| api_error(StatusCode::BAD_GATEWAY, "agent_error", &e.to_string()))?;
+        .map_err(|e| match e {
+            super::ports::agent::AgentError::TerminalInteraction(_) => agent_error(e),
+            _ => api_error(StatusCode::BAD_GATEWAY, "agent_error", &e.to_string()),
+        })?;
 
     Ok(Json(content_envelope(json!({ "switched": true }))))
 }
@@ -1305,8 +1523,9 @@ pub(crate) fn agent_event_record(
 /// read one can read the other.
 ///
 /// `stream_crypto` is present exactly when the request itself arrived through
-/// the encrypted transport, so a device paired without a transport key keeps
-/// the plaintext stream byte for byte.
+/// the encrypted transport, so on a `disabled` deployment the stream stays
+/// plaintext byte for byte (`required` serves no device without a transport
+/// key -- `require_device` below refuses it).
 async fn do_stream_agent_session(
     state: &AppState,
     asid: &str,
@@ -1370,6 +1589,7 @@ async fn do_stream_agent_session(
                     if !ev.asid().0.is_empty() && ev.asid() != &target_asid {
                         continue;
                     }
+                    hide_in_event(&mut ev, for_session(&devices, &target_asid.0).await);
                     message_images::attach_to_event(&devices, &mut ev).await;
                     let (ev_name, payload) = agent_event_record(&ev);
                     // `None` means the record could not be sealed. It is
@@ -1414,59 +1634,59 @@ pub async fn get_global_agent_catalog(
     let mut merged_commands = Vec::new();
     let mut primary_defaults = None;
 
-    for manager in &all_managers {
-        if let Ok(cat) = manager
-            .sessions()
-            .get_catalog(query.directory.as_deref())
-            .await
-        {
-            if primary_defaults.is_none() {
-                primary_defaults = Some(cat.defaults);
-            }
-            for m in cat.models {
-                if !merged_models
-                    .iter()
-                    .any(|existing: &crate::agents::domain::ModelInfo| {
-                        existing.id == m.id && existing.provider_id == m.provider_id
-                    })
-                {
-                    merged_models.push(m);
-                }
-            }
-            for a in cat.modes {
-                if !merged_modes
-                    .iter()
-                    .any(|existing: &crate::agents::domain::ModeInfo| existing.id == a.id)
-                {
-                    merged_modes.push(a);
-                }
-            }
-            for p in cat.providers {
-                if !merged_providers
-                    .iter()
-                    .any(|existing: &crate::agents::domain::ProviderInfo| existing.id == p.id)
-                {
-                    merged_providers.push(p);
-                }
-            }
-            for s in cat.skills {
-                if !merged_skills
-                    .iter()
-                    .any(|existing: &crate::agents::domain::SkillInfo| existing.id == s.id)
-                {
-                    merged_skills.push(s);
-                }
-            }
-            for c in cat.commands {
-                if !merged_commands
-                    .iter()
-                    .any(|existing: &crate::agents::domain::CommandInfo| existing.name == c.name)
-                {
-                    merged_commands.push(c);
-                }
-            }
-            merged_mcp.extend(cat.mcp);
+    let catalogs = futures::future::join_all(
+        all_managers
+            .iter()
+            .map(|manager| manager.sessions().get_catalog(query.directory.as_deref())),
+    )
+    .await;
+    for cat in catalogs.into_iter().flatten() {
+        if primary_defaults.is_none() {
+            primary_defaults = Some(cat.defaults);
         }
+        for m in cat.models {
+            if !merged_models
+                .iter()
+                .any(|existing: &crate::agents::domain::ModelInfo| {
+                    existing.id == m.id && existing.provider_id == m.provider_id
+                })
+            {
+                merged_models.push(m);
+            }
+        }
+        for a in cat.modes {
+            if !merged_modes
+                .iter()
+                .any(|existing: &crate::agents::domain::ModeInfo| existing.id == a.id)
+            {
+                merged_modes.push(a);
+            }
+        }
+        for p in cat.providers {
+            if !merged_providers
+                .iter()
+                .any(|existing: &crate::agents::domain::ProviderInfo| existing.id == p.id)
+            {
+                merged_providers.push(p);
+            }
+        }
+        for s in cat.skills {
+            if !merged_skills
+                .iter()
+                .any(|existing: &crate::agents::domain::SkillInfo| existing.id == s.id)
+            {
+                merged_skills.push(s);
+            }
+        }
+        for c in cat.commands {
+            if !merged_commands
+                .iter()
+                .any(|existing: &crate::agents::domain::CommandInfo| existing.name == c.name)
+            {
+                merged_commands.push(c);
+            }
+        }
+        merged_mcp.extend(cat.mcp);
     }
 
     let catalog = crate::agents::domain::AgentCatalog {
@@ -1509,6 +1729,36 @@ async fn list_agent_sessions_global(
     .await
 }
 
+async fn list_agent_sessions_page(
+    State(state): State<AppState>,
+    query: Result<Query<AgentSessionsQuery>, axum::extract::rejection::QueryRejection>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    require_device(&state, &headers)?;
+    // Capture extraction failures so malformed queries cannot bypass auth.
+    let Query(query) = query.map_err(|_| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_query",
+            "Invalid session query",
+        )
+    })?;
+    let session_query = query.to_page_query()?;
+    let manager = agent_manager_or_err(&state, query.agent_id.as_deref().unwrap()).await?;
+    let page = manager
+        .sessions()
+        .list_sessions_page(&session_query)
+        .await
+        .map_err(agent_error)?;
+    for session in &page.data {
+        state
+            .agent_runtime
+            .record_session_route(&session.asid.0, manager.agent().kind())
+            .await;
+    }
+    Ok(json_etag_response(&headers, content_envelope(json!(page))))
+}
+
 async fn create_agent_session_global(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1520,9 +1770,10 @@ async fn create_agent_session_global(
 async fn get_agent_session_global(
     State(state): State<AppState>,
     Path(asid): Path<String>,
+    Query(query): Query<AgentSnapshotQuery>,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
-    do_get_agent_session(&state, &asid, &headers).await
+    do_read_agent_session(&state, &asid, query.refresh, &headers).await
 }
 
 async fn get_agent_session_events_global(
@@ -1559,6 +1810,7 @@ async fn find_agent_files_root_global(
 ) -> ApiResult<Json<Value>> {
     do_find_agent_files(
         &state,
+        FileSearchScope::Agent(query.agent_id.as_deref()),
         query.query.as_deref().unwrap_or(""),
         query.limit.unwrap_or(20),
         query.directory.as_deref(),
@@ -1569,12 +1821,13 @@ async fn find_agent_files_root_global(
 
 async fn find_agent_files_global(
     State(state): State<AppState>,
-    Path(_asid): Path<String>,
+    Path(asid): Path<String>,
     Query(query): Query<AgentFilesQuery>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     do_find_agent_files(
         &state,
+        FileSearchScope::Session(&asid),
         query.query.as_deref().unwrap_or(""),
         query.limit.unwrap_or(20),
         query.directory.as_deref(),
@@ -1676,9 +1929,10 @@ async fn create_agent_session_legacy(
 async fn get_agent_session_legacy(
     State(state): State<AppState>,
     Path((_session_id, asid)): Path<(String, String)>,
+    Query(query): Query<AgentSnapshotQuery>,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
-    do_get_agent_session(&state, &asid, &headers).await
+    do_read_agent_session(&state, &asid, query.refresh, &headers).await
 }
 
 async fn get_agent_session_events_legacy(
@@ -1716,6 +1970,7 @@ async fn find_agent_files_root_legacy(
 ) -> ApiResult<Json<Value>> {
     do_find_agent_files(
         &state,
+        FileSearchScope::Agent(query.agent_id.as_deref()),
         query.query.as_deref().unwrap_or(""),
         query.limit.unwrap_or(20),
         query.directory.as_deref(),
@@ -1726,12 +1981,13 @@ async fn find_agent_files_root_legacy(
 
 async fn find_agent_files_legacy(
     State(state): State<AppState>,
-    Path((_session_id, _asid)): Path<(String, String)>,
+    Path((_session_id, asid)): Path<(String, String)>,
     Query(query): Query<AgentFilesQuery>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     do_find_agent_files(
         &state,
+        FileSearchScope::Session(&asid),
         query.query.as_deref().unwrap_or(""),
         query.limit.unwrap_or(20),
         query.directory.as_deref(),
@@ -1939,6 +2195,17 @@ fn agent_error(err: super::ports::agent::AgentError) -> (StatusCode, Json<Value>
     // as its own field so the app can offer to forget the session rather than
     // parse a sentence.
     match &err {
+        super::ports::agent::AgentError::SessionNotFound(_) => {
+            api_error(StatusCode::NOT_FOUND, "session_not_found", &err.to_string())
+        }
+        super::ports::agent::AgentError::TerminalInteraction(runtime) => (
+            StatusCode::CONFLICT,
+            Json(
+                json!({ "error": { "code": "agent_terminal_interaction_required",
+                "message": "Native interaction is unavailable; use the current terminal binding when provided",
+                "runtime": runtime } }),
+            ),
+        ),
         super::ports::agent::AgentError::WorkspaceMissing(directory) => {
             workspace_missing(directory)
         }
@@ -1950,6 +2217,11 @@ fn agent_error(err: super::ports::agent::AgentError) -> (StatusCode, Json<Value>
         super::ports::agent::AgentError::InvalidRequest(message) => {
             api_error(StatusCode::BAD_REQUEST, "invalid_request", message)
         }
+        super::ports::agent::AgentError::HistoryCursorLost => api_error(
+            StatusCode::CONFLICT,
+            "history_cursor_lost",
+            &err.to_string(),
+        ),
         _ => api_error(StatusCode::BAD_GATEWAY, "agent_error", &err.to_string()),
     }
 }
@@ -1983,6 +2255,13 @@ pub(crate) fn workspace_missing(directory: &str) -> (StatusCode, Json<Value>) {
     )
 }
 
+/// The body limit of the routes that take a prompt (`config::takes_large_body`).
+/// The transport middleware authenticates such a request before its body
+/// is read (`server::large_body_after_auth`); this is the limit it then gets.
+pub(crate) fn large_body() -> axum::extract::DefaultBodyLimit {
+    axum::extract::DefaultBodyLimit::max(crate::MAX_PROMPT_BODY_BYTES)
+}
+
 /// The guard every directory-scoped route runs before proxying.
 fn require_directory(directory: Option<&str>) -> Result<(), (StatusCode, Json<Value>)> {
     super::adapters::opencode::driver::check_directory(directory).map_err(agent_error)
@@ -1999,25 +2278,287 @@ async fn list_agent_session_children(
     do_list_agent_sessions(&state, &session_query, query.agent_id.as_deref(), &headers).await
 }
 
+/// How deep `/descendants` walks below the session asked about.
+const MAX_DESCENDANT_DEPTH: usize = 8;
+/// The most sessions `/descendants` answers; past it the answer is `truncated`.
+const MAX_DESCENDANTS: usize = 500;
+
+/// `GET /api/agent-sessions/{asid}/descendants`: `/children` over every
+/// depth at once. The app used to walk `/children` once per descendant to
+/// open a workbench (fifty-odd requests for one tree); this is one.
+async fn list_agent_session_descendants(
+    State(state): State<AppState>,
+    Path(asid): Path<String>,
+    Query(query): Query<AgentSessionsQuery>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    do_list_agent_session_descendants(&state, &asid, &query, &headers).await
+}
+
+/// Breadth-first over the adapters' children listings, the same query
+/// per parent as `/children` takes (less the cursor, which pages one
+/// listing and cannot page a tree), at most [`MAX_DESCENDANT_DEPTH`] deep
+/// and [`MAX_DESCENDANTS`] sessions; `truncated: true` beside the list
+/// when either bound cut the walk short. Error semantics are `/children`'s:
+/// an agent that fails is skipped while another answers, unless it was the
+/// one named.
+async fn do_list_agent_session_descendants(
+    state: &AppState,
+    asid: &str,
+    query: &AgentSessionsQuery,
+    headers: &HeaderMap,
+) -> ApiResult<Response> {
+    require_device(state, headers)?;
+    if query.cursor.is_some() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_query",
+            "descendants take no cursor",
+        ));
+    }
+    let agent_id = query.agent_id.as_deref().filter(|id| !id.trim().is_empty());
+    let all_managers = managers_for_read(state, agent_id).await?;
+    let mut session_query = query.to_session_query();
+
+    let mut seen: std::collections::HashSet<String> = [asid.to_owned()].into_iter().collect();
+    let mut sessions = Vec::new();
+    let mut frontier = vec![asid.to_owned()];
+    let mut truncated = false;
+    let mut any_success = false;
+    let mut last_err = None;
+    'walk: for _ in 0..MAX_DESCENDANT_DEPTH {
+        if frontier.is_empty() {
+            break;
+        }
+        let mut next = Vec::new();
+        for parent in &frontier {
+            session_query.parent_id = Some(parent.clone());
+            for manager in &all_managers {
+                let list = match manager.sessions().list_sessions(&session_query).await {
+                    Ok(list) => list,
+                    Err(e) => {
+                        tracing::warn!(
+                            agent_id = manager.agent().kind(),
+                            error = %e,
+                            "agent children list failed; skipping this agent"
+                        );
+                        last_err = Some(e);
+                        continue;
+                    }
+                };
+                any_success = true;
+                for session in list {
+                    if !seen.insert(session.asid.0.clone()) {
+                        continue;
+                    }
+                    if sessions.len() >= MAX_DESCENDANTS {
+                        truncated = true;
+                        break 'walk;
+                    }
+                    state
+                        .agent_runtime
+                        .record_session_route(&session.asid.0, manager.agent().kind())
+                        .await;
+                    next.push(session.asid.0.clone());
+                    sessions.push(session);
+                }
+            }
+        }
+        frontier = next;
+    }
+    if !frontier.is_empty() {
+        // Depth exhausted with children still to ask about.
+        truncated = true;
+    }
+    if !any_success || (agent_id.is_some() && last_err.is_some()) {
+        if let Some(err) = last_err {
+            return Err(agent_error(err));
+        }
+    }
+    sessions.sort_by_key(|session| std::cmp::Reverse(session.updated_ms));
+    let mut data = json!({ "data": sessions });
+    if truncated {
+        data["truncated"] = Value::Bool(true);
+    }
+    Ok(json_etag_response(headers, content_envelope(data)))
+}
+
 async fn delete_agent_session_global(
     State(state): State<AppState>,
     Path(asid): Path<String>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
-    let manager = session_manager_or_err!(&state, &headers, &asid);
+    do_delete_agent_session(&state, &asid, None, &headers).await
+}
+
+async fn delete_agent_session_scoped(
+    State(state): State<AppState>,
+    Path((agent_id, asid)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    do_delete_agent_session(&state, &asid, Some(&agent_id), &headers).await
+}
+
+async fn do_delete_agent_session(
+    state: &AppState,
+    asid: &str,
+    agent_id: Option<&str>,
+    headers: &HeaderMap,
+) -> ApiResult<Json<Value>> {
+    require_device(state, headers)?;
+    let manager = if let Some(agent_id) = agent_id {
+        if asid.is_empty()
+            || asid.len() > 128
+            || matches!(asid, "." | "..")
+            || !asid.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':')
+            })
+        {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_session",
+                "Invalid session identifier",
+            ));
+        }
+        let manager = agent_manager_or_err(state, agent_id).await?;
+        let info = manager.agent().get_session(asid).await.map_err(|error| {
+            use super::ports::agent::AgentError;
+            let missing = matches!(&error, AgentError::SessionNotFound(_))
+                || matches!(&error, AgentError::RequestFailed(message) if message.starts_with("HTTP 404"));
+            if missing {
+                api_error(
+                    StatusCode::NOT_FOUND,
+                    "session_not_found",
+                    "The selected agent does not own this session",
+                )
+            } else {
+                api_error(
+                    StatusCode::BAD_GATEWAY,
+                    "agent_error",
+                    "The selected agent could not verify this session",
+                )
+            }
+        })?;
+        if info.asid.0 != asid {
+            return Err(api_error(
+                StatusCode::CONFLICT,
+                "session_changed",
+                "The selected agent returned a different session",
+            ));
+        }
+        manager
+    } else {
+        session_manager_or_err(state, asid).await?
+    };
     manager
         .agent()
-        .delete_session(&asid)
+        .delete_session(asid)
         .await
         .map_err(agent_error)?;
     // OpenCode deletes the children too, but it also announces each one on the
     // stream, so the mirror only has to forget this session here.
     manager
         .mirror()
-        .remove_session(&AgentSessionId(asid.clone()))
+        .remove_session(&AgentSessionId(asid.to_owned()))
         .await;
-    state.agent_runtime.forget_session_route(&asid).await;
+    if let Some(agent_id) = agent_id {
+        state
+            .agent_runtime
+            .forget_session_route_for_agent(asid, agent_id)
+            .await;
+    } else {
+        state.agent_runtime.forget_session_route(asid).await;
+    }
     Ok(Json(content_envelope(json!({ "deleted": true }))))
+}
+
+async fn fork_agent_session(
+    State(state): State<AppState>,
+    Path(asid): Path<String>,
+    headers: HeaderMap,
+    body: Option<Json<ForkSessionBody>>,
+) -> ApiResult<Json<Value>> {
+    do_fork_agent_session(
+        &state,
+        &asid,
+        None,
+        body.map(|Json(body)| body).unwrap_or_default(),
+        &headers,
+    )
+    .await
+}
+
+async fn fork_agent_session_scoped(
+    State(state): State<AppState>,
+    Path((agent_id, asid)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Option<Json<ForkSessionBody>>,
+) -> ApiResult<Json<Value>> {
+    do_fork_agent_session(
+        &state,
+        &asid,
+        Some(&agent_id),
+        body.map(|Json(body)| body).unwrap_or_default(),
+        &headers,
+    )
+    .await
+}
+
+async fn do_fork_agent_session(
+    state: &AppState,
+    asid: &str,
+    agent_id: Option<&str>,
+    body: ForkSessionBody,
+    headers: &HeaderMap,
+) -> ApiResult<Json<Value>> {
+    require_device(state, headers)?;
+    validate_text(asid)?;
+    if asid.len() > 128
+        || matches!(asid, "." | "..")
+        || !asid
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+        || asid.trim().is_empty()
+        || body
+            .message_id
+            .as_ref()
+            .is_some_and(|id| id.trim().is_empty())
+    {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_session",
+            "Session and message identities must not be empty",
+        ));
+    }
+    if let Some(id) = &body.message_id {
+        validate_text(id)?;
+    }
+    let manager = match agent_id {
+        Some(agent_id) => agent_manager_or_err(state, agent_id).await?,
+        None => session_manager_or_err(state, asid).await?,
+    };
+    let source = manager
+        .agent()
+        .get_session(asid)
+        .await
+        .map_err(agent_error)?;
+    if source.asid.0 != asid {
+        return Err(api_error(
+            StatusCode::CONFLICT,
+            "session_changed",
+            "The selected agent returned a different session",
+        ));
+    }
+    let session = manager
+        .sessions()
+        .fork_session(asid, body.message_id.as_deref())
+        .await
+        .map_err(agent_error)?;
+    state
+        .agent_runtime
+        .record_session_route(&session.asid.0, manager.agent().kind())
+        .await;
+    Ok(Json(content_envelope(json!(session))))
 }
 
 async fn rename_agent_session(
@@ -2496,7 +3037,7 @@ async fn get_agent_inbox(
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     let manager = session_manager_or_err!(&state, &headers, &asid);
-    let items = manager
+    let mut items = manager
         .agent()
         .get_inbox(&asid)
         .await
@@ -2504,8 +3045,11 @@ async fn get_agent_inbox(
     // Refresh the mirror so a later snapshot and the stream agree.
     manager
         .mirror()
-        .set_inbox(&AgentSessionId(asid), items.clone())
+        .set_inbox(&AgentSessionId(asid.clone()), items.clone())
         .await;
+    if for_session(&state, &asid).await.task {
+        hide_in_inbox(&mut items);
+    }
     Ok(Json(content_envelope(json!({ "items": items }))))
 }
 
@@ -2812,6 +3356,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_rejected_session_resume_is_not_a_missing_session() {
+        use super::super::ports::agent::AgentError;
+        let (status, Json(body)) = agent_error(AgentError::RequestFailed(
+            "thread already has an active writer".into(),
+        ));
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(body["error"]["code"], "agent_error");
+        let (status, Json(body)) = agent_error(AgentError::SessionNotFound("gone".into()));
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"]["code"], "session_not_found");
+    }
+
     /// A folder that has been deleted is a 404 that names it, never a 502 --
     /// and the path is its own field so the app can offer to forget the
     /// session rather than parse a sentence out of the message.
@@ -3098,6 +3655,51 @@ mod tests {
         assert_eq!(bare.into_mode(), "plan");
     }
 
+    #[tokio::test]
+    async fn explicit_snapshot_refresh_requires_app_device_before_provider_lookup() {
+        let state = crate::test_support::required_test_state(
+            "admin",
+            vec![
+                crate::test_support::sealed(crate::test_support::test_peer_device(
+                    "peer",
+                    "peer-token",
+                )),
+                crate::test_support::test_peer_device("old-peer", "old-peer-token"),
+            ],
+        );
+        for (headers, status, code) in [
+            (
+                HeaderMap::new(),
+                StatusCode::UNAUTHORIZED,
+                "missing_authorization",
+            ),
+            (
+                crate::test_support::bearer_headers("admin"),
+                StatusCode::FORBIDDEN,
+                "invalid_token",
+            ),
+            (
+                crate::test_support::sealed_bearer_headers("peer-token"),
+                StatusCode::FORBIDDEN,
+                "peer_forbidden",
+            ),
+            (
+                crate::test_support::bearer_headers("old-peer-token"),
+                StatusCode::UPGRADE_REQUIRED,
+                "device_repair_required",
+            ),
+        ] {
+            let refusal = do_read_agent_session(&state, "fixture", true, &headers)
+                .await
+                .unwrap_err();
+            assert_eq!(refusal.0, status);
+            assert_eq!(
+                crate::test_support::error_body(&refusal)["error"]["code"],
+                code
+            );
+        }
+    }
+
     async fn create_refusal(body: Value) -> (StatusCode, Value) {
         let state = crate::test_support::test_state(
             "admin",
@@ -3166,11 +3768,1022 @@ mod tests {
         state
     }
 
+    /// One answer for the whole tree: every depth below the session, each
+    /// row shaped as `/children` shapes it, newest first, merged over the
+    /// attached agents unless one is named; nothing from another tree, and
+    /// the session itself is not its own descendant.
+    #[tokio::test]
+    async fn descendants_route_flattens_the_tree_under_one_session() {
+        let opencode = FakeAgent::new("opencode").with_session_tree(&[
+            ("root", None, 1),
+            ("a", Some("root"), 5),
+            ("b", Some("root"), 3),
+            ("a1", Some("a"), 7),
+            ("a2", Some("a"), 2),
+            ("a1x", Some("a1"), 9),
+            ("b1", Some("b"), 4),
+            ("other", None, 8),
+            ("other-child", Some("other"), 6),
+        ]);
+        let oc_calls = opencode.calls.clone();
+        let t3 = FakeAgent::new("t3").with_session_tree(&[("t3-child", Some("root"), 10)]);
+        let state = state_with(vec![opencode, t3]).await;
+        for (headers, expected) in [
+            (HeaderMap::new(), StatusCode::UNAUTHORIZED),
+            (
+                crate::test_support::bearer_headers("wrong"),
+                StatusCode::FORBIDDEN,
+            ),
+        ] {
+            let response = get_response(
+                state.clone(),
+                "/api/agent-sessions/root/descendants",
+                headers,
+            )
+            .await;
+            assert_eq!(response.status(), expected);
+        }
+
+        let response = get_response(
+            state.clone(),
+            "/api/agent-sessions/root/descendants",
+            device_headers(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["capabilities"]["session_descendants"], true);
+        assert_eq!(
+            ids(&body["data"]["data"]),
+            [
+                ("t3-child".to_string(), "t3".to_string()),
+                ("a1x".to_string(), "opencode".to_string()),
+                ("a1".to_string(), "opencode".to_string()),
+                ("a".to_string(), "opencode".to_string()),
+                ("b1".to_string(), "opencode".to_string()),
+                ("b".to_string(), "opencode".to_string()),
+                ("a2".to_string(), "opencode".to_string()),
+            ]
+        );
+        assert!(body["data"].get("truncated").is_none(), "{body}");
+        // Asked per parent, breadth first, as `/children` asks -- every
+        // agent about every session found, whichever agent listed it.
+        let asked: Vec<String> = oc_calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| call.starts_with("list_sessions"))
+            .cloned()
+            .collect();
+        assert_eq!(
+            asked,
+            [
+                "list_sessions parent=root",
+                "list_sessions parent=a",
+                "list_sessions parent=b",
+                "list_sessions parent=t3-child",
+                "list_sessions parent=a1",
+                "list_sessions parent=a2",
+                "list_sessions parent=b1",
+                "list_sessions parent=a1x",
+            ]
+        );
+        assert_eq!(
+            state
+                .agent_runtime
+                .manager_for_session("a1x")
+                .await
+                .unwrap()
+                .agent()
+                .kind(),
+            "opencode",
+            "every descendant is routed to the agent that listed it"
+        );
+
+        // One agent named: its tree only. A cursor cannot page a tree.
+        let response = get_response(
+            state.clone(),
+            "/api/agent-sessions/root/descendants?agent_id=t3",
+            device_headers(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(
+            ids(&body["data"]["data"]),
+            [("t3-child".to_string(), "t3".to_string())]
+        );
+        let response = get_response(
+            state.clone(),
+            "/api/agent-sessions/root/descendants?agent_id=opencode&cursor=x",
+            device_headers(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(response).await["error"]["code"], "invalid_query");
+
+        // A leaf has none, and that is an empty list, not an error.
+        let response = get_response(
+            state.clone(),
+            "/api/agent-sessions/a1x/descendants",
+            device_headers(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_json(response).await["data"]["data"], json!([]));
+    }
+
+    /// The walk is bounded: eight levels deep and five hundred sessions.
+    /// Past either, what was gathered is answered with `truncated: true`,
+    /// never an error and never a list that quietly stops.
+    #[tokio::test]
+    async fn descendants_route_truncates_past_its_depth_and_size_bounds() {
+        // A chain twelve deep under `root`: eight levels are answered.
+        let chain: Vec<(String, Option<String>, u64)> = (1..=12)
+            .map(|depth| {
+                let parent = if depth == 1 {
+                    "root".to_string()
+                } else {
+                    format!("d{}", depth - 1)
+                };
+                (format!("d{depth}"), Some(parent), depth as u64)
+            })
+            .collect();
+        let chain_refs: Vec<(&str, Option<&str>, u64)> = chain
+            .iter()
+            .map(|(asid, parent, updated)| (asid.as_str(), parent.as_deref(), *updated))
+            .collect();
+        let state = state_with(vec![
+            FakeAgent::new("opencode").with_session_tree(&chain_refs)
+        ])
+        .await;
+        let response = get_response(
+            state,
+            "/api/agent-sessions/root/descendants",
+            device_headers(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        let listed = ids(&body["data"]["data"]);
+        assert_eq!(listed.len(), MAX_DESCENDANT_DEPTH);
+        assert_eq!(
+            listed[0].0, "d8",
+            "newest first: the deepest level answered"
+        );
+        assert_eq!(body["data"]["truncated"], true);
+
+        // Six hundred children under one session: five hundred are answered.
+        let wide: Vec<(String, Option<String>, u64)> = (0..600)
+            .map(|n| (format!("c{n}"), Some("root".to_string()), n as u64))
+            .collect();
+        let wide_refs: Vec<(&str, Option<&str>, u64)> = wide
+            .iter()
+            .map(|(asid, parent, updated)| (asid.as_str(), parent.as_deref(), *updated))
+            .collect();
+        let state = state_with(vec![
+            FakeAgent::new("opencode").with_session_tree(&wide_refs)
+        ])
+        .await;
+        let response = get_response(
+            state,
+            "/api/agent-sessions/root/descendants?limit=100",
+            device_headers(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(ids(&body["data"]["data"]).len(), MAX_DESCENDANTS);
+        assert_eq!(body["data"]["truncated"], true);
+    }
+
+    /// `/children`'s error semantics carry over: an agent that fails is
+    /// skipped while another answers; the one named failing is a 502.
+    #[tokio::test]
+    async fn descendants_route_skips_a_failing_agent_unless_it_was_named() {
+        let state = state_with(vec![
+            FakeAgent::new("opencode").with_session_tree(&[("kid", Some("root"), 1)]),
+            FakeAgent::new("t3").failing(),
+        ])
+        .await;
+        let response = get_response(
+            state.clone(),
+            "/api/agent-sessions/root/descendants",
+            device_headers(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            ids(&body_json(response).await["data"]["data"]),
+            [("kid".to_string(), "opencode".to_string())]
+        );
+        let response = get_response(
+            state,
+            "/api/agent-sessions/root/descendants?agent_id=t3",
+            device_headers(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn timeline_earlier_route_authenticates_and_refuses_unsupported_adapters() {
+        let state = state_with(vec![
+            FakeAgent::new("opencode").with_sessions(&[("owned", 1)])
+        ])
+        .await;
+        for (headers, expected) in [
+            (HeaderMap::new(), StatusCode::UNAUTHORIZED),
+            (
+                crate::test_support::bearer_headers("wrong"),
+                StatusCode::FORBIDDEN,
+            ),
+        ] {
+            assert_eq!(
+                do_load_earlier_timeline(&state, "owned", &headers)
+                    .await
+                    .unwrap_err()
+                    .0,
+                expected
+            );
+        }
+        let refusal = do_load_earlier_timeline(&state, "owned", &device_headers())
+            .await
+            .unwrap_err();
+        assert_eq!(refusal.0, StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(
+            crate::test_support::error_body(&refusal)["error"]["code"],
+            "feature_unsupported"
+        );
+    }
+
+    #[tokio::test]
+    async fn timeline_earlier_route_uses_codex_owner_and_retains_bounded_rows_in_snapshot() {
+        use crate::agents::adapters::codex::{
+            tests::{golden, Fixture},
+            CodexDriver,
+        };
+        use crate::agents::ports::agent::AgentPort;
+        use std::sync::Arc;
+        let mut fixture = Fixture::new(|r| match r["method"].as_str().unwrap() {
+            "thread/read" => json!({"thread":golden()["thread"]}),
+            "thread/items/list" => {
+                let offset = r["params"]["cursor"].as_str().map(|s|s.parse::<usize>().unwrap()).unwrap_or(0);
+                let end = (offset+r["params"]["limit"].as_u64().unwrap() as usize).min(181);
+                let rows: Vec<_> = (offset..end).map(|n| {
+                    let item = if n == 180 {
+                        json!({"type":"dynamicToolCall","id":"hidden","tool":"muqun.tasks.list","arguments":{},"status":"completed"})
+                    } else {
+                        json!({"type":"agentMessage","id":format!("item-{}",181-n),"text":"synthetic"})
+                    };
+                    json!({"turnId":"turn","item":item})
+                }).collect();
+                json!({"data":rows,"nextCursor":if end<181 {json!(end.to_string())} else {Value::Null}})
+            },
+            _ => panic!("unexpected route fixture RPC"),
+        }).await;
+        fixture.ready().await;
+        let driver = Arc::new(CodexDriver::new(fixture.client.clone()));
+        let id = golden()["thread"]["id"].as_str().unwrap().to_owned();
+        let tail = driver.get_timeline(&id, 100).await.unwrap();
+        let state = state_with(vec![FakeAgent::new("opencode")]).await;
+        let manager = Arc::new(crate::agents::manager::AgentManager::for_test(driver));
+        manager
+            .mirror()
+            .update_session(
+                crate::agents::adapters::codex::mapper::session(&golden()["thread"]).unwrap(),
+            )
+            .await;
+        manager
+            .mirror()
+            .upsert_timeline_items(&AgentSessionId(id.clone()), tail.clone())
+            .await;
+        let held_tail = manager
+            .mirror()
+            .get_snapshot(&AgentSessionId(id.clone()))
+            .await
+            .unwrap()
+            .timeline;
+        state.agent_runtime.attach_for_test(manager.clone()).await;
+        let Json(first) = do_load_earlier_timeline(&state, &id, &device_headers())
+            .await
+            .unwrap();
+        assert_eq!(first["data"]["items"].as_array().unwrap().len(), 80);
+        assert_eq!(first["data"]["exhausted"], false);
+        let Json(last) = do_load_earlier_timeline(&state, &id, &device_headers())
+            .await
+            .unwrap();
+        assert_eq!(
+            last["data"]["items"],
+            json!([]),
+            "internal tool row is filtered"
+        );
+        assert_eq!(last["data"]["exhausted"], false);
+        let Json(end) = do_load_earlier_timeline(&state, &id, &device_headers())
+            .await
+            .unwrap();
+        assert_eq!(end["data"]["items"], json!([]));
+        assert_eq!(end["data"]["exhausted"], true);
+        let snapshot = manager
+            .mirror()
+            .get_snapshot(&AgentSessionId(id))
+            .await
+            .unwrap();
+        assert_eq!(snapshot.timeline.len(), 181);
+        assert_eq!(&snapshot.timeline[81..], &held_tail);
+    }
+
+    /// The DeepSeek owner pages like the Codex one: each pull is one older
+    /// batch under the frozen cut, retained in the snapshot, and `exhausted`
+    /// only once the adapter has nothing below.
+    #[tokio::test]
+    async fn timeline_earlier_route_uses_deepseek_owner_and_retains_rows_in_snapshot() {
+        use crate::agents::adapters::deepseek::{
+            client::tests::{paged_history, rpc_server},
+            DeepseekDriver,
+        };
+        use crate::agents::ports::agent::AgentPort;
+        use std::sync::Arc;
+        let (app, _calls) = paged_history(0);
+        let (client, server) = rpc_server(app).await;
+        let driver = Arc::new(DeepseekDriver::with_client(client));
+        let tail = driver.get_timeline("s", 30).await.unwrap();
+        assert_eq!(tail[0].seq, 270, "thirty messages: the newest page");
+        let state = state_with(vec![FakeAgent::new("opencode")]).await;
+        let manager = Arc::new(crate::agents::manager::AgentManager::for_test(driver));
+        manager
+            .mirror()
+            .update_session(
+                crate::agents::adapters::deepseek::mapper::map_session(&json!({
+                    "sessionId": "s", "cwd": "/qa", "title": "paged"
+                }))
+                .unwrap(),
+            )
+            .await;
+        manager
+            .mirror()
+            .upsert_timeline_items(&AgentSessionId("s".into()), tail.clone())
+            .await;
+        state.agent_runtime.attach_for_test(manager.clone()).await;
+        // The fixture serves no session list, so the route is recorded by hand.
+        state
+            .agent_runtime
+            .record_session_route("s", "deepseek")
+            .await;
+        let mut lowest = 270;
+        let mut batches = 0;
+        let mut ids: Vec<String> = tail.iter().map(|item| item.id.clone()).collect();
+        loop {
+            let Json(batch) = do_load_earlier_timeline(&state, "s", &device_headers())
+                .await
+                .unwrap();
+            let items = batch["data"]["items"].as_array().unwrap();
+            if batch["data"]["exhausted"] == true {
+                assert!(items.is_empty());
+                break;
+            }
+            batches += 1;
+            assert!(!items.is_empty(), "a page under the cut is never empty");
+            // Contiguous below the rows held: the record at the cut may be a
+            // tool result, joined onto the call just before it, so the last
+            // row sits at most two seqs under the cut.
+            let last = items.last().unwrap()["seq"].as_u64().unwrap();
+            assert!(last < lowest && lowest - last <= 2, "{last} under {lowest}");
+            lowest = items[0]["seq"].as_u64().unwrap();
+            let mut older: Vec<String> = items
+                .iter()
+                .map(|item| item["id"].as_str().unwrap().to_owned())
+                .collect();
+            older.append(&mut ids);
+            ids = older;
+        }
+        assert_eq!(lowest, 0);
+        assert!(batches >= 2, "{batches} batches: the walk was paged");
+        // Every batch is retained in the snapshot, oldest first, before the
+        // tail it was read under (the mirror numbers the rows itself).
+        let snapshot = manager
+            .mirror()
+            .get_snapshot(&AgentSessionId("s".into()))
+            .await
+            .unwrap();
+        assert_eq!(
+            snapshot
+                .timeline
+                .iter()
+                .map(|item| item.id.clone())
+                .collect::<Vec<_>>(),
+            ids
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn fork_route_authenticates_selects_exact_provider_and_registers_new_session() {
+        let codex = FakeAgent::new("codex").with_sessions(&[("source", 1)]);
+        let codex_calls = codex.calls.clone();
+        let opencode = FakeAgent::new("opencode").with_sessions(&[("source", 1)]);
+        let calls = opencode.calls.clone();
+        let state = state_with(vec![codex, opencode]).await;
+        for (headers, expected) in [
+            (HeaderMap::new(), StatusCode::UNAUTHORIZED),
+            (
+                crate::test_support::bearer_headers("wrong"),
+                StatusCode::FORBIDDEN,
+            ),
+        ] {
+            assert_eq!(
+                do_fork_agent_session(
+                    &state,
+                    "source",
+                    Some("opencode"),
+                    ForkSessionBody::default(),
+                    &headers
+                )
+                .await
+                .unwrap_err()
+                .0,
+                expected
+            );
+        }
+        assert!(calls.lock().unwrap().is_empty() && codex_calls.lock().unwrap().is_empty());
+        let Json(body) = do_fork_agent_session(
+            &state,
+            "source",
+            Some("opencode"),
+            ForkSessionBody {
+                message_id: Some("boundary".into()),
+            },
+            &device_headers(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(body["data"]["asid"], "opencode_fork");
+        assert_eq!(body["data"]["agent_id"], "opencode");
+        assert_eq!(*calls.lock().unwrap(), ["fork_session source boundary"]);
+        assert!(codex_calls.lock().unwrap().is_empty());
+        let manager = state
+            .agent_runtime
+            .manager_for_session("opencode_fork")
+            .await
+            .unwrap();
+        assert_eq!(manager.agent().kind(), "opencode");
+        assert!(manager
+            .mirror()
+            .get_snapshot(&AgentSessionId("opencode_fork".into()))
+            .await
+            .is_some());
+        assert!(do_fork_agent_session(
+            &state,
+            "missing",
+            Some("codex"),
+            ForkSessionBody::default(),
+            &device_headers()
+        )
+        .await
+        .is_err());
+        assert!(codex_calls.lock().unwrap().is_empty());
+    }
+
     async fn body_json(response: Response) -> Value {
         let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
             .await
             .expect("body reads");
         serde_json::from_slice(&bytes).expect("body is json")
+    }
+
+    async fn get_response(state: AppState, uri: &str, headers: HeaderMap) -> Response {
+        use tower::ServiceExt;
+        let mut request = axum::http::Request::builder().uri(uri);
+        *request.headers_mut().unwrap() = headers;
+        mount(Router::new())
+            .with_state(state)
+            .oneshot(request.body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn session_page_dispatches_once_to_the_selected_provider_and_retains_order_and_cursors() {
+        use crate::agents::use_cases::session_service::tests::PageAgent;
+        let state = state_with(vec![FakeAgent::new("deepseek").failing()]).await;
+        let agent = PageAgent::new("opencode");
+        let queries = agent.queries.clone();
+        state
+            .agent_runtime
+            .attach_for_test(std::sync::Arc::new(
+                super::super::manager::AgentManager::for_test(std::sync::Arc::new(agent)),
+            ))
+            .await;
+        let uri = "/api/agent-sessions/page?agent_id=opencode&directory=~&roots=true&order=asc&search=work&cursor=opaque%2B%2F%3D";
+        let response = get_response(state.clone(), uri, device_headers()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let tag = response.headers()[header::ETAG].clone();
+        let body = body_json(response).await;
+        assert_eq!(
+            ids(&body["data"]["data"]),
+            [
+                ("older".to_string(), "opencode".to_string()),
+                ("newer".to_string(), "opencode".to_string()),
+            ]
+        );
+        assert_eq!(
+            body["data"]["cursor"],
+            json!({"next": "next+/=", "previous": "previous-/="})
+        );
+        assert_eq!(
+            *queries.lock().unwrap(),
+            [(
+                true,
+                SessionQuery {
+                    directory: expand_directory_param(Some("~")),
+                    parent_id: Some("null".into()),
+                    limit: Some(50),
+                    order: Some("asc".into()),
+                    search: Some("work".into()),
+                    cursor: Some("opaque+/=".into()),
+                }
+            )]
+        );
+        let owner = state
+            .agent_runtime
+            .manager_for_session("older")
+            .await
+            .unwrap();
+        assert_eq!(owner.agent().kind(), "opencode");
+        let mut headers = device_headers();
+        headers.insert(header::IF_NONE_MATCH, tag);
+        assert_eq!(
+            get_response(state, uri, headers).await.status(),
+            StatusCode::NOT_MODIFIED
+        );
+    }
+
+    #[tokio::test]
+    async fn session_page_authentication_precedes_malformed_query_rejection() {
+        use crate::agents::use_cases::session_service::tests::PageAgent;
+        let state = state_with(vec![]).await;
+        let agent = PageAgent::new("opencode");
+        let queries = agent.queries.clone();
+        state
+            .agent_runtime
+            .attach_for_test(std::sync::Arc::new(
+                super::super::manager::AgentManager::for_test(std::sync::Arc::new(agent)),
+            ))
+            .await;
+        for query in ["limit=no", "roots=maybe"] {
+            let uri = format!("/api/agent-sessions/page?agent_id=opencode&{query}");
+            for (headers, status, code) in [
+                (
+                    HeaderMap::new(),
+                    StatusCode::UNAUTHORIZED,
+                    "missing_authorization",
+                ),
+                (
+                    crate::test_support::bearer_headers("wrong-token"),
+                    StatusCode::FORBIDDEN,
+                    "invalid_token",
+                ),
+                (device_headers(), StatusCode::BAD_REQUEST, "invalid_query"),
+            ] {
+                let response = get_response(state.clone(), &uri, headers).await;
+                assert_eq!(response.status(), status, "{query}: {code}");
+                assert_eq!(body_json(response).await["error"]["code"], code);
+                assert!(queries.lock().unwrap().is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn session_page_rejects_invalid_queries_and_missing_auth_before_upstream() {
+        use crate::agents::use_cases::session_service::tests::PageAgent;
+        let state = state_with(vec![]).await;
+        let agent = PageAgent::new("opencode");
+        let queries = agent.queries.clone();
+        state
+            .agent_runtime
+            .attach_for_test(std::sync::Arc::new(
+                super::super::manager::AgentManager::for_test(std::sync::Arc::new(agent)),
+            ))
+            .await;
+        assert_eq!(
+            get_response(
+                state.clone(),
+                "/api/agent-sessions/page?agent_id=opencode",
+                HeaderMap::new()
+            )
+            .await
+            .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let oversized = format!(
+            "agent_id=opencode&cursor={}",
+            "x".repeat(MAX_SESSION_CURSOR_BYTES + 1)
+        );
+        for query in [
+            "",
+            "agent_id=",
+            "agent_id=%20",
+            "agent_id=opencode&limit=0",
+            "agent_id=opencode&limit=101",
+            "agent_id=opencode&limit=-1",
+            "agent_id=opencode&limit=no",
+            "agent_id=opencode&order=newest",
+            "agent_id=opencode&cursor=",
+            "agent_id=opencode&cursor=%0A",
+            "agent_id=opencode&roots=maybe",
+            "agent_id=opencode&directory=relative",
+            "agent_id=opencode&directory=~other",
+            "agent_id=opencode&parent_id=%20",
+            &oversized,
+        ] {
+            let response = get_response(
+                state.clone(),
+                &format!("/api/agent-sessions/page?{query}"),
+                device_headers(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{query}");
+        }
+        assert!(queries.lock().unwrap().is_empty());
+        for limit in [1, 100] {
+            let response = get_response(
+                state.clone(),
+                &format!("/api/agent-sessions/page?agent_id=opencode&limit={limit}&order=desc"),
+                device_headers(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        assert_eq!(queries.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn session_page_maps_unsupported_unknown_and_unavailable_agents() {
+        let state = state_with(vec![FakeAgent::new("deepseek")]).await;
+        for (agent_id, status, code) in [
+            (
+                "deepseek",
+                StatusCode::NOT_IMPLEMENTED,
+                "feature_unsupported",
+            ),
+            ("unknown", StatusCode::BAD_REQUEST, "invalid_agent"),
+            (
+                "opencode",
+                StatusCode::SERVICE_UNAVAILABLE,
+                "agent_unavailable",
+            ),
+        ] {
+            let response = get_response(
+                state.clone(),
+                &format!("/api/agent-sessions/page?agent_id={agent_id}"),
+                device_headers(),
+            )
+            .await;
+            assert_eq!(response.status(), status);
+            assert_eq!(body_json(response).await["error"]["code"], code);
+        }
+    }
+
+    #[tokio::test]
+    async fn unscoped_legacy_cursor_is_rejected_before_any_provider_fanout() {
+        use crate::agents::use_cases::session_service::tests::PageAgent;
+        let state = state_with(vec![]).await;
+        let mut query_logs = vec![];
+        for kind in ["opencode", "deepseek"] {
+            let agent = PageAgent::new(kind);
+            query_logs.push(agent.queries.clone());
+            state
+                .agent_runtime
+                .attach_for_test(std::sync::Arc::new(
+                    super::super::manager::AgentManager::for_test(std::sync::Arc::new(agent)),
+                ))
+                .await;
+        }
+        for path in [
+            "/api/agent-sessions",
+            "/api/sessions/ignored/agent-sessions",
+        ] {
+            let response = get_response(
+                state.clone(),
+                &format!("{path}?cursor=opaque"),
+                device_headers(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        assert!(query_logs.iter().all(|log| log.lock().unwrap().is_empty()));
+        let response = get_response(state, "/api/agent-sessions", device_headers()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["data"].as_array().unwrap().len(), 4);
+        assert_eq!(body["data"][0]["updated_ms"], 30);
+        assert_eq!(body["data"][3]["updated_ms"], 10);
+        for log in query_logs {
+            assert_eq!(
+                log.lock().unwrap().as_slice(),
+                [(
+                    false,
+                    SessionQuery {
+                        limit: Some(50),
+                        ..Default::default()
+                    }
+                )]
+            );
+        }
+    }
+
+    async fn delete_response(state: AppState, uri: &str, token: Option<&str>) -> Response {
+        use tower::ServiceExt;
+        let mut request = axum::http::Request::builder().method("DELETE").uri(uri);
+        if let Some(token) = token {
+            request = request.header("authorization", format!("Bearer {token}"));
+        }
+        mount(Router::new())
+            .with_state(state)
+            .oneshot(request.body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn scoped_session_delete_selects_the_named_owner_even_for_colliding_ids() {
+        let opencode = FakeAgent::new("opencode")
+            .with_sessions(&[("shared", 1)])
+            .with_session_deletion();
+        let t3 = FakeAgent::new("t3")
+            .with_sessions(&[("shared", 1)])
+            .with_session_deletion();
+        let oc_calls = opencode.calls.clone();
+        let t3_calls = t3.calls.clone();
+        let state = state_with(vec![opencode, t3]).await;
+        state
+            .agent_runtime
+            .record_session_route("shared", "t3")
+            .await;
+
+        let response = delete_response(
+            state.clone(),
+            "/api/agents/opencode/sessions/shared",
+            Some("device-token"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_json(response).await["data"]["deleted"], true);
+        assert_eq!(*oc_calls.lock().unwrap(), ["delete_session shared"]);
+        assert!(t3_calls.lock().unwrap().is_empty());
+        assert_eq!(
+            state
+                .agent_runtime
+                .manager_for_session("shared")
+                .await
+                .unwrap()
+                .agent()
+                .kind(),
+            "t3",
+            "scoped deletion must keep another provider's cached route"
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_session_delete_never_falls_back_to_another_provider() {
+        let opencode = FakeAgent::new("opencode")
+            .with_sessions(&[("owned", 1)])
+            .with_session_deletion();
+        let oc_calls = opencode.calls.clone();
+        let t3 = FakeAgent::new("t3").with_session_deletion();
+        let t3_calls = t3.calls.clone();
+        let state = state_with(vec![opencode, t3]).await;
+        state
+            .agent_runtime
+            .record_session_route("owned", "opencode")
+            .await;
+        let response =
+            delete_response(state, "/api/agents/t3/sessions/owned", Some("device-token")).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            body_json(response).await["error"]["code"],
+            "session_not_found"
+        );
+        assert!(oc_calls.lock().unwrap().is_empty());
+        assert!(t3_calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn scoped_session_delete_refuses_unknown_unavailable_and_untrusted_callers() {
+        let state = state_with(Vec::new()).await;
+        // The admin token is a control-route refusal of `required` mode (see
+        // `control_routes_reject_the_admin_token`); the state here is
+        // token-only, where it acts as the owner's app.
+        for (agent_id, token, status, code) in [
+            (
+                "unknown",
+                None,
+                StatusCode::UNAUTHORIZED,
+                "missing_authorization",
+            ),
+            (
+                "unknown",
+                Some("wrong"),
+                StatusCode::FORBIDDEN,
+                "invalid_token",
+            ),
+            (
+                "unknown",
+                Some("device-token"),
+                StatusCode::BAD_REQUEST,
+                "invalid_agent",
+            ),
+            (
+                "t3",
+                Some("device-token"),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "agent_unavailable",
+            ),
+        ] {
+            let response = delete_response(
+                state.clone(),
+                &format!("/api/agents/{agent_id}/sessions/owned"),
+                token,
+            )
+            .await;
+            assert_eq!(response.status(), status);
+            assert_eq!(body_json(response).await["error"]["code"], code);
+        }
+        let peer_state = crate::test_support::test_state(
+            "admin",
+            vec![crate::test_support::test_peer_device("peer", "peer-token")],
+        );
+        let response = delete_response(
+            peer_state,
+            "/api/agents/unknown/sessions/owned",
+            Some("peer-token"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(body_json(response).await["error"]["code"], "peer_forbidden");
+    }
+
+    #[tokio::test]
+    async fn scoped_session_delete_propagates_unsupported_without_forgetting_the_session() {
+        let deepseek = FakeAgent::new("deepseek").with_sessions(&[("owned", 1)]);
+        let calls = deepseek.calls.clone();
+        let state = state_with(vec![deepseek]).await;
+        state
+            .agent_runtime
+            .record_session_route("owned", "deepseek")
+            .await;
+        let response = delete_response(
+            state.clone(),
+            "/api/agents/deepseek/sessions/owned",
+            Some("device-token"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(
+            body_json(response).await["error"]["code"],
+            "feature_unsupported"
+        );
+        assert!(calls.lock().unwrap().is_empty());
+        assert_eq!(
+            state
+                .agent_runtime
+                .manager_for_session("owned")
+                .await
+                .unwrap()
+                .agent()
+                .kind(),
+            "deepseek"
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_session_delete_refuses_the_providers_http_missing_session_response() {
+        let mut opencode = FakeAgent::new("opencode")
+            .with_sessions(&[("owned", 1)])
+            .with_session_deletion();
+        opencode.http_404.push("owned".into());
+        let calls = opencode.calls.clone();
+        let response = delete_response(
+            state_with(vec![opencode]).await,
+            "/api/agents/opencode/sessions/owned",
+            Some("device-token"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            body_json(response).await["error"]["code"],
+            "session_not_found"
+        );
+        assert!(calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn legacy_session_delete_keeps_the_recorded_owner_lookup() {
+        let opencode = FakeAgent::new("opencode")
+            .with_sessions(&[("shared", 1)])
+            .with_session_deletion();
+        let t3 = FakeAgent::new("t3")
+            .with_sessions(&[("shared", 1)])
+            .with_session_deletion();
+        let oc_calls = opencode.calls.clone();
+        let t3_calls = t3.calls.clone();
+        let state = state_with(vec![opencode, t3]).await;
+        state
+            .agent_runtime
+            .record_session_route("shared", "t3")
+            .await;
+        let response =
+            delete_response(state, "/api/agent-sessions/shared", Some("device-token")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(oc_calls.lock().unwrap().is_empty());
+        assert_eq!(*t3_calls.lock().unwrap(), ["delete_session shared"]);
+    }
+
+    #[tokio::test]
+    async fn scoped_session_delete_rejects_ids_that_could_change_the_provider_request_path() {
+        let state = state_with(Vec::new()).await;
+        for id in [
+            "..",
+            "owned%2Fchild",
+            "owned%3Fquery",
+            "owned%23fragment",
+            "owned%252fchild",
+        ] {
+            let response = delete_response(
+                state.clone(),
+                &format!("/api/agents/opencode/sessions/{id}"),
+                Some("device-token"),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(
+                body_json(response).await["error"]["code"],
+                "invalid_session"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn scoped_session_delete_binds_encrypted_provider_identity_and_refuses_replay() {
+        use base64::Engine as _;
+        use tower::ServiceExt;
+
+        let opencode = FakeAgent::new("opencode")
+            .with_sessions(&[("shared", 1)])
+            .with_session_deletion();
+        let t3 = FakeAgent::new("t3")
+            .with_sessions(&[("shared", 1)])
+            .with_session_deletion();
+        let oc_calls = opencode.calls.clone();
+        let t3_calls = t3.calls.clone();
+        let state = state_with(vec![opencode, t3]).await;
+        let key = [13; 32];
+        state.devices.lock().unwrap()[0].transport_key =
+            Some(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key));
+        let path = "/api/agents/opencode/sessions/shared";
+        let payload = json!({ "token": "device-token", "body": "" });
+        let envelope = crate::connectivity::transport::seal(
+            &key,
+            crate::connectivity::transport::Direction::Request,
+            format!("DELETE {path}").as_bytes(),
+            &serde_json::to_vec(&payload).unwrap(),
+            crate::now_unix_ms(),
+        )
+        .unwrap();
+        let bytes = serde_json::to_vec(&envelope).unwrap();
+        let request = |path: &str| {
+            axum::http::Request::builder()
+                .method("DELETE")
+                .uri(path)
+                .header("x-muqun-transport", "1")
+                .header("x-muqun-device", "phone-1")
+                .body(axum::body::Body::from(bytes.clone()))
+                .unwrap()
+        };
+        let app = mount(Router::new())
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                crate::platform::server::encrypted_transport,
+            ))
+            .with_state(state);
+        let tampered = app
+            .clone()
+            .oneshot(request("/api/agents/t3/sessions/shared"))
+            .await
+            .unwrap();
+        assert_eq!(tampered.status(), StatusCode::FORBIDDEN);
+        assert!(oc_calls.lock().unwrap().is_empty());
+        assert!(t3_calls.lock().unwrap().is_empty());
+        assert_eq!(
+            app.clone().oneshot(request(path)).await.unwrap().status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            app.oneshot(request(path)).await.unwrap().status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(*oc_calls.lock().unwrap(), ["delete_session shared"]);
+        assert!(t3_calls.lock().unwrap().is_empty());
     }
 
     fn ids(data: &Value) -> Vec<(String, String)> {
@@ -3301,6 +4914,56 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn file_mentions_use_the_session_owner_and_directory_not_the_primary_provider() {
+        let primary = FakeAgent::new("opencode");
+        let primary_calls = primary.calls.clone();
+        let mut selected = FakeAgent::new("codex").with_sessions(&[("selected", 1)]);
+        let directory = crate::test_support::asset_test_dir("agent-file-scope");
+        selected.sessions[0].directory = Some(directory.as_path().to_string_lossy().into_owned());
+        let selected_calls = selected.calls.clone();
+        let state = state_with(vec![primary, selected]).await;
+        let _ = do_find_agent_files(
+            &state,
+            FileSearchScope::Session("selected"),
+            "name",
+            10,
+            Some("/wrong-project"),
+            &device_headers(),
+        )
+        .await
+        .unwrap();
+        assert!(!primary_calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|call| call.starts_with("find_files:")));
+        assert!(selected_calls
+            .lock()
+            .unwrap()
+            .contains(&format!("find_files:{}", directory.as_path().display())));
+        let _ = do_find_agent_files(
+            &state,
+            FileSearchScope::Agent(Some("codex")),
+            "name",
+            10,
+            Some(directory.as_path().to_str().unwrap()),
+            &device_headers(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            selected_calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|call| call.starts_with("find_files:"))
+                .count(),
+            2
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     /// The directory-scoped routes expand `~` before the missing-folder check,
     /// so a `~/…` that is gone is the usual 404 naming the absolute path.
     #[tokio::test]
@@ -3308,6 +4971,7 @@ mod tests {
         let state = state_with(vec![FakeAgent::new("opencode")]).await;
         let refusal = do_find_agent_files(
             &state,
+            FileSearchScope::Agent(None),
             "x",
             10,
             Some("~/muqun-no-such-dir-for-tests"),
@@ -3327,9 +4991,16 @@ mod tests {
         );
 
         // And one that exists is let through.
-        let Json(_) = do_find_agent_files(&state, "x", 10, Some("~"), &device_headers())
-            .await
-            .expect("home is a workspace the agent can search");
+        let Json(_) = do_find_agent_files(
+            &state,
+            FileSearchScope::Agent(None),
+            "x",
+            10,
+            Some("~"),
+            &device_headers(),
+        )
+        .await
+        .expect("home is a workspace the agent can search");
     }
 
     #[tokio::test]

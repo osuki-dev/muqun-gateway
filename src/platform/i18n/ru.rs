@@ -17,6 +17,7 @@ pub(super) const RU: &[(&str, &str)] = &[
     // -- push notifications --------------------------------------------------
     ("Agent", "Агент"),
     ("Approval needed", "Требуется разрешение"),
+    ("Needs your input", "Нужен ваш ответ"),
     ("Agent blocked", "Агент ожидает"),
     ("Agent done", "Агент завершил работу"),
     ("{name} is waiting for your approval.", "{name} ожидает вашего разрешения."),
@@ -27,6 +28,10 @@ pub(super) const RU: &[(&str, &str)] = &[
     ("Expo push service request failed", "запрос к push-сервису Expo не выполнен"),
     ("Herdr did not return the created pane id", "Herdr не вернул id созданной панели"),
     ("Herdr is unavailable", "Herdr недоступен"),
+    ("No terminal pane belongs to the calling process", "Ни одна панель терминала не принадлежит вызывающему процессу"),
+    ("Task not found", "Задача не найдена"),
+    ("Token expired", "Срок действия токена истёк"),
+    ("Token not found", "Токен не найден"),
     (
         "agent is not one this gateway offers; see GET /api/agents/catalog",
         "agent не входит в число агентов, которые предлагает этот Gateway; см. GET /api/agents/catalog",
@@ -82,6 +87,11 @@ pub(super) const RU: &[(&str, &str)] = &[
     ("invalid Authorization header", "недопустимый заголовок Authorization"),
     ("invalid pairing code", "недопустимый код привязки"),
     ("invalid token", "недопустимый токен"),
+    (
+        "the MCP endpoint answers only local callers on this machine",
+        "конечная точка MCP отвечает только локальным вызовам на этой машине",
+    ),
+    ("the assistant token store is unavailable", "хранилище токенов ассистента недоступно"),
     ("keys must contain 1 to 32 entries", "keys должен содержать от 1 до 32 элементов"),
     ("missing Authorization header", "отсутствует заголовок Authorization"),
     ("mode must be on, off, or toggle", "mode должен быть on, off или toggle"),
@@ -127,6 +137,7 @@ pub(super) const RU: &[(&str, &str)] = &[
     ("the file field must carry a filename", "поле file должно содержать имя файла"),
     ("the pane is not waiting on an approval", "панель не ожидает разрешения"),
     ("the pane is waiting on a different approval", "панель ожидает другого разрешения"),
+    ("the task request failed", "запрос задачи не выполнен"),
     ("the upload must be at most 25 MiB", "размер загружаемого файла не должен превышать 25 МиБ"),
     (
         "this approval has no option with that number",
@@ -163,4 +174,53 @@ pub(super) const RU: &[(&str, &str)] = &[
         "branch_name не должен содержать пустой сегмент пути или сегмент, начинающийся или заканчивающийся точкой",
     ),
     ("branch_name must not end with .lock", "branch_name не должен заканчиваться на .lock"),
+    // -- tasks, lazygit and assets ------------------------------------------
+    (
+        "No terminal session is reachable on this computer",
+        "На этом компьютере нет доступного сеанса терминала",
+    ),
+    (
+        "That agent is not available",
+        "Этот агент недоступен",
+    ),
+    (
+        "Only a paused or waiting task opened on a device can be confirmed",
+        "Подтвердить можно только приостановленную или ожидающую задачу, открытую на устройстве",
+    ),
+    (
+        "the agent could not start the task",
+        "агенту не удалось запустить задачу",
+    ),
+    (
+        "label must be at most 200 characters",
+        "label должен содержать не более 200 символов",
+    ),
+    (
+        "goal must be non-empty and at most 32 KiB",
+        "goal не должен быть пустым и должен занимать не более 32 КиБ",
+    ),
+    (
+        "summary must be at most 32 KiB",
+        "summary должен занимать не более 32 КиБ",
+    ),
+    (
+        "Unknown model for that agent. Use a model id from its catalog, or <provider_id>/<model_id>.",
+        "Неизвестная модель для этого агента. Укажите id модели из его каталога или <provider_id>/<model_id>.",
+    ),
+    (
+        "Unknown variant '{variant}' (the model offers: {offered}).",
+        "Неизвестное значение variant '{variant}' (модель предлагает: {offered}).",
+    ),
+    (
+        "Install lazygit on the Gateway host",
+        "Установите lazygit на хост Gateway",
+    ),
+    (
+        "The source pane is not in an accessible Git repository",
+        "Исходная панель не находится в доступном Git-репозитории",
+    ),
+    (
+        "the asset exceeds its content size limit",
+        "файл превышает ограничение на размер содержимого",
+    ),
 ];

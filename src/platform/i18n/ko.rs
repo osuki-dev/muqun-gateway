@@ -18,6 +18,7 @@ pub(super) const KO: &[(&str, &str)] = &[
     // -- push notifications --------------------------------------------------
     ("Agent", "에이전트"),
     ("Approval needed", "승인 필요"),
+    ("Needs your input", "입력이 필요합니다"),
     ("Agent blocked", "에이전트 대기 중"),
     ("Agent done", "에이전트 완료"),
     ("{name} is waiting for your approval.", "{name}이(가) 승인을 기다리고 있습니다."),
@@ -28,6 +29,10 @@ pub(super) const KO: &[(&str, &str)] = &[
     ("Expo push service request failed", "Expo 푸시 서비스 요청에 실패했습니다"),
     ("Herdr did not return the created pane id", "Herdr가 생성된 패널의 id를 반환하지 않았습니다"),
     ("Herdr is unavailable", "Herdr를 사용할 수 없습니다"),
+    ("No terminal pane belongs to the calling process", "호출한 프로세스에 속한 터미널 패널이 없습니다"),
+    ("Task not found", "작업을 찾을 수 없습니다"),
+    ("Token expired", "토큰이 만료되었습니다"),
+    ("Token not found", "토큰을 찾을 수 없습니다"),
     (
         "agent is not one this gateway offers; see GET /api/agents/catalog",
         "이 Gateway가 제공하는 agent가 아닙니다. GET /api/agents/catalog 참조",
@@ -68,6 +73,11 @@ pub(super) const KO: &[(&str, &str)] = &[
     ("invalid Authorization header", "Authorization 헤더가 올바르지 않습니다"),
     ("invalid pairing code", "페어링 코드가 올바르지 않습니다"),
     ("invalid token", "토큰이 올바르지 않습니다"),
+    (
+        "the MCP endpoint answers only local callers on this machine",
+        "MCP 엔드포인트는 이 머신의 로컬 호출자에게만 응답합니다",
+    ),
+    ("the assistant token store is unavailable", "어시스턴트 토큰 저장소를 사용할 수 없습니다"),
     ("keys must contain 1 to 32 entries", "keys에는 항목이 1개에서 32개까지 있어야 합니다"),
     ("missing Authorization header", "Authorization 헤더가 없습니다"),
     ("mode must be on, off, or toggle", "mode는 on, off 또는 toggle이어야 합니다"),
@@ -107,6 +117,7 @@ pub(super) const KO: &[(&str, &str)] = &[
     ("the file field must carry a filename", "file 필드에 파일 이름이 있어야 합니다"),
     ("the pane is not waiting on an approval", "이 패널은 승인을 기다리고 있지 않습니다"),
     ("the pane is waiting on a different approval", "이 패널이 기다리는 것은 다른 승인입니다"),
+    ("the task request failed", "작업 요청이 실패했습니다"),
     ("the upload must be at most 25 MiB", "업로드는 최대 25 MiB까지 가능합니다"),
     ("this approval has no option with that number", "이 승인에는 그 번호의 옵션이 없습니다"),
     ("this approval offers no option with that meaning", "이 승인에는 그 뜻에 해당하는 옵션이 없습니다"),
@@ -134,4 +145,53 @@ pub(super) const KO: &[(&str, &str)] = &[
         "branch_name에는 빈 경로 세그먼트나 점으로 시작 또는 끝나는 세그먼트가 있을 수 없습니다",
     ),
     ("branch_name must not end with .lock", "branch_name은 .lock으로 끝날 수 없습니다"),
+    // -- tasks, lazygit and assets ------------------------------------------
+    (
+        "No terminal session is reachable on this computer",
+        "이 컴퓨터에서 연결할 수 있는 터미널 세션이 없습니다",
+    ),
+    (
+        "That agent is not available",
+        "해당 에이전트를 사용할 수 없습니다",
+    ),
+    (
+        "Only a paused or waiting task opened on a device can be confirmed",
+        "기기에서 연 작업 중 일시 정지되었거나 대기 중인 작업만 확인할 수 있습니다",
+    ),
+    (
+        "the agent could not start the task",
+        "에이전트가 작업을 시작하지 못했습니다",
+    ),
+    (
+        "label must be at most 200 characters",
+        "label은 최대 200자여야 합니다",
+    ),
+    (
+        "goal must be non-empty and at most 32 KiB",
+        "goal은 비어 있을 수 없으며 최대 32 KiB여야 합니다",
+    ),
+    (
+        "summary must be at most 32 KiB",
+        "summary는 최대 32 KiB여야 합니다",
+    ),
+    (
+        "Unknown model for that agent. Use a model id from its catalog, or <provider_id>/<model_id>.",
+        "해당 에이전트에 없는 모델입니다. 카탈로그의 모델 id 또는 <provider_id>/<model_id>를 사용하세요.",
+    ),
+    (
+        "Unknown variant '{variant}' (the model offers: {offered}).",
+        "알 수 없는 variant '{variant}'입니다(이 모델이 제공하는 값: {offered}).",
+    ),
+    (
+        "Install lazygit on the Gateway host",
+        "Gateway 호스트에 lazygit을 설치하세요",
+    ),
+    (
+        "The source pane is not in an accessible Git repository",
+        "원본 패널이 접근 가능한 Git 저장소에 있지 않습니다",
+    ),
+    (
+        "the asset exceeds its content size limit",
+        "파일이 콘텐츠 크기 제한을 초과합니다",
+    ),
 ];

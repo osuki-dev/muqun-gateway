@@ -45,6 +45,9 @@ impl From<SetupBackend> for BackendKind {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct Config {
+    /// Captured-prefix storage selection; changing it requires a restart.
+    #[serde(default, skip_serializing_if = "HistoryConfig::is_default")]
+    pub(crate) history: HistoryConfig,
     pub(crate) server_id: String,
     pub(crate) label: String,
     pub(crate) listen: String,
@@ -78,6 +81,28 @@ pub(crate) struct Config {
     /// omitted when empty, so an existing `config.json` keeps working untouched.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) agent_commands: BTreeMap<String, String>,
+    /// Agent kind -> the arguments every agent the gateway launches for that
+    /// kind starts with, in place of the built-in defaults (bypass-permission
+    /// flags for `codex` and `claude`; see `agents::tasks::agent_launch_args`).
+    /// A non-empty list replaces the defaults; an empty list turns them off
+    /// for that kind. Omitted when empty.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) agent_launch_args: BTreeMap<String, Vec<String>>,
+    /// Variables every agent the gateway launches starts with -- typically a
+    /// proxy (`HTTPS_PROXY`, ...) that the owner's interactive shell sets but
+    /// the gateway's own environment lacks. Values are never logged.
+    #[serde(default, skip_serializing_if = "AgentEnv::is_empty")]
+    pub(crate) agent_env: AgentEnv,
+    /// Mark the directory an agent is launched in as trusted, so it does not
+    /// stop at "Do you trust the files in this folder?" with nobody at the
+    /// terminal: in Claude Code's own config
+    /// (`projects["<dir>"].hasTrustDialogAccepted` in `~/.claude.json`), and
+    /// with Codex's `-c projects=…` for that run. On by default -- the
+    /// owner's choice, for agents launched from their phone -- and only ever
+    /// for directories inside their home; `false` does neither. Omitted from
+    /// a written config while on.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub(crate) agent_trust_folders: bool,
     /// Put the agent's own question, and the answers it is offering, into a
     /// blocked push.
     ///
@@ -98,12 +123,162 @@ pub(crate) struct Config {
     /// owner asked for; `{"autostart": false}` leaves that to them.
     #[serde(default, skip_serializing_if = "is_default_opencode")]
     pub(crate) opencode: agents::OpencodeConfig,
-    /// Configuration for the DeepSeek agent adapter
+    /// DeepSeek Harness. Off unless `enabled` or `endpoint` is set. `autostart`
+    /// defaults to true, matching OpenCode, but a missing key does not start a
+    /// process until DeepSeek is enabled.
     #[serde(default, skip_serializing_if = "is_default_deepseek")]
     pub(crate) deepseek: agents::DeepseekConfig,
     /// The T3 Code agent adapter: off unless `enabled` or `url` is set.
     #[serde(default, skip_serializing_if = "is_default_t3")]
     pub(crate) t3: agents::T3Config,
+    /// Private Codex app-server support is on unless explicitly disabled.
+    /// Authentication and permission configuration remain owned by Codex.
+    #[serde(default, skip_serializing_if = "is_default_codex")]
+    pub(crate) codex: agents::runtime::CodexConfig,
+    /// Master switch for service agents; terminal agents remain independent.
+    #[serde(default, skip_serializing_if = "AgentRuntimeConfig::is_default")]
+    pub(crate) agent_runtime: AgentRuntimeConfig,
+    /// The shared SQLite store. Omitted from a written config while it is the
+    /// default, so an existing `config.json` round-trips untouched.
+    #[serde(default, skip_serializing_if = "StoreConfig::is_default")]
+    pub(crate) store: StoreConfig,
+    /// The `/mcp` endpoint for agents on this machine. On unless switched off.
+    #[serde(default, skip_serializing_if = "McpConfig::is_default")]
+    pub(crate) mcp: McpConfig,
+    /// The owner's other computers. See `FleetConfig`.
+    #[serde(default, skip_serializing_if = "FleetConfig::is_default")]
+    pub(crate) fleet: FleetConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AgentRuntimeConfig {
+    #[serde(default = "default_true")]
+    pub(crate) enabled: bool,
+}
+
+impl Default for AgentRuntimeConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+impl AgentRuntimeConfig {
+    fn is_default(&self) -> bool {
+        self.enabled
+    }
+}
+
+/// `{"mcp": {"enabled": false}}` removes `/mcp` and `/api/mcp/tokens*`, stops
+/// the token sweeper and gives OpenCode no `MUQUN_MCP_*` environment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct McpConfig {
+    #[serde(default = "mcp_enabled_default")]
+    pub(crate) enabled: bool,
+    /// Give the agents the gateway starts the muqun server at launch
+    /// (`mcp::inject`), without writing their configuration. Omitted from
+    /// a written config while on.
+    #[serde(default = "mcp_enabled_default", skip_serializing_if = "is_true")]
+    pub(crate) inject_into_agents: bool,
+}
+
+fn mcp_enabled_default() -> bool {
+    true
+}
+
+impl Default for McpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            inject_into_agents: true,
+        }
+    }
+}
+
+impl McpConfig {
+    pub(crate) fn is_default(&self) -> bool {
+        *self == McpConfig::default()
+    }
+}
+
+/// `{"fleet": {"accept_delegations": false}}`: other computers this one is
+/// linked with may not open tasks here (`POST /api/tasks` with a gateway
+/// token answers 403 `delegations_disabled`). On by default; the phone's
+/// "Accept work from other computers" switch writes it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct FleetConfig {
+    #[serde(default = "default_true")]
+    pub(crate) accept_delegations: bool,
+}
+
+impl Default for FleetConfig {
+    fn default() -> Self {
+        Self {
+            accept_delegations: true,
+        }
+    }
+}
+
+impl FleetConfig {
+    pub(crate) fn is_default(&self) -> bool {
+        *self == FleetConfig::default()
+    }
+}
+
+/// Whether the shared SQLite store is encrypted, and where its key lives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum StoreEncryption {
+    /// Plain SQLite. For machines where the state directory is already encrypted.
+    Off,
+    /// SQLCipher, keyed by `store.key` in the state directory.
+    #[default]
+    File,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct StoreConfig {
+    #[serde(default)]
+    pub(crate) encryption: StoreEncryption,
+}
+
+impl StoreConfig {
+    pub(crate) fn is_default(&self) -> bool {
+        *self == StoreConfig::default()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum HistoryStorage {
+    Memory,
+    Sqlite,
+}
+
+/// What `history.storage` is when config.json does not say: making SQLite the
+/// default is this one line (a config that names its storage keeps it).
+pub(crate) const DEFAULT_HISTORY_STORAGE: HistoryStorage = HistoryStorage::Memory;
+
+impl Default for HistoryStorage {
+    fn default() -> Self {
+        DEFAULT_HISTORY_STORAGE
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct HistoryConfig {
+    #[serde(default)]
+    pub(crate) storage: HistoryStorage,
+}
+
+impl HistoryConfig {
+    fn is_default(&self) -> bool {
+        self.storage == DEFAULT_HISTORY_STORAGE
+    }
 }
 
 /// `skip_serializing_if` for the OpenCode block, so an existing `config.json`
@@ -113,11 +288,19 @@ pub(crate) fn is_default_opencode(config: &agents::OpencodeConfig) -> bool {
 }
 
 pub(crate) fn is_default_deepseek(config: &agents::DeepseekConfig) -> bool {
-    !config.enabled && config.endpoint.is_none() && config.token.is_none()
+    !config.enabled
+        && config.autostart
+        && config.endpoint.is_none()
+        && config.token.is_none()
+        && config.secret.is_none()
 }
 
 pub(crate) fn is_default_t3(config: &agents::T3Config) -> bool {
     *config == agents::T3Config::default()
+}
+
+pub(crate) fn is_default_codex(config: &agents::runtime::CodexConfig) -> bool {
+    *config == agents::runtime::CodexConfig::default()
 }
 
 pub(crate) fn is_required_transport(mode: &TransportEncryptionMode) -> bool {
@@ -127,6 +310,61 @@ pub(crate) fn is_required_transport(mode: &TransportEncryptionMode) -> bool {
 /// `skip_serializing_if` for a flag whose absence is its default.
 pub(crate) fn is_false(value: &bool) -> bool {
     !*value
+}
+
+/// `skip_serializing_if` for a flag that is on when absent.
+fn is_true(value: &bool) -> bool {
+    *value
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// `agent_env`: a map whose `Debug` names the variables but never shows a
+/// value, so a logged config cannot leak a proxy credential.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub(crate) struct AgentEnv(pub(crate) BTreeMap<String, String>);
+
+impl AgentEnv {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// The variables whose names a shell and `env` accept
+    /// (`[A-Za-z_][A-Za-z0-9_]*`); anything else is dropped with a warning
+    /// that names the key only.
+    pub(crate) fn usable(&self) -> BTreeMap<String, String> {
+        self.0
+            .iter()
+            .filter(|(key, _)| {
+                let ok = is_env_name(key);
+                if !ok {
+                    tracing::warn!("agent_env: ignoring {key:?}, not a valid variable name");
+                }
+                ok
+            })
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect()
+    }
+}
+
+impl std::fmt::Debug for AgentEnv {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_set()
+            .entries(self.0.keys().map(|key| format!("{key}=<redacted>")))
+            .finish()
+    }
+}
+
+fn is_env_name(key: &str) -> bool {
+    let mut chars = key.chars();
+    chars
+        .next()
+        .is_some_and(|first| first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
 }
 
 impl Config {
@@ -214,7 +452,12 @@ pub(crate) const MAX_PAIRING_CODE_ATTEMPTS: u8 = 8;
 
 pub(crate) const PAIRING_RATE_LIMIT_WINDOW_MS: u128 = 10 * 60 * 1000;
 
-pub(crate) const MAX_PAIRING_REQUESTS_PER_WINDOW: usize = 6;
+/// Pairing requests per window. Twelve: an owner pairing their devices again
+/// after `required` transport refused the key-less ones (an emulator or two,
+/// a phone, a linked computer) must not run into "too many pairing
+/// requests" halfway. Online code guessing is bounded separately by the
+/// eight-attempt lockout on each code (`MAX_PAIRING_CODE_ATTEMPTS`).
+pub(crate) const MAX_PAIRING_REQUESTS_PER_WINDOW: usize = 12;
 
 pub(crate) const MAX_SEND_KEYS: usize = 32;
 
@@ -311,6 +554,18 @@ pub(crate) const HERDR_PROTOCOL_MIN: u64 = 17;
 
 pub(crate) const MAX_REQUEST_BODY_BYTES: usize = 128 * 1024;
 
+/// The body a prompt, a slash command or a new task may carry: a pasted
+/// log or a long goal is ordinary there. Only these routes take it, and
+/// only from a caller `require_device` already let through
+/// (`server::large_body_after_auth`); everything else stays at
+/// [`MAX_REQUEST_BODY_BYTES`].
+pub(crate) const MAX_PROMPT_BODY_BYTES: usize = 1024 * 1024;
+
+/// Whether `path` is one of the routes that take [`MAX_PROMPT_BODY_BYTES`].
+pub(crate) fn takes_large_body(path: &str) -> bool {
+    path == "/api/tasks" || path.ends_with("/prompt") || path.ends_with("/command")
+}
+
 /// Version of the unified content model this gateway speaks. Declared on every
 /// content envelope so a client renders what it knows and falls back for the
 /// rest; additive changes bump the minor. 1.1.0 added the parts endpoint, which
@@ -333,6 +588,115 @@ pub(crate) const CONTENT_SCHEMA_VERSION: &str = "1.5.0";
 #[cfg(test)]
 mod tests {
     use crate::*;
+
+    #[test]
+    fn codex_and_master_runtime_default_on_roundtrip_explicit_off_and_reject_secrets() {
+        let base = json!({"server_id":"synthetic-server","label":"fixture","listen":"127.0.0.1:23847","public_url":"","token_hash":"synthetic-hash","sessions":[]});
+        let default: Config = serde_json::from_value(base.clone()).unwrap();
+        assert!(default.codex.enabled && default.agent_runtime.enabled);
+        assert_eq!(serde_json::to_value(default).unwrap(), base);
+        for key in ["codex", "agent_runtime"] {
+            let mut off = base.clone();
+            off[key] = json!({"enabled":false});
+            let config: Config = serde_json::from_value(off.clone()).unwrap();
+            assert!(!if key == "codex" {
+                config.codex.enabled
+            } else {
+                config.agent_runtime.enabled
+            });
+            assert_eq!(serde_json::to_value(config).unwrap(), off);
+            let mut empty = base.clone();
+            empty[key] = json!({});
+            let config: Config = serde_json::from_value(empty).unwrap();
+            assert!(config.codex.enabled && config.agent_runtime.enabled);
+            let mut unknown = base.clone();
+            unknown[key] = json!({"api_key":"synthetic-not-a-credential"});
+            assert!(serde_json::from_value::<Config>(unknown).is_err());
+        }
+        let mut configured = base;
+        configured["codex"] = json!({"enabled":true,"binary":"/synthetic/bin/codex"});
+        let config: Config = serde_json::from_value(configured.clone()).unwrap();
+        assert_eq!(config.codex.binary.as_deref(), Some("/synthetic/bin/codex"));
+        assert_eq!(serde_json::to_value(config).unwrap(), configured);
+    }
+
+    #[test]
+    fn the_store_block_is_left_out_when_default_and_strict_when_present() {
+        let base = json!({
+            "server_id": "s1",
+            "label": "mac",
+            "listen": "127.0.0.1:23847",
+            "public_url": "https://example.ts.net",
+            "token_hash": "abc",
+            "sessions": []
+        });
+        let config: Config = serde_json::from_value(base.clone()).unwrap();
+        assert_eq!(config.store.encryption, StoreEncryption::File);
+        assert_eq!(serde_json::to_value(&config).unwrap(), base);
+
+        let mut off = base.clone();
+        off["store"] = json!({"encryption": "off"});
+        let config: Config = serde_json::from_value(off.clone()).unwrap();
+        assert_eq!(config.store.encryption, StoreEncryption::Off);
+        assert_eq!(serde_json::to_value(&config).unwrap(), off);
+
+        let mut unknown = base;
+        unknown["store"] = json!({"foo": 1});
+        assert!(serde_json::from_value::<Config>(unknown).is_err());
+    }
+
+    #[test]
+    fn the_mcp_block_is_left_out_when_default_and_strict_when_present() {
+        let base = json!({
+            "server_id": "s1",
+            "label": "mac",
+            "listen": "127.0.0.1:23847",
+            "public_url": "https://example.ts.net",
+            "token_hash": "abc",
+            "sessions": []
+        });
+        let config: Config = serde_json::from_value(base.clone()).unwrap();
+        assert!(config.mcp.enabled);
+        assert_eq!(serde_json::to_value(&config).unwrap(), base);
+
+        let mut off = base.clone();
+        off["mcp"] = json!({"enabled": false});
+        let config: Config = serde_json::from_value(off.clone()).unwrap();
+        assert!(!config.mcp.enabled);
+        assert_eq!(serde_json::to_value(&config).unwrap(), off);
+
+        let mut empty = base.clone();
+        empty["mcp"] = json!({});
+        assert!(serde_json::from_value::<Config>(empty).unwrap().mcp.enabled);
+
+        let mut unknown = base;
+        unknown["mcp"] = json!({"path": "/x"});
+        assert!(serde_json::from_value::<Config>(unknown).is_err());
+    }
+
+    #[test]
+    fn history_storage_defaults_to_memory_roundtrips_sqlite_and_rejects_unknown_modes() {
+        let base = json!({"server_id":"s", "label":"fixture", "listen":"127.0.0.1:23847", "public_url":"", "token_hash":"fixture", "sessions":[]});
+        let default: Config = serde_json::from_value(base.clone()).unwrap();
+        assert_eq!(default.history.storage, super::HistoryStorage::Memory);
+        assert!(serde_json::to_value(default)
+            .unwrap()
+            .get("history")
+            .is_none());
+        for storage in ["sqlite", "unknown"] {
+            let mut configured = base.clone();
+            configured["history"] = json!({"storage":storage});
+            let parsed = serde_json::from_value::<Config>(configured);
+            if storage == "sqlite" {
+                assert_eq!(
+                    serde_json::to_value(parsed.unwrap()).unwrap()["history"]["storage"],
+                    "sqlite"
+                );
+            } else {
+                assert!(parsed.is_err());
+            }
+        }
+    }
 
     #[test]
     fn the_t3_block_is_read_from_config_json_and_left_out_when_default() {
@@ -402,5 +766,31 @@ mod tests {
             config.agent_commands.get("claude").map(String::as_str),
             Some("claude-canary")
         );
+    }
+
+    #[test]
+    fn agent_launch_args_and_agent_env_load_and_never_show_a_value() {
+        let config: Config = serde_json::from_value(json!({
+            "server_id": "s1",
+            "label": "mac",
+            "listen": "127.0.0.1:23847",
+            "public_url": "https://example.ts.net",
+            "token_hash": "abc",
+            "sessions": [],
+            "agent_launch_args": { "codex": [], "claude": ["--model", "opus"] },
+            "agent_env": {
+                "HTTPS_PROXY": "http://user:pw-q7xz@proxy:7890",
+                "bad-name": "x",
+                "1X": "y"
+            }
+        }))
+        .unwrap();
+        assert_eq!(config.agent_launch_args["codex"], Vec::<String>::new());
+        assert_eq!(config.agent_launch_args["claude"], ["--model", "opus"]);
+        assert!(config.agent_trust_folders, "on unless switched off");
+        assert!(!format!("{config:?}").contains("pw-q7xz"));
+        assert!(format!("{config:?}").contains("HTTPS_PROXY"));
+        let usable = config.agent_env.usable();
+        assert_eq!(usable.keys().collect::<Vec<_>>(), ["HTTPS_PROXY"]);
     }
 }

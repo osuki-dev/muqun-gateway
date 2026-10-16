@@ -17,7 +17,7 @@ fn agents_plane_schema() -> Value {
                     "type": "object",
                     "required": ["id", "name", "kind", "status", "enabled", "features", "models", "modes"],
                     "properties": {
-                        "id": { "type": "string", "enum": ["opencode", "deepseek"] },
+                        "id": { "type": "string", "enum": ["opencode", "deepseek", "t3"] },
                         "name": { "type": "string" },
                         "kind": { "type": "string" },
                         "status": { "type": "string", "enum": ["connected", "reachable", "offline", "disabled", "not_installed", "unconfigured"] },
@@ -41,6 +41,8 @@ fn agents_plane_schema() -> Value {
                                 "compaction": { "type": "boolean" },
                                 "backgroundShells": { "type": "boolean" },
                                 "attachments": { "type": "boolean" },
+                                "sessionPagination": { "type": "boolean", "description": "This provider supports GET /api/agent-sessions/page; absent or false means use the legacy array list" },
+                                "timelineEarlier": { "type": "boolean", "description": "This provider supports POST /api/agent-sessions/{asid}/timeline/earlier; require agent_timeline_earlier_v1 too. Absent or false means unsupported" },
                                 "attachmentsByPath": { "type": "boolean", "description": "Attachments reach the agent as host paths appended to the prompt text (the agent reads them with its own tools) rather than as native file parts" }
                             }
                         },
@@ -95,6 +97,18 @@ pub fn openapi_spec() -> Value {
             "description": "Token-protected mobile API for controlling local terminal workspaces through a configured tmux or Herdr backend. Human-readable text is localized: send X-Muqun-Locale (or Accept-Language) with one of `en`, `zh-TW`, `zh-CN`, `ja`, `ko`, `de`, `fr`, `es`, `pt`, `ru`, `vi`, `th`. Error `code` values, decision names and other wire vocabulary are the same bytes in every locale."
         },
         "components": {
+            "schemas": {
+                "TaskState": task_state_schema(),
+                "TaskView": task_view_schema(),
+                "TaskEvent": task_event_schema(),
+                "TokenBinding": {
+                    "type": "object",
+                    "description": "`pane` (session_id, pane_id) or `agent` (agent_id)",
+                    "required": ["kind"],
+                    "properties": { "kind": { "type": "string", "enum": ["pane", "agent"] } },
+                    "additionalProperties": true
+                }
+            },
             "securitySchemes": {
                 "bearerAuth": {
                     "type": "http",
@@ -130,7 +144,7 @@ pub fn openapi_spec() -> Value {
             "/api/meta": { "get": simple_endpoint("Gateway API, backend, and legacy compatibility metadata") },
             "/api/pair/request": {
                 "post": {
-                    "summary": "Request pairing from Muqun app",
+                    "summary": "Request pairing from Muqun app. The code shown on this computer lives five minutes (expires_in_ms: 300000); a code minted with POST /api/pair/pending for another gateway lives one (60000)",
                     "security": [],
                     "requestBody": json_body(object_schema(&[("request_id", "string"), ("device_name", "string")], &["request_id"])),
                     "responses": ok_response()
@@ -144,7 +158,26 @@ pub fn openapi_spec() -> Value {
                     "responses": ok_response()
                 }
             },
-            "/api/pairings": { "get": simple_endpoint("List devices holding a gateway token") },
+            "/api/pairings": { "get": {
+                "summary": "List devices holding a gateway token",
+                "responses": json_ok("The paired devices", json!({
+                    "type": "object",
+                    "required": ["devices"],
+                    "properties": { "devices": { "type": "array", "items": {
+                        "type": "object",
+                        "required": ["id", "name", "paired_unix_ms", "last_seen_unix_ms", "kind", "current"],
+                        "properties": {
+                            "id": { "type": "string" },
+                            "name": { "type": "string" },
+                            "paired_unix_ms": { "type": "integer" },
+                            "last_seen_unix_ms": { "type": "integer" },
+                            "kind": { "type": "string", "enum": ["app", "gateway"] },
+                            "server_id": { "type": ["string", "null"], "description": "kind gateway: the id that computer gave for itself when it paired here, when known (null otherwise); matches its peer_server_id" },
+                            "current": { "type": "boolean", "description": "The device whose token made this request" }
+                        }
+                    } } }
+                }))
+            } },
             "/api/pairings/{deviceId}": {
                 "delete": {
                     "summary": "Revoke one device's gateway token",
@@ -155,6 +188,7 @@ pub fn openapi_spec() -> Value {
             "/api/devices/push-token": {
                 "post": {
                     "summary": "Register this Muqun device's Expo push token",
+                    "description": "push_token_owner_binding_v1: authenticated registration binds the token to the calling paired App device. Legacy unowned registrations are suppressed until re-registration; reopening an older App may still skip registration because of its seven-day cache. See README upgrade guidance. No automatic App revision handshake is implied.",
                     "requestBody": json_body(object_schema(&[("token", "string"), ("platform", "string"), ("device_name", "string"), ("locale", "string")], &["token", "platform"])),
                     "responses": ok_response()
                 },
@@ -347,7 +381,7 @@ pub fn openapi_spec() -> Value {
             "/api/sessions/{sessionId}/tasks": {
                 "post": {
                     "summary": "Start a new task: a checkout, a workspace, an agent, and the first prompt",
-                    "description": "With `branch_name`, the task gets its own git worktree; without it, the task runs in the repo as it stands. `repo_path` must be, or be inside, a workspace this session already has open -- anything else is 403, and a symlink out of one resolves to the outside path and fails there too. `branch_name` is held to letters, digits, dot, underscore, dash and slash, with `..`, a leading dash, and dot-leading segments refused, so it can only ever be a ref and never an argument. The agent is started, then the gateway waits for it to become interactive before the prompt is sent. Asking twice for the same branch reuses the existing checkout rather than making a second one.",
+                    "description": "With `branch_name`, the task gets its own git worktree; without it, the task runs in the repo as it stands. `repo_path` must be, or be inside, a workspace this session already has open -- anything else is 403, and a symlink out of one resolves to the outside path and fails there too. `branch_name` is held to letters, digits, dot, underscore, dash and slash, with `..`, a leading dash, and dot-leading segments refused, so it can only ever be a ref and never an argument. The agent is started, then the gateway waits for it to become interactive before the prompt is sent. Asking twice for the same branch reuses the existing checkout rather than making a second one. Nobody is at the terminal to answer an approval prompt, so `codex` starts with `--dangerously-bypass-approvals-and-sandbox` plus a `-c projects=...` override that trusts the task directory, and `claude` with `--dangerously-skip-permissions`; `agent_launch_args` in config.json replaces these per kind (an empty list turns them off), and `agent_args` follow them. `agent_env` in config.json is set in the new pane's environment (values are never logged).",
                     "parameters": [path_param("sessionId")],
                     "requestBody": json_body(json!({
                         "type": "object",
@@ -358,7 +392,7 @@ pub fn openapi_spec() -> Value {
                             "agent": { "type": "string", "description": "Agent kind from GET /api/agents/catalog" },
                             "prompt": { "type": "string", "description": "Sent once the agent is interactive" },
                             "workspace_label": { "type": "string" },
-                            "agent_args": { "type": "array", "items": { "type": "string" } },
+                            "agent_args": { "type": "array", "items": { "type": "string" }, "description": "Appended after the launch defaults (see agent_launch_args)" },
                             "startup_timeout_ms": { "type": "integer", "description": "How long to wait for the agent to become interactive, 3001 to 300000, default 30000" }
                         }
                     })),
@@ -368,7 +402,7 @@ pub fn openapi_spec() -> Value {
             "/api/sessions/{sessionId}/spawn": {
                 "post": {
                     "summary": "Start an agent in a new pane, without describing a repository",
-                    "description": "The light half of task dispatch: run this agent, here. The agent must be one this gateway offers -- a Herdr kind or a profile in agents.json -- and cwd, when given, must be a directory this session already works in, exactly the fence repo_path is under; anything else is 403. With tab_id the pane is split off whatever that tab has focused, so a second agent lands beside the first; without it the agent gets a tab of its own. GET recent-cwds answers with the directories cwd will accept. The reply names the pane and says whether the agent came up and whether the prompt landed; a 207 means the pane exists and something after it did not, which is not the same as nothing having happened.",
+                    "description": "The light half of task dispatch: run this agent, here. The agent must be one this gateway offers -- a Herdr kind or a profile in agents.json -- and cwd, when given, must be a directory this session already works in, exactly the fence repo_path is under; anything else is 403. With tab_id the pane is split off whatever that tab has focused, so a second agent lands beside the first; without it the agent gets a tab of its own. GET recent-cwds answers with the directories cwd will accept. The reply names the pane and says whether the agent came up and whether the prompt landed; a 207 means the pane exists and something after it did not, which is not the same as nothing having happened. The agent starts with the same launch defaults and `agent_env` as task dispatch.",
                     "parameters": [path_param("sessionId")],
                     "requestBody": json_body(json!({
                         "type": "object",
@@ -470,7 +504,7 @@ pub fn openapi_spec() -> Value {
                 "get": {
                     "summary": "What changed in the pane's checkout",
                     "description": "git status --porcelain=v2 plus git diff --numstat HEAD, run read-only (--no-optional-locks, so the agent working in the checkout never loses index.lock) inside the checkout the pane's fenced working directory belongs to. One entry per changed file -- staged, unstaged and untracked together, which is what 'what did the agent change' means -- with line totals; binary files carry null totals. The list stops at 2000 files and says so with truncated; repo.changed_files is still the full count. A pane outside any checkout answers repo: null and an empty list, not an error. Announced as git_diff.",
-                    "parameters": [path_param("sessionId"), path_param("paneId")],
+                    "parameters": [path_param("sessionId"), path_param("paneId"), query_param("worktree", "Optional exact canonical path from git/worktrees; unavailable or unrelated checkouts are refused with 403 invalid_worktree. Announced as git_worktrees.")],
                     "responses": git_status_responses()
                 }
             },
@@ -481,6 +515,7 @@ pub fn openapi_spec() -> Value {
                     "parameters": [
                         path_param("sessionId"),
                         path_param("paneId"),
+                        query_param("worktree", "Optional exact canonical path from git/worktrees; read-only and restricted to this pane's repository"),
                         query_param("path", "The file, relative to the checkout's top level"),
                         query_param("old_path", "For a renamed or copied file, the path before, so git renders the rename rather than a new file"),
                         query_param("staged", "Absent: working tree against HEAD. true: index against HEAD. false: working tree against index"),
@@ -604,7 +639,7 @@ pub fn openapi_spec() -> Value {
             "/api/agent-sessions": {
                 "get": {
                     "summary": "List all active AI agent sessions",
-                    "description": "Returns agent sessions merged across every attached agent, or for one agent with agent_id. Each session carries agent_id.",
+                    "description": "Returns an array of agent sessions merged across every attached agent, or for one agent with agent_id, sorted newest updated_ms first. The default limit is 50 per agent and failing providers are skipped while another succeeds. Each session carries agent_id. An unscoped cursor is rejected before fanout; this legacy response exposes no continuation cursors. Use /api/agent-sessions/page for explicit single-provider pagination.",
                     "responses": ok_response()
                 },
                 "post": {
@@ -742,7 +777,608 @@ pub fn openapi_spec() -> Value {
         }
     });
     spec["paths"]["/api/sessions/{sessionId}/panes/{paneId}/history"] = captured_history_path();
+    spec["paths"]["/api/sessions/{sessionId}/panes/{paneId}/history/segments"] =
+        captured_history_segments_path();
+    spec["paths"]["/api/sessions/{sessionId}/panes/{paneId}/git/worktrees"] = git_worktrees_path();
+    spec["paths"]["/api/agents/{agent_id}/sessions/{asid}"] = json!({
+        "delete": {
+            "summary": "Delete a session from its exact owning agent",
+            "description": "Announced as agent_session_delete_scoped. Verify the exact session belongs to the named attached agent and delete only there, without falling back to another agent. Older gateways return 404 for this distinct route; clients must never fall back to the legacy unscoped DELETE. 400 invalid_agent or invalid_session, 503 agent_unavailable, 404 session_not_found, 409 session_changed, 502 agent_error, 501 feature_unsupported. Provider deletion removes a conversation; it does not guarantee active processes have stopped.",
+            "parameters": [path_param("agent_id"), path_param("asid")],
+            "responses": ok_response()
+        }
+    });
+    spec["paths"]["/api/history/storage"] = json!({ "get": {
+        "summary": "Which captured-history storage this Gateway runs with (memory or sqlite, from config.json at startup) and, for sqlite, what it holds, from counters the write loop keeps. Requires the admin token or a device",
+        "responses": json_ok("The storage", json!({
+            "type": "object",
+            "required": ["storage"],
+            "properties": {
+                "storage": { "type": "string", "enum": ["memory", "sqlite"] },
+                "healthy": { "type": "boolean", "description": "sqlite only: the last write pass worked (a failing store retries on its own)" },
+                "checkpoints": { "type": "integer", "description": "sqlite only: stored checkpoints, one per pane and format" },
+                "wal_bytes": { "type": "integer", "description": "sqlite only: the store's WAL file, as of the last write pass" }
+            }
+        }))
+    }});
+    spec["paths"]["/api/sessions/{sessionId}/panes/{paneId}/lazygit"] = lazygit_endpoints();
+    spec["paths"]["/api/agent-sessions/{asid}/audio-asset"] = audio_asset_endpoint();
+    spec["paths"]["/api/agent-sessions/page"] = session_page_endpoint();
+    spec["paths"]["/api/agent-sessions/{asid}/timeline/earlier"] = json!({"post": {
+        "summary": "Read the next older timeline batch for the session owner",
+        "description": "Requires a paired App device and both agent_timeline_earlier_v1 and owning-provider features.timelineEarlier true. No body or client cursor. Load the selected snapshot first; merge rows by stable ID and (message_id, ordinal), preserving the viewport. At most 80 mapped rows. exhausted is true only on an empty adapter batch; filtering may produce an empty visible items array with exhausted false. State is provider/session scoped; serialize client pulls and do not automatically retry an ambiguously completed POST. Failed/cancelled provider reads preserve the cursor; successful explicit snapshot refresh resets the newest-tail boundary. See docs/agent-api.md.",
+        "parameters": [{"name":"asid","in":"path","required":true,"schema":{"type":"string"}}],
+        "responses": {
+            "200": {"description":"Content envelope containing data.items and data.exhausted", "content":{"application/json":{"schema":{
+                "type":"object", "required":["schema_version","capabilities","data"], "properties":{
+                    "schema_version":{"const":CONTENT_SCHEMA_VERSION}, "capabilities":{"type":"object"},
+                    "data":{"type":"object","required":["items","exhausted"],"properties":{
+                        "items":{"type":"array","maxItems":80,"items":{"type":"object"}},
+                        "exhausted":{"type":"boolean"}
+                    }}
+                }
+            }}}},
+            "401":{"description":"Missing authentication"},
+            "403":{"description":"Invalid device credential or forbidden peer"},
+            "404":{"description":"Session not found"},
+            "501":{"description":"feature_unsupported: the owning adapter does not implement earlier timeline pages"},
+            "502":{"description":"agent_error: provider or bounded history traversal failed; cursor not consumed"},
+            "503":{"description":"agent_unavailable"}
+        }
+    }});
+    spec["paths"]["/api/agent-sessions/{asid}/file-asset"] = json!({"get": {
+        "summary": "Resolve a local file output inside an agent session",
+        "description": "Requires device authentication and agent_file_assets capability. Resolves audio, video, images, documents and binary files inside the server-owned directory. Web URLs, path escapes and symlinks outside the root are refused. Returns data.asset metadata with an opaque id.",
+        "parameters": [path_param("asid"), query_param("uri", "Local file URI or path")], "responses": ok_response()
+    }});
+    spec["paths"]["/api/agent-images/{id}/{variant}"] = json!({"get": {
+        "summary": "Read an authorized original or optional WebP derivative",
+        "description": "Requires paired App authentication and agent_image_previews_v1. Registration and original canonical-file scope are rechecked even on cache hits. Legacy original/download stream authorized files in 64 KiB chunks with weak metadata ETag and single Range; these unversioned URLs do not fix content across requests. With agent_image_versions_v1, variant=version lazily returns data.asset {id,version,etag,size,mime,name,url,download_url} for a fixed original; use its returned versioned URLs and strong If-Match for multipart consistency. Existing sealed transport has a bounded collector, so large consumers still need small ranges (e.g. 8 MiB). thumbnail/preview return bounded WebP (384/1600 edge; source <=25 MiB), or 415 without replacing the original. No arbitrary path query. Private/no-store and existing pairing transport rules apply.",
+        "parameters": [path_param("id"), {"in":"path", "name":"variant", "required":true, "schema":{"type":"string", "enum":["original","download","thumbnail","preview","version"]}}],
+        "responses": {"200":{"description":"Original/WebP bytes, or fixed-version descriptor JSON for variant=version"},"206":{"description":"Original single byte range"},"304":{"description":"ETag matched"},"401":{"description":"Missing device authentication"},"403":{"description":"Invalid credential or forbidden peer"},"404":{"description":"Registration or authorized original unavailable"},"409":{"description":"Source/version changed during acquisition"},"415":{"description":"image_preview_unavailable: use original"},"416":{"description":"Original range not satisfiable"},"503":{"description":"Original storage unavailable"},"507":{"description":"Fixed-version copy admission full; originals preserved"}}
+    }});
+    spec["paths"]["/api/agent-images/{id}/{variant}/{version}"] = json!({"get": {
+        "summary":"Read one fixed original content version",
+        "description":"Requires agent_image_versions_v1 and paired App auth. First GET the asset's version_url (/api/agent-images/{id}/version) for data.asset {id,version,etag,size,mime,name,url,download_url}; acquisition lazily reuses an immutable original or streams/copies/hashes then atomically publishes a fixed original. Version is full SHA256; ETag is the strong quoted sha256-<hex>. Send bounded Range plus exact strong If-Match to returned URL. Verify whole AEAD reply, ETag, Content-Range/length/total; never append a 200 fallback or combine versions. Wrong/weak If-Match or weak If-Range gives 412. Old unversioned routes retain weak semantics. Original authorization fence/expiry and fixed-object identity are rechecked. No per-range full-file hashing. Additional copies use fixed original-store 1 GiB/4096-file admission, never deleting unique originals. Registrations are bounded/ephemeral; 409 requires descriptor refresh, not mixing old/new parts. Copy bytes are fixed, not a claim of an instantaneous atomic source snapshot.",
+        "parameters":[path_param("id"),{"in":"path","name":"variant","required":true,"schema":{"type":"string","enum":["original","download"]}},{"in":"path","name":"version","required":true,"schema":{"type":"string","pattern":"^[a-f0-9]{64}$"}}],
+        "responses":{"200":{"description":"Full fixed original; never append as a range"},"206":{"description":"Fixed original range"},"304":{"description":"Version ETag matched"},"401":{"description":"Missing auth"},"403":{"description":"Invalid credential/peer"},"404":{"description":"Original authorization unavailable"},"409":{"description":"Source/version changed or registration unavailable"},"412":{"description":"Strong version precondition failed"},"416":{"description":"Range not satisfiable"},"503":{"description":"Original storage unavailable"},"507":{"description":"Version storage admission full; sources/originals preserved"}}
+    }});
+    for (path, item) in tasks_fleet_mcp_paths() {
+        spec["paths"][path] = item;
+    }
+    spec["paths"]["/api/assets/{assetId}/download"] = json!({"get": {
+        "summary": "Save one authenticated asset, including binary files",
+        "description": "Requires device authentication and asset_download capability. Rechecks the indexed directory boundary and limits content to 10 MiB. Returns attachment content disposition; preview-only restrictions remain on the content endpoint.",
+        "parameters": [path_param("assetId")], "responses": ok_response()
+    }});
     spec
+}
+
+fn task_view_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["task_id", "state", "kind", "goal", "summary", "exit_code", "binding", "updated_ms", "parent_task_id", "origin", "label", "requested_by", "children"],
+        "properties": {
+            "task_id": { "type": "string", "description": "`t_` followed by 22 URL-safe characters" },
+            "state": { "$ref": "#/components/schemas/TaskState" },
+            "kind": { "type": "string", "enum": ["delegation", "command"] },
+            "goal": { "type": "string", "description": "The delegated goal, or the command line of a command task" },
+            "summary": { "type": ["string", "null"], "description": "A delegation's result as one line of at most 240 characters: the agent's own summary when done, a hint (its last message) when idle_unconfirmed, and when failed the error the agent, provider or backend gave (never a bare word); a command's exit code and output tail" },
+            "progress": { "type": "string", "description": "Only while the task is working (not paused, waiting or ended), and once something is known (task_ledger_complete): what it is doing now, one line of at most 120 characters -- a session agent's current tool call or the start of its latest message, a terminal agent's last prose line. Updates are published as task.updated at most every 2 s per task, a held-back line when the 2 s are up; kept in memory, so absent after a gateway restart until the agent moves again" },
+            "exit_code": { "type": ["integer", "null"] },
+            "peer_reachable": { "type": "boolean", "description": "A mirror only (binding peer): its computer answered within the last 2 minutes" },
+            "peer_last_seen_ms": { "type": "integer", "description": "A mirror only: when its computer last answered; absent if it never did" },
+            "reason": { "type": "string", "enum": ["peer_unlinked", "peer_lost_task", "peer_not_confirmed", "peer_unreachable"], "description": "A mirror only, made when the view is: why a failed mirror failed (peer_unlinked, peer_lost_task, peer_not_confirmed) or why an open one is stuck (peer_unreachable); the app words it, the summary stays plain prose" },
+            "binding": {
+                "type": "object",
+                "description": "What the task runs in. `kind` is `none`, `agent_session` (with agent_id, asid), `pane` (with session_id, pane_id, tab_id; plus agent_id, the terminal agent kind, for a delegation to a terminal agent -- absent for a command), or `peer` (fleet_peers: a mirror of task remote_task_id on linked computer peer_id, whose own server id is peer_server_id; peer_name is that computer's name when the mirror was made, a display fallback; remote_task_id is empty while a create that got no answer has not found its task there yet)",
+                "required": ["kind"],
+                "properties": { "kind": { "type": "string", "enum": ["none", "agent_session", "pane", "peer"] } },
+                "additionalProperties": true
+            },
+            "created_ms": { "type": "integer" },
+            "updated_ms": { "type": "integer" },
+            "reopened_ms": { "type": ["integer", "null"], "description": "When the same live session or pane started another user turn after finishing" },
+            "reopen_count": { "type": "integer", "description": "Number of times this assignment resumed; acknowledgements apply to one finish only" },
+            "client_ref": { "type": "string", "description": "The requester's own reference for the task (POST /api/tasks client_ref), when it gave one" },
+            "model": { "type": "string", "description": "A terminal delegation only: the model its launch passed, else (codex) its own config's -- what GET /api/tasks/defaults answers -- else \"default\" (the agent's own)" },
+            "variant": { "type": "string", "description": "A terminal delegation only: the effort that goes with model, when known" },
+            "parent_task_id": { "type": ["string", "null"], "description": "The open task this one was started from, when the gateway could tell" },
+            "origin": { "type": "string", "enum": ["device", "agent", "mcp", "peer"], "description": "device: POST /api/tasks; peer: POST /api/tasks by another of the owner's computers (fleet_peers); agent: started by work the gateway tracks (its agent service, or the pane of an open task); mcp: any other MCP host. Tasks stored before origins existed are mcp" },
+            "label": { "type": ["string", "null"], "description": "A short title the requester gave" },
+            "mentions": { "type": "array", "items": { "type": "string" }, "description": "Only when there are any: the computers the user named when opening the task, as this gateway names them, or self" },
+            "requested_by": {
+                "description": "The device that opened the task (origin device), or the computer (origin peer, kind gateway, named from its device record); otherwise null",
+                "oneOf": [
+                    { "type": "null" },
+                    {
+                        "type": "object",
+                        "required": ["kind", "id", "name"],
+                        "properties": {
+                            "kind": { "type": "string", "enum": ["device", "gateway"] },
+                            "id": { "type": "string" },
+                            "name": { "type": "string" },
+                            "server_id": { "type": "string", "description": "kind gateway: the id that computer gave for itself when it paired here, when known" }
+                        }
+                    }
+                ]
+            },
+            "children": {
+                "type": "object",
+                "description": "Direct children, counted when the view is made. active: not finished and not waiting",
+                "required": ["total", "active", "waiting", "failed"],
+                "properties": {
+                    "total": { "type": "integer" },
+                    "active": { "type": "integer" },
+                    "waiting": { "type": "integer" },
+                    "failed": { "type": "integer" }
+                }
+            }
+        }
+    })
+}
+
+fn task_state_schema() -> Value {
+    json!({
+        "type": "string",
+        "enum": ["queued", "dispatching", "working", "waiting", "idle_unconfirmed", "done", "failed", "cancelled"],
+        "description": "done, failed and cancelled are terminal. A delegation is done only on an explicit signal (task_ledger_complete: the agent's tasks.complete call or MUQUN_TASK_DONE marker, or POST /api/tasks/{id}/complete); an agent that stops without one is idle_unconfirmed, a pause whose summary is a hint"
+    })
+}
+
+fn task_event_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["task_id", "seq", "at_ms", "from", "to", "source", "note"],
+        "properties": {
+            "task_id": { "type": "string" },
+            "seq": { "type": "integer" },
+            "at_ms": { "type": "integer" },
+            "from": { "oneOf": [{ "$ref": "#/components/schemas/TaskState" }, { "type": "null" }] },
+            "to": { "$ref": "#/components/schemas/TaskState" },
+            "source": { "type": "string" },
+            "note": { "type": ["string", "null"] }
+        }
+    })
+}
+
+fn json_ok(description: &str, schema: Value) -> Value {
+    json!({
+        "200": {
+            "description": description,
+            "content": { "application/json": { "schema": schema } }
+        },
+        "401": { "description": "Missing or invalid authorization" },
+        "403": { "description": "Invalid token" }
+    })
+}
+
+/// `/api/tasks*`, `/api/fleet/self`, the peer routes (`/api/peers*`,
+/// `POST /api/pair/pending`, `/api/fleet/settings`) and `/api/mcp/tokens*`. The last pair is
+/// mounted only while `mcp.enabled` is true (the default).
+fn tasks_fleet_mcp_paths() -> Vec<(&'static str, Value)> {
+    let task_view = || json!({ "$ref": "#/components/schemas/TaskView" });
+    let not_found = |mut responses: Value, text: &str| {
+        responses["404"] = json!({ "description": text });
+        responses
+    };
+    let mut list_responses = json_ok(
+        "Tasks, newest update first",
+        json!({
+            "type": "object",
+            "required": ["tasks"],
+            "properties": { "tasks": { "type": "array", "items": task_view() } }
+        }),
+    );
+    list_responses["400"] = json!({ "description": "invalid_request: an unknown state name, a limit that is not a positive integer, or an empty root" });
+    let mut create_responses = json_ok(
+        "The new task's view, plus where to open it: the agent session (asid), or for a terminal agent the pane it runs in (pane_id). A terminal agent's task answers dispatching as soon as its pane exists, and moves to working or failed once the agent is started in the background",
+        json!({
+            "allOf": [task_view(), {
+                "type": "object",
+                "properties": {
+                    "asid": { "type": ["string", "null"], "description": "Present unless the agent is a terminal agent" },
+                    "pane_id": { "type": "string", "description": "Present for a terminal agent (binding.kind pane)" }
+                }
+            }]
+        }),
+    );
+    create_responses["400"] = json!({ "description": "invalid_request (empty or oversized goal, oversized label, empty name), invalid_directory, directory_not_found, not_a_directory, unknown_model, invalid_mentions (too many mentions, or one naming no linked computer), terminal_unknown (session_id names no terminal session here), attachments_unsupported (attachments with a terminal agent, for another computer, or from one), invalid_attachment (a reference that is no file uploaded here; checked before anything is made)" });
+    create_responses["502"] = json!({ "description": "agent_error: the agent could not start the session or take the prompt, or no pane could be made for a terminal agent" });
+    create_responses["403"] = json!({ "description": "delegations_disabled: another of the owner's computers (fleet_peers) asked while this computer takes no work from other computers (fleet.accept_delegations); checked before the body. Its task otherwise opens as a device's does, with origin peer and requested_by named from its device record" });
+    create_responses["503"] = json!({ "description": "agent_unavailable: the agent is not attached (a session agent is never started in a pane) or a terminal agent is not on PATH; no_terminal: no terminal session answers (or the one session_id names does not)" });
+    let read_responses = not_found(
+        json_ok(
+            "The task and its state history, oldest first",
+            json!({
+                "type": "object",
+                "required": ["task", "events"],
+                "properties": {
+                    "task": task_view(),
+                    "events": { "type": "array", "items": { "$ref": "#/components/schemas/TaskEvent" } }
+                }
+            }),
+        ),
+        "task_not_found",
+    );
+    let cancel_responses = not_found(
+        json_ok(
+            "The task after the cancel; cancelling a finished task changes nothing",
+            task_view(),
+        ),
+        "task_not_found",
+    );
+    let mut complete_responses = not_found(
+        json_ok(
+            "The task, now done; a task already done is answered as it stands",
+            task_view(),
+        ),
+        "task_not_found",
+    );
+    complete_responses["400"] = json!({ "description": "invalid_request: the body is not a JSON object with an optional string summary" });
+    complete_responses["409"] = json!({ "description": "task_not_confirmable: the task was not opened on a device (origin device), or it is neither idle_unconfirmed nor waiting" });
+    let mut issue_responses = json_ok(
+        "A fresh pane-bound assistant token. The token is shown only here",
+        json!({
+            "type": "object",
+            "required": ["token", "token_id", "expires_ms", "binding"],
+            "properties": {
+                "token": { "type": "string" },
+                "token_id": { "type": "string" },
+                "expires_ms": { "type": ["integer", "null"], "description": "null for an agent token, which does not expire" },
+                "binding": { "$ref": "#/components/schemas/TokenBinding" }
+            }
+        }),
+    );
+    issue_responses["400"] = json!({ "description": "invalid_request" });
+    issue_responses["404"] = json!({ "description": "None of ancestor_pids is the shell of a pane the gateway manages" });
+    let revoke_responses = not_found(
+        json!({
+            "204": { "description": "Revoked; /mcp refuses the token from the next call" },
+            "401": { "description": "Missing or invalid authorization" },
+            "403": { "description": "Invalid token" }
+        }),
+        "token_not_found",
+    );
+    vec![
+        (
+            "/api/tasks",
+            json!({ "get": {
+                "summary": "List tasks. Requires the task_ledger capability and a device token",
+                "parameters": [
+                    query_param("state", "Comma list of task states; empty is no filter"),
+                    query_param("limit", "Page size, default 50, at most 200"),
+                    query_param("root", "Only this task and its descendants (task_ledger_create); an unknown id lists nothing")
+                ],
+                "responses": list_responses
+            }, "post": {
+                "summary": "Open a delegation from the device: a new agent session with the goal as its first prompt, or, for a terminal agent from the agent catalog (codex, claude, ...), a new pane running it with the goal as its first prompt (on the command line for codex and claude on tmux, else typed in). Requires the task_ledger_create capability and a device token (or, fleet_peers, another computer's gateway token); a terminal agent needs task_ledger_pane",
+                "requestBody": json_body(json!({
+                    "type": "object",
+                    "properties": {
+                        "goal": { "type": "string", "description": "At most 32 KiB; required unless kind is command" },
+                        "agent_id": { "type": "string", "description": "An attached agent (opencode, ...) or a terminal agent kind from GET /api/agents/catalog (codex, claude, ...). Default: the primary agent" },
+                        "cwd": { "type": "string", "description": "Absolute directory (~ expands); default: the home directory" },
+                        "mode": { "type": "string", "description": "Ignored for a terminal agent" },
+                        "model": { "type": "string", "description": "A model id from the agent's catalog, or provider_id/model_id. For a terminal agent, passed to its launch for this run only (codex: -c model; claude: --model where its --help lists it); 1 to 128 of A-Z a-z 0-9 . _ : / @ + -, not starting with -" },
+                        "variant": { "type": "string", "description": "The model's variant (reasoning effort), applied when the session is created so the first turn uses it. Applied only together with model (ignored otherwise); must be one of the model's catalog variants when it lists any. For a terminal agent, passed to its launch (codex: -c model_reasoning_effort; claude: --effort where listed)" },
+                        "kind": { "type": "string", "enum": ["delegation", "command"], "description": "command: run `command` as a command task (a visible pane, no agent) and answer with its exit_code, stdout_tail and pane_id once it ended within timeout_s; goal is then not needed. Another computer's command (exec.run with machine) runs only in a directory inside this computer's home" },
+                        "command": { "type": "string", "description": "kind command: the shell command, at most 16 KiB" },
+                        "timeout_s": { "type": "integer", "description": "kind command: how long the create waits for it, 1..=45 (default 30)" },
+                        "attachments": { "type": "array", "items": { "type": "string" }, "maxItems": 16, "description": "Files sent with the goal, as POST /api/agent-sessions/{asid}/prompt takes them (uploaded asset references or file paths on this computer), handed to the agent with its first prompt. A session agent on this computer only: with a terminal agent or another computer it is 400 attachments_unsupported" },
+                        "session_id": { "type": "string", "description": "For a terminal agent: the terminal session to start it in, by its config id (a tmux session or Herdr). Default: the first that answers. One this computer has no session for is 400 terminal_unknown" },
+                        "label": { "type": "string", "description": "A short title, at most 200 characters" },
+                        "client_ref": { "type": "string", "description": "The requester's own reference, 1 to 128 of A-Z, a-z, 0-9, - and _, echoed in the task's view: how another computer whose create got no answer finds the task" },
+                        "mentions": { "type": "array", "items": { "type": "string" }, "maxItems": 8, "description": "The computers the user named: linked computers' names (any case) or self; more than 8, or a name that is neither, is 400 invalid_mentions. Kept on the task, never added to the goal" }
+                    }
+                })),
+                "responses": create_responses
+            }}),
+        ),
+        (
+            "/api/tasks/defaults",
+            json!({ "get": {
+                "summary": "What a task the device opens would run with: default_cwd (the device's most recent task directory, null when unknown); with agent_id naming an agent that runs in a terminal pane, also model and variant -- the model/variant query values where its launch can pass them, else the agent's own (Codex's config), else model \"default\"",
+                "parameters": [
+                    query_param("agent_id", "An agent kind; a terminal agent adds model and variant to the answer"),
+                    query_param("model", "The model the task would name"),
+                    query_param("variant", "The effort the task would name")
+                ],
+                "responses": json_ok("Defaults", json!({
+                    "type": "object",
+                    "properties": {
+                        "default_cwd": { "type": ["string", "null"] },
+                        "model": { "type": "string" },
+                        "variant": { "type": ["string", "null"] }
+                    }
+                }))
+            }}),
+        ),
+        (
+            "/api/tasks/{id}",
+            json!({ "get": {
+                "summary": "Read one task and its state history",
+                "parameters": [path_param("id")],
+                "responses": read_responses
+            }}),
+        ),
+        (
+            "/api/tasks/{id}/cancel",
+            json!({ "post": {
+                "summary": "Interrupt the agent or send Ctrl-C to the command",
+                "parameters": [path_param("id")],
+                "responses": cancel_responses
+            }}),
+        ),
+        (
+            "/api/tasks/{id}/complete",
+            json!({ "post": {
+                "summary": "Confirm that a delegation the device opened, paused (idle_unconfirmed) or waiting on the user, is finished: it becomes done and task.updated is published. Requires the task_ledger_complete capability and a device token",
+                "parameters": [path_param("id")],
+                "requestBody": {
+                    "required": false,
+                    "content": { "application/json": { "schema": {
+                        "type": "object",
+                        "properties": {
+                            "summary": { "type": "string", "description": "The new summary, one line, cut to 240 characters; without it the task keeps its hint" }
+                        }
+                    }}}
+                },
+                "responses": complete_responses
+            }}),
+        ),
+        (
+            "/api/fleet/self",
+            json!({ "get": {
+                "summary": "This machine's capability manifest. Requires the fleet capability",
+                "responses": json_ok("The manifest", json!({
+                    "type": "object",
+                    "required": ["machineId", "label", "hostname", "os", "arch", "gatewayVersion", "agents", "terminal", "toolchains", "tasks", "suitableFor"],
+                    "properties": {
+                        "machineId": { "type": "string" },
+                        "label": { "type": "string" },
+                        "hostname": { "type": "string" },
+                        "os": { "type": "string" },
+                        "arch": { "type": "string" },
+                        "gatewayVersion": { "type": "string" },
+                        "agents": { "type": "array", "items": { "type": "object" } },
+                        "terminal": { "type": "array", "items": { "type": "object" } },
+                        "toolchains": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "required": ["id", "version", "path"],
+                                "properties": {
+                                    "id": { "type": "string" },
+                                    "version": { "type": ["string", "null"] },
+                                    "path": { "type": ["string", "null"] }
+                                }
+                            }
+                        },
+                        "tasks": {
+                            "type": "object",
+                            "properties": { "active": { "type": "integer" }, "waiting": { "type": "integer" } }
+                        },
+                        "suitableFor": { "type": "array", "items": { "type": "string" } }
+                    }
+                }))
+            }}),
+        ),
+        (
+            "/api/mcp/tokens",
+            json!({
+                "post": {
+                    "summary": "Issue an assistant token for the pane the caller runs in. Requires the admin token (the `muqun-gateway mcp token-helper` command uses it); present only while mcp.enabled is true",
+                    "requestBody": json_body(json!({
+                        "type": "object",
+                        "required": ["ancestor_pids"],
+                        "properties": {
+                            "ancestor_pids": { "type": "array", "items": { "type": "integer" }, "description": "The caller's own pid first, then its parent, and so on up" },
+                            "label": { "type": "string" }
+                        }
+                    })),
+                    "responses": issue_responses
+                },
+                "get": {
+                    "summary": "List assistant tokens, never the tokens themselves. Requires a device token",
+                    "responses": json_ok("Issued tokens", json!({
+                        "type": "object",
+                        "required": ["tokens"],
+                        "properties": { "tokens": { "type": "array", "items": {
+                            "type": "object",
+                            "required": ["id", "binding", "label", "issued_ms", "expires_ms", "last_used_ms", "revoked_ms"],
+                            "properties": {
+                                "id": { "type": "string" },
+                                "binding": { "$ref": "#/components/schemas/TokenBinding" },
+                                "label": { "type": "string" },
+                                "issued_ms": { "type": "integer" },
+                                "expires_ms": { "type": ["integer", "null"], "description": "null for an agent token, which does not expire" },
+                                "last_used_ms": { "type": ["integer", "null"] },
+                                "revoked_ms": { "type": ["integer", "null"] }
+                            }
+                        }}}
+                    }))
+                }
+            }),
+        ),
+        (
+            "/api/mcp/tokens/{id}",
+            json!({ "delete": {
+                "summary": "Revoke an assistant token. Requires a device token",
+                "parameters": [path_param("id")],
+                "responses": revoke_responses
+            }}),
+        ),
+        (
+            "/api/pair/pending",
+            json!({ "post": {
+                "summary": "Mint a pairing code on the owner's behalf for a device not in front of this computer: another gateway being linked (kind gateway). Requires the admin token or an app device; another gateway's token is refused (peer_forbidden). Requires the fleet_peers capability",
+                "requestBody": json_body(json!({
+                    "type": "object",
+                    "required": ["device_name"],
+                    "properties": {
+                        "device_name": { "type": "string", "description": "At most 80 characters, no control characters" },
+                        "kind": { "type": "string", "enum": ["gateway"], "description": "Must be gateway; an app pairs in front of the screen" },
+                        "server_id": { "type": "string", "description": "kind gateway: the claiming gateway's own server id, kept on its device record so DELETE /api/peers/{id} on this computer can revoke it; never used to replace or evict a device" }
+                    }
+                })),
+                "responses": with_errors(json_ok("What POST /api/pair/claim takes", json!({
+                    "type": "object",
+                    "required": ["request_id", "code", "expires_in_ms"],
+                    "properties": {
+                        "request_id": { "type": "string" },
+                        "code": { "type": "string" },
+                        "expires_in_ms": { "type": "integer", "description": "60000: a minted code lives one minute (a pairing a device asks for itself, POST /api/pair/request, lives five: 300000)" }
+                    }
+                })), &[
+                    ("400", "invalid_request, invalid_device_name"),
+                    ("409", "pairing_in_progress: another pairing is pending (a minted code lives a minute only: then it is neither shown nor claimable)"),
+                    ("429", "pairing_rate_limited"),
+                ])
+            }}),
+        ),
+        (
+            "/api/pair/pending/{request_id}",
+            json!({ "delete": {
+                "summary": "Take back a code minted with POST /api/pair/pending (the link attempt failed), freeing the pending slot. Only the device token (or the admin token) that minted it; another gateway's token is refused (peer_forbidden)",
+                "parameters": [path_param("request_id")],
+                "responses": with_errors(json_ok("Cancelled", json!({
+                    "type": "object",
+                    "required": ["cancelled"],
+                    "properties": { "cancelled": { "type": "boolean" } }
+                })), &[
+                    ("404", "pairing_not_found: no code of this caller's with that request_id is pending"),
+                ])
+            }}),
+        ),
+        (
+            "/api/peers",
+            json!({
+                "get": {
+                    "summary": "The accept switch and this computer's linked gateways; a peer not heard from for a minute is pinged first. Requires the fleet_peers capability and the admin token or an app device",
+                    "responses": json_ok("Peers", json!({
+                        "type": "object",
+                        "required": ["accept_delegations", "peers"],
+                        "properties": {
+                            "accept_delegations": { "type": "boolean" },
+                            "peers": { "type": "array", "items": peer_view() }
+                        }
+                    }))
+                },
+                "post": {
+                    "summary": "Pair this gateway with the one at url through a code minted there (POST /api/pair/pending), and remember it as name",
+                    "requestBody": json_body(json!({
+                        "type": "object",
+                        "required": ["url", "name", "request_id", "code"],
+                        "properties": {
+                            "url": { "type": "string", "description": "http:// or https://, at most 512 bytes; the address the phone uses for it" },
+                            "name": { "type": "string" },
+                            "request_id": { "type": "string" },
+                            "code": { "type": "string" }
+                        }
+                    })),
+                    "responses": with_errors(json_ok("The new peer", peer_view()), &[
+                        ("400", "invalid_request; peer_is_self: the url is this gateway"),
+                        ("409", "name_conflict: name is this computer's own (checked before the claim, so the code stays good). peer_refused: the other gateway refused the code; error.reason is pairing_code_expired, invalid_pairing_code, pairing_not_requested, invalid_token or refused. peer_name_taken: another peer has that name. peer_conflict: a peer giving the same id is already linked (remove it first)"),
+                        ("502", "peer_unreachable: nothing answered at url"),
+                    ])
+                }
+            }),
+        ),
+        (
+            "/api/peers/{id}",
+            json!({
+                "patch": {
+                    "summary": "Rename a linked gateway and/or change the address it is reached at; a new url is proven with one call carrying the link's token before it is kept",
+                    "parameters": [path_param("id")],
+                    "requestBody": json_body(json!({
+                        "type": "object",
+                        "minProperties": 1,
+                        "properties": {
+                            "name": { "type": "string" },
+                            "url": { "type": "string", "description": "http:// or https://, at most 512 bytes" }
+                        }
+                    })),
+                    "responses": with_errors(json_ok("The changed peer", peer_view()), &[
+                        ("400", "invalid_request"),
+                        ("404", "peer_not_found"),
+                        ("409", "peer_name_taken: another peer has that name. name_conflict: this computer's own name. peer_refused: what answers at the new url does not know this link (error.reason)"),
+                        ("502", "peer_unreachable: nothing answered at the new url"),
+                    ])
+                },
+                "delete": {
+                    "summary": "Unlink a gateway: forget it here, ask it to revoke this gateway's token, and revoke the gateway devices here that paired as its server_id. Each revoke is best effort and runs whatever the other did. The admin token or an app device only",
+                    "parameters": [path_param("id")],
+                    "responses": {
+                        "200": { "description": "Unlinked", "content": { "application/json": { "schema": {
+                            "type": "object",
+                            "required": ["remote_revoked", "counterpart_found", "counterpart_revoked"],
+                            "properties": {
+                                "remote_revoked": { "type": "boolean", "description": "The peer confirmed it revoked this gateway's token" },
+                                "counterpart_found": { "type": "boolean", "description": "A gateway device here paired as the peer's server_id" },
+                                "counterpart_revoked": { "type": "boolean", "description": "A gateway device here that paired as the peer's server_id was found and revoked" }
+                            }
+                        } } } },
+                        "401": { "description": "Missing or invalid authorization" },
+                        "403": { "description": "Invalid token, or peer_forbidden" },
+                        "404": { "description": "peer_not_found" }
+                    }
+                }
+            }),
+        ),
+        (
+            "/api/fleet/settings",
+            json!({ "put": {
+                "summary": "The accept switch: whether linked gateways may open tasks here. Written to config.json (fleet.accept_delegations). Requires the fleet_peers capability and the admin token or an app device",
+                "requestBody": json_body(json!({
+                    "type": "object",
+                    "required": ["accept_delegations"],
+                    "properties": { "accept_delegations": { "type": "boolean" } }
+                })),
+                "responses": with_errors(json_ok("The switch as it now stands", json!({
+                    "type": "object",
+                    "required": ["accept_delegations"],
+                    "properties": { "accept_delegations": { "type": "boolean" } }
+                })), &[("400", "invalid_request")])
+            }}),
+        ),
+    ]
+}
+
+/// `responses` plus the named error statuses.
+fn with_errors(mut responses: Value, errors: &[(&str, &str)]) -> Value {
+    for (status, description) in errors {
+        responses[*status] = json!({ "description": description });
+    }
+    responses
+}
+
+/// A linked gateway as `/api/peers*` answers it: never its token.
+fn peer_view() -> Value {
+    json!({
+        "type": "object",
+        "required": ["peer_id", "server_id", "name", "url", "reachable", "last_seen_ms"],
+        "properties": {
+            "peer_id": { "type": "string", "description": "This gateway's own id for the link" },
+            "server_id": { "type": "string", "description": "The id the other gateway gave for itself; display data, never a key" },
+            "name": { "type": "string" },
+            "url": { "type": "string" },
+            "reachable": { "type": "boolean", "description": "It answered within the last 2 minutes, and no call since failed to reach it (a closed task socket or a failed call reads unreachable at once)" },
+            "last_seen_ms": { "type": ["integer", "null"] },
+            "unauthorized": { "type": "boolean", "description": "Present (true) when it no longer takes this gateway's token: link it again; a link for the same computer or name replaces it" }
+        }
+    })
+}
+
+fn audio_asset_endpoint() -> Value {
+    json!({
+        "get": {
+            "summary": "Resolve an audio tool output inside the agent session directory",
+            "description": "Requires device authentication and agent_audio_assets capability. Resolves a relative, absolute or file:// URI inside the server-owned session directory, verifies audio bytes and returns data.asset metadata with an opaque id. GET /api/assets/{id}/content rechecks containment, requires authentication and limits content to 10 MiB. Web URIs, non-audio files and paths outside the directory return 404. Video is not supported.",
+            "parameters": [path_param("asid"), query_param("uri", "Audio file URI or path")],
+            "responses": ok_response()
+        }
+    })
 }
 
 fn task_steps_schema() -> Value {
@@ -932,7 +1568,7 @@ const GENERATION_DOC: &str = "The gateway instance generation: an opaque string 
 fn captured_history_path() -> Value {
     json!({ "get": {
         "summary": "Page bounded Gateway-captured historical rows",
-        "description": "Requires pane_captured_history. Frozen, memory-only historical prefix of already-observed recent-unwrapped rows; excludes the last mutable screen and does not seed from or paginate native backlog. ANSI/text captures are independent. First page is newest; prepend older pages, each internally oldest-to-newest. First pages reuse the same device/request snapshot for 60 seconds from creation. Append/repaint cannot alter its pages. Capture reset, truncation, eviction, detected resize or observed pane identity/disappearance invalidates it. This is not a complete archive and has no native range coordinates. See docs/captured-history.md for retention and reset semantics. Existing output routes are unchanged.",
+        "description": "Requires pane_captured_history. Legacy single historical prefix of already-observed recent-unwrapped rows, not all sealed segments; excludes the mutable screen and never seeds from native backlog. Memory storage is default; optional SQLite checkpoints require verified identity. ANSI/text captures are independent. First page is newest; prepend older pages, each internally oldest-to-newest. Snapshots last 60 seconds from creation. This is not a complete archive and has no native range coordinates. See docs/captured-history.md for retention and reset semantics. Existing output routes are unchanged.",
         "parameters": [
             path_param("sessionId"), path_param("paneId"),
             { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 500, "default": 200 }, "description": "Maximum rows per page; keep fixed throughout traversal. Raw row bytes plus newline allowances are capped at 256 KiB." },
@@ -982,6 +1618,38 @@ fn captured_history_responses() -> Value {
         responses[status] = json!({ "description": description });
     }
     responses
+}
+
+fn captured_history_segments_path() -> Value {
+    let mut path = captured_history_path();
+    path["get"]["summary"] = json!("Page bounded Gateway-captured history segments");
+    path["get"]["description"] = json!("Requires pane_captured_history_segments_v1 (memory or SQLite). First page contains the newest retained historical rows; older pages can span segments. Blocks and rows are oldest-to-newest within each page; limit bounds total rows, not blocks. Segment IDs are stable across pages. Boundaries are metadata, never separator rows; no cross-segment deduplication, live viewport or native backlog stitching. Distinct endpoint-bound snapshots expire 60 seconds from creation. This is sampled retained history, not a complete archive. Legacy /history remains a single prefix. See docs/captured-history.md.");
+    let mut responses = captured_history_responses();
+    responses["200"]["description"] =
+        json!("Versioned segment page; empty not_captured is a successful answer");
+    let data = &mut responses["200"]["content"]["application/json"]["schema"]["properties"]["data"];
+    let required = data["required"].as_array_mut().unwrap();
+    required.retain(|field| field != "capture_epoch" && field != "rows");
+    required.push(json!("segments"));
+    let properties = data["properties"].as_object_mut().unwrap();
+    properties.remove("capture_epoch");
+    properties.remove("rows");
+    properties.insert("segments".into(), json!({
+        "type": "array", "maxItems": 64,
+        "items": {
+            "type": "object",
+            "required": ["segment_id", "started_at_ms", "sealed_at_ms", "boundary_reason", "rows"],
+            "properties": {
+                "segment_id": { "type": "string" },
+                "started_at_ms": { "type": "integer", "minimum": 0 },
+                "sealed_at_ms": { "type": ["integer", "null"], "minimum": 0 },
+                "boundary_reason": { "type": "string", "enum": ["observation-start", "gateway-restart", "capture-policy-change", "resize", "editor-change", "capture-reset"] },
+                "rows": { "type": "array", "maxItems": 500, "items": { "type": "string" } }
+            }
+        }
+    }));
+    path["get"]["responses"] = responses;
+    path
 }
 
 /// `GET .../output`: Herdr's `pane_read` result shape, plus the generation.
@@ -1158,7 +1826,7 @@ fn asset_schema() -> Value {
             "id": { "type": "string" },
             "path": { "type": "string" },
             "name": { "type": "string" },
-            "kind": { "type": "string", "enum": ["image", "markdown", "text", "pdf", "binary"] },
+            "kind": { "type": "string", "enum": ["image", "audio", "video", "markdown", "text", "pdf", "binary"] },
             "mime": { "type": "string" },
             "size": { "type": "integer" },
             "modified_unix_ms": { "type": "integer" },
@@ -1184,8 +1852,18 @@ fn content_envelope_schema(data: Value) -> Value {
                     ("image_upload", "boolean"),
                     ("composer", "boolean"),
                     ("message_image_assets", "boolean"),
+                    ("session_descendants", "boolean"),
+                    ("task_ledger_delivery", "boolean"),
                 ],
-                &["parts", "assets", "image_upload", "composer", "message_image_assets"],
+                &[
+                    "parts",
+                    "assets",
+                    "image_upload",
+                    "composer",
+                    "message_image_assets",
+                    "session_descendants",
+                    "task_ledger_delivery",
+                ],
             ),
             "data": data
         }
@@ -1242,6 +1920,7 @@ fn part_schema() -> Value {
                 "items": object_schema(&[("text", "string"), ("done", "boolean")], &["text", "done"])
             },
             "text": { "type": "string", "description": "status and prompt: the line's content" },
+            "attachments": { "type": "array", "items": { "type": "string" }, "description": "prompt: optional verified image data URIs, declared by codex_transcript_images_v1; 2 MiB per decoded image and 8 MiB encoded total per response. Exact producer conversation binding is required. Text and ranges stay unchanged." },
             "spinner": { "type": "boolean", "description": "status: the line is one of the agent's animated frames" },
             "approval_id": { "type": "string", "description": "approval: what POST .../approval answers. Only a source that reports approval state can raise one; a pane read through a marker dictionary carries its menu on the approvals endpoint instead" },
             "prompt": { "type": "string", "description": "approval: the question, written by the gateway from the protocol's own action name and never quoted out of a terminal" },
@@ -1355,6 +2034,21 @@ fn pane_context_responses() -> Value {
     });
     responses["404"] = json!({ "description": "Unknown session" });
     responses
+}
+
+fn git_worktrees_path() -> Value {
+    json!({
+        "get": {
+            "summary": "List available Git-linked checkouts of this pane's repository",
+            "description": "Paired-device read, announced as git_worktrees. Uses Git's authoritative worktree inventory and verifies canonical checkout/common-directory identity. Missing, bare, replaced and fenced-out checkouts are omitted. The content envelope data contains current (canonical pane checkout path or null) and worktrees (path, branch, head, detached). Outside a checkout the list is empty. Selecting a worktree on git/status or git/diff never checks out a branch or moves a pane. The existing vcs/discard route always targets the pane's original checkout; lazygit can select a verified linked checkout when pane_lazygit_worktree is advertised.",
+            "parameters": [path_param("sessionId"), path_param("paneId")],
+            "responses": {
+                "200": { "description": "Versioned content envelope with current and worktrees" },
+                "403": { "description": "Paired device required" },
+                "504": { "description": "Git inventory timed out" }
+            }
+        }
+    })
 }
 
 fn git_status_responses() -> Value {
@@ -1570,6 +2264,46 @@ fn ok_response() -> Value {
     })
 }
 
+fn session_page_endpoint() -> Value {
+    json!({"get": {
+        "summary": "Read one ordered session page from one selected agent",
+        "description": "Requires a paired App device and the existing encrypted transport policy. agent_session_pages_v1 declares the endpoint, while planes.agents.agents[].features.sessionPagination declares provider support. No aggregation, sorting or automatic continuation: provider order and cursors are retained. The versioned content envelope intentionally contains data.data and data.cursor, whose next and previous keys are explicit null when unavailable. Cursors are upstream opaque values, not locally cryptographically bound by Gateway. Reuse only with the same selected agent, this endpoint, normalized directory, parent_id/roots filter, search, order and limit; restart pagination when any changes. Supports the list's private ETag/If-None-Match behavior. Older Apps still request 50 and do not automatically page; App adoption is deferred.",
+        "parameters": [
+            {"name": "agent_id", "in": "query", "required": true, "description": "One explicit nonempty agent identifier. Unknown: 400 invalid_agent; known but unattached: 503 agent_unavailable", "schema": {"type": "string", "minLength": 1, "maxLength": 256}},
+            {"name": "directory", "in": "query", "description": "Nonempty absolute or home-relative workspace path; trimmed, ~ expanded and canonicalized when it exists. Maximum 4096 UTF-8 bytes", "schema": {"type": "string", "minLength": 1, "maxLength": 4096}},
+            {"name": "parent_id", "in": "query", "description": "Nonempty parent session ID (maximum 256 UTF-8 bytes), or literal null for roots; takes precedence over roots", "schema": {"type": "string", "minLength": 1, "maxLength": 256}},
+            {"name": "roots", "in": "query", "description": "true means parent_id=null when no explicit parent_id is given", "schema": {"type": "boolean"}},
+            {"name": "limit", "in": "query", "schema": {"type": "integer", "minimum": 1, "maximum": 100, "default": 50}},
+            {"name": "order", "in": "query", "schema": {"type": "string", "enum": ["asc", "desc"], "default": "desc"}},
+            {"name": "search", "in": "query", "description": "Provider search filter, maximum 4096 UTF-8 bytes", "schema": {"type": "string", "maxLength": 4096}},
+            {"name": "cursor", "in": "query", "description": "Nonempty opaque provider cursor, URL-encoded without altering its bytes; maximum 16384 UTF-8 bytes. Control characters are rejected in all string filters", "schema": {"type": "string", "minLength": 1, "maxLength": 16384}}
+        ],
+        "responses": {
+            "200": {"description": "One provider page in the content envelope", "headers": {"ETag": {"schema": {"type": "string"}}}, "content": {"application/json": {"schema": {
+                "type": "object", "required": ["schema_version", "capabilities", "data"], "properties": {
+                    "schema_version": {"const": CONTENT_SCHEMA_VERSION},
+                    "capabilities": {"type": "object"},
+                    "data": {"type": "object", "required": ["data", "cursor"], "properties": {
+                        "data": {"type": "array", "items": {"type": "object", "description": "AgentSessionInfo as documented in docs/agent-api.md; service-owned agent_id and read-marker overlays, in provider order", "required": ["asid", "agent_id", "title", "status", "updated_ms"], "properties": {
+                            "asid": {"type": "string"}, "agent_id": {"type": "string"}, "title": {"type": "string"}, "status": {"type": "string"}, "updated_ms": {"type": "integer"}
+                        }}},
+                        "cursor": {"type": "object", "required": ["next", "previous"], "properties": {
+                            "next": {"type": ["string", "null"]}, "previous": {"type": ["string", "null"]}
+                        }}
+                    }}
+                }
+            }}}},
+            "304": {"description": "Unchanged page; empty body"},
+            "400": {"description": "Invalid query or unknown agent; rejected before upstream requests"},
+            "401": {"description": "Missing authentication"},
+            "403": {"description": "Invalid device credential, forbidden peer, or required encrypted transport missing"},
+            "501": {"description": "feature_unsupported: selected adapter does not support session pagination"},
+            "502": {"description": "agent_error: selected provider failed"},
+            "503": {"description": "agent_unavailable: selected provider is not attached"}
+        }
+    }})
+}
+
 pub const DOCS_HTML: &str = r#"<!doctype html>
 <html>
   <head>
@@ -1584,9 +2318,158 @@ pub const DOCS_HTML: &str = r#"<!doctype html>
 </html>
 "#;
 
+fn lazygit_endpoints() -> Value {
+    json!({
+        "get": {
+            "summary": "Check whether lazygit can open for this pane",
+            "description": "Requires a paired device. Checks an executable lazygit on the Gateway host's PATH and the source pane's canonical Git checkout. No process is launched. Announced as pane_lazygit; optional worktree selection requires pane_lazygit_worktree and is revalidated against the source repository's canonical Git inventory.",
+            "parameters": [path_param("sessionId"), path_param("paneId"), query_param("worktree", "Optional exact canonical path from git/worktrees. Announced as pane_lazygit_worktree; unavailable or unrelated checkouts are refused with 403 invalid_worktree.")],
+            "responses": ok_response()
+        },
+        "post": {
+            "summary": "Open lazygit in a dedicated terminal tab",
+            "description": "No client command or arbitrary cwd is accepted. Optional worktree selection requires pane_lazygit_worktree and is revalidated before creating a terminal. Creates an unfocused tab in the source pane's workspace and verified selected checkout (the original checkout when omitted), starts the installed lazygit once, and returns data.target with session_id, workspace_id, tab_id and pane_id plus started. A false started means inspect the created target, not automatically repeat the launch. Desktop focus is preserved.",
+            "parameters": [path_param("sessionId"), path_param("paneId"), query_param("worktree", "Optional exact canonical path from git/worktrees. Announced as pane_lazygit_worktree; unavailable or unrelated checkouts are refused with 403 invalid_worktree.")],
+            "responses": ok_response()
+        }
+    })
+}
+
 #[cfg(test)]
 mod history_contract_tests {
     use super::*;
+
+    #[test]
+    fn timeline_earlier_spec_has_explicit_gates_bounded_rows_and_unsupported_error() {
+        let spec = openapi_spec();
+        let post = &spec["paths"]["/api/agent-sessions/{asid}/timeline/earlier"]["post"];
+        let description = post["description"].as_str().unwrap();
+        assert!(description.contains("agent_timeline_earlier_v1"));
+        assert!(description.contains("features.timelineEarlier true"));
+        assert!(post.get("requestBody").is_none());
+        let data = &post["responses"]["200"]["content"]["application/json"]["schema"]["properties"]
+            ["data"];
+        assert_eq!(data["required"], json!(["items", "exhausted"]));
+        assert_eq!(data["properties"]["items"]["maxItems"], 80);
+        assert!(post["responses"].get("501").is_some());
+        assert!(crate::API_CAPABILITIES.contains(&"agent_timeline_earlier_v1"));
+    }
+
+    #[test]
+    fn session_page_spec_has_selected_scope_limits_and_nested_null_cursors() {
+        let spec = openapi_spec();
+        let get = &spec["paths"]["/api/agent-sessions/page"]["get"];
+        let parameters = get["parameters"].as_array().unwrap();
+        let parameter = |name| parameters.iter().find(|p| p["name"] == name).unwrap();
+        assert_eq!(parameter("agent_id")["required"], true);
+        assert_eq!(
+            parameter("limit")["schema"],
+            json!({"type": "integer", "minimum": 1, "maximum": 100, "default": 50})
+        );
+        assert_eq!(parameter("order")["schema"]["enum"], json!(["asc", "desc"]));
+        let page =
+            &get["responses"]["200"]["content"]["application/json"]["schema"]["properties"]["data"];
+        assert_eq!(page["required"], json!(["data", "cursor"]));
+        assert_eq!(page["properties"]["data"]["type"], "array");
+        let cursor = &page["properties"]["cursor"];
+        assert_eq!(cursor["required"], json!(["next", "previous"]));
+        for direction in ["next", "previous"] {
+            assert_eq!(
+                cursor["properties"][direction]["type"],
+                json!(["string", "null"])
+            );
+        }
+        assert!(get["responses"].get("501").is_some());
+        assert!(crate::API_CAPABILITIES.contains(&"agent_session_pages_v1"));
+    }
+
+    #[test]
+    fn tasks_fleet_and_mcp_token_paths_are_in_the_spec() {
+        let spec = openapi_spec();
+        for (path, method) in [
+            ("/api/tasks", "get"),
+            ("/api/tasks/{id}", "get"),
+            ("/api/tasks/{id}/cancel", "post"),
+            ("/api/tasks/{id}/complete", "post"),
+            ("/api/fleet/self", "get"),
+            ("/api/history/storage", "get"),
+            ("/api/mcp/tokens", "post"),
+            ("/api/mcp/tokens", "get"),
+            ("/api/mcp/tokens/{id}", "delete"),
+            ("/api/pair/pending", "post"),
+            ("/api/pair/pending/{request_id}", "delete"),
+            ("/api/peers", "get"),
+            ("/api/peers", "post"),
+            ("/api/peers/{id}", "patch"),
+            ("/api/peers/{id}", "delete"),
+            ("/api/fleet/settings", "put"),
+        ] {
+            assert!(spec["paths"][path][method].is_object(), "{method} {path}");
+        }
+        assert_eq!(
+            spec["paths"]["/api/mcp/tokens/{id}"]["delete"]["responses"]["204"]["description"],
+            "Revoked; /mcp refuses the token from the next call"
+        );
+        assert!(spec["components"]["schemas"]["TaskState"]["enum"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("idle_unconfirmed")));
+    }
+
+    #[test]
+    fn captured_history_segments_openapi_preserves_the_additive_contract() {
+        let spec = openapi_spec();
+        let legacy = &spec["paths"]["/api/sessions/{sessionId}/panes/{paneId}/history"]["get"];
+        let get =
+            &spec["paths"]["/api/sessions/{sessionId}/panes/{paneId}/history/segments"]["get"];
+        assert!(get["description"]
+            .as_str()
+            .unwrap()
+            .contains("pane_captured_history_segments_v1"));
+        assert_eq!(get["parameters"], legacy["parameters"]);
+        assert_eq!(
+            get["responses"].as_object().unwrap().len(),
+            legacy["responses"].as_object().unwrap().len()
+        );
+        let data =
+            &get["responses"]["200"]["content"]["application/json"]["schema"]["properties"]["data"];
+        let properties = &data["properties"];
+        assert!(data["required"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("segments")));
+        assert!(properties.get("capture_epoch").is_none());
+        assert!(properties.get("rows").is_none());
+        assert_eq!(properties["row_count"]["maximum"], 500);
+        assert_eq!(properties["snapshot_id"]["type"], json!(["string", "null"]));
+        assert_eq!(properties["next_before"]["type"], json!(["string", "null"]));
+        assert_eq!(properties["order"]["const"], "oldest-to-newest");
+        assert_eq!(properties["includes_live_viewport"]["const"], false);
+        assert_eq!(properties["complete_archive"]["const"], false);
+        let segment = &properties["segments"]["items"];
+        assert_eq!(
+            segment["required"],
+            json!([
+                "segment_id",
+                "started_at_ms",
+                "sealed_at_ms",
+                "boundary_reason",
+                "rows"
+            ])
+        );
+        assert_eq!(
+            segment["properties"]["boundary_reason"]["enum"],
+            json!([
+                "observation-start",
+                "gateway-restart",
+                "capture-policy-change",
+                "resize",
+                "editor-change",
+                "capture-reset"
+            ])
+        );
+        assert!(crate::API_CAPABILITIES.contains(&"pane_captured_history_segments_v1"));
+    }
 
     #[test]
     fn captured_history_openapi_capability_and_bounded_contract_are_explicit() {

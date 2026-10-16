@@ -9,13 +9,23 @@ use super::client::SessionListFilter;
 use super::discovery::OpencodeEndpoint;
 use super::mapper;
 use crate::agents::domain::{
-    AgentCatalog, AgentProject, AgentSessionInfo, ModelRef, PermissionDecision, SessionQuery,
+    AgentCatalog, AgentProject, AgentSessionInfo, ModelRef, PermissionDecision, SessionPage,
+    SessionQuery,
 };
 use crate::agents::ports::agent::{AgentError, AgentFuture, AgentPort, FileDiffItem};
 
 /// The permission action OpenCode raises when a tool reaches outside the
 /// session's own directory.
 const EXTERNAL_DIRECTORY_ACTION: &str = "external_directory";
+
+fn map_session_list(raw: &[Value]) -> Result<Vec<AgentSessionInfo>, AgentError> {
+    raw.iter()
+        .map(|session| {
+            mapper::map_session(session)
+                .ok_or_else(|| AgentError::Protocol("Failed to parse listed session".into()))
+        })
+        .collect()
+}
 
 /// How long a missing directory stays quiet in the log after being reported
 /// once. A phone polling a screen whose folder is gone would otherwise write a
@@ -156,6 +166,32 @@ pub struct OpencodeDriver {
     /// Built catalogs by directory. See [`CATALOG_CACHE_TTL`]; cleared
     /// outright whenever OpenCode says a catalog surface changed.
     catalog_cache: Mutex<HashMap<String, CachedCatalog>>,
+    /// Where `load_earlier_timeline` stands per session.
+    earlier: Mutex<HashMap<String, EarlierCursor>>,
+}
+
+/// The newest messages of a session delivered so far. OpenCode's message
+/// route takes `limit` and `order` and no cursor, so the page below is
+/// read as the newest `held + page` messages and cut at the oldest one
+/// held; `oldest_id` is where that cut falls.
+#[derive(Clone)]
+struct EarlierCursor {
+    held: usize,
+    oldest_id: String,
+    /// The last read answered fewer than asked: nothing lies below.
+    exhausted: bool,
+}
+
+/// The most messages an earlier read asks for in all.
+const MAX_HISTORY_MESSAGES: usize = 2000;
+/// How many older messages one `load_earlier_timeline` adds.
+const EARLIER_PAGE_MESSAGES: usize = 80;
+
+fn message_id(message: &Value) -> Option<&str> {
+    message
+        .get("id")
+        .or_else(|| message.pointer("/info/id"))
+        .and_then(Value::as_str)
 }
 
 impl OpencodeDriver {
@@ -164,7 +200,32 @@ impl OpencodeDriver {
             client: Arc::new(OpencodeClient::new(endpoint)),
             primed: Mutex::new(HashSet::new()),
             catalog_cache: Mutex::new(HashMap::new()),
+            earlier: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Remember the newest `messages` as delivered for `session_id`. A
+    /// shallower read than one already held (the end-of-run refetch of the
+    /// newest few) does not move the cursor back up.
+    fn hold_newest(&self, session_id: &str, messages: &[Value], asked: usize) {
+        let Some(oldest_id) = messages.first().and_then(message_id) else {
+            return;
+        };
+        let mut earlier = self.earlier.lock().unwrap_or_else(|p| p.into_inner());
+        if earlier
+            .get(session_id)
+            .is_some_and(|held| held.held >= messages.len())
+        {
+            return;
+        }
+        earlier.insert(
+            session_id.to_owned(),
+            EarlierCursor {
+                held: messages.len(),
+                oldest_id: oldest_id.to_owned(),
+                exhausted: messages.len() < asked,
+            },
+        );
     }
 
     pub fn client(&self) -> &OpencodeClient {
@@ -455,11 +516,27 @@ impl AgentPort for OpencodeDriver {
                 .client
                 .list_sessions(query.directory.as_deref(), &filter)
                 .await?;
-            let sessions = raw_sessions
-                .iter()
-                .filter_map(mapper::map_session)
-                .collect();
-            Ok(sessions)
+            map_session_list(&raw_sessions)
+        })
+    }
+
+    fn list_sessions_page<'a>(&'a self, query: &'a SessionQuery) -> AgentFuture<'a, SessionPage> {
+        Box::pin(async move {
+            let filter = SessionListFilter {
+                parent_id: query.parent_id.as_deref(),
+                limit: query.limit,
+                order: query.order.as_deref(),
+                search: query.search.as_deref(),
+                cursor: query.cursor.as_deref(),
+            };
+            let page = self
+                .client
+                .list_sessions_page(query.directory.as_deref(), &filter)
+                .await?;
+            Ok(SessionPage {
+                data: map_session_list(&page.data)?,
+                cursor: page.cursor,
+            })
         })
     }
 
@@ -484,8 +561,17 @@ impl AgentPort for OpencodeDriver {
     fn get_session<'a>(&'a self, session_id: &'a str) -> AgentFuture<'a, AgentSessionInfo> {
         Box::pin(async move {
             let raw = self.client.get_session(session_id).await?;
-            mapper::map_session(&raw)
-                .ok_or_else(|| AgentError::SessionNotFound(session_id.to_string()))
+            let mut info = mapper::map_session(&raw)
+                .ok_or_else(|| AgentError::SessionNotFound(session_id.to_string()))?;
+            // A failed session's reason is on its failed message only.
+            if info.status == crate::agents::domain::AgentSessionStatus::Failed
+                && info.error.is_none()
+            {
+                if let Ok(messages) = self.client.get_messages(session_id, 5).await {
+                    info.error = mapper::last_failure(&messages);
+                }
+            }
+            Ok(info)
         })
     }
 
@@ -506,6 +592,61 @@ impl AgentPort for OpencodeDriver {
             self.client
                 .send_prompt(session_id, text, attachments, delivery)
                 .await?;
+            Ok(())
+        })
+    }
+
+    fn adds_mcp_servers(&self) -> bool {
+        true
+    }
+
+    fn set_session_instruction<'a>(
+        &'a self,
+        session_id: &'a str,
+        key: &'a str,
+        text: &'a str,
+    ) -> AgentFuture<'a, bool> {
+        Box::pin(async move {
+            self.client
+                .set_session_instruction(session_id, key, text)
+                .await
+        })
+    }
+
+    fn remove_session_instruction<'a>(
+        &'a self,
+        session_id: &'a str,
+        key: &'a str,
+    ) -> AgentFuture<'a, ()> {
+        Box::pin(async move {
+            self.client
+                .remove_session_instruction(session_id, key)
+                .await
+        })
+    }
+
+    fn mcp_server_connected<'a>(
+        &'a self,
+        name: &'a str,
+        directory: Option<&'a str>,
+    ) -> AgentFuture<'a, bool> {
+        Box::pin(async move {
+            let servers = self.client.get_mcp(directory).await?;
+            Ok(servers.iter().any(|server| {
+                server.get("name").and_then(Value::as_str) == Some(name)
+                    && server.pointer("/status/status").and_then(Value::as_str) == Some("connected")
+            }))
+        })
+    }
+
+    fn add_mcp_server<'a>(
+        &'a self,
+        name: &'a str,
+        config: &'a Value,
+        directory: Option<&'a str>,
+    ) -> AgentFuture<'a, ()> {
+        Box::pin(async move {
+            self.client.add_mcp_server(name, config, directory).await?;
             Ok(())
         })
     }
@@ -607,7 +748,8 @@ impl AgentPort for OpencodeDriver {
             // other. In sequence they were eight round trips the app waited
             // through before it could open a picker; together they cost the
             // slowest of them. Three of them settle (see `settled_list`), and
-            // settling concurrently is the same waiting either way.
+            // settling concurrently is the same waiting either way; skills
+            // and commands do not (see below).
             let (
                 raw_models,
                 raw_agents,
@@ -627,9 +769,13 @@ impl AgentPort for OpencodeDriver {
                         .inspect_err(|e| log("mcp", e))
                         .unwrap_or_default()
                 },
-                self.settled_list("skill", directory, |d| self.client.skills_or_empty(d)),
+                // Skills and commands are legitimately empty for most
+                // directories: waiting for them to "settle" cost a second and
+                // a half per empty surface. They are read once; models,
+                // agents and providers, which are never truly empty, settle.
+                self.client.skills_or_empty(directory),
                 self.settled_list("provider", directory, |d| self.client.providers_or_empty(d)),
-                self.settled_list("command", directory, |d| self.client.commands_or_empty(d)),
+                self.client.commands_or_empty(directory),
                 async {
                     self.client
                         .get_default_model(directory)
@@ -755,8 +901,65 @@ impl AgentPort for OpencodeDriver {
     ) -> AgentFuture<'a, Vec<crate::agents::domain::TimelineItem>> {
         Box::pin(async move {
             let messages = self.client.get_messages(session_id, limit).await?;
+            self.hold_newest(session_id, &messages, limit);
             let asid = crate::agents::domain::AgentSessionId(session_id.to_string());
             Ok(mapper::map_messages_to_timeline(&messages, &asid))
+        })
+    }
+
+    /// The messages below the oldest one delivered, up to
+    /// [`EARLIER_PAGE_MESSAGES`] of them, read as the newest `held + page`
+    /// messages and cut at that one. Empty once a read answered fewer than
+    /// asked (nothing older); `HistoryCursorLost` before any snapshot was
+    /// read here or when the cut message is no longer in the history.
+    fn load_earlier_timeline<'a>(
+        &'a self,
+        session_id: &'a str,
+        limit: usize,
+    ) -> AgentFuture<'a, Vec<crate::agents::domain::TimelineItem>> {
+        Box::pin(async move {
+            if limit == 0 || limit > MAX_HISTORY_MESSAGES {
+                return Err(AgentError::InvalidRequest(
+                    "OpenCode history limit exceeds 2000 messages".into(),
+                ));
+            }
+            let cursor = self
+                .earlier
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(session_id)
+                .cloned();
+            let Some(cursor) = cursor else {
+                return Err(AgentError::HistoryCursorLost);
+            };
+            if cursor.exhausted || cursor.held >= MAX_HISTORY_MESSAGES {
+                return Ok(Vec::new());
+            }
+            let asked = (cursor.held + limit.min(EARLIER_PAGE_MESSAGES)).min(MAX_HISTORY_MESSAGES);
+            let messages = self.client.get_messages_capped(session_id, asked).await?;
+            let Some(cut) = messages
+                .iter()
+                .position(|message| message_id(message) == Some(cursor.oldest_id.as_str()))
+            else {
+                return Err(AgentError::HistoryCursorLost);
+            };
+            let older = &messages[..cut];
+            let exhausted = messages.len() < asked || older.is_empty();
+            if let Some(oldest_id) = messages.first().and_then(message_id) {
+                self.earlier
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .insert(
+                        session_id.to_owned(),
+                        EarlierCursor {
+                            held: messages.len(),
+                            oldest_id: oldest_id.to_owned(),
+                            exhausted,
+                        },
+                    );
+            }
+            let asid = crate::agents::domain::AgentSessionId(session_id.to_string());
+            Ok(mapper::map_messages_to_timeline(older, &asid))
         })
     }
 
@@ -1000,9 +1203,153 @@ impl AgentPort for OpencodeDriver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// OpenCode pages its messages by `limit` and `order` alone. Each
+    /// earlier batch is the newest `held + 80` messages cut at the oldest
+    /// one held, so the batches tile the history downwards without a gap or
+    /// a repeat, and the end is where a read answers fewer than asked. The
+    /// end-of-run refetch of the newest few never moves the cursor back up.
+    #[tokio::test]
+    async fn earlier_pages_cut_below_the_oldest_held_message() {
+        use axum::{extract::Query, routing::get, Router};
+        use std::sync::{Arc, Mutex};
+        let asked: Arc<Mutex<Vec<usize>>> = Arc::default();
+        let seen = asked.clone();
+        let app = Router::new().route(
+            "/api/session/{id}/message",
+            get(
+                move |Query(query): Query<std::collections::HashMap<String, String>>| {
+                    let seen = seen.clone();
+                    async move {
+                        assert_eq!(query.get("order").map(String::as_str), Some("desc"));
+                        let limit: usize = query["limit"].parse().unwrap();
+                        seen.lock().unwrap().push(limit);
+                        // 300 messages, newest first as `order=desc` answers.
+                        let page: Vec<Value> = (0..300)
+                            .rev()
+                            .take(limit)
+                            .map(|n| serde_json::json!({ "id": format!("m-{n}"), "type": "user", "text": format!("message {n}") }))
+                            .collect();
+                        axum::Json(page)
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let driver = OpencodeDriver::new(OpencodeEndpoint {
+            url: format!("http://{}", listener.local_addr().unwrap()),
+            password: None,
+            version: Some("2.0.27".into()),
+            pid: None,
+        });
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let ids = |items: &[crate::agents::domain::TimelineItem]| -> Vec<String> {
+            items.iter().map(|item| item.message_id.clone()).collect()
+        };
+
+        let tail = driver.get_timeline("s", 100).await.unwrap();
+        assert_eq!(ids(&tail).first().map(String::as_str), Some("m-200"));
+        assert_eq!(ids(&tail).last().map(String::as_str), Some("m-299"));
+        // The refetch of the newest few: the cursor stays at m-200.
+        assert_eq!(driver.get_timeline("s", 5).await.unwrap().len(), 5);
+
+        let mut lowest = 200;
+        for expected in [120, 40, 0] {
+            let batch = driver.load_earlier_timeline("s", 80).await.unwrap();
+            let batch_ids = ids(&batch);
+            assert_eq!(
+                batch_ids.first().map(String::as_str),
+                Some(format!("m-{expected}").as_str())
+            );
+            assert_eq!(
+                batch_ids.last().map(String::as_str),
+                Some(format!("m-{}", lowest - 1).as_str())
+            );
+            lowest = expected;
+        }
+        assert!(driver
+            .load_earlier_timeline("s", 80)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(matches!(
+            driver.load_earlier_timeline("never", 80).await,
+            Err(AgentError::HistoryCursorLost)
+        ));
+        assert_eq!(*asked.lock().unwrap(), vec![100, 5, 180, 260, 340]);
+        server.abort();
+    }
     use serde_json::json;
 
-    const UPLOADS: &str = "/home/ryu/.local/share/muqun-gateway/uploads/*";
+    const UPLOADS: &str = "/home/example-user/.local/share/muqun-gateway/uploads/*";
+
+    async fn session_page_driver(page: Value) -> (OpencodeDriver, tokio::task::JoinHandle<()>) {
+        use axum::{routing::get, Json, Router};
+        let app = Router::new().route(
+            "/api/session",
+            get(move || {
+                let page = page.clone();
+                async move { Json(page) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let driver = OpencodeDriver::new(OpencodeEndpoint {
+            url: format!("http://{}", listener.local_addr().unwrap()),
+            password: None,
+            version: Some("2.0.27".into()),
+            pid: None,
+        });
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (driver, task)
+    }
+
+    #[tokio::test]
+    async fn session_page_mapping_preserves_upstream_ascending_order_and_cursors() {
+        let (driver, task) = session_page_driver(json!({
+            "data": [{"id": "ses-older", "time": {"updated": 1}}, {"id": "ses-newer", "time": {"updated": 2}}],
+            "cursor": {"next": "opaque-next", "previous": "opaque-previous"}
+        })).await;
+        let page = driver
+            .list_sessions_page(&SessionQuery {
+                order: Some("asc".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            page.data
+                .iter()
+                .map(|info| (info.asid.0.as_str(), info.updated_ms))
+                .collect::<Vec<_>>(),
+            vec![("ses-older", 1), ("ses-newer", 2)]
+        );
+        assert_eq!(page.cursor.next.as_deref(), Some("opaque-next"));
+        assert_eq!(page.cursor.previous.as_deref(), Some("opaque-previous"));
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn session_lists_fail_on_unmappable_records_instead_of_returning_partial_data() {
+        for malformed in [
+            json!({"title": "missing id"}),
+            json!({"id": 1}),
+            json!("not a session"),
+        ] {
+            let (driver, task) = session_page_driver(json!({
+                "data": [{"id": "ses-valid"}, malformed], "cursor": {"next": null, "previous": null}
+            }))
+            .await;
+            assert!(matches!(
+                driver.list_sessions_page(&SessionQuery::default()).await,
+                Err(AgentError::Protocol(_))
+            ));
+            assert!(matches!(
+                driver.list_sessions(&SessionQuery::default()).await,
+                Err(AgentError::Protocol(_))
+            ));
+            task.abort();
+        }
+    }
 
     /// Every project OpenCode remembers, checked against the host.
     ///

@@ -17,6 +17,7 @@ use super::client::{
 use super::endpoint::T3Endpoint;
 use super::mapper;
 use super::stream::ThreadWatcher;
+use super::v2;
 use crate::agents::domain::{
     AgentCatalog, AgentProject, AgentSessionInfo, FormRequest, ModelRef, PermissionDecision,
     PermissionRequest, SessionQuery, TimelineItem,
@@ -24,6 +25,9 @@ use crate::agents::domain::{
 use crate::agents::ports::agent::{
     append_attachment_paths, AgentError, AgentFuture, AgentPort, AttachmentMode, FileDiffItem,
 };
+
+/// The title a thread is created with; read back, it means "untitled".
+pub(crate) const NEW_THREAD_TITLE: &str = "New thread";
 
 pub struct T3Driver {
     client: Arc<T3Client>,
@@ -79,6 +83,13 @@ impl T3Driver {
         thread_id: &str,
     ) -> Result<(AgentSessionInfo, Value), AgentError> {
         let detail = self.client.thread_snapshot(thread_id, None).await?;
+        if self.client.is_v2() {
+            let projection = detail["projection"].clone();
+            let roots = mapper::project_roots(&self.client.shell_snapshot().await?);
+            let info = v2::mapper::session(&projection["thread"], Some(&projection), &roots)
+                .ok_or_else(|| AgentError::Protocol("invalid V2 thread".into()))?;
+            return Ok((info, projection));
+        }
         let thread = detail
             .get("thread")
             .cloned()
@@ -125,9 +136,7 @@ impl T3Driver {
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| dir.to_string());
-        self.client
-            .dispatch(commands::project_create(&project_id, &title, dir))
-            .await?;
+        self.client.create_project(&project_id, &title, dir).await?;
         tracing::info!(project_id = %project_id, "t3 project created");
         Ok(project_id)
     }
@@ -156,7 +165,22 @@ impl AgentPort for T3Driver {
     }
 
     fn probe(&self) -> AgentFuture<'_, bool> {
-        Box::pin(async move { Ok(self.client.endpoint.probe_healthy(self.client.http()).await) })
+        Box::pin(async move {
+            Ok(self
+                .client
+                .endpoint
+                .describe(self.client.http())
+                .await
+                .is_ok_and(|descriptor| {
+                    descriptor.protocol().ok() == Some(self.client.endpoint.protocol)
+                        && self
+                            .client
+                            .endpoint
+                            .environment_id
+                            .as_ref()
+                            .is_none_or(|id| id == &descriptor.environment_id)
+                }))
+        })
     }
 
     fn list_projects(&self) -> AgentFuture<'_, Vec<AgentProject>> {
@@ -176,7 +200,11 @@ impl AgentPort for T3Driver {
     ) -> AgentFuture<'a, Vec<AgentSessionInfo>> {
         Box::pin(async move {
             let shell = self.client.shell_snapshot().await?;
-            let mut sessions = mapper::map_shell_sessions(&shell);
+            let mut sessions = if self.client.is_v2() {
+                v2::mapper::shell_sessions(&shell)
+            } else {
+                mapper::map_shell_sessions(&shell)
+            };
             sessions.retain(|s| query.keeps_parent(s.parent_id.as_deref()));
             if let Some(dir) = query.directory.as_deref().map(|d| d.trim_end_matches('/')) {
                 sessions.retain(|s| {
@@ -253,16 +281,27 @@ impl AgentPort for T3Driver {
                 None => self.default_model().await?,
             };
             let thread_id = new_id();
-            let title = "New thread";
+            let title = NEW_THREAD_TITLE;
             self.client
-                .dispatch(commands::thread_create(
-                    &thread_id,
-                    &project_id,
-                    title,
-                    &selection,
-                    runtime_mode,
-                    interaction_mode,
-                ))
+                .dispatch(if self.client.is_v2() {
+                    v2::commands::thread_create(
+                        &thread_id,
+                        &project_id,
+                        title,
+                        &selection,
+                        runtime_mode,
+                        interaction_mode,
+                    )
+                } else {
+                    commands::thread_create(
+                        &thread_id,
+                        &project_id,
+                        title,
+                        &selection,
+                        runtime_mode,
+                        interaction_mode,
+                    )
+                })
                 .await?;
             self.watcher.watch(&thread_id);
             match self.session_from_snapshot(&thread_id).await {
@@ -273,6 +312,11 @@ impl AgentPort for T3Driver {
                     Ok(AgentSessionInfo {
                         asid: thread_id.clone().into(),
                         backend_session_id: String::new(),
+                        runtime: None,
+                        context_usage: None,
+                        git_info: None,
+                        agent_name: None,
+                        agent_role: None,
                         agent_id: String::new(),
                         title: title.into(),
                         mode: None,
@@ -315,7 +359,7 @@ impl AgentPort for T3Driver {
         session_id: &'a str,
         text: &'a str,
         attachments: &'a [String],
-        _delivery: Option<&'a str>,
+        delivery: Option<&'a str>,
     ) -> AgentFuture<'a, ()> {
         Box::pin(async move {
             let id = validate_id(session_id, "session id")?;
@@ -324,6 +368,26 @@ impl AgentPort for T3Driver {
             let text = append_attachment_paths(text, attachments);
             let text = bounded_prompt(&text)?;
             let (info, thread) = self.session_from_snapshot(&id).await?;
+            if self.client.is_v2() {
+                // Default delivery never interrupts or restarts a root run.
+                // A concurrent upstream rejection remains an error, not an
+                // excuse to submit the prompt again with another mode.
+                if delivery.is_some_and(|value| !value.trim().is_empty()) {
+                    return Err(AgentError::Unsupported("explicit T3 delivery mode".into()));
+                }
+                let model = info.model.as_ref().map(mapper::model_selection_from_ref);
+                self.client
+                    .dispatch(v2::commands::message_dispatch(
+                        &id,
+                        &new_id(),
+                        text,
+                        model.as_ref(),
+                        v2::projection::has_active_run(&thread),
+                    ))
+                    .await?;
+                self.watcher.watch(&id);
+                return Ok(());
+            }
             let runtime_mode = thread
                 .get("runtimeMode")
                 .and_then(Value::as_str)
@@ -359,6 +423,11 @@ impl AgentPort for T3Driver {
         message_id: &'a str,
     ) -> AgentFuture<'a, ()> {
         Box::pin(async move {
+            if self.client.is_v2() {
+                return Err(AgentError::Unsupported(
+                    "V2 message-targeted conversation and file revert".into(),
+                ));
+            }
             let id = validate_id(session_id, "session id")?;
             let target = mapper::t3_message_id(message_id.trim());
             let turn_count = if let Ok(n) = target.parse::<u64>() {
@@ -379,6 +448,14 @@ impl AgentPort for T3Driver {
     fn interrupt<'a>(&'a self, session_id: &'a str) -> AgentFuture<'a, ()> {
         Box::pin(async move {
             let id = validate_id(session_id, "session id")?;
+            if self.client.is_v2() {
+                let (_, projection) = self.session_from_snapshot(&id).await?;
+                let run = v2::mapper::interrupt_run(&projection)?;
+                self.client
+                    .dispatch(v2::commands::interrupt(&id, run))
+                    .await?;
+                return Ok(());
+            }
             self.client.dispatch(commands::turn_interrupt(&id)).await?;
             Ok(())
         })
@@ -389,10 +466,29 @@ impl AgentPort for T3Driver {
             let id = validate_id(session_id, "session id")?;
             let (_, thread) = self.session_from_snapshot(&id).await?;
             let config = self.client.get_config().await?;
-            validate_model_driver(&thread, model, &config)?;
+            if !self.client.is_v2() {
+                validate_model_driver(&thread, model, &config)?;
+            } else if !v2::projection::rows(&config, "providers")
+                .iter()
+                .any(|provider| {
+                    v2::projection::string(provider, "instanceId") == Some(&model.provider_id)
+                        && provider.get("enabled").and_then(Value::as_bool) == Some(true)
+                        && v2::projection::rows(provider, "models")
+                            .iter()
+                            .any(|m| v2::projection::string(m, "slug") == Some(&model.model_id))
+                })
+            {
+                return Err(AgentError::RequestFailed(
+                    "selected model is not in the enabled T3 catalog".into(),
+                ));
+            }
             let selection = mapper::model_selection_from_ref(model);
             self.client
-                .dispatch(commands::thread_set_model(&id, &selection))
+                .dispatch(if self.client.is_v2() {
+                    v2::commands::set_model(&id, &selection)
+                } else {
+                    commands::thread_set_model(&id, &selection)
+                })
                 .await?;
             Ok(())
         })
@@ -419,11 +515,24 @@ impl AgentPort for T3Driver {
         session_id: &'a str,
         request_id: &'a str,
         decision: PermissionDecision,
-        _message: Option<&'a str>,
+        message: Option<&'a str>,
     ) -> AgentFuture<'a, ()> {
         Box::pin(async move {
             let id = validate_id(session_id, "session id")?;
             let request = validate_id(request_id, "request id")?;
+            // Neither protocol's approval reply carries text: a reason the
+            // user wrote would be dropped on the floor, so it is refused.
+            if message.is_some_and(|value| !value.trim().is_empty()) {
+                return Err(AgentError::Unsupported("approval reason".into()));
+            }
+            if self.client.is_v2() {
+                let (_, projection) = self.session_from_snapshot(&id).await?;
+                let choice = v2::mapper::approval_decision(&projection, &request, decision)?;
+                self.client
+                    .dispatch(v2::commands::respond(&id, &request, Some(choice), None))
+                    .await?;
+                return Ok(());
+            }
             // Prefer the decisions the request itself offered; a label is
             // not necessarily a valid reply, but the decision ids are.
             let offered: Vec<Value> = match self.session_from_snapshot(&id).await {
@@ -468,6 +577,14 @@ impl AgentPort for T3Driver {
         Box::pin(async move {
             let id = validate_id(session_id, "session id")?;
             let request = validate_id(form_id, "form id")?;
+            if self.client.is_v2() {
+                let (_, projection) = self.session_from_snapshot(&id).await?;
+                v2::mapper::validate_answers(&projection, &request, &answers)?;
+                self.client
+                    .dispatch(v2::commands::respond(&id, &request, None, Some(answers)))
+                    .await?;
+                return Ok(());
+            }
             if !answers.is_object() {
                 return Err(AgentError::RequestFailed(
                     "answers must be an object".into(),
@@ -497,6 +614,9 @@ impl AgentPort for T3Driver {
     ) -> AgentFuture<'a, Vec<FileDiffItem>> {
         Box::pin(async move {
             let id = validate_id(session_id, "session id")?;
+            if self.client.is_v2() {
+                return Err(AgentError::Unsupported("V2 cumulative file diff".into()));
+            }
             if !matches!(mode, "working" | "branch") {
                 return Err(AgentError::Unsupported(format!("vcs diff mode {mode}")));
             }
@@ -517,7 +637,11 @@ impl AgentPort for T3Driver {
         Box::pin(async move {
             let id = validate_id(session_id, "session id")?;
             let (_, thread) = self.session_from_snapshot(&id).await?;
-            Ok(mapper::map_pending_permissions(&id, &thread))
+            Ok(if self.client.is_v2() {
+                v2::mapper::permissions(&id, &thread)
+            } else {
+                mapper::map_pending_permissions(&id, &thread)
+            })
         })
     }
 
@@ -525,7 +649,11 @@ impl AgentPort for T3Driver {
         Box::pin(async move {
             let id = validate_id(session_id, "session id")?;
             let (_, thread) = self.session_from_snapshot(&id).await?;
-            Ok(mapper::map_pending_forms(&id, &thread))
+            Ok(if self.client.is_v2() {
+                v2::mapper::forms(&id, &thread)
+            } else {
+                mapper::map_pending_forms(&id, &thread)
+            })
         })
     }
 
@@ -536,7 +664,19 @@ impl AgentPort for T3Driver {
     ) -> AgentFuture<'a, Vec<TimelineItem>> {
         Box::pin(async move {
             let id = validate_id(session_id, "session id")?;
-            let detail = self.client.thread_snapshot(&id, None).await?;
+            let detail = self.client.timeline_snapshot(&id, limit).await?;
+            if self.client.is_v2() {
+                self.watcher.watch(&id);
+                let mut items = v2::mapper::timeline(
+                    &id,
+                    &detail["projection"],
+                    detail["snapshotSequence"].as_u64().unwrap_or(0),
+                );
+                if limit > 0 && items.len() > limit {
+                    items.drain(..items.len() - limit);
+                }
+                return Ok(items);
+            }
             let thread = detail
                 .get("thread")
                 .ok_or_else(|| AgentError::Protocol("thread snapshot without thread".into()))?;
@@ -553,6 +693,7 @@ impl AgentPort for T3Driver {
         Box::pin(async move {
             let id = validate_id(session_id, "session id")?;
             self.client.dispatch(commands::thread_delete(&id)).await?;
+            self.client.forget_timeline(&id).await;
             self.watcher.unwatch(&id);
             Ok(())
         })
@@ -566,7 +707,11 @@ impl AgentPort for T3Driver {
                 return Err(AgentError::RequestFailed("invalid title".into()));
             }
             self.client
-                .dispatch(commands::thread_rename(&id, title))
+                .dispatch(if self.client.is_v2() {
+                    v2::commands::rename(&id, title)
+                } else {
+                    commands::thread_rename(&id, title)
+                })
                 .await?;
             Ok(())
         })

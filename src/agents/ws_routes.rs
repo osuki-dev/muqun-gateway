@@ -39,8 +39,12 @@ use tokio::sync::{broadcast, oneshot};
 
 use super::domain::AgentDomainEvent;
 use super::routes::agent_event_record;
+use crate::connectivity::authority::DeviceKind;
+use crate::platform::http::require_device_or_peer;
+use crate::tasks::domain::{PrincipalKind, TaskId, TaskPrincipal, TaskState};
+use crate::tasks::events::TaskDomainEvent;
 use crate::{
-    api_error, require_device, still_paired, transport, AppState, EncryptedStreamContext,
+    api_error, still_paired, transport, AppState, EncryptedStreamContext,
     STREAM_DEVICE_RECHECK_INTERVAL,
 };
 
@@ -104,6 +108,9 @@ pub(crate) enum FrameError {
     FrameTooLarge,
     /// A newer socket from the same device took this one's place.
     Superseded,
+    /// Another computer's socket asked for agent sessions; it may follow
+    /// tasks (`subscribe_tasks`) and nothing else.
+    PeerForbidden,
 }
 
 impl FrameError {
@@ -116,6 +123,7 @@ impl FrameError {
             Self::TooManySubscriptions => "too_many_subscriptions",
             Self::FrameTooLarge => "frame_too_large",
             Self::Superseded => "superseded",
+            Self::PeerForbidden => "peer_forbidden",
         }
     }
 }
@@ -130,6 +138,7 @@ pub(crate) enum ClientFrame {
     Subscribe(String),
     Unsubscribe(String),
     SubscribeAll,
+    SubscribeTasks,
     Ping,
 }
 
@@ -158,6 +167,7 @@ impl ClientFrame {
             "subscribe" => Ok(Self::Subscribe(asid()?)),
             "unsubscribe" => Ok(Self::Unsubscribe(asid()?)),
             "subscribe_all" => Ok(Self::SubscribeAll),
+            "subscribe_tasks" => Ok(Self::SubscribeTasks),
             "ping" => Ok(Self::Ping),
             _ => Err(FrameError::UnknownType),
         }
@@ -200,15 +210,66 @@ pub(crate) fn event_frame(event: &AgentDomainEvent) -> String {
     )
 }
 
+/// A task change. There is no session, so `asid` is `null`; `data` is the task
+/// as `GET /api/tasks` shows it. The all-subscription keeps its existing
+/// `event` type, while a task-only subscription uses `task`.
+fn task_frame(event: &TaskDomainEvent, kind: &str) -> String {
+    let data = serde_json::to_string(match event {
+        TaskDomainEvent::Updated { task, .. } => task,
+    })
+    .unwrap_or_else(|_| String::from("null"));
+    format!(
+        r#"{{"t":{},"asid":null,"seq":{},"event":{},"data":{}}}"#,
+        json_string(kind),
+        event.seq(),
+        json_string(event.event_name()),
+        data
+    )
+}
+
+pub(crate) fn task_event_frame(event: &TaskDomainEvent) -> String {
+    task_frame(event, "event")
+}
+
+pub(crate) fn task_only_frame(event: &TaskDomainEvent) -> String {
+    task_frame(event, "task")
+}
+
 pub(crate) fn resync_frame(asid: &str) -> String {
     format!(r#"{{"t":"resync","asid":{}}}"#, json_string(asid))
 }
 
-pub(crate) fn subscribed_frame(asid: Option<&str>) -> String {
+/// After task events were dropped: `asid` `""` (every session, which is how
+/// an App reads a resync aimed at its task listeners) plus `"tasks":true`
+/// so a client can tell this one apart and refetch only `GET /api/tasks`.
+pub(crate) fn task_resync_frame() -> String {
+    String::from(r#"{"t":"resync","asid":"","tasks":true}"#)
+}
+
+pub(crate) fn subscribed_frame(asid: Option<&str>, tasks_ended: bool) -> String {
+    let tasks = if tasks_ended { r#","tasks":false"# } else { "" };
     match asid {
-        Some(asid) => format!(r#"{{"t":"subscribed","asid":{}}}"#, json_string(asid)),
-        None => String::from(r#"{"t":"subscribed","all":true}"#),
+        Some(asid) => format!(
+            r#"{{"t":"subscribed","asid":{}{tasks}}}"#,
+            json_string(asid)
+        ),
+        None => format!(r#"{{"t":"subscribed","all":true{tasks}}}"#),
     }
+}
+
+/// What a task the device opens without `cwd` runs in (`default_cwd`, see
+/// `TaskService::default_cwd`), for a task subscription: sent after its
+/// `subscribed`, after a task resync, and when a task the device opens
+/// changes it.
+pub(crate) fn defaults_frame(default_cwd: Option<&str>) -> String {
+    format!(
+        r#"{{"t":"defaults","default_cwd":{}}}"#,
+        default_cwd.map_or_else(|| "null".to_owned(), json_string)
+    )
+}
+
+pub(crate) fn subscribed_tasks_frame() -> String {
+    String::from(r#"{"t":"subscribed","tasks":true}"#)
 }
 
 pub(crate) fn error_frame(error: FrameError) -> String {
@@ -343,13 +404,14 @@ impl FrameCodec {
 #[derive(Debug, Default)]
 pub(crate) struct Subscriptions {
     all: bool,
+    tasks_only: bool,
     sessions: BTreeSet<String>,
 }
 
 impl Subscriptions {
     /// Apply a subscription frame, answering the acknowledgement to send.
-    /// `subscribe_all` is sticky for the life of the connection; an
-    /// `unsubscribe` after it only drops the asid from the explicit set.
+    /// `subscribe_all` is unaffected by `unsubscribe`; `subscribe_tasks`
+    /// switches to task-only delivery and clears session subscriptions.
     pub(crate) fn apply(&mut self, frame: &ClientFrame) -> Result<Option<String>, FrameError> {
         match frame {
             ClientFrame::Subscribe(asid) => {
@@ -357,7 +419,9 @@ impl Subscriptions {
                     return Err(FrameError::TooManySubscriptions);
                 }
                 self.sessions.insert(asid.clone());
-                Ok(Some(subscribed_frame(Some(asid))))
+                let ack = subscribed_frame(Some(asid), self.tasks_only);
+                self.tasks_only = false;
+                Ok(Some(ack))
             }
             ClientFrame::Unsubscribe(asid) => {
                 self.sessions.remove(asid);
@@ -365,7 +429,15 @@ impl Subscriptions {
             }
             ClientFrame::SubscribeAll => {
                 self.all = true;
-                Ok(Some(subscribed_frame(None)))
+                let ack = subscribed_frame(None, self.tasks_only);
+                self.tasks_only = false;
+                Ok(Some(ack))
+            }
+            ClientFrame::SubscribeTasks => {
+                self.all = false;
+                self.sessions.clear();
+                self.tasks_only = true;
+                Ok(Some(subscribed_tasks_frame()))
             }
             ClientFrame::Ping => Ok(Some(PONG_FRAME.to_owned())),
         }
@@ -382,6 +454,15 @@ impl Subscriptions {
             return !self.sessions.is_empty();
         }
         self.sessions.contains(asid)
+    }
+
+    /// Whether task changes go out on this connection.
+    pub(crate) fn wants_tasks(&self) -> bool {
+        self.all || self.tasks_only
+    }
+
+    pub(crate) fn tasks_only(&self) -> bool {
+        self.tasks_only
     }
 
     /// The sessions to tell to resync after this connection fell behind the
@@ -509,10 +590,19 @@ async fn open_event_socket(
     headers: HeaderMap,
     upgrade: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
 ) -> Response {
-    let device_id = match require_device(&state, &headers) {
-        Ok(device_id) => device_id,
+    let caller = match require_device_or_peer(&state, &headers) {
+        Ok(caller) => caller,
         Err(error) => return error.into_response(),
     };
+    // Another computer follows its tasks as itself, a `Gateway` principal.
+    let device = TaskPrincipal {
+        kind: match caller.kind {
+            DeviceKind::App => PrincipalKind::Device,
+            DeviceKind::Gateway => PrincipalKind::Gateway,
+        },
+        id: caller.device_id,
+    };
+    let device_id = device.id.clone();
     let Ok(upgrade) = upgrade else {
         return api_error(
             StatusCode::BAD_REQUEST,
@@ -547,6 +637,7 @@ async fn open_event_socket(
     // Subscribed before the upgrade completes, so nothing published between
     // the 101 and the first poll of the connection is missed.
     let events = state.agent_runtime.subscribe_events();
+    let tasks = state.task_events.subscribe();
     upgrade
         .max_message_size(MAX_INBOUND_FRAME_BYTES)
         .max_frame_size(MAX_INBOUND_FRAME_BYTES)
@@ -557,7 +648,7 @@ async fn open_event_socket(
                 timings: state.ws_connections.timings,
             };
             connection
-                .run(state, device_id, connection_id, events, slot)
+                .run(state, device, connection_id, events, tasks, slot)
                 .await;
         })
 }
@@ -601,6 +692,29 @@ impl Connection {
             .await;
     }
 
+    /// Send the device's `defaults` frame when `always`, or when it differs
+    /// from the one last sent (`sent`).
+    async fn send_defaults(
+        &mut self,
+        state: &AppState,
+        device: &TaskPrincipal,
+        sent: &mut Option<Option<String>>,
+        always: bool,
+    ) -> Result<(), Gone> {
+        // Another computer gets no defaults, as `GET /api/tasks/defaults`
+        // refuses it.
+        if device.kind == PrincipalKind::Gateway {
+            return Ok(());
+        }
+        let now = state.tasks.default_cwd(device).await;
+        if !always && sent.as_ref() == Some(&now) {
+            return Ok(());
+        }
+        let frame = defaults_frame(now.as_deref());
+        *sent = Some(now);
+        self.send(&frame).await
+    }
+
     /// Say why, then close.
     async fn fail(&mut self, error: FrameError) {
         if self.send(&error_frame(error)).await.is_ok() {
@@ -611,9 +725,10 @@ impl Connection {
     async fn run(
         mut self,
         state: AppState,
-        device_id: String,
+        device: TaskPrincipal,
         connection_id: String,
         mut events: broadcast::Receiver<AgentDomainEvent>,
+        mut tasks: broadcast::Receiver<TaskDomainEvent>,
         mut slot: WsSlot,
     ) {
         if self
@@ -636,6 +751,10 @@ impl Connection {
         );
         recheck.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut unanswered_pings = 0_u8;
+        let device_id = device.id.clone();
+        let peer = device.kind == PrincipalKind::Gateway;
+        // The `defaults` frame last sent, once one was.
+        let mut defaults_sent: Option<Option<String>> = None;
 
         loop {
             tokio::select! {
@@ -685,14 +804,33 @@ impl Connection {
                     };
                     // Any frame from the client is proof it is alive.
                     unanswered_pings = 0;
-                    let reply = self
+                    let frame = self
                         .codec
                         .decode(text.as_str())
-                        .and_then(|plaintext| ClientFrame::parse(&plaintext))
-                        .and_then(|frame| subscriptions.apply(&frame));
-                    match reply {
+                        .and_then(|plaintext| ClientFrame::parse(&plaintext));
+                    let tasks_now = matches!(frame, Ok(ClientFrame::SubscribeTasks));
+                    // Another computer follows tasks only, never an agent session.
+                    let frame = frame.and_then(|frame| match frame {
+                        ClientFrame::Subscribe(_)
+                        | ClientFrame::Unsubscribe(_)
+                        | ClientFrame::SubscribeAll
+                            if peer =>
+                        {
+                            Err(FrameError::PeerForbidden)
+                        }
+                        frame => Ok(frame),
+                    });
+                    match frame.and_then(|frame| subscriptions.apply(&frame)) {
                         Ok(Some(reply)) => {
                             if self.send(&reply).await.is_err() {
+                                return;
+                            }
+                            if tasks_now
+                                && self
+                                    .send_defaults(&state, &device, &mut defaults_sent, true)
+                                    .await
+                                    .is_err()
+                            {
                                 return;
                             }
                         }
@@ -706,6 +844,10 @@ impl Connection {
                 event = events.recv() => match event {
                     Ok(mut event) => {
                         if subscriptions.wants(&event.asid().0) {
+                            let asid = event.asid().0.clone();
+                            let plumbing =
+                                crate::tasks::transcript::for_session(&state, &asid).await;
+                            crate::tasks::transcript::hide_in_event(&mut event, plumbing);
                             super::message_images::attach_to_event(&state, &mut event).await;
                             if self.send(&event_frame(&event)).await.is_err() {
                                 return;
@@ -723,6 +865,66 @@ impl Connection {
                             }
                         }
                     }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        self.close().await;
+                        return;
+                    }
+                },
+                task = tasks.recv() => match task {
+                    Ok(task) => {
+                        if subscriptions.wants_tasks() {
+                            // Snapshots and resync reads use `/api/tasks`; live
+                            // and finished task frames need the same ownership
+                            // check against the store, not display metadata.
+                            let TaskDomainEvent::Updated { task: view, .. } = &task;
+                            if peer && state.tasks.owned(&device, &TaskId(view.task_id.clone())).await.is_err() {
+                                continue;
+                            }
+                            let frame = if subscriptions.tasks_only() {
+                                task_only_frame(&task)
+                            } else {
+                                task_event_frame(&task)
+                            };
+                            if self.send(&frame).await.is_err() {
+                                return;
+                            }
+                            // Only a task the device just opened can change
+                            // where its next one runs.
+                            let TaskDomainEvent::Updated { task, .. } = &task;
+                            let opened = task.requested_by.as_ref().is_some_and(|by| by.id == device.id)
+                                && matches!(task.state, TaskState::Queued | TaskState::Dispatching);
+                            if subscriptions.tasks_only()
+                                && opened
+                                && self
+                                    .send_defaults(&state, &device, &mut defaults_sent, false)
+                                    .await
+                                    .is_err()
+                            {
+                                return;
+                            }
+                        }
+                    }
+                    // Fell behind the task broadcast: a task that changed in
+                    // the dropped stretch may never change again, so "the next
+                    // event supersedes it" is not enough. Ask for a refetch of
+                    // `GET /api/tasks` with the one frame the App already
+                    // reads that way: a resync for every session.
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        if subscriptions.wants_tasks()
+                            && self.send(&task_resync_frame()).await.is_err()
+                        {
+                            return;
+                        }
+                        if subscriptions.tasks_only()
+                            && self
+                                .send_defaults(&state, &device, &mut defaults_sent, true)
+                                .await
+                                .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    // The sender lives in `AppState`, which this task holds.
                     Err(broadcast::error::RecvError::Closed) => {
                         self.close().await;
                         return;

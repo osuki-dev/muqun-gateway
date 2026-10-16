@@ -18,7 +18,7 @@
 //! The manager (`agents/manager/t3.rs`) folds [`T3StreamEvent`]s into
 //! `AgentDomainEvent`s with the functions in `mapper`.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -34,6 +34,11 @@ use super::rpc::{RpcError, StreamItem, Subscription};
 pub enum ShellEvent {
     /// The full shell: `{projects, threads, snapshotSequence}`.
     Snapshot(Value),
+    /// Repository resolution refresh, not an application-log baseline.
+    Enrichment {
+        snapshot: Value,
+        resolved_roots: Vec<String>,
+    },
     /// The initial snapshot or replay is done; what follows is live.
     Synchronized,
     ProjectUpserted {
@@ -57,6 +62,8 @@ pub enum ShellEvent {
 /// An item of one thread's stream, typed by event.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ThreadEvent {
+    /// Protocol 2's native projection. Coverage belongs to the snapshot.
+    V2Snapshot(Value),
     /// `OrchestrationThreadDetailSnapshot`: `{snapshotSequence, thread, page?}`.
     Snapshot(Value),
     Synchronized,
@@ -238,6 +245,65 @@ fn sequence_of(item: &Value) -> Option<u64> {
                 .and_then(|s| s.get("snapshotSequence"))
                 .and_then(Value::as_u64)
         })
+        .or_else(|| item.get("snapshotSequence").and_then(Value::as_u64))
+}
+
+pub fn parse_v2_shell_item(item: &Value) -> Option<ShellEvent> {
+    let sequence = item.get("sequence").and_then(Value::as_u64);
+    Some(match item.get("kind").and_then(Value::as_str)? {
+        "snapshot" => {
+            let snapshot = item.get("snapshot")?;
+            snapshot.get("snapshotSequence")?.as_u64()?;
+            snapshot.get("threads")?.as_array()?;
+            snapshot.get("projects")?.as_array()?;
+            if let Some(roots) = item.get("resolvedRepositoryIdentityRoots") {
+                let resolved_roots = roots
+                    .as_array()?
+                    .iter()
+                    .map(|root| root.as_str().map(str::to_string))
+                    .collect::<Option<Vec<_>>>()?;
+                return Some(ShellEvent::Enrichment {
+                    snapshot: snapshot.clone(),
+                    resolved_roots,
+                });
+            }
+            ShellEvent::Snapshot(snapshot.clone())
+        }
+        "synchronized" => ShellEvent::Synchronized,
+        "project.updated" => {
+            item.pointer("/project/id")?.as_str()?;
+            ShellEvent::ProjectUpserted {
+                sequence: sequence?,
+                project: item["project"].clone(),
+            }
+        }
+        "project.removed" => ShellEvent::ProjectRemoved {
+            sequence: sequence?,
+            project_id: item["projectId"].as_str()?.to_string(),
+        },
+        "thread.updated" => {
+            item.pointer("/thread/id")?.as_str()?;
+            ShellEvent::ThreadUpserted {
+                sequence: sequence?,
+                thread: item["thread"].clone(),
+            }
+        }
+        "thread.removed" => ShellEvent::ThreadRemoved {
+            sequence: sequence?,
+            thread_id: item["threadId"].as_str()?.to_string(),
+        },
+        _ => return None,
+    })
+}
+
+fn duplicate(sequence: Option<u64>, last: Option<u64>, snapshot: bool) -> bool {
+    sequence.zip(last).is_some_and(|(sequence, last)| {
+        if snapshot {
+            sequence < last
+        } else {
+            sequence <= last
+        }
+    })
 }
 
 /// Most threads followed at once. Each is one open subscription on the
@@ -346,6 +412,8 @@ impl T3StreamListener {
 struct WatchedThread {
     last_seq: Option<u64>,
     sub: Option<Subscription>,
+    rollback_runs: HashSet<String>,
+    generation: Option<String>,
 }
 
 struct ListenerTask {
@@ -369,6 +437,8 @@ impl ListenerTask {
         self.threads.entry(id.to_string()).or_insert(WatchedThread {
             last_seq: None,
             sub: None,
+            rollback_runs: HashSet::new(),
+            generation: None,
         });
         if self.threads.len() > MAX_WATCHED_THREADS {
             let oldest = self.order.pop_front()?;
@@ -389,6 +459,38 @@ impl ListenerTask {
             if self.cancel.is_cancelled() {
                 break;
             }
+            if self.client.is_v2() {
+                // Fresh HTTP control state per connection generation. Never
+                // reuse a cursor from a previous environment/connection.
+                self.shell_seq = None;
+                for watched in self.threads.values_mut() {
+                    watched.last_seq = None;
+                }
+                let snapshot = tokio::select! {_ = self.cancel.cancelled()=>break,result=self.client.shell_snapshot()=>result};
+                match snapshot {
+                    Ok(snapshot) => {
+                        let seq = snapshot.get("snapshotSequence").and_then(Value::as_u64);
+                        if seq.is_none()
+                            || snapshot.get("threads").and_then(Value::as_array).is_none()
+                        {
+                            break;
+                        }
+                        if self
+                            .events
+                            .send(T3StreamEvent::Shell(ShellEvent::Snapshot(snapshot)))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                        self.shell_seq = seq;
+                    }
+                    Err(_) => {
+                        tokio::select! {_ = self.cancel.cancelled()=>break,_=tokio::time::sleep(backoff)=>{}}
+                        continue;
+                    }
+                }
+            }
             let shell = tokio::select! {
                 _ = self.cancel.cancelled() => break,
                 result = self.client.subscribe_shell(self.shell_seq) => result,
@@ -402,6 +504,12 @@ impl ListenerTask {
                         Some(reason) => {
                             tracing::warn!(%reason, "t3 shell stream ended; resubscribing");
                             self.drop_thread_subscriptions();
+                            // Decode/loss recovery is a resync, not a replay
+                            // after an item we could not safely apply.
+                            self.shell_seq = None;
+                            for watched in self.threads.values_mut() {
+                                watched.last_seq = None;
+                            }
                             if self
                                 .events
                                 .send(T3StreamEvent::Disconnected { reason })
@@ -478,13 +586,21 @@ impl ListenerTask {
                 },
                 item = shell.next() => match item {
                     Some(StreamItem::Value(v)) => {
-                        if let Some(seq) = sequence_of(&v) {
-                            self.shell_seq = Some(seq);
-                        }
-                        if let Some(event) = parse_shell_item(&v) {
+                        let seq=sequence_of(&v);
+                        let event = if self.client.is_v2() {parse_v2_shell_item(&v)} else {parse_shell_item(&v)};
+                        let enrichment=matches!(event,Some(ShellEvent::Enrichment{..}));
+                        if !enrichment && duplicate(seq,self.shell_seq,v["kind"]=="snapshot") {continue;}
+                        if let Some(event) = event {
                             if self.events.send(T3StreamEvent::Shell(event)).await.is_err() {
                                 return None;
                             }
+                            if !enrichment {if let Some(seq)=seq {self.shell_seq=Some(seq);}}
+                        } else {
+                            let kind=v["kind"].as_str().unwrap_or("");
+                            let known=if self.client.is_v2(){matches!(kind,"snapshot"|"synchronized"|"project.updated"|"project.removed"|"thread.updated"|"thread.removed")}
+                                else {matches!(kind,"snapshot"|"synchronized"|"project-upserted"|"project-removed"|"thread-upserted"|"thread-removed")};
+                            if !known && seq.is_some() {self.shell_seq=seq;continue;}
+                            return Some("shell item decode failed".into());
                         }
                     }
                     Some(StreamItem::End(result)) => {
@@ -498,9 +614,15 @@ impl ListenerTask {
                 (thread_id, item) = any_thread => {
                     match item {
                         Some(StreamItem::Value(v)) => {
-                            if let Some(seq) = sequence_of(&v) {
-                                if let Some(w) = self.threads.get_mut(&thread_id) {
-                                    w.last_seq = Some(seq);
+                            let seq=sequence_of(&v);
+                            let last=self.threads.get(&thread_id).and_then(|w|w.last_seq);
+                            if duplicate(seq,last,v["kind"]=="snapshot") {continue;}
+                            if self.client.is_v2() {
+                                let cancel=self.cancel.clone();
+                                let result=tokio::select!{_=cancel.cancelled()=>return None,result=self.apply_v2_item(&thread_id,&v)=>result};
+                                match result {
+                                    Ok(())=>continue,
+                                    Err(error)=>return Some(error.to_string()),
                                 }
                             }
                             if let Some(event) = parse_thread_item(&v) {
@@ -508,9 +630,12 @@ impl ListenerTask {
                                 if self.events.send(T3StreamEvent::Thread { thread_id: thread_id.clone(), event }).await.is_err() {
                                     return None;
                                 }
+                                if let Some(seq)=seq {if let Some(w)=self.threads.get_mut(&thread_id) {w.last_seq=Some(seq);}}
                                 if deleted {
                                     self.forget(&thread_id);
                                 }
+                            } else {
+                                return Some("thread item decode failed".into());
                             }
                         }
                         Some(StreamItem::End(result)) => {
@@ -536,6 +661,72 @@ impl ListenerTask {
     }
 
     async fn open_thread(&mut self, id: &str) {
+        if self.client.is_v2() {
+            let generation = match self.client.timeline_generation(id).await {
+                Ok(generation) => generation,
+                Err(error) => {
+                    let _ = self
+                        .events
+                        .send(T3StreamEvent::Disconnected {
+                            reason: error.to_string(),
+                        })
+                        .await;
+                    return;
+                }
+            };
+            if let Some(watched) = self.threads.get_mut(id) {
+                if watched.generation.as_deref() != Some(&generation) {
+                    watched.rollback_runs.clear();
+                }
+                watched.generation = Some(generation.clone());
+            }
+            let snapshot = tokio::select! {_=self.cancel.cancelled()=>return,result=self.client.thread_snapshot(id,None)=>result};
+            match snapshot {
+                Ok(snapshot) => {
+                    let cancel = self.cancel.clone();
+                    let snapshot = tokio::select! {_=cancel.cancelled()=>return,result=self.complete_rollback_snapshot(id,snapshot)=>match result {Ok(snapshot)=>snapshot,Err(_)=>return}};
+                    let snapshot = match self
+                        .client
+                        .order_snapshot_in_generation(id, snapshot, &generation, true)
+                        .await
+                    {
+                        Ok(snapshot) => snapshot,
+                        Err(error) => {
+                            let _ = self
+                                .events
+                                .send(T3StreamEvent::Disconnected {
+                                    reason: error.to_string(),
+                                })
+                                .await;
+                            return;
+                        }
+                    };
+                    let seq = snapshot["snapshotSequence"].as_u64();
+                    if self
+                        .events
+                        .send(T3StreamEvent::Thread {
+                            thread_id: id.to_string(),
+                            event: ThreadEvent::V2Snapshot(snapshot),
+                        })
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    if let Some(w) = self.threads.get_mut(id) {
+                        w.last_seq = seq;
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(thread_id=%id,error=%error,"T3 V2 initial snapshot failed");
+                    // A read failed, so ask the stream for a fresh bounded
+                    // snapshot; never resume after an uninstalled cursor.
+                    if let Some(w) = self.threads.get_mut(id) {
+                        w.last_seq = None;
+                    }
+                }
+            }
+        }
         let last_seq = self.threads.get(id).and_then(|w| w.last_seq);
         match self.client.subscribe_thread(id, last_seq).await {
             Ok(sub) => {
@@ -556,11 +747,181 @@ impl ListenerTask {
             }
         }
     }
+
+    async fn apply_v2_item(
+        &mut self,
+        id: &str,
+        item: &Value,
+    ) -> Result<(), crate::agents::ports::agent::AgentError> {
+        use crate::agents::ports::agent::AgentError;
+        let generation = self
+            .threads
+            .get(id)
+            .and_then(|watched| watched.generation.clone())
+            .ok_or_else(|| AgentError::Protocol("V2 thread stream has no incarnation".into()))?;
+        let snapshot = match item["kind"].as_str() {
+            Some("synchronized") => return Ok(()),
+            Some("snapshot") => {
+                super::v2::projection::validate_snapshot(item, id)?;
+                item.clone()
+            }
+            Some("event") => {
+                let seq = item["sequence"]
+                    .as_u64()
+                    .ok_or_else(|| AgentError::Protocol("event without sequence".into()))?;
+                if !super::v2::projection::validate_event(item, id)? {
+                    if let Some(w) = self.threads.get_mut(id) {
+                        w.last_seq = Some(seq);
+                    }
+                    return Ok(());
+                }
+                if item.pointer("/event/type").and_then(Value::as_str) == Some("thread.deleted") {
+                    self.events
+                        .send(T3StreamEvent::Thread {
+                            thread_id: id.to_string(),
+                            event: ThreadEvent::Deleted { sequence: seq },
+                        })
+                        .await
+                        .map_err(|_| AgentError::Network("listener closed".into()))?;
+                    self.forget(id);
+                    return Ok(());
+                }
+                // Visible position is server-owned (forked/inherited rows need
+                // not follow local ordinals). Refresh rather than inventing
+                // positions or appending message.updated text as a delta.
+                let snapshot = self.client.thread_snapshot(id, None).await?;
+                if snapshot["snapshotSequence"]
+                    .as_u64()
+                    .is_none_or(|s| s < seq)
+                {
+                    return Err(AgentError::Protocol("snapshot behind live event".into()));
+                }
+                snapshot
+            }
+            _ => return Err(AgentError::Protocol("invalid V2 stream item".into())),
+        };
+        let snapshot = self.complete_rollback_snapshot(id, snapshot).await?;
+        let snapshot = self
+            .client
+            .order_snapshot_in_generation(id, snapshot, &generation, true)
+            .await?;
+        let sequence = snapshot["snapshotSequence"].as_u64();
+        self.events
+            .send(T3StreamEvent::Thread {
+                thread_id: id.to_string(),
+                event: ThreadEvent::V2Snapshot(snapshot),
+            })
+            .await
+            .map_err(|_| AgentError::Network("listener closed".into()))?;
+        if let Some(w) = self.threads.get_mut(id) {
+            w.last_seq = sequence;
+        }
+        Ok(())
+    }
+
+    async fn complete_rollback_snapshot(
+        &mut self,
+        id: &str,
+        mut snapshot: Value,
+    ) -> Result<Value, crate::agents::ports::agent::AgentError> {
+        let rolled_back: HashSet<String> =
+            super::v2::projection::rows(&snapshot["projection"], "runs")
+                .iter()
+                .filter(|run| run["status"] == "rolled_back")
+                .filter_map(|run| run["id"].as_str().map(str::to_string))
+                .collect();
+        let new_rollback = self.threads.get(id).is_some_and(|watched| {
+            rolled_back
+                .iter()
+                .any(|run| !watched.rollback_runs.contains(run))
+        });
+        if new_rollback && snapshot["hasMoreHistory"] == true {
+            let prior = snapshot["snapshotSequence"].as_u64().unwrap_or(0);
+            snapshot = self.client.timeline_snapshot(id, 0).await?;
+            if snapshot["snapshotSequence"]
+                .as_u64()
+                .is_none_or(|sequence| sequence < prior)
+            {
+                return Err(crate::agents::ports::agent::AgentError::Protocol(
+                    "rollback snapshot behind live control state".into(),
+                ));
+            }
+        }
+        if let Some(watched) = self.threads.get_mut(id) {
+            watched.rollback_runs = rolled_back;
+        }
+        Ok(snapshot)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn stale_complete_projection_cannot_advance_a_thread_cursor() {
+        let client = Arc::new(T3Client::new(super::super::T3Endpoint::new(
+            "http://127.0.0.1:9",
+            super::super::T3Credential::None,
+        )));
+        let snapshot = |ids: &[&str], sequence: u64, complete: bool| {
+            let mut value: Value =
+                serde_json::from_str(include_str!("fixtures/v2/projection.json")).unwrap();
+            value["snapshotSequence"] = serde_json::json!(sequence);
+            value["hasMoreHistory"] = serde_json::json!(!complete);
+            let sample = value["projection"]["visibleTurnItems"][0].clone();
+            value["projection"]["visibleTurnItems"] = Value::Array(
+                ids.iter()
+                    .enumerate()
+                    .map(|(position, id)| {
+                        let mut row = sample.clone();
+                        row["position"] = serde_json::json!(position);
+                        row["sourceThreadId"] = serde_json::json!("thread");
+                        row["sourceItemId"] = serde_json::json!(id);
+                        row["item"]["id"] = serde_json::json!(id);
+                        row
+                    })
+                    .collect(),
+            );
+            value
+        };
+        let generation = client.timeline_generation("thread").await.unwrap();
+        for value in [
+            snapshot(&["A", "B"], 10, false),
+            snapshot(&["A"], 20, true),
+            snapshot(&["A", "C"], 21, false),
+        ] {
+            client
+                .order_snapshot_in_generation("thread", value, &generation, true)
+                .await
+                .unwrap();
+        }
+        let (_control_tx, control_rx) = mpsc::channel(1);
+        let (events, mut received) = mpsc::channel(8);
+        let mut task = ListenerTask {
+            client: client.clone(),
+            cancel: CancellationToken::new(),
+            control_rx,
+            events,
+            shell_seq: Some(21),
+            threads: HashMap::new(),
+            order: VecDeque::new(),
+        };
+        task.remember("thread");
+        let watched = task.threads.get_mut("thread").unwrap();
+        watched.last_seq = Some(21);
+        watched.generation = Some(generation);
+        let mut stale = snapshot(&["A", "B"], 10, true);
+        stale["kind"] = serde_json::json!("snapshot");
+        assert!(task.apply_v2_item("thread", &stale).await.is_err());
+        assert_eq!(task.threads["thread"].last_seq, Some(21));
+        assert_eq!(task.shell_seq, Some(21));
+        assert!(
+            received.try_recv().is_err(),
+            "no stale control projection may be forwarded"
+        );
+        client.shutdown();
+    }
 
     /// The thread items captured during the approval probe, in order.
     fn captured_thread_items() -> Vec<Value> {

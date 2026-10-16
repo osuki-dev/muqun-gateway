@@ -17,6 +17,7 @@ pub(super) const VI: &[(&str, &str)] = &[
     // -- push notifications --------------------------------------------------
     ("Agent", "Tác tử"),
     ("Approval needed", "Cần chấp thuận"),
+    ("Needs your input", "Cần bạn trả lời"),
     ("Agent blocked", "Tác tử đang chờ"),
     ("Agent done", "Tác tử đã xong"),
     ("{name} is waiting for your approval.", "{name} đang chờ bạn chấp thuận."),
@@ -27,6 +28,10 @@ pub(super) const VI: &[(&str, &str)] = &[
     ("Expo push service request failed", "yêu cầu tới dịch vụ thông báo đẩy của Expo thất bại"),
     ("Herdr did not return the created pane id", "Herdr không trả về id của ngăn vừa tạo"),
     ("Herdr is unavailable", "không kết nối được với Herdr"),
+    ("No terminal pane belongs to the calling process", "Không có pane terminal nào thuộc về tiến trình đang gọi"),
+    ("Task not found", "Không tìm thấy tác vụ"),
+    ("Token expired", "Token đã hết hạn"),
+    ("Token not found", "Không tìm thấy token"),
     (
         "agent is not one this gateway offers; see GET /api/agents/catalog",
         "agent không nằm trong số tác tử mà gateway này cung cấp; xem GET /api/agents/catalog",
@@ -85,6 +90,11 @@ pub(super) const VI: &[(&str, &str)] = &[
     ("invalid Authorization header", "header Authorization không hợp lệ"),
     ("invalid pairing code", "mã ghép nối không hợp lệ"),
     ("invalid token", "token không hợp lệ"),
+    (
+        "the MCP endpoint answers only local callers on this machine",
+        "endpoint MCP chỉ trả lời các lời gọi cục bộ trên máy này",
+    ),
+    ("the assistant token store is unavailable", "kho token của trợ lý không khả dụng"),
     ("keys must contain 1 to 32 entries", "keys phải chứa từ 1 đến 32 mục"),
     ("missing Authorization header", "thiếu header Authorization"),
     ("mode must be on, off, or toggle", "mode phải là on, off hoặc toggle"),
@@ -130,6 +140,7 @@ pub(super) const VI: &[(&str, &str)] = &[
     ("the file field must carry a filename", "trường file phải kèm tên tệp"),
     ("the pane is not waiting on an approval", "ngăn này không đang chờ chấp thuận"),
     ("the pane is waiting on a different approval", "ngăn này đang chờ một chấp thuận khác"),
+    ("the task request failed", "yêu cầu tác vụ thất bại"),
     ("the upload must be at most 25 MiB", "tệp tải lên tối đa 25 MiB"),
     (
         "this approval has no option with that number",
@@ -166,4 +177,53 @@ pub(super) const VI: &[(&str, &str)] = &[
         "branch_name không được có đoạn đường dẫn trống hoặc đoạn bắt đầu hay kết thúc bằng dấu chấm",
     ),
     ("branch_name must not end with .lock", "branch_name không được kết thúc bằng .lock"),
+    // -- tasks, lazygit and assets ------------------------------------------
+    (
+        "No terminal session is reachable on this computer",
+        "Không có phiên terminal nào truy cập được trên máy tính này",
+    ),
+    (
+        "That agent is not available",
+        "Tác tử đó không khả dụng",
+    ),
+    (
+        "Only a paused or waiting task opened on a device can be confirmed",
+        "Chỉ có thể xác nhận tác vụ đang tạm dừng hoặc đang chờ được mở từ thiết bị",
+    ),
+    (
+        "the agent could not start the task",
+        "tác tử không thể bắt đầu tác vụ",
+    ),
+    (
+        "label must be at most 200 characters",
+        "label tối đa 200 ký tự",
+    ),
+    (
+        "goal must be non-empty and at most 32 KiB",
+        "goal không được để trống và tối đa 32 KiB",
+    ),
+    (
+        "summary must be at most 32 KiB",
+        "summary tối đa 32 KiB",
+    ),
+    (
+        "Unknown model for that agent. Use a model id from its catalog, or <provider_id>/<model_id>.",
+        "Tác tử đó không có model này. Hãy dùng id model trong danh mục của nó, hoặc <provider_id>/<model_id>.",
+    ),
+    (
+        "Unknown variant '{variant}' (the model offers: {offered}).",
+        "variant '{variant}' không hợp lệ (model này có: {offered}).",
+    ),
+    (
+        "Install lazygit on the Gateway host",
+        "Hãy cài lazygit trên máy chủ Gateway",
+    ),
+    (
+        "The source pane is not in an accessible Git repository",
+        "Pane nguồn không nằm trong kho Git có thể truy cập",
+    ),
+    (
+        "the asset exceeds its content size limit",
+        "tệp vượt quá giới hạn kích thước nội dung",
+    ),
 ];

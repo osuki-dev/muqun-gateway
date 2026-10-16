@@ -6,34 +6,70 @@ use std::process::{Command as ProcessCommand, Stdio};
 use anyhow::Context as _;
 use base64::Engine as _;
 
+pub(crate) mod db_key;
+pub(crate) mod sqlite;
+
 use super::manage::{revoke_managed_device, truncate};
 use super::state_lock;
 use crate::authority::DeviceRecord;
 use crate::{
     transport, Config, PairingFile, PushTokenRecord, CONFIG_FILE, DEVICES_BACKUP_FILE,
-    DEVICES_FILE, HERDR_PLUGIN_IMPORT_MARKER, MAX_DEVICE_NAME_CHARS, PAIRING_CODE_CHARACTER_COUNT,
-    PAIRING_FILE, PID_FILE, PUSH_TOKENS_FILE,
+    DEVICES_FILE, MAX_DEVICE_NAME_CHARS, PAIRING_CODE_CHARACTER_COUNT, PAIRING_FILE, PID_FILE,
+    PUSH_TOKENS_FILE,
 };
 
-pub(crate) fn load_config(config_path: Option<String>) -> anyhow::Result<Config> {
+/// The config file `run` reads: the `--config` path when given, else the
+/// standard one.
+pub(crate) fn config_file_path(config_path: Option<&str>) -> anyhow::Result<PathBuf> {
     // Resolved lazily on purpose: `config_dir` consults the rename migration,
     // which loads the pre-rename config by explicit path. An eagerly evaluated
     // default would recurse between the two until the stack ran out.
-    let path = match config_path {
+    Ok(match config_path {
         Some(path) => PathBuf::from(path),
         None => config_dir()?.join(CONFIG_FILE),
-    };
+    })
+}
+
+pub(crate) fn load_config(config_path: Option<String>) -> anyhow::Result<Config> {
+    let path = config_file_path(config_path.as_deref())?;
     let bytes = std::fs::read(&path)
         .with_context(|| format!("failed to read config {}", path.display()))?;
     Ok(serde_json::from_slice(&bytes)?)
 }
 
+/// A config directory named on the command line (`mcp token-helper
+/// --config-dir`), which outranks the environment: a host may run the helper
+/// with a stripped environment.
+static CONFIG_DIR_OVERRIDE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Make [`config_dir`] answer `dir` for the rest of this process.
+pub(crate) fn override_config_dir(dir: PathBuf) {
+    let _ = CONFIG_DIR_OVERRIDE.set(dir);
+}
+
+/// The test binary's config directory, beside its state directory: the
+/// pairing routes read and rotate `pairing.json` through `config_dir`, and a
+/// test must never do that to the gateway installed for the current user.
+#[cfg(test)]
 pub(crate) fn config_dir() -> anyhow::Result<std::path::PathBuf> {
+    if let Some(path) = CONFIG_DIR_OVERRIDE.get() {
+        return Ok(path.clone());
+    }
+    let dir = test_state_dir().join("config");
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+#[cfg(not(test))]
+pub(crate) fn config_dir() -> anyhow::Result<std::path::PathBuf> {
+    if let Some(path) = CONFIG_DIR_OVERRIDE.get() {
+        return Ok(path.clone());
+    }
     if let Some(path) = std::env::var_os("MUQUN_GATEWAY_CONFIG_DIR") {
         return Ok(path.into());
     }
     let standalone = standalone_config_dir()?;
-    if !standalone.join(HERDR_PLUGIN_IMPORT_MARKER).exists() {
+    if !standalone.join(crate::HERDR_PLUGIN_IMPORT_MARKER).exists() {
         if let Ok(path) = std::env::var("HERDR_PLUGIN_CONFIG_DIR") {
             return Ok(path.into());
         }
@@ -91,7 +127,10 @@ pub(crate) fn state_dir() -> anyhow::Result<std::path::PathBuf> {
         return Ok(path.into());
     }
     let standalone_config = standalone_config_dir()?;
-    if !standalone_config.join(HERDR_PLUGIN_IMPORT_MARKER).exists() {
+    if !standalone_config
+        .join(crate::HERDR_PLUGIN_IMPORT_MARKER)
+        .exists()
+    {
         if let Ok(path) = std::env::var("HERDR_PLUGIN_STATE_DIR") {
             return Ok(path.into());
         }
@@ -272,6 +311,19 @@ pub(crate) fn write_devices(devices: &[DeviceRecord]) -> anyhow::Result<()> {
     write_devices_at(&dir, devices)
 }
 
+/// Publish a membership change only after its durable write succeeds. The
+/// caller keeps the device lock throughout, serializing push admission and
+/// registrations with revoke, install replacement and capacity eviction.
+pub(crate) fn persist_devices_before_publish(
+    current: &mut Vec<DeviceRecord>,
+    proposed: Vec<DeviceRecord>,
+    persist: impl FnOnce(&[DeviceRecord]) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    persist(&proposed)?;
+    *current = proposed;
+    Ok(())
+}
+
 /// Persist the device list, keeping the generation it replaces beside it.
 ///
 /// The backup is what turns a bad list into an inconvenience instead of a
@@ -300,7 +352,7 @@ pub(crate) fn list_devices() -> anyhow::Result<()> {
         println!(
             "{}  {}  paired {}  last seen {}",
             device.id,
-            truncate(&device.name, 32),
+            truncate(&device.listed_name(), 42),
             format_unix_ms(device.paired_unix_ms),
             format_unix_ms(device.last_seen_unix_ms)
         );
@@ -346,6 +398,8 @@ pub(crate) fn revoke_device_by_id(device_id: &str) -> anyhow::Result<bool> {
 }
 
 pub(crate) fn revoke_device_at(dir: &std::path::Path, device_id: &str) -> anyhow::Result<bool> {
+    // Stale push records deliberately remain on disk. Startup/send admission
+    // checks authoritative membership; push-file cleanup cannot undo a revoke.
     let removed = update_devices_at(dir, |devices| {
         let previous_len = devices.len();
         devices.retain(|device| device.id != device_id);
@@ -641,6 +695,33 @@ pub(crate) fn lock_down_secret_dir(dir: &std::path::Path) {
 #[cfg(not(unix))]
 pub(crate) fn lock_down_secret_dir(_dir: &std::path::Path) {}
 
+/// The directory under the state directory that holds the shared SQLite store.
+pub(crate) const STORE_DIR: &str = "store";
+
+pub(crate) fn store_db_path(state: &std::path::Path) -> PathBuf {
+    state.join(STORE_DIR).join("gateway.sqlite3")
+}
+
+/// Create `dir` (and its parents) and make sure only the owner can list it.
+pub(crate) fn ensure_secret_dir(dir: &std::path::Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
+    lock_down_secret_dir(dir);
+    Ok(())
+}
+
+/// Make a secret file readable by its owner only.
+#[cfg(unix)]
+pub(crate) fn lock_down_secret_file(path: &std::path::Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("cannot restrict {}", path.display()))
+}
+
+#[cfg(not(unix))]
+pub(crate) fn lock_down_secret_file(_path: &std::path::Path) -> anyhow::Result<()> {
+    Ok(())
+}
+
 /// Replace a secret file's contents in one step, never leaving it short.
 ///
 /// Truncating the real file and writing into it is what loses pairings. It
@@ -798,6 +879,26 @@ pub(crate) fn hostname_label() -> String {
     "Server".into()
 }
 
+/// Read the config file at `path`, change it, and write it back, one writer
+/// at a time: a running gateway changes its label (`PATCH /api/meta`) and its
+/// accept switch (`PUT /api/fleet/settings`) this way, and neither may lose
+/// the other's write. Written through `Config`, so the file keeps its order.
+pub(crate) fn edit_config(
+    path: &std::path::Path,
+    edit: impl FnOnce(&mut Config),
+) -> anyhow::Result<()> {
+    static WRITER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _writer = WRITER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let bytes =
+        std::fs::read(path).with_context(|| format!("failed to read config {}", path.display()))?;
+    let mut config: Config = serde_json::from_slice(&bytes)?;
+    edit(&mut config);
+    write_secret_file(path, &serde_json::to_vec_pretty(&config)?)
+        .with_context(|| format!("failed to write config {}", path.display()))
+}
+
 /// Persist a new display label into the config (and the pairing payload), so a
 /// name set from the app shows up in push notifications. Mirrors
 /// `update_public_url`.
@@ -809,11 +910,9 @@ pub(crate) fn update_server_label(label: &str) -> anyhow::Result<String> {
             && !label.chars().any(char::is_control),
         "label must be non-empty, at most {MAX_DEVICE_NAME_CHARS} characters, and free of control characters"
     );
-    let config_path = config_dir()?.join(CONFIG_FILE);
-    let mut config = load_config(None)?;
-    config.label = label.to_string();
-    write_secret_file(&config_path, &serde_json::to_vec_pretty(&config)?)
-        .with_context(|| format!("failed to write config {}", config_path.display()))?;
+    edit_config(&config_dir()?.join(CONFIG_FILE), |config| {
+        config.label = label.to_string();
+    })?;
 
     if let Ok(mut pairing) = read_pairing_file() {
         pairing.payload.label = label.to_string();
@@ -932,6 +1031,50 @@ pub(crate) fn now_unix_ms() -> u128 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis())
         .unwrap_or_default()
+}
+
+/// A JSON object from a host's MCP config file, `None` when the file is absent.
+/// A file that exists but is not a JSON object is an error, never overwritten.
+pub(crate) fn read_json_object_at(
+    path: &std::path::Path,
+) -> anyhow::Result<Option<serde_json::Map<String, serde_json::Value>>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let bytes =
+        std::fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    match serde_json::from_slice(&bytes)
+        .with_context(|| format!("{} is not valid JSON; left untouched", path.display()))?
+    {
+        serde_json::Value::Object(map) => Ok(Some(map)),
+        _ => anyhow::bail!("{} is not a JSON object; left untouched", path.display()),
+    }
+}
+
+/// Replace a project's (non-secret) config file atomically: a complete
+/// temporary beside it, then a rename. It holds `${MUQUN_MCP_TOKEN}`-style
+/// references, never a token, so it keeps ordinary permissions.
+pub(crate) fn write_json_object_at(
+    path: &std::path::Path,
+    value: &serde_json::Map<String, serde_json::Value>,
+) -> anyhow::Result<()> {
+    let directory = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("config path has no file name")?;
+    let temporary = directory.join(format!(".{name}.tmp-{}", std::process::id()));
+    let mut bytes = serde_json::to_vec_pretty(value)?;
+    bytes.push(b'\n');
+    let result =
+        std::fs::write(&temporary, &bytes).and_then(|()| std::fs::rename(&temporary, path));
+    if let Err(error) = result {
+        std::fs::remove_file(&temporary).ok();
+        return Err(
+            anyhow::Error::new(error).context(format!("failed to write {}", path.display()))
+        );
+    }
+    Ok(())
 }
 
 pub(crate) fn write_config(path: &std::path::Path, config: &Config) -> anyhow::Result<()> {
@@ -1318,7 +1461,8 @@ mod tests {
     }
 
     /// A `push-tokens.json` written before the locale field existed still
-    /// loads, and the device it describes is notified in English.
+    /// loads with English rendering, but needs authenticated re-registration
+    /// before any notification can be sent.
     #[test]
     fn a_push_token_registered_before_locales_existed_still_loads() {
         let old: Vec<PushTokenRecord> = serde_json::from_str(
@@ -1327,6 +1471,7 @@ mod tests {
         )
         .expect("the field is optional, so an older file is still a valid one");
         assert_eq!(old[0].locale, None);
+        assert_eq!(old[0].device_id, None);
         assert_eq!(old[0].locale(), Locale::En);
 
         let current: Vec<PushTokenRecord> = serde_json::from_str(
@@ -1344,5 +1489,53 @@ mod tests {
         )
         .unwrap();
         assert_eq!(odd[0].locale(), Locale::En);
+    }
+
+    #[test]
+    fn failed_membership_persistence_keeps_the_published_generation() {
+        let original = vec![device_fixture("phone")];
+        for proposed in [vec![], vec![device_fixture("replacement")]] {
+            let mut current = original.clone();
+            assert!(persist_devices_before_publish(
+                &mut current,
+                proposed.clone(),
+                |_| anyhow::bail!("injected disk failure")
+            )
+            .is_err());
+            assert_eq!(current, original);
+            persist_devices_before_publish(&mut current, proposed.clone(), |saved| {
+                assert_eq!(saved, proposed);
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(current, proposed);
+        }
+    }
+
+    #[test]
+    fn offline_revoke_and_restart_ignore_stale_push_file_even_if_cleanup_would_fail() {
+        let dir = test_state_dir().join(format!("push-revoke-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        write_devices_at(&dir, &[device_fixture("phone")]).unwrap();
+        let stale = r#"[{"token":"ExpoPushToken[stale]","device_id":"phone","platform":"ios","updated_unix_ms":1}]"#;
+        std::fs::write(dir.join(PUSH_TOKENS_FILE), stale).unwrap();
+        assert!(revoke_device_at(&dir, "phone").unwrap());
+        assert_eq!(
+            std::fs::read_to_string(dir.join(PUSH_TOKENS_FILE)).unwrap(),
+            stale
+        );
+        let restarted = test_state("admin", read_devices_at(&dir.join(DEVICES_FILE)).unwrap());
+        *restarted.push_tokens.lock().unwrap() = serde_json::from_str(stale).unwrap();
+        assert!(crate::connectivity::push::registered_recipients(&restarted)
+            .unwrap()
+            .is_empty());
+
+        // A path that cannot be a push file must not affect device revocation.
+        std::fs::remove_file(dir.join(PUSH_TOKENS_FILE)).unwrap();
+        std::fs::create_dir(dir.join(PUSH_TOKENS_FILE)).unwrap();
+        write_devices_at(&dir, &[device_fixture("tablet")]).unwrap();
+        assert!(revoke_device_at(&dir, "tablet").unwrap());
+        assert!(read_devices_at(&dir.join(DEVICES_FILE)).unwrap().is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

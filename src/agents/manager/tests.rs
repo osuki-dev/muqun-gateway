@@ -1,9 +1,358 @@
 //! Event-dispatch tests. The frames are real ones, captured from a live
 //! OpenCode 2.0.1 session (`tests/fixtures/opencode-events/`).
 use super::*;
-use crate::agents::adapters::opencode::sse::OpencodeSseListener;
+use crate::agents::adapters::opencode::sse::{read_test_request, OpencodeSseListener};
 use crate::agents::domain::AgentPart;
 use crate::agents::ports::mirror::SessionMirrorPort;
+
+fn delta(session: &str, message: &str, kind: &str, ordinal: u64, text: &str) -> OpencodeRawEvent {
+    OpencodeRawEvent {
+        id: None,
+        created: None,
+        location: None,
+        event_type: format!("session.{kind}.delta"),
+        data: json!({"sessionID": session, "assistantMessageID": message, "ordinal": ordinal, "delta": text}),
+    }
+}
+
+#[test]
+fn delta_deadline_is_from_first_arrival_and_buffer_is_bounded() {
+    let start = tokio::time::Instant::now();
+    let mut coalescer = DeltaCoalescer::default();
+    assert!(coalescer
+        .push(delta("s", "m", "text", 0, "你"), start)
+        .is_none());
+    let second = delta("s", "m", "text", 0, "🙂");
+    assert!(coalescer.can_merge(&second));
+    assert!(coalescer
+        .push(second, start + std::time::Duration::from_millis(39))
+        .is_none());
+    assert_eq!(coalescer.deadline(), Some(start + DELTA_FLUSH_DELAY));
+    assert_eq!(coalescer.take().unwrap().data["delta"], "你🙂");
+
+    let full = "x".repeat(MAX_PENDING_DELTA_BYTES);
+    assert_eq!(
+        coalescer
+            .push(delta("s", "m", "text", 0, &full), start)
+            .unwrap()
+            .data["delta"],
+        full
+    );
+    assert!(coalescer.deadline().is_none());
+    coalescer.push(delta("s", "m", "text", 0, "x"), start);
+    assert!(!coalescer.can_merge(&delta("s", "m", "text", 0, &full)));
+}
+
+#[test]
+fn delta_runs_never_cross_identity_metadata_or_non_delta_boundaries() {
+    let raw = delta("s", "m", "text", 0, "first");
+    let mut coalescer = DeltaCoalescer::default();
+    coalescer.push(raw.clone(), tokio::time::Instant::now());
+    for different in [
+        delta("other", "m", "text", 0, "x"),
+        delta("s", "other", "text", 0, "x"),
+        delta("s", "m", "reasoning", 0, "x"),
+        delta("s", "m", "text", 1, "x"),
+    ] {
+        assert!(!coalescer.can_merge(&different));
+    }
+    let mut different = raw.clone();
+    different.data["metadata"] = json!({"something": "new"});
+    assert!(!coalescer.can_merge(&different));
+    different = raw.clone();
+    different.location = Some(json!({"directory":"other"}));
+    assert!(!coalescer.can_merge(&different));
+    for kind in [
+        "session.text.ended",
+        "session.reasoning.ended",
+        "session.idle",
+        "session.status",
+        "session.tool.input.started",
+        "form.created",
+        "permission.asked",
+        "session.deleted",
+        "gateway.stream.resync",
+    ] {
+        different = raw.clone();
+        different.event_type = kind.to_string();
+        assert!(!coalescer.can_merge(&different), "{kind}");
+    }
+    different = raw;
+    different.data.as_object_mut().unwrap().remove("sessionID");
+    assert!(!coalescer.can_merge(&different));
+}
+
+#[tokio::test]
+async fn pump_drains_and_final_flush_preserves_whole_rows_and_completion_markers() {
+    let markers = "\nMUQUN_TASK_DONE: 完成🙂\nMUQUN_TASK_BLOCKED: 等待";
+    let raws: Vec<_> = (0..1000)
+        .map(|_| delta("s", "m", "text", 0, &"x".repeat(32)))
+        .chain(std::iter::once(delta("s", "m", "text", 0, markers)))
+        .collect();
+    let baseline = ctx();
+    let mut baseline_rx = baseline.tx.subscribe();
+    let mut baseline_count = 0;
+    let mut baseline_bytes = 0;
+    for raw in &raws {
+        AgentManager::handle_raw_event(raw.clone(), &baseline).await;
+        if let AgentDomainEvent::TimelineUpsert { items, .. } = baseline_rx.recv().await.unwrap() {
+            baseline_count += 1;
+            if let AgentPart::Text { text } = &items[0].part {
+                baseline_bytes += text.len();
+            }
+        } else {
+            panic!("whole row required");
+        }
+    }
+    let coalesced = ctx();
+    let mut out = coalesced.tx.subscribe();
+    let (tx, rx) = broadcast::channel(2048);
+    for raw in raws {
+        tx.send(raw).unwrap();
+    }
+    drop(tx);
+    AgentManager::pump_events(rx, coalesced.clone()).await;
+    let mut count = 0;
+    let mut bytes = 0;
+    while let Ok(event) = out.try_recv() {
+        if let AgentDomainEvent::TimelineUpsert { items, .. } = event {
+            count += 1;
+            if let AgentPart::Text { text } = &items[0].part {
+                bytes += text.len();
+            }
+        } else {
+            panic!("whole row required");
+        }
+    }
+    assert_eq!(baseline_count, 1001);
+    assert_eq!(count, 4);
+    assert_eq!(baseline_bytes, 16_048_000 + markers.len());
+    assert_eq!(bytes, 81_152 + markers.len());
+    let before = baseline
+        .mirror
+        .get_snapshot(&AgentSessionId("s".into()))
+        .await
+        .unwrap();
+    let after = coalesced
+        .mirror
+        .get_snapshot(&AgentSessionId("s".into()))
+        .await
+        .unwrap();
+    assert_eq!(before.timeline[0].part, after.timeline[0].part);
+    assert_eq!(
+        after.timeline[0].part,
+        AgentPart::Text {
+            text: format!("{}{markers}", "x".repeat(32000))
+        }
+    );
+    eprintln!("deterministic whole-row work: {baseline_count} -> {count} emissions; {baseline_bytes} -> {bytes} prefix text bytes");
+}
+
+#[tokio::test]
+async fn pump_flushes_before_status_fulltext_and_lag_then_drains_close() {
+    let context = ctx();
+    let mut out = context.tx.subscribe();
+    let (tx, rx) = broadcast::channel(16);
+    tx.send(delta("s", "m", "text", 0, "before")).unwrap();
+    let mut status = delta("s", "m", "text", 0, "ignored");
+    status.event_type = "session.idle".into();
+    tx.send(status).unwrap();
+    tx.send(delta("s", "m", "text", 0, " plus")).unwrap();
+    let mut fulltext = delta("s", "m", "text", 0, "unused");
+    fulltext.event_type = "session.text.ended".into();
+    fulltext.data["text"] = json!("authoritative 完成🙂");
+    tx.send(fulltext).unwrap();
+    drop(tx);
+    AgentManager::pump_events(rx, context.clone()).await;
+    for expected in ["before", "status", "before plus", "authoritative 完成🙂"] {
+        let event = out.recv().await.unwrap();
+        if expected == "status" {
+            assert!(matches!(event, AgentDomainEvent::StatusChanged { .. }));
+        } else if let AgentDomainEvent::TimelineUpsert { items, .. } = event {
+            assert_eq!(
+                items[0].part,
+                AgentPart::Text {
+                    text: expected.into()
+                }
+            );
+        } else {
+            panic!("expected text row");
+        }
+    }
+    // An overflow is a boundary even when all retained frames are deltas.
+    let (tx, rx) = broadcast::channel(2);
+    for _ in 0..4 {
+        tx.send(delta("s", "m2", "text", 0, "x")).unwrap();
+    }
+    drop(tx);
+    AgentManager::pump_events(rx, context).await;
+    assert!(matches!(
+        out.recv().await.unwrap(),
+        AgentDomainEvent::Resync { .. }
+    ));
+    assert!(matches!(
+        out.recv().await.unwrap(),
+        AgentDomainEvent::TimelineUpsert { .. }
+    ));
+}
+
+#[tokio::test]
+async fn idle_pump_cancellation_releases_context_and_drops_queued_events() {
+    let context = ctx();
+    let weak = Arc::downgrade(&context);
+    let cancel = context.cancel.clone();
+    let mut out = context.tx.subscribe();
+    let (tx, rx) = broadcast::channel(16);
+    let pump = tokio::spawn(AgentManager::pump_events(rx, context));
+    tokio::task::yield_now().await;
+    cancel.cancel();
+    tx.send(delta("s", "m", "text", 0, "stale")).ok();
+    tokio::time::timeout(std::time::Duration::from_millis(200), pump)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(weak.upgrade().is_none());
+    assert!(out.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn pump_flush_timer_runs_without_more_upstream_events() {
+    let context = ctx();
+    let mut out = context.tx.subscribe();
+    let (tx, rx) = broadcast::channel(16);
+    let pump = tokio::spawn(AgentManager::pump_events(rx, context.clone()));
+    tx.send(delta("s", "m", "reasoning", 0, "思考🙂")).unwrap();
+    let event = tokio::time::timeout(std::time::Duration::from_millis(200), out.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let AgentDomainEvent::TimelineUpsert { items, .. } = event else {
+        panic!("whole row")
+    };
+    assert_eq!(
+        items[0].part,
+        AgentPart::Reasoning {
+            text: "思考🙂".into(),
+            duration_ms: None
+        }
+    );
+    context.cancel.cancel();
+    pump.await.unwrap();
+}
+
+#[tokio::test]
+async fn cancellation_discards_pending_delta_and_interrupts_inflight_hydration() {
+    let context = ctx();
+    let mut out = context.tx.subscribe();
+    let (tx, rx) = broadcast::channel(16);
+    let pump = tokio::spawn(AgentManager::pump_events(rx, context.clone()));
+    tx.send(delta("s", "m", "text", 0, "must not emit after stop"))
+        .unwrap();
+    // The local first-delta window has begun, but has not elapsed.
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    context.cancel.cancel();
+    pump.await.unwrap();
+    assert!(out.try_recv().is_err());
+
+    use tokio::io::AsyncReadExt;
+    let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", tcp.local_addr().unwrap());
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = tcp.accept().await.unwrap();
+        read_test_request(&mut socket).await;
+        ready_tx.send(()).unwrap();
+        let mut byte = [0];
+        assert_eq!(socket.read(&mut byte).await.unwrap(), 0);
+    });
+    let (events_tx, mut events_rx) = broadcast::channel(16);
+    let driver = Arc::new(OpencodeDriver::new(OpencodeEndpoint {
+        url,
+        password: None,
+        version: None,
+        pid: None,
+    }));
+    let context = Arc::new(EventContext::new(
+        driver,
+        Arc::new(MemoryMirror::new()),
+        events_tx,
+    ));
+    let weak = Arc::downgrade(&context);
+    let cancel = context.cancel.clone();
+    let (tx, rx) = broadcast::channel(16);
+    let pump = tokio::spawn(AgentManager::pump_events(rx, context));
+    let mut start = delta("s", "m", "text", 0, "unused");
+    start.event_type = "session.execution.started".into();
+    tx.send(start).unwrap();
+    ready_rx.await.unwrap();
+    cancel.cancel();
+    tokio::time::timeout(std::time::Duration::from_millis(200), pump)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(weak.upgrade().is_none());
+    assert!(events_rx.try_recv().is_err());
+    tokio::time::timeout(std::time::Duration::from_secs(1), server)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn repeated_http_manager_replacement_releases_mirrors_and_reattaches() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", tcp.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        for _ in 0..5 {
+            let (mut socket, _) = tcp.accept().await.unwrap();
+            read_test_request(&mut socket).await;
+            let payload = format!(
+                "data: {}\n\n",
+                serde_json::to_string(&delta("s", "m", "text", 0, "reattached🙂")).unwrap()
+            );
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n").await.unwrap();
+            socket
+                .write_all(format!("{:x}\r\n{payload}\r\n", payload.len()).as_bytes())
+                .await
+                .unwrap();
+            let mut byte = [0];
+            assert_eq!(socket.read(&mut byte).await.unwrap(), 0);
+        }
+    });
+    let (tx, mut out) = broadcast::channel(32);
+    for _ in 0..5 {
+        let manager = AgentManager::connect(
+            OpencodeEndpoint {
+                url: url.clone(),
+                password: None,
+                version: None,
+                pid: None,
+            },
+            tx.clone(),
+        );
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), out.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(event, AgentDomainEvent::TimelineUpsert { .. }));
+        let weak = Arc::downgrade(manager.mirror());
+        manager.shutdown();
+        drop(manager);
+        tokio::time::timeout(std::time::Duration::from_millis(200), async {
+            while weak.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("replacement releases old mirror");
+        assert!(out.try_recv().is_err());
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(2), server)
+        .await
+        .unwrap()
+        .unwrap();
+}
 
 fn ctx() -> Arc<EventContext> {
     // The driver points at a port nothing is listening on: every test here is
@@ -132,6 +481,63 @@ async fn a_rename_updates_the_title_in_place() {
 }
 
 #[tokio::test]
+async fn step_usage_never_replaces_cumulative_session_usage() {
+    let ctx = ctx();
+    replay(&ctx, "session-lifecycle.sse").await;
+    let asid = AgentSessionId("ses_f5112fddafferdTlgNjwonf8Au".to_string());
+    let mut rx = ctx.tx.subscribe();
+
+    let cumulative = serde_json::json!({
+        "sessionID": asid.0,
+        "cost": 2.5,
+        "tokens": {
+            "input": 1000, "output": 200, "reasoning": 100,
+            "cache": { "read": 9000, "write": 500 }
+        }
+    });
+    let dispatch = |event_type: &str, data: Value| OpencodeRawEvent {
+        id: None,
+        event_type: event_type.to_string(),
+        created: None,
+        location: None,
+        data,
+    };
+    AgentManager::handle_raw_event(dispatch("session.usage.updated", cumulative.clone()), &ctx)
+        .await;
+    let expected = ctx.mirror.session_info(&asid).await.unwrap();
+
+    let step = serde_json::json!({
+        "sessionID": asid.0,
+        "cost": 0.1,
+        "tokens": {
+            "input": 10, "output": 20, "reasoning": 5,
+            "cache": { "read": 90, "write": 0 }
+        }
+    });
+    for _ in 0..2 {
+        AgentManager::handle_raw_event(dispatch("session.step.ended", step.clone()), &ctx).await;
+        let info = ctx.mirror.session_info(&asid).await.unwrap();
+        assert_eq!(info.tokens, expected.tokens);
+        assert_eq!(info.cost, expected.cost);
+    }
+
+    // Cumulative snapshots can also be replayed; they replace rather than add.
+    AgentManager::handle_raw_event(dispatch("session.usage.updated", cumulative), &ctx).await;
+    let info = ctx.mirror.session_info(&asid).await.unwrap();
+    assert_eq!(info.tokens, expected.tokens);
+    assert_eq!(info.cost, expected.cost);
+    let mut updates = 0;
+    while let Ok(event) = rx.try_recv() {
+        if let AgentDomainEvent::SessionUpdated { info, .. } = event {
+            updates += 1;
+            assert_eq!(info.tokens, expected.tokens);
+            assert_eq!(info.cost, expected.cost);
+        }
+    }
+    assert_eq!(updates, 2, "only cumulative usage is published to the app");
+}
+
+#[tokio::test]
 async fn a_failed_run_carries_the_error_to_the_client() {
     let ctx = ctx();
     let mut rx = ctx.tx.subscribe();
@@ -203,7 +609,17 @@ async fn compaction_is_forwarded_as_its_own_event() {
 
 #[tokio::test]
 async fn inbox_events_publish_the_whole_queue() {
-    let ctx = ctx();
+    use axum::{routing::get, Json, Router};
+    let (ctx, server) = upstream_context(Router::new().route(
+        "/api/session/ses_f511626fdffe0ncuGo6c1jS5Yk/message/msg_0aee9f378001y9wbp0QWYBAhkE",
+        get(|| async {
+            Json(json!({"data": {
+                "id": "msg_0aee9f378001y9wbp0QWYBAhkE", "type": "user",
+                "text": "A delivered input.", "time": {"created": 100}
+            }}))
+        }),
+    ))
+    .await;
     let mut rx = ctx.tx.subscribe();
     replay(&ctx, "inbox.sse").await;
 
@@ -218,6 +634,526 @@ async fn inbox_events_publish_the_whole_queue() {
         items.is_empty(),
         "the delivered item leaves the queue, got {items:?}"
     );
+    server.abort();
+}
+
+fn session_event(event_type: &str, data: Value) -> OpencodeRawEvent {
+    OpencodeRawEvent {
+        id: None,
+        created: None,
+        location: None,
+        event_type: event_type.to_string(),
+        data,
+    }
+}
+
+async fn upstream_context(app: axum::Router) -> (Arc<EventContext>, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let driver = Arc::new(OpencodeDriver::new(OpencodeEndpoint {
+        url: format!("http://{}", listener.local_addr().unwrap()),
+        password: None,
+        version: Some("2.0.27".into()),
+        pid: None,
+    }));
+    let (tx, _) = broadcast::channel(256);
+    let ctx = Arc::new(EventContext::new(driver, Arc::new(MemoryMirror::new()), tx));
+    let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (ctx, task)
+}
+
+#[tokio::test]
+async fn delivered_user_enters_timeline_without_blocking_assistant_or_waiting_for_run_end() {
+    use axum::{routing::get, Json, Router};
+    let started = Arc::new(tokio::sync::Semaphore::new(0));
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let native = json!({"id": "msg-10", "type": "user", "text": "Continue in parallel.",
+        "files": [], "time": {"created": 100}});
+    let response = native.clone();
+    let (started_http, release_http) = (started.clone(), release.clone());
+    let (ctx, server) = upstream_context(Router::new().route(
+        "/api/session/ses-delivered/message/msg-10",
+        get(move || {
+            let (started, release, response) =
+                (started_http.clone(), release_http.clone(), response.clone());
+            async move {
+                started.add_permits(1);
+                let _permit = release.acquire().await.unwrap();
+                Json(json!({"data": response}))
+            }
+        }),
+    ))
+    .await;
+    let asid = AgentSessionId("ses-delivered".into());
+    let mut out = ctx.tx.subscribe();
+    let (tx, rx) = broadcast::channel(16);
+    let pump = tokio::spawn(AgentManager::pump_events(rx, ctx.clone()));
+    tx.send(session_event(
+        "session.inbox.enqueued",
+        json!({
+            "sessionID": asid.0, "inboxID": "msg-10", "item": {
+                "type": "user", "delivery": "steer", "payload": {"text": "Continue in parallel."}
+            }
+        }),
+    ))
+    .unwrap();
+    let delivered = session_event(
+        "session.inbox.delivered",
+        json!({
+            "sessionID": asid.0, "inboxID": "msg-10"
+        }),
+    );
+    tx.send(delivered.clone()).unwrap();
+    tx.send(delta(&asid.0, "msg-11", "text", 0, "Working."))
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if let AgentDomainEvent::TimelineUpsert { items, .. } = out.recv().await.unwrap() {
+                assert_eq!(items[0].role, TimelineRole::Assistant);
+                break;
+            }
+        }
+        let _started = started.acquire().await.unwrap();
+    })
+    .await
+    .expect("a pending delivered-message GET must not block assistant events");
+    assert_eq!(
+        ctx.mirror.inbox(&asid).await.len(),
+        1,
+        "retain the receipt until its row exists"
+    );
+    release.add_permits(1);
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if let AgentDomainEvent::TimelineUpsert { items, .. } = out.recv().await.unwrap() {
+                if items[0].role == TimelineRole::User {
+                    assert_eq!(items[0].id, "msg-10:t0");
+                    assert_eq!(
+                        items[0].part,
+                        AgentPart::Text {
+                            text: "Continue in parallel.".into()
+                        }
+                    );
+                    break;
+                }
+            }
+        }
+        let AgentDomainEvent::InboxChanged { items, .. } = out.recv().await.unwrap() else {
+            panic!("the queue receipt leaves only after the canonical row is published");
+        };
+        assert!(items.is_empty());
+    })
+    .await
+    .unwrap();
+    // A repeated delivery and later canonical readback address the same native row.
+    AgentManager::handle_raw_event(delivered, &ctx).await;
+    ctx.mirror
+        .upsert_timeline_items(&asid, mapper::map_message(&native, &asid))
+        .await;
+    let snapshot = ctx.mirror.get_snapshot(&asid).await.unwrap();
+    assert_eq!(snapshot.timeline.len(), 2);
+    assert_eq!(snapshot.timeline[0].role, TimelineRole::User);
+    assert_eq!(snapshot.timeline[1].role, TimelineRole::Assistant);
+    ctx.cancel.cancel();
+    pump.await.unwrap();
+    server.abort();
+}
+
+#[tokio::test]
+async fn failed_delivered_read_keeps_receipt_and_shutdown_cancels_pending_read() {
+    use axum::{http::StatusCode, routing::get, Json, Router};
+    let fail = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let started = Arc::new(tokio::sync::Semaphore::new(0));
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let (fail_http, started_http, release_http) = (fail.clone(), started.clone(), release.clone());
+    let (ctx, server) = upstream_context(Router::new().route(
+        "/api/session/ses-delivered/message/msg-10",
+        get(move || {
+            let (fail, started, release) = (
+                fail_http.clone(),
+                started_http.clone(),
+                release_http.clone(),
+            );
+            async move {
+                if fail.load(std::sync::atomic::Ordering::SeqCst) {
+                    return (StatusCode::SERVICE_UNAVAILABLE, Json(Value::Null));
+                }
+                started.add_permits(1);
+                let _permit = release.acquire().await.unwrap();
+                (
+                    StatusCode::OK,
+                    Json(json!({"data": {"id": "msg-10", "type": "user",
+                    "text": "Continue in parallel.", "time": {"created": 100}}})),
+                )
+            }
+        }),
+    ))
+    .await;
+    let asid = AgentSessionId("ses-delivered".into());
+    let receipt =
+        json!({"id": "msg-10", "type": "user", "payload": {"text": "Continue in parallel."}});
+    ctx.mirror.set_inbox(&asid, vec![receipt.clone()]).await;
+    let mut out = ctx.tx.subscribe();
+    let delivered = session_event(
+        "session.inbox.delivered",
+        json!({"sessionID": asid.0, "inboxID": "msg-10"}),
+    );
+    AgentManager::handle_raw_event(delivered.clone(), &ctx).await;
+    assert_eq!(ctx.mirror.inbox(&asid).await, vec![receipt]);
+    assert!(ctx
+        .mirror
+        .get_snapshot(&asid)
+        .await
+        .unwrap()
+        .timeline
+        .is_empty());
+    assert!(matches!(
+        out.try_recv().unwrap(),
+        AgentDomainEvent::Resync { .. }
+    ));
+    assert!(out.try_recv().is_err());
+    fail.store(false, std::sync::atomic::Ordering::SeqCst);
+    let (tx, rx) = broadcast::channel(16);
+    let pump = tokio::spawn(AgentManager::pump_events(rx, ctx.clone()));
+    tx.send(delivered).unwrap();
+    let _started = tokio::time::timeout(std::time::Duration::from_secs(2), started.acquire())
+        .await
+        .unwrap()
+        .unwrap();
+    ctx.cancel.cancel();
+    tokio::time::timeout(std::time::Duration::from_secs(1), pump)
+        .await
+        .unwrap()
+        .unwrap();
+    release.add_permits(1);
+    assert!(ctx
+        .mirror
+        .get_snapshot(&asid)
+        .await
+        .unwrap()
+        .timeline
+        .is_empty());
+    assert_eq!(ctx.mirror.inbox(&asid).await.len(), 1);
+    assert!(out.try_recv().is_err());
+    server.abort();
+}
+
+#[tokio::test]
+async fn http_mirror_removal_and_recreation_fence_an_inflight_delivered_read() {
+    use axum::{routing::get, Json, Router};
+    let started = Arc::new(tokio::sync::Semaphore::new(0));
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let (started_http, release_http) = (started.clone(), release.clone());
+    let (ctx, server) = upstream_context(Router::new().route(
+        "/api/session/ses-delivered/message/msg-10",
+        get(move || {
+            let (started, release) = (started_http.clone(), release_http.clone());
+            async move {
+                started.add_permits(1);
+                let _permit = release.acquire().await.unwrap();
+                Json(json!({"data": {"id": "msg-10", "type": "user",
+                    "text": "Keep the original input.", "time": {"created": 100}}}))
+            }
+        }),
+    ))
+    .await;
+    let asid = AgentSessionId("ses-delivered".into());
+    ctx.mirror
+        .set_inbox(&asid, vec![json!({"id": "msg-10", "type": "user"})])
+        .await;
+    let mut out = ctx.tx.subscribe();
+    let (tx, rx) = broadcast::channel(16);
+    let pump = tokio::spawn(AgentManager::pump_events(rx, ctx.clone()));
+    tx.send(session_event(
+        "session.inbox.delivered",
+        json!({
+            "sessionID": asid.0, "inboxID": "msg-10"
+        }),
+    ))
+    .unwrap();
+    let _started = tokio::time::timeout(std::time::Duration::from_secs(2), started.acquire())
+        .await
+        .unwrap()
+        .unwrap();
+    // The HTTP delete route removes the mirror directly, without first passing
+    // a deletion event through this pump. Recreate the same ID to also catch an
+    // existence-only check that would accept the old incarnation's read.
+    ctx.mirror.remove_session(&asid).await;
+    assert!(ctx.mirror.get_snapshot(&asid).await.is_none());
+    let replacement = vec![json!({"id": "msg-new", "type": "user"})];
+    ctx.mirror.set_inbox(&asid, replacement.clone()).await;
+    release.add_permits(1);
+    let event = tokio::time::timeout(std::time::Duration::from_secs(2), out.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(event, AgentDomainEvent::Resync { .. }),
+        "an obsolete read must not publish into the replacement session: {event:?}"
+    );
+    let current = ctx.mirror.get_snapshot(&asid).await.unwrap();
+    assert!(current.timeline.is_empty());
+    assert_eq!(current.inbox, replacement);
+    assert!(out.try_recv().is_err());
+    ctx.cancel.cancel();
+    pump.await.unwrap();
+    server.abort();
+}
+
+#[tokio::test]
+async fn inbox_delivery_changes_preserve_payload_and_order_until_removed() {
+    use axum::{routing::get, Json, Router};
+    let (ctx, server) = upstream_context(Router::new().route(
+        "/api/session/ses-inbox/message/msg-first",
+        get(|| async {
+            Json(json!({"data": {
+                "id": "msg-first", "type": "user", "text": "Keep this text 日本語",
+                "time": {"created": 100}
+            }}))
+        }),
+    ))
+    .await;
+    let mut rx = ctx.tx.subscribe();
+    let asid = AgentSessionId("ses-inbox".into());
+    let first = json!({"type": "user", "delivery": "queue", "payload": {
+        "text": "Keep this text 日本語", "attachments": [{"uri": "file:///example"}]
+    }, "metadata": {"source": "app"}});
+    let second = json!({"type": "user", "delivery": "queue", "payload": {"text": "Second"}});
+    for (id, item) in [("msg-first", &first), ("msg-second", &second)] {
+        AgentManager::handle_raw_event(
+            session_event(
+                "session.inbox.enqueued",
+                json!({
+                    "sessionID": asid.0, "inboxID": id, "item": item
+                }),
+            ),
+            &ctx,
+        )
+        .await;
+    }
+    let mut expected = vec![first, second];
+    expected[0]["id"] = json!("msg-first");
+    expected[1]["id"] = json!("msg-second");
+    for delivery in ["steer", "queue"] {
+        AgentManager::handle_raw_event(
+            session_event(
+                "session.inbox.delivery.changed",
+                json!({
+                    "sessionID": asid.0, "inboxID": "msg-first", "delivery": delivery
+                }),
+            ),
+            &ctx,
+        )
+        .await;
+        expected[0]["delivery"] = json!(delivery);
+        assert_eq!(ctx.mirror.inbox(&asid).await, expected);
+        let mut last = None;
+        while let Ok(event) = rx.try_recv() {
+            if let AgentDomainEvent::InboxChanged { items, .. } = event {
+                last = Some(items);
+            }
+        }
+        assert_eq!(last.unwrap(), expected);
+    }
+    for (event_type, id) in [
+        ("session.inbox.delivered", "msg-first"),
+        ("session.inbox.cancelled", "msg-second"),
+    ] {
+        AgentManager::handle_raw_event(
+            session_event(event_type, json!({"sessionID": asid.0, "inboxID": id})),
+            &ctx,
+        )
+        .await;
+        expected.remove(0);
+        assert_eq!(ctx.mirror.inbox(&asid).await, expected);
+        let mut last = None;
+        while let Ok(event) = rx.try_recv() {
+            if let AgentDomainEvent::InboxChanged { items, .. } = event {
+                last = Some(items);
+            }
+        }
+        assert_eq!(last.expect("inbox removal was published"), expected);
+    }
+    server.abort();
+}
+
+#[tokio::test]
+async fn unknown_inbox_delivery_refetches_the_authoritative_queue() {
+    use axum::{routing::get, Json, Router};
+    let authoritative = vec![
+        json!({"id": "msg-other", "type": "user", "delivery": "queue",
+        "payload": {"text": "The changed item was already delivered"}}),
+    ];
+    let response = authoritative.clone();
+    let (ctx, task) = upstream_context(Router::new().route(
+        "/api/session/ses-inbox/inbox",
+        get(move || async move { Json(json!({"data": response})) }),
+    ))
+    .await;
+    let asid = AgentSessionId("ses-inbox".into());
+    ctx.mirror
+        .set_inbox(&asid, vec![json!({"id": "msg-stale"})])
+        .await;
+    let mut rx = ctx.tx.subscribe();
+    AgentManager::handle_raw_event(
+        session_event(
+            "session.inbox.delivery.changed",
+            json!({
+                "sessionID": asid.0, "inboxID": "msg-unknown", "delivery": "steer"
+            }),
+        ),
+        &ctx,
+    )
+    .await;
+    assert_eq!(ctx.mirror.inbox(&asid).await, authoritative);
+    let AgentDomainEvent::InboxChanged { items, .. } = rx.try_recv().unwrap() else {
+        panic!("refetched inbox was not published");
+    };
+    assert_eq!(items, authoritative);
+    assert!(rx.try_recv().is_err());
+    task.abort();
+}
+
+#[tokio::test]
+async fn failed_unknown_inbox_refetch_does_not_invent_or_remove_items() {
+    let ctx = ctx();
+    let asid = AgentSessionId("ses-inbox".into());
+    let items = vec![json!({"id": "msg-known", "payload": {"text": "Keep"}})];
+    ctx.mirror.set_inbox(&asid, items.clone()).await;
+    let mut rx = ctx.tx.subscribe();
+    AgentManager::handle_raw_event(
+        session_event(
+            "session.inbox.delivery.changed",
+            json!({
+                "sessionID": asid.0, "inboxID": "msg-unknown", "delivery": "steer"
+            }),
+        ),
+        &ctx,
+    )
+    .await;
+    assert_eq!(ctx.mirror.inbox(&asid).await, items);
+    assert!(rx.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn session_viewed_event_and_view_request_share_monotonic_read_markers() {
+    use axum::{
+        routing::{get, post},
+        Json, Router,
+    };
+    let (ctx, task) = upstream_context(
+        Router::new()
+            .route(
+                "/api/session/ses-viewed",
+                get(|| async {
+                    Json(json!({"data": {"id": "ses-viewed", "title": "Read markers",
+                "time": {"idle": 100, "viewed": 10}}}))
+                }),
+            )
+            .route(
+                "/api/session/ses-viewed/view",
+                post(|Json(body): Json<Value>| async move {
+                    assert_eq!(body, json!({"idle": 150}));
+                    axum::http::StatusCode::NO_CONTENT
+                }),
+            ),
+    )
+    .await;
+    let asid = AgentSessionId("ses-viewed".into());
+    let mut rx = ctx.tx.subscribe();
+    AgentManager::handle_raw_event(
+        session_event("session.viewed", json!({"sessionID": asid.0, "idle": 100})),
+        &ctx,
+    )
+    .await;
+    assert_eq!(
+        ctx.mirror
+            .get_snapshot(&asid)
+            .await
+            .unwrap()
+            .info
+            .time_viewed,
+        Some(100)
+    );
+    let mut last = None;
+    while let Ok(event) = rx.try_recv() {
+        if let AgentDomainEvent::SessionUpdated { info, .. } = event {
+            last = Some(info.time_viewed);
+        }
+    }
+    assert_eq!(last, Some(Some(100)));
+    let (tx, mut request_rx) = broadcast::channel(16);
+    let manager = AgentManager::assemble(
+        ctx.driver.clone(),
+        ctx.mirror.clone(),
+        tx,
+        "test".into(),
+        Some("2.0.27".into()),
+        Arc::new(|| false),
+        Arc::new(|| {}),
+    );
+    manager.view_session(&asid.0, 150).await.unwrap();
+    let AgentDomainEvent::SessionUpdated { info, .. } = request_rx.try_recv().unwrap() else {
+        panic!("view request did not publish read state");
+    };
+    assert_eq!(info.time_viewed, Some(150));
+    // A delayed event cannot move the request's read marker backward.
+    AgentManager::handle_raw_event(
+        session_event("session.viewed", json!({"sessionID": asid.0, "idle": 100})),
+        &ctx,
+    )
+    .await;
+    AgentManager::handle_raw_event(
+        session_event("session.updated", json!({"sessionID": asid.0})),
+        &ctx,
+    )
+    .await;
+    let info = ctx.mirror.get_snapshot(&asid).await.unwrap().info;
+    assert_eq!(info.time_viewed, Some(150));
+    assert_eq!(info.time_idle, Some(100));
+    while let Ok(event) = rx.try_recv() {
+        if let AgentDomainEvent::SessionUpdated { info, .. } = event {
+            assert_eq!(info.time_viewed, Some(150));
+        }
+    }
+    task.abort();
+}
+
+#[tokio::test]
+async fn malformed_session_viewed_events_do_not_change_read_state() {
+    let ctx = ctx();
+    let asid = AgentSessionId("ses-viewed".into());
+    ctx.mirror
+        .update_session(
+            mapper::map_session(&json!({"id": asid.0,
+        "time": {"idle": 100}}))
+            .unwrap(),
+        )
+        .await;
+    let before = ctx.mirror.get_snapshot(&asid).await.unwrap();
+    let mut rx = ctx.tx.subscribe();
+    for idle in [
+        Value::Null,
+        json!("100"),
+        json!(-1),
+        json!(100.5),
+        json!({}),
+    ] {
+        AgentManager::handle_raw_event(
+            session_event("session.viewed", json!({"sessionID": asid.0, "idle": idle})),
+            &ctx,
+        )
+        .await;
+    }
+    AgentManager::handle_raw_event(
+        session_event("session.viewed", json!({"sessionID": asid.0})),
+        &ctx,
+    )
+    .await;
+    let after = ctx.mirror.get_snapshot(&asid).await.unwrap();
+    assert_eq!(after.seq, before.seq);
+    assert_eq!(after.info.time_viewed, None);
+    assert_eq!(after.info.time_idle, Some(100));
+    assert!(rx.try_recv().is_err());
 }
 
 #[tokio::test]

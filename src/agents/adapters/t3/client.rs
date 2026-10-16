@@ -14,10 +14,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use reqwest::Client;
 use serde_json::{json, Value};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
-use super::endpoint::{read_bounded, short, BearerGrant, T3Credential, T3Endpoint, MAX_HTTP_BODY};
+use super::endpoint::{
+    read_bounded, short, BearerGrant, T3Credential, T3Endpoint, T3Protocol, MAX_HTTP_BODY,
+};
 use super::rpc::{RpcConfig, RpcConnection, RpcError, Subscription};
 use crate::agents::ports::agent::AgentError;
 
@@ -365,12 +367,19 @@ struct Auth {
     pairing: Option<String>,
 }
 
+#[derive(Clone)]
+struct TimelineState {
+    generation: String,
+    order: super::v2::projection::TimelineOrder,
+}
+
 pub struct T3Client {
     pub endpoint: T3Endpoint,
     http: Client,
     auth: Arc<RwLock<Auth>>,
     rpc: RpcConnection,
     cancel: CancellationToken,
+    timeline_orders: Mutex<std::collections::HashMap<String, TimelineState>>,
 }
 
 impl T3Client {
@@ -407,6 +416,11 @@ impl T3Client {
                 let http = http.clone();
                 let auth = auth.clone();
                 Box::pin(async move {
+                    // A reconnect must not carry credentials or V1 cursors into a
+                    // replaced environment. The runtime adopts a fresh driver.
+                    verify_environment(&endpoint, &http)
+                        .await
+                        .map_err(|e| e.to_string())?;
                     let bearer = bearer_for(&endpoint, &http, &auth)
                         .await
                         .map_err(|e| e.to_string())?;
@@ -428,11 +442,140 @@ impl T3Client {
             auth,
             rpc,
             cancel,
+            timeline_orders: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
     pub fn http(&self) -> &Client {
         &self.http
+    }
+
+    pub fn is_v2(&self) -> bool {
+        self.endpoint.protocol == T3Protocol::V2
+    }
+
+    /// Capture before starting I/O. A forgotten/recreated thread gets a new
+    /// incarnation, so an old in-flight read cannot populate the new cache.
+    pub async fn timeline_generation(&self, id: &str) -> Result<String, AgentError> {
+        if self.cancel.is_cancelled() {
+            return Err(AgentError::NotAvailable(
+                "T3 client closed; reload required".into(),
+            ));
+        }
+        let mut orders = self.timeline_orders.lock().await;
+        if orders.len() >= 128 && !orders.contains_key(id) {
+            return Err(AgentError::Protocol(
+                "V2 timeline order cache exceeds thread budget".into(),
+            ));
+        }
+        Ok(orders
+            .entry(id.into())
+            .or_insert_with(|| TimelineState {
+                generation: new_id(),
+                order: Default::default(),
+            })
+            .generation
+            .clone())
+    }
+
+    #[cfg(test)]
+    pub async fn order_snapshot(&self, id: &str, detail: Value) -> Result<Value, AgentError> {
+        let generation = match detail["gatewayTimelineGeneration"].as_str() {
+            Some(generation) => generation.into(),
+            None => self.timeline_generation(id).await?,
+        };
+        self.order_snapshot_in_generation(id, detail, &generation, false)
+            .await
+    }
+
+    pub async fn order_live_snapshot(&self, id: &str, detail: Value) -> Result<Value, AgentError> {
+        let generation = match detail["gatewayTimelineGeneration"].as_str() {
+            Some(generation) => generation.into(),
+            None => self.timeline_generation(id).await?,
+        };
+        self.order_snapshot_in_generation(id, detail, &generation, true)
+            .await
+    }
+
+    pub async fn order_snapshot_in_generation(
+        &self,
+        id: &str,
+        mut detail: Value,
+        generation: &str,
+        live: bool,
+    ) -> Result<Value, AgentError> {
+        let mut orders = self.timeline_orders.lock().await;
+        if self.cancel.is_cancelled() {
+            return Err(AgentError::NotAvailable(
+                "T3 client closed; reload required".into(),
+            ));
+        }
+        let state = orders
+            .get(id)
+            .filter(|state| state.generation == generation)
+            .ok_or_else(|| {
+                AgentError::Protocol("V2 timeline incarnation changed; reload required".into())
+            })?;
+        if live && state.order.is_stale(&detail) {
+            return Err(AgentError::Protocol(
+                "stale V2 live snapshot requires resync".into(),
+            ));
+        }
+        let mut order = state.order.clone();
+        order.install(&mut detail)?;
+        let bytes = orders
+            .iter()
+            .filter(|(thread, _)| thread.as_str() != id)
+            .map(|(_, state)| state.order.retained_bytes())
+            .fold(order.retained_bytes(), usize::saturating_add);
+        if bytes > 2 * MAX_HTTP_BODY {
+            return Err(AgentError::Protocol(
+                "V2 timeline order cache exceeds memory budget".into(),
+            ));
+        }
+        orders.insert(
+            id.into(),
+            TimelineState {
+                generation: generation.into(),
+                order,
+            },
+        );
+        detail["gatewayTimelineGeneration"] = Value::String(generation.into());
+        Ok(detail)
+    }
+
+    pub async fn forget_timeline(&self, id: &str) {
+        self.timeline_orders.lock().await.remove(id);
+    }
+
+    pub async fn create_project(
+        &self,
+        id: &str,
+        title: &str,
+        root: &str,
+    ) -> Result<(), AgentError> {
+        if !self.is_v2() {
+            self.dispatch(commands::project_create(id, title, root))
+                .await?;
+            return Ok(());
+        }
+        let bearer = self.bearer().await?;
+        let response = self
+            .http
+            .post(format!("{}/api/projects/mutate", self.endpoint.url))
+            .bearer_auth(bearer)
+            .json(&super::v2::commands::project_create(id, title, root))
+            .send()
+            .await
+            .map_err(|e| AgentError::Network(short(&e.to_string())))?;
+        let status = response.status();
+        read_bounded(response, MAX_HTTP_BODY).await?;
+        if !status.is_success() {
+            return Err(AgentError::RequestFailed(format!(
+                "project mutation HTTP {status}"
+            )));
+        }
+        Ok(())
     }
 
     pub fn rpc(&self) -> &RpcConnection {
@@ -447,6 +590,9 @@ impl T3Client {
     /// The bearer currently held, exchanging the pairing credential on first
     /// use.
     pub async fn bearer(&self) -> Result<String, AgentError> {
+        if self.endpoint.environment_id.is_some() {
+            verify_environment(&self.endpoint, &self.http).await?;
+        }
         bearer_for(&self.endpoint, &self.http, &self.auth).await
     }
 
@@ -561,6 +707,9 @@ impl T3Client {
             "reasoningMessages": true,
             "requestCompletionMarker": true,
         });
+        if self.is_v2() {
+            payload = json!({"threadId":thread_id,"requestCompletionMarker":true,"acceptBoundedSnapshot":true});
+        }
         if let Some(seq) = after_sequence {
             payload["afterSequence"] = json!(seq);
         }
@@ -586,6 +735,13 @@ impl T3Client {
         turn_limit: Option<usize>,
     ) -> Result<Value, AgentError> {
         let id = validate_id(thread_id, "session id")?;
+        if self.is_v2() {
+            let detail = self
+                .get_json(format!("{HTTP_THREAD_SNAPSHOT}/{id}/bounded"))
+                .await?;
+            super::v2::projection::validate_snapshot(&detail, &id)?;
+            return Ok(detail);
+        }
         let mut path = format!("{HTTP_THREAD_SNAPSHOT}/{id}?reasoningMessages=true");
         if let Some(limit) = turn_limit {
             path.push_str(&format!("&turnLimit={}", limit.max(1)));
@@ -599,16 +755,33 @@ impl T3Client {
     }
 
     async fn get_json(&self, path: String) -> Result<Value, AgentError> {
+        self.get_json_counted(path, MAX_HTTP_BODY)
+            .await
+            .map(|(value, _)| value)
+    }
+
+    async fn get_json_counted(
+        &self,
+        path: String,
+        remaining: usize,
+    ) -> Result<(Value, usize), AgentError> {
+        if remaining == 0 {
+            return Err(AgentError::Protocol("history exceeds byte budget".into()));
+        }
         let bearer = self.bearer().await?;
-        let resp = self
+        let mut request = self
             .http
             .get(format!("{}{path}", self.endpoint.url))
-            .bearer_auth(&bearer)
+            .bearer_auth(&bearer);
+        if self.is_v2() && path.starts_with("/api/orchestration/") {
+            request = request.header("x-t3-orchestration-protocol", "2");
+        }
+        let resp = request
             .send()
             .await
             .map_err(|e| AgentError::Network(short(&e.to_string())))?;
         let status = resp.status();
-        let body = read_bounded(resp, MAX_HTTP_BODY).await?;
+        let body = read_bounded(resp, MAX_HTTP_BODY.min(remaining)).await?;
         if status.as_u16() == 401 {
             return Err(AgentError::NotAvailable(
                 "the stored T3 credential was rejected; pair again".into(),
@@ -618,8 +791,85 @@ impl T3Client {
             tracing::debug!(%status, path = %path.split('?').next().unwrap_or(""), "t3 http read failed");
             return Err(AgentError::RequestFailed(format!("HTTP {status}")));
         }
-        serde_json::from_slice(&body).map_err(|e| AgentError::Protocol(short(&e.to_string())))
+        let value = serde_json::from_slice(&body)
+            .map_err(|e| AgentError::Protocol(short(&e.to_string())))?;
+        Ok((value, body.len()))
     }
+
+    /// Historical rows only. Page sequences never replace live control state.
+    pub async fn timeline_snapshot(
+        &self,
+        thread_id: &str,
+        limit: usize,
+    ) -> Result<Value, AgentError> {
+        if !self.is_v2() {
+            return self.thread_snapshot(thread_id, None).await;
+        }
+        let id = validate_id(thread_id, "session id")?;
+        let generation = self.timeline_generation(&id).await?;
+        let (mut detail, mut bytes) = self
+            .get_json_counted(
+                format!("{HTTP_THREAD_SNAPSHOT}/{id}/bounded"),
+                MAX_HTTP_BODY,
+            )
+            .await?;
+        super::v2::projection::validate_snapshot(&detail, &id)?;
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..64 {
+            let count = super::v2::mapper::timeline(thread_id, &detail["projection"], 0).len();
+            if limit > 0 && count >= limit {
+                break;
+            }
+            if detail.get("hasMoreHistory").and_then(Value::as_bool) != Some(true) {
+                break;
+            }
+            let cursor = detail
+                .get("historyCursor")
+                .and_then(Value::as_str)
+                .ok_or_else(|| AgentError::Protocol("history has no cursor".into()))?
+                .to_string();
+            if cursor.len() > 8192 || !seen.insert(cursor.clone()) {
+                return Err(AgentError::Protocol(
+                    "invalid or repeated history cursor".into(),
+                ));
+            }
+            let id = validate_id(thread_id, "session id")?;
+            let mut url = reqwest::Url::parse(&format!(
+                "{}{HTTP_THREAD_SNAPSHOT}/{id}/history",
+                self.endpoint.url
+            ))
+            .map_err(|_| AgentError::Protocol("invalid endpoint".into()))?;
+            url.query_pairs_mut().append_pair("cursor", &cursor);
+            let path = format!("{}?{}", url.path(), url.query().unwrap_or(""));
+            let (page, consumed) = self.get_json_counted(path, MAX_HTTP_BODY - bytes).await?;
+            bytes += consumed;
+            super::v2::projection::merge_history(&mut detail, &page)?;
+        }
+        if detail.get("hasMoreHistory").and_then(Value::as_bool) == Some(true)
+            && (limit == 0
+                || super::v2::mapper::timeline(thread_id, &detail["projection"], 0).len() < limit)
+        {
+            return Err(AgentError::Protocol("history exceeds page budget".into()));
+        }
+        self.order_snapshot_in_generation(thread_id, detail, &generation, false)
+            .await
+    }
+}
+
+async fn verify_environment(endpoint: &T3Endpoint, http: &Client) -> Result<(), AgentError> {
+    let descriptor = endpoint.describe(http).await?;
+    let protocol = descriptor.protocol()?;
+    if protocol != endpoint.protocol
+        || endpoint
+            .environment_id
+            .as_ref()
+            .is_some_and(|id| id != &descriptor.environment_id)
+    {
+        return Err(AgentError::NotAvailable(
+            "T3 environment or protocol changed; reattach required".into(),
+        ));
+    }
+    Ok(())
 }
 
 async fn bearer_for(
@@ -639,6 +889,7 @@ async fn bearer_for(
             "no T3 credential configured; pair with the server first".into(),
         ));
     };
+    verify_environment(endpoint, http).await?;
     match endpoint
         .exchange_pairing(http, &pairing, CLIENT_LABEL)
         .await
@@ -652,14 +903,8 @@ async fn bearer_for(
             guard.bearer = Some(token.clone());
             Ok(token)
         }
-        Err(e) => {
-            // The credential may still be valid (network blip); keep it for
-            // the next attempt. A rejection consumed it either way.
-            if matches!(e, AgentError::Network(_)) {
-                guard.pairing = Some(pairing);
-            }
-            Err(e)
-        }
+        // The server may have consumed the one-time token before a lost reply.
+        Err(e) => Err(e),
     }
 }
 

@@ -19,6 +19,7 @@ pub(super) const FR: &[(&str, &str)] = &[
     // -- push notifications --------------------------------------------------
     ("Agent", "Agent de codage"),
     ("Approval needed", "Approbation requise"),
+    ("Needs your input", "Attend votre réponse"),
     ("Agent blocked", "Agent bloqué"),
     ("Agent done", "Exécution terminée"),
     ("{name} is waiting for your approval.", "{name} attend votre approbation."),
@@ -29,6 +30,10 @@ pub(super) const FR: &[(&str, &str)] = &[
     ("Expo push service request failed", "Échec de la requête au service push Expo"),
     ("Herdr did not return the created pane id", "Herdr n’a pas renvoyé l’id du panneau créé"),
     ("Herdr is unavailable", "Herdr est indisponible"),
+    ("No terminal pane belongs to the calling process", "Aucun panneau de terminal n'appartient au processus appelant"),
+    ("Task not found", "Tâche introuvable"),
+    ("Token expired", "Jeton expiré"),
+    ("Token not found", "Jeton introuvable"),
     (
         "agent is not one this gateway offers; see GET /api/agents/catalog",
         "cet agent n’est pas proposé par ce Gateway ; voir GET /api/agents/catalog",
@@ -96,6 +101,14 @@ pub(super) const FR: &[(&str, &str)] = &[
     ("invalid Authorization header", "en-tête Authorization invalide"),
     ("invalid pairing code", "code d’appairage invalide"),
     ("invalid token", "token invalide"),
+    (
+        "the MCP endpoint answers only local callers on this machine",
+        "le point de terminaison MCP ne répond qu'aux appelants locaux de cette machine",
+    ),
+    (
+        "the assistant token store is unavailable",
+        "le stockage des tokens d'assistant est indisponible",
+    ),
     ("keys must contain 1 to 32 entries", "keys doit contenir de 1 à 32 entrées"),
     ("missing Authorization header", "en-tête Authorization manquant"),
     ("mode must be on, off, or toggle", "mode doit être on, off ou toggle"),
@@ -138,6 +151,7 @@ pub(super) const FR: &[(&str, &str)] = &[
     ("the file field must carry a filename", "le champ file doit comporter un nom de fichier"),
     ("the pane is not waiting on an approval", "ce panneau n’attend aucune approbation"),
     ("the pane is waiting on a different approval", "ce panneau attend une autre approbation"),
+    ("the task request failed", "la requête de tâche a échoué"),
     ("the upload must be at most 25 MiB", "le fichier envoyé ne doit pas dépasser 25 MiB"),
     (
         "this approval has no option with that number",
@@ -174,4 +188,53 @@ pub(super) const FR: &[(&str, &str)] = &[
         "branch_name ne doit pas comporter de segment de chemin vide, ni de segment commençant ou finissant par un point",
     ),
     ("branch_name must not end with .lock", "branch_name ne doit pas se terminer par .lock"),
+    // -- tasks, lazygit and assets ------------------------------------------
+    (
+        "No terminal session is reachable on this computer",
+        "Aucune session de terminal n’est joignable sur cet ordinateur",
+    ),
+    (
+        "That agent is not available",
+        "Cet agent n’est pas disponible",
+    ),
+    (
+        "Only a paused or waiting task opened on a device can be confirmed",
+        "Seule une tâche en pause ou en attente ouverte depuis un appareil peut être confirmée",
+    ),
+    (
+        "the agent could not start the task",
+        "l’agent n’a pas pu démarrer la tâche",
+    ),
+    (
+        "label must be at most 200 characters",
+        "label doit faire au plus 200 caractères",
+    ),
+    (
+        "goal must be non-empty and at most 32 KiB",
+        "goal ne doit pas être vide et doit faire au plus 32 KiB",
+    ),
+    (
+        "summary must be at most 32 KiB",
+        "summary doit faire au plus 32 KiB",
+    ),
+    (
+        "Unknown model for that agent. Use a model id from its catalog, or <provider_id>/<model_id>.",
+        "Modèle inconnu pour cet agent. Utilisez un id de modèle de son catalogue, ou <provider_id>/<model_id>.",
+    ),
+    (
+        "Unknown variant '{variant}' (the model offers: {offered}).",
+        "Valeur de variant inconnue '{variant}' (le modèle propose : {offered}).",
+    ),
+    (
+        "Install lazygit on the Gateway host",
+        "Installez lazygit sur l’hôte du Gateway",
+    ),
+    (
+        "The source pane is not in an accessible Git repository",
+        "Le panneau source n’est dans aucun dépôt Git accessible",
+    ),
+    (
+        "the asset exceeds its content size limit",
+        "le fichier dépasse sa taille maximale de contenu",
+    ),
 ];

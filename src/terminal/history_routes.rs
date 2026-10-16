@@ -8,8 +8,8 @@ use serde_json::Value;
 
 use super::history::{parse_cursor, HistoryError, HistoryScope, MAX_HISTORY_LIMIT};
 use crate::{
-    api_error, backend, backend_api_error, content_envelope, find_session, require_device,
-    terminal_backend, ApiResult, AppState,
+    api_error, backend_api_error, content_envelope, find_session, require_device, terminal_backend,
+    ApiResult, AppState,
 };
 
 #[derive(Debug, Default, Deserialize)]
@@ -21,11 +21,52 @@ pub(crate) struct HistoryQuery {
     source: Option<String>,
 }
 
+/// `GET /api/history/storage`: which storage this Gateway runs with and,
+/// for SQLite, what it holds -- read from counters, never a query here.
+/// The admin token (`manage`) or a device.
+pub(crate) async fn history_storage(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    if crate::require_admin(&state.config, &headers).is_err() {
+        require_device(&state, &headers)?;
+    }
+    let mut answer = serde_json::json!({ "storage": state.config.history.storage });
+    if let Some(stats) = state.history.stats() {
+        if let (Some(answer), Value::Object(stats)) =
+            (answer.as_object_mut(), serde_json::json!(stats))
+        {
+            answer.extend(stats);
+        }
+    }
+    Ok(Json(answer))
+}
+
 pub(crate) async fn pane_history(
     State(state): State<AppState>,
     Path((session_id, pane_id)): Path<(String, String)>,
     Query(query): Query<HistoryQuery>,
     headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    pane_history_for(state, session_id, pane_id, query, headers, false).await
+}
+
+pub(crate) async fn pane_history_segments(
+    State(state): State<AppState>,
+    Path((session_id, pane_id)): Path<(String, String)>,
+    Query(query): Query<HistoryQuery>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    pane_history_for(state, session_id, pane_id, query, headers, true).await
+}
+
+async fn pane_history_for(
+    state: AppState,
+    session_id: String,
+    pane_id: String,
+    query: HistoryQuery,
+    headers: HeaderMap,
+    segmented: bool,
 ) -> ApiResult<Json<Value>> {
     let device = require_device(&state, &headers)?;
     let scope = validate_query(&session_id, &pane_id, device, &state.generation, &query)?;
@@ -38,7 +79,6 @@ pub(crate) async fn pane_history(
         .await
         .map_err(backend_api_error)?;
     let live = panes.iter().any(|pane| pane.id.as_str() == pane_id);
-    let listing = backend::compat::pane_list(panes);
     state
         .scrollback
         .lock()
@@ -49,7 +89,7 @@ pub(crate) async fn pane_history(
                 "failed to lock captured history",
             )
         })?
-        .observe_listing(&session_id, &listing);
+        .observe_native_listing(&session_id, &panes);
     if !live {
         return Err(if query.before.is_some() {
             history_error(HistoryError::Gone)
@@ -57,9 +97,16 @@ pub(crate) async fn pane_history(
             api_error(StatusCode::NOT_FOUND, "pane_not_found", "pane not found")
         });
     }
-    let page = super::history::read_page(state.history.as_ref(), scope, query.before.as_deref())
-        .await
-        .map_err(history_error)?;
+    let mut page = if segmented {
+        super::history::read_segment_page(state.history.as_ref(), scope, query.before.as_deref())
+            .await
+    } else {
+        super::history::read_page(state.history.as_ref(), scope, query.before.as_deref()).await
+    }
+    .map_err(history_error)?;
+    if !segmented {
+        super::exit_marker::strip_history_page(&mut page);
+    }
     Ok(Json(content_envelope(page)))
 }
 
@@ -235,6 +282,120 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn structured_history_http_contract_is_additive_authenticated_and_marker_filtered() {
+        let fixture = Fixture::new().await;
+        let uri = "/api/sessions/s/panes/p/history/segments?limit=2";
+        assert_eq!(
+            get(fixture.app(), uri, None).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+        let (status, body) = get(fixture.app(), uri, Some("token")).await;
+        assert_eq!(status, StatusCode::OK);
+        let page = &body["data"];
+        assert_eq!(page["segments"][0]["rows"], json!(["row 5", "row 6"]));
+        assert_eq!(page["row_count"], 2);
+        assert_eq!(page["source"], "gateway-captured");
+        assert_eq!(page["read_source"], "recent-unwrapped");
+        assert_eq!(page["includes_live_viewport"], false);
+        assert_eq!(page["complete_archive"], false);
+        assert!(page.get("rows").is_none() && page.get("capture_epoch").is_none());
+        assert_eq!(page["segments"][0].as_object().unwrap().len(), 5);
+        let cursor = page["next_before"].as_str().unwrap();
+        let (status, older) = get(
+            fixture.app(),
+            &format!("{uri}&before={cursor}"),
+            Some("token"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            older["data"]["segments"][0]["segment_id"],
+            page["segments"][0]["segment_id"]
+        );
+        assert_eq!(
+            older["data"]["segments"][0]["rows"],
+            json!(["row 3", "row 4"])
+        );
+        assert_eq!(
+            get(
+                fixture.app(),
+                &format!("/api/sessions/s/panes/p/history?limit=2&before={cursor}"),
+                Some("token")
+            )
+            .await
+            .0,
+            StatusCode::CONFLICT
+        );
+        for query in [
+            "limit=0",
+            "limit=501",
+            "format=html",
+            "source=native",
+            "start=1",
+        ] {
+            assert_eq!(
+                get(
+                    fixture.app(),
+                    &format!("/api/sessions/s/panes/p/history/segments?{query}"),
+                    Some("token")
+                )
+                .await
+                .0,
+                StatusCode::BAD_REQUEST
+            );
+        }
+        let (_, ansi) = get(
+            fixture.app(),
+            "/api/sessions/s/panes/p/history/segments?limit=2&format=ansi",
+            Some("token"),
+        )
+        .await;
+        assert_eq!(
+            ansi["data"]["segments"][0]["rows"],
+            json!(["\u{1b}[31mrow 5\u{1b}[0m", "\u{1b}[31mrow 6\u{1b}[0m"])
+        );
+        let (_, empty) = get(
+            fixture.app(),
+            "/api/sessions/s/panes/native/history/segments",
+            Some("token"),
+        )
+        .await;
+        assert_eq!(empty["data"]["availability"], "not_captured");
+        assert!(empty["data"]["snapshot_id"].is_null() && empty["data"]["next_before"].is_null());
+    }
+
+    #[tokio::test]
+    async fn the_storage_route_says_which_store_runs_and_what_it_holds() {
+        let mut fixture = Fixture::new().await;
+        let uri = "/api/history/storage";
+        let memory = get(fixture.app(), uri, Some("token")).await;
+        assert_eq!(memory, (StatusCode::OK, json!({ "storage": "memory" })));
+        assert_eq!(
+            get(fixture.app(), uri, None).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+        fixture.state.config.history.storage = crate::platform::config::HistoryStorage::Sqlite;
+        fixture.state.history = std::sync::Arc::new(
+            super::super::history_sqlite::SqliteHistoryRepository::open(
+                fixture.state.db.clone(),
+                &fixture.state.config,
+                fixture.state.scrollback.clone(),
+            )
+            .await,
+        );
+        let (status, sqlite) = get(fixture.app(), uri, Some("admin")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            (&sqlite["storage"], &sqlite["healthy"]),
+            (&json!("sqlite"), &json!(true))
+        );
+        assert!(
+            sqlite["checkpoints"].is_u64() && sqlite["wal_bytes"].is_u64(),
+            "{sqlite}"
+        );
+    }
+
+    #[tokio::test]
     async fn captured_history_http_contract_formats_and_concurrent_first_pages() {
         let fixture = Fixture::new().await;
         let uri = "/api/sessions/s/panes/p/history?limit=2";
@@ -275,13 +436,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn captured_history_does_not_serve_exit_marker_rows() {
+        let fixture = Fixture::new().await;
+        {
+            // Row 12 is an `exec.run` exit marker; it scrolls into history.
+            let row = |i: usize| match i {
+                12 => "\u{1f}muqun-exit:t_1:0\u{1f}".to_owned(),
+                _ => format!("row {i}"),
+            };
+            let mut store = fixture.state.scrollback.lock().unwrap();
+            for top in 8..14 {
+                let frame = (top..top + 4).map(row).collect::<Vec<_>>().join("\n");
+                store.record_frame("s", "p", "recent_unwrapped", "text", &frame);
+            }
+        }
+        let (status, body) = get(
+            fixture.app(),
+            "/api/sessions/s/panes/p/history?limit=500",
+            Some("token"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let rows = body["data"]["rows"].to_string();
+        assert!(rows.contains("row 11"), "{rows}");
+        assert!(!rows.contains("muqun-exit"), "{rows}");
+    }
+
+    #[tokio::test]
     async fn captured_history_auth_invalid_queries_cursor_cross_scope_and_restart() {
         let fixture = Fixture::new().await;
         let uri = "/api/sessions/s/panes/p/history?limit=2";
+        // The admin token's refusal belongs to `required` mode
+        // (`control_routes_reject_the_admin_token`); this fixture is token-only.
         for (token, expected) in [
             (None, StatusCode::UNAUTHORIZED),
             (Some("bad"), StatusCode::FORBIDDEN),
-            (Some("admin"), StatusCode::FORBIDDEN),
         ] {
             assert_eq!(get(fixture.app(), uri, token).await.0, expected);
         }
@@ -382,7 +571,8 @@ mod tests {
 
     #[tokio::test]
     async fn captured_history_sealed_transport_accepts_real_envelope_not_forged_proof() {
-        let fixture = Fixture::new().await;
+        let mut fixture = Fixture::new().await;
+        fixture.state.config.transport_encryption = TransportEncryptionMode::Required;
         let key = generate_token();
         let material = transport::decode_key(&key).unwrap();
         fixture.state.devices.lock().unwrap()[0].transport_key = Some(key.clone());
@@ -512,7 +702,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires tmux; creates only a private socket/server"]
-    async fn captured_history_real_isolated_tmux_pages_and_resize_reset() {
+    async fn captured_history_real_isolated_tmux_sqlite_restart_pages_and_resize_reset() {
         struct IsolatedTmux {
             directory: PathBuf,
             socket: PathBuf,
@@ -596,11 +786,24 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         };
         let panes = backend.list_panes().await.unwrap();
+        assert!(
+            pane.history_identity.is_some(),
+            "native server/root incarnation was not verified"
+        );
+        let old_repository = std::sync::Arc::new(
+            super::super::history_sqlite::SqliteHistoryRepository::open(
+                state.db.clone(),
+                &state.config,
+                state.scrollback.clone(),
+            )
+            .await,
+        );
+        state.history = old_repository.clone();
         state
             .scrollback
             .lock()
             .unwrap()
-            .observe_listing("s", &backend::compat::pane_list(panes));
+            .observe_native_listing("s", &panes);
         for top in 0..8 {
             std::fs::write(&control, format!("{top}\n")).unwrap();
             let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
@@ -625,6 +828,20 @@ mod tests {
                     .lines()
                     .any(|row| row.trim() == format!("row {}", top + 6))
                 {
+                    let _ansi = pane_output(
+                        State(state.clone()),
+                        Path(("s".into(), pane.id.to_string())),
+                        Query(OutputQuery {
+                            source: Some("recent-unwrapped".into()),
+                            lines: Some(200),
+                            format: Some("ansi".into()),
+                            start: None,
+                            end: None,
+                        }),
+                        bearer_headers("token"),
+                    )
+                    .await
+                    .unwrap();
                     break;
                 }
                 assert!(
@@ -650,6 +867,73 @@ mod tests {
         let cursor = first.1["data"]["next_before"].as_str().unwrap();
         let second = get(app(), &format!("{uri}&before={cursor}"), Some("token")).await;
         assert_eq!(second.1["data"]["rows"], json!(["row 3", "row 4"]));
+        // Join the actual storage worker; do not use a timed guess that it closed.
+        state.history = std::sync::Arc::new(
+            super::super::history_memory::MemoryHistoryRepository::new(state.scrollback.clone()),
+        );
+        std::sync::Arc::try_unwrap(old_repository)
+            .ok()
+            .unwrap()
+            .close()
+            .await;
+        state.scrollback =
+            std::sync::Arc::new(std::sync::Mutex::new(scrollback::ScrollbackStore::default()));
+        state.generation = crate::new_generation();
+        state.history = std::sync::Arc::new(
+            super::super::history_sqlite::SqliteHistoryRepository::open(
+                state.db.clone(),
+                &state.config,
+                state.scrollback.clone(),
+            )
+            .await,
+        );
+        let app = || {
+            crate::terminal::routes::mount(Router::new())
+                .layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    encrypted_transport,
+                ))
+                .layer(middleware::from_fn(security_headers))
+                .with_state(state.clone())
+        };
+        let gone = get(app(), &format!("{uri}&before={cursor}"), Some("token")).await;
+        assert_eq!(gone.0, StatusCode::GONE);
+        let recovered = get(app(), &uri, Some("token")).await;
+        assert_eq!(recovered.0, StatusCode::OK);
+        assert_eq!(recovered.1["data"]["rows"], first.1["data"]["rows"]);
+        assert_eq!(recovered.1["data"]["row_count"], 2);
+        assert_eq!(recovered.1["data"]["has_more"], true);
+        // The recovered checkpoint pages like a live capture.
+        let older = recovered.1["data"]["next_before"].as_str().unwrap();
+        let second = get(app(), &format!("{uri}&before={older}"), Some("token")).await;
+        assert_eq!(second.0, StatusCode::OK);
+        assert_eq!(second.1["data"]["rows"], json!(["row 3", "row 4"]));
+        // So does the ANSI shape the app reads, page for page.
+        let ansi = format!("{uri}&format=ansi");
+        let colored = get(app(), &ansi, Some("token")).await;
+        assert_eq!(colored.0, StatusCode::OK);
+        let rows = colored.1["data"]["rows"].as_array().unwrap();
+        assert_eq!(colored.1["data"]["row_count"], rows.len());
+        assert!(
+            rows.len() == 2
+                && rows
+                    .iter()
+                    .all(|row| row.as_str().unwrap().contains("row ")),
+            "{rows:?}"
+        );
+        let older = colored.1["data"]["next_before"].as_str().unwrap();
+        let colored = get(app(), &format!("{ansi}&before={older}"), Some("token")).await;
+        assert_eq!(colored.0, StatusCode::OK);
+        assert_eq!(colored.1["data"]["row_count"], 2);
+        assert_eq!(
+            state
+                .scrollback
+                .lock()
+                .unwrap()
+                .depth("s", pane.id.as_str()),
+            0
+        );
+        let cursor = recovered.1["data"]["next_before"].as_str().unwrap();
         let resized = ProcessCommand::new("tmux")
             .arg("-S")
             .arg(&isolated.socket)
@@ -668,5 +952,104 @@ mod tests {
         let gone = get(app(), &format!("{uri}&before={cursor}"), Some("token")).await;
         assert_eq!(gone.0, StatusCode::GONE);
         assert_eq!(gone.1["error"]["code"], "history_cursor_gone");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires real Herdr; launches only a fixture HOME/config/private socket"]
+    async fn real_isolated_herdr_native_identity_survives_gateway_adapter_restart() {
+        use super::super::backend::{CreateWorkspace, HerdrBackend, TerminalBackend};
+        use std::process::{Command as ProcessCommand, Stdio};
+        struct Server(std::process::Child);
+        impl Drop for Server {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        struct Directory(PathBuf);
+        impl Drop for Directory {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        // A short base, like the tmux test's: a socket path must fit `sun_path`.
+        let base = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+            .join(".cache/tmp/opencode");
+        let fixture = Directory(
+            if base.is_dir() {
+                base
+            } else {
+                std::env::temp_dir()
+            }
+            .join(format!("hist-{}", uuid::Uuid::new_v4().simple())),
+        );
+        std::fs::create_dir_all(&fixture.0).unwrap();
+        let config_path = fixture.0.join("herdr.toml");
+        std::fs::write(&config_path, "").unwrap();
+        let socket = fixture.0.join("herdr.sock");
+        let mut command = ProcessCommand::new("herdr");
+        for name in [
+            "TMUX",
+            "HERDR_SESSION",
+            "HERDR_SOCKET_PATH",
+            "HERDR_CLIENT_SOCKET_PATH",
+            "HERDR_PANE_ID",
+            "HERDR_TAB_ID",
+            "HERDR_WORKSPACE_ID",
+            "HERDR_ENV",
+        ] {
+            command.env_remove(name);
+        }
+        command
+            .env("HOME", &fixture.0)
+            .env("XDG_CONFIG_HOME", fixture.0.join("config"))
+            .env("HERDR_CONFIG_PATH", &config_path)
+            .env("HERDR_SOCKET_PATH", &socket)
+            .current_dir(&fixture.0)
+            .arg("server")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(std::fs::File::create(fixture.0.join("herdr-stderr.log")).unwrap());
+        let _server = Server(command.spawn().unwrap());
+        let backend = HerdrBackend::new(&socket);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if backend.metadata().await.is_ok() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "isolated Herdr never became ready"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        backend
+            .create_workspace(&CreateWorkspace {
+                cwd: Some(fixture.0.clone()),
+                label: Some("history-identity-qa".into()),
+                focus: false,
+                env: None,
+            })
+            .await
+            .unwrap();
+        let first = backend.list_panes().await.unwrap();
+        assert!(!first.is_empty());
+        for pane in &first {
+            assert!(
+                pane.history_identity.is_some(),
+                "Herdr peer/root process identity was not verified"
+            );
+        }
+        let restarted_adapter = HerdrBackend::new(&socket);
+        let second = restarted_adapter.list_panes().await.unwrap();
+        for pane in first {
+            let second = second.iter().find(|current| current.id == pane.id).unwrap();
+            assert_eq!(pane.history_identity, second.history_identity);
+            assert!(!super::super::backend::compat::pane_get(second.clone())
+                .to_string()
+                .contains("history_identity"));
+        }
     }
 }

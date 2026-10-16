@@ -20,6 +20,7 @@ pub(super) const ZH_CN: &[(&str, &str)] = &[
     // -- push notifications --------------------------------------------------
     ("Agent", "代理"),
     ("Approval needed", "需要批准"),
+    ("Needs your input", "需要你的输入"),
     ("Agent blocked", "代理等待中"),
     ("Agent done", "代理已完成"),
     ("{name} is waiting for your approval.", "{name} 正在等待你的批准。"),
@@ -30,6 +31,10 @@ pub(super) const ZH_CN: &[(&str, &str)] = &[
     ("Expo push service request failed", "Expo 推送服务请求失败"),
     ("Herdr did not return the created pane id", "Herdr 没有返回所创建面板的 id"),
     ("Herdr is unavailable", "无法连接到 Herdr"),
+    ("No terminal pane belongs to the calling process", "没有属于调用进程的终端面板"),
+    ("Task not found", "未找到任务"),
+    ("Token expired", "token 已过期"),
+    ("Token not found", "未找到 token"),
     (
         "agent is not one this gateway offers; see GET /api/agents/catalog",
         "这个 Gateway 未提供该代理；请参阅 GET /api/agents/catalog",
@@ -85,6 +90,8 @@ pub(super) const ZH_CN: &[(&str, &str)] = &[
     ("invalid Authorization header", "Authorization 请求头无效"),
     ("invalid pairing code", "配对码无效"),
     ("invalid token", "token 无效"),
+    ("the MCP endpoint answers only local callers on this machine", "MCP 端点只响应本机上的本地调用方"),
+    ("the assistant token store is unavailable", "助手 token 存储不可用"),
     ("keys must contain 1 to 32 entries", "keys 必须包含 1 到 32 个条目"),
     ("missing Authorization header", "缺少 Authorization 请求头"),
     ("mode must be on, off, or toggle", "mode 必须是 on、off 或 toggle"),
@@ -133,6 +140,7 @@ pub(super) const ZH_CN: &[(&str, &str)] = &[
         "the pane is waiting on a different approval",
         "这个面板正在等待的是另一个批准",
     ),
+    ("the task request failed", "任务请求失败"),
     ("the upload must be at most 25 MiB", "上传的文件最多 25 MiB"),
     (
         "this approval has no option with that number",
@@ -169,4 +177,53 @@ pub(super) const ZH_CN: &[(&str, &str)] = &[
         "branch_name 不能有空的路径段，路径段也不能以点开头或结尾",
     ),
     ("branch_name must not end with .lock", "branch_name 不能以 .lock 结尾"),
+    // -- tasks, lazygit and assets ------------------------------------------
+    (
+        "No terminal session is reachable on this computer",
+        "这台电脑上没有可连接的终端会话",
+    ),
+    (
+        "That agent is not available",
+        "该代理不可用",
+    ),
+    (
+        "Only a paused or waiting task opened on a device can be confirmed",
+        "只有在设备上打开、已暂停或等待中的任务才能确认",
+    ),
+    (
+        "the agent could not start the task",
+        "代理无法启动这个任务",
+    ),
+    (
+        "label must be at most 200 characters",
+        "label 最多 200 个字符",
+    ),
+    (
+        "goal must be non-empty and at most 32 KiB",
+        "goal 不能为空，且最多 32 KiB",
+    ),
+    (
+        "summary must be at most 32 KiB",
+        "summary 最多 32 KiB",
+    ),
+    (
+        "Unknown model for that agent. Use a model id from its catalog, or <provider_id>/<model_id>.",
+        "该代理没有这个模型。请使用其目录中的模型 id，或 <provider_id>/<model_id>。",
+    ),
+    (
+        "Unknown variant '{variant}' (the model offers: {offered}).",
+        "未知的 variant '{variant}'（该模型提供：{offered}）。",
+    ),
+    (
+        "Install lazygit on the Gateway host",
+        "请在 Gateway 主机上安装 lazygit",
+    ),
+    (
+        "The source pane is not in an accessible Git repository",
+        "源面板不在可访问的 Git 仓库中",
+    ),
+    (
+        "the asset exceeds its content size limit",
+        "文件超过了其内容大小上限",
+    ),
 ];

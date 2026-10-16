@@ -1,9 +1,11 @@
 use reqwest::{Client, Response, StatusCode};
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::time::Duration;
 
 use super::discovery::OpencodeEndpoint;
 use super::shell_kill;
+use crate::agents::domain::SessionCursor;
 use crate::agents::ports::agent::AgentError;
 
 /// The optional filters `GET /api/session` accepts.
@@ -17,6 +19,37 @@ pub struct SessionListFilter<'a> {
     pub order: Option<&'a str>,
     pub search: Option<&'a str>,
     pub cursor: Option<&'a str>,
+}
+
+const SESSION_PAGE_LIMIT: usize = 100;
+const SESSION_LIST_MAX_REQUESTS: usize = 20;
+const SESSION_LIST_MAX_RECORDS: usize = 1_000;
+const SESSION_LIST_MAX_BYTES: usize = 4 * 1024 * 1024;
+/// The most one earlier-history read of a session's messages may weigh.
+const HISTORY_READ_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+/// The messages of a `GET /session/{id}/message?order=desc` answer, oldest
+/// first: the page is reversed here, so callers always receive oldest-first.
+fn message_list(res: Value) -> Vec<Value> {
+    let mut items = match res.as_array() {
+        Some(arr) => arr.clone(),
+        None => res
+            .get("data")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default(),
+    };
+    items.reverse();
+    items
+}
+const SESSION_LIST_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// OpenCode's cursor is opaque. Neither page order nor cursor values are
+/// reconstructed locally; absent and null cursor fields both mean no cursor.
+#[derive(Debug, serde::Deserialize)]
+pub(crate) struct SessionListPage {
+    pub data: Vec<Value>,
+    pub cursor: SessionCursor,
 }
 
 #[derive(Clone)]
@@ -120,6 +153,80 @@ impl OpencodeClient {
         self.handle_resp(resp, "POST", path).await
     }
 
+    pub async fn put_with_query(
+        &self,
+        path: &str,
+        query: &[(String, String)],
+        body: &Value,
+    ) -> Result<Value, AgentError> {
+        let url = format!("{}{path}", self.endpoint.url);
+        let req = self.authed_req(self.http.put(&url).query(query).json(body));
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| AgentError::Network(e.to_string()))?;
+        self.handle_resp(resp, "PUT", path).await
+    }
+
+    /// `PUT /api/experimental/session/{id}/instructions/entries/{key}`: a
+    /// durable per-session instruction. `Ok(false)` when this OpenCode has
+    /// no such route (404).
+    pub async fn set_session_instruction(
+        &self,
+        session_id: &str,
+        key: &str,
+        text: &str,
+    ) -> Result<bool, AgentError> {
+        let path = format!("/api/experimental/session/{session_id}/instructions/entries/{key}");
+        let url = format!("{}{path}", self.endpoint.url);
+        let req = self.authed_req(self.http.put(&url).json(&json!({ "value": text })));
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| AgentError::Network(e.to_string()))?;
+        if resp.status() == StatusCode::NOT_FOUND {
+            return Ok(false);
+        }
+        self.handle_resp(resp, "PUT", &path).await?;
+        Ok(true)
+    }
+
+    /// Removing an entry that is not there (404) is done too.
+    pub async fn remove_session_instruction(
+        &self,
+        session_id: &str,
+        key: &str,
+    ) -> Result<(), AgentError> {
+        let path = format!("/api/experimental/session/{session_id}/instructions/entries/{key}");
+        let url = format!("{}{path}", self.endpoint.url);
+        let resp = self
+            .authed_req(self.http.delete(&url))
+            .send()
+            .await
+            .map_err(|e| AgentError::Network(e.to_string()))?;
+        if resp.status() == StatusCode::NOT_FOUND {
+            return Ok(());
+        }
+        self.handle_resp(resp, "DELETE", &path).await?;
+        Ok(())
+    }
+
+    /// `PUT /api/experimental/mcp/{name}`: add (or replace) an MCP server
+    /// for `directory` and connect it, until the service restarts.
+    pub async fn add_mcp_server(
+        &self,
+        name: &str,
+        config: &Value,
+        directory: Option<&str>,
+    ) -> Result<Value, AgentError> {
+        self.put_with_query(
+            &format!("/api/experimental/mcp/{name}"),
+            &location_query(directory),
+            &json!({ "config": config }),
+        )
+        .await
+    }
+
     pub async fn patch(&self, path: &str, body: &Value) -> Result<Value, AgentError> {
         let url = format!("{}{path}", self.endpoint.url);
         let req = self.authed_req(self.http.patch(&url).json(body));
@@ -150,6 +257,80 @@ impl OpencodeClient {
         directory: Option<&str>,
         filter: &SessionListFilter<'_>,
     ) -> Result<Vec<Value>, AgentError> {
+        if filter
+            .limit
+            .is_some_and(|limit| limit > SESSION_LIST_MAX_RECORDS)
+        {
+            return Err(AgentError::Protocol(
+                "Session list exceeds record budget".into(),
+            ));
+        }
+        if filter.limit == Some(0) {
+            return Ok(Vec::new());
+        }
+        tokio::time::timeout(SESSION_LIST_TIMEOUT, async {
+            let target = filter.limit.unwrap_or(SESSION_LIST_MAX_RECORDS);
+            let mut sessions = Vec::new();
+            let mut cursor = filter.cursor.map(str::to_string);
+            let mut seen = HashSet::new();
+            let mut remaining_bytes = SESSION_LIST_MAX_BYTES;
+            for _ in 0..SESSION_LIST_MAX_REQUESTS {
+                if let Some(ref cursor) = cursor {
+                    if !seen.insert(cursor.clone()) {
+                        return Err(AgentError::Protocol("Session list cursor cycle".into()));
+                    }
+                }
+                let page_filter = SessionListFilter {
+                    limit: Some((target - sessions.len()).min(SESSION_PAGE_LIMIT)),
+                    cursor: cursor.as_deref(),
+                    ..filter.clone()
+                };
+                let (page, bytes) = self
+                    .read_session_page(directory, &page_filter, remaining_bytes)
+                    .await?;
+                remaining_bytes -= bytes;
+                sessions.extend(page.data);
+                if page.cursor.next.is_none() || filter.limit == Some(sessions.len()) {
+                    return Ok(sessions);
+                }
+                if sessions.len() == target || remaining_bytes == 0 {
+                    return Err(AgentError::Protocol(
+                        "Session list exhausted its budget before completion".into(),
+                    ));
+                }
+                cursor = page.cursor.next;
+            }
+            Err(AgentError::Protocol(
+                "Session list exceeds request budget".into(),
+            ))
+        })
+        .await
+        .map_err(|_| AgentError::Protocol("Session list exceeds total time budget".into()))?
+    }
+
+    /// Fetch exactly one bounded page, preserving both upstream cursors.
+    pub(crate) async fn list_sessions_page(
+        &self,
+        directory: Option<&str>,
+        filter: &SessionListFilter<'_>,
+    ) -> Result<SessionListPage, AgentError> {
+        self.read_session_page(directory, filter, SESSION_LIST_MAX_BYTES)
+            .await
+            .map(|(page, _)| page)
+    }
+
+    async fn read_session_page(
+        &self,
+        directory: Option<&str>,
+        filter: &SessionListFilter<'_>,
+        byte_limit: usize,
+    ) -> Result<(SessionListPage, usize), AgentError> {
+        let limit = filter.limit.unwrap_or(50);
+        if !(1..=SESSION_PAGE_LIMIT).contains(&limit) {
+            return Err(AgentError::InvalidRequest(
+                "Session page limit must be between 1 and 100".into(),
+            ));
+        }
         let mut query: Vec<(String, String)> = Vec::new();
         if let Some(d) = directory {
             query.push(("directory".to_string(), d.to_string()));
@@ -157,9 +338,7 @@ impl OpencodeClient {
         if let Some(parent) = filter.parent_id {
             query.push(("parentID".to_string(), parent.to_string()));
         }
-        if let Some(limit) = filter.limit {
-            query.push(("limit".to_string(), limit.to_string()));
-        }
+        query.push(("limit".to_string(), limit.to_string()));
         if let Some(order) = filter.order {
             query.push(("order".to_string(), order.to_string()));
         }
@@ -169,12 +348,44 @@ impl OpencodeClient {
         if let Some(cursor) = filter.cursor {
             query.push(("cursor".to_string(), cursor.to_string()));
         }
-        let res = self.get("/api/session", &query).await?;
-        Ok(res
-            .get("data")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default())
+        let mut response = self
+            .authed_req(
+                self.http
+                    .get(format!("{}/api/session", self.endpoint.url))
+                    .query(&query),
+            )
+            .send()
+            .await
+            .map_err(|err| AgentError::Network(err.to_string()))?;
+        let status = response.status();
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|err| AgentError::Network(err.to_string()))?
+        {
+            if chunk.len() > byte_limit - bytes.len() {
+                return Err(AgentError::Protocol(
+                    "Session list exceeds response byte budget".into(),
+                ));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        if !status.is_success() {
+            return Err(AgentError::RequestFailed(empty_body_failure(
+                status.as_u16(),
+                "GET",
+                "/api/session",
+            )));
+        }
+        let page: SessionListPage = serde_json::from_slice(&bytes)
+            .map_err(|err| AgentError::Protocol(format!("Invalid session page: {err}")))?;
+        if page.data.len() > limit {
+            return Err(AgentError::Protocol(
+                "Session page exceeds requested record limit".into(),
+            ));
+        }
+        Ok((page, bytes.len()))
     }
 
     pub async fn create_session(
@@ -204,6 +415,73 @@ impl OpencodeClient {
         self.get_plain(&format!("/api/session/{id}")).await
     }
 
+    /// V2 delivered inbox IDs are the projected message IDs. This global
+    /// Session-ID route takes no location: native Session.message compares the
+    /// stored owning sessionID before returning data. Never use a queue preview.
+    pub async fn get_message(
+        &self,
+        session_id: &str,
+        message_id: &str,
+    ) -> Result<Value, AgentError> {
+        let response = self
+            .get_plain(&format!("/api/session/{session_id}/message/{message_id}"))
+            .await?;
+        response
+            .get("data")
+            .filter(|message| message.get("id").and_then(Value::as_str) == Some(message_id))
+            .cloned()
+            .ok_or_else(|| AgentError::Protocol("Delivered message identity mismatch".into()))
+    }
+
+    /// `get_messages` for the growing reads of `load_earlier_timeline`,
+    /// refusing an answer over [`HISTORY_READ_MAX_BYTES`] instead of
+    /// buffering it whole: the route has no cursor, so each older page is
+    /// read as the newest `limit` messages again, and that read must stay
+    /// bounded like the session list is.
+    pub async fn get_messages_capped(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> Result<Vec<Value>, AgentError> {
+        let query = [("limit", limit.to_string()), ("order", "desc".to_owned())];
+        let mut response = self
+            .authed_req(
+                self.http
+                    .get(format!(
+                        "{}/api/session/{session_id}/message",
+                        self.endpoint.url
+                    ))
+                    .query(&query),
+            )
+            .send()
+            .await
+            .map_err(|err| AgentError::Network(err.to_string()))?;
+        let status = response.status();
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|err| AgentError::Network(err.to_string()))?
+        {
+            if chunk.len() > HISTORY_READ_MAX_BYTES - bytes.len() {
+                return Err(AgentError::Protocol(
+                    "History read exceeds response byte budget".into(),
+                ));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        if !status.is_success() {
+            return Err(AgentError::RequestFailed(empty_body_failure(
+                status.as_u16(),
+                "GET",
+                "/api/session/{id}/message",
+            )));
+        }
+        let res: Value =
+            serde_json::from_slice(&bytes).map_err(|err| AgentError::Protocol(err.to_string()))?;
+        Ok(message_list(res))
+    }
+
     pub async fn get_messages(
         &self,
         session_id: &str,
@@ -222,16 +500,7 @@ impl OpencodeClient {
                 &[("limit", limit_str.as_str()), ("order", "desc")],
             )
             .await?;
-        let mut items = match res.as_array() {
-            Some(arr) => arr.clone(),
-            None => res
-                .get("data")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default(),
-        };
-        items.reverse();
-        Ok(items)
+        Ok(message_list(res))
     }
 
     pub async fn send_prompt(
@@ -344,11 +613,11 @@ impl OpencodeClient {
         &self,
         session_id: &str,
         request_id: &str,
-        reply: &str,
+        decision: &str,
         message: Option<&str>,
     ) -> Result<Value, AgentError> {
         let mut body = json!({
-            "reply": reply,
+            "decision": decision,
         });
         if let Some(msg) = message.filter(|m| !m.trim().is_empty()) {
             body["message"] = json!(msg);
@@ -1055,6 +1324,496 @@ pub(crate) fn model_ref_json(model: &crate::agents::domain::ModelRef) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    type SessionRequests =
+        std::sync::Arc<std::sync::Mutex<Vec<std::collections::HashMap<String, String>>>>;
+
+    async fn session_pages_upstream(
+        pages: Vec<(StatusCode, String)>,
+    ) -> (OpencodeClient, SessionRequests, tokio::task::JoinHandle<()>) {
+        use axum::{extract::Query, routing::get, Router};
+        use std::sync::{Arc, Mutex};
+
+        let calls: SessionRequests = Arc::new(Mutex::new(Vec::new()));
+        let recorded = calls.clone();
+        let pages = Arc::new(pages);
+        let app = Router::new().route(
+            "/api/session",
+            get(
+                move |Query(query): Query<std::collections::HashMap<String, String>>| {
+                    let recorded = recorded.clone();
+                    let pages = pages.clone();
+                    async move {
+                        let mut calls = recorded.lock().unwrap();
+                        let index = calls.len();
+                        calls.push(query);
+                        pages.get(index).cloned().unwrap_or((
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "unexpected request".into(),
+                        ))
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = OpencodeClient::new(OpencodeEndpoint {
+            url: format!("http://{}", listener.local_addr().unwrap()),
+            password: None,
+            version: Some("2.0.27".into()),
+            pid: None,
+        });
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (client, calls, task)
+    }
+
+    fn session_page(start: usize, count: usize, next: Option<&str>) -> String {
+        json!({
+            "data": (start..start + count).map(|id| json!({"id": format!("ses-{id}")})).collect::<Vec<_>>(),
+            "cursor": {"next": next, "previous": null}
+        }).to_string()
+    }
+
+    #[tokio::test]
+    async fn session_page_preserves_filters_cursors_and_order_in_one_request() {
+        let page = json!({"data": [{"id": "ses-z"}, {"id": "ses-a"}],
+            "cursor": {"next": "opaque+next/日本語", "previous": "opaque-previous"}});
+        let (client, calls, task) =
+            session_pages_upstream(vec![(StatusCode::OK, page.to_string())]).await;
+        let result = client
+            .list_sessions_page(
+                Some("/work/example"),
+                &SessionListFilter {
+                    parent_id: Some("null"),
+                    limit: Some(50),
+                    order: Some("asc"),
+                    search: Some("title 日本語"),
+                    cursor: Some("opaque?input+/"),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.data, page["data"].as_array().unwrap().clone());
+        assert_eq!(result.cursor.next.as_deref(), Some("opaque+next/日本語"));
+        assert_eq!(result.cursor.previous.as_deref(), Some("opaque-previous"));
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![std::collections::HashMap::from([
+                ("directory".into(), "/work/example".into()),
+                ("parentID".into(), "null".into()),
+                ("limit".into(), "50".into()),
+                ("order".into(), "asc".into()),
+                ("search".into(), "title 日本語".into()),
+                ("cursor".into(), "opaque?input+/".into()),
+            ])]
+        );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn legacy_session_list_follows_next_until_the_total_limit_not_page_length() {
+        for (limit, expected_requests, expected_count) in [(50, 1, 50), (100, 2, 100)] {
+            let (client, calls, task) = session_pages_upstream(vec![
+                (StatusCode::OK, session_page(0, 50, Some("page-two"))),
+                (StatusCode::OK, session_page(50, 50, Some("page-three"))),
+            ])
+            .await;
+            let result = client
+                .list_sessions(
+                    Some("/work"),
+                    &SessionListFilter {
+                        limit: Some(limit),
+                        parent_id: Some("parent"),
+                        order: Some("desc"),
+                        search: Some("query"),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(result.len(), expected_count);
+            assert_eq!(result[0]["id"], "ses-0");
+            assert_eq!(
+                result[result.len() - 1]["id"],
+                format!("ses-{}", expected_count - 1)
+            );
+            let calls = calls.lock().unwrap();
+            assert_eq!(calls.len(), expected_requests);
+            assert_eq!(calls[0]["limit"], limit.to_string());
+            for call in calls.iter() {
+                assert_eq!(call["directory"], "/work");
+                assert_eq!(call["parentID"], "parent");
+                assert_eq!(call["order"], "desc");
+                assert_eq!(call["search"], "query");
+            }
+            if expected_requests == 2 {
+                assert_eq!(calls[1]["cursor"], "page-two");
+                assert_eq!(calls[1]["limit"], "50");
+            }
+            task.abort();
+        }
+        let (client, calls, task) = session_pages_upstream(vec![
+            (StatusCode::OK, session_page(0, 0, Some("after-empty"))),
+            (StatusCode::OK, session_page(1, 1, Some("after-short"))),
+            (StatusCode::OK, session_page(2, 1, None)),
+        ])
+        .await;
+        let result = client
+            .list_sessions(
+                None,
+                &SessionListFilter {
+                    limit: Some(50),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(result, vec![json!({"id": "ses-1"}), json!({"id": "ses-2"})]);
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[1]["cursor"], "after-empty");
+        assert_eq!(calls[2]["limit"], "49");
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn session_list_rejects_cursor_cycles_and_page_two_failures() {
+        for pages in [
+            vec![
+                (StatusCode::OK, session_page(0, 1, Some("loop"))),
+                (StatusCode::OK, session_page(1, 1, Some("loop"))),
+            ],
+            vec![
+                (StatusCode::OK, session_page(0, 1, Some("next"))),
+                (StatusCode::INTERNAL_SERVER_ERROR, "failed".into()),
+            ],
+        ] {
+            let (client, calls, task) = session_pages_upstream(pages).await;
+            assert!(client
+                .list_sessions(None, &SessionListFilter::default())
+                .await
+                .is_err());
+            assert_eq!(calls.lock().unwrap().len(), 2);
+            task.abort();
+        }
+        let (client, calls, task) =
+            session_pages_upstream(vec![(StatusCode::OK, session_page(0, 1, Some("start")))]).await;
+        assert!(
+            matches!(client.list_sessions(None, &SessionListFilter {cursor: Some("start"), ..Default::default()}).await, Err(AgentError::Protocol(message)) if message.contains("cursor cycle"))
+        );
+        assert_eq!(calls.lock().unwrap().len(), 1);
+        assert_eq!(calls.lock().unwrap()[0]["cursor"], "start");
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn session_list_keeps_repeated_records_and_requests_only_remaining_capacity() {
+        let (client, calls, task) = session_pages_upstream(vec![
+            (StatusCode::OK, session_page(0, 1, Some("next"))),
+            (StatusCode::OK, session_page(0, 1, Some("unused"))),
+        ])
+        .await;
+        let result = client
+            .list_sessions(
+                None,
+                &SessionListFilter {
+                    limit: Some(2),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(result, vec![json!({"id": "ses-0"}), json!({"id": "ses-0"})]);
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0]["limit"], "2");
+        assert_eq!(calls[1]["limit"], "1");
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn session_pages_reject_malformed_shapes_and_overfull_pages() {
+        for malformed in [
+            json!({}),
+            json!({"data": []}),
+            json!({"data": null, "cursor": {}}),
+            json!({"data": [], "cursor": null}),
+            json!({"data": [], "cursor": {"next": 123}}),
+            json!({"data": [], "cursor": {"previous": false}}),
+            json!({"data": [{"id": "a"}, {"id": "b"}], "cursor": {}}),
+        ] {
+            let (client, _, task) =
+                session_pages_upstream(vec![(StatusCode::OK, malformed.to_string())]).await;
+            assert!(matches!(
+                client
+                    .list_sessions_page(
+                        None,
+                        &SessionListFilter {
+                            limit: Some(1),
+                            ..Default::default()
+                        }
+                    )
+                    .await,
+                Err(AgentError::Protocol(_))
+            ));
+            task.abort();
+        }
+        for cursor in [json!({}), json!({"next": null, "previous": null})] {
+            let (client, calls, task) = session_pages_upstream(vec![(
+                StatusCode::OK,
+                json!({"data": [], "cursor": cursor}).to_string(),
+            )])
+            .await;
+            let page = client
+                .list_sessions_page(None, &SessionListFilter::default())
+                .await
+                .unwrap();
+            assert!(page.cursor.next.is_none());
+            assert!(page.cursor.previous.is_none());
+            assert_eq!(calls.lock().unwrap()[0]["limit"], "50");
+            task.abort();
+        }
+        let (client, calls, task) = session_pages_upstream(Vec::new()).await;
+        for limit in [0, 101] {
+            assert!(matches!(
+                client
+                    .list_sessions_page(
+                        None,
+                        &SessionListFilter {
+                            limit: Some(limit),
+                            ..Default::default()
+                        }
+                    )
+                    .await,
+                Err(AgentError::InvalidRequest(_))
+            ));
+        }
+        assert!(calls.lock().unwrap().is_empty());
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn unlimited_session_list_enforces_request_and_record_budget_boundaries() {
+        for (count, pages, exhausted) in [
+            (1, 20, false),
+            (1, 20, true),
+            (100, 10, false),
+            (100, 10, true),
+        ] {
+            let responses = (0..pages)
+                .map(|index| {
+                    let next = format!("cursor-{}", index + 1);
+                    (
+                        StatusCode::OK,
+                        session_page(
+                            index * count,
+                            count,
+                            if index + 1 == pages && exhausted {
+                                None
+                            } else {
+                                Some(&next)
+                            },
+                        ),
+                    )
+                })
+                .collect();
+            let (client, calls, task) = session_pages_upstream(responses).await;
+            let result = client
+                .list_sessions(None, &SessionListFilter::default())
+                .await;
+            if exhausted {
+                assert_eq!(result.unwrap().len(), count * pages);
+            } else {
+                assert!(matches!(result, Err(AgentError::Protocol(_))));
+            }
+            assert_eq!(calls.lock().unwrap().len(), pages);
+            task.abort();
+        }
+        let (client, calls, task) = session_pages_upstream(Vec::new()).await;
+        assert!(matches!(
+            client
+                .list_sessions(
+                    None,
+                    &SessionListFilter {
+                        limit: Some(1001),
+                        ..Default::default()
+                    }
+                )
+                .await,
+            Err(AgentError::Protocol(_))
+        ));
+        assert!(calls.lock().unwrap().is_empty());
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn session_pages_bound_actual_body_bytes_individually_and_cumulatively() {
+        let mut exact = session_page(0, 1, None);
+        exact.push_str(&" ".repeat(SESSION_LIST_MAX_BYTES - exact.len()));
+        let (client, _, task) = session_pages_upstream(vec![(StatusCode::OK, exact.clone())]).await;
+        assert_eq!(
+            client
+                .list_sessions_page(None, &SessionListFilter::default())
+                .await
+                .unwrap()
+                .data
+                .len(),
+            1
+        );
+        task.abort();
+        exact.push(' ');
+        let (client, _, task) = session_pages_upstream(vec![(StatusCode::OK, exact)]).await;
+        assert!(matches!(
+            client
+                .list_sessions_page(None, &SessionListFilter::default())
+                .await,
+            Err(AgentError::Protocol(_))
+        ));
+        task.abort();
+        let mut first = session_page(0, 1, Some("next"));
+        first.push_str(&" ".repeat(SESSION_LIST_MAX_BYTES / 2 + 1 - first.len()));
+        let mut second = session_page(1, 1, None);
+        second.push_str(&" ".repeat(SESSION_LIST_MAX_BYTES / 2 - second.len()));
+        let (client, calls, task) =
+            session_pages_upstream(vec![(StatusCode::OK, first), (StatusCode::OK, second)]).await;
+        assert!(matches!(
+            client
+                .list_sessions(None, &SessionListFilter::default())
+                .await,
+            Err(AgentError::Protocol(_))
+        ));
+        assert_eq!(calls.lock().unwrap().len(), 2);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn session_page_bounds_chunked_bodies_without_content_length() {
+        use axum::{body::Body, routing::get, Router};
+        let chunk = vec![b' '; SESSION_LIST_MAX_BYTES / 2];
+        let app = Router::new().route(
+            "/api/session",
+            get(move || {
+                let chunks = vec![chunk.clone(), chunk.clone(), vec![b' ']];
+                async move {
+                    Body::from_stream(tokio_stream::iter(
+                        chunks.into_iter().map(Ok::<_, std::io::Error>),
+                    ))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = OpencodeClient::new(OpencodeEndpoint {
+            url: format!("http://{}", listener.local_addr().unwrap()),
+            password: None,
+            version: None,
+            pid: None,
+        });
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        assert!(
+            matches!(client.list_sessions_page(None, &SessionListFilter::default()).await, Err(AgentError::Protocol(message)) if message.contains("byte budget"))
+        );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn session_list_has_one_total_deadline_across_pages() {
+        use axum::{routing::get, Router};
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let recorded = calls.clone();
+        let app = Router::new().route(
+            "/api/session",
+            get(move || {
+                let recorded = recorded.clone();
+                async move {
+                    let index = recorded.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_secs(8)).await;
+                    session_page(index, 1, Some("next"))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = OpencodeClient::new(OpencodeEndpoint {
+            url: format!("http://{}", listener.local_addr().unwrap()),
+            password: None,
+            version: None,
+            pid: None,
+        });
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let started = tokio::time::Instant::now();
+        assert!(
+            matches!(client.list_sessions(None, &SessionListFilter::default()).await, Err(AgentError::Protocol(message)) if message.contains("total time budget"))
+        );
+        assert!(started.elapsed() < Duration::from_secs(17));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn permission_reply_requires_decision_for_all_upstream_variants() {
+        use axum::{routing::post, Json, Router};
+        use std::sync::{Arc, Mutex};
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let recorded = calls.clone();
+        let app = Router::new().route(
+            "/api/session/ses_QA/permission/req_QA/reply",
+            post(move |Json(body): Json<Value>| async move {
+                let valid = !body.as_object().unwrap().contains_key("reply")
+                    && matches!(
+                        body.get("decision").and_then(Value::as_str),
+                        Some("once" | "always" | "reject")
+                    );
+                recorded.lock().unwrap().push(body);
+                if valid {
+                    StatusCode::NO_CONTENT
+                } else {
+                    StatusCode::BAD_REQUEST
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = OpencodeClient::new(OpencodeEndpoint {
+            url: format!("http://{}", listener.local_addr().unwrap()),
+            password: None,
+            version: Some("2.0.27".into()),
+            pid: None,
+        });
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        // The mock must reject the old spelling, not silently accept any body.
+        assert!(client
+            .post(
+                "/api/session/ses_QA/permission/req_QA/reply",
+                &json!({"reply": "once"}),
+            )
+            .await
+            .is_err());
+        for (decision, message) in [
+            ("once", None),
+            ("always", Some("  ")),
+            ("reject", Some("Please use the read-only tool instead.")),
+        ] {
+            assert_eq!(
+                client
+                    .reply_permission("ses_QA", "req_QA", decision, message)
+                    .await
+                    .unwrap(),
+                json!({"success": true})
+            );
+        }
+        task.abort();
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![
+                json!({"reply": "once"}),
+                json!({"decision": "once"}),
+                json!({"decision": "always"}),
+                json!({"decision": "reject", "message": "Please use the read-only tool instead."}),
+            ]
+        );
+    }
 
     async fn rename_against_upstream(
         patch_status: StatusCode,

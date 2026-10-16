@@ -39,7 +39,8 @@ impl Install {
             "public_url": format!("http://{address}"), "token_hash": token_hash,
             "sessions": [{"id": "qa", "label": "isolated", "backend": "tmux", "socket_path": root.join("no-terminal.sock")}],
             "autostart_backends": [], "opencode": {"enabled": false, "autostart": false},
-            "deepseek": {"enabled": false}, "t3": {"enabled": false}
+            "deepseek": {"enabled": false}, "t3": {"enabled": false},
+            "codex": {"enabled": false}, "agent_runtime": {"enabled": false}
         })).unwrap()).unwrap();
         fs::write(
             config.join("pairing.json"),
@@ -59,7 +60,15 @@ impl Install {
         fs::write(&script, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$MOCK_LOG\"\n[ -z \"$MOCK_BUS_FAIL\" ] || exit 1\ncase \"$*\" in *GetUnit*) printf '%s\\n' '{\"type\":\"o\",\"data\":[\"/org/freedesktop/systemd1/unit/fixture\"]}';; *GetAll*Manager*) cat \"$MOCK_MANAGER\";; *GetAll*) cat \"$MOCK_PROPERTIES\";; *) exit 1;; esac\n").unwrap();
         fs::set_permissions(script, fs::Permissions::from_mode(0o700)).unwrap();
         // Even a backend liveness probe must never reach a host terminal.
-        for name in ["tmux", "tailscale"] {
+        for name in [
+            "tmux",
+            "tailscale",
+            "claude",
+            "codex",
+            "opencode",
+            "t3",
+            "deepseek",
+        ] {
             let script = root.join("bin").join(name);
             fs::write(&script, "#!/bin/sh\nexit 1\n").unwrap();
             fs::set_permissions(script, fs::Permissions::from_mode(0o700)).unwrap();
@@ -78,6 +87,7 @@ impl Install {
             .env_clear()
             .current_dir(&self.root)
             .env("HOME", self.root.join("home"))
+            .env("CODEX_HOME", self.root.join("codex-home"))
             .env("XDG_CONFIG_HOME", self.root.join("xdg-config"))
             .env("XDG_DATA_HOME", self.root.join("xdg-data"))
             .env("XDG_STATE_HOME", self.root.join("xdg-state"))
@@ -175,6 +185,407 @@ impl Drop for Install {
             }
         }
         let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+/// A foreground Gateway in a private process group. It owns no daemon process.
+struct ForegroundGateway {
+    child: std::process::Child,
+    root: PathBuf,
+}
+
+impl ForegroundGateway {
+    fn wait_listening(&mut self) {
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while !fs::read_to_string(self.root.join("foreground.out"))
+            .unwrap_or_default()
+            .contains("terminal gateway listening on")
+        {
+            assert!(
+                self.child.try_wait().unwrap().is_none(),
+                "fixture Gateway exited before listening"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "fixture Gateway never started listening"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn stop(&mut self) {
+        let started = Instant::now();
+        // SAFETY: this is the directly owned, unreaped fixture child.
+        assert_eq!(
+            unsafe { libc::kill(self.child.id() as libc::pid_t, libc::SIGTERM) },
+            0
+        );
+        let deadline = started + Duration::from_secs(5);
+        let status = loop {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                break status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "Gateway did not finish Codex shutdown"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(status.success());
+        eprintln!("shared Codex connection shutdown: {:?}", started.elapsed());
+    }
+}
+
+impl Drop for ForegroundGateway {
+    fn drop(&mut self) {
+        if self.child.try_wait().ok().flatten().is_none() {
+            // SAFETY: signal only the directly owned, unreaped fixture child.
+            unsafe {
+                libc::kill(self.child.id() as libc::pid_t, libc::SIGTERM);
+            }
+            let deadline = Instant::now() + Duration::from_secs(6);
+            while self.child.try_wait().ok().flatten().is_none() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = self.child.kill();
+        }
+        let _ = self.child.wait();
+    }
+}
+
+fn configure_fake_codex(install: &Install, master_enabled: bool) -> PathBuf {
+    let executable = install.root.join("bin/fake-codex");
+    fs::write(
+        &executable,
+        r#"#!/bin/sh
+[ "$1" = --fixture-ready ] && exit 0
+printf '%s' "$$" > "$FAKE_CODEX_PID"
+printf '%s\n' "$@" >> "$FAKE_CODEX_ARGV"
+[ "$*" = 'app-server daemon start' ] || exit 1
+# The test owns the synthetic daemon, not this short-lived official CLI stand-in.
+i=0
+while [ ! -e "$FAKE_CODEX_SOCKET_READY" ]; do
+    [ "$i" -lt 100 ] || exit 1
+    sleep 0.05
+    i=$((i + 1))
+done
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+    // Side-effect-free readiness addresses only a fake immutable script's
+    // pre-exec ETXTBSY; it is not a retry of upstream agent work.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match Command::new(&executable).arg("--fixture-ready").status() {
+            Ok(status) => {
+                assert!(status.success());
+                break;
+            }
+            Err(error) if error.raw_os_error() == Some(libc::ETXTBSY) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "fake Codex fixture remained busy"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("fake Codex readiness failed: {error}"),
+        }
+    }
+    let path = install.config.join("config.json");
+    let mut config: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    config["agent_runtime"] = json!({"enabled":master_enabled});
+    config["codex"] = json!({"binary":executable});
+    fs::write(path, serde_json::to_vec(&config).unwrap()).unwrap();
+    executable
+}
+
+fn foreground_gateway(install: &Install) -> ForegroundGateway {
+    use std::os::unix::process::CommandExt as _;
+    let mut command = install.command(&["run"]);
+    command
+        .process_group(0)
+        .env("FAKE_CODEX_PID", install.root.join("fake-codex.pid"))
+        .env("FAKE_CODEX_ARGV", install.root.join("fake-codex.argv"))
+        .env(
+            "FAKE_CODEX_SOCKET_READY",
+            install.root.join("fake-codex.socket-ready"),
+        )
+        .stdout(fs::File::create(install.root.join("foreground.out")).unwrap())
+        .stderr(fs::File::create(install.root.join("foreground.err")).unwrap());
+    ForegroundGateway {
+        child: command.spawn().unwrap(),
+        root: install.root.clone(),
+    }
+}
+
+/// Emulates the daemon outside Gateway ownership. Only its unique socket is
+/// created/removed; the official per-UID directory and other daemons are untouched.
+struct SharedCodexDaemon {
+    socket: PathBuf,
+    task: tokio::task::JoinHandle<()>,
+    requests: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    disconnected: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl SharedCodexDaemon {
+    fn new(install: &Install) -> Self {
+        use futures::{SinkExt as _, StreamExt as _};
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::os::unix::fs::{symlink, DirBuilderExt as _, MetadataExt as _};
+        use std::sync::{atomic::Ordering, Arc, Mutex};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let home = install.root.join("codex-home");
+        let parent = home.join("app-server-control");
+        fs::create_dir_all(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+        let home = fs::canonicalize(home).unwrap();
+        let alias = fs::canonicalize(parent)
+            .unwrap()
+            .join("app-server-control.sock");
+        // Production requires this official root, irrespective of TMPDIR.
+        let uid = unsafe { libc::geteuid() };
+        let directory = fs::canonicalize("/tmp")
+            .unwrap()
+            .join(format!("codex-daemon-{uid}"));
+        match fs::DirBuilder::new().mode(0o700).create(&directory) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => panic!("cannot create daemon socket directory: {error}"),
+        }
+        let metadata = fs::symlink_metadata(&directory).unwrap();
+        assert!(metadata.is_dir() && !metadata.file_type().is_symlink());
+        assert_eq!(metadata.uid(), uid);
+        assert_eq!(metadata.mode() & 0o777, 0o700);
+        let socket = directory.join(hex::encode(Sha256::digest(alias.as_os_str().as_bytes())));
+        assert!(!socket.exists(), "fixture socket must be unique");
+        let path = socket.clone();
+        let root = install.root.clone();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let seen = requests.clone();
+        let disconnected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let closed = disconnected.clone();
+        let task = tokio::spawn(async move {
+            // No alias exists until the real Gateway invokes daemon start.
+            while !root.join("fake-codex.argv").exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let listener = tokio::net::UnixListener::bind(&path).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+            symlink(&path, &alias).unwrap();
+            fs::write(root.join("fake-codex.socket-ready"), "ready").unwrap();
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+                while let Some(Ok(Message::Text(text))) = ws.next().await {
+                    let request: serde_json::Value = serde_json::from_str(&text).unwrap();
+                    seen.lock().unwrap().push(request.clone());
+                    let Some(id) = request.get("id") else {
+                        continue;
+                    };
+                    let result = match request["method"].as_str().unwrap() {
+                        "initialize" => {
+                            json!({"userAgent":"codex_cli_rs/0.162.1 (synthetic fixture)","codexHome":home})
+                        }
+                        "account/read" => json!({"account":null,"requiresOpenaiAuth":false}),
+                        "config/read" => json!({"config":{"model_provider":null}}),
+                        "skills/list" => json!({"data":[]}),
+                        "model/list" | "thread/list" | "thread/loaded/list" => {
+                            json!({"data":[],"nextCursor":null})
+                        }
+                        method => panic!("unexpected lifecycle RPC: {method}"),
+                    };
+                    if ws
+                        .send(Message::Text(
+                            json!({"id":id,"result":result}).to_string().into(),
+                        ))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                    if request["method"] == "account/read" {
+                        fs::write(root.join("fake-codex.ready"), "ready").unwrap();
+                    }
+                }
+                closed.store(true, Ordering::Release);
+            }
+        });
+        Self {
+            socket,
+            task,
+            requests,
+            disconnected,
+        }
+    }
+}
+
+impl Drop for SharedCodexDaemon {
+    fn drop(&mut self) {
+        self.task.abort();
+        let _ = fs::remove_file(&self.socket);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn codex_shared_daemon_starts_from_config_and_survives_gateway_sigterm() {
+    use futures::{SinkExt as _, StreamExt as _};
+    use std::sync::atomic::Ordering;
+    use tokio_tungstenite::tungstenite::Message;
+
+    for use_path_defaults in [false, true] {
+        let install = Install::new();
+        let executable = configure_fake_codex(&install, true);
+        if use_path_defaults {
+            // Both omitted blocks default on, and normal PATH selects only
+            // this immutable fixture, never an ambient installed Codex.
+            let path_binary = install.root.join("bin/codex");
+            fs::remove_file(&path_binary).unwrap();
+            fs::hard_link(&executable, &path_binary).unwrap();
+            let path = install.config.join("config.json");
+            let mut config: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            config.as_object_mut().unwrap().remove("codex");
+            config.as_object_mut().unwrap().remove("agent_runtime");
+            fs::write(path, serde_json::to_vec(&config).unwrap()).unwrap();
+        }
+        let daemon = SharedCodexDaemon::new(&install);
+        let mut gateway = foreground_gateway(&install);
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while !install.root.join("fake-codex.ready").exists()
+            || !fs::read_to_string(install.root.join("foreground.err"))
+                .unwrap_or_default()
+                .contains("adopted the running Codex daemon")
+        {
+            assert!(!daemon.task.is_finished(), "synthetic daemon failed");
+            assert!(
+                gateway.child.try_wait().unwrap().is_none(),
+                "Gateway exited before fake Codex readiness"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "fake Codex was not initialized: {}",
+                fs::read_to_string(install.root.join("foreground.err")).unwrap_or_default()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        gateway.wait_listening();
+        assert_eq!(
+            fs::read_to_string(install.root.join("fake-codex.argv")).unwrap(),
+            "app-server\ndaemon\nstart\n"
+        );
+        gateway.stop();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !daemon.disconnected.load(Ordering::Acquire) {
+                assert!(!daemon.task.is_finished(), "synthetic daemon failed");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("Gateway must close its shared connection");
+        let methods: Vec<_> = daemon
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|r| r["method"].as_str().unwrap().to_owned())
+            .collect();
+        assert!(methods.iter().any(|m| m == "initialize"));
+        assert!(methods.iter().any(|m| m == "initialized"));
+        assert!(methods.iter().any(|m| m == "account/read"));
+        eprintln!("shared daemon RPCs before disconnect: {methods:?}");
+        assert!(
+            methods.iter().all(|m| matches!(
+                m.as_str(),
+                "initialize"
+                    | "initialized"
+                    | "account/read"
+                    | "config/read"
+                    | "model/list"
+                    | "skills/list"
+                    | "thread/list"
+                    | "thread/loaded/list"
+            )),
+            "shutdown must not send daemon or thread mutations: {methods:?}"
+        );
+        // A fresh client must still get a real reply after Gateway has exited.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let stream = tokio::net::UnixStream::connect(&daemon.socket)
+                .await
+                .unwrap();
+            let (mut ws, _) = tokio_tungstenite::client_async("ws://localhost/rpc", stream)
+                .await
+                .unwrap();
+            ws.send(Message::Text(
+                json!({"id":99,"method":"initialize","params":{}})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+            let reply = ws.next().await.unwrap().unwrap().into_text().unwrap();
+            let reply: serde_json::Value = serde_json::from_str(&reply).unwrap();
+            assert_eq!(reply["id"], 99);
+            assert_eq!(
+                reply["result"]["codexHome"],
+                json!(fs::canonicalize(install.root.join("codex-home")).unwrap())
+            );
+        })
+        .await
+        .expect("shared daemon must remain responsive after Gateway shutdown");
+        assert_eq!(
+            fs::read_to_string(install.root.join("fake-codex.argv")).unwrap(),
+            "app-server\ndaemon\nstart\n",
+            "shutdown must not invoke daemon stop/restart"
+        );
+    }
+}
+
+#[test]
+fn codex_master_off_cli_and_bind_failure_never_start_the_configured_daemon() {
+    let install = Install::new();
+    configure_fake_codex(&install, false);
+    let list = install.ok(&["agent", "--json"]);
+    let agents: serde_json::Value = serde_json::from_slice(&list.stdout).unwrap();
+    assert!(agents
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|a| a["status"] == "disabled"));
+    assert!(!install.root.join("fake-codex.pid").exists());
+    assert!(!install.root.join("fake-codex.argv").exists());
+    configure_fake_codex(&install, true);
+    let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let path = install.config.join("config.json");
+    let mut config: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    config["listen"] = json!(occupied.local_addr().unwrap().to_string());
+    fs::write(path, serde_json::to_vec(&config).unwrap()).unwrap();
+    let result = install.run(&["run"]);
+    assert!(!result.status.success());
+    assert!(!install.root.join("fake-codex.pid").exists());
+    assert!(!install.root.join("fake-codex.argv").exists());
+}
+
+#[test]
+fn codex_explicit_disable_and_master_off_reach_the_running_server_without_daemon_startup() {
+    for master_off in [true, false] {
+        let install = Install::new();
+        configure_fake_codex(&install, !master_off);
+        if !master_off {
+            let path = install.config.join("config.json");
+            let mut config: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            config["codex"]["enabled"] = json!(false);
+            fs::write(path, serde_json::to_vec(&config).unwrap()).unwrap();
+        }
+        let mut gateway = foreground_gateway(&install);
+        gateway.wait_listening();
+        gateway.stop();
+        assert!(!install.root.join("fake-codex.pid").exists());
+        assert!(!install.root.join("fake-codex.argv").exists());
     }
 }
 
@@ -622,7 +1033,7 @@ fn manager_pty_navigates_scrolls_resizes_and_keeps_start_failures_in_the_ui() {
     )
     .unwrap();
     let mut manager = ManagerPty::open(&install);
-    let output = manager.until("Enter Start gateway");
+    let output = manager.until("s start · t stop · r restart");
     assert!(output.contains("Runtime"));
     assert!(output.contains("Connectivity"));
     assert!(
@@ -630,24 +1041,29 @@ fn manager_pty_navigates_scrolls_resizes_and_keeps_start_failures_in_the_ui() {
         "active tab is not reversed: {output:?}"
     );
     manager.send(b"2\x1b[F");
-    let output = manager.until_all(&["> qa-39", "终端 e\u{301} 39"]);
+    let output = manager.until_all(&["▌ qa-39", "终端 e\u{301} 39"]);
     assert!(
         output.contains("终端 e\u{301} 39"),
         "wide selected label missing: {output:?}"
     );
+    // Enter opens the backend's actions; its first is "Make default".
+    manager.send(b"\r");
+    manager.until("Make default");
     manager.send(b"\r");
     manager.until("default is now qa-39");
     let changed: serde_json::Value =
         serde_json::from_slice(&fs::read(install.config.join("config.json")).unwrap()).unwrap();
     assert_eq!(changed["sessions"][0]["id"], "qa-39");
-    manager.send(b"d");
+    manager.send(b"\r");
+    manager.until("Remove backend");
+    manager.send(b"\x1b[B\x1b[B\r");
     manager.until("Remove terminal backend?");
     manager.send(b"\x1b");
     manager.until("backend unchanged");
     manager.send(b"3");
     manager.until("No devices paired yet.");
     manager.send(b"\r");
-    manager.until("Scan with Muqun");
+    manager.until("1 Scan the QR in Muqun");
     let size = libc::winsize {
         ws_row: 8,
         ws_col: 40,
@@ -672,7 +1088,7 @@ fn manager_pty_navigates_scrolls_resizes_and_keeps_start_failures_in_the_ui() {
     );
     // Confirm the larger frame before sending a standalone Esc: resize
     // notification and key decoding are asynchronous, separate transitions.
-    manager.until("Scan with Muqun");
+    manager.until("1 Scan the QR in Muqun");
     manager.send(b"\x1b");
     manager.until("No devices paired yet.");
     manager.send(b"4\r");
@@ -684,7 +1100,32 @@ fn manager_pty_navigates_scrolls_resizes_and_keeps_start_failures_in_the_ui() {
     manager.until("Edit Gateway address");
     manager.send(b"\x1b");
     manager.until("url unchanged");
+    // Detect address offers the address; Esc leaves config.json as it was.
+    let before = fs::read(install.config.join("config.json")).unwrap();
+    manager.send(b"\x1b[B\r");
+    manager.until("Edit Gateway address");
+    manager.send(b"\x1b");
+    manager.until("url unchanged");
+    assert_eq!(
+        fs::read(install.config.join("config.json")).unwrap(),
+        before
+    );
+    // History checkpoints: the chooser writes the one key it changes.
+    manager.send(b"\x1b[B\x1b[B\x1b[B\r");
+    manager.until("only while Gateway runs");
+    manager.send(b"\x1b[B\r");
+    manager.until("History checkpoints: SQLite");
+    let mut after: serde_json::Value =
+        serde_json::from_slice(&fs::read(install.config.join("config.json")).unwrap()).unwrap();
+    assert_eq!(after["history"]["storage"], "sqlite");
+    after.as_object_mut().unwrap().remove("history");
+    let mut before: serde_json::Value = serde_json::from_slice(&before).unwrap();
+    before.as_object_mut().unwrap().remove("history");
+    assert_eq!(after, before, "only history.storage changed");
+    // Enter is not the start key on Overview; `s` is.
     manager.send(b"1\r");
+    manager.until("Status: ready");
+    manager.send(b"s");
     manager.until("Action failed: gateway exited during startup");
     assert!(
         manager.child.try_wait().unwrap().is_none(),
@@ -714,9 +1155,13 @@ fn manager_enter_targets_the_selected_device_and_esc_only_cancels_revocation() {
     ])).unwrap();
     fs::write(&file, &records).unwrap();
     let mut manager = ManagerPty::open(&install);
-    manager.until("Enter Start gateway");
+    manager.until("s start · t stop · r restart");
+    // Enter shows the device; x there reviews its revocation.
     manager.send(b"3\x1b[B\r");
-    let output = manager.until("Enter Confirm selection");
+    let output = manager.until("x revoke · Esc back");
+    assert!(output.contains("First phone 中文 e\u{301}"));
+    manager.send(b"x");
+    let output = manager.until("Enter confirm");
     assert!(output.contains("Selected: First phone 中文 e\u{301}"));
     assert!(output.contains("loses Gateway access immediately"));
     manager.send(b"\x1b");
@@ -741,7 +1186,7 @@ fn manager_compact_pairing_keeps_the_full_address_reachable_without_resizing() {
     )
     .unwrap();
     let mut manager = ManagerPty::open(&install);
-    manager.until("Enter Start gateway");
+    manager.until("s start · t stop · r restart");
     let size = libc::winsize {
         ws_row: 8,
         ws_col: 40,
@@ -755,10 +1200,10 @@ fn manager_compact_pairing_keeps_the_full_address_reachable_without_resizing() {
     );
     // Wait for the resized Overview frame before starting pairing, so PTY
     // resize delivery cannot overlap the navigation input being asserted.
-    manager.until("Tab Views | Esc Back | q Close");
+    manager.until("Tab next view · q quit");
     manager.send(b"3\r");
     let output = manager.until(&address[..30]);
-    assert!(output.contains("Down for URL"));
+    assert!(output.contains("Resize for the full QR"));
     // Address has a nine-cell prefix, leaving thirty cells per wrapped segment.
     for segment in address.as_bytes().chunks(30).skip(1) {
         manager.send(b"\x1b[B");

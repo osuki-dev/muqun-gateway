@@ -4,10 +4,30 @@ use std::pin::Pin;
 
 use crate::agents::domain::{
     AgentCatalog, AgentProject, AgentSessionInfo, FormRequest, ModelRef, PermissionDecision,
-    PermissionRequest, SessionQuery, TimelineItem,
+    PermissionRequest, SessionPage, SessionQuery, TimelineItem,
 };
 
 pub type AgentFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, AgentError>> + Send + 'a>>;
+
+/// A bounded tail whose pagination boundary is not yet accepted. Stateful
+/// adapters provide a one-shot synchronous commit; dropping it discards the
+/// candidate. The mirror must validate its revision before invoking this hook,
+/// then accept the rows without another await. No rollback of shared state.
+pub struct PreparedTimeline<'a> {
+    pub items: Vec<TimelineItem>,
+    pub(crate) commit: Option<TimelineCommit<'a>>,
+}
+
+pub(crate) type TimelineCommit<'a> = Box<dyn FnOnce() -> Result<(), AgentError> + Send + 'a>;
+
+impl PreparedTimeline<'_> {
+    pub fn ready(items: Vec<TimelineItem>) -> Self {
+        Self {
+            items,
+            commit: None,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub enum AgentError {
@@ -31,6 +51,12 @@ pub enum AgentError {
     /// such as handing the agent a file it never uploaded. A `400`, not an
     /// agent fault.
     InvalidRequest(String),
+    /// A live external runtime must be controlled through its existing terminal.
+    TerminalInteraction(Box<crate::agents::domain::SessionRuntime>),
+    /// `load_earlier_timeline` has no cursor for the session -- no snapshot
+    /// was read in this process, it was evicted, or the history changed
+    /// under it. Not exhaustion: the app re-reads the snapshot and pages on.
+    HistoryCursorLost,
 }
 
 impl fmt::Display for AgentError {
@@ -46,6 +72,13 @@ impl fmt::Display for AgentError {
             Self::Protocol(msg) => write!(f, "Protocol error: {msg}"),
             Self::Unsupported(cap) => write!(f, "Agent does not support capability: {cap}"),
             Self::InvalidRequest(msg) => write!(f, "Invalid request: {msg}"),
+            Self::HistoryCursorLost => f.write_str(
+                "The earlier-history cursor for this session is gone; read the snapshot again",
+            ),
+            Self::TerminalInteraction(_) => write!(
+                f,
+                "Native interaction is unavailable; use the current terminal binding when provided"
+            ),
         }
     }
 }
@@ -65,9 +98,19 @@ pub struct FileDiffItem {
 pub enum AttachmentMode {
     /// The agent's own API carries file parts.
     Native,
+    /// Native file parts, restricted to files uploaded to this Gateway.
+    /// Remote URLs, data URIs and arbitrary host paths are not accepted.
+    NativeUploads,
     /// The agent has no attachment API but can read files off this host, so
     /// the prompt use case lists the paths in the text instead.
     ByPath,
+}
+
+/// A new service-owned session that an official terminal client can attach to.
+/// No prompt has been submitted; the caller performs its existing one-shot delivery.
+pub struct PreparedTerminalLaunch {
+    pub session: AgentSessionInfo,
+    pub arguments: Vec<String>,
 }
 
 /// `text` followed by a block listing `paths` for an agent that reads files
@@ -100,6 +143,11 @@ pub trait AgentPort: Send + Sync {
         query: &'a SessionQuery,
     ) -> AgentFuture<'a, Vec<AgentSessionInfo>>;
 
+    /// Read one ordered page from a single provider, without losing cursors.
+    fn list_sessions_page<'a>(&'a self, _query: &'a SessionQuery) -> AgentFuture<'a, SessionPage> {
+        Box::pin(async { Err(AgentError::Unsupported("session pagination".into())) })
+    }
+
     /// Create a new session
     fn create_session<'a>(
         &'a self,
@@ -108,8 +156,35 @@ pub trait AgentPort: Send + Sync {
         mode: Option<&'a str>,
     ) -> AgentFuture<'a, AgentSessionInfo>;
 
+    /// Prepare a shared session from supported native CLI choices. Unsupported
+    /// is returned only before creating a session; other failures are ambiguous
+    /// and must never trigger a second launch or prompt delivery.
+    fn prepare_terminal_launch<'a>(
+        &'a self,
+        _directory: &'a str,
+        _title: &'a str,
+        _arguments: &'a [String],
+    ) -> AgentFuture<'a, PreparedTerminalLaunch> {
+        Box::pin(async { Err(AgentError::Unsupported("shared terminal startup".into())) })
+    }
+
     /// Get session metadata
     fn get_session<'a>(&'a self, session_id: &'a str) -> AgentFuture<'a, AgentSessionInfo>;
+
+    /// Prepare a user-selected snapshot, even when its retained mirror is warm.
+    /// Must not replace history or submit a prompt. Discovery and metadata-only
+    /// reads do not call this hook. Rejected ownership must remain an error.
+    fn prepare_selected_session<'a>(&'a self, _id: &'a str) -> AgentFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    /// Optional fresh runtime observation, without reading/replacing transcript history.
+    fn session_runtime<'a>(
+        &'a self,
+        _id: &'a str,
+    ) -> AgentFuture<'a, Option<crate::agents::domain::SessionRuntime>> {
+        Box::pin(async { Ok(None) })
+    }
 
     /// Whether `send_prompt` takes attachments natively or wants them listed
     /// in the text as host paths.
@@ -125,6 +200,58 @@ pub trait AgentPort: Send + Sync {
         attachments: &'a [String],
         delivery: Option<&'a str>,
     ) -> AgentFuture<'a, ()>;
+
+    /// Whether the agent's service takes an MCP server at runtime
+    /// ([`AgentPort::add_mcp_server`]).
+    fn adds_mcp_servers(&self) -> bool {
+        false
+    }
+
+    /// Whether the MCP server `name` is connected for `directory`.
+    fn mcp_server_connected<'a>(
+        &'a self,
+        _name: &'a str,
+        _directory: Option<&'a str>,
+    ) -> AgentFuture<'a, bool> {
+        Box::pin(async { Ok(false) })
+    }
+
+    /// Register (or replace) the MCP server `name` with `config` for
+    /// `directory` until the service restarts; no configuration file is
+    /// written.
+    fn add_mcp_server<'a>(
+        &'a self,
+        _name: &'a str,
+        _config: &'a serde_json::Value,
+        _directory: Option<&'a str>,
+    ) -> AgentFuture<'a, ()> {
+        Box::pin(async {
+            Err(AgentError::InvalidRequest(
+                "this agent takes no MCP server at runtime".into(),
+            ))
+        })
+    }
+
+    /// Attach (or replace) a durable instruction `text` under `key` to
+    /// session `session_id`, outside its conversation. `Ok(false)` when the
+    /// agent has no such thing.
+    fn set_session_instruction<'a>(
+        &'a self,
+        _session_id: &'a str,
+        _key: &'a str,
+        _text: &'a str,
+    ) -> AgentFuture<'a, bool> {
+        Box::pin(async { Ok(false) })
+    }
+
+    /// Remove the instruction under `key` from session `session_id`.
+    fn remove_session_instruction<'a>(
+        &'a self,
+        _session_id: &'a str,
+        _key: &'a str,
+    ) -> AgentFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
 
     /// Revert session to a previous message and roll back file changes
     fn revert_session<'a>(
@@ -170,6 +297,18 @@ pub trait AgentPort: Send + Sync {
     /// Fetch available catalog (models, agents, MCP)
     fn get_catalog<'a>(&'a self, directory: Option<&'a str>) -> AgentFuture<'a, AgentCatalog>;
 
+    /// Whether the latest catalog read actually received a skills list.
+    /// Stays false when the host has no skills method or the call failed.
+    fn skills_listed(&self) -> bool {
+        false
+    }
+
+    /// Whether the latest catalog read included slash commands from the
+    /// downloaded command catalog. Stays false when that file is absent.
+    fn slash_commands_listed(&self) -> bool {
+        false
+    }
+
     /// Fetch the VCS diff for a session's directory. `mode` is one of
     /// `working`, `branch` or `committed`; OpenCode requires it.
     fn get_vcs_diff<'a>(
@@ -195,6 +334,32 @@ pub trait AgentPort: Send + Sync {
         session_id: &'a str,
         limit: usize,
     ) -> AgentFuture<'a, Vec<TimelineItem>>;
+
+    /// Prepare a canonical snapshot tail. Legacy/stateless adapters keep their
+    /// existing reads; stateful pagination is committed at mirror acceptance.
+    fn prepare_timeline<'a>(
+        &'a self,
+        session_id: &'a str,
+        limit: usize,
+    ) -> AgentFuture<'a, PreparedTimeline<'a>> {
+        Box::pin(async move {
+            self.get_timeline(session_id, limit)
+                .await
+                .map(PreparedTimeline::ready)
+        })
+    }
+
+    /// The next older page after `get_timeline`, or an empty page when this
+    /// supporting agent has no further history. Unsupported adapters must not
+    /// present an empty page as successful exhaustion. The newest page stays
+    /// the snapshot.
+    fn load_earlier_timeline<'a>(
+        &'a self,
+        _session_id: &'a str,
+        _limit: usize,
+    ) -> AgentFuture<'a, Vec<TimelineItem>> {
+        Box::pin(async { Err(AgentError::Unsupported("timeline earlier".into())) })
+    }
 
     /// Delete a session
     fn delete_session<'a>(&'a self, _session_id: &'a str) -> AgentFuture<'a, ()> {

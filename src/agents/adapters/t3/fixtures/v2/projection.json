@@ -1,0 +1,39 @@
+{
+  "snapshotSequence": 10,
+  "historyCursor": "opaque/older+cursor=",
+  "hasMoreHistory": true,
+  "latestLocalTurnOrdinal": 2,
+  "projection": {
+    "thread": {"id":"thread","projectId":"project","title":"V2 fixture","providerInstanceId":"claudeAgent","modelSelection":{"instanceId":"claudeAgent","model":"claude-haiku-4-5"},"runtimeMode":"approval-required","interactionMode":"default","activeProviderThreadId":"provider-thread","worktreePath":null,"branch":null,"lineage":{"parentThreadId":null},"createdAt":"2026-10-13T10:00:00.000Z","updatedAt":"2026-10-13T10:00:02.000Z","archivedAt":null,"deletedAt":null},
+    "runs": [{"id":"root-run","threadId":"thread","ordinal":2,"providerInstanceId":"claudeAgent","modelSelection":{"instanceId":"claudeAgent","model":"claude-haiku-4-5"},"userMessageId":"user","rootNodeId":"root-node","status":"running"}],
+    "attempts": [],
+    "nodes": [
+      {"id":"root-node","threadId":"thread","runId":"root-run","parentNodeId":null,"rootNodeId":"root-node","kind":"root_turn","status":"running","providerThreadId":"provider-thread"},
+      {"id":"approval-node","threadId":"thread","runId":"root-run","parentNodeId":"root-node","rootNodeId":"root-node","kind":"approval_request","status":"waiting","providerThreadId":"provider-thread"},
+      {"id":"form-node","threadId":"thread","runId":"root-run","parentNodeId":"root-node","rootNodeId":"root-node","kind":"user_input_request","status":"waiting","providerThreadId":"provider-thread"}
+    ],
+    "subagents": [],
+    "providerSessions": [{"id":"provider-session","providerInstanceId":"claudeAgent","driver":"claudeAgent","status":"running"}],
+    "providerThreads": [{"id":"provider-thread","providerInstanceId":"claudeAgent","providerSessionId":"provider-session"}],
+    "providerTurns": [],
+    "runtimeRequests": [
+      {"id":"approval","nodeId":"approval-node","kind":"file-change","status":"pending","responseCapability":{"type":"live","providerSessionId":"provider-session"}},
+      {"id":"question","nodeId":"form-node","kind":"user_input","status":"pending","responseCapability":{"type":"message"}}
+    ],
+    "messages": [{"id":"assistant","threadId":"thread","runId":"root-run","nodeId":"root-node","role":"assistant","text":"Current whole message","attachments":[],"streaming":true,"createdAt":"2026-10-13T10:00:01.000Z","updatedAt":"2026-10-13T10:00:02.000Z"}],
+    "turnItems": [
+      {"id":"approval-item","threadId":"thread","runId":"root-run","nodeId":"approval-node","type":"approval_request","requestId":"approval","requestKind":"file-change","prompt":"Write a file?","options":[{"decision":"accept","label":"Allow once"},{"decision":"acceptForSession","label":"Allow session"},{"decision":"acceptAlways","label":"Allow always"},{"decision":"decline","label":"Deny"},{"decision":"cancel","label":"Cancel"}],"ordinal":3,"status":"waiting","updatedAt":"2026-10-13T10:00:02.000Z"},
+      {"id":"question-item","threadId":"thread","runId":"root-run","nodeId":"form-node","type":"user_input_request","requestId":"question","questions":[{"id":"choice","header":"Choice","question":"Which color?","options":[{"label":"Blue","description":"Cool","value":"blue"}],"allowCustomAnswer":false}],"ordinal":4,"status":"waiting","updatedAt":"2026-10-13T10:00:02.000Z"}
+    ],
+    "plans": [],
+    "checkpointScopes": [],
+    "checkpoints": [],
+    "contextHandoffs": [],
+    "contextTransfers": [],
+    "visibleTurnItems": [
+      {"position":1,"visibility":"local","sourceThreadId":"thread","sourceItemId":"assistant-item","item":{"id":"assistant-item","threadId":"thread","runId":"root-run","nodeId":"root-node","type":"assistant_message","messageId":"assistant","text":"Current whole message","streaming":true,"ordinal":9,"status":"running","updatedAt":"2026-10-13T10:00:02.000Z"}},
+      {"position":0,"visibility":"inherited","sourceThreadId":"parent","sourceItemId":"user-item","item":{"id":"user-item","threadId":"parent","runId":"parent-run","nodeId":null,"type":"user_message","messageId":"user","text":"Earlier inherited prompt","attachments":[],"ordinal":90,"status":"completed","updatedAt":"2026-10-13T10:00:03.000Z"}}
+    ],
+    "updatedAt":"2026-10-13T10:00:02.000Z"
+  }
+}

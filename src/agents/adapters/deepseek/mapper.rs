@@ -9,6 +9,9 @@ use crate::agents::domain::{
     ToolCallStatus, ToolTime,
 };
 
+/// The title of a DeepSeek session it has not named.
+pub(crate) const UNTITLED: &str = "DeepSeek Agent Session";
+
 /// Map a DeepSeek Harness `SessionSummary` JSON object into Gateway `AgentSessionInfo`.
 pub fn map_session(raw: &Value) -> Option<AgentSessionInfo> {
     let session_id = raw.get("sessionId").and_then(Value::as_str)?;
@@ -76,13 +79,14 @@ pub fn map_session(raw: &Value) -> Option<AgentSessionInfo> {
             }
         });
 
-    // Derive a clean title
+    // Untitled sessions keep the placeholder clients have always shown; a
+    // task's title ignores it (`untitled_placeholder`).
     let title = raw
         .get("title")
         .or_else(|| projections_values.and_then(|v| v.get("title")))
         .and_then(Value::as_str)
         .filter(|t| !t.trim().is_empty())
-        .unwrap_or("DeepSeek Agent Session")
+        .unwrap_or(UNTITLED)
         .to_string();
 
     let status = if running {
@@ -95,6 +99,11 @@ pub fn map_session(raw: &Value) -> Option<AgentSessionInfo> {
         asid: AgentSessionId(session_id.to_string()),
         agent_id: String::new(),
         backend_session_id: session_id.to_string(),
+        runtime: None,
+        context_usage: None,
+        git_info: None,
+        agent_name: None,
+        agent_role: None,
         title,
         mode: projections_values
             .and_then(|v| v.get("agentPreset"))
@@ -579,10 +588,26 @@ pub fn map_record(event: &Value) -> Vec<TimelineItem> {
 /// Map the records of a `session/page` (or a follow snapshot) into rows,
 /// with every `tool/result` in the page joined onto its call.
 pub fn map_timeline_records(raw_page: &Value) -> Vec<TimelineItem> {
+    map_timeline_records_carrying(raw_page, &mut Vec::new())
+}
+
+/// The most tool results carried from one history page to the next older
+/// one. A result whose call is further back than that stays unapplied.
+const MAX_CARRIED_RESULTS: usize = 256;
+
+/// `map_timeline_records` for one page of a walk that continues backwards:
+/// a `tool/result` whose call is not on this page (it lies on an older one,
+/// below the cut) is kept in `carried`, and the results carried in from the
+/// newer pages are applied to the calls found here.
+pub fn map_timeline_records_carrying(
+    raw_page: &Value,
+    carried: &mut Vec<(ToolResult, u64)>,
+) -> Vec<TimelineItem> {
     let mut items: Vec<TimelineItem> = Vec::new();
     let Some(records) = raw_page.get("records").and_then(Value::as_array) else {
         return items;
     };
+    let mut orphaned = Vec::new();
     for entry in records {
         let Some(event) = entry.get("event") else {
             continue;
@@ -593,19 +618,35 @@ pub fn map_timeline_records(raw_page: &Value) -> Vec<TimelineItem> {
             let Some(result) = event.get("data").and_then(map_tool_result) else {
                 continue;
             };
-            for item in items.iter_mut() {
-                if let AgentPart::Tool(ref mut call) = item.part {
-                    if call.id == result.call_id {
-                        apply_tool_result(call, &result, time);
-                        item.updated_ms = time;
-                    }
-                }
+            if !apply_to_call(&mut items, &result, time) {
+                orphaned.push((result, time));
             }
             continue;
         }
         items.extend(map_record(event));
     }
+    // Results the newer pages could not place: their calls may be here.
+    carried.retain(|(result, time)| !apply_to_call(&mut items, result, *time));
+    // This page's own orphans come before the older ones still unplaced.
+    orphaned.append(carried);
+    orphaned.truncate(MAX_CARRIED_RESULTS);
+    *carried = orphaned;
     items
+}
+
+/// Apply `result` to the call it answers, if that call is among `items`.
+fn apply_to_call(items: &mut [TimelineItem], result: &ToolResult, time: u64) -> bool {
+    let mut applied = false;
+    for item in items.iter_mut() {
+        if let AgentPart::Tool(ref mut call) = item.part {
+            if call.id == result.call_id {
+                apply_tool_result(call, result, time);
+                item.updated_ms = time;
+                applied = true;
+            }
+        }
+    }
+    applied
 }
 
 /// Project tool call metadata so App UI components (like code diff or terminal)
@@ -923,6 +964,7 @@ pub fn map_question_request(
         .unwrap_or("Question")
         .to_string();
     Some(FormRequest {
+        nonblocking: false,
         id: event_id.to_string(),
         asid: AgentSessionId(agent_id.to_string()),
         title,
@@ -982,6 +1024,38 @@ pub fn question_answers(questions: &Value, answers: &Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A page cut between a call and its result: mapped on its own, the
+    /// result finds no call and is carried; the older page, mapped with
+    /// the carried results, completes the call it holds.
+    #[test]
+    fn a_tool_result_cut_from_its_call_is_carried_to_the_older_page() {
+        let newer = json!({ "records": [
+            { "type": "event", "event": { "type": "tool/result", "seq": 11, "time": 11, "data": {
+                "message": { "role": "tool", "toolCallId": "c-10", "content": [ { "type": "text", "text": "done" } ] } } } },
+            { "type": "event", "event": { "type": "user/message", "seq": 12, "time": 12, "data": {
+                "role": "user", "content": [ { "type": "text", "text": "thanks" } ] } } },
+        ] });
+        let older = json!({ "records": [
+            { "type": "event", "event": { "type": "assistant/message", "seq": 10, "time": 10, "data": {
+                "message": { "role": "assistant", "content": [ { "type": "tool-call", "id": "c-10", "name": "bash", "arguments": "{}" } ] } } } },
+        ] });
+        let mut carried = Vec::new();
+        let items = map_timeline_records_carrying(&newer, &mut carried);
+        assert_eq!(items.len(), 1, "the result alone is no row");
+        assert_eq!(carried.len(), 1);
+        assert_eq!(carried[0].0.call_id, "c-10");
+
+        let items = map_timeline_records_carrying(&older, &mut carried);
+        let AgentPart::Tool(ref call) = items[0].part else {
+            panic!("a tool row");
+        };
+        assert_eq!(call.status, ToolCallStatus::Completed);
+        assert_eq!(items[0].updated_ms, 11);
+        assert!(carried.is_empty(), "applied, so no longer carried");
+        // The plain mapper is the same walk with nothing carried in or out.
+        assert_eq!(map_timeline_records(&older).len(), 1);
+    }
     fn raw_catalog() -> Value {
         json!({ "default": { "provider": "deepseek", "model": "deepseek-chat" },
                 "groups": [{ "provider": "deepseek", "models": [{ "id": "deepseek-chat" }] }] })

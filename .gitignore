@@ -9,6 +9,15 @@ pairing.json
 push-tokens.json
 config.json
 
+# Local environment credentials; keep a shareable template trackable.
+.env
+.env.*
+!.env.example
+
+# Conventional SSH private-key filenames (public .pub files remain trackable).
+id_rsa
+id_ed25519
+
 # OS / editor cruft
 .DS_Store
 *.swp

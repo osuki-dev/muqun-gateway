@@ -304,6 +304,45 @@ pub struct MessageImageAsset {
     pub width: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub height: Option<u32>,
+    /// Optional derivatives; `url` remains the original for legacy save/copy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thumbnail_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub download_url: Option<String>,
+    /// Lazy authenticated fixed-version descriptor, not image bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+    /// No authorized original URL was established. `url` is empty, not a
+    /// fabricated endpoint; the original source remains in attachments/content.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unavailable_reason: Option<String>,
+}
+
+impl MessageImageAsset {
+    pub(crate) fn unavailable(source: &str, reason: &str) -> Self {
+        Self {
+            src: if source.starts_with("data:") {
+                String::new()
+            } else {
+                source.into()
+            },
+            asset_id: String::new(),
+            url: String::new(),
+            mime: "application/octet-stream".into(),
+            width: None,
+            height: None,
+            thumbnail_url: None,
+            preview_url: None,
+            download_url: None,
+            version_url: None,
+            size: None,
+            unavailable_reason: Some(reason.into()),
+        }
+    }
 }
 
 impl TimelineItem {

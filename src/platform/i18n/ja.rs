@@ -21,6 +21,7 @@ pub(super) const JA: &[(&str, &str)] = &[
     // -- push notifications --------------------------------------------------
     ("Agent", "エージェント"),
     ("Approval needed", "承認が必要"),
+    ("Needs your input", "入力が必要です"),
     ("Agent blocked", "エージェントが待機中"),
     ("Agent done", "エージェントが完了"),
     ("{name} is waiting for your approval.", "{name} が承認を待っています。"),
@@ -31,6 +32,10 @@ pub(super) const JA: &[(&str, &str)] = &[
     ("Expo push service request failed", "Expo プッシュサービスへのリクエストが失敗しました"),
     ("Herdr did not return the created pane id", "Herdr が作成したパネルの id を返しませんでした"),
     ("Herdr is unavailable", "Herdr に接続できません"),
+    ("No terminal pane belongs to the calling process", "呼び出し元のプロセスに対応するターミナルパネルがありません"),
+    ("Task not found", "タスクが見つかりません"),
+    ("Token expired", "トークンの有効期限が切れています"),
+    ("Token not found", "トークンが見つかりません"),
     (
         "agent is not one this gateway offers; see GET /api/agents/catalog",
         "agent はこの Gateway が提供していないものです。GET /api/agents/catalog を参照してください",
@@ -71,6 +76,11 @@ pub(super) const JA: &[(&str, &str)] = &[
     ("invalid Authorization header", "Authorization ヘッダーが不正です"),
     ("invalid pairing code", "ペアリングコードが不正です"),
     ("invalid token", "トークンが不正です"),
+    (
+        "the MCP endpoint answers only local callers on this machine",
+        "MCP エンドポイントはこのマシン上のローカルな呼び出し元にのみ応答します",
+    ),
+    ("the assistant token store is unavailable", "アシスタントトークンのストアを利用できません"),
     ("keys must contain 1 to 32 entries", "keys は 1〜32 個の項目を含めてください"),
     ("missing Authorization header", "Authorization ヘッダーがありません"),
     ("mode must be on, off, or toggle", "mode は on、off、toggle のいずれかにしてください"),
@@ -110,6 +120,7 @@ pub(super) const JA: &[(&str, &str)] = &[
     ("the file field must carry a filename", "file フィールドにはファイル名が必要です"),
     ("the pane is not waiting on an approval", "このパネルは承認を待っていません"),
     ("the pane is waiting on a different approval", "このパネルは別の承認を待っています"),
+    ("the task request failed", "タスクの要求に失敗しました"),
     ("the upload must be at most 25 MiB", "アップロードは 25 MiB 以内にしてください"),
     ("this approval has no option with that number", "この承認にその番号の選択肢はありません"),
     ("this approval offers no option with that meaning", "この承認にその意味の選択肢はありません"),
@@ -137,4 +148,53 @@ pub(super) const JA: &[(&str, &str)] = &[
         "branch_name に空のパスセグメントや、ドットで始まる・終わるセグメントは使えません",
     ),
     ("branch_name must not end with .lock", "branch_name の末尾に .lock は使えません"),
+    // -- tasks, lazygit and assets ------------------------------------------
+    (
+        "No terminal session is reachable on this computer",
+        "このコンピューターで接続できるターミナルセッションがありません",
+    ),
+    (
+        "That agent is not available",
+        "そのエージェントは利用できません",
+    ),
+    (
+        "Only a paused or waiting task opened on a device can be confirmed",
+        "確認できるのは、デバイスから開いた一時停止中または待機中のタスクだけです",
+    ),
+    (
+        "the agent could not start the task",
+        "エージェントがタスクを開始できませんでした",
+    ),
+    (
+        "label must be at most 200 characters",
+        "label は 200 文字以内にしてください",
+    ),
+    (
+        "goal must be non-empty and at most 32 KiB",
+        "goal は空にできません。32 KiB 以内にしてください",
+    ),
+    (
+        "summary must be at most 32 KiB",
+        "summary は 32 KiB 以内にしてください",
+    ),
+    (
+        "Unknown model for that agent. Use a model id from its catalog, or <provider_id>/<model_id>.",
+        "そのエージェントにこのモデルはありません。カタログのモデル id か <provider_id>/<model_id> を指定してください。",
+    ),
+    (
+        "Unknown variant '{variant}' (the model offers: {offered}).",
+        "不明な variant '{variant}' です（このモデルの候補: {offered}）。",
+    ),
+    (
+        "Install lazygit on the Gateway host",
+        "Gateway のホストに lazygit をインストールしてください",
+    ),
+    (
+        "The source pane is not in an accessible Git repository",
+        "元のパネルはアクセスできる Git リポジトリ内にありません",
+    ),
+    (
+        "the asset exceeds its content size limit",
+        "ファイルが内容サイズの上限を超えています",
+    ),
 ];

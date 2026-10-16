@@ -17,7 +17,7 @@ Two planes are implemented in this binary:
   adapters implement it.
 - **Agents plane** — agent sessions, models, prompts, tasks,
   permissions, approvals and event history, behind the `AgentPort`
-  port; the OpenCode, DeepSeek and T3 Code adapters implement it.
+  port; the OpenCode, DeepSeek, T3 Code and Codex adapters implement it.
 
 `/api/discovery` also reports an **SSH plane**, but that one is the app's own
 transport, not a gateway subsystem: the phone can open an SSH connection to a
@@ -49,7 +49,7 @@ the far side. The gateway implements no SSH client or server itself.
 │   │ port: TerminalBackend      │  │ port: AgentPort                │     │
 │   └─────────────┬──────────────┘  └───────────────┬────────────────┘     │
 │                 │                                 │                      │
-│        Herdr adapter · tmux adapter   OpenCode · DeepSeek · T3 Code      │
+│        Herdr adapter · tmux adapter   OpenCode · DeepSeek · T3 · Codex   │
 │                                       adapters                           │
 │                                                                          │
 │  routes: platform (health, discovery, openapi) · connectivity (pairing,  │
@@ -62,6 +62,7 @@ the far side. The gateway implements no SSH client or server itself.
         │
         ▼
  Herdr unix socket · tmux argv · OpenCode / DeepSeek HTTP · T3 WebSocket
+ Codex private app-server stdio
 ```
 
 A request travels: the phone authenticates with its device token (and, when
@@ -83,11 +84,29 @@ curl -fsSL https://muqun.dev/gateway.sh | sh
 It downloads a prebuilt, statically linked binary for your platform, so no Rust
 toolchain is needed.
 
-tmux is all it needs — Herdr is optional. The installer configures whichever
-backends are actually present: tmux, Herdr, or both. Herdr-only installs also use
+tmux is enough as a terminal backend — Herdr is optional. The installer configures
+whichever backends are actually present: tmux, Herdr, or both. Herdr-only installs also use
 the standalone gateway so it can start independently at login/boot.
-Re-running it is safe: it never duplicates a backend, never loses a paired
-device, and never flips a default an earlier install chose.
+For an existing install, the script identifies and delegates to its protected
+updater; it does not overwrite the binary or issue a second restart. An older
+install without that updater is retained and refused with manual migration
+guidance: back up config/state, verify a reviewed release, stop through the
+existing service owner, and keep the old image for recovery. Do not delete the
+installed binary to bypass the check.
+
+Fresh installs resolve one stable `vX.Y.Z` tag, download its binary and matching
+checksum over HTTPS into private staging, and verify SHA256 before publication
+(integrity, not publisher signing). Native ELF/Mach-O headers and architecture
+are checked before staged execution; a time/output-bounded `--version` probe
+must match the pinned tag before publication. Fresh installation requires `curl`
+and `sha256sum` or `shasum`; macOS also requires preinstalled system Perl for
+atomic no-clobber publication via direct `link()`, and fails closed if unavailable.
+The script does not install dependencies automatically or perform a global install.
+Numbered stages report `OK`, `FAILED`, or
+readiness `UNCONFIRMED`, rather than claiming an unconfirmed Gateway is running.
+Supported TTYs show curl's measured download progress; `NO_COLOR`, dumb terminals
+and non-TTY output stay plain. Stage lines remain usable in narrow terminals,
+including 32 columns.
 
 The installer downloads the [agent command catalog](https://agent-commands.muqun.dev/)
 once for terminal slash-command suggestions. It does not run a refresh service.
@@ -111,34 +130,66 @@ Open the manager on your computer:
 muqun-gateway manage
 ```
 
-Open **Devices** (`3`), then press Enter (first device) or `p` (new device)
-to see the QR code. Scan it in Muqun, then type back the short code your
-computer displays. That is the whole of pairing.
+Open **Devices** (`3`), then press Enter (first device) or `p` (new device).
+The pairing flow is three steps, shown on screen as
+"1 Scan the QR in Muqun · 2 Type this code on the phone · 3 Done" (a narrow
+terminal shows only the current step, as "Step 1 of 3: Scan the QR in
+Muqun"): scan the QR, type the short code your computer displays into the
+phone, and the screen reports "Paired as <name>" on its own. The state line under the QR
+("Waiting for the phone…") updates without a key press, and a phone that
+scans the QR opens the code step by itself. Esc, Enter, or `r` returns to the
+device list; `p` pairs another device.
 
 No camera on the phone? Type the gateway's address into the app instead, and
 finish with the same short code.
 
-The manager has four views. `1`–`4`, Tab/Shift-Tab, or Left/Right switches
-views; Up/Down or `j`/`k` selects a row and Enter performs the visible primary
-action. PageUp/PageDown scrolls. Esc goes back from a view or cancels a dialog;
-at Overview, Esc closes the manager. `q` closes from any main view without
-stopping Gateway. Confirmations default to **cancel**: arrows/Tab choose,
-Enter accepts the selected answer. The footer shows full-word, view-specific
-actions. Long lists keep the selected item visible after a resize.
+Manual code pairing remains supported. Without the QR's pairing key, the
+claim sends `code` and `request_id` without an application encryption envelope.
+Encrypting the response with a key derived from those values does not prevent
+a passive observer who captures both request and response on an unprotected
+link from recovering the credentials. Use the QR key, a verified protected
+tunnel, or HTTPS where available.
 
-| view | keys |
-| --- | --- |
-| Overview (`1`) | `s` start, `t` stop, `r` restart the gateway |
-| Terminals (`2`) | `h` / `m` add Herdr / tmux; `f` make the selected backend default; `d` remove it; `b` toggle its backend autostart |
-| Devices (`3`) | `p` show pairing QR; `x` revoke the selected device after confirmation; `r` return to the device list |
-| Settings (`4`) | `u` edit URL; `a` detect URL; `e` toggle transport encryption; `g` enable/disable gateway autostart; `c` check stable updates; `i` install an update after confirmation |
+Every view starts with a one-line header: Gateway version, whether it is
+running and where it listens, whether Herdr and the agent service answer,
+and how many devices are paired. While Gateway runs, the links refresh
+every few seconds; a stopped Gateway is not asked.
 
-Enter starts/stops Gateway in Overview, makes the selected terminal backend
-the default in Terminals, pairs the first device or reviews revocation in
-Devices, and changes the selected setting in Settings. The `>` selection marker
-is separate from the explicit `[default]` backend label. Empty lists explain
-the next step. Gateway stop, backend removal, and device revocation explain
-their scope before you confirm; none closes terminal tasks.
+The manager has four views: 1 Overview, 2 Terminals, 3 Devices, 4 Settings.
+`1`–`4`, Tab/Shift-Tab, or Left/Right switches views; Up/Down or `j`/`k`
+selects a row, and **Enter is the only verb on a row**: it toggles a switch,
+opens a chooser for a choice, or edits a text. On Overview Enter does nothing;
+starting and stopping Gateway always take `s` and `t`. Esc always goes one
+level back (pairing flow → device list, dialog → its view, view → Overview,
+Overview → closed); `q` closes from any main view without stopping Gateway.
+Confirmations default to **cancel**.
+
+The footer is one line of the same shape on every view,
+`↑↓ select · Enter change · Tab next view · q quit` (Overview, which has no
+rows, shows `Tab next view · q quit`), plus the view's own keys for actions
+that are not a row:
+
+| view | rows (Enter) | own keys |
+| --- | --- | --- |
+| Overview (`1`) | — | `s` start, `t` stop, `r` restart the gateway |
+| Terminals (`2`) | a backend's actions: make default, start with Gateway on/off, remove | `h` / `m` add Herdr / tmux |
+| Devices (`3`) | the device's kind, pairing and last-seen times (last seen is saved every few minutes, so it can lag); `x` there revokes it | `p` pair a device; `x` revoke the selected one |
+| Settings (`4`) | change the selected setting (Detect address offers the address; Enter applies it) | `PgUp`/`PgDn` page; `r` restart the gateway |
+
+Settings lists every setting as one row with its current value, a one-line
+explanation of the feature it switches, and, in grey, where it lives
+(`config.json › history.storage`), grouped as: *Gateway* (login autostart,
+address, detect address, transport encryption, updates), *Storage* (history
+checkpoints memory/SQLite, store encryption, read-only), *Agents started from
+the phone* (skipping the agents' own approval prompts, trusting the task
+folder, the environment passed to agents, values never shown), and
+*Assistant access* (the MCP server, loopback only), and *Other computers*
+(where linking with your other computers will appear). A change that applies
+only after a restart says `restart needed` on its row, and the header shows
+`Restart needed` until `r` restarts Gateway. Rows longer than the terminal end
+in `…` rather than a clipped word. Empty lists explain the next step. Gateway
+stop, backend removal, and device revocation explain their scope before you
+confirm; none closes terminal tasks.
 
 Runtime/connectivity/backend panels use the terminal's default background,
 with bold/reversed active tabs and rows, restrained status accents, and a
@@ -215,8 +266,8 @@ muqun-gateway update           # explicitly download, verify and install a newer
 muqun-gateway --version        # side-effect-free installed binary version
 ```
 
-Settings (`4`) in `manage` has the same update/check use case. `c` checks;
-`i` checks and asks for confirmation before downloading or downtime. Nothing
+Settings (`4`) in `manage` has the same update/check use case: Enter on
+Updates checks, and asks for confirmation before downloading or downtime. Nothing
 checks or installs updates in the background. Stable `vX.Y.Z` versions only;
 development/prerelease builds and downgrades are not supported.
 
@@ -293,14 +344,16 @@ that points to another installation.
 ```sh
 muqun-gateway agent                  # each agent's status and the next step (--json for the raw list)
 muqun-gateway agent setup t3         # store a T3 Code credential and enable T3
-muqun-gateway agent setup deepseek   # point the gateway at a running DeepSeek Harness
+muqun-gateway agent setup deepseek   # enable DeepSeek; Gateway starts or joins the harness
 ```
 
 `agent` probes the agents from your shell the way the running gateway does,
 prints one line per agent (`id  status  version  endpoint  → next step`) and
 whether the gateway is running, and exits non-zero while an enabled agent is not
 usable. It reports reachability only: it never attaches, so it shows `reachable`
-where the gateway may be `connected`. A T3 bearer the server refuses (expired or
+where the gateway may be `connected`. For Codex, the shell probe only checks the
+executable; authentication/readiness remains unknown until Gateway supervision.
+A T3 bearer the server refuses (expired or
 revoked) shows as `unconfigured`. `setup t3` checks that a T3 server answers
 (`--url`, else `t3.url`, else `http://127.0.0.1:3773`), mints a bearer with
 `t3 auth session issue` when `t3` is on `PATH` (`--base-dir` is passed through) or
@@ -310,15 +363,82 @@ and `--base-dir` is ignored with it; a non-loopback `--url` always needs
 and sets `t3.enabled`/`t3.url` in `config.json`. It prints how long the bearer
 lasts: what T3 granted for a pairing code, or 30 days (unless T3 caps it) for
 an issued one. The gateway cannot renew it; re-run `agent setup t3` when it
-expires (`agent` then shows T3 as `unconfigured`). `setup deepseek` probes
-`--endpoint`, `deepseek.endpoint`, `DEEPSEEK_HARNESS_URL`/`DSH_URL`, then ports
-3080 and 19387 (with `deepseek.token`/`secret`, else the `DEEPSEEK_HARNESS_*` /
-`DSH_*` token and secret from the environment), and sets
-`deepseek.enabled`/`deepseek.endpoint`. An explicit endpoint still takes the
-token and secret from the environment when config.json has none. Both offer to restart the gateway's
-user service when the change needs one (`--yes` skips the question). `agent setup
-opencode` only shows the OpenCode binary the gateway would use: OpenCode needs
-no setup.
+expires (`agent` then shows T3 as `unconfigured`). `setup deepseek` enables
+DeepSeek. Gateway adopts a healthy harness, or starts one when
+`deepseek.autostart` is on. That flag defaults to true, the same way
+`opencode.autostart` does, but `deepseek.enabled` defaults to false, so a
+config that omits the new key does not start a process until DeepSeek is
+enabled. Set `autostart` to false to only adopt a harness you started.
+The listen address is `deepseek.endpoint`, or `http://127.0.0.1:3080` when
+it is absent and no environment override is set. Configured HTTP(S) URLs use
+their normal scheme default port (80/443) when no port is written, and retain
+reverse-proxy path prefixes. Scheme-less host:port addresses use HTTP;
+query/fragment are removed from the base and userinfo is refused. Setup probes
+`--endpoint`, else `deepseek.endpoint`, else `DEEPSEEK_HARNESS_URL`/`DSH_URL`,
+else ports 3080 and 19387 (with
+`deepseek.token`/`secret`, else the `DEEPSEEK_HARNESS_*` / `DSH_*` token and
+secret from the environment) and joins a healthy one. Port 19387 is not a
+port the gateway opens; it is only adopted when something is already
+listening there. The command prints the manual start line for the runner
+that exists (`dsh`, otherwise `bunx` without `--bun`, otherwise
+`npx --yes`), still `web --no-open`, with `--host` and `--port` from that
+endpoint. If none of those runners is on PATH it says so and exits normally.
+A failed explicit environment override never falls back to a different target
+or starts a harness. Setup leaves configuration unchanged on such a failure;
+after a successful environment-only setup it saves that endpoint with
+`autostart: false`, preserving attach-only behavior.
+A missing runner does not stop the gateway. The harness is started in its
+own session and is not stopped when the gateway stops. An explicit endpoint
+still takes the token and secret from the environment when config.json has
+none. Both offer to restart the gateway's user service when the change needs
+one (`--yes` skips the question). `agent setup opencode` only shows the
+OpenCode binary the gateway would use: OpenCode needs no setup.
+
+### Agents started from the phone
+
+Nobody sits at the terminal of an agent the gateway starts for the phone or an
+MCP caller in a terminal pane, so by default terminal Codex starts with
+`--dangerously-bypass-approvals-and-sandbox` and Claude Code with
+`--dangerously-skip-permissions`, and the task directory is marked trusted
+for both (only directories inside your home). That agent then runs commands
+without asking. To keep the prompts, set the launch arguments per kind in
+`config.json` (an empty list means none) and turn folder trust off:
+
+```json
+{ "agent_launch_args": { "codex": [], "claude": [] }, "agent_trust_folders": false }
+```
+
+The gateway logs the launch arguments in effect at startup, and `manage` shows
+and switches them under Settings › Agents started from the phone. Details: [Agent API](docs/agent-api.md#terminal-agents-launched-for-remote-dispatch).
+
+Delegated agents run as your OS user. Selecting a task folder is not a sandbox;
+`agent_launch_args` and `agent_trust_folders` are owner controls, not isolation
+from other processes or shell commands running as that same user.
+
+### The Codex service agent
+
+Codex support is **on by default**. At boot Gateway starts the one shared
+daemon with `codex app-server daemon start` when its socket is absent, or
+attaches if Codex already started it. A terminal Codex opened later joins that
+same socket and the same threads. Gateway does not start a second private
+server, and it never stops or restarts the daemon. It never installs Codex or
+logs you in automatically. A missing installation or authentication does not
+block other agents. Codex **0.162.1 or newer** is accepted. The protocol was checked against 0.162.1.
+
+To turn it off in `config.json`:
+
+```json
+{ "codex": { "enabled": false } }
+```
+
+`agent_runtime.enabled: false` turns off all service agents, not terminal agents.
+`muqun-gateway agent setup codex` only explains setup; it does not start Codex or
+change authentication. Terminal Codex launch routes and their permission flags
+are unchanged and separate from this private service agent. Model selection is
+an ephemeral next-turn choice, not a durable pre-turn upstream change. See the
+[Agent API](docs/agent-api.md) and [Codex protocol reference](docs/codex-protocol.md)
+for capabilities and limits. Real Codex and paired App/macOS acceptance remain
+deferred; protocol fixtures are not live certification.
 
 ### The OpenCode agent
 
@@ -351,11 +471,38 @@ INFO no OpenCode service found, starting one binary=/home/you/.opencode/bin/open
 INFO adopted the running OpenCode service url=http://127.0.0.1:49374 version="2.0.14" binary=/home/you/.opencode/bin/opencode
 ```
 
-If what it finds is older than 2.0 it refuses it — started or adopted — with
-one line saying which file, which version, and that `opencode.binary` is how to
-point it elsewhere. OpenCode 1 is a different API, and half-working with it is
-worse than saying so. `GET /api/agent-status` reports the same facts to the
-app, including whether the agent was `adopted` or `spawned`.
+The binary probe refuses a known major other than 2; adoption requires a known
+2.x live version. Refusal messages are generic and do not echo the untrusted
+version. Check your installation and the available startup diagnostics; set
+`opencode.binary` to the intended binary's absolute path in `config.json` if
+needed. OpenCode 1 is a different API, and future major versions are not
+accepted. `GET /api/agent-status` reports the service version and whether the
+agent was `adopted` or `spawned` when available.
+
+Adoption requires authenticated live `/api/info` with a valid PID and 2.x
+version; a registration's PID and version must match that reply. Credentials
+are redacted from debug output. An explicit `OPENCODE_URL` (or legacy
+`HERDR_GATEWAY_OPENCODE_URL`) is attach-only: failed authentication, identity
+or version checks never start a fallback local service.
+
+The upstream contract baseline is OpenCode **2.0.27** (released October 12,
+2026), checked against published source and mocked protocol replies, not live
+platform certification. Gateway absorbs the protocol mapping without requiring
+an existing App update. Session lists remain arrays; optional pagination needs
+`agent_session_pages_v1` and the selected agent's `sessionPagination` flag
+(OpenCode and Codex). The current App still requests fifty sessions and does not
+automatically fetch further pages. See the [Agent API](docs/agent-api.md#get-apiagent-sessionspage).
+
+### DeepSeek Harness compatibility
+
+The Gateway adapter tracks the **rc.2** contract: history uses one
+authoritative projection cut, file references use a live session scope, and
+model selection/probing validate the upstream success payload. These mappings
+require no existing App change or replacement of your upstream package. Existing
+HTTP and HTTP-backed reverse-proxy paths remain supported. The **0.2.1-alpha.2**
+native HTTPS Origin/Cookie flow and optional asynchronous questions with late
+answers are currently unsupported; this does not mean all HTTPS reverse proxies
+are unsupported, or that ordinary blocking forms are unsupported.
 
 ### T3 Code
 
@@ -376,7 +523,11 @@ state directory (readable by you only), and never needs the token again.
 `t3.runtime_mode` sets what new threads may do without asking
 (`full-access` by default, or `approval-required`, `auto-accept-edits`,
 `auto`). The full reference is in `docs/agent-api.md` under "Configuring T3
-Code".
+Code". Protocol 1 or 2 is selected automatically from the server descriptor;
+an omitted protocol means 1, and unknown values are unsupported. Revert is
+available only after protocol 1 is known; it is false for V2 or an unknown
+protocol. See [T3 protocol reference](docs/t3-protocol.md) for the pinned V2
+nightly-source baseline and validation limits.
 
 If the configured listen IP changes or is unavailable, startup reports the
 address and asks you to update `listen` in the gateway's `config.json`, then
@@ -410,6 +561,28 @@ Disabling the option affects future starts, not existing terminal processes.
 Reinstall the service after upgrading to apply the child-process lifetime rules:
 gateway restarts must not kill persistent terminal servers. On macOS this is
 login startup; on Linux boot startup requires the user service and lingering.
+
+### Lazygit
+
+Install `lazygit` on the Gateway host to offer it in a compatible App's Terminal
+Git workspace. The Gateway advertises `pane_lazygit` and
+checks the installed executable and the source pane's Git checkout before the
+App shows an entry. No App-provided shell command or arbitrary working directory is used.
+
+`pane_lazygit_worktree` adds an optional `worktree` query parameter to the
+availability and launch routes. The App must select an exact canonical path
+from `git/worktrees`; the Gateway verifies it against the source repository's
+current linked-checkout inventory for every request. A removed or unrelated
+checkout is refused before creating a terminal. Omit the selector to retain
+the original source-checkout behavior on older Apps and Gateways.
+
+Launching creates a dedicated tab in the same workspace and starts lazygit in
+the selected checkout, leaving the source terminal's desktop focus unchanged. The App
+selects the new pane and exposes its virtual keyboard. Lazygit has its own key
+profile and full-screen output handling; it receives no Vim-specific commands.
+If startup cannot be confirmed, open the already-created terminal to inspect it
+instead of retrying automatically. Gateways without this capability retain their
+existing terminal and Changes behavior.
 
 ### Modifier chords on tmux
 
@@ -453,11 +626,45 @@ Put both devices on [Tailscale](https://tailscale.com) and point the gateway at
 your tailnet address. That keeps the gateway off the public internet and needs
 no port forwarding. Use Tailscale Serve, not Funnel.
 
+HTTP calls remain supported, including inside a verified SSH or Tailscale
+tunnel. That protected path differs from plain HTTP on an unprotected LAN or
+WAN link; a hostname or address range alone does not prove the path is protected.
+
 ## Update
 
-Re-run the install command. It replaces the binary in place, and your paired
-phones stay paired.
+Re-run the install command to use the installed protected updater, or use
+`muqun-gateway update` directly. See [Manual stable updates](#manual-stable-updates)
+for supported installs and recovery limits. Back up the shared database and its
+encryption key together before a schema upgrade; binary rollback alone cannot
+undo a database migration.
+
+### Push registration after upgrading
+
+`push_token_owner_binding_v1` means notifications are sent only to registrations
+owned by a currently paired App device. Legacy registrations without an owner
+are retained but suppressed until an authenticated registration replaces them.
+An older App may cache registration for seven days, so reopening it alone need
+not restore notifications. On each paired App, turn notifications **OFF**, let
+unregistration finish, then **ON** in App settings to clear the cache and register
+again (notification permission and a working Gateway connection are required).
+Recovery is not automatic or a seamless upgrade guarantee.
+
+Future App integration must negotiate this capability and remember a stable
+registration revision after a successful authenticated re-registration, not
+re-register on every Gateway build or restart. That App work is still pending.
+
+### Captured terminal history
+
+`pane_captured_history_segments_v1` adds `/history/segments` for bounded sampled
+history in memory or SQLite, with explicit segment boundaries and no live viewport
+or native backlog stitching. The legacy `pane_captured_history` `/history` API
+remains a single prefix, not all retained segments. SQLite checkpoint support is
+still separately advertised. See [Captured history](docs/captured-history.md).
+App capability negotiation and its history window limits are deferred; this
+Gateway contract does not mean the current App browses every segment.
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+Apache-2.0. See [LICENSE](LICENSE).
+The original MIT copyright and permission notice for inherited code is retained
+in [LICENSE-MIT](LICENSE-MIT).

@@ -14,9 +14,9 @@
 # on a fresh install when present; existing defaults and pairings are retained.
 #
 # On a first install it also configures, starts, and opens the pairing QR for
-# you. Re-running updates the binary, runs idempotent setup, and reloads it
-# while preserving the server identity, devices, and backend list -- and
-# never flips a default an earlier install already chose.
+# you. Re-running delegates to the installed protected updater, preserving
+# running state, server identity, devices, and backend defaults. Older installs
+# without that updater require a manual migration; they are never overwritten.
 # macOS and Linux only.
 set -eu
 
@@ -26,10 +26,49 @@ MIN_HERDR_VERSION="0.7.5"
 # does not want it on their PATH by default.
 INSTALL_DIR="${MUQUN_GATEWAY_INSTALL_DIR:-$HOME/.local/bin}"
 
-green() { printf '\033[1;32m%s\033[0m\n' "$1"; }
-info()  { printf '\033[1;36m==>\033[0m %s\n' "$1"; }
-warn()  { printf '\033[1;33m!\033[0m  %s\n' "$1"; }
-die()   { printf '\033[1;31mError:\033[0m %s\n' "$1" >&2; exit 1; }
+color=0
+if [ -t 1 ] && [ "${TERM:-dumb}" != dumb ] && [ "${NO_COLOR+x}" != x ]; then
+  color=1
+  printf '\033[1;36mMuqun Gateway\033[0m\n'
+fi
+green() { if [ "$color" = 1 ]; then printf '\033[1;32m%s\033[0m\n' "$1"; else printf '%s\n' "$1"; fi; }
+info()  { if [ "$color" = 1 ]; then printf '\033[1;36m==>\033[0m %s\n' "$1"; else printf '==> %s\n' "$1"; fi; }
+warn()  { if [ "$color" = 1 ]; then printf '\033[1;33m!\033[0m %s\n' "$1"; else printf '! %s\n' "$1"; fi; }
+stage_number=0
+failure_reported=0
+staging=""
+probe_pid=""
+watchdog_pid=""
+stage() { stage_number=$((stage_number + 1)); printf '\n[%s] %s\n' "$stage_number" "$1"; }
+stage_ok() { green "[$stage_number] OK"; }
+die() {
+  failure_reported=1
+  printf '[%s] FAILED\nError: %s\n' "$stage_number" "$1" >&2
+  printf 'Summary: stopped at stage %s.\n' "$stage_number" >&2
+  exit 1
+}
+finish() {
+  stop_probe
+  if [ "$1" -ne 0 ] && [ "$failure_reported" = 0 ]; then
+    printf '[%s] FAILED\nInstallation stopped; see the error above.\n' "$stage_number" >&2
+    printf 'Summary: stopped at stage %s.\n' "$stage_number" >&2
+  fi
+  if [ -n "$staging" ]; then rm -rf "$staging"; fi
+}
+stop_probe() {
+  if [ -n "$watchdog_pid" ]; then
+    kill "$watchdog_pid" 2>/dev/null || true
+    wait "$watchdog_pid" 2>/dev/null || true
+    watchdog_pid=""
+  fi
+  if [ -n "$probe_pid" ]; then
+    kill -KILL "$probe_pid" 2>/dev/null || true
+    wait "$probe_pid" 2>/dev/null || true
+    probe_pid=""
+  fi
+}
+trap 'finish $?' 0
+trap 'exit 1' HUP INT TERM
 
 version_at_least() {
   awk -v current="$1" -v required="$2" '
@@ -54,6 +93,7 @@ version_at_least() {
 }
 
 # 1. Operating system -- Windows is not supported yet.
+stage "Check platform and backends"
 case "$(uname -s)" in
   Darwin) info "Detected macOS" ;;
   Linux)  info "Detected Linux" ;;
@@ -98,17 +138,42 @@ case "$os/$arch" in
   *)                          target="" ;;
 esac
 
-command -v curl >/dev/null 2>&1 || die "curl is required to download the binary."
-mkdir -p "$INSTALL_DIR"
+stage_ok
+stage "Check install destination"
+mkdir -p "$INSTALL_DIR" || die "Cannot create install directory: $INSTALL_DIR"
 binary="$INSTALL_DIR/muqun-gateway"
 
-download_url="https://github.com/$REPO/releases/latest/download/muqun-gateway-$target"
-if [ -n "$target" ] && curl -fsSL "$download_url" -o "$binary.new" 2>/dev/null; then
-  chmod +x "$binary.new"
-  mv "$binary.new" "$binary"
-  info "Installed the latest prebuilt binary for $target to $binary"
-else
-  rm -f "$binary.new"
+if [ -L "$binary" ] || { [ -e "$binary" ] && [ ! -f "$binary" ]; }; then
+  die "Refusing symlink or nonregular destination: $binary"
+fi
+if [ -e "$binary" ]; then
+  stage_ok
+  stage "Check protected updater"
+  # An exit-zero unknown command is not capability evidence. Match the actual
+  # protected updater's help, not just any old CLI accepting 'update --help'.
+  if [ -x "$binary" ] && update_help="$("$binary" update --help 2>/dev/null)" &&
+     printf '%s\n' "$update_help" | grep -Fq 'Usage: muqun-gateway update [OPTIONS]' &&
+     printf '%s\n' "$update_help" | grep -Fq 'newer stable official release (never downgrades)' &&
+     printf '%s\n' "$update_help" | grep -Fq -- '--check'; then
+    stage_ok
+    stage "Run protected update"
+    info "Using the installed verified updater (with lifecycle rollback)."
+    "$binary" update || die "Protected update failed; no shell replacement or restart was attempted."
+    stage_ok
+    green "Summary: protected updater finished."
+    echo "Running state and setup left to the updater."
+    echo "Open the pairing QR any time with: $binary manage"
+    exit 0
+  fi
+  die "This install lacks the protected updater; the existing binary was retained.
+  Back up your Gateway config and state before a manual migration. Build a
+  reviewed release from source, or verify its tagged binary against the matching
+  .sha256 asset, then stop the Gateway through its existing service owner before
+  replacing it. Preserve config/state and keep the old image for manual recovery.
+  Do not delete the old binary to bypass this check."
+fi
+
+if [ -z "$target" ]; then
   die "No prebuilt binary found for this platform ($os/$arch). Build from source instead:
   git clone https://github.com/$REPO.git
   cd $(basename "$REPO")
@@ -117,6 +182,144 @@ else
   ./target/release/muqun-gateway start
   ./target/release/muqun-gateway manage"
 fi
+stage_ok
+
+stage "Resolve stable release"
+command -v curl >/dev/null 2>&1 || die "curl is required to download the binary."
+if command -v sha256sum >/dev/null 2>&1; then
+  hash_command=sha256sum
+elif command -v shasum >/dev/null 2>&1; then
+  hash_command=shasum
+else
+  die "sha256sum or shasum is required to verify the binary."
+fi
+if [ "$os" = Darwin ]; then
+  command -v perl >/dev/null 2>&1 || die "System Perl is required for atomic no-clobber publication on macOS; nothing installed."
+fi
+
+# Private, unique staging on the destination filesystem. Never touch a shared
+# .new name or clean any path not created by this invocation.
+umask 077
+staging="$(mktemp -d "$INSTALL_DIR/.muqun-gateway-install.XXXXXX")" || die "Cannot create private staging directory."
+
+download() (
+  # curl versions before 8.4 only enforce --max-filesize for known lengths.
+  # The file-size limit also bounds chunked writes (shell units are at least
+  # 512 bytes; use 1024 conservatively on both macOS and Linux).
+  ulimit -c 0 || exit 1
+  ulimit -f "$((($3 + 1023) / 1024))" || exit 1
+  url="$1" output="$2" max_bytes="$3"
+  set -- -fsSL
+  if [ "$color" = 1 ] && [ -t 2 ]; then
+    # curl reports measured bytes/known Content-Length, never a simulated %.
+    # Let curl size its own progress display to the terminal.
+    set -- -fSL --progress-bar
+  fi
+  curl "$@" --proto '=https' --proto-redir '=https' --connect-timeout 10 \
+    --max-time 120 --max-filesize "$max_bytes" "$url" -o "$output" || exit 1
+  [ "$(wc -c < "$output")" -le "$max_bytes" ]
+)
+
+# Resolve latest once by its HTTPS redirect, then pin both assets to that tag.
+# HEAD avoids downloading the release page or needing a JSON parser dependency.
+release_url="$(curl -fsSLI --proto '=https' --proto-redir '=https' \
+  --connect-timeout 10 --max-time 30 --max-filesize 1048576 \
+  -o /dev/null -w '%{url_effective}' "https://github.com/$REPO/releases/latest")" || die "Cannot resolve the latest stable release."
+tag="${release_url#https://github.com/$REPO/releases/tag/}"
+case "$tag" in
+  *[!v0-9.]*) die "Latest release did not resolve to a stable vX.Y.Z tag." ;;
+esac
+if [ "$tag" = "$release_url" ] ||
+   ! printf '%s\n' "$tag" | grep -Eq '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'; then
+  die "Latest release did not resolve to a stable vX.Y.Z tag."
+fi
+stage_ok
+stage "Download binary and checksum"
+asset="muqun-gateway-$target"
+download_url="https://github.com/$REPO/releases/download/$tag/$asset"
+download "$download_url" "$staging/$asset" 268435456 || die "Binary download failed; nothing installed."
+download "$download_url.sha256" "$staging/checksum" 1024 || die "Checksum download failed; nothing installed."
+stage_ok
+stage "Verify release identity"
+expected_hash="$(awk -v name="$asset" '
+  NR != 1 { bad = 1 }
+  NR == 1 {
+    hash = substr($0, 1, 64)
+    if (length(hash) != 64 || hash ~ /[^0-9a-f]/ || substr($0, 65) != "  " name) bad = 1
+  }
+  END { if (NR != 1 || bad) exit 1; print hash }
+' "$staging/checksum")" || die "Malformed checksum or wrong asset name; nothing installed."
+if [ "$hash_command" = sha256sum ]; then
+  actual_hash="$(sha256sum "$staging/$asset")" || die "Cannot hash downloaded binary."
+else
+  actual_hash="$(shasum -a 256 "$staging/$asset")" || die "Cannot hash downloaded binary."
+fi
+actual_hash="${actual_hash%% *}"
+[ "$actual_hash" = "$expected_hash" ] || die "SHA256 mismatch; nothing installed."
+# Mirror platform/update.rs: only native 64-bit little-endian ELF/Mach-O with
+# the expected CPU may reach --version. Read exactly the bounded header, not
+# file(1)'s descriptive output or an executable shell script.
+header="$(od -An -v -tx1 -N20 "$staging/$asset")" || die "Cannot inspect executable header."
+printf '%s\n' "$header" | awk -v os="$os" -v arch="$arch" '
+  { for (i = 1; i <= NF; i++) bytes[++count] = $i }
+  END {
+    if (count != 20) exit 1
+    if (os == "Linux") {
+      magic = bytes[1] bytes[2] bytes[3] bytes[4] bytes[5] bytes[6] bytes[7]
+      cpu = bytes[19] bytes[20]
+      exit !(magic == "7f454c46020101" && cpu == (arch == "x86_64" ? "3e00" : "b700"))
+    }
+    magic = bytes[1] bytes[2] bytes[3] bytes[4]
+    cpu = bytes[5] bytes[6] bytes[7] bytes[8]
+    exit !(os == "Darwin" && magic == "cffaedfe" && cpu == (arch == "x86_64" ? "07000001" : "0c000001"))
+  }
+' || die "Release binary does not match this native platform; not executed or installed."
+chmod 755 "$staging/$asset"
+# Only this staged native image is probed, with no input, bounded output and
+# a five-second wall deadline. Reap both the probe and its watchdog on every
+# exit; never print untrusted version output or fall back to publication.
+(
+  ulimit -c 0 && ulimit -f 1 || exit 1
+  exec "$staging/$asset" --version
+) </dev/null > "$staging/version" 2>/dev/null &
+probe_pid=$!
+(
+  timer=""
+  trap 'if [ -n "$timer" ]; then kill "$timer" 2>/dev/null || true; wait "$timer" 2>/dev/null || true; fi; exit 0' HUP INT TERM
+  sleep 5 &
+  timer=$!
+  wait "$timer" || exit 0
+  kill -KILL "$probe_pid" 2>/dev/null || true
+) >/dev/null 2>&1 &
+watchdog_pid=$!
+probe_status=0
+wait "$probe_pid" || probe_status=$?
+probe_pid=""
+stop_probe
+[ "$probe_status" = 0 ] || die "Staged binary version probe failed or timed out; nothing installed."
+[ "$(wc -c < "$staging/version")" -le 256 ] || die "Staged binary version output exceeded its bound; nothing installed."
+awk -v expected="muqun-gateway ${tag#v}" '
+  NR != 1 || $0 != expected { bad = 1 }
+  END { exit (NR != 1 || bad) }
+' "$staging/version" || die "Staged binary version does not match $tag; nothing installed."
+stage_ok
+stage "Publish verified binary"
+# A concurrent installer must not clobber an image published since our check.
+# Hard-link publication refuses existing files; also refuse directory/symlink
+# destinations rather than letting ln interpret them as a target directory.
+[ ! -e "$binary" ] && [ ! -L "$binary" ] || die "Destination appeared during installation; nothing replaced."
+if [ "$os" = Linux ]; then
+  ln -T "$staging/$asset" "$binary" || die "Cannot publish binary; nothing replaced."
+else
+  # Apple's ln AND link utility route directory targets through linkit().
+  # System Perl (also used by shasum) calls link(2) directly: an unexpected
+  # directory, symlink or file is atomically EEXIST, never a target directory.
+  perl -e 'link($ARGV[0], $ARGV[1]) or die "Atomic publication failed: $!\n"' \
+    -- "$staging/$asset" "$binary" || die "Cannot publish binary; nothing replaced."
+fi
+info "Installed verified $tag binary for $target to $binary (SHA256 integrity, not signing)."
+stage_ok
+stage "Configure first-run setup"
 
 case ":$PATH:" in
   *":$INSTALL_DIR:"*) ;;
@@ -234,6 +437,8 @@ else
 fi
 echo "  Change later: $binary backend autostart <backend-id> on|off"
 
+stage_ok
+stage "Start Gateway and ask autostart"
 if [ "$already_installed" = 1 ]; then
   # Refresh the unit as well as the binary, including child-process lifetime
   # rules that keep persistent terminals alive across gateway restarts.
@@ -314,6 +519,8 @@ else
   echo "    $binary service install"
 fi
 
+stage_ok
+stage "Check Gateway readiness"
 # Confirm it actually came up. A service manager accepting the job, or a child
 # being spawned, is not a gateway answering on its port: on v0.12.1 a launchd
 # reload could fail halfway and this script still went on to call the result
@@ -339,12 +546,22 @@ case "$gateway_state" in
   Then start it with: $binary service install   (or: $binary start)" ;;
   *) warn "Could not confirm that the gateway is running. Check with: $binary service status" ;;
 esac
+if [ "$gateway_state" = running ]; then
+  stage_ok
+else
+  warn "[$stage_number] UNCONFIRMED"
+fi
 
 echo
 if [ "$config_existed" = 1 ]; then
-  green "Muqun Gateway is updated and running (pairings kept)."
+  green "Summary: Muqun Gateway is updated (pairings kept)."
 else
-  green "Muqun Gateway is configured and running."
+  green "Summary: Muqun Gateway is configured."
+fi
+if [ "$gateway_state" = running ]; then
+  echo "Gateway readiness: running."
+else
+  echo "Gateway readiness: unconfirmed; check service status."
 fi
 echo "Backends configured:"
 "$binary" backend list | awk -F'\t' '{ printf "  %s %s (%s)\n", (NR == 1 ? "*" : " "), $1, $2 }'

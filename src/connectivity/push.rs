@@ -6,10 +6,18 @@ use serde_json::{json, Value};
 use crate::approvals;
 use crate::platform::i18n::{self, Locale};
 use crate::platform::manage::truncate;
+use crate::{AppState, DeviceRecord};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct PushTokenRecord {
     pub(crate) token: String,
+    /// Only a currently paired App may receive pushes. Legacy unowned records
+    /// remain readable but must be authenticated and registered again to send.
+    #[serde(default)]
+    pub(crate) device_id: Option<String>,
+    /// Distinguishes re-registration even after unregistering in the same ms.
+    #[serde(default)]
+    pub(crate) registration_id: Option<String>,
     pub(crate) platform: String,
     pub(crate) device_name: Option<String>,
     /// The language this device asked to be notified in, as the exact code the
@@ -24,6 +32,96 @@ pub(crate) struct PushTokenRecord {
     #[serde(default)]
     pub(crate) locale: Option<String>,
     pub(crate) updated_unix_ms: u128,
+}
+
+fn has_paired_owner(record: &PushTokenRecord, devices: &[DeviceRecord]) -> bool {
+    record.device_id.as_deref().is_some_and(|id| {
+        devices
+            .iter()
+            .any(|device| device.id == id && device.kind.is_app())
+    })
+}
+
+/// All push readers take devices before tokens; poisoning either fails closed.
+pub(crate) fn registered_recipients(state: &AppState) -> anyhow::Result<Vec<PushTokenRecord>> {
+    let devices = state
+        .devices
+        .lock()
+        .map_err(|_| anyhow::anyhow!("device lock failed"))?;
+    let tokens = state
+        .push_tokens
+        .lock()
+        .map_err(|_| anyhow::anyhow!("push token lock failed"))?;
+    Ok(tokens
+        .iter()
+        .filter(|record| has_paired_owner(record, &devices))
+        .cloned()
+        .collect())
+}
+
+/// Admission is repeated immediately before every Expo batch, not just when a
+/// watcher snapshots recipients. Revoke/replacement and registration changes
+/// are serialized by devices -> tokens. Locks never cross the network await.
+/// Once admitted, an in-flight batch cannot be recalled by a later revocation.
+fn admit_batch(
+    state: &AppState,
+    candidates: &[PushTokenRecord],
+) -> anyhow::Result<Vec<PushTokenRecord>> {
+    let devices = state
+        .devices
+        .lock()
+        .map_err(|_| anyhow::anyhow!("device lock failed"))?;
+    let tokens = state
+        .push_tokens
+        .lock()
+        .map_err(|_| anyhow::anyhow!("push token lock failed"))?;
+    Ok(candidates
+        .iter()
+        .filter(|record| {
+            has_paired_owner(record, &devices) && tokens.iter().any(|current| current == *record)
+        })
+        .cloned()
+        .collect())
+}
+
+pub(crate) async fn send_registered_push_notifications(
+    state: &AppState,
+    candidates: &[PushTokenRecord],
+    title: String,
+    body: String,
+    data: serde_json::Map<String, Value>,
+) -> anyhow::Result<Value> {
+    send_batches(state, candidates, |admitted| {
+        let title = title.clone();
+        let body = body.clone();
+        let data = data.clone();
+        async move { crate::send_expo_push_notifications(&admitted, title, body, data).await }
+    })
+    .await
+}
+
+async fn send_batches<F, Fut>(
+    state: &AppState,
+    candidates: &[PushTokenRecord],
+    mut send: F,
+) -> anyhow::Result<Value>
+where
+    F: FnMut(Vec<PushTokenRecord>) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<Value>>,
+{
+    let mut tickets = Vec::new();
+    // Expo accepts at most 100 messages per request.
+    for batch in candidates.chunks(100) {
+        let admitted = admit_batch(state, batch)?;
+        if admitted.is_empty() {
+            continue;
+        }
+        let result = send(admitted).await?;
+        if let Some(data) = result.get("data").and_then(Value::as_array) {
+            tickets.extend(data.iter().cloned());
+        }
+    }
+    Ok(json!({ "data": tickets }))
 }
 
 impl PushTokenRecord {
@@ -46,11 +144,12 @@ pub(crate) struct AgentPushNotification {
     pub(crate) data: serde_json::Map<String, Value>,
 }
 
-/// What happened, in the only three ways this gateway ever raises a push.
+/// What happened, before a registered device chooses its language.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AgentNotice {
     ApprovalPending,
     AgentBlocked,
+    AgentInputRequired,
     AgentCompleted,
 }
 
@@ -138,6 +237,7 @@ impl AgentPushNotice {
                 ("Approval needed", "{name} is waiting for your approval.")
             }
             AgentNotice::AgentBlocked => ("Agent blocked", "{name} needs your input."),
+            AgentNotice::AgentInputRequired => ("Needs your input", "{name} needs your input."),
             AgentNotice::AgentCompleted => ("Agent done", "{name} finished running."),
         };
         // Title carries which server so a multi-server user knows where to
@@ -176,5 +276,184 @@ impl AgentPushNotice {
             None => i18n::t_slots(locale, body, &[("name", &agent)]),
         };
         AgentPushNotification { title, body, data }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::*;
+
+    fn registration(token: &str, owner: Option<&str>) -> PushTokenRecord {
+        PushTokenRecord {
+            token: token.into(),
+            device_id: owner.map(str::to_owned),
+            registration_id: Some(uuid::Uuid::new_v4().to_string()),
+            platform: "ios".into(),
+            device_name: None,
+            locale: Some("zh-TW".into()),
+            updated_unix_ms: 1,
+        }
+    }
+
+    #[test]
+    fn recipients_require_current_app_membership_and_exact_registration() {
+        let state = test_state(
+            "admin",
+            vec![
+                test_device("app", "app-token"),
+                test_peer_device("peer", "peer-token"),
+            ],
+        );
+        let active = registration("ExpoPushToken[active]", Some("app"));
+        let candidates = vec![
+            active.clone(),
+            registration("ExpoPushToken[revoked]", Some("gone")),
+            registration("ExpoPushToken[legacy]", None),
+            registration("ExpoPushToken[peer]", Some("peer")),
+        ];
+        *state.push_tokens.lock().unwrap() = candidates.clone();
+        assert_eq!(registered_recipients(&state).unwrap(), vec![active.clone()]);
+        assert_eq!(
+            admit_batch(&state, &candidates).unwrap(),
+            vec![active.clone()]
+        );
+        state.push_tokens.lock().unwrap()[0].registration_id = Some("new-generation".into());
+        assert!(admit_batch(&state, &[active]).unwrap().is_empty());
+        state.devices.lock().unwrap().clear();
+        assert!(registered_recipients(&state).unwrap().is_empty());
+    }
+
+    #[test]
+    fn install_replacement_and_capacity_eviction_cut_off_old_pushes() {
+        for replace_install in [false, true] {
+            let mut old = test_device("old", "old-token");
+            old.install_id = Some("install".into());
+            let state = test_state("admin", vec![old]);
+            let record = registration("ExpoPushToken[old]", Some("old"));
+            state.push_tokens.lock().unwrap().push(record.clone());
+            let mut new = test_device("new", "new-token");
+            new.paired_unix_ms = 2_000;
+            new.install_id = replace_install.then(|| "install".into());
+            authority::enroll_device(&mut state.devices.lock().unwrap(), new, 1).unwrap();
+            assert!(admit_batch(&state, &[record]).unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn every_batch_rechecks_membership_without_holding_locks_over_send() {
+        let state = test_state("admin", vec![test_device("app", "token")]);
+        let candidates: Vec<_> = (0..101)
+            .map(|n| registration(&format!("ExpoPushToken[{n}]"), Some("app")))
+            .collect();
+        *state.push_tokens.lock().unwrap() = candidates.clone();
+        let mut calls = 0;
+        let result = send_batches(&state, &candidates, |batch| {
+            calls += 1;
+            assert_eq!(batch.len(), 100);
+            let mut devices = state.devices.try_lock().expect("no device lock over send");
+            let _tokens = state
+                .push_tokens
+                .try_lock()
+                .expect("no token lock over send");
+            devices.clear();
+            std::future::ready(Ok(json!({ "data": [{ "status": "ok" }] })))
+        })
+        .await
+        .unwrap();
+        assert_eq!(calls, 1, "second batch is suppressed after revoke");
+        assert_eq!(result["data"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn next_batch_rechecks_registration_even_when_the_owner_is_still_paired() {
+        let state = test_state("admin", vec![test_device("app", "token")]);
+        let candidates: Vec<_> = (0..101)
+            .map(|n| registration(&format!("ExpoPushToken[{n}]"), Some("app")))
+            .collect();
+        *state.push_tokens.lock().unwrap() = candidates.clone();
+        let mut calls = 0;
+        send_batches(&state, &candidates, |_| {
+            calls += 1;
+            state.push_tokens.lock().unwrap()[100].registration_id = Some("reregistered".into());
+            std::future::ready(Ok(json!({ "data": [] })))
+        })
+        .await
+        .unwrap();
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn admission_fails_closed_if_either_lock_is_poisoned() {
+        for poison_devices in [false, true] {
+            let state = test_state("admin", vec![test_device("app", "token")]);
+            let record = registration("ExpoPushToken[active]", Some("app"));
+            state.push_tokens.lock().unwrap().push(record.clone());
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if poison_devices {
+                    let _guard = state.devices.lock().unwrap();
+                    panic!("poison devices");
+                } else {
+                    let _guard = state.push_tokens.lock().unwrap();
+                    panic!("poison tokens");
+                }
+            }));
+            assert!(registered_recipients(&state).is_err());
+            assert!(admit_batch(&state, &[record]).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_and_legacy_records_never_reach_the_sender() {
+        let state = test_state("admin", vec![]);
+        let candidates = vec![
+            registration("ExpoPushToken[old]", Some("old")),
+            registration("ExpoPushToken[legacy]", None),
+        ];
+        *state.push_tokens.lock().unwrap() = candidates.clone();
+        let result = send_batches(&state, &candidates, |_| async {
+            anyhow::bail!("no Expo request may be made")
+        })
+        .await
+        .unwrap();
+        assert_eq!(result, json!({ "data": [] }));
+        // Drive both public routes without any eligible recipient: no traffic.
+        let response = crate::connectivity::routes::send_test_notification(
+            State(test_state("admin", vec![test_device("app", "token")])),
+            bearer_headers("token"),
+            Json(crate::connectivity::routes::SendPushNotificationBody {
+                title: None,
+                body: None,
+                data: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.0["device_count"], 0);
+        crate::terminal::routes::deliver_agent_notification(
+            &state,
+            AgentPushNotice {
+                notice: AgentNotice::AgentCompleted,
+                server_label: "test".into(),
+                agent_name: None,
+                data: Default::default(),
+                choices: vec![],
+                detail: None,
+            },
+        )
+        .await;
+    }
+
+    #[test]
+    fn all_push_paths_use_authoritative_admission() {
+        // Prevent a future route/watcher from reverting to the raw HTTP sender.
+        assert!(!include_str!("routes.rs").contains("send_expo_push_notifications"));
+        assert!(!include_str!("../terminal/routes.rs").contains("send_expo_push_notifications"));
+        assert_eq!(
+            include_str!("../terminal/routes.rs")
+                .matches("send_registered_push_notifications(")
+                .count(),
+            2
+        );
     }
 }

@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::broadcast;
+use tokio_util::sync::CancellationToken;
 
 use super::discovery::OpencodeEndpoint;
 
@@ -12,6 +13,66 @@ use super::discovery::OpencodeEndpoint;
 /// `message.part.updated` runs to tens of kilobytes -- but it is not unbounded.
 /// A stream that never emits a blank line must not grow memory without limit.
 pub(crate) const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
+
+/// Frame in bytes, not HTTP chunks: UTF-8 is decoded only at a blank line.
+/// Once oversized, discard through that same boundary (never parse its tail).
+#[derive(Default)]
+struct FrameBuffer {
+    bytes: Vec<u8>,
+    line_bytes: usize,
+    line_is_cr: bool,
+    discarding: bool,
+}
+
+impl FrameBuffer {
+    fn push(&mut self, chunk: &[u8], sender: &broadcast::Sender<OpencodeRawEvent>) {
+        for &byte in chunk {
+            let boundary = byte == b'\n'
+                && (self.line_bytes == 0 || (self.line_bytes == 1 && self.line_is_cr));
+            if !self.discarding {
+                if self.bytes.len() == MAX_FRAME_BYTES {
+                    self.discarding = true;
+                    self.bytes.clear();
+                    tracing::warn!("oversized sse frame discarded");
+                    Self::loss(sender, "event_frame_oversized");
+                } else {
+                    self.bytes.push(byte);
+                }
+            }
+            if boundary {
+                if !self.discarding {
+                    match std::str::from_utf8(&self.bytes) {
+                        Ok(block) => OpencodeSseListener::process_block(block, sender),
+                        Err(err) => {
+                            tracing::warn!(%err, "invalid utf8 sse frame discarded");
+                            Self::loss(sender, "event_frame_invalid_utf8");
+                        }
+                    }
+                }
+                self.bytes.clear();
+                self.discarding = false;
+            }
+            if byte == b'\n' {
+                self.line_bytes = 0;
+                self.line_is_cr = false;
+            } else {
+                self.line_bytes = self.line_bytes.saturating_add(1);
+                self.line_is_cr = byte == b'\r';
+            }
+        }
+    }
+
+    fn loss(sender: &broadcast::Sender<OpencodeRawEvent>, reason: &str) {
+        // Internal signal only; the pump maps this to the existing Resync.
+        let _ = sender.send(OpencodeRawEvent {
+            id: None,
+            event_type: "gateway.stream.resync".to_string(),
+            created: None,
+            location: None,
+            data: serde_json::json!({ "reason": reason }),
+        });
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpencodeRawEvent {
@@ -34,6 +95,7 @@ pub struct OpencodeSseListener {
     sender: broadcast::Sender<OpencodeRawEvent>,
     running: Arc<AtomicBool>,
     connected: Arc<AtomicBool>,
+    cancel: CancellationToken,
 }
 
 impl OpencodeSseListener {
@@ -44,6 +106,7 @@ impl OpencodeSseListener {
             sender,
             running: Arc::new(AtomicBool::new(false)),
             connected: Arc::new(AtomicBool::new(false)),
+            cancel: CancellationToken::new(),
         };
         (listener, rx)
     }
@@ -58,14 +121,23 @@ impl OpencodeSseListener {
     /// False once `stop` has been called, which is how a reader that finds its
     /// channel closed can tell an orderly hand-over from a real failure.
     pub fn is_running(&self) -> bool {
-        self.running.load(Ordering::SeqCst)
+        !self.cancel.is_cancelled() && self.running.load(Ordering::SeqCst)
     }
 
     pub fn is_connected(&self) -> bool {
-        self.connected.load(Ordering::SeqCst)
+        !self.cancel.is_cancelled() && self.connected.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn cancel_token(&self) -> CancellationToken {
+        self.cancel.clone()
     }
 
     pub fn start(&self) {
+        // A stopped generation is retired; manager reattachment constructs a
+        // fresh listener/token rather than reviving its old event pump.
+        if self.cancel.is_cancelled() {
+            return;
+        }
         if self.running.swap(true, Ordering::SeqCst) {
             return;
         }
@@ -74,6 +146,7 @@ impl OpencodeSseListener {
         let sender = self.sender.clone();
         let running = self.running.clone();
         let connected = self.connected.clone();
+        let cancel = self.cancel.clone();
 
         tokio::spawn(async move {
             let mut backoff = Duration::from_millis(500);
@@ -98,43 +171,29 @@ impl OpencodeSseListener {
                     req = req.basic_auth("opencode", Some(pwd));
                 }
 
-                match req.send().await {
+                let response = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => break,
+                    response = req.send() => response,
+                };
+                match response {
                     Ok(resp) if resp.status().is_success() => {
                         backoff = Duration::from_millis(500); // Reset backoff
                         connected.store(true, Ordering::SeqCst);
                         tracing::info!(url = %url, "opencode event stream connected");
 
                         let mut stream = resp.bytes_stream();
-                        let mut buffer = String::new();
+                        let mut buffer = FrameBuffer::default();
 
-                        while let Some(chunk_res) = stream.next().await {
-                            if !running.load(Ordering::SeqCst) {
-                                break;
-                            }
+                        loop {
+                            let chunk_res = tokio::select! {
+                                biased;
+                                _ = cancel.cancelled() => break,
+                                chunk = stream.next() => chunk,
+                            };
+                            let Some(chunk_res) = chunk_res else { break };
                             match chunk_res {
-                                Ok(bytes) => match std::str::from_utf8(&bytes) {
-                                    Ok(text) => {
-                                        buffer.push_str(text);
-                                        while let Some(pos) = buffer.find("\n\n") {
-                                            let message_block = buffer[..pos].to_string();
-                                            buffer.drain(..pos + 2);
-                                            Self::process_block(&message_block, &sender);
-                                        }
-                                        if buffer.len() > MAX_FRAME_BYTES {
-                                            tracing::warn!(
-                                                bytes = buffer.len(),
-                                                "oversized sse frame discarded"
-                                            );
-                                            buffer.clear();
-                                        }
-                                    }
-                                    Err(err) => {
-                                        // A chunk can split a multi-byte
-                                        // character; only give up if the whole
-                                        // buffer is unusable.
-                                        tracing::debug!(%err, "non-utf8 sse chunk skipped");
-                                    }
-                                },
+                                Ok(bytes) => buffer.push(&bytes, &sender),
                                 Err(err) => {
                                     tracing::warn!(%err, "opencode event stream read failed");
                                     break;
@@ -142,6 +201,11 @@ impl OpencodeSseListener {
                             }
                         }
                         connected.store(false, Ordering::SeqCst);
+                        if !cancel.is_cancelled() {
+                            // V2 is live-only. A reconnect cannot replay what
+                            // arrived while disconnected, even at a boundary.
+                            FrameBuffer::loss(&sender, "event_stream_disconnected");
+                        }
                         tracing::warn!(url = %url, "opencode event stream ended");
                     }
                     Ok(resp) => {
@@ -162,14 +226,20 @@ impl OpencodeSseListener {
                     break;
                 }
 
-                tokio::time::sleep(backoff).await;
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => break,
+                    _ = tokio::time::sleep(backoff) => {},
+                }
                 backoff = (backoff * 2).min(max_backoff);
             }
             connected.store(false, Ordering::SeqCst);
+            running.store(false, Ordering::SeqCst);
         });
     }
 
     pub fn stop(&self) {
+        self.cancel.cancel();
         self.running.store(false, Ordering::SeqCst);
         self.connected.store(false, Ordering::SeqCst);
     }
@@ -215,8 +285,181 @@ impl OpencodeSseListener {
 }
 
 #[cfg(test)]
+pub(crate) async fn read_test_request(socket: &mut tokio::net::TcpStream) {
+    use tokio::io::AsyncReadExt;
+    let mut headers = Vec::new();
+    while !headers.ends_with(b"\r\n\r\n") {
+        headers.push(socket.read_u8().await.unwrap());
+        assert!(headers.len() < 4096, "fake GET request headers bounded");
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn endpoint(url: String) -> OpencodeEndpoint {
+        OpencodeEndpoint {
+            url,
+            password: None,
+            version: None,
+            pid: None,
+        }
+    }
+
+    fn unicode_frames(ending: &str) -> Vec<u8> {
+        format!(
+            "data: {{\"type\":\"session.text.delta\",\"data\":{{\"delta\":\"你好🙂\"}}}}{ending}{ending}data: {{\"type\":\"session.idle\",\"data\":{{}}}}{ending}{ending}"
+        ).into_bytes()
+    }
+
+    #[test]
+    fn unicode_and_concatenated_frames_survive_every_byte_split() {
+        for ending in ["\n", "\r\n"] {
+            let frames = unicode_frames(ending);
+            for split in 0..=frames.len() {
+                let (tx, mut rx) = broadcast::channel(4);
+                let mut buffer = FrameBuffer::default();
+                buffer.push(&frames[..split], &tx);
+                buffer.push(&frames[split..], &tx);
+                assert_eq!(rx.try_recv().unwrap().data["delta"], "你好🙂");
+                assert_eq!(rx.try_recv().unwrap().event_type, "session.idle");
+                assert!(rx.try_recv().is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn oversized_frames_recover_only_at_boundary_even_with_delimiter_in_chunk() {
+        for split_oversize in [false, true] {
+            let (tx, mut rx) = broadcast::channel(8);
+            let mut buffer = FrameBuffer::default();
+            let mut oversized = vec![b'x'; MAX_FRAME_BYTES + 1];
+            oversized.extend_from_slice(b"data: {\"type\":\"must.not.parse\"}\r\n\r\n");
+            oversized.extend_from_slice(&unicode_frames("\r\n"));
+            if split_oversize {
+                buffer.push(&oversized[..MAX_FRAME_BYTES + 1], &tx);
+                assert!(buffer.bytes.is_empty());
+                buffer.push(&oversized[MAX_FRAME_BYTES + 1..], &tx);
+            } else {
+                buffer.push(&oversized, &tx);
+            }
+            assert_eq!(rx.try_recv().unwrap().event_type, "gateway.stream.resync");
+            assert_eq!(rx.try_recv().unwrap().data["delta"], "你好🙂");
+            assert_eq!(rx.try_recv().unwrap().event_type, "session.idle");
+            assert!(rx.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn invalid_utf8_resyncs_without_losing_the_following_frame() {
+        let (tx, mut rx) = broadcast::channel(4);
+        let mut buffer = FrameBuffer::default();
+        buffer.push(b"data: \xff\n\n", &tx);
+        buffer.push(&unicode_frames("\n"), &tx);
+        assert_eq!(
+            rx.try_recv().unwrap().data["reason"],
+            "event_frame_invalid_utf8"
+        );
+        assert_eq!(rx.try_recv().unwrap().data["delta"], "你好🙂");
+        assert_eq!(rx.try_recv().unwrap().event_type, "session.idle");
+    }
+
+    #[tokio::test]
+    async fn live_only_http_disconnect_announces_resync_after_complete_frames() {
+        let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", tcp.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = tcp.accept().await.unwrap();
+            read_test_request(&mut socket).await;
+            let body = unicode_frames("\n");
+            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).as_bytes()).await.unwrap();
+            socket.write_all(&body).await.unwrap();
+        });
+        let (listener, mut rx) = OpencodeSseListener::new(endpoint(url));
+        listener.start();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            assert_eq!(rx.recv().await.unwrap().data["delta"], "你好🙂");
+            assert_eq!(rx.recv().await.unwrap().event_type, "session.idle");
+            assert_eq!(
+                rx.recv().await.unwrap().data["reason"],
+                "event_stream_disconnected"
+            );
+        })
+        .await
+        .unwrap();
+        listener.stop();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn real_http_one_byte_chunks_preserve_unicode() {
+        let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", tcp.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = tcp.accept().await.unwrap();
+            read_test_request(&mut socket).await;
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n").await.unwrap();
+            for byte in unicode_frames("\r\n") {
+                socket
+                    .write_all(&[b'1', b'\r', b'\n', byte, b'\r', b'\n'])
+                    .await
+                    .unwrap();
+            }
+            socket.flush().await.unwrap();
+            let mut byte = [0];
+            assert_eq!(socket.read(&mut byte).await.unwrap(), 0);
+        });
+        let (listener, mut rx) = OpencodeSseListener::new(endpoint(url));
+        listener.start();
+        let event = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.data["delta"], "你好🙂");
+        assert_eq!(rx.recv().await.unwrap().event_type, "session.idle");
+        listener.stop();
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn stop_cancels_idle_handshake_stream_and_backoff() {
+        for response in [None, Some("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n"), Some("HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")] {
+            let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", tcp.local_addr().unwrap());
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = tcp.accept().await.unwrap();
+                read_test_request(&mut socket).await;
+                if let Some(response) = response {
+                    socket.write_all(response.as_bytes()).await.unwrap();
+                    socket.flush().await.unwrap();
+                }
+                ready_tx.send(()).unwrap();
+                let mut byte = [0];
+                assert_eq!(socket.read(&mut byte).await.unwrap(), 0);
+            });
+            let (listener, _rx) = OpencodeSseListener::new(endpoint(url));
+            listener.start();
+            ready_rx.await.unwrap();
+            // Let headers reach the reader, so 503 exercises its backoff
+            // rather than merely cancelling the still-pending handshake.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            listener.stop();
+            // With only the task's clone left, Weak proves the reader exited,
+            // including while in backoff (which holds no active socket).
+            let weak = Arc::downgrade(&listener.running);
+            drop(listener);
+            tokio::time::timeout(Duration::from_millis(200), async {
+                while weak.upgrade().is_some() { tokio::task::yield_now().await; }
+            }).await.expect("reader releases state immediately");
+            tokio::time::timeout(Duration::from_secs(1), server).await.unwrap().unwrap();
+        }
+    }
 
     #[test]
     fn a_heartbeat_comment_is_not_an_event() {

@@ -209,6 +209,8 @@ impl TerminalBackendFeatures {
 #[serde(rename_all = "camelCase")]
 pub struct TerminalFeatures {
     /// Frozen pagination of bounded Gateway captures, not native ranged reads.
+    /// Segment support is negotiated via `pane_captured_history_segments_v1`
+    /// in the gateway-wide capability list, independently of storage mode.
     #[serde(default)]
     pub captured_history: bool,
     pub multi_window: bool,
@@ -347,7 +349,8 @@ pub async fn build_terminal_plane_discovery(state: &AppState) -> TerminalPlaneDi
 /// Build combined discovery planes
 pub async fn build_discovery_planes(state: &AppState) -> DiscoveryPlanes {
     let terminal = build_terminal_plane_discovery(state).await;
-    let agents = state.agent_runtime.discover_agents().await;
+    let mut agents = state.agent_runtime.discover_agents().await;
+    agents.order_for_picker();
     // The SSH plane is the app's transport, not a gateway subsystem: the phone
     // opens its own SSH connection and tunnels this gateway's loopback port, so
     // the same HTTP API answers on the far side. These flags only tell the app
@@ -366,7 +369,34 @@ pub async fn build_discovery_planes(state: &AppState) -> DiscoveryPlanes {
     }
 }
 
+/// Usable providers precede unavailable ones; Codex then OpenCode lead the
+/// ready group. An unavailable Codex does not displace an existing fallback.
+pub(crate) fn order_agents(agents: &mut [AgentDiscoveryInfo]) {
+    let preference = crate::agents::runtime::AGENT_PREFERENCE;
+    agents.sort_by_key(|agent| {
+        let ready = agent.enabled
+            && matches!(
+                agent.status,
+                AgentAvailability::Connected | AgentAvailability::Reachable
+            );
+        let rank = if agent.id == "codex" && !ready {
+            usize::MAX
+        } else {
+            preference
+                .iter()
+                .position(|id| *id == agent.id)
+                .unwrap_or(preference.len())
+        };
+        (!ready, rank)
+    });
+}
+
 impl AgentPlaneDiscovery {
+    /// Use the runtime's ordering for HTTP discovery as well as CLI discovery.
+    fn order_for_picker(&mut self) {
+        order_agents(&mut self.agents);
+    }
+
     /// Drop what only a paired device should learn: where each agent
     /// listens and which version it runs.
     pub fn redact_endpoints(&mut self) {
@@ -389,12 +419,29 @@ pub async fn build_discovery(state: &AppState, _sealed: bool, authenticated: boo
             .iter()
             .any(|c| c == crate::AGENT_COLLABORATION_CAPABILITY)
     });
-    let legacy_capabilities: Vec<String> = crate::gateway_capabilities(collaboration_somewhere)
-        .into_iter()
-        .map(String::from)
-        .collect();
+    let legacy_capabilities: Vec<String> = crate::gateway_capabilities(
+        collaboration_somewhere,
+        state.config.mcp.enabled && crate::mcp::serves_agents(&state.config.listen),
+        state.config.history.storage == crate::platform::config::HistoryStorage::Sqlite,
+    )
+    .into_iter()
+    .map(String::from)
+    .collect();
 
+    // What `POST /api/tasks` can do for each agent, beside its features.
+    let mut planes = serde_json::to_value(&planes).unwrap_or(Value::Null);
+    if let Some(agents) = planes
+        .pointer_mut("/agents/agents")
+        .and_then(Value::as_array_mut)
+    {
+        for agent in agents {
+            let id = agent["id"].as_str().unwrap_or_default().to_owned();
+            agent["ledgerDelivery"] =
+                json!(crate::tasks::routes::ledger_delivery_names(state, &id).await);
+        }
+    }
     json!({
+        "transport_versions": crate::connectivity::transport::SUPPORTED_VERSIONS,
         "ok": true,
         "gatewayVersion": env!("CARGO_PKG_VERSION"),
         "apiVersion": crate::GATEWAY_API_VERSION,
@@ -406,28 +453,251 @@ pub async fn build_discovery(state: &AppState, _sealed: bool, authenticated: boo
         "generation": &*state.generation,
         "serverId": state.config.server_id,
         "label": state.config.label,
+        // What `POST /api/uploads` takes, for the app to say on a 413. Two
+        // numbers, the same for everyone.
+        "uploads": {
+            "maxBytes": crate::platform::uploads::MAX_UPLOAD_BYTES,
+            "maxVideoBytes": crate::platform::uploads::MAX_VIDEO_UPLOAD_BYTES,
+        },
         "planes": planes,
         // Not redacted for anyone: a path and a protocol number say nothing
         // an unauthenticated caller could not learn by trying the upgrade.
-        "transports": transports_discovery(),
+        "transports": transports_discovery(
+            state
+                .config
+                .mcp
+                .enabled
+                .then(crate::mcp::hosts::helper_for_this_gateway)
+                .as_deref(),
+        ),
         "capabilities": legacy_capabilities,
     })
 }
 
 /// The App-facing transports beyond plain HTTP, keyed by name. An App that
-/// does not know a key ignores it and keeps using HTTP and SSE.
-pub fn transports_discovery() -> Value {
-    json!({
+/// does not know a key ignores it and keeps using HTTP and SSE. `mcp_helper`
+/// is the token helper command while MCP is enabled.
+pub fn transports_discovery(mcp_helper: Option<&str>) -> Value {
+    let mut transports = json!({
         "websocket": {
             "path": crate::agents::ws_routes::WS_PATH,
             "protocol": crate::agents::ws_routes::WS_PROTOCOL,
-        }
-    })
+        },
+    });
+    if let Some(helper) = mcp_helper {
+        // Loopback only; agents on this machine, not the App. The helper
+        // command is a name, not a secret.
+        transports["mcp"] = json!({
+            "path": crate::mcp::MCP_PATH,
+            "loopback_only": true,
+            "token_helper": helper,
+        });
+    }
+    transports
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn picker_prefers_ready_codex_then_opencode_without_changing_provider_metadata() {
+        for status in [AgentAvailability::Connected, AgentAvailability::Reachable] {
+            let mut plane = crate::agents::AgentRuntime::disabled()
+                .discover_agents()
+                .await;
+            let codex = plane.agents.iter_mut().find(|a| a.id == "codex").unwrap();
+            codex.enabled = true;
+            codex.status = status;
+            let metadata: BTreeMap<_, _> = plane
+                .agents
+                .iter()
+                .map(|agent| (agent.id.clone(), serde_json::to_value(agent).unwrap()))
+                .collect();
+            plane.order_for_picker();
+            assert_eq!(
+                plane
+                    .agents
+                    .iter()
+                    .map(|a| a.id.as_str())
+                    .collect::<Vec<_>>(),
+                ["codex", "opencode", "deepseek", "t3"]
+            );
+            for agent in &plane.agents {
+                assert_eq!(serde_json::to_value(agent).unwrap(), metadata[&agent.id]);
+            }
+            let once = serde_json::to_value(&plane).unwrap();
+            plane.order_for_picker();
+            assert_eq!(serde_json::to_value(&plane).unwrap(), once);
+        }
+    }
+
+    #[tokio::test]
+    async fn picker_does_not_promote_unavailable_or_disabled_codex() {
+        for (status, enabled) in [
+            (AgentAvailability::Offline, true),
+            (AgentAvailability::Disabled, false),
+            (AgentAvailability::NotInstalled, true),
+            (AgentAvailability::Unconfigured, true),
+            (AgentAvailability::Unsupported, true),
+            (AgentAvailability::Connected, false),
+            (AgentAvailability::Reachable, false),
+        ] {
+            let mut plane = crate::agents::AgentRuntime::disabled()
+                .discover_agents()
+                .await;
+            let codex = plane.agents.iter_mut().find(|a| a.id == "codex").unwrap();
+            codex.enabled = enabled;
+            codex.status = status;
+            let opencode = plane
+                .agents
+                .iter_mut()
+                .find(|a| a.id == "opencode")
+                .unwrap();
+            opencode.enabled = true;
+            opencode.status = AgentAvailability::Connected;
+            plane.order_for_picker();
+            assert_eq!(
+                plane
+                    .agents
+                    .iter()
+                    .map(|a| a.id.as_str())
+                    .collect::<Vec<_>>(),
+                ["opencode", "deepseek", "t3", "codex"]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn picker_prefers_connected_fallback_over_unavailable_primary_choices() {
+        let mut plane = crate::agents::AgentRuntime::disabled()
+            .discover_agents()
+            .await;
+        let t3 = plane.agents.iter_mut().find(|a| a.id == "t3").unwrap();
+        t3.enabled = true;
+        t3.status = AgentAvailability::Connected;
+        plane.order_for_picker();
+        assert_eq!(plane.agents[0].id, "t3");
+        assert_eq!(plane.agents.last().unwrap().id, "codex");
+    }
+
+    #[tokio::test]
+    async fn picker_without_codex_preserves_other_provider_order_and_entries() {
+        let mut plane = crate::agents::AgentRuntime::disabled()
+            .discover_agents()
+            .await;
+        plane.agents.retain(|a| a.id != "codex");
+        plane.agents.reverse();
+        plane.order_for_picker();
+        assert_eq!(
+            plane
+                .agents
+                .iter()
+                .map(|a| a.id.as_str())
+                .collect::<Vec<_>>(),
+            ["opencode", "deepseek", "t3"]
+        );
+    }
+
+    #[tokio::test]
+    async fn session_pages_discovery_preserves_runtime_provider_flags() {
+        let state = crate::test_state("admin", Vec::new());
+        let discovery = build_discovery(&state, false, true).await;
+        assert!(discovery["capabilities"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("agent_session_pages_v1")));
+        let agents = discovery["planes"]["agents"]["agents"].as_array().unwrap();
+        for (id, supported) in [("opencode", true), ("deepseek", false), ("t3", false)] {
+            let agent = agents.iter().find(|agent| agent["id"] == id).unwrap();
+            let pagination = agent["features"]["sessionPagination"].as_bool();
+            if id == "t3" {
+                assert_eq!(pagination.unwrap_or(false), supported, "{id}");
+            } else {
+                assert_eq!(pagination, Some(supported), "{id}");
+            }
+            assert!(
+                agent["features"].get("extra").is_none(),
+                "flags are flattened"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn timeline_earlier_discovery_declares_only_the_implementing_adapters() {
+        let state = crate::test_state("admin", Vec::new());
+        let discovery = build_discovery(&state, false, true).await;
+        assert!(discovery["capabilities"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("agent_timeline_earlier_v1")));
+        let agents = discovery["planes"]["agents"]["agents"].as_array().unwrap();
+        for (id, supported) in [
+            ("opencode", true),
+            ("deepseek", true),
+            ("t3", false),
+            ("codex", true),
+        ] {
+            let agent = agents.iter().find(|agent| agent["id"] == id).unwrap();
+            assert_eq!(agent["features"]["timelineEarlier"], supported, "{id}");
+            assert!(agent["features"].get("timeline_earlier").is_none());
+            assert!(agent["features"].get("extra").is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn captured_segments_and_push_ownership_are_discovered_in_both_storage_modes() {
+        for storage in [
+            crate::platform::config::HistoryStorage::Memory,
+            crate::platform::config::HistoryStorage::Sqlite,
+        ] {
+            let mut state = crate::test_state("admin", Vec::new());
+            state.config.history.storage = storage;
+            let discovery = super::build_discovery(&state, false, true).await;
+            for capability in [
+                "pane_captured_history",
+                "pane_captured_history_segments_v1",
+                "push_token_owner_binding_v1",
+            ] {
+                assert!(discovery["capabilities"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|c| c == capability));
+            }
+            assert_eq!(
+                discovery["planes"]["terminal"]["features"]["capturedHistory"],
+                true
+            );
+        }
+    }
+
+    #[test]
+    fn transports_announce_mcp_only_when_enabled() {
+        let on = transports_discovery(Some(crate::mcp::hosts::HELPER));
+        assert_eq!(
+            on["mcp"],
+            json!({
+                "path": "/mcp",
+                "loopback_only": true,
+                "token_helper": "muqun-gateway mcp token-helper",
+            })
+        );
+        assert!(on["websocket"].is_object());
+        assert!(transports_discovery(None).get("mcp").is_none());
+        let custom = transports_discovery(Some("muqun-gateway mcp token-helper --config-dir /c"));
+        assert_eq!(
+            custom["mcp"]["token_helper"],
+            "muqun-gateway mcp token-helper --config-dir /c"
+        );
+    }
+
+    #[test]
+    fn mcp_server_capability_follows_the_config() {
+        assert!(!crate::API_CAPABILITIES.contains(&"mcp_server"));
+        assert!(crate::gateway_capabilities(false, true, false).contains(&"mcp_server"));
+        assert!(!crate::gateway_capabilities(false, false, false).contains(&"mcp_server"));
+    }
 
     #[test]
     fn agent_discovery_info_serializes_with_camel_case() {

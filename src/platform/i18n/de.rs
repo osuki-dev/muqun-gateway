@@ -19,6 +19,7 @@ pub(super) const DE: &[(&str, &str)] = &[
     // -- push notifications --------------------------------------------------
     ("Agent", "Der Agent"),
     ("Approval needed", "Freigabe erforderlich"),
+    ("Needs your input", "Braucht deine Eingabe"),
     ("Agent blocked", "Agent wartet"),
     ("Agent done", "Agent fertig"),
     ("{name} is waiting for your approval.", "{name} wartet auf deine Freigabe."),
@@ -32,6 +33,10 @@ pub(super) const DE: &[(&str, &str)] = &[
         "Herdr hat die id des erstellten Panels nicht zurückgegeben",
     ),
     ("Herdr is unavailable", "Herdr ist nicht erreichbar"),
+    ("No terminal pane belongs to the calling process", "Kein Terminal-Panel gehört zum aufrufenden Prozess"),
+    ("Task not found", "Aufgabe nicht gefunden"),
+    ("Token expired", "Token abgelaufen"),
+    ("Token not found", "Token nicht gefunden"),
     (
         "agent is not one this gateway offers; see GET /api/agents/catalog",
         "agent ist keiner, den dieses Gateway anbietet; siehe GET /api/agents/catalog",
@@ -93,6 +98,14 @@ pub(super) const DE: &[(&str, &str)] = &[
     ("invalid Authorization header", "ungültiger Authorization-Header"),
     ("invalid pairing code", "ungültiger Kopplungscode"),
     ("invalid token", "ungültiges Token"),
+    (
+        "the MCP endpoint answers only local callers on this machine",
+        "der MCP-Endpunkt antwortet nur lokalen Aufrufern auf dieser Maschine",
+    ),
+    (
+        "the assistant token store is unavailable",
+        "der Speicher für Assistenten-Tokens ist nicht verfügbar",
+    ),
     ("keys must contain 1 to 32 entries", "keys muss 1 bis 32 Einträge enthalten"),
     ("missing Authorization header", "fehlender Authorization-Header"),
     ("mode must be on, off, or toggle", "mode muss on, off oder toggle sein"),
@@ -138,6 +151,7 @@ pub(super) const DE: &[(&str, &str)] = &[
     ("the file field must carry a filename", "das file-Feld muss einen Dateinamen enthalten"),
     ("the pane is not waiting on an approval", "das Panel wartet nicht auf eine Freigabe"),
     ("the pane is waiting on a different approval", "das Panel wartet auf eine andere Freigabe"),
+    ("the task request failed", "die Aufgabenanfrage ist fehlgeschlagen"),
     ("the upload must be at most 25 MiB", "der Upload darf höchstens 25 MiB groß sein"),
     (
         "this approval has no option with that number",
@@ -180,4 +194,53 @@ pub(super) const DE: &[(&str, &str)] = &[
         "branch_name darf kein leeres Pfadsegment haben und kein Segment, das mit einem Punkt beginnt oder endet",
     ),
     ("branch_name must not end with .lock", "branch_name darf nicht auf .lock enden"),
+    // -- tasks, lazygit and assets ------------------------------------------
+    (
+        "No terminal session is reachable on this computer",
+        "Auf diesem Computer ist keine Terminal-Sitzung erreichbar",
+    ),
+    (
+        "That agent is not available",
+        "Dieser Agent ist nicht verfügbar",
+    ),
+    (
+        "Only a paused or waiting task opened on a device can be confirmed",
+        "Bestätigen lässt sich nur eine pausierte oder wartende Aufgabe, die auf einem Gerät geöffnet wurde",
+    ),
+    (
+        "the agent could not start the task",
+        "der Agent konnte die Aufgabe nicht starten",
+    ),
+    (
+        "label must be at most 200 characters",
+        "label darf höchstens 200 Zeichen lang sein",
+    ),
+    (
+        "goal must be non-empty and at most 32 KiB",
+        "goal darf nicht leer und höchstens 32 KiB groß sein",
+    ),
+    (
+        "summary must be at most 32 KiB",
+        "summary darf höchstens 32 KiB groß sein",
+    ),
+    (
+        "Unknown model for that agent. Use a model id from its catalog, or <provider_id>/<model_id>.",
+        "Unbekanntes Modell für diesen Agent. Verwende eine Modell-ID aus seinem Katalog oder <provider_id>/<model_id>.",
+    ),
+    (
+        "Unknown variant '{variant}' (the model offers: {offered}).",
+        "Unbekannte variant '{variant}' (das Modell bietet: {offered}).",
+    ),
+    (
+        "Install lazygit on the Gateway host",
+        "Installiere lazygit auf dem Gateway-Host",
+    ),
+    (
+        "The source pane is not in an accessible Git repository",
+        "Das Quell-Panel liegt in keinem zugänglichen Git-Repository",
+    ),
+    (
+        "the asset exceeds its content size limit",
+        "die Datei überschreitet ihre Größenbeschränkung",
+    ),
 ];

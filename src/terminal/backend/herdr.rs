@@ -106,7 +106,7 @@ use super::keys::{unknown_key, KeyBase, KeyChord, KeyboardVocabulary, NamedKey};
 use super::{
     Agent, AgentStatus, BackendActivity, BackendActivityStream, BackendError, BackendFuture,
     BackendKind, BackendMetadata, CreateTab, CreateWorkspace, OutputFormat, OutputSource, Pane,
-    PaneId, PaneOutput, ReadPane, SendTextMode, SplitDirection, SplitPane, StartAgent,
+    PaneEnvVia, PaneId, PaneOutput, ReadPane, SendTextMode, SplitDirection, SplitPane, StartAgent,
     StartedAgent, Tab, TabId, TerminalBackend, Workspace, WorkspaceId, Worktree, WorktreePlacement,
     WorktreeRequest,
 };
@@ -259,9 +259,43 @@ impl HerdrBackend {
     /// own -- `request_transport` is the only caller and it supplies one.
     #[cfg(unix)]
     async fn exchange(&self, method: &str, params: Value) -> anyhow::Result<Value> {
+        Ok(self.exchange_with_peer(method, params).await?.0)
+    }
+
+    #[cfg(unix)]
+    async fn exchange_with_peer(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> anyhow::Result<(Value, Option<u32>)> {
         let mut stream = UnixStream::connect(&self.socket_path)
             .await
             .with_context(|| format!("failed to connect {}", self.socket_path.display()))?;
+        let peer = stream
+            .peer_cred()
+            .ok()
+            .and_then(|cred| cred.pid())
+            .and_then(|pid| u32::try_from(pid).ok());
+        #[cfg(target_os = "macos")]
+        let peer = peer.or_else(|| {
+            use std::os::fd::AsRawFd;
+            let mut pid: libc::pid_t = 0;
+            let mut size = std::mem::size_of_val(&pid) as libc::socklen_t;
+            // SAFETY: stream owns the fd and getsockopt receives a correctly
+            // sized pid output buffer. No bytes are consumed from the socket.
+            let result = unsafe {
+                libc::getsockopt(
+                    stream.as_raw_fd(),
+                    libc::SOL_LOCAL,
+                    libc::LOCAL_PEERPID,
+                    (&mut pid as *mut libc::pid_t).cast(),
+                    &mut size,
+                )
+            };
+            (result == 0 && size as usize == std::mem::size_of_val(&pid))
+                .then(|| u32::try_from(pid).ok())
+                .flatten()
+        });
         let request = json!({
             "id": format!("gateway:{}", uuid::Uuid::new_v4()),
             "method": method,
@@ -274,7 +308,7 @@ impl HerdrBackend {
         let mut reader = BufReader::new(stream);
         let mut line = String::new();
         reader.read_line(&mut line).await?;
-        Ok(serde_json::from_str(&line)?)
+        Ok((serde_json::from_str(&line)?, peer))
     }
 }
 
@@ -486,6 +520,9 @@ impl TerminalBackend for HerdrBackend {
             if let Some(label) = &request.label {
                 params.insert("label".into(), json!(label));
             }
+            if let Some(env) = &request.env {
+                params.insert("env".into(), json!(env));
+            }
             params.insert("focus".into(), json!(request.focus));
             let response = self
                 .request("workspace.create", Value::Object(params))
@@ -528,6 +565,9 @@ impl TerminalBackend for HerdrBackend {
             }
             if let Some(label) = &request.label {
                 params.insert("label".into(), json!(label));
+            }
+            if let Some(env) = &request.env {
+                params.insert("env".into(), json!(env));
             }
             params.insert("focus".into(), json!(request.focus));
             let response = self.request("tab.create", Value::Object(params)).await?;
@@ -713,6 +753,11 @@ impl TerminalBackend for HerdrBackend {
         })
     }
 
+    /// `workspace.create`, `tab.create` and `pane.split` all take `env`.
+    fn applies_pane_env(&self, _via: PaneEnvVia) -> BackendFuture<'_, bool> {
+        Box::pin(async { Ok(true) })
+    }
+
     fn start_agent<'a>(&'a self, request: &'a StartAgent) -> BackendFuture<'a, StartedAgent> {
         Box::pin(async move {
             let mut params = serde_json::Map::new();
@@ -787,6 +832,10 @@ impl TerminalBackend for HerdrBackend {
                 argv,
                 instance_id,
                 target: Some(name),
+                // `agent.start` takes no environment and Herdr types the
+                // launch line itself, so a pane that was not created with the
+                // variables cannot get them here.
+                env_applied: request.env.is_empty(),
             })
         })
     }
@@ -876,17 +925,32 @@ impl HerdrBackend {
         if !self.process_info.load(Ordering::Relaxed) {
             return pane;
         }
-        let info = match self
-            .request("pane.process_info", json!({ "pane_id": pane.id.as_str() }))
-            .await
-        {
-            Ok(response) => response,
-            Err(error) => {
+        let info = tokio::time::timeout(
+            self.request_timeout,
+            self.exchange_with_peer("pane.process_info", json!({ "pane_id": pane.id.as_str() })),
+        )
+        .await;
+        let (info, peer) = match info {
+            Ok(Ok((response, peer))) if response.get("error").is_none() => (response, peer),
+            Ok(Ok((response, _))) => {
+                let error = BackendError::Refused {
+                    code: response.pointer("/error/code").map(|code| {
+                        code.as_str()
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| code.to_string())
+                    }),
+                    message: response
+                        .pointer("/error/message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("request refused")
+                        .to_owned(),
+                };
                 if unknown_method(&error) {
                     self.process_info.store(false, Ordering::Relaxed);
                 }
                 return pane;
             }
+            _ => return pane,
         };
         let info = info.pointer("/result/process_info").unwrap_or(&info);
         if pane.foreground_command.is_none() {
@@ -896,6 +960,12 @@ impl HerdrBackend {
             .get("shell_pid")
             .and_then(Value::as_u64)
             .and_then(|pid| u32::try_from(pid).ok());
+        if pane.shell_pid.is_none() {
+            pane.shell_pid = shell;
+        }
+        if let (Some(server), Some(root)) = (peer, shell) {
+            pane.history_identity = super::process_identity::pane_incarnation(server, root).await;
+        }
         if let Some((columns, rows)) = shell.and_then(|pid| self.pane_grid(pid)) {
             if pane.width.is_none() {
                 pane.width = Some(columns);
@@ -1156,6 +1226,7 @@ fn tab_from_json(value: &Value) -> Result<Tab, BackendError> {
 
 fn pane_from_json(value: &Value) -> Result<Pane, BackendError> {
     Ok(Pane {
+        history_identity: None,
         id: PaneId::new(required_string(value, "pane_id", "pane")?),
         terminal_id: value
             .get("terminal_id")
@@ -1260,6 +1331,7 @@ fn pane_from_json(value: &Value) -> Result<Pane, BackendError> {
         // fields, so this is a supported answer rather than a gap.
         cursor_x: None,
         cursor_y: None,
+        shell_pid: None,
     })
 }
 
@@ -1291,6 +1363,7 @@ fn agent_instance_id(value: &Value) -> Option<String> {
 fn agent_from_json(value: &Value) -> Result<Agent, BackendError> {
     let pane_id = required_string(value, "pane_id", "agent")?;
     Ok(Agent {
+        conversation_id: agent_conversation_id(value),
         instance_id: agent_instance_id(value),
         target: value
             .get("target")
@@ -1315,7 +1388,25 @@ fn agent_from_json(value: &Value) -> Result<Agent, BackendError> {
             .map(str::to_owned),
         status: AgentStatus::parse(value.get("agent_status").and_then(Value::as_str)),
         state_change_seq: value.get("state_change_seq").and_then(Value::as_u64),
+        shell_pid: value
+            .get("shell_pid")
+            .and_then(Value::as_u64)
+            .and_then(|pid| u32::try_from(pid).ok())
+            .filter(|pid| *pid > 0),
+        pending_user_input: value.get("pending_user_input").and_then(Value::as_bool),
     })
+}
+
+fn agent_conversation_id(value: &Value) -> Option<String> {
+    let kind = value.get("agent").or_else(|| value.get("kind"))?.as_str()?;
+    let session = &value["agent_session"];
+    if session["kind"] != "id" || session["agent"].as_str()? != kind {
+        return None;
+    }
+    session["value"]
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned)
 }
 
 fn worktree_params(request: &WorktreeRequest) -> Value {
@@ -1453,6 +1544,43 @@ fn required_string<'a>(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn native_question_attention_is_optional_and_independent_of_work_status() {
+        let mut raw = serde_json::json!({ "pane_id": "w1:p1", "agent_status": "working" });
+        let legacy = super::agent_from_json(&raw).unwrap();
+        assert_eq!(legacy.pending_user_input, None);
+        assert_eq!(legacy.shell_pid, None);
+        raw["pending_user_input"] = serde_json::json!(true);
+        raw["shell_pid"] = serde_json::json!(4242);
+        let pending = super::agent_from_json(&raw).unwrap();
+        assert_eq!(pending.pending_user_input, Some(true));
+        assert_eq!(pending.shell_pid, Some(4242));
+        assert_eq!(pending.status, super::AgentStatus::Working);
+        raw["agent_status"] = serde_json::json!("blocked");
+        let focused = super::agent_from_json(&raw).unwrap();
+        assert_eq!(focused.pending_user_input, Some(true));
+        assert_eq!(focused.status, super::AgentStatus::Blocked);
+        raw["pending_user_input"] = serde_json::json!("true");
+        assert_eq!(
+            super::agent_from_json(&raw).unwrap().pending_user_input,
+            None
+        );
+        for pid in [
+            serde_json::json!(0),
+            serde_json::json!(-1),
+            serde_json::json!("4242"),
+            serde_json::json!(u64::MAX),
+        ] {
+            raw["shell_pid"] = pid;
+            assert_eq!(super::agent_from_json(&raw).unwrap().shell_pid, None);
+        }
+        raw["pending_user_input"] = serde_json::json!(false);
+        assert_eq!(
+            super::agent_from_json(&raw).unwrap().pending_user_input,
+            Some(false)
+        );
+    }
+
+    #[test]
     fn agent_identity_is_conversation_scoped_not_pane_scoped() {
         let first = serde_json::json!({"terminal_id":"term", "agent_session":{"value":"first"}});
         let replacement =
@@ -1470,6 +1598,22 @@ mod tests {
             &serde_json::json!({"terminal_id":"", "agent_session":{"value":"first"}})
         )
         .is_none());
+    }
+
+    #[test]
+    fn conversation_identity_requires_the_matching_agent_and_id_kind() {
+        let mut agent = serde_json::json!({"agent":"codex", "agent_session":{
+            "agent":"codex", "kind":"id", "source":"herdr:codex", "value":"synthetic-id"
+        }});
+        assert_eq!(
+            super::agent_conversation_id(&agent).as_deref(),
+            Some("synthetic-id")
+        );
+        agent["agent_session"]["agent"] = serde_json::json!("claude");
+        assert!(super::agent_conversation_id(&agent).is_none());
+        agent["agent_session"]["agent"] = serde_json::json!("codex");
+        agent["agent_session"]["kind"] = serde_json::json!("path");
+        assert!(super::agent_conversation_id(&agent).is_none());
     }
 
     #[test]
@@ -1561,6 +1705,7 @@ mod tests {
                     executable: None,
                     args: vec![],
                     timeout_ms: 30_000,
+                    env: Default::default(),
                 })
                 .await
                 .unwrap();
@@ -1704,6 +1849,7 @@ mod tests {
                     executable: None,
                     args: vec![],
                     timeout_ms,
+                    env: Default::default(),
                 })
                 .await;
             match expected_error {
@@ -1767,11 +1913,13 @@ mod tests {
             "pane.get" => json!({ "pane": pane }),
             "agent.get" => json!({ "agent": agent }),
             "pane.read" => json!({ "read": { "text": "contract output", "revision": 9 } }),
-            // As herdr 0.8.2 answered for a real nvim pane, minus the shell
-            // pid: a test has no pty of that pid's to be measured.
+            // As herdr 0.8.2 answered for a real nvim pane, with a made-up
+            // shell pid: a test has no pty of that pid's to be measured (the
+            // fake pane carries its width, so the grid is never asked for).
             "pane.process_info" => json!({
                 "process_info": {
                     "pane_id": "p1",
+                    "shell_pid": 4242,
                     "foreground_process_group_id": 36692,
                     "foreground_processes": [{
                         "pid": 36692, "name": "nvim", "argv0": "nvim",
@@ -1808,6 +1956,7 @@ mod tests {
 
         let panes = backend.list_panes().await.unwrap();
         assert_eq!(panes[0].foreground_command.as_deref(), Some("nvim"));
+        assert_eq!(panes[0].shell_pid, Some(4242));
         let pane = backend.get_pane(&PaneId::new("p1")).await.unwrap();
         assert_eq!(pane.foreground_command.as_deref(), Some("nvim"));
         // And it reaches the wire the app reads, where `ScrollbackStore`
@@ -2237,6 +2386,7 @@ mod tests {
                 cwd: Some(std::env::temp_dir()),
                 label: Some("muqun-keys-probe".into()),
                 focus: false,
+                env: None,
             })
             .await
             .unwrap();
@@ -2440,6 +2590,7 @@ mod tests {
                 cwd: Some(PathBuf::from("/work/task")),
                 label: Some("task".into()),
                 focus: false,
+                env: None,
             })
             .await
             .unwrap();
@@ -2449,6 +2600,9 @@ mod tests {
                 cwd: None,
                 label: None,
                 focus: false,
+                env: json!({ "HTTPS_PROXY": "http://127.0.0.1:7890" })
+                    .as_object()
+                    .cloned(),
             })
             .await
             .unwrap();
@@ -2496,6 +2650,19 @@ mod tests {
             .unwrap();
         assert_eq!(split["params"]["target_pane_id"], "p1");
         assert_eq!(split["params"]["direction"], "down");
+        let tab = calls
+            .iter()
+            .find(|call| call["method"] == "tab.create")
+            .unwrap();
+        assert_eq!(
+            tab["params"]["env"],
+            json!({ "HTTPS_PROXY": "http://127.0.0.1:7890" })
+        );
+        let workspace = calls
+            .iter()
+            .find(|call| call["method"] == "workspace.create")
+            .unwrap();
+        assert!(workspace["params"].get("env").is_none());
     }
 
     /// A herdr that accepts the connection and then never answers used to
