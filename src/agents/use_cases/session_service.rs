@@ -161,16 +161,25 @@ impl SessionService {
             return Ok(snapshot);
         }
 
-        let mut info = self.agent.get_session(&asid.0).await?;
-        self.stamp(&mut info);
-        self.observe_runtime(&mut info).await;
-        self.mirror.update_session(info.clone()).await;
         let before_read = if let Some(memory) = &self.memory {
             memory.history_read_revision(asid).await.unwrap_or_default()
         } else {
             (0, 0)
         };
-        let prepared = self.agent.prepare_timeline(&asid.0, 100).await?;
+        // The cold reads at once: the session, its newest history, and what
+        // it still has pending. The revision above was taken before the
+        // history read, as it was when these ran one after another.
+        let (info, prepared, permissions, forms) = tokio::join!(
+            self.agent.get_session(&asid.0),
+            self.agent.prepare_timeline(&asid.0, 100),
+            self.agent.get_pending_permissions(&asid.0),
+            self.agent.get_pending_forms(&asid.0),
+        );
+        let mut info = info?;
+        self.stamp(&mut info);
+        self.observe_runtime(&mut info).await;
+        self.mirror.update_session(info.clone()).await;
+        let prepared = prepared?;
         let timeline = prepared.items;
         if let (Some(memory), Some(gate)) = (&self.memory, &history_gate) {
             if !memory
@@ -200,10 +209,20 @@ impl SessionService {
             }
         }
 
-        // Anything raised while the stream was down is read back here:
+        // Anything raised while the stream was down was read back above:
         // `/api/event` is volatile and drops what happened during a
         // disconnect, so a permission prompt could otherwise be lost for good.
-        self.catch_up_pending(asid).await;
+        let permissions = permissions.unwrap_or_else(|err| {
+            tracing::debug!(asid = %asid.0, %err, "pending permission catch-up failed");
+            Vec::new()
+        });
+        let forms = forms.unwrap_or_else(|err| {
+            tracing::debug!(asid = %asid.0, %err, "pending form catch-up failed");
+            Vec::new()
+        });
+        if !permissions.is_empty() || !forms.is_empty() {
+            self.mirror_pending(asid, permissions, forms).await;
+        }
 
         if let Some(mut snapshot) = self.mirror.get_snapshot(asid).await {
             self.observe_runtime(&mut snapshot.info).await;
