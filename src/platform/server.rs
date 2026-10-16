@@ -409,34 +409,56 @@ const LARGE_BODY_PERMITS: usize = 8;
 
 static HUGE_BODIES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(HUGE_BODY_PERMITS);
 static LARGE_BODIES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(LARGE_BODY_PERMITS);
+
 /// The devices with a large body in flight, one each on top of the pool,
-/// keyed by device id *and* the connection's peer address: the id is a
-/// clear header anyone on the path can copy, and keyed on it alone a
-/// stranger's connection could hold the real device's slot. A stranger at
-/// another address takes only a pool permit, which the read timeout gives
-/// back when its body stalls.
+/// keyed by device id *and* the peer's IP address: the id is a clear header
+/// anyone on the path can copy, and keyed on it alone a stranger's
+/// connection could hold the real device's slot; keyed on the whole socket
+/// address every new connection would be a new slot.
 static DEVICES_WITH_LARGE_BODIES: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashSet<String>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
-/// A large body that makes no progress for this long is dropped, and its
-/// place given up: a stalled connection must not hold a permit.
-const LARGE_BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
-/// The longest the sealed read of one large body may take in all.
-const LARGE_BODY_READ_TIMEOUT: Duration = Duration::from_secs(180);
+/// Large bodies in flight per peer IP address, whatever device ids they
+/// name: a copied id from one address claims at most this many.
+const MAX_LARGE_BODIES_PER_IP: usize = 2;
+static LARGE_BODIES_BY_IP: std::sync::LazyLock<std::sync::Mutex<HashMap<std::net::IpAddr, usize>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
-/// A place among the large bodies in flight, for one identified device.
-/// Owned by the body it admits ([`GatedBody`]): released when that body is
-/// fully consumed or dropped, never earlier.
+/// The sealed path has to read a body before its envelope can be opened,
+/// so that read is made on a clear device header alone. It draws from its
+/// own small budget, never from the pool above: four such reads at once in
+/// all, two per peer IP address. Once the envelope has opened and the
+/// device is verified, the request moves to the pool and the device's slot.
+const PREAUTH_SEALED_PERMITS: usize = 4;
+const MAX_PREAUTH_SEALED_PER_IP: usize = 2;
+static PREAUTH_SEALED: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(PREAUTH_SEALED_PERMITS);
+static PREAUTH_SEALED_BY_IP: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<std::net::IpAddr, usize>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// The longest any large body may take to arrive in all.
+const LARGE_BODY_READ_TIMEOUT: Duration = Duration::from_secs(180);
+/// A large body has to keep arriving: under this many bytes in any window
+/// of [`LARGE_BODY_RATE_WINDOW`] ends it, so a trickle cannot keep a place.
+const LARGE_BODY_RATE_WINDOW: Duration = Duration::from_secs(10);
+const LARGE_BODY_MIN_BYTES_PER_WINDOW: usize = 64 * 1024 * 10;
+
+/// A place among the large bodies in flight. Owned by the body it admits
+/// ([`GatedBody`]): released when that body is fully consumed or dropped,
+/// never earlier.
 #[derive(Clone)]
 pub(crate) struct LargeBodyPermit {
     /// Held, never read: dropping the last clone gives the place back.
-    _place: std::sync::Arc<LargeBodyPlace>,
+    _place: std::sync::Arc<dyn std::any::Any + Send + Sync>,
 }
 
+/// A verified device's place: a pool permit, its `(device id, peer IP)`
+/// slot and its count against the peer IP.
 struct LargeBodyPlace {
     _permit: tokio::sync::SemaphorePermit<'static>,
-    /// `(device id, peer address)` as [`slot_key`] spells it.
     slot: String,
+    ip: Option<std::net::IpAddr>,
 }
 
 impl Drop for LargeBodyPlace {
@@ -444,26 +466,105 @@ impl Drop for LargeBodyPlace {
         if let Ok(mut devices) = DEVICES_WITH_LARGE_BODIES.lock() {
             devices.remove(&self.slot);
         }
+        if let Some(ip) = self.ip {
+            release_count(&LARGE_BODIES_BY_IP, ip);
+        }
     }
 }
 
-/// The per-device slot of a connection: the device id with the peer address
-/// the request came in on (`ConnectInfo`; the test harness has none).
+/// A pre-authentication sealed read's place: a permit of the small budget
+/// and its count against the peer IP.
+struct PreauthPlace {
+    _permit: tokio::sync::SemaphorePermit<'static>,
+    ip: Option<std::net::IpAddr>,
+}
+
+impl Drop for PreauthPlace {
+    fn drop(&mut self) {
+        if let Some(ip) = self.ip {
+            release_count(&PREAUTH_SEALED_BY_IP, ip);
+        }
+    }
+}
+
+type IpCounts = std::sync::LazyLock<std::sync::Mutex<HashMap<std::net::IpAddr, usize>>>;
+
+/// Count `ip` in `counts` unless it already stands at `max`.
+fn take_count(counts: &IpCounts, ip: Option<std::net::IpAddr>, max: usize) -> bool {
+    let Some(ip) = ip else {
+        return true;
+    };
+    let mut counts = counts
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let count = counts.entry(ip).or_insert(0);
+    if *count >= max {
+        return false;
+    }
+    *count += 1;
+    true
+}
+
+fn release_count(counts: &IpCounts, ip: std::net::IpAddr) {
+    if let Ok(mut counts) = counts.lock() {
+        if let Some(count) = counts.get_mut(&ip) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                counts.remove(&ip);
+            }
+        }
+    }
+}
+
+fn busy() -> (StatusCode, Json<serde_json::Value>) {
+    api_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "busy",
+        "too many large requests are in flight; try again in a moment",
+    )
+}
+
+/// The per-device slot of a connection: the device id with the IP address
+/// the request came in from (`ConnectInfo`; the test harness has none).
 fn slot_key(device_id: &str, peer: Option<&SocketAddr>) -> String {
     match peer {
-        Some(peer) => format!("{device_id}@{peer}"),
+        Some(peer) => format!("{device_id}@{}", peer.ip()),
         None => device_id.to_owned(),
     }
 }
 
+/// A place for the pre-authentication read of a sealed body of up to
+/// `plaintext_limit` bytes from `peer`, or `None` when the route takes
+/// only the ordinary limit. From the small budget, never the pool. `Err`:
+/// that budget is spent, in all or for this address.
+pub(crate) fn preauth_sealed_permit(
+    plaintext_limit: usize,
+    peer: Option<&SocketAddr>,
+) -> Result<Option<LargeBodyPermit>, (StatusCode, Json<serde_json::Value>)> {
+    if plaintext_limit <= MAX_REQUEST_BODY_BYTES {
+        return Ok(None);
+    }
+    let permit = PREAUTH_SEALED.try_acquire().map_err(|_| busy())?;
+    let ip = peer.map(SocketAddr::ip);
+    if !take_count(&PREAUTH_SEALED_BY_IP, ip, MAX_PREAUTH_SEALED_PER_IP) {
+        return Err(busy());
+    }
+    Ok(Some(LargeBodyPermit {
+        _place: std::sync::Arc::new(PreauthPlace {
+            _permit: permit,
+            ip,
+        }),
+    }))
+}
+
 /// A permit for a body of up to `plaintext_limit` bytes on this route from
-/// `device_id` on the connection from `peer`, or `None` when the route
-/// takes only the ordinary limit. Taken only for an identified device -- a
-/// paired record that holds a transport key on the sealed path, a caller
-/// `require_device_or_peer` let through on the cleartext one -- so no
-/// unidentified connection ever holds a place. The shared pool is taken
-/// first, then the connection's own slot. `Err`: the pool is spent, or
-/// this device already has a body in flight from this address.
+/// the verified device `device_id` on the connection from `peer`, or
+/// `None` when the route takes only the ordinary limit. Taken only once the
+/// device is verified -- the opened envelope's token against its record on
+/// the sealed path, `require_device_or_peer` on the cleartext one -- so no
+/// unidentified connection ever holds a place here. The pool is taken
+/// first, then the address's count, then the device's slot. `Err`: any of
+/// them is spent.
 pub(crate) fn large_body_permit(
     plaintext_limit: usize,
     device_id: &str,
@@ -472,33 +573,33 @@ pub(crate) fn large_body_permit(
     if plaintext_limit <= MAX_REQUEST_BODY_BYTES {
         return Ok(None);
     }
-    let busy = || {
-        api_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "busy",
-            "too many large requests are in flight; try again in a moment",
-        )
-    };
     let gate = if plaintext_limit > 25 * 1024 * 1024 {
         &HUGE_BODIES
     } else {
         &LARGE_BODIES
     };
+    // The pool permit is dropped with `permit` on every refusal below.
     let permit = gate.try_acquire().map_err(|_| busy())?;
+    let ip = peer.map(SocketAddr::ip);
+    if !take_count(&LARGE_BODIES_BY_IP, ip, MAX_LARGE_BODIES_PER_IP) {
+        return Err(busy());
+    }
     let slot = slot_key(device_id, peer);
-    {
-        let mut devices = DEVICES_WITH_LARGE_BODIES
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if !devices.insert(slot.clone()) {
-            // The pool permit is dropped with `permit` here.
-            return Err(busy());
+    let taken = DEVICES_WITH_LARGE_BODIES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(slot.clone());
+    if !taken {
+        if let Some(ip) = ip {
+            release_count(&LARGE_BODIES_BY_IP, ip);
         }
+        return Err(busy());
     }
     Ok(Some(LargeBodyPermit {
         _place: std::sync::Arc::new(LargeBodyPlace {
             _permit: permit,
             slot,
+            ip,
         }),
     }))
 }
@@ -512,23 +613,57 @@ fn peer_of(extensions: &axum::http::Extensions) -> Option<SocketAddr> {
 }
 
 /// `body` with `permit` bound to it: the place is given up when the body
-/// is fully consumed or dropped, and a body that stalls for
-/// [`LARGE_BODY_IDLE_TIMEOUT`] ends in an error, giving it up too.
+/// is fully consumed or dropped. The body is bounded in time as well: it
+/// ends in an error past [`LARGE_BODY_READ_TIMEOUT`] in all, or when fewer
+/// than [`LARGE_BODY_MIN_BYTES_PER_WINDOW`] arrived in a window of
+/// [`LARGE_BODY_RATE_WINDOW`], and the error gives the place up too.
 pub(crate) fn gated_body(body: Body, permit: Option<LargeBodyPermit>) -> Body {
     match permit {
-        Some(permit) => Body::from_stream(GatedBody {
-            inner: body.into_data_stream(),
-            idle: Box::pin(tokio::time::sleep(LARGE_BODY_IDLE_TIMEOUT)),
-            _permit: permit,
-        }),
+        Some(permit) => {
+            let now = tokio::time::Instant::now();
+            Body::from_stream(GatedBody {
+                inner: body.into_data_stream(),
+                deadline: now + LARGE_BODY_READ_TIMEOUT,
+                window_start: now,
+                window_bytes: 0,
+                timer: Box::pin(tokio::time::sleep_until(now + LARGE_BODY_RATE_WINDOW)),
+                _permit: permit,
+            })
+        }
         None => body,
     }
 }
 
 struct GatedBody {
     inner: axum::body::BodyDataStream,
-    idle: std::pin::Pin<Box<tokio::time::Sleep>>,
+    deadline: tokio::time::Instant,
+    window_start: tokio::time::Instant,
+    window_bytes: usize,
+    /// Fires at the end of the current window or at the deadline,
+    /// whichever is first, so a body that sends nothing is still judged.
+    timer: std::pin::Pin<Box<tokio::time::Sleep>>,
     _permit: LargeBodyPermit,
+}
+
+impl GatedBody {
+    /// Judge the body at `now`: over the deadline, or a window that closed
+    /// short of its bytes, ends it. A window that closed with enough opens
+    /// the next one.
+    fn judge(&mut self, now: tokio::time::Instant) -> Result<(), axum::BoxError> {
+        if now >= self.deadline {
+            return Err("the request body was not received in time".into());
+        }
+        if now >= self.window_start + LARGE_BODY_RATE_WINDOW {
+            if self.window_bytes < LARGE_BODY_MIN_BYTES_PER_WINDOW {
+                return Err("the request body arrived too slowly".into());
+            }
+            self.window_start = now;
+            self.window_bytes = 0;
+        }
+        let next = (self.window_start + LARGE_BODY_RATE_WINDOW).min(self.deadline);
+        self.timer.as_mut().reset(next);
+        Ok(())
+    }
 }
 
 impl futures::Stream for GatedBody {
@@ -540,17 +675,31 @@ impl futures::Stream for GatedBody {
     ) -> std::task::Poll<Option<Self::Item>> {
         use std::future::Future as _;
         use std::task::Poll;
+        let now = tokio::time::Instant::now();
         match std::pin::Pin::new(&mut self.inner).poll_next(cx) {
-            Poll::Ready(next) => {
-                self.idle
-                    .as_mut()
-                    .reset(tokio::time::Instant::now() + LARGE_BODY_IDLE_TIMEOUT);
-                Poll::Ready(next.map(|frame| frame.map_err(Into::into)))
+            Poll::Ready(Some(Ok(bytes))) => {
+                self.window_bytes = self.window_bytes.saturating_add(bytes.len());
+                if let Err(error) = self.judge(now) {
+                    return Poll::Ready(Some(Err(error)));
+                }
+                Poll::Ready(Some(Ok(bytes)))
             }
-            Poll::Pending => match self.idle.as_mut().poll(cx) {
-                Poll::Ready(()) => Poll::Ready(Some(Err("the request body stalled".into()))),
-                Poll::Pending => Poll::Pending,
-            },
+            Poll::Ready(Some(Err(error))) => Poll::Ready(Some(Err(error.into()))),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => {
+                if self.timer.as_mut().poll(cx).is_ready() {
+                    if let Err(error) = self.judge(now) {
+                        return Poll::Ready(Some(Err(error)));
+                    }
+                    // Re-armed by `judge`: register the new timer.
+                    if self.timer.as_mut().poll(cx).is_ready() {
+                        return Poll::Ready(Some(Err(
+                            "the request body was not received in time".into()
+                        )));
+                    }
+                }
+                Poll::Pending
+            }
         }
     }
 }
@@ -746,7 +895,9 @@ pub(crate) async fn decrypt_transport_request(
                 "missing_transport_device",
                 "missing encrypted transport device",
             )
-        })?;
+        })?
+        .to_owned();
+    let device_id = device_id.as_str();
     let (token_hash, transport_key) = {
         let devices = lock_devices(state)?;
         let device = devices
@@ -776,21 +927,21 @@ pub(crate) async fn decrypt_transport_request(
     );
     // Sized to the route, because this read happens outside the router's own
     // body limits and is therefore the only thing bounding them. A large one
-    // takes its place among the large bodies in flight first -- for this
-    // device, which the header above showed to be a paired record holding a
-    // key -- or is refused before a byte of it is read, and the read is
-    // bounded in time as well as size so a stalled connection gives the
+    // takes a place in the pre-authentication budget first -- the header
+    // above showed a paired record holding a key, nothing more yet -- or is
+    // refused before a byte of it is read, and the read is bounded in time
+    // and throughput as well as size so a stalled connection gives the
     // place back.
     let plaintext_limit = plaintext_body_limit(parts.uri.path());
-    let permit = large_body_permit(
-        plaintext_limit,
-        device_id,
-        peer_of(&parts.extensions).as_ref(),
-    )?;
-    let body = gated_body(body, permit.clone());
+    let peer = peer_of(&parts.extensions);
+    // Not the pool: the small pre-authentication budget, until the envelope
+    // has opened and the device is verified below.
+    let preauth = preauth_sealed_permit(plaintext_limit, peer.as_ref())?;
+    let large = preauth.is_some();
+    let body = gated_body(body, preauth);
     let read = to_bytes(body, sealed_body_ceiling(plaintext_limit));
-    let body_bytes = match permit {
-        Some(_) => tokio::time::timeout(LARGE_BODY_READ_TIMEOUT, read)
+    let body_bytes = if large {
+        tokio::time::timeout(LARGE_BODY_READ_TIMEOUT, read)
             .await
             .map_err(|_| {
                 api_error(
@@ -798,8 +949,9 @@ pub(crate) async fn decrypt_transport_request(
                     "body_timeout",
                     "the request body was not received in time",
                 )
-            })?,
-        None => read.await,
+            })?
+    } else {
+        read.await
     }
     .map_err(|_| {
         api_error(
@@ -911,7 +1063,10 @@ pub(crate) async fn decrypt_transport_request(
         request_nonce: envelope.nonce.clone(),
         transport_version: envelope.version,
     });
-    // The opened body keeps the place until the handler has consumed it.
+    // Verified now: the request moves from the pre-authentication budget
+    // (given up with the read above) to the pool and this device's slot,
+    // which the opened body keeps until the handler has consumed it.
+    let permit = large_body_permit(plaintext_limit, device_id, peer.as_ref())?;
     Ok((
         Request::from_parts(parts, gated_body(Body::from(body), permit)),
         material,
