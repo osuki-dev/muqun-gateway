@@ -25,6 +25,23 @@ const SESSION_PAGE_LIMIT: usize = 100;
 const SESSION_LIST_MAX_REQUESTS: usize = 20;
 const SESSION_LIST_MAX_RECORDS: usize = 1_000;
 const SESSION_LIST_MAX_BYTES: usize = 4 * 1024 * 1024;
+/// The most one earlier-history read of a session's messages may weigh.
+const HISTORY_READ_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+/// The messages of a `GET /session/{id}/message?order=desc` answer, oldest
+/// first: the page is reversed here, so callers always receive oldest-first.
+fn message_list(res: Value) -> Vec<Value> {
+    let mut items = match res.as_array() {
+        Some(arr) => arr.clone(),
+        None => res
+            .get("data")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default(),
+    };
+    items.reverse();
+    items
+}
 const SESSION_LIST_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// OpenCode's cursor is opaque. Neither page order nor cursor values are
@@ -416,6 +433,55 @@ impl OpencodeClient {
             .ok_or_else(|| AgentError::Protocol("Delivered message identity mismatch".into()))
     }
 
+    /// `get_messages` for the growing reads of `load_earlier_timeline`,
+    /// refusing an answer over [`HISTORY_READ_MAX_BYTES`] instead of
+    /// buffering it whole: the route has no cursor, so each older page is
+    /// read as the newest `limit` messages again, and that read must stay
+    /// bounded like the session list is.
+    pub async fn get_messages_capped(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> Result<Vec<Value>, AgentError> {
+        let query = [("limit", limit.to_string()), ("order", "desc".to_owned())];
+        let mut response = self
+            .authed_req(
+                self.http
+                    .get(format!(
+                        "{}/api/session/{session_id}/message",
+                        self.endpoint.url
+                    ))
+                    .query(&query),
+            )
+            .send()
+            .await
+            .map_err(|err| AgentError::Network(err.to_string()))?;
+        let status = response.status();
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|err| AgentError::Network(err.to_string()))?
+        {
+            if chunk.len() > HISTORY_READ_MAX_BYTES - bytes.len() {
+                return Err(AgentError::Protocol(
+                    "History read exceeds response byte budget".into(),
+                ));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        if !status.is_success() {
+            return Err(AgentError::RequestFailed(empty_body_failure(
+                status.as_u16(),
+                "GET",
+                "/api/session/{id}/message",
+            )));
+        }
+        let res: Value =
+            serde_json::from_slice(&bytes).map_err(|err| AgentError::Protocol(err.to_string()))?;
+        Ok(message_list(res))
+    }
+
     pub async fn get_messages(
         &self,
         session_id: &str,
@@ -434,16 +500,7 @@ impl OpencodeClient {
                 &[("limit", limit_str.as_str()), ("order", "desc")],
             )
             .await?;
-        let mut items = match res.as_array() {
-            Some(arr) => arr.clone(),
-            None => res
-                .get("data")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default(),
-        };
-        items.reverse();
-        Ok(items)
+        Ok(message_list(res))
     }
 
     pub async fn send_prompt(

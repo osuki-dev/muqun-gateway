@@ -2,6 +2,11 @@
 
 ## Changes and fixes
 
+- OpenCode sessions page back too: `POST /api/agent-sessions/{asid}/timeline/earlier`
+  (`features.timelineEarlier: true`) delivers the 80 messages below the
+  oldest one shown, read as the newest `held + 80` (OpenCode's message route
+  has no cursor) and bounded to 2,000 messages and 8 MiB per read.
+
 - **Agents are told about the linked computers up front, and to prefer
   `exec.run`.** A task the owner opens on their phone now carries, in the
   agent's instructions (the MCP server instructions, Claude Code's appended

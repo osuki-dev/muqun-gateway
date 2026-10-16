@@ -1876,7 +1876,7 @@ fn opencode_features(
         attachments_by_path: false,
         extra: std::collections::BTreeMap::from([
             ("sessionPagination".into(), serde_json::json!(true)),
-            ("timelineEarlier".into(), serde_json::json!(false)),
+            ("timelineEarlier".into(), serde_json::json!(true)),
             ("sessionRename".into(), serde_json::json!(true)),
             ("sessionDelete".into(), serde_json::json!(true)),
             ("sessionFork".into(), serde_json::json!(false)),

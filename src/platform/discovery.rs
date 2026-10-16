@@ -615,7 +615,7 @@ mod tests {
             .contains(&json!("agent_timeline_earlier_v1")));
         let agents = discovery["planes"]["agents"]["agents"].as_array().unwrap();
         for (id, supported) in [
-            ("opencode", false),
+            ("opencode", true),
             ("deepseek", true),
             ("t3", false),
             ("codex", true),

@@ -166,6 +166,32 @@ pub struct OpencodeDriver {
     /// Built catalogs by directory. See [`CATALOG_CACHE_TTL`]; cleared
     /// outright whenever OpenCode says a catalog surface changed.
     catalog_cache: Mutex<HashMap<String, CachedCatalog>>,
+    /// Where `load_earlier_timeline` stands per session.
+    earlier: Mutex<HashMap<String, EarlierCursor>>,
+}
+
+/// The newest messages of a session delivered so far. OpenCode's message
+/// route takes `limit` and `order` and no cursor, so the page below is
+/// read as the newest `held + page` messages and cut at the oldest one
+/// held; `oldest_id` is where that cut falls.
+#[derive(Clone)]
+struct EarlierCursor {
+    held: usize,
+    oldest_id: String,
+    /// The last read answered fewer than asked: nothing lies below.
+    exhausted: bool,
+}
+
+/// The most messages an earlier read asks for in all.
+const MAX_HISTORY_MESSAGES: usize = 2000;
+/// How many older messages one `load_earlier_timeline` adds.
+const EARLIER_PAGE_MESSAGES: usize = 80;
+
+fn message_id(message: &Value) -> Option<&str> {
+    message
+        .get("id")
+        .or_else(|| message.pointer("/info/id"))
+        .and_then(Value::as_str)
 }
 
 impl OpencodeDriver {
@@ -174,7 +200,32 @@ impl OpencodeDriver {
             client: Arc::new(OpencodeClient::new(endpoint)),
             primed: Mutex::new(HashSet::new()),
             catalog_cache: Mutex::new(HashMap::new()),
+            earlier: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Remember the newest `messages` as delivered for `session_id`. A
+    /// shallower read than one already held (the end-of-run refetch of the
+    /// newest few) does not move the cursor back up.
+    fn hold_newest(&self, session_id: &str, messages: &[Value], asked: usize) {
+        let Some(oldest_id) = messages.first().and_then(message_id) else {
+            return;
+        };
+        let mut earlier = self.earlier.lock().unwrap_or_else(|p| p.into_inner());
+        if earlier
+            .get(session_id)
+            .is_some_and(|held| held.held >= messages.len())
+        {
+            return;
+        }
+        earlier.insert(
+            session_id.to_owned(),
+            EarlierCursor {
+                held: messages.len(),
+                oldest_id: oldest_id.to_owned(),
+                exhausted: messages.len() < asked,
+            },
+        );
     }
 
     pub fn client(&self) -> &OpencodeClient {
@@ -845,8 +896,66 @@ impl AgentPort for OpencodeDriver {
     ) -> AgentFuture<'a, Vec<crate::agents::domain::TimelineItem>> {
         Box::pin(async move {
             let messages = self.client.get_messages(session_id, limit).await?;
+            self.hold_newest(session_id, &messages, limit);
             let asid = crate::agents::domain::AgentSessionId(session_id.to_string());
             Ok(mapper::map_messages_to_timeline(&messages, &asid))
+        })
+    }
+
+    /// The messages below the oldest one delivered, up to
+    /// [`EARLIER_PAGE_MESSAGES`] of them, read as the newest `held + page`
+    /// messages and cut at that one. Empty once a read answered fewer than
+    /// asked (nothing older), or before any snapshot was read.
+    fn load_earlier_timeline<'a>(
+        &'a self,
+        session_id: &'a str,
+        limit: usize,
+    ) -> AgentFuture<'a, Vec<crate::agents::domain::TimelineItem>> {
+        Box::pin(async move {
+            if limit == 0 || limit > MAX_HISTORY_MESSAGES {
+                return Err(AgentError::InvalidRequest(
+                    "OpenCode history limit exceeds 2000 messages".into(),
+                ));
+            }
+            let cursor = self
+                .earlier
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(session_id)
+                .cloned();
+            let Some(cursor) = cursor else {
+                return Ok(Vec::new());
+            };
+            if cursor.exhausted || cursor.held >= MAX_HISTORY_MESSAGES {
+                return Ok(Vec::new());
+            }
+            let asked = (cursor.held + limit.min(EARLIER_PAGE_MESSAGES)).min(MAX_HISTORY_MESSAGES);
+            let messages = self.client.get_messages_capped(session_id, asked).await?;
+            let Some(cut) = messages
+                .iter()
+                .position(|message| message_id(message) == Some(cursor.oldest_id.as_str()))
+            else {
+                return Err(AgentError::NotAvailable(
+                    "the session's history changed; refresh it".into(),
+                ));
+            };
+            let older = &messages[..cut];
+            let exhausted = messages.len() < asked || older.is_empty();
+            if let Some(oldest_id) = messages.first().and_then(message_id) {
+                self.earlier
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .insert(
+                        session_id.to_owned(),
+                        EarlierCursor {
+                            held: messages.len(),
+                            oldest_id: oldest_id.to_owned(),
+                            exhausted,
+                        },
+                    );
+            }
+            let asid = crate::agents::domain::AgentSessionId(session_id.to_string());
+            Ok(mapper::map_messages_to_timeline(older, &asid))
         })
     }
 
@@ -1090,6 +1199,83 @@ impl AgentPort for OpencodeDriver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// OpenCode pages its messages by `limit` and `order` alone. Each
+    /// earlier batch is the newest `held + 80` messages cut at the oldest
+    /// one held, so the batches tile the history downwards without a gap or
+    /// a repeat, and the end is where a read answers fewer than asked. The
+    /// end-of-run refetch of the newest few never moves the cursor back up.
+    #[tokio::test]
+    async fn earlier_pages_cut_below_the_oldest_held_message() {
+        use axum::{extract::Query, routing::get, Router};
+        use std::sync::{Arc, Mutex};
+        let asked: Arc<Mutex<Vec<usize>>> = Arc::default();
+        let seen = asked.clone();
+        let app = Router::new().route(
+            "/api/session/{id}/message",
+            get(
+                move |Query(query): Query<std::collections::HashMap<String, String>>| {
+                    let seen = seen.clone();
+                    async move {
+                        assert_eq!(query.get("order").map(String::as_str), Some("desc"));
+                        let limit: usize = query["limit"].parse().unwrap();
+                        seen.lock().unwrap().push(limit);
+                        // 300 messages, newest first as `order=desc` answers.
+                        let page: Vec<Value> = (0..300)
+                            .rev()
+                            .take(limit)
+                            .map(|n| serde_json::json!({ "id": format!("m-{n}"), "type": "user", "text": format!("message {n}") }))
+                            .collect();
+                        axum::Json(page)
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let driver = OpencodeDriver::new(OpencodeEndpoint {
+            url: format!("http://{}", listener.local_addr().unwrap()),
+            password: None,
+            version: Some("2.0.27".into()),
+            pid: None,
+        });
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let ids = |items: &[crate::agents::domain::TimelineItem]| -> Vec<String> {
+            items.iter().map(|item| item.message_id.clone()).collect()
+        };
+
+        let tail = driver.get_timeline("s", 100).await.unwrap();
+        assert_eq!(ids(&tail).first().map(String::as_str), Some("m-200"));
+        assert_eq!(ids(&tail).last().map(String::as_str), Some("m-299"));
+        // The refetch of the newest few: the cursor stays at m-200.
+        assert_eq!(driver.get_timeline("s", 5).await.unwrap().len(), 5);
+
+        let mut lowest = 200;
+        for expected in [120, 40, 0] {
+            let batch = driver.load_earlier_timeline("s", 80).await.unwrap();
+            let batch_ids = ids(&batch);
+            assert_eq!(
+                batch_ids.first().map(String::as_str),
+                Some(format!("m-{expected}").as_str())
+            );
+            assert_eq!(
+                batch_ids.last().map(String::as_str),
+                Some(format!("m-{}", lowest - 1).as_str())
+            );
+            lowest = expected;
+        }
+        assert!(driver
+            .load_earlier_timeline("s", 80)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(driver
+            .load_earlier_timeline("never", 80)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(*asked.lock().unwrap(), vec![100, 5, 180, 260, 340]);
+        server.abort();
+    }
     use serde_json::json;
 
     const UPLOADS: &str = "/home/example-user/.local/share/muqun-gateway/uploads/*";

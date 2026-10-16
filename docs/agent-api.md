@@ -602,8 +602,14 @@ by `(message_id, ordinal)`.
 Gate remote history pulls on **both** global capability
 `agent_timeline_earlier_v1` and the owning provider's
 `planes.agents.agents[].features.timelineEarlier === true`. Never infer support
-from a Gateway version or agent name. Codex and DeepSeek implement it; OpenCode
-and T3 return `501 feature_unsupported`, not successful exhaustion.
+from a Gateway version or agent name. Codex, DeepSeek and OpenCode implement
+it; T3 returns `501 feature_unsupported`, not successful exhaustion.
+
+OpenCode's message route takes `limit` and `order` and no cursor, so each
+earlier batch is read as the newest `held + 80` messages (bounded to 2,000
+messages and 8 MiB per read) and cut at the oldest message already delivered;
+a read that answers fewer than asked is the end. A session whose history
+changed under the cursor answers `503` (`agent_unavailable`): refresh it.
 
 DeepSeek pages `session/page` backwards under the frozen `asOfSeq` cut the
 snapshot was read under: opening reads the newest hundred messages within a
