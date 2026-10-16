@@ -1512,8 +1512,9 @@ pub(crate) fn agent_event_record(
 /// read one can read the other.
 ///
 /// `stream_crypto` is present exactly when the request itself arrived through
-/// the encrypted transport, so a device paired without a transport key keeps
-/// the plaintext stream byte for byte.
+/// the encrypted transport, so on a `disabled` deployment the stream stays
+/// plaintext byte for byte (`required` serves no device without a transport
+/// key -- `require_device` below refuses it).
 async fn do_stream_agent_session(
     state: &AppState,
     asid: &str,
@@ -3528,9 +3529,15 @@ mod tests {
 
     #[tokio::test]
     async fn explicit_snapshot_refresh_requires_app_device_before_provider_lookup() {
-        let state = crate::test_support::test_state(
+        let state = crate::test_support::required_test_state(
             "admin",
-            vec![crate::test_support::test_peer_device("peer", "peer-token")],
+            vec![
+                crate::test_support::sealed(crate::test_support::test_peer_device(
+                    "peer",
+                    "peer-token",
+                )),
+                crate::test_support::test_peer_device("old-peer", "old-peer-token"),
+            ],
         );
         for (headers, status, code) in [
             (
@@ -3544,9 +3551,14 @@ mod tests {
                 "invalid_token",
             ),
             (
-                crate::test_support::bearer_headers("peer-token"),
+                crate::test_support::sealed_bearer_headers("peer-token"),
                 StatusCode::FORBIDDEN,
                 "peer_forbidden",
+            ),
+            (
+                crate::test_support::bearer_headers("old-peer-token"),
+                StatusCode::UPGRADE_REQUIRED,
+                "device_repair_required",
             ),
         ] {
             let refusal = do_read_agent_session(&state, "fixture", true, &headers)
@@ -4129,6 +4141,9 @@ mod tests {
     #[tokio::test]
     async fn scoped_session_delete_refuses_unknown_unavailable_and_untrusted_callers() {
         let state = state_with(Vec::new()).await;
+        // The admin token is a control-route refusal of `required` mode (see
+        // `control_routes_reject_the_admin_token`); the state here is
+        // token-only, where it acts as the owner's app.
         for (agent_id, token, status, code) in [
             (
                 "unknown",
@@ -4139,12 +4154,6 @@ mod tests {
             (
                 "unknown",
                 Some("wrong"),
-                StatusCode::FORBIDDEN,
-                "invalid_token",
-            ),
-            (
-                "unknown",
-                Some("admin"),
                 StatusCode::FORBIDDEN,
                 "invalid_token",
             ),

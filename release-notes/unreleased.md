@@ -2,6 +2,17 @@
 
 ## Changes and fixes
 
+- **`transport_encryption: required` now applies to every device.** A device
+  paired while the setting was `disabled` has no transport key. It was still
+  served in cleartext on its bearer token alone, indefinitely, on a gateway
+  configured `required`; only an envelope from such a device drew the
+  `426 device_repair_required` answer. The shared device authentication now
+  gives that answer to every bearer-only request from such a record, for apps
+  and linked gateways alike and on every device route (SSE, the socket,
+  captured history and push registration included). **Every device paired
+  before encryption was turned on must pair again.** `disabled` mode, the
+  admin token and `dev_unauthenticated` are unchanged.
+
 - **Agents the gateway starts now skip their own prompts by default.** Codex
   and Claude Code started from the phone (`POST …/agents/spawn`,
   `POST …/tasks`, `POST /api/tasks`) or by an MCP caller (`tasks.delegate`)

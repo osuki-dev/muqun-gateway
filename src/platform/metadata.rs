@@ -268,10 +268,12 @@ pub(crate) fn gateway_capabilities(
 ///
 /// It is a property of the device, not of the gateway: a device paired while
 /// `transport_encryption` was `disabled` holds no transport key and is
-/// authorised on its bearer token alone, and stays that way after the setting
-/// changes -- `require_device` demands the proof header from exactly the
-/// devices that have a key. So the honest answer to "is this connection
-/// encrypted at the application layer" is about the device asking.
+/// authorised on its bearer token alone. In `disabled` mode it stays that
+/// way after a sealed device is paired beside it; in `required` mode
+/// `require_device` refuses it with `426 device_repair_required` until it
+/// pairs again, and demands the proof header from every device it serves.
+/// So the honest answer to "is this connection encrypted at the application
+/// layer" is about the device asking.
 pub(crate) fn device_seals_its_transport(state: &AppState, device_id: &str) -> bool {
     state.devices.lock().is_ok_and(|devices| {
         devices
@@ -1131,8 +1133,8 @@ mod tests {
     /// a gateway that does seal as one that does not.
     ///
     /// It is a property of the *device*: one paired while encryption was
-    /// disabled holds no transport key, is authorised on its bearer token
-    /// alone, and stays that way after the setting changes.
+    /// disabled holds no transport key and is authorised on its bearer token
+    /// alone (in `required` mode it is refused until it pairs again).
     #[tokio::test]
     async fn the_metadata_says_whether_this_device_actually_seals_its_requests() {
         let sealed_token = "sealed-device";

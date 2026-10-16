@@ -624,7 +624,8 @@ pub(crate) async fn events(
     let device_id = require_device(&state, &headers)?;
     // Present exactly when the request arrived through the encrypted
     // transport. From here on every event this connection emits is sealed;
-    // a device paired without a transport key keeps the plaintext stream.
+    // on a `disabled` deployment the stream stays plaintext (`required`
+    // serves no device without a transport key -- `require_device` above).
     let mut sealer = match stream_crypto {
         Some(Extension(context)) => Some(EventStreamSealer::new(&context).map_err(|_| {
             api_error(

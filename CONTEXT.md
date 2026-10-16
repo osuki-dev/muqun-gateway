@@ -421,8 +421,13 @@ The public listener is normally localhost behind Tailscale Serve HTTPS or a
 Tailscale IPv4 address. HTTPS is preferred. Application transport encryption is
 `required` by default and binds a per-device AES-GCM key to each newly paired
 device, so its bearer token is not sufficient by itself. `disabled` is an
-explicit token-only compatibility mode. Existing device records retain their
-pairing mode; changing the gateway setting governs newly paired devices.
+explicit token-only compatibility mode. In `required` mode every device is
+held to it: a record paired while the setting was `disabled` holds no
+transport key, and its bearer-only requests are refused with
+`426 device_repair_required` by `require_device`/`require_device_or_peer`
+(so by every device route) until it pairs again. Switching to `required`
+therefore means pairing every earlier device again; switching to `disabled`
+keeps serving sealed devices on their token.
 
 HTTP calls and manual HTTP code pairing remain supported. HTTP inside a
 verified SSH or Tailscale tunnel differs from plain HTTP on an unprotected

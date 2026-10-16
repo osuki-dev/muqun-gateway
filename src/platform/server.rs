@@ -32,10 +32,11 @@ use crate::terminal::routes::{
     spawn_agent_notification_watchers, spawn_agent_permission_watchers, spawn_approval_watchers,
 };
 use crate::{
-    agent_events, agents, api_error, backend_startup, connectivity, gateway_listener, hash_token,
-    i18n, load_config, lock_devices, now_unix_ms, scrollback, state_dir, state_lock, transport,
-    unreachable_listen_warning, warn_about_missing_backend_programs, ApiResult, AppState, Config,
-    APPROVAL_EVENT_CAPACITY, MAX_REQUEST_BODY_BYTES,
+    agent_events, agents, api_error, backend_startup, connectivity, device_repair_required,
+    gateway_listener, hash_token, i18n, load_config, lock_devices, now_unix_ms, scrollback,
+    state_dir, state_lock, transport, unreachable_listen_warning,
+    warn_about_missing_backend_programs, ApiResult, AppState, Config, APPROVAL_EVENT_CAPACITY,
+    MAX_REQUEST_BODY_BYTES,
 };
 
 pub(crate) async fn run(config_path: Option<String>) -> anyhow::Result<()> {
@@ -537,13 +538,10 @@ pub(crate) async fn decrypt_transport_request(
             .iter()
             .find(|device| device.id == device_id)
             .ok_or_else(|| api_error(StatusCode::FORBIDDEN, "invalid_token", "invalid token"))?;
-        let transport_key = device.transport_key.clone().ok_or_else(|| {
-            api_error(
-                StatusCode::UPGRADE_REQUIRED,
-                "device_repair_required",
-                "pair this device again to enable encrypted transport",
-            )
-        })?;
+        let transport_key = device
+            .transport_key
+            .clone()
+            .ok_or_else(device_repair_required)?;
         (device.token_hash.clone(), transport_key)
     };
     let material = transport::decode_key(&transport_key).map_err(|_| {
@@ -1443,7 +1441,7 @@ mod tests {
         let material = transport::decode_key(&transport_key).unwrap();
         let mut device = test_device("phone-1", token);
         device.transport_key = Some(transport_key);
-        let state = test_state("admin-token", vec![device]);
+        let state = required_test_state("admin-token", vec![device]);
         assert!(require_device(&state, &bearer_headers(token)).is_err());
 
         let stolen_token_material = base64::engine::general_purpose::STANDARD
@@ -1811,8 +1809,9 @@ mod tests {
         assert_eq!(inner["event"], "agent.timeline.upsert");
         assert_eq!(inner["data"], r#"{"items":[]}"#);
 
-        // A device paired without a transport key keeps the plaintext stream,
-        // byte for byte: no sealer, no envelope, the event under its own name.
+        // A device without a transport key, on a `disabled` deployment (the
+        // only mode that serves one), keeps the plaintext stream byte for
+        // byte: no sealer, no envelope, the event under its own name.
         let mut plain: Option<EventStreamSealer> = None;
         let event = stream_event(&mut plain, "agent.timeline.upsert", r#"{"items":[]}"#)
             .expect("a cleartext stream still emits");

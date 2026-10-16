@@ -34,7 +34,7 @@ pub(crate) fn test_config(token: &str) -> Config {
         listen: "127.0.0.1:23100".into(),
         public_url: "http://127.0.0.1:23100".into(),
         token_hash: hash_token(token),
-        transport_encryption: TransportEncryptionMode::Required,
+        transport_encryption: TransportEncryptionMode::Disabled,
         dev_unauthenticated: false,
         sessions: vec![SessionConfig {
             id: "default".into(),
@@ -59,6 +59,33 @@ pub(crate) fn test_config(token: &str) -> Config {
         mcp: crate::platform::config::McpConfig::default(),
         fleet: Default::default(),
     }
+}
+
+/// The transport key the test fixtures give a device whose token hashes to
+/// `token_hash`: derived, so a header builder that knows only the token can
+/// produce the proof the middleware would have set after opening a sealed
+/// request (`sealed_bearer_headers`).
+pub(crate) fn test_transport_key_for(token_hash: &str) -> String {
+    use sha2::{Digest as _, Sha256};
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(token_hash.as_bytes()))
+}
+
+/// `device`, paired while encryption was on: it holds the fixture transport
+/// key for its token and is served in `required` mode only with the proof
+/// `sealed_bearer_headers` carries.
+pub(crate) fn sealed(mut device: DeviceRecord) -> DeviceRecord {
+    device.transport_key = Some(test_transport_key_for(&device.token_hash));
+    device
+}
+
+/// A state in `transport_encryption: required`: `test_state` is token-only
+/// (`disabled`), the mode a device without a transport key can still be
+/// served in. Devices here need to be `sealed` and the requests to carry
+/// `sealed_bearer_headers`.
+pub(crate) fn required_test_state(admin_token: &str, devices: Vec<DeviceRecord>) -> AppState {
+    let mut state = test_state(admin_token, devices);
+    state.config.transport_encryption = TransportEncryptionMode::Required;
+    state
 }
 
 pub(crate) fn test_device(id: &str, token: &str) -> DeviceRecord {
@@ -175,6 +202,18 @@ pub(crate) fn bearer_headers(token: &str) -> HeaderMap {
     headers.insert(
         axum::http::header::AUTHORIZATION,
         HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+    );
+    headers
+}
+
+/// What a handler sees for a `sealed` device's request once the transport
+/// middleware has opened the envelope: the bearer token and the proof header
+/// only the middleware may set.
+pub(crate) fn sealed_bearer_headers(token: &str) -> HeaderMap {
+    let mut headers = bearer_headers(token);
+    headers.insert(
+        axum::http::HeaderName::from_static(TRANSPORT_PROOF_HEADER),
+        HeaderValue::from_str(&test_transport_key_for(&hash_token(token))).unwrap(),
     );
     headers
 }

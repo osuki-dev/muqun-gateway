@@ -1284,9 +1284,12 @@ mod tests {
 
     #[test]
     fn pairing_revocation_accepts_manager_or_device_but_control_stays_device_only() {
-        let state = test_state("admin-token", vec![test_device("device-1", "device-token")]);
+        let state = required_test_state(
+            "admin-token",
+            vec![sealed(test_device("device-1", "device-token"))],
+        );
         assert!(require_pairing_manager(&state, &bearer_headers("admin-token")).is_ok());
-        assert!(require_pairing_manager(&state, &bearer_headers("device-token")).is_ok());
+        assert!(require_pairing_manager(&state, &sealed_bearer_headers("device-token")).is_ok());
         assert!(require_pairing_manager(&state, &bearer_headers("wrong")).is_err());
         assert!(require_device(&state, &bearer_headers("admin-token")).is_err());
     }
@@ -1323,7 +1326,7 @@ mod tests {
 
     #[tokio::test]
     async fn manual_pairing_ends_up_with_the_same_transport_key_a_qr_pairing_would() {
-        let state = test_state("admin-token", vec![]);
+        let state = required_test_state("admin-token", vec![]);
         assert_eq!(
             state.config.transport_encryption,
             TransportEncryptionMode::Required
@@ -1375,7 +1378,7 @@ mod tests {
 
     #[tokio::test]
     async fn manual_pairing_response_cannot_be_opened_without_the_code() {
-        let state = test_state("admin-token", vec![]);
+        let state = required_test_state("admin-token", vec![]);
         pair_request(
             State(state.clone()),
             Json(json!({ "request_id": "manual-eaves", "device_name": "Phone" })),
