@@ -92,6 +92,18 @@ stays unconditional, `agent_spawn` included: spawning runs on tmux as well as
 Herdr, so a tmux-only gateway still announces it. tmux sessions are unaffected
 in every respect except that they no longer claim a feature they cannot perform.
 
+## T3 Code 0.1.0
+
+T3 Code shipped stable **v0.1.0** on 2026-10-15, which makes Orchestrator V2
+(protocol 2) the stable, V2-only server. The gateway's V2 path already matches
+its wire; the pin moved to v0.1.0 and the one new event type
+(`thread.pull-request-link-updated`) is accepted. What a V2 server cannot do
+through this gateway, as before: **revert and the VCS diff are not available
+for T3 sessions** (`features.revert` is false on protocol 2), and V1 threads
+the server migrated show their message text only. Update every machine that
+runs `t3 serve` (upstream pingdotgg/t3code#14871): a 0.0.x server keeps
+protocol 1 and everything documented for it.
+
 ## App compatibility
 
 - **An older App with this gateway.** Unchanged, except on a machine with no

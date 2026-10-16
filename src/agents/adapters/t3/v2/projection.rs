@@ -558,6 +558,9 @@ pub fn validate_event(item: &Value, thread_id: &str) -> Result<bool, AgentError>
             | "thread.visited"
             | "thread.marked-unread"
             | "thread.pull-request-synced"
+            // v0.1.0: a thread's pull-request link changed. Nothing here
+            // shows it; accepted so it is not skipped as an unknown type.
+            | "thread.pull-request-link-updated"
             | "thread.metadata-updated"
             | "thread.runtime-mode-updated"
             | "thread.interaction-mode-updated"
@@ -622,6 +625,8 @@ pub fn validate_event(item: &Value, thread_id: &str) -> Result<bool, AgentError>
         "checkpoint.rollback-requested" => &["scopeId", "checkpointId", "requestedAt"],
         "provider-session.detached" => &[],
         "run.background-work-cancelled" => &[],
+        // v0.1.0: the link is the payload; there is no entity id to require.
+        "thread.pull-request-link-updated" => &[],
         _ => &["id"],
     };
     if required
