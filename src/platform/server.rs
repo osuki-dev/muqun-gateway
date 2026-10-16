@@ -407,20 +407,23 @@ pub(crate) fn plaintext_body_limit(path: &str) -> usize {
     }
 }
 
-/// On the routes that take a larger body (`config::takes_large_body`), a
-/// cleartext request is authenticated here, before any extractor reads its
+/// On the routes that take a larger body (`config::takes_large_body`),
+/// every request is authenticated here, before any extractor reads its
 /// body: a caller without a device token is refused on its headers alone
 /// and never has a megabyte buffered for it. The handlers authenticate
-/// again themselves, as they always did. A sealed request carries its token
-/// inside the envelope, so its body is read (bounded by the route's sealed
-/// ceiling) to open it, exactly as an upload's is.
+/// again themselves, as they always did.
+///
+/// This runs inside `encrypted_transport`, which has by now opened a
+/// sealed request -- its body read under the route's sealed ceiling, as an
+/// upload's is -- and put the device's bearer token and proof on it, so
+/// the one check here reads the same headers for either transport and
+/// never looks at the transport header itself.
 pub(crate) async fn large_body_after_auth(
     State(state): State<AppState>,
     request: Request<Body>,
     next: Next,
 ) -> Response {
-    let sealed = request.headers().contains_key(TRANSPORT_HEADER);
-    if !sealed && crate::platform::config::takes_large_body(request.uri().path()) {
+    if crate::platform::config::takes_large_body(request.uri().path()) {
         if let Err(refusal) = require_device_or_peer(&state, request.headers()) {
             return refusal.into_response();
         }
@@ -486,13 +489,19 @@ pub(crate) async fn encrypted_transport(
     let mut request = request;
     request.headers_mut().remove(TRANSPORT_PROOF_HEADER);
 
-    if request
-        .headers()
-        .get(TRANSPORT_HEADER)
-        .and_then(|value| value.to_str().ok())
-        != Some("1")
-    {
-        return next.run(request).await;
+    // Absent: cleartext. `1`: sealed. Anything else is refused outright,
+    // so no other layer can read the header differently from this one.
+    match request.headers().get(TRANSPORT_HEADER) {
+        None => return next.run(request).await,
+        Some(value) if value.as_bytes() == b"1" => {}
+        Some(_) => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_transport",
+                "unsupported transport header",
+            )
+            .into_response();
+        }
     }
 
     let websocket = is_websocket_upgrade(request.headers());
@@ -1229,6 +1238,77 @@ fn cgroup_stat_mb(key: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use crate::*;
+
+    /// The larger body of a prompt route is reachable only past
+    /// authentication, whatever the transport header says: an unknown
+    /// `x-muqun-transport` value is refused by the transport layer, a
+    /// cleartext request without a token by the body-limit layer, and
+    /// neither lets the handler (and so the body) be reached.
+    #[tokio::test]
+    async fn a_large_body_route_authenticates_before_any_body_is_read() {
+        use axum::routing::post;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tower::ServiceExt as _;
+        let reached = std::sync::Arc::new(AtomicUsize::new(0));
+        let state = test_state("admin", vec![test_device("phone", "device-token")]);
+        let app = {
+            let reached = reached.clone();
+            Router::new()
+                .route(
+                    "/api/tasks",
+                    post(move |body: axum::body::Bytes| {
+                        let reached = reached.clone();
+                        async move {
+                            reached.fetch_add(1, Ordering::SeqCst);
+                            format!("{}", body.len())
+                        }
+                    })
+                    .layer(crate::agents::routes::large_body()),
+                )
+                .layer(axum::extract::DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
+                .layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    large_body_after_auth,
+                ))
+                .layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    encrypted_transport,
+                ))
+                .with_state(state)
+        };
+        let send = |headers: Vec<(&'static str, &'static str)>| {
+            let app = app.clone();
+            async move {
+                let mut request = Request::builder().method("POST").uri("/api/tasks");
+                for (name, value) in headers {
+                    request = request.header(name, value);
+                }
+                let response = app
+                    .oneshot(request.body(Body::from(vec![b'x'; 200 * 1024])).unwrap())
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let body = axum::body::to_bytes(response.into_body(), 1 << 16)
+                    .await
+                    .unwrap();
+                (status, String::from_utf8_lossy(&body).into_owned())
+            }
+        };
+        // A transport header that is not `1` is not "sealed" to anyone.
+        let (status, body) = send(vec![(TRANSPORT_HEADER, "0")]).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("invalid_transport"), "{body}");
+        assert_eq!(reached.load(Ordering::SeqCst), 0, "the body was never read");
+        // Cleartext without a token: refused on the headers.
+        let (status, _) = send(vec![]).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(reached.load(Ordering::SeqCst), 0);
+        // A device gets the larger limit: 200 KiB is over the ordinary one.
+        let (status, body) = send(vec![("authorization", "Bearer device-token")]).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body, (200 * 1024).to_string());
+        assert_eq!(reached.load(Ordering::SeqCst), 1);
+    }
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
