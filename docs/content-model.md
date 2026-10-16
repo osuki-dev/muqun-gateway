@@ -420,7 +420,7 @@ will stream something renderable. Audio signatures include WAV, MP3, AAC,
 audio-branded M4A, FLAC and Ogg Vorbis/Opus; extensions alone never enable a
 preview. Generic MP4, AVI and Ogg Theora remain binary without a preview. The
 content endpoint retains device authentication, workspace fencing and its
-10 MiB ceiling. Native playback format support is the client's responsibility.
+32 MiB ceiling. Native playback format support is the client's responsibility.
 
 ### Endpoints (additive)
 
@@ -511,7 +511,7 @@ bytes and paths outside it return 404. No client-supplied directory is trusted.
 
 The opaque asset id uses the existing authenticated content endpoint. Containment
 is checked again when content is read, including symlink replacements, and the
-10 MiB content limit applies. This capability does not include video playback.
+32 MiB content limit applies. This capability does not include video playback.
 
 ## Rollout slices
 
