@@ -441,6 +441,12 @@ pub async fn build_discovery(state: &AppState, _sealed: bool, authenticated: boo
         "generation": &*state.generation,
         "serverId": state.config.server_id,
         "label": state.config.label,
+        // What `POST /api/uploads` takes, for the app to say on a 413. Two
+        // numbers, the same for everyone.
+        "uploads": {
+            "maxBytes": crate::platform::uploads::MAX_UPLOAD_BYTES,
+            "maxVideoBytes": crate::platform::uploads::MAX_VIDEO_UPLOAD_BYTES,
+        },
         "planes": planes,
         // Not redacted for anyone: a path and a protocol number say nothing
         // an unauthenticated caller could not learn by trying the upgrade.

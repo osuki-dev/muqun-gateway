@@ -24,7 +24,7 @@ use super::metadata::SessionLivenessCache;
 use super::store::{
     ensure_pairing_transport_key, load_devices_for_service, load_push_tokens_for_service,
 };
-use super::uploads::{spawn_upload_gc, MAX_UPLOAD_BYTES, UPLOADS_PATH};
+use super::uploads::{spawn_upload_gc, MAX_VIDEO_UPLOAD_BYTES, UPLOADS_PATH};
 use crate::platform;
 use crate::platform::i18n::Locale;
 use crate::terminal;
@@ -383,7 +383,7 @@ pub(crate) const SEALED_SCAFFOLD_BYTES: usize = 4096;
 /// about 16/9 of what it carries. The middleware buffers the *outer* bytes, so
 /// this, and not the plaintext limit, is what its ceiling has to be.
 ///
-/// It was `MAX_UPLOAD_BYTES + MAX_REQUEST_BODY_BYTES`, the plaintext limits
+/// It was the upload limit plus `MAX_REQUEST_BODY_BYTES`, the plaintext limits
 /// added together, which is both too small and too large. Too small for the
 /// route it was sized for: 25 MiB of file is about 44 MiB on the wire, so
 /// uploads died above roughly 14 MiB -- and died as a bare `invalid_envelope`,
@@ -400,7 +400,7 @@ pub(crate) const fn sealed_body_ceiling(plaintext: usize) -> usize {
 /// body limits allow it in the clear.
 pub(crate) fn plaintext_body_limit(path: &str) -> usize {
     if path == UPLOADS_PATH {
-        MAX_UPLOAD_BYTES
+        MAX_VIDEO_UPLOAD_BYTES
     } else if crate::platform::config::takes_large_body(path) {
         crate::MAX_PROMPT_BODY_BYTES
     } else {
@@ -1455,7 +1455,7 @@ mod tests {
     /// upload must be at most 25 MiB". Over its own encrypted transport --
     /// which is on by default -- it could not actually accept one: the
     /// middleware buffered the sealed bytes against a ceiling sized for the
-    /// plaintext, and a 25 MiB file is about 44 MiB sealed.
+    /// plaintext, and a 64 MiB file is about 112 MiB sealed.
     #[test]
     fn a_maximum_upload_fits_through_the_encrypted_transport() {
         let transport_key = generate_token();
@@ -1463,42 +1463,48 @@ mod tests {
 
         // Measured at a size that is quick to seal rather than at the ceiling
         // itself. The expansion is affine -- base64, JSON, seal, base64 -- so
-        // one sample fixes the slope, and `MAX_UPLOAD_BYTES` is exactly 25 of
-        // these. The exact version is
+        // an empty body fixes the intercept, one sample the slope, and
+        // `MAX_VIDEO_UPLOAD_BYTES` is exactly 64 of these. The exact version is
         // `a_literal_maximum_upload_seals_within_the_ceiling`, kept ignored
-        // because sealing 25 MiB in a debug build takes twelve seconds.
+        // because sealing 64 MiB in a debug build takes half a minute.
         const SAMPLE: usize = 1024 * 1024;
         let sampled = sealed_wire_len(&material, "device-token", UPLOADS_PATH, SAMPLE);
         assert!(sampled <= sealed_body_ceiling(SAMPLE));
 
-        let at_maximum = sampled * (MAX_UPLOAD_BYTES / SAMPLE);
-        let previous = MAX_UPLOAD_BYTES + MAX_REQUEST_BODY_BYTES;
+        let empty = sealed_wire_len(&material, "device-token", UPLOADS_PATH, 0);
+        let at_maximum = empty + (sampled - empty) * (MAX_VIDEO_UPLOAD_BYTES / SAMPLE);
+        let previous = MAX_VIDEO_UPLOAD_BYTES + MAX_REQUEST_BODY_BYTES;
         assert!(
             at_maximum > previous,
-            "a {MAX_UPLOAD_BYTES}-byte upload seals to about {at_maximum} bytes, \
+            "a {MAX_VIDEO_UPLOAD_BYTES}-byte upload seals to about {at_maximum} bytes, \
              which the old {previous}-byte ceiling should not have fit"
         );
         assert!(
-            at_maximum <= sealed_body_ceiling(MAX_UPLOAD_BYTES),
+            at_maximum <= sealed_body_ceiling(MAX_VIDEO_UPLOAD_BYTES),
             "sealed about {at_maximum} bytes against a ceiling of {}",
-            sealed_body_ceiling(MAX_UPLOAD_BYTES)
+            sealed_body_ceiling(MAX_VIDEO_UPLOAD_BYTES)
         );
     }
 
     #[test]
-    #[ignore = "seals 25 MiB; slow in a debug build"]
+    #[ignore = "seals 64 MiB; slow in a debug build"]
     fn a_literal_maximum_upload_seals_within_the_ceiling() {
         let transport_key = generate_token();
         let material = transport::decode_key(&transport_key).unwrap();
-        let wire = sealed_wire_len(&material, "device-token", UPLOADS_PATH, MAX_UPLOAD_BYTES);
+        let wire = sealed_wire_len(
+            &material,
+            "device-token",
+            UPLOADS_PATH,
+            MAX_VIDEO_UPLOAD_BYTES,
+        );
         assert!(
-            wire > MAX_UPLOAD_BYTES + MAX_REQUEST_BODY_BYTES,
+            wire > MAX_VIDEO_UPLOAD_BYTES + MAX_REQUEST_BODY_BYTES,
             "sealed to {wire} bytes"
         );
         assert!(
-            wire <= sealed_body_ceiling(MAX_UPLOAD_BYTES),
+            wire <= sealed_body_ceiling(MAX_VIDEO_UPLOAD_BYTES),
             "sealed {wire} bytes against a ceiling of {}",
-            sealed_body_ceiling(MAX_UPLOAD_BYTES)
+            sealed_body_ceiling(MAX_VIDEO_UPLOAD_BYTES)
         );
     }
 
@@ -1508,7 +1514,7 @@ mod tests {
     /// on any route buffer 25 MiB.
     #[test]
     fn every_other_route_is_held_to_the_small_body_limit() {
-        assert_eq!(plaintext_body_limit(UPLOADS_PATH), MAX_UPLOAD_BYTES);
+        assert_eq!(plaintext_body_limit(UPLOADS_PATH), MAX_VIDEO_UPLOAD_BYTES);
         for path in [
             "/api/sessions/default/panes/%1/send-text",
             "/api/pair/claim",
@@ -1523,7 +1529,7 @@ mod tests {
             );
         }
         assert!(
-            sealed_body_ceiling(MAX_REQUEST_BODY_BYTES) < MAX_UPLOAD_BYTES,
+            sealed_body_ceiling(MAX_REQUEST_BODY_BYTES) < MAX_VIDEO_UPLOAD_BYTES,
             "the non-upload ceiling must be far under what it used to be"
         );
     }

@@ -2,6 +2,14 @@
 
 ## Changes and fixes
 
+- **Screen recordings can be attached.** `POST /api/uploads` accepts MP4 and
+  QuickTime video (the same `ftyp` brands the asset preview plays) up to
+  64 MiB; every other type keeps its 25 MiB. `GET /api/discovery` carries
+  both limits as `uploads.maxBytes` and `uploads.maxVideoBytes`. An upload is
+  buffered whole while it is sniffed and written, so a video in flight costs
+  up to 64 MiB of memory (about 1.4 times that for a sealed one while its
+  envelope is opened).
+
 - Session-to-agent routes survive a restart (store namespace
   `agent_session_routes`): the first open of each session after a restart no
   longer probes every attached agent in turn, which took up to twelve
