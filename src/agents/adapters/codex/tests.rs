@@ -1262,16 +1262,22 @@ async fn codex_overlapping_history_tails_preserve_shared_order_anchors() {
 }
 
 #[tokio::test]
-async fn codex_reasoning_expansion_limit_fails_without_silently_clipping_parts() {
+async fn codex_reasoning_expansion_limit_keeps_the_first_parts_and_the_connection() {
     let mut fixture = Fixture::new(|_| json!({})).await;
     fixture.ready().await;
     let driver = CodexDriver::new(fixture.client.clone());
-    let item = json!({"type":"reasoning","id":"synthetic-reasoning","summary":vec!["";MAX_REASONING_PARTS+1],"content":[]});
-    assert!(matches!(
-        driver.ordered_items("synthetic-thread", "synthetic-turn", &item, 0),
-        Err(AgentError::Protocol(_))
-    ));
-    assert!(!fixture.client.is_ready());
+    let item = json!({"type":"reasoning","id":"synthetic-reasoning","summary":vec!["x";MAX_REASONING_PARTS+1],"content":[]});
+    let rows = driver
+        .ordered_items("synthetic-thread", "synthetic-turn", &item, 0)
+        .unwrap();
+    assert!(
+        !rows.is_empty(),
+        "the item is kept, clipped to its first parts"
+    );
+    assert!(
+        fixture.client.is_ready(),
+        "an oversized item costs its tail, never the connection"
+    );
 }
 
 #[tokio::test]

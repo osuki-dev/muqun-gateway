@@ -68,6 +68,9 @@ struct HistoryPage {
     remaining: Vec<TimelineItem>,
     seen: HashSet<String>,
     retained_bytes: usize,
+    /// When this page was last committed (a snapshot or an earlier batch
+    /// read), for evicting the least recently read session first.
+    read_at_ms: u64,
 }
 
 #[derive(Default)]
@@ -229,10 +232,11 @@ impl CodexDriver {
         validate_id(id)?;
         let mut usage = self.usage.lock().await;
         if usage.len() >= MAX_SESSIONS && !usage.contains_key(id) {
-            self.client.stop();
-            return Err(AgentError::NotAvailable(
-                "Codex usage capacity exhausted".into(),
-            ));
+            // A cache of each session's last usage: another session's entry
+            // goes, never the connection.
+            if let Some(evicted) = usage.keys().next().cloned() {
+                usage.remove(&evicted);
+            }
         }
         usage.insert(id.into(), super::usage::Usage::from_wire(value));
         Ok(())
@@ -597,18 +601,30 @@ impl CodexDriver {
         item: &Value,
         at_ms: u64,
     ) -> Result<Vec<TimelineItem>, AgentError> {
-        if item["type"] == "reasoning"
+        // A reasoning item past the part limit is kept to its first parts
+        // rather than costing the connection.
+        let truncated;
+        let item = if item["type"] == "reasoning"
             && ["summary", "content"].iter().any(|key| {
                 item[*key]
                     .as_array()
                     .is_some_and(|parts| parts.len() > super::MAX_REASONING_PARTS)
-            })
-        {
-            self.client.stop();
-            return Err(AgentError::Protocol(
-                "Codex reasoning part limit exceeded; resync required".into(),
-            ));
-        }
+            }) {
+            let mut clipped = item.clone();
+            for key in ["summary", "content"] {
+                if let Some(parts) = clipped[key].as_array_mut() {
+                    parts.truncate(super::MAX_REASONING_PARTS);
+                }
+            }
+            tracing::warn!(
+                thread,
+                "Codex reasoning item past the part limit; kept its first parts"
+            );
+            truncated = clipped;
+            &truncated
+        } else {
+            item
+        };
         if item["receiverThreadIds"].as_array().is_some_and(|targets| {
             targets.len() > 512
                 || serde_json::to_vec(item).map_or(true, |wire| {
@@ -1117,18 +1133,36 @@ impl CodexDriver {
         page.retained_bytes = serde_json::to_vec(&(&page.pending, &page.remaining, &page.seen))
             .map_err(|_| AgentError::Protocol("invalid Codex history state".into()))?
             .len();
-        let bytes = history
-            .iter()
-            .filter(|(key, _)| key.as_str() != id)
-            .map(|(_, held)| held.retained_bytes)
-            .sum::<usize>();
-        if (!history.contains_key(id) && history.len() >= MAX_SESSIONS)
-            || bytes.saturating_add(page.retained_bytes) > MAX_HISTORY_RETAINED_BYTES
-        {
+        if page.retained_bytes > MAX_HISTORY_RETAINED_BYTES {
             return Err(AgentError::RequestFailed(
                 "Codex history retention budget exhausted; no page consumed".into(),
             ));
         }
+        // The budget is shared by every session. Rather than refuse this one
+        // because others hold pages, the least recently read of the others
+        // give theirs up: their next earlier pull answers `HistoryCursorLost`
+        // and the app re-reads the snapshot.
+        let over_budget = |history: &HashMap<String, HistoryPage>| {
+            let bytes = history
+                .iter()
+                .filter(|(key, _)| key.as_str() != id)
+                .map(|(_, held)| held.retained_bytes)
+                .sum::<usize>();
+            (!history.contains_key(id) && history.len() >= MAX_SESSIONS)
+                || bytes.saturating_add(page.retained_bytes) > MAX_HISTORY_RETAINED_BYTES
+        };
+        while over_budget(history) {
+            let Some(oldest) = history
+                .iter()
+                .filter(|(key, _)| key.as_str() != id)
+                .min_by_key(|(_, held)| held.read_at_ms)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            history.remove(&oldest);
+        }
+        page.read_at_ms = crate::tasks::domain::now_ms();
         history.insert(id.to_string(), page);
         Ok(())
     }
@@ -2624,25 +2658,47 @@ mod history_tests {
         );
     }
 
+    /// The retention budget is shared: a session is never refused a page
+    /// because others hold theirs. The least recently read of the others
+    /// are evicted until the page fits; only a page that cannot fit on its
+    /// own is refused, and then nothing is consumed or evicted.
     #[test]
-    fn codex_history_retention_refuses_over_budget_without_evicting_or_consuming_state() {
+    fn codex_history_retention_evicts_the_least_recently_read_session_first() {
         let mut history = HashMap::new();
-        history.insert(
-            "held".into(),
-            HistoryPage {
-                retained_bytes: MAX_HISTORY_RETAINED_BYTES,
-                ..Default::default()
-            },
-        );
-        assert!(CodexDriver::commit_history(&mut history, "new", HistoryPage::default()).is_err());
-        assert_eq!(history.len(), 1);
-        assert_eq!(history["held"].retained_bytes, MAX_HISTORY_RETAINED_BYTES);
-        for n in 1..MAX_SESSIONS {
-            history.insert(n.to_string(), HistoryPage::default());
+        for (id, bytes, read_at_ms) in [
+            ("stale", MAX_HISTORY_RETAINED_BYTES / 2, 1),
+            ("recent", MAX_HISTORY_RETAINED_BYTES / 2 - 64, 2),
+        ] {
+            history.insert(
+                id.into(),
+                HistoryPage {
+                    retained_bytes: bytes,
+                    read_at_ms,
+                    ..Default::default()
+                },
+            );
         }
-        assert!(CodexDriver::commit_history(&mut history, "new", HistoryPage::default()).is_err());
+        // Committing a page recomputes its size from its contents: empty.
+        CodexDriver::commit_history(&mut history, "new", HistoryPage::default()).unwrap();
+        assert!(history.contains_key("new"));
+        assert!(history.contains_key("stale") && history.contains_key("recent"));
+        // One over the session cap evicts the least recently read, not the newest.
+        for n in history.len()..MAX_SESSIONS {
+            history.insert(
+                n.to_string(),
+                HistoryPage {
+                    read_at_ms: 10,
+                    ..Default::default()
+                },
+            );
+        }
+        CodexDriver::commit_history(&mut history, "another", HistoryPage::default()).unwrap();
         assert_eq!(history.len(), MAX_SESSIONS);
-        assert!(!history.contains_key("new"));
+        assert!(
+            !history.contains_key("stale"),
+            "the least recently read went"
+        );
+        assert!(history.contains_key("recent") && history.contains_key("another"));
     }
 }
 
