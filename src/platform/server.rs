@@ -33,10 +33,10 @@ use crate::terminal::routes::{
 };
 use crate::{
     agent_events, agents, api_error, backend_startup, connectivity, device_repair_required,
-    gateway_listener, hash_token, i18n, load_config, lock_devices, now_unix_ms, scrollback,
-    state_dir, state_lock, transport, unreachable_listen_warning,
-    warn_about_missing_backend_programs, ApiResult, AppState, Config, APPROVAL_EVENT_CAPACITY,
-    MAX_REQUEST_BODY_BYTES,
+    gateway_listener, hash_token, i18n, load_config, lock_devices, now_unix_ms,
+    require_device_or_peer, scrollback, state_dir, state_lock, transport,
+    unreachable_listen_warning, warn_about_missing_backend_programs, ApiResult, AppState, Config,
+    APPROVAL_EVENT_CAPACITY, MAX_REQUEST_BODY_BYTES,
 };
 
 pub(crate) async fn run(config_path: Option<String>) -> anyhow::Result<()> {
@@ -247,6 +247,10 @@ pub(crate) async fn run(config_path: Option<String>) -> anyhow::Result<()> {
         app
     }
     .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
+    .layer(middleware::from_fn_with_state(
+        state.clone(),
+        large_body_after_auth,
+    ))
     // Inside the encrypted transport, so what it compresses is the
     // plaintext body and not the sealed base64 -- ciphertext does not
     // compress, and sealing first is why nothing downstream could.
@@ -396,9 +400,32 @@ pub(crate) const fn sealed_body_ceiling(plaintext: usize) -> usize {
 pub(crate) fn plaintext_body_limit(path: &str) -> usize {
     if path == UPLOADS_PATH {
         MAX_UPLOAD_BYTES
+    } else if crate::platform::config::takes_large_body(path) {
+        crate::MAX_PROMPT_BODY_BYTES
     } else {
         MAX_REQUEST_BODY_BYTES
     }
+}
+
+/// On the routes that take a larger body (`config::takes_large_body`), a
+/// cleartext request is authenticated here, before any extractor reads its
+/// body: a caller without a device token is refused on its headers alone
+/// and never has a megabyte buffered for it. The handlers authenticate
+/// again themselves, as they always did. A sealed request carries its token
+/// inside the envelope, so its body is read (bounded by the route's sealed
+/// ceiling) to open it, exactly as an upload's is.
+pub(crate) async fn large_body_after_auth(
+    State(state): State<AppState>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let sealed = request.headers().contains_key(TRANSPORT_HEADER);
+    if !sealed && crate::platform::config::takes_large_body(request.uri().path()) {
+        if let Err(refusal) = require_device_or_peer(&state, request.headers()) {
+            return refusal.into_response();
+        }
+    }
+    next.run(request).await
 }
 
 #[derive(Serialize, Deserialize)]

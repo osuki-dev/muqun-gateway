@@ -444,7 +444,7 @@ pub fn mount(router: Router<AppState>) -> Router<AppState> {
         )
         .route(
             "/api/agent-sessions/{asid}/command",
-            post(run_agent_session_command),
+            post(run_agent_session_command).layer(large_body()),
         )
         .route("/api/agent-sessions/{asid}/inbox", get(get_agent_inbox))
         .route(
@@ -489,7 +489,7 @@ pub fn mount(router: Router<AppState>) -> Router<AppState> {
         )
         .route(
             "/api/agent-sessions/{asid}/prompt",
-            post(send_agent_prompt_global),
+            post(send_agent_prompt_global).layer(large_body()),
         )
         .route(
             "/api/agent-sessions/{asid}/interrupt",
@@ -577,7 +577,7 @@ pub fn mount(router: Router<AppState>) -> Router<AppState> {
         )
         .route(
             "/api/sessions/{session_id}/agent-sessions/{asid}/prompt",
-            post(send_agent_prompt_legacy),
+            post(send_agent_prompt_legacy).layer(large_body()),
         )
         .route(
             "/api/sessions/{session_id}/agent-sessions/{asid}/interrupt",
@@ -2253,6 +2253,13 @@ pub(crate) fn workspace_missing(directory: &str) -> (StatusCode, Json<Value>) {
             }
         })),
     )
+}
+
+/// The body limit of the routes that take a prompt (`config::takes_large_body`).
+/// The transport middleware authenticates such a request before its body
+/// is read (`server::large_body_after_auth`); this is the limit it then gets.
+pub(crate) fn large_body() -> axum::extract::DefaultBodyLimit {
+    axum::extract::DefaultBodyLimit::max(crate::MAX_PROMPT_BODY_BYTES)
 }
 
 /// The guard every directory-scoped route runs before proxying.

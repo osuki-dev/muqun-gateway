@@ -31,7 +31,12 @@ const MAX_LABEL_CHARS: usize = 200;
 const MAX_MENTIONS: usize = 8;
 pub(crate) fn mount(router: Router<AppState>) -> Router<AppState> {
     router
-        .route("/api/tasks", get(list).post(create))
+        .route(
+            "/api/tasks",
+            get(list)
+                .post(create)
+                .layer(crate::agents::routes::large_body()),
+        )
         .route("/api/tasks/defaults", get(defaults))
         .route("/api/tasks/{id}", get(read))
         .route("/api/tasks/{id}/cancel", post(cancel))

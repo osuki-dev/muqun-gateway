@@ -549,6 +549,18 @@ pub(crate) const HERDR_PROTOCOL_MIN: u64 = 17;
 
 pub(crate) const MAX_REQUEST_BODY_BYTES: usize = 128 * 1024;
 
+/// The body a prompt, a slash command or a new task may carry: a pasted
+/// log or a long goal is ordinary there. Only these routes take it, and
+/// only from a caller `require_device` already let through
+/// (`server::large_body_after_auth`); everything else stays at
+/// [`MAX_REQUEST_BODY_BYTES`].
+pub(crate) const MAX_PROMPT_BODY_BYTES: usize = 1024 * 1024;
+
+/// Whether `path` is one of the routes that take [`MAX_PROMPT_BODY_BYTES`].
+pub(crate) fn takes_large_body(path: &str) -> bool {
+    path == "/api/tasks" || path.ends_with("/prompt") || path.ends_with("/command")
+}
+
 /// Version of the unified content model this gateway speaks. Declared on every
 /// content envelope so a client renders what it knows and falls back for the
 /// rest; additive changes bump the minor. 1.1.0 added the parts endpoint, which
