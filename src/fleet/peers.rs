@@ -229,6 +229,11 @@ pub(crate) struct LinkRequest {
     /// The peer said `transport_encryption: required` of itself: a claim
     /// answer in the clear is not taken.
     pub transport_required: bool,
+    /// The id the owner knows the other computer by (the phone is paired
+    /// with it). Given, the claim answer has to say the same, so the row's
+    /// `server_id` -- what removing the peer revokes the counterpart login
+    /// by -- is the owner's word and not the claimant's.
+    pub server_id: Option<String>,
 }
 
 #[derive(Debug)]
@@ -243,6 +248,8 @@ pub(crate) enum LinkError {
     NameTaken,
     /// A peer asserting the same id is already linked.
     Conflict,
+    /// The claim answer named another id than the owner did.
+    IdentityMismatch,
     Store(anyhow::Error),
 }
 
@@ -765,7 +772,10 @@ impl PeerService {
             manifest: None,
             unauthorized: false,
         };
-        match self.keep(own_id, peer.clone()).await {
+        match self
+            .keep(own_id, request.server_id.as_deref(), peer.clone())
+            .await
+        {
             Ok(peer) => Ok(peer),
             Err(error) => {
                 revoke(&peer).await;
@@ -774,10 +784,19 @@ impl PeerService {
         }
     }
 
-    /// The rest of [`link`](Self::link) after the claim.
-    async fn keep(&self, own_id: &str, mut peer: Peer) -> Result<Peer, LinkError> {
+    /// The rest of [`link`](Self::link) after the claim. `expected_id` is
+    /// the id the owner gave for the peer, when they did.
+    async fn keep(
+        &self,
+        own_id: &str,
+        expected_id: Option<&str>,
+        mut peer: Peer,
+    ) -> Result<Peer, LinkError> {
         if peer.server_id == own_id {
             return Err(LinkError::IsSelf);
+        }
+        if expected_id.is_some_and(|expected| expected != peer.server_id) {
+            return Err(LinkError::IdentityMismatch);
         }
         let peers = self.store.list().await.map_err(LinkError::Store)?;
         // A link that stopped working is what the phone links again: the new

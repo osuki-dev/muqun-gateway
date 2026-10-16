@@ -158,7 +158,11 @@ The retired `herdr.gateway` identifier remains only for migration compatibility.
   the driver restores that observer after a restart without resending the command.
   A `peers` row is keyed by this gateway's own id; the `server_id` the
   peer gave is display data, and a second link giving one already held is
-  `409 peer_conflict`, never a merge. On the other side a gateway enrolment
+  `409 peer_conflict`, never a merge. An owner-given `server_id` on
+  `POST /api/peers` must match the claim answer (`409
+  peer_identity_mismatch`). A gateway-kind login record's `server_id` is
+  set only by the owner's mint (`POST /api/pair/pending`), never by the
+  claimant's `POST /api/pair/request`, since unlinking revokes by it. On the other side a gateway enrolment
   has no install id, so a claim can never replace or revoke another
   device; a link that fails after the claim revokes what it enrolled, with
   that device's own token. A name another peer holds is refused

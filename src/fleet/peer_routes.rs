@@ -15,8 +15,8 @@ use serde_json::{json, Value};
 use super::peers::{LinkError, LinkRequest, PeerView, RenameError};
 use crate::tasks::domain::now_ms;
 use crate::{
-    api_error, require_admin, require_device, valid_device_name, valid_request_id, ApiResult,
-    AppState,
+    api_error, require_admin, require_device, valid_device_name, valid_install_id,
+    valid_request_id, ApiResult, AppState,
 };
 
 const MAX_URL_BYTES: usize = 512;
@@ -145,6 +145,11 @@ struct LinkBody {
     /// clear is refused.
     #[serde(default)]
     transport_encryption: Option<String>,
+    /// The id the owner knows the other computer by. Given, its claim
+    /// answer must say the same (`409 peer_identity_mismatch`), so the peer
+    /// is kept under the owner's word and not under what it said of itself.
+    #[serde(default)]
+    server_id: Option<String>,
 }
 
 /// `POST /api/peers`: pair with the gateway at `url` through the code it
@@ -166,6 +171,10 @@ async fn link(
         || body.pairing_key.as_deref().is_some_and(|key| {
             !crate::transport::decode_key(key).is_ok_and(|material| material.len() == 32)
         })
+        || body
+            .server_id
+            .as_deref()
+            .is_some_and(|id| !valid_install_id(id))
     {
         return Err(invalid_request());
     }
@@ -178,6 +187,7 @@ async fn link(
         code: code.to_owned(),
         pairing_key: body.pairing_key,
         transport_required: body.transport_encryption.as_deref() == Some("required"),
+        server_id: body.server_id,
     };
     let peer = state
         .peers
@@ -212,6 +222,11 @@ async fn link(
                 StatusCode::BAD_REQUEST,
                 "peer_is_self",
                 "that address is this computer",
+            ),
+            LinkError::IdentityMismatch => api_error(
+                StatusCode::CONFLICT,
+                "peer_identity_mismatch",
+                "the computer at that address is not the one named",
             ),
             LinkError::Store(error) => store_failed(error),
         })?;
@@ -413,12 +428,30 @@ mod tests {
         // under a name a peer holds is refused and keeps nothing either.
         let mut first = Vec::new();
         let mut mini_id = String::new();
-        for (target, at, name, expected, code) in [
-            (&mini, &url, "mini", StatusCode::OK, Value::Null),
+        for (target, at, name, server_id, expected, code) in [
+            // The owner names another computer than the one answering: not
+            // kept, and what the claim enrolled is taken back.
+            (
+                &mini,
+                &url,
+                "mini",
+                Some("srv-other"),
+                StatusCode::CONFLICT,
+                json!("peer_identity_mismatch"),
+            ),
+            (
+                &mini,
+                &url,
+                "mini",
+                Some("srv-mini"),
+                StatusCode::OK,
+                Value::Null,
+            ),
             (
                 &mini,
                 &url,
                 "mini 2",
+                None,
                 StatusCode::CONFLICT,
                 json!("peer_conflict"),
             ),
@@ -428,6 +461,7 @@ mod tests {
                 &other,
                 &other_url,
                 "Coding",
+                None,
                 StatusCode::CONFLICT,
                 json!("name_conflict"),
             ),
@@ -435,6 +469,7 @@ mod tests {
                 &other,
                 &other_url,
                 "MINI",
+                None,
                 StatusCode::CONFLICT,
                 json!("peer_name_taken"),
             ),
@@ -469,6 +504,7 @@ mod tests {
                     "url": at, "name": name,
                     "request_id": minted["request_id"], "code": minted["code"],
                     "pairing_key": minted["pairing_key"],
+                    "server_id": server_id,
                 })),
             )
             .await;
@@ -477,6 +513,12 @@ mod tests {
                 (expected, &code),
                 "{name}: {peer}"
             );
+            if code == json!("peer_identity_mismatch") {
+                assert!(
+                    gateways(&mini).is_empty(),
+                    "the enrolled login is taken back"
+                );
+            }
             assert!(
                 peer.get("token").is_none(),
                 "the token never leaves the gateway"
@@ -765,13 +807,16 @@ mod tests {
         // mini takes back both directions, and only a gateway device that
         // paired as exactly mini's id.
         for (id, server_id, kind) in [
-            ("mini-login", "srv-mini", DeviceKind::Gateway),
-            ("other-login", "srv-other", DeviceKind::Gateway),
-            ("near-login", "srv-mini-2", DeviceKind::Gateway),
-            ("phone", "srv-mini", DeviceKind::App),
+            ("mini-login", Some("srv-mini"), DeviceKind::Gateway),
+            ("other-login", Some("srv-other"), DeviceKind::Gateway),
+            ("near-login", Some("srv-mini-2"), DeviceKind::Gateway),
+            ("phone", Some("srv-mini"), DeviceKind::App),
+            // A gateway that asked for its code itself, whatever it said of
+            // itself then: no owner named it mini's.
+            ("self-requested-login", None, DeviceKind::Gateway),
         ] {
             coding.devices.lock().unwrap().push(DeviceRecord {
-                server_id: Some(server_id.into()),
+                server_id: server_id.map(str::to_owned),
                 kind,
                 ..test_peer_device(id, id)
             });
@@ -813,6 +858,7 @@ mod tests {
             ("other-login", true),
             ("near-login", true),
             ("phone", true),
+            ("self-requested-login", true),
         ] {
             assert_eq!(left.iter().any(|left| left == id), kept, "{id}");
         }

@@ -2,6 +2,17 @@
 
 ## Changes and fixes
 
+- **A linking gateway can no longer say whose login it is.**
+  `POST /api/pair/request` with `kind: gateway` accepted a `server_id` and
+  kept it on the login record, which is what `DELETE /api/peers/{id}` revokes
+  by: a remote naming another computer's id would have had that computer's
+  login here revoked instead of its own. The field is now ignored there; a
+  gateway login's `server_id` comes only from the owner's mint
+  (`POST /api/pair/pending`), and a login made from a self-requested code has
+  none (revoke it from the device list). `POST /api/peers` additionally takes
+  an optional `server_id` the owner knows the other computer by, which its
+  claim answer must match (`409 peer_identity_mismatch`).
+
 - **Linking two computers no longer sends the pairing code in the clear.**
   `POST /api/pair/pending` answers `pairing_key` (the pairing transport key the
   QR carries) on a `required` gateway; the app passes it to `POST /api/peers`

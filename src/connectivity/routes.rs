@@ -41,11 +41,14 @@ pub(crate) struct PairRequestBody {
     pub(crate) install_id: Option<String>,
     /// `gateway` when another of the owner's gateways is pairing itself
     /// (`muqun-gateway peers link`); absent for the app.
+    ///
+    /// A `server_id` in the body (older gateways sent their own) is
+    /// ignored. The id a gateway's login here carries
+    /// (`DeviceRecord::server_id`) is what the owner said at the mint
+    /// (`POST /api/pair/pending`), never the claimant's say-so: it is what
+    /// `DELETE /api/peers/{id}` revokes by.
     #[serde(default)]
     pub(crate) kind: Option<DeviceKind>,
-    /// A gateway's own server id (`DeviceRecord::server_id`).
-    #[serde(default)]
-    pub(crate) server_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -178,7 +181,10 @@ pub(crate) async fn pair_request(
         request_id: body.request_id.clone(),
         device_name,
         install_id,
-        server_id: gateway_server_id(kind, body.server_id.as_deref()),
+        // Whose login this is comes from the owner alone (the mint). A
+        // claimant naming another computer's id here would have that
+        // computer's removal revoke this login, or leave the real one in place.
+        server_id: None,
         kind,
         code: code.clone(),
         code_hash: hash_token(&code),
@@ -208,7 +214,8 @@ fn enrolment_identity(kind: DeviceKind, install_id: Option<&str>) -> Option<Stri
     }
 }
 
-/// A gateway's server id as given, kept when it looks like one; an app has none.
+/// A gateway's server id as the owner gave it at the mint, kept when it
+/// looks like one; an app has none.
 fn gateway_server_id(kind: DeviceKind, server_id: Option<&str>) -> Option<String> {
     match kind {
         DeviceKind::Gateway => server_id
@@ -1479,6 +1486,78 @@ mod tests {
         let (status, minted) = mint(&state, "Coding").await;
         assert_eq!(status, StatusCode::OK, "{minted}");
         assert!(minted.get("pairing_key").is_none(), "{minted}");
+    }
+
+    /// A gateway that asks for a code itself (`muqun-gateway peers link`)
+    /// may call itself what it likes: the login it ends up with carries no
+    /// server id, so removing the computer it named does not revoke it, and
+    /// nothing it says reaches a pending code the owner minted.
+    #[tokio::test]
+    async fn a_pairing_request_cannot_say_whose_login_it_is() {
+        let state = test_state("admin-token", vec![]);
+        pair_request(
+            State(state.clone()),
+            Json(json!({
+                "request_id": "peer-hostile", "device_name": "Coding",
+                "kind": "gateway", "server_id": "srv-mini",
+            })),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            state
+                .pending_pairing
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|pending| (pending.kind, pending.server_id.clone())),
+            Some((DeviceKind::Gateway, None))
+        );
+        let code = pending_code(&state);
+        pair_claim(
+            State(state.clone()),
+            Json(json!({ "request_id": "peer-hostile", "code": code })),
+        )
+        .await
+        .unwrap();
+        {
+            let devices = state.devices.lock().unwrap();
+            assert_eq!(devices.len(), 1);
+            assert_eq!(devices[0].kind, DeviceKind::Gateway);
+            assert_eq!(
+                devices[0].server_id, None,
+                "the claimant's say-so is not kept"
+            );
+        }
+
+        // The owner minted a code for mini: a request under that request id
+        // answers the pending pairing as it is and changes nothing about it,
+        // and a request under another id is refused while it is pending.
+        let (status, minted) = mint(&state, "mini").await;
+        assert_eq!(status, StatusCode::OK, "{minted}");
+        let request_id = minted["request_id"].as_str().unwrap();
+        for (id, expected) in [
+            (request_id, StatusCode::OK),
+            ("peer-2", StatusCode::CONFLICT),
+        ] {
+            let status = match pair_request(
+                State(state.clone()),
+                Json(json!({
+                    "request_id": id, "device_name": "Hostile",
+                    "kind": "gateway", "server_id": "srv-other",
+                })),
+            )
+            .await
+            {
+                Ok(response) => response.status(),
+                Err((status, _)) => status,
+            };
+            assert_eq!(status, expected, "{id}");
+        }
+        let pending = state.pending_pairing.lock().unwrap().clone().unwrap();
+        assert_eq!(pending.request_id, request_id);
+        assert_eq!(pending.device_name, "mini");
+        assert_eq!(pending.server_id.as_deref(), Some("srv-coding"));
     }
 
     /// `POST /api/pair/pending` with the admin token: `(status, body)`.
