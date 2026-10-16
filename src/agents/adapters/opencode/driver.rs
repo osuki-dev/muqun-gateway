@@ -905,7 +905,8 @@ impl AgentPort for OpencodeDriver {
     /// The messages below the oldest one delivered, up to
     /// [`EARLIER_PAGE_MESSAGES`] of them, read as the newest `held + page`
     /// messages and cut at that one. Empty once a read answered fewer than
-    /// asked (nothing older), or before any snapshot was read.
+    /// asked (nothing older); `HistoryCursorLost` before any snapshot was
+    /// read here or when the cut message is no longer in the history.
     fn load_earlier_timeline<'a>(
         &'a self,
         session_id: &'a str,
@@ -924,7 +925,7 @@ impl AgentPort for OpencodeDriver {
                 .get(session_id)
                 .cloned();
             let Some(cursor) = cursor else {
-                return Ok(Vec::new());
+                return Err(AgentError::HistoryCursorLost);
             };
             if cursor.exhausted || cursor.held >= MAX_HISTORY_MESSAGES {
                 return Ok(Vec::new());
@@ -935,9 +936,7 @@ impl AgentPort for OpencodeDriver {
                 .iter()
                 .position(|message| message_id(message) == Some(cursor.oldest_id.as_str()))
             else {
-                return Err(AgentError::NotAvailable(
-                    "the session's history changed; refresh it".into(),
-                ));
+                return Err(AgentError::HistoryCursorLost);
             };
             let older = &messages[..cut];
             let exhausted = messages.len() < asked || older.is_empty();
@@ -1268,11 +1267,10 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
-        assert!(driver
-            .load_earlier_timeline("never", 80)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(matches!(
+            driver.load_earlier_timeline("never", 80).await,
+            Err(AgentError::HistoryCursorLost)
+        ));
         assert_eq!(*asked.lock().unwrap(), vec![100, 5, 180, 260, 340]);
         server.abort();
     }

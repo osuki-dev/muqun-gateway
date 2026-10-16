@@ -1963,7 +1963,7 @@ impl AgentPort for CodexDriver {
                 .get(session_id)
                 .cloned()
             else {
-                return Ok(Vec::new());
+                return Err(AgentError::HistoryCursorLost);
             };
             if page.started
                 && page.cursor.is_none()

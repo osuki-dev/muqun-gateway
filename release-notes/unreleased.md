@@ -2,6 +2,13 @@
 
 ## Changes and fixes
 
+- The earlier-history route answers `409 history_cursor_lost` when the
+  gateway holds no cursor for the session (a restart, an eviction, a history
+  that changed), where it used to answer an empty batch that read as the end
+  of history; the app re-reads the snapshot and pulls on. The mirror keeps
+  5,000 rows per session (was 1,500), so the earlier pages just pulled are
+  not the first rows trimmed by the next upsert.
+
 - OpenCode sessions page back too: `POST /api/agent-sessions/{asid}/timeline/earlier`
   (`features.timelineEarlier: true`) delivers the 80 messages below the
   oldest one shown, read as the newest `held + 80` (OpenCode's message route

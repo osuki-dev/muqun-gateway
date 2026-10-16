@@ -632,6 +632,11 @@ can therefore still say false; the following pull confirms the end. Filtering
 internal plumbing can yield `items: []` with `exhausted: false`; continue later,
 do not infer the end from the visible array alone.
 
+`409 history_cursor_lost` means the gateway holds no earlier-history cursor for
+the session: no snapshot was read in this gateway process (a restart, or the
+cursor was evicted), or the history changed under it. It is never exhaustion:
+read the snapshot again (`GET /api/agent-sessions/{asid}`) and pull on.
+
 State belongs to the provider/session in this Gateway process, not a particular
 App: concurrent requests consume successive disjoint batches. Apps must serialize
 their own pulls and must not automatically retry a POST whose successful reply

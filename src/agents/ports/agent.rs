@@ -53,6 +53,10 @@ pub enum AgentError {
     InvalidRequest(String),
     /// A live external runtime must be controlled through its existing terminal.
     TerminalInteraction(Box<crate::agents::domain::SessionRuntime>),
+    /// `load_earlier_timeline` has no cursor for the session -- no snapshot
+    /// was read in this process, it was evicted, or the history changed
+    /// under it. Not exhaustion: the app re-reads the snapshot and pages on.
+    HistoryCursorLost,
 }
 
 impl fmt::Display for AgentError {
@@ -68,6 +72,9 @@ impl fmt::Display for AgentError {
             Self::Protocol(msg) => write!(f, "Protocol error: {msg}"),
             Self::Unsupported(cap) => write!(f, "Agent does not support capability: {cap}"),
             Self::InvalidRequest(msg) => write!(f, "Invalid request: {msg}"),
+            Self::HistoryCursorLost => f.write_str(
+                "The earlier-history cursor for this session is gone; read the snapshot again",
+            ),
             Self::TerminalInteraction(_) => write!(
                 f,
                 "Native interaction is unavailable; use the current terminal binding when provided"

@@ -17,7 +17,10 @@ const MAX_EVENT_LOG_ENTRIES: usize = 2000;
 /// a refetch carries a whole timeline, so a count alone bounds nothing.
 const MAX_EVENT_LOG_BYTES: usize = 4 * 1024 * 1024;
 /// Timeline rows kept per session; the oldest are dropped first.
-const MAX_TIMELINE_ITEMS: usize = 1500;
+/// Rows kept per session. The trim drops the oldest, which are exactly the
+/// earlier pages the app just pulled, so the cap holds the newest hundred
+/// plus many earlier batches before a pull is undone by the next upsert.
+const MAX_TIMELINE_ITEMS: usize = 5000;
 /// Per tool call, how much output text is kept. Beyond this the text is cut and
 /// the part is flagged `truncated`.
 const MAX_TOOL_OUTPUT_BYTES: usize = 64 * 1024;

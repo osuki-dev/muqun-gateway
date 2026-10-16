@@ -531,7 +531,7 @@ impl AgentPort for DeepseekDriver {
 
     /// The page below the oldest row delivered for this session, under the
     /// frozen cut the snapshot was read under. Empty once the walk reached
-    /// seq 0, or before any snapshot was read.
+    /// seq 0; `HistoryCursorLost` before any snapshot was read here.
     fn load_earlier_timeline<'a>(
         &'a self,
         session_id: &'a str,
@@ -550,7 +550,7 @@ impl AgentPort for DeepseekDriver {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .get(session_id)
             else {
-                return Ok(Vec::new());
+                return Err(AgentError::HistoryCursorLost);
             };
             if !cursor.has_more {
                 return Ok(Vec::new());
@@ -967,12 +967,12 @@ mod tests {
             .is_empty());
         // The earlier batch read one page; the exhausted calls read nothing.
         assert_eq!(calls.lock().unwrap().len(), 6);
-        // A session never opened has nothing to page; a bad limit is refused.
-        assert!(driver
-            .load_earlier_timeline("never", 80)
-            .await
-            .unwrap()
-            .is_empty());
+        // A session never opened here has no cursor: not exhaustion, a
+        // refusal the app answers by reading the snapshot again.
+        assert!(matches!(
+            driver.load_earlier_timeline("never", 80).await,
+            Err(AgentError::HistoryCursorLost)
+        ));
         assert!(matches!(
             driver.load_earlier_timeline("s", 0).await,
             Err(AgentError::InvalidRequest(_))

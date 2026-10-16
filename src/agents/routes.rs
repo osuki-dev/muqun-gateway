@@ -2217,6 +2217,11 @@ fn agent_error(err: super::ports::agent::AgentError) -> (StatusCode, Json<Value>
         super::ports::agent::AgentError::InvalidRequest(message) => {
             api_error(StatusCode::BAD_REQUEST, "invalid_request", message)
         }
+        super::ports::agent::AgentError::HistoryCursorLost => api_error(
+            StatusCode::CONFLICT,
+            "history_cursor_lost",
+            &err.to_string(),
+        ),
         _ => api_error(StatusCode::BAD_GATEWAY, "agent_error", &err.to_string()),
     }
 }
