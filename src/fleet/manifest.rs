@@ -279,6 +279,7 @@ impl Heard {
                 .unwrap_or_default()
                 .to_owned(),
             online: self.reachable,
+            state: MachineState::of(self.reachable, self.peer.unauthorized),
             suitable_for: self.strings("suitableFor"),
             tasks_active: manifest
                 .and_then(|manifest| manifest["tasks"]["active"].as_u64())
@@ -332,14 +333,43 @@ pub(crate) struct TaskCounts {
     pub waiting: usize,
 }
 
+/// What is known of a computer's availability, as `fleet.list` says it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum MachineState {
+    /// It answered within the last two minutes.
+    Online,
+    /// It was asked and did not answer.
+    Offline,
+    /// A linked computer not checked in the last minute.
+    Unknown,
+    /// It answered `401`/`403` `invalid_token` last: it no longer takes
+    /// this computer's token (unlinked there, or the login revoked). Not
+    /// offline -- it is there, and linking again is the remedy.
+    Unauthorized,
+}
+
+impl MachineState {
+    fn of(reachable: Option<bool>, unauthorized: bool) -> Self {
+        match (unauthorized, reachable) {
+            (true, _) => Self::Unauthorized,
+            (false, Some(true)) => Self::Online,
+            (false, Some(false)) => Self::Offline,
+            (false, None) => Self::Unknown,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct MachineSummary {
     pub machine_id: String,
     pub label: String,
     pub os: String,
-    /// `null`: a linked computer not checked in the last minute.
+    /// `null`: a linked computer not checked in the last minute. `false`
+    /// for an `unauthorized` computer too; `state` tells them apart.
     pub online: Option<bool>,
+    pub state: MachineState,
     pub suitable_for: Vec<String>,
     pub tasks_active: usize,
 }
@@ -509,6 +539,7 @@ impl FleetService {
             label: manifest.label.clone(),
             os: manifest.os.to_owned(),
             online: Some(true),
+            state: MachineState::Online,
             suitable_for: manifest.suitable_for.clone(),
             tasks_active: manifest.tasks.active,
         }];

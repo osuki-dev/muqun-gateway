@@ -1325,11 +1325,13 @@ mod tests {
         });
         // nas never answered: nothing is known of it yet; pinged, 127.0.0.1:9 refuses at once.
         let refused = "http://127.0.0.1:9".to_owned();
-        for (id, name, seen, url) in [
-            ("srv-mini", "mini", Some(now), &refused),
-            ("srv-nas", "nas", None, &refused),
-            ("srv-old", "old", None, &old_url),
-            ("srv-slow", "slow", None, &slow_url),
+        // gone answered invalid_token last: not offline, unauthorized.
+        for (id, name, seen, url, unauthorized) in [
+            ("srv-mini", "mini", Some(now), &refused, false),
+            ("srv-nas", "nas", None, &refused, false),
+            ("srv-old", "old", None, &old_url, false),
+            ("srv-slow", "slow", None, &slow_url, false),
+            ("srv-gone", "gone", Some(now), &refused, true),
         ] {
             state
                 .peers
@@ -1346,7 +1348,7 @@ mod tests {
                     last_seen_ms: seen,
                     capabilities: vec!["fleet_peers".into()],
                     manifest: seen.map(|_| manifest.clone()),
-                    unauthorized: false,
+                    unauthorized,
                 })
                 .await;
         }
@@ -1379,12 +1381,14 @@ mod tests {
         assert_eq!(
             peers,
             [
+                (json!("gone"), json!(false), json!(["ios-build"])),
                 (json!("mini"), json!(true), json!(["ios-build"])),
                 (json!("nas"), Value::Null, json!([])),
                 (json!("old"), Value::Null, json!([])),
                 (json!("slow"), Value::Null, json!([])),
             ]
         );
+        assert_eq!(body["peers"][0]["unauthorized"], true);
         assert_eq!(body["peers"][0]["agents"][0]["id"], "opencode");
 
         for (machine, expected) in [
@@ -1425,17 +1429,21 @@ mod tests {
                 (
                     m["label"].clone(),
                     m["online"].clone(),
+                    m["state"].clone(),
                     m["tasksActive"].clone(),
                 )
             })
             .collect();
+        assert_eq!(machines[0].2, json!("online"), "this computer");
         assert_eq!(
             machines[1..],
             [
-                (json!("mini"), json!(true), json!(2)),
-                (json!("nas"), json!(false), json!(0)),
-                (json!("old"), json!(true), json!(0)),
-                (json!("slow"), Value::Null, json!(0)),
+                // Told apart from an offline one: it is there, refusing.
+                (json!("gone"), json!(false), json!("unauthorized"), json!(2)),
+                (json!("mini"), json!(true), json!("online"), json!(2)),
+                (json!("nas"), json!(false), json!("offline"), json!(0)),
+                (json!("old"), json!(true), json!("online"), json!(0)),
+                (json!("slow"), Value::Null, json!("unknown"), json!(0)),
             ]
         );
 

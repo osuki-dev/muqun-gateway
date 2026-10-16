@@ -2,6 +2,11 @@
 
 ## Changes and fixes
 
+- `fleet.list` machines carry `state`: `online`, `offline`, `unknown` (not
+  checked in the last minute) or `unauthorized`. A linked computer whose
+  token was revoked read as plainly offline before; it is there, refusing,
+  and linking again is the remedy. `online` is unchanged (`false` for it).
+
 - **`GET /api/agent-sessions/{asid}/descendants`**: a session's whole subtree
   in one answer, where the app walked `/children` once per descendant (fifty
   requests to open one workbench). Same query, authorisation and error
