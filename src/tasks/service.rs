@@ -495,10 +495,36 @@ impl Publishing<'_> {
     }
 }
 
+/// What a task is bound to, for the log: the kind and the agent or
+/// computer, never a pane's shell pid or a session's id.
+fn binding_for_log(binding: &TaskBinding) -> String {
+    match binding {
+        TaskBinding::None => "none".to_owned(),
+        TaskBinding::AgentSession { agent_id, .. } => format!("agent_session/{agent_id}"),
+        TaskBinding::Pane { agent_id, .. } => match agent_id {
+            Some(agent_id) => format!("pane/{agent_id}"),
+            None => "pane".to_owned(),
+        },
+        TaskBinding::Peer { peer_name, .. } => format!("peer/{peer_name}"),
+    }
+}
+
 impl TaskStore for Publishing<'_> {
     fn insert<'a>(&'a self, task: &'a Task) -> TaskFuture<'a, Task> {
         Box::pin(async move {
             let task = self.0.store.insert(task).await?;
+            // One line per task the host can answer "where did my task go"
+            // from: ids, kinds and names, never the goal, a body or a token.
+            tracing::info!(
+                task = %task.id.0,
+                kind = ?task.kind,
+                state = ?task.state,
+                origin = ?task.origin,
+                requested_by = task.requester_name.as_deref().unwrap_or("-"),
+                binding = %binding_for_log(&task.binding),
+                mentions = task.mentions.len(),
+                "task created"
+            );
             self.publish(&task).await;
             Ok(task)
         })
@@ -525,7 +551,24 @@ impl TaskStore for Publishing<'_> {
             if change.to.is_terminal() && change.session_title.is_none() {
                 change.session_title = self.0.live_title(id);
             }
+            let (source, reason, exit_code) = (
+                change.source.clone(),
+                change
+                    .note
+                    .as_deref()
+                    .map(|note| one_line(note, SUMMARY_CHARS)),
+                change.exit_code,
+            );
             let task = self.0.store.transition(id, change).await?;
+            tracing::info!(
+                task = %task.id.0,
+                state = ?task.state,
+                source = %source,
+                reason = reason.as_deref().unwrap_or("-"),
+                exit_code = ?exit_code.or(task.exit_code),
+                binding = %binding_for_log(&task.binding),
+                "task moved"
+            );
             if task.state.is_terminal() {
                 if let Ok(mut live) = self.0.live.lock() {
                     live.titles.remove(id);
