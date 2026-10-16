@@ -340,7 +340,7 @@ fn is_task_instruction_notice(text: &str, description: Option<&str>) -> bool {
     let key = crate::mcp::inject::SESSION_INSTRUCTION_KEY;
     description.is_some_and(|description| {
         description.starts_with("Instructions updated") && description.contains(key)
-    }) || text.trim() == crate::mcp::inject::TASK_SENTENCE
+    }) || text.trim().starts_with(crate::mcp::inject::TASK_SENTENCE)
 }
 
 /// Whether `text` is exactly that notice: its first line, then nothing or

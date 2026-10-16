@@ -288,6 +288,46 @@ impl Heard {
     }
 }
 
+/// One line for an agent working on a task the owner opened: the linked
+/// computers by name with what is known of their reachability, and the
+/// ones the owner named for the task, so it reaches for `exec.run` /
+/// `tasks.delegate` with `machine` without a `fleet.describe` first.
+/// Names and reachability only -- never a URL, an id, a token or a key.
+/// `None` when nothing is linked and nothing was named.
+pub(crate) async fn prompt_line(state: &AppState, mentions: &[String]) -> Option<String> {
+    let peers = heard(state).await;
+    if peers.is_empty() && mentions.is_empty() {
+        return None;
+    }
+    let mut line = String::new();
+    if !peers.is_empty() {
+        let listed: Vec<String> = peers
+            .iter()
+            .map(|heard| {
+                let state = match MachineState::of(heard.reachable, heard.peer.unauthorized) {
+                    MachineState::Online => "reachable",
+                    MachineState::Offline => "unreachable",
+                    MachineState::Unknown => "not checked lately",
+                    MachineState::Unauthorized => "no longer takes this computer's token",
+                };
+                format!("{} ({state})", heard.peer.name)
+            })
+            .collect();
+        line.push_str("Linked computers, for exec.run or tasks.delegate with machine: ");
+        line.push_str(&listed.join(", "));
+        line.push('.');
+    }
+    if !mentions.is_empty() {
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str("The user named for this task: ");
+        line.push_str(&mentions.join(", "));
+        line.push('.');
+    }
+    Some(line)
+}
+
 /// Every linked computer as last heard, answered at once; those whose
 /// reachability or manifest is stale are refreshed in the background (one
 /// refresh per peer at a time), for the next call to see.

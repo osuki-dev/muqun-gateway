@@ -475,6 +475,9 @@ pub(crate) struct MuqunMcp {
     /// Whether the caller was started for a task ([`started_for_task`]):
     /// its instructions then say so plainly.
     in_task: bool,
+    /// The computers the task's agent may hand work to ([`fleet_line`]),
+    /// told in its instructions.
+    fleet: Option<String>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -485,8 +488,15 @@ impl MuqunMcp {
             state,
             session,
             in_task: false,
+            fleet: None,
             tool_router: Self::tool_router(),
         }
+    }
+
+    /// The computers the task's agent may hand work to ([`fleet_line`]).
+    pub(crate) fn fleet(mut self, fleet: Option<String>) -> Self {
+        self.fleet = fleet;
+        self
     }
 
     /// The handler for a caller that [`started_for_task`] says is a task.
@@ -548,7 +558,7 @@ impl MuqunMcp {
 
     #[tool(
         name = "exec.run",
-        description = "Run a shell command in a visible terminal pane on this computer, or (machine) on a linked computer, and return its exit code and output tail. Blocks up to timeout_s (max 45); if still running, returns a task_id for tasks.wait. For a command or a short script on another computer use this, not tasks.delegate: no agent is started there."
+        description = "Run a shell command in a visible terminal pane on this computer, or (machine) on a linked computer, and return its exit code and output tail. Blocks up to timeout_s (max 45); if still running, returns a task_id for tasks.wait. For a command or a short script on another computer use this first, before your own SSH and not tasks.delegate: it is visible, recorded, interruptible and approved there, and no agent is started."
     )]
     async fn exec_run(
         &self,
@@ -846,14 +856,14 @@ impl ServerHandler for MuqunMcp {
                 "muqun-gateway",
                 env!("CARGO_PKG_VERSION"),
             ))
-            .with_instructions(instructions(self.in_task))
+            .with_instructions(instructions(self.in_task, self.fleet.as_deref()))
     }
 }
 
 /// What the server tells a caller about itself and about finishing a task:
 /// plainly to one started for a task (`in_task`), conditionally to anyone
 /// else, who may never have been given one.
-pub(crate) fn instructions(in_task: bool) -> String {
+pub(crate) fn instructions(in_task: bool, fleet: Option<&str>) -> String {
     let about = "Muqun Gateway on this computer. fleet.describe says what it has and which \
                  other computers are linked to it, exec.run runs short commands, \
                  tasks.delegate hands work to a coding agent -- if the work will take long, \
@@ -861,9 +871,13 @@ pub(crate) fn instructions(in_task: bool) -> String {
                  tasks.wait (at most 45 s) only for short jobs; tasks.delegate(machine) \
                  sends work to a linked computer, and your task's summary (tasks.read without \
                  a task_id) lists the ones the user named (mentions). For a command or a \
-                 short script on another computer, call exec.run with machine; delegate a goal \
-                 only when the other computer needs an agent of its own. Do not restate the \
-                 completion protocol in a delegated goal: the agent there already knows it.";
+                 short script on another computer, call exec.run with machine first: it runs \
+                 in a visible pane there, is recorded, can be interrupted and goes through \
+                 approvals. Fall back to your own SSH only when that computer is not linked \
+                 or exec.run cannot do it (an interactive session, a directory outside its \
+                 home), and say so. Delegate a goal only when the other computer needs an \
+                 agent of its own. Do not restate the completion protocol in a delegated \
+                 goal: the agent there already knows it.";
     let finish = "call tasks.complete with a one-line summary; when you stop because you \
                   need the user, call it with outcome \"blocked\" and the reason; if you \
                   cannot call it, end with the line MUQUN_TASK_DONE: <summary> (or \
@@ -872,11 +886,12 @@ pub(crate) fn instructions(in_task: bool) -> String {
     if in_task {
         // First and imperative: a host may show this beside many other
         // instructions, and an agent that just stops leaves its task paused.
+        let fleet = fleet.map(|fleet| format!(" {fleet}")).unwrap_or_default();
         format!(
             "IMPORTANT: Muqun started you to work on one task, given as your first \
              prompt, and the person who sent it sees it as unfinished until you report \
              back. As your last action for that task, after answering, call the muqun \
-             tool tasks.complete -- {finish} {about}"
+             tool tasks.complete -- {finish} {about}{fleet}"
         )
     } else {
         format!(
@@ -890,6 +905,33 @@ pub(crate) fn instructions(in_task: bool) -> String {
 /// What `tasks.read` without a task_id answers a session that has no task.
 const NO_TASK: &str = "This session has no Muqun task: ignore the task protocol -- do not call \
      tasks.complete and print no marker.";
+
+/// The task the caller of `/mcp` was started for, if it was.
+async fn task_of(
+    state: &AppState,
+    session: &AssistantSession,
+) -> Option<crate::tasks::domain::Task> {
+    match &session.binding {
+        crate::mcp::tokens::TokenBinding::Pane {
+            session_id,
+            pane_id,
+        } => state.tasks.open_task_of_pane(session_id, pane_id).await,
+        crate::mcp::tokens::TokenBinding::Agent { .. } => None,
+        crate::mcp::tokens::TokenBinding::Task { task_id } => {
+            super::issue::task_authority(state, task_id)
+                .await
+                .ok()
+                .flatten()
+        }
+    }
+}
+
+/// The line about linked computers for the caller's task, when it is one
+/// the owner opened here (`tasks::service::fleet_line`).
+pub(crate) async fn fleet_line(state: &AppState, session: &AssistantSession) -> Option<String> {
+    let task = task_of(state, session).await?;
+    crate::tasks::service::fleet_line(state, &task).await
+}
 
 /// Whether the caller of `/mcp` was started for a task: a pane-bound token
 /// whose pane holds an open task. An agent-bound token is shared by every

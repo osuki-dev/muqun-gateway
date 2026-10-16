@@ -700,6 +700,8 @@ pub(crate) struct TaskLaunch<'a> {
     pub out_of_band: bool,
     /// The model and effort the task named, as launch arguments.
     pub model_args: &'a [String],
+    /// The computers it may hand work to (`fleet::manifest::prompt_line`).
+    pub fleet: Option<&'a str>,
 }
 
 /// Start the agent in the placed pane. Claude Code and Codex get `prompt`
@@ -741,7 +743,9 @@ pub(crate) async fn start_agent_in_place(
     if let Some(task) = task {
         // A task's agent is told, out of band, how to report the task's end.
         if task.out_of_band {
-            agent_args.extend(crate::mcp::inject::terminal_task_args(&state.config, agent).await);
+            agent_args.extend(
+                crate::mcp::inject::terminal_task_args(&state.config, agent, task.fleet).await,
+            );
         }
         // The model and effort the task named, after the configured
         // arguments (a later `-c` wins) and before the prompt.

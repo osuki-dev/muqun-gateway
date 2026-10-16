@@ -1016,16 +1016,18 @@ impl TaskService {
     /// Whether an open task is bound to pane `pane_id` of terminal session
     /// `session_id`: its agent was started for that task.
     pub(crate) async fn open_task_in_pane(&self, session_id: &str, pane_id: &str) -> bool {
+        self.open_task_of_pane(session_id, pane_id).await.is_some()
+    }
+
+    /// The open task bound to a pane, if one is.
+    pub(crate) async fn open_task_of_pane(&self, session_id: &str, pane_id: &str) -> Option<Task> {
         let filter = TaskFilter {
             pane: Some((session_id.to_owned(), pane_id.to_owned())),
             states: Some(OPEN_STATES.to_vec()),
             limit: 1,
             ..Default::default()
         };
-        self.store
-            .list(filter)
-            .await
-            .is_ok_and(|tasks| !tasks.is_empty())
+        self.store.list(filter).await.ok()?.into_iter().next()
     }
 
     /// Whether any task, open or ended, is bound to agent session `asid`:
@@ -1294,12 +1296,13 @@ impl TaskService {
             // Served as a task's session from here, so the notice the
             // instruction may leave at once is stripped like the rest.
             self.mark_task_session(&asid.0);
+            let fleet = fleet_line(state, &task).await;
             match manager
                 .agent()
                 .set_session_instruction(
                     &asid.0,
                     crate::mcp::inject::SESSION_INSTRUCTION_KEY,
-                    crate::mcp::inject::TASK_SENTENCE,
+                    &crate::mcp::inject::task_sentence(fleet.as_deref()),
                 )
                 .await
             {
@@ -1575,6 +1578,16 @@ pub(crate) struct TerminalStart {
 /// takes one, otherwise typed) unless the task ended meanwhile -- a cancel, or a
 /// follower that gave up on it -- then move the task to working and follow
 /// it -- or fail it naming the step.
+/// The computers a task's agent is told about: for a task the owner opened
+/// here, the linked computers and the ones the owner named; a task another
+/// computer sent over is told nothing (one hop, and no further names).
+pub(crate) async fn fleet_line(state: &AppState, task: &Task) -> Option<String> {
+    if task.origin != TaskOrigin::Device {
+        return None;
+    }
+    crate::fleet::manifest::prompt_line(state, &task.mentions).await
+}
+
 pub(crate) async fn start_terminal_agent(
     state: AppState,
     session: crate::SessionConfig,
@@ -1605,6 +1618,7 @@ pub(crate) async fn start_terminal_agent(
     }
     let pane_id = placed.place.pane_id.clone();
     let mut goal = goal;
+    let fleet = fleet_line(&state, &task).await;
     // What ran before the launch command was typed is never its job.
     let mut before = pane_agent::before_launch().await;
     let (mut launched, mut to_type) = start_agent_in_place(
@@ -1618,6 +1632,7 @@ pub(crate) async fn start_terminal_agent(
             task_id: &task.id.0,
             out_of_band: true,
             model_args: &model_args,
+            fleet: fleet.as_deref(),
         }),
     )
     .await;
@@ -1626,7 +1641,7 @@ pub(crate) async fn start_terminal_agent(
     // or error; a shell foreground alone never proves a rejected goal.
     let out_of_band = kind == "claude"
         && crate::mcp::inject::enabled(&state.config)
-        && !crate::mcp::inject::terminal_task_args(&state.config, &kind)
+        && !crate::mcp::inject::terminal_task_args(&state.config, &kind, None)
             .await
             .is_empty();
     if out_of_band
@@ -1647,6 +1662,7 @@ pub(crate) async fn start_terminal_agent(
             Some(TaskLaunch {
                 task_id: &task.id.0,
                 out_of_band: false,
+                fleet: None,
                 model_args: &model_args,
             }),
         )

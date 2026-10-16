@@ -2560,6 +2560,7 @@ pub(crate) mod tests {
                     task_id: &task.id.0,
                     out_of_band: true,
                     model_args: &[],
+                    fleet: None,
                 }),
             )
             .await;

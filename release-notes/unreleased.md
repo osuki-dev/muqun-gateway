@@ -2,6 +2,22 @@
 
 ## Changes and fixes
 
+- **Agents are told about the linked computers up front, and to prefer
+  `exec.run`.** A task the owner opens on their phone now carries, in the
+  agent's instructions (the MCP server instructions, Claude Code's appended
+  system prompt, Codex's `developer_instructions`, OpenCode's session
+  instruction), one line naming every linked computer with its reachability
+  and the computers the owner named -- names and reachability only, never a
+  URL, an id, a token or a key -- so the agent reaches for `exec.run` /
+  `tasks.delegate` with `machine` without a `fleet.describe` first. The
+  routing sentence now says to call `exec.run` with `machine` first for a
+  command on another computer (visible, recorded, interruptible, approved
+  there) and to fall back to its own SSH only when that computer is not
+  linked or `exec.run` cannot do it, saying so. A task another computer sent
+  over is told nothing (one hop). The home-directory fence on a received
+  command is unchanged: it applies to another gateway's command, never to
+  the owner's app.
+
 - `fleet.list` machines carry `state`: `online`, `offline`, `unknown` (not
   checked in the last minute) or `unauthorized`. A linked computer whose
   token was revoked read as plainly offline before; it is there, refusing,
