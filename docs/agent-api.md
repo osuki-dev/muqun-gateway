@@ -232,6 +232,10 @@ and `version` removed from every agent.
 - `endpoint` and `version` are omitted when unknown or redacted. `models[]` and
   `modes[]` are that agent's own catalog summary; `reasoningEffortTiers` is
   omitted when empty; `modes[].description` when unset.
+- `ledgerDelivery` (per agent) lists the deliveries `POST /api/tasks` can
+  perform for that `agent_id`: `"session"` (a session adapter of that kind
+  is attached) and/or `"pane"` (a terminal launcher is known). See
+  `docs/mcp.md`, capability `task_ledger_delivery`.
 - `features` (per agent) says what the agent can do, so the App can hide
   controls rather than call and get `501 feature_unsupported`. The keys are
   camelCase (there is no snake_case spelling of them in this payload; the

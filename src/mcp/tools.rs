@@ -385,7 +385,7 @@ impl DelegateArgs {
             None => None,
         };
         Ok(DelegateRequest {
-            session_delivery: false,
+            delivery: None,
             goal: self.goal,
             cwd,
             agent_id: self.agent_id,

@@ -428,6 +428,18 @@ pub async fn build_discovery(state: &AppState, _sealed: bool, authenticated: boo
     .map(String::from)
     .collect();
 
+    // What `POST /api/tasks` can do for each agent, beside its features.
+    let mut planes = serde_json::to_value(&planes).unwrap_or(Value::Null);
+    if let Some(agents) = planes
+        .pointer_mut("/agents/agents")
+        .and_then(Value::as_array_mut)
+    {
+        for agent in agents {
+            let id = agent["id"].as_str().unwrap_or_default().to_owned();
+            agent["ledgerDelivery"] =
+                json!(crate::tasks::routes::ledger_delivery_names(state, &id).await);
+        }
+    }
     json!({
         "transport_versions": crate::connectivity::transport::SUPPORTED_VERSIONS,
         "ok": true,

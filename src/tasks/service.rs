@@ -212,9 +212,19 @@ pub(crate) struct DelegateRequest {
     /// asset references or file paths on this computer): handed to a
     /// session agent with its first prompt.
     pub attachments: Vec<String>,
-    /// `delivery: "session"`: an agent that is both a terminal agent and a
-    /// session agent (Codex) opens a native agent session, never a pane.
-    pub session_delivery: bool,
+    /// Where the task runs when the device said: a native agent session or
+    /// a terminal pane. `None`: as the agent kind decides (a session agent's
+    /// session, a terminal agent's pane).
+    pub delivery: Option<Delivery>,
+}
+
+/// How a delegation is delivered to its agent (`POST /api/tasks` `delivery`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Delivery {
+    /// A native agent session, through the agent's session adapter.
+    Session,
+    /// A terminal pane the agent is started in.
+    Pane,
 }
 
 /// Who asked for a task, as a task view shows it.
@@ -1199,7 +1209,12 @@ impl TaskService {
             }
         }
         if let Some(kind) = request.agent_id.as_deref() {
-            if !request.session_delivery && runs_in_pane(state, kind).await {
+            let in_pane = match request.delivery {
+                Some(Delivery::Pane) => true,
+                Some(Delivery::Session) => false,
+                None => runs_in_pane(state, kind).await,
+            };
+            if in_pane {
                 if !request.attachments.is_empty() {
                     return Err(TaskError::AttachmentsUnsupported);
                 }
@@ -3571,7 +3586,7 @@ mod tests {
 
     fn request(machine: Option<&str>) -> DelegateRequest {
         DelegateRequest {
-            session_delivery: false,
+            delivery: None,
             goal: "fix the build".into(),
             cwd: Some("/work".into()),
             agent_id: None,

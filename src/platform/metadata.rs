@@ -139,12 +139,11 @@ pub(crate) const API_CAPABILITIES: &[&str] = &[
     // task is `done` only on its MUQUN_TASK_DONE marker; an idle agent is
     // `idle_unconfirmed`.
     "task_ledger_pane",
-    // `POST /api/tasks` with `delivery: "session"` opens a task on the named
-    // agent's native session adapter -- Codex, otherwise a terminal agent --
-    // bound to an agent session (`binding.kind == "agent_session"`), the
-    // create answer carrying `asid`. `400 invalid_request` when no session
-    // agent of that kind is enabled.
-    "task_ledger_codex_session",
+    // `POST /api/tasks` takes `delivery: "session" | "pane"`, routed as said
+    // or `400 invalid_request` when that agent cannot do it; each discovery
+    // entry says what it can as `ledgerDelivery`, each terminal catalog entry
+    // as `ledger_delivery`. Absent, the agent kind decides as before.
+    "task_ledger_delivery",
     // A delegation (session or terminal agent) is `done` only on an explicit
     // signal: the agent's `tasks.complete` MCP call, its MUQUN_TASK_DONE
     // marker line, or the device's `POST /api/tasks/{id}/complete` (for an

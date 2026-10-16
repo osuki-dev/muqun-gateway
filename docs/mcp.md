@@ -3,10 +3,9 @@
 Capabilities: `mcp_server` (the `/mcp` endpoint; present only while
 `mcp.enabled` is true), `fleet`, `task_ledger`, `task_ledger_create`
 (`POST /api/tasks` and the task tree), `task_ledger_pane` (a terminal agent
-as `agent_id`, bound to its pane), `task_ledger_codex_session`
-(`POST /api/tasks` takes `delivery: "session"`: a Codex task opens on the
-native Codex adapter, bound to an agent session, instead of in a pane),
-`task_ledger_complete` (a delegation is
+as `agent_id`, bound to its pane), `task_ledger_delivery` (`POST /api/tasks`
+takes `delivery: "session" | "pane"`; each discovery agent entry says what
+it can do as `ledgerDelivery`), `task_ledger_complete` (a delegation is
 `done` only on an explicit signal: `tasks.complete`, the `MUQUN_TASK_DONE`
 marker, or the device's `POST /api/tasks/{id}/complete`; see
 [Finishing a delegation](#finishing-a-delegation)), `task_ws_subscription` (`subscribe_tasks`
@@ -442,16 +441,18 @@ Anything else is `400 invalid_attachment`, checked before anything is made:
 no task row, no session. They go only to a session agent on this computer:
 with a terminal agent, for another computer, or sent by another computer,
 the create is `400 attachments_unsupported` and nothing is made.
-`delivery` chooses where an agent that is both a terminal agent and a
-session agent (Codex) runs: absent or `"pane"`, a terminal pane as before;
-`"session"`, a native agent session through the same path OpenCode,
-DeepSeek and T3 delegations take (`model`, `variant`, `cwd`, `mentions`,
+`delivery` says where the task runs: `"session"`, a native agent session
+through the agent's session adapter (`model`, `variant`, `cwd`, `mentions`,
 `client_ref` and `attachments` honoured, the answer carrying `asid`, the
-binding `agent_session`). `"session"` without an enabled session agent of
-that kind (the native Codex adapter, `codex.enabled`) is
-`400 invalid_request` and nothing is made. Announced as
-`task_ledger_codex_session`, in `/health` and on the content envelope; an
-app sends it only when it sees that capability.
+binding `agent_session`); `"pane"`, a terminal pane the agent is started in
+(the answer carrying `pane_id`). Absent, the agent kind decides exactly as
+before. What an agent can do is `ledgerDelivery` on its `/api/discovery`
+entry (`["session"]`, `["pane"]` or `["session", "pane"]`: a session
+adapter of that kind attached, a terminal launcher known) and
+`ledger_delivery` on its `GET /api/agents/catalog` entry; a delivery the
+agent cannot perform is `400 invalid_request` and nothing is made.
+Announced as `task_ledger_delivery`, in `/health` and on the content
+envelope; an app sends `delivery` only when it sees that capability.
 Fields the gateway does not know are ignored. The answer is
 the task view plus the session to open:
 

@@ -179,7 +179,16 @@ pub(crate) async fn agents_catalog(
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
-    let agents = tasks::agent_catalog(&state.config.agent_commands);
+    let mut agents = json!(tasks::agent_catalog(&state.config.agent_commands));
+    // What `POST /api/tasks` can do for each: a pane always, a session too
+    // when a session adapter of that kind is attached.
+    if let Some(entries) = agents.as_array_mut() {
+        for entry in entries {
+            let kind = entry["kind"].as_str().unwrap_or_default().to_owned();
+            entry["ledger_delivery"] =
+                json!(crate::tasks::routes::ledger_delivery_names(&state, &kind).await);
+        }
+    }
     Ok(Json(json!({
         "agents": agents,
         "default_startup_timeout_ms": tasks::DEFAULT_AGENT_START_TIMEOUT_MS

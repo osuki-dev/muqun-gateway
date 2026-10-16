@@ -22,14 +22,14 @@
   "too many pairing requests". The eight wrong-code lockout per code is
   unchanged.
 
-- **A Codex task from the phone can be a ledger task.** `POST /api/tasks`
-  took `agent_id: "codex"` as a terminal pane only, so the app opened native
-  Codex sessions directly and the Home card could show only a transient
-  local row. With `delivery: "session"` (capability
-  `task_ledger_codex_session`) the task opens on the native Codex adapter,
-  bound to an agent session with its `asid`, like an OpenCode delegation;
-  without an enabled native Codex adapter it is `400 invalid_request`.
-  Absent, nothing changes.
+- **The device chooses where a task runs.** `POST /api/tasks` took an agent
+  that is both a terminal agent and a session agent as a terminal pane only,
+  so the app opened such sessions directly and the Home card could show only
+  a transient local row. `delivery: "session" | "pane"` (capability
+  `task_ledger_delivery`) routes the task as said -- a native agent session
+  with its `asid`, or a pane with its `pane_id` -- and each `/api/discovery`
+  agent entry says what it can do as `ledgerDelivery`; a delivery the agent
+  cannot perform is `400 invalid_request`. Absent, nothing changes.
 
 - A phone whose clock is off by more than five minutes now reads
   `403 clock_skew` with `error.server_time_ms` instead of the generic
