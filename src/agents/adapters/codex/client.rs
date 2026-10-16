@@ -841,14 +841,15 @@ impl CodexClient {
         method: &str,
         params: Value,
     ) -> Result<(Value, usize), AgentError> {
-        if self.state.history_only
-            && !image_history_request(method, &params)
-            && !(method == "account/read" && params["refreshToken"] == false)
-            && !(method == "initialize" && !self.is_ready())
-        {
-            return Err(AgentError::Unsupported(
-                "Codex history connection is read-only".into(),
-            ));
+        if self.state.history_only {
+            let allowed = image_history_request(method, &params)
+                || (method == "account/read" && params["refreshToken"] == false)
+                || (method == "initialize" && !self.is_ready());
+            if !allowed {
+                return Err(AgentError::Unsupported(
+                    "Codex history connection is read-only".into(),
+                ));
+            }
         }
         if self.state.cancel.is_cancelled() {
             return Err(disconnected());

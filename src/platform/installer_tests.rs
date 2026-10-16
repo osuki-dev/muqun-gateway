@@ -140,7 +140,7 @@ fn run_installer_case(
     // A closed PATH makes backend detection independent of the test host.
     for name in [
         "awk", "cut", "head", "chmod", "mkdir", "basename", "id", "uname", "cp", "sleep", "grep",
-        "mktemp", "rm", "wc", "ln", "cat", "ls", "stty", "od", "perl",
+        "mktemp", "rm", "wc", "ln", "cat", "ls", "stty", "od", "perl", "stat",
     ] {
         let program = [format!("/usr/bin/{name}"), format!("/bin/{name}")]
             .into_iter()
@@ -255,8 +255,14 @@ case "$output" in
 esac
 case "$(umask)" in 0077|077) :;; *) exit 91;; esac
 [ -d "${output%/*}" ] && [ ! -e "$output" ] || exit 91
-permissions="$(ls -ld "${output%/*}")"
-case "$permissions" in 'drwx------ '*) :;; *) exit 91;; esac
+# Numeric modes ignore ls metadata markers for extended attributes and ACLs.
+# Probe GNU stat first, then BSD stat, without retaining a failed probe's output.
+if permissions="$(stat -c '%a' "${output%/*}" 2>/dev/null)"; then
+  :
+else
+  permissions="$(stat -f '%Lp' "${output%/*}")" || exit 91
+fi
+[ "$permissions" = 700 ] || exit 91
 case "$url" in
   "https://github.com/osuki-dev/muqun-gateway/releases/download/$MOCK_TAG/muqun-gateway-"*.sha256)
     [ "$limit" = 1024 ] || exit 91
