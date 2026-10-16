@@ -606,7 +606,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn timeline_earlier_discovery_declares_only_the_implementing_adapter() {
+    async fn timeline_earlier_discovery_declares_only_the_implementing_adapters() {
         let state = crate::test_state("admin", Vec::new());
         let discovery = build_discovery(&state, false, true).await;
         assert!(discovery["capabilities"]
@@ -616,7 +616,7 @@ mod tests {
         let agents = discovery["planes"]["agents"]["agents"].as_array().unwrap();
         for (id, supported) in [
             ("opencode", false),
-            ("deepseek", false),
+            ("deepseek", true),
             ("t3", false),
             ("codex", true),
         ] {

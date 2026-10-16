@@ -602,8 +602,15 @@ by `(message_id, ordinal)`.
 Gate remote history pulls on **both** global capability
 `agent_timeline_earlier_v1` and the owning provider's
 `planes.agents.agents[].features.timelineEarlier === true`. Never infer support
-from a Gateway version or agent name. Currently only Codex implements it; other
-adapters return `501 feature_unsupported`, not successful exhaustion.
+from a Gateway version or agent name. Codex and DeepSeek implement it; OpenCode
+and T3 return `501 feature_unsupported`, not successful exhaustion.
+
+DeepSeek pages `session/page` backwards under the frozen `asOfSeq` cut the
+snapshot was read under: opening reads the newest hundred messages within a
+2 MiB budget, each earlier batch the pages below the oldest row delivered
+within 8 MiB, and a page that would exceed the budget waits for the next
+pull. A history is never refused for its size. A tool result cut from its
+call by a page boundary is joined onto the call when that older page arrives.
 
 No request body or client cursor. Load the selected session snapshot first, then
 request one earlier batch at a time. The existing content envelope carries

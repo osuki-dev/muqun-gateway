@@ -1,9 +1,12 @@
 use serde_json::Value;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
-use super::client::DeepseekClient;
+use super::client::{
+    DeepseekClient, HistoryWalk, INITIAL_HISTORY_RETAINED_BYTES, MAX_HISTORY_RETAINED_BYTES,
+};
 use super::endpoint::DeepseekEndpoint;
-use super::mapper;
+use super::mapper::{self, ToolResult};
 use super::stream::DeepseekInteractions;
 use crate::agents::domain::{
     AgentCatalog, AgentProject, AgentSessionId, AgentSessionInfo, AgentSessionStatus, FormRequest,
@@ -13,19 +16,117 @@ use crate::agents::ports::agent::{
     AgentError, AgentFuture, AgentPort, AttachmentMode, FileDiffItem,
 };
 
+/// The most `load_earlier_timeline` maps in one batch, as the route documents.
+const MAX_EARLIER_ITEMS: usize = 2000;
+/// How many sessions keep a history cursor; the oldest is forgotten past it.
+const MAX_HISTORY_CURSORS: usize = 256;
+
+/// Where a session's history reads stopped: `load_earlier_timeline` reads
+/// the page just below `before_seq`, under the same frozen `through_seq`
+/// the snapshot was read under (`DeepseekClient::read_history`).
+#[derive(Clone, Debug)]
+struct HistoryCursor {
+    through_seq: i64,
+    /// The oldest seq delivered so far; the next walk's exclusive bound.
+    before_seq: i64,
+    has_more: bool,
+    /// `tool/result` records whose calls lie below `before_seq`
+    /// (`mapper::map_timeline_records_carrying`).
+    carried: Vec<(ToolResult, u64)>,
+}
+
+#[derive(Default)]
+struct HistoryCursors {
+    by_session: HashMap<String, HistoryCursor>,
+    order: VecDeque<String>,
+}
+
+impl HistoryCursors {
+    fn get(&self, session_id: &str) -> Option<HistoryCursor> {
+        self.by_session.get(session_id).cloned()
+    }
+
+    /// Keep `cursor` for `session_id`. A snapshot read that stops above a
+    /// cursor already held (the end-of-run refetch of the newest twenty
+    /// messages, a refresh after earlier pages were loaded) does not move
+    /// that cursor back up: the mirror holds the rows between, and
+    /// `load_earlier_timeline` continues below what was delivered.
+    fn keep(&mut self, session_id: &str, cursor: HistoryCursor, deeper_only: bool) {
+        if deeper_only
+            && self
+                .by_session
+                .get(session_id)
+                .is_some_and(|held| held.before_seq <= cursor.before_seq)
+        {
+            return;
+        }
+        if !self.by_session.contains_key(session_id) {
+            self.order.push_back(session_id.to_owned());
+            while self.order.len() > MAX_HISTORY_CURSORS {
+                if let Some(oldest) = self.order.pop_front() {
+                    self.by_session.remove(&oldest);
+                }
+            }
+        }
+        self.by_session.insert(session_id.to_owned(), cursor);
+    }
+}
+
 pub struct DeepseekDriver {
     pub client: Arc<DeepseekClient>,
+    /// Serializes history walks, so concurrent `load_earlier_timeline`
+    /// calls consume successive disjoint pages.
+    history: tokio::sync::Mutex<()>,
+    cursors: std::sync::Mutex<HistoryCursors>,
 }
 
 impl DeepseekDriver {
     pub fn new(endpoint: DeepseekEndpoint) -> Self {
         Self {
             client: Arc::new(DeepseekClient::new(endpoint)),
+            history: tokio::sync::Mutex::new(()),
+            cursors: std::sync::Mutex::new(HistoryCursors::default()),
         }
     }
 
     pub fn client(&self) -> &DeepseekClient {
         &self.client
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_client(client: DeepseekClient) -> Self {
+        Self {
+            client: Arc::new(client),
+            history: tokio::sync::Mutex::new(()),
+            cursors: std::sync::Mutex::new(HistoryCursors::default()),
+        }
+    }
+
+    /// Map `walk` for `session_id` and remember where it stopped.
+    fn keep_history(
+        &self,
+        session_id: &str,
+        walk: &HistoryWalk,
+        mut carried: Vec<(ToolResult, u64)>,
+        deeper_only: bool,
+    ) -> Vec<TimelineItem> {
+        let items = mapper::map_timeline_records_carrying(&walk.page, &mut carried);
+        let mut cursors = self
+            .cursors
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let before_seq = walk.earliest_seq.unwrap_or(walk.through_seq + 1);
+        cursors.keep(
+            session_id,
+            HistoryCursor {
+                through_seq: walk.through_seq,
+                before_seq,
+                has_more: walk.has_more,
+                carried,
+            },
+            deeper_only,
+        );
+        items
     }
 }
 
@@ -419,8 +520,53 @@ impl AgentPort for DeepseekDriver {
         limit: usize,
     ) -> AgentFuture<'a, Vec<TimelineItem>> {
         Box::pin(async move {
-            let res = self.client.get_page(session_id, limit).await?;
-            Ok(mapper::map_timeline_records(&res))
+            let _history_read = self.history.lock().await;
+            let walk = self
+                .client
+                .read_history(session_id, None, limit, INITIAL_HISTORY_RETAINED_BYTES)
+                .await?;
+            Ok(self.keep_history(session_id, &walk, Vec::new(), true))
+        })
+    }
+
+    /// The page below the oldest row delivered for this session, under the
+    /// frozen cut the snapshot was read under. Empty once the walk reached
+    /// seq 0, or before any snapshot was read.
+    fn load_earlier_timeline<'a>(
+        &'a self,
+        session_id: &'a str,
+        limit: usize,
+    ) -> AgentFuture<'a, Vec<TimelineItem>> {
+        Box::pin(async move {
+            if limit == 0 || limit > MAX_EARLIER_ITEMS {
+                return Err(AgentError::InvalidRequest(
+                    "DeepSeek history limit exceeds 2000 mapped rows".into(),
+                ));
+            }
+            let _history_read = self.history.lock().await;
+            let Some(cursor) = self
+                .cursors
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(session_id)
+            else {
+                return Ok(Vec::new());
+            };
+            if !cursor.has_more {
+                return Ok(Vec::new());
+            }
+            let walk = self
+                .client
+                .read_history(
+                    session_id,
+                    Some((cursor.through_seq, cursor.before_seq)),
+                    limit,
+                    MAX_HISTORY_RETAINED_BYTES,
+                )
+                .await?;
+            // A failed read above left the cursor where it was: the page is
+            // consumed only once it is delivered.
+            Ok(self.keep_history(session_id, &walk, cursor.carried, false))
         })
     }
 
@@ -736,6 +882,101 @@ mod tests {
         assert_eq!(known.directory.as_deref(), Some("/qa"));
         assert_eq!(known.title, "Known session");
         assert_eq!(projection_calls.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+
+    /// Opening reads the newest pages within the opening budget and never
+    /// fails for the size of the history; `load_earlier_timeline` then
+    /// delivers the pages below, one batch at a time under the same frozen
+    /// cut, completing calls whose results sat above a page cut, until seq
+    /// 0, after which it is empty. The end-of-run refetch of the newest
+    /// messages does not move the cursor back up.
+    #[tokio::test]
+    async fn history_opens_within_budget_and_pages_earlier_to_the_start() {
+        use crate::agents::adapters::deepseek::client::tests::{paged_history, rpc_server};
+        use crate::agents::domain::{AgentPart, ToolCallStatus};
+        // Pages of 90 records at 7,000 bytes each are about 630 KiB: under
+        // the 1 MiB response cap, and the opening budget of 2 MiB holds
+        // three of them but not the 60-record fourth.
+        let (app, calls) = paged_history(7_000);
+        let (client, server) = rpc_server(app).await;
+        let driver = DeepseekDriver {
+            client: Arc::new(client),
+            history: tokio::sync::Mutex::new(()),
+            cursors: std::sync::Mutex::new(HistoryCursors::default()),
+        };
+        let seq_of = |item: &TimelineItem| item.seq;
+        // A limit the message count never reaches: the bytes end the walk.
+        let tail = driver.get_timeline("s", 500).await.unwrap();
+        assert_eq!(seq_of(&tail[0]), 90);
+        // Seq 359 is a tool result, joined onto the call at 358: no row of its own.
+        assert_eq!(seq_of(tail.last().unwrap()), 358);
+        // The opening walk asked for the fourth page and left it for later.
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![
+                (359, 360, 50),
+                (359, 270, 50),
+                (359, 180, 50),
+                (359, 90, 50)
+            ]
+        );
+        let mut all = tail.clone();
+
+        // Before anything else, the refetch of a finished run: the newest
+        // twenty messages again, and the cursor stays where the walk got to.
+        let refetched = driver.get_timeline("s", 20).await.unwrap();
+        assert!(refetched.len() < tail.len());
+        assert_eq!(
+            driver.cursors.lock().unwrap().get("s").unwrap().before_seq,
+            90
+        );
+
+        let earlier = driver.load_earlier_timeline("s", 80).await.unwrap();
+        assert_eq!(seq_of(&earlier[0]), 0);
+        assert_eq!(seq_of(earlier.last().unwrap()), 88);
+        // Seq 89 is the result of the call at seq 88, cut from it by the
+        // page boundary at 90: the row at 88 is complete all the same.
+        let call_at_88 = earlier
+            .iter()
+            .find(|item| item.seq == 88)
+            .expect("the call row");
+        let AgentPart::Tool(ref call) = call_at_88.part else {
+            panic!("a tool row");
+        };
+        assert_eq!(call.status, ToolCallStatus::Completed);
+        let mut rest = earlier;
+        rest.append(&mut all);
+        all = rest;
+        let seqs: Vec<u64> = all.iter().map(seq_of).collect();
+        let mut sorted = seqs.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(seqs, sorted, "oldest first, no row twice");
+        assert_eq!(seqs.first(), Some(&0));
+
+        assert!(driver
+            .load_earlier_timeline("s", 80)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(driver
+            .load_earlier_timeline("s", 80)
+            .await
+            .unwrap()
+            .is_empty());
+        // The earlier batch read one page; the exhausted calls read nothing.
+        assert_eq!(calls.lock().unwrap().len(), 6);
+        // A session never opened has nothing to page; a bad limit is refused.
+        assert!(driver
+            .load_earlier_timeline("never", 80)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(matches!(
+            driver.load_earlier_timeline("s", 0).await,
+            Err(AgentError::InvalidRequest(_))
+        ));
         server.abort();
     }
 

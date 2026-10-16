@@ -3747,6 +3747,90 @@ mod tests {
         assert_eq!(&snapshot.timeline[81..], &held_tail);
     }
 
+    /// The DeepSeek owner pages like the Codex one: each pull is one older
+    /// batch under the frozen cut, retained in the snapshot, and `exhausted`
+    /// only once the adapter has nothing below.
+    #[tokio::test]
+    async fn timeline_earlier_route_uses_deepseek_owner_and_retains_rows_in_snapshot() {
+        use crate::agents::adapters::deepseek::{
+            client::tests::{paged_history, rpc_server},
+            DeepseekDriver,
+        };
+        use crate::agents::ports::agent::AgentPort;
+        use std::sync::Arc;
+        let (app, _calls) = paged_history(0);
+        let (client, server) = rpc_server(app).await;
+        let driver = Arc::new(DeepseekDriver::with_client(client));
+        let tail = driver.get_timeline("s", 30).await.unwrap();
+        assert_eq!(tail[0].seq, 270, "thirty messages: the newest page");
+        let state = state_with(vec![FakeAgent::new("opencode")]).await;
+        let manager = Arc::new(crate::agents::manager::AgentManager::for_test(driver));
+        manager
+            .mirror()
+            .update_session(
+                crate::agents::adapters::deepseek::mapper::map_session(&json!({
+                    "sessionId": "s", "cwd": "/qa", "title": "paged"
+                }))
+                .unwrap(),
+            )
+            .await;
+        manager
+            .mirror()
+            .upsert_timeline_items(&AgentSessionId("s".into()), tail.clone())
+            .await;
+        state.agent_runtime.attach_for_test(manager.clone()).await;
+        // The fixture serves no session list, so the route is recorded by hand.
+        state
+            .agent_runtime
+            .record_session_route("s", "deepseek")
+            .await;
+        let mut lowest = 270;
+        let mut batches = 0;
+        let mut ids: Vec<String> = tail.iter().map(|item| item.id.clone()).collect();
+        loop {
+            let Json(batch) = do_load_earlier_timeline(&state, "s", &device_headers())
+                .await
+                .unwrap();
+            let items = batch["data"]["items"].as_array().unwrap();
+            if batch["data"]["exhausted"] == true {
+                assert!(items.is_empty());
+                break;
+            }
+            batches += 1;
+            assert!(!items.is_empty(), "a page under the cut is never empty");
+            // Contiguous below the rows held: the record at the cut may be a
+            // tool result, joined onto the call just before it, so the last
+            // row sits at most two seqs under the cut.
+            let last = items.last().unwrap()["seq"].as_u64().unwrap();
+            assert!(last < lowest && lowest - last <= 2, "{last} under {lowest}");
+            lowest = items[0]["seq"].as_u64().unwrap();
+            let mut older: Vec<String> = items
+                .iter()
+                .map(|item| item["id"].as_str().unwrap().to_owned())
+                .collect();
+            older.append(&mut ids);
+            ids = older;
+        }
+        assert_eq!(lowest, 0);
+        assert!(batches >= 2, "{batches} batches: the walk was paged");
+        // Every batch is retained in the snapshot, oldest first, before the
+        // tail it was read under (the mirror numbers the rows itself).
+        let snapshot = manager
+            .mirror()
+            .get_snapshot(&AgentSessionId("s".into()))
+            .await
+            .unwrap();
+        assert_eq!(
+            snapshot
+                .timeline
+                .iter()
+                .map(|item| item.id.clone())
+                .collect::<Vec<_>>(),
+            ids
+        );
+        server.abort();
+    }
+
     #[tokio::test]
     async fn fork_route_authenticates_selects_exact_provider_and_registers_new_session() {
         let codex = FakeAgent::new("codex").with_sessions(&[("source", 1)]);

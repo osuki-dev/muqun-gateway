@@ -2,6 +2,17 @@
 
 ## Changes and fixes
 
+- **A long DeepSeek session opens again, and pages back.** Opening a DeepSeek
+  session walked its whole history fifty messages at a time and refused the
+  session (`upstream history too large`) once the records passed 1 MiB, so a
+  session with a large tool output could not be opened at all. The walk now
+  keeps what fits its budget (2 MiB on open) and stops there, and DeepSeek
+  implements `POST /api/agent-sessions/{asid}/timeline/earlier`
+  (`features.timelineEarlier: true`): each pull delivers the pages below the
+  oldest row shown, under the same frozen cut, within 8 MiB, until the start
+  of the session. A tool result separated from its call by a page boundary is
+  joined onto the call when that page arrives.
+
 - **A linking gateway can no longer say whose login it is.**
   `POST /api/pair/request` with `kind: gateway` accepted a `server_id` and
   kept it on the login record, which is what `DELETE /api/peers/{id}` revokes

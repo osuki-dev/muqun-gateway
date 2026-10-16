@@ -1845,7 +1845,7 @@ fn deepseek_features(
             ("sessionDelete".into(), serde_json::json!(false)),
             ("sessionFork".into(), serde_json::json!(true)),
             ("sessionPagination".into(), serde_json::Value::Bool(false)),
-            ("timelineEarlier".into(), serde_json::json!(false)),
+            ("timelineEarlier".into(), serde_json::json!(true)),
         ]),
     }
 }

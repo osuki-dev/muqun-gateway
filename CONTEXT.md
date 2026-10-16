@@ -341,7 +341,14 @@ pages. The current App's fifty-session request does not become full pagination.
 See [Agent API](docs/agent-api.md#get-apiagent-sessionspage) for the contract.
 
 DeepSeek's **rc.2** mapping reads `session/projections.asOfSeq` as the
-authoritative history cut and retains it across backward pages. File references
+authoritative history cut and retains it across backward pages
+(`DeepseekClient::read_history`): the opening read keeps the newest pages
+within `INITIAL_HISTORY_RETAINED_BYTES` (2 MiB) and says `hasMore` rather
+than failing for the size of a history, and the driver keeps a per-session
+cursor (`through_seq`, the oldest seq delivered, carried tool results) that
+`load_earlier_timeline` continues from, one batch within
+`MAX_HISTORY_RETAINED_BYTES` (8 MiB) at a time, until seq 0. The
+end-of-run refetch of the newest messages never moves that cursor back up. File references
 use `fileReferences/list` with the live session as `agentId`; workspace file
 list/stat use `workspaceFileScopeId`, not a directory substituted for session
 scope. Model switching reads the returned `selected` model; readiness requires
