@@ -459,19 +459,20 @@ fn decode_pairing_body<T: serde::de::DeserializeOwned>(
             "invalid encrypted request",
         )
     })?;
-    let plaintext = transport::open(
+    let plaintext = transport::open_checked(
         &pairing_transport_material()?,
         direction,
         aad,
         &envelope,
         now_unix_ms(),
     )
-    .map_err(|_| {
-        api_error(
+    .map_err(|error| match error {
+        transport::OpenError::Expired => crate::clock_skew(now_unix_ms()),
+        transport::OpenError::Invalid => api_error(
             StatusCode::FORBIDDEN,
             "invalid_envelope",
             "invalid encrypted request",
-        )
+        ),
     })?;
     let nonce = envelope.nonce;
     serde_json::from_slice(&plaintext)

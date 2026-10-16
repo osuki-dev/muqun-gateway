@@ -226,6 +226,21 @@ pub(crate) fn device_repair_required() -> (StatusCode, Json<Value>) {
     )
 }
 
+/// The refusal of an envelope that authenticated but whose timestamp is
+/// outside the allowed skew of this computer's clock: `clock_skew`, with
+/// this computer's time beside it so the app can say by how much the
+/// phone's clock is off. Nothing else is revealed; a device whose envelope
+/// did not open reads `invalid_envelope` as before.
+pub(crate) fn clock_skew(server_time_ms: u128) -> (StatusCode, Json<Value>) {
+    let (status, Json(mut body)) = api_error(
+        StatusCode::FORBIDDEN,
+        "clock_skew",
+        "this device's clock and the gateway's disagree by more than five minutes",
+    );
+    body["error"]["server_time_ms"] = json!(server_time_ms);
+    (status, Json(body))
+}
+
 /// Whether a device authorised earlier is still authorised now.
 ///
 /// For a long-lived connection, which is authorised once and then outlives the

@@ -32,9 +32,9 @@ use crate::terminal::routes::{
     spawn_agent_notification_watchers, spawn_agent_permission_watchers, spawn_approval_watchers,
 };
 use crate::{
-    agent_events, agents, api_error, backend_startup, connectivity, device_repair_required,
-    gateway_listener, hash_token, i18n, load_config, lock_devices, now_unix_ms,
-    require_device_or_peer, scrollback, state_dir, state_lock, transport,
+    agent_events, agents, api_error, backend_startup, clock_skew, connectivity,
+    device_repair_required, gateway_listener, hash_token, i18n, load_config, lock_devices,
+    now_unix_ms, require_device_or_peer, scrollback, state_dir, state_lock, transport,
     unreachable_listen_warning, warn_about_missing_backend_programs, ApiResult, AppState, Config,
     APPROVAL_EVENT_CAPACITY, MAX_REQUEST_BODY_BYTES,
 };
@@ -626,19 +626,20 @@ pub(crate) async fn decrypt_transport_request(
             "invalid encrypted request",
         )
     })?;
-    let plaintext = transport::open(
+    let plaintext = transport::open_checked(
         &material,
         transport::Direction::Request,
         aad.as_bytes(),
         &envelope,
         now_unix_ms(),
     )
-    .map_err(|_| {
-        api_error(
+    .map_err(|error| match error {
+        transport::OpenError::Expired => clock_skew(now_unix_ms()),
+        transport::OpenError::Invalid => api_error(
             StatusCode::FORBIDDEN,
             "invalid_envelope",
             "invalid encrypted request",
-        )
+        ),
     })?;
     let payload: EncryptedRequestPayload = serde_json::from_slice(&plaintext).map_err(|_| {
         api_error(
@@ -759,11 +760,23 @@ where
     })?;
     match accepted {
         Acceptance::Accepted => Ok(()),
-        Acceptance::InvalidMetadata => Err(api_error(
-            StatusCode::FORBIDDEN,
-            "invalid_envelope",
-            "invalid encrypted request",
-        )),
+        // Freshness is judged again on the store thread (the request may
+        // have waited in its queue past the window); the envelope
+        // authenticated above, so a stale one is told the same as at open.
+        Acceptance::InvalidMetadata => {
+            let now = now_unix_ms();
+            Err(
+                if transport::timestamp_is_fresh(envelope.timestamp_ms, now) {
+                    api_error(
+                        StatusCode::FORBIDDEN,
+                        "invalid_envelope",
+                        "invalid encrypted request",
+                    )
+                } else {
+                    clock_skew(now)
+                },
+            )
+        }
         Acceptance::Replayed => Err(api_error(
             StatusCode::CONFLICT,
             "replayed_request",
@@ -2105,7 +2118,9 @@ mod transport_v2_tests {
         )
         .is_ok());
         // Authentication at the inclusive boundary does not authorize later
-        // admission. Its refusal must not be reported as an infrastructure error.
+        // admission. Its refusal must not be reported as an infrastructure
+        // error: the envelope authenticated and is stale by now, so it is
+        // the clock-skew refusal, a 403 carrying this computer's time.
         for (envelope, now) in [
             (envelope, boundary + 1),
             (
@@ -2136,7 +2151,8 @@ mod transport_v2_tests {
             let body: serde_json::Value =
                 serde_json::from_slice(&to_bytes(response.into_body(), 8192).await.unwrap())
                     .unwrap();
-            assert_eq!(body["error"]["code"], "invalid_envelope");
+            assert_eq!(body["error"]["code"], "clock_skew");
+            assert!(body["error"]["server_time_ms"].is_u64(), "{body}");
         }
         let rows: (i64, i64, i64) = state
             .db

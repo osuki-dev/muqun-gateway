@@ -2,6 +2,11 @@
 
 ## Changes and fixes
 
+- A phone whose clock is off by more than five minutes now reads
+  `403 clock_skew` with `error.server_time_ms` instead of the generic
+  `invalid_envelope`, so the app can say by how much. Only an envelope that
+  authenticated is told so.
+
 - The earlier-history route answers `409 history_cursor_lost` when the
   gateway holds no cursor for the session (a restart, an eviction, a history
   that changed), where it used to answer an empty batch that read as the end

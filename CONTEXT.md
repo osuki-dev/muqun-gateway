@@ -524,6 +524,13 @@ path/query, with the initiating request nonce appended for replies. Responses
 use the authenticated request revision. SSE/WebSocket record keys and counters
 remain unchanged; their opening request uses the negotiated envelope.
 
+An envelope that authenticates but whose timestamp is outside the five-minute
+window is refused as `403 clock_skew` with `error.server_time_ms`, on the
+request path, at replay admission and on a QR pairing claim; an envelope that
+does not open stays `invalid_envelope`, so the distinction reaches only the
+key's holder (`transport::open_checked` authenticates before it judges
+freshness).
+
 Clients verify an authenticated, nonce-bound v2 read before durably pinning v2
 and sending an application operation. A plain `transport_version_required`
 refusal may suggest a v2 read but cannot establish a trusted pin. Lost replies
