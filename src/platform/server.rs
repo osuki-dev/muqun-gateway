@@ -141,6 +141,7 @@ pub(crate) async fn run(config_path: Option<String>) -> anyhow::Result<()> {
         crate::platform::config::StoreEncryption::Off => err,
     })?;
     agent_runtime.restore_native_codex_sessions(db.clone());
+    agent_runtime.persist_session_routes(db.clone()).await;
     let task_events = tokio::sync::broadcast::channel(crate::tasks::events::TASK_EVENT_CAPACITY).0;
     let presence = Arc::new(crate::fleet::peers::PeerPresence::default());
     let tasks = Arc::new(crate::tasks::service::TaskService::new(

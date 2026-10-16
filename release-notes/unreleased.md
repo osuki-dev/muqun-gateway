@@ -2,6 +2,13 @@
 
 ## Changes and fixes
 
+- Session-to-agent routes survive a restart (store namespace
+  `agent_session_routes`): the first open of each session after a restart no
+  longer probes every attached agent in turn, which took up to twelve
+  seconds with four. The store gains a migration, so a binary from before it
+  refuses the migrated database until the backup is restored, as with every
+  store migration.
+
 - Twelve pairing requests per ten minutes (was six), so an owner pairing
   several devices again after turning encryption on is not stopped by
   "too many pairing requests". The eight wrong-code lockout per code is

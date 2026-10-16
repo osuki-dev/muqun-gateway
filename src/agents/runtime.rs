@@ -73,6 +73,22 @@ fn pick_primary<T>(map: &BTreeMap<String, T>) -> Option<&T> {
     AGENT_PREFERENCE.iter().find_map(|id| map.get(*id))
 }
 
+/// The session-to-agent routes, kept across restarts: without them the
+/// first open of each session after a restart probed every attached agent
+/// in turn (up to twelve seconds with four). A route is a hint of which
+/// adapter to ask, never an authorisation: the adapter asked still answers
+/// `SessionNotFound` for a session it does not own, and the caller's device
+/// token is checked by the route as before.
+pub(crate) const SESSION_ROUTES_MIGRATION: crate::platform::store::sqlite::Migration =
+    crate::platform::store::sqlite::Migration {
+        namespace: "agent_session_routes",
+        steps: &["CREATE TABLE agent_session_routes (
+            asid TEXT PRIMARY KEY,
+            agent_id TEXT NOT NULL,
+            updated_ms INTEGER NOT NULL
+        );"],
+    };
+
 /// Remembered session routes, bounded: insertion order is kept so the oldest
 /// can be dropped.
 #[derive(Default)]
@@ -252,6 +268,8 @@ pub struct AgentRuntime {
     manager: RwLock<Option<Arc<AgentManager>>>,
     managers: RwLock<BTreeMap<String, Arc<AgentManager>>>,
     session_routes: RwLock<SessionRoutes>,
+    /// Where the routes are kept across restarts, once the store is open.
+    route_store: std::sync::OnceLock<Arc<crate::platform::store::sqlite::SqliteStore>>,
     /// The last agent discovery and when it was taken.
     discovery_cache: RwLock<Option<(tokio::time::Instant, crate::discovery::AgentPlaneDiscovery)>>,
     /// One refresh at a time; the rest wait and read its result.
@@ -410,7 +428,68 @@ impl AgentRuntime {
             mcp: std::sync::OnceLock::new(),
             terminal_runtime: std::sync::OnceLock::new(),
             native_codex_sessions: std::sync::OnceLock::new(),
+            route_store: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Keep the session routes in `db` from now on, and start from the ones
+    /// a previous run left there (the newest [`MAX_SESSION_ROUTES`]).
+    pub(crate) async fn persist_session_routes(
+        &self,
+        db: Arc<crate::platform::store::sqlite::SqliteStore>,
+    ) {
+        let loaded = db
+            .call(|db| {
+                let mut rows = db.prepare(
+                    "SELECT asid, agent_id FROM agent_session_routes ORDER BY updated_ms DESC LIMIT ?1",
+                )?;
+                let routes: Vec<(String, String)> = rows
+                    .query_map([MAX_SESSION_ROUTES as i64], |row| Ok((row.get(0)?, row.get(1)?)))?
+                    .collect::<Result<_, _>>()?;
+                Ok(routes)
+            })
+            .await;
+        match loaded {
+            Ok(routes) => {
+                let mut held = self.session_routes.write().await;
+                // Oldest first, so the newest are the last to be dropped.
+                for (asid, agent_id) in routes.into_iter().rev() {
+                    held.insert(&asid, &agent_id);
+                }
+            }
+            Err(error) => tracing::warn!("session routes could not be loaded: {error:#}"),
+        }
+        let _ = self.route_store.set(db);
+    }
+
+    async fn store_route(&self, asid: &str, agent_id: Option<&str>) {
+        let Some(db) = self.route_store.get() else {
+            return;
+        };
+        let (asid, agent_id) = (asid.to_owned(), agent_id.map(str::to_owned));
+        let written = db
+            .call(move |db| {
+                match agent_id {
+                    Some(agent_id) => {
+                        db.execute(
+                            "INSERT OR REPLACE INTO agent_session_routes(asid, agent_id, updated_ms) VALUES(?1, ?2, ?3)",
+                            rusqlite::params![asid, agent_id, crate::tasks::domain::now_ms() as i64],
+                        )?;
+                        db.execute(
+                            "DELETE FROM agent_session_routes WHERE asid NOT IN (SELECT asid FROM agent_session_routes ORDER BY updated_ms DESC LIMIT ?1)",
+                            [MAX_SESSION_ROUTES as i64],
+                        )?;
+                    }
+                    None => {
+                        db.execute("DELETE FROM agent_session_routes WHERE asid=?1", [asid])?;
+                    }
+                }
+                Ok(())
+            })
+            .await;
+        if let Err(error) = written {
+            tracing::debug!("session route not kept: {error:#}");
+        }
     }
 
     pub(crate) fn observe_terminal_sessions(&self, sessions: &[crate::SessionConfig]) {
@@ -566,19 +645,35 @@ impl AgentRuntime {
 
     /// Record routing for a session id to its owning agent.
     pub async fn record_session_route(&self, asid: &str, agent_id: &str) {
-        self.session_routes.write().await.insert(asid, agent_id);
+        let changed = {
+            let mut routes = self.session_routes.write().await;
+            let changed = routes.map.get(asid).is_none_or(|owner| owner != agent_id);
+            routes.insert(asid, agent_id);
+            changed
+        };
+        if changed {
+            self.store_route(asid, Some(agent_id)).await;
+        }
     }
 
     /// Drop the route of a session that no longer exists.
     pub async fn forget_session_route(&self, asid: &str) {
         self.session_routes.write().await.remove(asid);
+        self.store_route(asid, None).await;
     }
 
     /// Forget a deleted session without clearing another agent's same-id route.
     pub(crate) async fn forget_session_route_for_agent(&self, asid: &str, agent_id: &str) {
-        let mut routes = self.session_routes.write().await;
-        if routes.map.get(asid).is_some_and(|owner| owner == agent_id) {
-            routes.remove(asid);
+        let removed = {
+            let mut routes = self.session_routes.write().await;
+            let owned = routes.map.get(asid).is_some_and(|owner| owner == agent_id);
+            if owned {
+                routes.remove(asid);
+            }
+            owned
+        };
+        if removed {
+            self.store_route(asid, None).await;
         }
     }
 

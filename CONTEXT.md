@@ -37,6 +37,10 @@ The retired `herdr.gateway` identifier remains only for migration compatibility.
     service agents default on for Codex and OpenCode, with the master
     `agent_runtime.enabled` switch independent of terminal-agent dispatch.
   - `routes.rs`: the OpenCode-style agent-session API (global and legacy paths).
+    The session-to-agent routes `manager_for_session` records (which adapter
+    to ask for a session) are kept in the shared store's
+    `agent_session_routes` namespace across restarts, the newest 4,096; a
+    route is a hint of whom to ask, never an authorisation.
   - `session_routes.rs`: terminal-multiplexer agent orchestration -- task
     dispatch, agent spawn, prompt delivery, approvals, and agent event history.
   - `tasks.rs`, `agent_events.rs`, `approvals.rs`: task step logs, the agent
