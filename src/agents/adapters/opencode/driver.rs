@@ -748,7 +748,8 @@ impl AgentPort for OpencodeDriver {
             // other. In sequence they were eight round trips the app waited
             // through before it could open a picker; together they cost the
             // slowest of them. Three of them settle (see `settled_list`), and
-            // settling concurrently is the same waiting either way.
+            // settling concurrently is the same waiting either way; skills
+            // and commands do not (see below).
             let (
                 raw_models,
                 raw_agents,
@@ -768,9 +769,13 @@ impl AgentPort for OpencodeDriver {
                         .inspect_err(|e| log("mcp", e))
                         .unwrap_or_default()
                 },
-                self.settled_list("skill", directory, |d| self.client.skills_or_empty(d)),
+                // Skills and commands are legitimately empty for most
+                // directories: waiting for them to "settle" cost a second and
+                // a half per empty surface. They are read once; models,
+                // agents and providers, which are never truly empty, settle.
+                self.client.skills_or_empty(directory),
                 self.settled_list("provider", directory, |d| self.client.providers_or_empty(d)),
-                self.settled_list("command", directory, |d| self.client.commands_or_empty(d)),
+                self.client.commands_or_empty(directory),
                 async {
                     self.client
                         .get_default_model(directory)
