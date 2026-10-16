@@ -409,7 +409,12 @@ const LARGE_BODY_PERMITS: usize = 8;
 
 static HUGE_BODIES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(HUGE_BODY_PERMITS);
 static LARGE_BODIES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(LARGE_BODY_PERMITS);
-/// The devices with a large body in flight: one each, on top of the pool.
+/// The devices with a large body in flight, one each on top of the pool,
+/// keyed by device id *and* the connection's peer address: the id is a
+/// clear header anyone on the path can copy, and keyed on it alone a
+/// stranger's connection could hold the real device's slot. A stranger at
+/// another address takes only a pool permit, which the read timeout gives
+/// back when its body stalls.
 static DEVICES_WITH_LARGE_BODIES: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashSet<String>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
@@ -430,26 +435,39 @@ pub(crate) struct LargeBodyPermit {
 
 struct LargeBodyPlace {
     _permit: tokio::sync::SemaphorePermit<'static>,
-    device_id: String,
+    /// `(device id, peer address)` as [`slot_key`] spells it.
+    slot: String,
 }
 
 impl Drop for LargeBodyPlace {
     fn drop(&mut self) {
         if let Ok(mut devices) = DEVICES_WITH_LARGE_BODIES.lock() {
-            devices.remove(&self.device_id);
+            devices.remove(&self.slot);
         }
     }
 }
 
+/// The per-device slot of a connection: the device id with the peer address
+/// the request came in on (`ConnectInfo`; the test harness has none).
+fn slot_key(device_id: &str, peer: Option<&SocketAddr>) -> String {
+    match peer {
+        Some(peer) => format!("{device_id}@{peer}"),
+        None => device_id.to_owned(),
+    }
+}
+
 /// A permit for a body of up to `plaintext_limit` bytes on this route from
-/// `device_id`, or `None` when the route takes only the ordinary limit.
-/// Taken only for an identified device -- a paired record that holds a
-/// transport key on the sealed path, a caller `require_device_or_peer` let
-/// through on the cleartext one -- so no unidentified connection ever holds
-/// a place. `Err`: the pool is spent, or this device already has one.
+/// `device_id` on the connection from `peer`, or `None` when the route
+/// takes only the ordinary limit. Taken only for an identified device -- a
+/// paired record that holds a transport key on the sealed path, a caller
+/// `require_device_or_peer` let through on the cleartext one -- so no
+/// unidentified connection ever holds a place. The shared pool is taken
+/// first, then the connection's own slot. `Err`: the pool is spent, or
+/// this device already has a body in flight from this address.
 pub(crate) fn large_body_permit(
     plaintext_limit: usize,
     device_id: &str,
+    peer: Option<&SocketAddr>,
 ) -> Result<Option<LargeBodyPermit>, (StatusCode, Json<serde_json::Value>)> {
     if plaintext_limit <= MAX_REQUEST_BODY_BYTES {
         return Ok(None);
@@ -466,28 +484,31 @@ pub(crate) fn large_body_permit(
     } else {
         &LARGE_BODIES
     };
+    let permit = gate.try_acquire().map_err(|_| busy())?;
+    let slot = slot_key(device_id, peer);
     {
         let mut devices = DEVICES_WITH_LARGE_BODIES
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if !devices.insert(device_id.to_owned()) {
+        if !devices.insert(slot.clone()) {
+            // The pool permit is dropped with `permit` here.
             return Err(busy());
         }
     }
-    match gate.try_acquire() {
-        Ok(permit) => Ok(Some(LargeBodyPermit {
-            _place: std::sync::Arc::new(LargeBodyPlace {
-                _permit: permit,
-                device_id: device_id.to_owned(),
-            }),
-        })),
-        Err(_) => {
-            if let Ok(mut devices) = DEVICES_WITH_LARGE_BODIES.lock() {
-                devices.remove(device_id);
-            }
-            Err(busy())
-        }
-    }
+    Ok(Some(LargeBodyPermit {
+        _place: std::sync::Arc::new(LargeBodyPlace {
+            _permit: permit,
+            slot,
+        }),
+    }))
+}
+
+/// The address a request's connection came in from, when the listener
+/// recorded it (`into_make_service_with_connect_info`).
+fn peer_of(extensions: &axum::http::Extensions) -> Option<SocketAddr> {
+    extensions
+        .get::<axum::extract::ConnectInfo<SocketAddr>>()
+        .map(|info| info.0)
 }
 
 /// `body` with `permit` bound to it: the place is given up when the body
@@ -579,7 +600,8 @@ pub(crate) async fn large_body_after_auth(
     {
         return next.run(request).await;
     }
-    let permit = match large_body_permit(plaintext_limit, &caller.device_id) {
+    let peer = peer_of(request.extensions());
+    let permit = match large_body_permit(plaintext_limit, &caller.device_id, peer.as_ref()) {
         Ok(permit) => permit,
         Err(refusal) => return refusal.into_response(),
     };
@@ -760,7 +782,11 @@ pub(crate) async fn decrypt_transport_request(
     // bounded in time as well as size so a stalled connection gives the
     // place back.
     let plaintext_limit = plaintext_body_limit(parts.uri.path());
-    let permit = large_body_permit(plaintext_limit, device_id)?;
+    let permit = large_body_permit(
+        plaintext_limit,
+        device_id,
+        peer_of(&parts.extensions).as_ref(),
+    )?;
     let body = gated_body(body, permit.clone());
     let read = to_bytes(body, sealed_body_ceiling(plaintext_limit));
     let body_bytes = match permit {
