@@ -27,7 +27,8 @@ model, not new protocols.
 {
   "schema_version": "1.4.0",
   "capabilities": { "parts": true, "assets": true, "image_upload": true,
-                    "composer": true, "message_image_assets": true },
+                    "composer": true, "message_image_assets": true,
+                    "session_descendants": true },
   "data": { }
 }
 ```

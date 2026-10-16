@@ -2,6 +2,14 @@
 
 ## Changes and fixes
 
+- **`GET /api/agent-sessions/{asid}/descendants`**: a session's whole subtree
+  in one answer, where the app walked `/children` once per descendant (fifty
+  requests to open one workbench). Same query, authorisation and error
+  semantics as `/children`; `data.data` holds the sessions, newest first, at
+  most 8 levels deep and 500 sessions, with `data.truncated: true` when a
+  bound cut the walk short. The envelope announces it as
+  `capabilities.session_descendants`.
+
 - **A long DeepSeek session opens again, and pages back.** Opening a DeepSeek
   session walked its whole history fifty messages at a time and refused the
   session (`upstream history too large`) once the records passed 1 MiB, so a

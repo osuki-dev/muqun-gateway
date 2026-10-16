@@ -28,6 +28,9 @@ pub(crate) fn content_envelope(data: Value) -> Value {
             // embeds by host path, resolved to asset URLs. See
             // `agents::message_images`.
             "message_image_assets": true,
+            // `GET /api/agent-sessions/{asid}/descendants` lists a session's
+            // whole subtree in one answer (`agents::routes`).
+            "session_descendants": true,
         },
         "data": data,
     })

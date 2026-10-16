@@ -543,7 +543,7 @@ is intentional, preserving the OpenCode page contract:
 ```json
 {
   "schema_version": "1.5.0",
-  "capabilities": { "parts": true, "assets": true, "image_upload": true, "composer": true, "message_image_assets": true },
+  "capabilities": { "parts": true, "assets": true, "image_upload": true, "composer": true, "message_image_assets": true, "session_descendants": true },
   "data": {
     "data": [{ "asid": "ses_1", "agent_id": "opencode", "title": "Example", "status": "idle", "updated_ms": 1 }],
     "cursor": { "next": "opaque-provider-cursor", "previous": null }
@@ -658,6 +658,35 @@ or contradictory anchors return an explicit error, never a fabricated partial en
 Same response as the list route, filtered to this session's children. Accepts
 the same `limit` / `order` / `search` / `cursor`. Every adapter honours the
 parent filter; DeepSeek and T3 have no sub-agent sessions, so they list none.
+
+### `GET /api/agent-sessions/{asid}/descendants`
+
+`/children` over every depth at once, for opening a workbench with one request
+instead of one per descendant. `capabilities.session_descendants: true` on the
+envelope says a gateway answers it. The same query as `/children` (`agent_id`,
+`limit`, `order`, `search`, `directory`; `cursor` is `400 invalid_query`, a
+cursor pages one listing and cannot page a tree), the same authorisation, and
+the same error semantics (an agent that fails is skipped while another
+answers, unless it was the one named). The answer nests the list, so the walk
+can say when it stopped short:
+
+```json
+{
+  "schema_version": "1.5.0",
+  "capabilities": { "...": true, "session_descendants": true },
+  "data": {
+    "data": [{ "asid": "ses_2", "agent_id": "opencode", "parent_id": "ses_1", "...": "..." }],
+    "truncated": true
+  }
+}
+```
+
+`data.data` is every session below `{asid}` (never `{asid}` itself), each
+shaped exactly as `/children` shapes a session, newest `updated_ms` first; a
+breadth-first walk over the adapters' children listings, at most **8 levels
+deep** and **500 sessions**. `truncated` is present, and `true`, only when one
+of those bounds cut the walk short: there are deeper or further sessions that
+were not asked for. Absent means the list is the whole subtree.
 
 ### `DELETE /api/agent-sessions/{asid}`
 

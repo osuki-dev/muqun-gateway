@@ -382,6 +382,10 @@ pub fn mount(router: Router<AppState>) -> Router<AppState> {
             get(list_agent_session_children),
         )
         .route(
+            "/api/agent-sessions/{asid}/descendants",
+            get(list_agent_session_descendants),
+        )
+        .route(
             "/api/agent-sessions/{asid}/rename",
             post(rename_agent_session),
         )
@@ -2255,6 +2259,111 @@ async fn list_agent_session_children(
     do_list_agent_sessions(&state, &session_query, query.agent_id.as_deref(), &headers).await
 }
 
+/// How deep `/descendants` walks below the session asked about.
+const MAX_DESCENDANT_DEPTH: usize = 8;
+/// The most sessions `/descendants` answers; past it the answer is `truncated`.
+const MAX_DESCENDANTS: usize = 500;
+
+/// `GET /api/agent-sessions/{asid}/descendants`: `/children` over every
+/// depth at once. The app used to walk `/children` once per descendant to
+/// open a workbench (fifty-odd requests for one tree); this is one.
+async fn list_agent_session_descendants(
+    State(state): State<AppState>,
+    Path(asid): Path<String>,
+    Query(query): Query<AgentSessionsQuery>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    do_list_agent_session_descendants(&state, &asid, &query, &headers).await
+}
+
+/// Breadth-first over the adapters' children listings, the same query
+/// per parent as `/children` takes (less the cursor, which pages one
+/// listing and cannot page a tree), at most [`MAX_DESCENDANT_DEPTH`] deep
+/// and [`MAX_DESCENDANTS`] sessions; `truncated: true` beside the list
+/// when either bound cut the walk short. Error semantics are `/children`'s:
+/// an agent that fails is skipped while another answers, unless it was the
+/// one named.
+async fn do_list_agent_session_descendants(
+    state: &AppState,
+    asid: &str,
+    query: &AgentSessionsQuery,
+    headers: &HeaderMap,
+) -> ApiResult<Response> {
+    require_device(state, headers)?;
+    if query.cursor.is_some() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_query",
+            "descendants take no cursor",
+        ));
+    }
+    let agent_id = query.agent_id.as_deref().filter(|id| !id.trim().is_empty());
+    let all_managers = managers_for_read(state, agent_id).await?;
+    let mut session_query = query.to_session_query();
+
+    let mut seen: std::collections::HashSet<String> = [asid.to_owned()].into_iter().collect();
+    let mut sessions = Vec::new();
+    let mut frontier = vec![asid.to_owned()];
+    let mut truncated = false;
+    let mut any_success = false;
+    let mut last_err = None;
+    'walk: for _ in 0..MAX_DESCENDANT_DEPTH {
+        if frontier.is_empty() {
+            break;
+        }
+        let mut next = Vec::new();
+        for parent in &frontier {
+            session_query.parent_id = Some(parent.clone());
+            for manager in &all_managers {
+                let list = match manager.sessions().list_sessions(&session_query).await {
+                    Ok(list) => list,
+                    Err(e) => {
+                        tracing::warn!(
+                            agent_id = manager.agent().kind(),
+                            error = %e,
+                            "agent children list failed; skipping this agent"
+                        );
+                        last_err = Some(e);
+                        continue;
+                    }
+                };
+                any_success = true;
+                for session in list {
+                    if !seen.insert(session.asid.0.clone()) {
+                        continue;
+                    }
+                    if sessions.len() >= MAX_DESCENDANTS {
+                        truncated = true;
+                        break 'walk;
+                    }
+                    state
+                        .agent_runtime
+                        .record_session_route(&session.asid.0, manager.agent().kind())
+                        .await;
+                    next.push(session.asid.0.clone());
+                    sessions.push(session);
+                }
+            }
+        }
+        frontier = next;
+    }
+    if !frontier.is_empty() {
+        // Depth exhausted with children still to ask about.
+        truncated = true;
+    }
+    if !any_success || (agent_id.is_some() && last_err.is_some()) {
+        if let Some(err) = last_err {
+            return Err(agent_error(err));
+        }
+    }
+    sessions.sort_by_key(|session| std::cmp::Reverse(session.updated_ms));
+    let mut data = json!({ "data": sessions });
+    if truncated {
+        data["truncated"] = Value::Bool(true);
+    }
+    Ok(json_etag_response(headers, content_envelope(data)))
+}
+
 async fn delete_agent_session_global(
     State(state): State<AppState>,
     Path(asid): Path<String>,
@@ -3638,6 +3747,224 @@ mod tests {
             state.agent_runtime.attach_for_test(agent.manager()).await;
         }
         state
+    }
+
+    /// One answer for the whole tree: every depth below the session, each
+    /// row shaped as `/children` shapes it, newest first, merged over the
+    /// attached agents unless one is named; nothing from another tree, and
+    /// the session itself is not its own descendant.
+    #[tokio::test]
+    async fn descendants_route_flattens_the_tree_under_one_session() {
+        let opencode = FakeAgent::new("opencode").with_session_tree(&[
+            ("root", None, 1),
+            ("a", Some("root"), 5),
+            ("b", Some("root"), 3),
+            ("a1", Some("a"), 7),
+            ("a2", Some("a"), 2),
+            ("a1x", Some("a1"), 9),
+            ("b1", Some("b"), 4),
+            ("other", None, 8),
+            ("other-child", Some("other"), 6),
+        ]);
+        let oc_calls = opencode.calls.clone();
+        let t3 = FakeAgent::new("t3").with_session_tree(&[("t3-child", Some("root"), 10)]);
+        let state = state_with(vec![opencode, t3]).await;
+        for (headers, expected) in [
+            (HeaderMap::new(), StatusCode::UNAUTHORIZED),
+            (
+                crate::test_support::bearer_headers("wrong"),
+                StatusCode::FORBIDDEN,
+            ),
+        ] {
+            let response = get_response(
+                state.clone(),
+                "/api/agent-sessions/root/descendants",
+                headers,
+            )
+            .await;
+            assert_eq!(response.status(), expected);
+        }
+
+        let response = get_response(
+            state.clone(),
+            "/api/agent-sessions/root/descendants",
+            device_headers(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["capabilities"]["session_descendants"], true);
+        assert_eq!(
+            ids(&body["data"]["data"]),
+            [
+                ("t3-child".to_string(), "t3".to_string()),
+                ("a1x".to_string(), "opencode".to_string()),
+                ("a1".to_string(), "opencode".to_string()),
+                ("a".to_string(), "opencode".to_string()),
+                ("b1".to_string(), "opencode".to_string()),
+                ("b".to_string(), "opencode".to_string()),
+                ("a2".to_string(), "opencode".to_string()),
+            ]
+        );
+        assert!(body["data"].get("truncated").is_none(), "{body}");
+        // Asked per parent, breadth first, as `/children` asks -- every
+        // agent about every session found, whichever agent listed it.
+        let asked: Vec<String> = oc_calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| call.starts_with("list_sessions"))
+            .cloned()
+            .collect();
+        assert_eq!(
+            asked,
+            [
+                "list_sessions parent=root",
+                "list_sessions parent=a",
+                "list_sessions parent=b",
+                "list_sessions parent=t3-child",
+                "list_sessions parent=a1",
+                "list_sessions parent=a2",
+                "list_sessions parent=b1",
+                "list_sessions parent=a1x",
+            ]
+        );
+        assert_eq!(
+            state
+                .agent_runtime
+                .manager_for_session("a1x")
+                .await
+                .unwrap()
+                .agent()
+                .kind(),
+            "opencode",
+            "every descendant is routed to the agent that listed it"
+        );
+
+        // One agent named: its tree only. A cursor cannot page a tree.
+        let response = get_response(
+            state.clone(),
+            "/api/agent-sessions/root/descendants?agent_id=t3",
+            device_headers(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(
+            ids(&body["data"]["data"]),
+            [("t3-child".to_string(), "t3".to_string())]
+        );
+        let response = get_response(
+            state.clone(),
+            "/api/agent-sessions/root/descendants?agent_id=opencode&cursor=x",
+            device_headers(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(response).await["error"]["code"], "invalid_query");
+
+        // A leaf has none, and that is an empty list, not an error.
+        let response = get_response(
+            state.clone(),
+            "/api/agent-sessions/a1x/descendants",
+            device_headers(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_json(response).await["data"]["data"], json!([]));
+    }
+
+    /// The walk is bounded: eight levels deep and five hundred sessions.
+    /// Past either, what was gathered is answered with `truncated: true`,
+    /// never an error and never a list that quietly stops.
+    #[tokio::test]
+    async fn descendants_route_truncates_past_its_depth_and_size_bounds() {
+        // A chain twelve deep under `root`: eight levels are answered.
+        let chain: Vec<(String, Option<String>, u64)> = (1..=12)
+            .map(|depth| {
+                let parent = if depth == 1 {
+                    "root".to_string()
+                } else {
+                    format!("d{}", depth - 1)
+                };
+                (format!("d{depth}"), Some(parent), depth as u64)
+            })
+            .collect();
+        let chain_refs: Vec<(&str, Option<&str>, u64)> = chain
+            .iter()
+            .map(|(asid, parent, updated)| (asid.as_str(), parent.as_deref(), *updated))
+            .collect();
+        let state = state_with(vec![
+            FakeAgent::new("opencode").with_session_tree(&chain_refs)
+        ])
+        .await;
+        let response = get_response(
+            state,
+            "/api/agent-sessions/root/descendants",
+            device_headers(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        let listed = ids(&body["data"]["data"]);
+        assert_eq!(listed.len(), MAX_DESCENDANT_DEPTH);
+        assert_eq!(
+            listed[0].0, "d8",
+            "newest first: the deepest level answered"
+        );
+        assert_eq!(body["data"]["truncated"], true);
+
+        // Six hundred children under one session: five hundred are answered.
+        let wide: Vec<(String, Option<String>, u64)> = (0..600)
+            .map(|n| (format!("c{n}"), Some("root".to_string()), n as u64))
+            .collect();
+        let wide_refs: Vec<(&str, Option<&str>, u64)> = wide
+            .iter()
+            .map(|(asid, parent, updated)| (asid.as_str(), parent.as_deref(), *updated))
+            .collect();
+        let state = state_with(vec![
+            FakeAgent::new("opencode").with_session_tree(&wide_refs)
+        ])
+        .await;
+        let response = get_response(
+            state,
+            "/api/agent-sessions/root/descendants?limit=100",
+            device_headers(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(ids(&body["data"]["data"]).len(), MAX_DESCENDANTS);
+        assert_eq!(body["data"]["truncated"], true);
+    }
+
+    /// `/children`'s error semantics carry over: an agent that fails is
+    /// skipped while another answers; the one named failing is a 502.
+    #[tokio::test]
+    async fn descendants_route_skips_a_failing_agent_unless_it_was_named() {
+        let state = state_with(vec![
+            FakeAgent::new("opencode").with_session_tree(&[("kid", Some("root"), 1)]),
+            FakeAgent::new("t3").failing(),
+        ])
+        .await;
+        let response = get_response(
+            state.clone(),
+            "/api/agent-sessions/root/descendants",
+            device_headers(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            ids(&body_json(response).await["data"]["data"]),
+            [("kid".to_string(), "opencode".to_string())]
+        );
+        let response = get_response(
+            state,
+            "/api/agent-sessions/root/descendants?agent_id=t3",
+            device_headers(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     }
 
     #[tokio::test]

@@ -1852,8 +1852,16 @@ fn content_envelope_schema(data: Value) -> Value {
                     ("image_upload", "boolean"),
                     ("composer", "boolean"),
                     ("message_image_assets", "boolean"),
+                    ("session_descendants", "boolean"),
                 ],
-                &["parts", "assets", "image_upload", "composer", "message_image_assets"],
+                &[
+                    "parts",
+                    "assets",
+                    "image_upload",
+                    "composer",
+                    "message_image_assets",
+                    "session_descendants",
+                ],
             ),
             "data": data
         }

@@ -1103,6 +1103,20 @@ impl FakeAgent {
         self
     }
 
+    /// Sessions with parents: `(asid, parent, updated_ms)`. `list_sessions`
+    /// honours the parent filter as every real adapter does.
+    pub fn with_session_tree(mut self, sessions: &[(&str, Option<&str>, u64)]) -> Self {
+        self.sessions = sessions
+            .iter()
+            .map(|(asid, parent, updated_ms)| {
+                let mut session = fake_session(asid, *updated_ms);
+                session.parent_id = parent.map(str::to_owned);
+                session
+            })
+            .collect();
+        self
+    }
+
     pub fn with_session_deletion(mut self) -> Self {
         self.session_deletion = true;
         self
@@ -1210,13 +1224,22 @@ impl agents::ports::agent::AgentPort for FakeAgent {
     }
     fn list_sessions<'a>(
         &'a self,
-        _query: &'a agents::domain::SessionQuery,
+        query: &'a agents::domain::SessionQuery,
     ) -> agents::ports::agent::AgentFuture<'a, Vec<agents::domain::AgentSessionInfo>> {
         Box::pin(async move {
             if self.failing {
                 return self.fail();
             }
-            Ok(self.sessions.clone())
+            self.record(&format!(
+                "list_sessions parent={}",
+                query.parent_id.as_deref().unwrap_or("-")
+            ));
+            Ok(self
+                .sessions
+                .iter()
+                .filter(|session| query.keeps_parent(session.parent_id.as_deref()))
+                .cloned()
+                .collect())
         })
     }
     fn create_session<'a>(
