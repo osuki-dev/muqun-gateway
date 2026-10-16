@@ -164,8 +164,10 @@ wrapped in the envelope: the top level is `{"ok", "gatewayVersion",
 "transports", "capabilities"}`; `transports` is described under "WebSocket
 events" below. Both routes require a paired device (of either kind) or the
 admin token, like `/health`: a caller with no credential is `401`, a wrong one
-`403`. Nothing in the document is served unauthenticated -- it names the
-computer's id, label, version and configuration.
+`403`. Only the owner's app device gets the agents' `endpoint` and `version`;
+a linked gateway and the admin token get the document with those removed.
+Nothing in the document is served unauthenticated -- it names the computer's
+id, label, version and configuration.
 
 ```json
 {

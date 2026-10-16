@@ -47,21 +47,30 @@ pub async fn api_meta(State(state): State<AppState>, headers: HeaderMap) -> ApiR
 /// else: the document names this computer's id, label, version, generation,
 /// every capability and the agent configuration, which is fingerprinting
 /// for anyone on the network and the id the peer identity checks use.
-fn require_discovery_reader(state: &AppState, headers: &HeaderMap) -> ApiResult<Option<String>> {
+///
+/// Only the owner's app sees the unredacted agent plane (local endpoints
+/// and versions); a linked gateway and the admin token get the document
+/// with those removed, as they did when `require_device` refused them.
+fn require_discovery_reader(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> ApiResult<Option<crate::platform::http::Caller>> {
     if crate::require_admin(&state.config, headers).is_ok() {
         return Ok(None);
     }
-    Ok(Some(require_device_or_peer(state, headers)?.device_id))
+    Ok(Some(require_device_or_peer(state, headers)?))
 }
 
 async fn discovery_for(state: &AppState, headers: &HeaderMap) -> ApiResult<Json<Value>> {
-    let device_id = require_discovery_reader(state, headers)?;
-    let sealed = device_id
-        .as_deref()
-        .map(|id| device_seals_its_transport(state, id))
+    let caller = require_discovery_reader(state, headers)?;
+    let app = caller
+        .as_ref()
+        .filter(|caller| caller.kind == crate::DeviceKind::App);
+    let sealed = app
+        .map(|caller| device_seals_its_transport(state, &caller.device_id))
         .unwrap_or(false);
     Ok(Json(
-        super::discovery::build_discovery(state, sealed, true).await,
+        super::discovery::build_discovery(state, sealed, app.is_some()).await,
     ))
 }
 
