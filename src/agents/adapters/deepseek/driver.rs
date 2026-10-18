@@ -88,8 +88,8 @@ impl AgentPort for DeepseekDriver {
             let session_id = self.client.create_session(directory, model, mode).await?;
             let session_id = session_id.as_str();
 
-            if let Some(m) = model {
-                if let Err(e) = self
+            let selected_model = if let Some(m) = model {
+                Some(self
                     .client
                     .select_model(
                         session_id,
@@ -98,10 +98,13 @@ impl AgentPort for DeepseekDriver {
                         m.variant.as_deref(),
                     )
                     .await
-                {
-                    tracing::warn!(target: "deepseek", "select_model after create failed: {e}");
-                }
-            }
+                    .map_err(|e| AgentError::RequestFailed(format!(
+                        "session {} was created, but model selection failed: {e}; do not retry creation",
+                        session_id.chars().take(128).collect::<String>()
+                    )))?)
+            } else {
+                None
+            };
 
             Ok(AgentSessionInfo {
                 asid: AgentSessionId(session_id.to_string()),
@@ -109,7 +112,7 @@ impl AgentPort for DeepseekDriver {
                 backend_session_id: session_id.to_string(),
                 title: "New DeepSeek Session".to_string(),
                 mode: mode.map(str::to_string),
-                model: model.cloned(),
+                model: selected_model,
                 status: AgentSessionStatus::Idle,
                 directory: directory.map(str::to_string),
                 cost: None,
@@ -212,18 +215,73 @@ impl AgentPort for DeepseekDriver {
 
     fn find_files<'a>(
         &'a self,
-        _query: &'a str,
-        _limit: usize,
+        query: &'a str,
+        limit: usize,
         directory: Option<&'a str>,
     ) -> AgentFuture<'a, Vec<Value>> {
         Box::pin(async move {
-            let cwd = directory.unwrap_or(".");
-            let res = self.client.workspace_files_list(cwd, "").await?;
-            Ok(res
-                .get("files")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default())
+            let directory = directory.filter(|cwd| !cwd.is_empty()).ok_or_else(|| {
+                AgentError::RequestFailed("file search requires a session working directory".into())
+            })?;
+            let query_path = query.replace('\\', "/");
+            if query_path.starts_with('/') || query_path.split('/').any(|part| part == "..") {
+                return Err(AgentError::RequestFailed(
+                    "file search query must stay inside the workspace".into(),
+                ));
+            }
+            if limit == 0 {
+                return Ok(Vec::new());
+            }
+            let sessions = self.client.list_sessions(&SessionQuery::default()).await?;
+            let mut scoped = sessions.iter().filter(|session| {
+                session.get("cwd").and_then(Value::as_str) == Some(directory)
+                    && session.get("agentAvailable").and_then(Value::as_bool) == Some(true)
+            });
+            let session_id = scoped
+                .next()
+                .and_then(|session| session.get("sessionId"))
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .ok_or_else(|| {
+                    AgentError::NotAvailable("no live DeepSeek session owns this directory".into())
+                })?;
+            if scoped.next().is_some() {
+                return Err(AgentError::RequestFailed(
+                    "file search directory has multiple live DeepSeek sessions".into(),
+                ));
+            }
+            let res = self.client.file_references(session_id, query).await?;
+            let candidates = res.as_array().ok_or_else(|| {
+                AgentError::Protocol("file references response lacks candidates".into())
+            })?;
+            candidates
+                .iter()
+                .take(limit)
+                .map(|candidate| {
+                    let path = candidate
+                        .get("path")
+                        .and_then(Value::as_str)
+                        .filter(|path| {
+                            !path.is_empty()
+                                && !path.starts_with('/')
+                                && !path.starts_with('\\')
+                                && !path.replace('\\', "/").split('/').any(|part| part == "..")
+                        })
+                        .ok_or_else(|| {
+                            AgentError::Protocol(
+                                "file reference has an invalid workspace path".into(),
+                            )
+                        })?;
+                    let kind = candidate
+                        .get("kind")
+                        .and_then(Value::as_str)
+                        .filter(|kind| matches!(*kind, "file" | "directory"))
+                        .ok_or_else(|| {
+                            AgentError::Protocol("file reference has an invalid kind".into())
+                        })?;
+                    Ok(serde_json::json!({ "path": path, "type": kind }))
+                })
+                .collect()
         })
     }
 
@@ -414,6 +472,174 @@ impl AgentPort for DeepseekDriver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn rpc_server(app: axum::Router) -> (DeepseekDriver, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let driver = DeepseekDriver::new(DeepseekEndpoint::new(
+            format!("http://{}", listener.local_addr().unwrap()),
+            None,
+            None,
+        ));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (driver, server)
+    }
+
+    #[tokio::test]
+    async fn create_reports_accepted_model_or_explicit_partial_failure_without_retry() {
+        use axum::{routing::post, Json, Router};
+        use serde_json::json;
+        for selection in [
+            json!({ "ok": true, "value": { "selected": { "provider": "normalized", "model": "accepted", "reasoningEffort": "low" } } }),
+            json!({ "ok": true, "value": { "selected": { "provider": "normalized", "model": "accepted" } } }),
+            json!({ "ok": false, "error": { "code": "session/model-unavailable", "message": "not available" } }),
+            json!({ "ok": true, "value": {} }),
+        ] {
+            let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let created = seen.clone();
+            let selected = seen.clone();
+            let expected = selection.pointer("/value/selected").cloned();
+            let app = Router::new()
+                .route("/api/session/create", post(move |Json(body): Json<Value>| { let seen = created.clone(); async move {
+                    seen.lock().unwrap().push("create");
+                    assert_eq!(body.pointer("/payload/args/request/cwd"), Some(&json!("/qa")));
+                    Json(json!({ "result": { "ok": true, "value": { "sessionId": "created-session" } } }))
+                } }))
+                .route("/api/session/selectModel", post(move |Json(body): Json<Value>| { let seen = selected.clone(); let result = selection.clone(); async move {
+                    seen.lock().unwrap().push("select");
+                    assert_eq!(body.pointer("/payload/args/request"), Some(&json!({
+                        "sessionId": "created-session", "provider": "requested", "model": "alias", "reasoningEffort": "high"
+                    })));
+                    Json(json!({ "result": result }))
+                } }));
+            let (driver, server) = rpc_server(app).await;
+            let requested = ModelRef {
+                provider_id: "requested".into(),
+                model_id: "alias".into(),
+                variant: Some("high".into()),
+            };
+            let result = driver
+                .create_session(Some("/qa"), Some(&requested), None)
+                .await;
+            if let Some(expected) = expected {
+                let info = result.unwrap();
+                let model = info.model.unwrap();
+                assert_eq!(model.provider_id, "normalized");
+                assert_eq!(model.model_id, "accepted");
+                assert_eq!(
+                    model.variant.as_deref(),
+                    expected.get("reasoningEffort").and_then(Value::as_str)
+                );
+            } else {
+                let error = result.unwrap_err();
+                assert!(matches!(error, AgentError::RequestFailed(_)));
+                assert!(error.to_string().contains("created-session was created"));
+                assert!(error.to_string().contains("do not retry creation"));
+            }
+            assert_eq!(*seen.lock().unwrap(), vec!["create", "select"]);
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn file_search_uses_live_session_scope_query_and_limit() {
+        use axum::{routing::post, Json, Router};
+        use serde_json::json;
+        let app = Router::new()
+            .route(
+                "/api/session/list",
+                post(|| async {
+                    Json(json!({ "result": { "ok": true, "value": [
+                    { "sessionId": "other", "cwd": "/other", "agentAvailable": true },
+                    { "sessionId": "cold", "cwd": "/qa", "agentAvailable": false },
+                    { "sessionId": "owned", "cwd": "/qa", "agentAvailable": true }
+                ] } }))
+                }),
+            )
+            .route(
+                "/api/fileReferences/list",
+                post(|Json(body): Json<Value>| async move {
+                    assert_eq!(
+                        body.pointer("/payload/args"),
+                        Some(&json!({ "agentId": "owned", "query": "sr" }))
+                    );
+                    Json(json!({ "result": { "ok": true, "value": [
+                    { "path": "src/", "kind": "directory" },
+                    { "path": "src/lib.rs", "kind": "file" },
+                    { "path": "src/main.rs", "kind": "file" }
+                ] } }))
+                }),
+            );
+        let (driver, server) = rpc_server(app).await;
+        assert_eq!(
+            driver.find_files("sr", 2, Some("/qa")).await.unwrap(),
+            json!([
+                { "path": "src/", "type": "directory" }, { "path": "src/lib.rs", "type": "file" }
+            ])
+            .as_array()
+            .unwrap()
+            .clone()
+        );
+        assert!(matches!(
+            driver.find_files("sr", 2, Some("/missing")).await,
+            Err(AgentError::NotAvailable(_))
+        ));
+        assert!(matches!(
+            driver.find_files("sr", 2, None).await,
+            Err(AgentError::RequestFailed(_))
+        ));
+        assert!(matches!(
+            driver.find_files("../secret", 2, Some("/qa")).await,
+            Err(AgentError::RequestFailed(_))
+        ));
+        assert!(driver
+            .find_files("sr", 0, Some("/qa"))
+            .await
+            .unwrap()
+            .is_empty());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn file_search_rejects_ambiguous_scopes_and_upstream_refusals() {
+        use axum::{routing::post, Json, Router};
+        use serde_json::json;
+        for (sessions, references) in [
+            (
+                json!([
+                    { "sessionId": "one", "cwd": "/qa", "agentAvailable": true },
+                    { "sessionId": "two", "cwd": "/qa", "agentAvailable": true }
+                ]),
+                json!({ "ok": true, "value": [] }),
+            ),
+            (
+                json!([{ "sessionId": "one", "cwd": "/qa", "agentAvailable": true }]),
+                json!({ "ok": false, "error": { "code": "gateway/lookup-not-found" } }),
+            ),
+            (
+                json!([{ "sessionId": "one", "cwd": "/qa", "agentAvailable": true }]),
+                json!({ "ok": true, "value": [{ "path": "../secret", "kind": "file" }] }),
+            ),
+        ] {
+            let app = Router::new()
+                .route(
+                    "/api/session/list",
+                    post(move || {
+                        let value = sessions.clone();
+                        async move { Json(json!({ "result": { "ok": true, "value": value } })) }
+                    }),
+                )
+                .route(
+                    "/api/fileReferences/list",
+                    post(move || {
+                        let result = references.clone();
+                        async move { Json(json!({ "result": result })) }
+                    }),
+                );
+            let (driver, server) = rpc_server(app).await;
+            assert!(driver.find_files("sr", 2, Some("/qa")).await.is_err());
+            server.abort();
+        }
+    }
 
     #[tokio::test]
     async fn a_prompt_with_attachments_carries_the_paths_in_its_text() {

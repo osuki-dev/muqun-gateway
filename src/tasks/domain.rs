@@ -60,6 +60,17 @@ impl TaskState {
     }
 }
 
+/// The job a delegation's launch command started in its pane, as the
+/// terminal knew it then: its process group, and that group's leader by pid
+/// and start time -- a pid or group reused later by another process has
+/// another start time, so is never taken for it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct AgentJob {
+    pub pgid: i64,
+    pub leader: u32,
+    pub started: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum TaskBinding {
@@ -82,6 +93,20 @@ pub(crate) enum TaskBinding {
         /// started in this pane; absent for a command task.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agent_id: Option<String>,
+        /// The job this delegation's launch command started in the pane:
+        /// only that job is ever typed to (`tasks::notices`). Absent when
+        /// none was recorded -- then nothing is.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_job: Option<AgentJob>,
+        /// The model a delegation's agent runs: the one the request named
+        /// and the launch passed, else (Codex) its own config's -- what
+        /// `GET /api/tasks/defaults` answers. `None`: its own default, not
+        /// known.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        /// The reasoning effort that goes with `model`, likewise.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        variant: Option<String>,
     },
     /// A delegation running on another of the owner's computers: this task is
     /// its mirror here, kept in step with task `remote_task_id` on peer
@@ -133,9 +158,20 @@ pub(crate) enum TaskOrigin {
     Peer,
 }
 
+/// An observed caller context, never a client-supplied authorization claim.
+/// Provider tokens are shared: resolution is workflow inference, not isolation
+/// between hostile sessions running as the same OS user.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum ForwardingContext {
+    #[default]
+    Unknown,
+    Resolved,
+}
+
 /// Who asks for a new task, on whose behalf, and under which task.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Requested {
+    pub forwarding: ForwardingContext,
     /// Owns the task: only it (or a device) may read, wait for or cancel it.
     pub by: TaskPrincipal,
     pub origin: TaskOrigin,
@@ -152,6 +188,7 @@ impl Requested {
     #[cfg(test)]
     pub(crate) fn mcp(by: TaskPrincipal) -> Self {
         Self {
+            forwarding: ForwardingContext::Unknown,
             by,
             origin: TaskOrigin::Mcp,
             parent: None,
@@ -197,6 +234,10 @@ pub(crate) struct Task {
     /// (its device record's `server_id`), when another computer opened it.
     #[serde(default)]
     pub requester_server_id: Option<String>,
+    #[serde(default)]
+    pub reopened_ms: Option<u64>,
+    #[serde(default)]
+    pub reopen_count: u64,
 }
 
 /// A task's direct children by state, computed when the task is read.
@@ -235,6 +276,11 @@ pub(crate) struct TaskEvent {
 /// A requested move. `Some` fields replace the task's value, `None` keeps it.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct TaskChange {
+    /// A verified new turn on the same live binding; never a generic state move.
+    pub reopen: bool,
+    pub reopen_count: Option<u64>,
+    pub reopened_ms: Option<u64>,
+    pub expected_seq: Option<u64>,
     pub to: TaskState,
     pub source: String,
     pub note: Option<String>,
@@ -348,6 +394,9 @@ mod tests {
                 tab_id: None,
                 shell_pid: None,
                 agent_id: None,
+                agent_job: None,
+                model: None,
+                variant: None,
             }
         );
         assert_eq!(serde_json::to_string(&binding).unwrap(), stored);
@@ -357,6 +406,9 @@ mod tests {
             tab_id: None,
             shell_pid: Some(42),
             agent_id: None,
+            agent_job: None,
+            model: None,
+            variant: None,
         };
         let json = serde_json::to_string(&pinned).unwrap();
         assert_eq!(serde_json::from_str::<TaskBinding>(&json).unwrap(), pinned);
@@ -412,3 +464,23 @@ mod tests {
         );
     }
 }
+
+/// The session a delegation was asked from, where its result is told once
+/// it ends (`tasks::notices`): an agent service's session, or the pane a
+/// terminal agent runs in.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum NoticeTarget {
+    Session { agent_id: String, asid: String },
+    Pane { session_id: String, pane_id: String },
+}
+
+/// The states a parent is told about: the child ended, or stopped and needs
+/// someone.
+pub(crate) const REPORTED_STATES: [TaskState; 5] = [
+    TaskState::Done,
+    TaskState::Failed,
+    TaskState::Cancelled,
+    TaskState::Waiting,
+    TaskState::IdleUnconfirmed,
+];

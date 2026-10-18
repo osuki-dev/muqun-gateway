@@ -4,6 +4,7 @@
 pub(crate) mod domain;
 pub(crate) mod driver;
 pub(crate) mod events;
+pub(crate) mod notices;
 pub(crate) mod pane_agent;
 pub(crate) mod ports;
 pub(crate) mod routes;

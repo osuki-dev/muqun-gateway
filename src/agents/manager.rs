@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{broadcast, Mutex};
+use tokio_util::sync::CancellationToken;
 
 use serde_json::{json, Value};
 
@@ -25,6 +26,101 @@ const END_OF_RUN_REFETCH_LIMIT: usize = 20;
 /// Shell ids are remembered only so `shell.exited` -- which carries no session
 /// -- can be attributed. Bounded, because a long-lived gateway sees many.
 const MAX_TRACKED_SHELLS: usize = 256;
+
+const DELTA_FLUSH_DELAY: std::time::Duration = std::time::Duration::from_millis(40);
+const MAX_PENDING_DELTA_BYTES: usize = 8 * 1024;
+
+/// One contiguous run only. Whole-row protocol costs still grow with the
+/// transcript prefix, but batching avoids paying those costs for every token.
+#[derive(Default)]
+struct DeltaCoalescer {
+    pending: Option<PendingDelta>,
+}
+
+struct PendingDelta {
+    raw: OpencodeRawEvent,
+    text: String,
+    deadline: tokio::time::Instant,
+}
+
+impl DeltaCoalescer {
+    fn is_delta(raw: &OpencodeRawEvent) -> bool {
+        matches!(
+            raw.event_type.as_str(),
+            "session.text.delta" | "session.reasoning.delta"
+        ) && raw.data.get("sessionID").and_then(Value::as_str).is_some()
+            && raw
+                .data
+                .get("assistantMessageID")
+                .or_else(|| raw.data.get("messageID"))
+                .and_then(Value::as_str)
+                .is_some()
+            && raw.data.get("delta").and_then(Value::as_str).is_some()
+    }
+
+    fn can_merge(&self, raw: &OpencodeRawEvent) -> bool {
+        let Some(pending) = &self.pending else {
+            return false;
+        };
+        if !Self::is_delta(raw)
+            || pending.raw.event_type != raw.event_type
+            || pending.raw.location != raw.location
+            || pending.text.len() + raw.data["delta"].as_str().unwrap().len()
+                > MAX_PENDING_DELTA_BYTES
+        {
+            return false;
+        }
+        // Compare all payload metadata, not just the known row key. Envelope
+        // id/created are per event and are unused by the text handler.
+        let old = pending.raw.data.as_object().expect("delta object");
+        let new = raw.data.as_object().expect("delta object");
+        new.len() == old.len() + 1 && old.iter().all(|(key, value)| new.get(key) == Some(value))
+    }
+
+    fn push(
+        &mut self,
+        mut raw: OpencodeRawEvent,
+        now: tokio::time::Instant,
+    ) -> Option<OpencodeRawEvent> {
+        let Value::String(text) = raw
+            .data
+            .as_object_mut()
+            .expect("delta object")
+            .remove("delta")
+            .expect("delta present")
+        else {
+            unreachable!("string delta")
+        };
+        if let Some(pending) = &mut self.pending {
+            pending.text.push_str(&text);
+        } else {
+            self.pending = Some(PendingDelta {
+                raw,
+                text,
+                deadline: now + DELTA_FLUSH_DELAY,
+            });
+        }
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|p| p.text.len() >= MAX_PENDING_DELTA_BYTES)
+        {
+            self.take()
+        } else {
+            None
+        }
+    }
+
+    fn deadline(&self) -> Option<tokio::time::Instant> {
+        self.pending.as_ref().map(|p| p.deadline)
+    }
+
+    fn take(&mut self) -> Option<OpencodeRawEvent> {
+        let mut pending = self.pending.take()?;
+        pending.raw.data["delta"] = Value::String(pending.text);
+        Some(pending.raw)
+    }
+}
 
 pub struct AgentManager {
     agent: Arc<dyn AgentPort>,
@@ -75,6 +171,8 @@ pub(crate) struct EventContext {
     pub mirror: Arc<MemoryMirror>,
     pub tx: broadcast::Sender<AgentDomainEvent>,
     shells: ShellRegistry,
+    cancel: CancellationToken,
+    emission_gate: Arc<std::sync::Mutex<()>>,
 }
 
 impl EventContext {
@@ -88,10 +186,18 @@ impl EventContext {
             mirror,
             tx,
             shells: ShellRegistry::default(),
+            cancel: CancellationToken::new(),
+            emission_gate: Arc::new(std::sync::Mutex::new(())),
         }
     }
 
     fn emit(&self, mut event: AgentDomainEvent) {
+        // Linearize send against shutdown, including on a multithreaded
+        // runtime. A token check alone has a check/send race.
+        let _gate = self.emission_gate.lock().unwrap_or_else(|p| p.into_inner());
+        if self.cancel.is_cancelled() {
+            return;
+        }
         self.mirror.stamp_event(&mut event);
         // A send with no subscribers is not a failure: nobody is watching.
         let _ = self.tx.send(event);
@@ -224,60 +330,14 @@ impl AgentManager {
         let driver = Arc::new(OpencodeDriver::new(endpoint.clone()));
         let mirror = Arc::new(MemoryMirror::for_agent(driver.kind()));
 
-        let (listener, mut sse_rx) = OpencodeSseListener::new(endpoint);
+        let (listener, sse_rx) = OpencodeSseListener::new(endpoint);
         let listener = Arc::new(listener);
         listener.start();
 
-        let ctx = Arc::new(EventContext::new(
-            driver.clone(),
-            mirror.clone(),
-            events_tx.clone(),
-        ));
-
-        let pump_listener = listener.clone();
-        tokio::spawn(async move {
-            loop {
-                match sse_rx.recv().await {
-                    Ok(raw_event) => {
-                        Self::handle_raw_event(raw_event, &ctx).await;
-                    }
-                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                        // Dropping out of the loop here used to stop the
-                        // gateway processing OpenCode events for the rest of
-                        // the process lifetime. Tell the clients to resync and
-                        // keep reading.
-                        tracing::warn!(skipped, "opencode event backlog overflowed, resyncing");
-                        ctx.emit(AgentDomainEvent::Resync {
-                            asid: AgentSessionId(String::new()),
-                            reason: "event_backlog_overflow".to_string(),
-                        });
-                    }
-                    Err(broadcast::error::RecvError::Closed) => {
-                        // Every manager owns its listener and its channel, so
-                        // a re-discovery stops the old listener and this is
-                        // the old pump noticing. That is the hand-over working
-                        // -- it used to be logged as a warning, half a second
-                        // after the replacement stream had already connected,
-                        // which read like the new agent had failed.
-                        //
-                        // A channel that closes while the listener was still
-                        // meant to be reading is a different thing and keeps
-                        // its warning.
-                        if pump_listener.is_running() {
-                            tracing::warn!(
-                                "opencode event channel closed while still listening, \
-                                 stopping event pump"
-                            );
-                        } else {
-                            tracing::debug!(
-                                "previous opencode event pump wound down after hand-over"
-                            );
-                        }
-                        break;
-                    }
-                }
-            }
-        });
+        let mut ctx = EventContext::new(driver.clone(), mirror.clone(), events_tx.clone());
+        ctx.cancel = listener.cancel_token();
+        let emission_gate = ctx.emission_gate.clone();
+        tokio::spawn(Self::pump_events(sse_rx, Arc::new(ctx)));
 
         tracing::info!(
             url = %endpoint_url,
@@ -293,7 +353,10 @@ impl AgentManager {
             endpoint_url,
             endpoint_version,
             Arc::new(move || stream_listener.is_connected()),
-            Arc::new(move || shutdown_listener.stop()),
+            Arc::new(move || {
+                let _gate = emission_gate.lock().unwrap_or_else(|p| p.into_inner());
+                shutdown_listener.stop();
+            }),
         )
     }
 
@@ -564,6 +627,59 @@ impl AgentManager {
         (self.shutdown_handle)();
     }
 
+    async fn pump_events(mut rx: broadcast::Receiver<OpencodeRawEvent>, ctx: Arc<EventContext>) {
+        // The pump owns only a receiver and cancellation token, never the
+        // listener's sender. Cancellation also drops an in-flight hydration.
+        tokio::select! {
+            biased;
+            _ = ctx.cancel.cancelled() => {},
+            _ = async {
+                let mut deltas = DeltaCoalescer::default();
+                loop {
+                    let received = tokio::select! {
+                        biased;
+                        _ = async {
+                            match deltas.deadline() {
+                                Some(deadline) => tokio::time::sleep_until(deadline).await,
+                                None => std::future::pending::<()>().await,
+                            }
+                        } => {
+                            if let Some(raw) = deltas.take() {
+                                Self::handle_raw_event(raw, &ctx).await;
+                            }
+                            continue;
+                        }
+                        event = rx.recv() => event,
+                    };
+                    // Every boundary, including lag and channel close, first
+                    // flushes the run. Explicit shutdown instead discards it:
+                    // no old-manager events may reach replacement subscribers.
+                    if received.as_ref().map(|raw| !deltas.can_merge(raw)).unwrap_or(true) {
+                        if let Some(raw) = deltas.take() {
+                            Self::handle_raw_event(raw, &ctx).await;
+                        }
+                    }
+                    match received {
+                        Ok(raw) if DeltaCoalescer::is_delta(&raw) => {
+                            if let Some(raw) = deltas.push(raw, tokio::time::Instant::now()) {
+                                Self::handle_raw_event(raw, &ctx).await;
+                            }
+                        }
+                        Ok(raw) => Self::handle_raw_event(raw, &ctx).await,
+                        Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                            tracing::warn!(skipped, "opencode event backlog overflowed, resyncing");
+                            ctx.emit(AgentDomainEvent::Resync {
+                                asid: AgentSessionId(String::new()),
+                                reason: "event_backlog_overflow".to_string(),
+                            });
+                        }
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            } => {},
+        }
+    }
+
     pub(crate) async fn handle_raw_event(raw: OpencodeRawEvent, ctx: &EventContext) {
         let event_type = raw.event_type.as_str();
         let data = &raw.data;
@@ -582,6 +698,14 @@ impl AgentManager {
             });
 
         match event_type {
+            "gateway.stream.resync" => ctx.emit(AgentDomainEvent::Resync {
+                asid: AgentSessionId(String::new()),
+                reason: data
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("event_stream_loss")
+                    .to_string(),
+            }),
             // ---------------------------------------------------------------
             // Session lifecycle and identity
             // ---------------------------------------------------------------
@@ -809,15 +933,12 @@ impl AgentManager {
                 let error = data.pointer("/status/error").and_then(mapper::map_error);
                 ctx.set_status(&asid, status, error).await;
             }
-            "session.step.ended" => {
-                // Not a status change. It does carry the running cost/token
-                // totals for the step, which are worth keeping.
-                let Some(asid) = session_id.map(str::to_string).map(AgentSessionId) else {
-                    return;
-                };
-                Self::apply_usage(ctx, &asid, data).await;
-            }
-            "session.step.started" | "session.step.streamed" | "session.step.failed" => {}
+            // Step usage is per request, not cumulative. OpenCode publishes
+            // session.usage.updated after adding it to the session totals.
+            "session.step.started"
+            | "session.step.streamed"
+            | "session.step.ended"
+            | "session.step.failed" => {}
             "session.usage.updated" => {
                 let Some(asid) = session_id.map(str::to_string).map(AgentSessionId) else {
                     return;
@@ -828,8 +949,17 @@ impl AgentManager {
                 let Some(asid) = session_id.map(str::to_string).map(AgentSessionId) else {
                     return;
                 };
+                let Some(idle) = data.get("idle").and_then(Value::as_u64) else {
+                    return;
+                };
                 ctx.ensure_session(&asid).await;
-                ctx.patch_session(&asid, SessionPatch::default()).await;
+                if let Some((seq, info)) = ctx.mirror.mark_viewed(&asid, idle).await {
+                    ctx.emit(AgentDomainEvent::SessionUpdated {
+                        asid,
+                        info: Box::new(info),
+                        seq,
+                    });
+                }
             }
 
             // ---------------------------------------------------------------
@@ -1066,17 +1196,40 @@ impl AgentManager {
             // ---------------------------------------------------------------
             // Inbox (queued and steered prompts)
             // ---------------------------------------------------------------
-            "session.inbox.enqueued"
-            | "session.inbox.delivered"
-            | "session.inbox.cancelled"
-            | "session.inbox.delivery.changed" => {
+            "session.inbox.delivery.changed" => {
+                let Some(asid) = session_id.map(str::to_string).map(AgentSessionId) else {
+                    return;
+                };
+                let Some(inbox_id) = data.get("inboxID").and_then(Value::as_str) else {
+                    return;
+                };
+                let Some(delivery @ ("steer" | "queue")) =
+                    data.get("delivery").and_then(Value::as_str)
+                else {
+                    return;
+                };
+                let updated = ctx
+                    .mirror
+                    .update_inbox_delivery(&asid, inbox_id, delivery)
+                    .await;
+                let (seq, items) = match updated {
+                    Some(updated) => updated,
+                    None => match ctx.driver.get_inbox(&asid.0).await {
+                        Ok(items) => ctx.mirror.set_inbox(&asid, items).await,
+                        Err(err) => {
+                            tracing::debug!(asid = %asid.0, %err, "could not refetch inbox for delivery change");
+                            return;
+                        }
+                    },
+                };
+                ctx.emit(AgentDomainEvent::InboxChanged { asid, items, seq });
+            }
+            "session.inbox.enqueued" | "session.inbox.delivered" | "session.inbox.cancelled" => {
                 let Some(asid) = session_id.map(str::to_string).map(AgentSessionId) else {
                     return;
                 };
                 let inbox_id = data.get("inboxID").and_then(Value::as_str).unwrap_or("");
-                let item = if event_type == "session.inbox.enqueued"
-                    || event_type == "session.inbox.delivery.changed"
-                {
+                let item = if event_type == "session.inbox.enqueued" {
                     data.get("item").cloned()
                 } else {
                     None

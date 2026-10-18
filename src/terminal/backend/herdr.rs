@@ -1387,6 +1387,12 @@ fn agent_from_json(value: &Value) -> Result<Agent, BackendError> {
             .map(str::to_owned),
         status: AgentStatus::parse(value.get("agent_status").and_then(Value::as_str)),
         state_change_seq: value.get("state_change_seq").and_then(Value::as_u64),
+        shell_pid: value
+            .get("shell_pid")
+            .and_then(Value::as_u64)
+            .and_then(|pid| u32::try_from(pid).ok())
+            .filter(|pid| *pid > 0),
+        pending_user_input: value.get("pending_user_input").and_then(Value::as_bool),
     })
 }
 
@@ -1524,6 +1530,43 @@ fn required_string<'a>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_question_attention_is_optional_and_independent_of_work_status() {
+        let mut raw = serde_json::json!({ "pane_id": "w1:p1", "agent_status": "working" });
+        let legacy = super::agent_from_json(&raw).unwrap();
+        assert_eq!(legacy.pending_user_input, None);
+        assert_eq!(legacy.shell_pid, None);
+        raw["pending_user_input"] = serde_json::json!(true);
+        raw["shell_pid"] = serde_json::json!(4242);
+        let pending = super::agent_from_json(&raw).unwrap();
+        assert_eq!(pending.pending_user_input, Some(true));
+        assert_eq!(pending.shell_pid, Some(4242));
+        assert_eq!(pending.status, super::AgentStatus::Working);
+        raw["agent_status"] = serde_json::json!("blocked");
+        let focused = super::agent_from_json(&raw).unwrap();
+        assert_eq!(focused.pending_user_input, Some(true));
+        assert_eq!(focused.status, super::AgentStatus::Blocked);
+        raw["pending_user_input"] = serde_json::json!("true");
+        assert_eq!(
+            super::agent_from_json(&raw).unwrap().pending_user_input,
+            None
+        );
+        for pid in [
+            serde_json::json!(0),
+            serde_json::json!(-1),
+            serde_json::json!("4242"),
+            serde_json::json!(u64::MAX),
+        ] {
+            raw["shell_pid"] = pid;
+            assert_eq!(super::agent_from_json(&raw).unwrap().shell_pid, None);
+        }
+        raw["pending_user_input"] = serde_json::json!(false);
+        assert_eq!(
+            super::agent_from_json(&raw).unwrap().pending_user_input,
+            Some(false)
+        );
+    }
+
     #[test]
     fn agent_identity_is_conversation_scoped_not_pane_scoped() {
         let first = serde_json::json!({"terminal_id":"term", "agent_session":{"value":"first"}});

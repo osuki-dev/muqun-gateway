@@ -19,14 +19,14 @@
 //! `tasks.complete` finds the caller's own task the same way ([`own_task`]):
 //! a session may complete only the task it is working on.
 
-use futures::future::join_all;
+use futures::{future::join_all, stream, StreamExt, TryStreamExt};
 
 use super::tokens::{AssistantSession, TokenBinding};
 use crate::agents::domain::{AgentPart, AgentSessionId, TimelineItem, ToolCallStatus};
 use crate::agents::manager::AgentManager;
 use crate::agents::ports::mirror::SessionMirrorPort;
 use crate::tasks::domain::{
-    Requested, Task, TaskBinding, TaskFilter, TaskId, TaskKind, TaskOrigin,
+    NoticeTarget, Requested, Task, TaskBinding, TaskFilter, TaskId, TaskKind, TaskOrigin,
 };
 use crate::tasks::service::OPEN_STATES;
 use crate::AppState;
@@ -56,6 +56,7 @@ pub(crate) async fn requested(
         _ => TaskOrigin::Mcp,
     };
     Requested {
+        forwarding: crate::tasks::domain::ForwardingContext::Unknown,
         by: session.principal(),
         origin,
         parent,
@@ -64,11 +65,279 @@ pub(crate) async fn requested(
     }
 }
 
+/// Resolve remote forwarding separately from best-effort local tree filing.
+/// A full page, failed read, missing caller or ambiguous call is uncertainty,
+/// never evidence that the caller is local. All retained states participate:
+/// a finished/cancelled assignment can still have a live provider session.
+/// The provider token is shared, so even a resolved timeline is not a
+/// cryptographic session identity or a sandbox against hostile local agents.
+pub(crate) async fn requested_for_forwarding(
+    state: &AppState,
+    session: &AssistantSession,
+    call: &Call<'_>,
+) -> Result<Requested, crate::tasks::service::TaskError> {
+    use crate::tasks::domain::ForwardingContext;
+    use crate::tasks::service::TaskError;
+    let parent = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        forwarding_parent(state, &session.binding, call),
+    )
+    .await
+    .map_err(|_| TaskError::LineageUnresolved)??;
+    Ok(Requested {
+        forwarding: ForwardingContext::Resolved,
+        by: session.principal(),
+        origin: match (&session.binding, &parent) {
+            (TokenBinding::Agent { .. }, _) | (_, Some(_)) => TaskOrigin::Agent,
+            _ => TaskOrigin::Mcp,
+        },
+        parent,
+        name: None,
+        server_id: None,
+    })
+}
+
+async fn forwarding_parent(
+    state: &AppState,
+    binding: &TokenBinding,
+    call: &Call<'_>,
+) -> Result<Option<TaskId>, crate::tasks::service::TaskError> {
+    use crate::tasks::service::TaskError;
+    // The store caps pages at 1000. A full page is deliberately refused;
+    // it must never become a partial set on which authorization succeeds.
+    const LIMIT: usize = 1000;
+    let filter = match binding {
+        TokenBinding::Pane {
+            session_id,
+            pane_id,
+        } => TaskFilter {
+            pane: Some((session_id.clone(), pane_id.clone())),
+            limit: LIMIT,
+            ..Default::default()
+        },
+        TokenBinding::Agent { agent_id } => TaskFilter {
+            agent_id: Some(agent_id.clone()),
+            limit: LIMIT,
+            ..Default::default()
+        },
+    };
+    let candidates = state
+        .tasks
+        .open_tasks(filter)
+        .await
+        .map_err(|_| TaskError::LineageUnresolved)?;
+    if candidates.len() >= LIMIT {
+        return Err(TaskError::LineageUnresolved);
+    }
+    let TokenBinding::Agent { agent_id } = binding else {
+        if candidates
+            .iter()
+            .filter(|task| OPEN_STATES.contains(&task.state))
+            .count()
+            > 1
+        {
+            return Err(TaskError::LineageUnresolved);
+        }
+        // The credential names this exact pane. Retain the most recent
+        // assignment's ancestry even if it has already ended.
+        return Ok(candidates.first().map(|task| task.id.clone()));
+    };
+    let manager = state
+        .agent_runtime
+        .manager_for_agent(agent_id)
+        .await
+        .ok_or(TaskError::LineageUnresolved)?;
+    let mut sessions = std::collections::BTreeSet::new();
+    for task in &candidates {
+        if let TaskBinding::AgentSession { asid, .. } = &task.binding {
+            sessions.insert(asid.clone());
+        }
+    }
+    let tracked = sessions.clone();
+    sessions.extend(state.tasks.busy_sessions());
+    if sessions.is_empty() || sessions.len() >= LIMIT {
+        return Err(TaskError::LineageUnresolved);
+    }
+    // Bounded concurrency and the outer deadline avoid a slow provider
+    // turning this safety check into an unbounded request fan-out.
+    let matches: Vec<Option<String>> = stream::iter(sessions)
+        .map(|asid| {
+            let manager = &manager;
+            let tracked = &tracked;
+            async move {
+                if !tracked.contains(&asid) {
+                    // Busy IDs span providers. Only an explicit absence
+                    // excludes an unrelated provider's untracked session;
+                    // network/protocol errors still leave uncertainty.
+                    match manager.agent().get_session(&asid).await {
+                        Ok(_) => {}
+                        Err(crate::agents::ports::agent::AgentError::SessionNotFound(_)) => {
+                            return Ok(None);
+                        }
+                        Err(_) => return Err(TaskError::LineageUnresolved),
+                    }
+                }
+                let mut items = manager
+                    .agent()
+                    .get_timeline(&asid, PROBE_ITEMS)
+                    .await
+                    .map_err(|_| TaskError::LineageUnresolved)?;
+                if let Some(snapshot) = manager
+                    .mirror()
+                    .get_snapshot(&AgentSessionId(asid.clone()))
+                    .await
+                {
+                    let start = snapshot.timeline.len().saturating_sub(PROBE_ITEMS);
+                    items.extend(snapshot.timeline[start..].iter().cloned());
+                }
+                Ok::<_, TaskError>(items.iter().any(|item| runs(item, call)).then_some(asid))
+            }
+        })
+        .buffer_unordered(8)
+        .try_collect()
+        .await?;
+    let mut matches = matches.into_iter().flatten();
+    let Some(asid) = matches.next() else {
+        return Err(TaskError::LineageUnresolved);
+    };
+    if matches.next().is_some() {
+        return Err(TaskError::LineageUnresolved);
+    }
+    Ok(candidates.iter().find(|task| matches!(
+        &task.binding, TaskBinding::AgentSession { asid: task_asid, .. } if *task_asid == asid
+    )).map(|task| task.id.clone()))
+}
+
+/// The session making `call`, where its result is told (`tasks::notices`):
+/// a pane token's pane; for an agent token, the one session of that agent
+/// running this very call among those running a turn now -- task or not,
+/// since a person's own session delegates too. `None` when none or several
+/// fit: the caller then learns the result from `tasks.wait` only.
+pub(crate) async fn caller_session(
+    state: &AppState,
+    session: &AssistantSession,
+    call: &Call<'_>,
+) -> Option<NoticeTarget> {
+    let agent_id = match &session.binding {
+        TokenBinding::Pane {
+            session_id,
+            pane_id,
+        } => {
+            return Some(NoticeTarget::Pane {
+                session_id: session_id.clone(),
+                pane_id: pane_id.clone(),
+            })
+        }
+        TokenBinding::Agent { agent_id } => agent_id,
+    };
+    let manager = state.agent_runtime.manager_for_agent(agent_id).await?;
+    let busy = state.tasks.busy_sessions();
+    let probes = busy.iter().map(|asid| async {
+        session_items(&manager, asid)
+            .await
+            .iter()
+            .any(|item| runs(item, call))
+    });
+    let running = join_all(probes).await;
+    let mut fits = busy
+        .into_iter()
+        .zip(running)
+        .filter_map(|(asid, running)| running.then_some(asid));
+    match (fits.next(), fits.next()) {
+        (Some(asid), None) => Some(NoticeTarget::Session {
+            agent_id: agent_id.clone(),
+            asid,
+        }),
+        _ => None,
+    }
+}
+
+/// Whether `item` is `call` running right now.
+fn runs(item: &TimelineItem, call: &Call<'_>) -> bool {
+    match &item.part {
+        AgentPart::Tool(part) => {
+            part.state == ToolCallStatus::Running
+                && names_tool(&part.name, call.tool)
+                && call.args.iter().all(|(key, value)| {
+                    part.input.get(*key).and_then(|v| v.as_str()) == Some(*value)
+                })
+        }
+        _ => false,
+    }
+}
+
 async fn parent_of(state: &AppState, binding: &TokenBinding, call: &Call<'_>) -> Option<TaskId> {
     match <[Task; 1]>::try_from(fitting(state, binding, call).await) {
         Ok([task]) => Some(task.id),
+        Err(tasks) if tasks.is_empty() => finished_parent(state, binding, call).await,
         Err(_) => None,
     }
+}
+
+/// A tool call may reach MCP before the new-turn event or pane poll. The
+/// assignment still owns that session; finding its parent does not reopen it.
+async fn finished_parent(
+    state: &AppState,
+    binding: &TokenBinding,
+    call: &Call<'_>,
+) -> Option<TaskId> {
+    let TokenBinding::Agent { agent_id } = binding else {
+        return finished_pane_parent(state, binding).await;
+    };
+    let candidates = state
+        .tasks
+        .open_tasks(TaskFilter {
+            agent_id: Some(agent_id.clone()),
+            states: Some(vec![
+                crate::tasks::domain::TaskState::Done,
+                crate::tasks::domain::TaskState::Failed,
+            ]),
+            limit: MAX_CANDIDATES,
+            ..Default::default()
+        })
+        .await
+        .ok()?;
+    let [task] = <[Task; 1]>::try_from(calling(state, agent_id, candidates, call).await).ok()?;
+    let TaskBinding::AgentSession { asid, .. } = &task.binding else {
+        return None;
+    };
+    let manager = state.agent_runtime.manager_for_agent(agent_id).await?;
+    manager.sessions().get_session(asid).await.ok()?;
+    Some(task.id)
+}
+
+/// A terminal agent can make its first tool call before the pane observer
+/// sees the new turn. Keep that command under the same still-live assignment,
+/// including its peer-origin one-hop restriction, without treating the tool
+/// call itself as evidence that the assignment reopened.
+async fn finished_pane_parent(state: &AppState, binding: &TokenBinding) -> Option<TaskId> {
+    let TokenBinding::Pane {
+        session_id,
+        pane_id,
+    } = binding
+    else {
+        return None;
+    };
+    let tasks = state
+        .tasks
+        .open_tasks(TaskFilter {
+            pane: Some((session_id.clone(), pane_id.clone())),
+            limit: 1,
+            ..Default::default()
+        })
+        .await
+        .ok()?;
+    let task = tasks.first()?;
+    if task.kind != TaskKind::Delegation
+        || !matches!(
+            task.state,
+            crate::tasks::domain::TaskState::Done | crate::tasks::domain::TaskState::Failed
+        )
+        || !crate::tasks::pane_agent::same_live_job(task).await
+    {
+        return None;
+    }
+    Some(task.id.clone())
 }
 
 /// The open delegation `session` works on, for `tasks.complete` (`call`):
@@ -149,16 +418,7 @@ async fn calling(
         session_items(&manager, asid)
             .await
             .iter()
-            .any(|item| match &item.part {
-                AgentPart::Tool(part) => {
-                    part.state == ToolCallStatus::Running
-                        && names_tool(&part.name, call.tool)
-                        && call.args.iter().all(|(key, value)| {
-                            part.input.get(*key).and_then(|v| v.as_str()) == Some(*value)
-                        })
-                }
-                _ => false,
-            })
+            .any(|item| runs(item, call))
     });
     let calling = join_all(probes).await;
     candidates
@@ -246,6 +506,8 @@ mod tests {
             mentions: Vec::new(),
             client_ref: None,
             requester_server_id: None,
+            reopened_ms: None,
+            reopen_count: 0,
         }
     }
 
@@ -425,6 +687,22 @@ mod tests {
             assert_eq!(asked.parent, expected, "{name}");
             assert_eq!(asked.origin, TaskOrigin::Agent, "{name}");
             assert_eq!(asked.by.id, "agent:opencode");
+            // The same session, task or not, is where its result is told.
+            for (asid, _) in &sessions {
+                let busy = crate::agents::domain::AgentDomainEvent::StatusChanged {
+                    asid: crate::agents::domain::AgentSessionId(asid.to_string()),
+                    status: crate::agents::domain::AgentSessionStatus::Busy,
+                    error: None,
+                    seq: 1,
+                };
+                state.tasks.follow(&state, &busy).await;
+            }
+            let told = caller_session(&state, &agent_token(), &call).await;
+            let expected = has_parent.then(|| NoticeTarget::Session {
+                agent_id: "opencode".into(),
+                asid: "ses_parent".into(),
+            });
+            assert_eq!(told, expected, "{name}");
         }
     }
 
@@ -439,6 +717,9 @@ mod tests {
                 tab_id: None,
                 shell_pid: None,
                 agent_id: None,
+                agent_job: None,
+                model: None,
+                variant: None,
             },
         )
         .await;
@@ -450,6 +731,73 @@ mod tests {
             (elsewhere.parent, elsewhere.origin),
             (None, TaskOrigin::Mcp)
         );
+    }
+
+    #[tokio::test]
+    async fn a_first_tool_call_keeps_its_finished_session_parent_without_reopening_it() {
+        let call = run("make", "/w");
+        let state = state_with(&[(
+            "ses_parent",
+            calling(
+                "muqun_exec_run",
+                "running",
+                json!({"command":"make", "cwd":"/w"}),
+            ),
+        )])
+        .await;
+        let id = working(&state, session_of("ses_parent")).await;
+        state
+            .tasks
+            .move_to(
+                &id,
+                TaskChange {
+                    to: TaskState::Done,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let asked = requested(&state, &agent_token(), &call).await;
+        assert_eq!(asked.parent, Some(id.clone()));
+        assert_eq!(
+            state.tasks.task(&id).await.unwrap().unwrap().state,
+            TaskState::Done
+        );
+    }
+
+    #[tokio::test]
+    async fn a_finished_pane_without_its_recorded_job_is_not_a_parent() {
+        for ended in [TaskState::Done, TaskState::Failed, TaskState::Cancelled] {
+            let state = test_state("admin", Vec::new());
+            let id = working(
+                &state,
+                TaskBinding::Pane {
+                    session_id: "default".into(),
+                    pane_id: "%4".into(),
+                    tab_id: None,
+                    shell_pid: None,
+                    agent_id: Some("codex".into()),
+                    agent_job: None,
+                    model: None,
+                    variant: None,
+                },
+            )
+            .await;
+            state
+                .tasks
+                .move_to(
+                    &id,
+                    TaskChange {
+                        to: ended,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let asked = requested(&state, &pane_token("%4"), &run("make", "/w")).await;
+            assert_eq!(asked.parent, None);
+            assert_eq!(state.tasks.task(&id).await.unwrap().unwrap().state, ended);
+        }
     }
 
     /// `tasks.complete` reaches only the caller's own task: the session
@@ -516,6 +864,9 @@ mod tests {
             tab_id: None,
             shell_pid: None,
             agent_id: Some("claude".into()),
+            agent_job: None,
+            model: None,
+            variant: None,
         };
         let in_pane = working(&state, pane("%4")).await;
         assert_eq!(
@@ -527,6 +878,166 @@ mod tests {
             None,
             "another pane"
         );
+    }
+
+    #[tokio::test]
+    async fn forwarding_requires_a_unique_observed_session() {
+        use crate::tasks::domain::ForwardingContext;
+        use crate::tasks::service::TaskError;
+        let items = || {
+            calling(
+                "muqun_exec_run",
+                "running",
+                json!({"command":"pwd", "cwd":"~", "machine":"mini"}),
+            )
+        };
+        let call = Call {
+            tool: "exec.run",
+            args: vec![("command", "pwd"), ("cwd", "~"), ("machine", "mini")],
+        };
+        let state = state_with(&[("local", items())]).await;
+        // An ordinary local session need not have a task in the ledger.
+        state
+            .tasks
+            .follow(
+                &state,
+                &crate::agents::domain::AgentDomainEvent::StatusChanged {
+                    asid: AgentSessionId("local".into()),
+                    status: crate::agents::domain::AgentSessionStatus::Busy,
+                    error: None,
+                    seq: 1,
+                },
+            )
+            .await;
+        let by = requested_for_forwarding(&state, &agent_token(), &call)
+            .await
+            .unwrap();
+        assert_eq!(by.forwarding, ForwardingContext::Resolved);
+        assert_eq!(by.parent, None);
+        let other_machine = Call {
+            tool: "exec.run",
+            args: vec![("command", "pwd"), ("cwd", "~"), ("machine", "third")],
+        };
+        assert!(matches!(
+            requested_for_forwarding(&state, &agent_token(), &other_machine).await,
+            Err(TaskError::LineageUnresolved)
+        ));
+        let ambiguous = state_with(&[("a", items()), ("b", items())]).await;
+        working(&ambiguous, session_of("a")).await;
+        working(&ambiguous, session_of("b")).await;
+        assert!(matches!(
+            requested_for_forwarding(&ambiguous, &agent_token(), &call).await,
+            Err(TaskError::LineageUnresolved)
+        ));
+        let missing = state_with(&[]).await;
+        assert!(matches!(
+            requested_for_forwarding(&missing, &agent_token(), &call).await,
+            Err(TaskError::LineageUnresolved)
+        ));
+        // Ordinary best-effort local work remains available.
+        assert_eq!(
+            requested(&missing, &agent_token(), &call).await.parent,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn forwarding_filters_only_proven_absent_untracked_provider_sessions() {
+        use crate::tasks::service::TaskError;
+        let state = test_state("admin", Vec::new());
+        let mut agent = FakeAgent::new("opencode").with_sessions(&[("local", 1)]);
+        agent.session_timelines.insert(
+            "local".into(),
+            calling(
+                "muqun_exec_run",
+                "running",
+                json!({"command":"pwd", "cwd":"~"}),
+            ),
+        );
+        agent.http_404 = vec!["unreadable".into()];
+        state.agent_runtime.attach_for_test(agent.manager()).await;
+        let busy = |id: &str| crate::agents::domain::AgentDomainEvent::StatusChanged {
+            asid: AgentSessionId(id.into()),
+            status: crate::agents::domain::AgentSessionStatus::Busy,
+            error: None,
+            seq: 1,
+        };
+        state.tasks.follow(&state, &busy("local")).await;
+        state
+            .tasks
+            .follow(&state, &busy("another-provider-session"))
+            .await;
+        assert!(
+            requested_for_forwarding(&state, &agent_token(), &run("pwd", "~"))
+                .await
+                .is_ok()
+        );
+        // A generic provider failure (including an untyped HTTP 404) is
+        // not proof that this busy session belongs to another provider.
+        state.tasks.follow(&state, &busy("unreadable")).await;
+        assert!(matches!(
+            requested_for_forwarding(&state, &agent_token(), &run("pwd", "~")).await,
+            Err(TaskError::LineageUnresolved)
+        ));
+    }
+
+    #[tokio::test]
+    async fn forwarding_searches_past_twenty_but_refuses_a_full_page() {
+        use crate::tasks::service::TaskError;
+        let state = state_with(&[(
+            "old",
+            calling(
+                "muqun_exec_run",
+                "running",
+                json!({"command":"pwd", "cwd":"~"}),
+            ),
+        )])
+        .await;
+        let mut peer = open_task(session_of("old"));
+        peer.origin = TaskOrigin::Peer;
+        let id = state.tasks.insert_for_test(&peer).await;
+        for i in 0..21 {
+            state
+                .tasks
+                .insert_for_test(&open_task(session_of(&format!("other-{i}"))))
+                .await;
+        }
+        let by = requested_for_forwarding(&state, &agent_token(), &run("pwd", "~"))
+            .await
+            .unwrap();
+        assert_eq!(by.parent, Some(id));
+        for i in 22..1000 {
+            state
+                .tasks
+                .insert_for_test(&open_task(session_of(&format!("other-{i}"))))
+                .await;
+        }
+        assert!(matches!(
+            requested_for_forwarding(&state, &agent_token(), &run("pwd", "~")).await,
+            Err(TaskError::LineageUnresolved)
+        ));
+    }
+
+    #[tokio::test]
+    async fn forwarding_store_errors_are_not_local_roots() {
+        use crate::tasks::service::TaskError;
+        let state = test_state("admin", Vec::new());
+        let by = requested_for_forwarding(&state, &pane_token("%4"), &run("pwd", "~"))
+            .await
+            .unwrap();
+        assert_eq!(by.parent, None);
+        state
+            .db
+            .call(|db| {
+                db.execute_batch("DROP TABLE tasks")?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            requested_for_forwarding(&state, &pane_token("%4"), &run("pwd", "~")).await,
+            Err(TaskError::LineageUnresolved)
+        ));
     }
 
     #[test]

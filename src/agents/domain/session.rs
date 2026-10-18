@@ -89,6 +89,20 @@ impl SessionQuery {
     }
 }
 
+/// One provider page, retaining the provider's order and opaque cursors.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionPage {
+    pub data: Vec<AgentSessionInfo>,
+    pub cursor: SessionCursor,
+}
+
+/// Missing directions serialize as explicit nulls, not omitted fields.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionCursor {
+    pub next: Option<String>,
+    pub previous: Option<String>,
+}
+
 /// `Session.Info.revert`: a staged rollback the user can still cancel.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionRevertInfo {

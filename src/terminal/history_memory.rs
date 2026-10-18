@@ -39,7 +39,16 @@ impl MemoryHistoryRepository {
             .map_err(|_| HistoryError::Unavailable)?;
         snapshots.retain(|_, snap| {
             snap.created.elapsed() < SNAPSHOT_TTL
-                && captures.capture_epoch(&snap.scope) == Some(snap.epoch)
+                && if snap.segments.is_some() {
+                    captures
+                        .captured_segments(&snap.scope, false)
+                        .ok()
+                        .flatten()
+                        .map(|c| c.epoch)
+                        == Some(snap.epoch)
+                } else {
+                    captures.capture_epoch(&snap.scope) == Some(snap.epoch)
+                }
         });
         Ok(())
     }
@@ -52,16 +61,19 @@ impl HistoryRepository for MemoryHistoryRepository {
         include_rows: bool,
     ) -> HistoryFuture<'a, Option<Capture>> {
         Box::pin(async move {
-            self.captures
+            let mut captures = self
+                .captures
                 .lock()
-                .map_err(|_| HistoryError::Unavailable)?
-                .captured_history(scope, include_rows)
+                .map_err(|_| HistoryError::Unavailable)?;
+            captures.trim_segments();
+            captures.captured_history(scope, include_rows)
         })
     }
 
     fn find<'a>(
         &'a self,
         scope: &'a HistoryScope,
+        segmented: bool,
     ) -> HistoryFuture<'a, Option<Arc<HistorySnapshot>>> {
         Box::pin(async move {
             let mut snapshots = self
@@ -71,8 +83,23 @@ impl HistoryRepository for MemoryHistoryRepository {
             self.prune(&mut snapshots)?;
             Ok(snapshots
                 .values()
-                .find(|snap| snap.scope == *scope)
+                .find(|snap| snap.scope == *scope && snap.segments.is_some() == segmented)
                 .cloned())
+        })
+    }
+
+    fn capture_segments<'a>(
+        &'a self,
+        scope: &'a HistoryScope,
+        include_rows: bool,
+    ) -> HistoryFuture<'a, Option<Capture>> {
+        Box::pin(async move {
+            let mut captures = self
+                .captures
+                .lock()
+                .map_err(|_| HistoryError::Unavailable)?;
+            captures.trim_segments();
+            captures.captured_segments(scope, include_rows)
         })
     }
 
@@ -106,6 +133,7 @@ impl HistoryRepository for MemoryHistoryRepository {
                     && held.epoch == snapshot.epoch
                     && held.base == snapshot.base
                     && held.rows.len() == snapshot.rows.len()
+                    && held.segments == snapshot.segments
             }) {
                 return Ok(held.clone());
             }
@@ -168,6 +196,7 @@ impl HistoryRepository for MemoryHistoryRepository {
 
 #[cfg(test)]
 mod tests {
+    use super::super::history::read_segment_page;
     use super::super::history::{parse_cursor, read_page, MAX_PAGE_BYTES};
     use super::*;
     use serde_json::json;
@@ -386,6 +415,153 @@ mod tests {
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default()
             .to_owned()
+    }
+
+    #[tokio::test]
+    async fn segmented_pages_cross_boundaries_without_crossing_endpoint_or_mutating_snapshots() {
+        let repository =
+            MemoryHistoryRepository::new(Arc::new(Mutex::new(ScrollbackStore::default())));
+        let scope = scope("s", "p", 5);
+        feed(
+            &repository,
+            &scope,
+            &(0..7).map(|i| format!("old {i}")).collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            read_page(&repository, scope.clone(), None).await.unwrap()["row_count"],
+            5
+        );
+        // Suspend capture, keeping only the prefix (not the four live rows).
+        repository.captures.lock().unwrap().observe(
+            "s",
+            &json!({"pane_id":"p", "scroll":{"max_offset_from_bottom":200}}),
+        );
+        let retained = read_segment_page(&repository, scope.clone(), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            retained["segments"][0]["rows"],
+            json!(["old 2", "old 3", "old 4", "old 5", "old 6"])
+        );
+        assert_eq!(
+            read_page(&repository, scope.clone(), None).await.unwrap()["availability"],
+            "not_captured"
+        );
+        repository.captures.lock().unwrap().observe(
+            "s",
+            &json!({"pane_id":"p", "scroll":{"max_offset_from_bottom":0}}),
+        );
+        frame(&repository, &scope, "new 0\nnew 1\nnew 2");
+        frame(
+            &repository,
+            &scope,
+            "screen 0\nscreen 1\nscreen 2\nscreen 3",
+        );
+        let first = read_segment_page(&repository, scope.clone(), None)
+            .await
+            .unwrap();
+        assert_eq!(first["row_count"], 5);
+        assert_eq!(first["segments"].as_array().unwrap().len(), 2);
+        assert_eq!(first["segments"][0]["rows"], json!(["old 5", "old 6"]));
+        assert_eq!(
+            first["segments"][1]["rows"],
+            json!(["new 0", "new 1", "new 2"])
+        );
+        assert_ne!(
+            first["segments"][0]["segment_id"],
+            first["segments"][1]["segment_id"]
+        );
+        let cursor = first["next_before"].as_str().unwrap();
+        let older = read_segment_page(&repository, scope.clone(), Some(cursor))
+            .await
+            .unwrap();
+        assert_eq!(
+            older["segments"][0]["segment_id"],
+            first["segments"][0]["segment_id"]
+        );
+        assert_eq!(
+            older["segments"][0]["rows"],
+            json!(["old 0", "old 1", "old 2", "old 3", "old 4"])
+        );
+        frame(&repository, &scope, "next 0\nnext 1\nnext 2\nnext 3");
+        assert_eq!(
+            read_segment_page(&repository, scope.clone(), Some(cursor))
+                .await
+                .unwrap(),
+            older
+        );
+        assert_eq!(
+            read_page(&repository, scope.clone(), Some(cursor)).await,
+            Err(HistoryError::Mismatch)
+        );
+        // The legacy snapshot was reset by suspension, so cross-endpoint
+        // rejection is exercised with a current legacy traversal too.
+        let legacy = read_page(&repository, scope.clone(), None).await.unwrap();
+        let cursor = legacy["next_before"].as_str().unwrap();
+        assert_eq!(
+            read_segment_page(&repository, scope.clone(), Some(cursor)).await,
+            Err(HistoryError::Mismatch)
+        );
+    }
+
+    #[tokio::test]
+    async fn segmented_snapshot_ttl_trim_and_identity_reset_are_gone() {
+        let repository =
+            MemoryHistoryRepository::new(Arc::new(Mutex::new(ScrollbackStore::default())));
+        let scope = scope("s", "p", 2);
+        feed(
+            &repository,
+            &scope,
+            &(0..7).map(|i| format!("old {i}")).collect::<Vec<_>>(),
+        );
+        let page = read_segment_page(&repository, scope.clone(), None)
+            .await
+            .unwrap();
+        let cursor = page["next_before"].as_str().unwrap();
+        let (id, _) = parse_cursor(cursor).unwrap();
+        Arc::get_mut(repository.snapshots.lock().unwrap().get_mut(&id).unwrap())
+            .unwrap()
+            .created = Instant::now() - SNAPSHOT_TTL;
+        assert_eq!(
+            read_segment_page(&repository, scope.clone(), Some(cursor)).await,
+            Err(HistoryError::Gone)
+        );
+        let page = read_segment_page(&repository, scope.clone(), None)
+            .await
+            .unwrap();
+        let mut older = page.clone();
+        let mut oldest = String::new();
+        while let Some(cursor) = older["next_before"].as_str() {
+            oldest = cursor.into();
+            older = read_segment_page(&repository, scope.clone(), Some(cursor))
+                .await
+                .unwrap();
+        }
+        frame(
+            &repository,
+            &scope,
+            &(0..5000)
+                .map(|i| format!("busy {i}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        frame(&repository, &scope, "last 0\nlast 1\nlast 2\nlast 3");
+        assert_eq!(
+            read_segment_page(&repository, scope.clone(), Some(&oldest)).await,
+            Err(HistoryError::Gone)
+        );
+        let page = read_segment_page(&repository, scope.clone(), None)
+            .await
+            .unwrap();
+        repository
+            .captures
+            .lock()
+            .unwrap()
+            .observe_listing("s", &json!({"panes":[]}));
+        assert_eq!(
+            read_segment_page(&repository, scope, page["next_before"].as_str()).await,
+            Err(HistoryError::Gone)
+        );
     }
 
     #[tokio::test]

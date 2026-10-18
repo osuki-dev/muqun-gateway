@@ -123,10 +123,17 @@ pub(crate) fn strip_exit_markers(text: &str) -> Cow<'_, str> {
     )
 }
 
-/// Drop the marker rows of a captured-history page.
+/// Drop the marker rows of a captured-history page, and count what is left.
+/// Recording already leaves them out; this catches a checkpoint written
+/// before it did.
 pub(crate) fn strip_history_page(page: &mut Value) {
-    if let Some(rows) = page.get_mut("rows").and_then(Value::as_array_mut) {
-        rows.retain(|row| row.as_str().is_none_or(|row| parse_marker(row).is_none()));
+    let Some(rows) = page.get_mut("rows").and_then(Value::as_array_mut) else {
+        return;
+    };
+    rows.retain(|row| row.as_str().is_none_or(|row| parse_marker(row).is_none()));
+    let count = rows.len();
+    if page.get("row_count").is_some() {
+        page["row_count"] = count.into();
     }
 }
 
@@ -156,6 +163,13 @@ mod tests {
         let text = "a\n\u{1f}muqun-exit:t_1:0\u{1f}\nb\n";
         assert_eq!(strip_exit_markers(text), "a\nb\n");
         assert!(matches!(strip_exit_markers("plain"), Cow::Borrowed(_)));
+        // A history page counts the rows it serves.
+        let mut page = serde_json::json!({"rows": ["a", "muqun-exit:t_1:0", "b"], "row_count": 3});
+        strip_history_page(&mut page);
+        assert_eq!(
+            page,
+            serde_json::json!({"rows": ["a", "b"], "row_count": 2})
+        );
     }
 
     #[test]

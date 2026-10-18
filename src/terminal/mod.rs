@@ -9,6 +9,7 @@ pub mod factory;
 pub(crate) mod history;
 pub(crate) mod history_memory;
 pub(crate) mod history_routes;
+pub(crate) mod history_segments;
 pub(crate) mod history_sqlite;
 pub(crate) mod lazygit;
 pub mod login_env;

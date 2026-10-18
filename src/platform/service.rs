@@ -108,6 +108,10 @@ pub fn uninstall() -> Result<()> {
     }
     #[cfg(not(target_os = "macos"))]
     run_quiet("systemctl", &["--user", "daemon-reload"]);
+    // The domain a stop found the LaunchAgent in belongs to that install.
+    if let Ok(state) = crate::state_dir() {
+        let _ = std::fs::remove_file(state.join("launchd-domain"));
+    }
     Ok(())
 }
 
@@ -182,10 +186,19 @@ fn validate_install_unit(contents: &str, paths: &ServicePaths) -> Result<()> {
     anyhow::ensure!(config_matches && state_matches,
         "the installed service uses different config/state paths; refusing to control another installation");
     anyhow::ensure!(if cfg!(target_os = "macos") {
-        contents.contains("<key>AbandonProcessGroup</key>\n  <true/>")
+        plist_true(contents, "AbandonProcessGroup")
     } else { contents.contains("KillMode=process") || contents.contains("KillMode=none") },
         "the service may terminate terminal tasks; update its child-process lifetime rules before controlling it");
     Ok(())
+}
+
+/// Whether plist `contents` sets `key` to `<true/>`, however the file is
+/// indented (`plutil` and `defaults` rewrite it with tabs).
+#[cfg(any(target_os = "macos", test))]
+fn plist_true(contents: &str, key: &str) -> bool {
+    contents
+        .split_once(&format!("<key>{key}</key>"))
+        .is_some_and(|(_, after)| after.trim_start().starts_with("<true/>"))
 }
 
 /// The plist runs this binary: one `ProgramArguments`, no `Program`, and
@@ -1027,6 +1040,14 @@ mod tests {
                 "<key>AbandonProcessGroup</key>\n  <false/>",
             );
         assert!(validate_install_unit(&unsafe_unit, &fixture).is_err());
+        for (plist, kept) in [
+            ("<key>AbandonProcessGroup</key>\n  <true/>", true),
+            ("<dict>\n\t<key>AbandonProcessGroup</key>\n\t<true/>", true),
+            ("<key>AbandonProcessGroup</key>\n\t<false/>", false),
+            ("<key>KeepAlive</key>\n\t<true/>", false),
+        ] {
+            assert_eq!(plist_true(plist, "AbandonProcessGroup"), kept, "{plist:?}");
+        }
     }
 
     #[cfg(unix)]

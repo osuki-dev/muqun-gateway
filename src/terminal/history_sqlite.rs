@@ -1,8 +1,8 @@
 //! Optional captured-history checkpoints, kept in the shared store under the
-//! `history` namespace. The live fold coalesces revisions; on a tick where the
-//! fold's version moved, a Tokio task hands the store worker one pass that
-//! copies at most one bounded projection under the fold lock and writes it
-//! without that lock.
+//! `history` namespace. The live fold coalesces revisions; when the fold's
+//! version moves, a Tokio task hands the store worker one pass that takes at
+//! most one bounded projection's shared rows under the fold lock and encodes
+//! and writes it without that lock. An idle fold wakes it only to prune.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -11,14 +11,17 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 
 use super::history::{
     Capture, HistoryError, HistoryFuture, HistoryRepository, HistoryScope, HistorySnapshot,
+    StorageStats,
 };
 use super::history_memory::MemoryHistoryRepository;
+use super::history_segments::{Segment, SegmentPosition, MAX_SEGMENTS, RETENTION_MS};
 use super::scrollback::{ProjectionStamp, ScrollbackStore, MAX_PANE_BYTES, MAX_PANE_LINES};
 use crate::platform::config::{Config, HistoryStorage};
 use crate::platform::store::sqlite::{Migration, SqliteStore};
@@ -38,6 +41,22 @@ CREATE INDEX history_capture_retention ON history_captures(updated);
 CREATE INDEX history_capture_quota ON history_captures(updated, identity, bytes);
 DROP INDEX history_capture_retention;
 ",
+        // Parent rows continue to count read shapes, not segments. The legacy
+        // binary payload is retained verbatim and validated by the same decoder
+        // before adoption. A corrupt record can never authorize empty recovery.
+        "
+CREATE TABLE history_segments(identity TEXT NOT NULL REFERENCES history_captures(identity) ON DELETE CASCADE,
+  segment_id TEXT NOT NULL, position TEXT NOT NULL, rows BLOB NOT NULL,
+  bytes INTEGER NOT NULL, changed_ms INTEGER NOT NULL, PRIMARY KEY(identity,segment_id));
+CREATE INDEX history_segment_age ON history_segments(changed_ms);
+INSERT INTO history_segments SELECT identity, lower(hex(randomblob(16))),
+  json_object('segment_id', '00000000-0000-0000-0000-000000000000', 'started_at_ms', updated*1000,
+    'sealed_at_ms', updated*1000, 'boundary_reason', 'gateway-restart', 'base', 0, 'len', 0),
+  rows, bytes, updated*1000 FROM history_captures WHERE length(rows)>0;
+UPDATE history_captures SET rows=x'';
+UPDATE history_segments SET bytes=bytes+length(CAST(position AS BLOB))+length(segment_id)+16;
+UPDATE history_captures SET bytes=(SELECT coalesce(sum(bytes),0) FROM history_segments WHERE history_segments.identity=history_captures.identity)+length(CAST(identity AS BLOB))+length(CAST(policy AS BLOB))+64;
+",
     ],
 };
 
@@ -47,6 +66,8 @@ const MAX_PAYLOAD_BYTES: i64 = 24 * 1024 * 1024;
 // Length prefixes have their own bounded overhead, counted in payload quotas.
 const MAX_ENCODED_BYTES: usize = MAX_PANE_BYTES + 4 * MAX_PANE_LINES;
 const RETENTION_SECONDS: i64 = 7 * 24 * 60 * 60;
+/// How soon a pass that left work (a debounced scope, a projection still to
+/// write) is followed by the next.
 const FLUSH_TICK: Duration = Duration::from_millis(100);
 const PRUNE_EVERY: Duration = Duration::from_secs(60);
 /// A written scope waits this long before its next ordinary write; a reset,
@@ -54,12 +75,34 @@ const PRUNE_EVERY: Duration = Duration::from_secs(60);
 const WRITE_DEBOUNCE: Duration = Duration::from_secs(3);
 /// Checkpoint reads waiting on the shared store; one more is a 503.
 const MAX_PENDING_READS: usize = 16;
+/// A WAL past this is folded back into the database after the pass that
+/// grew it -- below SQLite's own autocheckpoint (1,000 pages, about 4 MiB),
+/// which folds pages back but never shrinks the file; TRUNCATE does.
+const WAL_CHECKPOINT_BYTES: u64 = 1024 * 1024;
+/// A writer that has written nothing for this long folds the WAL back on its
+/// next prune pass, so an idle store's WAL file is empty.
+const IDLE_CHECKPOINT: Duration = if cfg!(test) {
+    Duration::ZERO
+} else {
+    Duration::from_secs(60)
+};
+
+/// How long the write loop waits after a failed pass before it tries again:
+/// each failure moves one step on, and a pass that works starts over.
+const RETRY_AFTER: [Duration; 3] = [
+    Duration::from_secs(1),
+    Duration::from_secs(5),
+    Duration::from_secs(30),
+];
 
 pub(crate) struct SqliteHistoryRepository {
     memory: MemoryHistoryRepository,
-    /// `None` when initialization failed: every operation then answers 503.
-    checkpoints: Option<Arc<Checkpoints>>,
+    captures: Arc<Mutex<ScrollbackStore>>,
+    /// `None` until initialization works; a failed one is retried on the
+    /// write loop's backoff ([`RETRY_AFTER`]).
+    checkpoints: Arc<std::sync::RwLock<Option<Arc<Checkpoints>>>>,
     reads: Semaphore,
+    /// The write loop, or the initialization retrying before it.
     flusher: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -94,27 +137,57 @@ impl SqliteHistoryRepository {
         debounce: Duration,
     ) -> Self {
         let memory = MemoryHistoryRepository::new(captures.clone());
-        let checkpoints = match Checkpoints::open(db, config, captures, debounce).await {
-            Ok(checkpoints) => Some(checkpoints),
+        let slot = Arc::new(std::sync::RwLock::new(None));
+        let opened = Checkpoints::open(db.clone(), config, captures.clone(), debounce).await;
+        let flusher = match opened {
+            Ok(checkpoints) => {
+                if let Ok(mut slot) = slot.write() {
+                    *slot = Some(checkpoints.clone());
+                }
+                tokio::spawn(checkpoints.flush_forever())
+            }
             Err(error) => {
-                tracing::error!(%error, "captured history initialization failed; realtime output remains available");
-                None
+                tracing::error!(%error, "captured history initialization failed; retrying, realtime output remains available");
+                let (slot, config, captures) = (slot.clone(), config.clone(), captures.clone());
+                tokio::spawn(async move {
+                    for failures in 0usize.. {
+                        tokio::time::sleep(RETRY_AFTER[failures.min(RETRY_AFTER.len() - 1)]).await;
+                        match Checkpoints::open(db.clone(), &config, captures.clone(), debounce)
+                            .await
+                        {
+                            Ok(checkpoints) => {
+                                tracing::info!("captured history storage initialized");
+                                if let Ok(mut slot) = slot.write() {
+                                    *slot = Some(checkpoints.clone());
+                                }
+                                return checkpoints.flush_forever().await;
+                            }
+                            Err(error) => {
+                                tracing::debug!(%error, "captured history initialization failed again")
+                            }
+                        }
+                    }
+                })
             }
         };
-        let flusher = checkpoints
-            .clone()
-            .map(|checkpoints| tokio::spawn(checkpoints.flush_forever()));
         Self {
             memory,
-            checkpoints,
+            captures,
+            checkpoints: slot,
             reads: Semaphore::new(MAX_PENDING_READS),
-            flusher,
+            flusher: Some(flusher),
         }
     }
 
-    fn health(&self) -> Result<&Arc<Checkpoints>, HistoryError> {
-        self.checkpoints
-            .as_ref()
+    /// The store, once initialized.
+    fn checkpoints(&self) -> Option<Arc<Checkpoints>> {
+        self.checkpoints.read().ok()?.clone()
+    }
+
+    /// The store, while its last operation worked. Only what needs it --
+    /// recovering a checkpoint -- asks; what memory holds is served either way.
+    fn health(&self) -> Result<Arc<Checkpoints>, HistoryError> {
+        self.checkpoints()
             .filter(|checkpoints| checkpoints.healthy.load(Ordering::Acquire))
             .ok_or(HistoryError::Unavailable)
     }
@@ -138,28 +211,38 @@ impl SqliteHistoryRepository {
         }
     }
 
+    /// Adopt the pane's checkpoint, when one could be read: a verified,
+    /// unreset pane. Eligibility first, from the fold alone -- a pane that
+    /// could never have one answers from memory (`not_captured`, an empty
+    /// capture) whatever the store's health; only a read the store must
+    /// serve answers 503 while it fails.
     async fn recover(&self, scope: &HistoryScope) -> Result<(), HistoryError> {
-        let checkpoints = self.health()?;
-        let stamp = checkpoints
+        let stamp = self
             .captures
             .lock()
             .map_err(|_| HistoryError::Unavailable)?
             .projection_stamp(scope);
-        let Some(stamp) = stamp.filter(|stamp| stamp.native_identity.is_some() && !stamp.reset)
-        else {
+        let Some(stamp) = stamp.filter(|stamp| {
+            self.captures
+                .lock()
+                .is_ok_and(|c| c.recovery_pending(stamp))
+        }) else {
             return Ok(());
         };
+        let checkpoints = self.health()?;
         let _queued = self
             .reads
             .try_acquire()
             .map_err(|_| HistoryError::Unavailable)?;
-        if let Some((rows, expires)) = checkpoints.read(stamp.clone()).await? {
-            checkpoints
-                .captures
-                .lock()
-                .map_err(|_| HistoryError::Unavailable)?
-                .recover_checkpoint(&stamp, rows, expires);
-        }
+        let recovered = checkpoints
+            .read_segments(stamp.clone())
+            .await?
+            .unwrap_or_default();
+        checkpoints
+            .captures
+            .lock()
+            .map_err(|_| HistoryError::Unavailable)?
+            .recover_segments(&stamp, recovered);
         Ok(())
     }
 }
@@ -179,7 +262,6 @@ impl HistoryRepository for SqliteHistoryRepository {
         include_rows: bool,
     ) -> HistoryFuture<'a, Option<Capture>> {
         Box::pin(async move {
-            self.health()?;
             if include_rows {
                 let has_rows = self
                     .memory
@@ -196,29 +278,38 @@ impl HistoryRepository for SqliteHistoryRepository {
     fn find<'a>(
         &'a self,
         scope: &'a HistoryScope,
+        segmented: bool,
     ) -> HistoryFuture<'a, Option<Arc<HistorySnapshot>>> {
+        Box::pin(async move { self.memory.find(scope, segmented).await })
+    }
+    fn capture_segments<'a>(
+        &'a self,
+        scope: &'a HistoryScope,
+        include_rows: bool,
+    ) -> HistoryFuture<'a, Option<Capture>> {
         Box::pin(async move {
-            self.health()?;
-            self.memory.find(scope).await
+            self.recover(scope).await?;
+            self.memory.capture_segments(scope, include_rows).await
         })
     }
     fn load(&self, id: Uuid) -> HistoryFuture<'_, Option<Arc<HistorySnapshot>>> {
-        Box::pin(async move {
-            self.health()?;
-            self.memory.load(id).await
-        })
+        Box::pin(async move { self.memory.load(id).await })
     }
     fn pin(&self, snapshot: HistorySnapshot) -> HistoryFuture<'_, Arc<HistorySnapshot>> {
-        Box::pin(async move {
-            self.health()?;
-            self.memory.pin(snapshot).await
-        })
+        Box::pin(async move { self.memory.pin(snapshot).await })
     }
     fn remove(&self, id: Uuid) -> HistoryFuture<'_, ()> {
-        Box::pin(async move {
-            self.health()?;
-            self.memory.remove(id).await
-        })
+        Box::pin(async move { self.memory.remove(id).await })
+    }
+    fn stats(&self) -> Option<StorageStats> {
+        Some(
+            self.checkpoints()
+                .map_or_else(StorageStats::default, |checkpoints| StorageStats {
+                    healthy: checkpoints.healthy.load(Ordering::Acquire),
+                    checkpoints: checkpoints.stored.load(Ordering::Relaxed),
+                    wal_bytes: checkpoints.wal.load(Ordering::Relaxed),
+                }),
+        )
     }
 }
 
@@ -233,6 +324,13 @@ struct Checkpoints {
     debounce: Duration,
     healthy: AtomicBool,
     writer: Mutex<Writer>,
+    /// How often the write loop has woken: an idle fold leaves it asleep.
+    wakes: std::sync::atomic::AtomicU64,
+    /// When a pass last committed a change, for the idle WAL checkpoint.
+    last_write: Mutex<Instant>,
+    /// Stored checkpoints and WAL bytes as of the last pass, for `stats`.
+    stored: std::sync::atomic::AtomicU64,
+    wal: std::sync::atomic::AtomicU64,
 }
 
 /// `(session, pane, format)`.
@@ -260,6 +358,9 @@ struct SeenProjection {
     content: Option<[u8; 32]>,
     /// When this scope last changed the database.
     written: Instant,
+    /// This revision was over the bounds (a row past 256 KiB, say): not
+    /// stored, not tried again until the projection changes, said once.
+    oversized: bool,
 }
 
 impl Checkpoints {
@@ -273,10 +374,11 @@ impl Checkpoints {
         let namespaces = db
             .call(move |connection| {
                 let namespaces = reconcile_backends(connection, &config)?;
-                prune(connection, now_seconds())?;
-                Ok(namespaces)
+                prune(connection, now_seconds(), &[])?;
+                Ok((namespaces, stored_count(connection)?, wal_bytes(connection)))
             })
             .await?;
+        let (namespaces, stored, wal) = namespaces;
         Ok(Arc::new(Self {
             db,
             captures,
@@ -287,19 +389,33 @@ impl Checkpoints {
                 seen: HashMap::new(),
                 next_scope: None,
             }),
+            wakes: std::sync::atomic::AtomicU64::new(0),
+            last_write: Mutex::new(Instant::now()),
+            stored: std::sync::atomic::AtomicU64::new(stored),
+            wal: std::sync::atomic::AtomicU64::new(wal),
         }))
     }
 
     async fn flush_forever(self: Arc<Self>) {
-        let mut tick = tokio::time::interval(FLUSH_TICK);
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let Ok(changes) = self.captures.lock().map(|captures| captures.changes()) else {
+            return;
+        };
         // The fold's version as of the last pass that found nothing left to
         // do. While the fold still has exactly that version a pass would be a
-        // no-op, so idle ticks leave the shared worker alone until pruning is due.
+        // no-op, so the loop sleeps until the fold changes or pruning is due.
         let mut settled: Option<u64> = None;
         let mut pruned = Instant::now();
-        while self.healthy.load(Ordering::Acquire) {
-            tick.tick().await;
+        let mut failures = 0usize;
+        loop {
+            if settled.is_some() {
+                tokio::select! {
+                    () = changes.notified() => {}
+                    () = tokio::time::sleep_until((pruned + PRUNE_EVERY).into()) => {}
+                }
+            } else {
+                tokio::time::sleep(FLUSH_TICK).await;
+            }
+            self.wakes.fetch_add(1, Ordering::Relaxed);
             let prune_due = pruned.elapsed() >= PRUNE_EVERY;
             let snapshot = match self.captures.lock() {
                 Ok(captures) => (prune_due || settled != Some(captures.version()))
@@ -307,7 +423,7 @@ impl Checkpoints {
                 Err(_) => {
                     tracing::error!("captured history fold lock poisoned");
                     self.healthy.store(false, Ordering::Release);
-                    break;
+                    return;
                 }
             };
             let Some((version, stamps)) = snapshot else {
@@ -316,15 +432,22 @@ impl Checkpoints {
             if prune_due {
                 pruned = Instant::now();
             }
-            match self
+            let passed = self
                 .pass(now_seconds(), prune_due, stamps, self.debounce)
-                .await
-            {
-                Ok(true) => settled = Some(version),
-                Ok(false) => settled = None,
+                .await;
+            if passed.is_ok() && !self.healthy.swap(true, Ordering::AcqRel) {
+                tracing::info!("captured history storage works again");
+            }
+            match passed {
+                Ok(true) => (settled, failures) = (Some(version), 0),
+                Ok(false) => (settled, failures) = (None, 0),
                 Err(error) => {
-                    tracing::error!(%error, "captured history storage failed; realtime output remains available");
+                    let wait = RETRY_AFTER[failures.min(RETRY_AFTER.len() - 1)];
+                    tracing::error!(%error, retry_in_s = wait.as_secs(), "captured history storage failed; realtime output and captured rows in memory remain available");
                     self.healthy.store(false, Ordering::Release);
+                    failures += 1;
+                    settled = None;
+                    tokio::time::sleep(wait).await;
                 }
             }
         }
@@ -341,13 +464,48 @@ impl Checkpoints {
         let this = self.clone();
         self.db
             .call(move |connection| {
-                let idle = this.write_pass(connection, now, stamps, debounce)?;
-                if prune_due {
-                    prune(connection, now)?;
-                }
-                Ok(idle)
+                // Checkpoints are sampled and may lose their last seconds
+                // (see WRITE_DEBOUNCE), so their commits skip the fsync; the
+                // other domains' FULL durability is restored before any of
+                // their jobs runs on this one connection.
+                connection.pragma_update(None, "synchronous", "NORMAL")?;
+                // FULL comes back however the job ends, a panic included:
+                // the store catches it and the connection serves every domain.
+                let mut durable_again = DurableAgain(connection);
+                let connection = &mut *durable_again;
+                // The panes the last complete listings still show: quotas evict
+                // the rest first.
+                let live: Vec<String> = stamps.iter().filter_map(|stamp| this.key(stamp)).collect();
+                this.write_pass(connection, now, stamps, debounce, &live)
+                    .and_then(|idle| {
+                        if prune_due {
+                            prune(connection, now, &live)?;
+                        }
+                        this.fold_wal(connection, prune_due)?;
+                        this.stored
+                            .store(stored_count(connection)?, Ordering::Relaxed);
+                        this.wal.store(wal_bytes(connection), Ordering::Relaxed);
+                        Ok(idle)
+                    })
             })
             .await
+    }
+
+    /// Fold the WAL back into the database when it has grown past
+    /// [`WAL_CHECKPOINT_BYTES`], or on a prune pass once nothing has been
+    /// written for [`IDLE_CHECKPOINT`]. Runs on the store worker, never on a
+    /// request.
+    fn fold_wal(&self, connection: &Connection, prune_due: bool) -> anyhow::Result<()> {
+        let wal = wal_bytes(connection);
+        let idle = self
+            .last_write
+            .lock()
+            .map(|at| at.elapsed() >= IDLE_CHECKPOINT)
+            .unwrap_or(false);
+        if wal > WAL_CHECKPOINT_BYTES || (prune_due && idle && wal > 0) {
+            connection.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
+        }
+        Ok(())
     }
 
     /// A pass over the fold as it is now, without pruning.
@@ -366,10 +524,10 @@ impl Checkpoints {
         self.pass(now, false, stamps, debounce).await
     }
 
-    async fn read(
+    async fn read_segments(
         self: &Arc<Self>,
         stamp: ProjectionStamp,
-    ) -> Result<Option<(Vec<String>, Instant)>, HistoryError> {
+    ) -> Result<Option<Vec<Segment>>, HistoryError> {
         let this = self.clone();
         self.db
             .call(move |connection| this.read_rows(connection, &stamp))
@@ -379,6 +537,33 @@ impl Checkpoints {
                 self.healthy.store(false, Ordering::Release);
                 HistoryError::Unavailable
             })
+    }
+
+    #[cfg(test)]
+    async fn read(
+        self: &Arc<Self>,
+        stamp: ProjectionStamp,
+    ) -> Result<Option<(Vec<String>, Instant)>, HistoryError> {
+        Ok(self.read_segments(stamp).await?.map(|segments| {
+            let remaining = segments
+                .iter()
+                .map(|s| {
+                    s.changed_at_ms
+                        .saturating_add(RETENTION_MS)
+                        .saturating_sub(super::history_segments::now_ms())
+                })
+                .min()
+                .unwrap_or(0)
+                .max(0) as u64;
+            (
+                segments
+                    .iter()
+                    .flat_map(|s| &s.rows)
+                    .map(|r| r.to_string())
+                    .collect(),
+                Instant::now() + Duration::from_millis(remaining),
+            )
+        }))
     }
 
     /// `None` for a pane whose process identity is unverified: such a
@@ -402,31 +587,98 @@ impl Checkpoints {
         &self,
         connection: &Connection,
         stamp: &ProjectionStamp,
-    ) -> anyhow::Result<Option<(Vec<String>, Instant)>> {
+    ) -> anyhow::Result<Option<Vec<Segment>>> {
         let Some(key) = self.key(stamp) else {
             return Ok(None);
         };
-        let encoded: Option<(Vec<u8>, i64)> = connection
+        let policy: Option<String> = connection
             .query_row(
-                "SELECT rows,updated FROM history_captures WHERE identity=?1 AND policy=?2 AND updated>=?3",
-                params![key, stamp.policy, now_seconds() - RETENTION_SECONDS],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                "SELECT policy FROM history_captures WHERE identity=?1",
+                [&key],
+                |row| {
+                    let policy = row.get_ref(0)?.as_str()?;
+                    if policy.len() > 4096 {
+                        return Err(rusqlite::Error::InvalidQuery);
+                    }
+                    Ok(policy.to_owned())
+                },
             )
             .optional()?;
-        encoded
-            .map(|(encoded, updated)| {
-                Ok((
-                    decode_rows(&encoded)?,
-                    Instant::now()
-                        + Duration::from_secs(
-                            updated
-                                .saturating_add(RETENTION_SECONDS)
-                                .saturating_sub(now_seconds())
-                                .clamp(0, RETENTION_SECONDS) as u64,
-                        ),
-                ))
-            })
-            .transpose()
+        let Some(policy) = policy else {
+            return Ok(None);
+        };
+        // Dimensions and editor/capture policy delimit sampling, not native
+        // incarnation. Workspace/tab/terminal identity still must match.
+        let identity = |p: &str| -> anyhow::Result<Value> {
+            let value: Value = serde_json::from_str(p)?;
+            let policy = value
+                .as_array()
+                .filter(|p| p.len() == 3)
+                .ok_or_else(|| anyhow::anyhow!("invalid stored policy"))?;
+            let identity = policy[0]
+                .as_array()
+                .filter(|i| i.len() == 3)
+                .ok_or_else(|| anyhow::anyhow!("invalid stored identity"))?;
+            anyhow::ensure!(
+                identity.iter().all(|i| i.is_null() || i.is_string()),
+                "invalid stored identity"
+            );
+            Ok(policy[0].clone())
+        };
+        if identity(&policy)? != identity(&stamp.policy)? {
+            return Ok(None);
+        }
+        let cutoff = super::history_segments::now_ms() - RETENTION_MS;
+        let (count, row_bytes, metadata_bytes): (i64, i64, i64) = connection.query_row(
+            "SELECT count(*),coalesce(sum(length(rows)),0),coalesce(sum(length(CAST(position AS BLOB))),0) FROM history_segments WHERE identity=?1 AND changed_ms>?2",
+            params![key, cutoff], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))
+        )?;
+        anyhow::ensure!(
+            count <= MAX_SEGMENTS as i64
+                && row_bytes <= MAX_ENCODED_BYTES as i64
+                && metadata_bytes <= (MAX_SEGMENTS * 512) as i64,
+            "stored shape exceeds bounds"
+        );
+        let encoded: Vec<(String, String, Vec<u8>, i64)> = connection.prepare(
+            "SELECT segment_id,position,rows,changed_ms FROM history_segments WHERE identity=?1 AND changed_ms>?2 ORDER BY json_extract(position,'$.started_at_ms'),rowid"
+        )?.query_map(params![key, cutoff], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)))?.collect::<Result<_,_>>()?;
+        anyhow::ensure!(
+            encoded.len() <= MAX_SEGMENTS,
+            "stored segment count exceeds bounds"
+        );
+        let mut segments = Vec::new();
+        for (id, position, encoded, changed_at_ms) in encoded {
+            let mut position: SegmentPosition = serde_json::from_str(&position)?;
+            position.segment_id = Uuid::parse_str(&id)?.to_string();
+            let rows = decode_rows(&encoded)?
+                .into_iter()
+                .filter(|row| super::exit_marker::strip_exit_markers(row).as_ref() == row)
+                .map(super::scrollback::Row::from)
+                .collect::<Vec<_>>();
+            position.len = rows.len();
+            anyhow::ensure!(
+                position.base.checked_add(rows.len() as u64).is_some(),
+                "invalid stored row positions"
+            );
+            if !rows.is_empty() {
+                segments.push(Segment {
+                    position,
+                    changed_at_ms,
+                    rows,
+                });
+            }
+        }
+        anyhow::ensure!(
+            segments.iter().map(|s| s.rows.len()).sum::<usize>() <= MAX_PANE_LINES
+                && segments
+                    .iter()
+                    .flat_map(|s| &s.rows)
+                    .map(|r| r.len())
+                    .sum::<usize>()
+                    <= MAX_PANE_BYTES,
+            "stored shape exceeds bounds"
+        );
+        Ok(Some(segments))
     }
 
     /// One pass: forget one vanished or unverified scope, or write one changed
@@ -437,6 +689,7 @@ impl Checkpoints {
         now: i64,
         mut stamps: Vec<ProjectionStamp>,
         debounce: Duration,
+        open_keys: &[String],
     ) -> anyhow::Result<bool> {
         let mut writer = self
             .writer
@@ -445,12 +698,13 @@ impl Checkpoints {
         let live: HashSet<_> = stamps.iter().map(scope_key).collect();
         let gone = writer.seen.keys().find(|key| !live.contains(*key)).cloned();
         if let Some(scope) = gone {
-            if let Some(seen) = writer.seen.remove(&scope) {
+            if let Some(seen) = writer.seen.get(&scope) {
                 connection.execute(
                     "DELETE FROM history_captures WHERE identity=?1",
                     [&seen.key],
                 )?;
             }
+            writer.seen.remove(&scope);
             return Ok(false);
         }
         stamps.sort_by(|a, b| {
@@ -473,11 +727,12 @@ impl Checkpoints {
             }
             let Some(key) = self.key(&stamp) else {
                 // Verified -> unknown: what the verified process wrote goes.
-                if let Some(seen) = writer.seen.remove(&scope_key) {
+                if let Some(seen) = writer.seen.get(&scope_key) {
                     connection.execute(
                         "DELETE FROM history_captures WHERE identity=?1",
                         [&seen.key],
                     )?;
+                    writer.seen.remove(&scope_key);
                     return Ok(false);
                 }
                 continue;
@@ -486,6 +741,25 @@ impl Checkpoints {
                 key.len() <= 8192 && stamp.policy.len() <= 4096,
                 "capture metadata exceeds bounds"
             );
+            // Resolve recovery on the same store worker BEFORE any replacement,
+            // even when output has already produced a new historical prefix.
+            // Read/decoder errors leave recovery pending and the old SQL intact.
+            let pending = self
+                .captures
+                .lock()
+                .map_err(|_| anyhow::anyhow!("capture lock poisoned"))?
+                .recovery_pending(&stamp);
+            if pending {
+                let recovered = self.read_rows(connection, &stamp)?.unwrap_or_default();
+                if !self
+                    .captures
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("capture lock poisoned"))?
+                    .recover_segments(&stamp, recovered)
+                {
+                    continue;
+                }
+            }
             // A reset or a new identity is written at once; so is a projection
             // that emptied, whose row is deleted only when `stamp.reset` is set
             // (otherwise the stored row stays).
@@ -509,22 +783,76 @@ impl Checkpoints {
                     idle = false;
                     continue;
                 }
-                store
-                    .live_captured_history(&stamp.scope(), true)
-                    .map_err(|_| anyhow::anyhow!("capture projection exceeds bounds"))?
+                // Shared rows only: the copy and the encoding happen below,
+                // without the lock every read and frame waits on.
+                store.segment_projection(&stamp.scope())
             };
-            let encoded = capture
-                .filter(|capture| !capture.rows.is_empty())
-                .map(|capture| encode_rows(&capture.rows));
-            if let Some(encoded) = &encoded {
-                anyhow::ensure!(
-                    encoded.len() <= MAX_ENCODED_BYTES,
-                    "encoded projection exceeds bounds"
+            let encoded = capture.and_then(|segments| {
+                segments
+                    .into_iter()
+                    .map(|s| {
+                        let rows = encode_rows(&s.rows);
+                        Ok((
+                            s.position.segment_id.to_string(),
+                            serde_json::to_string(&s.position)
+                                .map_err(|_| HistoryError::Unavailable)?,
+                            rows,
+                            s.changed_at_ms,
+                        ))
+                    })
+                    .collect::<Result<Vec<_>, HistoryError>>()
+            });
+            // Over the bounds: this pane's outcome, not a storage failure.
+            // The others are still written and the store stays healthy.
+            let Some(encoded) = encoded.ok().filter(|encoded| {
+                encoded
+                    .iter()
+                    .map(|(_, position, rows, _)| rows.len() + position.len())
+                    .sum::<usize>()
+                    <= MAX_ENCODED_BYTES + MAX_SEGMENTS * 512
+            }) else {
+                if !seen.is_some_and(|seen| seen.oversized && seen.key == key) {
+                    tracing::warn!(
+                        pane = %stamp.pane,
+                        format = %stamp.format,
+                        "captured history: a projection is over the checkpoint bounds; not stored until it changes"
+                    );
+                }
+                connection.execute("DELETE FROM history_captures WHERE identity=?1", [&key])?;
+                writer.next_scope = Some(scope_key.clone());
+                writer.seen.insert(
+                    scope_key,
+                    SeenProjection {
+                        stamp,
+                        key,
+                        content: None,
+                        written: Instant::now(),
+                        oversized: true,
+                    },
                 );
+                continue;
+            };
+            let content: Option<[u8; 32]> = (!encoded.is_empty()).then(|| {
+                let mut hash = Sha256::new();
+                for (id, position, rows, changed) in &encoded {
+                    hash.update(id);
+                    hash.update(position);
+                    hash.update(rows);
+                    hash.update(changed.to_le_bytes());
+                }
+                hash.finalize().into()
+            });
+            if encoded.is_empty()
+                && seen.is_none()
+                && (!stamp.reset
+                    || self
+                        .captures
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("capture lock poisoned"))?
+                        .absence_acknowledged(&stamp))
+            {
+                continue;
             }
-            let content: Option<[u8; 32]> = encoded
-                .as_ref()
-                .map(|encoded| Sha256::digest(encoded).into());
             let previous = writer.seen.get(&scope_key);
             let unchanged = previous.is_some_and(|seen| {
                 seen.key == key
@@ -543,15 +871,45 @@ impl Checkpoints {
                         )?;
                     }
                 }
-                if let Some(encoded) = encoded {
-                    transaction.execute("INSERT INTO history_captures VALUES (?1,?2,?3,?4,?5) ON CONFLICT(identity) DO UPDATE SET policy=excluded.policy, rows=excluded.rows, bytes=excluded.bytes, updated=excluded.updated WHERE history_captures.rows != excluded.rows OR history_captures.policy != excluded.policy", params![key, stamp.policy, encoded, encoded.len() as i64, now])?;
-                    enforce_quotas(&transaction)?;
-                } else if stamp.reset {
+                if !encoded.is_empty() {
+                    let bytes = encoded
+                        .iter()
+                        .map(|(id, position, rows, _)| rows.len() + position.len() + id.len() + 16)
+                        .sum::<usize>() as i64
+                        + key.len() as i64
+                        + stamp.policy.len() as i64
+                        + 64;
+                    let updated = encoded
+                        .iter()
+                        .map(|(_, _, _, changed)| *changed / 1000)
+                        .max()
+                        .unwrap_or(now);
+                    transaction.execute("INSERT INTO history_captures VALUES (?1,?2,x'',?3,?4) ON CONFLICT(identity) DO UPDATE SET policy=excluded.policy, bytes=excluded.bytes, updated=excluded.updated", params![key, stamp.policy, bytes, updated])?;
+                    transaction
+                        .execute("DELETE FROM history_segments WHERE identity=?1", [&key])?;
+                    for (id, position, rows, changed) in encoded {
+                        transaction.execute(
+                            "INSERT INTO history_segments VALUES (?1,?2,?3,?4,?5,?6)",
+                            params![
+                                key,
+                                id,
+                                position,
+                                rows,
+                                (rows.len() + position.len() + id.len() + 16) as i64,
+                                changed
+                            ],
+                        )?;
+                    }
+                    enforce_quotas(&transaction, open_keys)?;
+                } else if stamp.reset || !pending {
                     transaction
                         .execute("DELETE FROM history_captures WHERE identity=?1", [&key])?;
                 }
                 transaction.commit()?;
                 written = Some(Instant::now());
+                if let Ok(mut at) = self.last_write.lock() {
+                    *at = Instant::now();
+                }
             }
             let still_current = self
                 .captures
@@ -561,12 +919,31 @@ impl Checkpoints {
                 .as_ref()
                 == Some(&stamp);
             if !still_current {
-                // The only writer serializes this compensating tombstone before
-                // another projection. Never publish an ack for a stale revision.
-                if !unchanged {
+                // A fresh frame during the write leaves the newer revision dirty,
+                // but must not delete recovered prefixes from the committed set.
+                // Only an observed identity reset authorizes a tombstone.
+                let invalid_identity = self
+                    .captures
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("capture lock poisoned"))?
+                    .projection_stamp(&stamp.scope())
+                    .is_none_or(|current| {
+                        current.native_identity != stamp.native_identity
+                            || current.reset != stamp.reset
+                    });
+                if invalid_identity {
                     connection.execute("DELETE FROM history_captures WHERE identity=?1", [&key])?;
                 }
                 continue;
+            }
+            if content.is_none() {
+                self.captures
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("capture lock poisoned"))?
+                    .acknowledge_absence(&stamp);
+                writer.seen.remove(&scope_key);
+                idle = false;
+                break;
             }
             // A concurrent reset leaves a different stamp dirty; an old ack
             // cannot make that new revision clean or authorize recovery.
@@ -578,6 +955,7 @@ impl Checkpoints {
                     key,
                     content,
                     written: written.unwrap_or_else(Instant::now),
+                    oversized: false,
                 },
             );
             idle = false;
@@ -638,25 +1016,90 @@ fn reconcile_backends(
 
 /// Age out records unchanged for the retention period, then apply the logical
 /// quotas.
-fn prune(connection: &mut Connection, now: i64) -> anyhow::Result<()> {
+fn prune(connection: &mut Connection, now: i64, live: &[String]) -> anyhow::Result<()> {
     let transaction = connection.transaction()?;
     transaction.execute(
         "DELETE FROM history_captures WHERE updated < ?1",
         [now - RETENTION_SECONDS],
     )?;
-    enforce_quotas(&transaction)?;
+    transaction.execute(
+        "DELETE FROM history_segments WHERE changed_ms <= ?1",
+        [(now - RETENTION_SECONDS) * 1000],
+    )?;
+    transaction.execute("UPDATE history_captures SET bytes=(SELECT coalesce(sum(bytes),0) FROM history_segments WHERE history_segments.identity=history_captures.identity)+length(CAST(identity AS BLOB))+length(CAST(policy AS BLOB))+64 WHERE rows=x''", [])?;
+    transaction.execute("DELETE FROM history_captures WHERE rows=x'' AND NOT EXISTS(SELECT 1 FROM history_segments WHERE history_segments.identity=history_captures.identity)", [])?;
+    enforce_quotas(&transaction, live)?;
     transaction.commit()?;
     Ok(())
 }
 
 /// Keep the newest actual updates that fit both the record and the payload
-/// quota; evict the rest in one statement over the covering index.
-fn enforce_quotas(transaction: &Transaction<'_>) -> anyhow::Result<()> {
-    transaction.execute(
-        "DELETE FROM history_captures WHERE identity IN (SELECT identity FROM (SELECT identity, row_number() OVER w n, sum(bytes) OVER w t FROM history_captures WINDOW w AS (ORDER BY updated DESC, identity DESC)) WHERE n > ?1 OR t > ?2)",
-        params![MAX_RECORDS, MAX_PAYLOAD_BYTES],
-    )?;
+/// quota, the `live` panes' (those the last complete listings still show)
+/// ranked before every other; evict the rest over the covering index. A live
+/// pane's checkpoint evicted for quota is logged: that is history a user may
+/// still page through.
+fn enforce_quotas(transaction: &Transaction<'_>, live: &[String]) -> anyhow::Result<()> {
+    let live_json = serde_json::to_string(live)?;
+    let evicted: Vec<(String, bool)> = transaction
+        .prepare(
+            "SELECT identity, live FROM (SELECT identity, live, row_number() OVER w n, sum(bytes) OVER w t FROM (SELECT identity, bytes, updated, identity IN (SELECT value FROM json_each(?3)) live FROM history_captures) WINDOW w AS (ORDER BY live DESC, updated DESC, identity DESC)) WHERE n > ?1 OR t > ?2",
+        )?
+        .query_map(params![MAX_RECORDS, MAX_PAYLOAD_BYTES, live_json], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?
+        .collect::<Result<_, _>>()?;
+    for (identity, _) in &evicted {
+        transaction.execute("DELETE FROM history_captures WHERE identity=?1", [identity])?;
+    }
+    let live_evicted = evicted.iter().filter(|(_, live)| *live).count();
+    if live_evicted > 0 {
+        tracing::warn!(
+            panes = live_evicted,
+            "captured history quota evicted the checkpoint of a pane that is still open"
+        );
+    }
     Ok(())
+}
+
+/// The shared connection, set back to `synchronous=FULL` when dropped.
+struct DurableAgain<'a>(&'a mut Connection);
+
+impl std::ops::Deref for DurableAgain<'_> {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        self.0
+    }
+}
+
+impl std::ops::DerefMut for DurableAgain<'_> {
+    fn deref_mut(&mut self) -> &mut Connection {
+        self.0
+    }
+}
+
+impl Drop for DurableAgain<'_> {
+    fn drop(&mut self) {
+        if let Err(error) = self.0.pragma_update(None, "synchronous", "FULL") {
+            tracing::error!(%error, "the shared store could not go back to synchronous=FULL");
+        }
+    }
+}
+
+/// How many checkpoints are stored, over the covering index.
+fn stored_count(connection: &Connection) -> anyhow::Result<u64> {
+    let count: i64 = connection.query_row("SELECT count(*) FROM history_captures", [], |row| {
+        row.get(0)
+    })?;
+    Ok(count.max(0) as u64)
+}
+
+/// The size of the store's WAL file; 0 when it has none.
+fn wal_bytes(connection: &Connection) -> u64 {
+    connection
+        .path()
+        .filter(|path| !path.is_empty())
+        .and_then(|path| std::fs::metadata(format!("{path}-wal")).ok())
+        .map_or(0, |wal| wal.len())
 }
 
 fn now_seconds() -> i64 {
@@ -666,9 +1109,10 @@ fn now_seconds() -> i64 {
         .unwrap_or(0)
 }
 
-fn encode_rows(rows: &[String]) -> Vec<u8> {
-    let mut encoded = Vec::with_capacity(rows.iter().map(|row| row.len() + 4).sum());
+fn encode_rows<R: AsRef<str>>(rows: &[R]) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(rows.iter().map(|row| row.as_ref().len() + 4).sum());
     for row in rows {
+        let row = row.as_ref();
         encoded.extend_from_slice(&(row.len() as u32).to_le_bytes());
         encoded.extend_from_slice(row.as_bytes());
     }

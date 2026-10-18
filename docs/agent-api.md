@@ -11,6 +11,31 @@ verbatim, so their keys stay camelCase.
 
 ## Conventions
 
+Terminal `/agents` and `/snapshot` responses advertise the optional
+`terminal_pending_user_input` capability when they can relay Herdr's native
+`pending_user_input` boolean. An exact `true` means an ordinary native question
+is pending; it can coexist with `working`, `idle`, or a focused input dialog.
+An approval overlay or temporarily unknown screen preserves previously known
+pending attention without permitting `agent.prompt`; it is independent of
+permission approval. Older Herdr versions omit the fact and are represented as
+unknown (`null`); this must not be confused with an observed `false`. Clients
+must not infer a question from `blocked`, titles, or versions.
+The fact identifies pending attention, not a question form or request ID.
+Sending an ordinary follow-up does not constitute answering the native question.
+The notification watcher remembers this boolean per opaque agent instance and
+raises `agent.input_required` on a newly observed pending boundary. Continued
+work-state changes or entering/leaving native answer/approval controls while
+pending do not repeat the reminder. Only an explicit false or disappearing
+instance clears the reminder boundary. Startup seeds
+already pending instances without replaying their old reminders. No request ID
+is available, so replacing one pending question with another without a false
+observation cannot be distinguished or announced separately.
+
+Native agent rows also relay optional `shell_pid`, observed with the agent, for
+correlating an existing pane task with its shell incarnation. Missing or invalid
+PIDs remain unknown. This field is not a substitute for opaque `instance_id`:
+another agent can start in the same shell, and the operating system can reuse PIDs.
+
 - **Auth.** Every route requires a paired device (`Authorization: Bearer
   <device token>`); a missing or malformed header is `401` and an unpaired or
   revoked device is `403`. This holds in every transport mode — a gateway with
@@ -366,13 +391,69 @@ in `agent_env` that must stay hidden from other accounts on the machine.
 | `directory` | Scope to a workspace directory. |
 | `parent_id` | List the children of one session. |
 | `roots` | `true` lists top-level sessions only — no subagent sessions. |
-| `limit`, `order`, `search`, `cursor` | Passed through to OpenCode. `order` is `asc` or `desc`. `limit` defaults to **50**. |
+| `limit`, `order`, `search`, `cursor` | Passed through to OpenCode. `order` is `asc` or `desc`. `limit` defaults to **50 per agent**. A `cursor` requires an explicit nonempty `agent_id`; unscoped cursors are rejected before any provider fanout. |
 | `agent_id` | Only that agent's sessions; absent merges every attached agent. See [Agents](#agents). |
 
 Returns `[AgentSessionInfo]`.
 
+This legacy array remains sorted newest `updated_ms` first, including a selected
+agent list. Aggregation and partial-provider-failure behavior are unchanged. It
+does not expose continuation cursors; use the additive page route below instead.
+
 A subagent run creates a real session whose `parent_id` is the caller's. Without
 `roots=true` those are mixed into the list.
+
+### `GET /api/agent-sessions/page`
+
+The global capability **`agent_session_pages_v1`** declares that this endpoint
+exists. It does not promise every provider supports pagination: check
+`planes.agents.agents[].features.sessionPagination` for the selected provider.
+Only `true` declares support (currently OpenCode); absent or `false` means
+unsupported.
+
+| Query | Meaning |
+|---|---|
+| `agent_id` | **Required**, one explicit nonempty provider ID, maximum 256 UTF-8 bytes. Never aggregates. |
+| `directory` | Optional nonempty absolute or home-relative workspace path, maximum 4096 UTF-8 bytes. Uses the list's trimming, `~` expansion and canonicalization when the directory exists. |
+| `parent_id` | Optional nonempty parent ID, maximum 256 UTF-8 bytes; literal `null` selects roots. An explicit value takes precedence over `roots`. |
+| `roots` | Optional boolean; `true` selects roots (`parent_id=null`) when no parent ID is given. |
+| `limit` | Integer **1–100**, default **50**. |
+| `order` | Only **`asc`** or **`desc`**, default **`desc`**. |
+| `search` | Optional provider search filter, maximum 4096 UTF-8 bytes. |
+| `cursor` | Optional nonempty opaque provider cursor, maximum **16384 UTF-8 bytes**. URL-encode without changing its bytes. |
+
+Control characters, empty scope values, invalid limits/order and malformed typed
+parameters are rejected with `400` before any upstream request. An unknown agent
+is `400 invalid_agent`; a known unattached agent is `503 agent_unavailable`.
+An adapter without pagination returns `501 feature_unsupported`, not an empty
+page. The selected provider's failure uses the existing `502 agent_error` mapping.
+
+Authentication, encrypted transport policy, the versioned content envelope and
+private ETag/`If-None-Match` behavior match the legacy list. The nested `data`
+is intentional, preserving the OpenCode page contract:
+
+```json
+{
+  "schema_version": "1.5.0",
+  "capabilities": { "parts": true, "assets": true, "image_upload": true, "composer": true, "message_image_assets": true },
+  "data": {
+    "data": [{ "asid": "ses_1", "agent_id": "opencode", "title": "Example", "status": "idle", "updated_ms": 1 }],
+    "cursor": { "next": "opaque-provider-cursor", "previous": null }
+  }
+}
+```
+
+Both cursor keys are always present and explicitly **`null`** when unavailable.
+The Gateway preserves provider order and both cursors, applies its normal
+agent ownership and read-marker overlays, and records session routes without
+sorting, refetching, aggregating or following another page automatically.
+
+Cursors are upstream values, **not locally cryptographically bound** by Gateway.
+Clients must reuse a cursor only on this selected-provider endpoint with the same
+agent, normalized directory, parent/roots filter, search, order and page size.
+**Restart pagination if any of those change**; never broadcast a provider cursor
+to every agent. Existing Apps still request fifty sessions and cannot
+automatically page. App adoption is deferred; the legacy array routes remain.
 
 ### `POST /api/agent-sessions`
 
@@ -414,6 +495,28 @@ parent filter; DeepSeek and T3 have no sub-agent sessions, so they list none.
 
 `{"deleted": true}`. OpenCode removes the session's children too, and announces
 each one on the stream.
+
+### `DELETE /api/agents/{agent_id}/sessions/{asid}`
+
+Gate provider-scoped deletion on `agent_session_delete_scoped`, then use the
+provider and session ID captured from the selected row. The gateway verifies
+that exact attached provider owns the session before deleting it, without
+consulting a cached owner or trying another provider. Unknown providers return
+`400 invalid_agent`; unavailable providers `503 agent_unavailable`; missing
+sessions `404 session_not_found`; a mismatched session response
+`409 session_changed`; a failed ownership read `502 agent_error`. The ID must
+be 1–128 ASCII letters, digits, `-`, `_`, `.`, or `:`, and cannot be `.` or `..`;
+unsafe IDs return `400 invalid_session`. No mutation occurs on these failures.
+
+The legacy route retains its original owner lookup. Older gateways return 404
+for this distinct scoped route, even when a client cached the capability before
+a downgrade. Clients must never fall back to the legacy route for scoped deletion
+or assume that an `agent_id` query on that route constrains its owner.
+
+OpenCode and T3 implement deletion; DeepSeek returns `501 feature_unsupported`.
+Provider deletion removes the conversation according to the provider's contract;
+the gateway does not promise that active work or child processes have stopped.
+It is separate from closing a terminal pane and from removing a local Home entry.
 
 ### `POST /api/agent-sessions/{asid}/rename`
 
@@ -1363,10 +1466,20 @@ tail it cannot place.
 
 ### Task plumbing in the transcript
 
+Every session is served without the muqun MCP server's tool rows -- on the
+snapshot, the timeline, the event replay, the SSE stream and `/api/ws`: a
+tool row named for that server under any host's prefix (`muqun_tasks_wait`,
+`mcp__muqun__exec.run`, `muqun.fleet.list`, …), any tool it has or will
+have, in every state (pending, running, completed, failed). They are
+internal; what a person sees of a delegation is its row on Home, the
+parent's `progress` (`Waiting for mini · 3 min`) and the result line the
+gateway tells the parent session ([mcp.md](mcp.md#being-told-how-a-delegation-ended)).
+A tool of the same name with no server prefix, or another server's, stays.
+The agent's own prose is untouched.
+
 A session a task is (or was) bound to ([docs/mcp.md](mcp.md#finishing-a-delegation))
-is served without the gateway's task plumbing -- on the snapshot, the
-timeline, the event replay, the SSE stream, `/api/ws` and `GET …/inbox`.
-Every other session is served as it is:
+is also served without the rest of the gateway's task plumbing, there and
+on `GET …/inbox`:
 
 - A user `text` row (or a `synthetic` row) that ends with the completion
   instruction an older gateway sent with a goal (goals now go alone) is served
@@ -1385,9 +1498,8 @@ Every other session is served as it is:
   marker never shows mid-turn. An `agent.timeline.upsert` whose rows are all
   left with nothing arrives as `agent.timeline.removed` for them. `seq` keeps
   counting, so a client may see a gap where a row was left out.
-- The agent's own `tasks.complete` call (under any host prefix, such as
-  `muqun_tasks_complete`) and the notice OpenCode leaves for the task's
-  per-session instruction (`Instructions updated: …muqun-task`) are left out.
+- The notice OpenCode leaves for the task's per-session instruction
+  (`Instructions updated: …muqun-task`) is left out.
 - OpenCode's Code Mode plumbing is left out: an `execute` tool row (held while
   its code is not known yet and the turn runs) whose whole code is
   `[return] search({query: '<string>'[, limit: <integer>]})[;]` for a muqun
@@ -2071,13 +2183,16 @@ on all of these:
 
 | Route | Body | Answer |
 |---|---|---|
-| `POST /api/pair/pending` (on the computer to be linked) | `{device_name, kind: "gateway", server_id?}` | `{request_id, code, expires_in_ms}` for `POST /api/peers` on the other side; `400 invalid_request` for any other `kind`; `409 pairing_in_progress` while another pairing is pending, `429 pairing_rate_limited`. A minted code lives one minute (`expires_in_ms` says so): unclaimed by then (the link failed), it is neither shown by `GET /api/pair/pending` nor claimable, and a new pairing -- a phone's, or the next mint -- takes its slot. |
+| `POST /api/pair/pending` (on the computer to be linked) | `{device_name, kind: "gateway", server_id?}` | `{request_id, code, expires_in_ms}` for `POST /api/peers` on the other side; `400 invalid_request` for any other `kind`; `409 pairing_in_progress` while another pairing is pending, `429 pairing_rate_limited`. A minted code lives one minute (`expires_in_ms: 60000`); a code a device asks for itself (`POST /api/pair/request`, shown on this computer's screen) lives five (`300000`), as `GET /api/pair/pending` reports for each: unclaimed by then (the link failed), it is neither shown by `GET /api/pair/pending` nor claimable, and a new pairing -- a phone's, or the next mint -- takes its slot. |
 | `DELETE /api/pair/pending/{request_id}` (same computer, same token that minted it) | none | `{cancelled: true}`: the minted code is gone and the slot free, for when `POST /api/peers` on the other side failed. Only the device (or the admin token) that minted it may; any other pending pairing, an expired one, or none is `404 pairing_not_found`. |
-| `GET /api/peers` | none | `{accept_delegations, peers: [{peer_id, server_id, name, url, reachable, last_seen_ms}]}`; a peer not heard from for a minute is pinged first (3 s), and one that no longer knows this gateway is forgotten and left out. |
-| `POST /api/peers` | `{url, name, request_id, code}` (`name` may not be `self`, in any case) | The new peer. `502 peer_unreachable`; `409 name_conflict` (`name` is this computer's own label, any case; checked before the claim, so the code stays good), `409 peer_refused` (`error.reason`: `pairing_code_expired`, `invalid_pairing_code`, `pairing_not_requested`, `invalid_token` or `refused`), `peer_conflict`, `peer_name_taken`; `400 peer_is_self`, `invalid_request`. |
-| `PATCH /api/peers/{peer_id}` | `{name?, url?}`, at least one (`name` not `self`; `url` as for `POST`) | The changed peer. A new `url` (its address changed) is proven first with one call carrying this link's token: `502 peer_unreachable` when nothing answers there, `409 peer_refused` when what answers does not know the link; neither keeps it. `400 invalid_request`, `409 peer_name_taken`, `409 name_conflict` (this computer's own label), `404 peer_not_found`. |
+| `GET /api/peers` | none | `{accept_delegations, peers: [{peer_id, server_id, name, url, reachable, last_seen_ms, unauthorized?}]}`; a peer not heard from for a minute is pinged first (3 s). One that answers `401`/`403` (it no longer takes this gateway's token) is kept and listed with `unauthorized: true` and `reachable: false`; a `POST /api/peers` for the same computer or under its name replaces it. |
+| `POST /api/peers` | `{url, name, request_id, code}` (`name` may not be `self`, in any case; `url` uses HTTP or HTTPS) | The new peer. `502 peer_unreachable`; `409 name_conflict` (`name` is this computer's own label, any case; checked before the claim, so the code stays good), `409 peer_refused` (`error.reason`: `pairing_code_expired`, `invalid_pairing_code`, `pairing_not_requested`, `invalid_token` or `refused`), `peer_conflict`, `peer_name_taken`; `400 peer_is_self`, `invalid_request`. |
+| `PATCH /api/peers/{peer_id}` | `{name?, url?}`, at least one (`name` not `self`; `url` uses HTTP or HTTPS) | The changed peer. A new `url` (its address changed) is proven first with one call carrying this link's token: `502 peer_unreachable` when nothing answers there, `409 peer_refused` when what answers does not know the link; neither keeps it. `400 invalid_request`, `409 peer_name_taken`, `409 name_conflict` (this computer's own label), `404 peer_not_found`. |
 | `DELETE /api/peers/{peer_id}` | none | `{remote_revoked, counterpart_found, counterpart_revoked}`; this gateway forgets the peer, asks it to revoke this gateway's device, and revokes the peer's own login here (below). `404 peer_not_found`. |
 | `PUT /api/fleet/settings` | `{accept_delegations}` | `{accept_delegations}`, written to `config.json` (`fleet.accept_delegations`). |
+
+Manual links accept HTTP and HTTPS URLs, including LAN and Tailscale
+addresses. Pairing requests and claims do not follow HTTP redirects.
 
 A peer's name is what `fleet.describe`/`fleet.list` show and what
 `POST /api/tasks` `mentions` must use (see
@@ -2091,8 +2206,8 @@ once, without `mentions`.
 checks it, so it never replaces or evicts a device; its only use is that
 `DELETE /api/peers/{id}` also revokes the gateway devices here whose
 `server_id` is that peer's (its login into this computer), so one call
-unlinks both directions. A peer forgotten after a `401`/`403` keeps its login
-here; its open mirrors fail (`reason: "peer_unlinked"`), as they do on
+unlinks both directions. A peer marked `unauthorized` after a `401`/`403`
+keeps its login here; its open mirrors fail (`reason: "peer_unlinked"`), as they do on
 `DELETE /api/peers/{id}`.
 `DELETE /api/peers/{id}` (the admin token or an app device only) answers
 `{"remote_revoked", "counterpart_found", "counterpart_revoked"}`: whether the
@@ -2116,7 +2231,7 @@ line. On a `failed` mirror: `peer_unlinked` (unlinked here, or the other
 computer no longer takes this one's token), `peer_lost_task` (the other
 computer no longer has the task), `peer_not_confirmed` (a create that got no
 answer never turned up there). On an open mirror: `peer_unreachable` while
-its computer has not answered in the last 2 minutes. Absent otherwise, and on
+its computer has not answered in the last 2 minutes, or went away just now (its task socket closed, a call to it failed). Absent otherwise, and on
 every task that is not a mirror. (`delegation_loop` is never a view reason:
 that delegation creates nothing; it is the MCP error code.) A task
 another computer opened here (`origin: "peer"`) can be confirmed from the phone

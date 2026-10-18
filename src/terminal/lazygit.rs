@@ -3,7 +3,7 @@
 use std::path::{Path as FsPath, PathBuf};
 use std::time::Duration;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use serde_json::{json, Value};
@@ -13,7 +13,7 @@ use crate::{
     ApiResult, AppState, BackendCreateTab, BackendPaneId, BackendSendTextMode,
 };
 
-use super::routes::{checkout_of, pane_fenced_cwd};
+use super::routes::{checkout_of, pane_fenced_cwd, selected_git_worktree, GitStatusQuery};
 
 fn launch_command(executable: &FsPath) -> String {
     // Only a resolved executable is interpolated. The repository is passed as
@@ -25,21 +25,26 @@ async fn repository(
     state: &AppState,
     session: &crate::SessionConfig,
     pane_id: &str,
-) -> Option<PathBuf> {
-    let cwd = pane_fenced_cwd(state, session, pane_id).await?;
-    checkout_of(&cwd).await
+    selected: Option<&str>,
+) -> ApiResult<Option<PathBuf>> {
+    let checkout = match pane_fenced_cwd(state, session, pane_id).await {
+        Some(cwd) => checkout_of(&cwd).await,
+        None => None,
+    };
+    selected_git_worktree(checkout, selected).await
 }
 
 pub(crate) async fn availability(
     State(state): State<AppState>,
     Path((session_id, pane_id)): Path<(String, String)>,
+    Query(query): Query<GitStatusQuery>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
     let session = find_session(&state.config, &session_id)?;
     let installed = crate::agents::tasks::find_on_path("lazygit").is_some();
     let root = if installed {
-        repository(&state, session, &pane_id).await
+        repository(&state, session, &pane_id, query.worktree.as_deref()).await?
     } else {
         None
     };
@@ -53,6 +58,7 @@ pub(crate) async fn availability(
 pub(crate) async fn launch(
     State(state): State<AppState>,
     Path((session_id, pane_id)): Path<(String, String)>,
+    Query(query): Query<GitStatusQuery>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
@@ -64,13 +70,15 @@ pub(crate) async fn launch(
             "Install lazygit on the Gateway host",
         )
     })?;
-    let root = repository(&state, session, &pane_id).await.ok_or_else(|| {
-        api_error(
-            StatusCode::CONFLICT,
-            "not_a_repository",
-            "The source pane is not in an accessible Git repository",
-        )
-    })?;
+    let root = repository(&state, session, &pane_id, query.worktree.as_deref())
+        .await?
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::CONFLICT,
+                "not_a_repository",
+                "The source pane is not in an accessible Git repository",
+            )
+        })?;
     let backend = terminal_backend(session);
     let source = backend
         .get_pane(&BackendPaneId::new(pane_id))
@@ -162,9 +170,21 @@ mod tests {
             let state = test_state("admin", Vec::new());
             let path = Path(("default".to_owned(), "missing".to_owned()));
             let result = if launch_operation {
-                launch(State(state), path, HeaderMap::new()).await
+                launch(
+                    State(state),
+                    path,
+                    Query(GitStatusQuery::default()),
+                    HeaderMap::new(),
+                )
+                .await
             } else {
-                availability(State(state), path, HeaderMap::new()).await
+                availability(
+                    State(state),
+                    path,
+                    Query(GitStatusQuery::default()),
+                    HeaderMap::new(),
+                )
+                .await
             };
             assert_eq!(result.unwrap_err().0, StatusCode::UNAUTHORIZED);
         }
@@ -176,6 +196,7 @@ mod tests {
         let result = launch(
             State(state),
             Path(("missing".to_owned(), "pane".to_owned())),
+            Query(GitStatusQuery::default()),
             bearer_headers("token"),
         )
         .await;
@@ -220,7 +241,7 @@ mod tests {
     }
     #[tokio::test]
     #[ignore = "requires installed tmux and lazygit"]
-    async fn real_git_tui_uses_a_dedicated_tab_and_preserves_source_focus() {
+    async fn real_git_tui_validates_selected_checkout_and_preserves_source_focus() {
         use crate::test_support::BackendKind;
         use crate::{BackendCreateWorkspace, SessionConfig};
         use std::process::Command;
@@ -246,6 +267,40 @@ mod tests {
             .status()
             .unwrap()
             .success());
+        assert!(Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args([
+                "-c",
+                "user.name=QA",
+                "-c",
+                "user.email=qa@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--allow-empty",
+                "-q",
+                "-m",
+                "fixture"
+            ])
+            .status()
+            .unwrap()
+            .success());
+        let linked = root.join("linked checkout's $(ignored)");
+        assert!(Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["worktree", "add", "-q", "-b", "linked"])
+            .arg(&linked)
+            .status()
+            .unwrap()
+            .success());
+        let linked = std::fs::canonicalize(linked).unwrap();
+        let selected = || {
+            Query(GitStatusQuery {
+                worktree: Some(linked.to_string_lossy().into_owned()),
+            })
+        };
         let mut state = test_state("admin", vec![test_device("qa", "token")]);
         state.config.sessions = vec![SessionConfig {
             id: "default".into(),
@@ -273,18 +328,51 @@ mod tests {
             .find(|tab| tab.focused)
             .unwrap()
             .id;
-        let available = availability(State(state.clone()), path(), bearer_headers("token"))
-            .await
-            .unwrap()
-            .0;
+        for launch_operation in [false, true] {
+            let invalid = Query(GitStatusQuery {
+                worktree: Some(std::env::temp_dir().to_string_lossy().into_owned()),
+            });
+            let refused = if launch_operation {
+                launch(
+                    State(state.clone()),
+                    path(),
+                    invalid,
+                    bearer_headers("token"),
+                )
+                .await
+            } else {
+                availability(
+                    State(state.clone()),
+                    path(),
+                    invalid,
+                    bearer_headers("token"),
+                )
+                .await
+            };
+            assert_eq!(refused.unwrap_err().0, StatusCode::FORBIDDEN);
+        }
+        assert_eq!(backend.list_panes().await.unwrap().len(), 1);
+        let available = availability(
+            State(state.clone()),
+            path(),
+            selected(),
+            bearer_headers("token"),
+        )
+        .await
+        .unwrap()
+        .0;
         assert_eq!(available["data"]["available"], true);
-        let result = launch(State(state), path(), bearer_headers("token"))
+        let result = launch(State(state), path(), selected(), bearer_headers("token"))
             .await
             .unwrap()
             .0;
         assert_eq!(result["data"]["started"], true, "{result}");
         let target = BackendPaneId::new(result["data"]["target"]["pane_id"].as_str().unwrap());
         assert_ne!(target, source.id);
+        assert_eq!(
+            backend.get_pane(&target).await.unwrap().cwd.as_deref(),
+            Some(linked.as_path())
+        );
         assert_eq!(backend.list_panes().await.unwrap().len(), 2);
         assert_eq!(
             backend

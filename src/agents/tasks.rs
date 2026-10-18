@@ -329,6 +329,76 @@ pub fn launch_prompt_args(kind: &str, prompt: &str) -> Option<[String; 2]> {
     (plain && matches!(kind, "claude" | "codex")).then(|| ["--".to_owned(), prompt.to_owned()])
 }
 
+/// Which of Claude Code's model flags the installed version takes, as its
+/// `--help` lists them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ModelFlags {
+    pub model: bool,
+    pub effort: bool,
+}
+
+impl ModelFlags {
+    pub fn from_help(help: &str) -> Self {
+        Self {
+            model: help.contains("--model"),
+            effort: help.contains("--effort"),
+        }
+    }
+}
+
+/// A model id or effort a launch may carry as an argument: 1 to 128 of
+/// `A-Z a-z 0-9 . _ : / @ + -`, not starting with `-` (never a flag).
+pub fn valid_model_word(word: &str) -> bool {
+    (1..=128).contains(&word.len())
+        && !word.starts_with('-')
+        && word
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "._:/@+-".contains(c))
+}
+
+/// The launch arguments that run terminal agent `kind` with the model and
+/// effort a task named, and the model and effort they set. Codex takes
+/// both as `-c` overrides of its config for this run only (the user's file
+/// is never touched); Claude Code takes `--model` and `--effort` where the
+/// installed version has them (`claude`). The effort applies only with a
+/// model, as for a session agent; another agent takes neither. Nothing
+/// named: no arguments, the agent's own default.
+pub fn model_args(
+    kind: &str,
+    model: Option<&str>,
+    variant: Option<&str>,
+    claude: ModelFlags,
+) -> (Vec<String>, Option<String>, Option<String>) {
+    let Some(model) = model else {
+        return (Vec::new(), None, None);
+    };
+    let toml = |value: &str| toml::Value::String(value.to_owned()).to_string();
+    let (mut args, mut applied) = (Vec::new(), (None, None));
+    match kind {
+        "codex" => {
+            args.extend(["-c".to_owned(), format!("model={}", toml(model))]);
+            applied.0 = Some(model.to_owned());
+            if let Some(variant) = variant {
+                args.extend([
+                    "-c".to_owned(),
+                    format!("model_reasoning_effort={}", toml(variant)),
+                ]);
+                applied.1 = Some(variant.to_owned());
+            }
+        }
+        "claude" if claude.model => {
+            args.extend(["--model".to_owned(), model.to_owned()]);
+            applied.0 = Some(model.to_owned());
+            if let Some(variant) = variant.filter(|_| claude.effort) {
+                args.extend(["--effort".to_owned(), variant.to_owned()]);
+                applied.1 = Some(variant.to_owned());
+            }
+        }
+        _ => {}
+    }
+    (args, applied.0, applied.1)
+}
+
 /// Claude Code's user config: `$CLAUDE_CONFIG_DIR/.claude.json` when that is
 /// set (`config_dir`), else `~/.claude.json`.
 pub fn claude_config_file(config_dir: Option<&str>, home: &Path) -> PathBuf {
@@ -584,7 +654,9 @@ pub struct GitWorktree {
 }
 
 fn git(repo: &Path, args: &[&str]) -> anyhow::Result<std::process::Output> {
-    let output = Command::new("git")
+    let mut cmd = Command::new("git");
+    crate::platform::git::scrub_git_env(&mut cmd);
+    let output = cmd
         .arg("-C")
         .arg(repo)
         .args(args)
@@ -781,6 +853,86 @@ mod tests {
                 .unwrap();
             assert!(output.status.success(), "git {args:?} failed");
         }
+    }
+
+    #[test]
+    fn worktree_fallback_scrubs_inherited_repository_and_config_in_a_subprocess() {
+        const ROOT_ENV: &str = "MUQUN_TEST_WORKTREE_ENV_ROOT";
+        if let Some(root) = std::env::var_os(ROOT_ENV) {
+            let root = PathBuf::from(root);
+            let repo = root.join("a/repo");
+            let checkout = root.join("checkout");
+            let worktree = git_worktree_add(&repo, &checkout, "isolated").unwrap();
+            assert!(worktree.created);
+            assert_eq!(
+                std::fs::read_to_string(checkout.join("README.md")).unwrap(),
+                "repo A\n"
+            );
+            assert_eq!(
+                PathBuf::from(git_checked(&checkout, &["rev-parse", "--show-toplevel"]).unwrap())
+                    .canonicalize()
+                    .unwrap(),
+                checkout.canonicalize().unwrap()
+            );
+            return;
+        }
+        let root = temp_dir("inherited-git-env");
+        init_repo(&root.join("a"));
+        init_repo(&root.join("b"));
+        let a = root.join("a/repo");
+        let b = root.join("b/repo");
+        std::fs::write(a.join("README.md"), "repo A\n").unwrap();
+        git_checked(&a, &["add", "README.md"]).unwrap();
+        git_checked(&a, &["-c", "commit.gpgsign=false", "commit", "-m", "A"]).unwrap();
+        let before = git_checked(&b, &["worktree", "list", "--porcelain"]).unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "agents::tasks::tests::worktree_fallback_scrubs_inherited_repository_and_config_in_a_subprocess", "--nocapture"])
+            .env(ROOT_ENV, &root)
+            .env("GIT_DIR", b.join(".git"))
+            .env("GIT_COMMON_DIR", b.join(".git"))
+            .env("GIT_WORK_TREE", &b)
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "core.bare")
+            .env("GIT_CONFIG_VALUE_0", "true")
+            .output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        assert_eq!(
+            git_checked(&b, &["worktree", "list", "--porcelain"]).unwrap(),
+            before
+        );
+        assert!(!branch_exists(&b, "isolated"));
+        assert_eq!(
+            std::fs::read_to_string(b.join("README.md")).unwrap(),
+            "hello\n"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn worktree_repository_identity_survives_a_symlinked_tmpdir() {
+        let root = temp_dir("symlinked-tmpdir").canonicalize().unwrap();
+        let real = root.join("real");
+        let alias = root.join("alias");
+        std::fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "agents::tasks::tests::worktree_fallback_scrubs_inherited_repository_and_config_in_a_subprocess", "--nocapture"])
+            .env("TMPDIR", &alias)
+            .output().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
     }
 
     #[test]
@@ -1334,5 +1486,117 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// What a pane delegation's launch carries for the model and effort it
+    /// asked for, and what it then reports as running.
+    #[test]
+    fn a_terminal_agent_runs_the_model_and_effort_a_task_names() {
+        let both = ModelFlags {
+            model: true,
+            effort: true,
+        };
+        let none = ModelFlags::default();
+        let model_only = ModelFlags {
+            model: true,
+            effort: false,
+        };
+        for (name, kind, model, variant, flags, args, applied) in [
+            (
+                "codex, both",
+                "codex",
+                Some("gpt-6-sol"),
+                Some("low"),
+                none,
+                vec![
+                    "-c",
+                    "model=\"gpt-6-sol\"",
+                    "-c",
+                    "model_reasoning_effort=\"low\"",
+                ],
+                (Some("gpt-6-sol"), Some("low")),
+            ),
+            (
+                "codex, model only",
+                "codex",
+                Some("gpt-6-sol"),
+                None,
+                none,
+                vec!["-c", "model=\"gpt-6-sol\""],
+                (Some("gpt-6-sol"), None),
+            ),
+            (
+                "codex, effort without a model",
+                "codex",
+                None,
+                Some("low"),
+                none,
+                vec![],
+                (None, None),
+            ),
+            (
+                "codex, nothing named",
+                "codex",
+                None,
+                None,
+                none,
+                vec![],
+                (None, None),
+            ),
+            (
+                "claude, both flags",
+                "claude",
+                Some("haiku"),
+                Some("low"),
+                both,
+                vec!["--model", "haiku", "--effort", "low"],
+                (Some("haiku"), Some("low")),
+            ),
+            (
+                "claude, no --effort",
+                "claude",
+                Some("haiku"),
+                Some("low"),
+                model_only,
+                vec!["--model", "haiku"],
+                (Some("haiku"), None),
+            ),
+            (
+                "claude, neither flag",
+                "claude",
+                Some("haiku"),
+                Some("low"),
+                none,
+                vec![],
+                (None, None),
+            ),
+            (
+                "another agent",
+                "gemini",
+                Some("m"),
+                Some("low"),
+                both,
+                vec![],
+                (None, None),
+            ),
+        ] {
+            let (got, model, variant) = model_args(kind, model, variant, flags);
+            assert_eq!(got, args, "{name}");
+            assert_eq!((model.as_deref(), variant.as_deref()), applied, "{name}");
+        }
+        assert_eq!(
+            ModelFlags::from_help("  --model <model>  Model for the session\n  --effort <level>"),
+            both
+        );
+        for (word, ok) in [
+            ("gpt-6-sol", true),
+            ("openai/gpt-6.1-sol", true),
+            ("-x", false),
+            ("a b", false),
+            ("a\"b", false),
+            ("", false),
+        ] {
+            assert_eq!(valid_model_word(word), ok, "{word:?}");
+        }
     }
 }

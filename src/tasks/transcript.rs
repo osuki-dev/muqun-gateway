@@ -38,7 +38,11 @@
 //! A streamed row left with nothing is removed (`agent.timeline.removed`)
 //! rather than left out, so a client never keeps an older version of it.
 //!
-//! Sessions no task is bound to are served as they are. The mirror, the
+//! Every session, task or not, is also served without the muqun MCP
+//! server's tool rows ([`is_muqun_tool`]), in every state: those calls are
+//! internal, and a person follows a delegation through Home, the parent's
+//! progress line and the result line told into the parent (`notices`). The
+//! rest of this list applies to task sessions only. The mirror, the
 //! agent's own reads and the task follower keep the raw text: detection
 //! (`pane_agent::marker`, `service::turn_end`) reads what the agent wrote.
 
@@ -49,17 +53,35 @@ use crate::agents::domain::{
     AgentDomainEvent, AgentPart, TimelineItem, TimelineRole, ToolCallStatus,
 };
 use crate::AppState;
-use serde_json::Value;
 
-/// How session `asid`'s transcript is served: `None` as it is, no task
-/// being (or having been) bound to it; else without the plumbing, holding
-/// back a last line still being written when it is `streaming` (running a
-/// turn).
-pub(crate) async fn for_session(state: &AppState, asid: &str) -> Option<Streaming> {
-    if !state.tasks.is_task_session(asid).await {
-        return None;
+/// How session `asid`'s transcript is served: every session without the
+/// muqun server's tool rows; one a task is (or was) bound to also without
+/// the rest of the plumbing, holding back a last line still being written
+/// when it is `streaming` (running a turn).
+pub(crate) async fn for_session(state: &AppState, asid: &str) -> Plumbing {
+    Plumbing {
+        streaming: Streaming(state.tasks.is_busy(asid)),
+        task: state.tasks.is_task_session(asid).await,
     }
-    Some(Streaming(state.tasks.is_busy(asid)))
+}
+
+/// What a session is served without (see [`for_session`]).
+#[derive(Clone, Copy)]
+pub(crate) struct Plumbing {
+    pub(crate) streaming: Streaming,
+    /// A task is (or was) bound to the session: markers, the completion
+    /// instruction and Code Mode lookups go too, not only muqun's tool rows.
+    pub(crate) task: bool,
+}
+
+/// A task session's plumbing, as the tests mostly read it.
+impl From<Streaming> for Plumbing {
+    fn from(streaming: Streaming) -> Self {
+        Self {
+            streaming,
+            task: true,
+        }
+    }
 }
 
 /// Whether the session is running a turn: its rows' last lines may still
@@ -68,9 +90,12 @@ pub(crate) async fn for_session(state: &AppState, asid: &str) -> Option<Streamin
 pub(crate) struct Streaming(pub(crate) bool);
 
 /// `items` as the reader sees them.
-pub(crate) fn hide_in_items(items: &mut Vec<TimelineItem>, streaming: Streaming) {
-    strip_consumed_markers(items, streaming);
-    items.retain_mut(|item| hide_in_item(item, streaming) != Served::Emptied);
+pub(crate) fn hide_in_items(items: &mut Vec<TimelineItem>, plumbing: impl Into<Plumbing>) {
+    let plumbing = plumbing.into();
+    if plumbing.task {
+        strip_consumed_markers(items, plumbing.streaming);
+    }
+    items.retain_mut(|item| hide_in_item(item, plumbing) != Served::Emptied);
 }
 
 /// Cut from `items` the marker line the ledger read each turn's end from:
@@ -175,7 +200,21 @@ enum Served {
     Emptied,
 }
 
-fn hide_in_item(item: &mut TimelineItem, streaming: Streaming) -> Served {
+fn hide_in_item(item: &mut TimelineItem, plumbing: Plumbing) -> Served {
+    // Every call of the muqun server's tools is internal, whatever its state
+    // and in every session: the reader sees a delegation through the Home
+    // rows, the parent's progress line and the result line it is told.
+    // So is an agent loading a skill (its name and path, no side effect):
+    // setup, not the work.
+    if let AgentPart::Tool(call) = &item.part {
+        if is_muqun_tool(&call.name) || call.name.eq_ignore_ascii_case("skill") {
+            return Served::Emptied;
+        }
+    }
+    if !plumbing.task {
+        return Served::Kept;
+    }
+    let streaming = plumbing.streaming;
     let (text, served) = match (item.role, &mut item.part) {
         (_, AgentPart::System { text, .. }) | (_, AgentPart::Synthetic { text, .. })
             if is_catalog_notice(text) =>
@@ -195,22 +234,6 @@ fn hide_in_item(item: &mut TimelineItem, streaming: Streaming) -> Served {
         }
         // Its marker line was cut before ([`strip_consumed_markers`]).
         (TimelineRole::Assistant, AgentPart::Text { text }) if text.trim().is_empty() => {
-            return Served::Emptied;
-        }
-        // The task protocol is how the ledger hears the agent, not the
-        // reader's business: muqun's own `tasks.complete`, and `tasks.read`
-        // asking whether this session has a task -- hidden while they run and
-        // once they succeed. One that failed (an error status, or a tool
-        // result that is an error) stays, so the reader sees why the task is
-        // still open; so does one the turn ended without a result, as for
-        // `execute`. Real work (`tasks.delegate`, `fleet.*`) stays.
-        (_, AgentPart::Tool(call))
-            if is_muqun_protocol_call(&call.name, &call.input)
-                && call.status != ToolCallStatus::Failed
-                && call.error.is_none()
-                && !answered_an_error(call)
-                && (streaming.0 || call.status == ToolCallStatus::Completed) =>
-        {
             return Served::Emptied;
         }
         (_, AgentPart::Tool(call)) if call.name == "execute" => {
@@ -244,13 +267,16 @@ fn hide_in_item(item: &mut TimelineItem, streaming: Streaming) -> Served {
 
 /// `event` as the reader sees it. An upsert whose every row is left with
 /// nothing becomes the removal of those rows.
-pub(crate) fn hide_in_event(event: &mut AgentDomainEvent, streaming: Streaming) {
+pub(crate) fn hide_in_event(event: &mut AgentDomainEvent, plumbing: impl Into<Plumbing>) {
+    let plumbing = plumbing.into();
     match event {
         AgentDomainEvent::TimelineUpsert { asid, items, seq } => {
-            strip_consumed_markers(items, streaming);
+            if plumbing.task {
+                strip_consumed_markers(items, plumbing.streaming);
+            }
             let mut emptied = Vec::new();
             items.retain_mut(|item| {
-                let kept = hide_in_item(item, streaming) == Served::Kept;
+                let kept = hide_in_item(item, plumbing) == Served::Kept;
                 if !kept {
                     emptied.push(item.id.clone());
                 }
@@ -264,7 +290,7 @@ pub(crate) fn hide_in_event(event: &mut AgentDomainEvent, streaming: Streaming) 
                 };
             }
         }
-        AgentDomainEvent::InboxChanged { items, .. } => hide_in_inbox(items),
+        AgentDomainEvent::InboxChanged { items, .. } if plumbing.task => hide_in_inbox(items),
         _ => {}
     }
 }
@@ -286,37 +312,16 @@ pub(crate) fn hide_in_inbox(items: &mut Vec<serde_json::Value>) {
     });
 }
 
-/// Whether a tool row is muqun's task protocol: `tasks.complete`, or
-/// `tasks.read` without a `task_id`, bare or under the prefix a host gives
-/// the muqun server's tools (`muqun_`, `muqun.`, `mcp__muqun__`). A bare
-/// name is taken as muqun's (a host may list a server's tools unprefixed);
-/// another server's prefixed tool of that name is not.
-fn is_muqun_protocol_call(name: &str, input: &Value) -> bool {
-    let bare = ["mcp__muqun__", "muqun__", "muqun_", "muqun."]
+/// Whether a tool row is a call of the muqun MCP server's tools -- any of
+/// them, under the name a host gives it: `mcp__muqun__<tool>` (Claude
+/// Code), `muqun_<tool>` (OpenCode), `muqun.<tool>` or `muqun__<tool>`.
+/// Server-qualified only: another server's tool of the same name stays.
+fn is_muqun_tool(name: &str) -> bool {
+    ["mcp__muqun__", "muqun__", "muqun_", "muqun."]
         .iter()
-        .find_map(|prefix| name.strip_prefix(prefix))
-        .unwrap_or(name);
-    match bare {
-        "tasks.complete" | "tasks_complete" => true,
-        "tasks.read" | "tasks_read" => input.get("task_id").is_none_or(Value::is_null),
-        _ => false,
-    }
-}
-
-/// Whether a tool call's result is an error the tool answered (MCP
-/// `isError`, muqun's `{"error": …}`), which a host may still mark completed.
-fn answered_an_error(call: &crate::agents::domain::ToolCall) -> bool {
-    [call.output.as_ref(), call.content.as_ref()]
-        .into_iter()
-        .flatten()
-        .any(|value| {
-            let text = match value {
-                Value::String(text) => text.clone(),
-                other => other.to_string(),
-            };
-            text.contains("\"isError\":true")
-                || text.contains("\"error\":\"")
-                || text.contains("\\\"error\\\":\\\"")
+        .any(|prefix| {
+            name.strip_prefix(prefix)
+                .is_some_and(|tool| !tool.is_empty())
         })
 }
 
@@ -349,16 +354,32 @@ fn is_catalog_notice(text: &str) -> bool {
 
 /// Whether `code` (an OpenCode Code Mode `execute` call) is only a catalog
 /// lookup of a muqun tool, read strictly as the whole code:
-/// `[return] search({query: <string>[, limit: <integer>]})[;]`, keys in any
-/// order, each once, the query a plain quoted string (no escapes, no
-/// template) that starts with `muqun` or names `tasks.`, `fleet.` or
-/// `exec.run`. Anything else -- another statement, a chained call, an
-/// operator, another key -- is the agent's own work and is shown.
+/// `[return] [await] search({query: <string>[, limit: <integer>]})[;]`, or
+/// the same bound to a name and returned --
+/// `const|let|var <id> = [await] search({...})[;] [return <id>[;]]` --
+/// keys in any order, each once, the query a plain quoted string (no
+/// escapes, no template) that starts with `muqun` or names `tasks.`,
+/// `fleet.` or `exec.run`. Anything else -- another statement, a chained
+/// call, an operator, another key, returning something else -- is the
+/// agent's own work and is shown.
 fn muqun_lookup(code: &str) -> bool {
     let mut at = Cursor(code.trim());
-    if at.word("return") && !at.0.starts_with(char::is_whitespace) {
-        return false;
-    }
+    let bound = if at.word("const") || at.word("let") || at.word("var") {
+        let rest = at.0.trim_start();
+        if rest.starts_with(['"', '\'']) {
+            return false;
+        }
+        match at.key() {
+            Some(name) if at.eat("=") && !at.0.trim_start().starts_with('=') => Some(name),
+            _ => return false,
+        }
+    } else {
+        if at.word("return") && !at.0.starts_with(char::is_whitespace) {
+            return false;
+        }
+        None
+    };
+    at.word("await");
     let (mut query, mut limit) = (None, false);
     let parsed = at.eat("search")
         && at.eat("(")
@@ -386,6 +407,14 @@ fn muqun_lookup(code: &str) -> bool {
         }
         && at.eat(")");
     at.eat(";");
+    if let Some(name) = bound {
+        if at.word("return")
+            && !(at.word(name) && at.0.trim_start().trim_start_matches(';').trim().is_empty())
+        {
+            return false;
+        }
+        at.eat(";");
+    }
     let ours = |query: &str| {
         let query = query.trim().to_ascii_lowercase();
         query.starts_with("muqun")
@@ -692,10 +721,28 @@ mod tests {
                 None,
             ),
             (
-                "a script that also looks one up",
+                "a lookup bound to a name and returned",
                 Assistant,
                 execute("const t = search({query:'muqun'});\nreturn t;"),
-                Some("const t = search({query:'muqun'});\nreturn t;"),
+                None,
+            ),
+            (
+                "the owner's lookup",
+                Assistant,
+                execute(r#"const x = search({query:"muqun fleet.describe exec.run tasks.complete tasks.read",limit:10}); return x;"#),
+                None,
+            ),
+            (
+                "a lookup followed by another call",
+                Assistant,
+                execute("const t = search({query:'muqun'});\nreturn run(t);"),
+                Some("const t = search({query:'muqun'});\nreturn run(t);"),
+            ),
+            (
+                "an agent loading a skill",
+                Assistant,
+                tool("skill", "completed", serde_json::json!({ "name": "a-workflow" })),
+                None,
             ),
             (
                 "a lookup of another tool",
@@ -730,19 +777,19 @@ mod tests {
                 "a report that failed",
                 Assistant,
                 tool("muqun_tasks_complete", "error", serde_json::Value::Null),
-                Some("<code>"),
+                None,
             ),
             (
                 "a report the tool answered with an error",
                 Assistant,
                 answered("muqun_tasks_complete", r#"{"error":"task_not_found","message":"x"}"#),
-                Some("<code>"),
+                None,
             ),
             (
                 "a report the turn left without a result",
                 Assistant,
                 tool("muqun_tasks_complete", "running", serde_json::Value::Null),
-                Some("<code>"),
+                None,
             ),
             (
                 "asking whether this session has a task",
@@ -757,9 +804,21 @@ mod tests {
                 Some("<code>"),
             ),
             (
-                "another muqun tool",
+                "every other muqun tool too",
                 Assistant,
                 tool("muqun_tasks_delegate", "completed", serde_json::Value::Null),
+                None,
+            ),
+            (
+                "a wait, however many",
+                Assistant,
+                tool("mcp__muqun__tasks.wait", "running", serde_json::Value::Null),
+                None,
+            ),
+            (
+                "a tool of that name from no server",
+                Assistant,
+                tool("tasks_complete", "completed", serde_json::Value::Null),
                 Some("<code>"),
             ),
             (
@@ -1013,5 +1072,30 @@ mod tests {
             matches!(&event, AgentDomainEvent::TimelineRemoved { ids, seq: 7, .. } if ids == &["i"]),
             "{event:?}"
         );
+    }
+
+    /// A session no task is bound to -- a person's own, which delegates too
+    /// -- loses the muqun server's tool rows and nothing else.
+    #[test]
+    fn any_session_is_served_without_muqun_tool_rows() {
+        use TimelineRole::Assistant;
+        let mut items = vec![
+            item(
+                Assistant,
+                tool("muqun_tasks_delegate", "completed", serde_json::Value::Null),
+            ),
+            item(
+                Assistant,
+                tool("muqun_tasks_wait", "running", serde_json::Value::Null),
+            ),
+            item(Assistant, text("MUQUN_TASK_DONE: kept here")),
+        ];
+        let own = Plumbing {
+            streaming: Streaming(false),
+            task: false,
+        };
+        hide_in_items(&mut items, own);
+        assert_eq!(items.len(), 1);
+        assert!(matches!(&items[0].part, AgentPart::Text { text } if text.contains("kept here")));
     }
 }

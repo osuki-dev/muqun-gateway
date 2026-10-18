@@ -10,8 +10,8 @@ use crate::agents::domain::{
 use crate::agents::ports::mirror::{AgentSessionSnapshot, MirrorFuture, SessionMirrorPort};
 
 /// Ring-buffer bounds. The mirror is a cache in front of OpenCode, not a store:
-/// everything it drops can be refetched, and a client that falls behind is told
-/// to resync. Nothing here may grow with the length of a session.
+/// replay it drops is recovered with a snapshot. Authoritative text/reasoning
+/// is not byte-capped: the current contract cannot report partial transcripts.
 const MAX_EVENT_LOG_ENTRIES: usize = 2000;
 /// Total serialized size of the per-session event log. A `TimelineUpsert` from
 /// a refetch carries a whole timeline, so a count alone bounds nothing.
@@ -87,7 +87,28 @@ fn truncate_tool_output(call: &mut ToolCall) {
 }
 
 fn event_size(event: &AgentDomainEvent) -> usize {
-    serde_json::to_string(event).map(|s| s.len()).unwrap_or(0)
+    #[derive(Default)]
+    struct ByteCount(usize);
+    impl std::io::Write for ByteCount {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.saturating_add(bytes.len());
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut count = ByteCount::default();
+    match serde_json::to_writer(&mut count, event) {
+        Ok(()) => count.0,
+        // An unserializable event cannot be safely replayed.
+        Err(_) => usize::MAX,
+    }
+}
+
+struct ReplayEvent {
+    event: AgentDomainEvent,
+    bytes: usize,
 }
 
 struct SessionState {
@@ -96,8 +117,10 @@ struct SessionState {
     permissions: HashMap<String, PermissionRequest>,
     forms: HashMap<String, FormRequest>,
     inbox: Vec<serde_json::Value>,
-    event_log: VecDeque<AgentDomainEvent>,
+    event_log: VecDeque<ReplayEvent>,
     event_log_bytes: usize,
+    /// Last discarded sequence, even when the replay log is now empty.
+    replay_floor: u64,
     current_seq: u64,
     touched_ms: u64,
     /// True while `info` is the local stand-in rather than something OpenCode
@@ -115,6 +138,7 @@ impl SessionState {
             inbox: Vec::new(),
             event_log: VecDeque::new(),
             event_log_bytes: 0,
+            replay_floor: 0,
             current_seq: 0,
             touched_ms: now_ms(),
             placeholder: false,
@@ -129,13 +153,22 @@ impl SessionState {
 
     fn push_event(&mut self, event: AgentDomainEvent) {
         let size = event_size(&event);
+        if size > MAX_EVENT_LOG_BYTES {
+            // Dropping only this event would leave a hole. Discard the entire
+            // prefix through it; subsequent retained events form a suffix.
+            self.event_log.clear();
+            self.event_log_bytes = 0;
+            self.replay_floor = self.replay_floor.max(event.seq());
+            return;
+        }
         self.event_log_bytes += size;
-        self.event_log.push_back(event);
+        self.event_log.push_back(ReplayEvent { event, bytes: size });
         while self.event_log.len() > MAX_EVENT_LOG_ENTRIES
-            || (self.event_log_bytes > MAX_EVENT_LOG_BYTES && self.event_log.len() > 1)
+            || self.event_log_bytes > MAX_EVENT_LOG_BYTES
         {
             if let Some(dropped) = self.event_log.pop_front() {
-                self.event_log_bytes = self.event_log_bytes.saturating_sub(event_size(&dropped));
+                self.event_log_bytes -= dropped.bytes;
+                self.replay_floor = self.replay_floor.max(dropped.event.seq());
             } else {
                 break;
             }
@@ -412,6 +445,33 @@ impl MemoryMirror {
             .get(asid)
             .map(|s| s.inbox.clone())
             .unwrap_or_default()
+    }
+
+    /// A delivery change carries no payload: mutate a known item in place.
+    /// `None` asks the caller to fetch the authoritative queue after releasing
+    /// the mirror lock, rather than inventing an item.
+    pub async fn update_inbox_delivery(
+        &self,
+        asid: &AgentSessionId,
+        inbox_id: &str,
+        delivery: &str,
+    ) -> Option<(u64, Vec<serde_json::Value>)> {
+        let mut sessions = self.sessions.write().await;
+        let state = sessions.get_mut(asid)?;
+        let item = state
+            .inbox
+            .iter_mut()
+            .find(|item| item.get("id").and_then(serde_json::Value::as_str) == Some(inbox_id))?;
+        item.as_object_mut()?
+            .insert("delivery".to_string(), serde_json::json!(delivery));
+        let seq = state.next_seq();
+        let items = state.inbox.clone();
+        state.push_event(AgentDomainEvent::InboxChanged {
+            asid: asid.clone(),
+            items: items.clone(),
+            seq,
+        });
+        Some((seq, items))
     }
 
     /// Record an inbox item the stream announced, without a round trip.
@@ -827,12 +887,8 @@ impl MemoryMirror {
         let current_seq = state.current_seq;
         let status = Some(state.info.status);
 
-        // A client that has never synced (`after=0`) is told to resync too
-        // whenever the log no longer starts at the beginning.
-        if let Some(first) = state.event_log.front() {
-            if after_seq < first.seq().saturating_sub(1) {
-                return (Vec::new(), status, true, current_seq);
-            }
+        if after_seq < state.replay_floor {
+            return (Vec::new(), status, true, current_seq);
         }
 
         let mut items: Vec<TimelineItem> = state
@@ -1052,20 +1108,15 @@ impl SessionMirrorPort for MemoryMirror {
             let sessions = self.sessions.read().await;
             let state = sessions.get(asid)?;
 
-            if let Some(first) = state.event_log.front() {
-                // The log starts at `first.seq()`, so it can answer for any
-                // client at or past `first.seq() - 1`. Anything earlier --
-                // including a client that has never synced -- must resync.
-                if after_seq < first.seq().saturating_sub(1) {
-                    return None;
-                }
+            if after_seq < state.replay_floor {
+                return None;
             }
 
             let events: Vec<AgentDomainEvent> = state
                 .event_log
                 .iter()
-                .filter(|ev| ev.seq() > after_seq)
-                .cloned()
+                .filter(|ev| ev.event.seq() > after_seq)
+                .map(|ev| ev.event.clone())
                 .collect();
             Some(events)
         })
@@ -1279,6 +1330,199 @@ mod tests {
             attachments: None,
             image_assets: None,
         }
+    }
+
+    fn replay_text(seq: u64, text: &str) -> AgentDomainEvent {
+        AgentDomainEvent::TimelineUpsert {
+            asid: AgentSessionId("s".into()),
+            items: vec![text_item("m:t0", "m", text)],
+            seq,
+        }
+    }
+
+    #[test]
+    fn replay_measures_serialized_bytes_exactly_and_enforces_count_and_bytes() {
+        let event = replay_text(1, "你好🙂\n\"\\\t");
+        assert_eq!(
+            event_size(&event),
+            serde_json::to_vec(&event).unwrap().len()
+        );
+        let mut state = SessionState::new(info(&AgentSessionId("s".into()), "test"));
+        for seq in 1..=MAX_EVENT_LOG_ENTRIES as u64 + 3 {
+            state.push_event(replay_text(seq, "x"));
+        }
+        assert_eq!(state.event_log.len(), MAX_EVENT_LOG_ENTRIES);
+        assert_eq!(state.replay_floor, 3);
+        assert_eq!(
+            state.event_log_bytes,
+            state.event_log.iter().map(|ev| ev.bytes).sum::<usize>()
+        );
+        for seq in MAX_EVENT_LOG_ENTRIES as u64 + 4..=MAX_EVENT_LOG_ENTRIES as u64 + 8 {
+            state.push_event(replay_text(seq, &"x".repeat(MAX_EVENT_LOG_BYTES / 4)));
+            assert!(state.event_log_bytes <= MAX_EVENT_LOG_BYTES);
+        }
+        assert_eq!(state.event_log.len(), 3, "serialized overhead counts too");
+        assert_eq!(
+            state.event_log_bytes,
+            state
+                .event_log
+                .iter()
+                .map(|ev| event_size(&ev.event))
+                .sum::<usize>()
+        );
+        let floor = state.replay_floor;
+        state.push_event(replay_text(
+            MAX_EVENT_LOG_ENTRIES as u64 + 9,
+            &"x".repeat(MAX_EVENT_LOG_BYTES),
+        ));
+        assert!(state.event_log.is_empty());
+        assert_eq!(state.event_log_bytes, 0);
+        assert!(state.replay_floor > floor);
+    }
+
+    #[test]
+    fn replay_retains_exact_budget_but_not_a_lone_oversized_event() {
+        let mut state = SessionState::new(info(&AgentSessionId("s".into()), "test"));
+        let overhead = event_size(&replay_text(1, ""));
+        let exact = replay_text(1, &"x".repeat(MAX_EVENT_LOG_BYTES - overhead));
+        assert_eq!(event_size(&exact), MAX_EVENT_LOG_BYTES);
+        state.push_event(exact);
+        assert_eq!(state.event_log_bytes, MAX_EVENT_LOG_BYTES);
+        state.push_event(replay_text(
+            2,
+            &"x".repeat(MAX_EVENT_LOG_BYTES - overhead + 1),
+        ));
+        assert!(state.event_log.is_empty());
+        assert_eq!(state.replay_floor, 2);
+        state.push_event(replay_text(3, "suffix"));
+        assert_eq!(state.event_log.len(), 1);
+        assert_eq!(state.event_log.front().unwrap().event.seq(), 3);
+        assert_eq!(state.replay_floor, 2);
+    }
+
+    #[tokio::test]
+    async fn count_eviction_refuses_old_cursors_but_accepts_the_replay_floor() {
+        let mirror = MemoryMirror::new();
+        let asid = AgentSessionId("count".into());
+        for _ in 0..MAX_EVENT_LOG_ENTRIES + 3 {
+            mirror
+                .update_status(&asid, AgentSessionStatus::Idle, None)
+                .await;
+        }
+        assert!(mirror.get_events_after(&asid, 2).await.is_none());
+        assert!(mirror.get_timeline_delta(&asid, 2).await.2);
+        let events = mirror.get_events_after(&asid, 3).await.unwrap();
+        assert_eq!(events.len(), MAX_EVENT_LOG_ENTRIES);
+        assert_eq!(events[0].seq(), 4);
+        assert!(!mirror.get_timeline_delta(&asid, 3).await.2);
+    }
+
+    #[tokio::test]
+    async fn empty_replay_floor_refuses_stale_cursors_and_snapshot_recovers_exact_text() {
+        let mirror = MemoryMirror::new();
+        let asid = AgentSessionId("s".into());
+        mirror.update_session(info(&asid, "large transcript")).await;
+        // No text/reasoning truncation: one authoritative row alone can be
+        // larger than the replay budget, including the completion markers.
+        let text = format!(
+            "{}\nMUQUN_TASK_DONE: 完成🙂\nMUQUN_TASK_BLOCKED: 等待",
+            "界🙂".repeat(MAX_EVENT_LOG_BYTES / 7 + 1)
+        );
+        let oversized_seq = mirror
+            .upsert_timeline_items(&asid, vec![text_item("m:t0", "m", &text)])
+            .await;
+        assert_eq!(mirror.event_log_len(&asid).await, 0);
+        for cursor in [0, oversized_seq - 1] {
+            assert!(mirror.get_events_after(&asid, cursor).await.is_none());
+            assert!(mirror.get_timeline_delta(&asid, cursor).await.2);
+        }
+        let snapshot = mirror.get_snapshot(&asid).await.unwrap();
+        assert_eq!(snapshot.seq, oversized_seq);
+        assert_eq!(
+            snapshot.timeline[0].part,
+            AgentPart::Text { text: text.clone() }
+        );
+        assert!(mirror
+            .get_events_after(&asid, snapshot.seq)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(!mirror.get_timeline_delta(&asid, snapshot.seq).await.2);
+        // A small suffix after an oversize event is contiguous and replayable
+        // from that snapshot; it cannot make an older cursor safe again.
+        mirror
+            .update_status(&asid, AgentSessionStatus::Idle, None)
+            .await;
+        let suffix = mirror.get_events_after(&asid, snapshot.seq).await.unwrap();
+        assert_eq!(suffix.len(), 1);
+        assert_eq!(suffix[0].seq(), snapshot.seq + 1);
+        assert!(mirror
+            .get_events_after(&asid, snapshot.seq - 1)
+            .await
+            .is_none());
+        mirror
+            .set_text_content(&asid, "m:r0", "m", 0, &text, true)
+            .await
+            .unwrap();
+        let snapshot = mirror.get_snapshot(&asid).await.unwrap();
+        let reasoning = snapshot.timeline.iter().find(|it| it.id == "m:r0").unwrap();
+        assert_eq!(
+            reasoning.part,
+            AgentPart::Reasoning {
+                text,
+                duration_ms: None
+            }
+        );
+        assert_eq!(mirror.event_log_len(&asid).await, 0);
+        assert!(mirror
+            .get_events_after(&asid, snapshot.seq)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(!mirror.get_timeline_delta(&asid, snapshot.seq).await.2);
+        assert!(mirror
+            .get_events_after(&asid, snapshot.seq - 1)
+            .await
+            .is_none());
+        assert!(mirror.get_timeline_delta(&asid, snapshot.seq - 1).await.2);
+    }
+
+    #[tokio::test]
+    async fn inbox_delivery_update_requires_a_cached_item_and_records_the_full_queue() {
+        let mirror = MemoryMirror::new();
+        let asid = AgentSessionId("ses-inbox".into());
+        assert!(mirror
+            .update_inbox_delivery(&asid, "missing", "steer")
+            .await
+            .is_none());
+        assert!(mirror.get_snapshot(&asid).await.is_none());
+        let mut items = vec![
+            serde_json::json!({"id": "first", "delivery": "queue", "payload": {"text": "Keep"}}),
+            serde_json::json!({"id": "second", "delivery": "queue", "payload": {"text": "Also keep"}}),
+        ];
+        let (before, _) = mirror.set_inbox(&asid, items.clone()).await;
+        assert!(mirror
+            .update_inbox_delivery(&asid, "missing", "steer")
+            .await
+            .is_none());
+        assert_eq!(mirror.get_snapshot(&asid).await.unwrap().seq, before);
+        let (seq, updated) = mirror
+            .update_inbox_delivery(&asid, "first", "steer")
+            .await
+            .unwrap();
+        items[0]["delivery"] = serde_json::json!("steer");
+        assert_eq!(updated, items);
+        assert_eq!(mirror.inbox(&asid).await, items);
+        assert_eq!(seq, before + 1);
+        let events = mirror.get_events_after(&asid, before).await.unwrap();
+        assert_eq!(events.len(), 1);
+        let AgentDomainEvent::InboxChanged {
+            items: recorded, ..
+        } = &events[0]
+        else {
+            panic!("delivery update did not record an inbox event");
+        };
+        assert_eq!(*recorded, items);
     }
 
     #[tokio::test]

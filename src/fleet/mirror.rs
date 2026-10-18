@@ -66,7 +66,7 @@ pub(crate) async fn delegate(
     let Some(peer) = state.peers.checked(state, peer).await else {
         return Err(TaskError::PeerUnauthorized(name));
     };
-    if !peer.reachable(now_ms()) {
+    if !state.peers.reachable(&peer, now_ms()) {
         return Err(TaskError::MachineUnreachable(name));
     }
     let now = now_ms();
@@ -96,6 +96,8 @@ pub(crate) async fn delegate(
             mentions: request.mentions.clone(),
             client_ref: Some(client_ref.clone()),
             requester_server_id: None,
+            reopened_ms: None,
+            reopen_count: 0,
         })
         .await?;
     let mut body = json!({ "goal": request.goal, "client_ref": client_ref });
@@ -106,6 +108,7 @@ pub(crate) async fn delegate(
         ("mode", &request.mode),
         ("model", &request.model),
         ("variant", &request.variant),
+        ("session_id", &request.session_id),
     ] {
         if let Some(value) = value {
             body[key] = json!(value);
@@ -166,6 +169,156 @@ pub(crate) async fn delegate(
     Ok(state.tasks.present(&now).await)
 }
 
+/// How long another computer is asked to wait for a command before it
+/// answers: within the peer client's request timeout. The rest of the
+/// caller's wait is spent here, on the mirror.
+const PEER_COMMAND_WAIT_S: u64 = 5;
+
+/// A command run on another computer (`exec.run` with `machine`), as its
+/// create answered.
+pub(crate) struct RemoteRun {
+    pub task: TaskView,
+    pub exit_code: Option<i32>,
+    pub stdout_tail: Option<String>,
+}
+
+/// Run `command` on `peer` as a command task of its own ledger -- a
+/// visible pane there, no agent session -- and keep a command mirror of it
+/// here, under the caller's task, moved as a delegation's mirror is. A peer
+/// that cannot take it leaves a failed mirror and says why.
+pub(crate) async fn run_command(
+    state: &AppState,
+    by: Requested,
+    peer: Peer,
+    command: String,
+    cwd: Option<String>,
+    timeout: Duration,
+) -> Result<RemoteRun, TaskError> {
+    let name = peer.name.clone();
+    let Some(peer) = state.peers.checked(state, peer).await else {
+        return Err(TaskError::PeerUnauthorized(name));
+    };
+    if !state.peers.reachable(&peer, now_ms()) {
+        return Err(TaskError::MachineUnreachable(name));
+    }
+    let now = now_ms();
+    let client_ref = uuid::Uuid::new_v4().simple().to_string();
+    let mirror = state
+        .tasks
+        .record(&Task {
+            id: TaskId::new(),
+            kind: TaskKind::Command,
+            goal: command.clone(),
+            cwd: cwd.clone(),
+            binding: TaskBinding::None,
+            state: TaskState::Queued,
+            summary: None,
+            exit_code: None,
+            created_by: by.by,
+            created_ms: now,
+            updated_ms: now,
+            seq: 0,
+            parent: by.parent,
+            origin: by.origin,
+            label: None,
+            requester_name: by.name,
+            session_title: None,
+            mentions: Vec::new(),
+            client_ref: Some(client_ref.clone()),
+            requester_server_id: None,
+            reopened_ms: None,
+            reopen_count: 0,
+        })
+        .await?;
+    let mut body = json!({
+        "kind": "command",
+        "command": command,
+        "client_ref": client_ref,
+        "timeout_s": timeout.as_secs().clamp(1, PEER_COMMAND_WAIT_S),
+    });
+    if let Some(cwd) = &cwd {
+        body["cwd"] = json!(cwd);
+    }
+    let created = match PeerClient::for_peer(&peer) {
+        Ok(client) => client.create_command(&body).await,
+        Err(_) => Err(PeerError::Unreachable("client".into())),
+    };
+    let (remote, answer) = match created {
+        Ok((remote, answer)) => (Some(remote), Some(answer)),
+        Err(PeerError::NoAnswer(_)) => (None, None),
+        Err(error) => {
+            let error = refusal(state, &peer, error).await;
+            state
+                .tasks
+                .record_failure(&mirror, failed(&error.to_string()))
+                .await;
+            return Err(error);
+        }
+    };
+    if remote.is_some() {
+        state.peers.mark_seen(&peer.peer_id).await;
+    }
+    let remote_task_id = remote
+        .as_ref()
+        .map(|remote| remote.task_id.clone())
+        .unwrap_or_default();
+    let mirror = state
+        .tasks
+        .move_to(
+            &mirror.id,
+            TaskChange {
+                binding: Some(binding(&peer, remote_task_id)),
+                to: TaskState::Dispatching,
+                source: SOURCE.into(),
+                ..Default::default()
+            },
+        )
+        .await?;
+    if let Some(remote) = &remote {
+        apply(state, &mirror, remote).await;
+    }
+    watch(state, &peer.peer_id);
+    let now = state
+        .tasks
+        .task(&mirror.id)
+        .await?
+        .ok_or(TaskError::NotFound)?;
+    let field = |key: &str| answer.as_ref().and_then(|answer| answer.get(key).cloned());
+    Ok(RemoteRun {
+        task: state.tasks.present(&now).await,
+        exit_code: field("exit_code")
+            .and_then(|code| code.as_i64())
+            .and_then(|code| i32::try_from(code).ok()),
+        stdout_tail: field("stdout_tail").and_then(|tail| tail.as_str().map(str::to_owned)),
+    })
+}
+
+/// A finished command mirror's output tail and exit code, as the command
+/// task over there recorded them (`exit <code>` then the tail). `None` when
+/// that computer cannot be read.
+pub(crate) async fn command_result(state: &AppState, task: &Task) -> Option<(Option<i32>, String)> {
+    let TaskBinding::Peer {
+        peer_id,
+        remote_task_id,
+        ..
+    } = &task.binding
+    else {
+        return None;
+    };
+    let peer = state.peers.get(peer_id).await?;
+    let there = PeerClient::for_peer(&peer)
+        .ok()?
+        .read_task(remote_task_id)
+        .await
+        .ok()?;
+    let summary = there.summary.unwrap_or_default();
+    let tail = match summary.split_once('\n') {
+        Some((first, rest)) if first.starts_with("exit ") => rest.to_owned(),
+        _ => String::new(),
+    };
+    Some((there.exit_code, tail))
+}
+
 fn binding(peer: &Peer, remote_task_id: String) -> TaskBinding {
     TaskBinding::Peer {
         peer_id: peer.peer_id.clone(),
@@ -184,7 +337,7 @@ async fn refusal(state: &AppState, peer: &Peer, error: PeerError) -> TaskError {
             TaskError::MachineUnreachable(machine)
         }
         PeerError::Unauthorized => {
-            forget(state, &peer.peer_id).await;
+            unauthorized(state, &peer.peer_id).await;
             TaskError::PeerUnauthorized(machine)
         }
         PeerError::Refused { code, .. } if code == "delegations_disabled" => {
@@ -230,11 +383,44 @@ pub(crate) fn mirror_change(mirror: &Task, remote: &RemoteTask) -> Option<TaskCh
 /// Copy `remote` into `mirror`: its progress line, and its state when that
 /// says something new. Whether the mirror moved.
 pub(crate) async fn apply(state: &AppState, mirror: &Task, remote: &RemoteTask) -> bool {
+    if remote.reopen_count < mirror.reopen_count {
+        return false;
+    }
+    let mut reopened = None;
+    if mirror.kind == TaskKind::Delegation
+        && mirror.state != TaskState::Cancelled
+        && remote.reopen_count > mirror.reopen_count
+    {
+        reopened = state
+            .tasks
+            .move_to(
+                &mirror.id,
+                TaskChange {
+                    to: TaskState::Working,
+                    source: SOURCE.into(),
+                    reopen: true,
+                    expected_seq: Some(mirror.seq),
+                    reopen_count: Some(remote.reopen_count),
+                    reopened_ms: remote.reopened_ms,
+                    ..Default::default()
+                },
+            )
+            .await
+            .ok();
+        if reopened.is_none() {
+            return false;
+        }
+    }
+    let mirror = reopened.as_ref().unwrap_or(mirror);
     if let (Some(line), false) = (&remote.progress, remote.state.is_terminal()) {
         state.tasks.note_progress(state, &mirror.id, line).await;
     }
+    // Before any move: an ending mirror keeps the title it had.
+    if let (Some(title), false) = (&remote.title, mirror.state.is_terminal()) {
+        state.tasks.mirror_titled(&mirror.id, title).await;
+    }
     let Some(change) = mirror_change(mirror, remote) else {
-        return false;
+        return reopened.is_some();
     };
     moved(state, mirror, change).await
 }
@@ -265,15 +451,30 @@ pub(crate) fn watch(state: &AppState, peer_id: &str) {
 async fn follow(state: AppState, peer_id: String) {
     let mut retry = RETRY_FIRST;
     loop {
-        let Some(peer) = state.peers.get(&peer_id).await else {
+        let Some(peer) = state
+            .peers
+            .get(&peer_id)
+            .await
+            .filter(|peer| !peer.unauthorized)
+        else {
             return;
         };
+        if watched_mirrors(&state, &peer_id).await.is_empty() {
+            return leave(&state, &peer_id).await;
+        }
+        // Restored mirrors negotiate and persist their transport pin before
+        // opening a socket, just as a new dispatch does before its request.
+        let Some(peer) = state.peers.checked(&state, peer).await else {
+            return;
+        };
+        if !state.peers.reachable(&peer, now_ms()) {
+            tokio::time::sleep(retry).await;
+            retry = (retry * 2).min(RETRY_MOST);
+            continue;
+        }
         let Ok(client) = PeerClient::for_peer(&peer) else {
             return;
         };
-        if open_mirrors(&state, &peer_id).await.is_empty() {
-            return leave(&state, &peer_id).await;
-        }
         let opened = Instant::now();
         match client.subscribe_tasks().await {
             Ok(mut feed) => {
@@ -281,14 +482,19 @@ async fn follow(state: AppState, peer_id: String) {
                 match follow_feed(&state, &client, &peer, &mut feed).await {
                     Ended::Idle => return leave(&state, &peer_id).await,
                     Ended::Forgotten => return,
+                    // The socket closing is the peer going away: unreachable
+                    // now, not once its last answer is two minutes old.
                     Ended::Socket if opened.elapsed() >= IDLE_CHECK => {
+                        state.peers.presence.down(&peer_id);
                         retry = RETRY_FIRST;
                         continue;
                     }
-                    Ended::Socket => {}
+                    Ended::Socket => state.peers.presence.down(&peer_id),
                 }
             }
-            Err(PeerError::Unauthorized) => return forget(&state, &peer_id).await,
+            Err(PeerError::Unauthorized) => return unauthorized(&state, &peer_id).await,
+            // A socket that cannot open is not the peer gone: the reads say
+            // (a proxy without WebSocket still answers them).
             Err(_) => {
                 if !read_all(&state, &client, &peer).await {
                     return;
@@ -304,7 +510,7 @@ async fn follow(state: AppState, peer_id: String) {
 /// was bound meanwhile -- then a new follower takes it.
 async fn leave(state: &AppState, peer_id: &str) {
     state.peers.sockets.leave(peer_id);
-    if !open_mirrors(state, peer_id).await.is_empty() {
+    if !watched_mirrors(state, peer_id).await.is_empty() {
         watch(state, peer_id);
     }
 }
@@ -327,13 +533,13 @@ async fn follow_feed(
     peer: &Peer,
     feed: &mut TaskFeed,
 ) -> Ended {
-    let mut open = open_mirrors(state, &peer.peer_id).await;
+    let mut open = watched_mirrors(state, &peer.peer_id).await;
     loop {
         if open.is_empty() {
             return Ended::Idle;
         }
         let item = tokio::time::timeout(IDLE_CHECK, feed.next()).await;
-        open = open_mirrors(state, &peer.peer_id).await;
+        open = watched_mirrors(state, &peer.peer_id).await;
         match item {
             // Quiet: seen only if B's own pings still arrive; and a mirror
             // whose create got no answer looks for its task (no frame may
@@ -377,7 +583,7 @@ async fn follow_feed(
 /// Read every open mirror of `peer` from it. `false`: the peer no longer
 /// knows this gateway and was forgotten.
 async fn read_all(state: &AppState, client: &PeerClient, peer: &Peer) -> bool {
-    for mirror in open_mirrors(state, &peer.peer_id).await {
+    for mirror in watched_mirrors(state, &peer.peer_id).await {
         if refresh(state, client, peer, &mirror).await.is_none() {
             return false;
         }
@@ -414,13 +620,16 @@ async fn refresh(
             Some(moved)
         }
         Err(PeerError::Unauthorized) => {
-            forget(state, &peer.peer_id).await;
+            unauthorized(state, &peer.peer_id).await;
             None
         }
         // Quiet: the mirror keeps its state. Published anyway, so its view's
         // `peer_reachable`/`peer_last_seen_ms` (§10.12) reach the phone and
         // a blocked `tasks.wait` wakes to them.
-        Err(_) => {
+        Err(error) => {
+            if matches!(error, PeerError::Unreachable(_) | PeerError::NoAnswer(_)) {
+                state.peers.presence.down(&peer.peer_id);
+            }
             state.tasks.republish(mirror).await;
             Some(false)
         }
@@ -462,16 +671,18 @@ async fn adopt(
 /// The peer answered 401/403: it was unlinked there, or this computer's
 /// login revoked. Its open mirrors fail (reason `peer_unlinked`): the task over
 /// there can never be read again, since a new link is a new login. Then the
-/// peer is forgotten (§10.10) -- last, since this may run in its follower,
-/// which forgetting ends. Every path that finds a link gone comes here.
-pub(crate) async fn forget(state: &AppState, peer_id: &str) {
-    tracing::info!(peer = %peer_id, "a peer no longer knows this gateway; forgetting it");
+/// peer is marked `unauthorized`, not forgotten: a delegation there says why,
+/// and the phone's next link under its name replaces it -- last, since this
+/// may run in its follower, which marking ends. Every path that finds a link
+/// gone comes here.
+pub(crate) async fn unauthorized(state: &AppState, peer_id: &str) {
+    tracing::info!(peer = %peer_id, "a peer no longer takes this gateway's token");
     state.peers.presence.gone(peer_id);
     for mirror in open_mirrors(state, peer_id).await {
         let why = ended(&mirror, UNLINKED_THERE);
         state.tasks.record_failure(&mirror, why).await;
     }
-    state.peers.forget(peer_id).await;
+    state.peers.mark_unauthorized(peer_id).await;
 }
 
 /// The open mirrors of `peer_id`.
@@ -483,6 +694,29 @@ async fn open_mirrors(state: &AppState, peer_id: &str) -> Vec<Task> {
         ..Default::default()
     };
     state.tasks.open_tasks(filter).await.unwrap_or_default()
+}
+
+/// Ended delegations stay subscribed so a new turn arrives as a normal frame.
+async fn watched_mirrors(state: &AppState, peer_id: &str) -> Vec<Task> {
+    // Recent history must not push an older, still-running mirror out of
+    // the socket's page. Reserve the existing full page for open work.
+    let mut watched = open_mirrors(state, peer_id).await;
+    let ended = state
+        .tasks
+        .open_tasks(TaskFilter {
+            peer: Some(peer_id.to_owned()),
+            states: Some(vec![TaskState::Done, TaskState::Failed]),
+            limit: 1000,
+            ..Default::default()
+        })
+        .await
+        .unwrap_or_default();
+    watched.extend(
+        ended
+            .into_iter()
+            .filter(|task| task.kind == TaskKind::Delegation),
+    );
+    watched
 }
 
 fn remote_id(task: &Task) -> &str {
@@ -509,9 +743,14 @@ pub(crate) async fn converge(state: &AppState, mirror: &Task) -> bool {
     if live && !remote_task_id.is_empty() {
         return false;
     }
-    let Some(peer) = state.peers.get(peer_id).await else {
-        // Forgotten (a restart between the forget and its mirrors' end):
-        // nothing can read its task again.
+    let Some(peer) = state
+        .peers
+        .get(peer_id)
+        .await
+        .filter(|peer| !peer.unauthorized)
+    else {
+        // Unlinked, or no longer taking this token (a restart between the
+        // mark and its mirrors' end): nothing can read its task again.
         let why = ended(mirror, NO_LONGER_LINKED);
         state.tasks.record_failure(mirror, why).await;
         return true;
@@ -612,7 +851,7 @@ mod tests {
     use serde_json::Value;
 
     use super::*;
-    use crate::mcp::tools::tests_support::delegate_as;
+    use crate::mcp::tools::tests_support::{delegate_as, run_as};
     use crate::tasks::domain::{PrincipalKind, TaskOrigin, TaskPrincipal};
     use crate::tasks::service::Outcome;
     use crate::test_support::{
@@ -649,18 +888,84 @@ mod tests {
             mentions: Vec::new(),
             client_ref: None,
             requester_server_id: None,
+            reopened_ms: None,
+            reopen_count: 0,
         }
     }
 
     fn remote(state: TaskState, summary: Option<&str>) -> RemoteTask {
         RemoteTask {
+            reopened_ms: None,
+            reopen_count: 0,
             task_id: "t_r".into(),
             client_ref: None,
             state,
             summary: summary.map(Into::into),
             exit_code: None,
             progress: None,
+            title: None,
         }
+    }
+
+    #[tokio::test]
+    async fn finished_history_does_not_displace_an_open_mirror() {
+        let state = crate::test_support::test_state("admin", vec![]);
+        let active = state
+            .tasks
+            .record(&mirror(TaskState::Working, None))
+            .await
+            .unwrap();
+        for _ in 0..1000 {
+            state
+                .tasks
+                .record(&mirror(TaskState::Done, Some("history")))
+                .await
+                .unwrap();
+        }
+        let watched = watched_mirrors(&state, "srv-mini").await;
+        assert_eq!(watched.len(), 1001);
+        assert!(watched.iter().any(|task| task.id == active.id));
+    }
+
+    #[tokio::test]
+    async fn a_reopened_mirror_keeps_its_id_and_follows_a_missed_finish() {
+        let state = crate::test_support::test_state("admin", vec![]);
+        let task = state
+            .tasks
+            .record(&mirror(TaskState::Done, Some("first")))
+            .await
+            .unwrap();
+        let mut there = remote(TaskState::Working, Some("first"));
+        there.reopen_count = 1;
+        there.reopened_ms = Some(42);
+        assert!(apply(&state, &task, &there).await);
+        let working = state.tasks.task(&task.id).await.unwrap().unwrap();
+        assert_eq!(working.state, TaskState::Working);
+        assert_eq!(working.reopen_count, 1);
+        // The peer completed and reopened while this mirror still said
+        // Working. The new generation must still be published to the app.
+        there.reopen_count = 2;
+        there.reopened_ms = Some(84);
+        assert!(apply(&state, &working, &there).await);
+        let working = state.tasks.task(&task.id).await.unwrap().unwrap();
+        assert_eq!(working.reopen_count, 2);
+        assert_eq!(working.reopened_ms, Some(84));
+        let mut stale = remote(TaskState::Done, Some("stale first result"));
+        stale.reopen_count = 1;
+        assert!(!apply(&state, &working, &stale).await);
+        there.state = TaskState::Done;
+        there.summary = Some("second".into());
+        assert!(apply(&state, &working, &there).await);
+        let done = state.tasks.task(&task.id).await.unwrap().unwrap();
+        // Several turns completed while disconnected: synchronize once.
+        there.reopen_count = 3;
+        there.summary = Some("fourth".into());
+        assert!(apply(&state, &done, &there).await);
+        let caught_up = state.tasks.task(&task.id).await.unwrap().unwrap();
+        assert_eq!(caught_up.reopen_count, 3);
+        assert_eq!(caught_up.state, TaskState::Done);
+        assert_eq!(caught_up.summary.as_deref(), Some("fourth"));
+        assert!(!apply(&state, &caught_up, &there).await);
     }
 
     fn peer(id: &str, name: &str, url: &str, seen: Option<u64>) -> Peer {
@@ -672,10 +977,12 @@ mod tests {
             token: "peer-token".into(),
             device_id: "coding-1".into(),
             transport_key: None,
+            transport_min_version: 1,
             added_ms: 0,
             last_seen_ms: seen,
             capabilities: vec![],
             manifest: None,
+            unauthorized: false,
         }
     }
 
@@ -938,6 +1245,12 @@ mod tests {
         ] {
             let error = delegate_as(&coding, machine, "goal").await.unwrap_err();
             assert_eq!(error["error"], code, "{machine}: {error}");
+            // A command there is refused the same way: the switch is that
+            // computer's for any work from another.
+            if machine != "old" {
+                let error = run_as(&coding, machine, "ls", 1).await.unwrap_err();
+                assert_eq!(error["error"], code, "exec.run on {machine}: {error}");
+            }
             if code == "machine_unknown" {
                 let message = error["message"].as_str().unwrap();
                 assert!(
@@ -946,10 +1259,12 @@ mod tests {
                 );
             }
         }
-        assert!(
-            coding.peers.get("srv-old").await.is_none(),
-            "a revoked link is forgotten"
-        );
+        // A revoked link is kept, marked: the next delegation there still
+        // names the reason, never machine_unknown, and the phone sees it.
+        let old = coding.peers.get("srv-old").await.unwrap();
+        assert!(old.unauthorized && old.view(now_ms()).unauthorized);
+        let again = delegate_as(&coding, "old", "goal").await.unwrap_err();
+        assert_eq!(again["error"], "unauthorized", "{again}");
         let stranded = coding.tasks.get_for_test(&stranded).await;
         assert_eq!(
             (stranded.state, stranded.summary.as_deref()),
@@ -992,12 +1307,171 @@ mod tests {
                     tab_id: None,
                     shell_pid: None,
                     agent_id: None,
+                    agent_job: None,
+                    model: None,
+                    variant: None,
                 },
                 ..mirror(TaskState::Working, None)
             })
             .await;
         let error = delegate_as(&coding, "mini", "goal").await.unwrap_err();
         assert_eq!(error["error"], "delegation_loop", "{error}");
+        let error = run_as(&coding, "mini", "ls", 1).await.unwrap_err();
+        assert_eq!(error["error"], "delegation_loop", "exec.run: {error}");
+    }
+
+    /// A command on another computer (`exec.run` with `machine`) runs there
+    /// as a command task of its own ledger -- a pane, no agent session --
+    /// with a command mirror here; its exit code and output tail come back.
+    #[tokio::test]
+    async fn a_command_on_another_computer_runs_there_without_an_agent() {
+        let herdr = FakeHerdr::start(vec!["$ "], None);
+        let mini = named(output_state(&herdr), "srv-mini", "mini");
+        mini.devices
+            .lock()
+            .unwrap()
+            .push(test_peer_device("coding-1", "peer-token"));
+        let url = serve(peer_router(mini.clone())).await;
+        let coding = named(output_state(&herdr), "srv-coding", "coding");
+        coding
+            .peers
+            .store_for_test(peer("srv-mini", "mini", &url, Some(now_ms())))
+            .await;
+
+        let ran = run_as(&coding, "mini", "ls ~/Desktop", 1).await.unwrap();
+        assert_eq!(ran["machine"], "mini", "{ran}");
+        let mirror_id = TaskId(ran["task_id"].as_str().unwrap().into());
+        let mirror = coding.tasks.get_for_test(&mirror_id).await;
+        assert_eq!(
+            (mirror.kind, &mirror.goal[..]),
+            (TaskKind::Command, "ls ~/Desktop")
+        );
+        let TaskBinding::Peer { remote_task_id, .. } = &mirror.binding else {
+            panic!("{:?}", mirror.binding);
+        };
+        let remote_id = TaskId(remote_task_id.clone());
+        let there = mini.tasks.get_for_test(&remote_id).await;
+        assert_eq!(
+            (there.kind, there.origin, &there.goal[..]),
+            (TaskKind::Command, TaskOrigin::Peer, "ls ~/Desktop")
+        );
+        assert!(
+            matches!(there.binding, TaskBinding::Pane { .. }),
+            "a pane there"
+        );
+        assert!(mini
+            .agent_runtime
+            .manager_for_agent("opencode")
+            .await
+            .is_none());
+
+        // It ends there: the wait here answers its exit code and tail.
+        mini.tasks
+            .move_to(
+                &remote_id,
+                TaskChange {
+                    to: TaskState::Done,
+                    summary: Some("exit 0\nDocuments\nNotes.txt\n".into()),
+                    exit_code: Some(0),
+                    source: "test".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let by = owner(&coding, &mirror_id).await;
+        let waited = coding
+            .tasks
+            .wait(&coding, &by, &mirror_id, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(waited.task.state, TaskState::Done);
+        assert_eq!(waited.task.exit_code, Some(0));
+        assert_eq!(
+            waited.stdout_tail.as_deref(),
+            Some("Documents\nNotes.txt\n")
+        );
+        // A caller may wait only after the result frame has already arrived.
+        // Finished mirrors must still return the command output on reread.
+        let reread = coding
+            .tasks
+            .wait(&coding, &by, &mirror_id, Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(reread.task.exit_code, Some(0));
+        assert_eq!(reread.stdout_tail, waited.stdout_tail);
+    }
+
+    /// A mirror reads as the task over there does: its goal's sentence until
+    /// that one has a name of its own, then the name.
+    #[tokio::test]
+    async fn a_mirror_takes_the_title_the_task_over_there_shows() {
+        let state = crate::test_support::test_state("admin", vec![]);
+        let id = state
+            .tasks
+            .insert_for_test(&Task {
+                goal: "Run xcodebuild -version, then sleep 90".into(),
+                ..mirror(TaskState::Working, None)
+            })
+            .await;
+        for (theirs, shown) in [
+            (None, "Run xcodebuild -version, then sleep 90"),
+            (Some("Checking Xcode version"), "Checking Xcode version"),
+        ] {
+            let mirrored = state.tasks.get_for_test(&id).await;
+            let remote = RemoteTask {
+                title: theirs.map(Into::into),
+                ..remote(TaskState::Working, None)
+            };
+            apply(&state, &mirrored, &remote).await;
+            let view = state
+                .tasks
+                .present(&state.tasks.get_for_test(&id).await)
+                .await;
+            assert_eq!(view.title, shown, "{theirs:?}");
+        }
+    }
+
+    /// A task is not done while a child it delegated is still out -- working,
+    /// paused or waiting: `tasks.complete` names it; blocked still goes.
+    #[tokio::test]
+    async fn a_parent_is_not_done_while_its_child_is_still_out() {
+        let state = crate::test_support::test_state("admin", vec![]);
+        let parent = state
+            .tasks
+            .insert_for_test(&Task {
+                binding: TaskBinding::None,
+                ..mirror(TaskState::Working, None)
+            })
+            .await;
+        let child = state
+            .tasks
+            .insert_for_test(&Task {
+                parent: Some(parent.clone()),
+                goal: "Check the Xcode version".into(),
+                ..mirror(TaskState::IdleUnconfirmed, None)
+            })
+            .await;
+        let refused = state
+            .tasks
+            .complete(&parent, "all done", Outcome::Done)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            refused.to_string(),
+            "mini is still on 'Check the Xcode version'; wait for it or cancel it."
+        );
+        let by = owner(&state, &child).await;
+        state.tasks.cancel(&state, &by, &child).await.unwrap();
+        assert_eq!(
+            state
+                .tasks
+                .complete(&parent, "all done", Outcome::Done)
+                .await
+                .unwrap()
+                .state,
+            TaskState::Done
+        );
     }
 
     /// What a mirror says about its computer (§10.12): structured fields,
@@ -1006,15 +1480,21 @@ mod tests {
     async fn a_mirror_says_whether_its_computer_answers() {
         let state = crate::test_support::test_state("admin", vec![]);
         let now = now_ms();
-        for (seen, reachable) in [
-            (Some(now), true),
-            (Some(now - 5 * 60_000), false),
-            (None, false),
+        for (seen, down, reachable) in [
+            (Some(now), false, true),
+            (Some(now - 5 * 60_000), false, false),
+            (None, false, false),
+            // Its task socket just closed: unreachable at once, its last
+            // answer kept.
+            (Some(now), true, false),
         ] {
             state
                 .peers
                 .store_for_test(peer("srv-mini", "mini", "http://127.0.0.1:9", seen))
                 .await;
+            if down {
+                state.peers.presence.down("srv-mini");
+            }
             let id = state
                 .tasks
                 .insert_for_test(&mirror(TaskState::Working, None))

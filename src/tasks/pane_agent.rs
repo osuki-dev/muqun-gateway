@@ -42,12 +42,13 @@
 //! every [`POLL`], backing off to [`MAX_PAUSED_POLL`] while nothing changes
 //! ([`paused_poll`]).
 
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use serde_json::Value;
 
-use super::domain::{one_line, Task, TaskBinding, TaskChange, TaskId, TaskState};
-use super::service::SUMMARY_CHARS;
+use super::domain::{one_line, AgentJob, Task, TaskBinding, TaskChange, TaskId, TaskState};
+use super::service::{TaskError, SUMMARY_CHARS};
 use super::{may_touch, same_pane};
 use crate::agents::tasks as agent_kinds;
 use crate::backend::{AgentStatus, OutputFormat, OutputSource, PaneId, ReadPane};
@@ -179,6 +180,485 @@ pub(crate) async fn exited_to_shell(session: &SessionConfig, pane_id: &str, kind
         if ready || tokio::time::Instant::now() >= deadline {
             return false;
         }
+    }
+}
+
+/// What a pane delegation to `kind` launches with for the model and effort
+/// the request named ([`agent_kinds::model_args`]), and the model and effort
+/// it then runs: those passed, else -- for Codex -- its own config's, the
+/// same source `GET /api/tasks/defaults` answers from, so the two agree.
+/// `None`: the agent's own default, not known. A model or effort that is
+/// no plain word is refused; Claude Code is asked which flags it takes.
+pub(crate) async fn launch_model(
+    state: &AppState,
+    kind: &str,
+    model: Option<&str>,
+    variant: Option<&str>,
+) -> Result<(Vec<String>, Option<String>, Option<String>), TaskError> {
+    if let Some(word) = [model, variant]
+        .into_iter()
+        .flatten()
+        .find(|word| !agent_kinds::valid_model_word(word))
+    {
+        return Err(TaskError::UnknownModel(word.to_owned()));
+    }
+    let flags = if kind == "claude" && model.is_some() {
+        let command = agent_kinds::agent_command(kind, &state.config.agent_commands);
+        let flags = claude_model_flags(state, &command);
+        if !flags.model || (variant.is_some() && !flags.effort) {
+            tracing::info!(
+                model = flags.model,
+                effort = flags.effort,
+                "Claude Code does not take every flag asked for; it runs without them"
+            );
+        }
+        flags
+    } else {
+        agent_kinds::ModelFlags::default()
+    };
+    let (args, mut ran, mut effort) = agent_kinds::model_args(kind, model, variant, flags);
+    if kind == "codex" && (ran.is_none() || effort.is_none()) {
+        if let Some((own, own_effort)) =
+            crate::mcp::inject::codex_default_model(&state.config).await
+        {
+            ran = ran.or(Some(own));
+            effort = effort.or(own_effort);
+        }
+    }
+    Ok((args, ran, effort))
+}
+
+/// How long a probe that failed is not tried again.
+const PROBE_FAILURE_TTL: Duration = Duration::from_secs(600);
+
+/// What is known of one command's Claude Code flags.
+#[derive(Default)]
+struct ClaudeProbe {
+    /// The program as the pane's shell finds it, and its `--version` line,
+    /// that `flags` were read from.
+    key: Option<(String, String)>,
+    flags: agent_kinds::ModelFlags,
+    running: bool,
+    failed_at: Option<std::time::Instant>,
+    /// A failure was warned about since the last success.
+    warned: bool,
+}
+
+fn claude_probes() -> &'static std::sync::Mutex<HashMap<String, ClaudeProbe>> {
+    static PROBES: std::sync::OnceLock<std::sync::Mutex<HashMap<String, ClaudeProbe>>> =
+        std::sync::OnceLock::new();
+    PROBES.get_or_init(Default::default)
+}
+
+/// Claude Code's model flags for `command`, as last read: never waits. A
+/// launch takes whatever is known now (nothing before the first probe ends)
+/// and has the probe checked again in the background.
+fn claude_model_flags(state: &AppState, command: &str) -> agent_kinds::ModelFlags {
+    refresh_claude_probe(state, command);
+    claude_probes()
+        .lock()
+        .ok()
+        .and_then(|probes| probes.get(command).map(|probe| probe.flags))
+        .unwrap_or_default()
+}
+
+/// Warm the probe for the configured Claude Code at gateway start.
+pub(crate) fn warm_claude_probe(state: &AppState) {
+    if is_available(state, "claude") {
+        let command = agent_kinds::agent_command("claude", &state.config.agent_commands);
+        refresh_claude_probe(state, &command);
+    }
+}
+
+/// Probe `command` in the background unless a probe is running or one failed
+/// within [`PROBE_FAILURE_TTL`]: find the program as a pane's shell does and
+/// read its `--version`; only when that differs from what the flags were
+/// read from, read its `--help` too. A failure keeps the flags known so far
+/// and is warned about once.
+fn refresh_claude_probe(state: &AppState, command: &str) {
+    {
+        let Ok(mut probes) = claude_probes().lock() else {
+            return;
+        };
+        let probe = probes.entry(command.to_owned()).or_default();
+        if probe.running
+            || probe
+                .failed_at
+                .is_some_and(|at| at.elapsed() < PROBE_FAILURE_TTL)
+        {
+            return;
+        }
+        probe.running = true;
+    }
+    let (state, command) = (state.clone(), command.to_owned());
+    tokio::spawn(async move {
+        let known = claude_probes()
+            .lock()
+            .ok()
+            .and_then(|probes| probes.get(&command).and_then(|probe| probe.key.clone()));
+        let found = match pane_program(&state, &command).await {
+            Some(key) if Some(&key) == known.as_ref() => Ok(None),
+            Some(key) => match claude_help(&state, &key.0).await {
+                Some(help) => Ok(Some((key, agent_kinds::ModelFlags::from_help(&help)))),
+                None => Err(()),
+            },
+            None => Err(()),
+        };
+        let Ok(mut probes) = claude_probes().lock() else {
+            return;
+        };
+        let probe = probes.entry(command.clone()).or_default();
+        probe.running = false;
+        match found {
+            Ok(fresh) => {
+                if let Some((key, flags)) = fresh {
+                    (probe.key, probe.flags) = (Some(key), flags);
+                }
+                (probe.failed_at, probe.warned) = (None, false);
+            }
+            Err(()) => {
+                probe.failed_at = Some(std::time::Instant::now());
+                if !probe.warned {
+                    probe.warned = true;
+                    tracing::warn!(
+                        command,
+                        "could not ask Claude Code which flags it takes; tasks launch with what is known"
+                    );
+                }
+            }
+        }
+    });
+}
+
+/// `program --help`, written to a file the gateway owns and read back:
+/// Claude Code (Node) exits before a pipe drains, and its help piped stops at
+/// 8192 bytes -- before `--model`.
+async fn claude_help(state: &AppState, program: &str) -> Option<String> {
+    let file = std::env::temp_dir().join(format!("muqun-claude-help-{}", uuid::Uuid::new_v4()));
+    let script = format!(
+        "{} --help >{} 2>&1",
+        shell_quoted(program),
+        shell_quoted(&file.to_string_lossy())
+    );
+    let ran = in_pane_shell(state, &script).await;
+    let help = std::fs::read_to_string(&file).ok();
+    let _ = std::fs::remove_file(&file);
+    ran.and(help).filter(|help| !help.is_empty())
+}
+
+/// The program a pane's shell runs for `command` (`command -v`; a path is
+/// taken as written) and its `--version` line. `None` for an alias or a
+/// function, a command that is no plain word, or a version that cannot be
+/// read.
+async fn pane_program(state: &AppState, command: &str) -> Option<(String, String)> {
+    let find = if command.contains('/') {
+        format!("p={}", shell_quoted(command))
+    } else if !command.starts_with('-')
+        && command
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
+    {
+        format!("p=$(command -v -- {}) || exit 1", shell_quoted(command))
+    } else {
+        return None;
+    };
+    let file = std::env::temp_dir().join(format!("muqun-claude-version-{}", uuid::Uuid::new_v4()));
+    let script = format!(
+        "{find}; \"$p\" --version >{} 2>&1; printf '\\n{FOUND}%s\\n' \"$p\"",
+        shell_quoted(&file.to_string_lossy())
+    );
+    let out = in_pane_shell(state, &script).await;
+    let version = std::fs::read_to_string(&file).ok();
+    let _ = std::fs::remove_file(&file);
+    let program = out?
+        .lines()
+        .find_map(|line| line.strip_prefix(FOUND))
+        .map(|path| path.trim().to_owned())
+        .filter(|path| path.starts_with('/'))?;
+    let version = version?.lines().next()?.trim().to_owned();
+    (!version.is_empty()).then_some((program, version))
+}
+
+/// The fence [`pane_program`] reads its answer after: profiles print things.
+const FOUND: &str = "__muqun_found__";
+
+/// `text` as one single-quoted shell word.
+fn shell_quoted(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "'\\''"))
+}
+
+/// `script`'s output, run by the user's login shell as a pane's runs
+/// (`-lic`) with `agent_env`, stdin empty, within 10 s. It runs in a
+/// process group of its own, killed whole when time runs out, so nothing it
+/// started is left behind.
+async fn in_pane_shell(state: &AppState, script: &str) -> Option<String> {
+    let mut shell = tokio::process::Command::new(crate::terminal::login_env::user_shell());
+    shell
+        .args(["-lic", script])
+        .envs(state.config.agent_env.usable())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    shell.process_group(0);
+    let child = shell.spawn().ok()?;
+    let group = child.id();
+    match tokio::time::timeout(Duration::from_secs(10), child.wait_with_output()).await {
+        Ok(out) => Some(String::from_utf8_lossy(&out.ok()?.stdout).into_owned()),
+        Err(_) => {
+            #[cfg(unix)]
+            if let Some(group) = group.and_then(|pid| i32::try_from(pid).ok()) {
+                // SAFETY: signals the process group this spawn created.
+                unsafe {
+                    libc::killpg(group, libc::SIGKILL);
+                }
+            }
+            None
+        }
+    }
+}
+
+/// The job a delegation launched in a pane: the pane's shell, and the job
+/// its launch command started (`TaskBinding::Pane`'s `shell_pid` and
+/// `agent_job`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PaneJob {
+    pub shell_pid: u32,
+    pub job: AgentJob,
+}
+
+/// Where a pane's launched job stands now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Front {
+    /// It holds the pane's terminal: typed text reaches it.
+    Agent,
+    /// Something else does (a shell, `ssh`, `sudo`, an editor; the agent
+    /// suspended with Ctrl-Z or put in the background).
+    Other,
+    /// The job (or the pane's shell) is gone, or its group is now another
+    /// process's.
+    Gone,
+}
+
+/// How long [`launched_job`] looks for the job once the launch is confirmed.
+const CAPTURE_WINDOW: Duration = Duration::from_secs(10);
+
+/// The processes there were just before a launch command was typed, and
+/// when: none of them is ever taken for the job the launch started.
+pub(crate) struct BeforeLaunch {
+    pids: HashSet<u32>,
+    at: std::time::Instant,
+}
+
+/// [`BeforeLaunch`] now; `None` when the process table cannot be read --
+/// then no job is recorded.
+pub(crate) async fn before_launch() -> Option<BeforeLaunch> {
+    let rows = job_table().await?;
+    Some(BeforeLaunch {
+        pids: rows.iter().map(|row| row.pid).collect(),
+        at: std::time::Instant::now(),
+    })
+}
+
+/// The job a launch command typed into `shell_pid`'s terminal started
+/// ([`new_job`]), looked for for at most [`CAPTURE_WINDOW`]; `None` when no
+/// process qualifies, the shell is not found, or the table cannot be read.
+pub(crate) async fn launched_job(shell_pid: u32, before: &BeforeLaunch) -> Option<AgentJob> {
+    let deadline = std::time::Instant::now() + CAPTURE_WINDOW;
+    loop {
+        let rows = job_table().await?;
+        rows.iter().find(|row| row.pid == shell_pid)?;
+        let since = before.at.elapsed().as_secs() + 1;
+        if let Some(job) = new_job(&rows, shell_pid, &before.pids, since) {
+            return Some(job);
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// The job a launch started, on a process table: of the shell's children
+/// on its terminal that lead their own process group, were not there before
+/// the launch (`before`) and have run no longer than since then (`since`
+/// seconds, against a pid reused meanwhile), the oldest -- and only when it
+/// holds the terminal. A job already there, or one started after it, is
+/// never taken.
+fn new_job(rows: &[Proc], shell_pid: u32, before: &HashSet<u32>, since: u64) -> Option<AgentJob> {
+    let shell = rows.iter().find(|row| row.pid == shell_pid)?;
+    if !on_terminal(&shell.tty) {
+        return None;
+    }
+    let leader = rows
+        .iter()
+        .filter(|row| {
+            row.ppid == shell.pid
+                && i64::from(row.pid) == row.pgid
+                && row.tty == shell.tty
+                && !before.contains(&row.pid)
+                && row.etime <= since
+        })
+        .max_by_key(|row| row.etime)?;
+    (shell.tpgid == leader.pgid).then(|| AgentJob {
+        pgid: leader.pgid,
+        leader: leader.pid,
+        started: leader.started.clone(),
+    })
+}
+
+/// Where `job` stands now ([`job_front`] on a fresh process table); a
+/// table that cannot be read or parsed answers `Other`, never `Agent`.
+pub(crate) async fn job_in_front(job: &PaneJob) -> Front {
+    match job_table().await {
+        Some(rows) => job_front(&rows, job),
+        None => Front::Other,
+    }
+}
+
+/// `ps -o pid=,ppid=,pgid=,tpgid=,tty=,etime=,lstart=` for every process,
+/// start times in UTC; `None` when it cannot be run or any row does not
+/// parse.
+async fn job_table() -> Option<Vec<Proc>> {
+    let out = tokio::process::Command::new("ps")
+        .args(["-A", "-o", "pid=,ppid=,pgid=,tpgid=,tty=,etime=,lstart="])
+        .env("LC_ALL", "C")
+        .env("TZ", "UTC")
+        .kill_on_drop(true)
+        .output()
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let mut rows = process_rows(&String::from_utf8_lossy(&out.stdout))?;
+    // Linux's `lstart` is derived from the boot time, which moves when the
+    // wall clock is stepped (NTP, a resume): the start time since boot, in
+    // clock ticks, never does. A process on no terminal is never a job.
+    if cfg!(target_os = "linux") {
+        for row in rows.iter_mut().filter(|row| on_terminal(&row.tty)) {
+            row.started = std::fs::read_to_string(format!("/proc/{}/stat", row.pid))
+                .ok()
+                .and_then(|stat| start_ticks(&stat))
+                .map_or_else(String::new, |ticks| format!("ticks:{ticks}"));
+        }
+    }
+    Some(rows)
+}
+
+/// The start time, in clock ticks since boot, in a `/proc/<pid>/stat` line:
+/// field 22, counted after the command name's closing parenthesis (the name
+/// may hold spaces and parentheses itself).
+fn start_ticks(stat: &str) -> Option<u64> {
+    let (_, rest) = stat.rsplit_once(')')?;
+    rest.split_whitespace().nth(19)?.parse().ok()
+}
+
+/// One `ps -o pid=,ppid=,pgid=,tpgid=,tty=,etime=,lstart=` row.
+#[derive(Debug, Clone)]
+struct Proc {
+    pid: u32,
+    ppid: u32,
+    pgid: i64,
+    tpgid: i64,
+    tty: String,
+    /// Seconds it has run.
+    etime: u64,
+    /// When it started, as `ps` prints it: compared, never parsed.
+    started: String,
+}
+
+/// The rows of a process table, by fixed columns: four numbers, the
+/// terminal, the elapsed time and the rest of the line as the start time.
+/// `None` when any row does not parse -- the table is then not trusted at
+/// all.
+fn process_rows(table: &str) -> Option<Vec<Proc>> {
+    table
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            let mut fields = line.split_whitespace();
+            let pid = fields.next()?.parse().ok()?;
+            let ppid = fields.next()?.parse().ok()?;
+            let pgid = fields.next()?.parse().ok()?;
+            let tpgid = fields.next()?.parse().ok()?;
+            let tty = fields.next()?.to_owned();
+            let etime = elapsed_seconds(fields.next()?)?;
+            let started = fields.collect::<Vec<_>>().join(" ");
+            (!started.is_empty()).then_some(Proc {
+                pid,
+                ppid,
+                pgid,
+                tpgid,
+                tty,
+                etime,
+                started,
+            })
+        })
+        .collect()
+}
+
+/// `ps`'s `etime`, `[[dd-]hh:]mm:ss`, in seconds.
+fn elapsed_seconds(etime: &str) -> Option<u64> {
+    let (days, clock) = match etime.split_once('-') {
+        Some((days, clock)) => (days.parse::<u64>().ok()?, clock),
+        None => (0, etime),
+    };
+    let mut seconds = 0u64;
+    let parts: Vec<&str> = clock.split(':').collect();
+    if !(2..=3).contains(&parts.len()) {
+        return None;
+    }
+    for part in parts {
+        seconds = seconds * 60 + part.parse::<u64>().ok()?;
+    }
+    Some(days * 86_400 + seconds)
+}
+
+/// Whether `ps` names a terminal there.
+fn on_terminal(tty: &str) -> bool {
+    !matches!(tty, "?" | "??" | "-" | "")
+}
+
+/// [`job_in_front`] on a process table. The recorded job's leader must
+/// still be there with the start time it had, still lead the recorded
+/// group, sit on the shell's terminal and descend from the shell --
+/// otherwise the job is gone, whatever now holds its pid or group. It is in
+/// front when the terminal's foreground group (as the shell reports it) is
+/// that group.
+fn job_front(rows: &[Proc], pane: &PaneJob) -> Front {
+    let Some(shell) = rows.iter().find(|row| row.pid == pane.shell_pid) else {
+        return Front::Gone;
+    };
+    let Some(leader) = rows.iter().find(|row| row.pid == pane.job.leader) else {
+        return Front::Gone;
+    };
+    let descends = || {
+        let mut at = leader.ppid;
+        for _ in 0..64 {
+            if at == shell.pid {
+                return true;
+            }
+            match rows.iter().find(|row| row.pid == at) {
+                Some(row) if row.ppid != at => at = row.ppid,
+                _ => return false,
+            }
+        }
+        false
+    };
+    if !on_terminal(&shell.tty)
+        || leader.started != pane.job.started
+        || leader.pgid != pane.job.pgid
+        || leader.tty != shell.tty
+        || !descends()
+    {
+        return Front::Gone;
+    }
+    if shell.tpgid == pane.job.pgid {
+        Front::Agent
+    } else {
+        Front::Other
     }
 }
 
@@ -800,6 +1280,24 @@ const CHROME: [&str; 12] = [
 /// Banner and tip lines, by how they start once their decoration is cut.
 const CHROME_START: [&str; 2] = ["Update available", "Tip:"];
 
+/// Claude Code's plan-usage banners, by their exact shape -- `You've used
+/// 92% of your weekly limit ...` and `Approaching usage limit \u{b7} resets
+/// ...` -- so the owner's usage never reaches a task row, while prose that
+/// merely starts or speaks that way is kept.
+fn plan_banner(text: &str) -> bool {
+    if let Some(rest) = text.strip_prefix("You've used ") {
+        let digits = rest.chars().take_while(char::is_ascii_digit).count();
+        return digits > 0
+            && rest[digits..].starts_with("% of your ")
+            && rest.split_whitespace().take(6).any(|word| word == "limit");
+    }
+    if let Some(rest) = text.strip_prefix("Approaching ") {
+        return rest.split_whitespace().take(3).any(|word| word == "limit")
+            && rest.contains("\u{b7} resets");
+    }
+    false
+}
+
 /// `line`'s text when it says something: not box drawing or a rule, not
 /// the agent's input prompt (`❯`, `›`), not a spinner, banner or footer
 /// hint, and with at least three letters or digits. A box's right edge is
@@ -821,7 +1319,7 @@ fn meaningful(line: &str) -> Option<&str> {
     let text = trimmed
         .trim_start_matches(|c: char| !c.is_alphanumeric() && !"([{\"'`/~.>$".contains(c))
         .trim_end_matches(|c: char| c == '│' || c.is_whitespace());
-    if CHROME_START.iter().any(|start| text.starts_with(start)) {
+    if CHROME_START.iter().any(|start| text.starts_with(start)) || plan_banner(text) {
         return None;
     }
     let words = text.chars().filter(|c| c.is_alphanumeric()).count();
@@ -885,12 +1383,14 @@ struct Observed {
     seen: Seen,
     screen: Option<String>,
     marker: Option<Marker>,
+    done_count: usize,
 }
 
 /// One read of the pane, its agent, its screen and its recent output; `None`
 /// when the backend cannot say.
 async fn observe(at: &Bound<'_>, rows: &mut Option<usize>) -> Option<Observed> {
     let (seen, screen) = observe_agent(at, rows).await?;
+    let mut done_count = 0;
     let marker = match seen {
         Seen::Gone => None,
         _ => terminal_backend(at.session)
@@ -904,13 +1404,72 @@ async fn observe(at: &Bound<'_>, rows: &mut Option<usize>) -> Option<Observed> {
             })
             .await
             .ok()
-            .and_then(|output| marker_after(&output.text, Some(at.goal))),
+            .and_then(|output| {
+                let marker = marker_after(&output.text, Some(at.goal));
+                if let Some(Marker::Done(summary)) = &marker {
+                    done_count = marker_lines(&output.text, Some(at.goal)).iter()
+                        .filter(|(_, _, marker)| matches!(marker, Marker::Done(text) if text == summary)).count();
+                }
+                marker
+            }),
     };
     Some(Observed {
         seen,
         screen,
         marker,
+        done_count,
     })
+}
+
+/// Reopening needs the launched job, not merely an agent-shaped screen in a
+/// reused pane. Older bindings without job identity remain finished.
+pub(crate) async fn same_live_job(task: &Task) -> bool {
+    let TaskBinding::Pane {
+        shell_pid: Some(shell_pid),
+        agent_job: Some(job),
+        ..
+    } = &task.binding
+    else {
+        return false;
+    };
+    job_in_front(&PaneJob {
+        shell_pid: *shell_pid,
+        job: job.clone(),
+    })
+    .await
+        == Front::Agent
+}
+
+#[derive(Default)]
+struct FinishedTurn {
+    seq: Option<u64>,
+    idle: bool,
+}
+
+impl FinishedTurn {
+    fn resumed(&mut self, state: TaskState, seq: u64, seen: Seen) -> bool {
+        if !matches!(state, TaskState::Done | TaskState::Failed) {
+            return false;
+        }
+        if self.seq != Some(seq) {
+            self.seq = Some(seq);
+            self.idle = false;
+        }
+        match seen {
+            Seen::Agent {
+                status: AgentStatus::Idle | AgentStatus::Completed,
+                ..
+            } => {
+                self.idle = true;
+                false
+            }
+            Seen::Agent {
+                status: AgentStatus::Working | AgentStatus::Starting,
+                ..
+            } => self.idle,
+            _ => false,
+        }
+    }
 }
 
 /// Claude Code's tool and message rows (`⏺`) on `screen`.
@@ -1010,9 +1569,9 @@ fn change_for(
     })
 }
 
-/// Follow `task`'s pane agent until the task ends, unless something already
-/// does. The driver calls this for every open pane delegation, which is how
-/// following resumes after a gateway restart.
+/// Follow the assignment while its launched job remains alive, including
+/// finished turns that can reopen. The driver restores followers after a
+/// gateway restart; a claimed task already has exactly one follower.
 pub(crate) fn follow(state: &AppState, task: &Task) {
     if !state.tasks.claim_follow(&task.id) {
         return;
@@ -1043,9 +1602,15 @@ async fn run(state: &AppState, id: &TaskId) {
     let mut known_seq = None;
     // The blocked reasons acted on before this follower, read once.
     let mut acted: Option<Vec<String>> = None;
+    let mut finished_turn = FinishedTurn::default();
+    let mut prior_done: Option<(String, usize)> = state
+        .tasks
+        .reopen_note(id)
+        .await
+        .and_then(|note| serde_json::from_str(&note).ok());
     loop {
         let task = match state.tasks.task(id).await {
-            Ok(Some(task)) if !task.state.is_terminal() => task,
+            Ok(Some(task)) if task.state != TaskState::Cancelled => task,
             Ok(_) => return,
             Err(error) => {
                 tracing::debug!(task = %id.0, %error, "pane follower: read failed");
@@ -1061,11 +1626,60 @@ async fn run(state: &AppState, id: &TaskId) {
         }
         let (mut now, mut seq, mut seen) = (task.state, task.seq, None);
         if let Some(observed) = observe(&at, &mut rows).await {
+            if task.state.is_terminal() {
+                if !same_live_job(&task).await {
+                    return;
+                }
+                if finished_turn.resumed(task.state, task.seq, observed.seen) {
+                    let baseline = match &observed.marker {
+                        Some(Marker::Done(text)) => Some((text.clone(), observed.done_count)),
+                        _ => None,
+                    };
+                    let note = baseline
+                        .as_ref()
+                        .and_then(|value| serde_json::to_string(value).ok());
+                    if state
+                        .tasks
+                        .reopen_with_note(&task, note, None)
+                        .await
+                        .is_ok()
+                    {
+                        prior_done = baseline;
+                        progress = Progress::default();
+                        progress.busy = true;
+                        last_marker = None;
+                        last_screen = None;
+                        known_seq = None;
+                    }
+                }
+                if matches!(observed.seen, Seen::Gone | Seen::NoAgent) {
+                    return;
+                }
+                let unchanged = last == Some((task.seq, Some(observed.seen)));
+                last = Some((task.seq, Some(observed.seen)));
+                // Catch the end of the reporting turn promptly, then let a
+                // finished idle pane back off like any paused assignment.
+                let (next, pause) = paused_poll(quiet, finished_turn.idle && quiet >= 2, unchanged);
+                quiet = if next == 0 && unchanged {
+                    quiet + 1
+                } else {
+                    next
+                };
+                tokio::time::sleep(pause).await;
+                continue;
+            }
             seen = Some(observed.seen);
-            let marker = match observed.seen {
+            let mut marker = match observed.seen {
                 Seen::Gone => last_marker.take(),
                 _ => observed.marker,
             };
+            // The previous turn's marker may still be in scrollback. It must
+            // not finish the new turn before a new result is reported.
+            if let (Some((old, count)), Some(Marker::Done(text))) = (&prior_done, &marker) {
+                if old == text && observed.done_count <= *count {
+                    marker = None;
+                }
+            }
             if acted.is_none() {
                 let reasons = state.tasks.marker_reasons(id).await;
                 progress.seed(marker.as_ref(), &reasons);
@@ -1146,6 +1760,143 @@ pub(crate) async fn interrupt(state: &AppState, task: &Task) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_finished_pane_requires_a_new_turn_not_the_remainder_of_its_old_turn() {
+        use super::*;
+        let seen = |status| Seen::Agent { status, seq: None };
+        for state in [TaskState::Done, TaskState::Failed] {
+            let mut turn = FinishedTurn::default();
+            assert!(!turn.resumed(state, 5, seen(AgentStatus::Working)));
+            assert!(!turn.resumed(state, 5, seen(AgentStatus::Idle)));
+            assert!(turn.resumed(state, 5, seen(AgentStatus::Working)));
+            // The next completion needs its own idle boundary.
+            assert!(!turn.resumed(state, 9, seen(AgentStatus::Working)));
+            assert!(!turn.resumed(state, 9, Seen::Gone));
+            assert!(!turn.resumed(state, 9, Seen::NoAgent));
+        }
+        let mut turn = FinishedTurn::default();
+        assert!(!turn.resumed(TaskState::Cancelled, 5, seen(AgentStatus::Idle)));
+        assert!(!turn.resumed(TaskState::Cancelled, 5, seen(AgentStatus::Working)));
+    }
+
+    /// Only the job the delegation launched, holding the pane's terminal, is
+    /// typed to; whatever else holds it, nothing is, and a job that is gone
+    /// -- or whose pid or group another process now has -- is given up.
+    #[test]
+    fn only_the_launched_job_holding_the_terminal_is_typed_to() {
+        // pid ppid pgid tpgid tty etime lstart; the pane's shell is 100 on
+        // pts/3, the launched job is group 200 led by 200.
+        const AT: &str = "Sun Oct 11 10:00:00 2026";
+        let pane = PaneJob {
+            shell_pid: 100,
+            job: AgentJob {
+                pgid: 200,
+                leader: 200,
+                started: AT.into(),
+            },
+        };
+        let rows = |lines: &[&str]| process_rows(&lines.join("\n")).unwrap();
+        let shell =
+            |tpgid: u32| format!("100 1 100 {tpgid} pts/3 01:00:00 Sun Oct 11 09:00:00 2026");
+        for (name, table, front) in [
+            (
+                "the recorded job in front",
+                rows(&[
+                    &shell(200),
+                    &format!("200 100 200 200 pts/3 05:00 {AT}"),
+                    &format!("201 200 200 200 pts/3 04:00 {AT}"),
+                ]),
+                Front::Agent,
+            ),
+            (
+                "the shell in front (Ctrl-Z)",
+                rows(&[&shell(100), &format!("200 100 200 100 pts/3 05:00 {AT}")]),
+                Front::Other,
+            ),
+            (
+                "another job in front (ssh, sudo, an editor)",
+                rows(&[
+                    &shell(300),
+                    &format!("200 100 200 300 pts/3 05:00 {AT}"),
+                    &format!("300 100 300 300 pts/3 00:10 {AT}"),
+                ]),
+                Front::Other,
+            ),
+            (
+                "the job gone after a restart",
+                rows(&[&shell(100)]),
+                Front::Gone,
+            ),
+            (
+                "the same pid and group, started at another time",
+                rows(&[
+                    &shell(200),
+                    "200 100 200 200 pts/3 00:03 Sun Oct 11 11:00:00 2026",
+                ]),
+                Front::Gone,
+            ),
+            (
+                "the leader on another terminal",
+                rows(&[&shell(200), &format!("200 100 200 200 pts/7 05:00 {AT}")]),
+                Front::Gone,
+            ),
+        ] {
+            assert_eq!(job_front(&table, &pane), front, "{name}");
+        }
+        assert!(
+            process_rows("100 1 x 200 pts/3 00:01 {AT}").is_none(),
+            "unparsable: not trusted"
+        );
+        assert_eq!(
+            elapsed_seconds("2-03:04:05"),
+            Some(2 * 86_400 + 3 * 3600 + 4 * 60 + 5)
+        );
+        // `/proc/<pid>/stat`, a command name holding a parenthesis and spaces.
+        let stat = "200 (a) b (c) S 100 200 200 34819 200 4194560 1 0 0 0 5 1 0 0 20 0 1 0 987654 1000 100";
+        assert_eq!(start_ticks(stat), Some(987_654));
+    }
+
+    /// The job recorded at launch is the one the launch started: never a
+    /// job already in front before it was typed, nor one started after it.
+    #[test]
+    fn the_launch_records_only_the_job_it_started() {
+        let before: HashSet<u32> = [1, 100, 150].into();
+        let shell =
+            |tpgid: u32| format!("100 1 100 {tpgid} pts/3 01:00:00 Sun Oct 11 09:00:00 2026");
+        let rows = |lines: &[&str]| process_rows(&lines.join("\n")).unwrap();
+        let old = "150 100 150 150 pts/3 10:00 Sun Oct 11 09:50:00 2026";
+        let agent = "200 100 200 200 pts/3 00:04 Sun Oct 11 10:00:00 2026";
+        let later = "300 100 300 300 pts/3 00:01 Sun Oct 11 10:00:03 2026";
+        for (name, table, recorded) in [
+            (
+                "the launched job in front",
+                rows(&[&shell(200), old, agent]),
+                Some(200),
+            ),
+            (
+                "a job there before the launch in front",
+                rows(&[&shell(150), old]),
+                None,
+            ),
+            (
+                "a job started after it in front",
+                rows(&[&shell(300), agent, later]),
+                None,
+            ),
+            (
+                "a reused pid older than the launch",
+                rows(&[
+                    &shell(200),
+                    "200 100 200 200 pts/3 09:00 Sun Oct 11 09:51:00 2026",
+                ]),
+                None,
+            ),
+        ] {
+            let job = new_job(&table, 100, &before, 6).map(|job| job.leader);
+            assert_eq!(job, recorded, "{name}");
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -1687,6 +2438,19 @@ mod tests {
             ),
             ("  ⎿  Tip: Use /memory to edit memory\n", None),
             ("Tip: Press Enter to submit your prompt\n", None),
+            (
+                "You've used 92% of your weekly limit \u{b7} resets Oct 15, 6pm \u{b7} /usage-credits to keep using Claude Code\n",
+                None,
+            ),
+            ("Approaching usage limit \u{b7} resets at 6pm\n", None),
+            (
+                "Approaching the bug differently this time\n",
+                Some("Approaching the bug differently this time"),
+            ),
+            (
+                "You've used the cache, so the build hit the API usage limit\n",
+                Some("You've used the cache, so the build hit the API usage limit"),
+            ),
             ("⏺ Read file.rs\n", Some("Read file.rs")),
             ("✶\n", None),
             (

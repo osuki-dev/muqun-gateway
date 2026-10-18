@@ -12,7 +12,7 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::peers::{LinkError, LinkRequest, RenameError};
+use super::peers::{LinkError, LinkRequest, PeerView, RenameError};
 use crate::tasks::domain::now_ms;
 use crate::{
     api_error, require_admin, require_device, valid_device_name, valid_request_id, ApiResult,
@@ -99,15 +99,23 @@ fn valid_name(name: &str) -> bool {
 async fn list(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Json<Value>> {
     owner(&state, &headers)?;
     let peers = state.peers.list().await.map_err(store_failed)?;
-    let peers = futures::future::join_all(
+    futures::future::join_all(
         peers
             .into_iter()
             .map(|peer| state.peers.checked(&state, peer)),
     )
     .await;
+    // Read again: a peer that no longer takes this gateway's token was just
+    // marked so, and is listed as `unauthorized` for the phone to link again.
+    let peers = state.peers.list().await.map_err(store_failed)?;
     let now = now_ms();
-    // A peer that no longer knows this gateway was just forgotten.
-    let views: Vec<_> = peers.iter().flatten().map(|peer| peer.view(now)).collect();
+    let views: Vec<_> = peers
+        .iter()
+        .map(|peer| PeerView {
+            reachable: state.peers.reachable(peer, now),
+            ..peer.view(now)
+        })
+        .collect();
     Ok(Json(json!({
         "accept_delegations": state.peers.accepts_delegations(),
         "peers": views,
@@ -356,7 +364,10 @@ mod tests {
     async fn a_gateway_links_to_another_through_a_pairing_code_and_unlinks() {
         let herdr = FakeHerdr::start(vec!["$ "], None);
         let mini = named(output_state(&herdr), "srv-mini", "mini");
-        let url = serve(peer_router(mini.clone())).await;
+        // Exercise new links and their sealed traffic over an HTTP hostname.
+        let url = serve(peer_router(mini.clone()))
+            .await
+            .replace("127.0.0.1", "localhost");
         let coding = named(output_state(&herdr), "srv-coding", "coding");
         let other = named(output_state(&herdr), "srv-other", "other");
         let other_url = serve(peer_router(other.clone())).await;
@@ -654,6 +665,51 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
 
+        // Mini stops taking coding's token: the link is kept and shown as
+        // unauthorized, and linking again under its name replaces it.
+        mini.devices
+            .lock()
+            .unwrap()
+            .retain(|device| device.kind != DeviceKind::Gateway);
+        crate::fleet::mirror::unauthorized(&coding, &mini_id).await;
+        let (_, listed) = call(&coding, "GET", "/api/peers", "token", None).await;
+        assert_eq!(
+            (
+                &listed["peers"][0]["unauthorized"],
+                &listed["peers"][0]["reachable"]
+            ),
+            (&json!(true), &json!(false))
+        );
+        let (status, minted) = call(
+            &mini,
+            "POST",
+            "/api/pair/pending",
+            "token",
+            Some(json!({ "device_name": "coding", "kind": "gateway", "server_id": "srv-coding" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{minted}");
+        let (status, relinked) = call(
+            &coding,
+            "POST",
+            "/api/peers",
+            "token",
+            Some(json!({
+                "url": url, "name": "Mac Mini",
+                "request_id": minted["request_id"], "code": minted["code"],
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{relinked}");
+        assert!(relinked.get("unauthorized").is_none(), "{relinked}");
+        let (_, listed) = call(&coding, "GET", "/api/peers", "token", None).await;
+        assert_eq!(
+            listed["peers"].as_array().unwrap().len(),
+            1,
+            "replaced, not added"
+        );
+        mini_id = relinked["peer_id"].as_str().unwrap().to_owned();
+
         // Mini's own login here, and records that only look like it: unlinking
         // mini takes back both directions, and only a gateway device that
         // paired as exactly mini's id.
@@ -742,10 +798,12 @@ mod tests {
                     token: "t".into(),
                     device_id: "d".into(),
                     transport_key: None,
+                    transport_min_version: 1,
                     added_ms: 0,
                     last_seen_ms: None,
                     capabilities: vec![],
                     manifest: None,
+                    unauthorized: false,
                 })
                 .await;
             if login {
@@ -753,6 +811,14 @@ mod tests {
                     server_id: Some(server_id.into()),
                     ..test_peer_device("nas-login", "nas-login")
                 });
+                // The phone's list carries it, to match the login by.
+                let (_, listed) = call(&coding, "GET", "/api/pairings", "token", None).await;
+                let login = listed["devices"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|d| d["id"] == "nas-login");
+                assert_eq!(login.unwrap()["server_id"], server_id, "{listed}");
             }
             let (status, unlinked) = call(
                 &coding,
@@ -782,6 +848,11 @@ mod tests {
             .lock()
             .unwrap()
             .push(test_peer_device("peer-1", "peer-token"));
+        // Files are a device's uploads here: another computer has none.
+        let body = json!({ "goal": "g", "attachments": ["/tmp/x.png"] });
+        let (got, answer) = call(&state, "POST", "/api/tasks", "peer-token", Some(body)).await;
+        assert_eq!(got, StatusCode::BAD_REQUEST, "{answer}");
+        assert_eq!(answer["error"]["code"], "attachments_unsupported");
         for (method, path, status) in [
             ("GET", "/api/tasks", StatusCode::OK),
             ("GET", "/api/tasks/t_missing", StatusCode::NOT_FOUND),

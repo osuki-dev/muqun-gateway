@@ -127,7 +127,7 @@ pub(crate) async fn run_agent_command(
                     "DeepSeek was already on for this endpoint; nothing to restart",
                 )?;
             }
-            SetupAgent::Opencode => setup_opencode()?,
+            SetupAgent::Opencode => setup_opencode().await?,
         },
     }
     Ok(())
@@ -553,7 +553,7 @@ fn dsh_credentials_path() -> Option<PathBuf> {
     Some(home.join(".credentials.yaml"))
 }
 
-fn setup_opencode() -> anyhow::Result<()> {
+async fn setup_opencode() -> anyhow::Result<()> {
     let config = load_config(None)?;
     println!(
         "OpenCode is managed by the gateway: it adopts a running `opencode service`, or \
@@ -562,7 +562,7 @@ fn setup_opencode() -> anyhow::Result<()> {
     match resolve_binary(config.opencode.binary.as_deref()) {
         Ok(path) => {
             println!("binary:  {}", path.display());
-            let version = binary_version(&path);
+            let version = binary_version(&path).await;
             println!("version: {}", version.as_deref().unwrap_or("unknown"));
         }
         Err(err) => println!("{err:#}"),

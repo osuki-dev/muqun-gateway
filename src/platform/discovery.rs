@@ -209,6 +209,8 @@ impl TerminalBackendFeatures {
 #[serde(rename_all = "camelCase")]
 pub struct TerminalFeatures {
     /// Frozen pagination of bounded Gateway captures, not native ranged reads.
+    /// Segment support is negotiated via `pane_captured_history_segments_v1`
+    /// in the gateway-wide capability list, independently of storage mode.
     #[serde(default)]
     pub captured_history: bool,
     pub multi_window: bool,
@@ -391,7 +393,7 @@ pub async fn build_discovery(state: &AppState, _sealed: bool, authenticated: boo
     });
     let legacy_capabilities: Vec<String> = crate::gateway_capabilities(
         collaboration_somewhere,
-        state.config.mcp.enabled,
+        state.config.mcp.enabled && crate::mcp::serves_agents(&state.config.listen),
         state.config.history.storage == crate::platform::config::HistoryStorage::Sqlite,
     )
     .into_iter()
@@ -399,6 +401,7 @@ pub async fn build_discovery(state: &AppState, _sealed: bool, authenticated: boo
     .collect();
 
     json!({
+        "transport_versions": crate::connectivity::transport::SUPPORTED_VERSIONS,
         "ok": true,
         "gatewayVersion": env!("CARGO_PKG_VERSION"),
         "apiVersion": crate::GATEWAY_API_VERSION,
@@ -450,6 +453,57 @@ pub fn transports_discovery(mcp_helper: Option<&str>) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn session_pages_discovery_preserves_runtime_provider_flags() {
+        let state = crate::test_state("admin", Vec::new());
+        let discovery = build_discovery(&state, false, true).await;
+        assert!(discovery["capabilities"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("agent_session_pages_v1")));
+        let agents = discovery["planes"]["agents"]["agents"].as_array().unwrap();
+        for (id, supported) in [("opencode", true), ("deepseek", false), ("t3", false)] {
+            let agent = agents.iter().find(|agent| agent["id"] == id).unwrap();
+            let pagination = agent["features"]["sessionPagination"].as_bool();
+            if id == "t3" {
+                assert_eq!(pagination.unwrap_or(false), supported, "{id}");
+            } else {
+                assert_eq!(pagination, Some(supported), "{id}");
+            }
+            assert!(
+                agent["features"].get("extra").is_none(),
+                "flags are flattened"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn captured_segments_and_push_ownership_are_discovered_in_both_storage_modes() {
+        for storage in [
+            crate::platform::config::HistoryStorage::Memory,
+            crate::platform::config::HistoryStorage::Sqlite,
+        ] {
+            let mut state = crate::test_state("admin", Vec::new());
+            state.config.history.storage = storage;
+            let discovery = super::build_discovery(&state, false, true).await;
+            for capability in [
+                "pane_captured_history",
+                "pane_captured_history_segments_v1",
+                "push_token_owner_binding_v1",
+            ] {
+                assert!(discovery["capabilities"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|c| c == capability));
+            }
+            assert_eq!(
+                discovery["planes"]["terminal"]["features"]["capturedHistory"],
+                true
+            );
+        }
+    }
 
     #[test]
     fn transports_announce_mcp_only_when_enabled() {

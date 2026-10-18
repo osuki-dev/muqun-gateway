@@ -16,7 +16,7 @@ use serde_json::{json, Value};
 use super::lineage;
 use super::tokens::AssistantSession;
 use crate::fleet::manifest::{is_self, DescribeError};
-use crate::tasks::domain::{clip, TaskBinding, TaskId, TaskPrincipal};
+use crate::tasks::domain::{clip, TaskBinding, TaskId, TaskPrincipal, REPORTED_STATES};
 use crate::tasks::run_command::{RunHandle, RunRequest};
 use crate::tasks::service::{
     summary_line, task_directory, valid_goal, valid_name, DelegateRequest, Outcome, ReadWhat,
@@ -183,17 +183,21 @@ fn task_error(error: TaskError) -> CallToolResult {
                 "Your task was handed to this computer by another one, so it cannot hand work on to {name}: one hop only. Do it here, or finish with tasks.complete (outcome blocked) and say what needs {name}."
             ),
         ),
+        TaskError::LineageUnresolved => fail(
+            "lineage_unresolved",
+            "The calling session or its task ancestry could not be resolved. Nothing was forwarded. Continue locally or ask the user to start the work from their own session.",
+        ),
         TaskError::PeerUnauthorized(name) => fail(
             "unauthorized",
             &format!(
-                "{name} no longer accepts this computer's link; it is linked again from the owner's phone."
+                "{name} no longer accepts this computer; link again from your phone."
             ),
         ),
         // An argument the computer there refused is the same mistake as here.
         TaskError::PeerRefused { machine, code }
             if matches!(
                 code.as_str(),
-                "invalid_request" | "unknown_model" | "unknown_variant"
+                "invalid_request" | "unknown_model" | "unknown_variant" | "terminal_unknown"
             ) =>
         {
             invalid(&format!("{machine} refused the arguments ({code})."))
@@ -214,15 +218,45 @@ fn task_error(error: TaskError) -> CallToolResult {
         ),
         TaskError::NoTimeline => invalid("Only a delegated task has a timeline."),
         TaskError::InvalidSummary => invalid("summary must be non-empty and at most 32 KiB"),
+        TaskError::ChildrenOpen(which) => fail("children_open", &which),
         TaskError::NoTerminal => fail(
             "no_terminal",
             "No terminal session is reachable on this computer.",
         ),
+        TaskError::TerminalUnknown(id) => invalid(&format!(
+            "No terminal session '{id}' on this computer; leave terminal out to use the first that answers."
+        )),
         error => {
             tracing::warn!("MCP task call failed: {error}");
             fail("internal", "The call failed.")
         }
     }
+}
+
+/// The reminder a delegating agent reads with its child's result.
+pub(crate) const CHILD_REMINDER: &str =
+    "If this result finishes your own task, call tasks.complete with a one-line summary.";
+
+/// `answer` about `child` (a `tasks.read` or `tasks.wait`) with
+/// [`CHILD_REMINDER`] as `when_finished`, when the child has a result and was
+/// delegated by a task still open. The line typed into a parent's pane stays
+/// plain prose; the reminder rides on what the agent reads.
+pub(crate) async fn with_reminder(state: &AppState, mut answer: Value, child: &TaskId) -> Value {
+    let Ok(Some(task)) = state.tasks.task(child).await else {
+        return answer;
+    };
+    if !REPORTED_STATES.contains(&task.state) {
+        return answer;
+    }
+    let Some(parent) = task.parent.as_ref() else {
+        return answer;
+    };
+    if let Ok(Some(parent)) = state.tasks.task(parent).await {
+        if !parent.state.is_terminal() && answer.is_object() {
+            answer["when_finished"] = json!(CHILD_REMINDER);
+        }
+    }
+    answer
 }
 
 fn reply<T: Serialize>(result: Result<T, TaskError>) -> Result<CallToolResult, ErrorData> {
@@ -266,13 +300,16 @@ pub(crate) struct DescribeArgs {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub(crate) struct ExecRunArgs {
-    /// Absolute working directory on this computer.
+    /// Absolute working directory on this computer; with machine, a directory on that computer inside its home ("~" allowed).
     pub cwd: String,
     /// Shell command, run as `sh -c <command>`.
     pub command: String,
     /// Seconds to wait before returning a task handle (1..=45, default 30).
     #[serde(default)]
     pub timeout_s: Option<u64>,
+    /// The computer to run on: "self" (default), or the name of a linked computer from fleet.describe (e.g. "mini"). The command runs in a visible pane there; no agent is started.
+    #[serde(default)]
+    pub machine: Option<String>,
 }
 
 impl ExecRunArgs {
@@ -284,6 +321,7 @@ impl ExecRunArgs {
             cwd: directory(&self.cwd)?,
             command: self.command,
             timeout: wait_slice(self.timeout_s),
+            client_ref: None,
         })
     }
 }
@@ -295,7 +333,7 @@ pub(crate) struct DelegateArgs {
     /// Absolute project directory on this computer (any existing one; for a terminal agent, where its pane opens).
     #[serde(default)]
     pub cwd: Option<String>,
-    /// Agent to use: a structured agent, e.g. "opencode", or a terminal agent from the agent catalog, e.g. "codex" or "claude" (started in a new terminal pane; mode, model and variant do not apply). Default: the primary agent.
+    /// Agent to use: a structured agent, e.g. "opencode", or a terminal agent from the agent catalog, e.g. "codex" or "claude" (started in a new terminal pane; model and variant are passed to its launch, mode does not apply). Default: the primary agent.
     #[serde(default)]
     pub agent_id: Option<String>,
     /// Agent mode, e.g. "build" or "plan".
@@ -310,6 +348,9 @@ pub(crate) struct DelegateArgs {
     /// The computer to run on: "self" (default), or the name of a linked computer from fleet.describe (e.g. "mini"); cwd is then a directory on that computer.
     #[serde(default)]
     pub machine: Option<String>,
+    /// For a terminal agent: the terminal session to start it in, by its id on that computer (e.g. "default" for tmux, or a Herdr session's id). Default: the first that answers.
+    #[serde(default)]
+    pub terminal: Option<String>,
 }
 
 impl DelegateArgs {
@@ -324,10 +365,16 @@ impl DelegateArgs {
         if !valid_goal(&self.goal) {
             return Err(invalid("goal must be non-empty and at most 32 KiB"));
         }
-        let names = [&self.agent_id, &self.mode, &self.model, &self.variant];
+        let names = [
+            &self.agent_id,
+            &self.mode,
+            &self.model,
+            &self.variant,
+            &self.terminal,
+        ];
         if !names.iter().filter_map(|n| n.as_deref()).all(valid_name) {
             return Err(invalid(
-                "agent_id, mode, model and variant must be non-empty and at most 256 bytes",
+                "agent_id, mode, model, variant and terminal must be non-empty and at most 256 bytes",
             ));
         }
         let here = is_self(self.machine.as_deref(), machine_id, label, peers);
@@ -348,6 +395,8 @@ impl DelegateArgs {
             label: None,
             mentions: Vec::new(),
             client_ref: None,
+            session_id: self.terminal,
+            attachments: Vec::new(),
         })
     }
 }
@@ -489,19 +538,33 @@ impl MuqunMcp {
                     "manifest_unavailable",
                     &format!("{name} answers but did not say what it offers."),
                 ),
+                Err(DescribeError::Unauthorized(name)) => fail(
+                    "unauthorized",
+                    &format!("{name} no longer accepts this computer; link again from your phone."),
+                ),
             },
         )
     }
 
     #[tool(
         name = "exec.run",
-        description = "Run a shell command in a visible terminal pane on this computer and return its exit code and output tail. Blocks up to timeout_s (max 45); if still running, returns a task_id for tasks.wait."
+        description = "Run a shell command in a visible terminal pane on this computer, or (machine) on a linked computer, and return its exit code and output tail. Blocks up to timeout_s (max 45); if still running, returns a task_id for tasks.wait. For a command or a short script on another computer use this, not tasks.delegate: no agent is started there."
     )]
     async fn exec_run(
         &self,
         Parameters(args): Parameters<ExecRunArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         let (command, cwd) = (args.command.clone(), args.cwd.clone());
+        let config = &self.state.config;
+        let peers = self.state.peers.names();
+        if !is_self(
+            args.machine.as_deref(),
+            &config.server_id,
+            &config.label,
+            &peers,
+        ) {
+            return self.exec_run_on(args).await;
+        }
         let request = match args.request() {
             Ok(request) => request,
             Err(refused) => return Ok(refused),
@@ -515,30 +578,114 @@ impl MuqunMcp {
         reply(run.map(command_result))
     }
 
+    /// `exec.run` with `machine`: a command task on that computer, mirrored
+    /// here; its exit code and output tail come back when it ends within the
+    /// wait, else a handle for `tasks.wait`, and the caller is told when it
+    /// ends.
+    async fn exec_run_on(&self, args: ExecRunArgs) -> Result<CallToolResult, ErrorData> {
+        if args.command.trim().is_empty() || args.command.len() > MAX_COMMAND_BYTES {
+            return Ok(invalid("command must be non-empty and at most 16 KiB"));
+        }
+        if args.cwd.is_empty() || args.cwd.len() > 4096 {
+            return Ok(invalid("cwd must be a directory path"));
+        }
+        let machine = args.machine.clone().unwrap_or_default();
+        let call = lineage::Call {
+            tool: "exec.run",
+            args: vec![
+                ("command", &args.command),
+                ("cwd", &args.cwd),
+                ("machine", &machine),
+            ],
+        };
+        let by = match lineage::requested_for_forwarding(&self.state, &self.session, &call).await {
+            Ok(by) => by,
+            Err(error) => return Ok(task_error(error)),
+        };
+        let caller = lineage::caller_session(&self.state, &self.session, &call).await;
+        let run = self
+            .state
+            .tasks
+            .run_on(
+                &self.state,
+                by,
+                &machine,
+                args.command,
+                Some(args.cwd),
+                wait_slice(args.timeout_s),
+            )
+            .await;
+        let run = match run {
+            Ok(run) => run,
+            Err(error) => return Ok(task_error(error)),
+        };
+        let id = TaskId(run.task.task_id.clone());
+        if !run.task.state.is_terminal() {
+            if let Some(caller) = caller {
+                self.state.tasks.notify(&id, &caller).await;
+            }
+        }
+        let machine = match &run.task.binding {
+            TaskBinding::Peer { peer_name, .. } => peer_name.clone(),
+            _ => machine,
+        };
+        Ok(ok(json!({
+            "task_id": run.task.task_id,
+            "state": run.task.state,
+            "exit_code": run.exit_code,
+            "stdout_tail": run.stdout_tail,
+            "machine": machine,
+        })))
+    }
+
     #[tool(
         name = "tasks.delegate",
-        description = "Start a sub-task on an agent, on this computer or (machine) on a linked one: a new session in cwd with your goal as the first prompt (for a terminal agent such as codex or claude, a new terminal pane running it). Returns task_id; poll with tasks.wait. One hop only: a task another computer handed here cannot hand work to a linked computer (delegation_loop)."
+        description = "Start a sub-task on an agent, on this computer or (machine) on a linked one: a new session in cwd with your goal as the first prompt (for a terminal agent such as codex or claude, a new terminal pane running it). Returns task_id. If the work will take long, end your turn after delegating; you will be told when it finishes. Use tasks.wait only for short jobs. One hop only: a task another computer handed here cannot hand work to a linked computer (delegation_loop)."
     )]
     async fn tasks_delegate(
         &self,
         Parameters(args): Parameters<DelegateArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         let goal = args.goal.clone();
+        let machine = args.machine.clone();
         let config = &self.state.config;
         let peers = self.state.peers.names();
         let request = match args.request(&config.server_id, &config.label, &peers) {
             Ok(request) => request,
             Err(refused) => return Ok(refused),
         };
-        let call = lineage::Call {
+        let mut call = lineage::Call {
             tool: "tasks.delegate",
             args: vec![("goal", &goal)],
         };
-        let by = lineage::requested(&self.state, &self.session, &call).await;
+        let remote = !is_self(machine.as_deref(), &config.server_id, &config.label, &peers);
+        let by = if remote {
+            if let Some(machine) = machine.as_deref() {
+                call.args.push(("machine", machine));
+            }
+            match lineage::requested_for_forwarding(&self.state, &self.session, &call).await {
+                Ok(by) => by,
+                Err(error) => return Ok(task_error(error)),
+            }
+        } else {
+            lineage::requested(&self.state, &self.session, &call).await
+        };
+        let caller = lineage::caller_session(&self.state, &self.session, &call).await;
         let view = match self.state.tasks.delegate(&self.state, by, request).await {
             Ok(view) => view,
             Err(error) => return Ok(task_error(error)),
         };
+        let id = TaskId(view.task_id.clone());
+        if let Some(caller) = caller {
+            self.state.tasks.notify(&id, &caller).await;
+        }
+        if let (Some(parent), Ok(Some(child))) = (
+            view.parent_task_id.as_ref(),
+            self.state.tasks.task(&id).await,
+        ) {
+            let parent = TaskId(parent.clone());
+            self.state.tasks.waits_on(&parent, &child).await;
+        }
         let mut body = json!(view);
         // The create went out and got no answer: whether it started is unknown.
         if let TaskBinding::Peer {
@@ -560,7 +707,7 @@ impl MuqunMcp {
 
     #[tool(
         name = "tasks.wait",
-        description = "Wait up to timeout_s (max 45) for a task to reach done/failed/waiting, or idle_unconfirmed (its agent stopped without completing: read its answer and decide; do not call again while it says idle_unconfirmed). Returns the current state and summary; call again while it says working."
+        description = "Wait up to timeout_s (max 45) for a task to reach done/failed/waiting, or idle_unconfirmed (its agent stopped without completing: read its answer and decide; do not call again while it says idle_unconfirmed). Returns the current state and summary. If the work will take long, end your turn after delegating; you will be told when it finishes. Use tasks.wait only for short jobs."
     )]
     async fn tasks_wait(
         &self,
@@ -568,7 +715,15 @@ impl MuqunMcp {
     ) -> Result<CallToolResult, ErrorData> {
         let (id, slice) = (TaskId(args.task_id), wait_slice(args.timeout_s));
         let tasks = &self.state.tasks;
-        reply(tasks.wait(&self.state, &self.by(), &id, slice).await)
+        let waited = tasks.wait(&self.state, &self.by(), &id, slice).await;
+        // What a wait answers is not told again into the caller's session.
+        if let Ok(waited) = &waited {
+            tasks.told(&id, waited.task.state).await;
+        }
+        Ok(match waited {
+            Ok(waited) => ok(with_reminder(&self.state, json!(waited), &id).await),
+            Err(error) => task_error(error),
+        })
     }
 
     #[tool(
@@ -605,6 +760,7 @@ impl MuqunMcp {
             .await
         {
             Err(TaskError::NotYours) => {}
+            Ok(read) => return Ok(ok(with_reminder(state, read, &id).await)),
             read => return reply(read),
         }
         // Not one it created: the task this session works on, if it is that.
@@ -662,8 +818,23 @@ impl MuqunMcp {
         &self,
         Parameters(args): Parameters<CancelArgs>,
     ) -> Result<CallToolResult, ErrorData> {
+        let task_id = args.task_id.clone();
         let id = TaskId(args.task_id);
-        reply(self.state.tasks.cancel(&self.state, &self.by(), &id).await)
+        let call = lineage::Call {
+            tool: "tasks.cancel",
+            args: vec![("task_id", &task_id)],
+        };
+        // Judged before the cancel ends the call: the session making it.
+        let caller = lineage::caller_session(&self.state, &self.session, &call).await;
+        let cancelled = self.state.tasks.cancel(&self.state, &self.by(), &id).await;
+        // The session that would be told cancelled it itself: not told back.
+        // Another session under the same token is not that parent.
+        if let (Ok(view), Some(caller)) = (&cancelled, caller) {
+            if self.state.tasks.notice_of(&id).await.as_ref() == Some(&caller) {
+                self.state.tasks.told(&id, view.state).await;
+            }
+        }
+        reply(cancelled)
     }
 }
 
@@ -685,10 +856,14 @@ impl ServerHandler for MuqunMcp {
 pub(crate) fn instructions(in_task: bool) -> String {
     let about = "Muqun Gateway on this computer. fleet.describe says what it has and which \
                  other computers are linked to it, exec.run runs short commands, \
-                 tasks.delegate + tasks.wait hand work to a coding agent (waits are capped at \
-                 45 s; call tasks.wait again while it says working); tasks.delegate(machine) \
+                 tasks.delegate hands work to a coding agent -- if the work will take long, \
+                 end your turn after delegating; you will be told when it finishes. Use \
+                 tasks.wait (at most 45 s) only for short jobs; tasks.delegate(machine) \
                  sends work to a linked computer, and your task's summary (tasks.read without \
-                 a task_id) lists the ones the user named (mentions).";
+                 a task_id) lists the ones the user named (mentions). For a command or a \
+                 short script on another computer, call exec.run with machine; delegate a goal \
+                 only when the other computer needs an agent of its own. Do not restate the \
+                 completion protocol in a delegated goal: the agent there already knows it.";
     let finish = "call tasks.complete with a one-line summary; when you stop because you \
                   need the user, call it with outcome \"blocked\" and the reason; if you \
                   cannot call it, end with the line MUQUN_TASK_DONE: <summary> (or \
@@ -736,6 +911,41 @@ pub(crate) mod tests_support {
     use super::*;
     use crate::mcp::tokens::TokenBinding;
 
+    /// The body `exec.run(machine, command)` answers: `Ok` unless it is an error.
+    pub(crate) async fn run_as(
+        state: &AppState,
+        machine: &str,
+        command: &str,
+        timeout_s: u64,
+    ) -> Result<Value, Value> {
+        let session = AssistantSession {
+            token_id: "tok-%1".into(),
+            binding: TokenBinding::Pane {
+                session_id: "default".into(),
+                pane_id: "%1".into(),
+            },
+            label: "test".into(),
+            expires_ms: None,
+        };
+        let args = ExecRunArgs {
+            cwd: "~".into(),
+            command: command.into(),
+            timeout_s: Some(timeout_s),
+            machine: Some(machine.into()),
+        };
+        let result = MuqunMcp::new(state.clone(), session)
+            .exec_run(Parameters(args))
+            .await
+            .unwrap();
+        let result = serde_json::to_value(result).unwrap();
+        let body = serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+        if result["isError"] == true {
+            Err(body)
+        } else {
+            Ok(body)
+        }
+    }
+
     /// The body `tasks.delegate(machine, goal)` answers: `Ok` unless it is an error.
     pub(crate) async fn delegate_as(
         state: &AppState,
@@ -759,6 +969,7 @@ pub(crate) mod tests_support {
             model: None,
             variant: None,
             machine: Some(machine.into()),
+            terminal: None,
         };
         let result = MuqunMcp::new(state.clone(), session)
             .tasks_delegate(Parameters(args))
@@ -834,6 +1045,7 @@ mod tests {
             model: None,
             variant: None,
             machine: None,
+            terminal: None,
         };
         let (error, _, body) = answer(mcp.tasks_delegate(Parameters(args)).await);
         assert!(!error, "{body}");
@@ -848,6 +1060,7 @@ mod tests {
             cwd: std::env::temp_dir().to_string_lossy().into_owned(),
             command: "sleep 60".into(),
             timeout_s: Some(1),
+            machine: None,
         };
         let (error, _, body) = answer(mcp.exec_run(Parameters(args)).await);
         assert!(!error, "{body}");
@@ -880,6 +1093,7 @@ mod tests {
             model: None,
             variant: None,
             machine: None,
+            terminal: None,
         };
         let (error, _, task) = answer(mcp.tasks_delegate(Parameters(args)).await);
         assert!(!error, "{task}");
@@ -894,6 +1108,15 @@ mod tests {
         let (error, _, cancelled) = answer(mcp.tasks_cancel(Parameters(args)).await);
         assert!(!error, "{cancelled}");
         assert_eq!(cancelled["state"], "cancelled");
+        assert!(
+            mcp.state
+                .tasks
+                .pending_notices(0, 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the caller's own cancel is not told back to it"
+        );
         let key = crate::terminal::shortcuts::interrupt_key(Some("claude"), None);
         assert!(
             herdr.calls.lock().unwrap().iter().any(|call| {
@@ -903,6 +1126,22 @@ mod tests {
             }),
             "the pane agent was interrupted with {key}"
         );
+
+        // A terminal session this computer does not have: refused, as an
+        // argument error, and nothing is made.
+        let args = DelegateArgs {
+            goal: "review the diff".into(),
+            cwd: None,
+            agent_id: Some("claude".into()),
+            mode: None,
+            model: None,
+            variant: None,
+            machine: None,
+            terminal: Some("nope".into()),
+        };
+        let (error, text, _) = answer(mcp.tasks_delegate(Parameters(args)).await);
+        assert!(error, "{text}");
+        assert!(text.contains("No terminal session 'nope'"), "{text}");
     }
 
     #[tokio::test]
@@ -913,6 +1152,7 @@ mod tests {
             cwd: std::env::temp_dir().to_string_lossy().into_owned(),
             command: "sleep 60".into(),
             timeout_s: Some(1),
+            machine: None,
         };
         let (_, _, run) = answer(mcp.exec_run(Parameters(args)).await);
         let args = ReadArgs {
@@ -995,6 +1235,7 @@ mod tests {
             expires_ms: None,
         };
         let device = crate::tasks::domain::Requested {
+            forwarding: crate::tasks::domain::ForwardingContext::Unknown,
             by: crate::tasks::domain::TaskPrincipal {
                 kind: crate::tasks::domain::PrincipalKind::Device,
                 id: "d1".into(),
@@ -1012,6 +1253,7 @@ mod tests {
             model: None,
             variant: None,
             machine: None,
+            terminal: None,
         }
         .request("srv-coding", "coding", &[])
         .unwrap();
@@ -1026,6 +1268,7 @@ mod tests {
             model: None,
             variant: None,
             machine: None,
+            terminal: None,
         };
         let (error, _, body) = answer(mcp.tasks_delegate(Parameters(args)).await);
         assert!(!error, "{body}");
@@ -1091,10 +1334,12 @@ mod tests {
                     token: "t".into(),
                     device_id: "d".into(),
                     transport_key: None,
+                    transport_min_version: 1,
                     added_ms: 0,
                     last_seen_ms: seen,
                     capabilities: vec!["fleet_peers".into()],
                     manifest: seen.map(|_| manifest.clone()),
+                    unauthorized: false,
                 })
                 .await;
         }
@@ -1200,6 +1445,9 @@ mod tests {
                 tab_id: None,
                 shell_pid: None,
                 agent_id: Some("claude".into()),
+                agent_job: None,
+                model: None,
+                variant: None,
             },
             state: TaskState::Working,
             summary: None,
@@ -1219,6 +1467,8 @@ mod tests {
             mentions: vec!["mini".into()],
             client_ref: None,
             requester_server_id: None,
+            reopened_ms: None,
+            reopen_count: 0,
         };
         let id = state.tasks.insert_for_test(&task).await;
         for (pane, task_id, expected) in [
@@ -1413,6 +1663,101 @@ mod tests {
                 "tasks.read",
                 "tasks.wait"
             ]
+        );
+    }
+
+    /// Another session under the same agent token cancelling a child is not
+    /// its parent: the parent session is still told.
+    #[tokio::test]
+    async fn a_cancel_from_another_session_is_still_told_to_the_parent() {
+        use crate::agents::domain::{AgentPart, TimelineItem, TimelineRole};
+        use crate::tasks::domain::{NoticeTarget, Task, TaskKind, TaskOrigin, TaskState};
+        let state = test_state("admin", Vec::new());
+        let child = Task {
+            id: TaskId::new(),
+            kind: TaskKind::Delegation,
+            goal: "g".into(),
+            cwd: None,
+            binding: TaskBinding::None,
+            state: TaskState::Working,
+            summary: None,
+            exit_code: None,
+            created_by: crate::tasks::domain::TaskPrincipal {
+                kind: crate::tasks::domain::PrincipalKind::Assistant,
+                id: TokenBinding::Agent {
+                    agent_id: "opencode".into(),
+                }
+                .owner_key(),
+            },
+            created_ms: crate::tasks::domain::now_ms(),
+            updated_ms: crate::tasks::domain::now_ms(),
+            seq: 0,
+            parent: None,
+            origin: TaskOrigin::Agent,
+            label: None,
+            requester_name: None,
+            session_title: None,
+            mentions: Vec::new(),
+            client_ref: None,
+            requester_server_id: None,
+            reopened_ms: None,
+            reopen_count: 0,
+        };
+        let id = state.tasks.insert_for_test(&child).await;
+        let running: crate::agents::domain::ToolCall = serde_json::from_value(serde_json::json!({
+            "id": "c1", "name": "muqun_tasks_cancel", "input": { "task_id": id.0 },
+            "state": "running", "status": "running"
+        }))
+        .unwrap();
+        let mut agent =
+            FakeAgent::new("opencode").with_sessions(&[("ses_parent", 1), ("ses_other", 1)]);
+        agent.session_timelines.insert(
+            "ses_other".into(),
+            vec![TimelineItem {
+                id: "p1".into(),
+                message_id: "m1".into(),
+                role: TimelineRole::Assistant,
+                part: AgentPart::Tool(running),
+                seq: 1,
+                updated_ms: 0,
+                ordinal: 0,
+                attachments: None,
+                image_assets: None,
+            }],
+        );
+        state.agent_runtime.attach_for_test(agent.manager()).await;
+        let busy = crate::agents::domain::AgentDomainEvent::StatusChanged {
+            asid: crate::agents::domain::AgentSessionId("ses_other".into()),
+            status: crate::agents::domain::AgentSessionStatus::Busy,
+            error: None,
+            seq: 1,
+        };
+        state.tasks.follow(&state, &busy).await;
+        let parent = NoticeTarget::Session {
+            agent_id: "opencode".into(),
+            asid: "ses_parent".into(),
+        };
+        state.tasks.notify(&id, &parent).await;
+        let session = AssistantSession {
+            token_id: "tok".into(),
+            binding: TokenBinding::Agent {
+                agent_id: "opencode".into(),
+            },
+            label: "opencode".into(),
+            expires_ms: None,
+        };
+        let mcp = MuqunMcp::new(state.clone(), session);
+        let (error, _, cancelled) = answer(
+            mcp.tasks_cancel(Parameters(CancelArgs {
+                task_id: id.0.clone(),
+            }))
+            .await,
+        );
+        assert!(!error, "{cancelled}");
+        assert_eq!(
+            state.tasks.pending_notices(0, 10).await.unwrap().len(),
+            1,
+            "the parent session is still told"
         );
     }
 }

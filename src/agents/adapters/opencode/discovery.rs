@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct OpencodeServiceRegistration {
     pub id: Option<String>,
     pub version: Option<String>,
@@ -10,19 +10,59 @@ pub struct OpencodeServiceRegistration {
     pub password: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct OpencodeEndpoint {
     pub url: String,
     pub password: Option<String>,
     pub version: Option<String>,
-    /// The service's process id, when its registration named one. Kept so the
+    /// The service's verified process id after probing. Kept so the
     /// gateway can report which binary an adopted service is actually running.
     pub pid: Option<u32>,
+}
+
+/// Identity fields from OpenCode 2.0.27's published `ServerInfo`. There is no
+/// instance id in this response; the registration id is compared separately.
+#[derive(Deserialize)]
+pub struct OpencodeServerInfo {
+    pub version: String,
+    pub pid: u32,
+    pub urls: Vec<String>,
+}
+
+impl std::fmt::Debug for OpencodeEndpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpencodeEndpoint")
+            .field("url", &self.url)
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("version", &self.version)
+            .field("pid", &self.pid)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for OpencodeServiceRegistration {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpencodeServiceRegistration")
+            .field("id", &self.id)
+            .field("url", &self.url)
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("version", &self.version)
+            .field("pid", &self.pid)
+            .finish()
+    }
 }
 
 impl OpencodeEndpoint {
     /// Discover OpenCode service configuration from standard state files or environment.
     pub async fn discover() -> Option<Self> {
+        Self::discover_with_registration_id()
+            .await
+            .map(|(endpoint, _)| endpoint)
+    }
+
+    /// Preserve the registration's instance id without inventing a server-info
+    /// field. Environment endpoints have no registration identity to match.
+    pub(crate) async fn discover_with_registration_id() -> Option<(Self, Option<String>)> {
         // 1. Check environment variables first if manually configured
         if let Ok(url) =
             std::env::var("OPENCODE_URL").or_else(|_| std::env::var("HERDR_GATEWAY_OPENCODE_URL"))
@@ -32,12 +72,15 @@ impl OpencodeEndpoint {
                 let password = std::env::var("OPENCODE_SERVER_PASSWORD")
                     .or_else(|_| std::env::var("OPENCODE_PASSWORD"))
                     .ok();
-                return Some(Self {
-                    url,
-                    password,
-                    version: None,
-                    pid: None,
-                });
+                return Some((
+                    Self {
+                        url,
+                        password,
+                        version: None,
+                        pid: None,
+                    },
+                    None,
+                ));
             }
         }
 
@@ -54,42 +97,58 @@ impl OpencodeEndpoint {
             return None;
         }
 
-        Some(Self {
-            url,
-            password: reg.password,
-            version: reg.version,
-            pid: reg.pid,
-        })
+        Some((
+            Self {
+                url,
+                password: reg.password,
+                version: reg.version,
+                pid: reg.pid,
+            },
+            reg.id,
+        ))
     }
 
     /// Verify the current OpenCode service is running and responsive.
     pub async fn probe_healthy(&self, client: &reqwest::Client) -> bool {
+        self.probe_info(client).await.is_some()
+    }
+
+    /// Authenticate and match the live identity against every supplied
+    /// registration constraint. Do not fall back to the registration version.
+    pub async fn probe_info(&self, client: &reqwest::Client) -> Option<OpencodeServerInfo> {
         let mut req = client.get(format!("{}/api/info", self.url));
         if let Some(ref pwd) = self.password {
             req = req.basic_auth("opencode", Some(pwd));
         }
-        let Ok(resp) = req.send().await else {
-            return false;
-        };
+        let resp = req.send().await.ok()?;
         if !resp.status().is_success() {
-            return false;
+            return None;
         }
-        let Ok(body) = resp.json::<serde_json::Value>().await else {
-            return false;
-        };
-        body.get("version")
-            .and_then(|v| v.as_str())
-            .is_some_and(|v| !v.is_empty())
-            && body
-                .get("pid")
-                .and_then(|v| v.as_u64())
-                .is_some_and(|pid| pid > 0)
-            && body
-                .get("urls")
-                .and_then(|v| v.as_array())
-                .is_some_and(|urls| {
-                    !urls.is_empty() && urls.iter().all(|url| url.as_str().is_some())
-                })
+        let info = resp.json::<OpencodeServerInfo>().await.ok()?;
+        if info.version.trim().is_empty()
+            || info.pid == 0
+            || info.urls.is_empty()
+            || info.urls.iter().any(|url| url.trim().is_empty())
+            || self.pid.is_some_and(|pid| pid != info.pid)
+            || self
+                .version
+                .as_ref()
+                .is_some_and(|version| version != &info.version)
+        {
+            return None;
+        }
+        Some(info)
+    }
+
+    /// An endpoint suitable for attachment and status reporting, populated
+    /// from authenticated live info rather than a possibly stale state file.
+    pub async fn verified(&self, client: &reqwest::Client) -> Option<Self> {
+        let info = self.probe_info(client).await?;
+        Some(Self {
+            version: Some(info.version),
+            pid: Some(info.pid),
+            ..self.clone()
+        })
     }
 }
 
@@ -161,6 +220,75 @@ mod tests {
             )
             .await
         );
+        for info in [
+            serde_json::json!({"version":" ","pid":123,"urls":["http://localhost"]}),
+            serde_json::json!({"version":"2.0.27","pid":1.5,"urls":["http://localhost"]}),
+            serde_json::json!({"version":"2.0.27","pid":4294967296u64,"urls":["http://localhost"]}),
+            serde_json::json!({"version":"2.0.27","pid":123,"urls":[""]}),
+            serde_json::json!({"version":"2.0.27","pid":123,"urls":[42]}),
+        ] {
+            assert!(!probe(StatusCode::OK, info).await);
+        }
+    }
+
+    #[tokio::test]
+    async fn matches_registration_identity_and_authenticates_info() {
+        use axum::{
+            http::{HeaderMap, StatusCode},
+            routing::get,
+            Json, Router,
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let app = Router::new().route("/api/info", get(|headers: HeaderMap| async move {
+            if headers.get("authorization").and_then(|h| h.to_str().ok()) != Some("Basic b3BlbmNvZGU6Zml4dHVyZS1wYXNzd29yZA==") {
+                return (StatusCode::UNAUTHORIZED, Json(serde_json::Value::Null));
+            }
+            (StatusCode::OK, Json(serde_json::json!({"version":"2.0.27","pid":123,"urls":["http://localhost"],"paths":{"tmp":"/fixture"}})))
+        }));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let mut endpoint = OpencodeEndpoint {
+            url,
+            password: Some("fixture-password".into()),
+            version: None,
+            pid: None,
+        };
+        let verified = endpoint.verified(&client).await.unwrap();
+        assert_eq!(verified.version.as_deref(), Some("2.0.27"));
+        assert_eq!(verified.pid, Some(123));
+        endpoint.pid = Some(456);
+        assert!(endpoint.verified(&client).await.is_none());
+        endpoint.pid = Some(123);
+        endpoint.version = Some("2.0.26".into());
+        assert!(endpoint.verified(&client).await.is_none());
+        endpoint.version = Some("2.0.27".into());
+        assert!(endpoint.verified(&client).await.is_some());
+        endpoint.password = Some("wrong-fixture-password".into());
+        assert!(endpoint.verified(&client).await.is_none());
+        server.abort();
+    }
+
+    #[test]
+    fn debug_redacts_service_passwords() {
+        let reg: OpencodeServiceRegistration = serde_json::from_str(
+            r#"{"url":"http://localhost","password":"fixture-private-password"}"#,
+        )
+        .unwrap();
+        let endpoint = OpencodeEndpoint {
+            url: reg.url.clone(),
+            password: reg.password.clone(),
+            version: None,
+            pid: None,
+        };
+        for output in [format!("{reg:?}"), format!("{endpoint:?}")] {
+            assert!(!output.contains("fixture-private-password"));
+            assert!(output.contains("<redacted>"));
+        }
     }
 
     #[test]

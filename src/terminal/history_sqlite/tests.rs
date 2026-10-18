@@ -1,5 +1,6 @@
 use super::super::backend::{AgentStatus, Pane, PaneId, TabId, WorkspaceId};
 use super::super::history::read_page;
+use super::super::history::read_segment_page;
 use super::*;
 use crate::platform::store::db_key::DbKey;
 use crate::platform::store::sqlite::ALL_MIGRATIONS;
@@ -123,6 +124,318 @@ async fn sql_i64(db: &SqliteStore, sql: &'static str) -> i64 {
 
 async fn record_count(checkpoints: &Checkpoints) -> i64 {
     sql_i64(&checkpoints.db, "SELECT count(*) FROM history_captures").await
+}
+
+async fn segment_rows(
+    repository: &dyn HistoryRepository,
+    mut scope: HistoryScope,
+) -> (Vec<String>, Vec<Value>) {
+    scope.limit = 500;
+    let mut page = read_segment_page(repository, scope.clone(), None)
+        .await
+        .unwrap();
+    let mut rows = Vec::new();
+    let mut segments = Vec::new();
+    loop {
+        let mut chunk = page["segments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|s| s["rows"].as_array().unwrap().iter())
+            .map(|r| r.as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        chunk.extend(rows);
+        rows = chunk;
+        let mut chunk = page["segments"].as_array().unwrap().clone();
+        chunk.extend(segments);
+        segments = chunk;
+        let Some(cursor) = page["next_before"].as_str() else {
+            break;
+        };
+        page = read_segment_page(repository, scope.clone(), Some(cursor))
+            .await
+            .unwrap();
+    }
+    (rows, segments)
+}
+
+#[tokio::test]
+async fn sqlite_recovery_precedes_fresh_writes_and_retains_4980_old_plus_20_new() {
+    for read_before_flush in [true, false] {
+        let fixture = Fixture::new();
+        let fold = captures(Some("A"), false);
+        {
+            let mut store = fold.lock().unwrap();
+            let stamp = store.projection_stamp(&scope()).unwrap();
+            assert!(store.recover_checkpoint(
+                &stamp,
+                (0..5000).map(|i| format!("old {i}")).collect(),
+                Instant::now() + Duration::from_secs(3600)
+            ));
+        }
+        let repository = fixture.open(fold).await;
+        persisted(&repository).await;
+        let (_, initial) = segment_rows(&repository, scope()).await;
+        let old_id = initial[0]["segment_id"].clone();
+        repository.close().await;
+
+        let fold = captures(Some("A"), false);
+        // Fresh output arrives before any history request or writer recovery.
+        fold.lock().unwrap().record_frame(
+            "default",
+            "p",
+            "recent_unwrapped",
+            "text",
+            &(0..20)
+                .map(|i| format!("new {i}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        fold.lock().unwrap().record_frame(
+            "default",
+            "p",
+            "recent_unwrapped",
+            "text",
+            "viewport 0\nviewport 1\nviewport 2\nviewport 3",
+        );
+        let repository = fixture.open(fold.clone()).await;
+        if !read_before_flush {
+            passes(&repository.checkpoints().unwrap(), now_seconds()).await;
+        }
+        let (rows, segments) = segment_rows(&repository, scope()).await;
+        assert_eq!(rows.len(), 5000);
+        assert_eq!(
+            rows,
+            (20..5000)
+                .map(|i| format!("old {i}"))
+                .chain((0..20).map(|i| format!("new {i}")))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(segments[0]["segment_id"], old_id);
+        assert!(segments.iter().all(|s| !s["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r.as_str().unwrap().starts_with("viewport"))));
+        assert_eq!(
+            read_page(&repository, scope(), None).await.unwrap()["rows"],
+            json!(["new 18", "new 19"])
+        );
+        persisted(&repository).await;
+        assert_eq!(
+            repository.stats().unwrap().checkpoints,
+            1,
+            "count read shapes, not segments"
+        );
+        repository.close().await;
+        // Another restart retains both independent segments with the same IDs.
+        let repository = fixture.open(captures(Some("A"), false)).await;
+        let (again, segments) = segment_rows(&repository, scope()).await;
+        assert_eq!(again, rows);
+        assert_eq!(segments[0]["segment_id"], old_id);
+        repository.close().await;
+    }
+}
+
+#[tokio::test]
+async fn sqlite_failed_recovery_does_not_replace_old_segments_and_heals_with_fresh_rows() {
+    let fixture = Fixture::new();
+    let repository = fixture.open(captures(Some("A"), true)).await;
+    persisted(&repository).await;
+    repository.close().await;
+    let fold = captures(Some("A"), true);
+    let worker = fixture.checkpoints(fold.clone()).await;
+    worker
+        .db
+        .call(|c| {
+            Ok(c.execute_batch("ALTER TABLE history_segments RENAME TO history_segments_away")?)
+        })
+        .await
+        .unwrap();
+    assert!(worker.flush_at(now_seconds()).await.is_err());
+    assert_eq!(
+        record_count(&worker).await,
+        1,
+        "recovery error is not confirmed absence"
+    );
+    let stamp = fold.lock().unwrap().projection_stamp(&scope()).unwrap();
+    assert!(fold.lock().unwrap().recovery_pending(&stamp));
+    assert_eq!(
+        worker.read_segments(stamp).await.unwrap_err(),
+        HistoryError::Unavailable
+    );
+    worker
+        .db
+        .call(|c| {
+            Ok(c.execute_batch("ALTER TABLE history_segments_away RENAME TO history_segments")?)
+        })
+        .await
+        .unwrap();
+    passes(&worker, now_seconds()).await;
+    let stamp = fold.lock().unwrap().projection_stamp(&scope()).unwrap();
+    let recovered = worker.read_segments(stamp).await.unwrap().unwrap();
+    assert_eq!(recovered.len(), 2);
+    assert_eq!(recovered.iter().map(|s| s.rows.len()).sum::<usize>(), 14);
+}
+
+#[tokio::test]
+async fn history_migration_seals_a_valid_legacy_checkpoint_and_keeps_its_age_and_identity() {
+    let fixture = Fixture::new();
+    let old = Migration {
+        namespace: "history",
+        steps: &MIGRATION.steps[..2],
+    };
+    let db = SqliteStore::open(&fixture.db_path(), Some(fixture.key.clone()), &[old]).unwrap();
+    let config = fixture.config.clone();
+    let stamp = captures(Some("A"), false)
+        .lock()
+        .unwrap()
+        .projection_stamp(&scope())
+        .unwrap();
+    let saved = stamp.clone();
+    let age = now_seconds() - 3600;
+    db.call(move |c| {
+        let namespaces = reconcile_backends(c, &config)?;
+        let key = json!([
+            namespaces["default"],
+            saved.native_identity.unwrap(),
+            saved.pane,
+            "recent_unwrapped",
+            saved.format
+        ])
+        .to_string();
+        let rows = encode_rows(&["legacy 0", "muqun-exit:fixture:0", "legacy 1"]);
+        c.execute(
+            "INSERT INTO history_captures VALUES (?1,?2,?3,?4,?5)",
+            params![key, saved.policy, rows, rows.len() as i64, age],
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    drop(db);
+    let repository = fixture.open(captures(Some("A"), false)).await;
+    let page = read_segment_page(&repository, scope(), None).await.unwrap();
+    assert_eq!(page["segments"][0]["rows"], json!(["legacy 0", "legacy 1"]));
+    assert_eq!(page["segments"][0]["boundary_reason"], "gateway-restart");
+    assert_eq!(page["segments"][0]["started_at_ms"], age * 1000);
+    let checkpoint = repository.checkpoints().unwrap();
+    let held = checkpoint.read_segments(stamp).await.unwrap().unwrap();
+    assert_eq!(held[0].changed_at_ms, age * 1000);
+    assert_eq!(record_count(&checkpoint).await, 1);
+    // A later segment's output updates the shape summary, not the old
+    // segment's age. Age pruning can then remove just that old segment.
+    checkpoint.captures.lock().unwrap().record_frame(
+        "default",
+        "p",
+        "recent_unwrapped",
+        "text",
+        "fresh 0\nfresh 1\nfresh 2",
+    );
+    checkpoint.captures.lock().unwrap().record_frame(
+        "default",
+        "p",
+        "recent_unwrapped",
+        "text",
+        "viewport 0\nviewport 1\nviewport 2\nviewport 3",
+    );
+    passes(&checkpoint, now_seconds()).await;
+    let stamp = checkpoint
+        .captures
+        .lock()
+        .unwrap()
+        .projection_stamp(&scope())
+        .unwrap();
+    let later = checkpoint
+        .read_segments(stamp.clone())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(later.len(), 2);
+    assert_eq!(later[0].changed_at_ms, age * 1000);
+    let id = later[0].position.segment_id.clone();
+    checkpoint
+        .db
+        .call(move |c| {
+            c.execute(
+                "UPDATE history_segments SET changed_ms=?1 WHERE segment_id=?2",
+                params![super::super::history_segments::now_ms() - RETENTION_MS, id],
+            )?;
+            prune(c, now_seconds(), &[])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let remaining = checkpoint.read_segments(stamp).await.unwrap().unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(
+        remaining[0]
+            .rows
+            .iter()
+            .map(|r| r.as_ref())
+            .collect::<Vec<_>>(),
+        ["fresh 0", "fresh 1", "fresh 2"]
+    );
+    assert_eq!(record_count(&checkpoint).await, 1);
+    drop(checkpoint);
+    repository.close().await;
+}
+
+#[tokio::test]
+async fn sqlite_repeated_resize_editor_and_native_backlog_boundaries_survive_restart() {
+    let fixture = Fixture::new();
+    let fold = captures(Some("A"), true);
+    let repository = fixture.open(fold.clone()).await;
+    persisted(&repository).await;
+    let (old, first) = segment_rows(&repository, scope()).await;
+    let old_id = first[0]["segment_id"].clone();
+    for cycle in 0..3 {
+        let mut editor = pane(Some("A"));
+        editor.width = Some(120 + cycle);
+        editor.foreground_command = Some("nvim".into());
+        fold.lock()
+            .unwrap()
+            .observe_native_listing("default", &[editor]);
+        fold.lock().unwrap().record_frame(
+            "default",
+            "p",
+            "recent_unwrapped",
+            "text",
+            "editor viewport only",
+        );
+        let mut native = pane(Some("A"));
+        native.width = Some(120 + cycle);
+        native.alternate_on = None; // Herdr's zero -> positive backlog policy.
+        native.max_offset_from_bottom = Some(200);
+        fold.lock()
+            .unwrap()
+            .observe_native_listing("default", &[native.clone()]);
+        let (kept, _) = segment_rows(&repository, scope()).await;
+        assert_eq!(kept, old);
+        assert_eq!(
+            read_page(&repository, scope(), None).await.unwrap()["availability"],
+            "not_captured"
+        );
+        native.max_offset_from_bottom = Some(0);
+        fold.lock()
+            .unwrap()
+            .observe_native_listing("default", &[native]);
+        fold.lock().unwrap().record_frame(
+            "default",
+            "p",
+            "recent_unwrapped",
+            "text",
+            "current viewport only",
+        );
+    }
+    passes(&repository.checkpoints().unwrap(), now_seconds()).await;
+    repository.close().await;
+    let repository = fixture.open(captures(Some("A"), false)).await;
+    let (kept, after) = segment_rows(&repository, scope()).await;
+    assert_eq!(kept, old);
+    assert_eq!(after[0]["segment_id"], old_id);
+    assert!(kept.iter().all(|r| !r.contains("viewport")));
+    repository.close().await;
 }
 
 async fn passes(checkpoints: &Arc<Checkpoints>, now: i64) {
@@ -530,14 +843,18 @@ async fn sqlite_retention_and_quota_eviction_do_not_resurrect_unchanged_polled_p
             .collect();
         let now = if expire {
             let expired = base + RETENTION_SECONDS + 1;
-            worker.db.call(move |c| prune(c, expired)).await.unwrap();
+            worker
+                .db
+                .call(move |c| prune(c, expired, &[]))
+                .await
+                .unwrap();
             expired
         } else {
             worker
                 .db
                 .call(move |c| {
                     for n in 0..MAX_RECORDS {
-                        let encoded = encode_rows(&["quota fixture".into()]);
+                        let encoded = encode_rows(&["quota fixture"]);
                         c.execute(
                             "INSERT INTO history_captures VALUES (?1,'quota',?2,?3,?4)",
                             params![
@@ -548,7 +865,7 @@ async fn sqlite_retention_and_quota_eviction_do_not_resurrect_unchanged_polled_p
                             ],
                         )?;
                     }
-                    prune(c, base + 1)
+                    prune(c, base + 1, &[])
                 })
                 .await
                 .unwrap();
@@ -605,7 +922,10 @@ async fn sqlite_retention_and_quota_eviction_do_not_resurrect_unchanged_polled_p
         assert_eq!(rows, live);
         assert_ne!(rows, original[0].rows);
         let text_updated = updated(&worker, worker.key(&text_stamp).unwrap()).await;
-        assert_eq!(text_updated, now + 1);
+        assert!(
+            (text_updated - now_seconds()).abs() <= 1,
+            "age is the actual observation, not the flush clock"
+        );
         let ansi_stamp = fold.lock().unwrap().projection_stamp(&scopes[1]).unwrap();
         assert!(
             worker.read(ansi_stamp).await.unwrap().is_none(),
@@ -623,7 +943,7 @@ async fn sqlite_retention_and_quota_eviction_do_not_resurrect_unchanged_polled_p
         assert!(worker.read(ansi_stamp.clone()).await.unwrap().is_some());
         assert_eq!(
             updated(&worker, worker.key(&ansi_stamp).unwrap()).await,
-            now + 2
+            now_seconds()
         );
         assert_eq!(
             updated(&worker, worker.key(&text_stamp).unwrap()).await,
@@ -638,16 +958,18 @@ async fn persisted(repository: &SqliteHistoryRepository) {
 
 /// Wait for the write loop to store the fold's current projection.
 async fn persisted_scope(repository: &SqliteHistoryRepository, scope: &HistoryScope) {
-    let checkpoints = repository.checkpoints.as_ref().unwrap();
+    let checkpoints = repository.checkpoints().unwrap();
     let (stamp, expected) = {
         let store = checkpoints.captures.lock().unwrap();
         (
             store.projection_stamp(scope).unwrap(),
             store
-                .live_captured_history(scope, true)
+                .segment_projection(scope)
                 .unwrap()
-                .unwrap()
-                .rows,
+                .iter()
+                .flat_map(|s| &s.rows)
+                .map(|r| r.to_string())
+                .collect::<Vec<_>>(),
         )
     };
     for _ in 0..100 {
@@ -690,6 +1012,13 @@ async fn real_worker_close_reopen_recovers_checkpoint_not_viewport_and_old_curso
         .unwrap();
     assert_eq!(checkpoint["rows"], json!(["row 5", "row 6"]));
     assert_ne!(checkpoint["capture_epoch"], first["capture_epoch"]);
+    let older = checkpoint["next_before"].as_str().unwrap();
+    assert_eq!(
+        read_page(&repository, restarted.clone(), Some(older))
+            .await
+            .unwrap()["rows"],
+        json!(["row 3", "row 4"])
+    );
     assert_eq!(fold.lock().unwrap().depth("default", "p"), 0);
     fold.lock().unwrap().record_frame(
         "default",
@@ -764,7 +1093,7 @@ async fn cross_process_unknown_install_endpoint_and_config_membership_fail_close
 }
 
 #[test]
-fn checkpoint_read_fence_rejects_delayed_recovery_after_reset_but_not_a_screen_frame() {
+fn checkpoint_recovery_survives_sampling_changes_but_rejects_identity_reset() {
     for reset in 0..3 {
         let store = captures(Some("A"), false);
         let mut store = store.lock().unwrap();
@@ -778,11 +1107,14 @@ fn checkpoint_read_fence_rejects_delayed_recovery_after_reset_but_not_a_screen_f
             1 => store.observe_native_listing("default", &[pane(Some("B"))]),
             _ => store.observe_listing("default", &json!({"panes": []})),
         }
-        assert!(!store.recover_checkpoint(
-            &stamp,
-            vec!["old".into()],
-            Instant::now() + Duration::from_secs(3600)
-        ));
+        assert_eq!(
+            store.recover_checkpoint(
+                &stamp,
+                vec!["old".into()],
+                Instant::now() + Duration::from_secs(3600)
+            ),
+            reset == 0
+        );
     }
     let store = captures(Some("A"), false);
     let mut store = store.lock().unwrap();
@@ -815,7 +1147,7 @@ fn checkpoint_read_fence_rejects_delayed_recovery_after_reset_but_not_a_screen_f
 }
 
 #[tokio::test]
-async fn sqlite_formats_are_independent_and_destructive_shrink_removes_durable_projection() {
+async fn sqlite_formats_are_independent_and_editor_transition_keeps_sealed_prefixes() {
     let fixture = Fixture::new();
     let fold = captures(Some("A"), true);
     feed_ansi(&mut fold.lock().unwrap());
@@ -849,41 +1181,73 @@ async fn sqlite_formats_are_independent_and_destructive_shrink_removes_durable_p
         json!([])
     );
     // Give both dirty shapes a pass on the store worker.
-    let checkpoints = repository.checkpoints.clone().unwrap();
+    let checkpoints = repository.checkpoints().unwrap();
     passes(&checkpoints, now_seconds()).await;
     drop(checkpoints);
     repository.close().await;
     let db = fixture.db();
     assert_eq!(
         sql_i64(&db, "SELECT count(*) FROM history_captures").await,
-        0
+        2
     );
 }
 
 #[tokio::test]
-async fn initialization_and_storage_failures_are_visible_not_memory_success() {
-    // A store without the history namespace cannot initialize.
+async fn storage_failures_spare_memory_and_heal_on_the_next_working_pass() {
+    // A store without the history namespace cannot initialize: what memory
+    // holds is still served; only a recovery that needs the store is a 503.
     let fixture = Fixture::new();
     let db = SqliteStore::open(&fixture.db_path(), None, &[]).unwrap();
     let repository =
         SqliteHistoryRepository::open(db, &fixture.config, captures(Some("A"), true)).await;
     assert_eq!(
+        read_page(&repository, scope(), None).await.unwrap()["rows"],
+        json!(["row 5", "row 6"])
+    );
+    repository.close().await;
+    let db = SqliteStore::open(&fixture.db_path(), None, &[]).unwrap();
+    let repository =
+        SqliteHistoryRepository::open(db, &fixture.config, captures(Some("A"), false)).await;
+    assert_eq!(
         read_page(&repository, scope(), None).await,
         Err(HistoryError::Unavailable)
     );
     repository.close().await;
+    // A pane that could never have a checkpoint answers from memory as it
+    // would with a working store.
+    let db = SqliteStore::open(&fixture.db_path(), None, &[]).unwrap();
+    let repository =
+        SqliteHistoryRepository::open(db.clone(), &fixture.config, captures(None, false)).await;
+    assert_eq!(
+        read_page(&repository, scope(), None).await.unwrap()["availability"],
+        "not_captured"
+    );
+    // Initialization is retried: once the store can hold history, it heals.
+    db.call(|c| Ok(c.execute_batch(&MIGRATION.steps.join(""))?))
+        .await
+        .unwrap();
+    for _ in 0..400 {
+        if repository.checkpoints().is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(repository.checkpoints().is_some(), "initialization healed");
+    repository.close().await;
 
-    // A write that fails stops the loop and fails every later operation,
-    // including a traversal whose snapshot is still pinned in memory.
+    // A write that fails marks the store unhealthy; the traversal pinned in
+    // memory goes on, and the loop retries until a pass works again.
     let fixture = Fixture::new();
     let fold = captures(Some("A"), true);
     let repository = fixture.open(fold.clone()).await;
     persisted(&repository).await;
     let first = read_page(&repository, scope(), None).await.unwrap();
-    let checkpoints = repository.checkpoints.clone().unwrap();
+    let checkpoints = repository.checkpoints().unwrap();
     checkpoints
         .db
-        .call(|c| Ok(c.execute_batch("DROP TABLE history_captures")?))
+        .call(|c| {
+            Ok(c.execute_batch("ALTER TABLE history_captures RENAME TO history_captures_away")?)
+        })
         .await
         .unwrap();
     fold.lock().unwrap().record_frame(
@@ -899,11 +1263,28 @@ async fn initialization_and_storage_failures_are_visible_not_memory_success() {
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    drop(checkpoints);
+    assert!(!checkpoints.healthy.load(Ordering::Acquire));
     assert_eq!(
-        read_page(&repository, scope(), first["next_before"].as_str()).await,
-        Err(HistoryError::Unavailable)
+        read_page(&repository, scope(), first["next_before"].as_str())
+            .await
+            .unwrap()["rows"],
+        json!(["row 3", "row 4"])
     );
+    checkpoints
+        .db
+        .call(|c| {
+            Ok(c.execute_batch("ALTER TABLE history_captures_away RENAME TO history_captures")?)
+        })
+        .await
+        .unwrap();
+    for _ in 0..400 {
+        if checkpoints.healthy.load(Ordering::Acquire) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(checkpoints.healthy.load(Ordering::Acquire), "healed");
+    drop(checkpoints);
     repository.close().await;
 }
 
@@ -963,15 +1344,10 @@ async fn retention_and_logical_quotas_keep_the_newest_updates_and_reads_do_not_r
                     let at = if n == 59 { aged + 1 } else { aged - 59 + n };
                     c.execute(
                         "INSERT INTO history_captures VALUES (?1,'policy',?2,?3,?4)",
-                        params![
-                            format!("fixture-{n:02}"),
-                            encode_rows(&["x".into()]),
-                            bytes,
-                            at
-                        ],
+                        params![format!("fixture-{n:02}"), encode_rows(&["x"]), bytes, at],
                     )?;
                 }
-                prune(c, now_seconds())
+                prune(c, now_seconds(), &[])
             })
             .await
             .unwrap();
@@ -1013,7 +1389,7 @@ async fn retention_and_logical_quotas_keep_the_newest_updates_and_reads_do_not_r
             .db
             .call(move |c| {
                 c.execute("UPDATE history_captures SET updated=?1", [expired])?;
-                prune(c, now_seconds())
+                prune(c, now_seconds(), &[])
             })
             .await
             .unwrap();
@@ -1128,5 +1504,124 @@ async fn default_memory_does_not_touch_the_history_tables() {
     assert_eq!(
         sql_i64(&db, "SELECT count(*) FROM history_captures").await,
         0
+    );
+}
+
+#[tokio::test]
+async fn an_idle_fold_does_not_wake_the_writer() {
+    let fixture = Fixture::new();
+    let fold = captures(Some("A"), true);
+    let repository = fixture.open(fold.clone()).await;
+    persisted(&repository).await;
+    let checkpoints = repository.checkpoints().unwrap();
+    let count = || checkpoints.wakes.load(Ordering::Relaxed);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let settled = count();
+    // The approval watcher's listing, unchanged, every 1.5 s in production.
+    for _ in 0..5 {
+        fold.lock()
+            .unwrap()
+            .observe_native_listing("default", &[pane(Some("A"))]);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(count(), settled, "no wake while nothing changes");
+    fold.lock().unwrap().record_frame(
+        "default",
+        "p",
+        "recent_unwrapped",
+        "text",
+        "row 8\nrow 9\nrow 10\nrow 11",
+    );
+    for _ in 0..100 {
+        if count() > settled {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(count() > settled, "a change wakes it");
+    drop(checkpoints);
+    repository.close().await;
+}
+
+#[tokio::test]
+async fn a_history_pass_leaves_full_durability_and_an_idle_prune_folds_the_wal_back() {
+    let fixture = Fixture::new();
+    let checkpoints = fixture.checkpoints(captures(Some("A"), true)).await;
+    passes(&checkpoints, now_seconds()).await;
+    assert_eq!(record_count(&checkpoints).await, 1);
+    let wal = || checkpoints.db.call(|c| Ok(wal_bytes(c)));
+    assert!(wal().await.unwrap() > 0, "the write went to the WAL");
+    // The connection the other domains share keeps FULL durability.
+    assert_eq!(sql_i64(&checkpoints.db, "PRAGMA synchronous").await, 2);
+    let stamps = checkpoints.captures.lock().unwrap().projection_stamps();
+    checkpoints
+        .pass(now_seconds(), true, stamps, Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(wal().await.unwrap(), 0, "an idle prune truncates the WAL");
+    assert_eq!(record_count(&checkpoints).await, 1, "nothing was lost");
+}
+
+#[tokio::test]
+async fn quotas_evict_closed_panes_before_open_ones() {
+    let fixture = Fixture::new();
+    let checkpoints = fixture.checkpoints(captures(None, false)).await;
+    let left = checkpoints
+        .db
+        .call(|c| {
+            let transaction = c.transaction()?;
+            // An open pane's checkpoint older than every closed pane's.
+            for (identity, updated) in std::iter::once(("open".to_owned(), 1))
+                .chain((0..MAX_RECORDS).map(|n| (format!("closed-{n:02}"), 100 + n)))
+            {
+                transaction.execute(
+                    "INSERT INTO history_captures VALUES (?1,'p',x'00',1,?2)",
+                    params![identity, updated],
+                )?;
+            }
+            enforce_quotas(&transaction, &["open".to_owned()])?;
+            let left: Vec<String> = transaction
+                .prepare("SELECT identity FROM history_captures ORDER BY identity")?
+                .query_map([], |row| row.get(0))?
+                .collect::<Result<_, _>>()?;
+            Ok(left)
+        })
+        .await
+        .unwrap();
+    assert_eq!(left.len() as i64, MAX_RECORDS);
+    assert!(left.contains(&"open".to_owned()), "the open pane stays");
+    assert!(
+        !left.contains(&"closed-00".to_owned()),
+        "the oldest closed one goes"
+    );
+}
+
+#[tokio::test]
+async fn an_oversized_projection_is_skipped_and_the_others_are_still_written() {
+    let fixture = Fixture::new();
+    let fold = captures(Some("A"), false);
+    {
+        let mut store = fold.lock().unwrap();
+        // One text row past a page's bound scrolls into history.
+        let big = "x".repeat(300 * 1024);
+        store.record_frame(
+            "default",
+            "p",
+            "recent_unwrapped",
+            "text",
+            &format!("{big}\na\nb\nc"),
+        );
+        store.record_frame("default", "p", "recent_unwrapped", "text", "a\nb\nc\nd");
+        feed_ansi(&mut store);
+    }
+    let checkpoints = fixture.checkpoints(fold).await;
+    for _ in 0..4 {
+        checkpoints.flush_at(now_seconds()).await.unwrap();
+    }
+    assert!(checkpoints.healthy.load(Ordering::Acquire));
+    assert_eq!(
+        record_count(&checkpoints).await,
+        1,
+        "the ANSI shape is stored"
     );
 }

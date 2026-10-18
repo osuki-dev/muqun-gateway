@@ -48,7 +48,10 @@ const STREAM_LOSS_FIRST_WAIT: Duration = Duration::ZERO;
 const STREAM_LOSS_MAX_WAIT: Duration = Duration::from_secs(30);
 /// The agent major version this gateway speaks. v1 is a different API, and
 /// half-working with it is worse than saying so.
-const MIN_OPENCODE_MAJOR: u64 = 2;
+const SUPPORTED_OPENCODE_MAJOR: u64 = 2;
+const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Each version stream is bounded independently, including diagnostic output.
+const VERSION_OUTPUT_LIMIT: u64 = 4096;
 
 /// Agent ids in primary-preference order. OpenCode is the established
 /// agent; DeepSeek and T3 Code are opt-in, so each is primary only when
@@ -146,7 +149,7 @@ pub struct DeepseekConfig {
     /// Explicit service endpoint URL (default is http://127.0.0.1:19387)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
-    /// Optional bearer auth token
+    /// Optional DSH launch token, exchanged for the service's root-session cookie.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
     /// Optional signing secret for browser-session cookie
@@ -155,7 +158,7 @@ pub struct DeepseekConfig {
 }
 
 /// `Debug` never prints the token or the cookie secret: `Config` derives
-/// `Debug` and is logged at startup, and a bearer in the journal is a leak.
+/// `Debug` and is logged at startup, and credentials in the journal are a leak.
 impl std::fmt::Debug for DeepseekConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let redact = |value: &Option<String>| value.as_ref().map(|_| "<redacted>");
@@ -228,12 +231,37 @@ pub struct AgentRuntime {
     deepseek_config: DeepseekConfig,
     t3: T3State,
     origin: RwLock<AgentOrigin>,
+    /// Identity last verified for the attached OpenCode manager. `/api/info`
+    /// has no instance id, so retain that field from registration separately.
+    opencode_instance: RwLock<Option<OpencodeInstance>>,
     /// Serialize startup commands; OpenCode owns the background service.
     start_lock: Mutex<()>,
     supervising: AtomicBool,
     /// Where OpenCode's `MUQUN_MCP_*` environment comes from; set once the
     /// token store exists (the runtime is built before it).
     mcp: std::sync::OnceLock<McpWiring>,
+}
+
+#[derive(PartialEq, Eq)]
+struct OpencodeInstance {
+    registration_id: Option<String>,
+    url: String,
+    version: Option<String>,
+    pid: Option<u32>,
+    // Credential rotation must reconnect the manager's client and SSE stream.
+    password: Option<String>,
+}
+
+impl OpencodeInstance {
+    fn new(endpoint: &OpencodeEndpoint, registration_id: Option<String>) -> Self {
+        Self {
+            registration_id,
+            url: endpoint.url.clone(),
+            version: endpoint.version.clone(),
+            pid: endpoint.pid,
+            password: endpoint.password.clone(),
+        }
+    }
 }
 
 /// What the gateway needs to mint OpenCode's assistant token.
@@ -298,6 +326,7 @@ impl AgentRuntime {
             deepseek_config,
             t3,
             origin: RwLock::new(AgentOrigin::None),
+            opencode_instance: RwLock::new(None),
             start_lock: Mutex::new(()),
             supervising: AtomicBool::new(false),
             mcp: std::sync::OnceLock::new(),
@@ -437,6 +466,14 @@ impl AgentRuntime {
     /// Drop the route of a session that no longer exists.
     pub async fn forget_session_route(&self, asid: &str) {
         self.session_routes.write().await.remove(asid);
+    }
+
+    /// Forget a deleted session without clearing another agent's same-id route.
+    pub(crate) async fn forget_session_route_for_agent(&self, asid: &str, agent_id: &str) {
+        let mut routes = self.session_routes.write().await;
+        if routes.map.get(asid).is_some_and(|owner| owner == agent_id) {
+            routes.remove(asid);
+        }
     }
 
     pub fn subscribe_events(&self) -> broadcast::Receiver<AgentDomainEvent> {
@@ -748,26 +785,39 @@ impl AgentRuntime {
                 modes,
             }
         } else {
-            let (status, endpoint_url, version, models, modes) =
+            let (status, endpoint_url, version, reason, models, modes) =
                 match OpencodeEndpoint::discover().await {
                     Some(endpoint) => {
                         let client = probe_client();
-                        if endpoint.probe_healthy(&client).await {
-                            let driver = crate::agents::adapters::opencode::OpencodeDriver::new(
-                                endpoint.clone(),
-                            );
-                            let (models, modes) = catalog_entry(&driver).await;
-                            (
-                                AgentAvailability::Reachable,
-                                Some(endpoint.url),
-                                endpoint.version,
-                                models,
-                                modes,
-                            )
+                        if let Some(endpoint) = endpoint.verified(&client).await {
+                            if check_live_version(endpoint.version.as_deref()).is_err() {
+                                (
+                                    AgentAvailability::Unsupported,
+                                    Some(endpoint.url),
+                                    endpoint.version,
+                                    Some("This gateway supports OpenCode 2.x only".to_string()),
+                                    Vec::new(),
+                                    Vec::new(),
+                                )
+                            } else {
+                                let driver = crate::agents::adapters::opencode::OpencodeDriver::new(
+                                    endpoint.clone(),
+                                );
+                                let (models, modes) = catalog_entry(&driver).await;
+                                (
+                                    AgentAvailability::Reachable,
+                                    Some(endpoint.url),
+                                    endpoint.version,
+                                    None,
+                                    models,
+                                    modes,
+                                )
+                            }
                         } else {
                             (
                                 AgentAvailability::Offline,
                                 Some(endpoint.url),
+                                None,
                                 None,
                                 Vec::new(),
                                 Vec::new(),
@@ -781,12 +831,14 @@ impl AgentRuntime {
                                 AgentAvailability::Offline,
                                 None,
                                 None,
+                                None,
                                 Vec::new(),
                                 Vec::new(),
                             )
                         } else {
                             (
                                 AgentAvailability::NotInstalled,
+                                None,
                                 None,
                                 None,
                                 Vec::new(),
@@ -809,7 +861,7 @@ impl AgentRuntime {
                 enabled: true,
                 endpoint: endpoint_url,
                 version,
-                reason: None,
+                reason,
                 features: opencode_features(supports_reasoning, has_models),
                 models,
                 modes,
@@ -909,7 +961,6 @@ impl AgentRuntime {
     /// One supervision pass. Returns whether an agent is attached and well.
     async fn check_and_repair(&self, start_backoff: &mut Duration) -> bool {
         let mut deepseek_ok = false;
-        let mut opencode_ok = false;
 
         // 1. Supervise DeepSeek
         if self.keep_if_healthy("deepseek").await {
@@ -939,52 +990,18 @@ impl AgentRuntime {
 
         // 2. Supervise OpenCode
         let discovered_opencode = if self.config.enabled {
-            OpencodeEndpoint::discover().await
+            OpencodeEndpoint::discover_with_registration_id().await
         } else {
             None
         };
 
-        if let Some(mgr) = self.manager_for_agent("opencode").await {
-            let same_endpoint = discovered_opencode
-                .as_ref()
-                .map(|e| e.url == mgr.endpoint_url())
-                .unwrap_or(false);
-            if same_endpoint && mgr.agent().probe().await.unwrap_or(false) {
-                opencode_ok = true;
-            } else {
-                tracing::warn!(
-                    url = mgr.endpoint_url(),
-                    "OpenCode agent unhealthy or moved, re-discovering"
-                );
-                mgr.shutdown();
-                self.managers.write().await.remove("opencode");
-            }
-        }
-
-        if !opencode_ok {
-            if let Some(endpoint) = discovered_opencode {
-                if endpoint.probe_healthy(&probe_client()).await
-                    && check_version(endpoint.version.as_deref()).is_ok()
-                {
-                    self.attach(endpoint, AgentOrigin::Adopted).await;
-                    opencode_ok = true;
-                }
-            }
-        }
-
-        if !opencode_ok && self.config.enabled && self.config.autostart {
-            match self.start_service().await {
-                Ok(endpoint) => {
-                    self.attach(endpoint, AgentOrigin::Spawned).await;
-                    opencode_ok = true;
-                }
-                Err(err) => {
-                    tracing::warn!(%err, backoff_s = start_backoff.as_secs(), "could not start opencode");
-                    tokio::time::sleep(*start_backoff).await;
-                    *start_backoff = (*start_backoff * 2).min(MAX_START_BACKOFF);
-                }
-            }
-        }
+        // An explicit endpoint is attach-only: a failed identity, auth or
+        // version check must not start an unrelated local fallback service.
+        let external_endpoint =
+            external_endpoint_configured_with(|name| std::env::var(name)).unwrap_or(true);
+        let opencode_ok = self
+            .supervise_opencode(discovered_opencode, external_endpoint, start_backoff)
+            .await;
 
         // 3. Supervise T3 Code
         let t3_ok = self.supervise_t3().await;
@@ -1003,7 +1020,76 @@ impl AgentRuntime {
         }
     }
 
-    async fn attach(&self, endpoint: OpencodeEndpoint, origin: AgentOrigin) {
+    async fn supervise_opencode(
+        &self,
+        discovered: Option<(OpencodeEndpoint, Option<String>)>,
+        external_endpoint: bool,
+        start_backoff: &mut Duration,
+    ) -> bool {
+        let mut healthy = self.repair_opencode(discovered).await;
+        if !healthy && self.config.enabled && self.config.autostart && !external_endpoint {
+            match self.start_service().await {
+                Ok((endpoint, id)) => {
+                    self.attach(endpoint, id, AgentOrigin::Spawned).await;
+                    healthy = true;
+                }
+                Err(err) => {
+                    tracing::warn!(%err, backoff_s = start_backoff.as_secs(), "could not start opencode");
+                    tokio::time::sleep(*start_backoff).await;
+                    *start_backoff = (*start_backoff * 2).min(MAX_START_BACKOFF);
+                }
+            }
+        }
+        healthy
+    }
+
+    async fn repair_opencode(
+        &self,
+        discovered: Option<(OpencodeEndpoint, Option<String>)>,
+    ) -> bool {
+        let verified = match discovered {
+            Some((endpoint, id)) => endpoint
+                .verified(&probe_client())
+                .await
+                .filter(|endpoint| check_live_version(endpoint.version.as_deref()).is_ok())
+                .map(|endpoint| (endpoint, id)),
+            None => None,
+        };
+        if let Some(manager) = self.manager_for_agent("opencode").await {
+            let identity = self.opencode_instance.read().await;
+            if verified.as_ref().is_some_and(|(endpoint, id)| {
+                endpoint.url == manager.endpoint_url()
+                    && endpoint.version == manager.version()
+                    && identity.as_ref() == Some(&OpencodeInstance::new(endpoint, id.clone()))
+            }) {
+                return true;
+            }
+            drop(identity);
+            tracing::warn!("OpenCode agent unhealthy or instance changed, re-discovering");
+            manager.shutdown();
+            self.managers.write().await.remove("opencode");
+            *self.opencode_instance.write().await = None;
+            let mut primary = self.manager.write().await;
+            if primary.as_ref().is_some_and(|p| Arc::ptr_eq(p, &manager)) {
+                *primary = None;
+                *self.origin.write().await = AgentOrigin::None;
+            }
+        }
+        if let Some((endpoint, id)) = verified {
+            self.attach(endpoint, id, AgentOrigin::Adopted).await;
+            true
+        } else {
+            false
+        }
+    }
+
+    async fn attach(
+        &self,
+        endpoint: OpencodeEndpoint,
+        registration_id: Option<String>,
+        origin: AgentOrigin,
+    ) {
+        let instance = OpencodeInstance::new(&endpoint, registration_id);
         let url = endpoint.url.clone();
         let version = endpoint.version.clone();
         // Which file is actually serving this. For a service this gateway
@@ -1017,6 +1103,9 @@ impl AgentRuntime {
             .map(|p| p.display().to_string());
         let manager = AgentManager::connect(endpoint, self.events_tx.clone());
         self.install("opencode", manager, origin).await;
+        // Publish identity only after installing its manager. Cancellation
+        // before this write causes a safe reattachment, never old-client reuse.
+        *self.opencode_instance.write().await = Some(instance);
         let path = path.unwrap_or_else(|| "unknown".to_string());
         match origin {
             AgentOrigin::Adopted => tracing::info!(
@@ -1116,7 +1205,7 @@ impl AgentRuntime {
 
     /// Let OpenCode load its saved service configuration and start or reuse
     /// its background server, then verify the registered endpoint.
-    async fn start_service(&self) -> anyhow::Result<OpencodeEndpoint> {
+    async fn start_service(&self) -> anyhow::Result<(OpencodeEndpoint, Option<String>)> {
         let _start = self.start_lock.lock().await;
 
         // `opencode.binary` if the owner set one, otherwise whatever `opencode`
@@ -1128,7 +1217,7 @@ impl AgentRuntime {
                 anyhow::bail!("{err}");
             }
         };
-        let version = binary_version(&binary);
+        let version = binary_version(&binary).await;
         if let Err(refusal) = check_version(version.as_deref()) {
             // One line, naming the file and what it said, because the reader
             // has to go and fix an install.
@@ -1294,8 +1383,14 @@ fn parse_major(version: &str) -> Option<u64> {
         .split_whitespace()
         .filter_map(|word| {
             let word = word.trim_start_matches(['v', 'V']);
-            let head = word.split(['.', '-', '+']).next()?;
-            head.parse::<u64>().ok().map(|major| (major, word))
+            let core = word.split(['-', '+']).next()?;
+            let mut parts = core.split('.');
+            let major = parts.next()?.parse::<u64>().ok()?;
+            if parts.any(|part| part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()))
+            {
+                return None;
+            }
+            Some((major, word))
         })
         // A bare `2` is not a version string; take the first word that looks
         // like one, so `opencode v2.0.1` is not read as the `opencode` in it.
@@ -1310,11 +1405,11 @@ fn parse_major(version: &str) -> Option<u64> {
         })
 }
 
-/// Whether a version is one this gateway will talk to.
+/// Whether a binary's reported version permits trying startup.
 ///
 /// An unreadable or absent version is allowed through: it cannot be shown to
-/// be too old, and refusing on silence would break an install that simply does
-/// not report one. Only a version that is legible *and* below 2.0 is refused.
+/// be incompatible, and refusing on silence would break an install that simply
+/// does not report one. The live server must still report a supported version.
 fn check_version(version: Option<&str>) -> Result<(), String> {
     let Some(version) = version.map(str::trim).filter(|v| !v.is_empty()) else {
         return Ok(());
@@ -1322,15 +1417,25 @@ fn check_version(version: Option<&str>) -> Result<(), String> {
     let Some(major) = parse_major(version) else {
         return Ok(());
     };
-    if major >= MIN_OPENCODE_MAJOR {
+    if major == SUPPORTED_OPENCODE_MAJOR {
         return Ok(());
     }
     Err(format!(
-        "it reports version {version}, and this gateway speaks OpenCode \
-         {MIN_OPENCODE_MAJOR}.x only. Install OpenCode 2, or point the gateway \
+        "this gateway speaks OpenCode \
+         {SUPPORTED_OPENCODE_MAJOR}.x only. Install a supported OpenCode version, or point the gateway \
          at the right one by setting `opencode.binary` to its absolute path in \
          config.json"
     ))
+}
+
+/// Unlike a binary flag probe, authenticated live info must establish a known
+/// supported major. Preserve the existing version-prefix parsing convention.
+fn check_live_version(version: Option<&str>) -> Result<(), String> {
+    if version.and_then(parse_major) == Some(SUPPORTED_OPENCODE_MAJOR) {
+        Ok(())
+    } else {
+        Err("This gateway supports OpenCode 2.x only".to_string())
+    }
 }
 
 /// `opencode.binary` if the owner set one, else `opencode` as `PATH` resolves
@@ -1480,19 +1585,56 @@ fn is_executable(path: &std::path::Path) -> bool {
 }
 
 /// What `<binary> --version` says, or `None` if it cannot be asked.
-pub(crate) fn binary_version(path: &std::path::Path) -> Option<String> {
-    let output = std::process::Command::new(path)
+/// Prefer the first nonempty stdout line, then stderr. Unlike the old probe,
+/// leading blank lines do not hide a version that follows them.
+pub(crate) async fn binary_version(path: &std::path::Path) -> Option<String> {
+    use tokio::io::AsyncReadExt as _;
+
+    let mut child = tokio::process::Command::new(path)
         .arg("--version")
-        .output()
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
         .ok()?;
-    let text = String::from_utf8_lossy(&output.stdout);
-    let text = if text.trim().is_empty() {
-        String::from_utf8_lossy(&output.stderr).to_string()
-    } else {
-        text.to_string()
+    let stdout = child.stdout.take().expect("piped version stdout");
+    let stderr = child.stderr.take().expect("piped version stderr");
+    // Read both pipes concurrently: either one can fill while the other is idle.
+    // One extra byte detects overflow without retaining an unbounded response.
+    async fn read(stream: impl tokio::io::AsyncRead + Unpin) -> std::io::Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        stream
+            .take(VERSION_OUTPUT_LIMIT + 1)
+            .read_to_end(&mut bytes)
+            .await?;
+        if bytes.len() as u64 > VERSION_OUTPUT_LIMIT {
+            return Err(std::io::Error::other("version output limit exceeded"));
+        }
+        Ok(bytes)
+    }
+    let result = tokio::time::timeout(VERSION_PROBE_TIMEOUT, async {
+        let (stdout, stderr) = tokio::try_join!(read(stdout), read(stderr))?;
+        // Preserve version reporting even for executables that exit nonzero.
+        child.wait().await?;
+        Ok::<_, std::io::Error>((stdout, stderr))
+    })
+    .await;
+    let (stdout, stderr) = match result {
+        Ok(Ok(output)) => output,
+        _ => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            return None;
+        }
     };
-    let line = text.lines().next()?.trim().to_string();
-    (!line.is_empty()).then_some(line)
+    [stdout, stderr].into_iter().find_map(|bytes| {
+        String::from_utf8_lossy(&bytes)
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .map(str::to_owned)
+    })
 }
 
 /// The executable behind a running pid, where the platform will say.
@@ -1516,13 +1658,14 @@ fn probe_client() -> reqwest::Client {
 /// Poll the registration file until the service answers its health probe, or
 /// give up after `STARTUP_WAIT`. Bounded on purpose: the caller backs off and
 /// tries again rather than blocking the supervisor forever.
-async fn wait_for_service() -> anyhow::Result<OpencodeEndpoint> {
+async fn wait_for_service() -> anyhow::Result<(OpencodeEndpoint, Option<String>)> {
     let client = probe_client();
     let deadline = std::time::Instant::now() + STARTUP_WAIT;
     loop {
-        if let Some(endpoint) = OpencodeEndpoint::discover().await {
-            if endpoint.probe_healthy(&client).await {
-                return Ok(endpoint);
+        if let Some((endpoint, id)) = OpencodeEndpoint::discover_with_registration_id().await {
+            if let Some(endpoint) = endpoint.verified(&client).await {
+                check_live_version(endpoint.version.as_deref()).map_err(anyhow::Error::msg)?;
+                return Ok((endpoint, id));
             }
         }
         if std::time::Instant::now() >= deadline {
@@ -1558,10 +1701,10 @@ fn deepseek_features(
         background_shells: false,
         attachments: true,
         attachments_by_path: true,
-        extra: std::collections::BTreeMap::from([(
-            "modeSwitching".into(),
-            serde_json::Value::Bool(false),
-        )]),
+        extra: std::collections::BTreeMap::from([
+            ("modeSwitching".into(), serde_json::Value::Bool(false)),
+            ("sessionPagination".into(), serde_json::Value::Bool(false)),
+        ]),
     }
 }
 
@@ -1585,13 +1728,496 @@ fn opencode_features(
         background_shells: true,
         attachments: true,
         attachments_by_path: false,
-        extra: std::collections::BTreeMap::new(),
+        extra: std::collections::BTreeMap::from([(
+            "sessionPagination".into(),
+            serde_json::Value::Bool(true),
+        )]),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct MockOpencode {
+        endpoint: OpencodeEndpoint,
+        info: Arc<RwLock<(axum::http::StatusCode, serde_json::Value)>>,
+        server: tokio::task::JoinHandle<()>,
+    }
+
+    impl MockOpencode {
+        async fn new() -> Self {
+            use axum::{
+                extract::State,
+                http::{HeaderMap, StatusCode},
+                routing::get,
+                Json, Router,
+            };
+            let info = Arc::new(RwLock::new((
+                StatusCode::OK,
+                serde_json::json!({
+                    "version":"2.0.27", "pid":123, "urls":["http://localhost"], "paths":{"tmp":"/fixture"}
+                }),
+            )));
+            let app = Router::new()
+                .route(
+                    "/api/info",
+                    get(
+                        |State(info): State<Arc<RwLock<(StatusCode, serde_json::Value)>>>,
+                         headers: HeaderMap| async move {
+                            if headers.get("authorization").and_then(|h| h.to_str().ok())
+                                != Some("Basic b3BlbmNvZGU6Zml4dHVyZS1wYXNzd29yZA==")
+                            {
+                                return (StatusCode::UNAUTHORIZED, Json(serde_json::Value::Null));
+                            }
+                            let (status, body) = info.read().await.clone();
+                            (status, Json(body))
+                        },
+                    ),
+                )
+                .with_state(info.clone());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = OpencodeEndpoint {
+                url: format!("http://{}", listener.local_addr().unwrap()),
+                password: Some("fixture-password".into()),
+                version: None,
+                pid: None,
+            };
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            Self {
+                endpoint,
+                info,
+                server,
+            }
+        }
+    }
+
+    impl Drop for MockOpencode {
+        fn drop(&mut self) {
+            self.server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn opencode_reuses_only_the_same_verified_instance_and_reports_actual_info() {
+        let service = MockOpencode::new().await;
+        let runtime = AgentRuntime::new(OpencodeConfig {
+            autostart: false,
+            ..Default::default()
+        });
+        let mut id = Some("fixture-instance-a".to_string());
+        assert!(
+            runtime
+                .repair_opencode(Some((service.endpoint.clone(), id.clone())))
+                .await
+        );
+        let first = runtime.manager_for_agent("opencode").await.unwrap();
+        assert_eq!(runtime.status().await.version.as_deref(), Some("2.0.27"));
+        assert_eq!(
+            runtime.opencode_instance.read().await.as_ref().unwrap().pid,
+            Some(123)
+        );
+        assert!(
+            runtime
+                .repair_opencode(Some((service.endpoint.clone(), id.clone())))
+                .await
+        );
+        assert!(Arc::ptr_eq(
+            &first,
+            &runtime.manager_for_agent("opencode").await.unwrap()
+        ));
+
+        let mut previous = first;
+        for (version, pid, registration_id) in [
+            ("2.0.27", 456, "fixture-instance-a"),
+            ("2.0.99", 456, "fixture-instance-a"),
+            ("2.0.99", 456, "fixture-instance-b"),
+        ] {
+            service.info.write().await.1 =
+                serde_json::json!({"version":version,"pid":pid,"urls":["http://localhost"]});
+            id = Some(registration_id.into());
+            assert!(
+                runtime
+                    .repair_opencode(Some((service.endpoint.clone(), id.clone())))
+                    .await
+            );
+            let current = runtime.manager_for_agent("opencode").await.unwrap();
+            assert!(!Arc::ptr_eq(&previous, &current));
+            assert_eq!(runtime.status().await.version.as_deref(), Some(version));
+            previous = current;
+        }
+
+        let mut stale = service.endpoint.clone();
+        stale.pid = Some(456);
+        stale.version = Some("2.0.27".into());
+        assert!(!runtime.repair_opencode(Some((stale, id.clone()))).await);
+        assert!(runtime.manager_for_agent("opencode").await.is_none());
+        assert!(runtime.opencode_instance.read().await.is_none());
+        assert!(
+            runtime
+                .repair_opencode(Some((service.endpoint.clone(), id)))
+                .await
+        );
+        let mut stale = service.endpoint.clone();
+        stale.pid = Some(123);
+        assert!(!runtime.repair_opencode(Some((stale, None))).await);
+        assert!(runtime.manager_for_agent("opencode").await.is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn invalid_explicit_opencode_never_attaches_or_starts_a_fallback() {
+        use axum::http::StatusCode;
+        let service = MockOpencode::new().await;
+        let binary = VersionScript::new("printf '2.0.27\\n'");
+        let runtime = AgentRuntime::new(OpencodeConfig {
+            autostart: true,
+            binary: Some(binary.0.to_str().unwrap().into()),
+            ..Default::default()
+        });
+        let mut backoff = Duration::from_secs(2);
+        for (status, body) in [
+            (StatusCode::UNAUTHORIZED, serde_json::Value::Null),
+            (StatusCode::FORBIDDEN, serde_json::Value::Null),
+            (StatusCode::SERVICE_UNAVAILABLE, serde_json::Value::Null),
+            (StatusCode::NOT_FOUND, serde_json::Value::Null),
+            (StatusCode::OK, serde_json::json!({"healthy":true})),
+            (
+                StatusCode::OK,
+                serde_json::json!({"version":"unknown","pid":123,"urls":["http://localhost"]}),
+            ),
+            (
+                StatusCode::OK,
+                serde_json::json!({"version":"1.18.4","pid":123,"urls":["http://localhost"]}),
+            ),
+            (
+                StatusCode::OK,
+                serde_json::json!({"version":"3.0.0","pid":123,"urls":["http://localhost"]}),
+            ),
+        ] {
+            *service.info.write().await = (status, body);
+            assert!(
+                !runtime
+                    .supervise_opencode(Some((service.endpoint.clone(), None)), true, &mut backoff)
+                    .await
+            );
+            assert!(runtime.manager_for_agent("opencode").await.is_none());
+        }
+        assert!(!runtime.supervise_opencode(None, true, &mut backoff).await);
+        assert_eq!(backoff, Duration::from_secs(2));
+        assert!(
+            !binary.0.with_file_name("pid").exists(),
+            "even the fallback binary version probe must not run"
+        );
+    }
+
+    #[test]
+    fn live_opencode_requires_a_known_supported_version_but_binary_silence_is_allowed() {
+        for version in [
+            None,
+            Some(""),
+            Some("unknown"),
+            Some("2.invalid"),
+            Some("1.18.4"),
+            Some("3.0.0"),
+        ] {
+            assert!(check_live_version(version).is_err());
+        }
+        for version in ["2.0.27", "2.0.99", "opencode v2.0.27", "v2.0.27-beta.3"] {
+            assert!(check_live_version(Some(version)).is_ok());
+        }
+        assert!(check_version(None).is_ok());
+        assert!(check_version(Some("unknown build")).is_ok());
+    }
+
+    #[test]
+    fn opencode_credential_rotation_changes_the_reuse_identity() {
+        let mut endpoint = OpencodeEndpoint {
+            url: "http://localhost".into(),
+            password: Some("fixture-old-password".into()),
+            version: Some("2.0.27".into()),
+            pid: Some(123),
+        };
+        let old = OpencodeInstance::new(&endpoint, None);
+        endpoint.password = Some("fixture-new-password".into());
+        assert!(old != OpencodeInstance::new(&endpoint, None));
+    }
+
+    #[tokio::test]
+    async fn opencode_probe_logs_do_not_capture_credentials_or_invalid_response_bodies() {
+        use tracing::instrument::WithSubscriber as _;
+        // With one live dispatch, tracing's global callsite cache is rebuilt
+        // using the registering thread's default. Another test can register
+        // our shared log callsite under NoSubscriber and suppress our capture.
+        // A second live dispatch forces registry-wide interest calculation.
+        let _interest_guard = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+        #[derive(Clone)]
+        struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let capture = Capture(Arc::default());
+        let writer = capture.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .without_time()
+            .with_writer(move || writer.clone())
+            .finish();
+        async {
+            let service = MockOpencode::new().await;
+            let runtime = AgentRuntime::new(OpencodeConfig {
+                autostart: false,
+                ..Default::default()
+            });
+            assert!(
+                runtime
+                    .repair_opencode(Some((service.endpoint.clone(), None)))
+                    .await
+            );
+            service.info.write().await.1 = serde_json::json!({
+                "version":"fixture-private-response", "pid":123, "urls":["http://localhost"]
+            });
+            assert!(
+                !runtime
+                    .repair_opencode(Some((service.endpoint.clone(), None)))
+                    .await
+            );
+        }
+        .with_subscriber(subscriber)
+        .await;
+        let log = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        assert!(log.contains("adopted the running OpenCode service"));
+        assert!(log.contains("instance changed"));
+        for secret in [
+            "fixture-password",
+            "b3BlbmNvZGU6Zml4dHVyZS1wYXNzd29yZA==",
+            "fixture-private-response",
+        ] {
+            assert!(
+                !log.contains(secret),
+                "sensitive fixture data leaked to logs"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    struct VersionScript(std::path::PathBuf);
+
+    #[cfg(unix)]
+    impl VersionScript {
+        fn new(body: &str) -> Self {
+            use std::os::unix::fs::PermissionsExt as _;
+            let root = std::env::temp_dir().join(format!("muqun-version-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&root).unwrap();
+            let path = root.join("probe");
+            let pid_path = root.join("pid");
+            std::fs::write(
+                &path,
+                format!(
+                    "#!/bin/sh\ntest \"$1\" = --fixture-ready && exit 0\ntest \"$1\" = --version || exit 99\nprintf '%s' \"$$\" > '{}'\n{body}\n",
+                    pid_path.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            // A concurrent fork can retain our already-closed writable fd
+            // until its exec, temporarily causing ETXTBSY. The readiness arm
+            // exits before recording a pid or running the probe body. Once
+            // executable, this immutable fixture cannot become busy again.
+            let deadline = std::time::Instant::now() + VERSION_PROBE_TIMEOUT;
+            loop {
+                match std::process::Command::new(&path)
+                    .arg("--fixture-ready")
+                    .status()
+                {
+                    Ok(status) => {
+                        assert!(status.success(), "version fixture readiness failed");
+                        break;
+                    }
+                    Err(error) if error.raw_os_error() == Some(libc::ETXTBSY) => {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "version fixture remained busy"
+                        );
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!(
+                        "version fixture readiness spawn failed: errno={:?}",
+                        error.raw_os_error()
+                    ),
+                }
+            }
+            Self(path)
+        }
+
+        fn assert_reaped(&self) {
+            let pid: libc::pid_t = std::fs::read_to_string(self.0.with_file_name("pid"))
+                .unwrap()
+                .parse()
+                .unwrap();
+            // Only this fixture's direct child: an exited but unreaped child
+            // would return its pid, and a still-running one would return zero.
+            assert_eq!(
+                unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) },
+                -1
+            );
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ECHILD)
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for VersionScript {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(self.0.parent().unwrap());
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn version_fixture_readiness_is_side_effect_free() {
+        for _ in 0..8 {
+            // The body fails if readiness has already run it.
+            let script = VersionScript::new(
+                "test ! -f \"$0.body-ran\" || exit 99; printf 'ran' > \"$0.body-ran\"; printf 'fixture-version\\n'",
+            );
+            assert!(!script.0.with_file_name("pid").exists());
+            assert!(!script.0.with_extension("body-ran").exists());
+            assert_eq!(
+                binary_version(&script.0).await.as_deref(),
+                Some("fixture-version")
+            );
+            assert!(script.0.with_extension("body-ran").exists());
+            script.assert_reaped();
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn binary_version_preserves_stdout_and_stderr_versions() {
+        for (body, expected) in [
+            (
+                "printf 'opencode 2.1.0\\nignored\\n'; printf 'diagnostic\\n' >&2",
+                Some("opencode 2.1.0"),
+            ),
+            (
+                "printf ' \\n\\n'; printf '\\n opencode 2.2.0 \\n' >&2; exit 7",
+                Some("opencode 2.2.0"),
+            ),
+            (
+                "printf '\\n opencode 2.3.0 \\n'; printf 'diagnostic\\n' >&2",
+                Some("opencode 2.3.0"),
+            ),
+            ("exit 0", None),
+        ] {
+            let script = VersionScript::new(body);
+            assert_eq!(binary_version(&script.0).await.as_deref(), expected);
+            script.assert_reaped();
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn binary_version_kills_and_reaps_output_floods() {
+        for redirect in ["", ">&2"] {
+            let script = VersionScript::new(&format!(
+                "while :; do printf '0123456789abcdef0123456789abcdef' {redirect}; done"
+            ));
+            let start = std::time::Instant::now();
+            assert_eq!(binary_version(&script.0).await, None);
+            assert!(start.elapsed() < VERSION_PROBE_TIMEOUT);
+            script.assert_reaped();
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn binary_version_accepts_exact_output_limit_but_rejects_one_extra_byte() {
+        for redirect in ["", ">&2"] {
+            for bytes in [VERSION_OUTPUT_LIMIT, VERSION_OUTPUT_LIMIT + 1] {
+                let output = "x".repeat(bytes as usize);
+                let script = VersionScript::new(&format!("printf '%s' '{output}' {redirect}"));
+                let expected = (bytes == VERSION_OUTPUT_LIMIT).then_some(output);
+                assert_eq!(binary_version(&script.0).await, expected);
+                script.assert_reaped();
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn binary_version_abort_kills_child_and_tokio_eventually_reaps_it() {
+        let script = VersionScript::new("while :; do :; done");
+        let path = script.0.clone();
+        let probe = tokio::spawn(async move { binary_version(&path).await });
+        // Wait for this fixture alone to report its pid. Partial file writes
+        // are retried, and an unsuccessful rendezvous still aborts the probe.
+        let ready = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(pid) = std::fs::read_to_string(script.0.with_file_name("pid"))
+                    .ok()
+                    .and_then(|pid| pid.parse::<libc::pid_t>().ok())
+                    .filter(|pid| *pid > 0)
+                {
+                    break pid;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        probe.abort();
+        assert!(probe.await.unwrap_err().is_cancelled());
+        let pid = ready.expect("version child reports its pid before cancellation");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                // WNOWAIT observes only our direct child without reaping it:
+                // ECHILD therefore proves Tokio, not this test, reaped it.
+                let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+                let result = unsafe {
+                    libc::waitid(
+                        libc::P_PID,
+                        pid as libc::id_t,
+                        &mut info,
+                        libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                    )
+                };
+                if result == -1 {
+                    assert_eq!(
+                        std::io::Error::last_os_error().raw_os_error(),
+                        Some(libc::ECHILD)
+                    );
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("cancelled version child is killed and reaped by Tokio");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn binary_version_times_out_without_stalling_runtime_heartbeat() {
+        // Shell builtins only: no descendant process to leak from the fixture.
+        let script = VersionScript::new("while :; do :; done");
+        let start = std::time::Instant::now();
+        let (version, ()) = tokio::join!(binary_version(&script.0), async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(start.elapsed() < Duration::from_secs(1));
+        });
+        assert_eq!(version, None);
+        assert!(start.elapsed() < VERSION_PROBE_TIMEOUT + Duration::from_secs(2));
+        script.assert_reaped();
+    }
 
     #[test]
     fn every_agent_serializes_the_capability_flags() {
@@ -1617,6 +2243,14 @@ mod tests {
             flags(deepseek_features(true, true)),
             [true, false, false, false, false, true, false, true]
         );
+        for (features, pagination) in [
+            (opencode_features(false, false), true),
+            (deepseek_features(false, false), false),
+        ] {
+            let wire = serde_json::to_value(features).unwrap();
+            assert_eq!(wire["sessionPagination"], pagination);
+            assert!(wire.get("session_pagination").is_none());
+        }
     }
 
     #[cfg(unix)]
@@ -1864,8 +2498,8 @@ mod tests {
     fn a_v1_agent_is_refused_and_the_refusal_says_what_to_do() {
         let refusal = check_version(Some("opencode 1.18.4")).expect_err("v1 is refused");
         assert!(
-            refusal.contains("1.18.4"),
-            "it names what it found: {refusal}"
+            refusal.contains("2.x only"),
+            "it names the supported range: {refusal}"
         );
         assert!(
             refusal.contains("opencode.binary"),
@@ -1873,7 +2507,9 @@ mod tests {
         );
 
         assert!(check_version(Some("opencode v2.0.1")).is_ok());
-        assert!(check_version(Some("v3.0.0")).is_ok());
+        assert!(check_version(Some("v3.0.0")).is_err());
+        assert!(check_version(Some("2.0.27")).is_ok());
+        assert!(check_version(Some("2.0.99")).is_ok());
     }
 
     /// Silence is not evidence of being old. An install that reports no

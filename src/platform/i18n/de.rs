@@ -19,6 +19,7 @@ pub(super) const DE: &[(&str, &str)] = &[
     // -- push notifications --------------------------------------------------
     ("Agent", "Der Agent"),
     ("Approval needed", "Freigabe erforderlich"),
+    ("Needs your input", "Braucht deine Eingabe"),
     ("Agent blocked", "Agent wartet"),
     ("Agent done", "Agent fertig"),
     ("{name} is waiting for your approval.", "{name} wartet auf deine Freigabe."),

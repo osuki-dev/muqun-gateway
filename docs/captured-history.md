@@ -1,7 +1,9 @@
 # Gateway captured terminal history
 
 Capability: `pane_captured_history` in `/health`, `/api/meta` and discovery's
-capability list. Discovery also announces `planes.terminal.features.capturedHistory`.
+capability list. The additive `pane_captured_history_segments_v1` capability
+announces segment pagination in both memory and SQLite modes. Discovery also
+announces `planes.terminal.features.capturedHistory`.
 This is independent of `backends[].features.pagedHistory`, which still describes
 **native** ranged `/output` reads. No App UI or App support is implied.
 
@@ -9,7 +11,7 @@ This is independent of `backends[].features.pagedHistory`, which still describes
 
 Uses the same device authentication and encrypted transport as the other pane
 routes. Cursors are not credentials. Storage defaults to memory. Optional SQLite
-storage can recover a verified live pane's last captured-prefix **checkpoint**;
+storage can recover a verified live pane's retained segment **checkpoint**;
 cursors always expire on Gateway restart. Existing `/output` tail stitching and
 native `start`/`end` range behavior are unchanged.
 
@@ -83,7 +85,64 @@ every terminal event. It can omit output between observations and cannot recover
 output from before observation started. Use `/output` separately for the live
 viewport; never merge it by native coordinates with these pages.
 
-## Snapshot lifetime and reset
+## Segment-aware pagination
+
+`GET /api/sessions/{session_id}/panes/{pane_id}/history/segments` requires
+`pane_captured_history_segments_v1`. It uses the same authentication, query
+parameters and error responses as `/history`, but its snapshots and cursors are
+distinct from the legacy endpoint. The standard content envelope's `data` is:
+
+```json
+{
+  "session_id": "default",
+  "pane_id": "w1:p1",
+  "generation": "opaque-gateway-instance",
+  "source": "gateway-captured",
+  "read_source": "recent-unwrapped",
+  "format": "text",
+  "availability": "captured",
+  "snapshot_id": "opaque-snapshot-identity",
+  "segments": [{
+    "segment_id": "opaque-segment-identity",
+    "started_at_ms": 1730000000000,
+    "sealed_at_ms": null,
+    "boundary_reason": "observation-start",
+    "rows": ["older row", "newer row"]
+  }],
+  "row_count": 2,
+  "has_more": false,
+  "next_before": null,
+  "order": "oldest-to-newest",
+  "includes_live_viewport": false,
+  "complete_archive": false
+}
+```
+
+`boundary_reason` is one of `observation-start`, `gateway-restart`,
+`capture-policy-change`, `resize`, `editor-change`, or `capture-reset`.
+`sealed_at_ms` is null for an open segment. Segment IDs remain stable across
+pages: a segment split by pagination keeps its ID. First pages return the newest
+retained historical rows; older pages can span segments. Blocks and rows within
+each page are oldest-to-newest. `limit` caps the **total rows**, not the number of
+blocks; `row_count` is their sum. Empty pages have `segments: []`, null
+`snapshot_id` and `next_before`, and `has_more: false`; availability retains the
+same captured/not_captured distinction.
+
+Boundaries are metadata, never fabricated separator rows. Do not deduplicate
+across segment boundaries, splice native backlog into them, or merge the live
+viewport. Page snapshots are frozen for 60 seconds, bound to the authenticated
+device and request shape, and cannot be merged across snapshot IDs or endpoints.
+Policy, resize, editor and capture resets seal a segment rather than erasing all
+previous observations of the same verified pane. Disappearance or changed pane
+identity still refuses adoption; an ID alone never authorizes old history.
+
+The legacy `/history` response remains a single prefix with `rows` and
+`capture_epoch`; it does **not** expose all sealed segments. Existing `/output`
+behavior is unchanged. App capability negotiation and its 2,000-row history
+window handling are deferred work, not delivered by this Gateway API. No promise
+is made that the current App can browse all retained segments.
+
+## Legacy snapshot lifetime and reset
 
 Nonempty snapshots are frozen for **60 seconds from creation**, not from last
 access. First-page requests with the same device/session/pane/format/limit and
@@ -134,13 +193,15 @@ unobserved destroy/recreate with identical native identity cannot be detected.
 | `409 history_cursor_mismatch` | Known cursor used with another device, session, pane, format, limit or generation; also a cursor request naming another source. Drop traversal and start without `before`. |
 | `410 history_cursor_gone` | Unknown/forged, expired, evicted or reset cursor, a page whose rows the capture has since trimmed off its front, or vanished pane during traversal. Drop traversal and start without `before`. A cursor from before Gateway restart is unknown and returns 410. |
 | `413 history_snapshot_too_large` | A historical row or snapshot exceeds byte limits; no partial/truncated row is silently served. |
-| `503 history_storage_unavailable` | Captured storage failed; an empty success is not substituted. |
+| `503 history_storage_unavailable` | Captured storage failed while the answer needed it (a checkpoint recovery); an empty success is not substituted. The store retries on its own; try again shortly. |
 | normal backend error | Live topology could not be checked; not proof that captured history is empty. |
 
 ## Resource bounds
 
-Existing live retention stays at 5,000 rows
-and 2 MiB per read-shape buffer, 48 buffers/24 MiB total. Snapshots add at most
+Retained segments share a summed **5,000 rows / 2 MiB / 64 segments per
+read shape**, **48 shapes / 24 MiB globally**, and **7 days** since an actual
+capture change; reads and unchanged polling do not extend age. These are totals,
+not a separate allowance for each segment. Snapshots add at most
 **32 snapshots / 8 MiB** (row capacities and row/page-vector allocations counted),
 at most **8 per session**, **2 per pane**, and **2 MiB of row text per snapshot**
 (the live capture's own cap, so a full pane always pins; its row/page-vector
@@ -158,46 +219,62 @@ prompt-delivery change in this feature.
 
 ## Optional SQLite checkpoints
 
-While Gateway is stopped, set this block in its `config.json`, then start it
-through the normal lifecycle command. Changing storage requires a controlled
-restart; it is not a live toggle or a Manager UI setting.
+Pick SQLite under Settings › "History checkpoints" in `muqun-gateway manage`
+(or, while Gateway is stopped, set this block in its `config.json`), then
+restart Gateway. Changing storage requires a controlled restart; it is not a
+live toggle.
 
 ```json
 {"history": {"storage": "sqlite"}}
 ```
 
 The accepted storage values are `memory` (default) and `sqlite`; unknown values
-are rejected. Omitting the block keeps existing config files compatible. The
+are rejected. Omitting the block keeps existing config files compatible and
+takes the default, which is one constant (`DEFAULT_HISTORY_STORAGE` in
+`platform/config.rs`); a config that names its storage keeps it whatever the
+default.
+
+`GET /api/history/storage` (the admin token or a device) answers which storage
+runs -- as read from `config.json` at startup, like the capability below -- and,
+for SQLite, `healthy`, `checkpoints` (stored read shapes, not segment count) and
+`wal_bytes`, from counters the write loop keeps, never a query on the request.
+`manage` shows them beside the setting while Gateway runs, for example
+`SQLite · 12 checkpoints · WAL 1.2 MiB`. The
 additional capability `pane_captured_history_sqlite_checkpoint` is announced
 only while `history.storage` is `sqlite` on a platform that can verify process
 identity (Linux, macOS): it means the checkpoints are
 **enabled** on this Gateway, not that every disk write has succeeded. With
-`memory` it is absent, and an App must not offer checkpoint-backed history. `pane_captured_history` and the history response contract remain
-unchanged. No App source change or complete-archive UI is provided.
+`memory` it is absent, and an App must not offer checkpoint-backed history.
+`pane_captured_history` remains unchanged; `pane_captured_history_segments_v1`
+is present in both modes. No App source change or complete-archive UI is provided.
 
 SQLite stores only historical prefixes in the exact `recent_unwrapped`/text or
 ANSI shape. It never stores the live viewport, pinned snapshots, device tokens,
-cursor tokens, or a native absolute range. The current projection is replaced in
-a transaction, including shrink, repaint, reset and deletion; it is not an
+cursor tokens, or a native absolute range. The bounded segment projection is
+checkpointed in a transaction; it is not an
 append-by-length log. A revision moves only when a frame actually changes a
 shape's fold; an identical polled frame does not. Revisions coalesce to the latest fold state, so a crash or stop can
 lose dirty work not yet flushed. This is a sampled checkpoint, not a write-ahead
 record of every accepted terminal frame.
 
-After restart, a history request first verifies live topology. Only a verified
-same native server and root-pane process can adopt an older prefix. That prefix
-gets a new runtime capture epoch with row base zero and remains separate from
-the live fold and `/output`. A mutable screen alone does not remove it. When the
-new run produces its first nonempty historical prefix, that fresh projection **replaces** the
-checkpoint outright; it is never concatenated across runs. This deliberately
-does not promise a seamless archive. The response still says
-`complete_archive: false` and `includes_live_viewport: false`. Old cursors return
-410 even when the checkpoint is readable with a new first-page request.
+After restart, recovery verifies live topology: only the same verified native
+server and root-pane process may adopt retained segments. The history migration
+converts old single-prefix checkpoints into segment projections. Recovery runs
+before a fresh projection can overwrite the matching disk checkpoint, not only
+on a late `/history` request. Recovered segments remain separate from the live
+fold and `/output`; new historical rows belong to a new `gateway-restart`
+segment, with no guessed overlap or cross-segment deduplication. This is still
+sampled history, not a seamless archive. The response says `complete_archive:
+false` and `includes_live_viewport: false`. Old cursors return 410 even when
+the checkpoint is readable with a new first-page request.
 
 Identity includes the installation `server_id`, configured backend type and
 canonical endpoint, a persisted per-backend configuration incarnation, native
-server/root-process incarnation, pane/workspace/tab identity, dimensions/editor
-policy, and source/format. tmux gets server and pane PIDs in the same listing;
+server/root-process incarnation, pane/workspace/tab/terminal identity, and
+source/format. Verified backend/server/root-process identity governs same-process
+recovery; dimensions and editor/capture-policy changes delimit segments rather
+than prohibit recovery of that same pane. They do not make an otherwise ineligible
+pane eligible for new capture. tmux gets server and pane PIDs in the same listing;
 Herdr uses the socket peer and that pane's `process_info.shell_pid`. Adapters
 verify same-user process ancestry and kernel incarnation: Linux boot UUID plus
 PID start ticks; macOS kernel boot time plus PID start timestamps. PIDs alone,
@@ -219,11 +296,54 @@ off) cannot be detected from the final config alone. It must not be used as an
 implicit purge; stop Gateway and clear the `history` records (see below) if
 that is the intent. A changed native server/root process still denies adoption independently.
 
+### Which panes are captured, and what a restart keeps
+
+In plain words:
+
+- **Captured:** panes whose program draws on the alternate screen and keeps no
+  scrollback of its own there -- Codex, Claude Code, OpenCode and other agent
+  TUIs -- and any pane the backend reports with no native backlog. For these
+  the terminal itself forgets what scrolled off, so Gateway keeps what it saw.
+- **Not captured:** an ordinary shell pane with native scrollback (tmux or
+  Herdr already keeps its history, and `/output` pages it natively); it
+  answers `not_captured`. A full-screen editor (nvim, vim, lazygit and the
+  like) repaints its screen in place, so it has no history to keep: its
+  current legacy prefix is `captured` with no rows. The segment endpoint can
+  still return earlier sealed segments; it does not retain editor repaint rows.
+- **Only what Gateway saw:** rows are captured while something reads the pane
+  -- the App's `/output` reads or its pane stream. Output that
+  scrolled past while nothing was reading is not there.
+
+After `muqun-gateway restart` with `history.storage: sqlite`, the segment endpoint
+can return rows checkpointed before restart, alongside separately bounded new
+segments. `next_before` pages through the retained rows when all of these hold:
+
+1. **The pane is the same process.** The tmux or Herdr server and the pane's
+   root process are the ones that were running before (checked by process
+   start time and boot id, not by pane id or PID alone). A pane whose server
+   or program was restarted starts empty.
+2. **The checkpoint was written.** Writes are sampled: changes from the last
+   ~3 seconds before the stop may not have reached the store.
+3. **Recovery passed before write.** Matching stored segments are recovered
+   before fresh capture can replace their disk projection. New observations
+   are a distinct segment, not an assumed continuation of old rows. Use
+   `/history/segments` to page all retained segments; legacy `/history` remains
+   only one prefix.
+4. **The checkpoint is fresh enough.** It was last changed within 7 days and
+   survived the 48-shape / 24 MiB quota and per-shape row/byte/segment bounds.
+
+Each format is recovered on its own: the ANSI rows come back only if the pane
+was read in ANSI before the restart (the App reads ANSI). A cursor from before
+the restart always answers `410 history_cursor_gone`; start again without
+`before` and the recovered rows are a new snapshot with a new
+runtime generation. Legacy `/history` also issues a new `capture_epoch`.
+
 ### Privacy, failure and retention bounds
 
 Checkpoints live in the Gateway's shared store, `<state>/store/gateway.sqlite3`,
 in the tables of the `history` namespace (`history_backends`,
-`history_captures`; its schema version is recorded in `muqun_schema`). The same
+`history_captures`, `history_segments`; its schema version is recorded in
+`muqun_schema`). The same
 file holds tasks and assistant tokens. The store directory is 0700 and the
 database 0600. With `store.encryption` set to `file` (the default) the whole
 database, history included, is encrypted at rest with SQLCipher under the key
@@ -234,35 +354,56 @@ encryption is separate and does not cover the database.
 
 The shared store's single worker thread owns the one SQLite connection; no
 SQLite operation runs on the Tokio executor, and no fold mutex is held while a
-job waits for that worker. Every 100 ms a Tokio task compares the fold's change
-counter with the last idle pass and submits one write pass to the worker when
-it moved, when pruning is due, or on every tick while a debounced scope is
-waiting (such a pass only checks metadata and copies no rows); at most 16
-checkpoint reads may wait on it, and one more is refused rather than queued.
-Dirty revisions remain coalesced in the bounded live fold. A projection written
+job waits for that worker. A Tokio task sleeps until the fold changes (a
+recorded frame, or a listing that changed a projection's identity, policy,
+fences or which buffers exist; the approval watcher's unchanged listing every
+1.5 s is not one) or pruning is due, so an idle Gateway does not wake it. It
+then submits one write pass to the worker, and while a pass leaves work behind
+(a debounced scope waiting, more projections to write) it follows up every
+100 ms (a debounced pass only checks metadata and copies no rows); at most 16
+checkpoint reads may wait on the worker, and one more is refused rather than
+queued.
+Dirty revisions remain coalesced in the bounded capture. A projection written
 in the last 3 seconds waits out that debounce unless its pane was reset or
-re-identified, or the projection emptied; those are handled at once. An emptied
-projection deletes its stored row only when the pane was reset; otherwise the
-stored row stays. Each pass copies at most one 2 MiB projection under a short lock and
-writes it in one transaction; an unchanged projection opens none. Late recovery
-rechecks the observation identity, fence and policy, and that no fresh
-historical prefix has appeared meanwhile; a frame that changed only the screen
-does not stop it. Write acknowledgements recheck the exact revision; reset work
+re-identified, or the projection emptied; those are handled at once. A sealed
+segment remains part of the retained projection, not a request to delete all
+history. Each pass takes at most one 2 MiB projection under a short lock --
+its rows are shared, so that is one reference count per row, never a copy of the
+text -- encodes it without the lock and writes it in one transaction (a
+projection over the bounds, such as one row past 256 KiB, is that pane's
+outcome rather than a storage failure: its stored row is removed, one warning
+is logged, it is not tried again until it changes, and the other panes go on
+being written); an unchanged projection opens none. Recovery
+rechecks the observation identity, fence and policy before adoption and gates
+fresh writes until recovery finishes. Write acknowledgements recheck the exact revision; reset work
 cannot make an older revision clean. The reused memory snapshot cache retains its 60-second TTL, atomic
 first-page deduplication and all device/scope quotas.
 
-Durable payload retention is at most **48 captures / 24 MiB**, **5,000 rows / 2 MiB
-of row text per shape**, for **7 days since the last actual projection change**,
+Durable payload retention is at most **48 shapes / 24 MiB**, **5,000 rows / 2 MiB
+of row text / 64 segments per shape**, for **7 days since the last actual projection change**,
 not the last read. Reads and unchanged polling do not extend age. Age pruning
 runs at startup and every 60 seconds; logical quotas also run after each written
-projection. The newest actual updates that fit both quotas are kept and the
-older ones evicted. Recovered checkpoints share the existing
+projection. Checkpoints of panes the last complete listings still show rank
+before every other; within each group the newest actual updates that fit both
+quotas are kept and the older ones evicted. Evicting an open pane's checkpoint
+for quota logs one warning line. Recovered checkpoints share the existing
 48-buffer/24-MiB live-memory budget; snapshots keep their separate 8-MiB budget.
 The bounded four-byte-per-row encoding overhead counts toward the payload quota,
 and recovered row/vector allocations count toward the total live-memory budget,
 not a second per-shape row-text cap. Front trims slide a live capture's row base
 without changing its epoch; checkpoints contain only retained rows, never trimmed
 rows or old cursor coordinates.
+Checkpoint writes commit with `synchronous=NORMAL`: in WAL mode that skips the
+fsync of each history commit, so a power cut can lose the last few seconds of
+checkpoints (already lost to the debounce) but never corrupts the file. The
+setting is switched back to `FULL` on the one shared connection before any
+other job runs, so tasks and tokens keep full durability. The WAL is folded
+back into the database (`wal_checkpoint(TRUNCATE)`, on the store worker, never
+on a request) after a pass that grew it past 1 MiB, and on the 60-second prune
+pass once nothing has been written for a minute, so an idle store's WAL file is
+empty (SQLite's own autocheckpoint folds pages back at about 4 MiB but never
+shrinks the file). A TRUNCATE takes the shared worker for a moment, so a task
+or token request arriving then waits that long; none runs on a request.
 The write loop retains a bounded last-processed content fingerprint independently of
 the database row. An unchanged poll cannot recreate an age-pruned or quota-evicted
 projection; a genuine change in that exact format can be persisted again.
@@ -271,26 +412,36 @@ A store that cannot be opened (wrong key, corruption, a schema newer than this
 Gateway) stops Gateway at startup; that is the shared store's rule for every
 domain, and the file is never rewritten or downgraded. The `history` migration
 runs in a transaction like every shared-store step, so a failed migration rolls
-back and records no schema version. Once Gateway is running,
-a failed history initialization, a failed checkpoint write or read, a full disk
-or read overload returns `503 history_storage_unavailable`, including when a
-pinned snapshot exists. No empty result or successful memory fallback conceals
-the selected store's failure. Output/control/SSE continue independently. A
-failed write stops further history writes until the cause is resolved and
-Gateway is restarted in a controlled way. Unknown identity without an eligible
+back and records no schema version. Once Gateway is running, a storage
+failure never takes away what memory holds: a first page or traversal of the
+current run's capture, and any pinned snapshot, is served as with `memory`.
+Only an answer that needs the store -- recovering a checkpoint -- returns `503
+history_storage_unavailable` while a failed initialization, a failed checkpoint
+write or read, a full disk or read overload stands; no empty result conceals
+it. A pane that could never have a checkpoint (unverified identity, a reset,
+native scrollback) is answered from memory -- `not_captured` or an empty
+capture -- whatever the store's health. A failed write pass, and a failed
+initialization, is retried after 1 s, then 5 s, then every 30 s, and the first
+attempt that works makes the store available again, with no restart.
+Output/control/SSE continue independently. Unknown identity without an eligible
 current-run capture returns the normal `not_captured`, not a claim that all old
 history was recovered.
 
 Turning storage off and restarting stops writes and leaves the `history` records
 retained but unread; memory mode never reads or writes those tables (they exist,
 empty or not, because the shared store creates every namespace). To remove them,
-stop Gateway and delete the rows of `history_captures` and `history_backends`
+stop Gateway and delete the rows of `history_segments`, then `history_captures`
+and `history_backends`
 with a SQLite tool that can open the store. When encrypted, that is a SQLCipher
 shell keyed with the hex in `<state>/store.key`, as the first statement:
 `PRAGMA key = "x'<64 hex characters from store.key>'";`. Removing the whole `<state>/store/` directory also removes tasks and
-assistant tokens. For a coherent backup, stop Gateway and copy `<state>/store/`
+assistant tokens. Before a schema upgrade, make a coherent backup: stop Gateway
+and copy `<state>/store/`
 together with `<state>/store.key`; never copy just a live main file, since its
-committed pages can still be in WAL.
+committed pages can still be in WAL. For rollback, restore a database backup
+compatible with the exact Gateway version together with its matching encryption
+key. An older binary refuses a newer schema; replacing the binary alone does
+not undo a migration. Do not delete the shared database as an upgrade workaround.
 
 ## Architecture
 
@@ -318,6 +469,6 @@ the write loop, transactions, retention and health; the shared store
 (`platform/store/sqlite.rs`) owns the file, its key, pragmas and the worker
 thread. The adapter wraps the existing memory adapter's bounded snapshot policy
 rather than duplicating it. `ScrollbackStore`
-owns dirty projection revisions, reset fences and separate recovered checkpoints;
+owns dirty segment projection revisions, reset fences and recovered checkpoints;
 it performs no SQLite I/O. The async application repository port and HTTP cursor
 contract are unchanged.

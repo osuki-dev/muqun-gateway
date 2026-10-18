@@ -24,6 +24,14 @@ pub(crate) enum McpCommand {
         /// writes this flag rather than relying on MUQUN_GATEWAY_CONFIG_DIR.
         #[arg(long, value_name = "DIR")]
         config_dir: Option<PathBuf>,
+        /// The `/mcp` address the host was given: checked to be this gateway
+        /// before a token is printed.
+        #[arg(long, value_name = "URL")]
+        url: Option<String>,
+        /// The gateway's state directory, when it is not the default: where
+        /// its identity file is.
+        #[arg(long, value_name = "DIR")]
+        state_dir: Option<PathBuf>,
     },
     /// Revoke assistant tokens. A running gateway sees it on the next call.
     #[command(group(clap::ArgGroup::new("which").required(true).args(["all", "id"])))]
@@ -57,7 +65,9 @@ pub(crate) enum McpCommand {
 
 fn default_url() -> String {
     match crate::load_config(None) {
-        Ok(config) => crate::mcp::local_url(&config.listen),
+        // Never an ephemeral fallback port: a config written now outlives
+        // this run of the gateway.
+        Ok(config) => crate::mcp::configured_url(&config.listen),
         Err(_) => crate::mcp::local_url(""),
     }
 }
@@ -78,9 +88,15 @@ fn enable_in_project(host: Host, path: &Path, url: &str, helper: &str) -> anyhow
     }
 }
 
-/// The loopback warning for the configured listen address, if it needs one.
+/// The loopback warning for the configured listen address, if it needs one:
+/// not when the running gateway serves `/mcp` on its own loopback listener.
 fn listen_warning_for_this_gateway() -> Option<String> {
     let config = crate::load_config(None).ok()?;
+    let recorded =
+        crate::mcp::recorded_url(&config.listen) != crate::mcp::local_url(&config.listen);
+    if recorded {
+        return None;
+    }
     crate::mcp::loopback_warning(&config.listen)
 }
 
@@ -145,7 +161,12 @@ fn helper_outcome(status: u16, body: &Value) -> Result<(), (i32, String)> {
     }
 }
 
-fn token_helper(bearer: bool, config_dir: Option<PathBuf>) -> anyhow::Result<()> {
+fn token_helper(
+    bearer: bool,
+    config_dir: Option<PathBuf>,
+    url: Option<String>,
+    state_dir: Option<PathBuf>,
+) -> anyhow::Result<()> {
     let fail = |code: i32, message: String| -> ! {
         eprintln!("{message}");
         std::process::exit(code)
@@ -160,6 +181,31 @@ fn token_helper(bearer: bool, config_dir: Option<PathBuf>) -> anyhow::Result<()>
         tracing::debug!("token-helper: {error:#}");
         fail(1, HELPER_FAILED.into())
     });
+    // Identity before credentials: the host sends this token to the address
+    // it was given at launch, so that address must be this gateway -- it
+    // knows the secret identity this gateway wrote -- not a process that
+    // took over a stale port.
+    // An entry written before the address was baked in: it cannot be checked.
+    let Some(url) = url else {
+        fail(
+            1,
+            String::from(
+                "muqun: this MCP entry is from an older gateway; run `muqun-gateway mcp enable` again",
+            ),
+        );
+    };
+    let file = match state_dir {
+        Some(dir) => Ok(crate::mcp::identity_file_in(&dir)),
+        None => crate::mcp::identity_file(),
+    };
+    let expected = file
+        .ok()
+        .and_then(|file| std::fs::read_to_string(file).ok())
+        .unwrap_or_default();
+    if let Err(refused) = crate::mcp::verify_identity(&url, expected.trim()) {
+        tracing::warn!("{refused}");
+        fail(1, refused);
+    }
     let pids = ancestor_chain(std::process::id(), MAX_ANCESTORS, parent_pid);
     let body = json!({ "ancestor_pids": pids });
     let (status, value) = match admin_request(&config, "POST", "/api/mcp/tokens", Some(&body)) {
@@ -209,11 +255,16 @@ async fn revoke(all: bool, id: Option<String>) -> anyhow::Result<()> {
 
 pub(crate) async fn run_mcp_command(command: McpCommand) -> anyhow::Result<()> {
     match command {
-        McpCommand::TokenHelper { bearer, config_dir } => token_helper(bearer, config_dir)?,
+        McpCommand::TokenHelper {
+            bearer,
+            config_dir,
+            url,
+            state_dir,
+        } => token_helper(bearer, config_dir, url, state_dir)?,
         McpCommand::Revoke { all, id } => revoke(all, id).await?,
         McpCommand::Enable { host, project, url } => {
             let url = url.unwrap_or_else(default_url);
-            let helper = hosts::helper_for_this_gateway();
+            let helper = hosts::helper_for_url(&url);
             if let Some(warning) = listen_warning_for_this_gateway() {
                 println!("{warning}");
             }
@@ -345,15 +396,24 @@ mod tests {
             "--bearer",
             "--config-dir",
             "/tmp/demo/config",
+            "--url",
+            "http://127.0.0.1:23847/mcp",
         ])
         .unwrap();
         let crate::cli::Command::Mcp {
-            command: McpCommand::TokenHelper { bearer, config_dir },
+            command:
+                McpCommand::TokenHelper {
+                    bearer,
+                    config_dir,
+                    url,
+                    ..
+                },
         } = cli.command
         else {
             panic!("not token-helper");
         };
         assert!(bearer);
         assert_eq!(config_dir, Some(PathBuf::from("/tmp/demo/config")));
+        assert_eq!(url.as_deref(), Some("http://127.0.0.1:23847/mcp"));
     }
 }

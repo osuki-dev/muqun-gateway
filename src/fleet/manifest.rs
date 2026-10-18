@@ -204,6 +204,9 @@ pub(crate) struct PeerEntry {
     pub name: String,
     /// `null`: not checked in the last minute (a check is under way).
     pub reachable: Option<bool>,
+    /// It no longer takes this computer's token: link it again.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub unauthorized: bool,
     /// When it last answered, ms since the epoch.
     pub last_seen: Option<u64>,
     pub capabilities: Vec<String>,
@@ -221,6 +224,8 @@ pub(crate) enum DescribeError {
     Unreachable(String),
     /// A linked computer that answers but gave no manifest (none cached).
     NoManifest(String),
+    /// A linked computer that no longer takes this computer's token.
+    Unauthorized(String),
 }
 
 /// A linked computer as last heard, without asking it now.
@@ -250,6 +255,7 @@ impl Heard {
         PeerEntry {
             name: self.peer.name.clone(),
             reachable: self.reachable,
+            unauthorized: self.peer.unauthorized,
             last_seen: self.peer.last_seen_ms,
             capabilities: self.peer.capabilities.clone(),
             agents: self
@@ -296,6 +302,12 @@ async fn heard(state: &AppState) -> Vec<Heard> {
     peers
         .into_iter()
         .map(|peer| {
+            if peer.unauthorized {
+                return Heard {
+                    reachable: Some(false),
+                    peer,
+                };
+            }
             state.peers.refresh_later(state, peer.clone());
             Heard {
                 reachable: state.peers.reachability(&peer, now),
@@ -478,8 +490,11 @@ impl FleetService {
                 return Ok(manifest);
             }
         }
-        let peer = state.peers.checked(state, peer).await.ok_or_else(unknown)?;
-        if !peer.reachable(now_ms()) {
+        let name = peer.name.clone();
+        let Some(peer) = state.peers.checked(state, peer).await else {
+            return Err(DescribeError::Unauthorized(name));
+        };
+        if !state.peers.reachable(&peer, now_ms()) {
             return Err(DescribeError::Unreachable(peer.name));
         }
         let manifest = state.peers.manifest_of(&peer).await;

@@ -20,6 +20,7 @@ pub(super) const ZH_CN: &[(&str, &str)] = &[
     // -- push notifications --------------------------------------------------
     ("Agent", "代理"),
     ("Approval needed", "需要批准"),
+    ("Needs your input", "需要你的输入"),
     ("Agent blocked", "代理等待中"),
     ("Agent done", "代理已完成"),
     ("{name} is waiting for your approval.", "{name} 正在等待你的批准。"),

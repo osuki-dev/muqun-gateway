@@ -48,11 +48,13 @@ pub(crate) const SESSION_INSTRUCTION_KEY: &str = "muqun-task";
 pub(crate) const RUNTIME_LABEL: &str = "opencode (started tasks)";
 
 /// Whether agents the gateway starts get the muqun server: MCP on, the
-/// switch on, and `/mcp` reachable on this computer's loopback.
+/// switch on, and `/mcp` reachable on this computer's loopback -- the listen
+/// address itself, or the loopback listener started beside it.
 pub(crate) fn enabled(config: &crate::Config) -> bool {
     config.mcp.enabled
         && config.mcp.inject_into_agents
-        && super::loopback_warning(&config.listen).is_none()
+        && (super::loopback_warning(&config.listen).is_none()
+            || super::local_url(&config.listen).starts_with("http://127.0.0.1:"))
 }
 
 /// The launch arguments that give the `kind` agent the server at `url`,
@@ -96,7 +98,7 @@ pub(crate) async fn terminal_args(config: &crate::Config, kind: &str) -> Vec<Str
         return Vec::new();
     }
     let url = super::local_url(&config.listen);
-    let helper = hosts::helper_for_this_gateway();
+    let helper = hosts::helper_for_url(&url);
     let file = if kind == "claude" {
         claude_file(&url, &helper).await
     } else {
@@ -201,11 +203,35 @@ fn configured_developer_instructions(configured: &[String]) -> Option<String> {
     found
 }
 
-/// The user's own Codex `developer_instructions`, if their config sets one,
-/// from `CODEX_HOME` as the agent will see it (`agent_env` first). Read
-/// only; a file that cannot be read or parsed gives nothing, logged, and the
-/// launch carries the sentence alone.
+/// The user's own Codex `developer_instructions`, if their config sets one.
+/// A config that cannot be read gives nothing, and the launch carries the
+/// sentence alone.
 async fn codex_developer_instructions(config: &crate::Config) -> Option<String> {
+    codex_config(config)
+        .await?
+        .get("developer_instructions")
+        .and_then(toml::Value::as_str)
+        .map(str::to_owned)
+}
+
+/// The model and reasoning effort the user's Codex config runs with, when
+/// it names a model: what a pane delegation that names none will run.
+pub(crate) async fn codex_default_model(
+    config: &crate::Config,
+) -> Option<(String, Option<String>)> {
+    let table = codex_config(config).await?;
+    let model = table.get("model")?.as_str()?.to_owned();
+    let effort = table
+        .get("model_reasoning_effort")
+        .and_then(toml::Value::as_str)
+        .map(str::to_owned);
+    Some((model, effort))
+}
+
+/// The user's Codex config, from `CODEX_HOME` as the agent will see it
+/// (`agent_env` first). Read only; a file that cannot be read or parsed
+/// gives nothing, logged.
+async fn codex_config(config: &crate::Config) -> Option<toml::Table> {
     let home = config
         .agent_env
         .usable()
@@ -217,18 +243,15 @@ async fn codex_developer_instructions(config: &crate::Config) -> Option<String> 
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
         Err(error) => {
-            tracing::warn!(%error, "Codex's config was not read; its task gets the sentence alone");
+            tracing::warn!(%error, "Codex's config was not read");
             return None;
         }
     };
     match toml::from_str::<toml::Table>(&text) {
-        Ok(table) => table
-            .get("developer_instructions")
-            .and_then(toml::Value::as_str)
-            .map(str::to_owned),
+        Ok(table) => Some(table),
         // The parse error quotes the file; only the fact is logged.
         Err(_) => {
-            tracing::warn!("Codex's config did not parse; its task gets the sentence alone");
+            tracing::warn!("Codex's config did not parse");
             None
         }
     }

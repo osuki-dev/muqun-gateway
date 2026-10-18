@@ -428,6 +428,7 @@ mod tests {
         for path in [
             "/api/sessions/{sessionId}/panes/{paneId}/context",
             "/api/sessions/{sessionId}/panes/{paneId}/git/status",
+            "/api/sessions/{sessionId}/panes/{paneId}/git/worktrees",
             "/api/sessions/{sessionId}/panes/{paneId}/git/diff",
             "/api/sessions/{sessionId}/panes/{paneId}/vcs/files",
             "/api/sessions/{sessionId}/panes/{paneId}/vcs/file",
@@ -449,6 +450,7 @@ mod tests {
             vec![
                 "sessionId",
                 "paneId",
+                "worktree",
                 "path",
                 "old_path",
                 "staged",
@@ -461,7 +463,12 @@ mod tests {
             spec["paths"]["/api/sessions/{sessionId}/panes/{paneId}/vcs/discard"]["post"]
                 .is_object()
         );
-        for capability in ["pane_context", "git_diff", "pane_vcs_files"] {
+        for capability in [
+            "pane_context",
+            "git_diff",
+            "pane_vcs_files",
+            "git_worktrees",
+        ] {
             assert!(
                 API_CAPABILITIES.contains(&capability),
                 "{capability} is not announced"
