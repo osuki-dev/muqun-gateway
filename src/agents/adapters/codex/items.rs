@@ -316,6 +316,25 @@ pub(super) fn parts(message: &str, id: &str, value: &Value) -> Vec<(String, Agen
 
 fn collaboration(message: &str, id: &str, value: &Value) -> Vec<(String, AgentPart)> {
     let activity = value["type"] == "subAgentActivity";
+    // Activity records describe a lifecycle event, not a tool invocation:
+    // they have kind/agentThreadId/agentPath but no prompt, tool or result.
+    // Preserve that distinction instead of manufacturing a null tool input.
+    let mut input = serde_json::Map::new();
+    for (wire_key, input_key) in [
+        (if activity { "kind" } else { "tool" }, "operation"),
+        ("model", "model"),
+        ("reasoningEffort", "reasoningEffort"),
+    ] {
+        if let Some(field) = present(value, wire_key) {
+            input.insert(input_key.into(), field);
+        }
+    }
+    if !activity {
+        if let Some(prompt) = present(value, "prompt") {
+            input.insert("prompt".into(), prompt);
+        }
+    }
+    let input = Value::Object(input);
     let targets: Vec<&str> = if activity {
         value["agentThreadId"].as_str().into_iter().collect()
     } else {
@@ -335,35 +354,55 @@ fn collaboration(message: &str, id: &str, value: &Value) -> Vec<(String, AgentPa
     } else {
         targets.into_iter().map(Some).collect()
     };
-    targets.into_iter().map(|target| {
-        let mut call = tool(value,"subagent".into(),json!({"prompt":value["prompt"],"operation":value["tool"],"model":value["model"],"reasoningEffort":value["reasoningEffort"]}),None);
-        call.child_session_id = target.map(str::to_owned);
-        let metadata = call.metadata.as_mut().unwrap();
-        metadata.as_object_mut().unwrap().remove("status");
-        if !activity { metadata["collabStatus"] = value["status"].clone(); }
-        let child_status = if activity {
-            match value["kind"].as_str() {
-                Some("started") => Some("running"),
-                Some("completed") => Some("completed"),
-                Some("interrupted") => Some("interrupted"),
-                _ => None,
+    targets
+        .into_iter()
+        .map(|target| {
+            let mut call = tool(value, "subagent".into(), input.clone(), None);
+            call.child_session_id = target.map(str::to_owned);
+            let metadata = call.metadata.as_mut().unwrap();
+            metadata.as_object_mut().unwrap().remove("status");
+            if !activity {
+                metadata["collabStatus"] = value["status"].clone();
             }
-        } else { target.and_then(|target| value["agentsStates"][target]["status"].as_str()) };
-        if let Some(status) = child_status {
-            metadata["status"] = json!(match status { "pendingInit" => "starting", "running" => "working", "errored" => "failed", other => other });
-        }
-        if let Some(target) = target {
-            metadata["sessionID"] = json!(target);
-            call.output = present(&value["agentsStates"][target],"message");
-        }
-        if activity {
-            call.state = ToolCallStatus::Completed;
-            call.status = call.state;
-            call.title = value["agentPath"].as_str().map(str::to_owned);
-        }
-        let row_id = target.map(|target| format!("{}:child:{}:{target}",tool_item_id(message,id),target.len())).unwrap_or_else(|| tool_item_id(message,id));
-        (row_id,AgentPart::Tool(call))
-    }).collect()
+            let child_status = if activity {
+                match value["kind"].as_str() {
+                    Some("started") => Some("running"),
+                    Some("completed") => Some("completed"),
+                    Some("interrupted") => Some("interrupted"),
+                    _ => None,
+                }
+            } else {
+                target.and_then(|target| value["agentsStates"][target]["status"].as_str())
+            };
+            if let Some(status) = child_status {
+                metadata["status"] = json!(match status {
+                    "pendingInit" => "starting",
+                    "running" => "working",
+                    "errored" => "failed",
+                    other => other,
+                });
+            }
+            if let Some(target) = target {
+                metadata["sessionID"] = json!(target);
+                call.output = present(&value["agentsStates"][target], "message");
+            }
+            if activity {
+                call.state = ToolCallStatus::Completed;
+                call.status = call.state;
+                call.title = value["agentPath"].as_str().map(str::to_owned);
+            }
+            let row_id = target
+                .map(|target| {
+                    format!(
+                        "{}:child:{}:{target}",
+                        tool_item_id(message, id),
+                        target.len()
+                    )
+                })
+                .unwrap_or_else(|| tool_item_id(message, id));
+            (row_id, AgentPart::Tool(call))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -954,6 +993,56 @@ mod tests {
         assert_eq!(call.child_session_id.as_deref(), Some("child"));
         assert_eq!(call.title.as_deref(), Some("/root/review"));
         assert!(call.metadata.unwrap().get("status").is_none());
+    }
+    #[test]
+    fn subagent_activity_keeps_its_operation_without_fabricating_prompt_or_result() {
+        for (kind, status) in [
+            ("started", Some("working")),
+            ("interacted", None),
+            ("interrupted", Some("interrupted")),
+            ("completed", Some("completed")),
+        ] {
+            // Published 0.163.0 ThreadItem: activity has no message/output.
+            let call = mapped(json!({
+                "type":"subAgentActivity", "id":"activity", "kind":kind,
+                "agentThreadId":"child", "agentPath":"/root/review",
+                "model":null, "reasoningEffort":null
+            }))
+            .remove(0);
+            assert_eq!(call.input, json!({"operation":kind}));
+            assert_eq!(call.child_session_id.as_deref(), Some("child"));
+            assert_eq!(call.title.as_deref(), Some("/root/review"));
+            assert_eq!(call.output, None);
+            assert_eq!(call.metadata.as_ref().unwrap()["status"].as_str(), status);
+        }
+        let call = mapped(json!({
+            "type":"subAgentActivity", "id":"created", "kind":"started",
+            "agentThreadId":"child", "agentPath":"/root/review",
+            "model":"model-id", "reasoningEffort":"high"
+        }))
+        .remove(0);
+        assert_eq!(
+            call.input,
+            json!({
+                "operation":"started", "model":"model-id", "reasoningEffort":"high"
+            })
+        );
+    }
+    #[test]
+    fn collaboration_preserves_real_prompt_and_returned_child_message() {
+        let call = mapped(json!({
+            "type":"collabAgentToolCall", "id":"send", "tool":"sendInput",
+            "status":"completed", "receiverThreadIds":["child"],
+            "prompt":"Review the change", "model":null, "reasoningEffort":null,
+            "agentsStates":{"child":{"status":"completed","message":"Reviewed: one issue"}}
+        }))
+        .remove(0);
+        assert_eq!(
+            call.input,
+            json!({"operation":"sendInput","prompt":"Review the change"})
+        );
+        assert_eq!(call.output, Some(json!("Reviewed: one issue")));
+        assert_eq!(call.child_session_id.as_deref(), Some("child"));
     }
     #[test]
     fn dynamic_web_sleep_and_mcp_outputs_are_not_silently_dropped() {
