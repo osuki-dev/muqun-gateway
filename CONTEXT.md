@@ -376,8 +376,9 @@ update. Unsupported optional features remain false. See
 [Codex protocol reference](docs/codex-protocol.md) for mappings and limits.
 
 T3 negotiates protocol **1 or 2** from the public descriptor, with missing meaning
-1 and unknown/malformed values unsupported. V2 uses a pinned nightly-source
-baseline, not a claim of live certification. Revert is advertised only for known
+1 and unknown/malformed values unsupported. V2's published-source reference is
+stable **v0.1.0** (October 15, 2026), checked against the original pinned nightly
+baseline; this is not live certification. Revert is advertised only for known
 protocol 1, never V2 or unknown. See [T3 protocol reference](docs/t3-protocol.md).
 Real Codex and paired App/macOS checks for this phase are deferred by user
 instruction; source/fixture evidence does not replace the required acceptance.

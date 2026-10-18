@@ -2,6 +2,23 @@
 
 ## Changes and fixes
 
+- Codex subagent activity records no longer manufacture null `prompt`,
+  `operation`, `model` and `reasoningEffort` arguments. Activities carry their
+  actual operation and supplied metadata; child-session identity is preserved.
+  Activity records do not include a reply in the upstream protocol. Actual
+  collaboration-tool replies still reach the App, and the complete conversation
+  remains available by explicitly opening the child session.
+
+- OpenCode event streams now retry when the upstream accepts a connection but
+  never returns response headers. A five-second handshake deadline enters the
+  existing reconnect backoff; established streams keep their unlimited lifetime.
+  No App update or configuration change is needed for this fix.
+
+- Refresh the locked Rust dependencies for libc, serde_json, sha2, tokio,
+  tokio-util, uuid and toml, including toml's supporting datetime crate. Keep
+  reqwest on 0.12.28 to preserve the existing TLS provider and certificate-root
+  behavior; the 0.13 migration needs separate compatibility validation.
+
 - **`GET /api/discovery` and `GET /api/capabilities` require a credential.**
   They answered anyone on the network with the computer's id, label,
   version, generation, every capability and the agent configuration (agent
@@ -163,8 +180,8 @@
   `agent_collaboration` when *any* configured session qualifies -- the weaker
   claim, kept for apps that only read that list.
 
-Nothing else changed. Every other capability is a property of the build and
-stays unconditional, `agent_spawn` included: spawning runs on tmux as well as
+Other capability declarations remain properties of the build and
+stay unconditional, `agent_spawn` included: spawning runs on tmux as well as
 Herdr, so a tmux-only gateway still announces it. tmux sessions are unaffected
 in every respect except that they no longer claim a feature they cannot perform.
 
@@ -194,13 +211,34 @@ protocol 1 and everything documented for it.
 
 ## Upgrade
 
-Restart the gateway. No configuration or migration is required, but read the
-first change above: agents started from the phone or by an MCP caller now run
-without their approval prompts unless `config.json` says otherwise.
+Back up the Gateway store before upgrading, then restart the gateway. Startup
+applies the pending store migrations, including session routing, fleet transport
+pins and durable transport replay admission. An older binary refuses a database
+whose migration version it cannot read; rollback requires a matching database
+backup, not just replacing the executable. Do not delete the store to downgrade.
+
+Devices paired before transport encryption was enabled must pair again when
+`transport_encryption` is `required`. Update Apps and Gateway peers and verify
+transport revision 2 before claiming its replay protections for a connection;
+legacy revision 1 remains supported during migration.
+
+Agents started from the phone or by an MCP caller run without their approval
+prompts by default. Preserve prompts with `agent_launch_args` and
+`agent_trust_folders` as described above.
 
 ## Validation
 
-Record the checks actually run before this is released.
+The October 18 dependency and event-stream candidate passed local Linux checks:
+
+- `cargo fmt --all -- --check`
+- `cargo clippy --locked --offline --all-targets -- -D warnings`
+- `cargo test --locked`: 1,810 passed, zero failed; 41 optional environment-specific or expensive tests ignored.
+- `cargo build --release --locked --offline`
+- `cargo audit`: 341 dependencies scanned, no advisories reported.
+
+The new local TCP regression covers a stalled event-stream handshake, successful
+reconnection and an established stream surviving beyond the handshake deadline.
+These results do not establish macOS or paired-agent acceptance.
 
 **Not verified here:** a real paired App-to-Gateway-to-agent delivery check.
 Capability announcement was exercised against a live tmux session over HTTP; no
