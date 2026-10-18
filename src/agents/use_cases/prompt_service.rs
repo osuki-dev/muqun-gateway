@@ -32,7 +32,7 @@ impl PromptService {
             .map_err(|_| AgentError::InvalidRequest("no upload directory".to_string()))?;
         let mode = self.agent.attachment_mode();
         let checked = checked_attachments(mode, attachments, &uploads)?;
-        if mode == AttachmentMode::Native {
+        if mode != AttachmentMode::ByPath {
             return self
                 .agent
                 .send_prompt(&asid.0, text, &checked, delivery)

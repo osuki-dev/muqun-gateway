@@ -4,8 +4,8 @@ use tokio::sync::RwLock;
 
 use crate::agents::domain::{
     tool_item_id, AgentDomainEvent, AgentErrorInfo, AgentPart, AgentSessionId, AgentSessionInfo,
-    AgentSessionStatus, FormRequest, PermissionRequest, RevertState, SessionRevertInfo,
-    TimelineItem, TimelineRole, ToolCall, ToolCallStatus, ToolTime,
+    AgentSessionStatus, FormRequest, FormResolutionReason, PermissionRequest, RevertState,
+    SessionRevertInfo, TimelineItem, TimelineRole, ToolCall, ToolCallStatus, ToolTime,
 };
 use crate::agents::ports::mirror::{AgentSessionSnapshot, MirrorFuture, SessionMirrorPort};
 
@@ -41,6 +41,11 @@ fn placeholder_session(asid: &AgentSessionId, status: AgentSessionStatus) -> Age
         asid: asid.clone(),
         agent_id: String::new(),
         backend_session_id: asid.0.clone(),
+        runtime: None,
+        context_usage: None,
+        git_info: None,
+        agent_name: None,
+        agent_role: None,
         title: String::new(),
         mode: None,
         model: None,
@@ -126,6 +131,10 @@ struct SessionState {
     /// True while `info` is the local stand-in rather than something OpenCode
     /// reported.
     placeholder: bool,
+    /// Metadata and live deltas do not prove that initial history was read.
+    history_initialized: bool,
+    history_gate: Arc<tokio::sync::Mutex<()>>,
+    history_removal_generation: u64,
 }
 
 impl SessionState {
@@ -142,6 +151,9 @@ impl SessionState {
             current_seq: 0,
             touched_ms: now_ms(),
             placeholder: false,
+            history_initialized: false,
+            history_gate: Arc::new(tokio::sync::Mutex::new(())),
+            history_removal_generation: 0,
         }
     }
 
@@ -225,6 +237,64 @@ pub struct MemoryMirror {
 }
 
 impl MemoryMirror {
+    /// Return the exact bounded, revision-stamped event retained for replay.
+    /// Live publishers must not resend the caller's unstamped input rows.
+    pub(crate) async fn record_timeline_upsert(
+        &self,
+        asid: &AgentSessionId,
+        items: Vec<TimelineItem>,
+    ) -> AgentDomainEvent {
+        let mut sessions = self.sessions.write().await;
+        let state = Self::entry(
+            &self.agent_id,
+            &mut sessions,
+            asid,
+            AgentSessionStatus::Idle,
+        );
+        let seq = state.next_seq();
+        let mut updated_items = Vec::new();
+        for mut item in items {
+            item.seq = seq;
+            if let AgentPart::Tool(ref mut call) = item.part {
+                truncate_tool_output(call);
+            }
+            state.insert_item(item.clone());
+            updated_items.push(item);
+        }
+        let event = AgentDomainEvent::TimelineUpsert {
+            asid: asid.clone(),
+            items: updated_items,
+            seq,
+        };
+        state.push_event(event.clone());
+        event
+    }
+
+    /// Preserve resolution semantics in the replay ring as well as live SSE.
+    pub(crate) async fn resolve_form_with_reason(
+        &self,
+        asid: &AgentSessionId,
+        form_id: &str,
+        reason: Option<FormResolutionReason>,
+    ) -> u64 {
+        let mut sessions = self.sessions.write().await;
+        let state = Self::entry(
+            &self.agent_id,
+            &mut sessions,
+            asid,
+            AgentSessionStatus::Idle,
+        );
+        state.forms.remove(form_id);
+        let seq = state.next_seq();
+        state.push_event(AgentDomainEvent::FormResolved {
+            asid: asid.clone(),
+            form_id: form_id.into(),
+            reason,
+            seq,
+        });
+        seq
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -286,6 +356,92 @@ impl MemoryMirror {
     pub async fn is_placeholder(&self, asid: &AgentSessionId) -> bool {
         let sessions = self.sessions.read().await;
         sessions.get(asid).map(|s| s.placeholder).unwrap_or(true)
+    }
+
+    pub(crate) async fn history_gate(&self, asid: &AgentSessionId) -> Arc<tokio::sync::Mutex<()>> {
+        let mut sessions = self.sessions.write().await;
+        Self::entry(
+            &self.agent_id,
+            &mut sessions,
+            asid,
+            AgentSessionStatus::Unknown,
+        )
+        .history_gate
+        .clone()
+    }
+
+    pub(crate) async fn history_initialized(&self, asid: &AgentSessionId) -> bool {
+        self.sessions
+            .read()
+            .await
+            .get(asid)
+            .is_some_and(|state| state.history_initialized)
+    }
+
+    pub(crate) async fn history_read_revision(&self, asid: &AgentSessionId) -> Option<(u64, u64)> {
+        self.sessions
+            .read()
+            .await
+            .get(asid)
+            .map(|state| (state.current_seq, state.history_removal_generation))
+    }
+
+    /// A newly created session has known empty history. Metadata for an existing
+    /// session or a fork does not establish that fact.
+    pub(crate) async fn mark_history_initialized(&self, asid: &AgentSessionId) {
+        if let Some(state) = self.sessions.write().await.get_mut(asid) {
+            state.history_initialized = true;
+        }
+    }
+
+    /// Merge one bounded initial history read without replacing newer live rows.
+    /// The gate identity fences eviction/recreation while the provider was read.
+    pub(crate) async fn initialize_history(
+        &self,
+        asid: &AgentSessionId,
+        gate: &Arc<tokio::sync::Mutex<()>>,
+        before_read: (u64, u64),
+        items: Vec<TimelineItem>,
+    ) -> bool {
+        let mut sessions = self.sessions.write().await;
+        let Some(state) = sessions.get_mut(asid) else {
+            return false;
+        };
+        if !Arc::ptr_eq(gate, &state.history_gate) {
+            return false;
+        }
+        if state.history_initialized {
+            return true;
+        }
+        if state.history_removal_generation != before_read.1 {
+            return false;
+        }
+        let mut accepted: Vec<_> = items
+            .into_iter()
+            .filter(|item| {
+                state
+                    .timeline
+                    .get(&item.id)
+                    .is_none_or(|current| current.seq <= before_read.0)
+            })
+            .collect();
+        if !accepted.is_empty() {
+            let seq = state.next_seq();
+            for item in &mut accepted {
+                item.seq = seq;
+                if let AgentPart::Tool(call) = &mut item.part {
+                    truncate_tool_output(call);
+                }
+                state.insert_item(item.clone());
+            }
+            state.push_event(AgentDomainEvent::TimelineUpsert {
+                asid: asid.clone(),
+                items: accepted,
+                seq,
+            });
+        }
+        state.history_initialized = true;
+        true
     }
 
     /// Upstream metadata cannot erase read markers the Gateway owns.
@@ -556,6 +712,8 @@ impl MemoryMirror {
     ) -> Option<(u64, Vec<String>)> {
         let mut sessions = self.sessions.write().await;
         let state = sessions.get_mut(asid)?;
+        // An unloaded row may still be in an in-flight canonical read.
+        state.history_removal_generation = state.history_removal_generation.wrapping_add(1);
         let doomed: Vec<String> = state
             .timeline
             .values()
@@ -589,6 +747,8 @@ impl MemoryMirror {
     ) -> Option<(u64, Vec<String>)> {
         let mut sessions = self.sessions.write().await;
         let state = sessions.get_mut(asid)?;
+        // An unloaded row may still be in an in-flight canonical read.
+        state.history_removal_generation = state.history_removal_generation.wrapping_add(1);
         let removed: Vec<String> = ids
             .iter()
             .filter(|id| state.timeline.remove(id.as_str()).is_some())
@@ -976,6 +1136,179 @@ impl MemoryMirror {
         sessions.get(asid).map(|s| s.event_log.len()).unwrap_or(0)
     }
 
+    /// Bounded by this mirror's normal session retention. Captured sequences
+    /// fence runtime observations that raced newer native events.
+    pub(crate) async fn runtime_sessions(&self) -> Vec<(AgentSessionId, u64)> {
+        self.sessions
+            .read()
+            .await
+            .iter()
+            .filter(|(_, state)| !state.placeholder)
+            .map(|(id, state)| (id.clone(), state.current_seq))
+            .collect()
+    }
+
+    /// Metadata-only fence: native token events must not clone retained history.
+    pub(crate) async fn non_native_runtime_seq(&self, asid: &AgentSessionId) -> Option<u64> {
+        let sessions = self.sessions.read().await;
+        let state = sessions.get(asid)?;
+        state
+            .info
+            .runtime
+            .as_ref()
+            .filter(|runtime| runtime.source != crate::agents::domain::RuntimeSource::Native)
+            .map(|_| state.current_seq)
+    }
+
+    pub(crate) async fn update_runtime(
+        &self,
+        asid: &AgentSessionId,
+        expected: u64,
+        runtime: crate::agents::domain::SessionRuntime,
+    ) -> Option<(u64, AgentSessionInfo)> {
+        self.update_runtime_decorated(asid, expected, runtime, |_| {})
+            .await
+    }
+
+    pub(crate) async fn update_runtime_decorated(
+        &self,
+        asid: &AgentSessionId,
+        expected: u64,
+        runtime: crate::agents::domain::SessionRuntime,
+        decorate: impl FnOnce(&mut AgentSessionInfo),
+    ) -> Option<(u64, AgentSessionInfo)> {
+        let mut sessions = self.sessions.write().await;
+        let state = sessions.get_mut(asid)?;
+        if state.current_seq != expected {
+            return None;
+        }
+        let previous = state.info.clone();
+        runtime.apply(&mut state.info);
+        decorate(&mut state.info);
+        if state.info == previous {
+            return None;
+        }
+        let seq = state.next_seq();
+        let info = state.info.clone();
+        state.push_event(AgentDomainEvent::SessionUpdated {
+            asid: asid.clone(),
+            info: Box::new(info.clone()),
+            seq,
+        });
+        Some((seq, info))
+    }
+
+    pub(crate) async fn observation_epoch(&self, asid: &AgentSessionId) -> Option<u64> {
+        self.sessions
+            .read()
+            .await
+            .get(asid)
+            .map(|state| state.replay_floor)
+    }
+
+    /// Atomically order observation metadata before appended items. Explicit
+    /// snapshot replacement and native ownership changes fence older batches.
+    pub(crate) async fn apply_observation(
+        &self,
+        asid: &AgentSessionId,
+        epoch: u64,
+        runtime: crate::agents::domain::SessionRuntime,
+        items: Vec<TimelineItem>,
+        decorate: impl FnOnce(&mut AgentSessionInfo),
+        publish: impl FnOnce(&[AgentDomainEvent]),
+    ) -> Option<Vec<AgentDomainEvent>> {
+        use crate::agents::domain::RuntimeSource;
+        let mut sessions = self.sessions.write().await;
+        let state = sessions.get_mut(asid)?;
+        if state.replay_floor != epoch
+            || state.placeholder
+            || state.info.runtime.as_ref().is_none_or(|old| {
+                old.source != RuntimeSource::Terminal || old.terminal != runtime.terminal
+            })
+            || runtime.source != RuntimeSource::Terminal
+        {
+            return None;
+        }
+        let previous = state.info.clone();
+        runtime.apply(&mut state.info);
+        decorate(&mut state.info);
+        let mut events = Vec::new();
+        if previous != state.info {
+            let seq = state.next_seq();
+            events.push(AgentDomainEvent::SessionUpdated {
+                asid: asid.clone(),
+                info: Box::new(state.info.clone()),
+                seq,
+            });
+        }
+        if !items.is_empty() {
+            let seq = state.next_seq();
+            let mut updated = Vec::new();
+            for mut item in items {
+                item.seq = seq;
+                if let AgentPart::Tool(ref mut call) = item.part {
+                    truncate_tool_output(call);
+                }
+                state.insert_item(item.clone());
+                updated.push(item);
+            }
+            events.push(AgentDomainEvent::TimelineUpsert {
+                asid: asid.clone(),
+                items: updated,
+                seq,
+            });
+        }
+        for event in &events {
+            state.push_event(event.clone());
+        }
+        // No I/O/await in publication. Later mirror writes cannot overtake this
+        // batch's metadata and items on the provider's broadcast stream.
+        publish(&events);
+        Some(events)
+    }
+
+    /// Commit an explicitly requested provider read only if no newer event won.
+    /// Invalidate older replay cursors; never broadcast replacement transcript rows.
+    pub(crate) async fn refresh_snapshot(
+        &self,
+        mut snapshot: crate::agents::ports::mirror::AgentSessionSnapshot,
+        expected: Option<u64>,
+    ) -> Option<crate::agents::ports::mirror::AgentSessionSnapshot> {
+        let mut sessions = self.sessions.write().await;
+        let asid = snapshot.info.asid.clone();
+        if sessions.get(&asid).map(|s| s.current_seq) != expected {
+            return None;
+        }
+        if let Some(previous) = sessions.get(&asid) {
+            snapshot.info.time_viewed = previous.info.time_viewed;
+            snapshot.info.time_idle = previous.info.time_idle;
+        }
+        let state = Self::entry(&self.agent_id, &mut sessions, &asid, snapshot.info.status);
+        state.info = snapshot.info.clone();
+        state.placeholder = false;
+        state.history_initialized = true;
+        state.timeline.clear();
+        for item in &snapshot.timeline {
+            state.insert_item(item.clone());
+        }
+        state.permissions = snapshot
+            .permissions
+            .iter()
+            .map(|p| (p.id.clone(), p.clone()))
+            .collect();
+        state.forms = snapshot
+            .forms
+            .iter()
+            .map(|p| (p.id.clone(), p.clone()))
+            .collect();
+        snapshot.inbox = state.inbox.clone();
+        snapshot.seq = state.next_seq();
+        state.event_log.clear();
+        state.event_log_bytes = 0;
+        state.replay_floor = snapshot.seq;
+        Some(snapshot)
+    }
+
     /// The session's info as held, without the rest of its snapshot.
     pub async fn session_info(&self, asid: &AgentSessionId) -> Option<AgentSessionInfo> {
         let sessions = self.sessions.read().await;
@@ -1178,34 +1511,7 @@ impl SessionMirrorPort for MemoryMirror {
         asid: &'a AgentSessionId,
         items: Vec<TimelineItem>,
     ) -> MirrorFuture<'a, u64> {
-        Box::pin(async move {
-            let mut sessions = self.sessions.write().await;
-            let state = Self::entry(
-                &self.agent_id,
-                &mut sessions,
-                asid,
-                AgentSessionStatus::Idle,
-            );
-            let seq = state.next_seq();
-            let mut updated_items = Vec::new();
-
-            for mut item in items {
-                item.seq = seq;
-                if let AgentPart::Tool(ref mut call) = item.part {
-                    truncate_tool_output(call);
-                }
-                state.insert_item(item.clone());
-                updated_items.push(item);
-            }
-
-            let event = AgentDomainEvent::TimelineUpsert {
-                asid: asid.clone(),
-                items: updated_items,
-                seq,
-            };
-            state.push_event(event);
-            seq
-        })
+        Box::pin(async move { self.record_timeline_upsert(asid, items).await.seq() })
     }
 
     fn add_permission<'a>(&'a self, request: PermissionRequest) -> MirrorFuture<'a, u64> {
@@ -1281,25 +1587,7 @@ impl SessionMirrorPort for MemoryMirror {
         asid: &'a AgentSessionId,
         form_id: &'a str,
     ) -> MirrorFuture<'a, u64> {
-        Box::pin(async move {
-            let mut sessions = self.sessions.write().await;
-            let state = Self::entry(
-                &self.agent_id,
-                &mut sessions,
-                asid,
-                AgentSessionStatus::Idle,
-            );
-            state.forms.remove(form_id);
-            let seq = state.next_seq();
-
-            let event = AgentDomainEvent::FormResolved {
-                asid: asid.clone(),
-                form_id: form_id.to_string(),
-                seq,
-            };
-            state.push_event(event);
-            seq
-        })
+        Box::pin(self.resolve_form_with_reason(asid, form_id, None))
     }
 }
 
@@ -1338,6 +1626,121 @@ mod tests {
             items: vec![text_item("m:t0", "m", text)],
             seq,
         }
+    }
+
+    #[tokio::test]
+    async fn persisted_batch_cannot_cross_explicit_refresh_or_native_ownership() {
+        use crate::agents::domain::{
+            RuntimeInteraction, RuntimeSource, RuntimeTerminal, SessionRuntime, TranscriptSource,
+        };
+        let mirror = MemoryMirror::new();
+        let asid = AgentSessionId("fixture".into());
+        let runtime = SessionRuntime {
+            source: RuntimeSource::Terminal,
+            interaction: RuntimeInteraction::Terminal,
+            transcript: Some(TranscriptSource::Persisted),
+            status: None,
+            reason: None,
+            terminal: Some(RuntimeTerminal {
+                session_id: "local".into(),
+                pane_id: "pane".into(),
+                instance_id: "binding".into(),
+            }),
+        };
+        let mut session = info(&asid, "fixture");
+        runtime.clone().apply(&mut session);
+        mirror.update_session(session).await;
+        let old_epoch = mirror.observation_epoch(&asid).await.unwrap();
+        let captured = mirror.get_snapshot(&asid).await.unwrap();
+        mirror
+            .refresh_snapshot(captured.clone(), Some(captured.seq))
+            .await
+            .unwrap();
+        assert!(mirror
+            .apply_observation(
+                &asid,
+                old_epoch,
+                runtime.clone(),
+                vec![text_item("stale", "stale", "stale")],
+                |_| {},
+                |_| {}
+            )
+            .await
+            .is_none());
+        let epoch = mirror.observation_epoch(&asid).await.unwrap();
+        let events = mirror
+            .apply_observation(
+                &asid,
+                epoch,
+                runtime.clone(),
+                vec![text_item("current", "current", "current")],
+                |info| info.title = "observed".into(),
+                |_| {},
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            &events[0],
+            AgentDomainEvent::SessionUpdated { .. }
+        ));
+        assert!(matches!(
+            &events[1],
+            AgentDomainEvent::TimelineUpsert { .. }
+        ));
+        let mut native = mirror.session_info(&asid).await.unwrap();
+        native.runtime.as_mut().unwrap().source = RuntimeSource::Native;
+        mirror.update_session(native).await;
+        assert!(mirror
+            .apply_observation(
+                &asid,
+                epoch,
+                runtime,
+                vec![text_item("late", "late", "late")],
+                |_| {},
+                |_| {}
+            )
+            .await
+            .is_none());
+        assert_eq!(mirror.get_snapshot(&asid).await.unwrap().timeline.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn explicit_refresh_fences_events_and_invalidates_old_replay_without_broadcast() {
+        let mirror = MemoryMirror::new();
+        let asid = AgentSessionId("fixture".into());
+        mirror.update_session(info(&asid, "old")).await;
+        mirror
+            .upsert_timeline_items(&asid, vec![text_item("old", "old", "old")])
+            .await;
+        let captured = mirror.get_snapshot(&asid).await.unwrap();
+        let mut fresh = captured.clone();
+        fresh.timeline = vec![text_item("new", "new", "new")];
+        mirror
+            .update_status(&asid, AgentSessionStatus::Busy, None)
+            .await;
+        assert!(mirror
+            .refresh_snapshot(fresh.clone(), Some(captured.seq))
+            .await
+            .is_none());
+        let current = mirror.get_snapshot(&asid).await.unwrap();
+        assert_eq!(current.timeline[0].id, "old");
+        fresh.info.status = AgentSessionStatus::Busy;
+        let committed = mirror
+            .refresh_snapshot(fresh, Some(current.seq))
+            .await
+            .unwrap();
+        assert!(committed.seq > current.seq);
+        assert!(mirror.get_events_after(&asid, current.seq).await.is_none());
+        assert!(mirror
+            .get_events_after(&asid, committed.seq)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            mirror.get_snapshot(&asid).await.unwrap().timeline[0].id,
+            "new"
+        );
+        assert_eq!(mirror.event_log_len(&asid).await, 0);
     }
 
     #[test]
@@ -1578,6 +1981,118 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn initial_history_is_distinct_from_metadata_and_preserves_newer_live_rows() {
+        let mirror = MemoryMirror::for_agent("codex");
+        let asid = AgentSessionId("initial-history".into());
+        mirror.update_session(info(&asid, "Existing session")).await;
+        let gate = mirror.history_gate(&asid).await;
+        assert!(!mirror.history_initialized(&asid).await);
+        let before = mirror.history_read_revision(&asid).await.unwrap();
+        mirror
+            .upsert_timeline_items(
+                &asid,
+                vec![text_item("answer", "turn", "Live completed answer")],
+            )
+            .await;
+        assert!(
+            mirror
+                .initialize_history(
+                    &asid,
+                    &gate,
+                    before,
+                    vec![
+                        text_item("question", "turn", "Original question"),
+                        text_item("answer", "turn", "Stale partial answer"),
+                    ]
+                )
+                .await
+        );
+        let snapshot = mirror.get_snapshot(&asid).await.unwrap();
+        assert!(mirror.history_initialized(&asid).await);
+        assert_eq!(snapshot.info.agent_id, "codex");
+        assert_eq!(snapshot.timeline.len(), 2);
+        assert!(snapshot.timeline.iter().any(
+            |item| matches!(&item.part, AgentPart::Text { text } if text == "Live completed answer")
+        ));
+        let second = vec![text_item(
+            "unrequested",
+            "turn",
+            "Do not replace initialized history",
+        )];
+        assert!(
+            mirror
+                .initialize_history(&asid, &gate, (snapshot.seq, 0), second)
+                .await
+        );
+        assert_eq!(
+            mirror.get_snapshot(&asid).await.unwrap().timeline,
+            snapshot.timeline
+        );
+    }
+
+    #[tokio::test]
+    async fn initial_history_cannot_resurrect_rows_removed_during_the_read() {
+        for boundary in [false, true] {
+            for cached in [false, true] {
+                let mirror = MemoryMirror::for_agent("codex");
+                let asid = AgentSessionId("removed-history".into());
+                mirror.update_session(info(&asid, "Existing session")).await;
+                let row = text_item("old-row", "msg_old", "Removed answer");
+                if cached {
+                    mirror.upsert_timeline_items(&asid, vec![row.clone()]).await;
+                }
+                let gate = mirror.history_gate(&asid).await;
+                let before = mirror.history_read_revision(&asid).await.unwrap();
+                if boundary {
+                    mirror.remove_timeline_from(&asid, "msg_old").await;
+                } else {
+                    mirror
+                        .remove_timeline_items(&asid, &["old-row".into()])
+                        .await;
+                }
+                assert!(
+                    !mirror
+                        .initialize_history(&asid, &gate, before, vec![row])
+                        .await
+                );
+                assert!(!mirror.history_initialized(&asid).await);
+                assert!(mirror
+                    .get_snapshot(&asid)
+                    .await
+                    .unwrap()
+                    .timeline
+                    .is_empty());
+                let after = mirror.history_read_revision(&asid).await.unwrap();
+                assert!(mirror.initialize_history(&asid, &gate, after, vec![]).await);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn initial_empty_history_is_cached_and_old_gate_cannot_initialize_recreated_session() {
+        let mirror = MemoryMirror::for_agent("codex");
+        let asid = AgentSessionId("empty-history".into());
+        mirror.update_session(info(&asid, "Empty session")).await;
+        let gate = mirror.history_gate(&asid).await;
+        assert!(
+            mirror
+                .initialize_history(&asid, &gate, (1, 0), vec![])
+                .await
+        );
+        assert!(mirror.history_initialized(&asid).await);
+        mirror.sessions.write().await.remove(&asid);
+        mirror
+            .update_session(info(&asid, "Recreated session"))
+            .await;
+        assert!(
+            !mirror
+                .initialize_history(&asid, &gate, (1, 0), vec![])
+                .await
+        );
+        assert!(!mirror.history_initialized(&asid).await);
+    }
+
+    #[tokio::test]
     async fn test_memory_mirror_lifecycle() {
         let mirror = MemoryMirror::new();
         let asid = AgentSessionId("ses-mirror-test".to_string());
@@ -1806,7 +2321,23 @@ mod tests {
             .await
             .expect("created");
 
-        let AgentPart::Tool(call) = item.part else {
+        let mut incoming = item.clone();
+        if let AgentPart::Tool(call) = &mut incoming.part {
+            call.output = Some(serde_json::json!(huge));
+            call.truncated = false;
+        }
+        let AgentDomainEvent::TimelineUpsert { items, seq, .. } =
+            mirror.record_timeline_upsert(&asid, vec![incoming]).await
+        else {
+            panic!("expected timeline event")
+        };
+        assert_eq!(items[0].seq, seq);
+        let snapshot = mirror.get_snapshot(&asid).await.unwrap();
+        assert_eq!(
+            serde_json::to_value(&items[0]).unwrap(),
+            serde_json::to_value(&snapshot.timeline[0]).unwrap()
+        );
+        let AgentPart::Tool(call) = &items[0].part else {
             panic!("expected a tool part");
         };
         assert!(call.truncated, "an oversized result is flagged");

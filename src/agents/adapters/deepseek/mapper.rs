@@ -99,6 +99,11 @@ pub fn map_session(raw: &Value) -> Option<AgentSessionInfo> {
         asid: AgentSessionId(session_id.to_string()),
         agent_id: String::new(),
         backend_session_id: session_id.to_string(),
+        runtime: None,
+        context_usage: None,
+        git_info: None,
+        agent_name: None,
+        agent_role: None,
         title,
         mode: projections_values
             .and_then(|v| v.get("agentPreset"))
@@ -927,6 +932,7 @@ pub fn map_question_request(
         .unwrap_or("Question")
         .to_string();
     Some(FormRequest {
+        nonblocking: false,
         id: event_id.to_string(),
         asid: AgentSessionId(agent_id.to_string()),
         title,

@@ -17,7 +17,7 @@ Two planes are implemented in this binary:
   adapters implement it.
 - **Agents plane** — agent sessions, models, prompts, tasks,
   permissions, approvals and event history, behind the `AgentPort`
-  port; the OpenCode, DeepSeek and T3 Code adapters implement it.
+  port; the OpenCode, DeepSeek, T3 Code and Codex adapters implement it.
 
 `/api/discovery` also reports an **SSH plane**, but that one is the app's own
 transport, not a gateway subsystem: the phone can open an SSH connection to a
@@ -49,7 +49,7 @@ the far side. The gateway implements no SSH client or server itself.
 │   │ port: TerminalBackend      │  │ port: AgentPort                │     │
 │   └─────────────┬──────────────┘  └───────────────┬────────────────┘     │
 │                 │                                 │                      │
-│        Herdr adapter · tmux adapter   OpenCode · DeepSeek · T3 Code      │
+│        Herdr adapter · tmux adapter   OpenCode · DeepSeek · T3 · Codex   │
 │                                       adapters                           │
 │                                                                          │
 │  routes: platform (health, discovery, openapi) · connectivity (pairing,  │
@@ -62,6 +62,7 @@ the far side. The gateway implements no SSH client or server itself.
         │
         ▼
  Herdr unix socket · tmux argv · OpenCode / DeepSeek HTTP · T3 WebSocket
+ Codex private app-server stdio
 ```
 
 A request travels: the phone authenticates with its device token (and, when
@@ -350,7 +351,9 @@ muqun-gateway agent setup deepseek   # point the gateway at a running DeepSeek H
 prints one line per agent (`id  status  version  endpoint  → next step`) and
 whether the gateway is running, and exits non-zero while an enabled agent is not
 usable. It reports reachability only: it never attaches, so it shows `reachable`
-where the gateway may be `connected`. A T3 bearer the server refuses (expired or
+where the gateway may be `connected`. For Codex, the shell probe only checks the
+executable; authentication/readiness remains unknown until Gateway supervision.
+A T3 bearer the server refuses (expired or
 revoked) shows as `unconfigured`. `setup t3` checks that a T3 server answers
 (`--url`, else `t3.url`, else `http://127.0.0.1:3773`), mints a bearer with
 `t3 auth session issue` when `t3` is on `PATH` (`--base-dir` is passed through) or
@@ -373,7 +376,7 @@ no setup.
 ### Agents started from the phone
 
 Nobody sits at the terminal of an agent the gateway starts for the phone or an
-MCP caller, so by default Codex starts with
+MCP caller in a terminal pane, so by default terminal Codex starts with
 `--dangerously-bypass-approvals-and-sandbox` and Claude Code with
 `--dangerously-skip-permissions`, and the task directory is marked trusted
 for both (only directories inside your home). That agent then runs commands
@@ -390,6 +393,31 @@ and switches them under Settings › Agents started from the phone. Details: [Ag
 Delegated agents run as your OS user. Selecting a task folder is not a sandbox;
 `agent_launch_args` and `agent_trust_folders` are owner controls, not isolation
 from other processes or shell commands running as that same user.
+
+### The Codex service agent
+
+Codex support is **on by default**. At boot Gateway starts the one shared
+daemon with `codex app-server daemon start` when its socket is absent, or
+attaches if Codex already started it. A terminal Codex opened later joins that
+same socket and the same threads. Gateway does not start a second private
+server, and it never stops or restarts the daemon. It never installs Codex or
+logs you in automatically. A missing installation or authentication does not
+block other agents. Codex **0.162.1 or newer** is accepted. The protocol was checked against 0.162.1.
+
+To turn it off in `config.json`:
+
+```json
+{ "codex": { "enabled": false } }
+```
+
+`agent_runtime.enabled: false` turns off all service agents, not terminal agents.
+`muqun-gateway agent setup codex` only explains setup; it does not start Codex or
+change authentication. Terminal Codex launch routes and their permission flags
+are unchanged and separate from this private service agent. Model selection is
+an ephemeral next-turn choice, not a durable pre-turn upstream change. See the
+[Agent API](docs/agent-api.md) and [Codex protocol reference](docs/codex-protocol.md)
+for capabilities and limits. Real Codex and paired App/macOS acceptance remain
+deferred; protocol fixtures are not live certification.
 
 ### The OpenCode agent
 
@@ -441,7 +469,7 @@ The upstream contract baseline is OpenCode **2.0.27** (released October 12,
 platform certification. Gateway absorbs the protocol mapping without requiring
 an existing App update. Session lists remain arrays; optional pagination needs
 `agent_session_pages_v1` and the selected agent's `sessionPagination` flag
-(OpenCode only). The current App still requests fifty sessions and does not
+(OpenCode and Codex). The current App still requests fifty sessions and does not
 automatically fetch further pages. See the [Agent API](docs/agent-api.md#get-apiagent-sessionspage).
 
 ### DeepSeek Harness compatibility
@@ -474,7 +502,11 @@ state directory (readable by you only), and never needs the token again.
 `t3.runtime_mode` sets what new threads may do without asking
 (`full-access` by default, or `approval-required`, `auto-accept-edits`,
 `auto`). The full reference is in `docs/agent-api.md` under "Configuring T3
-Code".
+Code". Protocol 1 or 2 is selected automatically from the server descriptor;
+an omitted protocol means 1, and unknown values are unsupported. Revert is
+available only after protocol 1 is known; it is false for V2 or an unknown
+protocol. See [T3 protocol reference](docs/t3-protocol.md) for the pinned V2
+nightly-source baseline and validation limits.
 
 If the configured listen IP changes or is unavailable, startup reports the
 address and asks you to update `listen` in the gateway's `config.json`, then
@@ -612,4 +644,6 @@ Gateway contract does not mean the current App browses every segment.
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+Apache-2.0. See [LICENSE](LICENSE).
+The original MIT copyright and permission notice for inherited code is retained
+in [LICENSE-MIT](LICENSE-MIT).

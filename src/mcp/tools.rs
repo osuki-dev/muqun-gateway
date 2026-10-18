@@ -902,6 +902,13 @@ pub(crate) async fn started_for_task(state: &AppState, session: &AssistantSessio
             pane_id,
         } => state.tasks.open_task_in_pane(session_id, pane_id).await,
         crate::mcp::tokens::TokenBinding::Agent { .. } => false,
+        crate::mcp::tokens::TokenBinding::Task { task_id } => {
+            super::issue::task_authority(state, task_id)
+                .await
+                .ok()
+                .flatten()
+                .is_some_and(|task| crate::tasks::service::OPEN_STATES.contains(&task.state))
+        }
     }
 }
 

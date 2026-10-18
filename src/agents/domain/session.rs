@@ -63,6 +63,26 @@ pub struct TokensUsage {
     pub cache_write: Option<u64>,
 }
 
+/// Current context occupancy, separate from cumulative session token usage.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionContextUsage {
+    pub tokens: Option<TokensUsage>,
+    pub total_tokens: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<serde_json::Value>,
+}
+
+/// Repository identity captured by the producer, not a live worktree status.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionGitInfo {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sha: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin_url: Option<String>,
+}
+
 /// The filters `GET /api/session` accepts, in the gateway's own vocabulary.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SessionQuery {
@@ -159,6 +179,86 @@ pub struct SessionForkInfo {
     pub message_id: Option<String>,
 }
 
+/// Observation and control ownership are independent of stored conversation history.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionRuntime {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript: Option<TranscriptSource>,
+    pub source: RuntimeSource,
+    pub interaction: RuntimeInteraction,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<TerminalRuntimeStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal: Option<RuntimeTerminal>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<RuntimeReason>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TranscriptSource {
+    Live,
+    Persisted,
+    Snapshot,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeSource {
+    Native,
+    Terminal,
+    Unobserved,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeInteraction {
+    Native,
+    Terminal,
+    Unavailable,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeReason {
+    NotLoaded,
+    AmbiguousTerminal,
+    TerminalUnavailable,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalRuntimeStatus {
+    Idle,
+    Working,
+    Blocked,
+    Starting,
+    Completed,
+    Unknown,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeTerminal {
+    pub session_id: String,
+    pub pane_id: String,
+    /// Opaque observed terminal/conversation binding; compare only, never decode.
+    /// It is not necessarily proof of a distinct process launch.
+    pub instance_id: String,
+}
+
+impl SessionRuntime {
+    pub fn apply(self, info: &mut AgentSessionInfo) {
+        if self.source == RuntimeSource::Terminal {
+            info.status = match self.status {
+                Some(TerminalRuntimeStatus::Working | TerminalRuntimeStatus::Starting) => {
+                    AgentSessionStatus::Busy
+                }
+                Some(TerminalRuntimeStatus::Idle) => AgentSessionStatus::Idle,
+                _ => AgentSessionStatus::Unknown,
+            };
+        } else if self.source == RuntimeSource::Unobserved {
+            info.status = AgentSessionStatus::Unknown;
+        }
+        info.runtime = Some(self);
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentSessionInfo {
     pub asid: AgentSessionId,
@@ -183,6 +283,16 @@ pub struct AgentSessionInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<ModelRef>,
     pub status: AgentSessionStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<SessionRuntime>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_usage: Option<SessionContextUsage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_info: Option<SessionGitInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_role: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub directory: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

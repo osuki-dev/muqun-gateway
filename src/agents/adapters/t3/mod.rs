@@ -28,6 +28,7 @@ pub mod endpoint;
 pub mod mapper;
 pub mod rpc;
 pub mod stream;
+pub mod v2;
 
 pub use client::T3Client;
 pub use driver::T3Driver;

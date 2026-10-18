@@ -107,6 +107,22 @@ pub(crate) async fn terminal_args(config: &crate::Config, kind: &str) -> Vec<Str
     launch_args(kind, &url, &helper, file.as_deref())
 }
 
+/// Per-thread shared Codex configuration, sent over its authenticated local
+/// API. The helper obtains authority for this task without daemon ancestry;
+/// neither these overrides nor terminal argv contain a bearer credential.
+pub(crate) fn terminal_task_shared_args(config: &crate::Config, task_id: &str) -> Vec<String> {
+    if !enabled(config) || !super::issue::valid_task_id(task_id) {
+        return Vec::new();
+    }
+    let url = super::local_url(&config.listen);
+    let helper = format!(
+        "{} --task-id {}",
+        hosts::helper_for_url(&url),
+        crate::terminal::shell_word::shell_word(task_id)
+    );
+    launch_args("codex", &url, &helper, None)
+}
+
 /// The launch arguments that give a `kind` agent started for a task
 /// [`TASK_SENTENCE`] out of band: Claude Code reads it from `file` (else
 /// from the argument) unless its configured launch arguments (`configured`)
@@ -413,6 +429,34 @@ async fn remove_if_there(path: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_thread_config_names_only_its_task_and_the_verified_helper() {
+        let state = crate::test_support::test_state("synthetic-admin", Vec::new());
+        let id = crate::tasks::domain::TaskId::new().0;
+        let args = terminal_task_shared_args(&state.config, &id);
+        assert_eq!(args.len(), 4);
+        let config: Vec<_> = args
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| {
+                assert_eq!(pair[0], "-c");
+                pair[1].as_str()
+            })
+            .collect();
+        assert!(config[0].starts_with("mcp_servers.muqun.url="));
+        assert!(config[1].contains("mcp token-helper"));
+        assert!(config[1].contains("--url"));
+        assert!(config[1].contains(&format!("--task-id '{id}'")));
+        assert!(!config
+            .iter()
+            .any(|value| value.contains("synthetic-admin") || value.contains("Bearer")));
+        assert!(terminal_task_shared_args(&state.config, "task; executable").is_empty());
+        let mut config = state.config.clone();
+        config.mcp.inject_into_agents = false;
+        assert!(terminal_task_shared_args(&config, &id).is_empty());
+    }
     use crate::test_support::{test_state, FakeAgent, FakeMcp};
 
     #[test]

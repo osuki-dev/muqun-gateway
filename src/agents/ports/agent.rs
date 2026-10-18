@@ -31,6 +31,8 @@ pub enum AgentError {
     /// such as handing the agent a file it never uploaded. A `400`, not an
     /// agent fault.
     InvalidRequest(String),
+    /// A live external runtime must be controlled through its existing terminal.
+    TerminalInteraction(Box<crate::agents::domain::SessionRuntime>),
 }
 
 impl fmt::Display for AgentError {
@@ -46,6 +48,10 @@ impl fmt::Display for AgentError {
             Self::Protocol(msg) => write!(f, "Protocol error: {msg}"),
             Self::Unsupported(cap) => write!(f, "Agent does not support capability: {cap}"),
             Self::InvalidRequest(msg) => write!(f, "Invalid request: {msg}"),
+            Self::TerminalInteraction(_) => write!(
+                f,
+                "Native interaction is unavailable; use the current terminal binding when provided"
+            ),
         }
     }
 }
@@ -65,9 +71,19 @@ pub struct FileDiffItem {
 pub enum AttachmentMode {
     /// The agent's own API carries file parts.
     Native,
+    /// Native file parts, restricted to files uploaded to this Gateway.
+    /// Remote URLs, data URIs and arbitrary host paths are not accepted.
+    NativeUploads,
     /// The agent has no attachment API but can read files off this host, so
     /// the prompt use case lists the paths in the text instead.
     ByPath,
+}
+
+/// A new service-owned session that an official terminal client can attach to.
+/// No prompt has been submitted; the caller performs its existing one-shot delivery.
+pub struct PreparedTerminalLaunch {
+    pub session: AgentSessionInfo,
+    pub arguments: Vec<String>,
 }
 
 /// `text` followed by a block listing `paths` for an agent that reads files
@@ -113,8 +129,35 @@ pub trait AgentPort: Send + Sync {
         mode: Option<&'a str>,
     ) -> AgentFuture<'a, AgentSessionInfo>;
 
+    /// Prepare a shared session from supported native CLI choices. Unsupported
+    /// is returned only before creating a session; other failures are ambiguous
+    /// and must never trigger a second launch or prompt delivery.
+    fn prepare_terminal_launch<'a>(
+        &'a self,
+        _directory: &'a str,
+        _title: &'a str,
+        _arguments: &'a [String],
+    ) -> AgentFuture<'a, PreparedTerminalLaunch> {
+        Box::pin(async { Err(AgentError::Unsupported("shared terminal startup".into())) })
+    }
+
     /// Get session metadata
     fn get_session<'a>(&'a self, session_id: &'a str) -> AgentFuture<'a, AgentSessionInfo>;
+
+    /// Prepare a user-selected snapshot, even when its retained mirror is warm.
+    /// Must not replace history or submit a prompt. Discovery and metadata-only
+    /// reads do not call this hook. Rejected ownership must remain an error.
+    fn prepare_selected_session<'a>(&'a self, _id: &'a str) -> AgentFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    /// Optional fresh runtime observation, without reading/replacing transcript history.
+    fn session_runtime<'a>(
+        &'a self,
+        _id: &'a str,
+    ) -> AgentFuture<'a, Option<crate::agents::domain::SessionRuntime>> {
+        Box::pin(async { Ok(None) })
+    }
 
     /// Whether `send_prompt` takes attachments natively or wants them listed
     /// in the text as host paths.

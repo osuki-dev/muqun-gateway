@@ -2,6 +2,7 @@
 
 pub mod backend;
 pub mod backend_startup;
+pub(crate) mod codex_images;
 pub mod command_catalog;
 pub mod composer;
 pub(crate) mod exit_marker;

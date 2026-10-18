@@ -1,10 +1,11 @@
-//! Pane-bound token issuance: which pane is the calling process in, and the
-//! sweep that retires a pane's token once the pane is gone.
+//! Pane/task-bound token issuance and retirement of ended bindings.
 //!
 //! The helper a pane runs sends the pids of its own ancestry; the pane whose
 //! shell is the nearest of them is the caller's pane. Pids are not a secret --
 //! the endpoint is admin-only (the CLI's pairing token), and the match is what
 //! binds the token to a place, not what authorises the request.
+//! A shared daemon's helper instead names its immutable task. The same admin
+//! credential authorizes issuance; task IDs are selectors, never credentials.
 
 use std::collections::HashSet;
 use std::time::Duration;
@@ -16,7 +17,7 @@ use serde_json::Value;
 
 use super::tokens::{IssuedToken, TokenBinding, PANE_TOKEN_TTL_MS};
 use crate::backend::Pane;
-use crate::tasks::domain::now_ms;
+use crate::tasks::domain::{now_ms, Task, TaskBinding, TaskId, TaskKind, TaskState};
 use crate::{api_error, terminal_backend, AppState};
 
 const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
@@ -28,7 +29,9 @@ const DEAD_TOKEN_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 #[derive(Debug, Deserialize)]
 pub(crate) struct IssueRequest {
     /// The caller's own pid first, then its parent, and so on up.
-    pub ancestor_pids: Vec<u32>,
+    pub ancestor_pids: Option<Vec<u32>>,
+    /// Admin-selected immutable task authority, never inferred from a daemon PID.
+    pub task_id: Option<String>,
     #[serde(default)]
     pub label: Option<String>,
 }
@@ -43,12 +46,35 @@ impl IssueRequest {
     /// Whether the request is within [`MAX_LABEL_CHARS`] and
     /// [`MAX_ANCESTOR_PIDS`].
     pub(crate) fn within_bounds(&self) -> bool {
-        self.ancestor_pids.len() <= MAX_ANCESTOR_PIDS
+        let binding_valid = match (&self.ancestor_pids, &self.task_id) {
+            (Some(pids), None) => pids.len() <= MAX_ANCESTOR_PIDS,
+            (None, Some(id)) => valid_task_id(id),
+            _ => false,
+        };
+        binding_valid
             && self
                 .label
                 .as_ref()
                 .is_none_or(|label| label.chars().count() <= MAX_LABEL_CHARS)
     }
+}
+
+pub(crate) fn valid_task_id(id: &str) -> bool {
+    id.len() == 24
+        && id.starts_with("t_")
+        && id[2..]
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
+}
+
+/// Kept done/failed delegations may run explicit follow-ups. Cancellation or
+/// deletion ends authority; another task in the same pane never inherits it.
+pub(crate) async fn task_authority(state: &AppState, id: &str) -> anyhow::Result<Option<Task>> {
+    Ok(state.tasks.task(&TaskId(id.to_owned())).await?.filter(|task| {
+        task.kind == TaskKind::Delegation
+            && task.state != TaskState::Cancelled
+            && matches!(&task.binding, TaskBinding::Pane { agent_id: Some(agent), .. } if agent == "codex")
+    }))
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -96,12 +122,39 @@ async fn list_all(state: &AppState) -> Listing {
     listing
 }
 
-pub(crate) async fn issue_for_process(
+pub(crate) async fn issue_for_caller(
     state: &AppState,
     request: IssueRequest,
 ) -> Result<IssuedToken, (StatusCode, Json<Value>)> {
+    if let Some(task_id) = request.task_id {
+        if !matches!(task_authority(state, &task_id).await, Ok(Some(_))) {
+            return Err(api_error(
+                StatusCode::NOT_FOUND,
+                "task_not_available",
+                "Task token authority is unavailable",
+            ));
+        }
+        return state
+            .mcp_tokens
+            .issue(
+                TokenBinding::Task { task_id },
+                request.label.unwrap_or_else(|| "codex task".into()),
+                PANE_TOKEN_TTL_MS,
+            )
+            .await
+            .map_err(|_| {
+                api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "token_store_unavailable",
+                    "the assistant token store is unavailable",
+                )
+            });
+    }
     let listing = list_all(state).await;
-    let Some(found) = match_pane(&request.ancestor_pids, &listing.panes) else {
+    let Some(found) = match_pane(
+        request.ancestor_pids.as_deref().unwrap_or_default(),
+        &listing.panes,
+    ) else {
         return Err(api_error(
             StatusCode::NOT_FOUND,
             "pane_not_found",
@@ -146,7 +199,7 @@ pub(crate) async fn sweep_closed_panes(state: &AppState) -> usize {
                 session_id,
                 pane_id,
             } => Some((row.id, session_id, pane_id)),
-            TokenBinding::Agent { .. } => None,
+            TokenBinding::Agent { .. } | TokenBinding::Task { .. } => None,
         })
         .collect();
     if pane_tokens.is_empty() {
@@ -172,15 +225,34 @@ pub(crate) async fn sweep_closed_panes(state: &AppState) -> usize {
     revoked
 }
 
+pub(crate) async fn sweep_task_tokens(state: &AppState) -> usize {
+    let Ok(rows) = state.mcp_tokens.list().await else {
+        return 0;
+    };
+    let mut revoked = 0;
+    for row in rows {
+        let TokenBinding::Task { task_id } = row.binding else {
+            continue;
+        };
+        // Store failure does not prove a task was deleted.
+        if matches!(task_authority(state, &task_id).await, Ok(None))
+            && matches!(state.mcp_tokens.revoke(&row.id).await, Ok(true))
+        {
+            revoked += 1;
+        }
+    }
+    revoked
+}
+
 pub(crate) fn spawn_sweeper(state: AppState) {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(SWEEP_INTERVAL);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tick.tick().await;
-            let revoked = sweep_closed_panes(&state).await;
+            let revoked = sweep_closed_panes(&state).await + sweep_task_tokens(&state).await;
             if revoked > 0 {
-                tracing::info!(revoked, "revoked assistant tokens of closed panes");
+                tracing::info!(revoked, "revoked assistant tokens whose bindings ended");
             }
             let before = now_ms().saturating_sub(DEAD_TOKEN_RETENTION.as_millis() as u64);
             match state.mcp_tokens.purge_dead(before).await {

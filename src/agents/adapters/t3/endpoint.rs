@@ -1,10 +1,8 @@
 //! Where a T3 Code server is and how the gateway proves itself to it.
 //!
 //! The auth flow, as observed against `t3 serve` 0.0.42 and still current in
-//! 0.0.45 (which reports `orchestrationProtocolVersion: 1`). Orchestrator V2
-//! servers (0.0.46 nightlies on) accept only V2 clients: a descriptor
-//! announcing a protocol above [`super::ORCHESTRATION_PROTOCOL_VERSION`] is
-//! never attached to (see [`EnvironmentDescriptor::unsupported_reason`]).
+//! 0.0.45 (protocol 1) and the pinned 0.0.46 nightly (protocol 2). The public
+//! descriptor selects the protocol before any one-time pairing exchange.
 //!
 //! The flow:
 //!
@@ -29,6 +27,23 @@ use serde_json::Value;
 
 use super::MAX_PAYLOAD_BYTES;
 use crate::agents::ports::agent::AgentError;
+
+/// Selected from the public descriptor, never from the server version string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum T3Protocol {
+    #[default]
+    V1,
+    V2,
+}
+
+impl T3Protocol {
+    pub fn version(self) -> u64 {
+        match self {
+            Self::V1 => 1,
+            Self::V2 => 2,
+        }
+    }
+}
 
 pub const WELL_KNOWN_PATH: &str = "/.well-known/t3/environment";
 pub const TOKEN_PATH: &str = "/oauth/token";
@@ -68,12 +83,23 @@ pub struct EnvironmentDescriptor {
     #[serde(rename = "serverVersion")]
     pub server_version: String,
     /// Absent on the wire means protocol 1.
-    #[serde(rename = "orchestrationProtocolVersion")]
+    #[serde(
+        rename = "orchestrationProtocolVersion",
+        default,
+        deserialize_with = "decode_protocol_version"
+    )]
     pub orchestration_protocol_version: Option<u64>,
     #[serde(default)]
     pub platform: Value,
     #[serde(default)]
     pub capabilities: Value,
+}
+
+fn decode_protocol_version<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<u64>, D::Error> {
+    // Omission is legacy V1; explicit null, strings and fractions are invalid.
+    u64::deserialize(deserializer).map(Some)
 }
 
 impl EnvironmentDescriptor {
@@ -82,16 +108,22 @@ impl EnvironmentDescriptor {
             .unwrap_or(super::ORCHESTRATION_PROTOCOL_VERSION)
     }
 
-    /// Why this gateway cannot drive the server, or `None` when it can: a
-    /// server speaking a newer orchestration protocol rejects this client.
+    /// Only known protocols are supported, including rejection of zero.
     pub fn unsupported_reason(&self) -> Option<String> {
         let version = self.protocol_version();
-        let supported = super::ORCHESTRATION_PROTOCOL_VERSION;
-        (version > supported).then(|| {
+        (!matches!(version, 1 | 2)).then(|| {
             format!(
-                "T3 server speaks orchestration protocol {version}; this gateway supports {supported}"
+                "T3 server speaks orchestration protocol {version}; this gateway supports 1 and 2"
             )
         })
+    }
+
+    pub fn protocol(&self) -> Result<T3Protocol, AgentError> {
+        match self.protocol_version() {
+            1 => Ok(T3Protocol::V1),
+            2 => Ok(T3Protocol::V2),
+            _ => Err(AgentError::Unsupported(self.unsupported_reason().unwrap())),
+        }
     }
 
     pub fn capability(&self, name: &str) -> bool {
@@ -127,6 +159,8 @@ pub struct T3Endpoint {
     /// `ws(s)://host:port/ws`, without the ticket.
     pub ws_url: String,
     pub credential: T3Credential,
+    pub protocol: T3Protocol,
+    pub environment_id: Option<String>,
 }
 
 impl T3Endpoint {
@@ -148,7 +182,18 @@ impl T3Endpoint {
             url,
             ws_url,
             credential,
+            protocol: T3Protocol::V1,
+            environment_id: None,
         }
+    }
+
+    pub fn with_descriptor(
+        mut self,
+        descriptor: &EnvironmentDescriptor,
+    ) -> Result<Self, AgentError> {
+        self.protocol = descriptor.protocol()?;
+        self.environment_id = Some(descriptor.environment_id.clone());
+        Ok(self)
     }
 
     /// `T3_URL` (or `T3CODE_URL`) plus `T3_TOKEN` (bearer) or
@@ -178,7 +223,11 @@ impl T3Endpoint {
     }
 
     pub fn ws_url_with_ticket(&self, ticket: &str) -> String {
-        format!("{}?wsTicket={}", self.ws_url, url_encode(ticket))
+        let mut url = format!("{}?wsTicket={}", self.ws_url, url_encode(ticket));
+        if self.protocol == T3Protocol::V2 {
+            url.push_str("&orchestrationProtocol=2");
+        }
+        url
     }
 
     /// Fetch the environment descriptor. This is the health probe: a server
@@ -238,6 +287,21 @@ impl T3Endpoint {
         pairing: &str,
         client_label: &str,
     ) -> Result<BearerGrant, AgentError> {
+        // This boundary also protects direct clients, not only the runtime.
+        // Reject an unknown protocol before consuming a bootstrap credential.
+        let descriptor = self.describe(http).await?;
+        descriptor.protocol()?;
+        if self
+            .environment_id
+            .as_ref()
+            .is_some_and(|id| id != &descriptor.environment_id)
+            || (self.environment_id.is_some()
+                && descriptor.protocol_version() != self.protocol.version())
+        {
+            return Err(AgentError::NotAvailable(
+                "T3 environment changed before pairing".into(),
+            ));
+        }
         let form = [
             ("grant_type", GRANT_TYPE),
             ("subject_token", pairing),
@@ -256,7 +320,7 @@ impl T3Endpoint {
         let status = resp.status();
         let body = read_bounded(resp, 64 * 1024).await?;
         if !status.is_success() {
-            tracing::warn!(%status, body = %String::from_utf8_lossy(&body[..body.len().min(300)]), "t3 pairing exchange rejected");
+            tracing::warn!(%status, "t3 pairing exchange rejected");
             return Err(AgentError::NotAvailable(format!(
                 "pairing exchange returned HTTP {status}"
             )));
@@ -433,12 +497,25 @@ mod tests {
     }
 
     #[test]
-    fn protocol_1_is_supported_and_protocol_2_is_not() {
+    fn only_known_protocols_are_supported() {
         assert_eq!(descriptor_with_protocol(1).unsupported_reason(), None);
+        assert_eq!(descriptor_with_protocol(2).unsupported_reason(), None);
         assert_eq!(
-            descriptor_with_protocol(2).unsupported_reason().as_deref(),
-            Some("T3 server speaks orchestration protocol 2; this gateway supports 1")
+            descriptor_with_protocol(3).unsupported_reason().as_deref(),
+            Some("T3 server speaks orchestration protocol 3; this gateway supports 1 and 2")
         );
+        assert!(descriptor_with_protocol(0).unsupported_reason().is_some());
+        for invalid in [
+            Value::Null,
+            serde_json::json!("2"),
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+        ] {
+            let mut raw: Value =
+                serde_json::from_str(include_str!("fixtures/environment.json")).unwrap();
+            raw["orchestrationProtocolVersion"] = invalid;
+            assert!(serde_json::from_value::<EnvironmentDescriptor>(raw).is_err());
+        }
     }
 
     #[test]
