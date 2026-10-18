@@ -131,6 +131,13 @@ pub trait AgentPort: Send + Sync {
     /// Agent identifier (e.g. "opencode", "claude")
     fn kind(&self) -> &'static str;
 
+    /// Optional account rate windows, unrelated to context tokens or billing.
+    fn account_limits(
+        &self,
+    ) -> AgentFuture<'_, crate::agents::domain::account_limits::AccountLimits> {
+        Box::pin(async { Err(AgentError::Unsupported("account limits".into())) })
+    }
+
     /// Health check / availability probe
     fn probe(&self) -> AgentFuture<'_, bool>;
 

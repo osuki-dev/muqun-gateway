@@ -1,4 +1,5 @@
 //! Shared-daemon adapter. Codex 0.162.1 is the oldest accepted app-server.
+mod account_limits;
 mod async_questions;
 mod budget;
 pub mod client;

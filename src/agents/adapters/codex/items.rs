@@ -265,12 +265,32 @@ pub(super) fn parts(message: &str, id: &str, value: &Value) -> Vec<(String, Agen
                 .remove("durationMs");
             call
         }
-        "imageView" => tool(
-            value,
-            "image_view".into(),
-            json!({"path":value["path"]}),
-            None,
-        ),
+        "imageView" => {
+            let mut call = tool(
+                value,
+                "image_view".into(),
+                json!({"path":value["path"]}),
+                None,
+            );
+            // The official item has no status: its presence records the viewed image.
+            call.state = ToolCallStatus::Completed;
+            call.status = call.state;
+            if let Some(path) = value["path"].as_str().filter(|path| {
+                !path.is_empty() && path.len() <= 4096 && !path.chars().any(char::is_control)
+            }) {
+                let uri = if hosted_path(path) {
+                    reqwest::Url::from_file_path(path)
+                        .ok()
+                        .map(|uri| uri.to_string())
+                } else {
+                    Some(path.to_owned())
+                };
+                if let Some(uri) = uri {
+                    call.content = Some(json!([{"type":"file", "uri":uri}]));
+                }
+            }
+            call
+        }
         "functionCallOutput" => tool(
             value,
             value["name"].as_str().unwrap_or("tool").into(),
@@ -508,6 +528,121 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(body.as_ref(), std::fs::read(path).unwrap());
+    }
+
+    #[tokio::test]
+    async fn image_view_outside_workspace_gets_authenticated_preview_and_exact_original() {
+        use axum::extract::{Path as RoutePath, State};
+        use axum::http::{HeaderMap, StatusCode};
+        let workspace = ImageWorkspace::new();
+        let temporary = ImageWorkspace::new();
+        let path = temporary.image("view 中文%20 (1).png");
+        image::RgbImage::new(2, 2).save(&path).unwrap();
+        let state = crate::test_state("admin", vec![crate::test_device("d1", "token")]);
+        let mut rows = mapper::item(
+            "thread",
+            "turn",
+            &json!({"type":"imageView","id":"view","path":path}),
+            0,
+        );
+        let AgentPart::Tool(call) = &rows[0].part else {
+            panic!("expected tool")
+        };
+        assert_eq!(call.status, ToolCallStatus::Completed);
+        crate::agents::message_images::attach_to_items(
+            &state,
+            "thread",
+            workspace.0.to_str(),
+            &mut rows,
+        )
+        .await;
+        let asset = &rows[0].image_assets.as_ref().unwrap()[0];
+        assert!(asset.unavailable_reason.is_none());
+        assert!(asset.preview_url.is_some());
+        assert!(asset.download_url.is_some());
+        let AgentPart::Tool(call) = &rows[0].part else {
+            panic!("expected tool")
+        };
+        assert_eq!(call.content.as_ref().unwrap()[0]["uri"], asset.url);
+        assert_eq!(call.content.as_ref().unwrap()[0]["mime"], "image/png");
+        assert_eq!(
+            crate::agents::message_images::image_content(
+                State(state.clone()),
+                RoutePath((asset.asset_id.clone(), "download".into())),
+                HeaderMap::new()
+            )
+            .await
+            .unwrap_err()
+            .0,
+            StatusCode::UNAUTHORIZED
+        );
+        for variant in ["preview", "download"] {
+            let response = crate::agents::message_images::image_content(
+                State(state.clone()),
+                RoutePath((asset.asset_id.clone(), variant.into())),
+                crate::bearer_headers("token"),
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            if variant == "download" {
+                assert_eq!(bytes.as_ref(), std::fs::read(&path).unwrap());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn image_view_refuses_non_images_and_does_not_widen_other_tool_file_scope() {
+        let workspace = ImageWorkspace::new();
+        let outside = ImageWorkspace::new();
+        let path = outside.image("not-an-image.png");
+        std::fs::write(&path, "synthetic credential text, not an image").unwrap();
+        let state = crate::test_state("admin", vec![]);
+        let mut rows = mapper::item(
+            "thread",
+            "turn",
+            &json!({"type":"imageView","id":"view","path":path}),
+            0,
+        );
+        crate::agents::message_images::attach_to_items(
+            &state,
+            "thread",
+            workspace.0.to_str(),
+            &mut rows,
+        )
+        .await;
+        let asset = &rows[0].image_assets.as_ref().unwrap()[0];
+        assert_eq!(
+            asset.unavailable_reason.as_deref(),
+            Some("image_content_unavailable")
+        );
+        assert!(asset.download_url.is_none());
+        let path = outside.image("real.png");
+        let mut rows = mapper::item(
+            "thread",
+            "turn",
+            &json!({"type":"imageView","id":"other","path":path}),
+            0,
+        );
+        if let AgentPart::Tool(call) = &mut rows[0].part {
+            call.name = "unrelated_tool".into();
+        }
+        crate::agents::message_images::attach_to_items(
+            &state,
+            "thread",
+            workspace.0.to_str(),
+            &mut rows,
+        )
+        .await;
+        assert_eq!(
+            rows[0].image_assets.as_ref().unwrap()[0]
+                .unavailable_reason
+                .as_deref(),
+            Some("reference_not_authorized_or_unavailable")
+        );
     }
 
     #[tokio::test]

@@ -1,0 +1,133 @@
+name: preview
+
+# Explicit publication only. Nothing publishes on ordinary feature pushes.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: preview-publication
+  cancel-in-progress: false
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Prepare unique preview version
+        id: version
+        run: python3 scripts/prepare-preview.py
+      - name: Install tmux
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends tmux
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked
+
+  build:
+    needs: checks
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+            builder: cargo
+          - os: macos-14
+            target: x86_64-apple-darwin
+            builder: cargo
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            builder: cross
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            builder: cross
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - name: Prepare same preview version
+        run: python3 scripts/prepare-preview.py
+      - name: Add native target
+        if: matrix.builder == 'cargo'
+        run: rustup target add ${{ matrix.target }}
+      - name: Install cross
+        if: matrix.builder == 'cross'
+        run: cargo install cross --locked --version 0.2.5
+      - name: Build
+        run: ${{ matrix.builder }} build --release --locked --target ${{ matrix.target }}
+      - name: Stage artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="muqun-gateway-${{ matrix.target }}"
+          cp "target/${{ matrix.target }}/release/muqun-gateway" "$binary"
+          shasum -a 256 "$binary" > "$binary.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: preview-${{ matrix.target }}
+          path: |
+            muqun-gateway-${{ matrix.target }}
+            muqun-gateway-${{ matrix.target }}.sha256
+          if-no-files-found: error
+
+  publish:
+    needs: [checks, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: preview-*
+          merge-multiple: true
+          path: artifacts
+      - name: Validate complete matrix and publish once
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PREVIEW_VERSION: ${{ needs.checks.outputs.version }}
+          SOURCE_SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$PREVIEW_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+-preview\.[0-9]+$ ]]
+          cd artifacts
+          for target in aarch64-apple-darwin x86_64-apple-darwin x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
+            test -s "muqun-gateway-$target"
+            test -s "muqun-gateway-$target.sha256"
+            sha256sum --check "muqun-gateway-$target.sha256"
+          done
+          test "$(find . -maxdepth 1 -type f | wc -l)" -eq 8
+          cd ..
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          notes = Path('release-notes/unreleased.md').read_text().strip()
+          assert notes
+          Path('preview-notes.md').write_text(notes + '\n\nPreview build from source commit ' + os.environ['SOURCE_SHA'] + '. CI stamps Cargo.toml and Cargo.lock to version ' + os.environ['PREVIEW_VERSION'] + '; the tag preserves the reviewed source tree.\n')
+          PY
+          tag="v$PREVIEW_VERSION"
+          # Existing tags/releases are never overwritten, including reruns.
+          if git ls-remote --exit-code --tags origin "refs/tags/$tag"; then
+            echo 'Preview tag already exists; refusing to publish.' >&2
+            exit 1
+          else
+            status=$?
+            test "$status" -eq 2
+          fi
+          gh release create "$tag" --target "$SOURCE_SHA" --draft --prerelease --latest=false --title "$tag" --notes-file preview-notes.md
+          gh release upload "$tag" artifacts/*
+          gh release edit "$tag" --draft=false --prerelease --latest=false

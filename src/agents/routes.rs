@@ -343,6 +343,10 @@ pub struct ReplyFormBody {
 pub fn mount(router: Router<AppState>) -> Router<AppState> {
     super::ws_routes::mount(router)
         .route(
+            "/api/agents/{agent_id}/account-limits",
+            get(get_account_limits),
+        )
+        .route(
             "/api/agent-sessions/{asid}/audio-asset",
             get(message_images::audio_asset),
         )
@@ -636,6 +640,26 @@ pub fn mount(router: Router<AppState>) -> Router<AppState> {
 // ---------------------------------------------------------------------------
 // Core implementation functions (pure OpenCode, zero herdr/tmux dependency)
 // ---------------------------------------------------------------------------
+
+async fn get_account_limits(
+    State(state): State<AppState>,
+    Path(agent_id): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    require_device(&state, &headers)?;
+    let manager = agent_manager_or_err(&state, &agent_id).await?;
+    let snapshot = manager
+        .agent()
+        .account_limits()
+        .await
+        .map_err(agent_error)?;
+    let mut response = Json(snapshot).into_response();
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    Ok(response)
+}
 
 /// The manager of one named agent. An id this gateway has never heard of is
 /// `400 invalid_agent`; a known one that is not attached is
@@ -3689,6 +3713,11 @@ mod tests {
                 "device_repair_required",
             ),
         ] {
+            let limits_refusal =
+                get_account_limits(State(state.clone()), Path("codex".into()), headers.clone())
+                    .await
+                    .unwrap_err();
+            assert_eq!(limits_refusal.0, status);
             let refusal = do_read_agent_session(&state, "fixture", true, &headers)
                 .await
                 .unwrap_err();
@@ -3766,6 +3795,24 @@ mod tests {
             state.agent_runtime.attach_for_test(agent.manager()).await;
         }
         state
+    }
+
+    #[tokio::test]
+    async fn account_limits_refuses_unsupported_and_never_falls_back() {
+        let state = state_with(vec![FakeAgent::new("opencode")]).await;
+        for (agent, status) in [
+            ("opencode", StatusCode::NOT_IMPLEMENTED),
+            ("codex", StatusCode::SERVICE_UNAVAILABLE),
+            ("unknown", StatusCode::BAD_REQUEST),
+        ] {
+            let response = get_response(
+                state.clone(),
+                &format!("/api/agents/{agent}/account-limits"),
+                crate::test_support::bearer_headers("device-token"),
+            )
+            .await;
+            assert_eq!(response.status(), status);
+        }
     }
 
     /// One answer for the whole tree: every depth below the session, each

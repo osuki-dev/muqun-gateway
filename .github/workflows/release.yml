@@ -30,6 +30,7 @@ jobs:
   # With the release already there, every matrix job takes the "it exists"
   # path and only uploads, which was never the racy part.
   release:
+    if: ${{ !contains(github.ref_name, '-') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

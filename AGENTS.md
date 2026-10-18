@@ -15,6 +15,14 @@ for experiments or automatically retry an ambiguous prompt submission.
 
 ## Releases
 
+- Preview publication also requires an explicit user release request. The manually
+  dispatched `preview.yml` workflow stamps the next patch version as
+  `X.Y.Z-preview.<run number>` in CI, checks and builds the complete matrix, then
+  publishes a GitHub prerelease with `make_latest=false`. Its tag preserves the
+  reviewed source commit; notes record the exact stamped version and source SHA.
+  Keep human-written `release-notes/unreleased.md` current before dispatch. Never
+  move an existing preview tag or silently downgrade an installed preview.
+
 - Publish releases from reviewed, tested commits using `vX.Y.Z` tags. Creating
   or pushing a tag requires a user request to release; a feature request does
   not authorize publishing a version.

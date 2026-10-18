@@ -206,7 +206,9 @@ The retired `herdr.gateway` identifier remains only for migration compatibility.
     confirmations, selected-row scrolling and cell-safe, `…`-cut rows.
   - `lifecycle.rs`: shared CLI/TUI start/stop/restart/status ownership and
     transition checks; serializes commands separately from the runtime state lock.
-  - `update.rs`: explicit stable-only official GitHub release checks and self-update;
+  - `update.rs`: explicit official GitHub release checks and self-update, stable by
+    default and preview only with `--channel preview`. Preview resolves the highest
+    numeric `X.Y.Z-preview.N` from a bounded, fully fetched release listing;
     requires the complete four-platform binary/checksum matrix, verifies bounded
     HTTPS downloads, SHA256/native platform/version, then atomically replaces with
     exact-image rollback. Retains one lifecycle controller across downtime; no
@@ -233,7 +235,7 @@ The retired `herdr.gateway` identifier remains only for migration compatibility.
   import compatibility and historical fixtures remain.
   Existing installs delegate to the identified protected updater without shell
   overwrite or a second restart; older installs are refused with manual migration
-  guidance. Fresh installs pin one stable tag for HTTPS binary/checksum downloads
+  guidance. Fresh installs pin one selected-channel tag for HTTPS binary/checksum downloads
   in private staging and verify SHA256 (integrity, not signing). Native
   ELF/Mach-O architecture is checked before staged execution; a time/output-bounded
   `--version` probe must match the pinned tag before publication. Fresh installs

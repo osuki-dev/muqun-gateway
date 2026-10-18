@@ -2,6 +2,16 @@
 
 ## Changes and fixes
 
+- Add an explicit Gateway preview channel for the installer and protected updater.
+  Stable remains the default; preview automatically selects the newest complete
+  `X.Y.Z-preview.N` release. Existing installs need a channel-capable stable updater
+  before switching. Preview uses the existing service and pairings; it does not
+  introduce a second instance or a new Herdr/App compatibility requirement.
+  Installing an update retains the existing lifecycle checks and restart behavior.
+  Returning to an older stable binary is still refused because binary rollback
+  alone cannot undo database migrations. Fresh preview installs require Python 3.
+  Publication uses a manually invoked CI workflow and never changes GitHub latest.
+
 - Codex subagent activity records no longer manufacture null `prompt`,
   `operation`, `model` and `reasoningEffort` arguments. Activities carry their
   actual operation and supplied metadata; child-session identity is preserved.

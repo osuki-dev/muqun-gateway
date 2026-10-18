@@ -242,11 +242,18 @@ fn joined_output_matches(output: Option<&Value>, content: &[Value]) -> bool {
     !content.is_empty() && remaining.is_empty()
 }
 
+#[derive(Clone, Copy)]
+enum FileScope {
+    Session,
+    AccountAttachment,
+    AccountImageView,
+}
+
 fn normalize(
     asid: &str,
     source: String,
     root: Option<&Path>,
-    user_attachment: bool,
+    scope: FileScope,
     budget: &mut usize,
     originals_dir: Option<&Path>,
 ) -> Normalized {
@@ -277,7 +284,10 @@ fn normalize(
         }
     } else {
         root.and_then(|root| {
-            if user_attachment {
+            if matches!(
+                scope,
+                FileScope::AccountAttachment | FileScope::AccountImageView
+            ) {
                 super::account_file(&source, root)
             } else {
                 hosted_file(&source, root)
@@ -310,6 +320,11 @@ fn normalize(
     let url = format!("/api/agent-images/{id}/original");
     let (width, height) = image_dimensions(&head).unzip();
     let image = kind.kind == AssetKind::Image;
+    // A native image-view item can explicitly reference account artifacts,
+    // but it must not turn a credential/non-image file into a downloadable asset.
+    if matches!(scope, FileScope::AccountImageView) && !image {
+        return failed("image_content_unavailable");
+    }
     let asset = MessageImageAsset {
         src: url.clone(),
         asset_id: id.clone(),
@@ -368,9 +383,32 @@ async fn attach_with_originals_dir(
                 .collect::<Vec<_>>();
             let user_attachment = item.role == crate::agents::domain::TimelineRole::User
                 && matches!(&item.part, AgentPart::Text { .. });
-            inputs.push((index, None, sources, user_attachment));
+            inputs.push((
+                index,
+                None,
+                sources,
+                if user_attachment {
+                    FileScope::AccountAttachment
+                } else {
+                    FileScope::Session
+                },
+            ));
         }
         if let AgentPart::Tool(call) = &mut item.part {
+            // Only the native structured imageView's exact file gets the same
+            // explicit account-artifact roots as a paired device file open.
+            // Arbitrary output text and other tool files retain their session fence.
+            let viewed_uri = (call.name == "image_view"
+                && call
+                    .metadata
+                    .as_ref()
+                    .is_some_and(|m| m["type"] == "imageView" && m["path"] == call.input["path"]))
+            .then(|| {
+                call.input["path"]
+                    .as_str()
+                    .and_then(|p| reqwest::Url::from_file_path(p).ok())
+            })
+            .flatten();
             if let Some(Value::Array(content)) = &call.content {
                 let raw = call.output.as_ref() == call.content.as_ref();
                 let has_file = content
@@ -389,7 +427,12 @@ async fn attach_with_originals_dir(
                             .and_then(|uri| uri.as_str().map(str::to_owned))
                         {
                             part["uri"] = Value::Null;
-                            inputs.push((index, Some(position), vec![(uri, false)], false));
+                            let scope = if viewed_uri.as_ref().is_some_and(|v| v.as_str() == uri) {
+                                FileScope::AccountImageView
+                            } else {
+                                FileScope::Session
+                            };
+                            inputs.push((index, Some(position), vec![(uri, false)], scope));
                         }
                     }
                 }
@@ -408,7 +451,7 @@ async fn attach_with_originals_dir(
         let mut budget = RESPONSE_WORK_BYTES;
         inputs
             .into_iter()
-            .map(|(index, position, sources, user_attachment)| {
+            .map(|(index, position, sources, scope)| {
                 let sources = sources
                     .into_iter()
                     .map(|(source, label)| {
@@ -423,7 +466,7 @@ async fn attach_with_originals_dir(
                                 &asid,
                                 source,
                                 root.as_deref(),
-                                user_attachment,
+                                scope,
                                 &mut budget,
                                 originals_dir.as_deref(),
                             )

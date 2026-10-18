@@ -95,6 +95,7 @@ fn run_installer(
 
 #[derive(Default)]
 struct DownloadCase {
+    preview: bool,
     existing: Option<&'static str>,
     fault: Option<&'static str>,
     tag: Option<&'static str>,
@@ -140,7 +141,7 @@ fn run_installer_case(
     // A closed PATH makes backend detection independent of the test host.
     for name in [
         "awk", "cut", "head", "chmod", "mkdir", "basename", "id", "uname", "cp", "sleep", "grep",
-        "mktemp", "rm", "wc", "ln", "cat", "ls", "stty", "od", "perl", "stat",
+        "mktemp", "rm", "wc", "ln", "cat", "ls", "stty", "od", "perl", "stat", "python3",
     ] {
         let program = [format!("/usr/bin/{name}"), format!("/bin/{name}")]
             .into_iter()
@@ -264,6 +265,9 @@ else
 fi
 [ "$permissions" = 700 ] || exit 91
 case "$url" in
+  "https://api.github.com/repos/osuki-dev/muqun-gateway/releases?per_page=100&page=1")
+    [ "$limit" = 1048576 ] || exit 91
+    cp "$MOCK_RELEASES" "$output";;
   "https://github.com/osuki-dev/muqun-gateway/releases/download/$MOCK_TAG/muqun-gateway-"*.sha256)
     [ "$limit" = 1024 ] || exit 91
     [ "$MOCK_FAULT" != missing ] || exit 22
@@ -324,10 +328,11 @@ case "$*" in
     empty-version) :;;
     oversized-version) printf '%02048d' 0;;
     hung-version) exec sleep 30;;
-    *) echo 'muqun-gateway 0.13.0';;
+    *) printf 'muqun-gateway %s\n' "$MOCK_VERSION";;
   esac;;
 'update --help')
   case "$MOCK_EXISTING" in
+    channel*) printf '%s\n' 'Check or manually install a newer stable official release (never downgrades).' 'Usage: muqun-gateway update [OPTIONS]' '  --check' '  --channel';;
     modern*) printf '%s\n' 'Check or manually install a newer stable official release (never downgrades).' 'Usage: muqun-gateway update [OPTIONS]' '  --check  Only check; do not download binaries or change running state.';;
     legacy) echo 'Usage: muqun-gateway [OPTIONS] <COMMAND>';;
     empty-help) :;;
@@ -380,6 +385,36 @@ esac
     let setup_log = root.join("setup.args");
     let socket = socket_name.map(|name| root.join(name));
     let installer = Path::new(env!("CARGO_MANIFEST_DIR")).join("install.sh");
+    // Preview parsing must not import modules supplied by the installer's cwd.
+    fs::write(
+        root.join("json.py"),
+        "raise RuntimeError('untrusted cwd module imported')\n",
+    )
+    .unwrap();
+    let preview_release = |tag: &str| {
+        let assets: Vec<_> = ["aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"].into_iter().flat_map(|target| {
+            [format!("muqun-gateway-{target}"), format!("muqun-gateway-{target}.sha256")].into_iter().map(move |name| serde_json::json!({
+                "browser_download_url": format!("https://github.com/osuki-dev/muqun-gateway/releases/download/{tag}/{name}"),
+                "name": name, "size": 100, "state": "uploaded"
+            }))
+        }).collect();
+        serde_json::json!({"tag_name": tag, "draft": false, "prerelease": true, "assets": assets})
+    };
+    let mut incomplete = preview_release("v0.13.0-preview.11");
+    incomplete["assets"].as_array_mut().unwrap().pop();
+    let mut metadata = vec![
+        preview_release("v0.13.0-preview.10"),
+        preview_release("v0.13.0-preview.9"),
+        incomplete,
+    ];
+    if case.fault == Some("preview-empty") {
+        metadata.clear();
+    }
+    fs::write(
+        root.join("releases.json"),
+        serde_json::to_vec(&metadata).unwrap(),
+    )
+    .unwrap();
     let mut cmd = if answer.is_some() {
         let mut cmd = Command::new("/usr/bin/script");
         #[cfg(target_os = "macos")]
@@ -393,6 +428,9 @@ esac
     } else {
         let mut cmd = Command::new("/bin/sh");
         cmd.arg(&installer);
+        if case.preview {
+            cmd.args(["--channel", "preview"]);
+        }
         // No controlling terminal: a piped install cannot silently say yes.
         use std::os::unix::process::CommandExt;
         unsafe {
@@ -436,6 +474,15 @@ esac
         .env("MUQUN_GATEWAY_INSTALL_DIR", &install)
         .env("MOCK_INSTALL_DIR", &install)
         .env("MOCK_BINARY", &fake)
+        .env("MOCK_RELEASES", root.join("releases.json"))
+        .env(
+            "MOCK_VERSION",
+            if case.preview {
+                "0.13.0-preview.10"
+            } else {
+                "0.13.0"
+            },
+        )
         .env("MOCK_SCRIPT", &script)
         .env("MOCK_PUBLISH_LOG", root.join("publish.log"))
         .env("MOCK_LOG", &log)
@@ -794,6 +841,46 @@ fn installer_delegates_modern_updates_without_shell_restart_or_replacement() {
     assert!(failure.contains("Protected update failed"), "{failure}");
     assert!(!failure.contains("service install"), "{failure}");
     assert!(!failure.contains("setup --backend"), "{failure}");
+}
+
+#[test]
+fn preview_installer_selects_latest_complete_and_requires_capable_updater() {
+    let failure = security_case(DownloadCase {
+        preview: true,
+        existing: Some("modern"),
+        ..Default::default()
+    })
+    .unwrap_err();
+    assert!(
+        failure.contains("channel-capable stable release"),
+        "{failure}"
+    );
+    assert!(!failure.contains("\nupdate\n"));
+    let calls = security_case(DownloadCase {
+        preview: true,
+        existing: Some("channel"),
+        ..Default::default()
+    })
+    .unwrap();
+    assert_eq!(calls, "update --help\nupdate --channel preview\n");
+    let calls = security_case(DownloadCase {
+        preview: true,
+        tag: Some("v0.13.0-preview.10"),
+        ..Default::default()
+    })
+    .unwrap();
+    assert!(calls.contains("--version"));
+    let failure = security_case(DownloadCase {
+        preview: true,
+        fault: Some("preview-empty"),
+        ..Default::default()
+    })
+    .unwrap_err();
+    assert!(
+        failure.contains("Cannot resolve a complete preview release"),
+        "{failure}"
+    );
+    assert!(!failure.contains("--version"));
 }
 
 #[test]

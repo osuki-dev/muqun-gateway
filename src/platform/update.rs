@@ -1,4 +1,4 @@
-//! Explicit, stable-only self-update. HTTPS + SHA256 provide transport/integrity,
+//! Explicit self-update, stable by default. HTTPS + SHA256 provide transport/integrity,
 //! not publisher signing. No alternate production origin or network retries.
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read as _, Write as _};
@@ -22,12 +22,43 @@ const MAX_BINARY: u64 = 256 * 1024 * 1024;
 const BACKUP: &str = ".muqun-gateway.update-backup";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct Version([u64; 3]);
+struct Version([u64; 3], Stability);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Stability {
+    Preview(u64),
+    Stable,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum Channel {
+    #[default]
+    Stable,
+    Preview,
+}
 
 impl Version {
     fn parse(value: &str) -> Result<Self> {
-        let parts: Vec<_> = value.split('.').collect();
-        anyhow::ensure!(parts.len() == 3, "updates require stable X.Y.Z versions; use your original installer for development/prerelease builds");
+        let (base, stability) = match value.split_once("-preview.") {
+            Some((base, number)) => {
+                anyhow::ensure!(
+                    !number.is_empty()
+                        && number.bytes().all(|b| b.is_ascii_digit())
+                        && (number.len() == 1 || !number.starts_with('0')),
+                    "invalid preview number"
+                );
+                (
+                    base,
+                    Stability::Preview(number.parse().context("preview number is too large")?),
+                )
+            }
+            None => (value, Stability::Stable),
+        };
+        let parts: Vec<_> = base.split('.').collect();
+        anyhow::ensure!(
+            parts.len() == 3,
+            "updates require X.Y.Z or X.Y.Z-preview.N versions"
+        );
         let mut version = [0; 3];
         for (index, part) in parts.iter().enumerate() {
             anyhow::ensure!(
@@ -38,11 +69,12 @@ impl Version {
             );
             version[index] = part.parse().context("version component is too large")?;
         }
-        Ok(Self(version))
+        Ok(Self(version, stability))
     }
 }
 
 #[derive(Deserialize)]
+#[cfg_attr(test, derive(serde::Serialize))]
 struct Release {
     tag_name: String,
     draft: bool,
@@ -51,6 +83,7 @@ struct Release {
 }
 
 #[derive(Clone, Deserialize)]
+#[cfg_attr(test, derive(serde::Serialize))]
 struct Asset {
     name: String,
     browser_download_url: String,
@@ -72,10 +105,13 @@ impl Plan {
 
     pub(crate) fn summary(&self) -> String {
         if self.available() {
-            format!("Gateway {} → {} available (official stable release; SHA256 integrity, not signing).", self.current, self.tag)
+            format!(
+                "Gateway {} → {} available (official release; SHA256 integrity, not signing).",
+                self.current, self.tag
+            )
         } else {
             format!(
-                "Gateway {}: no newer stable release (latest {}). No download or restart.",
+                "Gateway {}: no newer selected-channel release (latest {}; downgrades refused). No download or restart.",
                 self.current, self.tag
             )
         }
@@ -97,10 +133,14 @@ fn release_url(tag: &str, name: &str) -> String {
 }
 
 fn plan(release: Release, current: &str, target: &str) -> Result<Plan> {
+    plan_channel(release, current, target, Channel::Stable)
+}
+
+fn plan_channel(release: Release, current: &str, target: &str, channel: Channel) -> Result<Plan> {
     let installed = Version::parse(current)?;
     anyhow::ensure!(
-        !release.draft && !release.prerelease,
-        "latest release is not stable; no update attempted"
+        !release.draft && release.prerelease == (channel == Channel::Preview),
+        "release does not match the requested channel; no update attempted"
     );
     let latest = Version::parse(
         release
@@ -108,13 +148,20 @@ fn plan(release: Release, current: &str, target: &str) -> Result<Plan> {
             .strip_prefix('v')
             .context("release tag must be vX.Y.Z")?,
     )?;
+    anyhow::ensure!(
+        matches!(
+            (channel, latest.1),
+            (Channel::Stable, Stability::Stable) | (Channel::Preview, Stability::Preview(_))
+        ),
+        "release version does not match the requested channel"
+    );
     let mut result = Plan {
         current: current.into(),
         tag: release.tag_name,
         binary: None,
         checksum: None,
     };
-    if latest <= installed {
+    if latest <= installed && channel == Channel::Stable {
         return Ok(result);
     }
     anyhow::ensure!(TARGETS.contains(&target), "unsupported release target");
@@ -148,7 +195,27 @@ fn plan(release: Release, current: &str, target: &str) -> Result<Plan> {
             }
         }
     }
+    if latest <= installed {
+        result.binary = None;
+        result.checksum = None;
+    }
     Ok(result)
+}
+
+fn select_preview(releases: Vec<Release>, current: &str, target: &str) -> Result<Plan> {
+    let mut candidates: Vec<_> = releases
+        .into_iter()
+        .filter_map(|release| {
+            let version = Version::parse(release.tag_name.strip_prefix('v')?).ok()?;
+            let plan = plan_channel(release, current, target, Channel::Preview).ok()?;
+            Some((version, plan))
+        })
+        .collect();
+    candidates.sort_by_key(|(version, _)| *version);
+    candidates
+        .pop()
+        .map(|(_, plan)| plan)
+        .context("no complete official preview release found; nothing changed")
 }
 
 fn trusted_url(url: &reqwest::Url) -> bool {
@@ -220,6 +287,10 @@ async fn bounded_body(mut response: reqwest::Response, max: u64) -> Result<Vec<u
 }
 
 pub(crate) async fn check() -> Result<Plan> {
+    check_channel(Channel::Stable).await
+}
+
+pub(crate) async fn check_channel(channel: Channel) -> Result<Plan> {
     // Checking needs no config or mutable state. The running manager may still
     // be the old image after a successful update; inspect the installed image.
     let exe = super::setup::executable_path()?;
@@ -228,12 +299,42 @@ pub(crate) async fn check() -> Result<Plan> {
     } else {
         env!("CARGO_PKG_VERSION").into()
     };
+    if channel == Channel::Preview {
+        return check_preview(&client()?, &current).await;
+    }
     check_at(
         &client()?,
         &format!("https://api.github.com/repos/{REPO}/releases/latest"),
         &current,
     )
     .await
+}
+
+async fn check_preview(client: &reqwest::Client, current: &str) -> Result<Plan> {
+    check_preview_at(
+        client,
+        &format!("https://api.github.com/repos/{REPO}/releases"),
+        current,
+    )
+    .await
+}
+
+async fn check_preview_at(client: &reqwest::Client, endpoint: &str, current: &str) -> Result<Plan> {
+    let mut releases = Vec::new();
+    // Exhaust a bounded listing: never trust ordering or use a partial search.
+    for page in 1..=10 {
+        let url = format!("{endpoint}?per_page=100&page={page}");
+        let body = bounded_body(response(client, &url, 1024 * 1024).await?, 1024 * 1024).await?;
+        let batch: Vec<Release> =
+            serde_json::from_slice(&body).context("invalid preview release metadata")?;
+        anyhow::ensure!(batch.len() <= 100, "unexpected preview page size");
+        let complete = batch.len() < 100;
+        releases.extend(batch);
+        if complete {
+            return select_preview(releases, current, target()?);
+        }
+    }
+    anyhow::bail!("preview listing exceeds the 1000-release search bound; nothing changed")
 }
 
 async fn check_at(client: &reqwest::Client, url: &str, current: &str) -> Result<Plan> {
@@ -724,6 +825,75 @@ mod tests {
     }
 
     #[test]
+    fn preview_selection_orders_numbers_and_requires_complete_official_releases() {
+        let preview = |tag| {
+            let mut release = complete_release(tag);
+            release.prerelease = true;
+            release
+        };
+        let mut incomplete = preview("v0.15.0-preview.11");
+        incomplete.assets.pop();
+        let mut draft = preview("v0.15.0-preview.12");
+        draft.draft = true;
+        let mut foreign = preview("v0.15.0-preview.13");
+        foreign.assets[0].browser_download_url = "https://evil.test/payload".into();
+        let selected = select_preview(
+            vec![
+                preview("v0.15.0-preview.10"),
+                preview("v0.15.0-preview.9"),
+                incomplete,
+                draft,
+                foreign,
+                complete_release("v0.16.0"),
+            ],
+            "0.14.0",
+            target().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(selected.tag, "v0.15.0-preview.10");
+        assert!(selected.available());
+        assert!(plan(preview("v0.15.0-preview.10"), "0.14.0", target().unwrap()).is_err());
+        assert!(select_preview(
+            vec![complete_release("v0.16.0")],
+            "0.14.0",
+            target().unwrap()
+        )
+        .is_err());
+        for installed in ["0.15.0-preview.10", "0.15.0-preview.11", "0.15.0"] {
+            assert!(!select_preview(
+                vec![preview("v0.15.0-preview.10")],
+                installed,
+                target().unwrap()
+            )
+            .unwrap()
+            .available());
+        }
+        assert!(plan(
+            complete_release("v0.15.0"),
+            "0.15.0-preview.10",
+            target().unwrap()
+        )
+        .unwrap()
+        .available());
+        assert!(!plan(
+            complete_release("v0.14.0"),
+            "0.15.0-preview.10",
+            target().unwrap()
+        )
+        .unwrap()
+        .available());
+        for bad in [
+            "1.2.3-preview.01",
+            "1.2.3-preview.-1",
+            "1.2.3-preview.",
+            "1.2.3-preview.18446744073709551616",
+            "1.2.3-preview.1+build",
+        ] {
+            assert!(Version::parse(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
     fn stable_semver_and_matrix_fail_closed() {
         for bad in [
             "1",
@@ -956,6 +1126,49 @@ mod tests {
     }
 
     type Replies = Arc<Mutex<HashMap<String, (StatusCode, Vec<u8>)>>>;
+    #[tokio::test]
+    async fn preview_metadata_requires_complete_bounded_pagination() {
+        let server = Server::new().await;
+        let full_page = serde_json::to_vec(&vec![
+            serde_json::json!({
+                "tag_name": "v0.14.0", "draft": false, "prerelease": false, "assets": []
+            });
+            100
+        ])
+        .unwrap();
+        server.set(
+            "/releases?per_page=100&page=1",
+            StatusCode::OK,
+            full_page.clone(),
+        );
+        let endpoint = format!("{}/releases", server.url);
+        assert!(check_preview_at(&test_client(), &endpoint, "0.14.0")
+            .await
+            .is_err());
+        let mut preview = complete_release("v0.15.0-preview.10");
+        preview.prerelease = true;
+        server.set(
+            "/releases?per_page=100&page=2",
+            StatusCode::OK,
+            serde_json::to_vec(&vec![preview]).unwrap(),
+        );
+        let plan = check_preview_at(&test_client(), &endpoint, "0.14.0")
+            .await
+            .unwrap();
+        assert_eq!(plan.tag, "v0.15.0-preview.10");
+        for page in 2..=10 {
+            server.set(
+                &format!("/releases?per_page=100&page={page}"),
+                StatusCode::OK,
+                full_page.clone(),
+            );
+        }
+        assert!(check_preview_at(&test_client(), &endpoint, "0.14.0")
+            .await
+            .unwrap_err_string()
+            .contains("search bound"));
+    }
+
     struct Server {
         url: String,
         replies: Replies,
@@ -970,14 +1183,17 @@ mod tests {
                 State((replies, requests)): State<(Replies, Arc<Mutex<Vec<String>>>)>,
                 uri: axum::http::Uri,
             ) -> impl IntoResponse {
-                requests.lock().unwrap().push(uri.path().to_string());
+                requests
+                    .lock()
+                    .unwrap()
+                    .push(uri.path_and_query().unwrap().as_str().to_string());
                 if uri.path() == "/stall" {
                     tokio::time::sleep(Duration::from_secs(3)).await;
                 }
                 replies
                     .lock()
                     .unwrap()
-                    .get(uri.path())
+                    .get(uri.path_and_query().unwrap().as_str())
                     .cloned()
                     .unwrap_or((StatusCode::NOT_FOUND, Vec::new()))
             }

@@ -632,6 +632,52 @@ WAN link; a hostname or address range alone does not prove the path is protected
 
 ## Update
 
+### Preview channel
+
+Stable remains the default for installation, `muqun-gateway update`, and the
+management UI. Preview is selected explicitly on each invocation:
+
+```sh
+curl -fsSL https://muqun.dev/gateway.sh | sh -s -- --channel preview
+muqun-gateway update --channel preview --check
+muqun-gateway update --channel preview
+```
+
+The preview command selects the highest numeric `X.Y.Z-preview.N` release with
+all four platform binaries and their checksums. Drafts and incomplete releases
+are excluded. It pins the selected tag before downloading; it never falls back
+to stable when no preview exists. Metadata searches are bounded to ten pages
+of 100 releases, at 1 MiB per page; an incomplete search fails without installing.
+Fresh preview installation requires Python 3 for JSON parsing. Stable has no
+new prerequisite. Until the hosted installer and a channel-capable release are
+published, these commands are available only in this source checkout/build.
+
+An existing installation must already have a channel-capable protected updater.
+Otherwise the installer refuses preview and asks you to upgrade stable first;
+it never overwrites an old updater from the shell. Preview uses the existing
+binary, service, config, and pairings. It does not create a second instance, and
+running test code on a working installation can affect that installation.
+
+Return to stable with `muqun-gateway update --channel stable`. A stable release
+equal to the preview base is newer (`0.15.0` follows `0.15.0-preview.10`). If the
+latest stable is older, no download or restart occurs: downgrades remain refused.
+A binary backup does not reverse database migrations. Recovery to older code
+requires compatible database, encryption-key and config backups; never delete
+state or rotate credentials to force a rollback.
+
+Preview publication is a separate, manually dispatched GitHub workflow. It runs
+checks, builds all four platforms, validates eight assets, and only then publishes
+a prerelease that cannot become GitHub's latest stable release. Version stamping
+uses the source version's next patch plus `preview.<CI run number>`; the source
+tag preserves the reviewed commit, while CI stamps the package and lockfile for
+the binaries. Reproduce the version with `scripts/prepare-preview.py` in a scratch
+checkout and the same `GITHUB_RUN_NUMBER`. Human-written `release-notes/unreleased.md`
+is included with the source SHA and exact build version. Reruns never overwrite
+existing tags or releases. Publication requires an explicit release request;
+ordinary pushes do not publish previews.
+
+### Stable updates
+
 Re-run the install command to use the installed protected updater, or use
 `muqun-gateway update` directly. See [Manual stable updates](#manual-stable-updates)
 for supported installs and recovery limits. Back up the shared database and its

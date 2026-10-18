@@ -21,6 +21,14 @@
 set -eu
 
 REPO="osuki-dev/muqun-gateway"
+channel=stable
+case "$#" in
+  0) ;;
+  2) [ "$1" = --channel ] || { echo 'Usage: install.sh [--channel stable|preview]' >&2; exit 1; }
+     channel="$2" ;;
+  *) echo 'Usage: install.sh [--channel stable|preview]' >&2; exit 1 ;;
+esac
+case "$channel" in stable|preview) ;; *) echo 'Channel must be stable or preview.' >&2; exit 1 ;; esac
 MIN_HERDR_VERSION="0.7.5"
 # Where the standalone (non-Herdr) binary lands. Overridable for anyone who
 # does not want it on their PATH by default.
@@ -158,7 +166,12 @@ if [ -e "$binary" ]; then
     stage_ok
     stage "Run protected update"
     info "Using the installed verified updater (with lifecycle rollback)."
-    "$binary" update || die "Protected update failed; no shell replacement or restart was attempted."
+    if [ "$channel" = preview ]; then
+      printf '%s\n' "$update_help" | grep -Fq -- '--channel' || die "This updater does not support preview. Upgrade to a channel-capable stable release first; existing installation retained."
+      "$binary" update --channel preview || die "Protected preview update failed; no shell replacement or restart was attempted."
+    else
+      "$binary" update || die "Protected update failed; no shell replacement or restart was attempted."
+    fi
     stage_ok
     green "Summary: protected updater finished."
     echo "Running state and setup left to the updater."
@@ -184,7 +197,7 @@ if [ -z "$target" ]; then
 fi
 stage_ok
 
-stage "Resolve stable release"
+stage "Resolve $channel release"
 command -v curl >/dev/null 2>&1 || die "curl is required to download the binary."
 if command -v sha256sum >/dev/null 2>&1; then
   hash_command=sha256sum
@@ -220,6 +233,59 @@ download() (
   [ "$(wc -c < "$output")" -le "$max_bytes" ]
 )
 
+# Preview JSON parsing is an explicit prerequisite only for a fresh preview install.
+if [ "$channel" = preview ]; then
+  command -v python3 >/dev/null 2>&1 || die "Python 3 is required to resolve preview releases safely; nothing installed."
+  page=1
+  while :; do
+    download "https://api.github.com/repos/$REPO/releases?per_page=100&page=$page" "$staging/releases-$page.json" 1048576 || die "Cannot fetch preview metadata; nothing installed."
+    count="$(python3 -I -c 'import json,sys; a=json.load(open(sys.argv[1])); sys.exit("Invalid preview page") if not isinstance(a,list) or len(a)>100 else print(len(a))' "$staging/releases-$page.json")" || die "Invalid preview metadata."
+    [ "$count" -eq 100 ] || break
+    [ "$page" -lt 10 ] || die "Preview listing exceeds the 1000-release search bound; nothing installed."
+    page=$((page + 1))
+  done
+  tag="$(python3 -I - "$staging" "$REPO" <<'PY'
+import glob, json, re, sys
+targets = ['aarch64-apple-darwin', 'x86_64-apple-darwin',
+           'x86_64-unknown-linux-musl', 'aarch64-unknown-linux-musl']
+pattern = re.compile(r'v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-preview\.(0|[1-9][0-9]*)', re.ASCII)
+candidates = []
+for path in glob.glob(sys.argv[1] + '/releases-*.json'):
+    for release in json.load(open(path)):
+        if not isinstance(release, dict):
+            sys.exit('Invalid release metadata')
+        tag = release.get('tag_name', '')
+        match = pattern.fullmatch(tag) if isinstance(tag, str) else None
+        if not match or release.get('draft') is not False or release.get('prerelease') is not True:
+            continue
+        version = tuple(map(int, match.groups()))
+        if any(n > 18446744073709551615 for n in version):
+            continue
+        assets = release.get('assets', [])
+        if not isinstance(assets, list) or not all(isinstance(a, dict) for a in assets):
+            continue
+        valid = True
+        for target in targets:
+            name = 'muqun-gateway-' + target
+            for asset_name, limit in [(name, 268435456), (name + '.sha256', 1024)]:
+                found = [a for a in assets if a.get('name') == asset_name]
+                if len(found) != 1:
+                    valid = False
+                    continue
+                asset = found[0]
+                size = asset.get('size')
+                expected = 'https://github.com/' + sys.argv[2] + '/releases/download/' + tag + '/' + asset_name
+                if (type(size) is not int or not 0 < size <= limit or
+                    asset.get('state') != 'uploaded' or asset.get('browser_download_url') != expected):
+                    valid = False
+        if valid:
+            candidates.append((version, tag))
+if not candidates:
+    sys.exit('No complete official preview release found')
+print(max(candidates)[1])
+PY
+  )" || die "Cannot resolve a complete preview release; nothing installed."
+else
 # Resolve latest once by its HTTPS redirect, then pin both assets to that tag.
 # HEAD avoids downloading the release page or needing a JSON parser dependency.
 release_url="$(curl -fsSLI --proto '=https' --proto-redir '=https' \
@@ -232,6 +298,7 @@ esac
 if [ "$tag" = "$release_url" ] ||
    ! printf '%s\n' "$tag" | grep -Eq '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'; then
   die "Latest release did not resolve to a stable vX.Y.Z tag."
+fi
 fi
 stage_ok
 stage "Download binary and checksum"

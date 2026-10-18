@@ -5,6 +5,11 @@ what arrives on the event stream. The agents behind it are OpenCode, DeepSeek,
 T3 Code and Codex; where this document describes OpenCode's behaviour, it is
 OpenCode's.
 
+Optional account rate windows use the provider-neutral
+[account limits contract](agent-account-limits.md), separately from session
+context/token usage. Gate the existing context-panel section on
+`agent_account_limits_v1` and the selected agent's `features.accountLimits`.
+
 Every field name here is the one the code serializes — snake_case, as the
 domain types spell it — with two deliberate exceptions, both marked below:
 `metadata` and `content` on a tool call are OpenCode's own payloads, forwarded

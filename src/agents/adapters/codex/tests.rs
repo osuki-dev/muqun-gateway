@@ -225,6 +225,47 @@ impl Drop for Fixture {
 }
 
 #[tokio::test]
+async fn account_limits_reads_once_and_shares_a_bounded_snapshot() {
+    let mut fixture = Fixture::new(|request| {
+        assert_eq!(request["method"], "account/rateLimits/read");
+        json!({"rateLimits": {"primary": {"usedPercent":25,"windowDurationMins":300,"resetsAt":1800000000}}})
+    }).await;
+    fixture.ready().await;
+    let driver = CodexDriver::new(fixture.client.clone());
+    let (first, second) = tokio::join!(driver.account_limits(), driver.account_limits());
+    let first = first.unwrap();
+    let second = second.unwrap();
+    assert_eq!(first.status, "available");
+    assert_eq!(first.observed_at_ms, second.observed_at_ms);
+    assert_eq!(fixture.next().await["method"], "account/rateLimits/read");
+    assert!(fixture.requests.try_recv().is_err());
+    driver.invalidate_account_limits();
+    assert_eq!(driver.account_limits().await.unwrap().status, "available");
+    assert_eq!(fixture.next().await["method"], "account/rateLimits/read");
+}
+
+#[tokio::test]
+async fn account_limits_failure_is_private_and_keeps_the_connection_ready() {
+    let mut fixture =
+        Fixture::new_reply(|_| Err(json!({"code":-32000,"message":"private-account-detail"})))
+            .await;
+    fixture.ready().await;
+    let driver = CodexDriver::new(fixture.client.clone());
+    let result = driver.account_limits().await.unwrap();
+    assert_eq!(result.status, "unavailable");
+    assert!(!serde_json::to_string(&result)
+        .unwrap()
+        .contains("private-account-detail"));
+    assert_eq!(fixture.next().await["method"], "account/rateLimits/read");
+    let account = fixture.next().await;
+    assert_eq!(account["method"], "account/read");
+    assert_eq!(account["params"]["refreshToken"], false);
+    assert!(fixture.client.is_ready());
+    driver.account_limits().await.unwrap();
+    assert!(fixture.requests.try_recv().is_err());
+}
+
+#[tokio::test]
 async fn codex_history_follows_server_100_cap_for_mapped_tail_and_stable_chronological_ids() {
     for unmapped in [false, true] {
         let mut fixture=Fixture::new(move |r|match r["method"].as_str().unwrap() {
