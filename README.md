@@ -411,6 +411,21 @@ Reinstall the service after upgrading to apply the child-process lifetime rules:
 gateway restarts must not kill persistent terminal servers. On macOS this is
 login startup; on Linux boot startup requires the user service and lingering.
 
+### Lazygit
+
+Install `lazygit` on the Gateway host to offer it in a compatible App's Terminal
+Quick actions and Changes sheets. The Gateway advertises `pane_lazygit` and
+checks the installed executable and the source pane's Git checkout before the
+App shows an entry. No App-provided shell command or working directory is used.
+
+Launching creates a dedicated tab in the same workspace and starts lazygit in
+that checkout, leaving the source terminal's desktop focus unchanged. The App
+selects the new pane and exposes its virtual keyboard. Lazygit has its own key
+profile and full-screen output handling; it receives no Vim-specific commands.
+If startup cannot be confirmed, open the already-created terminal to inspect it
+instead of retrying automatically. Gateways without this capability retain their
+existing terminal and Changes behavior.
+
 ### Modifier chords on tmux
 
 Keys such as `shift+enter` (newline without sending), `ctrl+enter`, `ctrl+up`

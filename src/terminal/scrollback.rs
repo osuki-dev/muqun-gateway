@@ -985,6 +985,7 @@ fn read_key(session_id: &str, pane_id: &str, source: &str, format: &str) -> Stri
 fn is_editor_command(command: Option<&str>) -> bool {
     command.is_some_and(|command| {
         crate::shortcuts::EDITOR_PROGRAMS.contains(&command.trim().to_ascii_lowercase().as_str())
+            || crate::shortcuts::is_lazygit_command(command)
     })
 }
 
