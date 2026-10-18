@@ -371,6 +371,7 @@ pub(super) fn features() -> crate::discovery::AgentFeatures {
             ("subagentSessions".into(), serde_json::json!(true)),
             ("sessionTokenUsage".into(), serde_json::json!(true)),
             ("sessionContextUsage".into(), serde_json::json!(true)),
+            ("accountLimits".into(), serde_json::json!(true)),
             ("sessionGitInfo".into(), serde_json::json!(true)),
             ("modelSelectionScope".into(), serde_json::json!("next_turn")),
             (

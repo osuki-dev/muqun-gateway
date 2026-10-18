@@ -66,6 +66,9 @@ pub(crate) enum Command {
         /// Only check; do not download binaries or change running state.
         #[arg(long)]
         check: bool,
+        /// Release channel; preview is explicit and never permits downgrades.
+        #[arg(long, value_enum, default_value = "stable")]
+        channel: crate::platform::update::Channel,
     },
     /// Keep the gateway running across a logout or a reboot.
     Service {
@@ -224,8 +227,8 @@ pub(crate) async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Command::Restart => crate::restart_gateway(true)?,
         Command::Status => status()?,
         Command::Manage => manage()?,
-        Command::Update { check } => {
-            let plan = crate::platform::update::check().await?;
+        Command::Update { check, channel } => {
+            let plan = crate::platform::update::check_channel(channel).await?;
             println!("{}", plan.summary());
             if !check && plan.available() {
                 println!("Verifying download before downtime. Running Gateway will restart; terminal tasks and pairings stay unchanged.");

@@ -434,6 +434,10 @@ impl Context {
     }
 
     async fn notification(&self, method: &str, params: &Value) {
+        if method == "account/updated" {
+            self.driver.invalidate_account_limits();
+            return;
+        }
         if method == "thread/started" {
             self.session(&params["thread"], 0).await;
             return;

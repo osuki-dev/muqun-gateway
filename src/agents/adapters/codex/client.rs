@@ -295,6 +295,7 @@ fn read_only_request(method: &str, params: &Value) -> bool {
     matches!(
         method,
         "config/read"
+            | "account/rateLimits/read"
             | "model/list"
             | "skills/list"
             | "thread/list"
@@ -311,6 +312,7 @@ fn diagnostic_method(method: &str) -> &'static str {
         "initialize" => "initialize",
         "initialized" => "initialized",
         "account/read" => "account/read",
+        "account/rateLimits/read" => "account/rateLimits/read",
         "config/read" => "config/read",
         "model/list" => "model/list",
         "skills/list" => "skills/list",

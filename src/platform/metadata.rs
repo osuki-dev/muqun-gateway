@@ -39,6 +39,7 @@ pub(crate) const GATEWAY_API_MAJOR: u64 = 1;
 /// not belong in this list -- see [`AGENT_COLLABORATION_CAPABILITY`].
 pub(crate) const API_CAPABILITIES: &[&str] = &[
     "agent_catalog",
+    "agent_account_limits_v1",
     "agent_events",
     "multi_agent",
     "agent_forms",

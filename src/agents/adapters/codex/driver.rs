@@ -22,6 +22,7 @@ const FIRST_ITEM_POSITION: u64 = 1 << 63;
 
 pub struct CodexDriver {
     client: Arc<CodexClient>,
+    account_limits: super::account_limits::Cache,
     terminal_runtime: Option<Arc<crate::agents::terminal_runtime::TerminalRuntime>>,
     native_sessions: Option<Arc<super::native_sessions::NativeSessions>>,
     /// Only explicitly created, forked or submitted-to threads are resumed.
@@ -104,9 +105,14 @@ fn skill_path_ok(path: &str) -> bool {
 }
 
 impl CodexDriver {
+    pub(crate) fn invalidate_account_limits(&self) {
+        self.account_limits.invalidate();
+    }
+
     pub fn new(client: Arc<CodexClient>) -> Self {
         Self {
             client,
+            account_limits: Default::default(),
             terminal_runtime: None,
             native_sessions: None,
             loaded: Mutex::new(HashSet::new()),
@@ -1436,6 +1442,12 @@ impl CodexDriver {
 }
 
 impl AgentPort for CodexDriver {
+    fn account_limits(
+        &self,
+    ) -> AgentFuture<'_, crate::agents::domain::account_limits::AccountLimits> {
+        Box::pin(async { Ok(self.account_limits.read(&self.client).await) })
+    }
+
     fn prepare_terminal_launch<'a>(
         &'a self,
         directory: &'a str,

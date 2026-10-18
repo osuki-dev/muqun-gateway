@@ -33,10 +33,16 @@ fn update_cli_is_explicit_and_version_is_side_effect_free() {
     let help = invoke(&["update", "--help"]);
     assert!(help.status.success());
     assert!(String::from_utf8(help.stdout).unwrap().contains("--check"));
+    let channel_help = invoke(&["update", "--channel", "preview", "--help"]);
+    assert!(channel_help.status.success());
+    assert!(String::from_utf8(channel_help.stdout)
+        .unwrap()
+        .contains("--channel"));
     for args in [
         &["update", "--version", "v0.1.0"][..],
         &["update", "--url", "http://127.0.0.1/"][..],
         &["update", "--prerelease"][..],
+        &["update", "--channel", "nightly"][..],
     ] {
         assert!(
             !invoke(args).status.success(),

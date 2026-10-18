@@ -219,16 +219,6 @@ pub fn item(thread: &str, turn: &str, value: &Value, at_ms: u64) -> Vec<Timeline
         .into_iter()
         .enumerate()
         .map(|(ordinal, (id, mut part))| {
-            // Pinned rust-v0.162.1 ThreadItem: imageView { id, path:
-            // LegacyAppPathString }. Structural evidence, not a tool-name guess.
-            // Egress still authorizes the path and sniffs the actual MIME.
-            if value["type"] == "imageView" {
-                if let (AgentPart::Tool(call), Some(path)) = (&mut part, value["path"].as_str()) {
-                    call.content = Some(serde_json::json!([
-                        {"type":"file", "uri":path, "mime":"application/octet-stream"}
-                    ]));
-                }
-            }
             if value["type"] == "imageGeneration" {
                 if let (AgentPart::Tool(call), Some(encoded)) =
                     (&mut part, value["result"].as_str())
