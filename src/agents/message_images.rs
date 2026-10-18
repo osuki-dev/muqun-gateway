@@ -1029,7 +1029,7 @@ mod tests {
         }
         let outside = scratch.path().join("private.md");
         std::fs::write(&outside, "not authorized").unwrap();
-        let fences = vec![session.clone(), generated.clone()];
+        let fences = vec![session.clone(), std::fs::canonicalize(&generated).unwrap()];
         for (path, fence) in [
             (desktop.join("report.md"), home.clone()),
             (session.join("report.md"), session.clone()),
