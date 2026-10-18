@@ -1,4 +1,5 @@
 use reqwest::Client;
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::time::Duration;
 use uuid::Uuid;
@@ -13,6 +14,15 @@ pub(super) const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const ERROR_SNIPPET_BYTES: usize = 512;
 /// Delivery modes `session/prompt` accepts.
 const DELIVERY_MODES: [&str; 2] = ["queue", "steer"];
+const HISTORY_PAGE_MESSAGES: usize = 50;
+
+#[derive(Deserialize)]
+struct ModelSelection {
+    provider: String,
+    model: String,
+    #[serde(rename = "reasoningEffort")]
+    reasoning_effort: Option<String>,
+}
 
 pub(super) enum ReadError {
     TooLarge,
@@ -339,17 +349,107 @@ impl DeepseekClient {
 
     /// Read historical messages page: `session/page`
     pub async fn get_page(&self, session_id: &str, limit: usize) -> Result<Value, AgentError> {
-        let args = json!({
-            "request": {
-                "address": {
-                    "kind": "session",
-                    "sessionId": session_id,
-                },
-                "throughSeq": 999_999_999,
-                "maxMessages": limit,
+        if limit == 0 {
+            return Ok(json!({ "records": [], "hasMore": false }));
+        }
+        // rc.2 projections are a cold-safe observation at an exact log cut.
+        // Do not use list hints (which may be cached) or follow (which promotes
+        // cold sessions). Every backwards page must retain this same cut.
+        let projections = self.get_projections(session_id).await?;
+        if projections.is_null() {
+            return Err(AgentError::SessionNotFound(session_id.to_string()));
+        }
+        let through_seq = projections
+            .get("asOfSeq")
+            .and_then(Value::as_i64)
+            .filter(|seq| (-1..=9_007_199_254_740_991).contains(seq))
+            .ok_or_else(|| {
+                AgentError::Protocol("session projections lack a valid cursor".into())
+            })?;
+        let mut before_seq = through_seq + 1;
+        let mut remaining = limit;
+        let mut records = Vec::new();
+        let mut retained_bytes = 0;
+        let has_more = loop {
+            let page = self
+                .call_remote(
+                    "session",
+                    "page",
+                    json!({ "request": {
+                "address": { "kind": "session", "sessionId": session_id },
+                "throughSeq": through_seq,
+                "beforeSeq": before_seq,
+                "maxMessages": remaining.min(HISTORY_PAGE_MESSAGES),
+            } }),
+                )
+                .await?;
+            let page_records = page
+                .get("records")
+                .and_then(Value::as_array)
+                .ok_or_else(|| AgentError::Protocol("history page lacks records".into()))?;
+            let has_more = page
+                .get("hasMore")
+                .and_then(Value::as_bool)
+                .ok_or_else(|| AgentError::Protocol("history page lacks hasMore".into()))?;
+            let mut previous_seq = None;
+            let mut messages = 0;
+            for record in page_records {
+                let event = record
+                    .get("event")
+                    .filter(|_| record.get("type").and_then(Value::as_str) == Some("event"))
+                    .ok_or_else(|| AgentError::Protocol("invalid history record".into()))?;
+                let seq = event
+                    .get("seq")
+                    .and_then(Value::as_i64)
+                    .filter(|seq| *seq >= 0 && *seq <= through_seq && *seq < before_seq)
+                    .ok_or_else(|| {
+                        AgentError::Protocol("history record is outside the frozen cut".into())
+                    })?;
+                if previous_seq.is_some_and(|previous| seq != previous + 1) {
+                    return Err(AgentError::Protocol(
+                        "history page is not contiguous".into(),
+                    ));
+                }
+                previous_seq = Some(seq);
+                // The published page budget counts only append-origin human
+                // and assistant messages, not tool results or bookkeeping.
+                if matches!(
+                    event.get("type").and_then(Value::as_str),
+                    Some("user/message" | "assistant/message")
+                ) && event.get("surfaceOp").and_then(Value::as_str) == Some("append")
+                {
+                    messages += 1;
+                }
             }
-        });
-        self.call_remote("session", "page", args).await
+            if before_seq > 0 && previous_seq != Some(before_seq - 1) {
+                return Err(AgentError::Protocol("history page skipped records".into()));
+            }
+            retained_bytes += serde_json::to_vec(page_records)
+                .map_err(|_| AgentError::Protocol("invalid history page".into()))?
+                .len();
+            if retained_bytes > MAX_RESPONSE_BYTES {
+                return Err(AgentError::Protocol("upstream history too large".into()));
+            }
+            let first_seq = page_records
+                .first()
+                .and_then(|record| record.pointer("/event/seq"))
+                .and_then(Value::as_i64);
+            if has_more && first_seq.is_none_or(|seq| seq == 0) {
+                return Err(AgentError::Protocol("history page cannot advance".into()));
+            }
+            if !has_more && first_seq.is_some_and(|seq| seq > 0) {
+                return Err(AgentError::Protocol(
+                    "history page omitted earlier records".into(),
+                ));
+            }
+            records.splice(0..0, page_records.iter().cloned());
+            remaining = remaining.saturating_sub(messages);
+            if !has_more || remaining == 0 {
+                break has_more;
+            }
+            before_seq = first_seq.expect("nonempty page with more history");
+        };
+        Ok(json!({ "records": records, "hasMore": has_more }))
     }
 
     /// Read session projections: `session/projections`
@@ -379,7 +479,7 @@ impl DeepseekClient {
         provider: &str,
         model: &str,
         reasoning_effort: Option<&str>,
-    ) -> Result<Value, AgentError> {
+    ) -> Result<ModelRef, AgentError> {
         let mut selection = json!({
             "sessionId": session_id,
             "provider": provider,
@@ -393,29 +493,72 @@ impl DeepseekClient {
             "request": selection
         });
 
-        self.call_remote("session", "selectModel", args).await
+        let result = self.call_remote("session", "selectModel", args).await?;
+        let selected: ModelSelection =
+            serde_json::from_value(result.get("selected").cloned().unwrap_or(Value::Null))
+                .map_err(|_| {
+                    AgentError::Protocol("model selection response lacks selected model".into())
+                })?;
+        if selected.provider.is_empty() || selected.model.is_empty() {
+            return Err(AgentError::Protocol(
+                "model selection response has an empty model".into(),
+            ));
+        }
+        Ok(ModelRef {
+            provider_id: selected.provider,
+            model_id: selected.model,
+            variant: selected.reasoning_effort,
+        })
     }
 
     /// List files in workspace: `workspaceFiles/list`
-    pub async fn workspace_files_list(&self, cwd: &str, path: &str) -> Result<Value, AgentError> {
+    pub async fn workspace_files_list(
+        &self,
+        session_id: &str,
+        path: &str,
+    ) -> Result<Value, AgentError> {
+        if session_id.is_empty() || path.is_empty() {
+            return Err(AgentError::RequestFailed(
+                "workspace files require a session scope and nonempty path".into(),
+            ));
+        }
         let args = json!({
-            "workspaceFileScope": {
-                "cwd": cwd,
-            },
+            "workspaceFileScopeId": session_id,
             "path": path,
         });
         self.call_remote("workspaceFiles", "list", args).await
     }
 
     /// Read file metadata: `workspaceFiles/stat`
-    pub async fn workspace_files_stat(&self, cwd: &str, path: &str) -> Result<Value, AgentError> {
+    pub async fn workspace_files_stat(
+        &self,
+        session_id: &str,
+        path: &str,
+    ) -> Result<Value, AgentError> {
+        if session_id.is_empty() || path.is_empty() {
+            return Err(AgentError::RequestFailed(
+                "workspace files require a session scope and nonempty path".into(),
+            ));
+        }
         let args = json!({
-            "workspaceFileScope": {
-                "cwd": cwd,
-            },
+            "workspaceFileScopeId": session_id,
             "path": path,
         });
         self.call_remote("workspaceFiles", "stat", args).await
+    }
+
+    /// The Host resolves `agentId` from an existing live Session, never a cwd.
+    pub async fn file_references(
+        &self,
+        session_id: &str,
+        query: &str,
+    ) -> Result<Value, AgentError> {
+        self.call_remote(
+            "fileReferences",
+            "list",
+            json!({ "agentId": session_id, "query": query }),
+        )
+        .await
     }
 }
 
@@ -522,6 +665,178 @@ mod tests {
 
     fn client_for(url: String) -> DeepseekClient {
         DeepseekClient::new(DeepseekEndpoint::new(url, None, None))
+    }
+
+    async fn rpc_server(app: axum::Router) -> (DeepseekClient, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = client_for(format!("http://{}", listener.local_addr().unwrap()));
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (client, task)
+    }
+
+    #[tokio::test]
+    async fn history_pages_use_one_authoritative_cut_and_count_only_append_messages() {
+        use axum::{routing::post, Json, Router};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+        // rc.2 history.ts: dense events, an inclusive frozen throughSeq,
+        // exclusive beforeSeq, and only append user/assistant budget counts.
+        let source: Vec<Value> = (0..=360)
+            .map(|seq| {
+                let event = match seq % 3 {
+                    0 => json!({ "type": "user/message", "seq": seq, "time": seq, "surfaceOp": "append",
+                        "data": { "id": format!("u-{seq}"), "role": "user", "content": [{ "type": "text", "text": "hi" }], "source": { "kind": "user" } } }),
+                    1 => json!({ "type": "tool/result", "seq": seq, "time": seq, "surfaceOp": "append",
+                        "data": { "turn": 1, "step": 1, "message": { "id": format!("t-{seq}"), "role": "tool", "toolCallId": format!("c-{seq}"), "content": [{ "type": "text", "text": "result" }], "source": { "kind": "tool" } } } }),
+                    _ => json!({ "type": "step/end", "seq": seq, "time": seq, "data": { "turn": 1, "step": 1 } }),
+                };
+                json!({ "type": "event", "event": event })
+            })
+            .collect();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let seen = calls.clone();
+        let observations = Arc::new(AtomicUsize::new(0));
+        let reads = observations.clone();
+        let app = Router::new()
+            .route("/api/session/projections", post(move || { let reads = reads.clone(); async move {
+                let cursor = 359 + reads.fetch_add(1, Ordering::SeqCst);
+                Json(json!({ "result": { "ok": true, "value": { "asOfSeq": cursor, "values": {} } } }))
+            } }))
+            .route("/api/session/page", post(move |Json(body): Json<Value>| {
+                let source = source.clone();
+                let seen = seen.clone();
+                async move {
+                    let request = body.pointer("/payload/args/request").unwrap();
+                    assert_eq!(request["address"], json!({ "kind": "session", "sessionId": "s" }));
+                    let through = request["throughSeq"].as_u64().unwrap();
+                    // The actual log may have advanced; no post-cut events
+                    // should be requested or returned to the mapper.
+                    assert!(through <= 360, "released Host rejects future cursors");
+                    assert_eq!(through, 359);
+                    let before = request["beforeSeq"].as_u64().unwrap() as usize;
+                    let max = request["maxMessages"].as_u64().unwrap() as usize;
+                    assert!(max > 0 && max <= 50);
+                    seen.lock().unwrap().push((through, before, max));
+                    let mut count = 0;
+                    let mut cut = 0;
+                    for index in (0..before).rev() {
+                        if source[index].pointer("/event/type").and_then(Value::as_str) == Some("user/message") {
+                            count += 1;
+                            if count == max { cut = index; break; }
+                        }
+                    }
+                    Json(json!({ "result": { "ok": true, "value": {
+                        "records": source[cut..before], "hasMore": cut > 0
+                    } } }))
+                }
+            }));
+        let (client, server) = rpc_server(app).await;
+        let history = client.get_page("s", 110).await.unwrap();
+        let records = history["records"].as_array().unwrap();
+        assert_eq!(records.len(), 330);
+        assert_eq!(records.first().unwrap()["event"]["seq"], 30);
+        assert_eq!(records.last().unwrap()["event"]["seq"], 359);
+        assert_eq!(history["hasMore"], true);
+        assert_eq!(observations.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![(359, 360, 50), (359, 210, 50), (359, 60, 10)]
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn history_rejects_invalid_cursors_and_nonadvancing_or_out_of_cut_pages() {
+        use axum::{routing::post, Json, Router};
+        for (projections, page) in [
+            (Value::Null, json!({})),
+            (json!({ "values": {} }), json!({})),
+            (json!({ "asOfSeq": -2 }), json!({})),
+            (
+                json!({ "asOfSeq": 2 }),
+                json!({ "records": [], "hasMore": true }),
+            ),
+            (
+                json!({ "asOfSeq": 2 }),
+                json!({ "records": [{ "type": "event", "event": { "seq": 3 } }], "hasMore": false }),
+            ),
+        ] {
+            let app = Router::new()
+                .route(
+                    "/api/session/projections",
+                    post(move || {
+                        let value = projections.clone();
+                        async move { Json(json!({ "result": { "ok": true, "value": value } })) }
+                    }),
+                )
+                .route(
+                    "/api/session/page",
+                    post(move || {
+                        let value = page.clone();
+                        async move { Json(json!({ "result": { "ok": true, "value": value } })) }
+                    }),
+                );
+            let (client, server) = rpc_server(app).await;
+            assert!(matches!(
+                client.get_page("s", 2).await,
+                Err(AgentError::Protocol(_) | AgentError::SessionNotFound(_))
+            ));
+            server.abort();
+        }
+        let client = client_for("http://127.0.0.1:1".into());
+        assert_eq!(client.get_page("s", 0).await.unwrap()["records"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn empty_history_uses_the_published_minus_one_cut() {
+        use axum::{routing::post, Json, Router};
+        let app = Router::new()
+            .route("/api/session/projections", post(|| async {
+                Json(json!({ "result": { "ok": true, "value": { "asOfSeq": -1, "values": {} } } }))
+            }))
+            .route("/api/session/page", post(|Json(body): Json<Value>| async move {
+                assert_eq!(body.pointer("/payload/args/request/throughSeq"), Some(&json!(-1)));
+                assert_eq!(body.pointer("/payload/args/request/beforeSeq"), Some(&json!(0)));
+                Json(json!({ "result": { "ok": true, "value": { "records": [], "hasMore": false } } }))
+            }));
+        let (client, server) = rpc_server(app).await;
+        assert_eq!(client.get_page("s", 5).await.unwrap()["records"], json!([]));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn workspace_file_methods_send_session_scope_and_preserve_entries() {
+        use axum::{routing::post, Json, Router};
+        let app = Router::new()
+            .route("/api/workspaceFiles/list", post(|Json(body): Json<Value>| async move {
+                assert_eq!(body.pointer("/payload/args"), Some(&json!({ "workspaceFileScopeId": "s", "path": "." })));
+                Json(json!({ "result": { "ok": true, "value": { "path": "", "entries": [{ "name": "src", "type": "directory" }], "truncated": false } } }))
+            }))
+            .route("/api/workspaceFiles/stat", post(|Json(body): Json<Value>| async move {
+                assert_eq!(body.pointer("/payload/args"), Some(&json!({ "workspaceFileScopeId": "s", "path": "src/lib.rs" })));
+                Json(json!({ "result": { "ok": true, "value": { "absolutePath": "/qa/src/lib.rs", "version": "v1", "bytes": 8 } } }))
+            }));
+        let (client, server) = rpc_server(app).await;
+        assert_eq!(
+            client.workspace_files_list("s", ".").await.unwrap()["entries"][0]["name"],
+            "src"
+        );
+        assert_eq!(
+            client
+                .workspace_files_stat("s", "src/lib.rs")
+                .await
+                .unwrap()["absolutePath"],
+            "/qa/src/lib.rs"
+        );
+        assert!(matches!(
+            client.workspace_files_list("s", "").await,
+            Err(AgentError::RequestFailed(_))
+        ));
+        assert!(matches!(
+            client.workspace_files_stat("", "src/lib.rs").await,
+            Err(AgentError::RequestFailed(_))
+        ));
+        server.abort();
     }
 
     #[tokio::test]

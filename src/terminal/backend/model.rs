@@ -221,6 +221,11 @@ pub struct Agent {
     pub display_agent: Option<String>,
     pub status: AgentStatus,
     pub state_change_seq: Option<u64>,
+    /// Shell incarnation supplied with the native agent observation.
+    pub shell_pid: Option<u32>,
+    /// Native ordinary-question fact, independent of status. None means the
+    /// backend did not provide an observation, rather than an observed end.
+    pub pending_user_input: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

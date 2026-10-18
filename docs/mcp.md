@@ -110,10 +110,38 @@ When a token expires, `/mcp` answers 401 so the host fetches a new one:
 
 `MUQUN_MCP_URL` and the default URL `mcp enable` uses are
 `http://<listen host>:<port>/mcp`, with `127.0.0.1` for a wildcard listen
-address (`0.0.0.0`, `[::]`). `/mcp` still answers loopback peers only, so on
-a gateway bound to a non-loopback address a local caller is refused: `mcp
-enable` prints a warning, and the gateway logs one and gives OpenCode no
-`MUQUN_MCP_*` environment.
+address (`0.0.0.0`, `[::]`). `/mcp` answers loopback peers only. A gateway
+bound to one non-loopback address (a tailnet IP, say) therefore also listens
+on `127.0.0.1` and `::1` for `/mcp` alone -- the configured port when it is
+free there, else any free port -- and that is the URL every agent it starts
+is given (Claude Code's `--mcp-config`, Codex's overrides, OpenCode's
+registration), resolved by the running gateway at each launch. On the
+configured port nothing is recorded: every reader derives it. Only when
+that port is taken on loopback does the gateway record the other one in
+`<state>/mcp-endpoint` (written atomically, 0600), and it removes the file
+when it stops (SIGTERM/SIGINT or a normal exit). `mcp enable` reads it, and
+`manage` shows the address on the overview as `MCP: 127.0.0.1:<port>`. The
+configured address keeps refusing `/mcp` (`403 mcp_loopback_only`).
+
+Identity comes before credentials. At startup the gateway mints a random
+secret identity and writes it to `<state>/mcp-identity` (0600, removed when it
+stops); the secret is never served. `POST /mcp/identity {challenge}` answers
+`{proof}`, `HMAC-SHA256(secret, <its own /mcp address> "\n" challenge)` in hex,
+to a loopback caller with no proxy headers only (no rate limit: it is
+loopback-only, one HMAC per call, and a limit could only be used to make the
+helper refuse). Every helper command the gateway hands out (and `mcp enable`
+writes) carries the exact `/mcp` address the host was given (`mcp
+token-helper --url <url>`, plus `--state-dir` when the state directory is not
+the default); before printing a token, the helper reads the identity file
+itself, sends that address a fresh random challenge with no credential, and
+checks the proof for that address in constant time. A process on a stale port
+that relays the challenge to the real gateway gets a proof for the real
+address, which does not match its own. No identity file means no gateway
+running: no token. An entry without `--url` (written by an older gateway) is
+refused with "run `muqun-gateway mcp enable` again". Anything else answering
+there gets nothing: the helper prints `another process answers on
+127.0.0.1:<port>; not sending the token` and exits 1. `mcp enable` writes
+the configured port's address, never an ephemeral fallback.
 
 `muqun-gateway mcp revoke --all` or `--id <token-id>` revokes tokens from the
 CLI; a running gateway sees it on the next call. Paired devices can also
@@ -134,9 +162,9 @@ says `"truncated": true` when it left older ones out. `tasks.wait` and
 |---|---|---|
 | `fleet.list` | none | `{"machines": [{machineId, label, os, online, suitableFor, tasksActive}]}`: this computer first, then every linked computer (`machineId` is the id it gave for itself, which `fleet.describe` takes; `label` is the name this gateway gives it; `online` whether it is reachable, `null` while it was not checked in the last minute; `os`, `suitableFor` and `tasksActive` come from its cached manifest, empty or 0 while none was fetched). Answered at once from what this gateway last heard (see [Linked computers](#linked-computers)). List the computers this gateway can hand work to: this one and every linked one, with OS, what each is suitable for, whether it is reachable and how busy it is. |
 | `fleet.describe` | `machine?`: `"self"` (default, any case), this computer's `machineId` or label, or a linked computer's name (any case) or `machineId` from `fleet.list`; a linked computer's name wins over this computer's label | A compact manifest of that computer: `GET /api/fleet/self`'s fields, but each agent is only `{id, kind, status, version, modes, modelCount}` (mode ids, no model catalog) and each terminal backend `{sessionId, label, kind, connected, version}`. For this computer it also carries `peers`: one `{name, reachable, lastSeen, capabilities, agents, suitableFor}` per linked computer, answered at once from what this gateway last heard (`reachable` is `null` while it was not checked in the last minute; see [Linked computers](#linked-computers)). Naming a linked computer answers its cached manifest at once when it is known to answer; only a computer not checked lately, or with no manifest yet, is waited on: one check and, when it answers, one manifest fetch. What a computer offers: its agents, terminal backends, toolchains with versions, task counts and what it is suitable for. Without machine, this computer plus a short entry per linked computer (peers). |
-| `exec.run` | `cwd`: absolute directory; `command`: shell command, run as `sh -c <command>` (at most 16 KiB); `timeout_s?`: 1..=45, default 30 | `{task_id, state, exit_code, stdout_tail, duration_ms, pane}`. Run a shell command in a visible terminal pane on this computer and return its exit code and output tail. Blocks up to timeout_s (max 45); if still running, returns a task_id for tasks.wait. `exit_code` is null while it runs; `pane` is `{session_id, pane_id}`. |
-| `tasks.delegate` | `goal` (at most 32 KiB); `cwd?`: absolute directory; `agent_id?` (default: the primary agent; a terminal agent kind such as `codex` or `claude` starts it in a new pane instead, see [Delegating to a terminal agent](#delegating-to-a-terminal-agent)); `mode?` (for example `build` or `plan`); `model?`: a model id from the agent's catalog for `cwd` (for example `claude-haiku-5-5`), or `<provider_id>/<model_id>` to pick one provider; default: the agent's default. An unknown id is `invalid_arguments` and nothing is created; `variant?`: the model's variant (reasoning effort, for example `high`), applied when the session is created so the first turn uses it; applied only together with `model` (ignored otherwise), and must be one of the model's catalog variants when it lists any (else `invalid_arguments`); `machine?`: `"self"` (default, any case), this computer's `machineId` or label, or a linked computer's name (any case) or `machineId` -- a linked computer's name wins over this computer's label, and `self` always means this one; `cwd`, `agent_id`, `model` and `variant` are then checked by that computer (`~` allowed in `cwd`) | A task view (see [Tasks API](#tasks-api)), filed under the caller's task when the gateway can tell which one it is (see [Task tree](#task-tree)); for a linked computer, a mirror of the task there (see [Delegating to another computer](#delegating-to-another-computer)), with a `note` when the request got no answer. Start a sub-task on an agent, on this computer or (machine) on a linked one: a new session in cwd with your goal as the first prompt (for a terminal agent such as codex or claude, a new terminal pane running it). Returns task_id; poll with tasks.wait. One hop only: a task another computer handed here cannot hand work to a linked computer (delegation_loop). |
-| `tasks.wait` | `task_id`; `timeout_s?`: 1..=45, default 30 | The task view, plus `stdout_tail` for a command, and `answer` for a session delegation that is done or `idle_unconfirmed`: the agent's last message in full (`summary` holds only its first 240 characters, on one line). Returns once the task is done, failed, cancelled, `waiting` or `idle_unconfirmed` (its agent stopped without saying it is finished), or when the time is up. Wait up to timeout_s (max 45) for a task to reach done/failed/waiting, or idle_unconfirmed (its agent stopped without completing). Returns the current state and summary; call again while it says working. |
+| `exec.run` | `cwd`: absolute directory (with `machine`: a directory on that computer inside its home, `~` allowed); `command`: shell command, run as `sh -c <command>` (at most 16 KiB); `timeout_s?`: 1..=45, default 30; `machine?`: `"self"` (default) or a linked computer's name, as for `tasks.delegate` | `{task_id, state, exit_code, stdout_tail, duration_ms, pane}`; with `machine`, `{task_id, state, exit_code, stdout_tail, machine}`. Run a shell command in a visible terminal pane on this computer, or on a linked one (see [Commands on another computer](#commands-on-another-computer)), and return its exit code and output tail. Blocks up to timeout_s (max 45); if still running, returns a task_id for tasks.wait. `exit_code` is null while it runs; `pane` is `{session_id, pane_id}`. |
+| `tasks.delegate` | `goal` (at most 32 KiB); `cwd?`: absolute directory; `agent_id?` (default: the primary agent; a terminal agent kind such as `codex` or `claude` starts it in a new pane instead, see [Delegating to a terminal agent](#delegating-to-a-terminal-agent)); `mode?` (for example `build` or `plan`); `model?`: a model id from the agent's catalog for `cwd` (for example `claude-haiku-5-5`), or `<provider_id>/<model_id>` to pick one provider; default: the agent's default. An unknown id is `invalid_arguments` and nothing is created; `variant?`: the model's variant (reasoning effort, for example `high`), applied when the session is created so the first turn uses it; applied only together with `model` (ignored otherwise), and must be one of the model's catalog variants when it lists any (else `invalid_arguments`); `machine?`: `"self"` (default, any case), this computer's `machineId` or label, or a linked computer's name (any case) or `machineId` -- a linked computer's name wins over this computer's label, and `self` always means this one; `cwd`, `agent_id`, `model` and `variant` are then checked by that computer (`~` allowed in `cwd`) | A task view (see [Tasks API](#tasks-api)), filed under the caller's task when the gateway can tell which one it is (see [Task tree](#task-tree)); for a linked computer, a mirror of the task there (see [Delegating to another computer](#delegating-to-another-computer)), with a `note` when the request got no answer. Start a sub-task on an agent, on this computer or (machine) on a linked one: a new session in cwd with your goal as the first prompt (for a terminal agent such as codex or claude, a new terminal pane running it). Returns task_id. If the work will take long, end your turn after delegating; you will be told when it finishes. Use tasks.wait only for short jobs. One hop only: a task another computer handed here cannot hand work to a linked computer (delegation_loop). |
+| `tasks.wait` | `task_id`; `timeout_s?`: 1..=45, default 30 | The task view, plus `stdout_tail` for a command, and `answer` for a session delegation that is done or `idle_unconfirmed`: the agent's last message in full (`summary` holds only its first 240 characters, on one line). Returns once the task is done, failed, cancelled, `waiting` or `idle_unconfirmed` (its agent stopped without saying it is finished), or when the time is up. Wait up to timeout_s (max 45) for a task to reach done/failed/waiting, or idle_unconfirmed (its agent stopped without completing). Returns the current state and summary. If the work will take long, end your turn after delegating; you will be told when it finishes. Use tasks.wait only for short jobs. |
 | `tasks.read` | `task_id?`: default, the task the calling session works on; `what`: `summary` or `timeline`; `cursor?` (timeline only) | `summary`: the task view. `timeline`: `{task_id, items, cursor}`, the most recent agent items after `cursor`; pass the returned `cursor` to read on. Read a task you created, or (without task_id) the one this session was given: its summary or recent timeline. Your own task's summary lists the computers the user named for it (`mentions`). A command has no timeline. The session's own task is found as `tasks.complete` finds it (see [Finishing a delegation](#finishing-a-delegation)); none found is `task_not_found`. |
 | `tasks.cancel` | `task_id` | The task view after the cancel. Interrupt a task you created. |
 | `tasks.complete` | `summary`: what was done -- or, blocked, why the agent stopped -- one line (non-empty, at most 32 KiB; stored cut to 240 characters); `outcome?`: `done` (default) or `blocked`; `task_id?`: default, the task the calling session works on | The task view: `done` with that summary, or, for `outcome: "blocked"`, `waiting` with the reason as its `summary` (see [Blocked](#blocked)). Say how the task you were given ended: finished, or stopped because you need the user (a missing file, an unclear request, a permission you cannot get). Only the session working on the task may complete it (see [Finishing a delegation](#finishing-a-delegation)); any other task, none found, or a task that has already ended is `task_not_found`, whose message tells the agent to print the `MUQUN_TASK_DONE: <one-line summary>` (or `MUQUN_TASK_BLOCKED: <one-line reason>`) line instead. A task already `waiting` that is blocked again is answered as it stands. |
@@ -149,9 +177,11 @@ Error codes:
 | `task_not_found` | No task with that `task_id`, or it belongs to another assistant. |
 | `machine_unknown` | `machine` names neither this computer nor a linked one; the message lists the names that work. |
 | `machine_unreachable` | `fleet.describe` or `tasks.delegate` named a linked computer that does not answer now; nothing was started there. |
-| `delegation_loop` | `tasks.delegate(machine)` named a linked computer from a task another computer handed here (itself or an ancestor `origin: "peer"`): one hop only, so two computers never hand a goal back and forth; nothing is created. |
+| `children_open` | `tasks.complete` (done) on a task with a sub-task that has not ended -- working, paused (`idle_unconfirmed`) or `waiting`: the message names each ("mini is still on 'Checking Xcode version'; wait for it or cancel it."). `outcome: "blocked"` is still taken. A done marker line, or the owner confirming from the phone, still ends such a task: the rule is the agent's tool call only. |
+| `delegation_loop` | Remote delegation or execution named a linked computer from a task another computer handed here (itself or an ancestor `origin: "peer"`); nothing is forwarded. |
+| `lineage_unresolved` | Remote forwarding could not establish a unique caller and intact ancestry, including failed, ambiguous, timed-out or truncated evidence. Nothing was forwarded. Local work remains available; inspect the caller context before another attempt. |
 | `delegations_disabled` | `tasks.delegate` named a linked computer whose owner switched off work from other computers. |
-| `unauthorized` | `tasks.delegate` named a linked computer that no longer knows this one; the link is forgotten here, and the owner's phone links it again. |
+| `unauthorized` | `tasks.delegate` or `fleet.describe` named a linked computer that no longer takes this one's token ("mini no longer accepts this computer; link again from your phone"); the link is kept, marked `unauthorized`, until the owner's phone links it again. |
 | *the computer's own code* | `tasks.delegate`: the linked computer refused the task (for example `directory_not_found`, `agent_unavailable`); an argument it refused (`invalid_request`, `unknown_model`, `unknown_variant`) is `invalid_arguments`. The message names the computer. |
 | `manifest_unavailable` | `fleet.describe` named a linked computer that answers but gave no manifest, and none is cached (for example an older gateway). |
 | `agent_unavailable` | The requested agent is not available on this computer. |
@@ -377,7 +407,18 @@ computer's name (any case) or `self`. They are stored on the task as this
 gateway names them at that moment (a later rename of a computer does not
 change the tasks that named it), once each in the order given, and shown as the task
 view's `mentions`; the goal is sent as it is, and the agent finds them with
-`tasks.read` of its own task.
+`tasks.read` of its own task. `attachments` (at most 16) are the files sent
+with the goal, the same references `POST /api/agent-sessions/{asid}/prompt`
+takes (uploaded asset references, file paths on this computer); they go to
+the agent with the goal, its first prompt, exactly as that route sends them,
+and the task is recorded like any other. Each must be a file uploaded to this
+computer (`POST /api/uploads`): its path, or for an agent that takes files
+itself (OpenCode) a `file://` URI of it, inside the uploads folder once links
+are resolved -- or, for such an agent, an `http(s)://` or `data:` reference.
+Anything else is `400 invalid_attachment`, checked before anything is made:
+no task row, no session. They go only to a session agent on this computer:
+with a terminal agent, for another computer, or sent by another computer,
+the create is `400 attachments_unsupported` and nothing is made.
 Fields the gateway does not know are ignored. The answer is
 the task view plus the session to open:
 
@@ -393,13 +434,16 @@ the task view plus the session to open:
 
 | Error | When |
 |---|---|
-| `400 invalid_request` | An empty or oversized `goal`, a `label` over 200 characters, an empty or oversized (256 bytes) `agent_id`/`mode`/`model`/`variant`, or `mentions` that is not a list of strings. Nothing is created. |
+| `400 invalid_request` | An empty or oversized `goal`, a `label` over 200 characters, an empty or oversized (256 bytes) `agent_id`/`mode`/`model`/`variant`/`session_id`, more than 16 `attachments` or one empty or over 4096 bytes, or `mentions` that is not a list of strings. Nothing is created. |
 | `400 invalid_mentions` | `mentions` holds more than 8 names, or names a computer that is neither linked nor `self` (it may have been unlinked since the phone offered it). Nothing is created; the same body without `mentions` would be taken. |
 | `400 invalid_directory`, `directory_not_found`, `not_a_directory` | `cwd` is relative, missing, or not a directory. Nothing is created. |
 | `400 unknown_model` | `model` is not in the agent's catalog for `cwd`. Nothing is created. |
 | `400 unknown_variant` | `variant` is not one of the resolved model's catalog variants (a variant without a `model` is ignored). Nothing is created. |
 | `503 agent_unavailable` | That agent (or, without `agent_id`, any agent) is not attached. |
-| `503 no_terminal` | A terminal agent was named and no terminal session answers. Nothing is created. |
+| `503 no_terminal` | A terminal agent was named and no terminal session answers (or the one `session_id` names does not). Nothing is created. |
+| `400 terminal_unknown` | `session_id` names no terminal session of this computer. Nothing is created. |
+| `400 attachments_unsupported` | `attachments` were sent with a terminal agent, for another computer, or by another computer. Nothing is created. |
+| `400 invalid_attachment` | An attachment is not a file uploaded to this computer. Nothing is created. |
 | `400 invalid_request` (body) | The body is not a JSON object of the shape above. Authentication is checked first, so without a valid device token this is `401`/`403` whatever the body. |
 | `502 agent_error` | The agent could not create the session or take the prompt; the task is recorded as `failed`, with the error as its `summary`. |
 
@@ -414,7 +458,7 @@ error line as `summary`, or `done` -- since the task and its session exist.
 (`opencode`, `deepseek` and `t3` are session agents: unattached, they are
 `503 agent_unavailable`, never started in a pane). Then, for `POST /api/tasks`
 and `tasks.delegate` alike, the gateway opens a new tab in `cwd` in the first
-reachable terminal session, names the tab and pane after the task (its
+reachable terminal session (or the one `session_id` names, see below), names the tab and pane after the task (its
 `title`, see [Tasks API](#tasks-api)), starts the agent in it
 exactly as `POST /api/sessions/{id}/agents/spawn` does (its bypass launch
 arguments, `agent_env`, folder trust for `cwd`) and gives it the goal as its
@@ -438,8 +482,33 @@ file cannot be read. Neither agent's folder trust is set with
 task directory for that device (or home if it has none) for `POST /api/tasks`,
 and to wherever the backend opens the tab for `tasks.delegate`; it is not held
 to the spawn route's "a directory the session already has open" fence, as no
-other `POST /api/tasks` directory is. `mode`, `model` and `variant` do not
-apply and are ignored.
+other `POST /api/tasks` directory is. `mode` does not apply and is ignored.
+
+`model` and `variant` are passed to the agent's launch, for this run only
+(the user's own config is never touched): Codex gets `-c model="<model>"`
+and `-c model_reasoning_effort="<variant>"`; Claude Code gets `--model
+<model>` and `--effort <variant>`, each only when its `--help` lists the
+flag -- asked of the binary the user's interactive login shell runs for
+`claude` (with `agent_env`), as a pane's shell would -- a version
+manager's shim is run as found, never resolved through -- and kept until its
+`--version` changes. It is asked in the background, at start and whenever a
+launch finds another program or version; a launch never waits for it and
+uses what is known then (no flag before the first answer). One that fails is
+not asked again for 10 minutes and is warned about once; a flag it lacks is left out (logged), and the task shows what
+did run. As for a session agent, `variant` applies only together
+with `model`. Each must be 1 to 128 of `A-Z a-z 0-9 . _ : / @ + -`, not
+starting with `-` (else `400 unknown_model`). The binding and the task view
+carry the `model` and `variant` the launch passed; for what was not
+passed, Codex's own config (`model`, `model_reasoning_effort`); else
+`model: "default"`, the agent's own. `GET
+/api/tasks/defaults?agent_id=<kind>[&model=..&variant=..]` answers from the
+same resolution for a task not yet made, so the dock and the task row
+agree. `session_id` (`tasks.delegate`: `terminal`) chooses the terminal
+session by its id in `config.json` -- a tmux session or Herdr -- instead of
+the first that answers; an id this computer has no session for is `400
+terminal_unknown` (`invalid_arguments` from `tasks.delegate`), one that does
+not answer `503 no_terminal`. Nothing is created in either case. A delegation
+to a linked computer passes all three on, checked there.
 
 The task is a `delegation`, bound to the pane:
 
@@ -637,6 +706,69 @@ as it). A restarted follower takes the lines the task's history already
 acted on as read. A pane that closes, or an agent that exits, right after a
 blocked line fails with that reason: `the pane closed: <reason>`.
 
+### Being told how a delegation ended
+
+An agent need not poll a long delegation. `tasks.delegate` records the
+session it was called from: a pane token's pane, or -- for the agent service's
+shared token -- the one session of that agent running this very call right
+now (found as for the [task tree](#task-tree), among all its sessions in a
+turn, not only task sessions, since a person's own session delegates too).
+When the child reaches `done`, `failed`, `cancelled`, `waiting` or
+`idle_unconfirmed` and that session's turn is over, the gateway sends it one
+plain line, as a user message would be:
+
+- `mini finished: <summary>` (a session delegation on this computer: its
+  last message, up to 4000 characters; `The task "<title>"` names a local
+  child);
+- `mini could not finish: <reason>` (failed, or `it was cancelled.`);
+- `mini needs an answer: <question>` (`waiting`);
+- `mini stopped without saying it is finished: <its last message>`.
+
+A session still in its turn -- inside a `tasks.wait`, say -- is sent nothing:
+the wait answers it, and a state a wait returned is never sent again. A pane
+is told when its own delegation's follower saw the agent stop
+(`idle_unconfirmed` or `done`) and the job that delegation launched holds
+the pane's terminal. The gateway typed the launch command itself, so it
+records the job that command started (`agent_job`, for tmux and Herdr
+alike): a child of the pane's shell, on its terminal, leading its own
+process group, that was not there before the command was typed and has run
+no longer than since then -- the oldest such, and only while it holds the
+terminal, looked for for at most ten seconds once the launch is confirmed.
+A job already in front before the launch, or one started after it, is never
+taken. Its process group, and its leader's pid and start time (on Linux in
+clock ticks since boot, which a stepped clock never moves), are kept on that
+delegation -- the job used is always the child's own parent's, never
+whatever delegation the pane id holds now;
+how the agent was installed, and what its executable or arguments are,
+never matter. With no job recorded (an older task, or none found) nothing
+is ever typed to that pane -- there is no guess at what holds it. A line is
+typed only when the leader is still there with the same start time, still
+leads that group on the pane's terminal and descends from the pane's shell,
+and that group is the terminal's foreground group. Anything else in front
+-- the shell after Ctrl-Z, `ssh`, `sudo`, an editor, anything started
+afterwards -- is another group, so nothing is typed; the result is tried
+again on later passes for an hour (the agent may come back with `fg`, the
+same group), then given up. A job that is gone -- the agent exited, or its
+pid or group now belongs to another process (a different start time), as
+after a restart -- is given up at once, recorded
+as skipped. A send that fails is retried within the same hour, no longer.
+The line is sent the way a goal is (the agent's prompt call, a bracketed paste on
+tmux), and the foreground is looked at again before each Enter: if another
+group has the terminal by then, the pasted line is cleared (Ctrl-U) and Enter is
+never pressed. What the child wrote is untrusted, so the line is one line of
+plain text: escape sequences and control characters removed, line breaks
+and tabs turned into spaces, capped after that, and it always begins with
+the computer's name or the task's title, never with `/`, `!` or `:`. The line carries no ids and no instructions; what the parent reads of the child (`tasks.read`, `tasks.wait`) carries its `task_id` and, while the parent's own task is open, `when_finished`: "If this result finishes your own task, call tasks.complete with a one-line summary." Each move into a reported state is told once -- a second question after the
+first was answered is told again -- recorded in the task
+store (`task_notices`), so a restart does not tell it twice; a state not told
+within a day is dropped. A child whose parent task has ended (the owner
+cancelled it, say), whose parent session is gone, or whose pane's delegation
+ended other than done is not told; that row is resolved at once, and newer
+results are looked at first, so one that cannot be told yet never holds back
+another. When the calling session cannot be told apart (none
+or several fit), nothing is recorded and the caller learns the result from
+`tasks.wait` alone.
+
 ### Task tree
 
 A task started through `exec.run` or `tasks.delegate` is filed under the
@@ -678,13 +810,18 @@ discovery (the task API stays snake_case).
 
 Another of the owner's gateways that this one was paired with (capability
 `fleet_peers`; see [Linked gateways](agent-api.md#linked-gateways-fleet_peers)).
+Manual links accept HTTP and HTTPS URLs, including LAN and Tailscale addresses.
+
 There is no heartbeat, and `fleet.describe` and `fleet.list` never wait on
 another computer: they answer with what this gateway last heard. A computer
 neither heard from nor pinged in the last 60 s is `reachable: null` (not
 checked yet); the call starts a check of it in the background -- one at a
 time per computer -- so the next call knows (one that no longer knows this
-gateway's token is forgotten and left out). After a check it is `reachable`
-while its last answer is under 2 minutes old. Its manifest (`GET
+gateway's token is marked `unauthorized` and `reachable: false`). After a check it is `reachable`
+while its last answer is under 2 minutes old -- and not reachable at once,
+its last answer kept (`peer_last_seen_ms`), when its task socket closes or a
+call to it fails, until it answers again; the driver's 60 s pass is the
+fallback. Its manifest (`GET
 /api/fleet/self` on it, compacted to the keys above: strings of at most 256
 characters, numbers and booleans, each list at most 64 items) is asked for
 again in the same background step at most once a minute, answered or not,
@@ -692,6 +829,42 @@ and kept in the peer row, so a computer that does not answer still
 shows its last agents and `suitableFor`. `lastSeen` is ms since the epoch,
 null if it never answered. Names match in any case (Unicode-aware); no
 linked computer may be called `self`.
+
+### Continuing a finished assignment
+
+Finished delegations follow their original live session. A new user message
+after `done` or `failed` reopens the same task as `working`; a terminal
+delegation also requires its original shell and launched job identity and an
+idle-to-working boundary. Cancelled tasks, closed panes and deleted sessions
+do not reopen. Task views include `reopened_ms` and `reopen_count`, persisted
+with the state transition and delivered through ordinary `task.updated`
+frames, including peer mirrors. The previous summary stays until the new
+turn reports its result; a previous turn's marker does not complete it again.
+
+### Commands on another computer
+
+`exec.run` with `machine` runs the command on that linked computer without
+starting an agent there: the gateway opens a command task in that computer's
+ledger through its `POST /api/tasks` (`{"kind": "command", "command",
+"cwd", "timeout_s", "client_ref"}`), exactly as a local `exec.run` does
+there -- a visible pane, a `$ <command>` row on its card, `origin: peer`,
+`requested_by` this computer (`kind: gateway`, its `server_id`) -- and keeps
+a command mirror of it here, under the caller's task (`→ mini · $ <command>`
+on this card), moved as a delegation's mirror is. That computer is asked to
+wait at most 5 s; the rest of `timeout_s` is waited here on the mirror. The
+answer carries the exit code and the output tail (the same bounds as a local
+`exec.run`) once the command ended, else its `task_id`: `tasks.wait` on it
+answers them when it ends, and the calling session is told then, as for a
+delegation. The command text is the calling agent's, the same trust as a
+local `exec.run`; that computer checks it as its own command task (at most
+16 KiB) and runs another computer's command only in a directory inside its
+own home. Refusals are those of a delegation: `delegations_disabled` when
+that computer's "Accept work from other computers" switch is off,
+`machine_unknown`, `unauthorized`, `machine_unreachable`, and one hop only
+(`delegation_loop`: a task another computer handed here runs no command on
+a third). The MCP instructions say to prefer this over `tasks.delegate` for a
+command or a short script, and not to restate the completion protocol in a
+delegated goal.
 
 ### Delegating to another computer
 
@@ -730,7 +903,9 @@ peer_server_id, remote_task_id, peer_name}`.
   one's token (unlinked or revoked there: it answers `401`/`403`), its open
   mirrors fail (view `reason: "peer_unlinked"`, a plain summary) -- the task
   there can never be read again, since a new link is a new login -- and the
-  computer is forgotten (`unauthorized` on the next delegation). A mirror's
+  computer is marked `unauthorized`, not forgotten: the next delegation
+  there answers `unauthorized` (never `machine_unknown`, which is for names
+  never linked), and the phone's next link under its name replaces it. A mirror's
   `reason` field is described in [agent-api.md](agent-api.md#linked-gateways-fleet_peers).
 
 ### States

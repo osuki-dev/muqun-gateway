@@ -14,7 +14,8 @@ pub use model::{
 pub use permission::{PermissionDecision, PermissionOption, PermissionRequest};
 pub use session::{
     AgentErrorInfo, AgentProject, AgentSessionId, AgentSessionInfo, AgentSessionStatus, ModelRef,
-    RevertState, SessionForkInfo, SessionQuery, SessionRevertInfo, TokensUsage, WorktreeState,
+    RevertState, SessionCursor, SessionForkInfo, SessionPage, SessionQuery, SessionRevertInfo,
+    TokensUsage, WorktreeState,
 };
 pub use timeline::{
     part_item_id, push_input_partial, reasoning_item_id, text_item_id, tool_item_id, AgentPart,
@@ -35,6 +36,20 @@ mod contract_tests {
             .as_object()
             .map(|o| o.keys().cloned().collect())
             .unwrap_or_default()
+    }
+
+    #[test]
+    fn session_page_cursors_are_present_even_at_the_boundary() {
+        let page = SessionPage {
+            data: vec![],
+            cursor: SessionCursor::default(),
+        };
+        assert_eq!(
+            serde_json::to_value(page).unwrap(),
+            json!({
+                "data": [], "cursor": { "next": null, "previous": null }
+            })
+        );
     }
 
     #[test]

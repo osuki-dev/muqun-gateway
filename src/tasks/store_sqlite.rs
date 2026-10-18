@@ -6,8 +6,8 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 
 use super::domain::{
-    now_ms, ChildCounts, Task, TaskBinding, TaskChange, TaskEvent, TaskFilter, TaskId,
-    TaskPrincipal, TaskState,
+    now_ms, ChildCounts, NoticeTarget, Task, TaskBinding, TaskChange, TaskEvent, TaskFilter,
+    TaskId, TaskPrincipal, TaskState, REPORTED_STATES,
 };
 use super::ports::{TaskFuture, TaskStore, TaskStoreError};
 use crate::platform::store::sqlite::{Migration, SqliteStore};
@@ -42,11 +42,22 @@ ALTER TABLE tasks ADD COLUMN mentions TEXT;
 ALTER TABLE tasks ADD COLUMN client_ref TEXT;
 ", "
 ALTER TABLE tasks ADD COLUMN requester_server_id TEXT;
+", "
+CREATE TABLE task_notices(task_id TEXT PRIMARY KEY, target TEXT NOT NULL,
+  told_state TEXT, delivered_to_parent_ms INTEGER);
+", "
+ALTER TABLE task_notices ADD COLUMN told_seq INTEGER;
+UPDATE task_notices SET told_seq = (SELECT seq FROM tasks WHERE tasks.id = task_notices.task_id)
+  WHERE told_state IS NOT NULL
+    AND told_state = (SELECT state FROM tasks WHERE tasks.id = task_notices.task_id);
+", "
+ALTER TABLE tasks ADD COLUMN reopened_ms INTEGER;
+ALTER TABLE tasks ADD COLUMN reopen_count INTEGER NOT NULL DEFAULT 0;
 "],
 };
 
 const DEFAULT_LIST_LIMIT: usize = 100;
-const TASK_COLUMNS: &str = "id, kind, goal, cwd, binding, state, summary, exit_code, created_by, created_ms, updated_ms, seq, parent_task_id, origin, label, requester_name, session_title, mentions, client_ref, requester_server_id";
+const TASK_COLUMNS: &str = "id, kind, goal, cwd, binding, state, summary, exit_code, created_by, created_ms, updated_ms, seq, parent_task_id, origin, label, requester_name, session_title, mentions, client_ref, requester_server_id, reopened_ms, reopen_count";
 
 pub(crate) struct SqliteTaskStore {
     db: Arc<SqliteStore>,
@@ -67,7 +78,7 @@ impl TaskStore for SqliteTaskStore {
             let mut task = task;
             task.seq = seq;
             tx.execute(
-                &format!("INSERT INTO tasks({TASK_COLUMNS}) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)"),
+                &format!("INSERT INTO tasks({TASK_COLUMNS}) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)"),
                 params![
                     task.id.0,
                     enum_text(&task.kind)?,
@@ -89,6 +100,8 @@ impl TaskStore for SqliteTaskStore {
                     mentions_text(&task.mentions)?,
                     task.client_ref,
                     task.requester_server_id,
+                    task.reopened_ms.map(|at| at as i64),
+                    task.reopen_count as i64,
                 ],
             )?;
             append_event(&tx, &task.id, seq, None, task.state, "created", None)?;
@@ -213,7 +226,28 @@ impl TaskStore for SqliteTaskStore {
         Box::pin(self.db.call(move |c| {
             let tx = c.transaction()?;
             let mut task = load(&tx, &id)?.ok_or(TaskStoreError::NotFound)?;
-            if !task.state.can_move_to(change.to) {
+            let reopens = change.reopen
+                && change.to == TaskState::Working
+                && (matches!(task.state, TaskState::Done | TaskState::Failed)
+                    || (matches!(task.binding, TaskBinding::Peer { .. })
+                        && !task.state.is_terminal()
+                        && change.reopen_count.is_some_and(|count| count > task.reopen_count)))
+                && task.kind == super::domain::TaskKind::Delegation
+                && !matches!(task.binding, TaskBinding::None);
+            // Only the newest assignment owns a live binding. Check inside
+            // the transition transaction so reconciliation cannot revive an
+            // older row if another assignment appeared after its snapshot.
+            let superseded = reopens && tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM tasks WHERE binding = ?1 AND \
+                 (created_ms > ?2 OR (created_ms = ?2 AND rowid > \
+                 (SELECT rowid FROM tasks WHERE id = ?3))))",
+                params![serde_json::to_string(&task.binding)?, task.created_ms as i64, task.id.0],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if superseded || change.expected_seq.is_some_and(|seq| seq != task.seq)
+                || (change.reopen && !reopens)
+                || (!reopens && !task.state.can_move_to(change.to))
+            {
                 return Err(TaskStoreError::IllegalTransition {
                     from: task.state,
                     to: change.to,
@@ -237,8 +271,13 @@ impl TaskStore for SqliteTaskStore {
             }
             task.updated_ms = now_ms();
             task.seq = seq;
+            if reopens {
+                task.reopened_ms = Some(change.reopened_ms.unwrap_or(task.updated_ms));
+                task.reopen_count = change.reopen_count.unwrap_or(task.reopen_count + 1);
+                task.exit_code = None;
+            }
             tx.execute(
-                "UPDATE tasks SET state=?2, summary=?3, exit_code=?4, binding=?5, updated_ms=?6, seq=?7, session_title=?8 WHERE id=?1",
+                "UPDATE tasks SET state=?2, summary=?3, exit_code=?4, binding=?5, updated_ms=?6, seq=?7, session_title=?8, reopened_ms=?9, reopen_count=?10 WHERE id=?1",
                 params![
                     task.id.0,
                     enum_text(&task.state)?,
@@ -248,6 +287,8 @@ impl TaskStore for SqliteTaskStore {
                     task.updated_ms as i64,
                     task.seq as i64,
                     task.session_title,
+                    task.reopened_ms.map(|at| at as i64),
+                    task.reopen_count as i64,
                 ],
             )?;
             append_event(
@@ -309,8 +350,83 @@ impl TaskStore for SqliteTaskStore {
                 [before],
             )?;
             let purged = tx.execute(&format!("DELETE FROM tasks WHERE {ENDED}"), [before])?;
+            tx.execute(
+                "DELETE FROM task_notices WHERE task_id NOT IN (SELECT id FROM tasks)",
+                [],
+            )?;
             tx.commit()?;
             Ok(purged)
+        }))
+    }
+
+    fn set_notice<'a>(&'a self, id: &'a TaskId, target: &'a NoticeTarget) -> TaskFuture<'a, ()> {
+        let (id, target) = (id.0.clone(), json_text(target));
+        Box::pin(async move {
+            let target = target?;
+            self.db
+                .call(move |c| {
+                    c.execute(
+                        "INSERT INTO task_notices(task_id, target) VALUES(?1, ?2) \
+                         ON CONFLICT(task_id) DO UPDATE SET target=excluded.target",
+                        params![id, target],
+                    )?;
+                    Ok(())
+                })
+                .await
+        })
+    }
+
+    fn notice_of<'a>(&'a self, id: &'a TaskId) -> TaskFuture<'a, Option<NoticeTarget>> {
+        let id = id.0.clone();
+        Box::pin(self.db.call(move |c| {
+            let target: Option<String> = c
+                .query_row(
+                    "SELECT target FROM task_notices WHERE task_id = ?1",
+                    [id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            Ok(target.and_then(|target| serde_json::from_str(&target).ok()))
+        }))
+    }
+
+    fn pending_notices<'a>(
+        &'a self,
+        since_ms: u64,
+        limit: usize,
+    ) -> TaskFuture<'a, Vec<(Task, NoticeTarget)>> {
+        Box::pin(self.db.call(move |c| {
+            let reported = REPORTED_STATES
+                .iter()
+                .map(|state| enum_text(state).map(|text| format!("'{text}'")))
+                .collect::<anyhow::Result<Vec<_>>>()?
+                .join(", ");
+            let mut stmt = c.prepare(&format!(
+                "SELECT {TASK_COLUMNS}, target FROM tasks JOIN task_notices ON task_id = id \
+                 WHERE state IN ({reported}) AND updated_ms >= ?1 \
+                 AND (told_seq IS NULL OR told_seq != seq) \
+                 ORDER BY updated_ms DESC LIMIT ?2"
+            ))?;
+            let rows = stmt.query_map(params![since_ms as i64, limit as i64], |r| {
+                Ok((read_row(r)?, r.get::<_, String>(22)?))
+            })?;
+            let mut pending = Vec::new();
+            for row in rows {
+                let (task, target) = row?;
+                pending.push((task?, serde_json::from_str(&target)?));
+            }
+            Ok(pending)
+        }))
+    }
+
+    fn mark_told<'a>(&'a self, task: &'a Task, at_ms: u64) -> TaskFuture<'a, ()> {
+        let (id, state, seq) = (task.id.0.clone(), task.state, task.seq);
+        Box::pin(self.db.call(move |c| {
+            c.execute(
+                "UPDATE task_notices SET told_state = ?2, told_seq = ?3, delivered_to_parent_ms = ?4 WHERE task_id = ?1",
+                params![id, enum_text(&state)?, seq as i64, at_ms as i64],
+            )?;
+            Ok(())
         }))
     }
 
@@ -437,6 +553,8 @@ fn read_row(r: &Row<'_>) -> rusqlite::Result<anyhow::Result<Task>> {
             mentions,
             client_ref,
             requester_server_id,
+            reopened_ms: r.get::<_, Option<i64>>(20)?.map(|at| at as u64),
+            reopen_count: r.get::<_, i64>(21)? as u64,
         })
     })())
 }
@@ -507,6 +625,8 @@ mod tests {
             mentions: Vec::new(),
             client_ref: None,
             requester_server_id: None,
+            reopened_ms: None,
+            reopen_count: 0,
         }
     }
 
@@ -516,6 +636,39 @@ mod tests {
             source: "test".into(),
             ..Default::default()
         }
+    }
+
+    #[tokio::test]
+    async fn only_the_latest_assignment_on_a_binding_can_reopen() {
+        let store = SqliteTaskStore::new(temp_store("reopen-binding"));
+        let mut first = task("owner");
+        first.state = TaskState::Done;
+        first.binding = TaskBinding::AgentSession {
+            agent_id: "opencode".into(),
+            asid: "reused-session".into(),
+        };
+        let first = store.insert(&first).await.unwrap();
+        let mut next = first.clone();
+        next.id = TaskId::new();
+        let next = store.insert(&next).await.unwrap();
+        let reopen = |row: &Task| TaskChange {
+            reopen: true,
+            expected_seq: Some(row.seq),
+            ..change(TaskState::Working)
+        };
+        assert!(store.transition(&first.id, reopen(&first)).await.is_err());
+        assert_eq!(
+            store.get(&first.id).await.unwrap().unwrap().state,
+            TaskState::Done
+        );
+        assert_eq!(
+            store
+                .transition(&next.id, reopen(&next))
+                .await
+                .unwrap()
+                .state,
+            TaskState::Working
+        );
     }
 
     #[tokio::test]
@@ -622,6 +775,35 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("not found"), "{err}");
+    }
+
+    /// A notice told before steps were recorded is not told again on upgrade.
+    #[tokio::test]
+    async fn an_upgrade_re_tells_nothing() {
+        let path =
+            crate::test_state_dir().join(format!("tasks-v8-{}.sqlite3", uuid::Uuid::new_v4()));
+        let v8 = Migration {
+            namespace: "tasks",
+            steps: &MIGRATION.steps[..8],
+        };
+        {
+            let old = SqliteStore::open(&path, None, &[v8]).unwrap();
+            old.call(|c| {
+                c.execute(
+                    "INSERT INTO tasks(id, kind, goal, cwd, binding, state, summary, exit_code, created_by, created_ms, updated_ms, seq, origin) VALUES('t_told', 'delegation', 'g', NULL, '{\"kind\":\"none\"}', 'done', 'ok', NULL, '{\"kind\":\"assistant\",\"id\":\"a\"}', 1, ?1, 7, 'agent')",
+                    [now_ms() as i64],
+                )?;
+                c.execute(
+                    "INSERT INTO task_notices(task_id, target, told_state, delivered_to_parent_ms) VALUES('t_told', '{\"kind\":\"session\",\"agent_id\":\"opencode\",\"asid\":\"s\"}', 'done', 1)",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        }
+        let store = SqliteTaskStore::new(SqliteStore::open(&path, None, &[MIGRATION]).unwrap());
+        assert!(store.pending_notices(0, 10).await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -774,6 +956,9 @@ mod tests {
                 tab_id: None,
                 shell_pid: Some(9),
                 agent_id: None,
+                agent_job: None,
+                model: None,
+                variant: None,
             }))
             .await
             .unwrap();

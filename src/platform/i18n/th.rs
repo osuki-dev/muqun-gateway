@@ -13,6 +13,7 @@ pub(super) const TH: &[(&str, &str)] = &[
     ("Allow {action}?", "อนุญาต {action} หรือไม่"),
     ("Agent", "เอเจนต์"),
     ("Approval needed", "ต้องการการอนุมัติ"),
+    ("Needs your input", "ต้องการคำตอบจากคุณ"),
     ("Agent blocked", "เอเจนต์กำลังรออยู่"),
     ("Agent done", "เอเจนต์ทำงานเสร็จแล้ว"),
     ("{name} is waiting for your approval.", "{name} กำลังรอการอนุมัติจากคุณ"),

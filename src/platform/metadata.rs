@@ -47,6 +47,9 @@ pub(crate) const API_CAPABILITIES: &[&str] = &[
     "agent_models",
     "agent_permissions",
     "agent_sessions",
+    // Single-provider session pages; support is separately declared per agent.
+    "agent_session_pages_v1",
+    "agent_session_delete_scoped",
     "capabilities_discovery",
     "agent_discovery",
     "agent_spawn",
@@ -62,15 +65,21 @@ pub(crate) const API_CAPABILITIES: &[&str] = &[
     "device_revocation",
     "file_uploads",
     "git_diff",
+    "git_worktrees",
     "pane_lazygit",
+    "pane_lazygit_worktree",
     "one_time_pairing_codes",
     "pane_context",
     "pane_approvals",
+    // Optional native ordinary-question attention; never inferred from status or text here.
+    "terminal_pending_user_input",
     "pane_composer",
     "pane_file_search",
     "pane_interrupt",
     "pane_output_ansi",
     "pane_captured_history",
+    // Segment-aware captured pagination in both memory and SQLite storage modes.
+    "pane_captured_history_segments_v1",
     "pane_parts",
     "pane_parts_native",
     "pane_shortcuts",
@@ -80,6 +89,8 @@ pub(crate) const API_CAPABILITIES: &[&str] = &[
     "per_device_tokens",
     "push_notifications",
     "push_token_revocation",
+    // Push delivery requires an authenticated registration owned by a paired app.
+    "push_token_owner_binding_v1",
     "recent_cwds",
     // `GET /api/sessions/{id}/snapshot`, whose `agents` array is the same one
     // `GET .../agents` answers with -- `instance_id` and `target` included --
@@ -316,13 +327,16 @@ pub(crate) async fn gateway_metadata(
         "ok": true,
         "gatewayVersion": env!("CARGO_PKG_VERSION"),
         "apiVersion": GATEWAY_API_VERSION,
+        "transport_versions": crate::connectivity::transport::SUPPORTED_VERSIONS,
         "apiMajor": GATEWAY_API_MAJOR,
         "generation": &*state.generation,
         "minimumCompatibleApiVersion": "1.0.0",
         "legacyUnversionedApi": true,
         "capabilities": gateway_capabilities(
             collaboration_somewhere,
-            state.config.mcp.enabled,
+            // Not when this gateway's agents cannot reach /mcp (its loopback
+            // listener could not be bound).
+            state.config.mcp.enabled && crate::mcp::serves_agents(&state.config.listen),
             state.config.history.storage == crate::platform::config::HistoryStorage::Sqlite,
         ),
         "planes": planes,
@@ -1214,6 +1228,17 @@ mod tests {
             let mut state = crate::test_state("admin", Vec::new());
             state.config.history.storage = storage;
             let meta = gateway_metadata(&state, false).await.unwrap();
+            for capability in [
+                "pane_captured_history",
+                "pane_captured_history_segments_v1",
+                "push_token_owner_binding_v1",
+            ] {
+                assert!(meta["capabilities"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|c| c == capability));
+            }
             let listed = meta["capabilities"]
                 .as_array()
                 .unwrap()

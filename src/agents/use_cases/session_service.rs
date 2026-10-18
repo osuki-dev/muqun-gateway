@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::agents::domain::{
-    AgentCatalog, AgentSessionId, AgentSessionInfo, ModelRef, SessionQuery,
+    AgentCatalog, AgentSessionId, AgentSessionInfo, ModelRef, SessionPage, SessionQuery,
 };
 use crate::agents::ports::agent::{AgentError, AgentPort, FileDiffItem};
 use crate::agents::ports::mirror::{AgentSessionSnapshot, SessionMirrorPort};
@@ -51,13 +51,26 @@ impl SessionService {
         query: &SessionQuery,
     ) -> Result<Vec<AgentSessionInfo>, AgentError> {
         let mut sessions = self.agent.list_sessions(query).await?;
-        for session in &mut sessions {
+        self.overlay_sessions(&mut sessions).await;
+        Ok(sessions)
+    }
+
+    pub async fn list_sessions_page(
+        &self,
+        query: &SessionQuery,
+    ) -> Result<SessionPage, AgentError> {
+        let mut page = self.agent.list_sessions_page(query).await?;
+        self.overlay_sessions(&mut page.data).await;
+        Ok(page)
+    }
+
+    async fn overlay_sessions(&self, sessions: &mut [AgentSessionInfo]) {
+        for session in sessions {
             self.stamp(session);
             if let Some(memory) = &self.memory {
                 memory.overlay_read_markers(session).await;
             }
         }
-        Ok(sessions)
     }
 
     /// Tag a session with the agent that owns it. The one place agent
@@ -200,5 +213,118 @@ impl SessionService {
             self.mirror.upsert_timeline_items(asid, timeline).await;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use crate::agents::domain::*;
+    use crate::agents::ports::agent::AgentFuture;
+    use std::sync::Mutex;
+
+    /// A page-capable fake kept here so route tests exercise the same service.
+    pub(crate) struct PageAgent {
+        pub inner: crate::test_support::FakeAgent,
+        pub queries: Arc<Mutex<Vec<(bool, SessionQuery)>>>,
+    }
+
+    impl PageAgent {
+        pub fn new(kind: &'static str) -> Self {
+            Self {
+                inner: crate::test_support::FakeAgent::new(kind)
+                    .with_sessions(&[("older", 10), ("newer", 30)]),
+                queries: Arc::default(),
+            }
+        }
+    }
+
+    macro_rules! delegate {
+        ($($name:ident($($arg:ident: $ty:ty),*) -> $out:ty;)*) => {
+            $(fn $name<'a>(&'a self, $($arg: $ty),*) -> AgentFuture<'a, $out> {
+                self.inner.$name($($arg),*)
+            })*
+        };
+    }
+
+    impl AgentPort for PageAgent {
+        fn kind(&self) -> &'static str {
+            self.inner.kind
+        }
+
+        fn list_sessions<'a>(
+            &'a self,
+            query: &'a SessionQuery,
+        ) -> AgentFuture<'a, Vec<AgentSessionInfo>> {
+            self.queries.lock().unwrap().push((false, query.clone()));
+            self.inner.list_sessions(query)
+        }
+
+        fn list_sessions_page<'a>(
+            &'a self,
+            query: &'a SessionQuery,
+        ) -> AgentFuture<'a, SessionPage> {
+            self.queries.lock().unwrap().push((true, query.clone()));
+            Box::pin(async move {
+                Ok(SessionPage {
+                    data: self.inner.sessions.clone(),
+                    cursor: SessionCursor {
+                        next: Some("next+/=".into()),
+                        previous: Some("previous-/=".into()),
+                    },
+                })
+            })
+        }
+
+        delegate! {
+            probe() -> bool;
+            list_projects() -> Vec<AgentProject>;
+            create_session(directory: Option<&'a str>, model: Option<&'a ModelRef>, mode: Option<&'a str>) -> AgentSessionInfo;
+            get_session(session_id: &'a str) -> AgentSessionInfo;
+            send_prompt(session_id: &'a str, text: &'a str, attachments: &'a [String], delivery: Option<&'a str>) -> ();
+            revert_session(session_id: &'a str, message_id: &'a str) -> ();
+            interrupt(session_id: &'a str) -> ();
+            switch_model(session_id: &'a str, model: &'a ModelRef) -> ();
+            switch_mode(session_id: &'a str, mode: &'a str) -> ();
+            find_files(query: &'a str, limit: usize, directory: Option<&'a str>) -> Vec<serde_json::Value>;
+            reply_permission(session_id: &'a str, request_id: &'a str, decision: PermissionDecision, message: Option<&'a str>) -> ();
+            reply_form(session_id: &'a str, form_id: &'a str, answers: serde_json::Value) -> ();
+            get_catalog(directory: Option<&'a str>) -> AgentCatalog;
+            get_vcs_diff(session_id: &'a str, mode: &'a str) -> Vec<FileDiffItem>;
+            get_pending_permissions(session_id: &'a str) -> Vec<PermissionRequest>;
+            get_pending_forms(session_id: &'a str) -> Vec<FormRequest>;
+            get_timeline(session_id: &'a str, limit: usize) -> Vec<TimelineItem>;
+        }
+    }
+
+    #[tokio::test]
+    async fn session_page_overlays_markers_without_refetch_or_reordering() {
+        let agent = Arc::new(PageAgent::new("opencode"));
+        let mirror =
+            Arc::new(crate::agents::adapters::memory_mirror::MemoryMirror::for_agent("opencode"));
+        let mut cached = crate::test_support::fake_session("older", 999);
+        cached.time_idle = Some(80);
+        cached.time_viewed = Some(70);
+        mirror.update_session(cached).await;
+        let service = SessionService::with_memory_mirror(agent.clone(), mirror);
+        let query = SessionQuery {
+            limit: Some(50),
+            ..Default::default()
+        };
+        let page = service.list_sessions_page(&query).await.unwrap();
+        assert_eq!(
+            page.data
+                .iter()
+                .map(|s| s.asid.0.as_str())
+                .collect::<Vec<_>>(),
+            ["older", "newer"]
+        );
+        assert_eq!(page.data[0].updated_ms, 10);
+        assert_eq!(page.data[0].time_idle, Some(80));
+        assert_eq!(page.data[0].time_viewed, Some(70));
+        assert!(page.data.iter().all(|s| s.agent_id == "opencode"));
+        assert_eq!(page.cursor.next.as_deref(), Some("next+/="));
+        assert_eq!(page.cursor.previous.as_deref(), Some("previous-/="));
+        assert_eq!(*agent.queries.lock().unwrap(), [(true, query)]);
     }
 }

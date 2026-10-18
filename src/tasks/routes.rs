@@ -123,18 +123,42 @@ async fn list(
 }
 
 /// `GET /api/tasks/defaults`: what a task the device opens without `cwd`
-/// runs in (see [`TaskService::default_cwd`]); `null` when unknown.
+/// runs in (see [`TaskService::default_cwd`]); `null` when unknown. With
+/// `agent_id` naming an agent that runs in a terminal pane (and optionally
+/// `model`, `variant`), also the `model` and `variant` such a task would
+/// run: the ones named where its launch can pass them, else the agent's
+/// own (Codex's config), else `default`.
 ///
 /// [`TaskService::default_cwd`]: super::service::TaskService::default_cwd
-async fn defaults(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Json<Value>> {
+async fn defaults(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+) -> ApiResult<Json<Value>> {
     let by = principal(require_device(&state, &headers)?);
-    Ok(Json(
-        json!({ "default_cwd": state.tasks.default_cwd(&by).await }),
-    ))
+    let mut answer = json!({ "default_cwd": state.tasks.default_cwd(&by).await });
+    if let Some(kind) = query.get("agent_id") {
+        if super::service::runs_in_pane(&state, kind).await {
+            let (_, model, variant) = super::pane_agent::launch_model(
+                &state,
+                kind,
+                query.get("model").map(String::as_str),
+                query.get("variant").map(String::as_str),
+            )
+            .await
+            .map_err(|_| invalid_request())?;
+            let model = model.unwrap_or_else(|| "default".to_owned());
+            answer["model"] = json!(model);
+            answer["variant"] = json!(variant);
+        }
+    }
+    Ok(Json(answer))
 }
 
 #[derive(Debug, Deserialize)]
 struct CreateBody {
+    /// Required for a delegation (checked there); a command has `command`.
+    #[serde(default)]
     goal: String,
     #[serde(default)]
     agent_id: Option<String>,
@@ -154,7 +178,28 @@ struct CreateBody {
     /// The requester's own reference for the task, echoed in its view.
     #[serde(default)]
     client_ref: Option<String>,
+    /// The terminal session a terminal agent starts in, by its config id;
+    /// absent: the first that answers.
+    #[serde(default)]
+    session_id: Option<String>,
+    /// Files sent with the goal, as `POST /api/agent-sessions/{asid}/prompt`
+    /// takes them.
+    #[serde(default)]
+    attachments: Vec<String>,
+    /// `command`: run `command` as a command task (another computer's
+    /// `exec.run` with `machine`) instead of delegating `goal`.
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    command: Option<String>,
+    /// How long the create waits for the command before answering with its
+    /// handle (1..=45, default 30).
+    #[serde(default)]
+    timeout_s: Option<u64>,
 }
+
+/// How many attachments one task's goal may carry.
+const MAX_ATTACHMENTS: usize = 16;
 
 fn refused(code: &str, message: &str) -> (StatusCode, Json<Value>) {
     api_error(StatusCode::BAD_REQUEST, code, message)
@@ -220,7 +265,13 @@ impl CreateBody {
                 "goal must be non-empty and at most 32 KiB",
             ));
         }
-        let names = [&self.agent_id, &self.mode, &self.model, &self.variant];
+        let names = [
+            &self.agent_id,
+            &self.mode,
+            &self.model,
+            &self.variant,
+            &self.session_id,
+        ];
         if names
             .iter()
             .filter_map(|name| name.as_deref())
@@ -239,6 +290,17 @@ impl CreateBody {
             return Err(refused(
                 "invalid_request",
                 "label must be at most 200 characters",
+            ));
+        }
+        if self.attachments.len() > MAX_ATTACHMENTS
+            || self
+                .attachments
+                .iter()
+                .any(|reference| reference.trim().is_empty() || reference.len() > 4096)
+        {
+            return Err(refused(
+                "invalid_request",
+                "attachments must be at most 16 non-empty references",
             ));
         }
         let mentions = known_mentions(self.mentions, linked)?;
@@ -267,6 +329,8 @@ impl CreateBody {
             label,
             mentions,
             client_ref: self.client_ref,
+            session_id: self.session_id,
+            attachments: self.attachments,
         })
     }
 }
@@ -290,7 +354,26 @@ async fn create(
             "This computer does not take work from other computers",
         ));
     }
-    let Json(body) = body.map_err(|_| invalid_request())?;
+    let Json(mut body) = body.map_err(|_| invalid_request())?;
+    if body.kind.as_deref() == Some("command") {
+        return create_command(&state, caller, body).await;
+    }
+    if body
+        .kind
+        .as_deref()
+        .is_some_and(|kind| kind != "delegation")
+    {
+        return Err(invalid_request());
+    }
+    body.kind = None;
+    // References are files on this computer, uploaded from a device: another
+    // computer has none to send.
+    if caller.kind == DeviceKind::Gateway && !body.attachments.is_empty() {
+        return Err(refused(
+            "attachments_unsupported",
+            "Attachments go only to a session agent on this computer",
+        ));
+    }
     let by_caller = caller_principal(&caller);
     let previous_cwd = if body.cwd.is_none() {
         state
@@ -305,6 +388,7 @@ async fn create(
     // Named from the device record the token belongs to, never from the
     // body: another computer cannot pass itself off as a third (§10.5).
     let by = Requested {
+        forwarding: crate::tasks::domain::ForwardingContext::Unknown,
         by: by_caller,
         origin: match caller.kind {
             DeviceKind::App => TaskOrigin::Device,
@@ -330,6 +414,79 @@ async fn create(
     Ok(Json(answer))
 }
 
+/// `POST /api/tasks` with `kind: "command"`: run `command` in `cwd` (home
+/// when absent; `~` expands) as a command task, exactly as `exec.run` does
+/// here -- a visible pane, a row in this computer's ledger -- and answer
+/// with the task view, its exit code and output tail once it ended within
+/// `timeout_s`, else its handle. Another computer's command (`exec.run`
+/// with `machine`) runs only in a directory inside this computer's home.
+async fn create_command(
+    state: &AppState,
+    caller: Caller,
+    body: CreateBody,
+) -> ApiResult<Json<Value>> {
+    let command = body.command.unwrap_or_default();
+    if command.trim().is_empty() || command.len() > MAX_COMMAND_BYTES {
+        return Err(refused(
+            "invalid_request",
+            "command must be non-empty and at most 16 KiB",
+        ));
+    }
+    if body
+        .client_ref
+        .as_deref()
+        .is_some_and(|reference| !crate::valid_install_id(reference))
+    {
+        return Err(invalid_request());
+    }
+    let cwd = requested_directory(Some(body.cwd.as_deref().unwrap_or("~")))?
+        .ok_or_else(invalid_request)?;
+    let peer = caller.kind == DeviceKind::Gateway;
+    if peer {
+        let home = dirs::home_dir().and_then(|home| home.canonicalize().ok());
+        if !home.is_some_and(|home| std::path::Path::new(&cwd).starts_with(home)) {
+            return Err(refused(
+                "invalid_directory",
+                "Another computer's command runs only inside this computer's home",
+            ));
+        }
+    }
+    let request = crate::tasks::run_command::RunRequest {
+        cwd: cwd.into(),
+        command,
+        timeout: crate::mcp::tools::wait_slice(body.timeout_s),
+        client_ref: body.client_ref,
+    };
+    let by = Requested {
+        forwarding: crate::tasks::domain::ForwardingContext::Unknown,
+        by: caller_principal(&caller),
+        origin: if peer {
+            TaskOrigin::Peer
+        } else {
+            TaskOrigin::Device
+        },
+        parent: None,
+        name: Some(caller.name),
+        server_id: caller.server_id.clone(),
+    };
+    let handle = state
+        .tasks
+        .run(state, by, request)
+        .await
+        .map_err(create_failed)?;
+    let mut answer = json!(state.tasks.present(&handle.task).await);
+    answer["exit_code"] = json!(handle.exit_code);
+    answer["stdout_tail"] = json!(handle.stdout_tail);
+    answer["duration_ms"] = json!(handle.duration_ms);
+    if let TaskBinding::Pane { pane_id, .. } = &handle.task.binding {
+        answer["pane_id"] = json!(pane_id);
+    }
+    Ok(Json(answer))
+}
+
+/// The longest command a create runs, as `exec.run` takes it.
+const MAX_COMMAND_BYTES: usize = 16 * 1024;
+
 fn create_failed(error: TaskError) -> (StatusCode, Json<Value>) {
     match error {
         TaskError::NoTerminal => api_error(
@@ -341,6 +498,18 @@ fn create_failed(error: TaskError) -> (StatusCode, Json<Value>) {
             StatusCode::SERVICE_UNAVAILABLE,
             "agent_unavailable",
             "That agent is not available",
+        ),
+        TaskError::InvalidAttachment(_) => refused(
+            "invalid_attachment",
+            "An attachment is not a file uploaded to this computer",
+        ),
+        TaskError::AttachmentsUnsupported => refused(
+            "attachments_unsupported",
+            "Attachments go only to a session agent on this computer",
+        ),
+        TaskError::TerminalUnknown(_) => refused(
+            "terminal_unknown",
+            "No terminal session of that id on this computer",
         ),
         TaskError::UnknownModel(_) => refused(
             "unknown_model",
@@ -468,6 +637,8 @@ mod tests {
                 mentions: Vec::new(),
                 client_ref: None,
                 requester_server_id: None,
+                reopened_ms: None,
+                reopen_count: 0,
             })
             .await
             .unwrap();
@@ -638,6 +809,8 @@ mod tests {
                 mentions: Vec::new(),
                 client_ref: None,
                 requester_server_id: None,
+                reopened_ms: None,
+                reopen_count: 0,
             }
         };
         let mut ids = Vec::new();
@@ -712,14 +885,48 @@ mod tests {
 
     #[tokio::test]
     async fn a_device_opens_a_delegation_and_is_told_its_session() {
-        let state = with_agent().await;
+        let state = state();
+        let agent =
+            crate::test_support::FakeAgent::new("opencode").with_sessions(&[("opencode_new", 1)]);
+        let (prompts, attached, calls) = (
+            agent.prompts.clone(),
+            agent.attached.clone(),
+            agent.calls.clone(),
+        );
+        state.agent_runtime.attach_for_test(agent.manager()).await;
         let dir = std::env::temp_dir().canonicalize().unwrap();
+        // Two files uploaded through the gateway, as the dock sends them.
+        let uploads = crate::ensure_uploads_dir().unwrap();
+        let files: Vec<String> = ["shot.png", "notes.txt"]
+            .iter()
+            .map(|name| {
+                let path = uploads.join(format!("{}-{name}", uuid::Uuid::new_v4()));
+                std::fs::write(&path, b"x").unwrap();
+                path.canonicalize().unwrap().to_string_lossy().into_owned()
+            })
+            .collect();
+        // A file that was never uploaded is refused before anything is made:
+        // no task, no session.
+        let body = json!({ "goal": "g", "cwd": dir, "agent_id": "opencode",
+                           "attachments": [files[0], "/etc/hosts"] });
+        let (status, refusal) = send(&state, "POST", "/api/tasks", Some(body), true).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{refusal}");
+        assert_eq!(refusal["error"]["code"], "invalid_attachment");
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "{:?}",
+            calls.lock().unwrap()
+        );
+        let (_, listed) = call(&state, "GET", "/api/tasks").await;
+        assert_eq!(listed["tasks"], json!([]));
+
         let body = json!({
             "goal": "fix the build",
             "cwd": dir,
             "label": "  build  ",
             "agent_id": "opencode",
-            "mode": "build"
+            "mode": "build",
+            "attachments": files
         });
         let (status, task) = send(&state, "POST", "/api/tasks", Some(body), true).await;
         assert_eq!(status, StatusCode::OK, "{task}");
@@ -748,6 +955,10 @@ mod tests {
             .await;
         assert_eq!(stored.cwd.as_deref(), Some(dir.to_str().unwrap()));
         assert_eq!(stored.created_by, principal("d1".into()));
+
+        // The goal and both attachments, as the session prompt sends them.
+        assert_eq!(*prompts.lock().unwrap(), ["fix the build"]);
+        assert_eq!(*attached.lock().unwrap(), [files]);
 
         let (_, listed) = call(&state, "GET", "/api/tasks").await;
         assert_eq!(listed["tasks"][0]["origin"], "device");
@@ -831,6 +1042,8 @@ mod tests {
                         mentions: Vec::new(),
                         client_ref: None,
                         requester_server_id: None,
+                        reopened_ms: None,
+                        reopen_count: 0,
                     })
                     .await
                     .unwrap();
@@ -855,11 +1068,58 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_terminal_task_fixture_does_not_capture_an_unrelated_host_process() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = crate::test_support::asset_test_dir("unrelated-process");
+        let ps = dir.join("ps");
+        // The old fixture PID really exists, but has no launched child. The
+        // capture window must not be entered for this unrelated host process.
+        std::fs::write(&ps, "#!/bin/sh\nprintf '%s\\n' '4242 1 4242 4242 ?? 00:10 Tue Oct 13 00:00:00 2026'\nprintf '%s\\n' \"$*\" >> \"$MUQUN_TEST_PS_CALLS\"\n").unwrap();
+        std::fs::set_permissions(&ps, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let calls = dir.join("calls");
+        let path = std::env::join_paths(std::iter::once(dir.clone()).chain(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        )))
+        .unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tasks::routes::tests::a_terminal_agent_opens_in_a_pane_bound_to_its_task",
+                "--nocapture",
+            ])
+            .env("PATH", path)
+            .env("MUQUN_TEST_PS_CALLS", &calls)
+            .output()
+            .unwrap();
+        let trace = std::fs::read_to_string(calls).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        assert!(
+            trace
+                .lines()
+                .filter(|line| *line == "-A -o pid=,ppid=,pgid=,tpgid=,tty=,etime=,lstart=")
+                .count()
+                >= 2,
+            "the real before/after job capture must read the synthetic table: {trace}"
+        );
+    }
+
     #[tokio::test]
     async fn a_terminal_agent_opens_in_a_pane_bound_to_its_task() {
         let herdr = crate::FakeHerdr::start(vec!["$ "], None);
+        // A fake pane has no OS shell. A small fixed PID can name an unrelated
+        // host process and trigger the real launched-job capture's 10 s wait.
+        let shell_pid = u32::MAX;
         herdr.set_panes(json!([
-            { "pane_id": "w1:p9", "workspace_id": "w1", "tab_id": "w1:t9", "shell_pid": 4242 }
+            { "pane_id": "w1:p9", "workspace_id": "w1", "tab_id": "w1:t9", "shell_pid": shell_pid }
         ]));
         let mut state = state();
         state.config.sessions[0].socket_path = herdr.session().socket_path;
@@ -870,7 +1130,9 @@ mod tests {
             .insert("codex".into(), "sh".into());
         let dir = std::env::temp_dir().canonicalize().unwrap();
         let body = json!({ "goal": "fix the build", "cwd": dir, "agent_id": "codex",
-                           "model": "ignored", "label": "build" });
+                           "model": "gpt-6-sol", "variant": "low", "label": "build" });
+        // Subscribe before dispatch, so even a fast launch cannot lose its update.
+        let mut updates = state.task_events.subscribe();
         let (status, task) = send(&state, "POST", "/api/tasks", Some(body), true).await;
         assert_eq!(status, StatusCode::OK, "{task}");
         // Answered once the pane exists; the agent starts in the background.
@@ -881,15 +1143,28 @@ mod tests {
         assert_eq!(
             task["binding"],
             json!({ "kind": "pane", "session_id": "default", "pane_id": "w1:p9",
-                    "tab_id": "w1:t9", "shell_pid": 4242, "agent_id": "codex" })
+                    "tab_id": "w1:t9", "shell_pid": shell_pid, "agent_id": "codex",
+                    "model": "gpt-6-sol", "variant": "low" })
+        );
+        assert_eq!(
+            (&task["model"], &task["variant"]),
+            (&json!("gpt-6-sol"), &json!("low"))
         );
         let id = TaskId(task["task_id"].as_str().unwrap().into());
-        for _ in 0..400 {
-            if state.tasks.get_for_test(&id).await.state != TaskState::Dispatching {
-                break;
+        tokio::time::timeout(std::time::Duration::from_secs(4), async {
+            loop {
+                let crate::tasks::events::TaskDomainEvent::Updated { task, .. } =
+                    updates.recv().await.unwrap();
+                if task.task_id == id.0
+                    && !matches!(task.state, TaskState::Queued | TaskState::Dispatching)
+                {
+                    assert_eq!(task.state, TaskState::Working);
+                    break;
+                }
             }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
+        })
+        .await
+        .expect("the synthetic pane's launch must finish without host job capture");
         assert_eq!(
             state.tasks.get_for_test(&id).await.state,
             TaskState::Working
@@ -908,50 +1183,112 @@ mod tests {
             start["params"]["args"][0],
             crate::agents::tasks::CODEX_BYPASS_FLAG
         );
-        let prompt = calls
+        // The model and effort asked for, for this run only, before the goal.
+        let args: Vec<&str> = start["params"]["args"]
+            .as_array()
+            .unwrap()
             .iter()
-            .find(|c| c["method"] == "agent.prompt")
+            .filter_map(Value::as_str)
+            .collect();
+        let at = args
+            .iter()
+            .position(|arg| *arg == "model=\"gpt-6-sol\"")
             .unwrap();
+        assert_eq!(
+            &args[at - 1..at + 3],
+            [
+                "-c",
+                "model=\"gpt-6-sol\"",
+                "-c",
+                "model_reasoning_effort=\"low\""
+            ]
+        );
+        let prompts: Vec<_> = calls
+            .iter()
+            .filter(|c| c["method"] == "agent.prompt")
+            .collect();
+        assert_eq!(prompts.len(), 1, "the goal must be delivered exactly once");
+        let prompt = prompts[0];
         // The goal alone: how to finish is the MCP server's to say.
         assert_eq!(prompt["params"]["text"], "fix the build");
         assert_eq!(task["goal"], "fix the build");
 
-        // A task cancelled before its agent starts gets no agent and no goal.
-        let session = state.config.sessions[0].clone();
-        let placed =
-            crate::agents::session_routes::place_agent(&state, &session, "codex", None, None)
-                .await
-                .unwrap();
-        let cancelled = insert(&state, "late", Some(TaskState::Cancelled)).await;
-        let cancelled = state.tasks.get_for_test(&TaskId(cancelled)).await;
-        let prompts = || {
-            let calls = herdr.calls.lock().unwrap();
-            calls
-                .iter()
-                .filter(|c| c["method"] == "agent.prompt")
-                .count()
-        };
-        let before = prompts();
-        let starts = || {
-            let calls = herdr.calls.lock().unwrap();
-            calls
-                .iter()
-                .filter(|c| c["method"] == "agent.start")
-                .count()
-        };
-        let started = starts();
-        crate::tasks::service::start_terminal_agent(
-            state.clone(),
-            session,
-            "codex".into(),
-            None,
-            placed,
-            "late".into(),
-            cancelled,
-        )
-        .await;
-        assert_eq!(prompts(), before);
-        assert_eq!(starts(), started, "no agent started either");
+        // The terminal session the request names, not the first that
+        // answers; one this computer does not have is refused.
+        let mut other = state.config.sessions[0].clone();
+        other.id = "hd".into();
+        state.config.sessions.push(other);
+        // Files cannot go to a terminal agent. Refusals make nothing.
+        for (name, extra, status, answer) in [
+            (
+                "session hd",
+                json!({ "session_id": "hd" }),
+                StatusCode::OK,
+                json!("hd"),
+            ),
+            (
+                "session nope",
+                json!({ "session_id": "nope" }),
+                StatusCode::BAD_REQUEST,
+                json!("terminal_unknown"),
+            ),
+            (
+                "attachments",
+                json!({ "attachments": ["/tmp/x.png"] }),
+                StatusCode::BAD_REQUEST,
+                json!("attachments_unsupported"),
+            ),
+        ] {
+            let (_, before) = call(&state, "GET", "/api/tasks").await;
+            let mut body = json!({ "goal": "g", "cwd": dir, "agent_id": "codex" });
+            body.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let (status_got, view) = send(&state, "POST", "/api/tasks", Some(body), true).await;
+            assert_eq!(status_got, status, "{name}: {view}");
+            let (_, after) = call(&state, "GET", "/api/tasks").await;
+            let made = after["tasks"].as_array().unwrap().len()
+                - before["tasks"].as_array().unwrap().len();
+            if status == StatusCode::OK {
+                assert_eq!(view["binding"]["session_id"], answer, "{name}: {view}");
+                assert_eq!(made, 1, "{name}");
+            } else {
+                assert_eq!(view["error"]["code"], answer, "{name}: {view}");
+                assert_eq!(made, 0, "{name}");
+            }
+        }
+
+        // What such a task would run, before it is made: the named model and
+        // effort where the launch passes them; no plain word is refused.
+        for (query, status, model) in [
+            (
+                "agent_id=codex&model=gpt-6-sol&variant=low",
+                StatusCode::OK,
+                json!("gpt-6-sol"),
+            ),
+            (
+                "agent_id=codex&model=-x",
+                StatusCode::BAD_REQUEST,
+                Value::Null,
+            ),
+        ] {
+            let (got, defaults) = send(
+                &state,
+                "GET",
+                &format!("/api/tasks/defaults?{query}"),
+                None,
+                true,
+            )
+            .await;
+            assert_eq!(got, status, "{query}: {defaults}");
+            if status == StatusCode::OK {
+                assert_eq!(
+                    (&defaults["model"], &defaults["variant"]),
+                    (&model, &json!("low")),
+                    "{query}"
+                );
+            }
+        }
 
         // Neither an unknown agent nor an unattached session agent (OpenCode
         // is in the terminal catalog too) is started in a pane.
@@ -960,6 +1297,50 @@ mod tests {
             let (status, body) = send(&state, "POST", "/api/tasks", Some(body), true).await;
             assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{agent_id}");
             assert_eq!(body["error"]["code"], "agent_unavailable");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_terminal_task_never_starts_an_agent_or_sends_its_goal() {
+        // No earlier successful task shares this backend: its background
+        // launch must not be counted as the cancelled task starting.
+        let herdr = crate::FakeHerdr::start(vec!["$ "], None);
+        herdr.set_panes(json!([
+            { "pane_id": "w1:p9", "workspace_id": "w1", "tab_id": "w1:t9", "shell_pid": 4242 }
+        ]));
+        let mut state = state();
+        state.config.sessions[0].socket_path = herdr.session().socket_path;
+        state
+            .config
+            .agent_commands
+            .insert("codex".into(), "sh".into());
+        let session = state.config.sessions[0].clone();
+        let placed =
+            crate::agents::session_routes::place_agent(&state, &session, "codex", None, None)
+                .await
+                .unwrap();
+        let cancelled = insert(&state, "late", Some(TaskState::Cancelled)).await;
+        let cancelled = state.tasks.get_for_test(&TaskId(cancelled)).await;
+        crate::tasks::service::start_terminal_agent(
+            state.clone(),
+            session,
+            "codex".into(),
+            placed,
+            crate::tasks::service::TerminalStart {
+                cwd: None,
+                goal: "late".into(),
+                model_args: Vec::new(),
+            },
+            cancelled,
+        )
+        .await;
+        let calls = herdr.calls.lock().unwrap();
+        for method in ["agent.start", "agent.prompt"] {
+            assert_eq!(
+                calls.iter().filter(|call| call["method"] == method).count(),
+                0,
+                "a cancelled task must not send {method}"
+            );
         }
     }
 
@@ -976,10 +1357,12 @@ mod tests {
                 token: "t".into(),
                 device_id: "d".into(),
                 transport_key: None,
+                transport_min_version: 1,
                 added_ms: 0,
                 last_seen_ms: None,
                 capabilities: Vec::new(),
                 manifest: None,
+                unauthorized: false,
             })
             .await;
         let (status, _) = send(

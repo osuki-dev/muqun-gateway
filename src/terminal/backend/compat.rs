@@ -202,6 +202,8 @@ fn agent(value: &Agent) -> Value {
         "display_agent": value.display_agent.as_ref().or(value.kind.as_ref()),
         "agent_status": agent_status(value.status),
         "state_change_seq": value.state_change_seq,
+        "shell_pid": value.shell_pid,
+        "pending_user_input": value.pending_user_input,
     })
 }
 
@@ -277,6 +279,8 @@ mod tests {
                 display_agent: Some("Claude".into()),
                 status: AgentStatus::Working,
                 state_change_seq: Some(41),
+                pending_user_input: Some(true),
+                shell_pid: Some(4242),
             },
             // A tmux agent: no instance identity, and the keys are present and
             // null rather than missing, so the app reads one shape.
@@ -290,6 +294,8 @@ mod tests {
                 display_agent: None,
                 status: AgentStatus::Unknown,
                 state_change_seq: None,
+                pending_user_input: None,
+                shell_pid: None,
             },
         ];
 
@@ -307,6 +313,8 @@ mod tests {
         assert_eq!(first["agent"], "claude");
         assert_eq!(first["display_agent"], "Claude");
         assert_eq!(first["agent_status"], "working");
+        assert_eq!(first["pending_user_input"], true);
+        assert_eq!(first["shell_pid"], 4242);
 
         let second = &snap["result"]["agents"][1];
         assert!(
@@ -314,6 +322,13 @@ mod tests {
             "a tmux agent has no instance"
         );
         assert_eq!(second["target"], "%12");
+        assert!(second["pending_user_input"].is_null());
+        let mut resolved = agents[0].clone();
+        resolved.pending_user_input = Some(false);
+        assert_eq!(
+            agent_list(&[resolved])["result"]["agents"][0]["pending_user_input"],
+            false
+        );
         assert_eq!(
             second["display_agent"], "codex",
             "the kind stands in for a display name the backend did not give"

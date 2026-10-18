@@ -17,6 +17,7 @@ pub(super) const VI: &[(&str, &str)] = &[
     // -- push notifications --------------------------------------------------
     ("Agent", "Tác tử"),
     ("Approval needed", "Cần chấp thuận"),
+    ("Needs your input", "Cần bạn trả lời"),
     ("Agent blocked", "Tác tử đang chờ"),
     ("Agent done", "Tác tử đã xong"),
     ("{name} is waiting for your approval.", "{name} đang chờ bạn chấp thuận."),

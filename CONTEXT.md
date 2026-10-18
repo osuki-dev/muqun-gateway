@@ -53,11 +53,20 @@ The retired `herdr.gateway` identifier remains only for migration compatibility.
     captured-history pagination use case and async repository port, the memory
     adapter, the opt-in SQLite checkpoint adapter, and authenticated HTTP
     boundary. Captured historical prefix only, separately from native ranges and
-    the mutable viewport; bounded ephemeral snapshots. Storage is selected at
+    the mutable viewport; bounded ephemeral snapshots. The additive
+    `/history/segments` contract (`pane_captured_history_segments_v1`) pages
+    retained segments in either storage mode; legacy `/history` remains one
+    prefix. Storage is selected at
     composition from `config.history.storage` (default `memory`); `sqlite` keeps
     checkpoints in the shared store's `history` namespace, with verified native
     identities, replacement recovery and bounded retention. Operational and
     recovery constraints are in `docs/captured-history.md`.
+    Segment boundaries are metadata, never fabricated rows or cross-segment
+    deduplication. Each shape shares 5,000 rows/2 MiB/64 segments; global
+    retention is 48 shapes/24 MiB/7 days, with separate 60-second snapshots.
+    SQLite migrates old prefixes and recovers verified checkpoints before fresh
+    writes can overwrite them; storage stats count shapes, not segments.
+    App negotiation and its 2,000-row history window fix remain deferred.
   - `login_env.rs`: the `PATH` and `LC_CTYPE` a backend actually needs,
     recovered from a login shell. An init system starts the gateway with neither,
     and the tmux adapter cannot spawn tmux without the first or parse its output
@@ -72,6 +81,13 @@ The retired `herdr.gateway` identifier remains only for migration compatibility.
   - `routes.rs`: pairing and push-token registration routes.
   - `push.rs`: Expo notification payloads and the device records that receive
     them.
+    `push_token_owner_binding_v1` declares paired-App-owned authenticated
+    registrations; legacy unowned records are suppressed. Older Apps can skip
+    registration for seven days from their cache: reopening is not sufficient.
+    On each paired App, notifications OFF (wait for unregistration), then ON
+    clears that cache and performs authenticated registration. Future App work
+    must negotiate a stable registration revision, not re-register on every
+    Gateway build or restart; seamless upgrade acceptance remains pending.
 - `src/tasks/`: the work the gateway tracks. Domain types and the state
   machine (`domain.rs`), the `TaskStore` port with its SQLite adapter, the
   `TaskService` (delegate, wait, read, cancel, list, the task tree), command
@@ -122,9 +138,16 @@ The retired `herdr.gateway` identifier remains only for migration compatibility.
   shared store's `peers` table. `peer_client.rs` speaks to it through its
   device API, sealed when it issued a transport key. On the receiving side a
   gateway token reaches only `require_device_or_peer` routes (the task
-  routes but `POST`/`complete`, `subscribe_tasks`, `GET /api/fleet/self`,
+  routes except `complete`, `subscribe_tasks`, `GET /api/fleet/self`,
   its own `DELETE /api/pairings/{id}`); `require_device` refuses it with
   `peer_forbidden`. `fleet.accept_delegations` is the accept switch.
+  `exec.run(machine)` uses `POST /api/tasks` with `kind: command` to run a
+  short command on a peer without starting an agent. It retains a command
+  mirror and returns bounded output through `tasks.wait`; the receiver
+  restricts the working directory to its home and the sender enforces one hop.
+  A peer command keeps a single background observer after the create request
+  returns its handle, so its exit reaches waiters and result notices promptly;
+  the driver restores that observer after a restart without resending the command.
   A `peers` row is keyed by this gateway's own id; the `server_id` the
   peer gave is display data, and a second link giving one already held is
   `409 peer_conflict`, never a merge. On the other side a gateway enrolment
@@ -192,6 +215,17 @@ The retired `herdr.gateway` identifier remains only for migration compatibility.
 - `install.sh`, `release.sh`, `.github/workflows/release.yml`: standalone
   installation and releases. The plugin manifest/fetch step are retired;
   import compatibility and historical fixtures remain.
+  Existing installs delegate to the identified protected updater without shell
+  overwrite or a second restart; older installs are refused with manual migration
+  guidance. Fresh installs pin one stable tag for HTTPS binary/checksum downloads
+  in private staging and verify SHA256 (integrity, not signing). Native
+  ELF/Mach-O architecture is checked before staged execution; a time/output-bounded
+  `--version` probe must match the pinned tag before publication. Fresh installs
+  require curl and sha256sum/shasum; macOS also requires preinstalled system Perl
+  for direct `link()` atomic no-clobber publication and fails closed without it.
+  No automatic dependency or global installation is attempted. Numbered stages report
+  OK/FAILED/UNCONFIRMED; supported TTYs use real curl progress, with plain
+  NO_COLOR/dumb/non-TTY output and narrow-terminal-friendly stage labels.
 
 There are no nested `CONTEXT.md` files at present.
 
@@ -246,6 +280,18 @@ echo of the goal in the pane's recent output (`marker_after`), or the agent's
 delivery live in `src/agents/session_routes.rs`; the prompt wording, the marker
 and the `judge` table in `src/tasks/pane_agent.rs`.
 
+A finished delegation follows its still-live binding into another turn. A new
+user timeline item reopens an agent session; a pane must show an idle-to-busy
+boundary and retain its recorded shell and foreground job identity. Reopening
+keeps the task ID and prior summary, increments `reopen_count`, and records
+`reopened_ms`. Old completion markers are excluded from the new turn. Cancelled
+tasks and missing or reused bindings stay finished. Peer mirrors follow the
+same generation, including when a whole turn finished between observations.
+A terminal agent's first tool call can precede that observation. Its still-live
+finished assignment remains the parent for a command it starts, so child history
+and the peer-origin one-hop restriction do not depend on polling timing. A tool
+call alone does not reopen the assignment.
+
 ### Linked computers
 
 A peer is a `gateway` device on the other side: this gateway paired with it
@@ -262,6 +308,37 @@ computers the user `@`-named when opening a task (`POST /api/tasks`
 `mentions`, checked against the peer names) are stored on the task
 (`Task::mentions`) and reach the agent only through `tasks.read` of its own
 task, never through its conversation.
+
+### Agent upstream contract baselines
+
+OpenCode's upstream baseline is **2.0.27**, released October 12, 2026. The
+contract was checked against published source and mocked protocol replies;
+this is not live macOS/Linux platform certification. Discovery authenticates
+`GET /api/info`, requires a valid live PID and a known 2.x version, and matches
+any registered PID/version. Supervision also tracks the registration identity
+and reattaches when the instance changes. Credential-bearing debug output is
+redacted. Explicit `OPENCODE_URL` / `HERDR_GATEWAY_OPENCODE_URL` endpoints are
+attach-only: failed identity, authentication or version checks must not start a
+local fallback service. Older and future major versions are refused.
+
+Gateway absorbs upstream mappings without requiring an existing App update.
+The legacy session-list/children arrays remain; the additive page endpoint is
+gated by `agent_session_pages_v1` and per-agent `sessionPagination` (OpenCode
+only). It preserves provider cursors and order without automatically following
+pages. The current App's fifty-session request does not become full pagination.
+See [Agent API](docs/agent-api.md#get-apiagent-sessionspage) for the contract.
+
+DeepSeek's **rc.2** mapping reads `session/projections.asOfSeq` as the
+authoritative history cut and retains it across backward pages. File references
+use `fileReferences/list` with the live session as `agentId`; workspace file
+list/stat use `workspaceFileScopeId`, not a directory substituted for session
+scope. Model switching reads the returned `selected` model; readiness requires
+a matching `server-response`/`rpcId`, successful result and model-catalog shape,
+not merely HTTP 200. No upstream package replacement is required. Existing HTTP
+and HTTP-backed reverse-proxy paths are preserved; **0.2.1-alpha.2** native
+HTTPS Origin/Cookie handling and optional asynchronous questions with late
+answers remain unsupported. Do not generalize that limitation to every HTTPS
+reverse proxy or to ordinary blocking forms.
 
 ## Engineering conventions
 
@@ -320,6 +397,15 @@ device, so its bearer token is not sufficient by itself. `disabled` is an
 explicit token-only compatibility mode. Existing device records retain their
 pairing mode; changing the gateway setting governs newly paired devices.
 
+HTTP calls and manual HTTP code pairing remain supported. HTTP inside a
+verified SSH or Tailscale tunnel differs from plain HTTP on an unprotected
+LAN/WAN link; a hostname or address range alone is not evidence of protection.
+Without the QR's pairing key, the manual claim sends `code` and `request_id`
+without an application encryption envelope. A response key derived from those
+values cannot protect credentials from passive capture of both legs on an
+unprotected link. Use the QR key, a verified protected tunnel, or HTTPS where
+available.
+
 Agents the gateway launches for remote dispatch (`POST …/tasks`, `POST …/spawn`,
 and a terminal-agent delegation through `POST /api/tasks` or `tasks.delegate`)
 have nobody at the terminal to answer a prompt. They start with their own
@@ -345,6 +431,11 @@ so the goal is on that command line too, quoted by `shell_word` to read
 back unchanged in sh, bash, zsh and fish; a goal with a backslash or a
 control character other than a newline, other agents, and Herdr have it
 typed once the agent is up.
+
+Delegated agents run as the gateway's OS user with the default bypass flags
+above. Folder selection is not a sandbox: `agent_launch_args` and
+`agent_trust_folders` are owner controls, not isolation from same-user processes
+or shell access.
 
 `fleet.accept_delegations` (default `true`) is whether linked computers may
 open tasks here; the phone's switch writes it (`PUT /api/fleet/settings`),
@@ -372,3 +463,50 @@ Important quirks:
   automatically selects the first session and does not yet expose a picker.
 - The historical plugin ID (`herdr.gateway`) still identifies migration paths;
   legacy `herdr` response metadata remains unchanged for older Apps.
+
+### Encrypted transport revision 2 and durable request admission
+
+`transport_versions: [1, 2]` in authenticated health/discovery answers advertises
+revision 2. The transport header remains `1` (an encryption marker); paired keys
+and the HKDF key family do not change. Revision 2 authenticates
+`muqun-transport-v2\n<timestamp_ms>\n<existing AAD>`. Existing AAD is method plus
+path/query, with the initiating request nonce appended for replies. Responses
+use the authenticated request revision. SSE/WebSocket record keys and counters
+remain unchanged; their opening request uses the negotiated envelope.
+
+Clients verify an authenticated, nonce-bound v2 read before durably pinning v2
+and sending an application operation. A plain `transport_version_required`
+refusal may suggest a v2 read but cannot establish a trusted pin. Lost replies
+can be recovered with read-only negotiation; never retry an ambiguous mutation
+or downgrade a pin. `fleet::Peer.transport_min_version` persists outbound choice.
+
+`connectivity::replay_store` stores canonical nonce bytes and the minimum inbound
+revision per credential in SQLite, atomically before dispatch. A successfully
+admitted v2 request pins its credential across restart. Admission rechecks
+freshness on the SQLite worker inside the transaction, not only at decryption;
+invalid metadata changes neither the nonce ledger nor the version pin. Global
+v2 pruning advances a durable monotonic cutoff: v2 timestamps below it remain
+invalid after clock rollback or restart. Accepted legacy v1 identities remain
+until upgrade; unauthenticated timestamps are never grounds for eviction.
+Admission refuses at 262,144 outstanding identities per credential instead of
+evicting protection. A full legacy ledger returns `transport_version_required`
+so a read-only v2 negotiation can release old history without re-pairing.
+
+Legacy v1 still works during migration, including pairing bootstrap. Durable
+identities prevent replay of requests this Gateway has accepted, but cannot
+authenticate an unseen v1 request's freshness or recover pre-upgrade history.
+Do not describe legacy v1 as equivalent to v2. Update App and Gateway peers and
+verify v2 before claiming remediation for that connection. Back up the store
+before updating: the fleet migration and appended `transport` migration #2
+mean an older binary alone is not a valid rollback of the migrated database;
+store migration checks reject schemas newer than that binary supports. Recovery
+requires a database backup compatible with the exact binary version, not deleting
+the database. Replay history cleared by pre-fix builds cannot be reconstructed;
+this change does not retroactively repair that loss.
+
+Outbound MCP forwarding resolves context separately from best-effort local task
+filing. Missing, ambiguous, failed, timed-out or truncated evidence and broken
+ancestry return `lineage_unresolved` before remote work. Peer ancestry returns
+`delegation_loop`. Local operations retain their behavior. Shared provider
+credentials and same-user shell access are not a session sandbox; this is a
+conservative workflow boundary rather than hostile OS isolation.

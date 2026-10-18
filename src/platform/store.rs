@@ -294,6 +294,19 @@ pub(crate) fn write_devices(devices: &[DeviceRecord]) -> anyhow::Result<()> {
     write_devices_at(&dir, devices)
 }
 
+/// Publish a membership change only after its durable write succeeds. The
+/// caller keeps the device lock throughout, serializing push admission and
+/// registrations with revoke, install replacement and capacity eviction.
+pub(crate) fn persist_devices_before_publish(
+    current: &mut Vec<DeviceRecord>,
+    proposed: Vec<DeviceRecord>,
+    persist: impl FnOnce(&[DeviceRecord]) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    persist(&proposed)?;
+    *current = proposed;
+    Ok(())
+}
+
 /// Persist the device list, keeping the generation it replaces beside it.
 ///
 /// The backup is what turns a bad list into an inconvenience instead of a
@@ -368,6 +381,8 @@ pub(crate) fn revoke_device_by_id(device_id: &str) -> anyhow::Result<bool> {
 }
 
 pub(crate) fn revoke_device_at(dir: &std::path::Path, device_id: &str) -> anyhow::Result<bool> {
+    // Stale push records deliberately remain on disk. Startup/send admission
+    // checks authoritative membership; push-file cleanup cannot undo a revoke.
     let removed = update_devices_at(dir, |devices| {
         let previous_len = devices.len();
         devices.retain(|device| device.id != device_id);
@@ -1429,7 +1444,8 @@ mod tests {
     }
 
     /// A `push-tokens.json` written before the locale field existed still
-    /// loads, and the device it describes is notified in English.
+    /// loads with English rendering, but needs authenticated re-registration
+    /// before any notification can be sent.
     #[test]
     fn a_push_token_registered_before_locales_existed_still_loads() {
         let old: Vec<PushTokenRecord> = serde_json::from_str(
@@ -1438,6 +1454,7 @@ mod tests {
         )
         .expect("the field is optional, so an older file is still a valid one");
         assert_eq!(old[0].locale, None);
+        assert_eq!(old[0].device_id, None);
         assert_eq!(old[0].locale(), Locale::En);
 
         let current: Vec<PushTokenRecord> = serde_json::from_str(
@@ -1455,5 +1472,53 @@ mod tests {
         )
         .unwrap();
         assert_eq!(odd[0].locale(), Locale::En);
+    }
+
+    #[test]
+    fn failed_membership_persistence_keeps_the_published_generation() {
+        let original = vec![device_fixture("phone")];
+        for proposed in [vec![], vec![device_fixture("replacement")]] {
+            let mut current = original.clone();
+            assert!(persist_devices_before_publish(
+                &mut current,
+                proposed.clone(),
+                |_| anyhow::bail!("injected disk failure")
+            )
+            .is_err());
+            assert_eq!(current, original);
+            persist_devices_before_publish(&mut current, proposed.clone(), |saved| {
+                assert_eq!(saved, proposed);
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(current, proposed);
+        }
+    }
+
+    #[test]
+    fn offline_revoke_and_restart_ignore_stale_push_file_even_if_cleanup_would_fail() {
+        let dir = test_state_dir().join(format!("push-revoke-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        write_devices_at(&dir, &[device_fixture("phone")]).unwrap();
+        let stale = r#"[{"token":"ExpoPushToken[stale]","device_id":"phone","platform":"ios","updated_unix_ms":1}]"#;
+        std::fs::write(dir.join(PUSH_TOKENS_FILE), stale).unwrap();
+        assert!(revoke_device_at(&dir, "phone").unwrap());
+        assert_eq!(
+            std::fs::read_to_string(dir.join(PUSH_TOKENS_FILE)).unwrap(),
+            stale
+        );
+        let restarted = test_state("admin", read_devices_at(&dir.join(DEVICES_FILE)).unwrap());
+        *restarted.push_tokens.lock().unwrap() = serde_json::from_str(stale).unwrap();
+        assert!(crate::connectivity::push::registered_recipients(&restarted)
+            .unwrap()
+            .is_empty());
+
+        // A path that cannot be a push file must not affect device revocation.
+        std::fs::remove_file(dir.join(PUSH_TOKENS_FILE)).unwrap();
+        std::fs::create_dir(dir.join(PUSH_TOKENS_FILE)).unwrap();
+        write_devices_at(&dir, &[device_fixture("tablet")]).unwrap();
+        assert!(revoke_device_at(&dir, "tablet").unwrap());
+        assert!(read_devices_at(&dir.join(DEVICES_FILE)).unwrap().is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

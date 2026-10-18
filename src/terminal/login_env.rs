@@ -145,6 +145,12 @@ fn probe_login_shell() -> Option<LoginEnvironment> {
     Some(parse_probe(&stdout))
 }
 
+/// The user's login shell as the probes run it: `$SHELL` when it is a
+/// POSIX shell, else `/bin/sh`.
+pub(crate) fn user_shell() -> String {
+    probe_shell_for(std::env::var("SHELL").ok().as_deref())
+}
+
 /// Which shell to ask.
 ///
 /// `$SHELL` when it speaks POSIX, because that is where the user's own profile

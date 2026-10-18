@@ -21,11 +21,52 @@ pub(crate) struct HistoryQuery {
     source: Option<String>,
 }
 
+/// `GET /api/history/storage`: which storage this Gateway runs with and,
+/// for SQLite, what it holds -- read from counters, never a query here.
+/// The admin token (`manage`) or a device.
+pub(crate) async fn history_storage(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    if crate::require_admin(&state.config, &headers).is_err() {
+        require_device(&state, &headers)?;
+    }
+    let mut answer = serde_json::json!({ "storage": state.config.history.storage });
+    if let Some(stats) = state.history.stats() {
+        if let (Some(answer), Value::Object(stats)) =
+            (answer.as_object_mut(), serde_json::json!(stats))
+        {
+            answer.extend(stats);
+        }
+    }
+    Ok(Json(answer))
+}
+
 pub(crate) async fn pane_history(
     State(state): State<AppState>,
     Path((session_id, pane_id)): Path<(String, String)>,
     Query(query): Query<HistoryQuery>,
     headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    pane_history_for(state, session_id, pane_id, query, headers, false).await
+}
+
+pub(crate) async fn pane_history_segments(
+    State(state): State<AppState>,
+    Path((session_id, pane_id)): Path<(String, String)>,
+    Query(query): Query<HistoryQuery>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    pane_history_for(state, session_id, pane_id, query, headers, true).await
+}
+
+async fn pane_history_for(
+    state: AppState,
+    session_id: String,
+    pane_id: String,
+    query: HistoryQuery,
+    headers: HeaderMap,
+    segmented: bool,
 ) -> ApiResult<Json<Value>> {
     let device = require_device(&state, &headers)?;
     let scope = validate_query(&session_id, &pane_id, device, &state.generation, &query)?;
@@ -56,11 +97,16 @@ pub(crate) async fn pane_history(
             api_error(StatusCode::NOT_FOUND, "pane_not_found", "pane not found")
         });
     }
-    let mut page =
-        super::history::read_page(state.history.as_ref(), scope, query.before.as_deref())
+    let mut page = if segmented {
+        super::history::read_segment_page(state.history.as_ref(), scope, query.before.as_deref())
             .await
-            .map_err(history_error)?;
-    super::exit_marker::strip_history_page(&mut page);
+    } else {
+        super::history::read_page(state.history.as_ref(), scope, query.before.as_deref()).await
+    }
+    .map_err(history_error)?;
+    if !segmented {
+        super::exit_marker::strip_history_page(&mut page);
+    }
     Ok(Json(content_envelope(page)))
 }
 
@@ -233,6 +279,120 @@ mod tests {
             serde_json::from_slice(&body)
                 .unwrap_or_else(|_| json!({"rejection": String::from_utf8_lossy(&body)})),
         )
+    }
+
+    #[tokio::test]
+    async fn structured_history_http_contract_is_additive_authenticated_and_marker_filtered() {
+        let fixture = Fixture::new().await;
+        let uri = "/api/sessions/s/panes/p/history/segments?limit=2";
+        assert_eq!(
+            get(fixture.app(), uri, None).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+        let (status, body) = get(fixture.app(), uri, Some("token")).await;
+        assert_eq!(status, StatusCode::OK);
+        let page = &body["data"];
+        assert_eq!(page["segments"][0]["rows"], json!(["row 5", "row 6"]));
+        assert_eq!(page["row_count"], 2);
+        assert_eq!(page["source"], "gateway-captured");
+        assert_eq!(page["read_source"], "recent-unwrapped");
+        assert_eq!(page["includes_live_viewport"], false);
+        assert_eq!(page["complete_archive"], false);
+        assert!(page.get("rows").is_none() && page.get("capture_epoch").is_none());
+        assert_eq!(page["segments"][0].as_object().unwrap().len(), 5);
+        let cursor = page["next_before"].as_str().unwrap();
+        let (status, older) = get(
+            fixture.app(),
+            &format!("{uri}&before={cursor}"),
+            Some("token"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            older["data"]["segments"][0]["segment_id"],
+            page["segments"][0]["segment_id"]
+        );
+        assert_eq!(
+            older["data"]["segments"][0]["rows"],
+            json!(["row 3", "row 4"])
+        );
+        assert_eq!(
+            get(
+                fixture.app(),
+                &format!("/api/sessions/s/panes/p/history?limit=2&before={cursor}"),
+                Some("token")
+            )
+            .await
+            .0,
+            StatusCode::CONFLICT
+        );
+        for query in [
+            "limit=0",
+            "limit=501",
+            "format=html",
+            "source=native",
+            "start=1",
+        ] {
+            assert_eq!(
+                get(
+                    fixture.app(),
+                    &format!("/api/sessions/s/panes/p/history/segments?{query}"),
+                    Some("token")
+                )
+                .await
+                .0,
+                StatusCode::BAD_REQUEST
+            );
+        }
+        let (_, ansi) = get(
+            fixture.app(),
+            "/api/sessions/s/panes/p/history/segments?limit=2&format=ansi",
+            Some("token"),
+        )
+        .await;
+        assert_eq!(
+            ansi["data"]["segments"][0]["rows"],
+            json!(["\u{1b}[31mrow 5\u{1b}[0m", "\u{1b}[31mrow 6\u{1b}[0m"])
+        );
+        let (_, empty) = get(
+            fixture.app(),
+            "/api/sessions/s/panes/native/history/segments",
+            Some("token"),
+        )
+        .await;
+        assert_eq!(empty["data"]["availability"], "not_captured");
+        assert!(empty["data"]["snapshot_id"].is_null() && empty["data"]["next_before"].is_null());
+    }
+
+    #[tokio::test]
+    async fn the_storage_route_says_which_store_runs_and_what_it_holds() {
+        let mut fixture = Fixture::new().await;
+        let uri = "/api/history/storage";
+        let memory = get(fixture.app(), uri, Some("token")).await;
+        assert_eq!(memory, (StatusCode::OK, json!({ "storage": "memory" })));
+        assert_eq!(
+            get(fixture.app(), uri, None).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+        fixture.state.config.history.storage = crate::platform::config::HistoryStorage::Sqlite;
+        fixture.state.history = std::sync::Arc::new(
+            super::super::history_sqlite::SqliteHistoryRepository::open(
+                fixture.state.db.clone(),
+                &fixture.state.config,
+                fixture.state.scrollback.clone(),
+            )
+            .await,
+        );
+        let (status, sqlite) = get(fixture.app(), uri, Some("admin")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            (&sqlite["storage"], &sqlite["healthy"]),
+            (&json!("sqlite"), &json!(true))
+        );
+        assert!(
+            sqlite["checkpoints"].is_u64() && sqlite["wal_bytes"].is_u64(),
+            "{sqlite}"
+        );
     }
 
     #[tokio::test]
@@ -666,6 +826,20 @@ mod tests {
                     .lines()
                     .any(|row| row.trim() == format!("row {}", top + 6))
                 {
+                    let _ansi = pane_output(
+                        State(state.clone()),
+                        Path(("s".into(), pane.id.to_string())),
+                        Query(OutputQuery {
+                            source: Some("recent-unwrapped".into()),
+                            lines: Some(200),
+                            format: Some("ansi".into()),
+                            start: None,
+                            end: None,
+                        }),
+                        bearer_headers("token"),
+                    )
+                    .await
+                    .unwrap();
                     break;
                 }
                 assert!(
@@ -725,6 +899,30 @@ mod tests {
         let recovered = get(app(), &uri, Some("token")).await;
         assert_eq!(recovered.0, StatusCode::OK);
         assert_eq!(recovered.1["data"]["rows"], first.1["data"]["rows"]);
+        assert_eq!(recovered.1["data"]["row_count"], 2);
+        assert_eq!(recovered.1["data"]["has_more"], true);
+        // The recovered checkpoint pages like a live capture.
+        let older = recovered.1["data"]["next_before"].as_str().unwrap();
+        let second = get(app(), &format!("{uri}&before={older}"), Some("token")).await;
+        assert_eq!(second.0, StatusCode::OK);
+        assert_eq!(second.1["data"]["rows"], json!(["row 3", "row 4"]));
+        // So does the ANSI shape the app reads, page for page.
+        let ansi = format!("{uri}&format=ansi");
+        let colored = get(app(), &ansi, Some("token")).await;
+        assert_eq!(colored.0, StatusCode::OK);
+        let rows = colored.1["data"]["rows"].as_array().unwrap();
+        assert_eq!(colored.1["data"]["row_count"], rows.len());
+        assert!(
+            rows.len() == 2
+                && rows
+                    .iter()
+                    .all(|row| row.as_str().unwrap().contains("row ")),
+            "{rows:?}"
+        );
+        let older = colored.1["data"]["next_before"].as_str().unwrap();
+        let colored = get(app(), &format!("{ansi}&before={older}"), Some("token")).await;
+        assert_eq!(colored.0, StatusCode::OK);
+        assert_eq!(colored.1["data"]["row_count"], 2);
         assert_eq!(
             state
                 .scrollback

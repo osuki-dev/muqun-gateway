@@ -18,6 +18,7 @@ pub(super) const PT: &[(&str, &str)] = &[
     // -- push notifications --------------------------------------------------
     ("Agent", "Agente"),
     ("Approval needed", "Aprovação necessária"),
+    ("Needs your input", "Precisa da sua resposta"),
     ("Agent blocked", "Agente bloqueado"),
     ("Agent done", "Agente terminou"),
     ("{name} is waiting for your approval.", "{name} está à espera da sua aprovação."),

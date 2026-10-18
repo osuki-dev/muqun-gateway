@@ -83,11 +83,29 @@ curl -fsSL https://muqun.dev/gateway.sh | sh
 It downloads a prebuilt, statically linked binary for your platform, so no Rust
 toolchain is needed.
 
-tmux is all it needs — Herdr is optional. The installer configures whichever
-backends are actually present: tmux, Herdr, or both. Herdr-only installs also use
+tmux is enough as a terminal backend — Herdr is optional. The installer configures
+whichever backends are actually present: tmux, Herdr, or both. Herdr-only installs also use
 the standalone gateway so it can start independently at login/boot.
-Re-running it is safe: it never duplicates a backend, never loses a paired
-device, and never flips a default an earlier install chose.
+For an existing install, the script identifies and delegates to its protected
+updater; it does not overwrite the binary or issue a second restart. An older
+install without that updater is retained and refused with manual migration
+guidance: back up config/state, verify a reviewed release, stop through the
+existing service owner, and keep the old image for recovery. Do not delete the
+installed binary to bypass the check.
+
+Fresh installs resolve one stable `vX.Y.Z` tag, download its binary and matching
+checksum over HTTPS into private staging, and verify SHA256 before publication
+(integrity, not publisher signing). Native ELF/Mach-O headers and architecture
+are checked before staged execution; a time/output-bounded `--version` probe
+must match the pinned tag before publication. Fresh installation requires `curl`
+and `sha256sum` or `shasum`; macOS also requires preinstalled system Perl for
+atomic no-clobber publication via direct `link()`, and fails closed if unavailable.
+The script does not install dependencies automatically or perform a global install.
+Numbered stages report `OK`, `FAILED`, or
+readiness `UNCONFIRMED`, rather than claiming an unconfirmed Gateway is running.
+Supported TTYs show curl's measured download progress; `NO_COLOR`, dumb terminals
+and non-TTY output stay plain. Stage lines remain usable in narrow terminals,
+including 32 columns.
 
 The installer downloads the [agent command catalog](https://agent-commands.muqun.dev/)
 once for terminal slash-command suggestions. It does not run a refresh service.
@@ -123,6 +141,13 @@ device list; `p` pairs another device.
 
 No camera on the phone? Type the gateway's address into the app instead, and
 finish with the same short code.
+
+Manual code pairing remains supported. Without the QR's pairing key, the
+claim sends `code` and `request_id` without an application encryption envelope.
+Encrypting the response with a key derived from those values does not prevent
+a passive observer who captures both request and response on an unprotected
+link from recovering the credentials. Use the QR key, a verified protected
+tunnel, or HTTPS where available.
 
 Every view starts with a one-line header: Gateway version, whether it is
 running and where it listens, whether Herdr and the agent service answer,
@@ -362,6 +387,10 @@ without asking. To keep the prompts, set the launch arguments per kind in
 The gateway logs the launch arguments in effect at startup, and `manage` shows
 and switches them under Settings › Agents started from the phone. Details: [Agent API](docs/agent-api.md#terminal-agents-launched-for-remote-dispatch).
 
+Delegated agents run as your OS user. Selecting a task folder is not a sandbox;
+`agent_launch_args` and `agent_trust_folders` are owner controls, not isolation
+from other processes or shell commands running as that same user.
+
 ### The OpenCode agent
 
 The gateway's agent features require OpenCode 2 with `GET /api/info`. While the
@@ -393,11 +422,38 @@ INFO no OpenCode service found, starting one binary=/home/you/.opencode/bin/open
 INFO adopted the running OpenCode service url=http://127.0.0.1:49374 version="2.0.14" binary=/home/you/.opencode/bin/opencode
 ```
 
-If what it finds is older than 2.0 it refuses it — started or adopted — with
-one line saying which file, which version, and that `opencode.binary` is how to
-point it elsewhere. OpenCode 1 is a different API, and half-working with it is
-worse than saying so. `GET /api/agent-status` reports the same facts to the
-app, including whether the agent was `adopted` or `spawned`.
+The binary probe refuses a known major other than 2; adoption requires a known
+2.x live version. Refusal messages are generic and do not echo the untrusted
+version. Check your installation and the available startup diagnostics; set
+`opencode.binary` to the intended binary's absolute path in `config.json` if
+needed. OpenCode 1 is a different API, and future major versions are not
+accepted. `GET /api/agent-status` reports the service version and whether the
+agent was `adopted` or `spawned` when available.
+
+Adoption requires authenticated live `/api/info` with a valid PID and 2.x
+version; a registration's PID and version must match that reply. Credentials
+are redacted from debug output. An explicit `OPENCODE_URL` (or legacy
+`HERDR_GATEWAY_OPENCODE_URL`) is attach-only: failed authentication, identity
+or version checks never start a fallback local service.
+
+The upstream contract baseline is OpenCode **2.0.27** (released October 12,
+2026), checked against published source and mocked protocol replies, not live
+platform certification. Gateway absorbs the protocol mapping without requiring
+an existing App update. Session lists remain arrays; optional pagination needs
+`agent_session_pages_v1` and the selected agent's `sessionPagination` flag
+(OpenCode only). The current App still requests fifty sessions and does not
+automatically fetch further pages. See the [Agent API](docs/agent-api.md#get-apiagent-sessionspage).
+
+### DeepSeek Harness compatibility
+
+The Gateway adapter tracks the **rc.2** contract: history uses one
+authoritative projection cut, file references use a live session scope, and
+model selection/probing validate the upstream success payload. These mappings
+require no existing App change or replacement of your upstream package. Existing
+HTTP and HTTP-backed reverse-proxy paths remain supported. The **0.2.1-alpha.2**
+native HTTPS Origin/Cookie flow and optional asynchronous questions with late
+answers are currently unsupported; this does not mean all HTTPS reverse proxies
+are unsupported, or that ordinary blocking forms are unsupported.
 
 ### T3 Code
 
@@ -456,12 +512,19 @@ login startup; on Linux boot startup requires the user service and lingering.
 ### Lazygit
 
 Install `lazygit` on the Gateway host to offer it in a compatible App's Terminal
-Quick actions and Changes sheets. The Gateway advertises `pane_lazygit` and
+Git workspace. The Gateway advertises `pane_lazygit` and
 checks the installed executable and the source pane's Git checkout before the
-App shows an entry. No App-provided shell command or working directory is used.
+App shows an entry. No App-provided shell command or arbitrary working directory is used.
+
+`pane_lazygit_worktree` adds an optional `worktree` query parameter to the
+availability and launch routes. The App must select an exact canonical path
+from `git/worktrees`; the Gateway verifies it against the source repository's
+current linked-checkout inventory for every request. A removed or unrelated
+checkout is refused before creating a terminal. Omit the selector to retain
+the original source-checkout behavior on older Apps and Gateways.
 
 Launching creates a dedicated tab in the same workspace and starts lazygit in
-that checkout, leaving the source terminal's desktop focus unchanged. The App
+the selected checkout, leaving the source terminal's desktop focus unchanged. The App
 selects the new pane and exposes its virtual keyboard. Lazygit has its own key
 profile and full-screen output handling; it receives no Vim-specific commands.
 If startup cannot be confirmed, open the already-created terminal to inspect it
@@ -510,10 +573,42 @@ Put both devices on [Tailscale](https://tailscale.com) and point the gateway at
 your tailnet address. That keeps the gateway off the public internet and needs
 no port forwarding. Use Tailscale Serve, not Funnel.
 
+HTTP calls remain supported, including inside a verified SSH or Tailscale
+tunnel. That protected path differs from plain HTTP on an unprotected LAN or
+WAN link; a hostname or address range alone does not prove the path is protected.
+
 ## Update
 
-Re-run the install command. It replaces the binary in place, and your paired
-phones stay paired.
+Re-run the install command to use the installed protected updater, or use
+`muqun-gateway update` directly. See [Manual stable updates](#manual-stable-updates)
+for supported installs and recovery limits. Back up the shared database and its
+encryption key together before a schema upgrade; binary rollback alone cannot
+undo a database migration.
+
+### Push registration after upgrading
+
+`push_token_owner_binding_v1` means notifications are sent only to registrations
+owned by a currently paired App device. Legacy registrations without an owner
+are retained but suppressed until an authenticated registration replaces them.
+An older App may cache registration for seven days, so reopening it alone need
+not restore notifications. On each paired App, turn notifications **OFF**, let
+unregistration finish, then **ON** in App settings to clear the cache and register
+again (notification permission and a working Gateway connection are required).
+Recovery is not automatic or a seamless upgrade guarantee.
+
+Future App integration must negotiate this capability and remember a stable
+registration revision after a successful authenticated re-registration, not
+re-register on every Gateway build or restart. That App work is still pending.
+
+### Captured terminal history
+
+`pane_captured_history_segments_v1` adds `/history/segments` for bounded sampled
+history in memory or SQLite, with explicit segment boundaries and no live viewport
+or native backlog stitching. The legacy `pane_captured_history` `/history` API
+remains a single prefix, not all retained segments. SQLite checkpoint support is
+still separately advertised. See [Captured history](docs/captured-history.md).
+App capability negotiation and its history window limits are deferred; this
+Gateway contract does not mean the current App browses every segment.
 
 ## License
 

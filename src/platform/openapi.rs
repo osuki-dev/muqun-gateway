@@ -41,6 +41,7 @@ fn agents_plane_schema() -> Value {
                                 "compaction": { "type": "boolean" },
                                 "backgroundShells": { "type": "boolean" },
                                 "attachments": { "type": "boolean" },
+                                "sessionPagination": { "type": "boolean", "description": "This provider supports GET /api/agent-sessions/page; absent or false means use the legacy array list" },
                                 "attachmentsByPath": { "type": "boolean", "description": "Attachments reach the agent as host paths appended to the prompt text (the agent reads them with its own tools) rather than as native file parts" }
                             }
                         },
@@ -142,7 +143,7 @@ pub fn openapi_spec() -> Value {
             "/api/meta": { "get": simple_endpoint("Gateway API, backend, and legacy compatibility metadata") },
             "/api/pair/request": {
                 "post": {
-                    "summary": "Request pairing from Muqun app",
+                    "summary": "Request pairing from Muqun app. The code shown on this computer lives five minutes (expires_in_ms: 300000); a code minted with POST /api/pair/pending for another gateway lives one (60000)",
                     "security": [],
                     "requestBody": json_body(object_schema(&[("request_id", "string"), ("device_name", "string")], &["request_id"])),
                     "responses": ok_response()
@@ -156,7 +157,26 @@ pub fn openapi_spec() -> Value {
                     "responses": ok_response()
                 }
             },
-            "/api/pairings": { "get": simple_endpoint("List devices holding a gateway token") },
+            "/api/pairings": { "get": {
+                "summary": "List devices holding a gateway token",
+                "responses": json_ok("The paired devices", json!({
+                    "type": "object",
+                    "required": ["devices"],
+                    "properties": { "devices": { "type": "array", "items": {
+                        "type": "object",
+                        "required": ["id", "name", "paired_unix_ms", "last_seen_unix_ms", "kind", "current"],
+                        "properties": {
+                            "id": { "type": "string" },
+                            "name": { "type": "string" },
+                            "paired_unix_ms": { "type": "integer" },
+                            "last_seen_unix_ms": { "type": "integer" },
+                            "kind": { "type": "string", "enum": ["app", "gateway"] },
+                            "server_id": { "type": ["string", "null"], "description": "kind gateway: the id that computer gave for itself when it paired here, when known (null otherwise); matches its peer_server_id" },
+                            "current": { "type": "boolean", "description": "The device whose token made this request" }
+                        }
+                    } } }
+                }))
+            } },
             "/api/pairings/{deviceId}": {
                 "delete": {
                     "summary": "Revoke one device's gateway token",
@@ -167,6 +187,7 @@ pub fn openapi_spec() -> Value {
             "/api/devices/push-token": {
                 "post": {
                     "summary": "Register this Muqun device's Expo push token",
+                    "description": "push_token_owner_binding_v1: authenticated registration binds the token to the calling paired App device. Legacy unowned registrations are suppressed until re-registration; reopening an older App may still skip registration because of its seven-day cache. See README upgrade guidance. No automatic App revision handshake is implied.",
                     "requestBody": json_body(object_schema(&[("token", "string"), ("platform", "string"), ("device_name", "string"), ("locale", "string")], &["token", "platform"])),
                     "responses": ok_response()
                 },
@@ -482,7 +503,7 @@ pub fn openapi_spec() -> Value {
                 "get": {
                     "summary": "What changed in the pane's checkout",
                     "description": "git status --porcelain=v2 plus git diff --numstat HEAD, run read-only (--no-optional-locks, so the agent working in the checkout never loses index.lock) inside the checkout the pane's fenced working directory belongs to. One entry per changed file -- staged, unstaged and untracked together, which is what 'what did the agent change' means -- with line totals; binary files carry null totals. The list stops at 2000 files and says so with truncated; repo.changed_files is still the full count. A pane outside any checkout answers repo: null and an empty list, not an error. Announced as git_diff.",
-                    "parameters": [path_param("sessionId"), path_param("paneId")],
+                    "parameters": [path_param("sessionId"), path_param("paneId"), query_param("worktree", "Optional exact canonical path from git/worktrees; unavailable or unrelated checkouts are refused with 403 invalid_worktree. Announced as git_worktrees.")],
                     "responses": git_status_responses()
                 }
             },
@@ -493,6 +514,7 @@ pub fn openapi_spec() -> Value {
                     "parameters": [
                         path_param("sessionId"),
                         path_param("paneId"),
+                        query_param("worktree", "Optional exact canonical path from git/worktrees; read-only and restricted to this pane's repository"),
                         query_param("path", "The file, relative to the checkout's top level"),
                         query_param("old_path", "For a renamed or copied file, the path before, so git renders the rename rather than a new file"),
                         query_param("staged", "Absent: working tree against HEAD. true: index against HEAD. false: working tree against index"),
@@ -616,7 +638,7 @@ pub fn openapi_spec() -> Value {
             "/api/agent-sessions": {
                 "get": {
                     "summary": "List all active AI agent sessions",
-                    "description": "Returns agent sessions merged across every attached agent, or for one agent with agent_id. Each session carries agent_id.",
+                    "description": "Returns an array of agent sessions merged across every attached agent, or for one agent with agent_id, sorted newest updated_ms first. The default limit is 50 per agent and failing providers are skipped while another succeeds. Each session carries agent_id. An unscoped cursor is rejected before fanout; this legacy response exposes no continuation cursors. Use /api/agent-sessions/page for explicit single-provider pagination.",
                     "responses": ok_response()
                 },
                 "post": {
@@ -754,8 +776,33 @@ pub fn openapi_spec() -> Value {
         }
     });
     spec["paths"]["/api/sessions/{sessionId}/panes/{paneId}/history"] = captured_history_path();
+    spec["paths"]["/api/sessions/{sessionId}/panes/{paneId}/history/segments"] =
+        captured_history_segments_path();
+    spec["paths"]["/api/sessions/{sessionId}/panes/{paneId}/git/worktrees"] = git_worktrees_path();
+    spec["paths"]["/api/agents/{agent_id}/sessions/{asid}"] = json!({
+        "delete": {
+            "summary": "Delete a session from its exact owning agent",
+            "description": "Announced as agent_session_delete_scoped. Verify the exact session belongs to the named attached agent and delete only there, without falling back to another agent. Older gateways return 404 for this distinct route; clients must never fall back to the legacy unscoped DELETE. 400 invalid_agent or invalid_session, 503 agent_unavailable, 404 session_not_found, 409 session_changed, 502 agent_error, 501 feature_unsupported. Provider deletion removes a conversation; it does not guarantee active processes have stopped.",
+            "parameters": [path_param("agent_id"), path_param("asid")],
+            "responses": ok_response()
+        }
+    });
+    spec["paths"]["/api/history/storage"] = json!({ "get": {
+        "summary": "Which captured-history storage this Gateway runs with (memory or sqlite, from config.json at startup) and, for sqlite, what it holds, from counters the write loop keeps. Requires the admin token or a device",
+        "responses": json_ok("The storage", json!({
+            "type": "object",
+            "required": ["storage"],
+            "properties": {
+                "storage": { "type": "string", "enum": ["memory", "sqlite"] },
+                "healthy": { "type": "boolean", "description": "sqlite only: the last write pass worked (a failing store retries on its own)" },
+                "checkpoints": { "type": "integer", "description": "sqlite only: stored checkpoints, one per pane and format" },
+                "wal_bytes": { "type": "integer", "description": "sqlite only: the store's WAL file, as of the last write pass" }
+            }
+        }))
+    }});
     spec["paths"]["/api/sessions/{sessionId}/panes/{paneId}/lazygit"] = lazygit_endpoints();
     spec["paths"]["/api/agent-sessions/{asid}/audio-asset"] = audio_asset_endpoint();
+    spec["paths"]["/api/agent-sessions/page"] = session_page_endpoint();
     spec["paths"]["/api/agent-sessions/{asid}/file-asset"] = json!({"get": {
         "summary": "Resolve a local file output inside an agent session",
         "description": "Requires device authentication and agent_file_assets capability. Resolves audio, video, images, documents and binary files inside the server-owned directory. Web URLs, path escapes and symlinks outside the root are refused. Returns data.asset metadata with an opaque id.",
@@ -796,7 +843,11 @@ fn task_view_schema() -> Value {
             },
             "created_ms": { "type": "integer" },
             "updated_ms": { "type": "integer" },
+            "reopened_ms": { "type": ["integer", "null"], "description": "When the same live session or pane started another user turn after finishing" },
+            "reopen_count": { "type": "integer", "description": "Number of times this assignment resumed; acknowledgements apply to one finish only" },
             "client_ref": { "type": "string", "description": "The requester's own reference for the task (POST /api/tasks client_ref), when it gave one" },
+            "model": { "type": "string", "description": "A terminal delegation only: the model its launch passed, else (codex) its own config's -- what GET /api/tasks/defaults answers -- else \"default\" (the agent's own)" },
+            "variant": { "type": "string", "description": "A terminal delegation only: the effort that goes with model, when known" },
             "parent_task_id": { "type": ["string", "null"], "description": "The open task this one was started from, when the gateway could tell" },
             "origin": { "type": "string", "enum": ["device", "agent", "mcp", "peer"], "description": "device: POST /api/tasks; peer: POST /api/tasks by another of the owner's computers (fleet_peers); agent: started by work the gateway tracks (its agent service, or the pane of an open task); mcp: any other MCP host. Tasks stored before origins existed are mcp" },
             "label": { "type": ["string", "null"], "description": "A short title the requester gave" },
@@ -897,10 +948,10 @@ fn tasks_fleet_mcp_paths() -> Vec<(&'static str, Value)> {
             }]
         }),
     );
-    create_responses["400"] = json!({ "description": "invalid_request (empty or oversized goal, oversized label, empty name), invalid_directory, directory_not_found, not_a_directory, unknown_model, invalid_mentions (too many mentions, or one naming no linked computer)" });
+    create_responses["400"] = json!({ "description": "invalid_request (empty or oversized goal, oversized label, empty name), invalid_directory, directory_not_found, not_a_directory, unknown_model, invalid_mentions (too many mentions, or one naming no linked computer), terminal_unknown (session_id names no terminal session here), attachments_unsupported (attachments with a terminal agent, for another computer, or from one), invalid_attachment (a reference that is no file uploaded here; checked before anything is made)" });
     create_responses["502"] = json!({ "description": "agent_error: the agent could not start the session or take the prompt, or no pane could be made for a terminal agent" });
     create_responses["403"] = json!({ "description": "delegations_disabled: another of the owner's computers (fleet_peers) asked while this computer takes no work from other computers (fleet.accept_delegations); checked before the body. Its task otherwise opens as a device's does, with origin peer and requested_by named from its device record" });
-    create_responses["503"] = json!({ "description": "agent_unavailable: the agent is not attached (a session agent is never started in a pane) or a terminal agent is not on PATH; no_terminal: no terminal session answers" });
+    create_responses["503"] = json!({ "description": "agent_unavailable: the agent is not attached (a session agent is never started in a pane) or a terminal agent is not on PATH; no_terminal: no terminal session answers (or the one session_id names does not)" });
     let read_responses = not_found(
         json_ok(
             "The task and its state history, oldest first",
@@ -969,20 +1020,43 @@ fn tasks_fleet_mcp_paths() -> Vec<(&'static str, Value)> {
                 "summary": "Open a delegation from the device: a new agent session with the goal as its first prompt, or, for a terminal agent from the agent catalog (codex, claude, ...), a new pane running it with the goal as its first prompt (on the command line for codex and claude on tmux, else typed in). Requires the task_ledger_create capability and a device token (or, fleet_peers, another computer's gateway token); a terminal agent needs task_ledger_pane",
                 "requestBody": json_body(json!({
                     "type": "object",
-                    "required": ["goal"],
                     "properties": {
-                        "goal": { "type": "string", "description": "At most 32 KiB" },
+                        "goal": { "type": "string", "description": "At most 32 KiB; required unless kind is command" },
                         "agent_id": { "type": "string", "description": "An attached agent (opencode, ...) or a terminal agent kind from GET /api/agents/catalog (codex, claude, ...). Default: the primary agent" },
                         "cwd": { "type": "string", "description": "Absolute directory (~ expands); default: the home directory" },
                         "mode": { "type": "string", "description": "Ignored for a terminal agent" },
-                        "model": { "type": "string", "description": "A model id from the agent's catalog, or provider_id/model_id. Ignored for a terminal agent, as is variant" },
-                        "variant": { "type": "string", "description": "The model's variant (reasoning effort), applied when the session is created so the first turn uses it. Applied only together with model (ignored otherwise); must be one of the model's catalog variants when it lists any" },
+                        "model": { "type": "string", "description": "A model id from the agent's catalog, or provider_id/model_id. For a terminal agent, passed to its launch for this run only (codex: -c model; claude: --model where its --help lists it); 1 to 128 of A-Z a-z 0-9 . _ : / @ + -, not starting with -" },
+                        "variant": { "type": "string", "description": "The model's variant (reasoning effort), applied when the session is created so the first turn uses it. Applied only together with model (ignored otherwise); must be one of the model's catalog variants when it lists any. For a terminal agent, passed to its launch (codex: -c model_reasoning_effort; claude: --effort where listed)" },
+                        "kind": { "type": "string", "enum": ["delegation", "command"], "description": "command: run `command` as a command task (a visible pane, no agent) and answer with its exit_code, stdout_tail and pane_id once it ended within timeout_s; goal is then not needed. Another computer's command (exec.run with machine) runs only in a directory inside this computer's home" },
+                        "command": { "type": "string", "description": "kind command: the shell command, at most 16 KiB" },
+                        "timeout_s": { "type": "integer", "description": "kind command: how long the create waits for it, 1..=45 (default 30)" },
+                        "attachments": { "type": "array", "items": { "type": "string" }, "maxItems": 16, "description": "Files sent with the goal, as POST /api/agent-sessions/{asid}/prompt takes them (uploaded asset references or file paths on this computer), handed to the agent with its first prompt. A session agent on this computer only: with a terminal agent or another computer it is 400 attachments_unsupported" },
+                        "session_id": { "type": "string", "description": "For a terminal agent: the terminal session to start it in, by its config id (a tmux session or Herdr). Default: the first that answers. One this computer has no session for is 400 terminal_unknown" },
                         "label": { "type": "string", "description": "A short title, at most 200 characters" },
                         "client_ref": { "type": "string", "description": "The requester's own reference, 1 to 128 of A-Z, a-z, 0-9, - and _, echoed in the task's view: how another computer whose create got no answer finds the task" },
                         "mentions": { "type": "array", "items": { "type": "string" }, "maxItems": 8, "description": "The computers the user named: linked computers' names (any case) or self; more than 8, or a name that is neither, is 400 invalid_mentions. Kept on the task, never added to the goal" }
                     }
                 })),
                 "responses": create_responses
+            }}),
+        ),
+        (
+            "/api/tasks/defaults",
+            json!({ "get": {
+                "summary": "What a task the device opens would run with: default_cwd (the device's most recent task directory, null when unknown); with agent_id naming an agent that runs in a terminal pane, also model and variant -- the model/variant query values where its launch can pass them, else the agent's own (Codex's config), else model \"default\"",
+                "parameters": [
+                    query_param("agent_id", "An agent kind; a terminal agent adds model and variant to the answer"),
+                    query_param("model", "The model the task would name"),
+                    query_param("variant", "The effort the task would name")
+                ],
+                "responses": json_ok("Defaults", json!({
+                    "type": "object",
+                    "properties": {
+                        "default_cwd": { "type": ["string", "null"] },
+                        "model": { "type": "string" },
+                        "variant": { "type": ["string", "null"] }
+                    }
+                }))
             }}),
         ),
         (
@@ -1119,7 +1193,7 @@ fn tasks_fleet_mcp_paths() -> Vec<(&'static str, Value)> {
                     "properties": {
                         "request_id": { "type": "string" },
                         "code": { "type": "string" },
-                        "expires_in_ms": { "type": "integer" }
+                        "expires_in_ms": { "type": "integer", "description": "60000: a minted code lives one minute (a pairing a device asks for itself, POST /api/pair/request, lives five: 300000)" }
                     }
                 })), &[
                     ("400", "invalid_request, invalid_device_name"),
@@ -1254,8 +1328,9 @@ fn peer_view() -> Value {
             "server_id": { "type": "string", "description": "The id the other gateway gave for itself; display data, never a key" },
             "name": { "type": "string" },
             "url": { "type": "string" },
-            "reachable": { "type": "boolean", "description": "It answered within the last 2 minutes" },
-            "last_seen_ms": { "type": ["integer", "null"] }
+            "reachable": { "type": "boolean", "description": "It answered within the last 2 minutes, and no call since failed to reach it (a closed task socket or a failed call reads unreachable at once)" },
+            "last_seen_ms": { "type": ["integer", "null"] },
+            "unauthorized": { "type": "boolean", "description": "Present (true) when it no longer takes this gateway's token: link it again; a link for the same computer or name replaces it" }
         }
     })
 }
@@ -1458,7 +1533,7 @@ const GENERATION_DOC: &str = "The gateway instance generation: an opaque string 
 fn captured_history_path() -> Value {
     json!({ "get": {
         "summary": "Page bounded Gateway-captured historical rows",
-        "description": "Requires pane_captured_history. Frozen, memory-only historical prefix of already-observed recent-unwrapped rows; excludes the last mutable screen and does not seed from or paginate native backlog. ANSI/text captures are independent. First page is newest; prepend older pages, each internally oldest-to-newest. First pages reuse the same device/request snapshot for 60 seconds from creation. Append/repaint cannot alter its pages. Capture reset, truncation, eviction, detected resize or observed pane identity/disappearance invalidates it. This is not a complete archive and has no native range coordinates. See docs/captured-history.md for retention and reset semantics. Existing output routes are unchanged.",
+        "description": "Requires pane_captured_history. Legacy single historical prefix of already-observed recent-unwrapped rows, not all sealed segments; excludes the mutable screen and never seeds from native backlog. Memory storage is default; optional SQLite checkpoints require verified identity. ANSI/text captures are independent. First page is newest; prepend older pages, each internally oldest-to-newest. Snapshots last 60 seconds from creation. This is not a complete archive and has no native range coordinates. See docs/captured-history.md for retention and reset semantics. Existing output routes are unchanged.",
         "parameters": [
             path_param("sessionId"), path_param("paneId"),
             { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 500, "default": 200 }, "description": "Maximum rows per page; keep fixed throughout traversal. Raw row bytes plus newline allowances are capped at 256 KiB." },
@@ -1508,6 +1583,38 @@ fn captured_history_responses() -> Value {
         responses[status] = json!({ "description": description });
     }
     responses
+}
+
+fn captured_history_segments_path() -> Value {
+    let mut path = captured_history_path();
+    path["get"]["summary"] = json!("Page bounded Gateway-captured history segments");
+    path["get"]["description"] = json!("Requires pane_captured_history_segments_v1 (memory or SQLite). First page contains the newest retained historical rows; older pages can span segments. Blocks and rows are oldest-to-newest within each page; limit bounds total rows, not blocks. Segment IDs are stable across pages. Boundaries are metadata, never separator rows; no cross-segment deduplication, live viewport or native backlog stitching. Distinct endpoint-bound snapshots expire 60 seconds from creation. This is sampled retained history, not a complete archive. Legacy /history remains a single prefix. See docs/captured-history.md.");
+    let mut responses = captured_history_responses();
+    responses["200"]["description"] =
+        json!("Versioned segment page; empty not_captured is a successful answer");
+    let data = &mut responses["200"]["content"]["application/json"]["schema"]["properties"]["data"];
+    let required = data["required"].as_array_mut().unwrap();
+    required.retain(|field| field != "capture_epoch" && field != "rows");
+    required.push(json!("segments"));
+    let properties = data["properties"].as_object_mut().unwrap();
+    properties.remove("capture_epoch");
+    properties.remove("rows");
+    properties.insert("segments".into(), json!({
+        "type": "array", "maxItems": 64,
+        "items": {
+            "type": "object",
+            "required": ["segment_id", "started_at_ms", "sealed_at_ms", "boundary_reason", "rows"],
+            "properties": {
+                "segment_id": { "type": "string" },
+                "started_at_ms": { "type": "integer", "minimum": 0 },
+                "sealed_at_ms": { "type": ["integer", "null"], "minimum": 0 },
+                "boundary_reason": { "type": "string", "enum": ["observation-start", "gateway-restart", "capture-policy-change", "resize", "editor-change", "capture-reset"] },
+                "rows": { "type": "array", "maxItems": 500, "items": { "type": "string" } }
+            }
+        }
+    }));
+    path["get"]["responses"] = responses;
+    path
 }
 
 /// `GET .../output`: Herdr's `pane_read` result shape, plus the generation.
@@ -1883,6 +1990,21 @@ fn pane_context_responses() -> Value {
     responses
 }
 
+fn git_worktrees_path() -> Value {
+    json!({
+        "get": {
+            "summary": "List available Git-linked checkouts of this pane's repository",
+            "description": "Paired-device read, announced as git_worktrees. Uses Git's authoritative worktree inventory and verifies canonical checkout/common-directory identity. Missing, bare, replaced and fenced-out checkouts are omitted. The content envelope data contains current (canonical pane checkout path or null) and worktrees (path, branch, head, detached). Outside a checkout the list is empty. Selecting a worktree on git/status or git/diff never checks out a branch or moves a pane. The existing vcs/discard route always targets the pane's original checkout; lazygit can select a verified linked checkout when pane_lazygit_worktree is advertised.",
+            "parameters": [path_param("sessionId"), path_param("paneId")],
+            "responses": {
+                "200": { "description": "Versioned content envelope with current and worktrees" },
+                "403": { "description": "Paired device required" },
+                "504": { "description": "Git inventory timed out" }
+            }
+        }
+    })
+}
+
 fn git_status_responses() -> Value {
     let mut responses = ok_response();
     responses["200"] = json!({
@@ -2096,6 +2218,46 @@ fn ok_response() -> Value {
     })
 }
 
+fn session_page_endpoint() -> Value {
+    json!({"get": {
+        "summary": "Read one ordered session page from one selected agent",
+        "description": "Requires a paired App device and the existing encrypted transport policy. agent_session_pages_v1 declares the endpoint, while planes.agents.agents[].features.sessionPagination declares provider support. No aggregation, sorting or automatic continuation: provider order and cursors are retained. The versioned content envelope intentionally contains data.data and data.cursor, whose next and previous keys are explicit null when unavailable. Cursors are upstream opaque values, not locally cryptographically bound by Gateway. Reuse only with the same selected agent, this endpoint, normalized directory, parent_id/roots filter, search, order and limit; restart pagination when any changes. Supports the list's private ETag/If-None-Match behavior. Older Apps still request 50 and do not automatically page; App adoption is deferred.",
+        "parameters": [
+            {"name": "agent_id", "in": "query", "required": true, "description": "One explicit nonempty agent identifier. Unknown: 400 invalid_agent; known but unattached: 503 agent_unavailable", "schema": {"type": "string", "minLength": 1, "maxLength": 256}},
+            {"name": "directory", "in": "query", "description": "Nonempty absolute or home-relative workspace path; trimmed, ~ expanded and canonicalized when it exists. Maximum 4096 UTF-8 bytes", "schema": {"type": "string", "minLength": 1, "maxLength": 4096}},
+            {"name": "parent_id", "in": "query", "description": "Nonempty parent session ID (maximum 256 UTF-8 bytes), or literal null for roots; takes precedence over roots", "schema": {"type": "string", "minLength": 1, "maxLength": 256}},
+            {"name": "roots", "in": "query", "description": "true means parent_id=null when no explicit parent_id is given", "schema": {"type": "boolean"}},
+            {"name": "limit", "in": "query", "schema": {"type": "integer", "minimum": 1, "maximum": 100, "default": 50}},
+            {"name": "order", "in": "query", "schema": {"type": "string", "enum": ["asc", "desc"], "default": "desc"}},
+            {"name": "search", "in": "query", "description": "Provider search filter, maximum 4096 UTF-8 bytes", "schema": {"type": "string", "maxLength": 4096}},
+            {"name": "cursor", "in": "query", "description": "Nonempty opaque provider cursor, URL-encoded without altering its bytes; maximum 16384 UTF-8 bytes. Control characters are rejected in all string filters", "schema": {"type": "string", "minLength": 1, "maxLength": 16384}}
+        ],
+        "responses": {
+            "200": {"description": "One provider page in the content envelope", "headers": {"ETag": {"schema": {"type": "string"}}}, "content": {"application/json": {"schema": {
+                "type": "object", "required": ["schema_version", "capabilities", "data"], "properties": {
+                    "schema_version": {"const": CONTENT_SCHEMA_VERSION},
+                    "capabilities": {"type": "object"},
+                    "data": {"type": "object", "required": ["data", "cursor"], "properties": {
+                        "data": {"type": "array", "items": {"type": "object", "description": "AgentSessionInfo as documented in docs/agent-api.md; service-owned agent_id and read-marker overlays, in provider order", "required": ["asid", "agent_id", "title", "status", "updated_ms"], "properties": {
+                            "asid": {"type": "string"}, "agent_id": {"type": "string"}, "title": {"type": "string"}, "status": {"type": "string"}, "updated_ms": {"type": "integer"}
+                        }}},
+                        "cursor": {"type": "object", "required": ["next", "previous"], "properties": {
+                            "next": {"type": ["string", "null"]}, "previous": {"type": ["string", "null"]}
+                        }}
+                    }}
+                }
+            }}}},
+            "304": {"description": "Unchanged page; empty body"},
+            "400": {"description": "Invalid query or unknown agent; rejected before upstream requests"},
+            "401": {"description": "Missing authentication"},
+            "403": {"description": "Invalid device credential, forbidden peer, or required encrypted transport missing"},
+            "501": {"description": "feature_unsupported: selected adapter does not support session pagination"},
+            "502": {"description": "agent_error: selected provider failed"},
+            "503": {"description": "agent_unavailable: selected provider is not attached"}
+        }
+    }})
+}
+
 pub const DOCS_HTML: &str = r#"<!doctype html>
 <html>
   <head>
@@ -2114,14 +2276,14 @@ fn lazygit_endpoints() -> Value {
     json!({
         "get": {
             "summary": "Check whether lazygit can open for this pane",
-            "description": "Requires a paired device. Checks an executable lazygit on the Gateway host's PATH and the source pane's canonical Git checkout. No process is launched. Announced as pane_lazygit.",
-            "parameters": [path_param("sessionId"), path_param("paneId")],
+            "description": "Requires a paired device. Checks an executable lazygit on the Gateway host's PATH and the source pane's canonical Git checkout. No process is launched. Announced as pane_lazygit; optional worktree selection requires pane_lazygit_worktree and is revalidated against the source repository's canonical Git inventory.",
+            "parameters": [path_param("sessionId"), path_param("paneId"), query_param("worktree", "Optional exact canonical path from git/worktrees. Announced as pane_lazygit_worktree; unavailable or unrelated checkouts are refused with 403 invalid_worktree.")],
             "responses": ok_response()
         },
         "post": {
             "summary": "Open lazygit in a dedicated terminal tab",
-            "description": "No client command or cwd is accepted. Creates an unfocused tab in the source pane's workspace and checkout, starts the installed lazygit once, and returns data.target with session_id, workspace_id, tab_id and pane_id plus started. A false started means inspect the created target, not automatically repeat the launch. Desktop focus is preserved.",
-            "parameters": [path_param("sessionId"), path_param("paneId")],
+            "description": "No client command or arbitrary cwd is accepted. Optional worktree selection requires pane_lazygit_worktree and is revalidated before creating a terminal. Creates an unfocused tab in the source pane's workspace and verified selected checkout (the original checkout when omitted), starts the installed lazygit once, and returns data.target with session_id, workspace_id, tab_id and pane_id plus started. A false started means inspect the created target, not automatically repeat the launch. Desktop focus is preserved.",
+            "parameters": [path_param("sessionId"), path_param("paneId"), query_param("worktree", "Optional exact canonical path from git/worktrees. Announced as pane_lazygit_worktree; unavailable or unrelated checkouts are refused with 403 invalid_worktree.")],
             "responses": ok_response()
         }
     })
@@ -2132,6 +2294,34 @@ mod history_contract_tests {
     use super::*;
 
     #[test]
+    fn session_page_spec_has_selected_scope_limits_and_nested_null_cursors() {
+        let spec = openapi_spec();
+        let get = &spec["paths"]["/api/agent-sessions/page"]["get"];
+        let parameters = get["parameters"].as_array().unwrap();
+        let parameter = |name| parameters.iter().find(|p| p["name"] == name).unwrap();
+        assert_eq!(parameter("agent_id")["required"], true);
+        assert_eq!(
+            parameter("limit")["schema"],
+            json!({"type": "integer", "minimum": 1, "maximum": 100, "default": 50})
+        );
+        assert_eq!(parameter("order")["schema"]["enum"], json!(["asc", "desc"]));
+        let page =
+            &get["responses"]["200"]["content"]["application/json"]["schema"]["properties"]["data"];
+        assert_eq!(page["required"], json!(["data", "cursor"]));
+        assert_eq!(page["properties"]["data"]["type"], "array");
+        let cursor = &page["properties"]["cursor"];
+        assert_eq!(cursor["required"], json!(["next", "previous"]));
+        for direction in ["next", "previous"] {
+            assert_eq!(
+                cursor["properties"][direction]["type"],
+                json!(["string", "null"])
+            );
+        }
+        assert!(get["responses"].get("501").is_some());
+        assert!(crate::API_CAPABILITIES.contains(&"agent_session_pages_v1"));
+    }
+
+    #[test]
     fn tasks_fleet_and_mcp_token_paths_are_in_the_spec() {
         let spec = openapi_spec();
         for (path, method) in [
@@ -2140,6 +2330,7 @@ mod history_contract_tests {
             ("/api/tasks/{id}/cancel", "post"),
             ("/api/tasks/{id}/complete", "post"),
             ("/api/fleet/self", "get"),
+            ("/api/history/storage", "get"),
             ("/api/mcp/tokens", "post"),
             ("/api/mcp/tokens", "get"),
             ("/api/mcp/tokens/{id}", "delete"),
@@ -2161,6 +2352,61 @@ mod history_contract_tests {
             .as_array()
             .unwrap()
             .contains(&json!("idle_unconfirmed")));
+    }
+
+    #[test]
+    fn captured_history_segments_openapi_preserves_the_additive_contract() {
+        let spec = openapi_spec();
+        let legacy = &spec["paths"]["/api/sessions/{sessionId}/panes/{paneId}/history"]["get"];
+        let get =
+            &spec["paths"]["/api/sessions/{sessionId}/panes/{paneId}/history/segments"]["get"];
+        assert!(get["description"]
+            .as_str()
+            .unwrap()
+            .contains("pane_captured_history_segments_v1"));
+        assert_eq!(get["parameters"], legacy["parameters"]);
+        assert_eq!(
+            get["responses"].as_object().unwrap().len(),
+            legacy["responses"].as_object().unwrap().len()
+        );
+        let data =
+            &get["responses"]["200"]["content"]["application/json"]["schema"]["properties"]["data"];
+        let properties = &data["properties"];
+        assert!(data["required"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("segments")));
+        assert!(properties.get("capture_epoch").is_none());
+        assert!(properties.get("rows").is_none());
+        assert_eq!(properties["row_count"]["maximum"], 500);
+        assert_eq!(properties["snapshot_id"]["type"], json!(["string", "null"]));
+        assert_eq!(properties["next_before"]["type"], json!(["string", "null"]));
+        assert_eq!(properties["order"]["const"], "oldest-to-newest");
+        assert_eq!(properties["includes_live_viewport"]["const"], false);
+        assert_eq!(properties["complete_archive"]["const"], false);
+        let segment = &properties["segments"]["items"];
+        assert_eq!(
+            segment["required"],
+            json!([
+                "segment_id",
+                "started_at_ms",
+                "sealed_at_ms",
+                "boundary_reason",
+                "rows"
+            ])
+        );
+        assert_eq!(
+            segment["properties"]["boundary_reason"]["enum"],
+            json!([
+                "observation-start",
+                "gateway-restart",
+                "capture-policy-change",
+                "resize",
+                "editor-change",
+                "capture-reset"
+            ])
+        );
+        assert!(crate::API_CAPABILITIES.contains(&"pane_captured_history_segments_v1"));
     }
 
     #[test]

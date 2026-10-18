@@ -541,6 +541,14 @@ pub(crate) async fn spawn_agent(
 pub(crate) struct AgentLaunch {
     pub(crate) payload: Value,
     pub(crate) steps: tasks::StepLog,
+    pub(crate) prompt_delivery: PromptDelivery,
+}
+
+/// A submission attempt can have delivered the prompt even if its reply failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PromptDelivery {
+    NotAttempted,
+    Attempted,
 }
 
 /// The first half of [`launch_agent`]: the pane exists, nothing runs in it
@@ -670,7 +678,7 @@ pub(crate) async fn start_placed_agent(
     prompt: Option<&str>,
 ) -> AgentLaunch {
     let (mut launch, started) =
-        start_agent_in_place(state, session, agent, cwd, placed, prompt, false).await;
+        start_agent_in_place(state, session, agent, cwd, placed, prompt, None).await;
     if let Some(started) = started {
         type_agent_prompt(session, &started, prompt, &mut launch).await;
     }
@@ -681,6 +689,15 @@ pub(crate) async fn start_placed_agent(
 pub(crate) struct StartedAgent {
     pane_id: String,
     prompt_target: String,
+}
+
+/// How a delegation starts its agent ([`start_agent_in_place`]).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TaskLaunch<'a> {
+    /// Told how to report the task's end on its command line.
+    pub out_of_band: bool,
+    /// The model and effort the task named, as launch arguments.
+    pub model_args: &'a [String],
 }
 
 /// Start the agent in the placed pane. Claude Code and Codex get `prompt`
@@ -699,7 +716,7 @@ pub(crate) async fn start_agent_in_place(
     cwd: Option<&str>,
     placed: PlacedAgent,
     prompt: Option<&str>,
-    for_task: bool,
+    task: Option<TaskLaunch<'_>>,
 ) -> (AgentLaunch, Option<StartedAgent>) {
     let PlacedAgent {
         place,
@@ -719,9 +736,14 @@ pub(crate) async fn start_agent_in_place(
     );
     // The muqun server for the agent's own process, never its config.
     agent_args.extend(crate::mcp::inject::terminal_args(&state.config, agent).await);
-    // A task's agent is told, out of band, how to report the task's end.
-    if for_task {
-        agent_args.extend(crate::mcp::inject::terminal_task_args(&state.config, agent).await);
+    if let Some(task) = task {
+        // A task's agent is told, out of band, how to report the task's end.
+        if task.out_of_band {
+            agent_args.extend(crate::mcp::inject::terminal_task_args(&state.config, agent).await);
+        }
+        // The model and effort the task named, after the configured
+        // arguments (a later `-c` wins) and before the prompt.
+        agent_args.extend(task.model_args.iter().cloned());
     }
     let launch_prompt = prompt
         .filter(|_| terminal_backend(session).takes_launch_prompt())
@@ -729,6 +751,12 @@ pub(crate) async fn start_agent_in_place(
     if let Some((_, args)) = &launch_prompt {
         agent_args.extend(args.iter().cloned());
     }
+    // Record before calling the backend: an error can follow execution of argv.
+    let prompt_delivery = if launch_prompt.is_some() {
+        PromptDelivery::Attempted
+    } else {
+        PromptDelivery::NotAttempted
+    };
     trust_claude_folder(state, agent, agent_cwd.as_deref()).await;
     match start_backend_agent(
         session,
@@ -773,19 +801,40 @@ pub(crate) async fn start_agent_in_place(
             steps.failed("agent", err.code(), &err.message());
             // The pane is real and the user can type in it, so this is a 207
             // rather than an error that implies nothing was created.
-            return (AgentLaunch { payload, steps }, None);
+            return (
+                AgentLaunch {
+                    payload,
+                    steps,
+                    prompt_delivery,
+                },
+                None,
+            );
         }
     }
     if let Some((prompt, _)) = launch_prompt {
         steps.ok("prompt", json!({ "bytes": prompt.len(), "via": "argv" }));
         payload["prompt_submitted"] = json!(true);
-        return (AgentLaunch { payload, steps }, None);
+        return (
+            AgentLaunch {
+                payload,
+                steps,
+                prompt_delivery,
+            },
+            None,
+        );
     }
     let started = StartedAgent {
         pane_id: place.pane_id,
         prompt_target,
     };
-    (AgentLaunch { payload, steps }, Some(started))
+    (
+        AgentLaunch {
+            payload,
+            steps,
+            prompt_delivery,
+        },
+        Some(started),
+    )
 }
 
 /// Type `prompt` into a started agent, retrying until it is ready, and
@@ -796,11 +845,16 @@ pub(crate) async fn type_agent_prompt(
     prompt: Option<&str>,
     launch: &mut AgentLaunch,
 ) {
-    let AgentLaunch { payload, steps } = launch;
+    let AgentLaunch {
+        payload,
+        steps,
+        prompt_delivery,
+    } = launch;
     let prompt_target = &started.prompt_target;
     match prompt {
         None => steps.skipped("prompt", "no prompt was given"),
         Some(prompt) => {
+            *prompt_delivery = PromptDelivery::Attempted;
             // An agent that has just been launched is not a named agent yet --
             // it is a program still deciding what it is, and Herdr only learns
             // its name once it has drawn its first prompt. Waiting for that is
@@ -1524,10 +1578,7 @@ pub(crate) fn task_failure(err: HerdrCallError, steps: &tasks::StepLog) -> Respo
     // Herdr refusing is the user's request being wrong -- a path it does not
     // recognise, a branch already checked out somewhere it will not touch.
     // Anything else is the gateway or the socket failing, which is not.
-    let status = match err {
-        HerdrCallError::Herdr { .. } => StatusCode::BAD_REQUEST,
-        _ => StatusCode::BAD_GATEWAY,
-    };
+    let status = err.status();
     (
         status,
         Json(json!({
@@ -1917,17 +1968,29 @@ impl HerdrCallError {
         }
     }
 
-    pub(crate) fn into_api_error(self, method: &str) -> (StatusCode, Json<Value>) {
-        let status = match self {
+    /// Herdr refusing is the request being wrong (400), a target gone since
+    /// it was listed is not found (404); anything else is the gateway or the
+    /// socket failing (502).
+    pub(crate) fn status(&self) -> StatusCode {
+        match self {
+            Self::Herdr { .. } if self.code() == TARGET_NOT_FOUND => StatusCode::NOT_FOUND,
             Self::Herdr { .. } => StatusCode::BAD_REQUEST,
             _ => StatusCode::BAD_GATEWAY,
-        };
+        }
+    }
+
+    pub(crate) fn into_api_error(self, method: &str) -> (StatusCode, Json<Value>) {
+        let status = self.status();
         let code = self.code().to_owned();
         let message = self.message();
         tracing::warn!("Herdr request {method} failed: {message}");
         api_error(status, &code, &message)
     }
 }
+
+/// The code a target gone since it was listed answers with, as on the
+/// terminal routes.
+const TARGET_NOT_FOUND: &str = "backend_target_not_found";
 
 pub(crate) fn backend_call_error(method: &str, error: BackendError) -> HerdrCallError {
     match error {
@@ -1943,7 +2006,12 @@ pub(crate) fn backend_call_error(method: &str, error: BackendError) -> HerdrCall
         other @ (BackendError::Unavailable | BackendError::Unsupported(_)) => {
             HerdrCallError::Unavailable(other.to_string())
         }
-        other @ BackendError::InvalidTarget(_) => HerdrCallError::Unavailable(other.to_string()),
+        // A pane, window or session gone since it was listed: not found, as
+        // the terminal routes answer it -- never "the backend is down".
+        other @ BackendError::InvalidTarget(_) => HerdrCallError::Herdr {
+            method: method.to_owned(),
+            error: json!({ "code": TARGET_NOT_FOUND, "message": other.to_string() }),
+        },
     }
 }
 
@@ -2090,6 +2158,38 @@ mod tests {
     use super::*;
     use crate::agents::tasks;
     use crate::*;
+
+    /// What a backend error answers on these routes: a refusal is the
+    /// request's fault, a target gone since it was listed is not found, and
+    /// only a backend that cannot be reached is the gateway's. None of them
+    /// is a prompt worth sending again.
+    #[test]
+    fn a_gone_pane_is_not_found_not_an_unavailable_backend() {
+        for (error, status, code) in [
+            (
+                BackendError::Refused {
+                    code: None,
+                    message: "no".into(),
+                },
+                StatusCode::BAD_REQUEST,
+                "herdr_error",
+            ),
+            (
+                BackendError::InvalidTarget("pane"),
+                StatusCode::NOT_FOUND,
+                "backend_target_not_found",
+            ),
+            (
+                BackendError::Unavailable,
+                StatusCode::BAD_GATEWAY,
+                "herdr_unavailable",
+            ),
+        ] {
+            let call = backend_call_error("pane.read", error);
+            assert_eq!((call.status(), call.code()), (status, code));
+            assert!(!call.can_retry_prompt(), "{code}");
+        }
+    }
 
     #[test]
     fn folder_trust_off_trusts_no_folder() {

@@ -16,8 +16,9 @@ use tokio::sync::broadcast::{self, error::RecvError};
 use tokio::time::Instant;
 
 use super::domain::{
-    clip, now_ms, one_line, ChildCounts, PrincipalKind, Requested, Task, TaskBinding, TaskChange,
-    TaskEvent, TaskFilter, TaskId, TaskKind, TaskOrigin, TaskPrincipal, TaskState,
+    clip, now_ms, one_line, ChildCounts, NoticeTarget, PrincipalKind, Requested, Task, TaskBinding,
+    TaskChange, TaskEvent, TaskFilter, TaskId, TaskKind, TaskOrigin, TaskPrincipal, TaskState,
+    REPORTED_STATES,
 };
 use super::events::TaskDomainEvent;
 use super::pane_agent;
@@ -163,6 +164,16 @@ struct Live {
     /// The agent sessions running a turn now (their last status was busy):
     /// their last line may still be being written ([`super::transcript`]).
     busy: HashSet<String>,
+    /// The child each open parent last delegated and has not been told the
+    /// end of yet: its `progress` while it waits ([`TaskService::progress_of`]).
+    waiting_on: HashMap<TaskId, WaitingOn>,
+}
+
+/// A parent's untold delegation: which, to whom, and since when.
+struct WaitingOn {
+    child: TaskId,
+    who: String,
+    since_ms: u64,
 }
 
 /// One open task's progress.
@@ -194,6 +205,13 @@ pub(crate) struct DelegateRequest {
     pub mentions: Vec<String>,
     /// See [`Task::client_ref`].
     pub client_ref: Option<String>,
+    /// The terminal session a terminal agent starts in (a tmux session or
+    /// Herdr, by its id in the config); `None`: the first that answers.
+    pub session_id: Option<String>,
+    /// Files sent with the goal, as the session prompt takes them (uploaded
+    /// asset references or file paths on this computer): handed to a
+    /// session agent with its first prompt.
+    pub attachments: Vec<String>,
 }
 
 /// Who asked for a task, as a task view shows it.
@@ -220,6 +238,8 @@ pub(crate) struct TaskView {
     pub binding: TaskBinding,
     pub created_ms: u64,
     pub updated_ms: u64,
+    pub reopened_ms: Option<u64>,
+    pub reopen_count: u64,
     /// The open task this one was started from, if any.
     pub parent_task_id: Option<String>,
     pub origin: TaskOrigin,
@@ -251,6 +271,13 @@ pub(crate) struct TaskView {
     /// The requester's reference for it, when it gave one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_ref: Option<String>,
+    /// A terminal delegation's model and effort: those its launch passed,
+    /// else (Codex) its own config's, else `default` (the agent's own).
+    /// Absent on every other task.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub variant: Option<String>,
     /// A mirror's why, for the phone to word (its summary is prose):
     /// `peer_unlinked`, `peer_lost_task` or `peer_not_confirmed` on a failed
     /// one, `peer_unreachable` on an open one. Made when the view is.
@@ -321,6 +348,8 @@ pub(crate) enum TaskError {
     /// The caller's task came from another computer: it may not hand work
     /// to one in turn (one hop only). The computer it named.
     DelegationLoop(String),
+    /// The caller or an ancestor could not be established reliably.
+    LineageUnresolved,
     /// The linked computer refused the task with its own error code.
     PeerRefused {
         machine: String,
@@ -337,11 +366,21 @@ pub(crate) enum TaskError {
     },
     /// No configured terminal session answers, so a command has nowhere to run.
     NoTerminal,
+    /// The request named a terminal session this computer has no such id for.
+    TerminalUnknown(String),
+    /// Attachments sent where they cannot go along: a terminal agent, or
+    /// another computer (they are references on this one).
+    AttachmentsUnsupported,
+    /// An attachment that is no file uploaded to this computer.
+    InvalidAttachment(String),
     /// A timeline was asked of a task that has none (a command).
     NoTimeline,
     /// The device confirmed a task that is not its own paused or waiting
     /// delegation.
     NotConfirmable,
+    /// `tasks.complete` (done) on a task whose sub-tasks are not all over:
+    /// a plain sentence naming them.
+    ChildrenOpen(String),
     /// A completion summary that is empty (where one is required) or larger
     /// than [`MAX_SUMMARY_BYTES`].
     InvalidSummary,
@@ -353,6 +392,7 @@ pub(crate) enum TaskError {
 impl std::fmt::Display for TaskError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::ChildrenOpen(which) => write!(f, "{which}"),
             Self::NotFound => write!(f, "task not found"),
             Self::NotYours => write!(f, "task belongs to someone else"),
             Self::UnknownMachine { wanted, .. } => write!(f, "unknown machine '{wanted}'"),
@@ -364,6 +404,10 @@ impl std::fmt::Display for TaskError {
             Self::DelegationLoop(name) => {
                 write!(f, "a task from another computer cannot hand work to {name}")
             }
+            Self::LineageUnresolved => write!(
+                f,
+                "caller lineage could not be resolved; nothing was forwarded"
+            ),
             Self::PeerRefused { machine, code } => write!(f, "{machine} refused the task ({code})"),
             Self::AgentUnavailable(agent) => write!(f, "agent '{agent}' is not available"),
             Self::UnknownModel(model) => write!(f, "unknown model '{model}'"),
@@ -374,6 +418,11 @@ impl std::fmt::Display for TaskError {
                 )
             }
             Self::NoTerminal => write!(f, "{}", run_command::NO_TERMINAL),
+            Self::TerminalUnknown(id) => write!(f, "no terminal session '{id}'"),
+            Self::AttachmentsUnsupported => {
+                write!(f, "attachments go only to a session agent on this computer")
+            }
+            Self::InvalidAttachment(why) => write!(f, "{why}"),
             Self::NoTimeline => write!(f, "only a delegated task has a timeline"),
             Self::InvalidSummary => write!(f, "summary must be non-empty and at most 32 KiB"),
             Self::NotConfirmable => write!(
@@ -531,7 +580,7 @@ enum Step {
     Failed(Option<AgentErrorInfo>),
     /// A question form is pending, with its title ([`form_waiting`]).
     Form(String),
-    Move(TaskChange),
+    Move(Box<TaskChange>),
 }
 
 /// Whether a session is running a turn.
@@ -551,14 +600,14 @@ fn step(event: &AgentDomainEvent, asid: &str) -> Step {
             AgentSessionStatus::Busy | AgentSessionStatus::Retry => Step::Busy,
             AgentSessionStatus::Idle => Step::Idle,
             AgentSessionStatus::Failed => Step::Failed(error.clone()),
-            AgentSessionStatus::Interrupted => Step::Move(change(TaskState::Cancelled)),
+            AgentSessionStatus::Interrupted => Step::Move(Box::new(change(TaskState::Cancelled))),
             AgentSessionStatus::Unknown => Step::Stay,
         },
         // A permission request's line is its own prompt; a form's, the
         // agent's question when it asked one ([`form_waiting`]).
         AgentDomainEvent::PermissionPending {
             asid: id, request, ..
-        } if ours(id) => Step::Move(asking(&request.prompt)),
+        } if ours(id) => Step::Move(Box::new(asking(&request.prompt))),
         AgentDomainEvent::FormPending {
             asid: id, request, ..
         } if ours(id) => Step::Form(request.title.clone()),
@@ -566,13 +615,94 @@ fn step(event: &AgentDomainEvent, asid: &str) -> Step {
         | AgentDomainEvent::FormResolved { asid: id, .. }
             if ours(id) =>
         {
-            Step::Move(change(TaskState::Working))
+            Step::Move(Box::new(change(TaskState::Working)))
         }
         _ => Step::Stay,
     }
 }
 
 impl TaskService {
+    /// Resume the same assignment only after its observer verified a new turn.
+    /// The sequence check prevents a delayed observer from reviving a cancelled
+    /// task or overwriting another completion.
+    pub(crate) async fn reopen(&self, task: &Task, at: u64) -> Result<Task, TaskError> {
+        self.reopen_with_note(task, None, Some(at)).await
+    }
+
+    pub(crate) async fn reopen_with_note(
+        &self,
+        task: &Task,
+        note: Option<String>,
+        reopened_ms: Option<u64>,
+    ) -> Result<Task, TaskError> {
+        let now = self
+            .store()
+            .transition(
+                &task.id,
+                TaskChange {
+                    to: TaskState::Working,
+                    source: "new_user_turn".into(),
+                    note,
+                    reopen: true,
+                    reopened_ms,
+                    expected_seq: Some(task.seq),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        if let Ok(mut live) = self.live.lock() {
+            live.idled.remove(&task.id);
+            if let TaskBinding::AgentSession { asid, .. } = &task.binding {
+                live.sessions.remove(asid);
+            }
+        }
+        Ok(now)
+    }
+
+    pub(crate) async fn reopen_note(&self, id: &TaskId) -> Option<String> {
+        self.store
+            .events(id)
+            .await
+            .ok()?
+            .into_iter()
+            .rev()
+            .find(|event| event.source == "new_user_turn")?
+            .note
+    }
+
+    pub(crate) async fn reopen_session(
+        &self,
+        state: &AppState,
+        task: &Task,
+        items: &[TimelineItem],
+    ) -> bool {
+        if task.kind != TaskKind::Delegation
+            || !matches!(task.state, TaskState::Done | TaskState::Failed)
+        {
+            return false;
+        }
+        let Some(started_ms) = items
+            .iter()
+            .filter(|item| item.role == TimelineRole::User && item.updated_ms > task.updated_ms)
+            .map(|item| item.updated_ms)
+            .min()
+        else {
+            return false;
+        };
+        let TaskBinding::AgentSession { agent_id, asid } = &task.binding else {
+            return false;
+        };
+        let Some(manager) = state.agent_runtime.manager_for_agent(agent_id).await else {
+            return false;
+        };
+        if manager.sessions().get_session(asid).await.is_err() {
+            return false;
+        }
+        // Reconciliation may discover a turn after its answer already arrived.
+        // Filtering from observation time would discard that turn's completion.
+        self.reopen(task, started_ms).await.is_ok()
+    }
+
     pub(crate) fn new(
         store: Arc<dyn TaskStore>,
         events: broadcast::Sender<TaskDomainEvent>,
@@ -680,11 +810,68 @@ impl TaskService {
     }
 
     fn progress_of(&self, task: &Task) -> Option<String> {
-        if task.state.is_terminal() || paused(task.state) {
+        if task.state.is_terminal() {
             return None;
         }
         let live = self.live.lock().ok()?;
-        live.lines.get(&task.id).map(|entry| entry.line.clone())
+        let line = (!paused(task.state))
+            .then(|| live.lines.get(&task.id).map(|entry| entry.line.clone()))
+            .flatten();
+        // Its own turn is over (or quiet) while a child it delegated works.
+        line.or_else(|| {
+            live.waiting_on.get(&task.id).map(|waiting| {
+                waiting_line(&waiting.who, now_ms().saturating_sub(waiting.since_ms))
+            })
+        })
+    }
+
+    /// `parent` now waits on `child`: until the child's end is told, the
+    /// parent's progress reads `Waiting for <who> · <elapsed>`.
+    pub(crate) async fn waits_on(&self, parent: &TaskId, child: &Task) {
+        let who = match &child.binding {
+            TaskBinding::Peer { peer_name, .. } => peer_name.clone(),
+            TaskBinding::AgentSession { agent_id, .. } => agent_id.clone(),
+            TaskBinding::Pane {
+                agent_id: Some(agent_id),
+                ..
+            } => agent_id.clone(),
+            _ => String::from("a sub-task"),
+        };
+        if let Ok(mut live) = self.live.lock() {
+            live.waiting_on.insert(
+                parent.clone(),
+                WaitingOn {
+                    child: child.id.clone(),
+                    who,
+                    since_ms: child.created_ms,
+                },
+            );
+        }
+        if let Ok(Some(parent)) = self.store.get(parent).await {
+            self.store().publish(&parent).await;
+        }
+    }
+
+    /// Publish every parent still waiting on a child, so its elapsed time
+    /// moves on the phone.
+    pub(crate) async fn republish_waiting_parents(&self) {
+        let parents: Vec<TaskId> = self
+            .live
+            .lock()
+            .map(|live| live.waiting_on.keys().cloned().collect())
+            .unwrap_or_default();
+        for id in parents {
+            match self.store.get(&id).await {
+                Ok(Some(parent)) if !parent.state.is_terminal() => {
+                    self.store().publish(&parent).await
+                }
+                _ => {
+                    if let Ok(mut live) = self.live.lock() {
+                        live.waiting_on.remove(&id);
+                    }
+                }
+            }
+        }
     }
 
     fn forget_line(&self, id: &TaskId) {
@@ -718,6 +905,106 @@ impl TaskService {
         if let Ok(mut live) = self.live.lock() {
             live.task_sessions.insert(asid.to_owned(), true);
         }
+    }
+
+    /// Tell `target` how task `id` ends (`tasks::notices`).
+    pub(crate) async fn notify(&self, id: &TaskId, target: &NoticeTarget) {
+        if let Err(error) = self.store.set_notice(id, target).await {
+            tracing::warn!(task = %id.0, %error, "the parent will not be told how this task ends");
+        }
+    }
+
+    /// Where task `id`'s end is told, if anywhere.
+    pub(crate) async fn notice_of(&self, id: &TaskId) -> Option<NoticeTarget> {
+        self.store.notice_of(id).await.ok().flatten()
+    }
+
+    /// Untold reported states of tasks with a notice target (`tasks::notices`).
+    pub(crate) async fn pending_notices(
+        &self,
+        since_ms: u64,
+        limit: usize,
+    ) -> anyhow::Result<Vec<(Task, NoticeTarget)>> {
+        self.store.pending_notices(since_ms, limit).await
+    }
+
+    /// Task `id`'s `state` has reached its parent: delivered, or answered by
+    /// a wait. It is not told again.
+    pub(crate) async fn told(&self, id: &TaskId, state: TaskState) {
+        if !REPORTED_STATES.contains(&state) {
+            return;
+        }
+        let Ok(Some(child)) = self.store.get(id).await else {
+            return;
+        };
+        // Moved on since: that newer state is still to be told.
+        if child.state != state {
+            return;
+        }
+        self.told_task(&child).await;
+    }
+
+    /// `child`, as it was when its line was sent (captured before the send),
+    /// has been told: a move it made meanwhile is still to be told.
+    pub(crate) async fn told_task(&self, child: &Task) {
+        if let Err(error) = self.store.mark_told(child, now_ms()).await {
+            tracing::warn!(task = %child.id.0, %error, "could not record that the parent was told");
+        }
+        // Its parent waits no more: the progress line goes.
+        let Some(parent) = child.parent.clone() else {
+            return;
+        };
+        let cleared = self.live.lock().is_ok_and(|mut live| {
+            let ours = live
+                .waiting_on
+                .get(&parent)
+                .is_some_and(|waiting| waiting.child == child.id);
+            ours && live.waiting_on.remove(&parent).is_some()
+        });
+        if cleared {
+            if let Ok(Some(parent)) = self.store.get(&parent).await {
+                self.store().publish(&parent).await;
+            }
+        }
+    }
+
+    /// Delegation `parent`, when it is bound to pane `pane_id`: whether its
+    /// follower saw its agent stop (idle, or it reported done), and the job
+    /// its launch recorded there. Never another delegation that pane id
+    /// holds now (a restarted tmux reuses ids). `None`: `parent` is no
+    /// delegation bound to that pane.
+    pub(crate) async fn pane_task(
+        &self,
+        parent: &TaskId,
+        session_id: &str,
+        pane_id: &str,
+    ) -> Option<(TaskState, Option<pane_agent::PaneJob>)> {
+        let task = self.store.get(parent).await.ok()??;
+        let TaskBinding::Pane {
+            session_id: bound_session,
+            pane_id: bound_pane,
+            shell_pid,
+            agent_job,
+            ..
+        } = &task.binding
+        else {
+            return None;
+        };
+        if bound_session != session_id || bound_pane != pane_id {
+            return None;
+        }
+        let job = shell_pid
+            .zip(agent_job.clone())
+            .map(|(shell_pid, job)| pane_agent::PaneJob { shell_pid, job });
+        (task.kind == TaskKind::Delegation).then_some((task.state, job))
+    }
+
+    /// The agent sessions running a turn now, as the follower last saw them.
+    pub(crate) fn busy_sessions(&self) -> Vec<String> {
+        self.live
+            .lock()
+            .map(|live| live.busy.iter().cloned().collect())
+            .unwrap_or_default()
     }
 
     /// Whether agent session `asid` is running a turn, as the follower last
@@ -819,29 +1106,42 @@ impl TaskService {
         }
     }
 
-    /// Whether `by` works for a task another computer opened here, itself or
-    /// through its ancestors: such a task stays on this computer, so two
-    /// computers can never hand one goal back and forth. Best effort: a
-    /// caller whose task could not be told (`by.parent` is `None` when no
-    /// open task, or several, fit the call) passes, so a loop takes two
-    /// such misses in a row.
-    async fn handed_by_a_peer(&self, by: &Requested) -> bool {
-        if by.origin == TaskOrigin::Peer {
-            return true;
+    /// Refuse peer ancestry and any unresolved lineage before forwarding.
+    /// This is a workflow boundary, not a sandbox for same-user shell code.
+    async fn allow_forwarding(&self, by: &Requested, machine: &str) -> Result<(), TaskError> {
+        if by.origin == TaskOrigin::Peer || by.by.kind == PrincipalKind::Gateway {
+            return Err(TaskError::DelegationLoop(machine.to_owned()));
+        }
+        if by.by.kind == PrincipalKind::Assistant
+            && by.forwarding != crate::tasks::domain::ForwardingContext::Resolved
+        {
+            return Err(TaskError::LineageUnresolved);
         }
         let mut next = by.parent.clone();
-        // A tree is never this deep; the bound only guards a broken store.
+        let mut visited = std::collections::HashSet::new();
         for _ in 0..64 {
             let Some(id) = next else {
-                return false;
+                return Ok(());
             };
+            if !visited.insert(id.clone()) {
+                return Err(TaskError::LineageUnresolved);
+            }
             match self.store.get(&id).await {
-                Ok(Some(task)) if task.origin == TaskOrigin::Peer => return true,
+                Ok(Some(task)) if task.origin == TaskOrigin::Peer => {
+                    return Err(TaskError::DelegationLoop(machine.to_owned()));
+                }
+                Ok(Some(task))
+                    if task.parent.is_none()
+                        && task.created_by.kind == PrincipalKind::Assistant
+                        && matches!(task.origin, TaskOrigin::Agent | TaskOrigin::Mcp) =>
+                {
+                    return Err(TaskError::LineageUnresolved);
+                }
                 Ok(Some(task)) => next = task.parent,
-                _ => return false,
+                _ => return Err(TaskError::LineageUnresolved),
             }
         }
-        false
+        Err(TaskError::LineageUnresolved)
     }
 
     /// The task `id` as stored.
@@ -877,28 +1177,44 @@ impl TaskService {
             &state.config.label,
             &state.peers.names(),
         ) {
+            if !request.attachments.is_empty() {
+                return Err(TaskError::AttachmentsUnsupported);
+            }
             let wanted = request.machine.clone().unwrap_or_default();
             let Some(peer) = state.peers.resolve(&wanted).await else {
                 let known = state.peers.names();
                 return Err(TaskError::UnknownMachine { wanted, known });
             };
-            if self.handed_by_a_peer(&by).await {
-                return Err(TaskError::DelegationLoop(peer.name));
-            }
+            self.allow_forwarding(&by, &peer.name).await?;
             return crate::fleet::mirror::delegate(state, by, peer, request).await;
         }
+        if let Some(id) = request.session_id.as_deref() {
+            if !state.config.sessions.iter().any(|session| session.id == id) {
+                return Err(TaskError::TerminalUnknown(id.to_owned()));
+            }
+        }
         if let Some(kind) = request.agent_id.as_deref() {
-            // A session agent (OpenCode, DeepSeek, T3) is never started in a
-            // pane: unattached, it is unavailable.
-            if !AGENT_PREFERENCE.contains(&kind)
-                && state.agent_runtime.manager_for_agent(kind).await.is_none()
-                && pane_agent::is_terminal_agent(state, kind)
-            {
+            if runs_in_pane(state, kind).await {
+                if !request.attachments.is_empty() {
+                    return Err(TaskError::AttachmentsUnsupported);
+                }
                 return self.delegate_to_pane(state, by, request).await;
             }
         }
         let manager = agent_for(state, request.agent_id.as_deref()).await?;
         let agent_id = manager.agent().kind();
+        // Checked before anything is made: a reference the prompt would
+        // refuse is a refusal here, never a failed task and a stray session.
+        if !request.attachments.is_empty() {
+            let uploads = crate::uploads_dir()
+                .map_err(|_| TaskError::InvalidAttachment("no upload directory".into()))?;
+            crate::agents::use_cases::prompt_service::checked_attachments(
+                manager.agent().attachment_mode(),
+                &request.attachments,
+                &uploads,
+            )
+            .map_err(|error| TaskError::InvalidAttachment(error.to_string()))?;
+        }
         let variant = request.variant.as_deref();
         let model = match request.model.as_deref() {
             Some(id) => {
@@ -941,6 +1257,8 @@ impl TaskService {
                 mentions: request.mentions.clone(),
                 client_ref: request.client_ref.clone(),
                 requester_server_id: by.server_id.clone(),
+                reopened_ms: None,
+                reopen_count: 0,
             })
             .await?;
         let created = manager
@@ -1020,7 +1338,7 @@ impl TaskService {
             .await;
             manager
                 .prompts()
-                .send_prompt(&asid, &request.goal, &[], None)
+                .send_prompt(&asid, &request.goal, &request.attachments, None)
                 .await?;
             let task = self
                 .store()
@@ -1082,10 +1400,37 @@ impl TaskService {
         if !pane_agent::is_available(state, &kind) {
             return Err(TaskError::AgentUnavailable(kind));
         }
-        let session = run_command::reachable_session(state)
-            .await
-            .ok_or(TaskError::NoTerminal)?
-            .0;
+        let session = match request.session_id.as_deref() {
+            Some(id) => {
+                let session = state
+                    .config
+                    .sessions
+                    .iter()
+                    .find(|session| session.id == id)
+                    .cloned()
+                    .ok_or_else(|| TaskError::TerminalUnknown(id.to_owned()))?;
+                if !matches!(
+                    crate::terminal_backend(&session).probe_reachable().await,
+                    Ok(true)
+                ) {
+                    return Err(TaskError::NoTerminal);
+                }
+                session
+            }
+            None => {
+                run_command::reachable_session(state)
+                    .await
+                    .ok_or(TaskError::NoTerminal)?
+                    .0
+            }
+        };
+        let (model_args, model, variant) = pane_agent::launch_model(
+            state,
+            &kind,
+            request.model.as_deref(),
+            request.variant.as_deref(),
+        )
+        .await?;
         let now = now_ms();
         let task = self
             .store()
@@ -1110,6 +1455,8 @@ impl TaskService {
                 mentions: request.mentions.clone(),
                 client_ref: request.client_ref.clone(),
                 requester_server_id: by.server_id.clone(),
+                reopened_ms: None,
+                reopen_count: 0,
             })
             .await?;
         let cwd = request.cwd.as_deref();
@@ -1153,6 +1500,9 @@ impl TaskService {
             tab_id: placed.place.tab_id.clone(),
             shell_pid,
             agent_id: Some(kind.clone()),
+            agent_job: None,
+            model,
+            variant,
         };
         let dispatching = TaskChange {
             binding: Some(binding),
@@ -1167,16 +1517,18 @@ impl TaskService {
         };
         let view = self.present(&task).await;
         let state = state.clone();
-        let cwd = request.cwd.clone();
-        let goal = request.goal.clone();
+        let start = TerminalStart {
+            cwd: request.cwd.clone(),
+            goal: request.goal.clone(),
+            model_args,
+        };
         tokio::spawn(async move {
             let start = tokio::spawn(start_terminal_agent(
                 state.clone(),
                 session,
                 kind,
-                cwd,
                 placed,
-                goal,
+                start,
                 task.clone(),
             ));
             // A start that panicked must not leave the task dispatching.
@@ -1196,6 +1548,24 @@ impl TaskService {
     }
 }
 
+/// Whether a delegation to agent `kind` starts it in a terminal pane: a
+/// terminal agent from the catalog that no session runtime serves. A
+/// session agent (OpenCode, DeepSeek, T3) never is: unattached, it is
+/// unavailable.
+pub(crate) async fn runs_in_pane(state: &AppState, kind: &str) -> bool {
+    !AGENT_PREFERENCE.contains(&kind)
+        && state.agent_runtime.manager_for_agent(kind).await.is_none()
+        && pane_agent::is_terminal_agent(state, kind)
+}
+
+/// What [`start_terminal_agent`] starts the agent with: where, the goal, and
+/// the launch arguments for the model and effort the request named.
+pub(crate) struct TerminalStart {
+    pub cwd: Option<String>,
+    pub goal: String,
+    pub model_args: Vec<String>,
+}
+
 /// The background half of [`TaskService::delegate_to_pane`]: start the agent
 /// in its placed pane with the goal alone (on its command line where it
 /// takes one, otherwise typed) unless the task ended meanwhile -- a cancel, or a
@@ -1205,12 +1575,16 @@ pub(crate) async fn start_terminal_agent(
     state: AppState,
     session: crate::SessionConfig,
     kind: String,
-    cwd: Option<String>,
     placed: crate::agents::session_routes::PlacedAgent,
-    goal: String,
+    start: TerminalStart,
     task: Task,
 ) {
-    use crate::agents::session_routes::{start_agent_in_place, type_agent_prompt};
+    let TerminalStart {
+        cwd,
+        goal,
+        model_args,
+    } = start;
+    use crate::agents::session_routes::{start_agent_in_place, type_agent_prompt, TaskLaunch};
     let tasks = &state.tasks;
     // A cancel (or a follower that gave up) while the pane was made or the
     // agent started: nothing more is started or typed.
@@ -1227,6 +1601,8 @@ pub(crate) async fn start_terminal_agent(
     }
     let pane_id = placed.place.pane_id.clone();
     let mut goal = goal;
+    // What ran before the launch command was typed is never its job.
+    let mut before = pane_agent::before_launch().await;
     let (mut launched, mut to_type) = start_agent_in_place(
         &state,
         &session,
@@ -1234,27 +1610,28 @@ pub(crate) async fn start_terminal_agent(
         cwd.as_deref(),
         placed.clone(),
         Some(&goal),
-        true,
+        Some(TaskLaunch {
+            out_of_band: true,
+            model_args: &model_args,
+        }),
     )
     .await;
-    // A Claude Code seen to start with the sentence out of band and gone
-    // again, its pane back at a shell with no Claude Code left under it (it
-    // refused the flag), is started once more with the sentence typed after
-    // the goal -- whether the backend saw it start (tmux) or reported it
-    // exiting before it was ready (Herdr). A start that timed out is a failed
-    // launch: a slow agent may still come up, and must not start twice.
+    // Retry an explicit startup failure only when no goal submission was
+    // attempted. An argv goal can already have taken effect before an exit
+    // or error; a shell foreground alone never proves a rejected goal.
     let out_of_band = kind == "claude"
         && crate::mcp::inject::enabled(&state.config)
         && !crate::mcp::inject::terminal_task_args(&state.config, &kind)
             .await
             .is_empty();
     if out_of_band
-        && may_retry_typed(&launched.steps.value())
+        && may_retry_typed(&launched)
         && pane_agent::exited_to_shell(&session, &pane_id, &kind).await
         && !ended().await
     {
         tracing::info!(task = %task.id.0, "terminal task: started again with the sentence typed");
         goal = format!("{goal}\n\n{}", crate::mcp::inject::TASK_SENTENCE);
+        before = pane_agent::before_launch().await;
         (launched, to_type) = start_agent_in_place(
             &state,
             &session,
@@ -1262,7 +1639,10 @@ pub(crate) async fn start_terminal_agent(
             cwd.as_deref(),
             placed,
             Some(&goal),
-            false,
+            Some(TaskLaunch {
+                out_of_band: false,
+                model_args: &model_args,
+            }),
         )
         .await;
     }
@@ -1288,7 +1668,30 @@ pub(crate) async fn start_terminal_agent(
             .await;
         return;
     }
-    let to = change(TaskState::Working);
+    let mut to = change(TaskState::Working);
+    let mut binding = task.binding.clone();
+    if let TaskBinding::Pane {
+        shell_pid,
+        agent_job,
+        ..
+    } = &mut binding
+    {
+        // The job the launch started: the only one a told result is ever
+        // typed to (`tasks::notices`). Without one, nothing ever is.
+        *agent_job = match (*shell_pid, &before) {
+            (Some(shell_pid), Some(before)) => pane_agent::launched_job(shell_pid, before).await,
+            _ => None,
+        };
+        if agent_job.is_none() {
+            tracing::warn!(
+                task = %task.id.0,
+                "terminal task: no launched job recorded; its pane will not be typed to"
+            );
+        }
+    }
+    if binding != task.binding {
+        to.binding = Some(binding);
+    }
     // A follower or a cancel may have moved it meanwhile; follow whatever is
     // still open.
     if let Err(error) = tasks.store().transition(&task.id, to).await {
@@ -1302,6 +1705,11 @@ impl TaskService {
     /// (Queued passes Dispatching, Waiting passes Working), reading the
     /// task's current state first. The steps carry `to`'s source.
     pub(crate) async fn move_to(&self, task: &TaskId, to: TaskChange) -> Result<Task, TaskError> {
+        // A verified new generation is one atomic transition, including a
+        // peer that completed and reopened between two Working snapshots.
+        if to.reopen {
+            return Ok(self.store().transition(task, to).await?);
+        }
         let now = self.store.get(task).await?.ok_or(TaskError::NotFound)?;
         for step in steps_between(now.state, to.to) {
             let step = TaskChange {
@@ -1391,13 +1799,40 @@ impl TaskService {
         let deadline = Instant::now() + timeout.clamp(MIN_WAIT, MAX_WAIT);
         let task = self.owned(by, id).await?;
         let view = match &task.binding {
-            _ if task.state.is_terminal() => self.present(&task).await,
+            _ if task.state.is_terminal()
+                && !(task.kind == TaskKind::Command
+                    && matches!(task.binding, TaskBinding::Peer { .. })) =>
+            {
+                self.present(&task).await
+            }
             TaskBinding::Pane { .. } if task.kind == TaskKind::Delegation => {
                 self.wait_published(&task.id, deadline).await?
             }
             // A mirror whose computer is quiet is answered at once, saying
             // so (`peer_reachable: false`); the agent decides (§10.14).
             TaskBinding::Peer { .. } if self.peer_quiet(&task) => self.present(&task).await,
+            // A command on another computer: its tail and exit code come
+            // from there once it has ended.
+            TaskBinding::Peer { .. } if task.kind == TaskKind::Command => {
+                let view = self.wait_published(&task.id, deadline).await?;
+                let mut stdout_tail = None;
+                let mut view = view;
+                if view.state.is_terminal() {
+                    if let Some(now) = self.task(&task.id).await.ok().flatten() {
+                        if let Some((code, tail)) =
+                            crate::fleet::mirror::command_result(state, &now).await
+                        {
+                            stdout_tail = Some(tail);
+                            view.exit_code = view.exit_code.or(code);
+                        }
+                    }
+                }
+                return Ok(Waited {
+                    task: view,
+                    stdout_tail,
+                    answer: None,
+                });
+            }
             TaskBinding::Peer { .. } => self.wait_published(&task.id, deadline).await?,
             TaskBinding::Pane { .. } => {
                 let handle = self.poll_command(state, &task, deadline).await?;
@@ -1439,7 +1874,7 @@ impl TaskService {
         // Subscribe before reading the session, so nothing falls between.
         let mut events = state.agent_runtime.subscribe_events();
         let manager = session_manager(state, agent_id, asid).await?;
-        let since = task.created_ms;
+        let since = task.reopened_ms.unwrap_or(task.created_ms);
         let mut pending: VecDeque<_> = snapshot(&manager, asid, since, task.state).await?.into();
         let mut seen_busy = false;
         loop {
@@ -1462,10 +1897,10 @@ impl TaskService {
                     continue;
                 }
                 Step::Idle if !seen_busy => continue,
-                Step::Idle => turn_end(&summary_timeline(&manager, asid, task.created_ms).await),
+                Step::Idle => turn_end(&turn_timeline(&manager, asid, &task).await),
                 Step::Failed(error) => failed_change(&manager, &task, error.as_ref()).await,
                 Step::Form(title) => form_waiting(&manager, &task, &title).await,
-                Step::Move(to) => to,
+                Step::Move(to) => *to,
             };
             if to.to == task.state {
                 // The follower may have moved it since it was read (a paused
@@ -1723,9 +2158,49 @@ impl TaskService {
         by: Requested,
         request: RunRequest,
     ) -> Result<RunHandle, TaskError> {
-        run_command::start(state, &self.store(), by, request)
+        let handle = run_command::start(state, &self.store(), by, request)
             .await
-            .map_err(command_error)
+            .map_err(command_error)?;
+        run_command::follow_peer_command(state, &handle.task);
+        Ok(handle)
+    }
+
+    /// Run `command` on the linked computer `machine` (`exec.run` with
+    /// `machine`): a command task in that computer's ledger, mirrored here
+    /// under the caller's task, waited for up to `timeout` in all. One hop
+    /// only, as for a delegation.
+    pub(crate) async fn run_on(
+        &self,
+        state: &AppState,
+        by: Requested,
+        machine: &str,
+        command: String,
+        cwd: Option<String>,
+        timeout: Duration,
+    ) -> Result<crate::fleet::mirror::RemoteRun, TaskError> {
+        let Some(peer) = state.peers.resolve(machine).await else {
+            let known = state.peers.names();
+            return Err(TaskError::UnknownMachine {
+                wanted: machine.to_owned(),
+                known,
+            });
+        };
+        self.allow_forwarding(&by, &peer.name).await?;
+        let owner = by.by.clone();
+        let started = Instant::now();
+        let mut run =
+            crate::fleet::mirror::run_command(state, by, peer, command, cwd, timeout).await?;
+        let left = timeout.saturating_sub(started.elapsed());
+        if !run.task.state.is_terminal() && left >= MIN_WAIT {
+            let id = TaskId(run.task.task_id.clone());
+            let waited = self.wait(state, &owner, &id, left).await?;
+            run.task = waited.task;
+            run.stdout_tail = waited.stdout_tail.or(run.stdout_tail);
+        }
+        if run.task.state.is_terminal() && run.exit_code.is_none() {
+            run.exit_code = run.task.exit_code;
+        }
+        Ok(run)
     }
 
     /// Open tasks for the driver, as stored.
@@ -1836,6 +2311,18 @@ impl TaskService {
             }),
             _ => None,
         };
+        let (model, variant) = match &task.binding {
+            TaskBinding::Pane {
+                agent_id: Some(_),
+                model,
+                variant,
+                ..
+            } => (
+                Some(model.clone().unwrap_or_else(|| "default".to_owned())),
+                variant.clone(),
+            ),
+            _ => (None, None),
+        };
         TaskView {
             task_id: task.id.0.clone(),
             state: task.state,
@@ -1846,6 +2333,8 @@ impl TaskService {
             binding: task.binding.clone(),
             created_ms: task.created_ms,
             updated_ms: task.updated_ms,
+            reopened_ms: task.reopened_ms,
+            reopen_count: task.reopen_count,
             parent_task_id: task.parent.as_ref().map(|id| id.0.clone()),
             origin: task.origin,
             label: task.label.clone(),
@@ -1857,16 +2346,21 @@ impl TaskService {
             peer_last_seen_ms: None,
             mentions: task.mentions.clone(),
             client_ref: task.client_ref.clone(),
+            model,
+            variant,
             reason: None,
         }
     }
 
-    /// `task`'s title from its session's name: the live name for an open
-    /// task, the one kept when it ended for the rest; never its asid, nor its
-    /// goal restated or cut short.
+    /// `task`'s title from its session's name -- for a mirror, the title the
+    /// task over there shows: the live name for an open task, the one kept
+    /// when it ended for the rest; never its asid, nor its goal restated or
+    /// cut short.
     fn title_of(&self, task: &Task) -> Option<String> {
-        let TaskBinding::AgentSession { asid, .. } = &task.binding else {
-            return None;
+        let asid = match &task.binding {
+            TaskBinding::AgentSession { asid, .. } => asid.as_str(),
+            TaskBinding::Peer { .. } => "",
+            _ => return None,
         };
         if task.label.is_some() {
             return None;
@@ -1878,12 +2372,29 @@ impl TaskService {
         let name = one_line(&name, usize::MAX);
         let short = name.trim_end_matches(['…', '.']).trim_end();
         let goal = one_line(&task.goal, usize::MAX);
-        let says_more = !short.is_empty() && name != *asid && !goal.starts_with(short);
+        let says_more = !short.is_empty() && name != asid && !goal.starts_with(short);
         says_more.then(|| pane_agent::title(None, Some(&name), &task.goal))
     }
 
     fn live_title(&self, id: &TaskId) -> Option<String> {
         self.live.lock().ok()?.titles.get(id).cloned()
+    }
+
+    /// Mirror `id`'s task over there shows `title`: the mirror shows it too,
+    /// so one task reads the same on both computers' cards.
+    pub(crate) async fn mirror_titled(&self, id: &TaskId, title: &str) {
+        let title = one_line(title, SUMMARY_CHARS);
+        if title.is_empty() {
+            return;
+        }
+        let changed = self.live.lock().is_ok_and(|mut live| {
+            live.titles.insert(id.clone(), title.clone()).as_deref() != Some(title.as_str())
+        });
+        if changed {
+            if let Ok(Some(task)) = self.store.get(id).await {
+                self.store().publish(&task).await;
+            }
+        }
     }
 
     /// Agent session `asid` is named `title` now: remembered, when an open
@@ -1933,8 +2444,21 @@ impl TaskService {
         }
         match event {
             AgentDomainEvent::TimelineUpsert { asid, items, .. } => {
+                let latest = self
+                    .store
+                    .list(TaskFilter {
+                        asid: Some(asid.0.clone()),
+                        limit: 1,
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap_or_default();
+                let mut reopened = false;
+                if let Some(task) = latest.first() {
+                    reopened = self.reopen_session(state, task, items).await;
+                }
                 self.follow_progress(state, &asid.0, items).await;
-                return false;
+                return reopened;
             }
             AgentDomainEvent::SessionUpdated { asid, info, .. } => {
                 self.session_named(&asid.0, &info.title).await;
@@ -1992,7 +2516,7 @@ impl TaskService {
                     error,
                 ),
             },
-            Step::Move(to) if to.to != task.state => to,
+            Step::Move(to) if to.to != task.state => *to,
             _ => return false,
         };
         match self.settle(&task, sourced(to, FOLLOWER)).await {
@@ -2034,10 +2558,10 @@ impl TaskService {
         };
         let manager = state.agent_runtime.manager_for_agent(agent_id).await?;
         let session = manager.sessions().get_session(asid).await.ok()?;
-        if !finished_since(&session, task.created_ms) {
+        if !finished_since(&session, task.reopened_ms.unwrap_or(task.created_ms)) {
             return None;
         }
-        let to = turn_end(&summary_timeline(&manager, asid, task.created_ms).await);
+        let to = turn_end(&turn_timeline(&manager, asid, task).await);
         self.moves(task, &to).await.then_some(to)
     }
 
@@ -2077,8 +2601,49 @@ impl TaskService {
             if let Ok(mut live) = self.live.lock() {
                 live.idled.remove(id);
             }
+        } else if let Some(open) = self.open_children(id).await {
+            // Done means the whole of it: a child still out (working,
+            // paused, waiting) is finished or cancelled first.
+            return Err(TaskError::ChildrenOpen(open));
         }
         self.finish(id, to).await
+    }
+
+    /// A sentence naming task `id`'s sub-tasks that have not ended, if any:
+    /// `mini is still on 'Checking Xcode version'; wait for it or cancel it.`
+    async fn open_children(&self, id: &TaskId) -> Option<String> {
+        let filter = TaskFilter {
+            root: Some(id.clone()),
+            states: Some(OPEN_STATES.to_vec()),
+            limit: 20,
+            ..Default::default()
+        };
+        let open: Vec<String> = self
+            .store
+            .list(filter)
+            .await
+            .ok()?
+            .into_iter()
+            .filter(|task| task.id != *id)
+            .map(|child| {
+                let who = match &child.binding {
+                    TaskBinding::Peer { peer_name, .. } => peer_name.clone(),
+                    _ => String::from("A sub-task"),
+                };
+                let title = self.title_of(&child).unwrap_or_else(|| {
+                    pane_agent::title(
+                        child.label.as_deref(),
+                        child.session_title.as_deref(),
+                        &child.goal,
+                    )
+                });
+                format!("{who} is still on '{title}'")
+            })
+            .collect();
+        (!open.is_empty()).then(|| {
+            let it = if open.len() == 1 { "it" } else { "them" };
+            format!("{}; wait for {it} or cancel {it}.", open.join("; "))
+        })
     }
 
     /// Whether the task `id` is `waiting` because its agent said it is
@@ -2327,6 +2892,17 @@ fn untitled_placeholder(asid: &str, title: &str) -> bool {
         || title == crate::agents::adapters::deepseek::mapper::UNTITLED
 }
 
+/// A parent's progress while a child works: `Waiting for mini · 3 min`.
+fn waiting_line(who: &str, elapsed_ms: u64) -> String {
+    let minutes = elapsed_ms / 60_000;
+    let elapsed = match minutes {
+        0 => String::from("under a minute"),
+        1..=59 => format!("{minutes} min"),
+        _ => format!("{} h {} min", minutes / 60, minutes % 60),
+    };
+    format!("Waiting for {who} · {elapsed}")
+}
+
 /// Stopped short of an end: waiting on the user, or paused without saying
 /// it is finished.
 fn paused(state: TaskState) -> bool {
@@ -2370,7 +2946,7 @@ async fn form_waiting(manager: &AgentManager, task: &Task, title: &str) -> TaskC
     let TaskBinding::AgentSession { asid, .. } = &task.binding else {
         return asking(title);
     };
-    let items = summary_timeline(manager, asid, task.created_ms).await;
+    let items = turn_timeline(manager, asid, task).await;
     let last_tool = items
         .iter()
         .rposition(|item| matches!(item.part, AgentPart::Tool(_)));
@@ -2466,7 +3042,10 @@ pub(crate) async fn session_failure(
     since_ms: u64,
 ) -> String {
     if let Some(error) = error {
-        return one_line(&format!("{}: {}", error.name, error.message), SUMMARY_CHARS);
+        let agent = manager.map_or("the agent", |manager| agent_name(manager.agent().kind()));
+        return provider_failure(agent, error).unwrap_or_else(|| {
+            one_line(&format!("{}: {}", error.name, error.message), SUMMARY_CHARS)
+        });
     }
     let Some(manager) = manager else {
         return SESSION_FAILED.to_owned();
@@ -2484,6 +3063,59 @@ pub(crate) async fn session_failure(
     }
 }
 
+/// An agent kind as a person names it.
+fn agent_name(kind: &str) -> &str {
+    match kind {
+        "opencode" => "OpenCode",
+        "deepseek" => "DeepSeek",
+        "t3" => "T3 Code",
+        "claude" => "Claude Code",
+        "codex" => "Codex",
+        other => other,
+    }
+}
+
+/// A model provider's refusal (`provider.auth …`, `ProviderAuthError`,
+/// `provider.*`) in words for a person, never the raw error:
+/// `OpenCode could not reach its model provider (HTTP 403)`, or `OpenCode's
+/// model provider refused the request (429)`. `None`: not a provider error.
+fn provider_failure(agent: &str, error: &AgentErrorInfo) -> Option<String> {
+    let name = error.name.to_ascii_lowercase();
+    if !name.starts_with("provider") && name != "apierror" {
+        return None;
+    }
+    // An HTTP error status, never a port (`…:443`) that happens to have three digits.
+    let status = error.status.or_else(|| {
+        let message = error.message.as_bytes();
+        (0..message.len().saturating_sub(2)).find_map(|at| {
+            let digits = &message[at..at + 3];
+            let whole = digits.iter().all(u8::is_ascii_digit)
+                && (at == 0 || !message[at - 1].is_ascii_digit() && message[at - 1] != b':')
+                && message
+                    .get(at + 3)
+                    .is_none_or(|next| !next.is_ascii_digit());
+            let code: u16 = std::str::from_utf8(digits).ok()?.parse().ok()?;
+            (whole && (400..600).contains(&code)).then_some(code)
+        })
+    });
+    let mut capital = agent.chars();
+    let agent = match capital.next() {
+        Some(first) => first.to_uppercase().chain(capital).collect::<String>(),
+        None => String::new(),
+    };
+    Some(if name.contains("auth") {
+        let status = status
+            .map(|status| format!(" (HTTP {status})"))
+            .unwrap_or_default();
+        format!("{agent} could not reach its model provider{status}")
+    } else {
+        let status = status
+            .map(|status| format!(" ({status})"))
+            .unwrap_or_default();
+        format!("{agent}'s model provider refused the request{status}")
+    })
+}
+
 /// The timeline a finished delegation's summary is read from.
 ///
 /// The agent's own read is asked first (OpenCode persists its answer before
@@ -2493,6 +3125,19 @@ pub(crate) async fn session_failure(
 /// gateway's mirror of the session has the streamed rows by then, so when the
 /// agent's read lacks an assistant answer written since `since_ms` (the
 /// task's start), the mirror is read instead.
+pub(crate) async fn turn_timeline(
+    manager: &AgentManager,
+    asid: &str,
+    task: &Task,
+) -> Vec<TimelineItem> {
+    let since = task.reopened_ms.unwrap_or(task.created_ms);
+    summary_timeline(manager, asid, since)
+        .await
+        .into_iter()
+        .filter(|item| task.reopened_ms.is_none() || item.updated_ms >= since)
+        .collect()
+}
+
 pub(crate) async fn summary_timeline(
     manager: &AgentManager,
     asid: &str,
@@ -2538,28 +3183,46 @@ fn newest_answer(items: &[TimelineItem], since_ms: u64) -> Option<u64> {
 }
 
 /// The last assistant message of `asid`, in full; `None` when it cannot be read.
-async fn full_answer(state: &AppState, asid: &str, since_ms: u64) -> Option<String> {
+pub(crate) async fn full_answer(state: &AppState, asid: &str, since_ms: u64) -> Option<String> {
     let manager = state.agent_runtime.manager_for_session(asid).await?;
     // Never the child's marker: a parent quoting it would complete itself.
     last_assistant_text(&summary_timeline(&manager, asid, since_ms).await)
         .map(|text| super::transcript::without_any_marker(&text))
 }
 
-/// Whether a launch's steps leave room for starting the agent again with
-/// its sentence typed, once it is shown to have exited: the agent step
-/// succeeded (tmux saw it start), or failed because the agent exited before
-/// it was ready (Herdr's `agent_start_failed`). Never after a timeout or
-/// any other failure.
-fn may_retry_typed(steps: &Value) -> bool {
-    let Some(failed) = steps.as_array().and_then(|steps| {
-        steps
-            .iter()
-            .find(|step| step.get("status").and_then(Value::as_str) == Some("failed"))
-    }) else {
-        return true;
+/// Only an explicit exit before readiness, with no attempted goal delivery,
+/// permits the typed-sentence fallback. Missing or ambiguous evidence fails closed.
+fn may_retry_typed(launch: &crate::agents::session_routes::AgentLaunch) -> bool {
+    use crate::agents::session_routes::PromptDelivery;
+    if launch.prompt_delivery != PromptDelivery::NotAttempted
+        || launch.payload.get("agent_started") != Some(&json!(false))
+        || launch.payload.get("prompt_submitted") != Some(&json!(false))
+    {
+        return false;
+    }
+    let steps = launch.steps.value();
+    let Some(steps) = steps.as_array() else {
+        return false;
     };
-    failed.get("step").and_then(Value::as_str) == Some("agent")
-        && failed.pointer("/error/code").and_then(Value::as_str) == Some("agent_start_failed")
+    let mut failed_before_prompt = false;
+    for step in steps {
+        match (
+            step.get("step").and_then(Value::as_str),
+            step.get("status").and_then(Value::as_str),
+        ) {
+            (Some("agent"), Some("failed"))
+                if !failed_before_prompt
+                    && step.pointer("/error/code").and_then(Value::as_str)
+                        == Some("agent_start_failed") =>
+            {
+                failed_before_prompt = true;
+            }
+            (Some("agent" | "prompt"), _) | (_, Some("failed")) | (_, None) => return false,
+            (Some(_), Some("ok" | "skipped")) => {}
+            _ => return false,
+        }
+    }
+    failed_before_prompt
 }
 
 /// `"<step>: <message>"` for the first failed step of a launch.
@@ -2861,6 +3524,8 @@ mod tests {
             label: None,
             mentions: Vec::new(),
             client_ref: None,
+            session_id: None,
+            attachments: Vec::new(),
         }
     }
 
@@ -2911,24 +3576,464 @@ mod tests {
         }
     }
 
+    /// A model provider's refusal reads as a sentence; any other error keeps
+    /// its own words.
     #[test]
-    fn a_claude_that_refused_its_flag_is_retried_only_after_a_real_failure() {
-        let failed = |code: &str| {
-            json!([{ "step": "pane", "status": "ok" },
-                   { "step": "agent", "status": "failed", "error": { "code": code, "message": "x" } }])
+    fn a_provider_failure_is_worded_for_a_person() {
+        let error = |name: &str, message: &str, status: Option<u16>| AgentErrorInfo {
+            name: name.into(),
+            message: message.into(),
+            status,
         };
-        for (steps, retry) in [
-            (json!([{ "step": "agent", "status": "ok" }]), true),
-            (failed("agent_start_failed"), true),
-            (failed("agent_start_timeout"), false),
-            (failed("agent_not_found"), false),
+        for (error, worded) in [
             (
-                json!([{ "step": "pane", "status": "failed", "error": { "code": "agent_start_failed" } }]),
+                error("provider.auth", "Request failed: 403", None),
+                Some("OpenCode could not reach its model provider (HTTP 403)"),
+            ),
+            (
+                error("ProviderAuthError", "bad key", Some(401)),
+                Some("OpenCode could not reach its model provider (HTTP 401)"),
+            ),
+            (
+                error("provider.rate_limit", "Request failed: 429", None),
+                Some("OpenCode's model provider refused the request (429)"),
+            ),
+            (
+                error("APIError", "https://api.example:443 answered 503", None),
+                Some("OpenCode's model provider refused the request (503)"),
+            ),
+            (error("UnknownError", "boom", None), None),
+        ] {
+            assert_eq!(
+                provider_failure("OpenCode", &error).as_deref(),
+                worded,
+                "{error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn typed_fallback_requires_an_explicit_failure_and_no_delivery_attempt() {
+        use crate::agents::session_routes::{AgentLaunch, PromptDelivery};
+        for (step, code, delivery, retry) in [
+            (
+                "agent",
+                "agent_start_failed",
+                PromptDelivery::NotAttempted,
+                true,
+            ),
+            (
+                "agent",
+                "agent_start_failed",
+                PromptDelivery::Attempted,
+                false,
+            ),
+            (
+                "agent",
+                "agent_start_timeout",
+                PromptDelivery::NotAttempted,
+                false,
+            ),
+            (
+                "agent",
+                "agent_not_found",
+                PromptDelivery::NotAttempted,
+                false,
+            ),
+            (
+                "agent",
+                "herdr_unavailable",
+                PromptDelivery::NotAttempted,
+                false,
+            ),
+            (
+                "agent",
+                "invalid_herdr_response",
+                PromptDelivery::NotAttempted,
+                false,
+            ),
+            (
+                "pane",
+                "agent_start_failed",
+                PromptDelivery::NotAttempted,
+                false,
+            ),
+            (
+                "prompt",
+                "agent_start_failed",
+                PromptDelivery::NotAttempted,
                 false,
             ),
         ] {
-            assert_eq!(may_retry_typed(&steps), retry, "{steps}");
+            let mut steps = crate::agents::tasks::StepLog::new();
+            steps.failed(step, code, "x");
+            let mut launch = AgentLaunch {
+                payload: json!({ "agent_started": false, "prompt_submitted": false }),
+                steps,
+                prompt_delivery: delivery,
+            };
+            assert_eq!(
+                may_retry_typed(&launch),
+                retry,
+                "{step}: {code}, {delivery:?}"
+            );
+            launch.payload = Value::Null;
+            assert!(!may_retry_typed(&launch), "missing metadata: {code}");
         }
+        for success in [false, true] {
+            let mut steps = crate::agents::tasks::StepLog::new();
+            if success {
+                steps.ok("agent", json!({}));
+                steps.ok("prompt", json!({ "via": "argv" }));
+            }
+            assert!(!may_retry_typed(&AgentLaunch {
+                payload: json!({ "agent_started": false, "prompt_submitted": false }),
+                steps,
+                prompt_delivery: PromptDelivery::NotAttempted,
+            }));
+        }
+    }
+
+    async fn terminal_task(state: &AppState, pane_id: &str, goal: &str) -> Task {
+        let now = now_ms();
+        let task = Task {
+            id: TaskId::new(),
+            kind: TaskKind::Delegation,
+            goal: goal.into(),
+            cwd: None,
+            binding: TaskBinding::Pane {
+                session_id: state.config.sessions[0].id.clone(),
+                pane_id: pane_id.into(),
+                tab_id: None,
+                shell_pid: None,
+                agent_id: Some("claude".into()),
+                agent_job: None,
+                model: None,
+                variant: None,
+            },
+            state: TaskState::Queued,
+            summary: None,
+            exit_code: None,
+            created_by: assistant("a"),
+            created_ms: now,
+            updated_ms: now,
+            seq: 0,
+            parent: None,
+            origin: TaskOrigin::Mcp,
+            label: None,
+            requester_name: None,
+            session_title: None,
+            mentions: Vec::new(),
+            client_ref: None,
+            requester_server_id: None,
+            reopened_ms: None,
+            reopen_count: 0,
+        };
+        state.tasks.insert_for_test(&task).await;
+        state
+            .tasks
+            .move_to(&task.id, change(TaskState::Dispatching))
+            .await
+            .unwrap()
+    }
+
+    struct TaskStartHerdr {
+        socket: crate::test_support::TestSocket,
+        calls: Arc<std::sync::Mutex<Vec<Value>>>,
+        serving: tokio::task::JoinHandle<()>,
+    }
+
+    impl TaskStartHerdr {
+        fn start(first_error: Option<&'static str>) -> Self {
+            use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+            let socket = crate::test_support::TestSocket::new();
+            let listener = tokio::net::UnixListener::bind(&socket.path).unwrap();
+            let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let recorded = calls.clone();
+            let serving = tokio::spawn(async move {
+                let mut starts = 0;
+                while let Ok((stream, _)) = listener.accept().await {
+                    let mut reader = BufReader::new(stream);
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                        continue;
+                    }
+                    let request: Value = serde_json::from_str(&line).unwrap();
+                    recorded.lock().unwrap().push(request.clone());
+                    let method = request["method"].as_str().unwrap();
+                    let error = if method == "agent.start" {
+                        starts += 1;
+                        (starts == 1).then_some(first_error).flatten()
+                    } else {
+                        None
+                    };
+                    // A lost response cannot show whether the launch ran.
+                    if error == Some("disconnect") {
+                        continue;
+                    }
+                    let result = match method {
+                        "tab.create" => {
+                            json!({ "tab": { "tab_id": "w1:t1", "workspace_id": "w1", "active_pane_id": "w1:p1" } })
+                        }
+                        "pane.get" => {
+                            json!({ "pane": { "pane_id": "w1:p1", "workspace_id": "w1", "tab_id": "w1:t1" } })
+                        }
+                        "pane.list" => {
+                            json!({ "panes": [{ "pane_id": "w1:p1", "workspace_id": "w1", "tab_id": "w1:t1" }] })
+                        }
+                        "pane.process_info" => {
+                            json!({ "process_info": { "shell_pid": 4242, "foreground_processes": [{ "name": "sh", "argv0": "sh" }] } })
+                        }
+                        "pane.read" => json!({ "read": { "text": "$ ", "revision": 1 } }),
+                        "agent.list" => json!({ "agents": [] }),
+                        "ping" => json!({ "version": "0.9.0", "protocol": 17 }),
+                        _ => json!({ "ok": true }),
+                    };
+                    let response = match error {
+                        Some("malformed") => {
+                            json!({ "id": request["id"], "result": { "agent": { "terminal_id": "t" } } })
+                        }
+                        Some(code) => {
+                            json!({ "id": request["id"], "error": { "code": code, "message": "startup refused" } })
+                        }
+                        None => json!({ "id": request["id"], "result": result }),
+                    };
+                    let mut stream = reader.into_inner();
+                    stream
+                        .write_all(response.to_string().as_bytes())
+                        .await
+                        .unwrap();
+                    stream.write_all(b"\n").await.unwrap();
+                }
+            });
+            Self {
+                socket,
+                calls,
+                serving,
+            }
+        }
+    }
+
+    impl Drop for TaskStartHerdr {
+        fn drop(&mut self) {
+            self.serving.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_start_retries_only_before_a_typed_goal_can_be_delivered() {
+        for (error, starts, prompts, end) in [
+            (Some("agent_start_failed"), 2, 1, TaskState::Working),
+            (Some("agent_pane_busy"), 2, 1, TaskState::Working),
+            (None, 1, 1, TaskState::Working),
+            (Some("agent_start_timeout"), 1, 0, TaskState::Failed),
+            (Some("agent_not_ready"), 1, 0, TaskState::Failed),
+            (Some("disconnect"), 1, 0, TaskState::Failed),
+            (Some("malformed"), 1, 0, TaskState::Failed),
+        ] {
+            let fake = TaskStartHerdr::start(error);
+            let mut state = test_state("admin", Vec::new());
+            state.config.agent_trust_folders = false;
+            state.config.sessions[0].socket_path = fake.socket.path.to_string_lossy().into_owned();
+            let session = state.config.sessions[0].clone();
+            let placed =
+                crate::agents::session_routes::place_agent(&state, &session, "claude", None, None)
+                    .await
+                    .unwrap();
+            let goal = "apply the non-idempotent change once";
+            let task = terminal_task(&state, &placed.place.pane_id, goal).await;
+            start_terminal_agent(
+                state.clone(),
+                session,
+                "claude".into(),
+                placed,
+                TerminalStart {
+                    cwd: None,
+                    goal: goal.into(),
+                    model_args: Vec::new(),
+                },
+                task.clone(),
+            )
+            .await;
+            assert_eq!(
+                state.tasks.get_for_test(&task.id).await.state,
+                end,
+                "{error:?}"
+            );
+            let calls = fake.calls.lock().unwrap();
+            let launches: Vec<_> = calls
+                .iter()
+                .filter(|call| call["method"] == "agent.start")
+                .collect();
+            let deliveries: Vec<_> = calls
+                .iter()
+                .filter(|call| call["method"] == "agent.prompt")
+                .collect();
+            assert_eq!(launches.len(), starts, "{error:?}: {calls:?}");
+            assert_eq!(deliveries.len(), prompts, "{error:?}: {calls:?}");
+            assert!(launches.iter().all(|call| !call["params"]["args"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|arg| arg.as_str().is_some_and(|arg| arg.contains(goal)))));
+            if prompts > 0 {
+                let typed_fallback = error == Some("agent_start_failed");
+                let expected = if typed_fallback {
+                    format!("{goal}\n\n{}", crate::mcp::inject::TASK_SENTENCE)
+                } else {
+                    goal.to_owned()
+                };
+                assert_eq!(deliveries[0]["params"]["text"], expected, "{error:?}");
+                let args = launches.last().unwrap()["params"]["args"]
+                    .as_array()
+                    .unwrap();
+                assert_eq!(
+                    args.iter().any(|arg| arg
+                        .as_str()
+                        .is_some_and(|arg| arg.starts_with("--append-system-prompt"))),
+                    !typed_fallback
+                );
+            }
+        }
+    }
+
+    struct TaskTmux {
+        dir: std::path::PathBuf,
+        socket: std::path::PathBuf,
+    }
+
+    impl Drop for TaskTmux {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("tmux")
+                .arg("-S")
+                .arg(&self.socket)
+                .arg("kill-server")
+                .output();
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated tmux server; runs only a fake shell agent"]
+    async fn an_argv_goal_is_not_relaunched_after_success_and_a_rapid_exit() {
+        let dir = crate::test_support::asset_test_dir("task-argv");
+        let fake = TaskTmux {
+            socket: dir.join("tmux.sock"),
+            dir,
+        };
+        let created = std::process::Command::new("tmux")
+            .arg("-S")
+            .arg(&fake.socket)
+            .args([
+                "-f",
+                "/dev/null",
+                "new-session",
+                "-d",
+                "-s",
+                "task-argv",
+                "/bin/sh",
+            ])
+            .output()
+            .unwrap();
+        assert!(created.status.success(), "{created:?}");
+        let mut state = test_state("admin", Vec::new());
+        state.config.agent_trust_folders = false;
+        state.config.sessions[0].backend = crate::backend::BackendKind::Tmux;
+        state.config.sessions[0].socket_path = fake.socket.to_string_lossy().into_owned();
+        state
+            .config
+            .agent_commands
+            .insert("claude".into(), "sh".into());
+        let effects = fake.dir.join("effects");
+        let argv = fake.dir.join("argv");
+        let release = fake.dir.join("release");
+        // A non-idempotent side effect, then an exit. No AI process is run.
+        let script = format!(
+            "printf 'effect\\n' >> {}; printf '%s\\n' \"$@\" >> {}; while [ ! -f {} ]; do :; done",
+            crate::terminal::shell_word::shell_word(&effects.to_string_lossy()),
+            crate::terminal::shell_word::shell_word(&argv.to_string_lossy()),
+            crate::terminal::shell_word::shell_word(&release.to_string_lossy()),
+        );
+        state
+            .config
+            .agent_launch_args
+            .insert("claude".into(), vec!["-c".into(), script]);
+        let session = state.config.sessions[0].clone();
+        let placed =
+            crate::agents::session_routes::place_agent(&state, &session, "claude", None, None)
+                .await
+                .unwrap();
+        let goal = "apply the non-idempotent change once";
+        let task = terminal_task(&state, &placed.place.pane_id, goal).await;
+        let exit = tokio::spawn({
+            let effects = effects.clone();
+            async move {
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while !effects.exists() {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .unwrap();
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                std::fs::write(release, "exit").unwrap();
+            }
+        });
+        start_terminal_agent(
+            state.clone(),
+            session,
+            "claude".into(),
+            placed,
+            TerminalStart {
+                cwd: None,
+                goal: goal.into(),
+                model_args: Vec::new(),
+            },
+            task.clone(),
+        )
+        .await;
+        exit.await.unwrap();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(std::fs::read_to_string(effects).unwrap(), "effect\n");
+        let argv = std::fs::read_to_string(argv).unwrap();
+        assert!(argv.contains("--append-system-prompt"), "{argv}");
+        assert_eq!(argv.lines().filter(|arg| *arg == goal).count(), 1, "{argv}");
+        assert_eq!(
+            state.tasks.get_for_test(&task.id).await.state,
+            TaskState::Working
+        );
+        // The argv delivery disposition must survive a backend error too;
+        // absence of a successful prompt step is not proof of non-delivery.
+        state
+            .config
+            .agent_commands
+            .insert("claude".into(), "muqun-nonexistent-task-test-agent".into());
+        let placed = crate::agents::session_routes::place_agent(
+            &state,
+            &state.config.sessions[0],
+            "claude",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let (failed, to_type) = crate::agents::session_routes::start_agent_in_place(
+            &state,
+            &state.config.sessions[0],
+            "claude",
+            None,
+            placed,
+            Some(goal),
+            None,
+        )
+        .await;
+        assert_eq!(
+            failed.prompt_delivery,
+            crate::agents::session_routes::PromptDelivery::Attempted
+        );
+        assert!(failed.steps.has_failure());
+        assert!(to_type.is_none());
+        assert!(!may_retry_typed(&failed));
     }
 
     /// A state with an OpenCode fake whose new session exists (idle, unless
@@ -2971,6 +4076,71 @@ mod tests {
             state.agent_runtime.publish_for_test(event);
         }
         waiting.await.unwrap().unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_new_user_turn_reopens_only_a_live_finished_session() {
+        for (ended, live, fresh, expected) in [
+            (TaskState::Done, true, true, true),
+            (TaskState::Failed, true, true, true),
+            (TaskState::Cancelled, true, true, false),
+            (TaskState::Done, false, true, false),
+            (TaskState::Done, true, false, false),
+        ] {
+            let agent = FakeAgent::new("opencode");
+            let (state, id) = if live {
+                delegated(agent).await
+            } else {
+                tracked(agent).await
+            };
+            let task = state
+                .tasks
+                .move_to(
+                    &id,
+                    TaskChange {
+                        to: ended,
+                        summary: Some("first result".into()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let mut user = reply("follow-up", "Please continue");
+            user.role = TimelineRole::User;
+            user.updated_ms = task.updated_ms + u64::from(fresh);
+            assert_eq!(
+                state.tasks.reopen_session(&state, &task, &[user]).await,
+                expected
+            );
+            let now = state.tasks.task(&id).await.unwrap().unwrap();
+            assert_eq!(now.state, if expected { TaskState::Working } else { ended });
+            assert_eq!(now.summary.as_deref(), Some("first result"));
+            assert_eq!(now.reopen_count, u64::from(expected));
+            if expected {
+                assert_eq!(now.reopened_ms, Some(task.updated_ms + 1));
+                // A duplicate observer cannot reopen the same finish twice.
+                assert!(state
+                    .tasks
+                    .reopen(&task, task.updated_ms + 1)
+                    .await
+                    .is_err());
+                let done = state
+                    .tasks
+                    .move_to(
+                        &id,
+                        TaskChange {
+                            to: TaskState::Done,
+                            summary: Some("second result".into()),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(done.id, task.id);
+                assert_eq!(done.summary.as_deref(), Some("second result"));
+                assert_eq!(done.reopen_count, 1);
+            }
+        }
     }
 
     #[tokio::test]
@@ -3328,6 +4498,67 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn forwarding_refuses_unknown_peer_and_broken_ancestry() {
+        use crate::tasks::domain::ForwardingContext;
+        let (state, id) = delegated(FakeAgent::new("opencode")).await;
+        let mut by = Requested::mcp(assistant("a"));
+        assert!(matches!(
+            state.tasks.allow_forwarding(&by, "mini").await,
+            Err(TaskError::LineageUnresolved)
+        ));
+        by.forwarding = ForwardingContext::Resolved;
+        assert!(state.tasks.allow_forwarding(&by, "mini").await.is_ok());
+        by.parent = Some(TaskId("missing".into()));
+        assert!(matches!(
+            state.tasks.allow_forwarding(&by, "mini").await,
+            Err(TaskError::LineageUnresolved)
+        ));
+        // A child created locally while its caller was unknown cannot wash
+        // that missing lineage into a known local root on its next call.
+        by.parent = Some(id.clone());
+        assert!(matches!(
+            state.tasks.allow_forwarding(&by, "mini").await,
+            Err(TaskError::LineageUnresolved)
+        ));
+        let mut root = state.tasks.get_for_test(&id).await;
+        root.id = TaskId::new();
+        root.origin = TaskOrigin::Device;
+        root.created_by = device();
+        let local = state.tasks.insert_for_test(&root).await;
+        by.parent = Some(local.clone());
+        assert!(state.tasks.allow_forwarding(&by, "mini").await.is_ok());
+        root.id = TaskId::new();
+        root.origin = TaskOrigin::Peer;
+        let peer = state.tasks.insert_for_test(&root).await;
+        by.parent = Some(peer);
+        assert!(matches!(
+            state.tasks.allow_forwarding(&by, "mini").await,
+            Err(TaskError::DelegationLoop(_))
+        ));
+        root.id = TaskId::new();
+        root.origin = TaskOrigin::Device;
+        root.parent = Some(root.id.clone());
+        by.parent = Some(state.tasks.insert_for_test(&root).await);
+        assert!(matches!(
+            state.tasks.allow_forwarding(&by, "mini").await,
+            Err(TaskError::LineageUnresolved)
+        ));
+        by.parent = Some(local);
+        state
+            .db
+            .call(|db| {
+                db.execute_batch("DROP TABLE tasks")?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            state.tasks.allow_forwarding(&by, "mini").await,
+            Err(TaskError::LineageUnresolved)
+        ));
+    }
+
     /// A store that refuses every move to `refuse`.
     struct Refusing {
         inner: Arc<dyn TaskStore>,
@@ -3645,6 +4876,8 @@ mod tests {
                 mentions: Vec::new(),
                 client_ref: None,
                 requester_server_id: None,
+                reopened_ms: None,
+                reopen_count: 0,
             })
             .await;
         state
@@ -4199,6 +5432,7 @@ mod tests {
         let (state, parent) = delegated(FakeAgent::new("opencode")).await;
         let mut updates = state.task_events.subscribe();
         let by = Requested {
+            forwarding: crate::tasks::domain::ForwardingContext::Unknown,
             by: assistant("agent:opencode"),
             origin: TaskOrigin::Agent,
             parent: Some(parent.clone()),
@@ -4263,7 +5497,7 @@ mod tests {
                 Failed,
                 Some(error),
                 "",
-                Some("ProviderError: rate limited: try again later"),
+                Some("OpenCode's model provider refused the request (429)"),
             ),
             (
                 "no error: what the session last said",

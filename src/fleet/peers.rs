@@ -38,6 +38,10 @@ ALTER TABLE peers ADD COLUMN server_id TEXT;
 UPDATE peers SET server_id = peer_id;
 CREATE UNIQUE INDEX peers_by_server ON peers(server_id);
 ",
+        "
+ALTER TABLE peers ADD COLUMN unauthorized INTEGER NOT NULL DEFAULT 0;
+",
+        "ALTER TABLE peers ADD COLUMN transport_min_version INTEGER NOT NULL DEFAULT 1;",
     ],
 };
 
@@ -61,10 +65,17 @@ pub(crate) struct Peer {
     pub token: String,
     pub device_id: String,
     pub transport_key: Option<String>,
+    /// A durable, monotonic pin: once the authenticated peer advertises v2,
+    /// never send another v1 request with this link's credentials.
+    pub transport_min_version: u8,
     pub added_ms: u64,
     pub last_seen_ms: Option<u64>,
     pub capabilities: Vec<String>,
     pub manifest: Option<Value>,
+    /// The peer answered 401/403: it no longer takes this computer's token
+    /// (unlinked there, or this login revoked). Kept, not forgotten, so a
+    /// delegation names the reason; a link under its name replaces it.
+    pub unauthorized: bool,
 }
 
 /// Never the token or the transport key.
@@ -100,7 +111,7 @@ fn recent(seen: Option<u64>, now_ms: u64) -> bool {
 
 impl Peer {
     pub(crate) fn reachable(&self, now_ms: u64) -> bool {
-        recent(self.last_seen_ms, now_ms)
+        !self.unauthorized && recent(self.last_seen_ms, now_ms)
     }
 
     pub(crate) fn view(&self, now_ms: u64) -> PeerView {
@@ -111,6 +122,7 @@ impl Peer {
             url: self.url.clone(),
             reachable: self.reachable(now_ms),
             last_seen_ms: self.last_seen_ms,
+            unauthorized: self.unauthorized,
         }
     }
 }
@@ -124,6 +136,9 @@ pub(crate) struct PeerView {
     pub url: String,
     pub reachable: bool,
     pub last_seen_ms: Option<u64>,
+    /// It no longer takes this computer's token: link it again.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub unauthorized: bool,
 }
 
 pub(crate) trait PeerStore: Send + Sync {
@@ -132,6 +147,10 @@ pub(crate) trait PeerStore: Send + Sync {
     fn put<'a>(&'a self, peer: &'a Peer) -> TaskFuture<'a, ()>;
     fn list<'a>(&'a self) -> TaskFuture<'a, Vec<Peer>>;
     fn remove<'a>(&'a self, peer_id: &'a str) -> TaskFuture<'a, bool>;
+    /// Raise the outbound transport pin atomically; stale writes cannot lower it.
+    fn pin_transport_version<'a>(&'a self, peer_id: &'a str, version: u8) -> TaskFuture<'a, u8>;
+    /// Mark `peer_id` as no longer taking this computer's token.
+    fn set_unauthorized<'a>(&'a self, peer_id: &'a str) -> TaskFuture<'a, ()>;
     /// Change only `name` and/or `url` of the row, when it is still there:
     /// never a whole row from an older read. Whether it was.
     fn edit<'a>(
@@ -153,14 +172,32 @@ pub(crate) trait PeerStore: Send + Sync {
 /// When each peer last answered, in memory: written by [`PeerService`],
 /// read (from Task G3) by the task service to present mirrors without a
 /// store round trip.
+/// With each, whether it is known to be down right now (its task socket
+/// closed, a call to it failed): unreachable at once, whatever its last
+/// answer says, until it answers again.
 #[derive(Default)]
-pub(crate) struct PeerPresence(RwLock<HashMap<String, Option<u64>>>);
+pub(crate) struct PeerPresence(RwLock<HashMap<String, (Option<u64>, bool)>>);
 
 impl PeerPresence {
     pub(crate) fn seen(&self, peer_id: &str, at_ms: Option<u64>) {
         if let Ok(mut map) = self.0.write() {
-            map.insert(peer_id.to_owned(), at_ms);
+            map.insert(peer_id.to_owned(), (at_ms, false));
         }
+    }
+
+    /// `peer_id` stopped answering just now; its last answer is kept.
+    pub(crate) fn down(&self, peer_id: &str) {
+        if let Ok(mut map) = self.0.write() {
+            map.entry(peer_id.to_owned()).or_insert((None, true)).1 = true;
+        }
+    }
+
+    pub(crate) fn is_down(&self, peer_id: &str) -> bool {
+        self.0
+            .read()
+            .ok()
+            .and_then(|map| map.get(peer_id).map(|(_, down)| *down))
+            .unwrap_or(false)
     }
 
     pub(crate) fn gone(&self, peer_id: &str) {
@@ -171,13 +208,13 @@ impl PeerPresence {
 
     /// `(reachable, last_seen_ms)`; an unknown peer (unlinked, forgotten) is unreachable, never seen.
     pub(crate) fn of(&self, peer_id: &str, now_ms: u64) -> (bool, Option<u64>) {
-        let seen = self
+        let (seen, down) = self
             .0
             .read()
             .ok()
             .and_then(|map| map.get(peer_id).copied())
-            .flatten();
-        (recent(seen, now_ms), seen)
+            .unwrap_or((None, false));
+        (!down && recent(seen, now_ms), seen)
     }
 }
 
@@ -221,6 +258,24 @@ pub(crate) enum RenameError {
 async fn revoke(peer: &Peer) -> bool {
     let Ok(client) = PeerClient::for_peer(peer) else {
         return false;
+    };
+    // A failed link may already have sent a successful v2 probe before the
+    // local row was stored. Recover that read-only negotiation before the
+    // one revoke request; never retry the revoke itself.
+    let client = if peer.transport_key.is_some() && peer.transport_min_version == 1 {
+        let Ok(capabilities) = client.negotiate().await else {
+            return false;
+        };
+        let confirmed = Peer {
+            transport_min_version: capabilities.transport_version,
+            ..peer.clone()
+        };
+        let Ok(client) = PeerClient::for_peer(&confirmed) else {
+            return false;
+        };
+        client
+    } else {
+        client
     };
     let path = format!("/api/pairings/{}", peer.device_id);
     match client.json(Method::DELETE, &path, None).await {
@@ -432,6 +487,9 @@ impl PeerService {
     /// Whether `peer` answers, as far as is known without asking it now:
     /// `None` when it was neither heard from nor pinged in the last [`CHECK_EVERY`].
     pub(crate) fn reachability(&self, peer: &Peer, now: u64) -> Option<bool> {
+        if self.presence.is_down(&peer.peer_id) {
+            return Some(false);
+        }
         if within(peer.last_seen_ms, now, CHECK_EVERY) {
             return Some(true);
         }
@@ -440,7 +498,7 @@ impl PeerService {
             .lock()
             .ok()
             .and_then(|at| at.get(&peer.peer_id).copied());
-        within(pinged, now, CHECK_EVERY).then(|| peer.reachable(now))
+        within(pinged, now, CHECK_EVERY).then(|| self.reachable(peer, now))
     }
 
     /// Whether `peer`'s manifest was asked for in the last [`CHECK_EVERY`]:
@@ -495,7 +553,7 @@ impl PeerService {
         tokio::spawn(async move {
             let service = running.0.clone();
             if let Some(peer) = service.checked(&state, peer).await {
-                if peer.reachable(now_ms()) {
+                if service.reachable(&peer, now_ms()) {
                     service.manifest_of(&peer).await;
                 }
             }
@@ -504,30 +562,88 @@ impl PeerService {
     }
 
     /// `peer`, pinged first when its last answer is older than [`CHECK_EVERY`].
-    /// A peer that no longer knows this gateway's token is forgotten (§10.10),
-    /// its open mirrors failed, and answered as `None`.
+    /// A peer that no longer knows this gateway's token is marked so, its
+    /// open mirrors failed, and answered as `None` (as is one already marked).
     pub(crate) async fn checked(&self, state: &AppState, peer: Peer) -> Option<Peer> {
+        // A caller may still hold a snapshot from before another request
+        // upgraded this link. Always consult its durable pin before reuse.
+        let mut peer = match self.store.list().await {
+            Ok(peers) => peers
+                .into_iter()
+                .find(|stored| stored.peer_id == peer.peer_id)?,
+            Err(error) => {
+                tracing::warn!(peer = %peer.peer_id, "failed to read a peer's transport pin: {error:#}");
+                self.presence.down(&peer.peer_id);
+                return Some(peer);
+            }
+        };
+        if peer.unauthorized {
+            return None;
+        }
         let now = now_ms();
-        if peer
-            .last_seen_ms
-            .is_some_and(|seen| now.saturating_sub(seen) < CHECK_EVERY.as_millis() as u64)
+        // A recently seen legacy row may predate this binary. Discover once
+        // on its first checked use, even when its reachability cache is fresh.
+        let transport_checked = peer.transport_key.is_none()
+            || peer.transport_min_version >= 2
+            || self
+                .pinged_at
+                .lock()
+                .is_ok_and(|at| within(at.get(&peer.peer_id).copied(), now, CHECK_EVERY));
+        if !self.presence.is_down(&peer.peer_id)
+            && transport_checked
+            && peer
+                .last_seen_ms
+                .is_some_and(|seen| now.saturating_sub(seen) < CHECK_EVERY.as_millis() as u64)
         {
             return Some(peer);
         }
         let Ok(client) = PeerClient::for_peer(&peer) else {
             return Some(peer);
         };
-        // The public capability list is asked alongside: a check costs one timeout.
-        let (pinged, capabilities) = tokio::join!(
-            tokio::time::timeout(PING_TIMEOUT, client.ping()),
-            tokio::time::timeout(PING_TIMEOUT, client.capabilities()),
-        );
+        // Confirm v2 over a read-only probe, then persist before any business
+        // request. An unsealed upgrade hint alone can never set the pin.
+        let discovered = match tokio::time::timeout(PING_TIMEOUT, client.negotiate()).await {
+            Ok(Ok(discovered)) => Some(discovered),
+            Ok(Err(PeerError::Unauthorized)) => {
+                super::mirror::unauthorized(state, &peer.peer_id).await;
+                return None;
+            }
+            _ => None,
+        };
+        // Legacy compatibility requires a successfully authenticated answer
+        // without v2 support, not a missing or replaced discovery response.
+        // Otherwise stripping this response could hold a capable peer at v1.
+        if discovered.is_none() && peer.transport_key.is_some() && peer.transport_min_version == 1 {
+            self.presence.down(&peer.peer_id);
+            return Some(peer);
+        }
+        let capabilities = discovered.as_ref().map(|value| value.names.clone());
+        if let Some(discovered) = discovered {
+            if discovered.transport_version > peer.transport_min_version {
+                match self
+                    .store
+                    .pin_transport_version(&peer.peer_id, discovered.transport_version)
+                    .await
+                {
+                    Ok(version) => peer.transport_min_version = version,
+                    Err(error) => {
+                        tracing::warn!(peer = %peer.peer_id, "failed to pin a peer's transport: {error:#}");
+                        self.presence.down(&peer.peer_id);
+                        return Some(peer);
+                    }
+                }
+            }
+        }
+        let Ok(client) = PeerClient::for_peer(&peer) else {
+            self.presence.down(&peer.peer_id);
+            return Some(peer);
+        };
+        let pinged = tokio::time::timeout(PING_TIMEOUT, client.ping()).await;
         if let Ok(mut at) = self.pinged_at.lock() {
             at.insert(peer.peer_id.clone(), now_ms());
         }
         match pinged {
             Ok(Ok(())) => {
-                let capabilities = capabilities.ok().and_then(Result::ok);
                 let now = now_ms();
                 if let Err(error) = self
                     .store
@@ -544,11 +660,23 @@ impl PeerService {
                 })
             }
             Ok(Err(PeerError::Unauthorized)) => {
-                super::mirror::forget(state, &peer.peer_id).await;
+                super::mirror::unauthorized(state, &peer.peer_id).await;
                 None
             }
-            Ok(Err(_)) | Err(_) => Some(peer),
+            // It answered, refusing: still reachable.
+            Ok(Err(PeerError::Refused { .. })) => Some(peer),
+            // Unreachable at once, not after its last answer ages out.
+            Ok(Err(_)) | Err(_) => {
+                self.presence.down(&peer.peer_id);
+                Some(peer)
+            }
         }
+    }
+
+    /// Whether `peer` answers, as far as is known now: its last answer is
+    /// recent and nothing since said it went down.
+    pub(crate) fn reachable(&self, peer: &Peer, now_ms: u64) -> bool {
+        !self.presence.is_down(&peer.peer_id) && peer.reachable(now_ms)
     }
 
     /// `peer`'s manifest as `fleet.describe` shows it (its `GET /api/fleet/self`,
@@ -618,10 +746,12 @@ impl PeerService {
             token: claimed.token,
             device_id: claimed.device_id,
             transport_key: claimed.transport_key,
+            transport_min_version: 1,
             added_ms: now,
             last_seen_ms: Some(now),
             capabilities: Vec::new(),
             manifest: None,
+            unauthorized: false,
         };
         match self.keep(own_id, peer.clone()).await {
             Ok(peer) => Ok(peer),
@@ -638,6 +768,20 @@ impl PeerService {
             return Err(LinkError::IsSelf);
         }
         let peers = self.store.list().await.map_err(LinkError::Store)?;
+        // A link that stopped working is what the phone links again: the new
+        // one takes its place (same computer, or the same name).
+        let replaced: Vec<String> = peers
+            .iter()
+            .filter(|other| {
+                other.unauthorized
+                    && (other.server_id == peer.server_id || same_name(&other.name, &peer.name))
+            })
+            .map(|other| other.peer_id.clone())
+            .collect();
+        let peers: Vec<Peer> = peers
+            .into_iter()
+            .filter(|other| !replaced.contains(&other.peer_id))
+            .collect();
         if peers.iter().any(|other| other.server_id == peer.server_id) {
             // Already linked under that id: a second link is never merged into
             // it (the id is only what the claimant said); remove the first.
@@ -646,9 +790,16 @@ impl PeerService {
         if peers.iter().any(|other| same_name(&other.name, &peer.name)) {
             return Err(LinkError::NameTaken);
         }
-        // The first authenticated call proves the new credentials (and, sealed,
-        // the transport key) before they are kept; the public capability list
-        // fills the cache.
+        // Negotiate through read-only probes, then prove the token through
+        // an authenticated task read at the confirmed version (capabilities
+        // is public). Store the pin before returning the link for business use.
+        let client = PeerClient::for_peer(&peer).map_err(LinkError::Store)?;
+        let capabilities = client.negotiate().await.map_err(|error| match error {
+            PeerError::Unreachable(_) | PeerError::NoAnswer(_) => LinkError::Unreachable,
+            PeerError::Unauthorized => LinkError::Refused("invalid_token".into()),
+            PeerError::Refused { code, .. } => LinkError::Refused(code),
+        })?;
+        peer.transport_min_version = capabilities.transport_version;
         let client = PeerClient::for_peer(&peer).map_err(LinkError::Store)?;
         client.ping().await.map_err(|error| match error {
             PeerError::Unreachable(_) | PeerError::NoAnswer(_) => LinkError::Unreachable,
@@ -656,7 +807,12 @@ impl PeerService {
             PeerError::Refused { code, .. } => LinkError::Refused(code),
         })?;
         peer.last_seen_ms = Some(now_ms());
-        peer.capabilities = client.capabilities().await.unwrap_or_default();
+        peer.capabilities = capabilities.names;
+        for old in &replaced {
+            self.store.remove(old).await.map_err(LinkError::Store)?;
+            self.presence.gone(old);
+            self.drop_memory(old);
+        }
         self.store.put(&peer).await.map_err(LinkError::Store)?;
         self.presence.seen(&peer.peer_id, peer.last_seen_ms);
         self.refresh_names().await;
@@ -754,17 +910,18 @@ impl PeerService {
         Ok(Some(peer))
     }
 
-    /// Drop the row only (the peer answered 401/403: it no longer knows us).
-    /// Its login here stays: it may still be linked to this computer. Called
-    /// through [`mirror::forget`](super::mirror::forget), which ends its
-    /// open mirrors first.
-    pub(super) async fn forget(&self, peer_id: &str) {
-        if let Err(error) = self.store.remove(peer_id).await {
-            tracing::warn!(peer = %peer_id, "failed to forget a peer: {error:#}");
+    /// Mark the row (the peer answered 401/403: it no longer takes this
+    /// computer's token). The row and its name stay, so a delegation there
+    /// says `unauthorized`, and a new link under that name replaces it. Its
+    /// login here stays too: it may still be linked to this computer. Called
+    /// through [`mirror::unauthorized`](super::mirror::unauthorized), which
+    /// ends its open mirrors first.
+    pub(super) async fn mark_unauthorized(&self, peer_id: &str) {
+        if let Err(error) = self.store.set_unauthorized(peer_id).await {
+            tracing::warn!(peer = %peer_id, "failed to mark a peer unauthorized: {error:#}");
         }
         self.presence.gone(peer_id);
         self.drop_memory(peer_id);
-        self.refresh_names().await;
         // Last: the caller may be the follower itself.
         self.sockets.stop(peer_id);
     }
@@ -774,7 +931,10 @@ impl PeerService {
     pub(crate) async fn mark_seen(&self, peer_id: &str) {
         let now = now_ms();
         if let (_, Some(seen)) = self.presence.of(peer_id, now) {
-            if now.saturating_sub(seen) < SEEN_WRITE_EVERY.as_millis() as u64 {
+            // A peer known to be down is up again at once, written or not.
+            if now.saturating_sub(seen) < SEEN_WRITE_EVERY.as_millis() as u64
+                && !self.presence.is_down(peer_id)
+            {
                 return;
             }
         }

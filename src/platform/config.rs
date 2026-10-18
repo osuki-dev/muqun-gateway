@@ -223,12 +223,21 @@ impl StoreConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum HistoryStorage {
-    #[default]
     Memory,
     Sqlite,
+}
+
+/// What `history.storage` is when config.json does not say: making SQLite the
+/// default is this one line (a config that names its storage keeps it).
+pub(crate) const DEFAULT_HISTORY_STORAGE: HistoryStorage = HistoryStorage::Memory;
+
+impl Default for HistoryStorage {
+    fn default() -> Self {
+        DEFAULT_HISTORY_STORAGE
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -240,7 +249,7 @@ pub(crate) struct HistoryConfig {
 
 impl HistoryConfig {
     fn is_default(&self) -> bool {
-        self.storage == HistoryStorage::Memory
+        self.storage == DEFAULT_HISTORY_STORAGE
     }
 }
 

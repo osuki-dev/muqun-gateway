@@ -9,13 +9,23 @@ use super::client::SessionListFilter;
 use super::discovery::OpencodeEndpoint;
 use super::mapper;
 use crate::agents::domain::{
-    AgentCatalog, AgentProject, AgentSessionInfo, ModelRef, PermissionDecision, SessionQuery,
+    AgentCatalog, AgentProject, AgentSessionInfo, ModelRef, PermissionDecision, SessionPage,
+    SessionQuery,
 };
 use crate::agents::ports::agent::{AgentError, AgentFuture, AgentPort, FileDiffItem};
 
 /// The permission action OpenCode raises when a tool reaches outside the
 /// session's own directory.
 const EXTERNAL_DIRECTORY_ACTION: &str = "external_directory";
+
+fn map_session_list(raw: &[Value]) -> Result<Vec<AgentSessionInfo>, AgentError> {
+    raw.iter()
+        .map(|session| {
+            mapper::map_session(session)
+                .ok_or_else(|| AgentError::Protocol("Failed to parse listed session".into()))
+        })
+        .collect()
+}
 
 /// How long a missing directory stays quiet in the log after being reported
 /// once. A phone polling a screen whose folder is gone would otherwise write a
@@ -455,11 +465,27 @@ impl AgentPort for OpencodeDriver {
                 .client
                 .list_sessions(query.directory.as_deref(), &filter)
                 .await?;
-            let sessions = raw_sessions
-                .iter()
-                .filter_map(mapper::map_session)
-                .collect();
-            Ok(sessions)
+            map_session_list(&raw_sessions)
+        })
+    }
+
+    fn list_sessions_page<'a>(&'a self, query: &'a SessionQuery) -> AgentFuture<'a, SessionPage> {
+        Box::pin(async move {
+            let filter = SessionListFilter {
+                parent_id: query.parent_id.as_deref(),
+                limit: query.limit,
+                order: query.order.as_deref(),
+                search: query.search.as_deref(),
+                cursor: query.cursor.as_deref(),
+            };
+            let page = self
+                .client
+                .list_sessions_page(query.directory.as_deref(), &filter)
+                .await?;
+            Ok(SessionPage {
+                data: map_session_list(&page.data)?,
+                cursor: page.cursor,
+            })
         })
     }
 
@@ -1066,7 +1092,75 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    const UPLOADS: &str = "/home/ryu/.local/share/muqun-gateway/uploads/*";
+    const UPLOADS: &str = "/home/example-user/.local/share/muqun-gateway/uploads/*";
+
+    async fn session_page_driver(page: Value) -> (OpencodeDriver, tokio::task::JoinHandle<()>) {
+        use axum::{routing::get, Json, Router};
+        let app = Router::new().route(
+            "/api/session",
+            get(move || {
+                let page = page.clone();
+                async move { Json(page) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let driver = OpencodeDriver::new(OpencodeEndpoint {
+            url: format!("http://{}", listener.local_addr().unwrap()),
+            password: None,
+            version: Some("2.0.27".into()),
+            pid: None,
+        });
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (driver, task)
+    }
+
+    #[tokio::test]
+    async fn session_page_mapping_preserves_upstream_ascending_order_and_cursors() {
+        let (driver, task) = session_page_driver(json!({
+            "data": [{"id": "ses-older", "time": {"updated": 1}}, {"id": "ses-newer", "time": {"updated": 2}}],
+            "cursor": {"next": "opaque-next", "previous": "opaque-previous"}
+        })).await;
+        let page = driver
+            .list_sessions_page(&SessionQuery {
+                order: Some("asc".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            page.data
+                .iter()
+                .map(|info| (info.asid.0.as_str(), info.updated_ms))
+                .collect::<Vec<_>>(),
+            vec![("ses-older", 1), ("ses-newer", 2)]
+        );
+        assert_eq!(page.cursor.next.as_deref(), Some("opaque-next"));
+        assert_eq!(page.cursor.previous.as_deref(), Some("opaque-previous"));
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn session_lists_fail_on_unmappable_records_instead_of_returning_partial_data() {
+        for malformed in [
+            json!({"title": "missing id"}),
+            json!({"id": 1}),
+            json!("not a session"),
+        ] {
+            let (driver, task) = session_page_driver(json!({
+                "data": [{"id": "ses-valid"}, malformed], "cursor": {"next": null, "previous": null}
+            }))
+            .await;
+            assert!(matches!(
+                driver.list_sessions_page(&SessionQuery::default()).await,
+                Err(AgentError::Protocol(_))
+            ));
+            assert!(matches!(
+                driver.list_sessions(&SessionQuery::default()).await,
+                Err(AgentError::Protocol(_))
+            ));
+            task.abort();
+        }
+    }
 
     /// Every project OpenCode remembers, checked against the host.
     ///
