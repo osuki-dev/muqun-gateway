@@ -1,5 +1,6 @@
 use super::*;
-use crate::agents::domain::{AgentSessionId, AgentSessionStatus};
+use crate::agents::domain::{AgentSessionId, AgentSessionStatus, WorktreeState};
+use crate::tasks::events::TaskDomainEvent;
 use crate::*;
 
 use futures::{SinkExt as _, StreamExt as _};
@@ -34,6 +35,10 @@ fn client_frames_parse_and_anything_else_is_refused() {
     assert_eq!(
         ClientFrame::parse(r#"{"t":"subscribe_all"}"#),
         Ok(ClientFrame::SubscribeAll)
+    );
+    assert_eq!(
+        ClientFrame::parse(r#"{"t":"subscribe_tasks"}"#),
+        Ok(ClientFrame::SubscribeTasks)
     );
     assert_eq!(ClientFrame::parse(r#"{"t":"ping"}"#), Ok(ClientFrame::Ping));
 
@@ -73,10 +78,21 @@ fn server_frames_are_the_documented_strings() {
     );
     assert_eq!(resync_frame("ses_1"), r#"{"t":"resync","asid":"ses_1"}"#);
     assert_eq!(
-        subscribed_frame(Some("ses_1")),
+        task_resync_frame(),
+        r#"{"t":"resync","asid":"","tasks":true}"#
+    );
+    assert_eq!(
+        subscribed_frame(Some("ses_1"), false),
         r#"{"t":"subscribed","asid":"ses_1"}"#
     );
-    assert_eq!(subscribed_frame(None), r#"{"t":"subscribed","all":true}"#);
+    assert_eq!(
+        subscribed_frame(None, false),
+        r#"{"t":"subscribed","all":true}"#
+    );
+    assert_eq!(
+        subscribed_tasks_frame(),
+        r#"{"t":"subscribed","tasks":true}"#
+    );
     assert_eq!(
         error_frame(FrameError::OutOfOrder),
         r#"{"t":"error","code":"out_of_order"}"#
@@ -577,6 +593,164 @@ async fn subscribe_all_delivers_every_session() {
     assert_eq!(next_json(&mut client).await["asid"], "ses_b");
 }
 
+fn task_update(seq: u64) -> TaskDomainEvent {
+    TaskDomainEvent::Updated {
+        task: crate::tasks::service::TaskView {
+            task_id: "task-1".into(),
+            state: crate::tasks::domain::TaskState::Working,
+            kind: crate::tasks::domain::TaskKind::Command,
+            goal: "make test".into(),
+            summary: None,
+            exit_code: None,
+            binding: crate::tasks::domain::TaskBinding::None,
+            created_ms: 5,
+            updated_ms: 5,
+            parent_task_id: None,
+            origin: Default::default(),
+            label: None,
+            title: "t".into(),
+            requested_by: None,
+            children: Default::default(),
+            progress: None,
+            peer_reachable: None,
+            peer_last_seen_ms: None,
+            mentions: Vec::new(),
+            client_ref: None,
+            reason: None,
+        },
+        seq,
+    }
+}
+
+#[tokio::test]
+async fn subscribe_tasks_delivers_task_views_without_session_events() {
+    let state = test_state("admin", vec![test_device("phone-1", TOKEN)]);
+    let tasks = state.task_events.clone();
+    let runtime = state.agent_runtime.clone();
+    let addr = serve(state).await;
+    let (mut client, _) = connect(addr, &bearer()).await.unwrap();
+    assert_eq!(next_json(&mut client).await["t"], "hello");
+    send_text(&mut client, r#"{"t":"subscribe_tasks"}"#).await;
+    assert_eq!(
+        next_json(&mut client).await,
+        json!({ "t": "subscribed", "tasks": true })
+    );
+    // Where a task the device opens without `cwd` runs: no task yet, home.
+    assert_eq!(
+        next_json(&mut client).await,
+        json!({ "t": "defaults", "default_cwd": "~" })
+    );
+
+    runtime.publish_for_test(status_event("ses_1", 1));
+    runtime.publish_for_test(AgentDomainEvent::WorktreeChanged {
+        asid: AgentSessionId(String::new()),
+        state: WorktreeState::Updated,
+        directory: None,
+        project_id: None,
+        name: None,
+        branch: None,
+        error: None,
+    });
+    tasks.send(task_update(3)).unwrap();
+    let frame = next_json(&mut client).await;
+    assert_eq!(frame["t"], "task");
+    assert_eq!(frame["asid"], Value::Null);
+    assert_eq!(frame["seq"], 3);
+    assert_eq!(frame["event"], "task.updated");
+    assert_eq!(frame["data"]["task_id"], "task-1");
+    assert_eq!(frame["data"]["state"], "working");
+
+    runtime.publish_for_test(status_event("ses_1", 2));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), next_text(&mut client))
+            .await
+            .is_err(),
+        "session events must not reach a task-only socket"
+    );
+
+    for (subscribe, expected) in [
+        (
+            r#"{"t":"subscribe","asid":"ses_1"}"#,
+            json!({ "t": "subscribed", "asid": "ses_1", "tasks": false }),
+        ),
+        (
+            r#"{"t":"subscribe_all"}"#,
+            json!({ "t": "subscribed", "all": true, "tasks": false }),
+        ),
+    ] {
+        send_text(&mut client, r#"{"t":"subscribe_tasks"}"#).await;
+        next_json(&mut client).await;
+        assert_eq!(next_json(&mut client).await["t"], "defaults");
+        send_text(&mut client, subscribe).await;
+        assert_eq!(next_json(&mut client).await, expected);
+    }
+}
+
+#[tokio::test]
+async fn a_subscribe_all_socket_gets_task_updates_and_a_session_socket_does_not() {
+    let state = test_state("admin", vec![test_device("phone-1", TOKEN)]);
+    let tasks = state.task_events.clone();
+    let runtime = state.agent_runtime.clone();
+    let addr = serve(state).await;
+    let (mut all, _) = connect(addr, &bearer()).await.unwrap();
+    let (mut one, _) = connect(addr, &bearer()).await.unwrap();
+    next_json(&mut all).await;
+    next_json(&mut one).await;
+    send_text(&mut all, r#"{"t":"subscribe_all"}"#).await;
+    assert_eq!(next_json(&mut all).await["t"], "subscribed");
+    send_text(&mut one, r#"{"t":"subscribe","asid":"ses_1"}"#).await;
+    assert_eq!(next_json(&mut one).await["t"], "subscribed");
+
+    tasks.send(task_update(3)).unwrap();
+    assert_eq!(
+        next_text(&mut all).await.unwrap(),
+        r#"{"t":"event","asid":null,"seq":3,"event":"task.updated","data":{"task_id":"task-1","state":"working","kind":"command","goal":"make test","summary":null,"exit_code":null,"binding":{"kind":"none"},"created_ms":5,"updated_ms":5,"parent_task_id":null,"origin":"mcp","label":null,"title":"t","requested_by":null,"children":{"total":0,"active":0,"waiting":0,"failed":0}}}"#
+    );
+
+    // The session socket's next frame is the agent event, not the task one.
+    runtime.publish_for_test(status_event("ses_1", 1));
+    assert_eq!(next_json(&mut one).await["event"], "agent.status.changed");
+}
+
+#[tokio::test]
+async fn a_socket_that_falls_behind_the_task_events_is_told_to_refetch_them() {
+    // Either subscription that carries task events: what it is sent with.
+    for (subscribe, frame) in [("subscribe_all", "event"), ("subscribe_tasks", "task")] {
+        let state = test_state("admin", vec![test_device("phone-1", TOKEN)]);
+        let tasks = state.task_events.clone();
+        let addr = serve(state).await;
+        let (mut client, _) = connect(addr, &bearer()).await.unwrap();
+        next_json(&mut client).await;
+        send_text(&mut client, &format!(r#"{{"t":"{subscribe}"}}"#)).await;
+        assert_eq!(next_json(&mut client).await["t"], "subscribed");
+        let tasks_only = subscribe == "subscribe_tasks";
+        if tasks_only {
+            assert_eq!(next_json(&mut client).await["t"], "defaults");
+        }
+
+        // Sent without yielding, so the socket's receiver overflows before it
+        // reads anything.
+        let overflow = crate::tasks::events::TASK_EVENT_CAPACITY as u64 + 8;
+        for seq in 1..=overflow {
+            tasks.send(task_update(seq)).unwrap();
+        }
+        assert_eq!(
+            next_json(&mut client).await,
+            json!({ "t": "resync", "asid": "", "tasks": true }),
+            "{subscribe}"
+        );
+        // A task-only socket is told its defaults again with the refetch.
+        if tasks_only {
+            assert_eq!(next_json(&mut client).await["t"], "defaults");
+        }
+        // What is still buffered follows, oldest first.
+        let next = next_json(&mut client).await;
+        assert_eq!(next["t"], frame, "{subscribe}");
+        assert_eq!(next["event"], "task.updated");
+        assert!(next["seq"].as_u64().unwrap() > 8);
+    }
+}
+
 #[tokio::test]
 async fn an_unknown_frame_type_is_an_error_and_a_close() {
     let state = test_state("admin", vec![test_device("phone-1", TOKEN)]);
@@ -670,4 +844,42 @@ async fn an_oversized_client_frame_is_refused_and_ends_the_socket() {
         Some(r#"{"t":"error","code":"frame_too_large"}"#)
     );
     assert!(closes(&mut client).await);
+}
+
+/// Another computer's token follows tasks and nothing else (spec §10.3): a
+/// session subscription ends its socket with `peer_forbidden`.
+#[tokio::test]
+async fn a_peer_socket_may_follow_tasks_and_ping_only() {
+    let state = test_state(
+        "admin",
+        vec![crate::test_support::test_peer_device("coding-1", TOKEN)],
+    );
+    let addr = serve(state).await;
+    let forbidden = json!({ "t": "error", "code": "peer_forbidden" });
+    for (frame, answer) in [
+        (r#"{"t":"ping"}"#, json!({ "t": "pong" })),
+        (
+            r#"{"t":"subscribe_tasks"}"#,
+            json!({ "t": "subscribed", "tasks": true }),
+        ),
+        (r#"{"t":"subscribe","asid":"ses_1"}"#, forbidden.clone()),
+        (r#"{"t":"unsubscribe","asid":"ses_1"}"#, forbidden.clone()),
+        (r#"{"t":"subscribe_all"}"#, forbidden.clone()),
+    ] {
+        let (mut client, _) = connect(addr, &bearer()).await.unwrap();
+        assert_eq!(next_json(&mut client).await["t"], "hello");
+        send_text(&mut client, frame).await;
+        assert_eq!(next_json(&mut client).await, answer, "{frame}");
+        if answer == forbidden {
+            assert!(closes(&mut client).await, "{frame}");
+        } else {
+            // Still open, and no `defaults` frame: a peer gets none.
+            send_text(&mut client, r#"{"t":"ping"}"#).await;
+            assert_eq!(
+                next_json(&mut client).await,
+                json!({ "t": "pong" }),
+                "{frame}"
+            );
+        }
+    }
 }

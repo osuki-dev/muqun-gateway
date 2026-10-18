@@ -49,6 +49,7 @@ pub(crate) async fn run(config_path: Option<String>) -> anyhow::Result<()> {
     // already released.
     let _state_lock = state_lock::StateLock::acquire_owner(&state_dir()?)?;
     ensure_pairing_transport_key()?;
+    let config_file = platform::store::config_file_path(config_path.as_deref())?;
     let config = load_config(config_path)?;
     warn_about_missing_backend_programs(&config);
     let addr: SocketAddr = config
@@ -72,12 +73,40 @@ pub(crate) async fn run(config_path: Option<String>) -> anyhow::Result<()> {
         config.t3.clone(),
         Some(state_dir()?),
     );
-    agent_runtime.spawn_supervisor();
 
     let scrollback = Arc::new(Mutex::new(scrollback::ScrollbackStore::default()));
-    let history = Arc::new(terminal::history_memory::MemoryHistoryRepository::new(
-        scrollback.clone(),
+    let state_directory = state_dir()?;
+    let key = platform::store::db_key::key_for(&config.store, &state_directory)?;
+    let db = platform::store::sqlite::SqliteStore::open(
+        &platform::store::store_db_path(&state_directory),
+        key,
+        platform::store::sqlite::ALL_MIGRATIONS,
+    )
+    .map_err(|err| match config.store.encryption {
+        // One sentence that names both files, so the owner knows what to restore.
+        crate::platform::config::StoreEncryption::File => anyhow::anyhow!(
+            "{err} (key file: {})",
+            platform::store::db_key::key_file(&state_directory).display()
+        ),
+        crate::platform::config::StoreEncryption::Off => err,
+    })?;
+    let task_events = tokio::sync::broadcast::channel(crate::tasks::events::TASK_EVENT_CAPACITY).0;
+    let presence = Arc::new(crate::fleet::peers::PeerPresence::default());
+    let tasks = Arc::new(crate::tasks::service::TaskService::new(
+        Arc::new(crate::tasks::store_sqlite::SqliteTaskStore::new(db.clone())),
+        task_events.clone(),
+        config.server_id.clone(),
+        presence.clone(),
     ));
+    let peers = Arc::new(crate::fleet::peers::PeerService::new(
+        Arc::new(crate::fleet::peers_sqlite::SqlitePeerStore::new(db.clone())),
+        &config.fleet,
+        Some(config_file),
+        presence,
+    ));
+    peers.load_names().await;
+    let history =
+        terminal::history_sqlite::repository(&config, db.clone(), scrollback.clone()).await;
     let state = AppState {
         config,
         pending_pairing: Arc::new(Mutex::new(None)),
@@ -95,12 +124,50 @@ pub(crate) async fn run(config_path: Option<String>) -> anyhow::Result<()> {
         ws_connections: Arc::new(agents::ws_routes::WsRegistry::default()),
         generation: crate::new_generation(),
         message_images: Arc::default(),
+        mcp_tokens: Arc::new(crate::mcp::tokens_sqlite::SqliteTokenStore::new(db.clone())),
+        fleet: Arc::default(),
+        peers,
+        tasks,
+        task_events,
+        #[cfg(test)]
+        db,
     };
+    // A registration handed to a session agent's service outlives a switch
+    // turned off; its token does not.
+    crate::mcp::inject::startup_cleanup(&state.config, state.mcp_tokens.as_ref()).await;
+    // After the token store exists, so the first OpenCode start already gets
+    // its MCP environment.
+    if state.config.mcp.enabled {
+        match crate::mcp::loopback_warning(&state.config.listen) {
+            // An unusable URL is not handed to OpenCode.
+            Some(warning) => tracing::warn!("{warning}"),
+            None => state.agent_runtime.enable_mcp(
+                state.mcp_tokens.clone(),
+                crate::mcp::local_url(&state.config.listen),
+            ),
+        }
+    }
+    tracing::info!(
+        "agents started from a phone or an MCP caller launch with: {}",
+        crate::agents::tasks::launch_defaults(
+            &state.config.agent_launch_args,
+            state.config.agent_trust_folders
+        )
+        .join(" | ")
+    );
+    state.agent_runtime.spawn_supervisor();
     spawn_agent_notification_watchers(state.clone());
     spawn_agent_permission_watchers(state.clone());
     spawn_approval_watchers(state.clone());
     spawn_upload_gc();
     spawn_memory_watchdog();
+    if state.config.mcp.enabled {
+        crate::mcp::issue::spawn_sweeper(state.clone());
+    }
+    // Regardless of `mcp.enabled`: the phone's task list needs it too.
+    crate::tasks::driver::spawn(state.clone());
+    crate::tasks::driver::spawn_follower(state.clone());
+    crate::tasks::driver::spawn_instruction_cleanup(state.clone());
 
     let app = Router::new();
     let app = platform::routes::mount(app);
@@ -109,34 +176,42 @@ pub(crate) async fn run(config_path: Option<String>) -> anyhow::Result<()> {
     let app = agents::routes::mount(app);
     let app = terminal::routes::mount(app);
     let app = platform::uploads::mount(app);
-    let app = platform::assets::mount(app)
-        .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
-        // Inside the encrypted transport, so what it compresses is the
-        // plaintext body and not the sealed base64 -- ciphertext does not
-        // compress, and sealing first is why nothing downstream could.
-        //
-        // The default predicate already declines `text/event-stream` (a
-        // compressor would buffer a stream that is supposed to arrive a frame
-        // at a time) and content that is already compressed, such as an
-        // uploaded image. `SizeAbove` keeps it off bodies too small to be
-        // worth a header: below about half a kilobyte gzip usually costs more
-        // than it saves.
-        .layer(
-            CompressionLayer::new()
-                .compress_when(DefaultPredicate::new().and(SizeAbove::new(COMPRESSION_MIN_BYTES))),
-        )
-        .layer(middleware::from_fn(envelope_compression_gate))
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            encrypted_transport,
-        ))
-        .layer(middleware::from_fn_with_state(
-            known_hosts(&state.config),
-            known_host,
-        ))
-        .layer(middleware::from_fn(security_headers))
-        .layer(middleware::from_fn(request_locale))
-        .with_state(state);
+    let app = platform::assets::mount(app);
+    let app = crate::fleet::routes::mount(app);
+    let app = crate::fleet::peer_routes::mount(app);
+    let app = crate::tasks::routes::mount(app);
+    let app = if state.config.mcp.enabled {
+        crate::mcp::mount(app)
+    } else {
+        app
+    }
+    .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
+    // Inside the encrypted transport, so what it compresses is the
+    // plaintext body and not the sealed base64 -- ciphertext does not
+    // compress, and sealing first is why nothing downstream could.
+    //
+    // The default predicate already declines `text/event-stream` (a
+    // compressor would buffer a stream that is supposed to arrive a frame
+    // at a time) and content that is already compressed, such as an
+    // uploaded image. `SizeAbove` keeps it off bodies too small to be
+    // worth a header: below about half a kilobyte gzip usually costs more
+    // than it saves.
+    .layer(
+        CompressionLayer::new()
+            .compress_when(DefaultPredicate::new().and(SizeAbove::new(COMPRESSION_MIN_BYTES))),
+    )
+    .layer(middleware::from_fn(envelope_compression_gate))
+    .layer(middleware::from_fn_with_state(
+        state.clone(),
+        encrypted_transport,
+    ))
+    .layer(middleware::from_fn_with_state(
+        known_hosts(&state.config),
+        known_host,
+    ))
+    .layer(middleware::from_fn(security_headers))
+    .layer(middleware::from_fn(request_locale))
+    .with_state(state);
 
     if let Some(warning) = listen_warning {
         tracing::warn!("{warning}");
@@ -152,7 +227,12 @@ pub(crate) async fn run(config_path: Option<String>) -> anyhow::Result<()> {
         );
     }
     println!("terminal gateway listening on http://{addr}");
-    axum::serve(listener, app).await?;
+    // The peer address is what `/mcp` checks for loopback.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
 

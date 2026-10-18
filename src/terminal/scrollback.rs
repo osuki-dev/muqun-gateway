@@ -661,6 +661,9 @@ struct PaneBuffer {
     settling: usize,
     /// The width of the last box rule a read drew -- see `rule_width`.
     last_rule: Option<usize>,
+    /// The store's `durable_clock` when a read last changed what this buffer
+    /// projects; a read that changed nothing leaves it alone.
+    revision: u64,
 }
 
 /// What a read that agreed with nothing went on top of, kept until the buffer
@@ -685,8 +688,43 @@ struct Covered {
 }
 
 impl PaneBuffer {
-    /// Fold one read into the buffer -- see the module doc, "Placing a read".
-    fn fold(&mut self, incoming: Vec<String>, owns_screen: bool) {
+    /// Fold one read into the buffer and say whether it changed anything a
+    /// projection is made of. Conservative: any change to the byte or row
+    /// count, the screen height, the epoch, the front trim, the last row or
+    /// the last historical row counts.
+    fn fold(&mut self, incoming: Vec<String>, owns_screen: bool) -> bool {
+        let before = self.shape();
+        self.place(incoming, owns_screen);
+        self.shape() != before
+    }
+
+    fn shape(
+        &self,
+    ) -> (
+        usize,
+        usize,
+        usize,
+        Option<uuid::Uuid>,
+        u64,
+        Option<u64>,
+        Option<u64>,
+    ) {
+        let prefix = self.lines.len().saturating_sub(self.screen);
+        (
+            self.bytes,
+            self.lines.len(),
+            self.screen,
+            self.epoch,
+            self.trimmed,
+            self.hashes.back().copied(),
+            prefix
+                .checked_sub(1)
+                .and_then(|last| self.hashes.get(last).copied()),
+        )
+    }
+
+    /// Place one read in the buffer -- see the module doc, "Placing a read".
+    fn place(&mut self, incoming: Vec<String>, owns_screen: bool) {
         let frame: Vec<u64> = incoming.iter().map(|line| line_hash(line)).collect();
         let carries: Vec<bool> = incoming.iter().map(|line| row_carries(line)).collect();
         let shapes: Vec<u64> = incoming.iter().map(|line| shape_hash(line)).collect();
@@ -801,7 +839,7 @@ impl PaneBuffer {
                     self.screen = covered.screen;
                     self.last_frame = covered.last_frame;
                     self.last_shapes = covered.last_shapes;
-                    self.fold(incoming, false);
+                    self.place(incoming, false);
                 }
             }
             return;
@@ -939,6 +977,11 @@ pub struct ScrollbackStore {
     identities: HashMap<String, PaneObservation>,
     total_bytes: usize,
     clock: u64,
+    durable_clock: u64,
+    checkpoints: HashMap<String, Checkpoint>,
+    /// Bumped by every mutating entry point, so a durable writer can tell an
+    /// untouched fold from one it must look at again with one comparison.
+    version: u64,
 }
 
 #[derive(Debug)]
@@ -948,6 +991,33 @@ struct PaneObservation {
     /// Request-start fence, independent of buffer existence and read shape.
     /// Rotated on observed pane/policy resets and destructive buffer resets.
     capture_generation: uuid::Uuid,
+    native_identity: Option<String>,
+    durable_revision: u64,
+    reset: bool,
+    /// Identity, size and editor policy as a projection stamp spells them,
+    /// rebuilt whenever an observation can change one of them.
+    policy: String,
+}
+
+#[derive(Debug)]
+struct Checkpoint {
+    fence: CaptureFence,
+    epoch: uuid::Uuid,
+    rows: Vec<String>,
+    expires: std::time::Instant,
+    bytes: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProjectionStamp {
+    pub session: String,
+    pub pane: String,
+    pub format: String,
+    pub native_identity: Option<String>,
+    pub policy: String,
+    pub fence: CaptureFence,
+    pub revision: u64,
+    pub reset: bool,
 }
 
 /// A read can contribute only to the pane generation observed before its I/O.
@@ -1012,6 +1082,7 @@ impl ScrollbackStore {
     /// is the question this store actually needs answered and the one
     /// `alternate_on` answers directly.
     pub fn observe(&mut self, session_id: &str, value: &Value) {
+        self.version += 1;
         let mut passed_through = Vec::new();
         visit_panes(value, &mut |pane_id, pane| {
             let key = pane_key(session_id, pane_id);
@@ -1032,12 +1103,17 @@ impl ScrollbackStore {
                 .identities
                 .get(&key)
                 .map_or_else(uuid::Uuid::new_v4, |observed| observed.capture_generation);
+            let previous = self.identities.remove(&pane_key(session_id, pane_id));
             self.identities.insert(
                 key,
                 PaneObservation {
                     identity,
                     size,
                     capture_generation,
+                    native_identity: previous.as_ref().and_then(|o| o.native_identity.clone()),
+                    durable_revision: previous.as_ref().map_or(0, |o| o.durable_revision),
+                    reset: previous.is_some_and(|o| o.reset),
+                    policy: String::new(),
                 },
             );
             if let Some(scroll) = pane.get("scroll").and_then(Value::as_object) {
@@ -1063,6 +1139,11 @@ impl ScrollbackStore {
                     self.invalidate_capture(session_id, pane_id);
                 }
             }
+            let owns_screen = self.owns_screen(session_id, pane_id);
+            if let Some(observed) = self.identities.get_mut(&pane_key(session_id, pane_id)) {
+                observed.policy =
+                    serde_json::json!([observed.identity, observed.size, owns_screen]).to_string();
+            }
         });
         for pane_id in passed_through {
             self.forget_pane(session_id, &pane_id);
@@ -1084,6 +1165,7 @@ impl ScrollbackStore {
     /// caller that can tell "gone" from "not mentioned", so it is the one that
     /// prunes. The approval watcher calls it every 1500ms with exactly that.
     pub fn observe_listing(&mut self, session_id: &str, value: &Value) {
+        self.version += 1;
         self.observe(session_id, value);
         let mut live = HashSet::new();
         visit_panes(value, &mut |pane_id, _| {
@@ -1157,9 +1239,14 @@ impl ScrollbackStore {
     }
 
     fn advance_capture_generation(&mut self, session_id: &str, pane_id: &str) {
+        self.durable_clock += 1;
         if let Some(observed) = self.identities.get_mut(&pane_key(session_id, pane_id)) {
             observed.capture_generation = uuid::Uuid::new_v4();
+            observed.durable_revision = self.durable_clock;
+            observed.reset = true;
         }
+        let prefix = format!("{}/", pane_key(session_id, pane_id));
+        self.checkpoints.retain(|key, _| !key.starts_with(&prefix));
     }
 
     fn invalidate_capture(&mut self, session_id: &str, pane_id: &str) {
@@ -1226,7 +1313,10 @@ impl ScrollbackStore {
         buffer.snapshot_ready = true;
         let before = buffer.bytes;
         buffer.touched = clock;
-        buffer.fold(incoming, owns_screen);
+        if buffer.fold(incoming, owns_screen) {
+            self.durable_clock += 1;
+            buffer.revision = self.durable_clock;
+        }
         let reset = previous_epoch.is_some() && buffer.epoch != previous_epoch;
         self.total_bytes = self.total_bytes + buffer.bytes - before;
         self.evict();
@@ -1279,6 +1369,7 @@ impl ScrollbackStore {
         rows: usize,
         fence: Option<CaptureFence>,
     ) -> String {
+        self.version += 1;
         if !self.accepts_capture(session_id, pane_id, fence) {
             // Do not stitch another generation's cache under a stale response.
             return backend_text.to_owned();
@@ -1297,6 +1388,7 @@ impl ScrollbackStore {
         if self.record(&key, backend_text, owns_screen) {
             self.advance_capture_generation(session_id, pane_id);
         }
+        self.retire_checkpoints(session_id, pane_id);
         let backend_rows = split_lines(backend_text).len();
         self.window(&key, rows)
             .filter(|served| split_lines(served).len() > backend_rows)
@@ -1315,6 +1407,7 @@ impl ScrollbackStore {
         output: &str,
         fence: Option<CaptureFence>,
     ) {
+        self.version += 1;
         if output.is_empty() || !self.accepts_capture(session_id, pane_id, fence) {
             return;
         }
@@ -1332,6 +1425,7 @@ impl ScrollbackStore {
         if self.record(&key, output, owns_screen) {
             self.advance_capture_generation(session_id, pane_id);
         }
+        self.retire_checkpoints(session_id, pane_id);
     }
 
     /// Synchronous test/replay ingestion has no intervening backend I/O.
@@ -1468,7 +1562,27 @@ impl ScrollbackStore {
     }
 
     fn evict(&mut self) {
-        while self.buffers.len() > MAX_BUFFERS || self.total_bytes > MAX_TOTAL_BYTES {
+        while self.buffers.len() + self.checkpoints.len() > MAX_BUFFERS
+            || self.total_bytes
+                + self
+                    .checkpoints
+                    .values()
+                    .map(|checkpoint| checkpoint.bytes)
+                    .sum::<usize>()
+                > MAX_TOTAL_BYTES
+        {
+            if let Some(key) = self
+                .checkpoints
+                .iter()
+                .min_by_key(|(_, checkpoint)| checkpoint.expires)
+                .map(|(key, _)| key.clone())
+            {
+                let mut parts = key.split('/');
+                if let (Some(session), Some(pane)) = (parts.next(), parts.next()) {
+                    self.invalidate_capture(session, pane);
+                    continue;
+                }
+            }
             let Some(oldest) = self
                 .buffers
                 .iter()
@@ -1486,6 +1600,11 @@ impl ScrollbackStore {
                         && oldest.as_bytes().get(pane.len()) == Some(&b'/')
                     {
                         observed.capture_generation = uuid::Uuid::new_v4();
+                        self.durable_clock += 1;
+                        observed.durable_revision = self.durable_clock;
+                        observed.reset = true;
+                        let prefix = format!("{pane}/");
+                        self.checkpoints.retain(|key, _| !key.starts_with(&prefix));
                     }
                 }
             }
@@ -1493,6 +1612,9 @@ impl ScrollbackStore {
     }
 
     pub(crate) fn capture_epoch(&self, scope: &super::history::HistoryScope) -> Option<uuid::Uuid> {
+        if let Some(checkpoint) = self.checkpoint(scope) {
+            return Some(checkpoint.epoch);
+        }
         self.captured_buffer(scope).and_then(|buffer| buffer.epoch)
     }
 
@@ -1510,6 +1632,29 @@ impl ScrollbackStore {
     /// The memory adapter's capture projection. No pagination or pinned state
     /// lives in the fold; metadata-only checks do not copy any rows.
     pub(crate) fn captured_history(
+        &self,
+        scope: &super::history::HistoryScope,
+        include_rows: bool,
+    ) -> Result<Option<super::history::Capture>, super::history::HistoryError> {
+        if let Some(checkpoint) = self.checkpoint(scope) {
+            return Ok(Some(super::history::Capture {
+                epoch: checkpoint.epoch,
+                // Recovery is a fresh, immutable capture, not a continuation
+                // of the previous run's sliding window or cursor coordinates.
+                trimmed: 0,
+                len: checkpoint.rows.len(),
+                rows: if include_rows {
+                    checkpoint.rows.clone()
+                } else {
+                    Vec::new()
+                },
+            }));
+        }
+        self.live_captured_history(scope, include_rows)
+    }
+
+    /// Durable ingestion never writes a recovered checkpoint back as new work.
+    pub(crate) fn live_captured_history(
         &self,
         scope: &super::history::HistoryScope,
         include_rows: bool,
@@ -1548,6 +1693,213 @@ impl ScrollbackStore {
             len: count,
             rows,
         }))
+    }
+
+    /// Called with neutral native entities before compatibility serialization.
+    /// No private process identity is ever inserted into a public JSON envelope.
+    pub(crate) fn observe_native_listing(&mut self, session: &str, panes: &[super::backend::Pane]) {
+        self.version += 1;
+        // An existing unknown observation is not evidence for the newly verified
+        // process. Discard its rows and outstanding fences in either direction.
+        // A first-ever verified observation has no prior capture to quarantine
+        // and must remain eligible for checkpoint recovery.
+        for pane in panes {
+            let key = pane_key(session, pane.id.as_str());
+            if self
+                .identities
+                .get(&key)
+                .is_some_and(|o| o.native_identity != pane.history_identity)
+            {
+                self.forget_pane(session, pane.id.as_str());
+            }
+        }
+        self.observe_listing(session, &super::backend::compat::pane_list(panes.to_vec()));
+        for pane in panes {
+            let key = pane_key(session, pane.id.as_str());
+            if let Some(observed) = self.identities.get_mut(&key) {
+                observed.native_identity = pane.history_identity.clone();
+            }
+        }
+    }
+
+    fn retire_checkpoints(&mut self, session: &str, pane: &str) {
+        // Checkpoints are not inputs to the fold. A nonempty fresh historical
+        // prefix replaces them outright; a mutable screen alone cannot do so.
+        for format in ["text", "ansi"] {
+            let key = read_key(session, pane, "recent_unwrapped", format);
+            if self
+                .buffers
+                .get(&key)
+                .is_some_and(|b| b.snapshot_ready && b.lines.len() > b.screen)
+            {
+                self.checkpoints.remove(&key);
+            }
+        }
+    }
+
+    fn checkpoint(&self, scope: &super::history::HistoryScope) -> Option<&Checkpoint> {
+        self.checkpoints
+            .get(&read_key(
+                &scope.session,
+                &scope.pane,
+                "recent_unwrapped",
+                &scope.format,
+            ))
+            .filter(|held| {
+                self.begin_capture(&scope.session, &scope.pane) == Some(held.fence)
+                    && held.expires > std::time::Instant::now()
+            })
+    }
+
+    /// See the `version` field.
+    pub(crate) fn version(&self) -> u64 {
+        self.version
+    }
+
+    pub(crate) fn projection_stamps(&self) -> Vec<ProjectionStamp> {
+        let mut stamps = Vec::new();
+        for (key, observed) in &self.identities {
+            let Some((session, pane)) = key.split_once('/') else {
+                continue;
+            };
+            let Some(fence) = self.begin_capture(session, pane) else {
+                continue;
+            };
+            for format in ["text", "ansi"] {
+                let read = read_key(session, pane, "recent_unwrapped", format);
+                if !observed.reset
+                    && !self.buffers.contains_key(&read)
+                    && !self.checkpoints.contains_key(&read)
+                {
+                    continue;
+                }
+                stamps.push(ProjectionStamp {
+                    session: session.into(),
+                    pane: pane.into(),
+                    format: format.into(),
+                    native_identity: observed.native_identity.clone(),
+                    policy: observed.policy.clone(),
+                    fence,
+                    revision: self.projection_revision(observed, &read),
+                    reset: observed.reset,
+                });
+            }
+        }
+        stamps
+    }
+
+    pub(crate) fn projection_stamp(
+        &self,
+        scope: &super::history::HistoryScope,
+    ) -> Option<ProjectionStamp> {
+        let observed = self
+            .identities
+            .get(&pane_key(&scope.session, &scope.pane))?;
+        let fence = self.begin_capture(&scope.session, &scope.pane)?;
+        Some(ProjectionStamp {
+            session: scope.session.clone(),
+            pane: scope.pane.clone(),
+            format: scope.format.clone(),
+            native_identity: observed.native_identity.clone(),
+            policy: observed.policy.clone(),
+            fence,
+            revision: self.projection_revision(
+                observed,
+                &read_key(
+                    &scope.session,
+                    &scope.pane,
+                    "recent_unwrapped",
+                    &scope.format,
+                ),
+            ),
+            reset: observed.reset,
+        })
+    }
+
+    /// A pane-wide reset and a change to this one format's fold both move it;
+    /// both come off the one monotonic `durable_clock`.
+    fn projection_revision(&self, observed: &PaneObservation, read: &str) -> u64 {
+        self.buffers
+            .get(read)
+            .map_or(0, |buffer| buffer.revision)
+            .max(observed.durable_revision)
+    }
+
+    pub(crate) fn recover_checkpoint(
+        &mut self,
+        stamp: &ProjectionStamp,
+        rows: Vec<String>,
+        expires: std::time::Instant,
+    ) -> bool {
+        self.version += 1;
+        let scope = stamp.scope();
+        // Identity, fence and policy, not revision: a frame folded during the
+        // checkpoint read moves the revision without making the checkpoint
+        // stale. A fresh historical prefix is what replaces it, checked next.
+        let Some(current) = self.projection_stamp(&scope) else {
+            return false;
+        };
+        if stamp.reset
+            || current.reset
+            || current.native_identity != stamp.native_identity
+            || current.fence != stamp.fence
+            || current.policy != stamp.policy
+        {
+            return false;
+        }
+        if self
+            .captured_history(&scope, true)
+            .ok()
+            .flatten()
+            .is_some_and(|c| !c.rows.is_empty())
+        {
+            return false;
+        }
+        if rows.is_empty() || expires <= std::time::Instant::now() {
+            return false;
+        }
+        let key = read_key(
+            &stamp.session,
+            &stamp.pane,
+            "recent_unwrapped",
+            &stamp.format,
+        );
+        self.checkpoints
+            .retain(|_, checkpoint| checkpoint.expires > std::time::Instant::now());
+        if !self.checkpoints.contains_key(&key)
+            && self.checkpoints.len() + self.buffers.len() >= MAX_BUFFERS
+        {
+            return false;
+        }
+        let bytes = self.checkpoints.values().map(|c| c.bytes).sum::<usize>();
+        let incoming = rows.iter().map(String::capacity).sum::<usize>()
+            + rows.capacity() * std::mem::size_of::<String>();
+        if rows.iter().map(String::len).sum::<usize>() > MAX_PANE_BYTES
+            || self.total_bytes + bytes + incoming > MAX_TOTAL_BYTES
+        {
+            return false;
+        }
+        self.checkpoints.entry(key).or_insert_with(|| Checkpoint {
+            fence: stamp.fence,
+            epoch: uuid::Uuid::new_v4(),
+            rows,
+            expires,
+            bytes: incoming,
+        });
+        true
+    }
+}
+
+impl ProjectionStamp {
+    pub(crate) fn scope(&self) -> super::history::HistoryScope {
+        super::history::HistoryScope {
+            session: self.session.clone(),
+            pane: self.pane.clone(),
+            format: self.format.clone(),
+            device: String::new(),
+            generation: String::new(),
+            limit: 200,
+        }
     }
 }
 
@@ -1741,6 +2093,35 @@ mod tests {
             store.record_frame("s", "p", "recent_unwrapped", "text", &frame);
         }
         store
+    }
+
+    /// The stream records every polled frame; one that changes nothing must
+    /// not move the projection, or the durable writer never goes idle.
+    #[test]
+    fn an_unchanged_frame_leaves_the_projection_stamps_equal() {
+        let mut store = captured_history_store();
+        let before = store.projection_stamps();
+        assert!(!before.is_empty());
+        store.record_frame(
+            "s",
+            "p",
+            "recent_unwrapped",
+            "text",
+            "row 7\nrow 8\nrow 9\nrow 10",
+        );
+        assert_eq!(store.projection_stamps(), before);
+        store.record_frame(
+            "s",
+            "p",
+            "recent_unwrapped",
+            "text",
+            "row 8\nrow 9\nrow 10\nrow 11",
+        );
+        let moved = store.projection_stamps();
+        assert!(moved
+            .iter()
+            .zip(&before)
+            .any(|(a, b)| a.revision > b.revision));
     }
 
     #[test]

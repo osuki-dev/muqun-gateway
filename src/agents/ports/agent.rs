@@ -126,6 +126,58 @@ pub trait AgentPort: Send + Sync {
         delivery: Option<&'a str>,
     ) -> AgentFuture<'a, ()>;
 
+    /// Whether the agent's service takes an MCP server at runtime
+    /// ([`AgentPort::add_mcp_server`]).
+    fn adds_mcp_servers(&self) -> bool {
+        false
+    }
+
+    /// Whether the MCP server `name` is connected for `directory`.
+    fn mcp_server_connected<'a>(
+        &'a self,
+        _name: &'a str,
+        _directory: Option<&'a str>,
+    ) -> AgentFuture<'a, bool> {
+        Box::pin(async { Ok(false) })
+    }
+
+    /// Register (or replace) the MCP server `name` with `config` for
+    /// `directory` until the service restarts; no configuration file is
+    /// written.
+    fn add_mcp_server<'a>(
+        &'a self,
+        _name: &'a str,
+        _config: &'a serde_json::Value,
+        _directory: Option<&'a str>,
+    ) -> AgentFuture<'a, ()> {
+        Box::pin(async {
+            Err(AgentError::InvalidRequest(
+                "this agent takes no MCP server at runtime".into(),
+            ))
+        })
+    }
+
+    /// Attach (or replace) a durable instruction `text` under `key` to
+    /// session `session_id`, outside its conversation. `Ok(false)` when the
+    /// agent has no such thing.
+    fn set_session_instruction<'a>(
+        &'a self,
+        _session_id: &'a str,
+        _key: &'a str,
+        _text: &'a str,
+    ) -> AgentFuture<'a, bool> {
+        Box::pin(async { Ok(false) })
+    }
+
+    /// Remove the instruction under `key` from session `session_id`.
+    fn remove_session_instruction<'a>(
+        &'a self,
+        _session_id: &'a str,
+        _key: &'a str,
+    ) -> AgentFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
     /// Revert session to a previous message and roll back file changes
     fn revert_session<'a>(
         &'a self,

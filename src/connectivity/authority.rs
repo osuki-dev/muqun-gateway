@@ -16,11 +16,24 @@ pub struct PendingPairing {
     pub device_name: String,
     #[serde(default)]
     pub install_id: Option<String>,
+    #[serde(default, skip_serializing_if = "DeviceKind::is_app")]
+    pub kind: DeviceKind,
+    /// Another gateway's own server id, as it (or the owner's phone) said
+    /// when the pairing was made. Used only to take its login back when the
+    /// owner unlinks it here (`fleet::peers::unlink`); never to replace or
+    /// evict a device, since nothing checks it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_id: Option<String>,
     pub code: String,
     pub code_hash: String,
     pub created_unix_ms: u128,
     #[serde(default)]
     pub failed_attempts: u8,
+    /// Who minted it on the owner's behalf (`POST /api/pair/pending`): the
+    /// device id, or `admin`. Only they may cancel it; `None` for a pairing
+    /// a device asked for itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub minted_by: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,6 +41,24 @@ pub enum PairingCodeError {
     Missing,
     Expired,
     Invalid,
+}
+
+/// What holds a device token: the owner's app, or another of the owner's
+/// gateways that pairs itself to hand this one work (see `fleet::peers`).
+/// A gateway's token reaches only the routes that take `Caller`s
+/// (`require_device_or_peer`); every other device route refuses it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceKind {
+    #[default]
+    App,
+    Gateway,
+}
+
+impl DeviceKind {
+    pub fn is_app(&self) -> bool {
+        *self == Self::App
+    }
 }
 
 /// One paired device. The raw bearer token is returned only once during claim;
@@ -46,6 +77,24 @@ pub struct DeviceRecord {
     pub last_seen_unix_ms: u128,
     #[serde(default)]
     pub install_id: Option<String>,
+    #[serde(default, skip_serializing_if = "DeviceKind::is_app")]
+    pub kind: DeviceKind,
+    /// Another gateway's own server id, as it (or the owner's phone) said
+    /// when the pairing was made. Used only to take its login back when the
+    /// owner unlinks it here (`fleet::peers::unlink`); never to replace or
+    /// evict a device, since nothing checks it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_id: Option<String>,
+}
+
+impl DeviceRecord {
+    /// The name a device list shows: `coding (gateway)` for another computer.
+    pub fn listed_name(&self) -> String {
+        match self.kind {
+            DeviceKind::App => self.name.clone(),
+            DeviceKind::Gateway => format!("{} (gateway)", self.name),
+        }
+    }
 }
 
 pub fn hash_token(token: &str) -> String {
@@ -90,11 +139,32 @@ pub fn touch_device(
     stale
 }
 
+/// The device list is full and a gateway enrolment may not make room.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeviceCapReached;
+
 /// Replace an existing install, retain insertion order, and enforce the device
-/// ceiling. Persistence remains the caller's responsibility.
-pub fn enroll_device(devices: &mut Vec<DeviceRecord>, record: DeviceRecord, maximum: usize) {
+/// ceiling. An app at the ceiling evicts the oldest device; another gateway
+/// evicts only the oldest gateway device and never one of the owner's apps,
+/// and with none to evict it is refused. Persistence remains the caller's
+/// responsibility.
+pub fn enroll_device(
+    devices: &mut Vec<DeviceRecord>,
+    record: DeviceRecord,
+    maximum: usize,
+) -> Result<(), DeviceCapReached> {
     if let Some(install_id) = record.install_id.as_deref() {
         devices.retain(|device| device.install_id.as_deref() != Some(install_id));
+    }
+    devices.sort_by_key(|item| item.paired_unix_ms);
+    if record.kind == DeviceKind::Gateway {
+        while devices.len() >= maximum {
+            let oldest = devices
+                .iter()
+                .position(|device| device.kind == DeviceKind::Gateway)
+                .ok_or(DeviceCapReached)?;
+            devices.remove(oldest);
+        }
     }
     devices.push(record);
     devices.sort_by_key(|item| item.paired_unix_ms);
@@ -102,6 +172,7 @@ pub fn enroll_device(devices: &mut Vec<DeviceRecord>, record: DeviceRecord, maxi
         let excess = devices.len() - maximum;
         devices.drain(..excess);
     }
+    Ok(())
 }
 
 pub fn consume_pairing_code(
@@ -166,12 +237,14 @@ mod tests {
     fn device(id: &str, token: &str, install_id: Option<&str>) -> DeviceRecord {
         DeviceRecord {
             id: id.into(),
+            kind: DeviceKind::App,
             name: id.into(),
             token_hash: hash_token(token),
             transport_key: None,
             paired_unix_ms: 1,
             last_seen_unix_ms: 1,
             install_id: install_id.map(str::to_owned),
+            server_id: None,
         }
     }
 
@@ -200,10 +273,55 @@ mod tests {
             &mut devices,
             device("new", "new-token", Some("install")),
             16,
-        );
+        )
+        .unwrap();
         assert_eq!(devices.len(), 1);
         assert_eq!(devices[0].id, "new");
         assert_eq!(identify_device(&devices, "old-token"), None);
+    }
+
+    /// At the ceiling (two here) a phone makes room as it always did, and
+    /// another computer only ever at another computer's expense.
+    #[test]
+    fn a_full_device_list_never_drops_a_phone_for_a_computer() {
+        let at = |id: &str, kind: DeviceKind, paired: u128| DeviceRecord {
+            kind,
+            paired_unix_ms: paired,
+            ..device(id, id, None)
+        };
+        let (app, gateway) = (DeviceKind::App, DeviceKind::Gateway);
+        for (existing, newcomer, expected) in [
+            // A phone evicts the oldest device, whatever it is.
+            (
+                vec![at("p1", app, 1), at("g1", gateway, 2)],
+                at("p2", app, 3),
+                Ok(vec!["g1", "p2"]),
+            ),
+            // A computer evicts the oldest computer, not the older phone.
+            (
+                vec![at("p1", app, 1), at("g1", gateway, 2)],
+                at("g2", gateway, 3),
+                Ok(vec!["p1", "g2"]),
+            ),
+            // A computer with only phones to evict is refused; nothing changes.
+            (
+                vec![at("p1", app, 1), at("p2", app, 2)],
+                at("g1", gateway, 3),
+                Err(DeviceCapReached),
+            ),
+        ] {
+            let mut devices = existing.clone();
+            let outcome = enroll_device(&mut devices, newcomer.clone(), 2).map(|()| {
+                devices
+                    .iter()
+                    .map(|device| device.id.as_str())
+                    .collect::<Vec<_>>()
+            });
+            assert_eq!(outcome, expected, "{} joining", newcomer.id);
+            if outcome.is_err() {
+                assert_eq!(devices, existing, "a refusal leaves the list alone");
+            }
+        }
     }
     #[test]
     fn token_hash_is_stable_and_not_plaintext() {

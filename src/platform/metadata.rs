@@ -100,6 +100,50 @@ pub(crate) const API_CAPABILITIES: &[&str] = &[
     // any number of sessions. Also announced as `transports.websocket` in
     // `/api/discovery`. The per-session SSE stream stays the fallback.
     "ws_events",
+    // `GET /api/fleet/self`: this machine's capability manifest.
+    "fleet",
+    // `/api/tasks*` (the task ledger: delegations and command runs) and the
+    // `task.updated` frame on `/api/ws`. Not `tasks`, which is the older
+    // `POST /api/sessions/{id}/tasks` dispatch.
+    "task_ledger",
+    // `POST /api/tasks` (a device opens a delegation) and, in the same build,
+    // the task tree: `parent_task_id`, `origin`, `label`, `requested_by` and
+    // `children` on every task view and `GET /api/tasks?root=<id>`.
+    "task_ledger_create",
+    // `POST /api/tasks` and `tasks.delegate` take a terminal agent kind
+    // (`codex`, `claude`, ...) as `agent_id`: the task is bound to the pane
+    // the agent was started in (`binding.kind == "pane"` with `agent_id`)
+    // and the create answer (state `dispatching`) carries `pane_id` instead
+    // of `asid`. Such a
+    // task is `done` only on its MUQUN_TASK_DONE marker; an idle agent is
+    // `idle_unconfirmed`.
+    "task_ledger_pane",
+    // A delegation (session or terminal agent) is `done` only on an explicit
+    // signal: the agent's `tasks.complete` MCP call, its MUQUN_TASK_DONE
+    // marker line, or the device's `POST /api/tasks/{id}/complete` (for an
+    // `idle_unconfirmed` or `waiting` task it opened). A session agent whose
+    // turn ends without one is `idle_unconfirmed`, as a terminal agent is.
+    "task_ledger_complete",
+    // `subscribe_tasks` on `/api/ws`: task views without session events.
+    "task_ws_subscription",
+    // The task view of P1's Home card: `tasks.complete` takes `outcome`
+    // (`blocked` moves a delegation to `waiting`, as the MUQUN_TASK_BLOCKED
+    // marker does); a `waiting` task's `summary` is what the user is asked;
+    // `title` is always set (label, the session's own name, or the goal's
+    // first sentence); `progress` names a tool call in words.
+    "task_outcome",
+    // Where a task the device opens without `cwd` runs: `GET
+    // /api/tasks/defaults` and the `defaults` frame on `subscribe_tasks`
+    // (`default_cwd`, named from `~`).
+    "task_defaults",
+    // Other computers of the owner: `GET/POST /api/peers`,
+    // `PATCH/DELETE /api/peers/{id}`, `POST /api/pair/pending` (a code minted for
+    // another gateway), `PUT /api/fleet/settings` (`accept_delegations`),
+    // `kind: "gateway"` devices, `tasks.delegate` with `machine`, mirror
+    // tasks (`binding.kind == "peer"`, `peer_reachable`, `peer_last_seen_ms`)
+    // and tasks another computer opened (`origin: "peer"`,
+    // `requested_by.kind == "gateway"`).
+    "fleet_peers",
 ];
 
 /// Handing a task to an agent the app did not start, and following it home.
@@ -132,6 +176,17 @@ pub(crate) const API_CAPABILITIES: &[&str] = &[
 ///    machine", not "on the session you are looking at".
 pub(crate) const AGENT_COLLABORATION_CAPABILITY: &str = "agent_collaboration";
 
+/// `/mcp` on this listener: the gateway as an MCP server for agents on this
+/// machine (loopback, assistant token). Also `transports.mcp` in discovery.
+/// Conditional on `mcp.enabled`, because switching it off removes the route.
+pub(crate) const MCP_SERVER_CAPABILITY: &str = "mcp_server";
+
+/// Captured-history checkpoints are kept on disk and recovered after a
+/// restart. Conditional on `history.storage: sqlite`, because with `memory`
+/// there is nothing to recover and an App must not offer it, and on a platform
+/// that can verify process identity, without which nothing is ever recovered.
+pub(crate) const HISTORY_CHECKPOINT_CAPABILITY: &str = "pane_captured_history_sqlite_checkpoint";
+
 /// The first Herdr that puts an opaque agent instance id on the wire.
 ///
 /// The same floor `herdr_owns_prompt_submission` uses, and not a coincidence:
@@ -159,15 +214,28 @@ pub(crate) fn session_capabilities(
     }
 }
 
-/// The gateway-wide list: the build's own capabilities, plus collaboration if
-/// at least one configured session can actually deliver it.
+/// The gateway-wide list: the build's own capabilities, plus `mcp_server`
+/// while `mcp.enabled` is true, plus the history checkpoint capability while
+/// `history.storage` is `sqlite`, plus collaboration if at least one
+/// configured session can actually deliver it.
 ///
 /// Nothing else in the list is conditional, and nothing else should become
-/// conditional without the same justification: a capability that comes and goes
+/// conditional without the same justification (both config-gated entries have
+/// it: the config switch removes the behaviour): a capability that comes and goes
 /// with a socket is a capability a client has to re-check, and every entry in
 /// [`API_CAPABILITIES`] is true for as long as this binary is running.
-pub(crate) fn gateway_capabilities(collaboration_somewhere: bool) -> Vec<&'static str> {
+pub(crate) fn gateway_capabilities(
+    collaboration_somewhere: bool,
+    mcp_enabled: bool,
+    history_checkpoints: bool,
+) -> Vec<&'static str> {
     let mut capabilities: Vec<&'static str> = API_CAPABILITIES.to_vec();
+    if mcp_enabled {
+        capabilities.push(MCP_SERVER_CAPABILITY);
+    }
+    if history_checkpoints && crate::terminal::backend::PROCESS_IDENTITY_SUPPORTED {
+        capabilities.push(HISTORY_CHECKPOINT_CAPABILITY);
+    }
     if collaboration_somewhere {
         capabilities.push(AGENT_COLLABORATION_CAPABILITY);
     }
@@ -252,7 +320,11 @@ pub(crate) async fn gateway_metadata(
         "generation": &*state.generation,
         "minimumCompatibleApiVersion": "1.0.0",
         "legacyUnversionedApi": true,
-        "capabilities": gateway_capabilities(collaboration_somewhere),
+        "capabilities": gateway_capabilities(
+            collaboration_somewhere,
+            state.config.mcp.enabled,
+            state.config.history.storage == crate::platform::config::HistoryStorage::Sqlite,
+        ),
         "planes": planes,
         "serverId": state.config.server_id,
         "label": state.config.label,
@@ -306,8 +378,15 @@ pub(crate) static SESSION_METADATA_CACHE: std::sync::OnceLock<
 
 pub(crate) async fn session_metadata(session: &SessionConfig) -> (Value, Value) {
     let cache = SESSION_METADATA_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    // Keyed by where the session's server is too: a session id reused for
+    // another socket (a config reload, or another gateway in the same
+    // process, as tests run) must not be answered for the old one.
+    let key = format!(
+        "{}\n{:?}\n{}",
+        session.id, session.backend, session.socket_path
+    );
     if let Ok(cache) = cache.lock() {
-        if let Some((seen, answer)) = cache.get(&session.id) {
+        if let Some((seen, answer)) = cache.get(&key) {
             if seen.elapsed() < SESSION_LIVENESS_TTL {
                 return answer.clone();
             }
@@ -318,10 +397,7 @@ pub(crate) async fn session_metadata(session: &SessionConfig) -> (Value, Value) 
         // Bounded by the configured sessions, which is a handful; the sweep is
         // only here so a config reload cannot leave an entry behind for ever.
         cache.retain(|_, (seen, _)| seen.elapsed() < SESSION_LIVENESS_TTL);
-        cache.insert(
-            session.id.clone(),
-            (std::time::Instant::now(), answer.clone()),
-        );
+        cache.insert(key, (std::time::Instant::now(), answer.clone()));
     }
     answer
 }
@@ -734,6 +810,7 @@ mod tests {
     #[tokio::test]
     async fn session_liveness_reports_panes_present() {
         let panes = vec![Pane {
+            history_identity: None,
             id: BackendPaneId::new("p1"),
             terminal_id: None,
             workspace_id: BackendWorkspaceId::new("w1"),
@@ -753,6 +830,7 @@ mod tests {
             alternate_on: None,
             cursor_x: None,
             cursor_y: None,
+            shell_pid: None,
         }];
         let outcome = session_liveness(
             Box::pin(async move { Ok(panes) }),
@@ -990,6 +1068,7 @@ mod tests {
                 cwd: Some(std::env::temp_dir()),
                 label: Some("gateway-sessions-live".into()),
                 focus: true,
+                env: None,
             })
             .await
             .unwrap();
@@ -1112,12 +1191,44 @@ mod tests {
         assert!(session_capabilities(BackendKind::Herdr, false, Some("0.9.0")).is_empty());
     }
 
+    /// The checkpoint capability means "enabled": an App offers restart-surviving
+    /// history only on a gateway whose storage is `sqlite`.
+    #[tokio::test]
+    async fn the_history_checkpoint_capability_follows_the_storage_setting() {
+        assert!(!API_CAPABILITIES.contains(&HISTORY_CHECKPOINT_CAPABILITY));
+        let supported = crate::terminal::backend::PROCESS_IDENTITY_SUPPORTED;
+        assert_eq!(
+            supported,
+            cfg!(any(target_os = "linux", target_os = "macos"))
+        );
+        assert_eq!(
+            gateway_capabilities(false, false, true).contains(&HISTORY_CHECKPOINT_CAPABILITY),
+            supported,
+            "sqlite storage announces checkpoints only where identity is verifiable"
+        );
+        assert!(!gateway_capabilities(false, false, false).contains(&HISTORY_CHECKPOINT_CAPABILITY));
+        for (storage, announced) in [
+            (crate::platform::config::HistoryStorage::Memory, false),
+            (crate::platform::config::HistoryStorage::Sqlite, true),
+        ] {
+            let mut state = crate::test_state("admin", Vec::new());
+            state.config.history.storage = storage;
+            let meta = gateway_metadata(&state, false).await.unwrap();
+            let listed = meta["capabilities"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c == HISTORY_CHECKPOINT_CAPABILITY);
+            assert_eq!(listed, announced && supported, "{storage:?}");
+        }
+    }
+
     /// The gateway-wide list is the weaker, older-app-facing claim: it says
     /// "somewhere on this machine", and it must not disturb anything else.
     #[test]
     fn the_gateway_wide_list_adds_collaboration_and_changes_nothing_else() {
-        let without = gateway_capabilities(false);
-        let with = gateway_capabilities(true);
+        let without = gateway_capabilities(false, false, false);
+        let with = gateway_capabilities(true, false, false);
 
         assert!(!without.contains(&AGENT_COLLABORATION_CAPABILITY));
         assert!(with.contains(&AGENT_COLLABORATION_CAPABILITY));

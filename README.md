@@ -111,34 +111,59 @@ Open the manager on your computer:
 muqun-gateway manage
 ```
 
-Open **Devices** (`3`), then press Enter (first device) or `p` (new device)
-to see the QR code. Scan it in Muqun, then type back the short code your
-computer displays. That is the whole of pairing.
+Open **Devices** (`3`), then press Enter (first device) or `p` (new device).
+The pairing flow is three steps, shown on screen as
+"1 Scan the QR in Muqun · 2 Type this code on the phone · 3 Done" (a narrow
+terminal shows only the current step, as "Step 1 of 3: Scan the QR in
+Muqun"): scan the QR, type the short code your computer displays into the
+phone, and the screen reports "Paired as <name>" on its own. The state line under the QR
+("Waiting for the phone…") updates without a key press, and a phone that
+scans the QR opens the code step by itself. Esc, Enter, or `r` returns to the
+device list; `p` pairs another device.
 
 No camera on the phone? Type the gateway's address into the app instead, and
 finish with the same short code.
 
-The manager has four views. `1`–`4`, Tab/Shift-Tab, or Left/Right switches
-views; Up/Down or `j`/`k` selects a row and Enter performs the visible primary
-action. PageUp/PageDown scrolls. Esc goes back from a view or cancels a dialog;
-at Overview, Esc closes the manager. `q` closes from any main view without
-stopping Gateway. Confirmations default to **cancel**: arrows/Tab choose,
-Enter accepts the selected answer. The footer shows full-word, view-specific
-actions. Long lists keep the selected item visible after a resize.
+Every view starts with a one-line header: Gateway version, whether it is
+running and where it listens, whether Herdr and the agent service answer,
+and how many devices are paired. While Gateway runs, the links refresh
+every few seconds; a stopped Gateway is not asked.
 
-| view | keys |
-| --- | --- |
-| Overview (`1`) | `s` start, `t` stop, `r` restart the gateway |
-| Terminals (`2`) | `h` / `m` add Herdr / tmux; `f` make the selected backend default; `d` remove it; `b` toggle its backend autostart |
-| Devices (`3`) | `p` show pairing QR; `x` revoke the selected device after confirmation; `r` return to the device list |
-| Settings (`4`) | `u` edit URL; `a` detect URL; `e` toggle transport encryption; `g` enable/disable gateway autostart; `c` check stable updates; `i` install an update after confirmation |
+The manager has four views: 1 Overview, 2 Terminals, 3 Devices, 4 Settings.
+`1`–`4`, Tab/Shift-Tab, or Left/Right switches views; Up/Down or `j`/`k`
+selects a row, and **Enter is the only verb on a row**: it toggles a switch,
+opens a chooser for a choice, or edits a text. On Overview Enter does nothing;
+starting and stopping Gateway always take `s` and `t`. Esc always goes one
+level back (pairing flow → device list, dialog → its view, view → Overview,
+Overview → closed); `q` closes from any main view without stopping Gateway.
+Confirmations default to **cancel**.
 
-Enter starts/stops Gateway in Overview, makes the selected terminal backend
-the default in Terminals, pairs the first device or reviews revocation in
-Devices, and changes the selected setting in Settings. The `>` selection marker
-is separate from the explicit `[default]` backend label. Empty lists explain
-the next step. Gateway stop, backend removal, and device revocation explain
-their scope before you confirm; none closes terminal tasks.
+The footer is one line of the same shape on every view,
+`↑↓ select · Enter change · Tab next view · q quit` (Overview, which has no
+rows, shows `Tab next view · q quit`), plus the view's own keys for actions
+that are not a row:
+
+| view | rows (Enter) | own keys |
+| --- | --- | --- |
+| Overview (`1`) | — | `s` start, `t` stop, `r` restart the gateway |
+| Terminals (`2`) | a backend's actions: make default, start with Gateway on/off, remove | `h` / `m` add Herdr / tmux |
+| Devices (`3`) | the device's kind, pairing and last-seen times (last seen is saved every few minutes, so it can lag); `x` there revokes it | `p` pair a device; `x` revoke the selected one |
+| Settings (`4`) | change the selected setting (Detect address offers the address; Enter applies it) | `PgUp`/`PgDn` page; `r` restart the gateway |
+
+Settings lists every setting as one row with its current value, a one-line
+explanation of the feature it switches, and, in grey, where it lives
+(`config.json › history.storage`), grouped as: *Gateway* (login autostart,
+address, detect address, transport encryption, updates), *Storage* (history
+checkpoints memory/SQLite, store encryption, read-only), *Agents started from
+the phone* (skipping the agents' own approval prompts, trusting the task
+folder, the environment passed to agents, values never shown), and
+*Assistant access* (the MCP server, loopback only), and *Other computers*
+(where linking with your other computers will appear). A change that applies
+only after a restart says `restart needed` on its row, and the header shows
+`Restart needed` until `r` restarts Gateway. Rows longer than the terminal end
+in `…` rather than a clipped word. Empty lists explain the next step. Gateway
+stop, backend removal, and device revocation explain their scope before you
+confirm; none closes terminal tasks.
 
 Runtime/connectivity/backend panels use the terminal's default background,
 with bold/reversed active tabs and rows, restrained status accents, and a
@@ -215,8 +240,8 @@ muqun-gateway update           # explicitly download, verify and install a newer
 muqun-gateway --version        # side-effect-free installed binary version
 ```
 
-Settings (`4`) in `manage` has the same update/check use case. `c` checks;
-`i` checks and asks for confirmation before downloading or downtime. Nothing
+Settings (`4`) in `manage` has the same update/check use case: Enter on
+Updates checks, and asks for confirmation before downloading or downtime. Nothing
 checks or installs updates in the background. Stable `vX.Y.Z` versions only;
 development/prerelease builds and downgrades are not supported.
 
@@ -319,6 +344,23 @@ token and secret from the environment when config.json has none. Both offer to r
 user service when the change needs one (`--yes` skips the question). `agent setup
 opencode` only shows the OpenCode binary the gateway would use: OpenCode needs
 no setup.
+
+### Agents started from the phone
+
+Nobody sits at the terminal of an agent the gateway starts for the phone or an
+MCP caller, so by default Codex starts with
+`--dangerously-bypass-approvals-and-sandbox` and Claude Code with
+`--dangerously-skip-permissions`, and the task directory is marked trusted
+for both (only directories inside your home). That agent then runs commands
+without asking. To keep the prompts, set the launch arguments per kind in
+`config.json` (an empty list means none) and turn folder trust off:
+
+```json
+{ "agent_launch_args": { "codex": [], "claude": [] }, "agent_trust_folders": false }
+```
+
+The gateway logs the launch arguments in effect at startup, and `manage` shows
+and switches them under Settings › Agents started from the phone. Details: [Agent API](docs/agent-api.md#terminal-agents-launched-for-remote-dispatch).
 
 ### The OpenCode agent
 

@@ -416,10 +416,10 @@ mod tests {
     fn the_session_snapshot_is_announced_as_a_capability() {
         assert!(API_CAPABILITIES.contains(&"session_snapshot"));
         assert!(
-            gateway_capabilities(false).contains(&"session_snapshot"),
+            gateway_capabilities(false, true, false).contains(&"session_snapshot"),
             "it is a property of this build, not of a session's backend"
         );
-        assert!(gateway_capabilities(true).contains(&"session_snapshot"));
+        assert!(gateway_capabilities(true, true, false).contains(&"session_snapshot"));
     }
 
     #[test]

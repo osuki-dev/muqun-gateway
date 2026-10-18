@@ -6,6 +6,9 @@ use std::process::{Command as ProcessCommand, Stdio};
 use anyhow::Context as _;
 use base64::Engine as _;
 
+pub(crate) mod db_key;
+pub(crate) mod sqlite;
+
 use super::manage::{revoke_managed_device, truncate};
 use super::state_lock;
 use crate::authority::DeviceRecord;
@@ -15,20 +18,39 @@ use crate::{
     PAIRING_FILE, PID_FILE, PUSH_TOKENS_FILE,
 };
 
-pub(crate) fn load_config(config_path: Option<String>) -> anyhow::Result<Config> {
+/// The config file `run` reads: the `--config` path when given, else the
+/// standard one.
+pub(crate) fn config_file_path(config_path: Option<&str>) -> anyhow::Result<PathBuf> {
     // Resolved lazily on purpose: `config_dir` consults the rename migration,
     // which loads the pre-rename config by explicit path. An eagerly evaluated
     // default would recurse between the two until the stack ran out.
-    let path = match config_path {
+    Ok(match config_path {
         Some(path) => PathBuf::from(path),
         None => config_dir()?.join(CONFIG_FILE),
-    };
+    })
+}
+
+pub(crate) fn load_config(config_path: Option<String>) -> anyhow::Result<Config> {
+    let path = config_file_path(config_path.as_deref())?;
     let bytes = std::fs::read(&path)
         .with_context(|| format!("failed to read config {}", path.display()))?;
     Ok(serde_json::from_slice(&bytes)?)
 }
 
+/// A config directory named on the command line (`mcp token-helper
+/// --config-dir`), which outranks the environment: a host may run the helper
+/// with a stripped environment.
+static CONFIG_DIR_OVERRIDE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Make [`config_dir`] answer `dir` for the rest of this process.
+pub(crate) fn override_config_dir(dir: PathBuf) {
+    let _ = CONFIG_DIR_OVERRIDE.set(dir);
+}
+
 pub(crate) fn config_dir() -> anyhow::Result<std::path::PathBuf> {
+    if let Some(path) = CONFIG_DIR_OVERRIDE.get() {
+        return Ok(path.clone());
+    }
     if let Some(path) = std::env::var_os("MUQUN_GATEWAY_CONFIG_DIR") {
         return Ok(path.into());
     }
@@ -300,7 +322,7 @@ pub(crate) fn list_devices() -> anyhow::Result<()> {
         println!(
             "{}  {}  paired {}  last seen {}",
             device.id,
-            truncate(&device.name, 32),
+            truncate(&device.listed_name(), 42),
             format_unix_ms(device.paired_unix_ms),
             format_unix_ms(device.last_seen_unix_ms)
         );
@@ -641,6 +663,33 @@ pub(crate) fn lock_down_secret_dir(dir: &std::path::Path) {
 #[cfg(not(unix))]
 pub(crate) fn lock_down_secret_dir(_dir: &std::path::Path) {}
 
+/// The directory under the state directory that holds the shared SQLite store.
+pub(crate) const STORE_DIR: &str = "store";
+
+pub(crate) fn store_db_path(state: &std::path::Path) -> PathBuf {
+    state.join(STORE_DIR).join("gateway.sqlite3")
+}
+
+/// Create `dir` (and its parents) and make sure only the owner can list it.
+pub(crate) fn ensure_secret_dir(dir: &std::path::Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
+    lock_down_secret_dir(dir);
+    Ok(())
+}
+
+/// Make a secret file readable by its owner only.
+#[cfg(unix)]
+pub(crate) fn lock_down_secret_file(path: &std::path::Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("cannot restrict {}", path.display()))
+}
+
+#[cfg(not(unix))]
+pub(crate) fn lock_down_secret_file(_path: &std::path::Path) -> anyhow::Result<()> {
+    Ok(())
+}
+
 /// Replace a secret file's contents in one step, never leaving it short.
 ///
 /// Truncating the real file and writing into it is what loses pairings. It
@@ -798,6 +847,26 @@ pub(crate) fn hostname_label() -> String {
     "Server".into()
 }
 
+/// Read the config file at `path`, change it, and write it back, one writer
+/// at a time: a running gateway changes its label (`PATCH /api/meta`) and its
+/// accept switch (`PUT /api/fleet/settings`) this way, and neither may lose
+/// the other's write. Written through `Config`, so the file keeps its order.
+pub(crate) fn edit_config(
+    path: &std::path::Path,
+    edit: impl FnOnce(&mut Config),
+) -> anyhow::Result<()> {
+    static WRITER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _writer = WRITER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let bytes =
+        std::fs::read(path).with_context(|| format!("failed to read config {}", path.display()))?;
+    let mut config: Config = serde_json::from_slice(&bytes)?;
+    edit(&mut config);
+    write_secret_file(path, &serde_json::to_vec_pretty(&config)?)
+        .with_context(|| format!("failed to write config {}", path.display()))
+}
+
 /// Persist a new display label into the config (and the pairing payload), so a
 /// name set from the app shows up in push notifications. Mirrors
 /// `update_public_url`.
@@ -809,11 +878,9 @@ pub(crate) fn update_server_label(label: &str) -> anyhow::Result<String> {
             && !label.chars().any(char::is_control),
         "label must be non-empty, at most {MAX_DEVICE_NAME_CHARS} characters, and free of control characters"
     );
-    let config_path = config_dir()?.join(CONFIG_FILE);
-    let mut config = load_config(None)?;
-    config.label = label.to_string();
-    write_secret_file(&config_path, &serde_json::to_vec_pretty(&config)?)
-        .with_context(|| format!("failed to write config {}", config_path.display()))?;
+    edit_config(&config_dir()?.join(CONFIG_FILE), |config| {
+        config.label = label.to_string();
+    })?;
 
     if let Ok(mut pairing) = read_pairing_file() {
         pairing.payload.label = label.to_string();
@@ -932,6 +999,50 @@ pub(crate) fn now_unix_ms() -> u128 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis())
         .unwrap_or_default()
+}
+
+/// A JSON object from a host's MCP config file, `None` when the file is absent.
+/// A file that exists but is not a JSON object is an error, never overwritten.
+pub(crate) fn read_json_object_at(
+    path: &std::path::Path,
+) -> anyhow::Result<Option<serde_json::Map<String, serde_json::Value>>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let bytes =
+        std::fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    match serde_json::from_slice(&bytes)
+        .with_context(|| format!("{} is not valid JSON; left untouched", path.display()))?
+    {
+        serde_json::Value::Object(map) => Ok(Some(map)),
+        _ => anyhow::bail!("{} is not a JSON object; left untouched", path.display()),
+    }
+}
+
+/// Replace a project's (non-secret) config file atomically: a complete
+/// temporary beside it, then a rename. It holds `${MUQUN_MCP_TOKEN}`-style
+/// references, never a token, so it keeps ordinary permissions.
+pub(crate) fn write_json_object_at(
+    path: &std::path::Path,
+    value: &serde_json::Map<String, serde_json::Value>,
+) -> anyhow::Result<()> {
+    let directory = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("config path has no file name")?;
+    let temporary = directory.join(format!(".{name}.tmp-{}", std::process::id()));
+    let mut bytes = serde_json::to_vec_pretty(value)?;
+    bytes.push(b'\n');
+    let result =
+        std::fs::write(&temporary, &bytes).and_then(|()| std::fs::rename(&temporary, path));
+    if let Err(error) = result {
+        std::fs::remove_file(&temporary).ok();
+        return Err(
+            anyhow::Error::new(error).context(format!("failed to write {}", path.display()))
+        );
+    }
+    Ok(())
 }
 
 pub(crate) fn write_config(path: &std::path::Path, config: &Config) -> anyhow::Result<()> {

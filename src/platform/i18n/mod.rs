@@ -331,7 +331,7 @@ pub fn t_slots(locale: Locale, source: &str, slots: &[(&str, &str)]) -> String {
 // The catalogs.
 //
 // One table per language, all keyed by the same English source strings and all
-// carrying the same seventy-nine entries in the same order, so that a diff
+// carrying the same entries in the same order, so that a diff
 // between two of them is a diff of wording and nothing else. The tests hold
 // every table to the same invariants -- no duplicate key, no entry left as its
 // English source, every `{slot}` surviving into the translation -- by walking

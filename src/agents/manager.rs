@@ -652,6 +652,7 @@ impl AgentManager {
                         let asid = AgentSessionId(id.to_string());
                         if let Ok(info) = ctx.driver.get_session(id).await {
                             let seq = ctx.mirror.update_session(info.clone()).await;
+                            let info = Self::merged_info(ctx, &asid, info).await;
                             ctx.emit(AgentDomainEvent::SessionUpdated {
                                 asid,
                                 info: Box::new(info),
@@ -664,6 +665,9 @@ impl AgentManager {
                 if let Some(info) = mapper::map_session(info_raw) {
                     let asid = info.asid.clone();
                     let seq = ctx.mirror.update_session(info.clone()).await;
+                    // What the mirror kept: a live status and a failure's
+                    // reason the read does not carry.
+                    let info = Self::merged_info(ctx, &asid, info).await;
                     ctx.emit(AgentDomainEvent::SessionUpdated {
                         asid,
                         info: Box::new(info),
@@ -1206,6 +1210,16 @@ impl AgentManager {
                 tracing::trace!(event = other, "opencode event not mapped");
             }
         }
+    }
+
+    /// The session as the mirror holds it after `info` was merged in, else
+    /// `info` itself.
+    async fn merged_info(
+        ctx: &EventContext,
+        asid: &AgentSessionId,
+        info: crate::agents::domain::AgentSessionInfo,
+    ) -> crate::agents::domain::AgentSessionInfo {
+        ctx.mirror.session_info(asid).await.unwrap_or(info)
     }
 
     async fn apply_usage(ctx: &EventContext, asid: &AgentSessionId, data: &Value) {

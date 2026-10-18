@@ -622,7 +622,7 @@ fn manager_pty_navigates_scrolls_resizes_and_keeps_start_failures_in_the_ui() {
     )
     .unwrap();
     let mut manager = ManagerPty::open(&install);
-    let output = manager.until("Enter Start gateway");
+    let output = manager.until("s start · t stop · r restart");
     assert!(output.contains("Runtime"));
     assert!(output.contains("Connectivity"));
     assert!(
@@ -630,24 +630,29 @@ fn manager_pty_navigates_scrolls_resizes_and_keeps_start_failures_in_the_ui() {
         "active tab is not reversed: {output:?}"
     );
     manager.send(b"2\x1b[F");
-    let output = manager.until_all(&["> qa-39", "终端 e\u{301} 39"]);
+    let output = manager.until_all(&["▌ qa-39", "终端 e\u{301} 39"]);
     assert!(
         output.contains("终端 e\u{301} 39"),
         "wide selected label missing: {output:?}"
     );
+    // Enter opens the backend's actions; its first is "Make default".
+    manager.send(b"\r");
+    manager.until("Make default");
     manager.send(b"\r");
     manager.until("default is now qa-39");
     let changed: serde_json::Value =
         serde_json::from_slice(&fs::read(install.config.join("config.json")).unwrap()).unwrap();
     assert_eq!(changed["sessions"][0]["id"], "qa-39");
-    manager.send(b"d");
+    manager.send(b"\r");
+    manager.until("Remove backend");
+    manager.send(b"\x1b[B\x1b[B\r");
     manager.until("Remove terminal backend?");
     manager.send(b"\x1b");
     manager.until("backend unchanged");
     manager.send(b"3");
     manager.until("No devices paired yet.");
     manager.send(b"\r");
-    manager.until("Scan with Muqun");
+    manager.until("1 Scan the QR in Muqun");
     let size = libc::winsize {
         ws_row: 8,
         ws_col: 40,
@@ -672,7 +677,7 @@ fn manager_pty_navigates_scrolls_resizes_and_keeps_start_failures_in_the_ui() {
     );
     // Confirm the larger frame before sending a standalone Esc: resize
     // notification and key decoding are asynchronous, separate transitions.
-    manager.until("Scan with Muqun");
+    manager.until("1 Scan the QR in Muqun");
     manager.send(b"\x1b");
     manager.until("No devices paired yet.");
     manager.send(b"4\r");
@@ -684,7 +689,32 @@ fn manager_pty_navigates_scrolls_resizes_and_keeps_start_failures_in_the_ui() {
     manager.until("Edit Gateway address");
     manager.send(b"\x1b");
     manager.until("url unchanged");
+    // Detect address offers the address; Esc leaves config.json as it was.
+    let before = fs::read(install.config.join("config.json")).unwrap();
+    manager.send(b"\x1b[B\r");
+    manager.until("Edit Gateway address");
+    manager.send(b"\x1b");
+    manager.until("url unchanged");
+    assert_eq!(
+        fs::read(install.config.join("config.json")).unwrap(),
+        before
+    );
+    // History checkpoints: the chooser writes the one key it changes.
+    manager.send(b"\x1b[B\x1b[B\x1b[B\r");
+    manager.until("only while Gateway runs");
+    manager.send(b"\x1b[B\r");
+    manager.until("History checkpoints: SQLite");
+    let mut after: serde_json::Value =
+        serde_json::from_slice(&fs::read(install.config.join("config.json")).unwrap()).unwrap();
+    assert_eq!(after["history"]["storage"], "sqlite");
+    after.as_object_mut().unwrap().remove("history");
+    let mut before: serde_json::Value = serde_json::from_slice(&before).unwrap();
+    before.as_object_mut().unwrap().remove("history");
+    assert_eq!(after, before, "only history.storage changed");
+    // Enter is not the start key on Overview; `s` is.
     manager.send(b"1\r");
+    manager.until("Status: ready");
+    manager.send(b"s");
     manager.until("Action failed: gateway exited during startup");
     assert!(
         manager.child.try_wait().unwrap().is_none(),
@@ -714,9 +744,13 @@ fn manager_enter_targets_the_selected_device_and_esc_only_cancels_revocation() {
     ])).unwrap();
     fs::write(&file, &records).unwrap();
     let mut manager = ManagerPty::open(&install);
-    manager.until("Enter Start gateway");
+    manager.until("s start · t stop · r restart");
+    // Enter shows the device; x there reviews its revocation.
     manager.send(b"3\x1b[B\r");
-    let output = manager.until("Enter Confirm selection");
+    let output = manager.until("x revoke · Esc back");
+    assert!(output.contains("First phone 中文 e\u{301}"));
+    manager.send(b"x");
+    let output = manager.until("Enter confirm");
     assert!(output.contains("Selected: First phone 中文 e\u{301}"));
     assert!(output.contains("loses Gateway access immediately"));
     manager.send(b"\x1b");
@@ -741,7 +775,7 @@ fn manager_compact_pairing_keeps_the_full_address_reachable_without_resizing() {
     )
     .unwrap();
     let mut manager = ManagerPty::open(&install);
-    manager.until("Enter Start gateway");
+    manager.until("s start · t stop · r restart");
     let size = libc::winsize {
         ws_row: 8,
         ws_col: 40,
@@ -755,10 +789,10 @@ fn manager_compact_pairing_keeps_the_full_address_reachable_without_resizing() {
     );
     // Wait for the resized Overview frame before starting pairing, so PTY
     // resize delivery cannot overlap the navigation input being asserted.
-    manager.until("Tab Views | Esc Back | q Close");
+    manager.until("Tab next view · q quit");
     manager.send(b"3\r");
     let output = manager.until(&address[..30]);
-    assert!(output.contains("Down for URL"));
+    assert!(output.contains("Resize for the full QR"));
     // Address has a nine-cell prefix, leaving thirty cells per wrapped segment.
     for segment in address.as_bytes().chunks(30).skip(1) {
         manager.send(b"\x1b[B");

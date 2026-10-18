@@ -22,6 +22,10 @@ pub(super) const TH: &[(&str, &str)] = &[
     ("Expo push service request failed", "คำขอไปยังบริการแจ้งเตือนแบบพุชของ Expo ล้มเหลว"),
     ("Herdr did not return the created pane id", "Herdr ไม่ได้ส่ง id ของเพนที่สร้างขึ้นกลับมา"),
     ("Herdr is unavailable", "เชื่อมต่อกับ Herdr ไม่ได้"),
+    ("No terminal pane belongs to the calling process", "ไม่มีเพนของเทอร์มินัลที่เป็นของโปรเซสที่เรียกใช้"),
+    ("Task not found", "ไม่พบงาน"),
+    ("Token expired", "โทเคนหมดอายุแล้ว"),
+    ("Token not found", "ไม่พบโทเคน"),
     (
         "agent is not one this gateway offers; see GET /api/agents/catalog",
         "Gateway นี้ไม่ได้ให้บริการเอเจนต์ดังกล่าว ดูที่ GET /api/agents/catalog",
@@ -68,6 +72,11 @@ pub(super) const TH: &[(&str, &str)] = &[
     ("invalid Authorization header", "ส่วนหัว Authorization ไม่ถูกต้อง"),
     ("invalid pairing code", "รหัสจับคู่ไม่ถูกต้อง"),
     ("invalid token", "โทเคนไม่ถูกต้อง"),
+    (
+        "the MCP endpoint answers only local callers on this machine",
+        "ปลายทาง MCP ตอบเฉพาะผู้เรียกในเครื่องนี้เท่านั้น",
+    ),
+    ("the assistant token store is unavailable", "ที่เก็บโทเคนผู้ช่วยไม่พร้อมใช้งาน"),
     ("keys must contain 1 to 32 entries", "keys ต้องมี 1 ถึง 32 รายการ"),
     ("missing Authorization header", "ไม่มีส่วนหัว Authorization"),
     ("mode must be on, off, or toggle", "mode ต้องเป็น on, off หรือ toggle"),
@@ -107,6 +116,7 @@ pub(super) const TH: &[(&str, &str)] = &[
     ("the file field must carry a filename", "ฟิลด์ file ต้องมีชื่อไฟล์"),
     ("the pane is not waiting on an approval", "เพนนี้ไม่ได้กำลังรอการอนุมัติ"),
     ("the pane is waiting on a different approval", "เพนนี้กำลังรอการอนุมัติรายการอื่น"),
+    ("the task request failed", "คำของานล้มเหลว"),
     ("the upload must be at most 25 MiB", "ไฟล์ที่อัปโหลดต้องมีขนาดไม่เกิน 25 MiB"),
     (
         "this approval has no option with that number",
@@ -139,4 +149,53 @@ pub(super) const TH: &[(&str, &str)] = &[
         "branch_name ต้องไม่มีส่วนของเส้นทางที่ว่างเปล่า หรือส่วนที่ขึ้นต้นหรือลงท้ายด้วยจุด",
     ),
     ("branch_name must not end with .lock", "branch_name ต้องไม่ลงท้ายด้วย .lock"),
+    // -- tasks, lazygit and assets ------------------------------------------
+    (
+        "No terminal session is reachable on this computer",
+        "ไม่มีเซสชันเทอร์มินัลที่เชื่อมต่อได้บนคอมพิวเตอร์เครื่องนี้",
+    ),
+    (
+        "That agent is not available",
+        "ใช้เอเจนต์นั้นไม่ได้",
+    ),
+    (
+        "Only a paused or waiting task opened on a device can be confirmed",
+        "ยืนยันได้เฉพาะงานที่หยุดชั่วคราวหรือรออยู่ซึ่งเปิดจากอุปกรณ์เท่านั้น",
+    ),
+    (
+        "the agent could not start the task",
+        "เอเจนต์เริ่มงานไม่ได้",
+    ),
+    (
+        "label must be at most 200 characters",
+        "label ต้องมีความยาวไม่เกิน 200 ตัวอักษร",
+    ),
+    (
+        "goal must be non-empty and at most 32 KiB",
+        "goal ต้องไม่ว่างและมีขนาดไม่เกิน 32 KiB",
+    ),
+    (
+        "summary must be at most 32 KiB",
+        "summary ต้องมีขนาดไม่เกิน 32 KiB",
+    ),
+    (
+        "Unknown model for that agent. Use a model id from its catalog, or <provider_id>/<model_id>.",
+        "เอเจนต์นั้นไม่มีโมเดลนี้ ใช้ id ของโมเดลจากแค็ตตาล็อกของเอเจนต์ หรือ <provider_id>/<model_id>",
+    ),
+    (
+        "Unknown variant '{variant}' (the model offers: {offered}).",
+        "ไม่รู้จัก variant '{variant}' (โมเดลนี้มี: {offered})",
+    ),
+    (
+        "Install lazygit on the Gateway host",
+        "ติดตั้ง lazygit บนโฮสต์ของ Gateway",
+    ),
+    (
+        "The source pane is not in an accessible Git repository",
+        "เพนต้นทางไม่ได้อยู่ใน Git repository ที่เข้าถึงได้",
+    ),
+    (
+        "the asset exceeds its content size limit",
+        "ไฟล์มีขนาดเกินขีดจำกัดของเนื้อหา",
+    ),
 ];

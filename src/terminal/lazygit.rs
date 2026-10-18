@@ -18,7 +18,7 @@ use super::routes::{checkout_of, pane_fenced_cwd};
 fn launch_command(executable: &FsPath) -> String {
     // Only a resolved executable is interpolated. The repository is passed as
     // the new tab's native cwd, never as text through the shell.
-    format!("'{}'", executable.to_string_lossy().replace('\'', "'\\''"))
+    super::shell_word::shell_word(&executable.to_string_lossy())
 }
 
 async fn repository(
@@ -37,7 +37,7 @@ pub(crate) async fn availability(
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
     let session = find_session(&state.config, &session_id)?;
-    let installed = crate::tasks::find_on_path("lazygit").is_some();
+    let installed = crate::agents::tasks::find_on_path("lazygit").is_some();
     let root = if installed {
         repository(&state, session, &pane_id).await
     } else {
@@ -57,7 +57,7 @@ pub(crate) async fn launch(
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
     let session = find_session(&state.config, &session_id)?;
-    let executable = crate::tasks::find_on_path("lazygit").ok_or_else(|| {
+    let executable = crate::agents::tasks::find_on_path("lazygit").ok_or_else(|| {
         api_error(
             StatusCode::CONFLICT,
             "lazygit_not_installed",
@@ -82,6 +82,7 @@ pub(crate) async fn launch(
             cwd: Some(root),
             label: Some("lazygit".to_owned()),
             focus: false,
+            env: None,
         })
         .await
         .map_err(backend_api_error)?;
@@ -258,6 +259,7 @@ mod tests {
                 cwd: Some(root),
                 label: Some("lazygit-qa".into()),
                 focus: true,
+                env: None,
             })
             .await
             .unwrap();
