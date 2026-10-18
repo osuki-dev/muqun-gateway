@@ -1043,7 +1043,10 @@ mod tests {
             ] {
                 assert_eq!(
                     explicit_file(&source, fences.clone(), Some(&home), [cache.clone()]),
-                    Some((path.clone(), fence.clone()))
+                    Some((
+                        std::fs::canonicalize(&path).unwrap(),
+                        std::fs::canonicalize(&fence).unwrap()
+                    ))
                 );
             }
         }
