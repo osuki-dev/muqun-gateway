@@ -523,7 +523,7 @@ async fn a_sealed_device_upgrades_through_its_envelope_and_every_frame_is_sealed
 #[tokio::test]
 async fn a_sealed_device_cannot_upgrade_with_its_bare_token() {
     let (device, _) = encrypted_device();
-    let addr = serve(test_state("admin", vec![device])).await;
+    let addr = serve(required_test_state("admin", vec![device])).await;
     match connect(addr, &bearer()).await {
         Err(tungstenite::Error::Http(response)) => {
             assert_eq!(response.status(), StatusCode::FORBIDDEN)

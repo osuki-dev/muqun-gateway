@@ -12,8 +12,8 @@ use serde_json::{json, Value};
 
 use super::openapi::{openapi_spec, DOCS_HTML};
 use crate::{
-    api_error, device_seals_its_transport, gateway_metadata, require_device, update_server_label,
-    ApiResult, AppState,
+    api_error, device_seals_its_transport, gateway_metadata, require_device,
+    require_device_or_peer, update_server_label, ApiResult, AppState,
 };
 
 #[derive(Deserialize)]
@@ -41,32 +41,51 @@ pub async fn api_meta(State(state): State<AppState>, headers: HeaderMap) -> ApiR
     Ok(Json(gateway_metadata(&state, sealed).await?))
 }
 
+/// Who may read the discovery document: a paired device of either kind (a
+/// linked gateway reads `/api/capabilities` to negotiate its transport), or
+/// the admin token (the `manage` TUI reads the planes over loopback). Nobody
+/// else: the document names this computer's id, label, version, generation,
+/// every capability and the agent configuration, which is fingerprinting
+/// for anyone on the network and the id the peer identity checks use.
+///
+/// Only the owner's app sees the unredacted agent plane (local endpoints
+/// and versions); a linked gateway and the admin token get the document
+/// with those removed, as they did when `require_device` refused them.
+fn require_discovery_reader(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> ApiResult<Option<crate::platform::http::Caller>> {
+    if crate::require_admin(&state.config, headers).is_ok() {
+        return Ok(None);
+    }
+    Ok(Some(require_device_or_peer(state, headers)?))
+}
+
+async fn discovery_for(state: &AppState, headers: &HeaderMap) -> ApiResult<Json<Value>> {
+    let caller = require_discovery_reader(state, headers)?;
+    let app = caller
+        .as_ref()
+        .filter(|caller| caller.kind == crate::DeviceKind::App);
+    let sealed = app
+        .map(|caller| device_seals_its_transport(state, &caller.device_id))
+        .unwrap_or(false);
+    Ok(Json(
+        super::discovery::build_discovery(state, sealed, app.is_some()).await,
+    ))
+}
+
 pub async fn api_capabilities(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
-    let device_id = require_device(&state, &headers).ok();
-    let sealed = device_id
-        .as_deref()
-        .map(|id| device_seals_its_transport(&state, id))
-        .unwrap_or(false);
-
-    let discovery = super::discovery::build_discovery(&state, sealed, device_id.is_some()).await;
-    Ok(Json(discovery))
+    discovery_for(&state, &headers).await
 }
 
 pub async fn api_discovery(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
-    let device_id = require_device(&state, &headers).ok();
-    let sealed = device_id
-        .as_deref()
-        .map(|id| device_seals_its_transport(&state, id))
-        .unwrap_or(false);
-
-    let discovery = super::discovery::build_discovery(&state, sealed, device_id.is_some()).await;
-    Ok(Json(discovery))
+    discovery_for(&state, &headers).await
 }
 
 pub async fn api_set_label(
@@ -308,10 +327,21 @@ mod tests {
             .route("/api/capabilities", axum::routing::get(api_capabilities))
             .with_state(state);
 
+        // Nobody without a credential reads the document.
+        let bare = Request::builder()
+            .uri("/api/capabilities")
+            .method("GET")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(bare).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
         // 1. GET /api/capabilities
         let req = Request::builder()
             .uri("/api/capabilities")
             .method("GET")
+            .header("authorization", "Bearer device-token")
             .body(Body::empty())
             .unwrap();
         let res = app.clone().oneshot(req).await.unwrap();
@@ -374,6 +404,7 @@ mod tests {
         let req = Request::builder()
             .uri("/api/capabilities")
             .method("GET")
+            .header("authorization", "Bearer device-token")
             .body(Body::empty())
             .unwrap();
         let res = app.clone().oneshot(req).await.unwrap();

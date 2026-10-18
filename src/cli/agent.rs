@@ -21,7 +21,6 @@ use crate::{
     T3StoredCredential, CONFIG_FILE,
 };
 
-const DSH_START: &str = "bunx @deepseek-ai/dsh web --no-open";
 /// How the gateway names itself to an agent it pairs with.
 const CLIENT_LABEL: &str = "muqun-gateway";
 /// What a locally issued T3 bearer asks for: long, since the gateway keeps it
@@ -63,7 +62,7 @@ pub(crate) enum SetupAgent {
         #[arg(long, short)]
         yes: bool,
     },
-    /// Point the gateway at a running DeepSeek Harness and enable it.
+    /// Enable DeepSeek. Gateway starts or joins the harness.
     Deepseek {
         /// Harness URL; defaults to `deepseek.endpoint`, `DSH_URL`, then the
         /// local ports 3080 and 19387.
@@ -119,9 +118,9 @@ pub(crate) async fn run_agent_command(
             }
             SetupAgent::Deepseek { endpoint, yes } => {
                 let config_path = config_dir()?.join(CONFIG_FILE);
-                let env_url = std::env::var("DEEPSEEK_HARNESS_URL")
-                    .or_else(|_| std::env::var("DSH_URL"))
-                    .ok();
+                let env_url = crate::agents::runtime::deepseek::environment_endpoint(|key| {
+                    std::env::var_os(key).map(|value| value.into_string().unwrap_or_default())
+                });
                 let restart = setup_deepseek_at(&config_path, endpoint, env_url).await?;
                 restart_if_running(
                     restart,
@@ -282,7 +281,12 @@ pub(crate) fn next_step(id: &str, status: &AgentAvailability) -> Option<&'static
         }
         (Unsupported, "codex") => "use Codex 0.162.1 or newer, or upgrade Gateway protocol support",
         (Offline, "opencode") => "opencode service start",
-        (Offline | NotInstalled, "deepseek") => DSH_START,
+        (Offline, "deepseek") => {
+            "Gateway starts or joins DeepSeek Harness; run `muqun-gateway agent setup deepseek` for the manual command"
+        }
+        (NotInstalled, "deepseek") => {
+            "install dsh, or bunx, or npx; a missing runner does not stop the gateway"
+        }
         (Offline, "t3") => "open T3 Code, or run `t3 service install`",
         (NotInstalled, "opencode") => {
             "install OpenCode 2 (https://opencode.ai), or set `opencode.enabled` to false"
@@ -496,13 +500,16 @@ pub(crate) fn parse_issued_token(stdout: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// Find a healthy DeepSeek Harness and enable it in `config_path`; returns
-/// whether the running gateway needs a restart to see the change.
+/// Enable DeepSeek in `config_path`. A healthy harness is joined; otherwise
+/// the endpoint the gateway would start is saved. Returns whether the running
+/// gateway needs a restart to see the change. A missing runner is printed and
+/// is not an error.
 pub(crate) async fn setup_deepseek_at(
     config_path: &Path,
     endpoint: Option<String>,
     env_url: Option<String>,
 ) -> anyhow::Result<bool> {
+    use crate::agents::runtime::deepseek::{self, listen_target};
     let config = load_config(Some(config_path.to_string_lossy().into_owned()))?;
     match dsh_credentials_path() {
         Some(path) if path.exists() => {}
@@ -513,13 +520,25 @@ pub(crate) async fn setup_deepseek_at(
                 .to_string())
         ),
     }
-    let candidates = deepseek_candidates(endpoint, config.deepseek.endpoint.clone(), env_url);
+    let env_only = endpoint.is_none() && config.deepseek.endpoint.is_none() && env_url.is_some();
+    let explicit = endpoint
+        .as_deref()
+        .or(config.deepseek.endpoint.as_deref())
+        .or(env_url.as_deref());
+    let candidates = deepseek_candidates(
+        endpoint.clone(),
+        config.deepseek.endpoint.clone(),
+        env_url.clone(),
+    )
+    .iter()
+    .map(|url| listen_target(Some(url)).map_err(|err| anyhow!(err)))
+    .collect::<anyhow::Result<Vec<_>>>()?;
     let http = reqwest::Client::new();
     let mut found = None;
-    for url in &candidates {
+    for target in &candidates {
         // The same credentials the gateway will use: config, then env.
         let probe = DeepseekEndpoint::with_fallbacks(
-            url,
+            &target.url,
             config.deepseek.token.clone(),
             config.deepseek.secret.clone(),
         );
@@ -528,18 +547,46 @@ pub(crate) async fn setup_deepseek_at(
             break;
         }
     }
-    let Some(url) = found else {
-        anyhow::bail!(
-            "No DeepSeek Harness answers at {}. Start DeepSeek Harness first: `{DSH_START}`",
-            candidates.join(", ")
-        );
+    if env_only && found.is_none() {
+        anyhow::bail!("The explicit DeepSeek environment endpoint did not pass readiness; configuration was not changed");
+    }
+    let target = if let Some(url) = found.as_deref() {
+        listen_target(Some(url)).map_err(|err| anyhow!(err))?
+    } else {
+        // Do not pin the legacy 19387 probe. That port is only joined when
+        // something is already healthy there (`found`).
+        listen_target(explicit).map_err(|err| anyhow!(err))?
     };
-    println!("==> DeepSeek Harness answers at {url}");
+    println!("{}", deepseek::setup_summary(&target.url));
+    println!(
+        "{}",
+        deepseek::setup_manual_line(&target, |name| which(name).is_some())
+    );
+    if found.is_none() {
+        println!("{}", deepseek::NOTHING_ANSWERING);
+    } else {
+        println!("==> DeepSeek Harness answers at {}", target.url);
+    }
+    let mut after = config.deepseek.clone();
     let before = apply_config_edit(config_path, |config| {
-        enable_deepseek(&mut config.deepseek, &url)
+        enable_deepseek(&mut config.deepseek, &target.url);
+        if env_only {
+            // Persist the selected endpoint without turning an attach-only
+            // environment override into permission to spawn a harness there.
+            config.deepseek.autostart = false;
+        }
+        after = config.deepseek.clone();
     })?;
-    println!("==> Enabled DeepSeek at {url} in {}", config_path.display());
-    Ok(deepseek_needs_restart(&before.deepseek, &url))
+    println!(
+        "==> Enabled DeepSeek at {} in {}",
+        target.url,
+        config_path.display()
+    );
+    Ok(deepseek_needs_restart(
+        &before.deepseek,
+        &after,
+        env_url.as_deref(),
+    ))
 }
 
 /// Where to look for the Harness: the flag, else the configured endpoint,
@@ -563,11 +610,24 @@ pub(crate) fn enable_deepseek(deepseek: &mut DeepseekConfig, url: &str) {
     deepseek.endpoint = Some(url.to_string());
 }
 
-/// The DeepSeek settings are read once at start, and a configured endpoint
-/// already turns the agent on, so only a new endpoint needs a restart.
-pub(crate) fn deepseek_needs_restart(before: &DeepseekConfig, url: &str) -> bool {
-    let normal = |url: &str| DeepseekEndpoint::new(url, None, None).url;
-    before.endpoint.as_deref().map(normal) != Some(normal(url))
+/// Settings are read once at startup. Compare the effective base, adoption
+/// permission and spawn permission, not just the stored URL spelling.
+pub(crate) fn deepseek_needs_restart(
+    before: &DeepseekConfig,
+    after: &DeepseekConfig,
+    env_url: Option<&str>,
+) -> bool {
+    let effective = |config: &DeepseekConfig| {
+        let base =
+            crate::agents::runtime::deepseek::listen_target(config.endpoint.as_deref().or(env_url))
+                .ok()
+                .map(|target| target.url);
+        let adopt = base.is_some() && (config.enabled || config.endpoint.is_some());
+        let environment_override = config.endpoint.is_none() && env_url.is_some();
+        let spawn = base.is_some() && config.enabled && config.autostart && !environment_override;
+        (base, adopt, spawn)
+    };
+    effective(before) != effective(after)
 }
 
 /// The Harness credentials file the gateway signs its cookie with, as
@@ -702,7 +762,18 @@ mod tests {
                 Some("muqun-gateway agent setup deepseek"),
             ),
             ("opencode", Offline, Some("opencode service start")),
-            ("deepseek", Offline, Some(DSH_START)),
+            (
+                "deepseek",
+                Offline,
+                Some(
+                    "Gateway starts or joins DeepSeek Harness; run `muqun-gateway agent setup deepseek` for the manual command",
+                ),
+            ),
+            (
+                "deepseek",
+                NotInstalled,
+                Some("install dsh, or bunx, or npx; a missing runner does not stop the gateway"),
+            ),
             (
                 "t3",
                 Offline,
@@ -970,11 +1041,12 @@ mod tests {
             enable_deepseek(&mut config.deepseek, "http://127.0.0.1:3080")
         })
         .unwrap();
+        let after = reload(&path);
         assert!(deepseek_needs_restart(
             &before.deepseek,
-            "http://127.0.0.1:3080"
+            &after.deepseek,
+            None
         ));
-        let after = reload(&path);
         assert!(after.deepseek.enabled);
         assert_eq!(
             after.deepseek.endpoint.as_deref(),
@@ -984,23 +1056,202 @@ mod tests {
         assert_eq!(after.label, "keep me");
         assert!(!deepseek_needs_restart(
             &after.deepseek,
-            "http://127.0.0.1:3080"
+            &after.deepseek,
+            None
         ));
         std::fs::remove_dir_all(dir).ok();
     }
 
     #[tokio::test]
-    async fn setup_deepseek_fails_clearly_when_no_harness_answers() {
+    async fn setup_deepseek_enables_when_nothing_answers() {
         let (dir, path) = temp_config(T3Config::default());
-        let err = setup_deepseek_at(&path, Some("http://127.0.0.1:9".into()), None)
+        apply_config_edit(&path, |config| {
+            config.deepseek.token = Some("test-token".into());
+            config.deepseek.secret = Some("test-secret".into());
+        })
+        .unwrap();
+        let restart = setup_deepseek_at(&path, Some("http://127.0.0.1:9".into()), None)
             .await
-            .unwrap_err();
-        assert!(
-            err.to_string().contains("Start DeepSeek Harness first"),
-            "{err}"
+            .expect("a missing harness is not fatal");
+        assert!(restart);
+        let saved = reload(&path);
+        assert!(saved.deepseek.enabled);
+        assert_eq!(
+            saved.deepseek.endpoint.as_deref(),
+            Some("http://127.0.0.1:9")
         );
-        assert!(!reload(&path).deepseek.enabled, "config untouched");
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    async fn mock_deepseek_setup(
+        status: axum::http::StatusCode,
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/proxy", listener.local_addr().unwrap());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&calls);
+        let app = axum::Router::new().route(
+            "/proxy/api/session/modelCatalog",
+            axum::routing::post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let count = Arc::clone(&count);
+                async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    (
+                        status,
+                        axum::Json(serde_json::json!({
+                            "type": "server-response", "rpcId": body["rpcId"],
+                            "result": {"ok": true, "value": {
+                                "default": {"provider": "deepseek", "model": "chat"},
+                                "routableProviders": ["deepseek"], "groups": [], "failures": []
+                            }}
+                        })),
+                    )
+                }
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (url, calls, server)
+    }
+
+    #[tokio::test]
+    async fn setup_deepseek_normalizes_flag_config_and_environment_before_probing() {
+        let (url, calls, server) = mock_deepseek_setup(axum::http::StatusCode::OK).await;
+        for source in ["flag", "config", "env"] {
+            for raw in [
+                url.trim_start_matches("http://").to_string(),
+                format!("{url}/?x=1"),
+                format!("{url}#fragment"),
+            ] {
+                let (dir, path) = temp_config(T3Config::default());
+                apply_config_edit(&path, |config| {
+                    config.deepseek.token = Some("test-token".into());
+                    config.deepseek.secret = Some("test-secret".into());
+                    if source == "config" {
+                        config.deepseek.endpoint = Some(raw.clone());
+                    }
+                })
+                .unwrap();
+                setup_deepseek_at(
+                    &path,
+                    (source == "flag").then(|| raw.clone()),
+                    (source == "env").then_some(raw),
+                )
+                .await
+                .unwrap();
+                let saved = reload(&path);
+                assert_eq!(
+                    saved.deepseek.endpoint.as_deref(),
+                    Some(url.as_str()),
+                    "{source}"
+                );
+                assert!(saved.deepseek.enabled);
+                assert_eq!(saved.deepseek.autostart, source != "env");
+                std::fs::remove_dir_all(dir).ok();
+            }
+        }
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            9,
+            "each setup must reach the prefixed mock"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn setup_deepseek_failed_environment_override_does_not_save_default_target() {
+        let (url, calls, server) = mock_deepseek_setup(axum::http::StatusCode::UNAUTHORIZED).await;
+        let (dir, path) = temp_config(T3Config::default());
+        apply_config_edit(&path, |config| {
+            config.deepseek.token = Some("test-token".into());
+            config.deepseek.secret = Some("test-secret".into());
+        })
+        .unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert!(setup_deepseek_at(&path, None, Some(url.clone()))
+            .await
+            .is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        for invalid in [
+            format!(
+                "http://user:password@{}/proxy",
+                url.trim_start_matches("http://").trim_end_matches("/proxy")
+            ),
+            String::new(),
+            "ftp://127.0.0.1".into(),
+        ] {
+            assert!(setup_deepseek_at(&path, None, Some(invalid)).await.is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let invalid = format!(
+            "http://user:password@{}/proxy",
+            url.trim_start_matches("http://").trim_end_matches("/proxy")
+        );
+        assert!(
+            setup_deepseek_at(&path, Some(invalid.clone()), Some(url.clone()))
+                .await
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        apply_config_edit(&path, |config| config.deepseek.endpoint = Some(invalid)).unwrap();
+        let configured_before = std::fs::read(&path).unwrap();
+        assert!(setup_deepseek_at(&path, None, Some(url)).await.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), configured_before);
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "invalid flag/config must not fall back to environment"
+        );
+        std::fs::remove_dir_all(dir).ok();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn setup_deepseek_same_url_restart_tracks_effective_startup_permission() {
+        let (url, calls, server) = mock_deepseek_setup(axum::http::StatusCode::OK).await;
+        for (enabled, autostart, env_only, restart_expected) in [
+            (false, true, false, true),
+            (true, true, false, false),
+            (false, false, false, false),
+            (true, false, false, false),
+            (false, true, true, true),
+            (true, true, true, false),
+            (true, false, true, false),
+        ] {
+            let (dir, path) = temp_config(T3Config::default());
+            apply_config_edit(&path, |config| {
+                config.deepseek = DeepseekConfig {
+                    enabled,
+                    autostart,
+                    endpoint: (!env_only).then(|| format!("{url}/")),
+                    token: Some("test-token".into()),
+                    secret: Some("test-secret".into()),
+                };
+            })
+            .unwrap();
+            let restart = setup_deepseek_at(&path, None, env_only.then(|| url.clone()))
+                .await
+                .unwrap();
+            let saved = reload(&path);
+            assert!(saved.deepseek.enabled);
+            assert_eq!(saved.deepseek.endpoint.as_deref(), Some(url.as_str()));
+            assert_eq!(saved.deepseek.autostart, autostart && !env_only);
+            assert_eq!(
+                restart, restart_expected,
+                "enabled={enabled} autostart={autostart} env_only={env_only}"
+            );
+            std::fs::remove_dir_all(dir).ok();
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 7);
+        server.abort();
     }
 
     #[tokio::test]
@@ -1223,8 +1474,25 @@ mod tests {
             endpoint: Some("http://127.0.0.1:3080/".into()),
             ..Default::default()
         };
-        assert!(!deepseek_needs_restart(&deepseek, "http://127.0.0.1:3080"));
-        assert!(deepseek_needs_restart(&deepseek, "http://127.0.0.1:19387"));
+        let mut after = deepseek.clone();
+        enable_deepseek(&mut after, "http://127.0.0.1:3080");
+        assert!(
+            deepseek_needs_restart(&deepseek, &after, None),
+            "same URL gains spawn permission"
+        );
+        let before = after.clone();
+        after.endpoint = Some("127.0.0.1:3080/".into());
+        assert!(!deepseek_needs_restart(&before, &after, None));
+        after.endpoint = Some("http://127.0.0.1:19387".into());
+        assert!(deepseek_needs_restart(&before, &after, None));
+        let default_enabled = DeepseekConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        assert!(
+            !deepseek_needs_restart(&default_enabled, &before, None),
+            "pinning the same effective default does not change startup permission"
+        );
     }
 
     #[test]

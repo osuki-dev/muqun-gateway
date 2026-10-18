@@ -428,6 +428,18 @@ pub async fn build_discovery(state: &AppState, _sealed: bool, authenticated: boo
     .map(String::from)
     .collect();
 
+    // What `POST /api/tasks` can do for each agent, beside its features.
+    let mut planes = serde_json::to_value(&planes).unwrap_or(Value::Null);
+    if let Some(agents) = planes
+        .pointer_mut("/agents/agents")
+        .and_then(Value::as_array_mut)
+    {
+        for agent in agents {
+            let id = agent["id"].as_str().unwrap_or_default().to_owned();
+            agent["ledgerDelivery"] =
+                json!(crate::tasks::routes::ledger_delivery_names(state, &id).await);
+        }
+    }
     json!({
         "transport_versions": crate::connectivity::transport::SUPPORTED_VERSIONS,
         "ok": true,
@@ -441,6 +453,12 @@ pub async fn build_discovery(state: &AppState, _sealed: bool, authenticated: boo
         "generation": &*state.generation,
         "serverId": state.config.server_id,
         "label": state.config.label,
+        // What `POST /api/uploads` takes, for the app to say on a 413. Two
+        // numbers, the same for everyone.
+        "uploads": {
+            "maxBytes": crate::platform::uploads::MAX_UPLOAD_BYTES,
+            "maxVideoBytes": crate::platform::uploads::MAX_VIDEO_UPLOAD_BYTES,
+        },
         "planes": planes,
         // Not redacted for anyone: a path and a protocol number say nothing
         // an unauthenticated caller could not learn by trying the upgrade.
@@ -602,6 +620,28 @@ mod tests {
                 agent["features"].get("extra").is_none(),
                 "flags are flattened"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn timeline_earlier_discovery_declares_only_the_implementing_adapters() {
+        let state = crate::test_state("admin", Vec::new());
+        let discovery = build_discovery(&state, false, true).await;
+        assert!(discovery["capabilities"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("agent_timeline_earlier_v1")));
+        let agents = discovery["planes"]["agents"]["agents"].as_array().unwrap();
+        for (id, supported) in [
+            ("opencode", true),
+            ("deepseek", true),
+            ("t3", false),
+            ("codex", true),
+        ] {
+            let agent = agents.iter().find(|agent| agent["id"] == id).unwrap();
+            assert_eq!(agent["features"]["timelineEarlier"], supported, "{id}");
+            assert!(agent["features"].get("timeline_earlier").is_none());
+            assert!(agent["features"].get("extra").is_none());
         }
     }
 

@@ -74,7 +74,16 @@ decoding. A malformed envelope, malformed JSON, oversized frame, event overload
 or lost connection closes the connection and requests resynchronization rather
 than silently skipping/truncating transcript data.
 
-Bounds: 4 MiB per inbound/outbound frame or streamed text/output row, 32
+Bounds: 4 MiB per ordinary inbound/outbound frame or streamed text/output row.
+Primary shared transport accepts a successful `thread/items/list` reply up to 32 MiB only
+when its numeric ID matches a pending item-list request and its data contains at
+most 100 rows. The decoder's 32-MiB wire ceiling is not a total heap-memory bound;
+other oversized envelopes can be buffered before correlation rejects them.
+The separate read-only history decoder accepts at most 256 MiB, further reduced to
+the operation's remaining wire allowance. Its correlated item/full-turn and legacy
+`thread/read(includeTurns:true)` replies use that role-specific ceiling; full-turn
+pages retain their 100-row bound. Primary/live/control decoder bounds do not increase.
+Outbound frames and ordinary accepted inbound frames retain the 4-MiB limit. There are 32
 pending RPCs/server callbacks (callbacks also share an 8 MiB payload bound),
 32 scheduled metadata-read workers,
 16 queued events, 4,096 explicitly loaded
@@ -93,6 +102,80 @@ The transport actor owns complete frames and still closes on actual I/O failure.
 Unknown methods, thread creation/resume, turns and callback replies keep the
 mutation cancellation fence. A disconnected client refuses new requests before
 writing them; cached discovery and status no longer advertise it as connected.
+
+### Isolated shared history reads
+
+Image-bearing reads (`thread/items/list`, `thread/turns/list` with `itemsView:full`,
+and `thread/read` with `includeTurns:true`) use one lazily attached read-only
+connection per primary connection generation. This includes current-turn question
+recovery and rollout projection reads. Metadata-only reads and live/control traffic
+stay on the primary. The reader must match the primary's canonical Codex home,
+protected physical socket path/device/inode and peer UID; available peer PID and
+Linux process birth identity are pinned too. Alias/protection/identity checks are
+repeated before each read. Missing or replaced endpoints fail locally; this path
+never discovers another endpoint, spawns/restarts a daemon, logs in, or falls back
+to a large primary read. Initialization retains the existing version/home/auth
+validation and `account/read(refreshToken:false)`.
+
+The history role rejects mutations and callback replies before writing. Its actor
+admits at most one outstanding read, fails excess callers immediately, and keeps
+the reservation after caller cancellation until the late reply is consumed or a
+20-second total operation deadline ends the history transport. A failed reader is
+discarded. Only a decoder capacity failure of `thread/items/list` with an explicit
+count from 2 through 100 permits one automatic read-only recovery: normal item pages
+are first capped at eight to avoid requesting a huge aggregate, then reduce the count
+directly to one, keep the exact opaque cursor/turn/sort parameters, and attach a fresh
+verified reader. That smaller count is retained for later pages in this primary
+generation. No failed decoder is reused. A terminal error or failed one-item read
+enters a three-second cooldown before a later explicit read may reconnect; the one
+bounded shrinking recovery does not wait out or extend that cooldown. No other
+error, legacy read or mutation is automatically replayed. Primary cancellation closes its reader;
+reader failure does not publish a primary manager disconnect or change primary
+readiness. Errors remain errors, not empty/exhausted pages: failed preparations do
+not publish a cursor, replace retained history or mark hydration complete. Question
+recovery still checks the primary ownership revision and active turn before publishing.
+
+The operation shares its caller's traversal deadline (at most 20 seconds) and remaining
+wire-work allowance. Abandoned enqueued reads retain admission until completion or
+deadline, but do not start a shrinking recovery after caller cancellation. History
+traversals allow 768 MiB of total wire work, not 768-MiB frames: successful reply sizes
+plus a conservative charge of twice the **actual reader ceiling** per capacity failure
+(at most 512 MiB). That bounds an accumulated message plus one further bounded frame;
+larger advertised frames are rejected
+before payload reading. Work is charged before retry admission/publication, and a
+budget overrun is an explicit error. One final bounded decoder operation can exceed
+the remaining allowance before its size is known; it cannot publish a page or retry.
+Normal inventories retain their 32-MiB total budget. This wire-work accounting is not
+a decoder heap limit or a guarantee of upstream server computation/serialization cost.
+Persisted rollout projection retains its smaller four-call/2-MiB batch allowance
+and the enclosing poll's five-second absolute deadline, including time already spent
+on metadata/tail work. It passes only the remaining bytes/deadline into the history
+actor; its decoder is correspondingly at most 2 MiB, and exhausted work cannot open a
+recovery reader or start a fresh 20-second clock. A cached reader with a different
+ceiling is disconnected/replaced, never reused above the caller's bound.
+
+Shared snapshot/older reads publish a shorter nonempty window of complete accepted
+items when the remaining traversal work cannot admit another maximum-sized item,
+or its page/deadline budget is reached. The actual committed upstream cursor is kept
+for the next explicit older read; a short page is not EOF. Raw image results are moved
+out of the RPC envelope and projected once; only the mapped older prefix is cached
+when a row limit splits an item. No giant raw image is retained merely to remap it.
+
+This is **bounded aggregate recovery and request-local failure isolation, not complete
+long-history or attachment availability**. Item-count pagination splits oversized
+aggregates whose individual items fit. The bounded history-only ceiling accommodates
+approximately 200-MiB JSON image items without raising primary limits; measured wire
+and decoded image bytes differ (base64 is larger). It is not arbitrary-size streaming.
+A single item above that ceiling cannot be split by the
+item-count limit. The pinned item-list schema has no byte-range, image-result exclusion
+or item-content chunk parameter; no such upstream projection is assumed here.
+Authorized original-file/image download references are a separate asset-normalization
+unit, not fabricated from a failed undecoded reply. Oversized unsolicited primary
+notifications can still close the primary; isolating history does not solve that path.
+The wire ceiling is not a total heap-memory ceiling. Existing history/mirror cache
+limits must also be addressed separately before claiming arbitrarily long history
+remains navigable; they are not an upstream retention guarantee.
+
 Private-child shutdown closes stdin and allows up to 46 seconds for upstream cleanup;
 normal cleanup returns as soon as the child exits. If that grace expires,
 Gateway attempts cleanup of proven owned descendants, allowing 250 ms for
@@ -192,10 +275,37 @@ into timeline order until the requested **mapped** tail is satisfied or verified
 history end, including pages of unmapped items;
 `legacy` threads use `thread/read` with `includeTurns: true`. Legacy reads are
 bounded by the transport frame limit and fail instead of clipping a JSON body.
-The neutral history API returns the requested tail, at most 2,000 rows; it does
-not expose an invented history cursor. Unknown storage modes are Unsupported.
-Traversals share a 20-second total deadline, 128-page, 20,000-raw-row and 32-MiB
-actual-response-body budget, in addition to the 4-MiB frame bound. Malformed
+The neutral history API returns the requested tail, at most 2,000 mapped rows;
+it does not expose an invented history cursor. `timelineEarlier: true`, together
+with Gateway capability `agent_timeline_earlier_v1`, declares the stateful older
+page endpoint (80 mapped rows per HTTP batch). A raw residual page and an item-local
+mapped-prefix boundary retain reasoning rows split at a batch boundary, so no rows
+are clipped when one native item expands beyond the requested limit. Legacy reads
+retain their bounded raw response for the same older-row operation. Successful
+snapshot acceptance resets that session's boundary; failure/cancellation does not
+consume it. Canonical tail reads prepare a candidate with a one-shot synchronous
+commit. Initial history fences incarnation/removal generation and preserves newer
+live rows; refresh additionally requires an unchanged mirror sequence. The mirror
+invokes the commit under its write lock, then accepts rows without another await.
+A monotonic adapter revision, captured before metadata/rollout I/O, rejects stale
+candidates if earlier-page progress or another
+accepted tail won; candidates never roll back shared state. All async rollout and
+usage preparation finishes before the commit, and direct tail reads have no
+cancellable await after final publication. Four caller-owned prepared leases bound
+pending candidates and release on rejection/cancellation, without a token cache.
+This is pagination/transcript acceptance, not a general transaction over usage or
+all adapter state. Usage sampling may update its cache before acceptance; initial
+pending-request catch-up can be cancelled after mirror rows and pagination have
+already been accepted together.
+Tail and earlier page reads serialize; residual/cursor retention is bounded to 4096
+sessions and 32 MiB globally within this adapter, with explicit errors rather than
+silent eviction. Checked prefix positions insert older same-turn items before the
+displayed tail without renumbering stable anchors. Unknown storage modes are Unsupported.
+Traversals share a 20-second total deadline, 128-page and 20,000-raw-row budget.
+Inventories have a 32-MiB actual-response-body budget; shared image-bearing history
+uses the bounded 768-MiB wire-work accounting described above, including failed decodes.
+Each accepted isolated history reply fits its at-most-256-MiB reader ceiling; primary
+shared replies retain their 32-MiB exception and ordinary frames remain 4 MiB. Malformed
 pages/cursors, cursor cycles, RPC errors or exhausted budgets return errors, not
 partial inventories or an unsatisfied history tail advertised as complete.
 
@@ -313,9 +423,10 @@ acknowledgement: the result is reported unknown/error, **not resubmitted**.
 
 Per-provider flags declare only the implemented features. File-restoring revert
 and staged revert remain false: Codex's transcript-only `thread/revert` does
-not restore workspace files. Worktrees, modes, skills, inbox, slash commands,
-compaction, background shells, durable instructions and runtime MCP injection
-remain unsupported.
+not restore workspace files. Compaction is supported through the stable
+`thread/compact/start`, for owned native idle sessions only (see
+`codex-capabilities.md`). Worktrees, modes, inbox, background shells,
+durable instructions and runtime MCP injection remain unsupported.
 
 ## Acceptance evidence and limits
 
@@ -406,9 +517,10 @@ After an accepted shared-daemon rejoin, opening its timeline also recovers unans
 questions from the exact currently active turn. Paginated storage uses
 `thread/items/list` filtered by `turnId`; legacy storage uses a single
 `thread/turns/list` page with `itemsView: full`, requiring the returned active turn
-identity to match. Recovery is bounded to 1,600 items, 16 pages, 1 MiB of retained
-question/reply items, and the existing 20-second/32-MiB traversal and 4-MiB frame
-limits. It publishes no partial result. Committed answer envelopes are applied before
+identity to match. Recovery is bounded to 1,600 items, 128 pages, 1 MiB of retained
+question/reply items, and the shared 20-second deadline, history wire-work budget
+and role-specific correlated history-reply ceiling described above.
+It publishes no partial result. Committed answer envelopes are applied before
 question forms; bounded answer identities also prevent a concurrent TUI answer from
 being resurrected by recovery. Turn changes, completion, disconnect, or an unload/rejoin
 of the same thread fence the result. Explicit interrupt and prompt control do not wait

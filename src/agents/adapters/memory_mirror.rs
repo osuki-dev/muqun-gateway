@@ -17,7 +17,10 @@ const MAX_EVENT_LOG_ENTRIES: usize = 2000;
 /// a refetch carries a whole timeline, so a count alone bounds nothing.
 const MAX_EVENT_LOG_BYTES: usize = 4 * 1024 * 1024;
 /// Timeline rows kept per session; the oldest are dropped first.
-const MAX_TIMELINE_ITEMS: usize = 1500;
+/// Rows kept per session. The trim drops the oldest, which are exactly the
+/// earlier pages the app just pulled, so the cap holds the newest hundred
+/// plus many earlier batches before a pull is undone by the next upsert.
+const MAX_TIMELINE_ITEMS: usize = 5000;
 /// Per tool call, how much output text is kept. Beyond this the text is cut and
 /// the part is flagged `truncated`.
 const MAX_TOOL_OUTPUT_BYTES: usize = 64 * 1024;
@@ -236,7 +239,81 @@ pub struct MemoryMirror {
     agent_id: Arc<str>,
 }
 
+/// One existing session incarnation and removal boundary, captured before a
+/// delivered-input HTTP read. Ordinary assistant deltas do not invalidate it.
+pub(crate) struct DeliveredInputRevision {
+    incarnation: Arc<tokio::sync::Mutex<()>>,
+    removal_generation: u64,
+}
+
 impl MemoryMirror {
+    pub(crate) async fn delivered_input_revision(
+        &self,
+        asid: &AgentSessionId,
+    ) -> Option<DeliveredInputRevision> {
+        let sessions = self.sessions.read().await;
+        let state = sessions.get(asid).filter(|state| !state.info.deleted)?;
+        Some(DeliveredInputRevision {
+            incarnation: state.history_gate.clone(),
+            removal_generation: state.history_removal_generation,
+        })
+    }
+
+    /// Accept the canonical row and remove its receipt under the same write
+    /// lock as deletion/eviction. Never create an entry for an obsolete read.
+    /// Publication is synchronous under that lock so HTTP removal cannot
+    /// overtake the accepted events either.
+    pub(crate) async fn commit_delivered_input(
+        &self,
+        asid: &AgentSessionId,
+        revision: &DeliveredInputRevision,
+        inbox_id: &str,
+        items: Vec<TimelineItem>,
+        publish: impl FnOnce(&[AgentDomainEvent]),
+    ) -> bool {
+        let mut sessions = self.sessions.write().await;
+        let Some(state) = sessions.get_mut(asid) else {
+            return false;
+        };
+        if state.info.deleted
+            || !Arc::ptr_eq(&revision.incarnation, &state.history_gate)
+            || revision.removal_generation != state.history_removal_generation
+        {
+            return false;
+        }
+        let mut events = Vec::new();
+        if !items.is_empty() {
+            let seq = state.next_seq();
+            let mut updated = Vec::new();
+            for mut item in items {
+                item.seq = seq;
+                if let AgentPart::Tool(ref mut call) = item.part {
+                    truncate_tool_output(call);
+                }
+                state.insert_item(item.clone());
+                updated.push(item);
+            }
+            events.push(AgentDomainEvent::TimelineUpsert {
+                asid: asid.clone(),
+                items: updated,
+                seq,
+            });
+        }
+        state
+            .inbox
+            .retain(|item| item.get("id").and_then(serde_json::Value::as_str) != Some(inbox_id));
+        events.push(AgentDomainEvent::InboxChanged {
+            asid: asid.clone(),
+            items: state.inbox.clone(),
+            seq: state.next_seq(),
+        });
+        for event in &events {
+            state.push_event(event.clone());
+        }
+        publish(&events);
+        true
+    }
+
     /// Return the exact bounded, revision-stamped event retained for replay.
     /// Live publishers must not resend the caller's unstamped input rows.
     pub(crate) async fn record_timeline_upsert(
@@ -396,6 +473,7 @@ impl MemoryMirror {
 
     /// Merge one bounded initial history read without replacing newer live rows.
     /// The gate identity fences eviction/recreation while the provider was read.
+    #[cfg(test)]
     pub(crate) async fn initialize_history(
         &self,
         asid: &AgentSessionId,
@@ -403,18 +481,36 @@ impl MemoryMirror {
         before_read: (u64, u64),
         items: Vec<TimelineItem>,
     ) -> bool {
+        self.initialize_prepared_history(asid, gate, before_read, items, None)
+            .await
+            .expect("stateless history acceptance cannot fail")
+    }
+
+    pub(crate) async fn initialize_prepared_history(
+        &self,
+        asid: &AgentSessionId,
+        gate: &Arc<tokio::sync::Mutex<()>>,
+        before_read: (u64, u64),
+        items: Vec<TimelineItem>,
+        commit: Option<crate::agents::ports::agent::TimelineCommit<'_>>,
+    ) -> Result<bool, crate::agents::ports::agent::AgentError> {
         let mut sessions = self.sessions.write().await;
         let Some(state) = sessions.get_mut(asid) else {
-            return false;
+            return Ok(false);
         };
         if !Arc::ptr_eq(gate, &state.history_gate) {
-            return false;
+            return Ok(false);
         }
         if state.history_initialized {
-            return true;
+            return Ok(true);
         }
         if state.history_removal_generation != before_read.1 {
-            return false;
+            return Ok(false);
+        }
+        // Both fences have passed. The adapter's one-shot synchronous commit
+        // and mirror acceptance share this write lock and one uncancellable poll.
+        if let Some(commit) = commit {
+            commit()?;
         }
         let mut accepted: Vec<_> = items
             .into_iter()
@@ -441,7 +537,7 @@ impl MemoryMirror {
             });
         }
         state.history_initialized = true;
-        true
+        Ok(true)
     }
 
     /// Upstream metadata cannot erase read markers the Gateway owns.
@@ -1269,15 +1365,54 @@ impl MemoryMirror {
 
     /// Commit an explicitly requested provider read only if no newer event won.
     /// Invalidate older replay cursors; never broadcast replacement transcript rows.
+    #[cfg(test)]
     pub(crate) async fn refresh_snapshot(
+        &self,
+        snapshot: crate::agents::ports::mirror::AgentSessionSnapshot,
+        expected: Option<u64>,
+    ) -> Option<crate::agents::ports::mirror::AgentSessionSnapshot> {
+        self.refresh_prepared_snapshot(snapshot, expected, None, None)
+            .await
+            .expect("stateless snapshot acceptance cannot fail")
+    }
+
+    /// Capture sequence and incarnation together, fencing same-seq recreation.
+    pub(crate) async fn snapshot_read_revision(
+        &self,
+        asid: &AgentSessionId,
+    ) -> (Option<u64>, Option<Arc<tokio::sync::Mutex<()>>>) {
+        let sessions = self.sessions.read().await;
+        match sessions.get(asid) {
+            Some(state) => (Some(state.current_seq), Some(state.history_gate.clone())),
+            None => (None, None),
+        }
+    }
+
+    pub(crate) async fn refresh_prepared_snapshot(
         &self,
         mut snapshot: crate::agents::ports::mirror::AgentSessionSnapshot,
         expected: Option<u64>,
-    ) -> Option<crate::agents::ports::mirror::AgentSessionSnapshot> {
+        incarnation: Option<Arc<tokio::sync::Mutex<()>>>,
+        commit: Option<crate::agents::ports::agent::TimelineCommit<'_>>,
+    ) -> Result<
+        Option<crate::agents::ports::mirror::AgentSessionSnapshot>,
+        crate::agents::ports::agent::AgentError,
+    > {
         let mut sessions = self.sessions.write().await;
         let asid = snapshot.info.asid.clone();
-        if sessions.get(&asid).map(|s| s.current_seq) != expected {
-            return None;
+        if sessions.get(&asid).map(|s| s.current_seq) != expected
+            || incarnation.as_ref().is_some_and(|gate| {
+                sessions
+                    .get(&asid)
+                    .is_none_or(|state| !Arc::ptr_eq(gate, &state.history_gate))
+            })
+        {
+            return Ok(None);
+        }
+        // No await after this commit: a rejected adapter token cannot alter the
+        // mirror, and cancellation cannot split pagination from accepted rows.
+        if let Some(commit) = commit {
+            commit()?;
         }
         if let Some(previous) = sessions.get(&asid) {
             snapshot.info.time_viewed = previous.info.time_viewed;
@@ -1306,7 +1441,7 @@ impl MemoryMirror {
         state.event_log.clear();
         state.event_log_bytes = 0;
         state.replay_floor = snapshot.seq;
-        Some(snapshot)
+        Ok(Some(snapshot))
     }
 
     /// The session's info as held, without the rest of its snapshot.

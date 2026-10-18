@@ -14,8 +14,8 @@ use super::state_lock;
 use crate::authority::DeviceRecord;
 use crate::{
     transport, Config, PairingFile, PushTokenRecord, CONFIG_FILE, DEVICES_BACKUP_FILE,
-    DEVICES_FILE, HERDR_PLUGIN_IMPORT_MARKER, MAX_DEVICE_NAME_CHARS, PAIRING_CODE_CHARACTER_COUNT,
-    PAIRING_FILE, PID_FILE, PUSH_TOKENS_FILE,
+    DEVICES_FILE, MAX_DEVICE_NAME_CHARS, PAIRING_CODE_CHARACTER_COUNT, PAIRING_FILE, PID_FILE,
+    PUSH_TOKENS_FILE,
 };
 
 /// The config file `run` reads: the `--config` path when given, else the
@@ -47,6 +47,20 @@ pub(crate) fn override_config_dir(dir: PathBuf) {
     let _ = CONFIG_DIR_OVERRIDE.set(dir);
 }
 
+/// The test binary's config directory, beside its state directory: the
+/// pairing routes read and rotate `pairing.json` through `config_dir`, and a
+/// test must never do that to the gateway installed for the current user.
+#[cfg(test)]
+pub(crate) fn config_dir() -> anyhow::Result<std::path::PathBuf> {
+    if let Some(path) = CONFIG_DIR_OVERRIDE.get() {
+        return Ok(path.clone());
+    }
+    let dir = test_state_dir().join("config");
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+#[cfg(not(test))]
 pub(crate) fn config_dir() -> anyhow::Result<std::path::PathBuf> {
     if let Some(path) = CONFIG_DIR_OVERRIDE.get() {
         return Ok(path.clone());
@@ -55,7 +69,7 @@ pub(crate) fn config_dir() -> anyhow::Result<std::path::PathBuf> {
         return Ok(path.into());
     }
     let standalone = standalone_config_dir()?;
-    if !standalone.join(HERDR_PLUGIN_IMPORT_MARKER).exists() {
+    if !standalone.join(crate::HERDR_PLUGIN_IMPORT_MARKER).exists() {
         if let Ok(path) = std::env::var("HERDR_PLUGIN_CONFIG_DIR") {
             return Ok(path.into());
         }
@@ -113,7 +127,10 @@ pub(crate) fn state_dir() -> anyhow::Result<std::path::PathBuf> {
         return Ok(path.into());
     }
     let standalone_config = standalone_config_dir()?;
-    if !standalone_config.join(HERDR_PLUGIN_IMPORT_MARKER).exists() {
+    if !standalone_config
+        .join(crate::HERDR_PLUGIN_IMPORT_MARKER)
+        .exists()
+    {
         if let Ok(path) = std::env::var("HERDR_PLUGIN_STATE_DIR") {
             return Ok(path.into());
         }

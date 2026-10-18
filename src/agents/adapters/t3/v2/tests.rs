@@ -729,6 +729,12 @@ fn outer_event_sequence_and_known_decode_failures_are_distinct_from_extensions()
     assert!(projection::validate_event(&malformed, "thread").is_err());
     let extension = json!({"kind":"event","sequence":44,"event":{"type":"thread.future-feature"}});
     assert!(!projection::validate_event(&extension, "thread").unwrap());
+    // v0.1.0's one new type is known -- accepted and ignored, not skipped as
+    // an extension -- and held to the same envelope checks as the rest.
+    let link = json!({"kind":"event","sequence":45,"event":{"type":"thread.pull-request-link-updated","threadId":"thread","payload":{"url":"https://example.invalid/pull/1"}}});
+    assert!(projection::validate_event(&link, "thread").unwrap());
+    let other_thread = json!({"kind":"event","sequence":46,"event":{"type":"thread.pull-request-link-updated","threadId":"other","payload":{}}});
+    assert!(projection::validate_event(&other_thread, "thread").is_err());
 }
 
 use crate::agents::adapters::t3::{

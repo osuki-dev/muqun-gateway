@@ -15,6 +15,7 @@ use serde::Deserialize;
 use super::domain::{
     PrincipalKind, Requested, TaskBinding, TaskId, TaskOrigin, TaskPrincipal, TaskState,
 };
+use super::service::Delivery;
 use super::service::{
     task_directory, valid_goal, valid_name, BadDirectory, DelegateRequest, TaskError,
 };
@@ -31,7 +32,12 @@ const MAX_LABEL_CHARS: usize = 200;
 const MAX_MENTIONS: usize = 8;
 pub(crate) fn mount(router: Router<AppState>) -> Router<AppState> {
     router
-        .route("/api/tasks", get(list).post(create))
+        .route(
+            "/api/tasks",
+            get(list)
+                .post(create)
+                .layer(crate::agents::routes::large_body()),
+        )
         .route("/api/tasks/defaults", get(defaults))
         .route("/api/tasks/{id}", get(read))
         .route("/api/tasks/{id}/cancel", post(cancel))
@@ -196,6 +202,14 @@ struct CreateBody {
     /// handle (1..=45, default 30).
     #[serde(default)]
     timeout_s: Option<u64>,
+    /// `"session"`: open the task on the named agent's native session
+    /// adapter, bound to an agent session; `"pane"`: start the agent in a
+    /// terminal pane. Absent: as the agent kind decides, exactly as before.
+    /// What each agent can do is `ledgerDelivery` on its discovery entry
+    /// (`ledger_delivery` on the terminal catalog); capability
+    /// `task_ledger_delivery`.
+    #[serde(default)]
+    delivery: Option<String>,
 }
 
 /// How many attachments one task's goal may carry.
@@ -318,7 +332,14 @@ impl CreateBody {
         // task opens at home, as if nothing were remembered. Only a directory
         // the device asked for by name is refused when it is missing.
         let remembered = default_cwd.filter(|dir| std::path::Path::new(dir).is_dir());
+        let delivery = match self.delivery.as_deref() {
+            None => None,
+            Some("session") => Some(Delivery::Session),
+            Some("pane") => Some(Delivery::Pane),
+            Some(_) => return Err(invalid_request()),
+        };
         Ok(DelegateRequest {
+            delivery,
             goal: self.goal,
             cwd: requested_directory(self.cwd.as_deref().or(remembered))?,
             agent_id: self.agent_id,
@@ -333,6 +354,36 @@ impl CreateBody {
             attachments: self.attachments,
         })
     }
+}
+
+/// The deliveries `POST /api/tasks` can perform for agent `kind`:
+/// `Session` when a session adapter of that kind is attached, `Pane` when
+/// it is a known terminal agent. What `ledgerDelivery` on a discovery entry
+/// and `ledger_delivery` on the terminal catalog say.
+pub(crate) async fn ledger_deliveries(
+    state: &AppState,
+    kind: &str,
+) -> Vec<crate::tasks::service::Delivery> {
+    let mut deliveries = Vec::new();
+    if !kind.is_empty() && state.agent_runtime.manager_for_agent(kind).await.is_some() {
+        deliveries.push(crate::tasks::service::Delivery::Session);
+    }
+    if !kind.is_empty() && crate::tasks::pane_agent::is_terminal_agent(state, kind) {
+        deliveries.push(crate::tasks::service::Delivery::Pane);
+    }
+    deliveries
+}
+
+/// `ledger_deliveries` as the wire spells them.
+pub(crate) async fn ledger_delivery_names(state: &AppState, kind: &str) -> Vec<&'static str> {
+    ledger_deliveries(state, kind)
+        .await
+        .into_iter()
+        .map(|delivery| match delivery {
+            crate::tasks::service::Delivery::Session => "session",
+            crate::tasks::service::Delivery::Pane => "pane",
+        })
+        .collect()
 }
 
 /// `POST /api/tasks`: what `tasks.delegate` does -- a new agent session with
@@ -385,6 +436,18 @@ async fn create(
         None
     };
     let request = body.request(previous_cwd.as_deref(), &state.peers.names())?;
+    // A delivery the device named needs an agent that can do it: a session
+    // adapter attached for `session`, a known terminal agent for `pane`
+    // (`ledger_deliveries`). Refused before anything is made.
+    if let Some(delivery) = request.delivery {
+        let kind = request.agent_id.as_deref().unwrap_or_default();
+        if !ledger_deliveries(&state, kind).await.contains(&delivery) {
+            return Err(refused(
+                "invalid_request",
+                "that agent cannot take the delivery asked for",
+            ));
+        }
+    }
     // Named from the device record the token belongs to, never from the
     // body: another computer cannot pass itself off as a third (§10.5).
     let by = Requested {
@@ -881,6 +944,63 @@ mod tests {
             crate::test_support::FakeAgent::new("opencode").with_sessions(&[("opencode_new", 1)]);
         state.agent_runtime.attach_for_test(agent.manager()).await;
         state
+    }
+
+    /// `delivery: "session"` opens a task on the named agent's session
+    /// adapter, bound to an agent session and answered with its `asid`,
+    /// where the same body without it starts a pane for an agent that is
+    /// also a terminal agent; a delivery the agent cannot perform is refused
+    /// before anything is made, and the discovery entry says which it can.
+    #[tokio::test]
+    async fn a_named_delivery_is_routed_as_said_or_refused() {
+        let state = state();
+        let dir = std::env::temp_dir().canonicalize().unwrap();
+        let body = json!({ "goal": "g", "cwd": dir, "agent_id": "codex", "delivery": "session" });
+        let (status, refusal) = send(&state, "POST", "/api/tasks", Some(body.clone()), true).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{refusal}");
+        assert_eq!(refusal["error"]["code"], "invalid_request");
+        let (_, listed) = call(&state, "GET", "/api/tasks").await;
+        assert_eq!(listed["tasks"], json!([]));
+
+        let agent = crate::test_support::FakeAgent::new("codex").with_sessions(&[("codex_new", 1)]);
+        let prompts = agent.prompts.clone();
+        state.agent_runtime.attach_for_test(agent.manager()).await;
+        let (status, task) = send(&state, "POST", "/api/tasks", Some(body), true).await;
+        assert_eq!(status, StatusCode::OK, "{task}");
+        assert_eq!(task["asid"], "codex_new");
+        assert!(task.get("pane_id").is_none(), "{task}");
+        assert_eq!(
+            task["binding"],
+            json!({ "kind": "agent_session", "agent_id": "codex", "asid": "codex_new" })
+        );
+        assert_eq!(*prompts.lock().unwrap(), vec!["g".to_string()]);
+        assert_eq!(
+            ledger_delivery_names(&state, "codex").await,
+            ["session", "pane"],
+            "both, now that a session adapter of that kind is attached"
+        );
+        // An agent with no terminal launcher cannot be asked for a pane, one
+        // with no session adapter not for a session; a word that is neither
+        // is a bad request.
+        assert!(ledger_delivery_names(&state, "ghost-agent")
+            .await
+            .is_empty());
+        for (agent_id, delivery) in [
+            ("ghost-agent", "pane"),
+            ("ghost-agent", "session"),
+            ("codex", "carrier-pigeon"),
+        ] {
+            let (status, refusal) = send(
+                &state,
+                "POST",
+                "/api/tasks",
+                Some(json!({ "goal": "g", "agent_id": agent_id, "delivery": delivery })),
+                true,
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{agent_id}: {refusal}");
+            assert_eq!(refusal["error"]["code"], "invalid_request");
+        }
     }
 
     #[tokio::test]

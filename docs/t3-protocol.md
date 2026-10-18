@@ -408,8 +408,13 @@ Fixtures: `fixtures/activity_approval_requested.json`,
 
 V1 reference: stable **v0.0.45**, commit
 `6c8fed35dded9ff71c5b46807125457acbb76be6`.
-V2 reference: released **v0.0.46-nightly.20261013.3042**, commit
-`5d6e4192bfcf9eca09741605e12c72b5970025e4`.
+V2 reference: stable **v0.1.0** (released 2026-10-15), commit
+`81493efb71e8e8244f95d3e9f71d8369654ab151`, which makes Orchestrator V2 the
+stable, V2-only server. Its diff against the nightly this implementation was
+written to (`v0.0.46-nightly.20261013.3042`, `5d6e4192`) is contract-additive
+only: every RPC, command and endpoint identifier the adapter uses is
+unchanged; the one new event type, `thread.pull-request-link-updated`, is
+accepted and ignored (`validate_event`).
 Sources are the pinned `packages/contracts/src/orchestrationV2.ts`,
 `environmentHttp.ts`, `project.ts`, `apps/server/src/ws.ts` and
 `apps/server/src/orchestration-v2/` handlers. Synthetic, trimmed fixtures and

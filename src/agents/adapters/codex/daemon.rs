@@ -12,6 +12,61 @@ use crate::agents::ports::agent::AgentError;
 
 type Connection = (Arc<CodexClient>, mpsc::Receiver<CodexEvent>);
 
+#[cfg(unix)]
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct SharedIdentity {
+    pub(crate) home: PathBuf,
+    socket: PathBuf,
+    device: u64,
+    inode: u64,
+    uid: u32,
+    pid: Option<u32>,
+    birth: Option<u64>,
+}
+
+#[cfg(unix)]
+fn process_birth(pid: Option<u32>) -> Result<Option<u64>, AgentError> {
+    #[cfg(not(target_os = "linux"))]
+    let _ = pid;
+    #[cfg(target_os = "linux")]
+    if let Some(pid) = pid {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .map_err(|_| unavailable("Codex daemon process identity unavailable"))?;
+        let birth = stat
+            .rsplit_once(')')
+            .and_then(|(_, fields)| fields.split_whitespace().nth(19))
+            .and_then(|value| value.parse().ok())
+            .ok_or_else(|| unavailable("Codex daemon process identity unavailable"))?;
+        return Ok(Some(birth));
+    }
+    Ok(None)
+}
+
+#[cfg(unix)]
+impl SharedIdentity {
+    pub(crate) fn verify(&self) -> Result<(), AgentError> {
+        use std::os::unix::fs::MetadataExt;
+        let (home, path) = verified_socket_in(
+            &self.home,
+            self.socket.parent().expect("verified socket parent"),
+        )?
+        .ok_or_else(|| unavailable("Codex history endpoint disappeared"))?;
+        let metadata = std::fs::metadata(&path)
+            .map_err(|_| unavailable("Codex history endpoint unavailable"))?;
+        if home != self.home
+            || path != self.socket
+            || metadata.dev() != self.device
+            || metadata.ino() != self.inode
+            || process_birth(self.pid)? != self.birth
+        {
+            return Err(unavailable(
+                "Codex history endpoint identity changed; primary connection retained",
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[cfg(not(test))]
 pub(crate) async fn connect_existing() -> Result<Option<Connection>, AgentError> {
     #[cfg(unix)]
@@ -104,21 +159,98 @@ pub(crate) async fn connect_at(home: &Path) -> Result<Option<Connection>, AgentE
     let Some((home, socket_path)) = verified_socket(home)? else {
         return Ok(None);
     };
+    connect_verified(home, socket_path, None, None)
+        .await
+        .map(Some)
+}
+
+/// Attach only to the endpoint captured by this primary generation. No discovery,
+/// fallback, daemon lifecycle command, config write or authentication refresh.
+#[cfg(unix)]
+pub(crate) async fn connect_history(
+    identity: &SharedIdentity,
+    parent: tokio_util::sync::CancellationToken,
+    read_limit: usize,
+) -> Result<Arc<CodexClient>, AgentError> {
+    identity.verify()?;
+    let (client, _events) = connect_verified_limited(
+        identity.home.clone(),
+        identity.socket.clone(),
+        Some(identity),
+        Some(parent),
+        read_limit,
+    )
+    .await?;
+    Ok(client)
+}
+
+#[cfg(unix)]
+pub(crate) async fn connect_verified(
+    home: PathBuf,
+    socket_path: PathBuf,
+    expected: Option<&SharedIdentity>,
+    parent: Option<tokio_util::sync::CancellationToken>,
+) -> Result<Connection, AgentError> {
+    connect_verified_limited(
+        home,
+        socket_path,
+        expected,
+        parent,
+        super::client::MAX_SHARED_READ_FRAME_BYTES,
+    )
+    .await
+}
+
+#[cfg(unix)]
+async fn connect_verified_limited(
+    home: PathBuf,
+    socket_path: PathBuf,
+    expected: Option<&SharedIdentity>,
+    parent: Option<tokio_util::sync::CancellationToken>,
+    read_limit: usize,
+) -> Result<Connection, AgentError> {
+    use std::os::unix::fs::MetadataExt;
+    let before = std::fs::metadata(&socket_path)
+        .map_err(|_| unavailable("Codex daemon socket unavailable"))?;
     let connect = async {
         let stream = tokio::net::UnixStream::connect(&socket_path)
             .await
             .map_err(|_| unavailable("Codex daemon connection unavailable"))?;
-        if stream.peer_cred().map(|peer| peer.uid()).ok() != Some(unsafe { libc::geteuid() }) {
+        let peer = stream
+            .peer_cred()
+            .map_err(|_| unavailable("Codex daemon peer identity unavailable"))?;
+        if peer.uid() != unsafe { libc::geteuid() } {
             return Err(unavailable("Codex daemon peer identity mismatch"));
         }
+        let pid = peer.pid().and_then(|pid| u32::try_from(pid).ok());
+        let identity = SharedIdentity {
+            home: home.clone(),
+            socket: socket_path.clone(),
+            device: before.dev(),
+            inode: before.ino(),
+            uid: peer.uid(),
+            pid,
+            birth: process_birth(pid)?,
+        };
+        identity.verify()?;
+        if expected.is_some_and(|expected| expected != &identity) {
+            return Err(unavailable(
+                "Codex history peer identity changed; primary connection retained",
+            ));
+        }
         let config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
-            .max_frame_size(Some(super::client::MAX_FRAME_BYTES))
-            .max_message_size(Some(super::client::MAX_FRAME_BYTES));
+            .max_frame_size(Some(read_limit))
+            .max_message_size(Some(read_limit));
         let (socket, _) =
             tokio_tungstenite::client_async_with_config("ws://localhost/rpc", stream, Some(config))
                 .await
                 .map_err(|_| unavailable("Codex daemon handshake failed"))?;
-        Ok(CodexClient::from_websocket(socket, home, socket_path))
+        let (mut client, events) =
+            CodexClient::from_websocket_with_parent(socket, home, socket_path, parent, read_limit);
+        Arc::get_mut(&mut client)
+            .expect("new client has one owner")
+            .shared_identity = Some(identity);
+        Ok((client, events))
     };
     let (client, events) = tokio::time::timeout(Duration::from_secs(3), connect)
         .await
@@ -127,7 +259,12 @@ pub(crate) async fn connect_at(home: &Path) -> Result<Option<Connection>, AgentE
         client.stop();
         return Err(error);
     }
-    Ok(Some((client, events)))
+    client
+        .shared_identity
+        .as_ref()
+        .expect("verified connection")
+        .verify()?;
+    Ok((client, events))
 }
 
 #[cfg(all(test, unix))]

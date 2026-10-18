@@ -13,6 +13,14 @@ use tokio_util::sync::CancellationToken;
 use crate::agents::ports::agent::AgentError;
 
 pub const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
+// A stored item page can aggregate several multi-MiB image results. Match the
+// existing traversal byte budget, not the outbound/text-row bound. Only a
+// correlated shared thread/items/list result may use this larger wire budget.
+pub(crate) const MAX_SHARED_READ_FRAME_BYTES: usize = 32 * 1024 * 1024;
+pub(super) const MAX_HISTORY_FRAME_BYTES: usize = 256 * 1024 * 1024;
+// One failed bounded decoder (message + frame), then one complete single item.
+// This is total wire work, not an allocation or primary/control frame limit.
+pub(super) const MAX_HISTORY_WIRE_WORK_BYTES: usize = 3 * MAX_HISTORY_FRAME_BYTES;
 const MAX_PENDING: usize = 32;
 const MAX_SERVER_REQUEST_BYTES: usize = 8 * 1024 * 1024;
 const QUEUE_SIZE: usize = 16;
@@ -69,6 +77,7 @@ type Reply = oneshot::Sender<Result<(Value, usize), AgentError>>;
 
 struct Pending {
     reply: Reply,
+    diagnostic_method: &'static str,
     turn_thread: Option<String>,
     selection_config: bool,
     attaches_thread: bool,
@@ -78,6 +87,8 @@ struct Pending {
 struct State {
     generation: String,
     shared: bool,
+    history_only: bool,
+    read_limit: usize,
     subscribed: Mutex<HashMap<String, u64>>,
     ownership_revision: AtomicU64,
     pending: Mutex<HashMap<u64, Pending>>,
@@ -88,6 +99,8 @@ struct State {
     lifecycle_completed_turns: Mutex<HashMap<String, String>>,
     next_id: AtomicU64,
     ready: AtomicBool,
+    disconnect_reason: std::sync::OnceLock<&'static str>,
+    history_capacity: std::sync::OnceLock<HistoryCapacity>,
     cancel: CancellationToken,
     events: mpsc::Sender<CodexEvent>,
 }
@@ -106,7 +119,38 @@ impl State {
     fn request_id(&self, id: &Value) -> Option<String> {
         request_key(id).map(|key| format!("{}:{}", self.generation, hex::encode(key.as_bytes())))
     }
+    #[track_caller]
     fn stop(&self) {
+        self.stop_reason("local_stop");
+    }
+
+    #[track_caller]
+    fn stop_reason(&self, reason: &'static str) {
+        self.stop_request(reason, None, "none");
+    }
+
+    #[track_caller]
+    fn stop_request(&self, reason: &'static str, rpc_id: Option<u64>, method: &'static str) {
+        // One first-cause record per connection, before cancellation wakes other
+        // owners. Never log params, upstream errors or native callback ids.
+        if self.disconnect_reason.set(reason).is_ok() {
+            let pending = locked(&self.pending);
+            let inflight: Vec<_> = pending
+                .iter()
+                .map(|(id, request)| (*id, request.diagnostic_method))
+                .collect();
+            tracing::warn!(
+                connection = %self.generation,
+                shared = self.shared,
+                history_only = self.history_only,
+                reason,
+                ?rpc_id,
+                method,
+                ?inflight,
+                source = %std::panic::Location::caller(),
+                "Codex connection stopped; requests are not retried"
+            );
+        }
         self.ready.store(false, Ordering::Release);
         self.cancel.cancel();
         for (_, pending) in locked(&self.pending).drain() {
@@ -123,9 +167,12 @@ impl State {
         if self.cancel.is_cancelled() {
             return Err(disconnected());
         }
-        if self.events.try_send(event).is_err() {
+        if let Err(error) = self.events.try_send(event) {
             // Never skip a delta or approval while claiming a connected stream.
-            self.stop();
+            self.stop_reason(match error {
+                mpsc::error::TrySendError::Full(_) => "event_queue_overflow",
+                mpsc::error::TrySendError::Closed(_) => "event_consumer_closed",
+            });
             return Err(AgentError::NotAvailable(
                 "Codex event backlog overflow; resync required".into(),
             ));
@@ -145,6 +192,40 @@ pub struct CodexClient {
     expected_home: Option<std::path::PathBuf>,
     codex_home: std::sync::OnceLock<std::path::PathBuf>,
     shared_socket: Option<std::path::PathBuf>,
+    #[cfg(unix)]
+    pub(crate) shared_identity: Option<super::daemon::SharedIdentity>,
+    #[cfg(unix)]
+    history: Arc<tokio::sync::Mutex<HistoryConnection>>,
+    #[cfg(unix)]
+    history_admission: Arc<tokio::sync::Semaphore>,
+}
+
+#[cfg(unix)]
+#[derive(Default)]
+struct HistoryConnection {
+    client: Option<Arc<CodexClient>>,
+    retry_at: Option<tokio::time::Instant>,
+    item_limit: Option<u64>,
+}
+
+#[derive(Clone, Copy)]
+struct HistoryCapacity {
+    wire_work: usize,
+}
+
+/// These are the only image-bearing history operations. Central dispatch also
+/// covers bounded rollout/question readers which do not use Budget::call.
+pub(super) fn image_history_request(method: &str, params: &Value) -> bool {
+    method == "thread/items/list"
+        || (method == "thread/turns/list" && params["itemsView"] == "full")
+        || (method == "thread/read" && params["includeTurns"] == true)
+}
+
+fn history_error() -> AgentError {
+    AgentError::RequestFailed(
+        "Codex history read failed; primary connection retained; page not consumed; no mutation retried"
+            .into(),
+    )
 }
 
 struct WritePacket {
@@ -155,18 +236,24 @@ struct WriteGuard {
     state: Arc<State>,
     finished: bool,
     fence_on_cancel: bool,
+    deadline: tokio::time::Instant,
 }
 impl Drop for WriteGuard {
     fn drop(&mut self) {
         if !self.finished && self.fence_on_cancel {
-            self.state.stop();
+            self.state
+                .stop_reason(if tokio::time::Instant::now() >= self.deadline {
+                    "mutation_write_deadline"
+                } else {
+                    "mutation_write_cancelled"
+                });
         }
     }
 }
 
 impl Drop for CodexClient {
     fn drop(&mut self) {
-        self.state.stop();
+        self.state.stop_reason("last_client_dropped");
     }
 }
 
@@ -175,6 +262,7 @@ struct PendingGuard {
     id: u64,
     fence_on_cancel: bool,
     enqueued: AtomicBool,
+    diagnostic_method: &'static str,
 }
 impl Drop for PendingGuard {
     fn drop(&mut self) {
@@ -189,7 +277,11 @@ impl Drop for PendingGuard {
         if unfinished && self.fence_on_cancel {
             // Caller cancellation after a write is also ambiguous. Do not keep
             // accepting prompts while an unacknowledged mutation may run.
-            self.state.stop();
+            self.state.stop_request(
+                "mutation_caller_cancelled",
+                Some(self.id),
+                self.diagnostic_method,
+            );
         }
     }
 }
@@ -204,12 +296,40 @@ fn read_only_request(method: &str, params: &Value) -> bool {
         method,
         "config/read"
             | "model/list"
+            | "skills/list"
             | "thread/list"
             | "thread/read"
             | "thread/loaded/list"
             | "thread/turns/list"
             | "thread/items/list"
     ) || (method == "account/read" && params["refreshToken"] == false)
+}
+
+// Unknown input is never a log field, even when it is used as an RPC method.
+fn diagnostic_method(method: &str) -> &'static str {
+    match method {
+        "initialize" => "initialize",
+        "initialized" => "initialized",
+        "account/read" => "account/read",
+        "config/read" => "config/read",
+        "model/list" => "model/list",
+        "skills/list" => "skills/list",
+        "thread/list" => "thread/list",
+        "thread/read" => "thread/read",
+        "thread/loaded/list" => "thread/loaded/list",
+        "thread/turns/list" => "thread/turns/list",
+        "thread/items/list" => "thread/items/list",
+        "thread/start" => "thread/start",
+        "thread/resume" => "thread/resume",
+        "thread/fork" => "thread/fork",
+        "thread/name/set" => "thread/name/set",
+        "thread/delete" => "thread/delete",
+        "thread/compact/start" => "thread/compact/start",
+        "turn/start" => "turn/start",
+        "turn/steer" => "turn/steer",
+        "turn/interrupt" => "turn/interrupt",
+        _ => "other",
+    }
 }
 
 impl CodexClient {
@@ -260,6 +380,8 @@ impl CodexClient {
         let state = Arc::new(State {
             generation: uuid::Uuid::new_v4().to_string(),
             shared: false,
+            history_only: false,
+            read_limit: MAX_FRAME_BYTES,
             subscribed: Mutex::new(HashMap::new()),
             ownership_revision: AtomicU64::new(0),
             pending: Mutex::new(HashMap::new()),
@@ -269,6 +391,8 @@ impl CodexClient {
             lifecycle_completed_turns: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
             ready: AtomicBool::new(false),
+            disconnect_reason: std::sync::OnceLock::new(),
+            history_capacity: std::sync::OnceLock::new(),
             cancel: CancellationToken::new(),
             events,
         });
@@ -313,6 +437,12 @@ impl CodexClient {
                 expected_home: None,
                 codex_home: std::sync::OnceLock::new(),
                 shared_socket: None,
+                #[cfg(unix)]
+                shared_identity: None,
+                #[cfg(unix)]
+                history: Arc::default(),
+                #[cfg(unix)]
+                history_admission: Arc::new(tokio::sync::Semaphore::new(1)),
             }),
             rx,
         )
@@ -405,8 +535,15 @@ impl CodexClient {
     pub fn cancel_token(&self) -> CancellationToken {
         self.state.cancel.clone()
     }
+    #[track_caller]
     pub fn stop(&self) {
         self.state.stop();
+        #[cfg(unix)]
+        if let Ok(mut history) = self.history.try_lock() {
+            if let Some(client) = history.client.take() {
+                client.stop();
+            }
+        }
     }
 
     pub async fn initialize(&self) -> Result<(), AgentError> {
@@ -496,6 +633,22 @@ impl CodexClient {
         method: &str,
         params: Value,
     ) -> Result<(Value, usize), AgentError> {
+        self.call_sized_budgeted(
+            method,
+            params,
+            tokio::time::Instant::now() + self.timeout,
+            MAX_HISTORY_WIRE_WORK_BYTES,
+        )
+        .await
+    }
+
+    pub(super) async fn call_sized_budgeted(
+        &self,
+        method: &str,
+        params: Value,
+        deadline: tokio::time::Instant,
+        wire_allowance: usize,
+    ) -> Result<(Value, usize), AgentError> {
         if self.state.cancel.is_cancelled() {
             return Err(AgentError::NotAvailable(
                 "Codex connection is no longer ready; refresh its status before continuing".into(),
@@ -506,7 +659,175 @@ impl CodexClient {
                 "Codex is not initialized and authenticated".into(),
             ));
         }
+        #[cfg(unix)]
+        if self.is_shared() && !self.state.history_only && image_history_request(method, &params) {
+            return self
+                .history_call(method, params, deadline, wire_allowance)
+                .await;
+        }
         self.call_inner_sized(method, params).await
+    }
+
+    #[cfg(unix)]
+    async fn history_call(
+        &self,
+        method: &str,
+        mut params: Value,
+        deadline: tokio::time::Instant,
+        wire_allowance: usize,
+    ) -> Result<(Value, usize), AgentError> {
+        if wire_allowance == 0 || tokio::time::Instant::now() >= deadline {
+            return Err(history_error());
+        }
+        let identity = self.shared_identity.clone().ok_or_else(|| AgentError::RequestFailed("Codex history endpoint identity has not been verified; primary connection retained".into()))?;
+        // Fail fast: the owned actor, not the request future, retains this slot
+        // through a late reply or its bounded deadline after caller cancellation.
+        let permit = self
+            .history_admission
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| {
+                AgentError::RequestFailed(
+                    "Codex history read already pending; primary connection retained".into(),
+                )
+            })?;
+        let slot = self.history.clone();
+        let parent = self.cancel_token();
+        let method = diagnostic_method(method);
+        let (reply, receiver) = oneshot::channel();
+        tokio::spawn(async move {
+            let mut slot = slot.lock().await;
+            if slot
+                .retry_at
+                .is_some_and(|at| tokio::time::Instant::now() < at)
+            {
+                drop(slot);
+                drop(permit);
+                let _ = reply.send(Err(AgentError::RequestFailed(
+                    "Codex history reconnect cooling down; primary connection retained".into(),
+                )));
+                return;
+            }
+            // Only known item-count pages can be split. Cursor, turn and sort
+            // direction remain unchanged until a complete accepted reply.
+            let mut limit = (method == "thread/items/list")
+                .then(|| params["limit"].as_u64())
+                .flatten()
+                .filter(|limit| (1..=100).contains(limit))
+                .map(|limit| limit.min(8));
+            if let (Some(requested), Some(learned)) = (limit, slot.item_limit) {
+                limit = Some(requested.min(learned));
+            }
+            let mut wire_work = 0usize;
+            let allowance = wire_allowance.min(MAX_HISTORY_WIRE_WORK_BYTES);
+            let operation = async {
+                for attempt in 0..2 {
+                    if reply.is_closed()
+                        || wire_work >= allowance
+                        || tokio::time::Instant::now() >= deadline
+                    {
+                        return Err(history_error());
+                    }
+                    identity.verify()?;
+                    let read_limit = MAX_HISTORY_FRAME_BYTES.min(allowance - wire_work);
+                    if slot
+                        .client
+                        .as_ref()
+                        .is_some_and(|client| client.state.read_limit != read_limit)
+                    {
+                        if let Some(client) = slot.client.take() {
+                            client.stop();
+                        }
+                    }
+                    if slot
+                        .client
+                        .as_ref()
+                        .is_some_and(|client| !client.is_ready())
+                    {
+                        return Err(history_error());
+                    }
+                    if slot.client.is_none() {
+                        slot.client = Some(
+                            super::daemon::connect_history(&identity, parent.clone(), read_limit)
+                                .await?,
+                        );
+                    }
+                    if reply.is_closed() || tokio::time::Instant::now() >= deadline {
+                        return Err(history_error());
+                    }
+                    if let Some(limit) = limit {
+                        params["limit"] = json!(limit);
+                    }
+                    // No recursive dispatch. The history role still validates
+                    // every method and disallows callback replies/mutations.
+                    let client = slot.client.as_ref().expect("connected history client");
+                    let result = client.call_inner_sized(method, params.clone()).await;
+                    let capacity = client.state.history_capacity.get().copied();
+                    match result {
+                        Ok((value, bytes)) => {
+                            wire_work = wire_work.saturating_add(bytes);
+                            if wire_work > allowance {
+                                return Err(history_error());
+                            }
+                            return Ok((value, wire_work));
+                        }
+                        Err(_) => {
+                            let capacity = capacity.ok_or_else(history_error)?;
+                            wire_work = wire_work.saturating_add(capacity.wire_work);
+                            let smaller = match limit {
+                                Some(n) if n > 1 => 1,
+                                _ => return Err(history_error()),
+                            };
+                            if attempt == 1
+                                || wire_work >= allowance
+                                || reply.is_closed()
+                                || tokio::time::Instant::now() >= deadline
+                            {
+                                return Err(history_error());
+                            }
+                            // Capacity consumes decoder state. Never continue
+                            // that socket, nor wait out the terminal-failure
+                            // cooldown inside this bounded shrinking operation.
+                            if let Some(client) = slot.client.take() {
+                                client.stop();
+                            }
+                            limit = Some(smaller);
+                            slot.item_limit = Some(smaller);
+                            tracing::debug!(method, attempt, item_limit = smaller, wire_work,
+                                "Codex history capacity recovery; smaller read-only page on fresh reader");
+                        }
+                    }
+                }
+                Err(history_error())
+            };
+            let result = tokio::select! {
+                biased;
+                _ = parent.cancelled() => Err(history_error()),
+                result = tokio::time::timeout_at(deadline, operation) => result.unwrap_or_else(|_| Err(history_error())),
+            };
+            if result.is_err() {
+                if let Some(client) = slot.client.take() {
+                    client.stop();
+                }
+                slot.retry_at = Some(tokio::time::Instant::now() + Duration::from_secs(3));
+            } else {
+                slot.retry_at = None;
+            }
+            let result = result.map_err(|_| {
+                // These are bounded local diagnostics, not an upstream payload.
+                tracing::warn!(
+                    method,
+                    "Codex isolated history read failed; primary retained; no mutation replay"
+                );
+                history_error()
+            });
+            // Publish only after releasing admission; a promptly scheduled next
+            // page must not see a phantom previous request after its reply.
+            drop(slot);
+            drop(permit);
+            let _ = reply.send(result);
+        });
+        receiver.await.unwrap_or_else(|_| Err(history_error()))
     }
 
     async fn call_inner(&self, method: &str, params: Value) -> Result<Value, AgentError> {
@@ -520,6 +841,16 @@ impl CodexClient {
         method: &str,
         params: Value,
     ) -> Result<(Value, usize), AgentError> {
+        if self.state.history_only {
+            let allowed = image_history_request(method, &params)
+                || (method == "account/read" && params["refreshToken"] == false)
+                || (method == "initialize" && !self.is_ready());
+            if !allowed {
+                return Err(AgentError::Unsupported(
+                    "Codex history connection is read-only".into(),
+                ));
+            }
+        }
         if self.state.cancel.is_cancelled() {
             return Err(disconnected());
         }
@@ -528,7 +859,13 @@ impl CodexClient {
         let (reply, receiver) = oneshot::channel();
         {
             let mut pending = locked(&self.state.pending);
-            if pending.len() >= MAX_PENDING {
+            if pending.len()
+                >= if self.state.history_only {
+                    1
+                } else {
+                    MAX_PENDING
+                }
+            {
                 return Err(AgentError::NotAvailable(
                     "Codex request capacity exhausted".into(),
                 ));
@@ -537,6 +874,7 @@ impl CodexClient {
                 id,
                 Pending {
                     reply,
+                    diagnostic_method: diagnostic_method(method),
                     selection_config: method == "config/read",
                     attach_expected: (method == "thread/resume")
                         .then(|| params["threadId"].as_str().unwrap_or("").to_owned()),
@@ -557,6 +895,7 @@ impl CodexClient {
             id,
             fence_on_cancel,
             enqueued: AtomicBool::new(false),
+            diagnostic_method: diagnostic_method(method),
         };
         let deadline = tokio::time::Instant::now() + self.timeout;
         tokio::time::timeout_at(
@@ -565,6 +904,7 @@ impl CodexClient {
                 json!({"id":id,"method":method,"params":params}),
                 fence_on_cancel,
                 Some(&_guard.enqueued),
+                deadline,
             ),
         )
         .await
@@ -574,13 +914,19 @@ impl CodexClient {
             Ok(Err(_)) => Err(disconnected()),
             Err(_) => {
                 if !fence_on_cancel {
+                    tracing::warn!(connection = %self.state.generation, rpc_id = id,
+                        method = diagnostic_method(method), "Codex read deadline exceeded; connection retained; not retried");
                     return Err(AgentError::RequestFailed(
                         "Codex read deadline exceeded; not retried".into(),
                     ));
                 }
                 // A mutation may have been accepted. Close this connection;
                 // do not submit it again or allow further work to race it.
-                self.stop();
+                self.state.stop_request(
+                    "mutation_response_deadline",
+                    Some(id),
+                    diagnostic_method(method),
+                );
                 Err(AgentError::RequestFailed(
                     "Codex request deadline exceeded; outcome unknown; not retried".into(),
                 ))
@@ -589,7 +935,13 @@ impl CodexClient {
     }
 
     async fn write(&self, value: Value) -> Result<(), AgentError> {
-        self.write_guarded(value, true, None).await
+        self.write_guarded(
+            value,
+            true,
+            None,
+            tokio::time::Instant::now() + self.timeout,
+        )
+        .await
     }
 
     async fn write_guarded(
@@ -597,7 +949,21 @@ impl CodexClient {
         value: Value,
         fence_on_cancel: bool,
         enqueued: Option<&AtomicBool>,
+        deadline: tokio::time::Instant,
     ) -> Result<(), AgentError> {
+        if self.state.history_only {
+            let method = value["method"].as_str().unwrap_or("");
+            let allowed = (value.get("id").is_some()
+                && (image_history_request(method, &value["params"])
+                    || (method == "initialize" && !self.is_ready())
+                    || (method == "account/read" && value["params"]["refreshToken"] == false)))
+                || (method == "initialized" && !self.is_ready() && value.get("id").is_none());
+            if !allowed {
+                return Err(AgentError::Unsupported(
+                    "Codex history connection is read-only".into(),
+                ));
+            }
+        }
         let mut bytes = serde_json::to_vec(&value)
             .map_err(|_| AgentError::Protocol("invalid Codex request".into()))?;
         if bytes.len() > MAX_FRAME_BYTES {
@@ -611,8 +977,8 @@ impl CodexClient {
             state: self.state.clone(),
             finished: false,
             fence_on_cancel,
+            deadline,
         };
-        let deadline = tokio::time::Instant::now() + self.timeout;
         tokio::select! {
             biased;
             _ = self.state.cancel.cancelled() => return Err(disconnected()),
@@ -764,11 +1130,43 @@ async fn read_frames<R: AsyncRead + Unpin>(mut reader: R, state: Arc<State>) {
     }
 }
 
-fn route_frame(state: &State, value: Value, frame_bytes: usize) -> Result<(), AgentError> {
+fn route_frame(state: &State, mut value: Value, frame_bytes: usize) -> Result<(), AgentError> {
     if state.cancel.is_cancelled() {
         return Err(disconnected());
     }
+    if frame_bytes > MAX_FRAME_BYTES {
+        let item_page = state.shared
+            && frame_bytes <= state.read_limit
+            && value.get("method").is_none()
+            && value.get("error").is_none()
+            && value["id"].as_u64().is_some_and(|id| {
+                locked(&state.pending).get(&id).is_some_and(|pending| {
+                    match pending.diagnostic_method {
+                        "thread/items/list" => value["result"]["data"]
+                            .as_array()
+                            .is_some_and(|rows| rows.len() <= 100),
+                        "thread/turns/list" if state.history_only => value["result"]["data"]
+                            .as_array()
+                            .is_some_and(|rows| rows.len() <= 100),
+                        "thread/read" if state.history_only => {
+                            value["result"]["thread"]["turns"].is_array()
+                        }
+                        _ => false,
+                    }
+                })
+            });
+        if !item_page {
+            return Err(AgentError::Protocol(
+                "Codex response exceeds allowed frame limit".into(),
+            ));
+        }
+    }
     if let Some(method) = value["method"].as_str() {
+        // A read-only history socket never subscribes or handles approvals.
+        // Its disconnect/events have no route to the primary manager.
+        if state.history_only {
+            return Ok(());
+        }
         let params = value.get("params").cloned().unwrap_or(Value::Null);
         // Shared servers broadcast metadata for other clients. Only an accepted
         // explicit start/fork/rejoin authorizes this connection's live projection.
@@ -895,8 +1293,8 @@ fn route_frame(state: &State, value: Value, frame_bytes: usize) -> Result<(), Ag
                 ))
             } else {
                 value
-                    .get("result")
-                    .cloned()
+                    .get_mut("result")
+                    .map(Value::take)
                     .ok_or_else(|| AgentError::Protocol("Codex response missing result".into()))
             };
             if pending.attaches_thread && state.shared {

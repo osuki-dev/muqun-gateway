@@ -179,7 +179,16 @@ pub(crate) async fn agents_catalog(
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
-    let agents = tasks::agent_catalog(&state.config.agent_commands);
+    let mut agents = json!(tasks::agent_catalog(&state.config.agent_commands));
+    // What `POST /api/tasks` can do for each: a pane always, a session too
+    // when a session adapter of that kind is attached.
+    if let Some(entries) = agents.as_array_mut() {
+        for entry in entries {
+            let kind = entry["kind"].as_str().unwrap_or_default().to_owned();
+            entry["ledger_delivery"] =
+                json!(crate::tasks::routes::ledger_delivery_names(&state, &kind).await);
+        }
+    }
     Ok(Json(json!({
         "agents": agents,
         "default_startup_timeout_ms": tasks::DEFAULT_AGENT_START_TIMEOUT_MS
@@ -700,6 +709,8 @@ pub(crate) struct TaskLaunch<'a> {
     pub out_of_band: bool,
     /// The model and effort the task named, as launch arguments.
     pub model_args: &'a [String],
+    /// The computers it may hand work to (`fleet::manifest::prompt_line`).
+    pub fleet: Option<&'a str>,
 }
 
 /// Start the agent in the placed pane. Claude Code and Codex get `prompt`
@@ -741,7 +752,9 @@ pub(crate) async fn start_agent_in_place(
     if let Some(task) = task {
         // A task's agent is told, out of band, how to report the task's end.
         if task.out_of_band {
-            agent_args.extend(crate::mcp::inject::terminal_task_args(&state.config, agent).await);
+            agent_args.extend(
+                crate::mcp::inject::terminal_task_args(&state.config, agent, task.fleet).await,
+            );
         }
         // The model and effort the task named, after the configured
         // arguments (a later `-c` wins) and before the prompt.

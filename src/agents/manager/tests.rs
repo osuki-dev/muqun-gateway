@@ -609,7 +609,17 @@ async fn compaction_is_forwarded_as_its_own_event() {
 
 #[tokio::test]
 async fn inbox_events_publish_the_whole_queue() {
-    let ctx = ctx();
+    use axum::{routing::get, Json, Router};
+    let (ctx, server) = upstream_context(Router::new().route(
+        "/api/session/ses_f511626fdffe0ncuGo6c1jS5Yk/message/msg_0aee9f378001y9wbp0QWYBAhkE",
+        get(|| async {
+            Json(json!({"data": {
+                "id": "msg_0aee9f378001y9wbp0QWYBAhkE", "type": "user",
+                "text": "A delivered input.", "time": {"created": 100}
+            }}))
+        }),
+    ))
+    .await;
     let mut rx = ctx.tx.subscribe();
     replay(&ctx, "inbox.sse").await;
 
@@ -624,6 +634,7 @@ async fn inbox_events_publish_the_whole_queue() {
         items.is_empty(),
         "the delivered item leaves the queue, got {items:?}"
     );
+    server.abort();
 }
 
 fn session_event(event_type: &str, data: Value) -> OpencodeRawEvent {
@@ -651,8 +662,256 @@ async fn upstream_context(app: axum::Router) -> (Arc<EventContext>, tokio::task:
 }
 
 #[tokio::test]
+async fn delivered_user_enters_timeline_without_blocking_assistant_or_waiting_for_run_end() {
+    use axum::{routing::get, Json, Router};
+    let started = Arc::new(tokio::sync::Semaphore::new(0));
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let native = json!({"id": "msg-10", "type": "user", "text": "Continue in parallel.",
+        "files": [], "time": {"created": 100}});
+    let response = native.clone();
+    let (started_http, release_http) = (started.clone(), release.clone());
+    let (ctx, server) = upstream_context(Router::new().route(
+        "/api/session/ses-delivered/message/msg-10",
+        get(move || {
+            let (started, release, response) =
+                (started_http.clone(), release_http.clone(), response.clone());
+            async move {
+                started.add_permits(1);
+                let _permit = release.acquire().await.unwrap();
+                Json(json!({"data": response}))
+            }
+        }),
+    ))
+    .await;
+    let asid = AgentSessionId("ses-delivered".into());
+    let mut out = ctx.tx.subscribe();
+    let (tx, rx) = broadcast::channel(16);
+    let pump = tokio::spawn(AgentManager::pump_events(rx, ctx.clone()));
+    tx.send(session_event(
+        "session.inbox.enqueued",
+        json!({
+            "sessionID": asid.0, "inboxID": "msg-10", "item": {
+                "type": "user", "delivery": "steer", "payload": {"text": "Continue in parallel."}
+            }
+        }),
+    ))
+    .unwrap();
+    let delivered = session_event(
+        "session.inbox.delivered",
+        json!({
+            "sessionID": asid.0, "inboxID": "msg-10"
+        }),
+    );
+    tx.send(delivered.clone()).unwrap();
+    tx.send(delta(&asid.0, "msg-11", "text", 0, "Working."))
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if let AgentDomainEvent::TimelineUpsert { items, .. } = out.recv().await.unwrap() {
+                assert_eq!(items[0].role, TimelineRole::Assistant);
+                break;
+            }
+        }
+        let _started = started.acquire().await.unwrap();
+    })
+    .await
+    .expect("a pending delivered-message GET must not block assistant events");
+    assert_eq!(
+        ctx.mirror.inbox(&asid).await.len(),
+        1,
+        "retain the receipt until its row exists"
+    );
+    release.add_permits(1);
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if let AgentDomainEvent::TimelineUpsert { items, .. } = out.recv().await.unwrap() {
+                if items[0].role == TimelineRole::User {
+                    assert_eq!(items[0].id, "msg-10:t0");
+                    assert_eq!(
+                        items[0].part,
+                        AgentPart::Text {
+                            text: "Continue in parallel.".into()
+                        }
+                    );
+                    break;
+                }
+            }
+        }
+        let AgentDomainEvent::InboxChanged { items, .. } = out.recv().await.unwrap() else {
+            panic!("the queue receipt leaves only after the canonical row is published");
+        };
+        assert!(items.is_empty());
+    })
+    .await
+    .unwrap();
+    // A repeated delivery and later canonical readback address the same native row.
+    AgentManager::handle_raw_event(delivered, &ctx).await;
+    ctx.mirror
+        .upsert_timeline_items(&asid, mapper::map_message(&native, &asid))
+        .await;
+    let snapshot = ctx.mirror.get_snapshot(&asid).await.unwrap();
+    assert_eq!(snapshot.timeline.len(), 2);
+    assert_eq!(snapshot.timeline[0].role, TimelineRole::User);
+    assert_eq!(snapshot.timeline[1].role, TimelineRole::Assistant);
+    ctx.cancel.cancel();
+    pump.await.unwrap();
+    server.abort();
+}
+
+#[tokio::test]
+async fn failed_delivered_read_keeps_receipt_and_shutdown_cancels_pending_read() {
+    use axum::{http::StatusCode, routing::get, Json, Router};
+    let fail = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let started = Arc::new(tokio::sync::Semaphore::new(0));
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let (fail_http, started_http, release_http) = (fail.clone(), started.clone(), release.clone());
+    let (ctx, server) = upstream_context(Router::new().route(
+        "/api/session/ses-delivered/message/msg-10",
+        get(move || {
+            let (fail, started, release) = (
+                fail_http.clone(),
+                started_http.clone(),
+                release_http.clone(),
+            );
+            async move {
+                if fail.load(std::sync::atomic::Ordering::SeqCst) {
+                    return (StatusCode::SERVICE_UNAVAILABLE, Json(Value::Null));
+                }
+                started.add_permits(1);
+                let _permit = release.acquire().await.unwrap();
+                (
+                    StatusCode::OK,
+                    Json(json!({"data": {"id": "msg-10", "type": "user",
+                    "text": "Continue in parallel.", "time": {"created": 100}}})),
+                )
+            }
+        }),
+    ))
+    .await;
+    let asid = AgentSessionId("ses-delivered".into());
+    let receipt =
+        json!({"id": "msg-10", "type": "user", "payload": {"text": "Continue in parallel."}});
+    ctx.mirror.set_inbox(&asid, vec![receipt.clone()]).await;
+    let mut out = ctx.tx.subscribe();
+    let delivered = session_event(
+        "session.inbox.delivered",
+        json!({"sessionID": asid.0, "inboxID": "msg-10"}),
+    );
+    AgentManager::handle_raw_event(delivered.clone(), &ctx).await;
+    assert_eq!(ctx.mirror.inbox(&asid).await, vec![receipt]);
+    assert!(ctx
+        .mirror
+        .get_snapshot(&asid)
+        .await
+        .unwrap()
+        .timeline
+        .is_empty());
+    assert!(matches!(
+        out.try_recv().unwrap(),
+        AgentDomainEvent::Resync { .. }
+    ));
+    assert!(out.try_recv().is_err());
+    fail.store(false, std::sync::atomic::Ordering::SeqCst);
+    let (tx, rx) = broadcast::channel(16);
+    let pump = tokio::spawn(AgentManager::pump_events(rx, ctx.clone()));
+    tx.send(delivered).unwrap();
+    let _started = tokio::time::timeout(std::time::Duration::from_secs(2), started.acquire())
+        .await
+        .unwrap()
+        .unwrap();
+    ctx.cancel.cancel();
+    tokio::time::timeout(std::time::Duration::from_secs(1), pump)
+        .await
+        .unwrap()
+        .unwrap();
+    release.add_permits(1);
+    assert!(ctx
+        .mirror
+        .get_snapshot(&asid)
+        .await
+        .unwrap()
+        .timeline
+        .is_empty());
+    assert_eq!(ctx.mirror.inbox(&asid).await.len(), 1);
+    assert!(out.try_recv().is_err());
+    server.abort();
+}
+
+#[tokio::test]
+async fn http_mirror_removal_and_recreation_fence_an_inflight_delivered_read() {
+    use axum::{routing::get, Json, Router};
+    let started = Arc::new(tokio::sync::Semaphore::new(0));
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let (started_http, release_http) = (started.clone(), release.clone());
+    let (ctx, server) = upstream_context(Router::new().route(
+        "/api/session/ses-delivered/message/msg-10",
+        get(move || {
+            let (started, release) = (started_http.clone(), release_http.clone());
+            async move {
+                started.add_permits(1);
+                let _permit = release.acquire().await.unwrap();
+                Json(json!({"data": {"id": "msg-10", "type": "user",
+                    "text": "Keep the original input.", "time": {"created": 100}}}))
+            }
+        }),
+    ))
+    .await;
+    let asid = AgentSessionId("ses-delivered".into());
+    ctx.mirror
+        .set_inbox(&asid, vec![json!({"id": "msg-10", "type": "user"})])
+        .await;
+    let mut out = ctx.tx.subscribe();
+    let (tx, rx) = broadcast::channel(16);
+    let pump = tokio::spawn(AgentManager::pump_events(rx, ctx.clone()));
+    tx.send(session_event(
+        "session.inbox.delivered",
+        json!({
+            "sessionID": asid.0, "inboxID": "msg-10"
+        }),
+    ))
+    .unwrap();
+    let _started = tokio::time::timeout(std::time::Duration::from_secs(2), started.acquire())
+        .await
+        .unwrap()
+        .unwrap();
+    // The HTTP delete route removes the mirror directly, without first passing
+    // a deletion event through this pump. Recreate the same ID to also catch an
+    // existence-only check that would accept the old incarnation's read.
+    ctx.mirror.remove_session(&asid).await;
+    assert!(ctx.mirror.get_snapshot(&asid).await.is_none());
+    let replacement = vec![json!({"id": "msg-new", "type": "user"})];
+    ctx.mirror.set_inbox(&asid, replacement.clone()).await;
+    release.add_permits(1);
+    let event = tokio::time::timeout(std::time::Duration::from_secs(2), out.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(event, AgentDomainEvent::Resync { .. }),
+        "an obsolete read must not publish into the replacement session: {event:?}"
+    );
+    let current = ctx.mirror.get_snapshot(&asid).await.unwrap();
+    assert!(current.timeline.is_empty());
+    assert_eq!(current.inbox, replacement);
+    assert!(out.try_recv().is_err());
+    ctx.cancel.cancel();
+    pump.await.unwrap();
+    server.abort();
+}
+
+#[tokio::test]
 async fn inbox_delivery_changes_preserve_payload_and_order_until_removed() {
-    let ctx = ctx();
+    use axum::{routing::get, Json, Router};
+    let (ctx, server) = upstream_context(Router::new().route(
+        "/api/session/ses-inbox/message/msg-first",
+        get(|| async {
+            Json(json!({"data": {
+                "id": "msg-first", "type": "user", "text": "Keep this text 日本語",
+                "time": {"created": 100}
+            }}))
+        }),
+    ))
+    .await;
     let mut rx = ctx.tx.subscribe();
     let asid = AgentSessionId("ses-inbox".into());
     let first = json!({"type": "user", "delivery": "queue", "payload": {
@@ -706,11 +965,15 @@ async fn inbox_delivery_changes_preserve_payload_and_order_until_removed() {
         .await;
         expected.remove(0);
         assert_eq!(ctx.mirror.inbox(&asid).await, expected);
-        let AgentDomainEvent::InboxChanged { items, .. } = rx.try_recv().unwrap() else {
-            panic!("inbox removal was not published");
-        };
-        assert_eq!(items, expected);
+        let mut last = None;
+        while let Ok(event) = rx.try_recv() {
+            if let AgentDomainEvent::InboxChanged { items, .. } = event {
+                last = Some(items);
+            }
+        }
+        assert_eq!(last.expect("inbox removal was published"), expected);
     }
+    server.abort();
 }
 
 #[tokio::test]

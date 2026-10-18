@@ -624,7 +624,8 @@ pub(crate) async fn events(
     let device_id = require_device(&state, &headers)?;
     // Present exactly when the request arrived through the encrypted
     // transport. From here on every event this connection emits is sealed;
-    // a device paired without a transport key keeps the plaintext stream.
+    // on a `disabled` deployment the stream stays plaintext (`required`
+    // serves no device without a transport key -- `require_device` above).
     let mut sealer = match stream_crypto {
         Some(Extension(context)) => Some(EventStreamSealer::new(&context).map_err(|_| {
             api_error(
@@ -1772,21 +1773,31 @@ pub(crate) async fn backend_agent_list(session: &SessionConfig) -> Result<Value,
 pub(crate) async fn backend_agents(session: &SessionConfig) -> Result<Vec<Agent>, BackendError> {
     let terminal = terminal_backend(session);
     let mut agents = terminal.list_agents().await?;
-    for agent in agents
-        .iter_mut()
-        .filter(|agent| agent.kind.is_some() && agent.status == BackendAgentStatus::Unknown)
-    {
-        let output = terminal
-            .read_pane(&BackendReadPane {
-                pane_id: agent.pane_id.clone(),
-                source: BackendOutputSource::Visible,
-                format: BackendOutputFormat::Text,
-                lines: APPROVAL_READ_LINES,
-                start: None,
-                end: None,
-            })
-            .await;
+    // Every pane whose status the backend could not name is read at once:
+    // one read per agent, in sequence, made a snapshot with a dozen agents
+    // wait a dozen round trips.
+    let unknown: Vec<usize> = agents
+        .iter()
+        .enumerate()
+        .filter(|(_, agent)| agent.kind.is_some() && agent.status == BackendAgentStatus::Unknown)
+        .map(|(index, _)| index)
+        .collect();
+    let outputs = futures::future::join_all(unknown.iter().map(|index| {
+        let request = BackendReadPane {
+            pane_id: agents[*index].pane_id.clone(),
+            source: BackendOutputSource::Visible,
+            format: BackendOutputFormat::Text,
+            lines: APPROVAL_READ_LINES,
+            start: None,
+            end: None,
+        };
+        let terminal = &terminal;
+        async move { terminal.read_pane(&request).await }
+    }))
+    .await;
+    for (index, output) in unknown.into_iter().zip(outputs) {
         if let Ok(output) = output {
+            let agent = &mut agents[index];
             agent.status = infer_tmux_agent_status(agent.kind.as_deref(), &output.text);
         }
     }
@@ -4551,7 +4562,7 @@ mod tests {
             .0;
         assert_eq!(health["generation"], generation.as_str());
         let discovery =
-            crate::platform::routes::api_discovery(State(state.clone()), HeaderMap::new())
+            crate::platform::routes::api_discovery(State(state.clone()), bearer_headers("token"))
                 .await
                 .unwrap()
                 .0;

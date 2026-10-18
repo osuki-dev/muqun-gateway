@@ -28,6 +28,11 @@ pub(crate) fn content_envelope(data: Value) -> Value {
             // embeds by host path, resolved to asset URLs. See
             // `agents::message_images`.
             "message_image_assets": true,
+            // `GET /api/agent-sessions/{asid}/descendants` lists a session's
+            // whole subtree in one answer (`agents::routes`).
+            "session_descendants": true,
+            // `POST /api/tasks` takes `delivery` (`tasks::routes`).
+            "task_ledger_delivery": true,
         },
         "data": data,
     })
@@ -175,22 +180,29 @@ pub(crate) fn require_device_or_peer(state: &AppState, headers: &HeaderMap) -> A
             "invalid token",
         ));
     };
-    if let Some(transport_key) = devices
+    // `required` means every device: a record paired while encryption was
+    // `disabled` holds no transport key, so its bearer token cannot be
+    // accompanied by a proof and it cannot be served in cleartext either. It
+    // is told to pair again (426), after its token matched -- a stranger
+    // learns nothing about which devices exist. This is the same answer the
+    // transport middleware gives such a device when it sends an envelope.
+    let Some(transport_key) = devices
         .iter()
         .find(|device| device.id == device_id)
         .and_then(|device| device.transport_key.as_deref())
-    {
-        let proof = headers
-            .get(TRANSPORT_PROOF_HEADER)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or_default();
-        if !authority::authenticates_admin(&hash_token(transport_key), proof) {
-            return Err(api_error(
-                StatusCode::FORBIDDEN,
-                "device_proof_required",
-                "encrypted device proof is required",
-            ));
-        }
+    else {
+        return Err(device_repair_required());
+    };
+    let proof = headers
+        .get(TRANSPORT_PROOF_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    if !authority::authenticates_admin(&hash_token(transport_key), proof) {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "device_proof_required",
+            "encrypted device proof is required",
+        ));
     }
     if authority::touch_device(
         &mut devices,
@@ -204,6 +216,31 @@ pub(crate) fn require_device_or_peer(state: &AppState, headers: &HeaderMap) -> A
         }
     }
     matched_caller(&devices, device_id)
+}
+
+/// The refusal a device without a transport key reads in `required` mode:
+/// it was paired while encryption was `disabled` and has to pair again.
+pub(crate) fn device_repair_required() -> (StatusCode, Json<Value>) {
+    api_error(
+        StatusCode::UPGRADE_REQUIRED,
+        "device_repair_required",
+        "pair this device again to enable encrypted transport",
+    )
+}
+
+/// The refusal of an envelope that authenticated but whose timestamp is
+/// outside the allowed skew of this computer's clock: `clock_skew`, with
+/// this computer's time beside it so the app can say by how much the
+/// phone's clock is off. Nothing else is revealed; a device whose envelope
+/// did not open reads `invalid_envelope` as before.
+pub(crate) fn clock_skew(server_time_ms: u128) -> (StatusCode, Json<Value>) {
+    let (status, Json(mut body)) = api_error(
+        StatusCode::FORBIDDEN,
+        "clock_skew",
+        "this device's clock and the gateway's disagree by more than five minutes",
+    );
+    body["error"]["server_time_ms"] = json!(server_time_ms);
+    (status, Json(body))
 }
 
 /// Whether a device authorised earlier is still authorised now.
@@ -437,9 +474,89 @@ mod tests {
     fn control_routes_reject_the_admin_token() {
         // The admin token sits in plaintext on disk for the manage UI. Control
         // routes can run commands on the host, so it must not reach them.
-        let state = test_state("secret", vec![test_device("device-1", "device-token")]);
+        let state = required_test_state("secret", vec![test_device("device-1", "device-token")]);
         let err = require_device(&state, &bearer_headers("secret")).unwrap_err();
         assert_eq!(err.0, StatusCode::FORBIDDEN);
+        assert_eq!(error_body(&err)["error"]["code"], "invalid_token");
+    }
+
+    /// `required` means every device. A record paired while encryption was
+    /// `disabled` has no transport key, so there is no proof it could send;
+    /// it used to be served in cleartext on its bearer token alone, for as
+    /// long as the record lived. It is now told to pair again, whatever its
+    /// kind, and the shared helpers are where every device route (streams,
+    /// socket, history and push included) gets that answer from.
+    #[test]
+    fn in_required_mode_a_device_without_a_transport_key_must_pair_again() {
+        let state = required_test_state(
+            "admin-token",
+            vec![
+                test_device("phone-1", "phone-token"),
+                test_peer_device("peer-1", "peer-token"),
+                sealed(test_device("phone-2", "sealed-token")),
+            ],
+        );
+        for token in ["phone-token", "peer-token"] {
+            for refusal in [
+                require_device(&state, &bearer_headers(token)).unwrap_err(),
+                require_device_or_peer(&state, &bearer_headers(token)).unwrap_err(),
+            ] {
+                assert_eq!(refusal.0, StatusCode::UPGRADE_REQUIRED, "{token}");
+                let body = error_body(&refusal);
+                assert_eq!(body["error"]["code"], "device_repair_required");
+                assert_eq!(
+                    body["error"]["message"],
+                    "pair this device again to enable encrypted transport"
+                );
+            }
+        }
+        // A forged proof does not turn a key-less record into a sealed one.
+        assert_eq!(
+            require_device(&state, &sealed_bearer_headers("phone-token"))
+                .unwrap_err()
+                .0,
+            StatusCode::UPGRADE_REQUIRED
+        );
+        // A wrong token is still a wrong token: the 426 is only told to the
+        // device whose token matched, so nothing is learned by guessing.
+        assert_eq!(
+            require_device(&state, &bearer_headers("guess"))
+                .unwrap_err()
+                .0,
+            StatusCode::FORBIDDEN
+        );
+        // A sealed device is served with its proof and refused without it.
+        assert_eq!(
+            require_device(&state, &sealed_bearer_headers("sealed-token")).unwrap(),
+            "phone-2"
+        );
+        let refusal = require_device(&state, &bearer_headers("sealed-token")).unwrap_err();
+        assert_eq!(refusal.0, StatusCode::FORBIDDEN);
+        assert_eq!(
+            error_body(&refusal)["error"]["code"],
+            "device_proof_required"
+        );
+        // The admin token is as refused on control routes as it ever was.
+        assert_eq!(
+            require_device(&state, &bearer_headers("admin-token"))
+                .unwrap_err()
+                .0,
+            StatusCode::FORBIDDEN
+        );
+
+        // Cleartext mode is unchanged: no envelope, no proof, token only.
+        let mut cleartext = state;
+        cleartext.config.transport_encryption = TransportEncryptionMode::Disabled;
+        assert_eq!(
+            require_device(&cleartext, &bearer_headers("phone-token")).unwrap(),
+            "phone-1"
+        );
+        assert_eq!(
+            require_device_or_peer(&cleartext, &bearer_headers("peer-token"))
+                .unwrap()
+                .kind,
+            DeviceKind::Gateway
+        );
     }
 
     #[test]

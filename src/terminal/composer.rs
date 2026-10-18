@@ -711,11 +711,10 @@ pub fn sanitize(value: &str) -> String {
 // ---------------------------------------------------------------------------
 
 /// The `composer` object on a pane's capability descriptor, or `None` for an
-/// agent with no table.
-///
-/// `root` is the pane's canonical workspace root; without one -- a pane sitting
-/// at `/`, or one whose cwd Herdr did not report -- the builtin table still
-/// answers and workspace discovery is simply skipped.
+/// agent with neither a known profile nor a downloaded command catalog.
+/// Commands come only from the catalog; a known profile without a cached
+/// catalog still advertises file mentions, with an empty command list.
+/// Workspace files do not contribute command suggestions.
 pub fn descriptor(agent: Option<&str>, _root: Option<&Path>) -> Option<Value> {
     let table = table_for(agent);
     let snapshot = agent

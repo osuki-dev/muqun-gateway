@@ -520,10 +520,12 @@ impl AgentPort for T3Driver {
         Box::pin(async move {
             let id = validate_id(session_id, "session id")?;
             let request = validate_id(request_id, "request id")?;
+            // Neither protocol's approval reply carries text: a reason the
+            // user wrote would be dropped on the floor, so it is refused.
+            if message.is_some_and(|value| !value.trim().is_empty()) {
+                return Err(AgentError::Unsupported("approval reason".into()));
+            }
             if self.client.is_v2() {
-                if message.is_some_and(|value| !value.trim().is_empty()) {
-                    return Err(AgentError::Unsupported("V2 approval reason".into()));
-                }
                 let (_, projection) = self.session_from_snapshot(&id).await?;
                 let choice = v2::mapper::approval_decision(&projection, &request, decision)?;
                 self.client

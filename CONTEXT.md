@@ -37,6 +37,10 @@ The retired `herdr.gateway` identifier remains only for migration compatibility.
     service agents default on for Codex and OpenCode, with the master
     `agent_runtime.enabled` switch independent of terminal-agent dispatch.
   - `routes.rs`: the OpenCode-style agent-session API (global and legacy paths).
+    The session-to-agent routes `manager_for_session` records (which adapter
+    to ask for a session) are kept in the shared store's
+    `agent_session_routes` namespace across restarts, the newest 4,096; a
+    route is a hint of whom to ask, never an authorisation.
   - `session_routes.rs`: terminal-multiplexer agent orchestration -- task
     dispatch, agent spawn, prompt delivery, approvals, and agent event history.
   - `tasks.rs`, `agent_events.rs`, `approvals.rs`: task step logs, the agent
@@ -158,7 +162,11 @@ The retired `herdr.gateway` identifier remains only for migration compatibility.
   the driver restores that observer after a restart without resending the command.
   A `peers` row is keyed by this gateway's own id; the `server_id` the
   peer gave is display data, and a second link giving one already held is
-  `409 peer_conflict`, never a merge. On the other side a gateway enrolment
+  `409 peer_conflict`, never a merge. An owner-given `server_id` on
+  `POST /api/peers` must match the claim answer (`409
+  peer_identity_mismatch`). A gateway-kind login record's `server_id` is
+  set only by the owner's mint (`POST /api/pair/pending`), never by the
+  claimant's `POST /api/pair/request`, since unlinking revokes by it. On the other side a gateway enrolment
   has no install id, so a claim can never replace or revoke another
   device; a link that fails after the claim revokes what it enrolled, with
   that device's own token. A name another peer holds is refused
@@ -337,7 +345,14 @@ pages. The current App's fifty-session request does not become full pagination.
 See [Agent API](docs/agent-api.md#get-apiagent-sessionspage) for the contract.
 
 DeepSeek's **rc.2** mapping reads `session/projections.asOfSeq` as the
-authoritative history cut and retains it across backward pages. File references
+authoritative history cut and retains it across backward pages
+(`DeepseekClient::read_history`): the opening read keeps the newest pages
+within `INITIAL_HISTORY_RETAINED_BYTES` (2 MiB) and says `hasMore` rather
+than failing for the size of a history, and the driver keeps a per-session
+cursor (`through_seq`, the oldest seq delivered, carried tool results) that
+`load_earlier_timeline` continues from, one batch within
+`MAX_HISTORY_RETAINED_BYTES` (8 MiB) at a time, until seq 0. The
+end-of-run refetch of the newest messages never moves that cursor back up. File references
 use `fileReferences/list` with the live session as `agentId`; workspace file
 list/stat use `workspaceFileScopeId`, not a directory substituted for session
 scope. Model switching reads the returned `selected` model; readiness requires
@@ -361,8 +376,9 @@ update. Unsupported optional features remain false. See
 [Codex protocol reference](docs/codex-protocol.md) for mappings and limits.
 
 T3 negotiates protocol **1 or 2** from the public descriptor, with missing meaning
-1 and unknown/malformed values unsupported. V2 uses a pinned nightly-source
-baseline, not a claim of live certification. Revert is advertised only for known
+1 and unknown/malformed values unsupported. V2's published-source reference is
+stable **v0.1.0** (October 15, 2026), checked against the original pinned nightly
+baseline; this is not live certification. Revert is advertised only for known
 protocol 1, never V2 or unknown. See [T3 protocol reference](docs/t3-protocol.md).
 Real Codex and paired App/macOS checks for this phase are deferred by user
 instruction; source/fixture evidence does not replace the required acceptance.
@@ -421,8 +437,13 @@ The public listener is normally localhost behind Tailscale Serve HTTPS or a
 Tailscale IPv4 address. HTTPS is preferred. Application transport encryption is
 `required` by default and binds a per-device AES-GCM key to each newly paired
 device, so its bearer token is not sufficient by itself. `disabled` is an
-explicit token-only compatibility mode. Existing device records retain their
-pairing mode; changing the gateway setting governs newly paired devices.
+explicit token-only compatibility mode. In `required` mode every device is
+held to it: a record paired while the setting was `disabled` holds no
+transport key, and its bearer-only requests are refused with
+`426 device_repair_required` by `require_device`/`require_device_or_peer`
+(so by every device route) until it pairs again. Switching to `required`
+therefore means pairing every earlier device again; switching to `disabled`
+keeps serving sealed devices on their token.
 
 HTTP calls and manual HTTP code pairing remain supported. HTTP inside a
 verified SSH or Tailscale tunnel differs from plain HTTP on an unprotected
@@ -431,7 +452,14 @@ Without the QR's pairing key, the manual claim sends `code` and `request_id`
 without an application encryption envelope. A response key derived from those
 values cannot protect credentials from passive capture of both legs on an
 unprotected link. Use the QR key, a verified protected tunnel, or HTTPS where
-available.
+available. A gateway linking to another (`POST /api/peers`) gets that key
+from the mint: `POST /api/pair/pending` answers `pairing_key` in `required`
+mode, the phone hands it over with the code, and `peer_client::claim` seals
+the claim as the phone's QR claim is sealed and takes only an answer sealed
+under that key and bound to the claim's nonce (`claim_unsealed`,
+`claim_not_opened`). Without the key (an older app, `muqun-gateway peers
+link`), the code-sealed answer is kept, but an answer in the clear from a
+gateway that said `required` of itself is refused.
 
 Agents the gateway launches for remote dispatch (`POST …/tasks`, `POST …/spawn`,
 and a terminal-agent delegation through `POST /api/tasks` or `tasks.delegate`)
@@ -500,6 +528,24 @@ and the HKDF key family do not change. Revision 2 authenticates
 path/query, with the initiating request nonce appended for replies. Responses
 use the authenticated request revision. SSE/WebSocket record keys and counters
 remain unchanged; their opening request uses the negotiated envelope.
+
+A sealed request body cannot be authenticated before it is read: the token is
+inside the envelope, and the clear headers carry only a device id anyone on
+the path can copy. The pre-authentication read of a large sealed body is
+therefore *bounded* rather than prevented (`server::preauth_sealed_permit`,
+`GatedBody`): its own small budgets per route (uploads; prompt/command/task),
+a per-address count (IPv4 per address, IPv6 per /64), one read per clear
+device id, a minimum throughput and a deadline, with the request moving to the
+main pool and the device's slot only once the envelope has opened and the
+device is verified. This is the accepted residual: authenticating earlier
+needs a header MAC in a future envelope revision (v3), which is deferred.
+
+An envelope that authenticates but whose timestamp is outside the five-minute
+window is refused as `403 clock_skew` with `error.server_time_ms`, on the
+request path, at replay admission and on a QR pairing claim; an envelope that
+does not open stays `invalid_envelope`, so the distinction reaches only the
+key's holder (`transport::open_checked` authenticates before it judges
+freshness).
 
 Clients verify an authenticated, nonce-bound v2 read before durably pinning v2
 and sending an application operation. A plain `transport_version_required`

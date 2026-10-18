@@ -282,6 +282,14 @@ impl CodexState {
             info.version = manager.version();
             (info.models, info.modes) = super::catalog_entry(manager.agent().as_ref()).await;
             info.features = connection_features(Some(manager.endpoint_url()), &info.models);
+            // True only when skills/list actually answered. An unsupported
+            // method or an error leaves the catalog skills empty and this flag
+            // false. The static claim stays false until that read happens.
+            info.features.skills = manager.agent().skills_listed();
+            // True only when the downloaded Codex command catalog contributed
+            // rows on that same catalog read. A missing file leaves `/` on the
+            // app's own commands.
+            info.features.slash_commands = manager.agent().slash_commands_listed();
         } else if let Some(failure) = self.failure.lock().await.as_ref() {
             info.status = match failure {
                 AgentError::Unsupported(_) => AgentAvailability::Unsupported,
@@ -331,6 +339,7 @@ pub(super) fn features() -> crate::discovery::AgentFeatures {
         attachments_by_path: false,
         extra: std::collections::BTreeMap::from([
             ("sessionPagination".into(), serde_json::json!(true)),
+            ("timelineEarlier".into(), serde_json::json!(true)),
             ("sharedDaemon".into(), serde_json::json!(cfg!(unix))),
             ("sharedTaskStartup".into(), serde_json::json!(false)),
             ("sharedDaemonConnected".into(), serde_json::json!(false)),
@@ -357,7 +366,7 @@ pub(super) fn features() -> crate::discovery::AgentFeatures {
             ("forms".into(), serde_json::json!(true)),
             ("asyncQuestions".into(), serde_json::json!(true)),
             ("promptSteering".into(), serde_json::json!(true)),
-            ("fileMentions".into(), serde_json::json!(false)),
+            ("fileMentions".into(), serde_json::json!(true)),
             ("typedToolItems".into(), serde_json::json!(true)),
             ("subagentSessions".into(), serde_json::json!(true)),
             ("sessionTokenUsage".into(), serde_json::json!(true)),
@@ -1127,6 +1136,10 @@ pub(crate) mod tests {
     fn codex_feature_claims_do_not_include_file_rollback_or_optional_apis() {
         let features = features();
         assert!(features.streaming && features.tool_approvals && features.compaction);
+        assert!(
+            !features.skills,
+            "skills stay off until skills/list actually answers"
+        );
         assert!(features.attachments && !features.attachments_by_path);
         assert_eq!(features.extra["nativeImageInput"], true);
         assert_eq!(features.extra["attachmentInputScope"], "gateway_uploads");

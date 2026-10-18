@@ -12,6 +12,7 @@ pub struct Budget {
     deadline: tokio::time::Instant,
     pages: usize,
     bytes: usize,
+    byte_limit: usize,
     rows: usize,
 }
 fn exhausted() -> AgentError {
@@ -25,6 +26,7 @@ impl Budget {
             deadline: tokio::time::Instant::now() + Duration::from_secs(20),
             pages: 0,
             bytes: 0,
+            byte_limit: MAX_BYTES,
             rows: 0,
         }
     }
@@ -38,12 +40,22 @@ impl Budget {
             return Err(exhausted());
         }
         self.pages += 1;
-        let (value, bytes) =
-            tokio::time::timeout_at(self.deadline, client.call_sized(method, params))
-                .await
-                .map_err(|_| exhausted())??;
+        if client.is_shared() && super::client::image_history_request(method, &params) {
+            self.byte_limit = super::client::MAX_HISTORY_WIRE_WORK_BYTES;
+        }
+        let (value, bytes) = tokio::time::timeout_at(
+            self.deadline,
+            client.call_sized_budgeted(
+                method,
+                params,
+                self.deadline,
+                self.byte_limit.saturating_sub(self.bytes),
+            ),
+        )
+        .await
+        .map_err(|_| exhausted())??;
         self.bytes = self.bytes.checked_add(bytes).ok_or_else(exhausted)?;
-        if self.bytes > MAX_BYTES {
+        if self.bytes > self.byte_limit {
             return Err(exhausted());
         }
         Ok(value)
@@ -54,6 +66,12 @@ impl Budget {
             return Err(exhausted());
         }
         Ok(())
+    }
+    pub fn can_read_complete_history_item(&self) -> bool {
+        self.pages < MAX_PAGES
+            && tokio::time::Instant::now() < self.deadline
+            && super::client::MAX_HISTORY_WIRE_WORK_BYTES.saturating_sub(self.bytes)
+                >= super::client::MAX_HISTORY_FRAME_BYTES
     }
 }
 

@@ -47,7 +47,10 @@ use crate::{
 
 /// A phone previews artifacts, it does not download archives. Anything larger
 /// is refused rather than streamed, so one request can never tie up the host.
-pub(crate) const MAX_ASSET_CONTENT_BYTES: u64 = 10 * 1024 * 1024;
+/// The sealed response ceiling already allows the video limit, so a
+/// non-video asset gets the same room; the path gate and the no-follow open
+/// in front of this read are unchanged.
+pub(crate) const MAX_ASSET_CONTENT_BYTES: u64 = 32 * 1024 * 1024;
 pub(crate) const MAX_VIDEO_CONTENT_BYTES: u64 = 32 * 1024 * 1024;
 pub(crate) const ASSET_CONTENT_CHUNK_BYTES: usize = 64 * 1024;
 /// Enough of a file's head to decide what it is. The same bytes settle both the
@@ -1724,24 +1727,35 @@ mod tests {
     #[tokio::test]
     async fn video_content_accepts_eleven_mib_but_keeps_other_files_and_video_bounded() {
         let root = asset_test_dir("video-limit");
-        for (name, head, size, accepted) in [
+        for (name, head, size, accepted, content_type) in [
             (
                 "sample.mp4",
                 b"\x00\x00\x00\x18ftypisom".as_slice(),
                 11 * 1024 * 1024,
                 true,
+                "video/mp4",
             ),
+            // A non-video file gets the same 32 MiB as a video, no more.
             (
                 "sample.wav",
                 b"RIFF\x24\x00\x00\x00WAVEfmt ".as_slice(),
                 11 * 1024 * 1024,
+                true,
+                "audio/wav",
+            ),
+            (
+                "large.wav",
+                b"RIFF\x24\x00\x00\x00WAVEfmt ".as_slice(),
+                MAX_ASSET_CONTENT_BYTES + 1,
                 false,
+                "audio/wav",
             ),
             (
                 "large.mp4",
                 b"\x00\x00\x00\x18ftypisom".as_slice(),
                 MAX_VIDEO_CONTENT_BYTES + 1,
                 false,
+                "video/mp4",
             ),
         ] {
             let path = root.join(name);
@@ -1758,7 +1772,7 @@ mod tests {
                 asset_content(State(state), Path(entry.id), bearer_headers("token")).await;
             if accepted {
                 let response = response.unwrap();
-                assert_eq!(response.headers()["content-type"], "video/mp4");
+                assert_eq!(response.headers()["content-type"], content_type, "{name}");
                 assert_eq!(
                     axum::body::to_bytes(response.into_body(), MAX_VIDEO_CONTENT_BYTES as usize)
                         .await

@@ -20,6 +20,7 @@ pub(crate) struct Migration {
 /// Every domain that keeps rows in the shared store registers here.
 pub(crate) const ALL_MIGRATIONS: &[Migration] = &[
     crate::agents::adapters::codex::native_sessions::MIGRATION,
+    crate::agents::runtime::SESSION_ROUTES_MIGRATION,
     crate::connectivity::replay_store::MIGRATION,
     crate::tasks::store_sqlite::MIGRATION,
     crate::mcp::tokens::MIGRATION,

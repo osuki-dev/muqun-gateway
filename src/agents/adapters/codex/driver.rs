@@ -11,10 +11,12 @@ use super::{
 use crate::agents::domain::*;
 use crate::agents::ports::agent::{
     AgentError, AgentFuture, AgentPort, AttachmentMode, FileDiffItem, PreparedTerminalLaunch,
+    PreparedTimeline,
 };
 
 const MAX_SESSIONS: usize = 4096;
 const MAX_HISTORY_ITEMS: usize = 2000;
+const MAX_HISTORY_RETAINED_BYTES: usize = 32 * 1024 * 1024;
 // Leave room to insert an older authoritative prefix before a live/tail anchor.
 const FIRST_ITEM_POSITION: u64 = 1 << 63;
 
@@ -34,11 +36,48 @@ pub struct CodexDriver {
     usage: Mutex<HashMap<String, super::usage::Usage>>,
     pub(crate) rollouts: super::rollout::Rollouts,
     async_questions: Mutex<super::async_questions::Registry>,
+    /// Set only after `skills/list` returns a skills list. A missing method
+    /// or a bad payload leaves this false and the catalog skills empty.
+    skills_catalog: std::sync::atomic::AtomicBool,
+    /// Skill name (lowercased) to the `SKILL.md` path from the last list.
+    /// Codex turns a skill on with that path; the name alone is not enough.
+    skill_paths: std::sync::Mutex<HashMap<String, String>>,
+    /// Serializes provider page reads, not a prepared tail's mirror ACK.
+    history: Mutex<()>,
+    /// Synchronous revision-checked publication, also used inside mirror acceptance.
+    history_state: std::sync::Mutex<HistoryState>,
+    history_preparations: Arc<tokio::sync::Semaphore>,
+    /// Set only when the downloaded Codex command catalog contributed rows.
+    slash_catalog: std::sync::atomic::AtomicBool,
 }
 
 struct PendingModel {
     model: ModelRef,
     accepted_revision: Option<u64>,
+}
+
+#[derive(Clone, Default)]
+struct HistoryPage {
+    revision: u64,
+    started: bool,
+    cursor: Option<String>,
+    /// Raw page while preparing, oldest first. Shared pages are projected once
+    /// before publication; private stdio keeps its existing one-item expansion.
+    pending: Vec<Value>,
+    /// Older mapped prefix, without retaining/remapping a large raw image item.
+    remaining: Vec<TimelineItem>,
+    seen: HashSet<String>,
+    retained_bytes: usize,
+    /// When this page was last committed (a snapshot or an earlier batch
+    /// read), for evicting the least recently read session first.
+    read_at_ms: u64,
+}
+
+#[derive(Default)]
+struct HistoryState {
+    pages: HashMap<String, HistoryPage>,
+    /// Monotonic across session deletion/recreation, issued under this lock.
+    revision: u64,
 }
 
 fn unsupported<T>(capability: &str) -> Result<T, AgentError> {
@@ -50,6 +89,18 @@ fn validate_id(id: &str) -> Result<(), AgentError> {
         return Err(AgentError::InvalidRequest("invalid Codex thread id".into()));
     }
     Ok(())
+}
+
+fn skill_name_ok(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+fn skill_path_ok(path: &str) -> bool {
+    path.starts_with('/') && path.len() <= 4096 && !path.chars().any(char::is_control)
 }
 
 impl CodexDriver {
@@ -68,6 +119,12 @@ impl CodexDriver {
             usage: Mutex::new(HashMap::new()),
             rollouts: Default::default(),
             async_questions: Mutex::new(super::async_questions::Registry::default()),
+            skills_catalog: std::sync::atomic::AtomicBool::new(false),
+            skill_paths: std::sync::Mutex::new(HashMap::new()),
+            history: Mutex::new(()),
+            history_state: std::sync::Mutex::new(HistoryState::default()),
+            history_preparations: Arc::new(tokio::sync::Semaphore::new(4)),
+            slash_catalog: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -175,10 +232,11 @@ impl CodexDriver {
         validate_id(id)?;
         let mut usage = self.usage.lock().await;
         if usage.len() >= MAX_SESSIONS && !usage.contains_key(id) {
-            self.client.stop();
-            return Err(AgentError::NotAvailable(
-                "Codex usage capacity exhausted".into(),
-            ));
+            // A cache of each session's last usage: another session's entry
+            // goes, never the connection.
+            if let Some(evicted) = usage.keys().next().cloned() {
+                usage.remove(&evicted);
+            }
         }
         usage.insert(id.into(), super::usage::Usage::from_wire(value));
         Ok(())
@@ -424,14 +482,19 @@ impl CodexDriver {
                 "Codex item-order capacity exhausted; resync required".into(),
             ));
         }
-        let position = order.get(&key).copied().unwrap_or_else(|| {
-            order
+        let position = match order.get(&key).copied() {
+            Some(position) => position,
+            None => order
                 .iter()
                 .filter(|((t, u, _), _)| t == thread && u == turn)
-                .map(|(_, position)| position.saturating_add(1))
+                .map(|(_, position)| *position)
                 .max()
-                .unwrap_or(FIRST_ITEM_POSITION)
-        });
+                .map(|position| position.checked_add(1))
+                .unwrap_or(Some(FIRST_ITEM_POSITION))
+                .ok_or_else(|| {
+                    AgentError::Protocol("Codex item-order range exhausted; resync required".into())
+                })?,
+        };
         order.insert(key, position);
         Ok(position)
     }
@@ -442,38 +505,91 @@ impl CodexDriver {
         turn: &str,
         ids: &[String],
     ) -> Result<(), AgentError> {
+        self.set_history_order_at(thread, turn, ids, false)
+    }
+
+    fn set_history_order_at(
+        &self,
+        thread: &str,
+        turn: &str,
+        ids: &[String],
+        prefix: bool,
+    ) -> Result<(), AgentError> {
+        if ids.is_empty() {
+            return Ok(());
+        }
         let mut order = self.order.lock().unwrap_or_else(|p| p.into_inner());
         let key = |id: &str| (thread.to_string(), turn.to_string(), id.to_string());
+        let range_error = || {
+            AgentError::Protocol(
+                "Codex item-order range exhausted or changed; resync required".into(),
+            )
+        };
+        if ids.iter().collect::<HashSet<_>>().len() != ids.len() {
+            return Err(range_error());
+        }
         let new_ids: HashSet<_> = ids
             .iter()
             .filter(|id| !order.contains_key(&key(id)))
             .collect();
         if order.len() + new_ids.len() > 8192 {
-            self.client.stop();
-            return Err(AgentError::NotAvailable(
-                "Codex item-order capacity exhausted; resync required".into(),
+            // A historical page failing local retention is not a control/live
+            // transport failure. Leave the old order/cursor and primary intact.
+            return Err(AgentError::RequestFailed(
+                "Codex history item-order capacity exhausted; page not consumed".into(),
             ));
         }
         // Preserve a shared anchor when a larger or newer tail is requested.
         // Provider array order is authoritative even when Unix clocks regress.
-        let base = ids
-            .iter()
-            .enumerate()
-            .find_map(|(index, id)| {
-                order
-                    .get(&key(id))
-                    .and_then(|p| p.checked_sub(index as u64))
-            })
-            .unwrap_or_else(|| {
-                order
-                    .iter()
-                    .filter(|((t, u, _), _)| t == thread && u == turn)
-                    .map(|(_, p)| p.saturating_add(1))
-                    .max()
-                    .unwrap_or(FIRST_ITEM_POSITION)
-            });
+        let anchor = ids.iter().enumerate().find_map(|(index, id)| {
+            order
+                .get(&key(id))
+                .map(|p| p.checked_sub(index as u64).ok_or_else(range_error))
+        });
+        let base = if let Some(base) = anchor {
+            base?
+        } else if prefix {
+            order
+                .iter()
+                .filter(|((t, u, _), _)| t == thread && u == turn)
+                .map(|(_, p)| *p)
+                .min()
+                .map(|p| p.checked_sub(ids.len() as u64))
+                .unwrap_or(Some(FIRST_ITEM_POSITION))
+                .ok_or_else(range_error)?
+        } else {
+            order
+                .iter()
+                .filter(|((t, u, _), _)| t == thread && u == turn)
+                .map(|(_, p)| *p)
+                .max()
+                .map(|p| p.checked_add(1))
+                .unwrap_or(Some(FIRST_ITEM_POSITION))
+                .ok_or_else(range_error)?
+        };
+        let end = base
+            .checked_add(ids.len() as u64 - 1)
+            .ok_or_else(range_error)?;
+        // Never renumber a live or already displayed row. Conflicting anchors
+        // and occupied positions fail rather than silently moving the viewport.
+        for ((t, u, id), position) in order.iter() {
+            if t != thread || u != turn || *position < base || *position > end {
+                continue;
+            }
+            if ids.get((*position - base) as usize) != Some(id) {
+                return Err(range_error());
+            }
+        }
         for (index, id) in ids.iter().enumerate() {
-            order.insert(key(id), base.saturating_add(index as u64));
+            if order
+                .get(&key(id))
+                .is_some_and(|p| *p != base + index as u64)
+            {
+                return Err(range_error());
+            }
+        }
+        for (index, id) in ids.iter().enumerate() {
+            order.entry(key(id)).or_insert(base + index as u64);
         }
         Ok(())
     }
@@ -485,18 +601,30 @@ impl CodexDriver {
         item: &Value,
         at_ms: u64,
     ) -> Result<Vec<TimelineItem>, AgentError> {
-        if item["type"] == "reasoning"
+        // A reasoning item past the part limit is kept to its first parts
+        // rather than costing the connection.
+        let truncated;
+        let item = if item["type"] == "reasoning"
             && ["summary", "content"].iter().any(|key| {
                 item[*key]
                     .as_array()
                     .is_some_and(|parts| parts.len() > super::MAX_REASONING_PARTS)
-            })
-        {
-            self.client.stop();
-            return Err(AgentError::Protocol(
-                "Codex reasoning part limit exceeded; resync required".into(),
-            ));
-        }
+            }) {
+            let mut clipped = item.clone();
+            for key in ["summary", "content"] {
+                if let Some(parts) = clipped[key].as_array_mut() {
+                    parts.truncate(super::MAX_REASONING_PARTS);
+                }
+            }
+            tracing::warn!(
+                thread,
+                "Codex reasoning item past the part limit; kept its first parts"
+            );
+            truncated = clipped;
+            &truncated
+        } else {
+            item
+        };
         if item["receiverThreadIds"].as_array().is_some_and(|targets| {
             targets.len() > 512
                 || serde_json::to_vec(item).map_or(true, |wire| {
@@ -565,10 +693,16 @@ impl CodexDriver {
             .unwrap_or_else(|p| p.into_inner())
             .remove(id);
         self.metadata_versions.lock().await.remove(id);
-        self.order
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .retain(|(thread, _, _), _| thread != id);
+        let _history_read = self.history.lock().await;
+        let history = self.history_state.lock().unwrap_or_else(|p| p.into_inner());
+        // Native unload ends control ownership, not the historical viewport.
+        // Keep anchors while pagination/mirror rows can still refer to them.
+        if !history.pages.contains_key(id) {
+            self.order
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .retain(|(thread, _, _), _| thread != id);
+        }
     }
 
     /// Opening a selected timeline may rejoin a loaded shared runtime, or
@@ -665,7 +799,8 @@ impl CodexDriver {
         let mut seen = HashSet::new();
         let mut items = vec![];
         let mut retained_bytes = 0usize;
-        for _ in 0..16 {
+        let mut read_rows = 0usize;
+        for _ in 0..super::budget::MAX_PAGES {
             if self.client.subscription_revision(id) != Some(ownership)
                 || self.client.active_turn(id).as_deref() != Some(&turn)
             {
@@ -701,6 +836,12 @@ impl CodexDriver {
                 .ok_or_else(|| {
                     AgentError::Protocol("invalid Codex question recovery page".into())
                 })?;
+            read_rows += rows.len();
+            if read_rows > 1600 {
+                return Err(AgentError::RequestFailed(
+                    "Codex question recovery budget exhausted".into(),
+                ));
+            }
             for row in rows {
                 if row["turnId"] != turn || row["item"]["id"].as_str().is_none() {
                     return Err(AgentError::Protocol(
@@ -834,6 +975,347 @@ impl CodexDriver {
             }
         }
         mapper::catalog(&json!({"data":rows}), &provider)
+    }
+
+    /// Best-effort `skills/list`. Failure leaves `catalog.skills` empty and
+    /// does not fail the model catalog that was already read.
+    async fn attach_skills(&self, catalog: &mut AgentCatalog, directory: Option<&str>) {
+        let mut params = json!({});
+        if let Some(directory) = directory.filter(|directory| !directory.is_empty()) {
+            params["cwds"] = json!([directory]);
+        }
+        let response = match Budget::new()
+            .call(&self.client, "skills/list", params)
+            .await
+        {
+            Ok(response) => response,
+            Err(_) => return,
+        };
+        if let Ok(skills) = mapper::map_skills(&response) {
+            catalog.skills = skills;
+            self.store_skill_paths(&response);
+            self.skills_catalog
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    /// Keep the file path Codex needs to start a skill. An enabled copy wins
+    /// over a disabled one with the same name.
+    fn store_skill_paths(&self, response: &Value) {
+        let mut next: HashMap<String, (String, bool)> = HashMap::new();
+        let Some(groups) = response.get("data").and_then(Value::as_array) else {
+            return;
+        };
+        for group in groups {
+            let Some(rows) = group.get("skills").and_then(Value::as_array) else {
+                continue;
+            };
+            for row in rows {
+                let Some(name) = row.get("name").and_then(Value::as_str) else {
+                    continue;
+                };
+                let Some(path) = row.get("path").and_then(Value::as_str) else {
+                    continue;
+                };
+                if !skill_name_ok(name) || !skill_path_ok(path) {
+                    continue;
+                }
+                let enabled = row.get("enabled").and_then(Value::as_bool).unwrap_or(false);
+                let key = name.to_ascii_lowercase();
+                match next.get(&key) {
+                    Some((_, true)) => {}
+                    _ => {
+                        next.insert(key, (path.to_string(), enabled));
+                    }
+                }
+            }
+        }
+        if let Ok(mut paths) = self.skill_paths.lock() {
+            *paths = next
+                .into_iter()
+                .map(|(name, (path, _))| (name, path))
+                .collect();
+        }
+    }
+
+    async fn skill_path(&self, session_id: &str, name: &str) -> Result<String, AgentError> {
+        let thread = self.read_thread(session_id).await?;
+        let mut params = json!({});
+        if let Some(cwd) = thread["cwd"].as_str().filter(|cwd| !cwd.is_empty()) {
+            params["cwds"] = json!([cwd]);
+        }
+        if let Ok(response) = Budget::new()
+            .call(&self.client, "skills/list", params)
+            .await
+        {
+            self.store_skill_paths(&response);
+        }
+        let key = name.to_ascii_lowercase();
+        self.skill_paths
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| AgentError::InvalidRequest(format!("unknown Codex skill {name}")))
+    }
+
+    /// Start a turn whose input is already a Codex `UserInput` list.
+    async fn submit_turn(&self, id: &str, input: Vec<Value>) -> Result<(), AgentError> {
+        self.prepare_shared_interaction(id).await?;
+        let _guard = self.mutations.lock().await;
+        self.require_native_interaction(id).await?;
+        if self.client.active_turn(id).is_some() {
+            return Err(AgentError::InvalidRequest(
+                "Codex thread already has an active turn".into(),
+            ));
+        }
+        if !self.loaded.lock().await.contains(id) {
+            let thread = self.read_thread(id).await?;
+            if mapper::status(&thread["status"]) == AgentSessionStatus::Busy {
+                return Err(AgentError::InvalidRequest(
+                    "Codex thread is already active; not taking it over".into(),
+                ));
+            }
+            let resumed = self
+                .client
+                .call("thread/resume", json!({"threadId":id,"excludeTurns":true}))
+                .await?;
+            if resumed["thread"]["id"] != id {
+                return Err(AgentError::Protocol(
+                    "Codex resume identity mismatch".into(),
+                ));
+            }
+            self.selected_response(resumed).await?;
+        }
+        let mut params = json!({"threadId":id,"input":input});
+        let model = self
+            .next_models
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(id)
+            .filter(|choice| choice.accepted_revision.is_none())
+            .map(|choice| choice.model.clone());
+        if let Some(model) = model {
+            let thread = self.read_thread(id).await?;
+            if thread["modelProvider"] != model.provider_id {
+                return Err(AgentError::InvalidRequest(
+                    "Codex thread provider changed; select a matching configured model".into(),
+                ));
+            }
+            params["model"] = json!(model.model_id);
+            if let Some(effort) = model.variant {
+                params["effort"] = json!(effort);
+            }
+        }
+        let revision = self.metadata_revision(id).await?;
+        let response = self.client.call("turn/start", params).await?;
+        mapper::string(&response["turn"], "id")?;
+        self.record_native_acceptance(id).await;
+        if let Some(choice) = self
+            .next_models
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get_mut(id)
+        {
+            if choice.accepted_revision.is_none() {
+                choice.accepted_revision = Some(revision);
+            }
+        }
+        self.spawn_metadata_refresh(id, revision);
+        Ok(())
+    }
+
+    fn commit_history(
+        history: &mut HashMap<String, HistoryPage>,
+        id: &str,
+        mut page: HistoryPage,
+    ) -> Result<(), AgentError> {
+        page.retained_bytes = serde_json::to_vec(&(&page.pending, &page.remaining, &page.seen))
+            .map_err(|_| AgentError::Protocol("invalid Codex history state".into()))?
+            .len();
+        if page.retained_bytes > MAX_HISTORY_RETAINED_BYTES {
+            return Err(AgentError::RequestFailed(
+                "Codex history retention budget exhausted; no page consumed".into(),
+            ));
+        }
+        // The budget is shared by every session. Rather than refuse this one
+        // because others hold pages, the least recently read of the others
+        // give theirs up: their next earlier pull answers `HistoryCursorLost`
+        // and the app re-reads the snapshot.
+        let over_budget = |history: &HashMap<String, HistoryPage>| {
+            let bytes = history
+                .iter()
+                .filter(|(key, _)| key.as_str() != id)
+                .map(|(_, held)| held.retained_bytes)
+                .sum::<usize>();
+            (!history.contains_key(id) && history.len() >= MAX_SESSIONS)
+                || bytes.saturating_add(page.retained_bytes) > MAX_HISTORY_RETAINED_BYTES
+        };
+        while over_budget(history) {
+            let Some(oldest) = history
+                .iter()
+                .filter(|(key, _)| key.as_str() != id)
+                .min_by_key(|(_, held)| held.read_at_ms)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            history.remove(&oldest);
+        }
+        page.read_at_ms = crate::tasks::domain::now_ms();
+        history.insert(id.to_string(), page);
+        Ok(())
+    }
+
+    fn accept_history(
+        &self,
+        id: &str,
+        expected: Option<u64>,
+        mut page: HistoryPage,
+    ) -> Result<(), AgentError> {
+        let mut history = self.history_state.lock().unwrap_or_else(|p| p.into_inner());
+        if history.pages.get(id).map(|held| held.revision) != expected {
+            return Err(AgentError::NotAvailable(
+                "Codex history changed before snapshot acceptance; refresh again".into(),
+            ));
+        }
+        // One process-wide monotonic token prevents deletion/recreation ABA.
+        // It is not an upstream replay sequence or a presentation sort key.
+        let revision = history
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| AgentError::NotAvailable("Codex history revision exhausted".into()))?;
+        page.revision = revision;
+        Self::commit_history(&mut history.pages, id, page)?;
+        history.revision = revision;
+        Ok(())
+    }
+
+    async fn read_history_batch(
+        &self,
+        id: &str,
+        limit: usize,
+        state: &mut HistoryPage,
+        budget: &mut Budget,
+    ) -> Result<Vec<TimelineItem>, AgentError> {
+        let mut items = Vec::new();
+        while items.len() < limit {
+            if !state.remaining.is_empty() {
+                let start = state.remaining.len().saturating_sub(limit - items.len());
+                items.extend(state.remaining.drain(start..));
+                continue;
+            }
+            if state.pending.is_empty() {
+                if state.started && state.cursor.is_none() {
+                    break;
+                }
+                // A short, nonempty page is not EOF. Preserve the real cursor
+                // and publish complete items rather than repeatedly rejecting
+                // a large historical window at the next bounded read.
+                if !items.is_empty()
+                    && self.client.is_shared()
+                    && !budget.can_read_complete_history_item()
+                {
+                    break;
+                }
+                let page_limit = (limit - items.len()).min(100);
+                let mut page = budget.call(&self.client, "thread/items/list", json!({
+                    "threadId":id,"limit":page_limit,"sortDirection":"desc","cursor":state.cursor
+                })).await?;
+                let data = page["data"]
+                    .as_array()
+                    .ok_or_else(|| AgentError::Protocol("invalid Codex item page".into()))?;
+                if data.len() > page_limit {
+                    return Err(AgentError::Protocol("oversized Codex item page".into()));
+                }
+                budget.rows(data.len())?;
+                let next = next_cursor(&page, &mut state.seen)?;
+                if state.seen.len() > 8192 {
+                    return Err(AgentError::RequestFailed(
+                        "Codex history cursor capacity exhausted".into(),
+                    ));
+                }
+                if data.is_empty() && next.is_some() {
+                    return Err(AgentError::Protocol(
+                        "empty continuing Codex item page".into(),
+                    ));
+                }
+                let mut ids_by_turn: HashMap<String, Vec<String>> = HashMap::new();
+                for row in data.iter().rev() {
+                    let turn = mapper::string(row, "turnId")?;
+                    mapper::string(&row["item"], "type")?;
+                    if row["item"]["type"] == "reasoning"
+                        && ["summary", "content"].iter().any(|key| {
+                            row["item"][*key]
+                                .as_array()
+                                .is_some_and(|parts| parts.len() > super::MAX_REASONING_PARTS)
+                        })
+                    {
+                        return Err(AgentError::Protocol(
+                            "Codex reasoning part limit exceeded".into(),
+                        ));
+                    }
+                    ids_by_turn
+                        .entry(turn)
+                        .or_default()
+                        .push(mapper::string(&row["item"], "id")?);
+                }
+                for (turn, ids) in ids_by_turn {
+                    self.set_history_order_at(id, &turn, &ids, state.started)?;
+                }
+                state.pending = page["data"]
+                    .as_array_mut()
+                    .expect("validated item page")
+                    .drain(..)
+                    .rev()
+                    .collect();
+                state.cursor = next;
+                state.started = true;
+                if state.pending.is_empty() {
+                    break;
+                }
+            }
+            // Project the accepted page once and release all raw image bodies.
+            // A row-limited window retains only the mapped older prefix, not a
+            // giant item or the other raw images adjacent to it in this page.
+            let pending = if self.client.is_shared() {
+                std::mem::take(&mut state.pending)
+            } else {
+                vec![state.pending.pop().expect("nonempty history page")]
+            };
+            for row in pending {
+                let turn = mapper::string(&row, "turnId")?;
+                state.remaining.extend(
+                    self.ordered_items(
+                        id,
+                        &turn,
+                        &row["item"],
+                        row["startedAtMs"]
+                            .as_u64()
+                            .or_else(|| row["completedAtMs"].as_u64())
+                            .unwrap_or(0),
+                    )?,
+                );
+            }
+        }
+        items.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
+        Ok(items)
+    }
+
+    /// Local command catalog, not an app-server call. A missing file leaves
+    /// the command list empty and `slash_commands` off.
+    fn attach_commands(
+        &self,
+        catalog: &mut AgentCatalog,
+        snapshot: Option<&crate::command_catalog::Snapshot>,
+    ) {
+        catalog.commands = snapshot
+            .map(|snapshot| mapper::commands_from_catalog(&snapshot.commands))
+            .unwrap_or_default();
+        self.slash_catalog.store(
+            !catalog.commands.is_empty(),
+            std::sync::atomic::Ordering::Release,
+        );
     }
 
     async fn validate_model(&self, model: &ModelRef) -> Result<(), AgentError> {
@@ -1123,10 +1605,10 @@ impl AgentPort for CodexDriver {
             }
             // Validate uploads before any rejoin/resume or prompt mutation.
             let input = super::input::prepare(text, attachments).await?;
-            self.prepare_shared_interaction(id).await?;
-            let _guard = self.mutations.lock().await;
-            self.require_native_interaction(id).await?;
             if delivery == Some("steer") {
+                self.prepare_shared_interaction(id).await?;
+                let _guard = self.mutations.lock().await;
+                self.require_native_interaction(id).await?;
                 if !self.loaded.lock().await.contains(id) {
                     return unsupported("Codex steering requires an owned live thread");
                 }
@@ -1137,68 +1619,7 @@ impl AgentPort for CodexDriver {
                 })?;
                 return self.steer(id, &turn, input).await;
             }
-            if self.client.active_turn(id).is_some() {
-                return Err(AgentError::InvalidRequest(
-                    "Codex thread already has an active turn".into(),
-                ));
-            }
-            if !self.loaded.lock().await.contains(id) {
-                let thread = self.read_thread(id).await?;
-                if mapper::status(&thread["status"]) == AgentSessionStatus::Busy {
-                    return Err(AgentError::InvalidRequest(
-                        "Codex thread is already active; not taking it over".into(),
-                    ));
-                }
-                let resumed = self
-                    .client
-                    .call("thread/resume", json!({"threadId":id,"excludeTurns":true}))
-                    .await?;
-                if resumed["thread"]["id"] != id {
-                    return Err(AgentError::Protocol(
-                        "Codex resume identity mismatch".into(),
-                    ));
-                }
-                self.selected_response(resumed).await?;
-            }
-            let mut params = json!({"threadId":id,"input":input});
-            let model = self
-                .next_models
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .get(id)
-                .filter(|choice| choice.accepted_revision.is_none())
-                .map(|choice| choice.model.clone());
-            if let Some(model) = model {
-                let thread = self.read_thread(id).await?;
-                if thread["modelProvider"] != model.provider_id {
-                    return Err(AgentError::InvalidRequest(
-                        "Codex thread provider changed; select a matching configured model".into(),
-                    ));
-                }
-                params["model"] = json!(model.model_id);
-                if let Some(effort) = model.variant {
-                    params["effort"] = json!(effort);
-                }
-            }
-            let revision = self.metadata_revision(id).await?;
-            let response = self.client.call("turn/start", params).await?;
-            mapper::string(&response["turn"], "id")?;
-            self.record_native_acceptance(id).await;
-            if let Some(choice) = self
-                .next_models
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .get_mut(id)
-            {
-                if choice.accepted_revision.is_none() {
-                    choice.accepted_revision = Some(revision);
-                }
-            }
-            // The accepted turn applies model/effort for subsequent turns too.
-            // Re-read stable metadata; never mirror requested values or repeat
-            // turn/start when this read fails.
-            self.spawn_metadata_refresh(id, revision);
-            Ok(())
+            self.submit_turn(id, input).await
         })
     }
 
@@ -1327,6 +1748,13 @@ impl AgentPort for CodexDriver {
                     tracing::warn!("Could not remove deleted native Codex session evidence");
                 }
             }
+            let _history_read = self.history.lock().await;
+            self.history_state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .pages
+                .remove(id);
+            drop(_history_read);
             self.forget_thread(id).await;
             self.clear_usage(id).await;
             Ok(())
@@ -1499,14 +1927,137 @@ impl AgentPort for CodexDriver {
         })
     }
 
-    fn get_catalog<'a>(&'a self, _directory: Option<&'a str>) -> AgentFuture<'a, AgentCatalog> {
-        Box::pin(async move { self.catalog().await })
+    fn get_catalog<'a>(&'a self, directory: Option<&'a str>) -> AgentFuture<'a, AgentCatalog> {
+        Box::pin(async move {
+            self.skills_catalog
+                .store(false, std::sync::atomic::Ordering::Release);
+            self.slash_catalog
+                .store(false, std::sync::atomic::Ordering::Release);
+            let mut catalog = self.catalog().await?;
+            self.attach_skills(&mut catalog, directory).await;
+            self.attach_commands(&mut catalog, crate::command_catalog::load("codex").as_ref());
+            Ok(catalog)
+        })
+    }
+
+    fn skills_listed(&self) -> bool {
+        self.skills_catalog
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn slash_commands_listed(&self) -> bool {
+        self.slash_catalog
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn activate_skill<'a>(
+        &'a self,
+        session_id: &'a str,
+        name: &'a str,
+        resume: Option<bool>,
+    ) -> AgentFuture<'a, ()> {
+        Box::pin(async move {
+            if resume == Some(true) {
+                return unsupported("Codex skill resume");
+            }
+            validate_id(session_id)?;
+            let name = name.trim();
+            if !skill_name_ok(name) {
+                return Err(AgentError::InvalidRequest(
+                    "invalid Codex skill name".into(),
+                ));
+            }
+            let path = self.skill_path(session_id, name).await?;
+            self.submit_turn(
+                session_id,
+                vec![json!({"type":"skill","name":name,"path":path})],
+            )
+            .await
+        })
+    }
+
+    fn load_earlier_timeline<'a>(
+        &'a self,
+        session_id: &'a str,
+        limit: usize,
+    ) -> AgentFuture<'a, Vec<TimelineItem>> {
+        Box::pin(async move {
+            if limit == 0 || limit > MAX_HISTORY_ITEMS {
+                return Err(AgentError::InvalidRequest(
+                    "Codex history limit exceeds 2000 mapped rows".into(),
+                ));
+            }
+            validate_id(session_id)?;
+            let _history_read = self.history.lock().await;
+            let Some(mut page) = self
+                .history_state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .pages
+                .get(session_id)
+                .cloned()
+            else {
+                return Err(AgentError::HistoryCursorLost);
+            };
+            if page.started
+                && page.cursor.is_none()
+                && page.pending.is_empty()
+                && page.remaining.is_empty()
+            {
+                return Ok(Vec::new());
+            }
+            let expected = Some(page.revision);
+            let mut budget = Budget::new();
+            let items = self
+                .read_history_batch(session_id, limit, &mut page, &mut budget)
+                .await?;
+            self.accept_history(session_id, expected, page)?;
+            Ok(items)
+        })
+    }
+
+    fn run_command<'a>(
+        &'a self,
+        session_id: &'a str,
+        name: &'a str,
+        arguments: &'a str,
+        delivery: Option<&'a str>,
+    ) -> AgentFuture<'a, ()> {
+        Box::pin(async move {
+            // TUI commands and custom prompt names are not app-server RPCs.
+            // Never turn an unsupported command into a billable model turn.
+            if !mapper::is_compact_command(name) {
+                return unsupported("Codex slash command");
+            }
+            if !arguments.trim().is_empty() {
+                return Err(AgentError::InvalidRequest(
+                    "Codex compact takes no arguments".into(),
+                ));
+            }
+            self.compact_session(session_id, delivery).await.map(|_| ())
+        })
     }
 
     fn get_timeline<'a>(&'a self, id: &'a str, limit: usize) -> AgentFuture<'a, Vec<TimelineItem>> {
         Box::pin(async move {
+            let prepared = self.prepare_timeline(id, limit).await?;
+            if let Some(commit) = prepared.commit {
+                commit()?;
+            }
+            // The final commit and return are in one poll, with no cancellable
+            // await after pagination publication (including the rollout path).
+            Ok(prepared.items)
+        })
+    }
+
+    fn prepare_timeline<'a>(
+        &'a self,
+        id: &'a str,
+        limit: usize,
+    ) -> AgentFuture<'a, PreparedTimeline<'a>> {
+        Box::pin(async move {
             if limit == 0 {
-                return Ok(vec![]);
+                return Ok(PreparedTimeline::ready(vec![]));
             }
             if limit > MAX_HISTORY_ITEMS {
                 return Err(AgentError::InvalidRequest(
@@ -1514,6 +2065,24 @@ impl AgentPort for CodexDriver {
                 ));
             }
             validate_id(id)?;
+            // Prepared candidates live only in bounded caller-owned leases,
+            // never an unbounded token/cache registry. Drop also releases a slot.
+            let permit = self
+                .history_preparations
+                .clone()
+                .try_acquire_owned()
+                .map_err(|_| {
+                    AgentError::NotAvailable("Codex history preparation capacity exhausted".into())
+                })?;
+            // Fence the whole preparation, including metadata/rollout I/O and
+            // waiting for the page-read gate, not just the final item-page read.
+            let expected = self
+                .history_state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .pages
+                .get(id)
+                .map(|held| held.revision);
             let mut budget = Budget::new();
             let metadata = budget
                 .call(
@@ -1530,75 +2099,14 @@ impl AgentPort for CodexDriver {
             let thread = &metadata["thread"];
             self.rejoin_loaded(id, thread, true).await?;
             let prepared = super::rollout::Rollouts::prepare(self, thread).await;
-            let mut items = vec![];
-            match thread["historyMode"].as_str() {
+            // Rejoin uses the mutation lock; never take it while holding the
+            // history lock (delete holds mutations before clearing history).
+            let _history_read = self.history.lock().await;
+            let mut page = HistoryPage::default();
+            let items = match thread["historyMode"].as_str() {
                 Some("paginated") => {
-                    let mut rows = vec![];
-                    let mut cursor = None;
-                    let mut seen = HashSet::new();
-                    let mut mapped = 0;
-                    loop {
-                        let page_limit = (limit - mapped).min(100);
-                        let page = budget.call(&self.client,"thread/items/list",json!({"threadId":id,"limit":page_limit,"sortDirection":"desc","cursor":cursor})).await?;
-                        let data = page["data"].as_array().ok_or_else(|| {
-                            AgentError::Protocol("invalid Codex item page".into())
-                        })?;
-                        if data.len() > page_limit {
-                            return Err(AgentError::Protocol("oversized Codex item page".into()));
-                        }
-                        budget.rows(data.len())?;
-                        for row in data {
-                            let turn = mapper::string(row, "turnId")?;
-                            mapper::string(&row["item"], "id")?;
-                            mapper::string(&row["item"], "type")?;
-                            if row["item"]["type"] == "reasoning"
-                                && ["summary", "content"].iter().any(|key| {
-                                    row["item"][*key].as_array().is_some_and(|parts| {
-                                        parts.len() > super::MAX_REASONING_PARTS
-                                    })
-                                })
-                            {
-                                return Err(AgentError::Protocol(
-                                    "Codex reasoning part limit exceeded".into(),
-                                ));
-                            }
-                            mapped += mapper::item(id, &turn, &row["item"], 0).len();
-                        }
-                        rows.extend(data.iter().cloned());
-                        cursor = next_cursor(&page, &mut seen)?;
-                        if mapped >= limit || cursor.is_none() {
-                            break;
-                        }
-                        if data.is_empty() {
-                            return Err(AgentError::Protocol(
-                                "empty continuing Codex item page".into(),
-                            ));
-                        }
-                    }
-                    let mut ids_by_turn: HashMap<String, Vec<String>> = HashMap::new();
-                    for row in rows.iter().rev() {
-                        ids_by_turn
-                            .entry(mapper::string(row, "turnId")?)
-                            .or_default()
-                            .push(mapper::string(&row["item"], "id")?);
-                    }
-                    for (turn, ids) in ids_by_turn {
-                        self.set_history_order(id, &turn, &ids)?;
-                    }
-                    for row in rows.iter().rev() {
-                        let turn = mapper::string(row, "turnId")?;
-                        items.extend(
-                            self.ordered_items(
-                                id,
-                                &turn,
-                                &row["item"],
-                                row["startedAtMs"]
-                                    .as_u64()
-                                    .or_else(|| row["completedAtMs"].as_u64())
-                                    .unwrap_or(0),
-                            )?,
-                        );
-                    }
+                    self.read_history_batch(id, limit, &mut page, &mut budget)
+                        .await?
                 }
                 Some("legacy") => {
                     let response = budget
@@ -1626,28 +2134,34 @@ impl AgentPort for CodexDriver {
                                 .collect::<Result<Vec<_>, _>>()?;
                             self.set_history_order(id, &turn_id, &ids)?;
                             for row in rows {
-                                items.extend(self.ordered_items(
-                                    id,
-                                    &turn_id,
-                                    row,
-                                    turn["startedAt"].as_u64().unwrap_or(0).saturating_mul(1000),
-                                )?);
+                                page.pending.push(json!({"turnId":turn_id,"item":row,
+                                    "startedAtMs":turn["startedAt"].as_u64().unwrap_or(0).saturating_mul(1000)}));
                             }
                         }
                     }
+                    page.started = true;
+                    self.read_history_batch(id, limit, &mut page, &mut budget)
+                        .await?
                 }
                 _ => return unsupported("Codex thread history storage mode"),
-            }
-            items.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
-            if items.len() > limit {
-                items.drain(..items.len() - limit);
-            }
-            if let Some(prepared) = prepared {
+            };
+            // Finish every async preparation before exposing the candidate.
+            // A usage-lock wait, timeout or cancellation cannot reset history.
+            if let Some(prepared) = &prepared {
                 self.seed_usage(id, prepared.usage.as_ref(), prepared.external())
                     .await;
-                self.rollouts.install(id, prepared);
             }
-            Ok(items)
+            Ok(PreparedTimeline {
+                items,
+                commit: Some(Box::new(move || {
+                    let _permit = permit;
+                    self.accept_history(id, expected, page)?;
+                    if let Some(prepared) = prepared {
+                        self.rollouts.install(id, prepared);
+                    }
+                    Ok(())
+                })),
+            })
         })
     }
 
@@ -1659,11 +2173,68 @@ impl AgentPort for CodexDriver {
     }
     fn find_files<'a>(
         &'a self,
-        _query: &'a str,
-        _limit: usize,
-        _directory: Option<&'a str>,
+        query: &'a str,
+        limit: usize,
+        directory: Option<&'a str>,
     ) -> AgentFuture<'a, Vec<Value>> {
-        Box::pin(async { unsupported("Codex file search") })
+        Box::pin(async move {
+            let root = directory
+                .map(str::trim)
+                .filter(|path| path.starts_with('/') && !path.chars().any(char::is_control))
+                .ok_or_else(|| {
+                    AgentError::InvalidRequest(
+                        "Codex file search needs an absolute directory".into(),
+                    )
+                })?;
+            if limit == 0 || limit > 50 {
+                return Err(AgentError::InvalidRequest(
+                    "Codex file search limit must be 1 to 50".into(),
+                ));
+            }
+            let query = query.trim();
+            if query.len() > 256 {
+                return Err(AgentError::InvalidRequest(
+                    "Codex file search query is too long".into(),
+                ));
+            }
+            if query.is_empty() {
+                return Ok(Vec::new());
+            }
+            let response = self
+                .client
+                .call("fuzzyFileSearch", json!({"query": query, "roots": [root]}))
+                .await?;
+            let mut files = response
+                .get("files")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            files.sort_by(|a, b| {
+                b.get("score")
+                    .and_then(Value::as_u64)
+                    .cmp(&a.get("score").and_then(Value::as_u64))
+            });
+            Ok(files
+                .into_iter()
+                .filter_map(|row| {
+                    let relative = row.get("path").and_then(Value::as_str)?;
+                    let path = if relative.starts_with('/') {
+                        relative.to_string()
+                    } else {
+                        format!("{}/{}", root.trim_end_matches('/'), relative)
+                    };
+                    if !skill_path_ok(&path) {
+                        return None;
+                    }
+                    let kind = match row.get("match_type").and_then(Value::as_str) {
+                        Some("directory") => "directory",
+                        _ => "file",
+                    };
+                    Some(json!({"path": path, "type": kind}))
+                })
+                .take(limit)
+                .collect())
+        })
     }
     fn get_vcs_diff<'a>(
         &'a self,
@@ -1675,11 +2246,503 @@ impl AgentPort for CodexDriver {
 }
 
 #[cfg(test)]
+mod history_tests {
+    use super::super::tests::{golden, history_fixture_page, Fixture};
+    use super::*;
+    use crate::agents::adapters::memory_mirror::MemoryMirror;
+    use crate::agents::ports::mirror::SessionMirrorPort;
+    use crate::agents::use_cases::SessionService;
+    use std::future::Future;
+    use std::task::Poll;
+
+    // A notification after the fixture's RPC response proves the client reader
+    // delivered that reply. The test can then poll precisely to the blocked
+    // post-tail boundary, without sleeps or production instrumentation.
+    async fn rpc_barrier(fixture: &mut Fixture, id: &str) {
+        fixture
+            .send(json!({"method":"synthetic/historyBarrier","params":{"threadId":id}}))
+            .await;
+        loop {
+            let event = fixture.events.as_mut().unwrap().recv().await.unwrap();
+            if matches!(event, super::super::CodexEvent::Notification {method,..} if method == "synthetic/historyBarrier")
+            {
+                break;
+            }
+        }
+    }
+
+    async fn refresh_interleaving(case: &str) {
+        let mut fixture = Fixture::new(|r| match r["method"].as_str().unwrap() {
+            "thread/read" => json!({"thread":golden()["thread"]}),
+            "thread/items/list" => history_fixture_page(r, 241, false),
+            _ => panic!("unexpected history RPC"),
+        })
+        .await;
+        fixture.ready().await;
+        let driver = Arc::new(CodexDriver::new(fixture.client.clone()));
+        let memory = Arc::new(MemoryMirror::new());
+        let service = SessionService::with_memory_mirror(driver.clone(), memory.clone());
+        let id = AgentSessionId(golden()["thread"]["id"].as_str().unwrap().into());
+        let tail = service.get_snapshot(&id).await.unwrap().timeline;
+        let first = service.load_earlier_timeline(&id).await.unwrap();
+        assert_eq!(first.len(), 80);
+        while fixture.requests.try_recv().is_ok() {}
+
+        let forms = driver.async_questions.lock().await;
+        let mut refresh = Box::pin(service.refresh_snapshot(&id));
+        loop {
+            let request = tokio::select! {
+                biased;
+                result = &mut refresh => panic!("refresh must wait for forms: {result:?}"),
+                request = fixture.next() => request,
+            };
+            if request["method"] == "thread/items/list" {
+                break;
+            }
+        }
+        rpc_barrier(&mut fixture, &id.0).await;
+        std::future::poll_fn(|cx| {
+            assert!(
+                refresh.as_mut().poll(cx).is_pending(),
+                "tail succeeded; forms are blocked"
+            );
+            Poll::Ready(())
+        })
+        .await;
+
+        let mut earlier = None;
+        if case == "earlier" {
+            earlier = Some(service.load_earlier_timeline(&id).await.unwrap());
+        } else if case == "conflict" {
+            let mut info = memory.get_snapshot(&id).await.unwrap().info;
+            info.title = "newer live metadata".into();
+            memory.update_session(info).await;
+        }
+        if case == "cancel" {
+            drop(refresh);
+        } else {
+            drop(forms);
+            assert!(refresh.await.is_err(), "newer mirror state must win");
+        }
+        let remaining = match earlier {
+            Some(rows) => rows,
+            None => service.load_earlier_timeline(&id).await.unwrap(),
+        };
+        assert_eq!(
+            remaining.len(),
+            61,
+            "failed refresh cannot reset the cursor at 180"
+        );
+        assert!(remaining.last().unwrap().sort_key() < first.first().unwrap().sort_key());
+        let all: Vec<_> = tail.into_iter().chain(first).chain(remaining).collect();
+        assert_eq!(all.len(), 241);
+        assert_eq!(
+            all.iter().map(|row| &row.id).collect::<HashSet<_>>().len(),
+            241
+        );
+        assert!(service.load_earlier_timeline(&id).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn codex_history_review_refresh_mirror_conflict_preserves_earlier_boundary() {
+        refresh_interleaving("conflict").await;
+    }
+
+    #[tokio::test]
+    async fn codex_history_review_cancel_before_mirror_acceptance_preserves_boundary() {
+        refresh_interleaving("cancel").await;
+    }
+
+    #[tokio::test]
+    async fn codex_history_review_refresh_and_earlier_never_overwrite_new_progress() {
+        refresh_interleaving("earlier").await;
+    }
+
+    #[tokio::test]
+    async fn codex_history_review_prepared_rollout_usage_wait_cancellation_does_not_reset_cursor() {
+        let home = crate::test_support::asset_test_dir("history-prepared-rollout");
+        std::fs::create_dir_all(home.join("sessions/day")).unwrap();
+        let path = home.join("sessions/day/rollout.jsonl");
+        let id = uuid::Uuid::new_v4().to_string();
+        std::fs::write(
+            &path,
+            format!("{}\n", json!({"type":"session_meta","payload":{"id":id}})),
+        )
+        .unwrap();
+        let mut thread = golden()["thread"].clone();
+        thread["id"] = json!(id);
+        thread["path"] = json!(path);
+        let source = thread.clone();
+        let mut fixture = Fixture::new_in_home(
+            move |r| match r["method"].as_str().unwrap() {
+                "thread/read" => json!({"thread":source}),
+                "thread/items/list" => history_fixture_page(r, 241, false),
+                _ => panic!("unexpected history RPC"),
+            },
+            &home,
+        )
+        .await;
+        fixture.ready().await;
+        let mut driver = CodexDriver::new(fixture.client.clone());
+        driver.observe_terminals(Some(crate::agents::terminal_runtime::TerminalRuntime::new(
+            &[],
+        )));
+        assert!(
+            super::super::rollout::Rollouts::prepare(&driver, &thread)
+                .await
+                .is_some(),
+            "exercise the real prepared rollout branch"
+        );
+        driver.get_timeline(&id, 100).await.unwrap();
+        driver.load_earlier_timeline(&id, 80).await.unwrap();
+        while fixture.requests.try_recv().is_ok() {}
+        let usage = driver.usage.lock().await;
+        let mut read = Box::pin(driver.get_timeline(&id, 100));
+        loop {
+            let request = tokio::select! {
+                biased;
+                result = &mut read => panic!("usage lock must block the prepared rollout: {result:?}"),
+                request = fixture.next() => request,
+            };
+            if request["method"] == "thread/items/list" {
+                break;
+            }
+        }
+        rpc_barrier(&mut fixture, &id).await;
+        std::future::poll_fn(|cx| {
+            assert!(
+                read.as_mut().poll(cx).is_pending(),
+                "RPC completed; usage remains blocked"
+            );
+            Poll::Ready(())
+        })
+        .await;
+        drop(read);
+        drop(usage);
+        assert_eq!(
+            driver.load_earlier_timeline(&id, 80).await.unwrap().len(),
+            61
+        );
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[tokio::test]
+    async fn codex_history_review_stale_ack_cannot_change_initial_or_refreshed_mirror() {
+        for case in ["revision", "incarnation", "initial"] {
+            let mut fixture = Fixture::new(|r| match r["method"].as_str().unwrap() {
+                "thread/read" => json!({"thread":golden()["thread"]}),
+                "thread/items/list" => history_fixture_page(r, 241, false),
+                _ => panic!("unexpected history RPC"),
+            })
+            .await;
+            fixture.ready().await;
+            let driver = Arc::new(CodexDriver::new(fixture.client.clone()));
+            let memory = Arc::new(MemoryMirror::new());
+            let service = SessionService::with_memory_mirror(driver.clone(), memory.clone());
+            let id = AgentSessionId(golden()["thread"]["id"].as_str().unwrap().into());
+            if case == "initial" {
+                memory
+                    .update_session(driver.get_session(&id.0).await.unwrap())
+                    .await;
+                driver.get_timeline(&id.0, 100).await.unwrap();
+                driver.load_earlier_timeline(&id.0, 80).await.unwrap();
+            } else {
+                service.get_snapshot(&id).await.unwrap();
+                service.load_earlier_timeline(&id).await.unwrap();
+            }
+            let held = memory.get_snapshot(&id).await.unwrap();
+            let (seq, incarnation) = memory.snapshot_read_revision(&id).await;
+            let gate = memory.history_gate(&id).await;
+            let initial_revision = memory.history_read_revision(&id).await.unwrap();
+            let prepared = driver.prepare_timeline(&id.0, 100).await.unwrap();
+            if case == "incarnation" {
+                memory.remove_session(&id).await;
+                let mut recreated = held.info.clone();
+                recreated.title = "recreated incarnation".into();
+                for _ in 0..held.seq {
+                    memory.update_session(recreated.clone()).await;
+                }
+                assert_eq!(
+                    memory.get_snapshot(&id).await.unwrap().seq,
+                    held.seq,
+                    "ABA sequence matches"
+                );
+            } else {
+                // Deliberately advance only the adapter, not the mirror seq.
+                // A service-only lock or mirror-only fence cannot catch this.
+                assert_eq!(
+                    driver.load_earlier_timeline(&id.0, 80).await.unwrap().len(),
+                    61
+                );
+            }
+            if case == "initial" {
+                assert!(memory
+                    .initialize_prepared_history(
+                        &id,
+                        &gate,
+                        initial_revision,
+                        prepared.items,
+                        prepared.commit
+                    )
+                    .await
+                    .is_err());
+                assert!(!memory.history_initialized(&id).await);
+                assert!(memory.get_snapshot(&id).await.unwrap().timeline.is_empty());
+            } else {
+                let mut snapshot = held.clone();
+                snapshot.timeline = prepared.items;
+                let result = memory
+                    .refresh_prepared_snapshot(snapshot, seq, incarnation, prepared.commit)
+                    .await;
+                if case == "incarnation" {
+                    assert!(
+                        result.unwrap().is_none(),
+                        "old incarnation cannot ACK a new session"
+                    );
+                    let current = memory.get_snapshot(&id).await.unwrap();
+                    assert_eq!(current.info.title, "recreated incarnation");
+                    assert!(current.timeline.is_empty());
+                    assert_eq!(
+                        driver.load_earlier_timeline(&id.0, 80).await.unwrap().len(),
+                        61
+                    );
+                } else {
+                    assert!(matches!(result, Err(AgentError::NotAvailable(_))));
+                    let current = memory.get_snapshot(&id).await.unwrap();
+                    assert_eq!(current.seq, held.seq);
+                    assert_eq!(
+                        current.timeline, held.timeline,
+                        "adapter rejection must not alter mirror rows"
+                    );
+                }
+            }
+            assert!(driver
+                .load_earlier_timeline(&id.0, 80)
+                .await
+                .unwrap()
+                .is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_history_review_prepared_leases_are_bounded_and_drop_does_not_consume() {
+        let mut fixture = Fixture::new(|r| match r["method"].as_str().unwrap() {
+            "thread/read" => json!({"thread":golden()["thread"]}),
+            "thread/items/list" => history_fixture_page(r, 241, false),
+            _ => panic!("unexpected history RPC"),
+        })
+        .await;
+        fixture.ready().await;
+        let driver = CodexDriver::new(fixture.client.clone());
+        let id = golden()["thread"]["id"].as_str().unwrap().to_owned();
+        driver.get_timeline(&id, 100).await.unwrap();
+        driver.load_earlier_timeline(&id, 80).await.unwrap();
+        let mut candidates = Vec::new();
+        for _ in 0..4 {
+            candidates.push(driver.prepare_timeline(&id, 100).await.unwrap());
+        }
+        while fixture.requests.try_recv().is_ok() {}
+        assert!(matches!(
+            driver.prepare_timeline(&id, 100).await,
+            Err(AgentError::NotAvailable(_))
+        ));
+        assert!(
+            fixture.requests.try_recv().is_err(),
+            "capacity rejection precedes provider I/O"
+        );
+        drop(candidates.pop());
+        candidates.push(driver.prepare_timeline(&id, 100).await.unwrap());
+        assert_eq!(
+            driver.load_earlier_timeline(&id, 80).await.unwrap().len(),
+            61,
+            "uncommitted tails do not hold the read lock or reset pagination"
+        );
+        drop(candidates);
+        assert_eq!(driver.history_preparations.available_permits(), 4);
+        let held = driver.history_state.lock().unwrap().pages[&id].clone();
+        driver.history_state.lock().unwrap().revision = u64::MAX;
+        assert!(driver
+            .accept_history(&id, Some(held.revision), held.clone())
+            .is_err());
+        assert_eq!(
+            driver.history_state.lock().unwrap().pages[&id].revision,
+            held.revision
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_history_review_progress_during_metadata_preparation_fences_tail_ack() {
+        let mut fixture = Fixture::new(|r| match r["method"].as_str().unwrap() {
+            "thread/read" => json!({"thread":golden()["thread"]}),
+            "thread/items/list" => history_fixture_page(r, 3, true),
+            _ => panic!("unexpected history RPC"),
+        })
+        .await;
+        fixture.ready().await;
+        let driver = CodexDriver::new(fixture.client.clone());
+        let id = golden()["thread"]["id"].as_str().unwrap().to_owned();
+        let tail = driver.get_timeline(&id, 100).await.unwrap();
+        while fixture.requests.try_recv().is_ok() {}
+        let writer = fixture.writer.clone();
+        let response_block = writer.lock().await;
+        let mut candidate = Box::pin(driver.prepare_timeline(&id, 100));
+        let request = tokio::select! {
+            biased;
+            _ = &mut candidate => panic!("preparation must first request metadata"),
+            request = fixture.next() => request,
+        };
+        assert_eq!(request["method"], "thread/read");
+        // These rows are already in a residual page, so earlier can advance
+        // without another RPC while the tail's metadata reply is outstanding.
+        let first = driver.load_earlier_timeline(&id, 80).await.unwrap();
+        assert_eq!(first.len(), 80);
+        drop(response_block);
+        let prepared = candidate.await.unwrap();
+        assert!(
+            prepared.commit.unwrap()().is_err(),
+            "the ACK must fence progress from the start of preparation, not just the item-page read"
+        );
+        let mut all = tail;
+        all.extend(first);
+        all.extend(driver.load_earlier_timeline(&id, 2000).await.unwrap());
+        assert_eq!(all.len(), 303);
+        assert_eq!(
+            all.iter().map(|row| &row.id).collect::<HashSet<_>>().len(),
+            303
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_history_order_preserves_live_anchor_and_rejects_range_or_capacity_exhaustion() {
+        let mut fixture = Fixture::new(|_| panic!("order tests never make RPCs")).await;
+        fixture.ready().await;
+        let driver = CodexDriver::new(fixture.client.clone());
+        let live = driver.item_position("thread", "turn", "live").unwrap();
+        driver
+            .set_history_order_at("thread", "turn", &["old".into()], true)
+            .unwrap();
+        assert!(driver.item_position("thread", "turn", "old").unwrap() < live);
+        assert_eq!(
+            driver.item_position("thread", "turn", "live").unwrap(),
+            live
+        );
+        let key = ("thread".into(), "turn".into(), "old".into());
+        driver.order.lock().unwrap().insert(key, 0);
+        let before = driver.order.lock().unwrap().clone();
+        assert!(driver
+            .set_history_order_at("thread", "turn", &["older".into()], true)
+            .is_err());
+        assert_eq!(*driver.order.lock().unwrap(), before);
+        driver
+            .order
+            .lock()
+            .unwrap()
+            .insert(("max".into(), "turn".into(), "last".into()), u64::MAX);
+        assert!(driver.item_position("max", "turn", "overflow").is_err());
+        assert!(driver
+            .set_history_order("max", "turn", &["overflow".into()])
+            .is_err());
+        {
+            let mut order = driver.order.lock().unwrap();
+            for n in order.len()..8192 {
+                order.insert(("capacity".into(), "turn".into(), n.to_string()), n as u64);
+            }
+        }
+        assert!(driver
+            .set_history_order_at("thread", "turn", &["new".into()], true)
+            .is_err());
+        assert_eq!(driver.order.lock().unwrap().len(), 8192);
+        assert!(
+            fixture.client.is_ready(),
+            "history cache exhaustion must not stop the primary"
+        );
+    }
+
+    /// The retention budget is shared: a session is never refused a page
+    /// because others hold theirs. The least recently read of the others
+    /// are evicted until the page fits; only a page that cannot fit on its
+    /// own is refused, and then nothing is consumed or evicted.
+    #[test]
+    fn codex_history_retention_evicts_the_least_recently_read_session_first() {
+        let mut history = HashMap::new();
+        for (id, bytes, read_at_ms) in [
+            ("stale", MAX_HISTORY_RETAINED_BYTES / 2, 1),
+            ("recent", MAX_HISTORY_RETAINED_BYTES / 2 - 64, 2),
+        ] {
+            history.insert(
+                id.into(),
+                HistoryPage {
+                    retained_bytes: bytes,
+                    read_at_ms,
+                    ..Default::default()
+                },
+            );
+        }
+        // Committing a page recomputes its size from its contents: empty.
+        CodexDriver::commit_history(&mut history, "new", HistoryPage::default()).unwrap();
+        assert!(history.contains_key("new"));
+        assert!(history.contains_key("stale") && history.contains_key("recent"));
+        // One over the session cap evicts the least recently read, not the newest.
+        for n in history.len()..MAX_SESSIONS {
+            history.insert(
+                n.to_string(),
+                HistoryPage {
+                    read_at_ms: 10,
+                    ..Default::default()
+                },
+            );
+        }
+        CodexDriver::commit_history(&mut history, "another", HistoryPage::default()).unwrap();
+        assert_eq!(history.len(), MAX_SESSIONS);
+        assert!(
+            !history.contains_key("stale"),
+            "the least recently read went"
+        );
+        assert!(history.contains_key("recent") && history.contains_key("another"));
+    }
+}
+
+#[cfg(test)]
 mod model_page_tests {
     use super::super::tests::{golden, Fixture};
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn command_catalog_capability_tracks_runnable_rows_and_missing_snapshot() {
+        let mut fixture = Fixture::new(|_| panic!("local command rows must not call Codex")).await;
+        fixture.ready().await;
+        let driver = CodexDriver::new(fixture.client.clone());
+        let mut catalog = AgentCatalog::default();
+        let mut snapshot = crate::command_catalog::Snapshot {
+            agent: "codex-cli".into(),
+            version: "synthetic".into(),
+            commands: ["/new", "/export", "/compact"]
+                .into_iter()
+                .map(|name| crate::command_catalog::CatalogCommand {
+                    name: name.into(),
+                    description: "Synthetic command".into(),
+                    args_hint: None,
+                })
+                .collect(),
+        };
+        driver.attach_commands(&mut catalog, Some(&snapshot));
+        assert_eq!(catalog.commands.len(), 1);
+        assert_eq!(catalog.commands[0].name, "/compact");
+        assert!(driver.slash_commands_listed());
+
+        // Missing/invalid local files already load as None. Keep the existing
+        // empty-directory policy, including after a previous successful read.
+        driver.attach_commands(&mut catalog, None);
+        assert!(catalog.commands.is_empty());
+        assert!(!driver.slash_commands_listed());
+        snapshot.commands.pop();
+        driver.attach_commands(&mut catalog, Some(&snapshot));
+        assert!(catalog.commands.is_empty());
+        assert!(!driver.slash_commands_listed());
+        assert!(fixture.requests.try_recv().is_err());
+    }
 
     #[tokio::test]
     async fn compaction_requires_owned_idle_thread_and_never_resumes_or_retries() {

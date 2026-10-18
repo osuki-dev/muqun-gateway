@@ -25,6 +25,7 @@ use super::manager::AgentManager;
 
 pub(crate) mod codex;
 pub use codex::CodexConfig;
+pub(crate) mod deepseek;
 mod t3;
 use t3::{catalog_entry, T3State};
 pub use t3::{T3Config, DEFAULT_T3_URL};
@@ -71,6 +72,22 @@ const SESSION_LOOKUP_TIMEOUT: Duration = Duration::from_secs(3);
 fn pick_primary<T>(map: &BTreeMap<String, T>) -> Option<&T> {
     AGENT_PREFERENCE.iter().find_map(|id| map.get(*id))
 }
+
+/// The session-to-agent routes, kept across restarts: without them the
+/// first open of each session after a restart probed every attached agent
+/// in turn (up to twelve seconds with four). A route is a hint of which
+/// adapter to ask, never an authorisation: the adapter asked still answers
+/// `SessionNotFound` for a session it does not own, and the caller's device
+/// token is checked by the route as before.
+pub(crate) const SESSION_ROUTES_MIGRATION: crate::platform::store::sqlite::Migration =
+    crate::platform::store::sqlite::Migration {
+        namespace: "agent_session_routes",
+        steps: &["CREATE TABLE agent_session_routes (
+            asid TEXT PRIMARY KEY,
+            agent_id TEXT NOT NULL,
+            updated_ms INTEGER NOT NULL
+        );"],
+    };
 
 /// Remembered session routes, bounded: insertion order is kept so the oldest
 /// can be dropped.
@@ -141,12 +158,30 @@ impl Default for OpencodeConfig {
 }
 
 /// `deepseek` in `config.json`.
-#[derive(Clone, Default, Serialize, Deserialize)]
+///
+/// `autostart` uses the same serde default as [`OpencodeConfig::autostart`]
+/// (`default_true`). Spawn still requires `enabled`, which defaults to false,
+/// so a config written before this key existed does not start a process until
+/// DeepSeek is turned on. Once `enabled` is set and `autostart` is omitted,
+/// the gateway starts the harness. Set `autostart` to false to only adopt a
+/// harness you started yourself.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct DeepseekConfig {
-    /// Explicitly enable the DeepSeek agent
+    /// Explicitly enable the DeepSeek agent.
     #[serde(default)]
     pub enabled: bool,
-    /// Explicit service endpoint URL (default is http://127.0.0.1:19387)
+    /// Start `dsh web` when `enabled` and no healthy endpoint is listening.
+    ///
+    /// Defaults to true when the key is absent. See the struct comment for
+    /// why an old config without the key stays quiet until DeepSeek is enabled.
+    #[serde(default = "default_true")]
+    pub autostart: bool,
+    /// Service URL. When set, this host and port are what a spawned harness
+    /// listens on, and adoption probes this URL only. When absent, adoption
+    /// uses `DEEPSEEK_HARNESS_URL` / `DSH_URL` exclusively when set (attach-only),
+    /// otherwise tries port 3080, then the legacy port 19387. Without an
+    /// explicit endpoint or environment override, a spawned harness listens on
+    /// `http://127.0.0.1:3080`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
     /// Optional DSH launch token, exchanged for the service's root-session cookie.
@@ -157,6 +192,18 @@ pub struct DeepseekConfig {
     pub secret: Option<String>,
 }
 
+impl Default for DeepseekConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            autostart: true,
+            endpoint: None,
+            token: None,
+            secret: None,
+        }
+    }
+}
+
 /// `Debug` never prints the token or the cookie secret: `Config` derives
 /// `Debug` and is logged at startup, and credentials in the journal are a leak.
 impl std::fmt::Debug for DeepseekConfig {
@@ -164,6 +211,7 @@ impl std::fmt::Debug for DeepseekConfig {
         let redact = |value: &Option<String>| value.as_ref().map(|_| "<redacted>");
         f.debug_struct("DeepseekConfig")
             .field("enabled", &self.enabled)
+            .field("autostart", &self.autostart)
             .field("endpoint", &self.endpoint)
             .field("token", &redact(&self.token))
             .field("secret", &redact(&self.secret))
@@ -220,6 +268,8 @@ pub struct AgentRuntime {
     manager: RwLock<Option<Arc<AgentManager>>>,
     managers: RwLock<BTreeMap<String, Arc<AgentManager>>>,
     session_routes: RwLock<SessionRoutes>,
+    /// Where the routes are kept across restarts, once the store is open.
+    route_store: std::sync::OnceLock<Arc<crate::platform::store::sqlite::SqliteStore>>,
     /// The last agent discovery and when it was taken.
     discovery_cache: RwLock<Option<(tokio::time::Instant, crate::discovery::AgentPlaneDiscovery)>>,
     /// One refresh at a time; the rest wait and read its result.
@@ -231,6 +281,10 @@ pub struct AgentRuntime {
     deepseek_config: DeepseekConfig,
     t3: T3State,
     codex: codex::CodexState,
+    /// The harness this gateway started, if any. Not a kill handle.
+    deepseek_spawn: Mutex<deepseek::SpawnSlot>,
+    /// Origin of the attached DeepSeek manager, including when it is not primary.
+    deepseek_origin: RwLock<AgentOrigin>,
     origin: RwLock<AgentOrigin>,
     /// Identity last verified for the attached OpenCode manager. `/api/info`
     /// has no instance id, so retain that field from registration separately.
@@ -365,6 +419,8 @@ impl AgentRuntime {
             deepseek_config,
             t3,
             codex,
+            deepseek_spawn: Mutex::new(deepseek::SpawnSlot::default()),
+            deepseek_origin: RwLock::new(AgentOrigin::None),
             origin: RwLock::new(AgentOrigin::None),
             opencode_instance: RwLock::new(None),
             start_lock: Mutex::new(()),
@@ -372,7 +428,68 @@ impl AgentRuntime {
             mcp: std::sync::OnceLock::new(),
             terminal_runtime: std::sync::OnceLock::new(),
             native_codex_sessions: std::sync::OnceLock::new(),
+            route_store: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Keep the session routes in `db` from now on, and start from the ones
+    /// a previous run left there (the newest [`MAX_SESSION_ROUTES`]).
+    pub(crate) async fn persist_session_routes(
+        &self,
+        db: Arc<crate::platform::store::sqlite::SqliteStore>,
+    ) {
+        let loaded = db
+            .call(|db| {
+                let mut rows = db.prepare(
+                    "SELECT asid, agent_id FROM agent_session_routes ORDER BY updated_ms DESC LIMIT ?1",
+                )?;
+                let routes: Vec<(String, String)> = rows
+                    .query_map([MAX_SESSION_ROUTES as i64], |row| Ok((row.get(0)?, row.get(1)?)))?
+                    .collect::<Result<_, _>>()?;
+                Ok(routes)
+            })
+            .await;
+        match loaded {
+            Ok(routes) => {
+                let mut held = self.session_routes.write().await;
+                // Oldest first, so the newest are the last to be dropped.
+                for (asid, agent_id) in routes.into_iter().rev() {
+                    held.insert(&asid, &agent_id);
+                }
+            }
+            Err(error) => tracing::warn!("session routes could not be loaded: {error:#}"),
+        }
+        let _ = self.route_store.set(db);
+    }
+
+    async fn store_route(&self, asid: &str, agent_id: Option<&str>) {
+        let Some(db) = self.route_store.get() else {
+            return;
+        };
+        let (asid, agent_id) = (asid.to_owned(), agent_id.map(str::to_owned));
+        let written = db
+            .call(move |db| {
+                match agent_id {
+                    Some(agent_id) => {
+                        db.execute(
+                            "INSERT OR REPLACE INTO agent_session_routes(asid, agent_id, updated_ms) VALUES(?1, ?2, ?3)",
+                            rusqlite::params![asid, agent_id, crate::tasks::domain::now_ms() as i64],
+                        )?;
+                        db.execute(
+                            "DELETE FROM agent_session_routes WHERE asid NOT IN (SELECT asid FROM agent_session_routes ORDER BY updated_ms DESC LIMIT ?1)",
+                            [MAX_SESSION_ROUTES as i64],
+                        )?;
+                    }
+                    None => {
+                        db.execute("DELETE FROM agent_session_routes WHERE asid=?1", [asid])?;
+                    }
+                }
+                Ok(())
+            })
+            .await;
+        if let Err(error) = written {
+            tracing::debug!("session route not kept: {error:#}");
+        }
     }
 
     pub(crate) fn observe_terminal_sessions(&self, sessions: &[crate::SessionConfig]) {
@@ -443,6 +560,9 @@ impl AgentRuntime {
     #[cfg(test)]
     pub(crate) async fn attach_for_test(&self, manager: Arc<AgentManager>) {
         let kind = manager.agent().kind();
+        if kind == "deepseek" {
+            *self.deepseek_origin.write().await = AgentOrigin::Adopted;
+        }
         self.managers
             .write()
             .await
@@ -507,10 +627,14 @@ impl AgentRuntime {
                 return Some(m);
             }
         }
-        for (agent_id, manager) in self.attached_in_order().await {
-            let owns =
-                tokio::time::timeout(SESSION_LOOKUP_TIMEOUT, manager.agent().get_session(asid))
-                    .await;
+        // Probed at once, each under its own timeout; the first owner in
+        // preference order is chosen, as the serial walk chose it.
+        let attached = self.attached_in_order().await;
+        let owns = futures::future::join_all(attached.iter().map(|(_, manager)| {
+            tokio::time::timeout(SESSION_LOOKUP_TIMEOUT, manager.agent().get_session(asid))
+        }))
+        .await;
+        for ((agent_id, manager), owns) in attached.into_iter().zip(owns) {
             if matches!(owns, Ok(Ok(_))) {
                 self.record_session_route(asid, &agent_id).await;
                 return Some(manager);
@@ -521,19 +645,35 @@ impl AgentRuntime {
 
     /// Record routing for a session id to its owning agent.
     pub async fn record_session_route(&self, asid: &str, agent_id: &str) {
-        self.session_routes.write().await.insert(asid, agent_id);
+        let changed = {
+            let mut routes = self.session_routes.write().await;
+            let changed = routes.map.get(asid).is_none_or(|owner| owner != agent_id);
+            routes.insert(asid, agent_id);
+            changed
+        };
+        if changed {
+            self.store_route(asid, Some(agent_id)).await;
+        }
     }
 
     /// Drop the route of a session that no longer exists.
     pub async fn forget_session_route(&self, asid: &str) {
         self.session_routes.write().await.remove(asid);
+        self.store_route(asid, None).await;
     }
 
     /// Forget a deleted session without clearing another agent's same-id route.
     pub(crate) async fn forget_session_route_for_agent(&self, asid: &str, agent_id: &str) {
-        let mut routes = self.session_routes.write().await;
-        if routes.map.get(asid).is_some_and(|owner| owner == agent_id) {
-            routes.remove(asid);
+        let removed = {
+            let mut routes = self.session_routes.write().await;
+            let owned = routes.map.get(asid).is_some_and(|owner| owner == agent_id);
+            if owned {
+                routes.remove(asid);
+            }
+            owned
+        };
+        if removed {
+            self.store_route(asid, None).await;
         }
     }
 
@@ -591,7 +731,9 @@ impl AgentRuntime {
         Some(AgentStatus {
             available: kind != "codex" || manager.stream_connected(),
             installation: AgentInstallation::Installed,
-            origin: if kind == "codex"
+            origin: if kind == "deepseek" {
+                *self.deepseek_origin.read().await
+            } else if kind == "codex"
                 && manager.endpoint_url() == "stdio://private-codex-app-server"
             {
                 AgentOrigin::Spawned
@@ -749,13 +891,25 @@ impl AgentRuntime {
     /// One discovery pass, uncached and with no TTL or timeout. The routes go
     /// through `discover_agents`; this is for the `agent` CLI only.
     pub(crate) async fn probe_agents(&self) -> crate::discovery::AgentPlaneDiscovery {
+        let env_endpoint = deepseek::environment_endpoint(|key| {
+            std::env::var_os(key).map(|value| value.into_string().unwrap_or_default())
+        });
+        self.probe_agents_with_deepseek_override(env_endpoint.as_deref())
+            .await
+    }
+
+    async fn probe_agents_with_deepseek_override(
+        &self,
+        env_endpoint: Option<&str>,
+    ) -> crate::discovery::AgentPlaneDiscovery {
         use crate::discovery::{
             AgentAvailability, AgentDiscoveryInfo, AgentPlaneDiscovery, AgentPlaneFeatures,
         };
 
         let mut agents = Vec::new();
 
-        // 1. DeepSeek discovery
+        // 1. DeepSeek discovery. Read-only: never start a harness here, even
+        // when autostart is on. `npx --yes` / `bunx` download when executed.
         let deepseek_enabled =
             self.deepseek_config.enabled || self.deepseek_config.endpoint.is_some();
         let deepseek_info = if !deepseek_enabled {
@@ -793,14 +947,8 @@ impl AgentRuntime {
                 modes,
             }
         } else {
-            let ep = if let Some(ref url) = self.deepseek_config.endpoint {
-                Some(
-                    crate::agents::adapters::deepseek::DeepseekEndpoint::with_fallbacks(
-                        url.clone(),
-                        self.deepseek_config.token.clone(),
-                        self.deepseek_config.secret.clone(),
-                    ),
-                )
+            let ep = if let Some(url) = self.deepseek_config.endpoint.as_deref().or(env_endpoint) {
+                self.normalized_deepseek_endpoint(url)
             } else {
                 crate::agents::adapters::deepseek::DeepseekEndpoint::discover().await
             };
@@ -1040,7 +1188,7 @@ impl AgentRuntime {
             if self.stream_down().await {
                 tracing::warn!(
                     wait_s = stream_loss_wait.as_secs(),
-                    "opencode event stream is down, re-discovering"
+                    "primary agent event stream is down, re-discovering"
                 );
                 if !stream_loss_wait.is_zero() {
                     tokio::time::sleep(*stream_loss_wait).await;
@@ -1063,33 +1211,9 @@ impl AgentRuntime {
 
     /// One supervision pass. Returns whether an agent is attached and well.
     async fn check_and_repair(&self, start_backoff: &mut Duration) -> bool {
-        let mut deepseek_ok = false;
-
-        // 1. Supervise DeepSeek
-        if self.keep_if_healthy("deepseek").await {
-            deepseek_ok = true;
-        }
-        if !deepseek_ok && (self.deepseek_config.enabled || self.deepseek_config.endpoint.is_some())
-        {
-            let ep = if let Some(ref url) = self.deepseek_config.endpoint {
-                Some(
-                    crate::agents::adapters::deepseek::DeepseekEndpoint::with_fallbacks(
-                        url.clone(),
-                        self.deepseek_config.token.clone(),
-                        self.deepseek_config.secret.clone(),
-                    ),
-                )
-            } else {
-                crate::agents::adapters::deepseek::DeepseekEndpoint::discover().await
-            };
-            if let Some(endpoint) = ep {
-                let client = probe_client();
-                if endpoint.probe_healthy(&client).await {
-                    self.attach_deepseek(endpoint, AgentOrigin::Adopted).await;
-                    deepseek_ok = true;
-                }
-            }
-        }
+        // 1. Supervise DeepSeek: adopt a healthy harness, or start one when
+        // enabled and autostart is on. A missing runner does not fail the pass.
+        let deepseek_ok = self.supervise_deepseek().await;
 
         // 2. Supervise OpenCode
         let discovered_opencode = if self.config.enabled {
@@ -1290,11 +1414,20 @@ impl AgentRuntime {
         let version = endpoint.version.clone();
         let manager = AgentManager::connect_deepseek(endpoint, self.events_tx.clone());
         self.install("deepseek", manager, origin).await;
-        tracing::info!(
-            url = %url,
-            version = version.as_deref().unwrap_or("unknown"),
-            "adopted the running DeepSeek service"
-        );
+        *self.deepseek_origin.write().await = origin;
+        match origin {
+            AgentOrigin::Adopted => tracing::info!(
+                url = %url,
+                version = version.as_deref().unwrap_or("unknown"),
+                "adopted the running DeepSeek Harness"
+            ),
+            AgentOrigin::Spawned => tracing::info!(
+                url = %url,
+                version = version.as_deref().unwrap_or("unknown"),
+                "started DeepSeek Harness and attached to it"
+            ),
+            AgentOrigin::None => {}
+        }
     }
 
     async fn probe(&self, url: &str) -> bool {
@@ -1811,6 +1944,7 @@ fn deepseek_features(
             ("sessionDelete".into(), serde_json::json!(false)),
             ("sessionFork".into(), serde_json::json!(true)),
             ("sessionPagination".into(), serde_json::Value::Bool(false)),
+            ("timelineEarlier".into(), serde_json::json!(true)),
         ]),
     }
 }
@@ -1837,6 +1971,7 @@ fn opencode_features(
         attachments_by_path: false,
         extra: std::collections::BTreeMap::from([
             ("sessionPagination".into(), serde_json::json!(true)),
+            ("timelineEarlier".into(), serde_json::json!(true)),
             ("sessionRename".into(), serde_json::json!(true)),
             ("sessionDelete".into(), serde_json::json!(true)),
             ("sessionFork".into(), serde_json::json!(false)),
@@ -3297,6 +3432,9 @@ mod tests {
                 "model/list" => {
                     crate::agents::adapters::codex::tests::golden()["modelList"].clone()
                 }
+                // Catalog reads skills/list after models. An empty list is a
+                // real answer; it must not be treated as an unexpected mutation.
+                "skills/list" => serde_json::json!({"data": []}),
                 other => panic!("unexpected discovery mutation {other}"),
             }
         })

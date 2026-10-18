@@ -9,6 +9,26 @@ use crate::agents::domain::{
 
 pub type AgentFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, AgentError>> + Send + 'a>>;
 
+/// A bounded tail whose pagination boundary is not yet accepted. Stateful
+/// adapters provide a one-shot synchronous commit; dropping it discards the
+/// candidate. The mirror must validate its revision before invoking this hook,
+/// then accept the rows without another await. No rollback of shared state.
+pub struct PreparedTimeline<'a> {
+    pub items: Vec<TimelineItem>,
+    pub(crate) commit: Option<TimelineCommit<'a>>,
+}
+
+pub(crate) type TimelineCommit<'a> = Box<dyn FnOnce() -> Result<(), AgentError> + Send + 'a>;
+
+impl PreparedTimeline<'_> {
+    pub fn ready(items: Vec<TimelineItem>) -> Self {
+        Self {
+            items,
+            commit: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum AgentError {
     NotAvailable(String),
@@ -33,6 +53,10 @@ pub enum AgentError {
     InvalidRequest(String),
     /// A live external runtime must be controlled through its existing terminal.
     TerminalInteraction(Box<crate::agents::domain::SessionRuntime>),
+    /// `load_earlier_timeline` has no cursor for the session -- no snapshot
+    /// was read in this process, it was evicted, or the history changed
+    /// under it. Not exhaustion: the app re-reads the snapshot and pages on.
+    HistoryCursorLost,
 }
 
 impl fmt::Display for AgentError {
@@ -48,6 +72,9 @@ impl fmt::Display for AgentError {
             Self::Protocol(msg) => write!(f, "Protocol error: {msg}"),
             Self::Unsupported(cap) => write!(f, "Agent does not support capability: {cap}"),
             Self::InvalidRequest(msg) => write!(f, "Invalid request: {msg}"),
+            Self::HistoryCursorLost => f.write_str(
+                "The earlier-history cursor for this session is gone; read the snapshot again",
+            ),
             Self::TerminalInteraction(_) => write!(
                 f,
                 "Native interaction is unavailable; use the current terminal binding when provided"
@@ -270,6 +297,18 @@ pub trait AgentPort: Send + Sync {
     /// Fetch available catalog (models, agents, MCP)
     fn get_catalog<'a>(&'a self, directory: Option<&'a str>) -> AgentFuture<'a, AgentCatalog>;
 
+    /// Whether the latest catalog read actually received a skills list.
+    /// Stays false when the host has no skills method or the call failed.
+    fn skills_listed(&self) -> bool {
+        false
+    }
+
+    /// Whether the latest catalog read included slash commands from the
+    /// downloaded command catalog. Stays false when that file is absent.
+    fn slash_commands_listed(&self) -> bool {
+        false
+    }
+
     /// Fetch the VCS diff for a session's directory. `mode` is one of
     /// `working`, `branch` or `committed`; OpenCode requires it.
     fn get_vcs_diff<'a>(
@@ -295,6 +334,32 @@ pub trait AgentPort: Send + Sync {
         session_id: &'a str,
         limit: usize,
     ) -> AgentFuture<'a, Vec<TimelineItem>>;
+
+    /// Prepare a canonical snapshot tail. Legacy/stateless adapters keep their
+    /// existing reads; stateful pagination is committed at mirror acceptance.
+    fn prepare_timeline<'a>(
+        &'a self,
+        session_id: &'a str,
+        limit: usize,
+    ) -> AgentFuture<'a, PreparedTimeline<'a>> {
+        Box::pin(async move {
+            self.get_timeline(session_id, limit)
+                .await
+                .map(PreparedTimeline::ready)
+        })
+    }
+
+    /// The next older page after `get_timeline`, or an empty page when this
+    /// supporting agent has no further history. Unsupported adapters must not
+    /// present an empty page as successful exhaustion. The newest page stays
+    /// the snapshot.
+    fn load_earlier_timeline<'a>(
+        &'a self,
+        _session_id: &'a str,
+        _limit: usize,
+    ) -> AgentFuture<'a, Vec<TimelineItem>> {
+        Box::pin(async { Err(AgentError::Unsupported("timeline earlier".into())) })
+    }
 
     /// Delete a session
     fn delete_session<'a>(&'a self, _session_id: &'a str) -> AgentFuture<'a, ()> {

@@ -279,12 +279,53 @@ impl Heard {
                 .unwrap_or_default()
                 .to_owned(),
             online: self.reachable,
+            state: MachineState::of(self.reachable, self.peer.unauthorized),
             suitable_for: self.strings("suitableFor"),
             tasks_active: manifest
                 .and_then(|manifest| manifest["tasks"]["active"].as_u64())
                 .unwrap_or(0) as usize,
         }
     }
+}
+
+/// One line for an agent working on a task the owner opened: the linked
+/// computers by name with what is known of their reachability, and the
+/// ones the owner named for the task, so it reaches for `exec.run` /
+/// `tasks.delegate` with `machine` without a `fleet.describe` first.
+/// Names and reachability only -- never a URL, an id, a token or a key.
+/// `None` when nothing is linked and nothing was named.
+pub(crate) async fn prompt_line(state: &AppState, mentions: &[String]) -> Option<String> {
+    let peers = heard(state).await;
+    if peers.is_empty() && mentions.is_empty() {
+        return None;
+    }
+    let mut line = String::new();
+    if !peers.is_empty() {
+        let listed: Vec<String> = peers
+            .iter()
+            .map(|heard| {
+                let state = match MachineState::of(heard.reachable, heard.peer.unauthorized) {
+                    MachineState::Online => "reachable",
+                    MachineState::Offline => "unreachable",
+                    MachineState::Unknown => "not checked lately",
+                    MachineState::Unauthorized => "no longer takes this computer's token",
+                };
+                format!("{} ({state})", heard.peer.name)
+            })
+            .collect();
+        line.push_str("Linked computers, for exec.run or tasks.delegate with machine: ");
+        line.push_str(&listed.join(", "));
+        line.push('.');
+    }
+    if !mentions.is_empty() {
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str("The user named for this task: ");
+        line.push_str(&mentions.join(", "));
+        line.push('.');
+    }
+    Some(line)
 }
 
 /// Every linked computer as last heard, answered at once; those whose
@@ -332,14 +373,43 @@ pub(crate) struct TaskCounts {
     pub waiting: usize,
 }
 
+/// What is known of a computer's availability, as `fleet.list` says it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum MachineState {
+    /// It answered within the last two minutes.
+    Online,
+    /// It was asked and did not answer.
+    Offline,
+    /// A linked computer not checked in the last minute.
+    Unknown,
+    /// It answered `401`/`403` `invalid_token` last: it no longer takes
+    /// this computer's token (unlinked there, or the login revoked). Not
+    /// offline -- it is there, and linking again is the remedy.
+    Unauthorized,
+}
+
+impl MachineState {
+    fn of(reachable: Option<bool>, unauthorized: bool) -> Self {
+        match (unauthorized, reachable) {
+            (true, _) => Self::Unauthorized,
+            (false, Some(true)) => Self::Online,
+            (false, Some(false)) => Self::Offline,
+            (false, None) => Self::Unknown,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct MachineSummary {
     pub machine_id: String,
     pub label: String,
     pub os: String,
-    /// `null`: a linked computer not checked in the last minute.
+    /// `null`: a linked computer not checked in the last minute. `false`
+    /// for an `unauthorized` computer too; `state` tells them apart.
     pub online: Option<bool>,
+    pub state: MachineState,
     pub suitable_for: Vec<String>,
     pub tasks_active: usize,
 }
@@ -509,6 +579,7 @@ impl FleetService {
             label: manifest.label.clone(),
             os: manifest.os.to_owned(),
             online: Some(true),
+            state: MachineState::Online,
             suitable_for: manifest.suitable_for.clone(),
             tasks_active: manifest.tasks.active,
         }];
