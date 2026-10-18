@@ -123,7 +123,9 @@ pub(crate) struct Config {
     /// owner asked for; `{"autostart": false}` leaves that to them.
     #[serde(default, skip_serializing_if = "is_default_opencode")]
     pub(crate) opencode: agents::OpencodeConfig,
-    /// Configuration for the DeepSeek agent adapter
+    /// DeepSeek Harness. Off unless `enabled` or `endpoint` is set. `autostart`
+    /// defaults to true, matching OpenCode, but a missing key does not start a
+    /// process until DeepSeek is enabled.
     #[serde(default, skip_serializing_if = "is_default_deepseek")]
     pub(crate) deepseek: agents::DeepseekConfig,
     /// The T3 Code agent adapter: off unless `enabled` or `url` is set.
@@ -286,7 +288,11 @@ pub(crate) fn is_default_opencode(config: &agents::OpencodeConfig) -> bool {
 }
 
 pub(crate) fn is_default_deepseek(config: &agents::DeepseekConfig) -> bool {
-    !config.enabled && config.endpoint.is_none() && config.token.is_none()
+    !config.enabled
+        && config.autostart
+        && config.endpoint.is_none()
+        && config.token.is_none()
+        && config.secret.is_none()
 }
 
 pub(crate) fn is_default_t3(config: &agents::T3Config) -> bool {
@@ -446,7 +452,12 @@ pub(crate) const MAX_PAIRING_CODE_ATTEMPTS: u8 = 8;
 
 pub(crate) const PAIRING_RATE_LIMIT_WINDOW_MS: u128 = 10 * 60 * 1000;
 
-pub(crate) const MAX_PAIRING_REQUESTS_PER_WINDOW: usize = 6;
+/// Pairing requests per window. Twelve: an owner pairing their devices again
+/// after `required` transport refused the key-less ones (an emulator or two,
+/// a phone, a linked computer) must not run into "too many pairing
+/// requests" halfway. Online code guessing is bounded separately by the
+/// eight-attempt lockout on each code (`MAX_PAIRING_CODE_ATTEMPTS`).
+pub(crate) const MAX_PAIRING_REQUESTS_PER_WINDOW: usize = 12;
 
 pub(crate) const MAX_SEND_KEYS: usize = 32;
 
@@ -542,6 +553,18 @@ pub(crate) const STREAM_DEVICE_RECHECK_INTERVAL: Duration = Duration::from_secs(
 pub(crate) const HERDR_PROTOCOL_MIN: u64 = 17;
 
 pub(crate) const MAX_REQUEST_BODY_BYTES: usize = 128 * 1024;
+
+/// The body a prompt, a slash command or a new task may carry: a pasted
+/// log or a long goal is ordinary there. Only these routes take it, and
+/// only from a caller `require_device` already let through
+/// (`server::large_body_after_auth`); everything else stays at
+/// [`MAX_REQUEST_BODY_BYTES`].
+pub(crate) const MAX_PROMPT_BODY_BYTES: usize = 1024 * 1024;
+
+/// Whether `path` is one of the routes that take [`MAX_PROMPT_BODY_BYTES`].
+pub(crate) fn takes_large_body(path: &str) -> bool {
+    path == "/api/tasks" || path.ends_with("/prompt") || path.ends_with("/command")
+}
 
 /// Version of the unified content model this gateway speaks. Declared on every
 /// content envelope so a client renders what it knows and falls back for the

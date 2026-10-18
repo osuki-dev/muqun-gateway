@@ -18,8 +18,9 @@ pub struct PendingPairing {
     pub install_id: Option<String>,
     #[serde(default, skip_serializing_if = "DeviceKind::is_app")]
     pub kind: DeviceKind,
-    /// Another gateway's own server id, as it (or the owner's phone) said
-    /// when the pairing was made. Used only to take its login back when the
+    /// Another gateway's own server id, as the owner said when minting the
+    /// code for it (`POST /api/pair/pending`); a gateway asking for a code
+    /// itself cannot set it. Used only to take its login back when the
     /// owner unlinks it here (`fleet::peers::unlink`); never to replace or
     /// evict a device, since nothing checks it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -79,10 +80,12 @@ pub struct DeviceRecord {
     pub install_id: Option<String>,
     #[serde(default, skip_serializing_if = "DeviceKind::is_app")]
     pub kind: DeviceKind,
-    /// Another gateway's own server id, as it (or the owner's phone) said
-    /// when the pairing was made. Used only to take its login back when the
-    /// owner unlinks it here (`fleet::peers::unlink`); never to replace or
-    /// evict a device, since nothing checks it.
+    /// Another gateway's own server id, as the owner's phone said when it
+    /// minted the code this login claimed (`POST /api/pair/pending`); a
+    /// gateway that asked for its code itself has none. Used only to take
+    /// its login back when the owner unlinks it here
+    /// (`fleet::peers::unlink`); never to replace or evict a device, since
+    /// nothing checks it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server_id: Option<String>,
 }

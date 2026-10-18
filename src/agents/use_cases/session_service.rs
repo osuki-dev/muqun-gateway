@@ -161,35 +161,68 @@ impl SessionService {
             return Ok(snapshot);
         }
 
-        let mut info = self.agent.get_session(&asid.0).await?;
-        self.stamp(&mut info);
-        self.observe_runtime(&mut info).await;
-        self.mirror.update_session(info.clone()).await;
         let before_read = if let Some(memory) = &self.memory {
             memory.history_read_revision(asid).await.unwrap_or_default()
         } else {
             (0, 0)
         };
-        let timeline = self.agent.get_timeline(&asid.0, 100).await?;
+        // The cold reads at once: the session, its newest history, and what
+        // it still has pending. The revision above was taken before the
+        // history read, as it was when these ran one after another.
+        let (info, prepared, permissions, forms) = tokio::join!(
+            self.agent.get_session(&asid.0),
+            self.agent.prepare_timeline(&asid.0, 100),
+            self.agent.get_pending_permissions(&asid.0),
+            self.agent.get_pending_forms(&asid.0),
+        );
+        let mut info = info?;
+        self.stamp(&mut info);
+        self.observe_runtime(&mut info).await;
+        self.mirror.update_session(info.clone()).await;
+        let prepared = prepared?;
+        let timeline = prepared.items;
         if let (Some(memory), Some(gate)) = (&self.memory, &history_gate) {
             if !memory
-                .initialize_history(asid, gate, before_read, timeline.clone())
-                .await
+                .initialize_prepared_history(
+                    asid,
+                    gate,
+                    before_read,
+                    timeline.clone(),
+                    prepared.commit,
+                )
+                .await?
             {
                 return Err(AgentError::NotAvailable(
                     "Session changed during initial history read".into(),
                 ));
             }
-        } else if !timeline.is_empty() {
-            self.mirror
-                .upsert_timeline_items(asid, timeline.clone())
-                .await;
+        } else {
+            if prepared.commit.is_some() {
+                return Err(AgentError::Unsupported(
+                    "stateful history requires atomic mirror acceptance".into(),
+                ));
+            }
+            if !timeline.is_empty() {
+                self.mirror
+                    .upsert_timeline_items(asid, timeline.clone())
+                    .await;
+            }
         }
 
-        // Anything raised while the stream was down is read back here:
+        // Anything raised while the stream was down was read back above:
         // `/api/event` is volatile and drops what happened during a
         // disconnect, so a permission prompt could otherwise be lost for good.
-        self.catch_up_pending(asid).await;
+        let permissions = permissions.unwrap_or_else(|err| {
+            tracing::debug!(asid = %asid.0, %err, "pending permission catch-up failed");
+            Vec::new()
+        });
+        let forms = forms.unwrap_or_else(|err| {
+            tracing::debug!(asid = %asid.0, %err, "pending form catch-up failed");
+            Vec::new()
+        });
+        if !permissions.is_empty() || !forms.is_empty() {
+            self.mirror_pending(asid, permissions, forms).await;
+        }
 
         if let Some(mut snapshot) = self.mirror.get_snapshot(asid).await {
             self.observe_runtime(&mut snapshot.info).await;
@@ -228,9 +261,25 @@ impl SessionService {
         asid: &AgentSessionId,
     ) -> Result<AgentSessionSnapshot, AgentError> {
         self.agent.prepare_selected_session(&asid.0).await?;
-        let expected = self.mirror.get_snapshot(asid).await.map(|s| s.seq);
+        let memory = self
+            .memory
+            .as_ref()
+            .ok_or_else(|| AgentError::Unsupported("explicit session refresh".into()))?;
+        let (expected, incarnation) = memory.snapshot_read_revision(asid).await;
         let info = self.get_session(&asid.0).await?;
-        let timeline = self.agent.get_timeline(&asid.0, 100).await?;
+        let prepared = self.agent.prepare_timeline(&asid.0, 100).await?;
+        let fresh = prepared.items;
+        let mut timeline = fresh.clone();
+        if let Some(held) = self.mirror.get_snapshot(asid).await {
+            let fresh_ids: std::collections::HashSet<_> =
+                fresh.iter().map(|item| item.id.clone()).collect();
+            timeline.extend(
+                held.timeline
+                    .into_iter()
+                    .filter(|item| !fresh_ids.contains(&item.id)),
+            );
+            timeline.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
+        }
         let permissions = self.agent.get_pending_permissions(&asid.0).await?;
         let forms = self.agent.get_pending_forms(&asid.0).await?;
         let snapshot = AgentSessionSnapshot {
@@ -241,16 +290,24 @@ impl SessionService {
             inbox: Vec::new(),
             seq: 0,
         };
-        let memory = self
-            .memory
-            .as_ref()
-            .ok_or_else(|| AgentError::Unsupported("explicit session refresh".into()))?;
         memory
-            .refresh_snapshot(snapshot, expected)
-            .await
+            .refresh_prepared_snapshot(snapshot, expected, incarnation, prepared.commit)
+            .await?
             .ok_or_else(|| {
                 AgentError::NotAvailable("Session changed during refresh; refresh again".into())
             })
+    }
+
+    /// One older history page, kept in the mirror so a later snapshot still has it.
+    pub async fn load_earlier_timeline(
+        &self,
+        asid: &AgentSessionId,
+    ) -> Result<Vec<crate::agents::domain::TimelineItem>, AgentError> {
+        let items = self.agent.load_earlier_timeline(&asid.0, 80).await?;
+        if !items.is_empty() {
+            self.mirror.upsert_timeline_items(asid, items.clone()).await;
+        }
+        Ok(items)
     }
 
     /// Re-read the permissions and forms OpenCode still considers pending.

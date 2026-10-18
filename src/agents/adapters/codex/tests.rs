@@ -94,7 +94,7 @@ pub(crate) struct Fixture {
     pub client: Arc<CodexClient>,
     pub events: Option<mpsc::Receiver<CodexEvent>>,
     pub requests: mpsc::Receiver<Value>,
-    writer: Arc<Mutex<WriteHalf<tokio::io::DuplexStream>>>,
+    pub(super) writer: Arc<Mutex<WriteHalf<tokio::io::DuplexStream>>>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -301,6 +301,270 @@ async fn codex_history_unsatisfied_tail_errors_on_budget_cycles_malformed_pages_
             assert!(error.contains("cycle"));
         }
     }
+}
+
+pub(super) fn history_fixture_page(request: &Value, total: usize, reasoning: bool) -> Value {
+    let offset = request["params"]["cursor"]
+        .as_str()
+        .map(|s| s.parse::<usize>().unwrap())
+        .unwrap_or(0);
+    let end = (offset + request["params"]["limit"].as_u64().unwrap() as usize).min(total);
+    let rows: Vec<_> = (offset..end)
+        .map(|index| {
+            let position = total - 1 - index;
+            let item = if reasoning {
+                json!({"type":"reasoning","id":format!("item-{position}"),
+                    "summary":(0..101).map(|n|format!("text-{position}-{n}")).collect::<Vec<_>>(),"content":[]})
+            } else {
+                json!({"type":"agentMessage","id":format!("item-{position}"),"text":format!("text-{position}")})
+            };
+            json!({"turnId":"synthetic-turn","item":item,"startedAtMs":0})
+        })
+        .collect();
+    json!({"data":rows,"nextCursor":if end < total {json!(end.to_string())} else {Value::Null}})
+}
+
+#[tokio::test]
+async fn codex_earlier_same_turn_prefix_keeps_tail_sort_keys_and_merges_over_100_items() {
+    let mut fixture = Fixture::new(|r| match r["method"].as_str().unwrap() {
+        "thread/read" => json!({"thread":golden()["thread"]}),
+        "thread/items/list" => history_fixture_page(r, 241, false),
+        _ => panic!("unexpected history RPC"),
+    })
+    .await;
+    fixture.ready().await;
+    let driver = CodexDriver::new(fixture.client.clone());
+    let id = golden()["thread"]["id"].as_str().unwrap().to_owned();
+    let tail = driver.get_timeline(&id, 100).await.unwrap();
+    driver.forget_thread(&id).await;
+    let mut all = tail.clone();
+    loop {
+        let older = driver.load_earlier_timeline(&id, 80).await.unwrap();
+        assert!(older.len() <= 80);
+        if older.is_empty() {
+            break;
+        }
+        assert!(older.last().unwrap().sort_key() < all.first().unwrap().sort_key());
+        all.splice(..0, older);
+    }
+    assert_eq!(all.len(), 241);
+    for (n, row) in all.iter().enumerate() {
+        assert!(matches!(&row.part, AgentPart::Text {text} if text == &format!("text-{n}")));
+    }
+    assert_eq!(&all[141..], &tail);
+    assert!(driver
+        .load_earlier_timeline(&id, 1)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn codex_earlier_reasoning_mapped_boundary_traversal_has_no_lost_or_duplicate_rows() {
+    let mut fixture = Fixture::new(|r| match r["method"].as_str().unwrap() {
+        "thread/read" => json!({"thread":golden()["thread"]}),
+        "thread/items/list" => history_fixture_page(r, 3, true),
+        _ => panic!("unexpected history RPC"),
+    })
+    .await;
+    fixture.ready().await;
+    let driver = CodexDriver::new(fixture.client.clone());
+    let id = golden()["thread"]["id"].as_str().unwrap().to_owned();
+    let tail = driver.get_timeline(&id, 100).await.unwrap();
+    assert_eq!(tail.len(), 100);
+    let mut all = tail.clone();
+    loop {
+        let older = driver.load_earlier_timeline(&id, 80).await.unwrap();
+        assert!(older.len() <= 80, "limit is mapped rows, not native items");
+        if older.is_empty() {
+            break;
+        }
+        all.extend(older);
+    }
+    all.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
+    assert_eq!(all.len(), 303);
+    assert_eq!(
+        all.iter()
+            .map(|row| &row.id)
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        303
+    );
+    for (n, row) in all.iter().enumerate() {
+        assert!(
+            matches!(&row.part, AgentPart::Reasoning {text,..} if text == &format!("text-{}-{}", n/101, n%101))
+        );
+        assert_eq!(row.seq, 0);
+    }
+    assert_eq!(&all[203..], &tail);
+}
+
+#[tokio::test]
+async fn codex_earlier_failed_batch_and_refresh_do_not_consume_residual_or_cursor() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let fail_page = Arc::new(AtomicBool::new(false));
+    let fail_read = Arc::new(AtomicBool::new(false));
+    let page_flag = fail_page.clone();
+    let read_flag = fail_read.clone();
+    let mut fixture = Fixture::new_reply(move |r| match r["method"].as_str().unwrap() {
+        "thread/read" if read_flag.load(Ordering::Acquire) => {
+            Err(json!({"code":-32000,"message":"synthetic read failure"}))
+        }
+        "thread/read" => Ok(json!({"thread":golden()["thread"]})),
+        "thread/items/list" if page_flag.swap(false, Ordering::AcqRel) => {
+            Err(json!({"code":-32000,"message":"synthetic page failure"}))
+        }
+        "thread/items/list" => Ok(history_fixture_page(r, 3, true)),
+        _ => panic!("unexpected history RPC"),
+    })
+    .await;
+    fixture.ready().await;
+    let driver = CodexDriver::new(fixture.client.clone());
+    let id = golden()["thread"]["id"].as_str().unwrap().to_owned();
+    let tail = driver.get_timeline(&id, 1).await.unwrap();
+    assert_eq!(
+        driver.get_timeline(&id, 1).await.unwrap(),
+        tail,
+        "repeat refresh resets the same boundary"
+    );
+    for limit in [0, 2001] {
+        assert!(matches!(
+            driver.load_earlier_timeline(&id, limit).await,
+            Err(AgentError::InvalidRequest(_))
+        ));
+    }
+    fail_page.store(true, Ordering::Release);
+    assert!(
+        driver.load_earlier_timeline(&id, 101).await.is_err(),
+        "100 residual rows were staged before this RPC failed"
+    );
+    fail_read.store(true, Ordering::Release);
+    assert!(driver.get_timeline(&id, 1).await.is_err());
+    let older = driver.load_earlier_timeline(&id, 101).await.unwrap();
+    assert_eq!(older.len(), 101);
+    assert!(
+        matches!(&older.last().unwrap().part, AgentPart::Reasoning {text,..} if text == "text-2-99")
+    );
+    let mut all = tail;
+    all.extend(older);
+    all.extend(driver.load_earlier_timeline(&id, 2000).await.unwrap());
+    assert_eq!(all.len(), 303);
+    assert_eq!(
+        all.iter()
+            .map(|r| &r.id)
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        303
+    );
+    assert!(driver
+        .load_earlier_timeline(&id, 80)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn codex_earlier_concurrent_requests_are_disjoint_and_session_scoped() {
+    let mut fixture = Fixture::new(|r| match r["method"].as_str().unwrap() {
+        "thread/read" => {
+            let mut thread = golden()["thread"].clone();
+            thread["id"] = r["params"]["threadId"].clone();
+            json!({"thread":thread})
+        }
+        "thread/items/list" => history_fixture_page(r, 241, false),
+        _ => panic!("unexpected history RPC"),
+    })
+    .await;
+    fixture.ready().await;
+    let driver = CodexDriver::new(fixture.client.clone());
+    let mut all = driver.get_timeline("thread-a", 100).await.unwrap();
+    let b = driver.get_timeline("thread-b", 100).await.unwrap();
+    let (first, second, third) = tokio::join!(
+        driver.load_earlier_timeline("thread-a", 80),
+        driver.load_earlier_timeline("thread-a", 80),
+        driver.load_earlier_timeline("thread-a", 80),
+    );
+    let pages = [first.unwrap(), second.unwrap(), third.unwrap()];
+    assert_eq!(pages.iter().filter(|p| p.is_empty()).count(), 1);
+    all.extend(pages.into_iter().flatten());
+    all.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
+    assert_eq!(all.len(), 241);
+    assert_eq!(
+        all.iter()
+            .map(|r| &r.id)
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        241
+    );
+    for (n, row) in all.iter().enumerate() {
+        assert!(matches!(&row.part, AgentPart::Text {text} if text == &format!("text-{n}")));
+    }
+    let older_b = driver.load_earlier_timeline("thread-b", 80).await.unwrap();
+    assert_eq!(older_b.len(), 80);
+    assert!(older_b.last().unwrap().sort_key() < b.first().unwrap().sort_key());
+    assert!(older_b.iter().all(|r| r.id.starts_with("thread-b/")));
+}
+
+#[tokio::test]
+async fn codex_earlier_cancelled_rpc_keeps_staged_residual_retryable() {
+    let mut fixture = Fixture::new(|r| match r["method"].as_str().unwrap() {
+        "thread/read" => json!({"thread":golden()["thread"]}),
+        "thread/items/list" => history_fixture_page(r, 3, true),
+        _ => panic!("unexpected history RPC"),
+    })
+    .await;
+    fixture.ready().await;
+    let driver = Arc::new(CodexDriver::new(fixture.client.clone()));
+    let id = golden()["thread"]["id"].as_str().unwrap().to_owned();
+    driver.get_timeline(&id, 1).await.unwrap();
+    while fixture.requests.try_recv().is_ok() {}
+    let writer = fixture.writer.clone();
+    let response_block = writer.lock().await;
+    let worker = driver.clone();
+    let session = id.clone();
+    let task = tokio::spawn(async move { worker.load_earlier_timeline(&session, 101).await });
+    let request = fixture.next().await;
+    assert_eq!(request["params"]["cursor"], "1");
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    drop(response_block);
+    let rows = driver.load_earlier_timeline(&id, 101).await.unwrap();
+    assert_eq!(rows.len(), 101);
+    assert!(
+        matches!(&rows.last().unwrap().part, AgentPart::Reasoning {text,..} if text == "text-2-99")
+    );
+    assert!(fixture.client.is_ready());
+}
+
+#[tokio::test]
+async fn codex_earlier_legacy_reasoning_residual_keeps_summary_and_content_ordinals() {
+    let mut fixture = Fixture::new(|r| {
+        assert_eq!(r["method"], "thread/read");
+        let mut thread = golden()["thread"].clone();
+        thread["historyMode"] = json!("legacy");
+        thread["turns"] = json!([{"id":"turn","items":[{"id":"reason","type":"reasoning",
+            "summary":(0..50).map(|n|n.to_string()).collect::<Vec<_>>(),
+            "content":(50..101).map(|n|n.to_string()).collect::<Vec<_>>()
+        }]}]);
+        json!({"thread":thread})
+    })
+    .await;
+    fixture.ready().await;
+    let driver = CodexDriver::new(fixture.client.clone());
+    let id = golden()["thread"]["id"].as_str().unwrap().to_owned();
+    let tail = driver.get_timeline(&id, 100).await.unwrap();
+    assert_eq!(tail.len(), 100);
+    let older = driver.load_earlier_timeline(&id, 80).await.unwrap();
+    assert_eq!(older.len(), 1);
+    assert!(older[0].sort_key() < tail[0].sort_key());
+    assert_eq!(older[0].ordinal, 0);
+    assert_eq!(tail[48].ordinal, 49);
+    assert_eq!(tail[49].ordinal, 1_000_000);
+    assert!(driver
+        .load_earlier_timeline(&id, 80)
+        .await
+        .unwrap()
+        .is_empty());
 }
 
 #[tokio::test]
@@ -659,8 +923,13 @@ async fn codex_catalog_is_dynamic_and_optional_features_fail_closed() {
     let catalog = driver.get_catalog(None).await.unwrap();
     assert_eq!(catalog.models[0].variants.as_ref().unwrap()[0].id, "high");
     assert_eq!(catalog.defaults.model.unwrap().model_id, "fixture-model");
+    // The catch-all answers skills/list with the model page. That is not a
+    // skills list, so it must not invent skills or advertise the capability.
+    assert!(catalog.skills.is_empty());
+    assert!(!driver.skills_listed());
     fixture.next().await;
     fixture.next().await;
+    assert_eq!(fixture.next().await["method"], "skills/list");
     assert!(matches!(
         driver
             .revert_session("synthetic-a", "synthetic-message")
@@ -674,6 +943,68 @@ async fn codex_catalog_is_dynamic_and_optional_features_fail_closed() {
     assert!(driver.list_worktrees(None).await.is_err());
     assert!(driver.switch_mode("synthetic-a", "plan").await.is_err());
     assert!(fixture.requests.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn codex_skills_list_fills_the_catalog_and_an_error_keeps_the_models() {
+    let fail = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let failed = fail.clone();
+    let mut fixture = Fixture::new_reply(move |request| match request["method"].as_str().unwrap() {
+        "config/read" => Ok(json!({"config":{"model_provider":"openai"}})),
+        "model/list" => Ok(golden()["modelList"].clone()),
+        "skills/list" => {
+            if failed.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(json!({"code":-32601,"message":"method not found"}));
+            }
+            assert_eq!(request["params"]["cwds"], json!(["/synthetic/repo"]));
+            Ok(json!({
+                "data": [{
+                    "cwd": "/synthetic/repo",
+                    "skills": [
+                        {
+                            "name": "commit",
+                            "description": "Write a commit message",
+                            "interface": {"displayName": "Commit message", "shortDescription": "Draft the message"},
+                            "enabled": true,
+                            "path": "/synthetic/repo/.agents/skills/commit/SKILL.md",
+                            "scope": "repo"
+                        },
+                        {
+                            "name": "pdf",
+                            "description": "Read PDFs",
+                            "enabled": false,
+                            "path": "/synthetic/skills/pdf/SKILL.md",
+                            "scope": "user"
+                        }
+                    ],
+                    "errors": []
+                }]
+            }))
+        }
+        other => panic!("unexpected {other}"),
+    })
+    .await;
+    fixture.ready().await;
+    let driver = CodexDriver::new(fixture.client.clone());
+    let catalog = driver
+        .get_catalog(Some("/synthetic/repo"))
+        .await
+        .expect("model catalog survives skills/list");
+    assert_eq!(catalog.models[0].id, "fixture-model");
+    assert_eq!(catalog.skills.len(), 2);
+    assert_eq!(catalog.skills[0].id, "commit");
+    assert!(catalog.skills[0].slash);
+    assert!(!catalog.skills[1].slash);
+    assert!(driver.skills_listed());
+
+    fail.store(true, std::sync::atomic::Ordering::Release);
+    let catalog = driver
+        .get_catalog(None)
+        .await
+        .expect("a skills/list error does not fail the model catalog");
+    assert_eq!(catalog.models[0].id, "fixture-model");
+    assert!(catalog.skills.is_empty());
+    assert!(!driver.skills_listed());
 }
 
 #[tokio::test]
@@ -827,6 +1158,7 @@ async fn codex_loaded_switch_uses_real_next_turn_controls_and_configured_non_ope
                 json!({"config":{"model_provider":if changed.load(std::sync::atomic::Ordering::Acquire) {"synthetic-reconfigured-provider"} else {"synthetic-oss"},"model":"fixture-model","model_reasoning_effort":"medium","api_key":"synthetic-discarded-secret"},"layers":[{"private":"synthetic"}]})
             },
             "model/list" => {let mut catalog=golden()["modelList"].clone();let mut next=catalog["data"][0].clone();next["model"]=json!("synthetic-new");catalog["data"].as_array_mut().unwrap().push(next);catalog},
+            "skills/list" => json!({"data":[]}),
             "thread/start" => {assert_eq!(r["params"]["modelProvider"],"synthetic-oss");json!({"thread":thread,"model":"fixture-model","modelProvider":"synthetic-oss","reasoningEffort":"medium"})},
             "thread/read" => json!({"thread":thread}),
             // Faithful loaded/subscribed behavior: resume returns old selection.
@@ -930,16 +1262,22 @@ async fn codex_overlapping_history_tails_preserve_shared_order_anchors() {
 }
 
 #[tokio::test]
-async fn codex_reasoning_expansion_limit_fails_without_silently_clipping_parts() {
+async fn codex_reasoning_expansion_limit_keeps_the_first_parts_and_the_connection() {
     let mut fixture = Fixture::new(|_| json!({})).await;
     fixture.ready().await;
     let driver = CodexDriver::new(fixture.client.clone());
-    let item = json!({"type":"reasoning","id":"synthetic-reasoning","summary":vec!["";MAX_REASONING_PARTS+1],"content":[]});
-    assert!(matches!(
-        driver.ordered_items("synthetic-thread", "synthetic-turn", &item, 0),
-        Err(AgentError::Protocol(_))
-    ));
-    assert!(!fixture.client.is_ready());
+    let item = json!({"type":"reasoning","id":"synthetic-reasoning","summary":vec!["x";MAX_REASONING_PARTS+1],"content":[]});
+    let rows = driver
+        .ordered_items("synthetic-thread", "synthetic-turn", &item, 0)
+        .unwrap();
+    assert!(
+        !rows.is_empty(),
+        "the item is kept, clipped to its first parts"
+    );
+    assert!(
+        fixture.client.is_ready(),
+        "an oversized item costs its tail, never the connection"
+    );
 }
 
 #[tokio::test]
@@ -1244,4 +1582,181 @@ async fn owned_active_thread_can_steer_and_answer_async_questions_without_queue_
         }
     }
     assert_eq!((starts, steers), (1, 2));
+}
+
+#[tokio::test]
+async fn codex_skill_turn_carries_the_skill_file_and_file_search_stays_in_the_workspace() {
+    let thread_id = golden()["thread"]["id"].as_str().unwrap().to_string();
+    let mut fixture =
+        Fixture::new_reply(move |request| match request["method"].as_str().unwrap() {
+            "thread/read" => Ok(json!({"thread": golden()["thread"]})),
+            "thread/resume" => Ok(json!({"thread": golden()["thread"]})),
+            "skills/list" => {
+                assert_eq!(request["params"]["cwds"], json!(["/synthetic/workspace"]));
+                Ok(json!({
+                    "data": [{
+                        "cwd": "/synthetic/workspace",
+                        "skills": [{
+                            "name": "commit",
+                            "description": "Write a commit message",
+                            "enabled": true,
+                            "path": "/synthetic/workspace/.agents/skills/commit/SKILL.md",
+                            "scope": "repo"
+                        }],
+                        "errors": []
+                    }]
+                }))
+            }
+            "turn/start" => Ok(json!({"turn":{"id":"synthetic-turn","status":"inProgress"}})),
+            "fuzzyFileSearch" => {
+                assert_eq!(request["params"]["roots"], json!(["/synthetic/workspace"]));
+                assert_eq!(request["params"]["query"], "main");
+                Ok(json!({
+                    "files": [{
+                        "root": "/synthetic/workspace",
+                        "path": "src/main.rs",
+                        "match_type": "file",
+                        "file_name": "main.rs",
+                        "score": 9
+                    }]
+                }))
+            }
+            "thread/loaded/list" | "thread/list" | "config/read" => Ok(json!({})),
+            other => panic!("unexpected {other}"),
+        })
+        .await;
+    fixture.ready().await;
+    let driver = CodexDriver::new(fixture.client.clone());
+    driver
+        .activate_skill(&thread_id, "commit", None)
+        .await
+        .unwrap();
+    let mut saw_skill = false;
+    while let Ok(request) = fixture.requests.try_recv() {
+        if request["method"] == "turn/start" {
+            assert_eq!(
+                request["params"]["input"][0],
+                json!({
+                    "type": "skill",
+                    "name": "commit",
+                    "path": "/synthetic/workspace/.agents/skills/commit/SKILL.md"
+                })
+            );
+            saw_skill = true;
+        }
+    }
+    assert!(saw_skill);
+    let files = driver
+        .find_files("main", 8, Some("/synthetic/workspace"))
+        .await
+        .unwrap();
+    assert_eq!(files[0]["path"], "/synthetic/workspace/src/main.rs");
+    assert_eq!(files[0]["type"], "file");
+    assert!(driver
+        .find_files("main", 8, Some("relative"))
+        .await
+        .is_err());
+}
+
+async fn assert_command_is_rejected_without_a_turn(name: &str) {
+    let mut fixture = Fixture::new(|request| match request["method"].as_str().unwrap() {
+        "thread/read" | "thread/resume" => json!({"thread":golden()["thread"]}),
+        "turn/start" => json!({"turn":{"id":"synthetic-turn","status":"inProgress"}}),
+        other => panic!("unexpected {other}"),
+    })
+    .await;
+    fixture.ready().await;
+    let driver = CodexDriver::new(fixture.client.clone());
+    let id = golden()["thread"]["id"].as_str().unwrap().to_owned();
+    for delivery in [None, Some("steer"), Some("queue")] {
+        let result = driver
+            .run_command(&id, name, "synthetic arguments", delivery)
+            .await;
+        let mut methods = Vec::new();
+        while let Ok(request) = fixture.requests.try_recv() {
+            methods.push(request["method"].as_str().unwrap().to_owned());
+        }
+        assert!(
+            methods.is_empty(),
+            "{name} must not dispatch any RPC, got {methods:?}"
+        );
+        assert!(
+            matches!(result, Err(AgentError::Unsupported(_))),
+            "{name}: {result:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn codex_new_command_never_becomes_a_prompt() {
+    assert_command_is_rejected_without_a_turn("/new").await;
+}
+
+#[tokio::test]
+async fn codex_export_command_never_becomes_a_prompt() {
+    assert_command_is_rejected_without_a_turn("/export").await;
+}
+
+#[tokio::test]
+async fn codex_unknown_commands_never_become_prompts_or_skills() {
+    for name in [
+        "unknown",
+        "",
+        "/prompts:custom",
+        "/commit",
+        "/compact extra",
+        "//compact",
+    ] {
+        assert_command_is_rejected_without_a_turn(name).await;
+    }
+}
+
+#[tokio::test]
+async fn codex_compact_command_uses_native_rpc_and_rejects_arguments_and_delivery() {
+    let mut fixture = Fixture::new(|request| match request["method"].as_str().unwrap() {
+        "thread/start" | "thread/read" => json!({"thread":golden()["thread"]}),
+        "thread/compact/start" => {
+            assert_eq!(
+                request["params"],
+                json!({"threadId":golden()["thread"]["id"]})
+            );
+            json!({})
+        }
+        other => panic!("compact must not call {other}"),
+    })
+    .await;
+    fixture.ready().await;
+    let driver = CodexDriver::new(fixture.client.clone());
+    let id = golden()["thread"]["id"].as_str().unwrap().to_owned();
+    assert!(matches!(
+        driver.run_command(&id, "/compact", "", None).await,
+        Err(AgentError::InvalidRequest(_))
+    ));
+    assert!(
+        fixture.requests.try_recv().is_err(),
+        "an unowned thread must not resume"
+    );
+    driver.create_session(None, None, None).await.unwrap();
+    assert_eq!(fixture.next().await["method"], "thread/start");
+    assert!(matches!(
+        driver
+            .run_command(&id, "/compact", "instructions", None)
+            .await,
+        Err(AgentError::InvalidRequest(_))
+    ));
+    for delivery in ["queue", "steer", "auto"] {
+        assert!(matches!(
+            driver
+                .run_command(&id, "/compact", "", Some(delivery))
+                .await,
+            Err(AgentError::Unsupported(_))
+        ));
+    }
+    assert!(fixture.requests.try_recv().is_err());
+    for name in ["/compact", "compact", " /COMPACT "] {
+        driver.run_command(&id, name, "", None).await.unwrap();
+        assert_eq!(fixture.next().await["method"], "thread/read");
+        assert_eq!(fixture.next().await["method"], "thread/compact/start");
+        assert!(fixture.requests.try_recv().is_err());
+    }
 }

@@ -34,6 +34,15 @@ use crate::mcp::tokens::{AssistantTokenStore, TokenBinding};
 pub(crate) const TASK_SENTENCE: &str = "You were started for a Muqun task: when it is \
      finished call the muqun tool tasks.complete (outcome blocked if you need the user).";
 
+/// [`TASK_SENTENCE`] with the computers the agent may hand work to
+/// (`fleet::manifest::prompt_line`) after it, when there are any.
+pub(crate) fn task_sentence(fleet: Option<&str>) -> String {
+    match fleet {
+        Some(fleet) => format!("{TASK_SENTENCE} {fleet}"),
+        None => TASK_SENTENCE.to_owned(),
+    }
+}
+
 /// How long a token handed to a session agent's service lives: a service
 /// that outlives it answers not connected, and the next delegation there
 /// registers a fresh one.
@@ -134,6 +143,7 @@ pub(crate) fn task_args(
     configured: &[String],
     file: Option<&Path>,
     own: Option<&str>,
+    sentence: &str,
 ) -> Vec<String> {
     match kind {
         "claude" => {
@@ -147,18 +157,15 @@ pub(crate) fn task_args(
                     "--append-system-prompt-file".to_owned(),
                     file.to_string_lossy().into_owned(),
                 ],
-                (false, None) => vec![
-                    "--append-system-prompt".to_owned(),
-                    TASK_SENTENCE.to_owned(),
-                ],
+                (false, None) => vec!["--append-system-prompt".to_owned(), sentence.to_owned()],
             }
         }
         "codex" => {
             // A multi-line value of the user's stays multi-line: the backends
             // carry it as one argument (goals already are).
             let text = match own.map(str::trim).filter(|own| !own.is_empty()) {
-                Some(own) => format!("{own} {TASK_SENTENCE}"),
-                None => TASK_SENTENCE.to_owned(),
+                Some(own) => format!("{own} {sentence}"),
+                None => sentence.to_owned(),
             };
             vec![
                 "-c".to_owned(),
@@ -172,13 +179,18 @@ pub(crate) fn task_args(
 /// [`task_args`] for a task's agent about to start: Claude Code's file
 /// written into the gateway's state directory, Codex's own
 /// `developer_instructions` read (read-only) from `$CODEX_HOME/config.toml`.
-pub(crate) async fn terminal_task_args(config: &crate::Config, kind: &str) -> Vec<String> {
+pub(crate) async fn terminal_task_args(
+    config: &crate::Config,
+    kind: &str,
+    fleet: Option<&str>,
+) -> Vec<String> {
     if !enabled(config) || !matches!(kind, "claude" | "codex") {
         return Vec::new();
     }
     let configured = crate::agents::tasks::agent_launch_args(kind, &[], &config.agent_launch_args);
+    let sentence = task_sentence(fleet);
     let file = if kind == "claude" {
-        private_file("task-instruction.md", TASK_SENTENCE.as_bytes()).await
+        private_file("task-instruction.md", sentence.as_bytes()).await
     } else {
         None
     };
@@ -191,7 +203,13 @@ pub(crate) async fn terminal_task_args(config: &crate::Config, kind: &str) -> Ve
         },
         _ => None,
     };
-    task_args(kind, &configured, file.as_deref(), own.as_deref())
+    task_args(
+        kind,
+        &configured,
+        file.as_deref(),
+        own.as_deref(),
+        &sentence,
+    )
 }
 
 /// The `developer_instructions` a `-c`/`--config` in `configured` sets, as
@@ -583,14 +601,20 @@ mod tests {
             ("gemini", &[][..], None, vec![]),
         ] {
             assert_eq!(
-                task_args(kind, configured, Some(file), own),
+                task_args(kind, configured, Some(file), own, TASK_SENTENCE),
                 args,
                 "{kind} {own:?}"
             );
         }
         // A two-line value of the user's goes through as valid TOML holding
         // both lines and the sentence.
-        let args = task_args("codex", &[], None, Some("Line one.\nLine two."));
+        let args = task_args(
+            "codex",
+            &[],
+            None,
+            Some("Line one.\nLine two."),
+            TASK_SENTENCE,
+        );
         let table: toml::Table = toml::from_str(&args[1]).unwrap();
         assert_eq!(
             table["developer_instructions"].as_str().unwrap(),

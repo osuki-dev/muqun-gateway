@@ -212,6 +212,19 @@ pub(crate) struct DelegateRequest {
     /// asset references or file paths on this computer): handed to a
     /// session agent with its first prompt.
     pub attachments: Vec<String>,
+    /// Where the task runs when the device said: a native agent session or
+    /// a terminal pane. `None`: as the agent kind decides (a session agent's
+    /// session, a terminal agent's pane).
+    pub delivery: Option<Delivery>,
+}
+
+/// How a delegation is delivered to its agent (`POST /api/tasks` `delivery`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Delivery {
+    /// A native agent session, through the agent's session adapter.
+    Session,
+    /// A terminal pane the agent is started in.
+    Pane,
 }
 
 /// Who asked for a task, as a task view shows it.
@@ -482,10 +495,36 @@ impl Publishing<'_> {
     }
 }
 
+/// What a task is bound to, for the log: the kind and the agent or
+/// computer, never a pane's shell pid or a session's id.
+fn binding_for_log(binding: &TaskBinding) -> String {
+    match binding {
+        TaskBinding::None => "none".to_owned(),
+        TaskBinding::AgentSession { agent_id, .. } => format!("agent_session/{agent_id}"),
+        TaskBinding::Pane { agent_id, .. } => match agent_id {
+            Some(agent_id) => format!("pane/{agent_id}"),
+            None => "pane".to_owned(),
+        },
+        TaskBinding::Peer { peer_name, .. } => format!("peer/{peer_name}"),
+    }
+}
+
 impl TaskStore for Publishing<'_> {
     fn insert<'a>(&'a self, task: &'a Task) -> TaskFuture<'a, Task> {
         Box::pin(async move {
             let task = self.0.store.insert(task).await?;
+            // One line per task the host can answer "where did my task go"
+            // from: ids, kinds and names, never the goal, a body or a token.
+            tracing::info!(
+                task = %task.id.0,
+                kind = ?task.kind,
+                state = ?task.state,
+                origin = ?task.origin,
+                requested_by = task.requester_name.as_deref().unwrap_or("-"),
+                binding = %binding_for_log(&task.binding),
+                mentions = task.mentions.len(),
+                "task created"
+            );
             self.publish(&task).await;
             Ok(task)
         })
@@ -512,7 +551,24 @@ impl TaskStore for Publishing<'_> {
             if change.to.is_terminal() && change.session_title.is_none() {
                 change.session_title = self.0.live_title(id);
             }
+            let (source, reason, exit_code) = (
+                change.source.clone(),
+                change
+                    .note
+                    .as_deref()
+                    .map(|note| one_line(note, SUMMARY_CHARS)),
+                change.exit_code,
+            );
             let task = self.0.store.transition(id, change).await?;
+            tracing::info!(
+                task = %task.id.0,
+                state = ?task.state,
+                source = %source,
+                reason = reason.as_deref().unwrap_or("-"),
+                exit_code = ?exit_code.or(task.exit_code),
+                binding = %binding_for_log(&task.binding),
+                "task moved"
+            );
             if task.state.is_terminal() {
                 if let Ok(mut live) = self.0.live.lock() {
                     live.titles.remove(id);
@@ -1016,16 +1072,18 @@ impl TaskService {
     /// Whether an open task is bound to pane `pane_id` of terminal session
     /// `session_id`: its agent was started for that task.
     pub(crate) async fn open_task_in_pane(&self, session_id: &str, pane_id: &str) -> bool {
+        self.open_task_of_pane(session_id, pane_id).await.is_some()
+    }
+
+    /// The open task bound to a pane, if one is.
+    pub(crate) async fn open_task_of_pane(&self, session_id: &str, pane_id: &str) -> Option<Task> {
         let filter = TaskFilter {
             pane: Some((session_id.to_owned(), pane_id.to_owned())),
             states: Some(OPEN_STATES.to_vec()),
             limit: 1,
             ..Default::default()
         };
-        self.store
-            .list(filter)
-            .await
-            .is_ok_and(|tasks| !tasks.is_empty())
+        self.store.list(filter).await.ok()?.into_iter().next()
     }
 
     /// Whether any task, open or ended, is bound to agent session `asid`:
@@ -1194,7 +1252,12 @@ impl TaskService {
             }
         }
         if let Some(kind) = request.agent_id.as_deref() {
-            if runs_in_pane(state, kind).await {
+            let in_pane = match request.delivery {
+                Some(Delivery::Pane) => true,
+                Some(Delivery::Session) => false,
+                None => runs_in_pane(state, kind).await,
+            };
+            if in_pane {
                 if !request.attachments.is_empty() {
                     return Err(TaskError::AttachmentsUnsupported);
                 }
@@ -1294,12 +1357,13 @@ impl TaskService {
             // Served as a task's session from here, so the notice the
             // instruction may leave at once is stripped like the rest.
             self.mark_task_session(&asid.0);
+            let fleet = fleet_line(state, &task).await;
             match manager
                 .agent()
                 .set_session_instruction(
                     &asid.0,
                     crate::mcp::inject::SESSION_INSTRUCTION_KEY,
-                    crate::mcp::inject::TASK_SENTENCE,
+                    &crate::mcp::inject::task_sentence(fleet.as_deref()),
                 )
                 .await
             {
@@ -1575,6 +1639,16 @@ pub(crate) struct TerminalStart {
 /// takes one, otherwise typed) unless the task ended meanwhile -- a cancel, or a
 /// follower that gave up on it -- then move the task to working and follow
 /// it -- or fail it naming the step.
+/// The computers a task's agent is told about: for a task the owner opened
+/// here, the linked computers and the ones the owner named; a task another
+/// computer sent over is told nothing (one hop, and no further names).
+pub(crate) async fn fleet_line(state: &AppState, task: &Task) -> Option<String> {
+    if task.origin != TaskOrigin::Device {
+        return None;
+    }
+    crate::fleet::manifest::prompt_line(state, &task.mentions).await
+}
+
 pub(crate) async fn start_terminal_agent(
     state: AppState,
     session: crate::SessionConfig,
@@ -1605,6 +1679,7 @@ pub(crate) async fn start_terminal_agent(
     }
     let pane_id = placed.place.pane_id.clone();
     let mut goal = goal;
+    let fleet = fleet_line(&state, &task).await;
     // What ran before the launch command was typed is never its job.
     let mut before = pane_agent::before_launch().await;
     let (mut launched, mut to_type) = start_agent_in_place(
@@ -1618,6 +1693,7 @@ pub(crate) async fn start_terminal_agent(
             task_id: &task.id.0,
             out_of_band: true,
             model_args: &model_args,
+            fleet: fleet.as_deref(),
         }),
     )
     .await;
@@ -1626,7 +1702,7 @@ pub(crate) async fn start_terminal_agent(
     // or error; a shell foreground alone never proves a rejected goal.
     let out_of_band = kind == "claude"
         && crate::mcp::inject::enabled(&state.config)
-        && !crate::mcp::inject::terminal_task_args(&state.config, &kind)
+        && !crate::mcp::inject::terminal_task_args(&state.config, &kind, None)
             .await
             .is_empty();
     if out_of_band
@@ -1647,6 +1723,7 @@ pub(crate) async fn start_terminal_agent(
             Some(TaskLaunch {
                 task_id: &task.id.0,
                 out_of_band: false,
+                fleet: None,
                 model_args: &model_args,
             }),
         )
@@ -3552,6 +3629,7 @@ mod tests {
 
     fn request(machine: Option<&str>) -> DelegateRequest {
         DelegateRequest {
+            delivery: None,
             goal: "fix the build".into(),
             cwd: Some("/work".into()),
             agent_id: None,

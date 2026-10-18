@@ -28,23 +28,25 @@ futures = { version = "0.3.32", default-features = false, features = ["std"] }
 hkdf = "0.13.0"
 hmac = "0.13.0"
 indexmap = { version = "2.14.2", features = ["serde"] }
-libc = "0.2.178"
+# Authorized original-preserving image derivatives; no all-format/rayon/native codecs.
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "webp"] }
+libc = "0.2.191"
 # Default features pull in the `image` crate -- a full image decoder, and the
-# largest attack surface in this dependency tree -- for a renderer this gateway
-# never calls. The QR code is rendered to unicode half-blocks by the core crate.
+# a broad codec attack surface -- for a QR renderer this gateway never calls.
+# The separate image dependency above intentionally enables only three codecs.
 qrcode = { version = "0.14.1", default-features = false }
-reqwest = { version = "0.12.24", default-features = false, features = ["json", "rustls-tls", "stream"] }
+reqwest = { version = "0.12.28", default-features = false, features = ["json", "rustls-tls", "stream"] }
 serde = { version = "1.0.228", features = ["derive"] }
-serde_json = { version = "1.0.150", features = ["raw_value"] }
-sha2 = "0.11.0"
-tokio = { version = "1.53.0", features = ["fs", "macros", "net", "process", "rt-multi-thread", "io-util", "signal", "sync", "time"] }
+serde_json = { version = "1.0.154", features = ["raw_value"] }
+sha2 = "0.11.1"
+tokio = { version = "1.53.3", features = ["fs", "macros", "net", "process", "rt-multi-thread", "io-util", "signal", "sync", "time"] }
 tokio-stream = "0.1.18"
 # Structured logs for the agent engine: the SSE reader, the event mapper and
 # the OpenCode client all run unattended, and `eprintln!` left every failure
 # there indistinguishable from an idle stream.
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", default-features = false, features = ["ansi", "env-filter", "fmt", "smallvec", "std", "tracing-log"] }
-uuid = { version = "1.24.0", features = ["v4"] }
+uuid = { version = "1.28.0", features = ["v4"] }
 argon2 = { version = "0.6.0", default-features = false, features = ["alloc"] }
 # `rustls-tls-webpki-roots`: a linked peer at an `https://` URL is followed
 # over `wss://` (`fleet::peer_client::TaskFeed`), with the same rustls and
@@ -53,14 +55,14 @@ tokio-tungstenite = { version = "0.30.0", default-features = false, features = [
 # `CancellationToken` for the T3 Code RPC connection actor: one token stops
 # the socket task, its ping timer and every subscription together. Already in
 # the tree through reqwest, so this adds no compiled crate.
-tokio-util = "0.7.19"
+tokio-util = "0.7.20"
 rmcp = { version = "3", features = ["server", "transport-streamable-http-server", "macros"] }
 rusqlite = { version = "0.40", features = ["bundled-sqlcipher-vendored-openssl"] }
 hex = "0.4"
 # `ServiceExt::oneshot`: `/mcp` drives a per-request rmcp service with it, and
 # tests drive a Router. Already in the tree through axum.
 tower = { version = "0.5", default-features = false, features = ["util"] }
-toml = "0.9"
+toml = "1.1.8"
 
 [profile.release]
 # The gateway ships as a single prebuilt binary per platform. Thin LTO and one

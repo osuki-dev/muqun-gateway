@@ -13,6 +13,7 @@ use super::discovery::OpencodeEndpoint;
 /// `message.part.updated` runs to tens of kilobytes -- but it is not unbounded.
 /// A stream that never emits a blank line must not grow memory without limit.
 pub(crate) const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Frame in bytes, not HTTP chunks: UTF-8 is decoded only at a blank line.
 /// Once oversized, discard through that same boundary (never parse its tail).
@@ -133,6 +134,10 @@ impl OpencodeSseListener {
     }
 
     pub fn start(&self) {
+        self.start_with_handshake_timeout(HANDSHAKE_TIMEOUT);
+    }
+
+    fn start_with_handshake_timeout(&self, handshake_timeout: Duration) {
         // A stopped generation is retired; manager reattachment constructs a
         // fresh listener/token rather than reviving its old event pump.
         if self.cancel.is_cancelled() {
@@ -174,10 +179,12 @@ impl OpencodeSseListener {
                 let response = tokio::select! {
                     biased;
                     _ = cancel.cancelled() => break,
-                    response = req.send() => response,
+                    // Bound only connection/response headers. An established
+                    // SSE body may legitimately stay open indefinitely.
+                    response = tokio::time::timeout(handshake_timeout, req.send()) => response,
                 };
                 match response {
-                    Ok(resp) if resp.status().is_success() => {
+                    Ok(Ok(resp)) if resp.status().is_success() => {
                         backoff = Duration::from_millis(500); // Reset backoff
                         connected.store(true, Ordering::SeqCst);
                         tracing::info!(url = %url, "opencode event stream connected");
@@ -208,7 +215,7 @@ impl OpencodeSseListener {
                         }
                         tracing::warn!(url = %url, "opencode event stream ended");
                     }
-                    Ok(resp) => {
+                    Ok(Ok(resp)) => {
                         connected.store(false, Ordering::SeqCst);
                         tracing::warn!(
                             url = %url,
@@ -216,9 +223,13 @@ impl OpencodeSseListener {
                             "opencode event stream refused"
                         );
                     }
-                    Err(err) => {
+                    Ok(Err(err)) => {
                         connected.store(false, Ordering::SeqCst);
                         tracing::warn!(url = %url, %err, "opencode event stream unreachable");
+                    }
+                    Err(_) => {
+                        connected.store(false, Ordering::SeqCst);
+                        tracing::warn!(url = %url, "opencode event stream handshake timed out");
                     }
                 }
 
@@ -420,6 +431,63 @@ mod tests {
         assert_eq!(event.data["delta"], "你好🙂");
         assert_eq!(rx.recv().await.unwrap().event_type, "session.idle");
         listener.stop();
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn stalled_handshake_retries_and_established_stream_outlives_deadline() {
+        let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", tcp.local_addr().unwrap());
+        let handshake_timeout = Duration::from_millis(200);
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            // A responsive TCP peer that never answers the first GET must
+            // not strand the listener before it reaches its retry loop.
+            let (mut stalled, _) = tcp.accept().await.unwrap();
+            read_test_request(&mut stalled).await;
+            let mut byte = [0];
+            assert_eq!(stalled.read(&mut byte).await.unwrap(), 0);
+            let (mut socket, _) = tcp.accept().await.unwrap();
+            read_test_request(&mut socket).await;
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n").await.unwrap();
+            socket.flush().await.unwrap();
+            // The test waits longer than the handshake budget after headers.
+            // Only then does this same connection send its first event.
+            release_rx.await.unwrap();
+            let body = unicode_frames("\n");
+            socket
+                .write_all(format!("{:x}\r\n", body.len()).as_bytes())
+                .await
+                .unwrap();
+            socket.write_all(&body).await.unwrap();
+            socket.write_all(b"\r\n").await.unwrap();
+            socket.flush().await.unwrap();
+            assert_eq!(socket.read(&mut byte).await.unwrap(), 0);
+        });
+        let (listener, mut rx) = OpencodeSseListener::new(endpoint(url));
+        listener.start_with_handshake_timeout(handshake_timeout);
+        let result = tokio::time::timeout(Duration::from_secs(4), async {
+            while !listener.is_connected() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            tokio::time::sleep(handshake_timeout * 2).await;
+            assert!(
+                listener.is_connected(),
+                "SSE body has no handshake deadline"
+            );
+            release_tx.send(()).unwrap();
+            assert_eq!(rx.recv().await.unwrap().data["delta"], "你好🙂");
+            assert_eq!(rx.recv().await.unwrap().event_type, "session.idle");
+        })
+        .await;
+        listener.stop();
+        if result.is_err() {
+            server.abort();
+        }
+        result.expect("handshake timeout recovers without ending a healthy stream");
         tokio::time::timeout(Duration::from_secs(1), server)
             .await
             .unwrap()

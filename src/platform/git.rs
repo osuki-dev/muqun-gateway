@@ -37,9 +37,14 @@ use tokio::io::AsyncReadExt as _;
 use tokio::process::Command;
 
 /// One git process gets this long. A status on a large checkout is tens of
-/// milliseconds; a diff of one file is less. Five seconds is "the disk is
-/// asleep", not "the repository is big".
-pub const GIT_TIMEOUT: Duration = Duration::from_secs(5);
+/// milliseconds warm; cold, on a big checkout on a disk that was asleep, it
+/// has been seen to take seconds, and a status or file list that times out
+/// is a blank diff screen. Fifteen seconds, and `run` tries once more on a
+/// timeout.
+pub const GIT_TIMEOUT: Duration = Duration::from_secs(15);
+/// One file's patch is a smaller job and is read a page at a time: it keeps
+/// the shorter bound, so a paged read never holds the phone for long.
+pub const PATCH_TIMEOUT: Duration = Duration::from_secs(5);
 /// Stdout is read up to here and the process is then killed. A single file's
 /// patch that is bigger than this is not read on a phone.
 pub const MAX_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
@@ -366,7 +371,7 @@ pub async fn file_patch(
         args.push(old);
     }
 
-    let mut text = match run(toplevel, &args, &[0, 1]).await {
+    let mut text = match run_with(toplevel, &args, &[0, 1], PATCH_TIMEOUT).await {
         Ok(output) => String::from_utf8_lossy(&output.stdout).into_owned(),
         // An unborn branch has no HEAD; the file is then new by definition.
         Err(GitError::Failed(_)) if side == PatchSide::WorkingTreeVsHead => String::new(),
@@ -374,12 +379,18 @@ pub async fn file_patch(
     };
 
     if text.is_empty() && side == PatchSide::WorkingTreeVsHead {
-        let tracked = run(toplevel, &["ls-files", "-z", "--", &relative_str], &[0]).await?;
+        let tracked = run_with(
+            toplevel,
+            &["ls-files", "-z", "--", &relative_str],
+            &[0],
+            PATCH_TIMEOUT,
+        )
+        .await?;
         if tracked.stdout.is_empty() {
             let Some(_) = untracked_file_inside(toplevel, &relative) else {
                 return Ok(None);
             };
-            let output = run(
+            let output = run_with(
                 toplevel,
                 &[
                     "diff",
@@ -393,6 +404,7 @@ pub async fn file_patch(
                     &relative_str,
                 ],
                 &[0, 1],
+                PATCH_TIMEOUT,
             )
             .await?;
             text = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -1543,7 +1555,29 @@ fn scrub_env(cmd: &mut std::process::Command, inherited: impl Iterator<Item = Os
 ///
 /// `ok_codes` is which exit codes count as success: `diff --no-index` exits 1
 /// when the files differ, which is the answer being asked for.
+/// A status, list or lookup under [`GIT_TIMEOUT`], tried once more when it
+/// timed out. A loop with one await point, not two awaits: the second
+/// future would otherwise be laid out beside the first in every caller,
+/// and `changed_files` has enough call sites to overflow a thread's stack.
+/// One file's patch uses `run_with` directly under [`PATCH_TIMEOUT`] and
+/// is not retried.
 async fn run(cwd: &Path, args: &[&str], ok_codes: &[i32]) -> Result<Output, GitError> {
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        match run_with(cwd, args, ok_codes, GIT_TIMEOUT).await {
+            Err(GitError::Timeout) if attempts == 1 => continue,
+            other => return other,
+        }
+    }
+}
+
+async fn run_with(
+    cwd: &Path,
+    args: &[&str],
+    ok_codes: &[i32],
+    timeout: Duration,
+) -> Result<Output, GitError> {
     let mut cmd = command(cwd);
     cmd.args(args);
     let mut child = cmd.spawn().map_err(|err| match err.kind() {
@@ -1589,7 +1623,7 @@ async fn run(cwd: &Path, args: &[&str], ok_codes: &[i32]) -> Result<Output, GitE
         bytes
     };
 
-    let result = tokio::time::timeout(GIT_TIMEOUT, async {
+    let result = tokio::time::timeout(timeout, async {
         let ((stdout, status), stderr) = tokio::join!(read_stdout, read_stderr);
         let capped = stdout.len() >= MAX_OUTPUT_BYTES;
         (stdout, stderr, capped, status)

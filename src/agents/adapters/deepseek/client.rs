@@ -10,11 +10,38 @@ use crate::agents::ports::agent::{append_attachment_paths, AgentError};
 
 /// Largest upstream response body we will buffer.
 pub(super) const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+/// The most one history walk retains across its `session/page` calls
+/// (`read_history`, `get_page`). Separate from the single-response cap: a
+/// walk whose next page would take it over this stops and says `hasMore`,
+/// so a session is never refused for its size; the rest comes through
+/// `load_earlier_timeline`. A single page is under `MAX_RESPONSE_BYTES`, so
+/// the first page always fits.
+pub(super) const MAX_HISTORY_RETAINED_BYTES: usize = 8 * 1024 * 1024;
+/// The budget of the walk that opens a session: enough for the newest
+/// hundred messages of an ordinary session, small enough to open fast.
+pub(super) const INITIAL_HISTORY_RETAINED_BYTES: usize = 2 * 1024 * 1024;
+// A single page always fits the smallest budget, so a walk delivers at least one.
+const _: () = assert!(MAX_RESPONSE_BYTES <= INITIAL_HISTORY_RETAINED_BYTES);
+const _: () = assert!(INITIAL_HISTORY_RETAINED_BYTES <= MAX_HISTORY_RETAINED_BYTES);
 /// How much of an upstream error body is kept for logs.
 const ERROR_SNIPPET_BYTES: usize = 512;
 /// Delivery modes `session/prompt` accepts.
 const DELIVERY_MODES: [&str; 2] = ["queue", "steer"];
 const HISTORY_PAGE_MESSAGES: usize = 50;
+
+/// What one walk over `session/page` gathered (`read_history`).
+#[derive(Debug)]
+pub(super) struct HistoryWalk {
+    /// `{ "records": [...], "hasMore": bool }`, oldest first: what
+    /// `mapper::map_timeline_records` reads.
+    pub page: Value,
+    /// The frozen cut the walk read under; the next older walk keeps it.
+    pub through_seq: i64,
+    /// The oldest seq delivered, `None` for an empty walk.
+    pub earliest_seq: Option<i64>,
+    /// Older records remain below `earliest_seq`.
+    pub has_more: bool,
+}
 
 #[derive(Deserialize)]
 struct ModelSelection {
@@ -130,6 +157,20 @@ impl DeepseekClient {
         method: &str,
         args: Value,
     ) -> Result<Value, AgentError> {
+        self.call_remote_capped(namespace, method, args, MAX_RESPONSE_BYTES)
+            .await
+    }
+
+    /// `call_remote` with its own response cap, for the one answer that
+    /// grows with the owner's use (`session/list`) and must not be refused
+    /// whole once it passes the ordinary cap.
+    async fn call_remote_capped(
+        &self,
+        namespace: &str,
+        method: &str,
+        args: Value,
+        response_cap: usize,
+    ) -> Result<Value, AgentError> {
         let url = format!("{}/api/{namespace}/{method}", self.endpoint.url);
         let rpc_id = format!("req_{}", Uuid::new_v4().simple());
         let full_method = format!("{namespace}/{method}");
@@ -182,7 +223,7 @@ impl DeepseekClient {
             )));
         }
 
-        let bytes = read_capped(resp, MAX_RESPONSE_BYTES).await.map_err(|e| {
+        let bytes = read_capped(resp, response_cap).await.map_err(|e| {
             tracing::warn!(target: "deepseek", "{full_method}: reading response failed: {e}");
             match e {
                 ReadError::TooLarge => {
@@ -237,12 +278,21 @@ impl DeepseekClient {
         }
     }
 
-    /// List sessions from session-controller: `session/list`
+    /// The most a `session/list` answer may weigh: it names every session
+    /// the owner ever had, so it outgrows the ordinary response cap long
+    /// before any one of them does.
+    const SESSION_LIST_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+    /// List sessions from session-controller: `session/list`. The whole
+    /// list; the query's directory, search, order and limit are applied by
+    /// the driver, as the T3 adapter applies them.
     pub async fn list_sessions(&self, _query: &SessionQuery) -> Result<Vec<Value>, AgentError> {
         let args = json!({
             "_request": {}
         });
-        let result = self.call_remote("session", "list", args).await?;
+        let result = self
+            .call_remote_capped("session", "list", args, Self::SESSION_LIST_MAX_BYTES)
+            .await?;
         if let Some(items) = result.get("items").and_then(Value::as_array) {
             Ok(items.clone())
         } else if let Some(items) = result.get("sessions").and_then(Value::as_array) {
@@ -262,7 +312,18 @@ impl DeepseekClient {
         agent_preset: Option<&str>,
     ) -> Result<String, AgentError> {
         let session_id = format!("session-{}", Uuid::new_v4());
-        let cwd = directory.unwrap_or(".");
+        // Without a directory the session works in the owner's home, never
+        // in whatever directory the gateway process happens to run from.
+        let home = dirs::home_dir();
+        let cwd = match directory {
+            Some(directory) => directory,
+            None => home
+                .as_deref()
+                .and_then(std::path::Path::to_str)
+                .ok_or_else(|| {
+                    AgentError::InvalidRequest("a working directory is required".into())
+                })?,
+        };
         let mut req_body = json!({
             "sessionId": session_id,
             "cwd": cwd,
@@ -347,26 +408,69 @@ impl DeepseekClient {
         self.call_remote("session", "fork", args).await
     }
 
-    /// Read historical messages page: `session/page`
+    /// Read historical messages page: `session/page`. The newest `limit`
+    /// user/assistant messages under a fresh frozen cut, within
+    /// [`MAX_HISTORY_RETAINED_BYTES`].
     pub async fn get_page(&self, session_id: &str, limit: usize) -> Result<Value, AgentError> {
+        Ok(self
+            .read_history(session_id, None, limit, MAX_HISTORY_RETAINED_BYTES)
+            .await?
+            .page)
+    }
+
+    /// Walk `session/page` backwards for up to `limit` append-origin
+    /// user/assistant messages, retaining at most `budget_bytes` of records.
+    ///
+    /// `cut` continues an earlier walk: `(through_seq, before_seq)`, the
+    /// frozen cut it read under and the oldest seq it delivered, so the next
+    /// page is the one just below. `None` freezes a new cut from
+    /// `session/projections`. A walk stops short of `limit` when the next
+    /// page would exceed the budget, and says so with `has_more`; it never
+    /// fails for the size of the history.
+    pub(super) async fn read_history(
+        &self,
+        session_id: &str,
+        cut: Option<(i64, i64)>,
+        limit: usize,
+        budget_bytes: usize,
+    ) -> Result<HistoryWalk, AgentError> {
         if limit == 0 {
-            return Ok(json!({ "records": [], "hasMore": false }));
+            return Ok(HistoryWalk {
+                page: json!({ "records": [], "hasMore": false }),
+                through_seq: cut.map_or(-1, |(through_seq, _)| through_seq),
+                earliest_seq: None,
+                has_more: false,
+            });
         }
-        // rc.2 projections are a cold-safe observation at an exact log cut.
-        // Do not use list hints (which may be cached) or follow (which promotes
-        // cold sessions). Every backwards page must retain this same cut.
-        let projections = self.get_projections(session_id).await?;
-        if projections.is_null() {
-            return Err(AgentError::SessionNotFound(session_id.to_string()));
+        let (through_seq, mut before_seq) = match cut {
+            Some(cut) => cut,
+            None => {
+                // rc.2 projections are a cold-safe observation at an exact log
+                // cut. Do not use list hints (which may be cached) or follow
+                // (which promotes cold sessions). Every backwards page must
+                // retain this same cut.
+                let projections = self.get_projections(session_id).await?;
+                if projections.is_null() {
+                    return Err(AgentError::SessionNotFound(session_id.to_string()));
+                }
+                let through_seq = projections
+                    .get("asOfSeq")
+                    .and_then(Value::as_i64)
+                    .filter(|seq| (-1..=9_007_199_254_740_991).contains(seq))
+                    .ok_or_else(|| {
+                        AgentError::Protocol("session projections lack a valid cursor".into())
+                    })?;
+                (through_seq, through_seq + 1)
+            }
+        };
+        if before_seq <= 0 {
+            return Ok(HistoryWalk {
+                page: json!({ "records": [], "hasMore": false }),
+                through_seq,
+                earliest_seq: None,
+                has_more: false,
+            });
         }
-        let through_seq = projections
-            .get("asOfSeq")
-            .and_then(Value::as_i64)
-            .filter(|seq| (-1..=9_007_199_254_740_991).contains(seq))
-            .ok_or_else(|| {
-                AgentError::Protocol("session projections lack a valid cursor".into())
-            })?;
-        let mut before_seq = through_seq + 1;
         let mut remaining = limit;
         let mut records = Vec::new();
         let mut retained_bytes = 0;
@@ -424,12 +528,6 @@ impl DeepseekClient {
             if before_seq > 0 && previous_seq != Some(before_seq - 1) {
                 return Err(AgentError::Protocol("history page skipped records".into()));
             }
-            retained_bytes += serde_json::to_vec(page_records)
-                .map_err(|_| AgentError::Protocol("invalid history page".into()))?
-                .len();
-            if retained_bytes > MAX_RESPONSE_BYTES {
-                return Err(AgentError::Protocol("upstream history too large".into()));
-            }
             let first_seq = page_records
                 .first()
                 .and_then(|record| record.pointer("/event/seq"))
@@ -442,6 +540,15 @@ impl DeepseekClient {
                     "history page omitted earlier records".into(),
                 ));
             }
+            let page_bytes = serde_json::to_vec(page_records)
+                .map_err(|_| AgentError::Protocol("invalid history page".into()))?
+                .len();
+            // Over budget: keep what is gathered and leave this page to the
+            // next walk, which starts just below the oldest record kept.
+            if !records.is_empty() && retained_bytes + page_bytes > budget_bytes {
+                break true;
+            }
+            retained_bytes += page_bytes;
             records.splice(0..0, page_records.iter().cloned());
             remaining = remaining.saturating_sub(messages);
             if !has_more || remaining == 0 {
@@ -449,7 +556,16 @@ impl DeepseekClient {
             }
             before_seq = first_seq.expect("nonempty page with more history");
         };
-        Ok(json!({ "records": records, "hasMore": has_more }))
+        let earliest_seq = records
+            .first()
+            .and_then(|record| record.pointer("/event/seq"))
+            .and_then(Value::as_i64);
+        Ok(HistoryWalk {
+            page: json!({ "records": records, "hasMore": has_more }),
+            through_seq,
+            earliest_seq,
+            has_more,
+        })
     }
 
     /// Read session projections: `session/projections`
@@ -617,7 +733,7 @@ pub(super) mod test_server {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -667,7 +783,11 @@ mod tests {
         DeepseekClient::new(DeepseekEndpoint::new(url, None, None))
     }
 
-    async fn rpc_server(app: axum::Router) -> (DeepseekClient, tokio::task::JoinHandle<()>) {
+    use std::sync::{Arc, Mutex};
+
+    pub(crate) async fn rpc_server(
+        app: axum::Router,
+    ) -> (DeepseekClient, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let client = client_for(format!("http://{}", listener.local_addr().unwrap()));
         let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -741,6 +861,140 @@ mod tests {
         assert_eq!(
             *calls.lock().unwrap(),
             vec![(359, 360, 50), (359, 210, 50), (359, 60, 10)]
+        );
+        server.abort();
+    }
+
+    /// The `(throughSeq, beforeSeq, maxMessages)` of each page call made.
+    pub(crate) type PageCalls = Arc<Mutex<Vec<(u64, usize, usize)>>>;
+
+    /// A page the server pages by user messages: 30 per page over the dense
+    /// `0..=360` log, each record padded to `pad` bytes.
+    pub(crate) fn paged_history(pad: usize) -> (axum::Router, PageCalls) {
+        use axum::{routing::post, Json, Router};
+        let padding = "x".repeat(pad);
+        let source: Vec<Value> = (0..=360)
+            .map(|seq| {
+                let event = match seq % 3 {
+                    0 => json!({ "type": "user/message", "seq": seq, "time": seq, "surfaceOp": "append",
+                        "data": { "id": format!("u-{seq}"), "role": "user", "content": [{ "type": "text", "text": "hi" }], "source": { "kind": "user" }, "pad": padding } }),
+                    1 => json!({ "type": "assistant/message", "seq": seq, "time": seq, "surfaceOp": "append",
+                        "data": { "message": { "id": format!("a-{seq}"), "role": "assistant", "content": [{ "type": "tool-call", "id": format!("c-{seq}"), "name": "bash", "arguments": "{}" }] }, "pad": padding } }),
+                    // The result of the call one record back: on a page cut
+                    // it lands on the newer page and its call on the older.
+                    _ => json!({ "type": "tool/result", "seq": seq, "time": seq, "surfaceOp": "append",
+                        "data": { "turn": 1, "step": 1, "message": { "id": format!("t-{seq}"), "role": "tool", "toolCallId": format!("c-{}", seq - 1), "content": [{ "type": "text", "text": "done" }] }, "pad": padding } }),
+                };
+                json!({ "type": "event", "event": event })
+            })
+            .collect();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let seen = calls.clone();
+        let app = Router::new()
+            .route("/api/session/projections", post(|| async {
+                Json(json!({ "result": { "ok": true, "value": { "asOfSeq": 359, "values": {} } } }))
+            }))
+            .route("/api/session/page", post(move |Json(body): Json<Value>| {
+                let source = source.clone();
+                let seen = seen.clone();
+                async move {
+                    let request = body.pointer("/payload/args/request").unwrap();
+                    let through = request["throughSeq"].as_u64().unwrap();
+                    assert_eq!(through, 359, "every page keeps the frozen cut");
+                    let before = request["beforeSeq"].as_u64().unwrap() as usize;
+                    let max = request["maxMessages"].as_u64().unwrap() as usize;
+                    seen.lock().unwrap().push((through, before, max));
+                    let mut count = 0;
+                    let mut cut = 0;
+                    for index in (0..before).rev() {
+                        if source[index].pointer("/event/type").and_then(Value::as_str) == Some("user/message") {
+                            count += 1;
+                            if count == max.min(30) { cut = index; break; }
+                        }
+                    }
+                    Json(json!({ "result": { "ok": true, "value": {
+                        "records": source[cut..before], "hasMore": cut > 0
+                    } } }))
+                }
+            }));
+        (app, calls)
+    }
+
+    fn seqs(page: &Value) -> Vec<i64> {
+        page["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|record| record["event"]["seq"].as_i64().unwrap())
+            .collect()
+    }
+
+    /// A walk keeps what fits its budget and says `hasMore` rather than
+    /// failing; the next walk, given the cut and the oldest seq delivered,
+    /// continues just below it, and the pages tile the log with no gap or
+    /// overlap down to seq 0. `get_page` itself never fails for size.
+    #[tokio::test]
+    async fn a_walk_stops_within_its_budget_and_the_next_continues_below_it() {
+        let (app, calls) = paged_history(0);
+        let (client, server) = rpc_server(app).await;
+        // One page is about 20 KiB: a budget of 30 KiB holds exactly one.
+        let first = client
+            .read_history("s", None, 100, 30 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(seqs(&first.page), (270..=359).collect::<Vec<_>>());
+        assert!(first.has_more);
+        assert_eq!((first.through_seq, first.earliest_seq), (359, Some(270)));
+        assert_eq!(first.page["hasMore"], true);
+
+        let mut delivered = seqs(&first.page);
+        let mut cursor = (first.through_seq, first.earliest_seq.unwrap());
+        let mut walks = 0;
+        loop {
+            let walk = client
+                .read_history("s", Some(cursor), 100, 30 * 1024)
+                .await
+                .unwrap();
+            walks += 1;
+            let mut page = seqs(&walk.page);
+            assert_eq!(*page.last().unwrap() + 1, delivered[0], "contiguous below");
+            page.append(&mut delivered);
+            delivered = page;
+            if !walk.has_more {
+                assert_eq!(walk.earliest_seq, Some(0));
+                break;
+            }
+            cursor = (walk.through_seq, walk.earliest_seq.unwrap());
+        }
+        assert_eq!(walks, 3);
+        assert_eq!(delivered, (0..=359).collect::<Vec<_>>());
+        // Below seq 0 there is nothing: no call is made.
+        let end = client
+            .read_history("s", Some((359, 0)), 100, 30 * 1024)
+            .await
+            .unwrap();
+        assert!(!end.has_more && end.earliest_seq.is_none());
+        assert_eq!(seqs(&end.page), Vec::<i64>::new());
+        // The page refused by a walk's budget was asked for once and then
+        // asked for again by the walk that delivered it. Each page holds 30
+        // user and 30 assistant messages, so a walk of 100 asks for 40 next.
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![
+                (359, 360, 50),
+                (359, 270, 40),
+                (359, 270, 50),
+                (359, 180, 40),
+                (359, 180, 50),
+                (359, 90, 40),
+                (359, 90, 50),
+            ]
+        );
+        // Under the real budget, `get_page` for more messages than there
+        // are (240 user and assistant ones) reads the lot.
+        assert_eq!(
+            seqs(&client.get_page("s", 400).await.unwrap()),
+            (0..=359).collect::<Vec<_>>()
         );
         server.abort();
     }

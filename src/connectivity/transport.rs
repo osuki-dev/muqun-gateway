@@ -219,6 +219,17 @@ pub fn seal_version(
     })
 }
 
+/// Why an envelope did not open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenError {
+    /// It authenticated, but its timestamp is outside [`MAX_CLOCK_SKEW_MS`]
+    /// of now: the two clocks disagree. Said only of an envelope that did
+    /// authenticate, so the distinction reaches nobody but the key's holder.
+    Expired,
+    /// Malformed, tampered with, or sealed under another key.
+    Invalid,
+}
+
 pub fn open(
     material: &[u8],
     direction: Direction,
@@ -226,23 +237,41 @@ pub fn open(
     envelope: &Envelope,
     now_ms: u128,
 ) -> anyhow::Result<Vec<u8>> {
-    let authenticated_aad = envelope_aad(envelope.version, envelope.timestamp_ms, aad)?;
-    if !timestamp_is_fresh(envelope.timestamp_ms, now_ms) {
-        return Err(anyhow!("transport envelope expired"));
-    }
-    let nonce = nonce_bytes(&envelope.nonce)?;
-    let ciphertext = decode_key(&envelope.ciphertext)?;
-    let key = derive_key(material, direction)?;
+    open_checked(material, direction, aad, envelope, now_ms).map_err(|error| match error {
+        OpenError::Expired => anyhow!("transport envelope expired"),
+        OpenError::Invalid => anyhow!("transport authentication failed"),
+    })
+}
+
+/// [`open`], telling a stale envelope from a bad one. The ciphertext is
+/// authenticated first and the timestamp judged after, so `Expired` is
+/// never said of an envelope that did not open.
+pub fn open_checked(
+    material: &[u8],
+    direction: Direction,
+    aad: &[u8],
+    envelope: &Envelope,
+    now_ms: u128,
+) -> Result<Vec<u8>, OpenError> {
+    let authenticated_aad = envelope_aad(envelope.version, envelope.timestamp_ms, aad)
+        .map_err(|_| OpenError::Invalid)?;
+    let nonce = nonce_bytes(&envelope.nonce).map_err(|_| OpenError::Invalid)?;
+    let ciphertext = decode_key(&envelope.ciphertext).map_err(|_| OpenError::Invalid)?;
+    let key = derive_key(material, direction).map_err(|_| OpenError::Invalid)?;
     let cipher = Aes256Gcm::new_from_slice(&key).expect("AES-256 key has fixed length");
-    cipher
+    let plaintext = cipher
         .decrypt(
-            &Nonce::try_from(nonce.as_slice())?,
+            &Nonce::try_from(nonce.as_slice()).map_err(|_| OpenError::Invalid)?,
             Payload {
                 msg: &ciphertext,
                 aad: &authenticated_aad,
             },
         )
-        .map_err(|_| anyhow!("transport authentication failed"))
+        .map_err(|_| OpenError::Invalid)?;
+    if !timestamp_is_fresh(envelope.timestamp_ms, now_ms) {
+        return Err(OpenError::Expired);
+    }
+    Ok(plaintext)
 }
 
 pub(crate) fn timestamp_is_fresh(timestamp_ms: u128, now_ms: u128) -> bool {

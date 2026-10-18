@@ -34,7 +34,7 @@ pub(crate) fn test_config(token: &str) -> Config {
         listen: "127.0.0.1:23100".into(),
         public_url: "http://127.0.0.1:23100".into(),
         token_hash: hash_token(token),
-        transport_encryption: TransportEncryptionMode::Required,
+        transport_encryption: TransportEncryptionMode::Disabled,
         dev_unauthenticated: false,
         sessions: vec![SessionConfig {
             id: "default".into(),
@@ -59,6 +59,33 @@ pub(crate) fn test_config(token: &str) -> Config {
         mcp: crate::platform::config::McpConfig::default(),
         fleet: Default::default(),
     }
+}
+
+/// The transport key the test fixtures give a device whose token hashes to
+/// `token_hash`: derived, so a header builder that knows only the token can
+/// produce the proof the middleware would have set after opening a sealed
+/// request (`sealed_bearer_headers`).
+pub(crate) fn test_transport_key_for(token_hash: &str) -> String {
+    use sha2::{Digest as _, Sha256};
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(token_hash.as_bytes()))
+}
+
+/// `device`, paired while encryption was on: it holds the fixture transport
+/// key for its token and is served in `required` mode only with the proof
+/// `sealed_bearer_headers` carries.
+pub(crate) fn sealed(mut device: DeviceRecord) -> DeviceRecord {
+    device.transport_key = Some(test_transport_key_for(&device.token_hash));
+    device
+}
+
+/// A state in `transport_encryption: required`: `test_state` is token-only
+/// (`disabled`), the mode a device without a transport key can still be
+/// served in. Devices here need to be `sealed` and the requests to carry
+/// `sealed_bearer_headers`.
+pub(crate) fn required_test_state(admin_token: &str, devices: Vec<DeviceRecord>) -> AppState {
+    let mut state = test_state(admin_token, devices);
+    state.config.transport_encryption = TransportEncryptionMode::Required;
+    state
 }
 
 pub(crate) fn test_device(id: &str, token: &str) -> DeviceRecord {
@@ -175,6 +202,18 @@ pub(crate) fn bearer_headers(token: &str) -> HeaderMap {
     headers.insert(
         axum::http::header::AUTHORIZATION,
         HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+    );
+    headers
+}
+
+/// What a handler sees for a `sealed` device's request once the transport
+/// middleware has opened the envelope: the bearer token and the proof header
+/// only the middleware may set.
+pub(crate) fn sealed_bearer_headers(token: &str) -> HeaderMap {
+    let mut headers = bearer_headers(token);
+    headers.insert(
+        axum::http::HeaderName::from_static(TRANSPORT_PROOF_HEADER),
+        HeaderValue::from_str(&test_transport_key_for(&hash_token(token))).unwrap(),
     );
     headers
 }
@@ -861,6 +900,27 @@ pub(crate) fn liveness_session(id: &str, backend: BackendKind) -> SessionConfig 
     }
 }
 
+/// `pairing.json` in the test config directory, written once per process:
+/// what the pairing routes seal a QR-style claim with. Answers its current
+/// transport key (the routes rotate it after a sealed claim).
+pub(crate) fn test_pairing_transport_key() -> String {
+    let path = config_dir().unwrap().join(PAIRING_FILE);
+    if !path.exists() {
+        let pairing = PairingFile {
+            payload: PairingPayload {
+                kind: "muqun-gateway".into(),
+                server_id: "server-1".into(),
+                label: "test".into(),
+                url: "http://127.0.0.1:23100".into(),
+                token: "admin".into(),
+                transport_key: generate_token(),
+            },
+        };
+        write_secret_file(&path, &serde_json::to_vec(&pairing).unwrap()).unwrap();
+    }
+    read_pairing_file().unwrap().payload.transport_key
+}
+
 pub(crate) fn write_test_install(dir: &std::path::Path, server_id: &str, token: &str) {
     std::fs::create_dir_all(dir).unwrap();
     let mut config = test_config(token);
@@ -1043,6 +1103,20 @@ impl FakeAgent {
         self
     }
 
+    /// Sessions with parents: `(asid, parent, updated_ms)`. `list_sessions`
+    /// honours the parent filter as every real adapter does.
+    pub fn with_session_tree(mut self, sessions: &[(&str, Option<&str>, u64)]) -> Self {
+        self.sessions = sessions
+            .iter()
+            .map(|(asid, parent, updated_ms)| {
+                let mut session = fake_session(asid, *updated_ms);
+                session.parent_id = parent.map(str::to_owned);
+                session
+            })
+            .collect();
+        self
+    }
+
     pub fn with_session_deletion(mut self) -> Self {
         self.session_deletion = true;
         self
@@ -1150,13 +1224,22 @@ impl agents::ports::agent::AgentPort for FakeAgent {
     }
     fn list_sessions<'a>(
         &'a self,
-        _query: &'a agents::domain::SessionQuery,
+        query: &'a agents::domain::SessionQuery,
     ) -> agents::ports::agent::AgentFuture<'a, Vec<agents::domain::AgentSessionInfo>> {
         Box::pin(async move {
             if self.failing {
                 return self.fail();
             }
-            Ok(self.sessions.clone())
+            self.record(&format!(
+                "list_sessions parent={}",
+                query.parent_id.as_deref().unwrap_or("-")
+            ));
+            Ok(self
+                .sessions
+                .iter()
+                .filter(|session| query.keeps_parent(session.parent_id.as_deref()))
+                .cloned()
+                .collect())
         })
     }
     fn create_session<'a>(

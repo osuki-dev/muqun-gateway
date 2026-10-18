@@ -27,7 +27,8 @@ model, not new protocols.
 {
   "schema_version": "1.4.0",
   "capabilities": { "parts": true, "assets": true, "image_upload": true,
-                    "composer": true, "message_image_assets": true },
+                    "composer": true, "message_image_assets": true,
+                    "session_descendants": true },
   "data": { }
 }
 ```
@@ -288,42 +289,24 @@ row because the menu moved between the read and the answer.
 
 ## Composer capabilities (v1.3)
 
-The app's composer offers slash commands and `@` file mentions without knowing
-any agent by name, because the pane's descriptor says what this agent takes.
-`src/composer.rs` is one versioned table per agent kind, keyed the same way the
-dictionaries are, and `composer` is **absent entirely** for an agent with no
-table — a client can tell "this gateway knows nothing about this agent" from
-"this agent understands no slash commands", which a `null` would not allow.
+The app's composer offers slash commands and `@` file mentions from the pane's
+`composer` descriptor. `src/terminal/command_catalog.rs` reads a validated local
+snapshot downloaded by `muqun-gateway commands update`; descriptor reads do not
+contact the network. Each command has `source: "catalog"`. The snapshot's agent
+and version determine `captured_from`, so changing the CLI binary does not
+silently relabel an older command catalog as current.
 
-| table | read off | commands |
-|---|---|---|
-| `claude` | Claude Code 2.1.220, the shipped binary's own command definitions | 34 |
-| `codex` | `SlashCommand` at `rust-v0.145.0`, cross-checked against the installed binary | 44 |
-| `opencode` | opencode 1.18.0, the palette entries that register a slash name | 28 |
-| `qoder` | Qoder CLI 1.1.5, the shipped binary's own command definitions | 37 |
+`src/terminal/composer.rs` retains agent profiles for file-mention support and
+legacy capture metadata. Its historical builtin command arrays are not the
+source of slash-command suggestions. A known profile without a cached catalog
+returns an empty `slash_commands` array; an agent with neither a profile nor a
+catalog has no composer descriptor. Workspace skills and command files are not
+merged into suggestions.
 
-Nothing in those tables is remembered or inferred: no agent prints its slash
-commands to `--help`, so each was read out of the program actually installed on
-the machine. Debug-only, removed and platform-specific commands are left out —
-the table is what a phone should offer on a tap, not the agent's full surface.
-The tables are snapshot-pinned in `tests/fixtures/*-commands.json` (re-pin with
-`UPDATE_COMMAND_SNAPSHOTS=1 cargo test`), and a drift check fails if a table is
-keyed on a name no Herdr detection manifest reports, exactly as the dictionaries
-are checked. The same tables answer `GET .../shortcuts`: two lists of one
-agent's commands that could disagree would be one list too many.
-
-**Workspace commands** (`source: "workspace"`) are read from the pane's own
-workspace root, read-only: a skill directory holding a `SKILL.md` whose front
-matter names and describes it (`.claude/skills`, `.agents/skills`,
-`.codex/skills`, `.opencode/skills`, `.qoder/skills`) and a directory of one
-markdown file per command (`.claude/commands`, `.opencode/command`,
-`.qoder/commands`). Which directories are looked at is the agent's own list, so
-a Codex pane is not offered a Claude skill it cannot run. Discovery is under the
-same fence as the assets API — every directory and every file canonicalizes
-inside the root, so a symlinked skill directory pointing at another checkout is
-skipped — and it is capped at 64 commands and 64 KiB per file. A workspace
-command shadows a builtin of the same name: the file is what the agent actually
-reads.
+The catalog parser bounds download size, command count, names, descriptions and
+argument hints. An invalid download is refused before replacing a cached file.
+An installed CLI version, a downloaded command catalog and a verified protocol
+baseline are separate compatibility facts.
 
 ## Pane context and git (v1.5)
 
@@ -419,7 +402,7 @@ will stream something renderable. Audio signatures include WAV, MP3, AAC,
 audio-branded M4A, FLAC and Ogg Vorbis/Opus; extensions alone never enable a
 preview. Generic MP4, AVI and Ogg Theora remain binary without a preview. The
 content endpoint retains device authentication, workspace fencing and its
-10 MiB ceiling. Native playback format support is the client's responsibility.
+32 MiB ceiling. Native playback format support is the client's responsibility.
 
 ### Endpoints (additive)
 
@@ -510,7 +493,7 @@ bytes and paths outside it return 404. No client-supplied directory is trusted.
 
 The opaque asset id uses the existing authenticated content endpoint. Containment
 is checked again when content is read, including symlink replacements, and the
-10 MiB content limit applies. This capability does not include video playback.
+32 MiB content limit applies. This capability does not include video playback.
 
 ## Rollout slices
 

@@ -15,8 +15,8 @@ use serde_json::{json, Value};
 use super::peers::{LinkError, LinkRequest, PeerView, RenameError};
 use crate::tasks::domain::now_ms;
 use crate::{
-    api_error, require_admin, require_device, valid_device_name, valid_request_id, ApiResult,
-    AppState,
+    api_error, require_admin, require_device, valid_device_name, valid_install_id,
+    valid_request_id, ApiResult, AppState,
 };
 
 const MAX_URL_BYTES: usize = 512;
@@ -79,6 +79,10 @@ fn refusal_reason(code: &str) -> &'static str {
         "invalid_pairing_code" => "invalid_pairing_code",
         "pairing_not_requested" => "pairing_not_requested",
         "invalid_token" => "invalid_token",
+        // Its claim answer was not sealed as it had to be (in the clear, or
+        // not under the pairing key): nothing was kept.
+        "claim_unsealed" => "claim_unsealed",
+        "claim_not_opened" => "claim_not_opened",
         _ => "refused",
     }
 }
@@ -129,6 +133,23 @@ struct LinkBody {
     name: String,
     request_id: String,
     code: String,
+    /// `pairing_key` from the other computer's `POST /api/pair/pending`
+    /// answer (present when it runs `transport_encryption: required`): the
+    /// claim is sealed with it, as a phone seals a claim after scanning the
+    /// QR. An older app omits it and the claim goes out in the clear,
+    /// answered sealed under the code alone.
+    #[serde(default)]
+    pairing_key: Option<String>,
+    /// What the other computer's `POST /api/pair/request` said of itself
+    /// (`muqun-gateway peers link`): `required` means a claim answer in the
+    /// clear is refused.
+    #[serde(default)]
+    transport_encryption: Option<String>,
+    /// The id the owner knows the other computer by. Given, its claim
+    /// answer must say the same (`409 peer_identity_mismatch`), so the peer
+    /// is kept under the owner's word and not under what it said of itself.
+    #[serde(default)]
+    server_id: Option<String>,
 }
 
 /// `POST /api/peers`: pair with the gateway at `url` through the code it
@@ -147,6 +168,13 @@ async fn link(
         || !valid_request_id(&body.request_id)
         || code.is_empty()
         || code.chars().count() > MAX_CODE_CHARS
+        || body.pairing_key.as_deref().is_some_and(|key| {
+            !crate::transport::decode_key(key).is_ok_and(|material| material.len() == 32)
+        })
+        || body
+            .server_id
+            .as_deref()
+            .is_some_and(|id| !valid_install_id(id))
     {
         return Err(invalid_request());
     }
@@ -157,6 +185,9 @@ async fn link(
         name: body.name,
         request_id: body.request_id,
         code: code.to_owned(),
+        pairing_key: body.pairing_key,
+        transport_required: body.transport_encryption.as_deref() == Some("required"),
+        server_id: body.server_id,
     };
     let peer = state
         .peers
@@ -191,6 +222,11 @@ async fn link(
                 StatusCode::BAD_REQUEST,
                 "peer_is_self",
                 "that address is this computer",
+            ),
+            LinkError::IdentityMismatch => api_error(
+                StatusCode::CONFLICT,
+                "peer_identity_mismatch",
+                "the computer at that address is not the one named",
             ),
             LinkError::Store(error) => store_failed(error),
         })?;
@@ -356,14 +392,19 @@ mod tests {
     }
 
     /// The whole §5.1 flow on two in-process gateways: the introducer mints
-    /// a code on mini, hands it to coding, coding pairs itself with mini as a
-    /// gateway device (mini runs `transport_encryption: required`, so every
-    /// call after the claim is sealed), lists it, turns its own switch, and
+    /// a code on mini, hands it to coding with mini's pairing key, coding
+    /// pairs itself with mini as a gateway device through a sealed claim
+    /// (mini runs `transport_encryption: required`, so the claim, its answer
+    /// and every call after are sealed), lists it, turns its own switch, and
     /// unlinks it, which revokes coding's token on mini.
     #[tokio::test]
     async fn a_gateway_links_to_another_through_a_pairing_code_and_unlinks() {
         let herdr = FakeHerdr::start(vec!["$ "], None);
-        let mini = named(output_state(&herdr), "srv-mini", "mini");
+        crate::test_support::test_pairing_transport_key();
+        let mut mini = named(output_state(&herdr), "srv-mini", "mini");
+        // The introducer is the admin token here: mini's phone device holds no
+        // transport key, so in `required` mode it would be told to pair again.
+        mini.config.transport_encryption = crate::TransportEncryptionMode::Required;
         // Exercise new links and their sealed traffic over an HTTP hostname.
         let url = serve(peer_router(mini.clone()))
             .await
@@ -387,12 +428,30 @@ mod tests {
         // under a name a peer holds is refused and keeps nothing either.
         let mut first = Vec::new();
         let mut mini_id = String::new();
-        for (target, at, name, expected, code) in [
-            (&mini, &url, "mini", StatusCode::OK, Value::Null),
+        for (target, at, name, server_id, expected, code) in [
+            // The owner names another computer than the one answering: not
+            // kept, and what the claim enrolled is taken back.
+            (
+                &mini,
+                &url,
+                "mini",
+                Some("srv-other"),
+                StatusCode::CONFLICT,
+                json!("peer_identity_mismatch"),
+            ),
+            (
+                &mini,
+                &url,
+                "mini",
+                Some("srv-mini"),
+                StatusCode::OK,
+                Value::Null,
+            ),
             (
                 &mini,
                 &url,
                 "mini 2",
+                None,
                 StatusCode::CONFLICT,
                 json!("peer_conflict"),
             ),
@@ -402,6 +461,7 @@ mod tests {
                 &other,
                 &other_url,
                 "Coding",
+                None,
                 StatusCode::CONFLICT,
                 json!("name_conflict"),
             ),
@@ -409,19 +469,32 @@ mod tests {
                 &other,
                 &other_url,
                 "MINI",
+                None,
                 StatusCode::CONFLICT,
                 json!("peer_name_taken"),
             ),
         ] {
+            // Mini's introducer is the admin token (see above); other's phone
+            // may mint, as a phone does.
+            let minter = if std::ptr::eq(target, &mini) {
+                "admin"
+            } else {
+                "token"
+            };
             let (status, minted) = call(
                 target,
                 "POST",
                 "/api/pair/pending",
-                "token",
+                minter,
                 Some(json!({ "device_name": "coding", "kind": "gateway", "server_id": "srv-coding" })),
             )
             .await;
             assert_eq!(status, StatusCode::OK, "{minted}");
+            assert_eq!(
+                minted.get("pairing_key").is_some(),
+                std::ptr::eq(target, &mini),
+                "the pairing key comes with a `required` gateway's code: {minted}"
+            );
             let (status, peer) = call(
                 &coding,
                 "POST",
@@ -430,6 +503,8 @@ mod tests {
                 Some(json!({
                     "url": at, "name": name,
                     "request_id": minted["request_id"], "code": minted["code"],
+                    "pairing_key": minted["pairing_key"],
+                    "server_id": server_id,
                 })),
             )
             .await;
@@ -438,6 +513,12 @@ mod tests {
                 (expected, &code),
                 "{name}: {peer}"
             );
+            if code == json!("peer_identity_mismatch") {
+                assert!(
+                    gateways(&mini).is_empty(),
+                    "the enrolled login is taken back"
+                );
+            }
             assert!(
                 peer.get("token").is_none(),
                 "the token never leaves the gateway"
@@ -448,7 +529,7 @@ mod tests {
                     minted["request_id"].as_str().unwrap()
                 );
                 for expected in [StatusCode::OK, StatusCode::NOT_FOUND] {
-                    let (status, _) = call(target, "DELETE", &cancel, "token", None).await;
+                    let (status, _) = call(target, "DELETE", &cancel, minter, None).await;
                     assert_eq!(status, expected, "cancel the unclaimed code");
                 }
             }
@@ -476,8 +557,19 @@ mod tests {
                 .lock()
                 .unwrap()
                 .iter()
-                .any(|device| device.server_id.as_deref() == Some("srv-coding")),
-            "the phone said whose login it is"
+                .any(|device| device.server_id.as_deref() == Some("srv-coding")
+                    && device.transport_key.is_some()),
+            "the phone said whose login it is, and the login is sealed"
+        );
+        assert!(
+            coding
+                .peers
+                .get(&mini_id)
+                .await
+                .unwrap()
+                .transport_key
+                .is_some(),
+            "coding speaks to mini sealed from here on"
         );
         assert!(
             gateways(&other).is_empty(),
@@ -684,7 +776,7 @@ mod tests {
             &mini,
             "POST",
             "/api/pair/pending",
-            "token",
+            "admin",
             Some(json!({ "device_name": "coding", "kind": "gateway", "server_id": "srv-coding" })),
         )
         .await;
@@ -697,6 +789,7 @@ mod tests {
             Some(json!({
                 "url": url, "name": "Mac Mini",
                 "request_id": minted["request_id"], "code": minted["code"],
+                "pairing_key": minted["pairing_key"],
             })),
         )
         .await;
@@ -714,13 +807,16 @@ mod tests {
         // mini takes back both directions, and only a gateway device that
         // paired as exactly mini's id.
         for (id, server_id, kind) in [
-            ("mini-login", "srv-mini", DeviceKind::Gateway),
-            ("other-login", "srv-other", DeviceKind::Gateway),
-            ("near-login", "srv-mini-2", DeviceKind::Gateway),
-            ("phone", "srv-mini", DeviceKind::App),
+            ("mini-login", Some("srv-mini"), DeviceKind::Gateway),
+            ("other-login", Some("srv-other"), DeviceKind::Gateway),
+            ("near-login", Some("srv-mini-2"), DeviceKind::Gateway),
+            ("phone", Some("srv-mini"), DeviceKind::App),
+            // A gateway that asked for its code itself, whatever it said of
+            // itself then: no owner named it mini's.
+            ("self-requested-login", None, DeviceKind::Gateway),
         ] {
             coding.devices.lock().unwrap().push(DeviceRecord {
-                server_id: Some(server_id.into()),
+                server_id: server_id.map(str::to_owned),
                 kind,
                 ..test_peer_device(id, id)
             });
@@ -762,6 +858,7 @@ mod tests {
             ("other-login", true),
             ("near-login", true),
             ("phone", true),
+            ("self-requested-login", true),
         ] {
             assert_eq!(left.iter().any(|left| left == id), kept, "{id}");
         }

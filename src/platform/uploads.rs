@@ -23,9 +23,17 @@ use crate::{
 /// that is.
 pub(crate) const UPLOADS_PATH: &str = "/api/uploads";
 pub(crate) const UPLOADS_DIR: &str = "uploads";
-/// Ceiling on one upload body, enforced by the framework's body limit so an
-/// oversized request is cut off mid-stream instead of being buffered first.
+/// Ceiling on one upload that is not a video, enforced once the content has
+/// been sniffed. The route's body limit is [`MAX_VIDEO_UPLOAD_BYTES`], so a
+/// body between the two is read before it is refused.
 pub(crate) const MAX_UPLOAD_BYTES: usize = 25 * 1024 * 1024;
+/// Ceiling on one video upload (a phone's screen recording is routinely over
+/// 25 MiB), and the route's body limit, enforced by the framework so a body
+/// over it is cut off mid-stream instead of being buffered first. The whole
+/// body is buffered in memory while it is sniffed and written: up to this
+/// much per upload in flight, and about 1.4 times it for a sealed one
+/// while its envelope is opened.
+pub(crate) const MAX_VIDEO_UPLOAD_BYTES: usize = 64 * 1024 * 1024;
 /// The client's own file name is only ever echoed back, never used to build a
 /// path, so this is a display cap rather than a safety one.
 pub(crate) const MAX_UPLOAD_NAME_CHARS: usize = 120;
@@ -112,15 +120,25 @@ pub(crate) async fn upload_file(
         ));
     }
     let Some(kind) = sniff_upload_kind(&bytes)
+        .or_else(|| sniff_video_upload_kind(&bytes, &client_name))
         .or_else(|| sniff_office_upload_kind(&bytes))
         .or_else(|| sniff_document_upload_kind(&bytes, &client_name))
     else {
         return Err(api_error(
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
             "unsupported_file_type",
-            "only supported images, office documents, PDF, and UTF-8 text are accepted",
+            "only supported images, videos, office documents, PDF, and UTF-8 text are accepted",
         ));
     };
+    // The route's body limit is the video ceiling; everything else keeps the
+    // smaller one, decided by what the content turned out to be.
+    if !kind.mime.starts_with("video/") && bytes.len() > MAX_UPLOAD_BYTES {
+        return Err(api_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "upload_too_large",
+            "a file that is not a video may be at most 25 MiB",
+        ));
+    }
 
     let dir = ensure_uploads_dir().map_err(|err| {
         tracing::warn!("failed to prepare the upload directory: {err:#}");
@@ -386,6 +404,34 @@ pub(crate) fn sniff_upload_kind(bytes: &[u8]) -> Option<UploadKind> {
         });
     }
     None
+}
+
+/// An MP4 or QuickTime movie: the same `ftyp` brands and name extensions the
+/// asset preview accepts (`assets::sniff_asset_type`), so an upload the
+/// gateway stores is one it can also play back.
+pub(crate) fn sniff_video_upload_kind(bytes: &[u8], client_name: &str) -> Option<UploadKind> {
+    if bytes.len() < 12 || &bytes[4..8] != b"ftyp" {
+        return None;
+    }
+    let brand = &bytes[8..12];
+    if !matches!(
+        brand,
+        b"isom" | b"iso2" | b"mp41" | b"mp42" | b"avc1" | b"qt  " | b"M4V "
+    ) {
+        return None;
+    }
+    let extension = client_name.rsplit_once('.')?.1.to_ascii_lowercase();
+    match (brand, extension.as_str()) {
+        (b"qt  ", "mov") => Some(UploadKind {
+            extension: "mov",
+            mime: "video/quicktime",
+        }),
+        (_, "mp4" | "m4v" | "mov") => Some(UploadKind {
+            extension: "mp4",
+            mime: "video/mp4",
+        }),
+        _ => None,
+    }
 }
 
 /// Recognise modern Office/OpenDocument containers without extracting them.
@@ -771,7 +817,7 @@ pub(crate) fn mount(router: Router<AppState>) -> Router<AppState> {
         // get their own ceiling while every JSON route keeps the small one.
         .route(
             UPLOADS_PATH,
-            post(upload_file).layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES)),
+            post(upload_file).layer(DefaultBodyLimit::max(MAX_VIDEO_UPLOAD_BYTES)),
         )
         // Reading one back. The app needs this to draw the user's own
         // attachment in the transcript: the timeline item carries the host

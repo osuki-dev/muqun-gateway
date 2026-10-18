@@ -42,6 +42,7 @@ fn agents_plane_schema() -> Value {
                                 "backgroundShells": { "type": "boolean" },
                                 "attachments": { "type": "boolean" },
                                 "sessionPagination": { "type": "boolean", "description": "This provider supports GET /api/agent-sessions/page; absent or false means use the legacy array list" },
+                                "timelineEarlier": { "type": "boolean", "description": "This provider supports POST /api/agent-sessions/{asid}/timeline/earlier; require agent_timeline_earlier_v1 too. Absent or false means unsupported" },
                                 "attachmentsByPath": { "type": "boolean", "description": "Attachments reach the agent as host paths appended to the prompt text (the agent reads them with its own tools) rather than as native file parts" }
                             }
                         },
@@ -803,10 +804,44 @@ pub fn openapi_spec() -> Value {
     spec["paths"]["/api/sessions/{sessionId}/panes/{paneId}/lazygit"] = lazygit_endpoints();
     spec["paths"]["/api/agent-sessions/{asid}/audio-asset"] = audio_asset_endpoint();
     spec["paths"]["/api/agent-sessions/page"] = session_page_endpoint();
+    spec["paths"]["/api/agent-sessions/{asid}/timeline/earlier"] = json!({"post": {
+        "summary": "Read the next older timeline batch for the session owner",
+        "description": "Requires a paired App device and both agent_timeline_earlier_v1 and owning-provider features.timelineEarlier true. No body or client cursor. Load the selected snapshot first; merge rows by stable ID and (message_id, ordinal), preserving the viewport. At most 80 mapped rows. exhausted is true only on an empty adapter batch; filtering may produce an empty visible items array with exhausted false. State is provider/session scoped; serialize client pulls and do not automatically retry an ambiguously completed POST. Failed/cancelled provider reads preserve the cursor; successful explicit snapshot refresh resets the newest-tail boundary. See docs/agent-api.md.",
+        "parameters": [{"name":"asid","in":"path","required":true,"schema":{"type":"string"}}],
+        "responses": {
+            "200": {"description":"Content envelope containing data.items and data.exhausted", "content":{"application/json":{"schema":{
+                "type":"object", "required":["schema_version","capabilities","data"], "properties":{
+                    "schema_version":{"const":CONTENT_SCHEMA_VERSION}, "capabilities":{"type":"object"},
+                    "data":{"type":"object","required":["items","exhausted"],"properties":{
+                        "items":{"type":"array","maxItems":80,"items":{"type":"object"}},
+                        "exhausted":{"type":"boolean"}
+                    }}
+                }
+            }}}},
+            "401":{"description":"Missing authentication"},
+            "403":{"description":"Invalid device credential or forbidden peer"},
+            "404":{"description":"Session not found"},
+            "501":{"description":"feature_unsupported: the owning adapter does not implement earlier timeline pages"},
+            "502":{"description":"agent_error: provider or bounded history traversal failed; cursor not consumed"},
+            "503":{"description":"agent_unavailable"}
+        }
+    }});
     spec["paths"]["/api/agent-sessions/{asid}/file-asset"] = json!({"get": {
         "summary": "Resolve a local file output inside an agent session",
         "description": "Requires device authentication and agent_file_assets capability. Resolves audio, video, images, documents and binary files inside the server-owned directory. Web URLs, path escapes and symlinks outside the root are refused. Returns data.asset metadata with an opaque id.",
         "parameters": [path_param("asid"), query_param("uri", "Local file URI or path")], "responses": ok_response()
+    }});
+    spec["paths"]["/api/agent-images/{id}/{variant}"] = json!({"get": {
+        "summary": "Read an authorized original or optional WebP derivative",
+        "description": "Requires paired App authentication and agent_image_previews_v1. Registration and original canonical-file scope are rechecked even on cache hits. Legacy original/download stream authorized files in 64 KiB chunks with weak metadata ETag and single Range; these unversioned URLs do not fix content across requests. With agent_image_versions_v1, variant=version lazily returns data.asset {id,version,etag,size,mime,name,url,download_url} for a fixed original; use its returned versioned URLs and strong If-Match for multipart consistency. Existing sealed transport has a bounded collector, so large consumers still need small ranges (e.g. 8 MiB). thumbnail/preview return bounded WebP (384/1600 edge; source <=25 MiB), or 415 without replacing the original. No arbitrary path query. Private/no-store and existing pairing transport rules apply.",
+        "parameters": [path_param("id"), {"in":"path", "name":"variant", "required":true, "schema":{"type":"string", "enum":["original","download","thumbnail","preview","version"]}}],
+        "responses": {"200":{"description":"Original/WebP bytes, or fixed-version descriptor JSON for variant=version"},"206":{"description":"Original single byte range"},"304":{"description":"ETag matched"},"401":{"description":"Missing device authentication"},"403":{"description":"Invalid credential or forbidden peer"},"404":{"description":"Registration or authorized original unavailable"},"409":{"description":"Source/version changed during acquisition"},"415":{"description":"image_preview_unavailable: use original"},"416":{"description":"Original range not satisfiable"},"503":{"description":"Original storage unavailable"},"507":{"description":"Fixed-version copy admission full; originals preserved"}}
+    }});
+    spec["paths"]["/api/agent-images/{id}/{variant}/{version}"] = json!({"get": {
+        "summary":"Read one fixed original content version",
+        "description":"Requires agent_image_versions_v1 and paired App auth. First GET the asset's version_url (/api/agent-images/{id}/version) for data.asset {id,version,etag,size,mime,name,url,download_url}; acquisition lazily reuses an immutable original or streams/copies/hashes then atomically publishes a fixed original. Version is full SHA256; ETag is the strong quoted sha256-<hex>. Send bounded Range plus exact strong If-Match to returned URL. Verify whole AEAD reply, ETag, Content-Range/length/total; never append a 200 fallback or combine versions. Wrong/weak If-Match or weak If-Range gives 412. Old unversioned routes retain weak semantics. Original authorization fence/expiry and fixed-object identity are rechecked. No per-range full-file hashing. Additional copies use fixed original-store 1 GiB/4096-file admission, never deleting unique originals. Registrations are bounded/ephemeral; 409 requires descriptor refresh, not mixing old/new parts. Copy bytes are fixed, not a claim of an instantaneous atomic source snapshot.",
+        "parameters":[path_param("id"),{"in":"path","name":"variant","required":true,"schema":{"type":"string","enum":["original","download"]}},{"in":"path","name":"version","required":true,"schema":{"type":"string","pattern":"^[a-f0-9]{64}$"}}],
+        "responses":{"200":{"description":"Full fixed original; never append as a range"},"206":{"description":"Fixed original range"},"304":{"description":"Version ETag matched"},"401":{"description":"Missing auth"},"403":{"description":"Invalid credential/peer"},"404":{"description":"Original authorization unavailable"},"409":{"description":"Source/version changed or registration unavailable"},"412":{"description":"Strong version precondition failed"},"416":{"description":"Range not satisfiable"},"503":{"description":"Original storage unavailable"},"507":{"description":"Version storage admission full; sources/originals preserved"}}
     }});
     for (path, item) in tasks_fleet_mcp_paths() {
         spec["paths"][path] = item;
@@ -1817,8 +1852,18 @@ fn content_envelope_schema(data: Value) -> Value {
                     ("image_upload", "boolean"),
                     ("composer", "boolean"),
                     ("message_image_assets", "boolean"),
+                    ("session_descendants", "boolean"),
+                    ("task_ledger_delivery", "boolean"),
                 ],
-                &["parts", "assets", "image_upload", "composer", "message_image_assets"],
+                &[
+                    "parts",
+                    "assets",
+                    "image_upload",
+                    "composer",
+                    "message_image_assets",
+                    "session_descendants",
+                    "task_ledger_delivery",
+                ],
             ),
             "data": data
         }
@@ -2293,6 +2338,22 @@ fn lazygit_endpoints() -> Value {
 #[cfg(test)]
 mod history_contract_tests {
     use super::*;
+
+    #[test]
+    fn timeline_earlier_spec_has_explicit_gates_bounded_rows_and_unsupported_error() {
+        let spec = openapi_spec();
+        let post = &spec["paths"]["/api/agent-sessions/{asid}/timeline/earlier"]["post"];
+        let description = post["description"].as_str().unwrap();
+        assert!(description.contains("agent_timeline_earlier_v1"));
+        assert!(description.contains("features.timelineEarlier true"));
+        assert!(post.get("requestBody").is_none());
+        let data = &post["responses"]["200"]["content"]["application/json"]["schema"]["properties"]
+            ["data"];
+        assert_eq!(data["required"], json!(["items", "exhausted"]));
+        assert_eq!(data["properties"]["items"]["maxItems"], 80);
+        assert!(post["responses"].get("501").is_some());
+        assert!(crate::API_CAPABILITIES.contains(&"agent_timeline_earlier_v1"));
+    }
 
     #[test]
     fn session_page_spec_has_selected_scope_limits_and_nested_null_cursors() {

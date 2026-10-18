@@ -391,8 +391,17 @@ async fn serve(
         }
     }
     let in_task = tools::started_for_task(&state, &session).await;
+    let fleet = if in_task {
+        tools::fleet_line(&state, &session).await
+    } else {
+        None
+    };
     let service = StreamableHttpService::new(
-        move || Ok(tools::MuqunMcp::new(state.clone(), session.clone()).in_task(in_task)),
+        move || {
+            Ok(tools::MuqunMcp::new(state.clone(), session.clone())
+                .in_task(in_task)
+                .fleet(fleet.clone()))
+        },
         Arc::new(NeverSessionManager::default()),
         config(),
     );

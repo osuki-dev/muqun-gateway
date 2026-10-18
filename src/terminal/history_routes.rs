@@ -466,10 +466,11 @@ mod tests {
     async fn captured_history_auth_invalid_queries_cursor_cross_scope_and_restart() {
         let fixture = Fixture::new().await;
         let uri = "/api/sessions/s/panes/p/history?limit=2";
+        // The admin token's refusal belongs to `required` mode
+        // (`control_routes_reject_the_admin_token`); this fixture is token-only.
         for (token, expected) in [
             (None, StatusCode::UNAUTHORIZED),
             (Some("bad"), StatusCode::FORBIDDEN),
-            (Some("admin"), StatusCode::FORBIDDEN),
         ] {
             assert_eq!(get(fixture.app(), uri, token).await.0, expected);
         }
@@ -570,7 +571,8 @@ mod tests {
 
     #[tokio::test]
     async fn captured_history_sealed_transport_accepts_real_envelope_not_forged_proof() {
-        let fixture = Fixture::new().await;
+        let mut fixture = Fixture::new().await;
+        fixture.state.config.transport_encryption = TransportEncryptionMode::Required;
         let key = generate_token();
         let material = transport::decode_key(&key).unwrap();
         fixture.state.devices.lock().unwrap()[0].transport_key = Some(key.clone());

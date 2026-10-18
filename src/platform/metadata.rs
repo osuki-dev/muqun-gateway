@@ -59,6 +59,8 @@ pub(crate) const API_CAPABILITIES: &[&str] = &[
     "agent_discovery",
     "agent_spawn",
     "agent_timeline",
+    // Older timeline pages; adapter support is separately declared per agent.
+    "agent_timeline_earlier_v1",
     "agent_vcs",
     // `vcs/files`, `vcs/file` and `vcs/discard` on an agent session: git in
     // the session's directory, for every agent.
@@ -66,6 +68,8 @@ pub(crate) const API_CAPABILITIES: &[&str] = &[
     "assets",
     "agent_audio_assets",
     "agent_file_assets",
+    "agent_image_previews_v1",
+    "agent_image_versions_v1",
     "asset_download",
     "device_revocation",
     "file_uploads",
@@ -135,6 +139,11 @@ pub(crate) const API_CAPABILITIES: &[&str] = &[
     // task is `done` only on its MUQUN_TASK_DONE marker; an idle agent is
     // `idle_unconfirmed`.
     "task_ledger_pane",
+    // `POST /api/tasks` takes `delivery: "session" | "pane"`, routed as said
+    // or `400 invalid_request` when that agent cannot do it; each discovery
+    // entry says what it can as `ledgerDelivery`, each terminal catalog entry
+    // as `ledger_delivery`. Absent, the agent kind decides as before.
+    "task_ledger_delivery",
     // A delegation (session or terminal agent) is `done` only on an explicit
     // signal: the agent's `tasks.complete` MCP call, its MUQUN_TASK_DONE
     // marker line, or the device's `POST /api/tasks/{id}/complete` (for an
@@ -264,10 +273,12 @@ pub(crate) fn gateway_capabilities(
 ///
 /// It is a property of the device, not of the gateway: a device paired while
 /// `transport_encryption` was `disabled` holds no transport key and is
-/// authorised on its bearer token alone, and stays that way after the setting
-/// changes -- `require_device` demands the proof header from exactly the
-/// devices that have a key. So the honest answer to "is this connection
-/// encrypted at the application layer" is about the device asking.
+/// authorised on its bearer token alone. In `disabled` mode it stays that
+/// way after a sealed device is paired beside it; in `required` mode
+/// `require_device` refuses it with `426 device_repair_required` until it
+/// pairs again, and demands the proof header from every device it serves.
+/// So the honest answer to "is this connection encrypted at the application
+/// layer" is about the device asking.
 pub(crate) fn device_seals_its_transport(state: &AppState, device_id: &str) -> bool {
     state.devices.lock().is_ok_and(|devices| {
         devices
@@ -1127,8 +1138,8 @@ mod tests {
     /// a gateway that does seal as one that does not.
     ///
     /// It is a property of the *device*: one paired while encryption was
-    /// disabled holds no transport key, is authorised on its bearer token
-    /// alone, and stays that way after the setting changes.
+    /// disabled holds no transport key and is authorised on its bearer token
+    /// alone (in `required` mode it is refused until it pairs again).
     #[tokio::test]
     async fn the_metadata_says_whether_this_device_actually_seals_its_requests() {
         let sealed_token = "sealed-device";

@@ -344,7 +344,7 @@ that points to another installation.
 ```sh
 muqun-gateway agent                  # each agent's status and the next step (--json for the raw list)
 muqun-gateway agent setup t3         # store a T3 Code credential and enable T3
-muqun-gateway agent setup deepseek   # point the gateway at a running DeepSeek Harness
+muqun-gateway agent setup deepseek   # enable DeepSeek; Gateway starts or joins the harness
 ```
 
 `agent` probes the agents from your shell the way the running gateway does,
@@ -363,15 +363,36 @@ and `--base-dir` is ignored with it; a non-loopback `--url` always needs
 and sets `t3.enabled`/`t3.url` in `config.json`. It prints how long the bearer
 lasts: what T3 granted for a pairing code, or 30 days (unless T3 caps it) for
 an issued one. The gateway cannot renew it; re-run `agent setup t3` when it
-expires (`agent` then shows T3 as `unconfigured`). `setup deepseek` probes
-`--endpoint`, `deepseek.endpoint`, `DEEPSEEK_HARNESS_URL`/`DSH_URL`, then ports
-3080 and 19387 (with `deepseek.token`/`secret`, else the `DEEPSEEK_HARNESS_*` /
-`DSH_*` token and secret from the environment), and sets
-`deepseek.enabled`/`deepseek.endpoint`. An explicit endpoint still takes the
-token and secret from the environment when config.json has none. Both offer to restart the gateway's
-user service when the change needs one (`--yes` skips the question). `agent setup
-opencode` only shows the OpenCode binary the gateway would use: OpenCode needs
-no setup.
+expires (`agent` then shows T3 as `unconfigured`). `setup deepseek` enables
+DeepSeek. Gateway adopts a healthy harness, or starts one when
+`deepseek.autostart` is on. That flag defaults to true, the same way
+`opencode.autostart` does, but `deepseek.enabled` defaults to false, so a
+config that omits the new key does not start a process until DeepSeek is
+enabled. Set `autostart` to false to only adopt a harness you started.
+The listen address is `deepseek.endpoint`, or `http://127.0.0.1:3080` when
+it is absent and no environment override is set. Configured HTTP(S) URLs use
+their normal scheme default port (80/443) when no port is written, and retain
+reverse-proxy path prefixes. Scheme-less host:port addresses use HTTP;
+query/fragment are removed from the base and userinfo is refused. Setup probes
+`--endpoint`, else `deepseek.endpoint`, else `DEEPSEEK_HARNESS_URL`/`DSH_URL`,
+else ports 3080 and 19387 (with
+`deepseek.token`/`secret`, else the `DEEPSEEK_HARNESS_*` / `DSH_*` token and
+secret from the environment) and joins a healthy one. Port 19387 is not a
+port the gateway opens; it is only adopted when something is already
+listening there. The command prints the manual start line for the runner
+that exists (`dsh`, otherwise `bunx` without `--bun`, otherwise
+`npx --yes`), still `web --no-open`, with `--host` and `--port` from that
+endpoint. If none of those runners is on PATH it says so and exits normally.
+A failed explicit environment override never falls back to a different target
+or starts a harness. Setup leaves configuration unchanged on such a failure;
+after a successful environment-only setup it saves that endpoint with
+`autostart: false`, preserving attach-only behavior.
+A missing runner does not stop the gateway. The harness is started in its
+own session and is not stopped when the gateway stops. An explicit endpoint
+still takes the token and secret from the environment when config.json has
+none. Both offer to restart the gateway's user service when the change needs
+one (`--yes` skips the question). `agent setup opencode` only shows the
+OpenCode binary the gateway would use: OpenCode needs no setup.
 
 ### Agents started from the phone
 

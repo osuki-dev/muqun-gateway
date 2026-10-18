@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::future::IntoFuture as _;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::Context as _;
 use axum::body::{to_bytes, Body};
@@ -24,7 +25,7 @@ use super::metadata::SessionLivenessCache;
 use super::store::{
     ensure_pairing_transport_key, load_devices_for_service, load_push_tokens_for_service,
 };
-use super::uploads::{spawn_upload_gc, MAX_UPLOAD_BYTES, UPLOADS_PATH};
+use super::uploads::{spawn_upload_gc, MAX_VIDEO_UPLOAD_BYTES, UPLOADS_PATH};
 use crate::platform;
 use crate::platform::i18n::Locale;
 use crate::terminal;
@@ -32,8 +33,9 @@ use crate::terminal::routes::{
     spawn_agent_notification_watchers, spawn_agent_permission_watchers, spawn_approval_watchers,
 };
 use crate::{
-    agent_events, agents, api_error, backend_startup, connectivity, gateway_listener, hash_token,
-    i18n, load_config, lock_devices, now_unix_ms, scrollback, state_dir, state_lock, transport,
+    agent_events, agents, api_error, backend_startup, clock_skew, connectivity,
+    device_repair_required, gateway_listener, hash_token, i18n, load_config, lock_devices,
+    now_unix_ms, require_device_or_peer, scrollback, state_dir, state_lock, transport,
     unreachable_listen_warning, warn_about_missing_backend_programs, ApiResult, AppState, Config,
     APPROVAL_EVENT_CAPACITY, MAX_REQUEST_BODY_BYTES,
 };
@@ -140,6 +142,7 @@ pub(crate) async fn run(config_path: Option<String>) -> anyhow::Result<()> {
         crate::platform::config::StoreEncryption::Off => err,
     })?;
     agent_runtime.restore_native_codex_sessions(db.clone());
+    agent_runtime.persist_session_routes(db.clone()).await;
     let task_events = tokio::sync::broadcast::channel(crate::tasks::events::TASK_EVENT_CAPACITY).0;
     let presence = Arc::new(crate::fleet::peers::PeerPresence::default());
     let tasks = Arc::new(crate::tasks::service::TaskService::new(
@@ -246,6 +249,10 @@ pub(crate) async fn run(config_path: Option<String>) -> anyhow::Result<()> {
         app
     }
     .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
+    .layer(middleware::from_fn_with_state(
+        state.clone(),
+        large_body_after_auth,
+    ))
     // Inside the encrypted transport, so what it compresses is the
     // plaintext body and not the sealed base64 -- ciphertext does not
     // compress, and sealing first is why nothing downstream could.
@@ -377,7 +384,7 @@ pub(crate) const SEALED_SCAFFOLD_BYTES: usize = 4096;
 /// about 16/9 of what it carries. The middleware buffers the *outer* bytes, so
 /// this, and not the plaintext limit, is what its ceiling has to be.
 ///
-/// It was `MAX_UPLOAD_BYTES + MAX_REQUEST_BODY_BYTES`, the plaintext limits
+/// It was the upload limit plus `MAX_REQUEST_BODY_BYTES`, the plaintext limits
 /// added together, which is both too small and too large. Too small for the
 /// route it was sized for: 25 MiB of file is about 44 MiB on the wire, so
 /// uploads died above roughly 14 MiB -- and died as a bare `invalid_envelope`,
@@ -392,12 +399,432 @@ pub(crate) const fn sealed_body_ceiling(plaintext: usize) -> usize {
 
 /// The plaintext a route is allowed to carry, matching what the router's own
 /// body limits allow it in the clear.
+/// How many bodies above the ordinary 128 KiB limit may be in memory at
+/// once, process-wide: two of the biggest kind (an upload, up to 64 MiB
+/// plus its sealed envelope) and eight of the rest (a prompt, up to 1 MiB).
+/// A body is buffered whole, so without this the peak was one body per open
+/// connection; past the permits the answer is `503 busy`, before the read.
+const HUGE_BODY_PERMITS: usize = 2;
+const LARGE_BODY_PERMITS: usize = 8;
+
+static HUGE_BODIES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(HUGE_BODY_PERMITS);
+static LARGE_BODIES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(LARGE_BODY_PERMITS);
+
+/// The devices with a large body in flight, one each on top of the pool,
+/// keyed by device id *and* the peer's IP address: the id is a clear header
+/// anyone on the path can copy, and keyed on it alone a stranger's
+/// connection could hold the real device's slot; keyed on the whole socket
+/// address every new connection would be a new slot.
+static DEVICES_WITH_LARGE_BODIES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<String>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+/// Large bodies in flight per peer IP address, whatever device ids they
+/// name: a copied id from one address claims at most this many.
+const MAX_LARGE_BODIES_PER_IP: usize = 2;
+static LARGE_BODIES_BY_IP: std::sync::LazyLock<std::sync::Mutex<HashMap<std::net::IpAddr, usize>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// The sealed path has to read a body before its envelope can be opened,
+/// so that read is made on a clear device header alone. It draws from its
+/// own small budgets, never from the pool above: one budget for the uploads
+/// route and one for the prompt, command and task routes, so a stranger
+/// filling one does not starve the other -- four reads at once in each, two
+/// per peer address, and one per clear device id. Once the envelope has
+/// opened and the device is verified, the request moves to the pool and
+/// the device's slot.
+const PREAUTH_SEALED_PERMITS: usize = 4;
+const MAX_PREAUTH_SEALED_PER_IP: usize = 2;
+static PREAUTH_SEALED_UPLOADS: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(PREAUTH_SEALED_PERMITS);
+static PREAUTH_SEALED_PROMPTS: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(PREAUTH_SEALED_PERMITS);
+static PREAUTH_UPLOADS_BY_IP: IpCounts =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+static PREAUTH_PROMPTS_BY_IP: IpCounts =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+/// The `device id @ address` keys with a pre-authentication read in flight,
+/// one each -- never the clear id alone, which anyone on the path can copy
+/// and would make an exclusive slot a targeted lockout.
+static PREAUTH_SEALED_BY_DEVICE: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<String>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+/// The longest any large body may take to arrive in all.
+const LARGE_BODY_READ_TIMEOUT: Duration = Duration::from_secs(180);
+/// A large body has to keep arriving: under this many bytes in any window
+/// of [`LARGE_BODY_RATE_WINDOW`] ends it, so a trickle cannot keep a place.
+const LARGE_BODY_RATE_WINDOW: Duration = Duration::from_secs(10);
+const LARGE_BODY_MIN_BYTES_PER_WINDOW: usize = 64 * 1024 * 10;
+
+/// A place among the large bodies in flight. Owned by the body it admits
+/// ([`GatedBody`]): released when that body is fully consumed or dropped,
+/// never earlier.
+#[derive(Clone)]
+pub(crate) struct LargeBodyPermit {
+    /// Held, never read: dropping the last clone gives the place back.
+    _place: std::sync::Arc<dyn std::any::Any + Send + Sync>,
+}
+
+/// A verified device's place: a pool permit, its `(device id, peer IP)`
+/// slot and its count against the peer IP.
+struct LargeBodyPlace {
+    _permit: tokio::sync::SemaphorePermit<'static>,
+    slot: String,
+    ip: Option<std::net::IpAddr>,
+}
+
+impl Drop for LargeBodyPlace {
+    fn drop(&mut self) {
+        if let Ok(mut devices) = DEVICES_WITH_LARGE_BODIES.lock() {
+            devices.remove(&self.slot);
+        }
+        if let Some(ip) = self.ip {
+            release_count(&LARGE_BODIES_BY_IP, ip);
+        }
+    }
+}
+
+/// A pre-authentication sealed read's place: a permit of its route's
+/// budget, its count against the peer address and its `device id @
+/// address` key.
+struct PreauthPlace {
+    _permit: tokio::sync::SemaphorePermit<'static>,
+    by_ip: &'static IpCounts,
+    ip: Option<std::net::IpAddr>,
+    device_key: String,
+}
+
+impl Drop for PreauthPlace {
+    fn drop(&mut self) {
+        if let Some(ip) = self.ip {
+            release_count(self.by_ip, ip);
+        }
+        if let Ok(mut devices) = PREAUTH_SEALED_BY_DEVICE.lock() {
+            devices.remove(&self.device_key);
+        }
+    }
+}
+
+type IpCounts = std::sync::LazyLock<std::sync::Mutex<HashMap<std::net::IpAddr, usize>>>;
+
+/// The address a peer is counted under: an IPv4 address itself; an IPv6
+/// address that carries an IPv4 one -- IPv4-mapped `::ffff:a.b.c.d` (what a
+/// dual-stack listener reports for every IPv4 client), IPv4-compatible
+/// `::a.b.c.d`, NAT64 `64:ff9b::a.b.c.d` -- by that IPv4 address; and a
+/// native IPv6 address by its /64, which is what one subscriber holds. The
+/// mask is applied only to native IPv6: masking a mapped address would
+/// collapse every IPv4 client into one bucket and make the limits global.
+fn counted_address(ip: std::net::IpAddr) -> std::net::IpAddr {
+    let std::net::IpAddr::V6(v6) = ip else {
+        return ip;
+    };
+    if let Some(v4) = v6.to_ipv4_mapped() {
+        return std::net::IpAddr::V4(v4);
+    }
+    let segments = v6.segments();
+    let embedded = |hi: u16, lo: u16| std::net::Ipv4Addr::from(((hi as u32) << 16) | lo as u32);
+    // IPv4-compatible: 96 zero bits then the address (but not `::`/`::1`).
+    if segments[..6] == [0; 6] && !v6.is_unspecified() && !v6.is_loopback() {
+        return std::net::IpAddr::V4(embedded(segments[6], segments[7]));
+    }
+    // NAT64 well-known prefix 64:ff9b::/96.
+    if segments[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
+        return std::net::IpAddr::V4(embedded(segments[6], segments[7]));
+    }
+    std::net::IpAddr::V6(std::net::Ipv6Addr::from(u128::from(v6) & (u128::MAX << 64)))
+}
+
+/// Count `ip` in `counts` unless it already stands at `max`.
+fn take_count(counts: &IpCounts, ip: Option<std::net::IpAddr>, max: usize) -> bool {
+    let Some(ip) = ip else {
+        return true;
+    };
+    let mut counts = counts
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let count = counts.entry(ip).or_insert(0);
+    if *count >= max {
+        return false;
+    }
+    *count += 1;
+    true
+}
+
+fn release_count(counts: &IpCounts, ip: std::net::IpAddr) {
+    if let Ok(mut counts) = counts.lock() {
+        if let Some(count) = counts.get_mut(&ip) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                counts.remove(&ip);
+            }
+        }
+    }
+}
+
+fn busy() -> (StatusCode, Json<serde_json::Value>) {
+    api_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "busy",
+        "too many large requests are in flight; try again in a moment",
+    )
+}
+
+/// The per-device slot of a connection: the device id with the address
+/// the request came in from (`ConnectInfo`, as [`counted_address`] counts
+/// it; the test harness has none).
+fn slot_key(device_id: &str, peer: Option<&SocketAddr>) -> String {
+    match peer {
+        Some(peer) => format!("{device_id}@{}", counted_address(peer.ip())),
+        None => device_id.to_owned(),
+    }
+}
+
+/// A place for the pre-authentication read of a sealed body of up to
+/// `plaintext_limit` bytes from `peer`, naming the clear `device_id`, or
+/// `None` when the route takes only the ordinary limit. From the route's
+/// small budget, never the pool. `Err`: that budget is spent, in all, for
+/// this address, or for this device id.
+pub(crate) fn preauth_sealed_permit(
+    plaintext_limit: usize,
+    peer: Option<&SocketAddr>,
+    device_id: &str,
+) -> Result<Option<LargeBodyPermit>, (StatusCode, Json<serde_json::Value>)> {
+    if plaintext_limit <= MAX_REQUEST_BODY_BYTES {
+        return Ok(None);
+    }
+    let (budget, by_ip): (&'static tokio::sync::Semaphore, &'static IpCounts) =
+        if plaintext_limit > 25 * 1024 * 1024 {
+            (&PREAUTH_SEALED_UPLOADS, &PREAUTH_UPLOADS_BY_IP)
+        } else {
+            (&PREAUTH_SEALED_PROMPTS, &PREAUTH_PROMPTS_BY_IP)
+        };
+    // The permit is dropped with `permit` on every refusal below.
+    let permit = budget.try_acquire().map_err(|_| busy())?;
+    let ip = peer.map(|peer| counted_address(peer.ip()));
+    if !take_count(by_ip, ip, MAX_PREAUTH_SEALED_PER_IP) {
+        return Err(busy());
+    }
+    let device_key = slot_key(device_id, peer);
+    let taken = PREAUTH_SEALED_BY_DEVICE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(device_key.clone());
+    if !taken {
+        if let Some(ip) = ip {
+            release_count(by_ip, ip);
+        }
+        return Err(busy());
+    }
+    Ok(Some(LargeBodyPermit {
+        _place: std::sync::Arc::new(PreauthPlace {
+            _permit: permit,
+            by_ip,
+            ip,
+            device_key,
+        }),
+    }))
+}
+
+/// A permit for a body of up to `plaintext_limit` bytes on this route from
+/// the verified device `device_id` on the connection from `peer`, or
+/// `None` when the route takes only the ordinary limit. Taken only once the
+/// device is verified -- the opened envelope's token against its record on
+/// the sealed path, `require_device_or_peer` on the cleartext one -- so no
+/// unidentified connection ever holds a place here. The pool is taken
+/// first, then the address's count, then the device's slot. `Err`: any of
+/// them is spent.
+pub(crate) fn large_body_permit(
+    plaintext_limit: usize,
+    device_id: &str,
+    peer: Option<&SocketAddr>,
+) -> Result<Option<LargeBodyPermit>, (StatusCode, Json<serde_json::Value>)> {
+    if plaintext_limit <= MAX_REQUEST_BODY_BYTES {
+        return Ok(None);
+    }
+    let gate = if plaintext_limit > 25 * 1024 * 1024 {
+        &HUGE_BODIES
+    } else {
+        &LARGE_BODIES
+    };
+    // The pool permit is dropped with `permit` on every refusal below.
+    let permit = gate.try_acquire().map_err(|_| busy())?;
+    let ip = peer.map(|peer| counted_address(peer.ip()));
+    if !take_count(&LARGE_BODIES_BY_IP, ip, MAX_LARGE_BODIES_PER_IP) {
+        return Err(busy());
+    }
+    let slot = slot_key(device_id, peer);
+    let taken = DEVICES_WITH_LARGE_BODIES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(slot.clone());
+    if !taken {
+        if let Some(ip) = ip {
+            release_count(&LARGE_BODIES_BY_IP, ip);
+        }
+        return Err(busy());
+    }
+    Ok(Some(LargeBodyPermit {
+        _place: std::sync::Arc::new(LargeBodyPlace {
+            _permit: permit,
+            slot,
+            ip,
+        }),
+    }))
+}
+
+/// The address a request's connection came in from, when the listener
+/// recorded it (`into_make_service_with_connect_info`).
+fn peer_of(extensions: &axum::http::Extensions) -> Option<SocketAddr> {
+    extensions
+        .get::<axum::extract::ConnectInfo<SocketAddr>>()
+        .map(|info| info.0)
+}
+
+/// `body` with `permit` bound to it: the place is given up when the body
+/// is fully consumed or dropped. The body is bounded in time as well: it
+/// ends in an error past [`LARGE_BODY_READ_TIMEOUT`] in all, or when fewer
+/// than [`LARGE_BODY_MIN_BYTES_PER_WINDOW`] arrived in a window of
+/// [`LARGE_BODY_RATE_WINDOW`], and the error gives the place up too.
+pub(crate) fn gated_body(body: Body, permit: Option<LargeBodyPermit>) -> Body {
+    match permit {
+        Some(permit) => {
+            let now = tokio::time::Instant::now();
+            Body::from_stream(GatedBody {
+                inner: body.into_data_stream(),
+                deadline: now + LARGE_BODY_READ_TIMEOUT,
+                window_start: now,
+                window_bytes: 0,
+                timer: Box::pin(tokio::time::sleep_until(now + LARGE_BODY_RATE_WINDOW)),
+                _permit: permit,
+            })
+        }
+        None => body,
+    }
+}
+
+struct GatedBody {
+    inner: axum::body::BodyDataStream,
+    deadline: tokio::time::Instant,
+    window_start: tokio::time::Instant,
+    window_bytes: usize,
+    /// Fires at the end of the current window or at the deadline,
+    /// whichever is first, so a body that sends nothing is still judged.
+    timer: std::pin::Pin<Box<tokio::time::Sleep>>,
+    _permit: LargeBodyPermit,
+}
+
+impl GatedBody {
+    /// Judge the body at `now`: over the deadline, or a window that closed
+    /// short of its bytes, ends it. A window that closed with enough opens
+    /// the next one.
+    fn judge(&mut self, now: tokio::time::Instant) -> Result<(), axum::BoxError> {
+        if now >= self.deadline {
+            return Err("the request body was not received in time".into());
+        }
+        if now >= self.window_start + LARGE_BODY_RATE_WINDOW {
+            if self.window_bytes < LARGE_BODY_MIN_BYTES_PER_WINDOW {
+                return Err("the request body arrived too slowly".into());
+            }
+            self.window_start = now;
+            self.window_bytes = 0;
+        }
+        let next = (self.window_start + LARGE_BODY_RATE_WINDOW).min(self.deadline);
+        self.timer.as_mut().reset(next);
+        Ok(())
+    }
+}
+
+impl futures::Stream for GatedBody {
+    type Item = Result<axum::body::Bytes, axum::BoxError>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        use std::future::Future as _;
+        use std::task::Poll;
+        let now = tokio::time::Instant::now();
+        match std::pin::Pin::new(&mut self.inner).poll_next(cx) {
+            Poll::Ready(Some(Ok(bytes))) => {
+                self.window_bytes = self.window_bytes.saturating_add(bytes.len());
+                if let Err(error) = self.judge(now) {
+                    return Poll::Ready(Some(Err(error)));
+                }
+                Poll::Ready(Some(Ok(bytes)))
+            }
+            Poll::Ready(Some(Err(error))) => Poll::Ready(Some(Err(error.into()))),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => {
+                if self.timer.as_mut().poll(cx).is_ready() {
+                    if let Err(error) = self.judge(now) {
+                        return Poll::Ready(Some(Err(error)));
+                    }
+                    // Re-armed by `judge`: register the new timer.
+                    if self.timer.as_mut().poll(cx).is_ready() {
+                        return Poll::Ready(Some(Err(
+                            "the request body was not received in time".into()
+                        )));
+                    }
+                }
+                Poll::Pending
+            }
+        }
+    }
+}
+
 pub(crate) fn plaintext_body_limit(path: &str) -> usize {
     if path == UPLOADS_PATH {
-        MAX_UPLOAD_BYTES
+        MAX_VIDEO_UPLOAD_BYTES
+    } else if crate::platform::config::takes_large_body(path) {
+        crate::MAX_PROMPT_BODY_BYTES
     } else {
         MAX_REQUEST_BODY_BYTES
     }
+}
+
+/// On the routes that take a larger body (`config::takes_large_body`),
+/// every request is authenticated here, before any extractor reads its
+/// body: a caller without a device token is refused on its headers alone
+/// and never has a megabyte buffered for it. The handlers authenticate
+/// again themselves, as they always did.
+///
+/// This runs inside `encrypted_transport`, which has by now opened a
+/// sealed request -- its body read under the route's sealed ceiling, as an
+/// upload's is -- and put the device's bearer token and proof on it, so
+/// the one check here reads the same headers for either transport and
+/// never looks at the transport header itself.
+pub(crate) async fn large_body_after_auth(
+    State(state): State<AppState>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let plaintext_limit = plaintext_body_limit(request.uri().path());
+    if plaintext_limit <= MAX_REQUEST_BODY_BYTES {
+        return next.run(request).await;
+    }
+    let caller = match require_device_or_peer(&state, request.headers()) {
+        Ok(caller) => caller,
+        Err(refusal) => return refusal.into_response(),
+    };
+    // A sealed request holds its place from the decryption path, bound to
+    // its opened body; a cleartext one takes it here, past authentication,
+    // bound to the body the handler is about to read, so it is given up
+    // only when that body is consumed or dropped.
+    if request
+        .extensions()
+        .get::<EncryptedStreamContext>()
+        .is_some()
+    {
+        return next.run(request).await;
+    }
+    let peer = peer_of(request.extensions());
+    let permit = match large_body_permit(plaintext_limit, &caller.device_id, peer.as_ref()) {
+        Ok(permit) => permit,
+        Err(refusal) => return refusal.into_response(),
+    };
+    let (parts, body) = request.into_parts();
+    next.run(Request::from_parts(parts, gated_body(body, permit)))
+        .await
 }
 
 #[derive(Serialize, Deserialize)]
@@ -458,13 +885,19 @@ pub(crate) async fn encrypted_transport(
     let mut request = request;
     request.headers_mut().remove(TRANSPORT_PROOF_HEADER);
 
-    if request
-        .headers()
-        .get(TRANSPORT_HEADER)
-        .and_then(|value| value.to_str().ok())
-        != Some("1")
-    {
-        return next.run(request).await;
+    // Absent: cleartext. `1`: sealed. Anything else is refused outright,
+    // so no other layer can read the header differently from this one.
+    match request.headers().get(TRANSPORT_HEADER) {
+        None => return next.run(request).await,
+        Some(value) if value.as_bytes() == b"1" => {}
+        Some(_) => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_transport",
+                "unsupported transport header",
+            )
+            .into_response();
+        }
     }
 
     let websocket = is_websocket_upgrade(request.headers());
@@ -530,20 +963,19 @@ pub(crate) async fn decrypt_transport_request(
                 "missing_transport_device",
                 "missing encrypted transport device",
             )
-        })?;
+        })?
+        .to_owned();
+    let device_id = device_id.as_str();
     let (token_hash, transport_key) = {
         let devices = lock_devices(state)?;
         let device = devices
             .iter()
             .find(|device| device.id == device_id)
             .ok_or_else(|| api_error(StatusCode::FORBIDDEN, "invalid_token", "invalid token"))?;
-        let transport_key = device.transport_key.clone().ok_or_else(|| {
-            api_error(
-                StatusCode::UPGRADE_REQUIRED,
-                "device_repair_required",
-                "pair this device again to enable encrypted transport",
-            )
-        })?;
+        let transport_key = device
+            .transport_key
+            .clone()
+            .ok_or_else(device_repair_required)?;
         (device.token_hash.clone(), transport_key)
     };
     let material = transport::decode_key(&transport_key).map_err(|_| {
@@ -562,12 +994,33 @@ pub(crate) async fn decrypt_transport_request(
             .map_or(parts.uri.path(), |value| value.as_str())
     );
     // Sized to the route, because this read happens outside the router's own
-    // body limits and is therefore the only thing bounding them.
-    let body_bytes = to_bytes(
-        body,
-        sealed_body_ceiling(plaintext_body_limit(parts.uri.path())),
-    )
-    .await
+    // body limits and is therefore the only thing bounding them. A large one
+    // takes a place in the pre-authentication budget first -- the header
+    // above showed a paired record holding a key, nothing more yet -- or is
+    // refused before a byte of it is read, and the read is bounded in time
+    // and throughput as well as size so a stalled connection gives the
+    // place back.
+    let plaintext_limit = plaintext_body_limit(parts.uri.path());
+    let peer = peer_of(&parts.extensions);
+    // Not the pool: the small pre-authentication budget, until the envelope
+    // has opened and the device is verified below.
+    let preauth = preauth_sealed_permit(plaintext_limit, peer.as_ref(), device_id)?;
+    let large = preauth.is_some();
+    let body = gated_body(body, preauth);
+    let read = to_bytes(body, sealed_body_ceiling(plaintext_limit));
+    let body_bytes = if large {
+        tokio::time::timeout(LARGE_BODY_READ_TIMEOUT, read)
+            .await
+            .map_err(|_| {
+                api_error(
+                    StatusCode::REQUEST_TIMEOUT,
+                    "body_timeout",
+                    "the request body was not received in time",
+                )
+            })?
+    } else {
+        read.await
+    }
     .map_err(|_| {
         api_error(
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -592,19 +1045,20 @@ pub(crate) async fn decrypt_transport_request(
             "invalid encrypted request",
         )
     })?;
-    let plaintext = transport::open(
+    let plaintext = transport::open_checked(
         &material,
         transport::Direction::Request,
         aad.as_bytes(),
         &envelope,
         now_unix_ms(),
     )
-    .map_err(|_| {
-        api_error(
+    .map_err(|error| match error {
+        transport::OpenError::Expired => clock_skew(now_unix_ms()),
+        transport::OpenError::Invalid => api_error(
             StatusCode::FORBIDDEN,
             "invalid_envelope",
             "invalid encrypted request",
-        )
+        ),
     })?;
     let payload: EncryptedRequestPayload = serde_json::from_slice(&plaintext).map_err(|_| {
         api_error(
@@ -677,8 +1131,12 @@ pub(crate) async fn decrypt_transport_request(
         request_nonce: envelope.nonce.clone(),
         transport_version: envelope.version,
     });
+    // Verified now: the request moves from the pre-authentication budget
+    // (given up with the read above) to the pool and this device's slot,
+    // which the opened body keeps until the handler has consumed it.
+    let permit = large_body_permit(plaintext_limit, device_id, peer.as_ref())?;
     Ok((
-        Request::from_parts(parts, Body::from(body)),
+        Request::from_parts(parts, gated_body(Body::from(body), permit)),
         material,
         aad,
         envelope.nonce,
@@ -725,11 +1183,23 @@ where
     })?;
     match accepted {
         Acceptance::Accepted => Ok(()),
-        Acceptance::InvalidMetadata => Err(api_error(
-            StatusCode::FORBIDDEN,
-            "invalid_envelope",
-            "invalid encrypted request",
-        )),
+        // Freshness is judged again on the store thread (the request may
+        // have waited in its queue past the window); the envelope
+        // authenticated above, so a stale one is told the same as at open.
+        Acceptance::InvalidMetadata => {
+            let now = now_unix_ms();
+            Err(
+                if transport::timestamp_is_fresh(envelope.timestamp_ms, now) {
+                    api_error(
+                        StatusCode::FORBIDDEN,
+                        "invalid_envelope",
+                        "invalid encrypted request",
+                    )
+                } else {
+                    clock_skew(now)
+                },
+            )
+        }
         Acceptance::Replayed => Err(api_error(
             StatusCode::CONFLICT,
             "replayed_request",
@@ -1205,6 +1675,110 @@ fn cgroup_stat_mb(key: &str) -> Option<u64> {
 mod tests {
     use crate::*;
 
+    /// What a dual-stack listener reports for an IPv4 client is the mapped
+    /// `::ffff:a.b.c.d`; masking it to a /64 like native IPv6 would put every
+    /// IPv4 client in one bucket and make the per-address limits global.
+    /// Mapped, compatible and NAT64 addresses count as their IPv4; native
+    /// IPv6 counts by its /64.
+    #[test]
+    fn ipv4_clients_behind_a_dual_stack_listener_are_counted_apart() {
+        use std::net::IpAddr;
+        let counted = |text: &str| super::counted_address(text.parse::<IpAddr>().unwrap());
+        assert_eq!(
+            counted("::ffff:10.0.0.7"),
+            "10.0.0.7".parse::<IpAddr>().unwrap()
+        );
+        assert_ne!(counted("::ffff:10.0.0.7"), counted("::ffff:10.0.0.8"));
+        assert_eq!(counted("::10.0.0.7"), "10.0.0.7".parse::<IpAddr>().unwrap());
+        assert_eq!(
+            counted("64:ff9b::10.0.0.7"),
+            "10.0.0.7".parse::<IpAddr>().unwrap()
+        );
+        assert_eq!(counted("10.0.0.7"), "10.0.0.7".parse::<IpAddr>().unwrap());
+        assert_eq!(
+            counted("2001:db8:1:2:aaaa::1"),
+            counted("2001:db8:1:2:bbbb::2"),
+            "one /64 is one subscriber"
+        );
+        assert_ne!(counted("2001:db8:1:2::1"), counted("2001:db8:1:3::1"));
+        assert_eq!(
+            counted("::1"),
+            "::".parse::<IpAddr>().unwrap(),
+            "loopback is native, masked"
+        );
+    }
+
+    /// The larger body of a prompt route is reachable only past
+    /// authentication, whatever the transport header says: an unknown
+    /// `x-muqun-transport` value is refused by the transport layer, a
+    /// cleartext request without a token by the body-limit layer, and
+    /// neither lets the handler (and so the body) be reached.
+    #[tokio::test]
+    async fn a_large_body_route_authenticates_before_any_body_is_read() {
+        use axum::routing::post;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tower::ServiceExt as _;
+        let reached = std::sync::Arc::new(AtomicUsize::new(0));
+        let state = test_state("admin", vec![test_device("phone", "device-token")]);
+        let app = {
+            let reached = reached.clone();
+            Router::new()
+                .route(
+                    "/api/tasks",
+                    post(move |body: axum::body::Bytes| {
+                        let reached = reached.clone();
+                        async move {
+                            reached.fetch_add(1, Ordering::SeqCst);
+                            format!("{}", body.len())
+                        }
+                    })
+                    .layer(crate::agents::routes::large_body()),
+                )
+                .layer(axum::extract::DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
+                .layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    large_body_after_auth,
+                ))
+                .layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    encrypted_transport,
+                ))
+                .with_state(state)
+        };
+        let send = |headers: Vec<(&'static str, &'static str)>| {
+            let app = app.clone();
+            async move {
+                let mut request = Request::builder().method("POST").uri("/api/tasks");
+                for (name, value) in headers {
+                    request = request.header(name, value);
+                }
+                let response = app
+                    .oneshot(request.body(Body::from(vec![b'x'; 200 * 1024])).unwrap())
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let body = axum::body::to_bytes(response.into_body(), 1 << 16)
+                    .await
+                    .unwrap();
+                (status, String::from_utf8_lossy(&body).into_owned())
+            }
+        };
+        // A transport header that is not `1` is not "sealed" to anyone.
+        let (status, body) = send(vec![(TRANSPORT_HEADER, "0")]).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("invalid_transport"), "{body}");
+        assert_eq!(reached.load(Ordering::SeqCst), 0, "the body was never read");
+        // Cleartext without a token: refused on the headers.
+        let (status, _) = send(vec![]).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(reached.load(Ordering::SeqCst), 0);
+        // A device gets the larger limit: 200 KiB is over the ordinary one.
+        let (status, body) = send(vec![("authorization", "Bearer device-token")]).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body, (200 * 1024).to_string());
+        assert_eq!(reached.load(Ordering::SeqCst), 1);
+    }
+
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn codex_stop_propagates_unverified_cleanup_after_reaping_the_private_fake_tree() {
@@ -1336,7 +1910,7 @@ mod tests {
     /// upload must be at most 25 MiB". Over its own encrypted transport --
     /// which is on by default -- it could not actually accept one: the
     /// middleware buffered the sealed bytes against a ceiling sized for the
-    /// plaintext, and a 25 MiB file is about 44 MiB sealed.
+    /// plaintext, and a 64 MiB file is about 112 MiB sealed.
     #[test]
     fn a_maximum_upload_fits_through_the_encrypted_transport() {
         let transport_key = generate_token();
@@ -1344,42 +1918,48 @@ mod tests {
 
         // Measured at a size that is quick to seal rather than at the ceiling
         // itself. The expansion is affine -- base64, JSON, seal, base64 -- so
-        // one sample fixes the slope, and `MAX_UPLOAD_BYTES` is exactly 25 of
-        // these. The exact version is
+        // an empty body fixes the intercept, one sample the slope, and
+        // `MAX_VIDEO_UPLOAD_BYTES` is exactly 64 of these. The exact version is
         // `a_literal_maximum_upload_seals_within_the_ceiling`, kept ignored
-        // because sealing 25 MiB in a debug build takes twelve seconds.
+        // because sealing 64 MiB in a debug build takes half a minute.
         const SAMPLE: usize = 1024 * 1024;
         let sampled = sealed_wire_len(&material, "device-token", UPLOADS_PATH, SAMPLE);
         assert!(sampled <= sealed_body_ceiling(SAMPLE));
 
-        let at_maximum = sampled * (MAX_UPLOAD_BYTES / SAMPLE);
-        let previous = MAX_UPLOAD_BYTES + MAX_REQUEST_BODY_BYTES;
+        let empty = sealed_wire_len(&material, "device-token", UPLOADS_PATH, 0);
+        let at_maximum = empty + (sampled - empty) * (MAX_VIDEO_UPLOAD_BYTES / SAMPLE);
+        let previous = MAX_VIDEO_UPLOAD_BYTES + MAX_REQUEST_BODY_BYTES;
         assert!(
             at_maximum > previous,
-            "a {MAX_UPLOAD_BYTES}-byte upload seals to about {at_maximum} bytes, \
+            "a {MAX_VIDEO_UPLOAD_BYTES}-byte upload seals to about {at_maximum} bytes, \
              which the old {previous}-byte ceiling should not have fit"
         );
         assert!(
-            at_maximum <= sealed_body_ceiling(MAX_UPLOAD_BYTES),
+            at_maximum <= sealed_body_ceiling(MAX_VIDEO_UPLOAD_BYTES),
             "sealed about {at_maximum} bytes against a ceiling of {}",
-            sealed_body_ceiling(MAX_UPLOAD_BYTES)
+            sealed_body_ceiling(MAX_VIDEO_UPLOAD_BYTES)
         );
     }
 
     #[test]
-    #[ignore = "seals 25 MiB; slow in a debug build"]
+    #[ignore = "seals 64 MiB; slow in a debug build"]
     fn a_literal_maximum_upload_seals_within_the_ceiling() {
         let transport_key = generate_token();
         let material = transport::decode_key(&transport_key).unwrap();
-        let wire = sealed_wire_len(&material, "device-token", UPLOADS_PATH, MAX_UPLOAD_BYTES);
+        let wire = sealed_wire_len(
+            &material,
+            "device-token",
+            UPLOADS_PATH,
+            MAX_VIDEO_UPLOAD_BYTES,
+        );
         assert!(
-            wire > MAX_UPLOAD_BYTES + MAX_REQUEST_BODY_BYTES,
+            wire > MAX_VIDEO_UPLOAD_BYTES + MAX_REQUEST_BODY_BYTES,
             "sealed to {wire} bytes"
         );
         assert!(
-            wire <= sealed_body_ceiling(MAX_UPLOAD_BYTES),
+            wire <= sealed_body_ceiling(MAX_VIDEO_UPLOAD_BYTES),
             "sealed {wire} bytes against a ceiling of {}",
-            sealed_body_ceiling(MAX_UPLOAD_BYTES)
+            sealed_body_ceiling(MAX_VIDEO_UPLOAD_BYTES)
         );
     }
 
@@ -1389,7 +1969,7 @@ mod tests {
     /// on any route buffer 25 MiB.
     #[test]
     fn every_other_route_is_held_to_the_small_body_limit() {
-        assert_eq!(plaintext_body_limit(UPLOADS_PATH), MAX_UPLOAD_BYTES);
+        assert_eq!(plaintext_body_limit(UPLOADS_PATH), MAX_VIDEO_UPLOAD_BYTES);
         for path in [
             "/api/sessions/default/panes/%1/send-text",
             "/api/pair/claim",
@@ -1404,7 +1984,7 @@ mod tests {
             );
         }
         assert!(
-            sealed_body_ceiling(MAX_REQUEST_BODY_BYTES) < MAX_UPLOAD_BYTES,
+            sealed_body_ceiling(MAX_REQUEST_BODY_BYTES) < MAX_VIDEO_UPLOAD_BYTES,
             "the non-upload ceiling must be far under what it used to be"
         );
     }
@@ -1443,7 +2023,7 @@ mod tests {
         let material = transport::decode_key(&transport_key).unwrap();
         let mut device = test_device("phone-1", token);
         device.transport_key = Some(transport_key);
-        let state = test_state("admin-token", vec![device]);
+        let state = required_test_state("admin-token", vec![device]);
         assert!(require_device(&state, &bearer_headers(token)).is_err());
 
         let stolen_token_material = base64::engine::general_purpose::STANDARD
@@ -1811,8 +2391,9 @@ mod tests {
         assert_eq!(inner["event"], "agent.timeline.upsert");
         assert_eq!(inner["data"], r#"{"items":[]}"#);
 
-        // A device paired without a transport key keeps the plaintext stream,
-        // byte for byte: no sealer, no envelope, the event under its own name.
+        // A device without a transport key, on a `disabled` deployment (the
+        // only mode that serves one), keeps the plaintext stream byte for
+        // byte: no sealer, no envelope, the event under its own name.
         let mut plain: Option<EventStreamSealer> = None;
         let event = stream_event(&mut plain, "agent.timeline.upsert", r#"{"items":[]}"#)
             .expect("a cleartext stream still emits");
@@ -1999,7 +2580,9 @@ mod transport_v2_tests {
         )
         .is_ok());
         // Authentication at the inclusive boundary does not authorize later
-        // admission. Its refusal must not be reported as an infrastructure error.
+        // admission. Its refusal must not be reported as an infrastructure
+        // error: the envelope authenticated and is stale by now, so it is
+        // the clock-skew refusal, a 403 carrying this computer's time.
         for (envelope, now) in [
             (envelope, boundary + 1),
             (
@@ -2030,7 +2613,8 @@ mod transport_v2_tests {
             let body: serde_json::Value =
                 serde_json::from_slice(&to_bytes(response.into_body(), 8192).await.unwrap())
                     .unwrap();
-            assert_eq!(body["error"]["code"], "invalid_envelope");
+            assert_eq!(body["error"]["code"], "clock_skew");
+            assert!(body["error"]["server_time_ms"].is_u64(), "{body}");
         }
         let rows: (i64, i64, i64) = state
             .db

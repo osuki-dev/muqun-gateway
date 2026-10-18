@@ -5,7 +5,9 @@ use tokio_util::sync::CancellationToken;
 
 use serde_json::{json, Value};
 
-use super::adapters::memory_mirror::{MemoryMirror, SessionPatch, ToolPatch};
+use super::adapters::memory_mirror::{
+    DeliveredInputRevision, MemoryMirror, SessionPatch, ToolPatch,
+};
 use super::adapters::opencode::{
     mapper, OpencodeDriver, OpencodeEndpoint, OpencodeRawEvent, OpencodeSseListener,
 };
@@ -14,7 +16,7 @@ use super::domain::{
     AgentSessionStatus, CompactionStatus, RevertState, TimelineItem, TimelineRole, ToolCallStatus,
     WorktreeState,
 };
-use super::ports::agent::AgentPort;
+use super::ports::agent::{AgentError, AgentPort};
 use super::ports::mirror::SessionMirrorPort;
 use super::use_cases::{InteractionService, PromptService, SessionService};
 
@@ -26,6 +28,9 @@ const END_OF_RUN_REFETCH_LIMIT: usize = 20;
 /// Shell ids are remembered only so `shell.exited` -- which carries no session
 /// -- can be attributed. Bounded, because a long-lived gateway sees many.
 const MAX_TRACKED_SHELLS: usize = 256;
+
+/// Delivered inputs need one canonical read, not a blocking tail refetch.
+const MAX_DELIVERED_READS: usize = 8;
 
 const DELTA_FLUSH_DELAY: std::time::Duration = std::time::Duration::from_millis(40);
 const MAX_PENDING_DELTA_BYTES: usize = 8 * 1024;
@@ -296,9 +301,67 @@ impl EventContext {
         });
     }
 
-    /// The one refetch left in the event path: a safety net at the end of a
-    /// run, reading back only the turn that just finished rather than a
-    /// hundred messages at every step boundary.
+    async fn delivered_without_message(&self, asid: &AgentSessionId, inbox_id: &str) -> bool {
+        self.mirror.inbox(asid).await.iter().any(|item| {
+            item.get("id").and_then(Value::as_str) == Some(inbox_id)
+                && matches!(
+                    item.get("type").and_then(Value::as_str),
+                    Some("compaction" | "move")
+                )
+        })
+    }
+
+    async fn finish_delivered_read(
+        &self,
+        asid: AgentSessionId,
+        inbox_id: &str,
+        revision: DeliveredInputRevision,
+        message: Result<Value, AgentError>,
+    ) {
+        let items = message
+            .ok()
+            .map(|message| mapper::map_message(&message, &asid))
+            .unwrap_or_default();
+        if items.is_empty() {
+            // Removing the queue preview first would lose the only visible
+            // receipt when the read fails. Keep it until a later native read
+            // recovers; never resend input or invent its message contents.
+            tracing::warn!(asid = %asid.0, inbox_id, "could not read delivered message; retaining receipt");
+            self.emit(AgentDomainEvent::Resync {
+                asid,
+                reason: "delivered_message_read_failed".into(),
+            });
+            return;
+        }
+        self.commit_delivered_input(asid, inbox_id, revision, items)
+            .await;
+    }
+
+    async fn commit_delivered_input(
+        &self,
+        asid: AgentSessionId,
+        inbox_id: &str,
+        revision: DeliveredInputRevision,
+        items: Vec<TimelineItem>,
+    ) {
+        if !self
+            .mirror
+            .commit_delivered_input(&asid, &revision, inbox_id, items, |events| {
+                for event in events {
+                    self.emit(event.clone());
+                }
+            })
+            .await
+        {
+            self.emit(AgentDomainEvent::Resync {
+                asid,
+                reason: "delivered_message_session_changed".into(),
+            });
+        }
+    }
+
+    /// A safety net at the end of a run, reading back only the turn that just
+    /// finished rather than a hundred messages at every step boundary.
     async fn refetch_tail(&self, asid: &AgentSessionId) {
         match self
             .driver
@@ -645,6 +708,11 @@ impl AgentManager {
             _ = ctx.cancel.cancelled() => {},
             _ = async {
                 let mut deltas = DeltaCoalescer::default();
+                // Only HTTP reads run concurrently. Commit their results on this
+                // pump so deletion/revert can invalidate them before publication.
+                // Dropping the set aborts reads when the manager is replaced.
+                let mut deliveries = tokio::task::JoinSet::new();
+                let mut pending: HashMap<tokio::task::Id, (AgentSessionId, String, tokio::task::AbortHandle)> = HashMap::new();
                 loop {
                     let received = tokio::select! {
                         biased;
@@ -659,6 +727,25 @@ impl AgentManager {
                             }
                             continue;
                         }
+                        completed = deliveries.join_next_with_id(), if !deliveries.is_empty() => {
+                            match completed {
+                                Some(Ok((id, (revision, message)))) => {
+                                    if let Some((asid, inbox_id, _)) = pending.remove(&id) {
+                                        ctx.finish_delivered_read(asid, &inbox_id, revision, message).await;
+                                    }
+                                }
+                                Some(Err(error)) => {
+                                    if let Some((asid, _, _)) = pending.remove(&error.id()) {
+                                        ctx.emit(AgentDomainEvent::Resync {
+                                            asid,
+                                            reason: "delivered_message_read_failed".into(),
+                                        });
+                                    }
+                                }
+                                None => {}
+                            }
+                            continue;
+                        },
                         event = rx.recv() => event,
                     };
                     // Every boundary, including lag and channel close, first
@@ -675,8 +762,54 @@ impl AgentManager {
                                 Self::handle_raw_event(raw, &ctx).await;
                             }
                         }
-                        Ok(raw) => Self::handle_raw_event(raw, &ctx).await,
+                        Ok(raw) => {
+                            let session_id = raw.data.get("sessionID").and_then(Value::as_str);
+                            let inbox_id = raw.data.get("inboxID").and_then(Value::as_str);
+                            if matches!(raw.event_type.as_str(), "session.deleted" | "session.revert.committed" | "session.inbox.cancelled" | "gateway.stream.resync") {
+                                pending.retain(|_, (asid, id, task)| {
+                                    let invalidated = raw.event_type == "gateway.stream.resync" || session_id == Some(asid.0.as_str())
+                                        && (raw.event_type != "session.inbox.cancelled" || inbox_id == Some(id.as_str()));
+                                    if invalidated { task.abort(); }
+                                    !invalidated
+                                });
+                            }
+                            if raw.event_type == "session.inbox.delivered" {
+                                if let (Some(session_id), Some(inbox_id)) = (session_id, inbox_id) {
+                                    let asid = AgentSessionId(session_id.to_string());
+                                    if !ctx.delivered_without_message(&asid, inbox_id).await {
+                                        if pending.values().any(|(session, id, _)| session == &asid && id == inbox_id) {
+                                            continue;
+                                        }
+                                        if deliveries.len() == MAX_DELIVERED_READS {
+                                            ctx.emit(AgentDomainEvent::Resync {
+                                                asid,
+                                                reason: "delivered_message_read_capacity".into(),
+                                            });
+                                            continue;
+                                        }
+                                        let Some(revision) = ctx.mirror.delivered_input_revision(&asid).await else {
+                                            ctx.emit(AgentDomainEvent::Resync {
+                                                asid,
+                                                reason: "delivered_message_session_changed".into(),
+                                            });
+                                            continue;
+                                        };
+                                        let client = ctx.driver.client().clone();
+                                        let session = session_id.to_string();
+                                        let message = inbox_id.to_string();
+                                        let task = deliveries.spawn(async move {
+                                            (revision, client.get_message(&session, &message).await)
+                                        });
+                                        pending.insert(task.id(), (asid, inbox_id.to_string(), task));
+                                        continue;
+                                    }
+                                }
+                            }
+                            Self::handle_raw_event(raw, &ctx).await;
+                        },
                         Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                            for (_, _, task) in pending.values() { task.abort(); }
+                            pending.clear();
                             tracing::warn!(skipped, "opencode event backlog overflowed, resyncing");
                             ctx.emit(AgentDomainEvent::Resync {
                                 asid: AgentSessionId(String::new()),
@@ -1235,7 +1368,33 @@ impl AgentManager {
                 };
                 ctx.emit(AgentDomainEvent::InboxChanged { asid, items, seq });
             }
-            "session.inbox.enqueued" | "session.inbox.delivered" | "session.inbox.cancelled" => {
+            "session.inbox.delivered" => {
+                let (Some(session_id), Some(inbox_id)) =
+                    (session_id, data.get("inboxID").and_then(Value::as_str))
+                else {
+                    return;
+                };
+                let asid = AgentSessionId(session_id.to_string());
+                let Some(revision) = ctx.mirror.delivered_input_revision(&asid).await else {
+                    ctx.emit(AgentDomainEvent::Resync {
+                        asid,
+                        reason: "delivered_message_session_changed".into(),
+                    });
+                    return;
+                };
+                if !ctx.delivered_without_message(&asid, inbox_id).await {
+                    // OpenCode projects a user/synthetic message from this
+                    // event with id=inboxID; there is no subsequent user-created
+                    // event. The production pump offloads the canonical read.
+                    let message = ctx.driver.client().get_message(session_id, inbox_id).await;
+                    ctx.finish_delivered_read(asid, inbox_id, revision, message)
+                        .await;
+                } else {
+                    ctx.commit_delivered_input(asid, inbox_id, revision, Vec::new())
+                        .await;
+                }
+            }
+            "session.inbox.enqueued" | "session.inbox.cancelled" => {
                 let Some(asid) = session_id.map(str::to_string).map(AgentSessionId) else {
                     return;
                 };
