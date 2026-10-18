@@ -82,6 +82,10 @@ pub(crate) fn mount(router: Router<AppState>) -> Router<AppState> {
         )
         .route("/api/sessions/{session_id}/panes", get(panes))
         .route(
+            "/api/sessions/{session_id}/panes/{pane_id}/lazygit",
+            get(super::lazygit::availability).post(super::lazygit::launch),
+        )
+        .route(
             "/api/sessions/{session_id}/panes/{pane_id}",
             get(pane).patch(rename_pane).delete(close_pane),
         )

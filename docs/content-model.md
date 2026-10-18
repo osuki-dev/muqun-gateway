@@ -413,9 +413,13 @@ Anything the agent produced that exists as a file and the user may want to see.
   "previewable": true }
 ```
 
-`kind` is sniffed (same discipline as uploads): `image | markdown | text | pdf |
-binary`. `previewable` tells the client whether `GET /api/assets/{id}/content`
-will stream something renderable.
+`kind` is sniffed (same discipline as uploads): `image | audio | markdown | text |
+pdf | binary`. `previewable` tells the client whether `GET /api/assets/{id}/content`
+will stream something renderable. Audio signatures include WAV, MP3, AAC,
+audio-branded M4A, FLAC and Ogg Vorbis/Opus; extensions alone never enable a
+preview. Generic MP4, AVI and Ogg Theora remain binary without a preview. The
+content endpoint retains device authentication, workspace fencing and its
+10 MiB ceiling. Native playback format support is the client's responsibility.
 
 ### Endpoints (additive)
 
@@ -494,6 +498,19 @@ resolution map next to `attachments`:
   (OpenCode, T3 Code, DeepSeek) alike. Absent when a part has nothing to list;
   an older gateway never sends it, and `capabilities.message_image_assets` says
   this one does.
+
+## Agent audio outputs
+
+`capabilities.agent_audio_assets` announces authenticated audio resolution for
+tool file outputs. `GET /api/agent-sessions/{asid}/audio-asset?uri=...` resolves
+the file inside the session's server-owned directory and returns `data.asset`
+using the ordinary asset metadata shape. Relative paths, absolute paths and
+`file://` URIs are accepted only within that directory; remote URLs, non-audio
+bytes and paths outside it return 404. No client-supplied directory is trusted.
+
+The opaque asset id uses the existing authenticated content endpoint. Containment
+is checked again when content is read, including symlink replacements, and the
+10 MiB content limit applies. This capability does not include video playback.
 
 ## Rollout slices
 

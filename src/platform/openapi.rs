@@ -742,7 +742,30 @@ pub fn openapi_spec() -> Value {
         }
     });
     spec["paths"]["/api/sessions/{sessionId}/panes/{paneId}/history"] = captured_history_path();
+    spec["paths"]["/api/sessions/{sessionId}/panes/{paneId}/lazygit"] = lazygit_endpoints();
+    spec["paths"]["/api/agent-sessions/{asid}/audio-asset"] = audio_asset_endpoint();
+    spec["paths"]["/api/agent-sessions/{asid}/file-asset"] = json!({"get": {
+        "summary": "Resolve a local file output inside an agent session",
+        "description": "Requires device authentication and agent_file_assets capability. Resolves audio, video, images, documents and binary files inside the server-owned directory. Web URLs, path escapes and symlinks outside the root are refused. Returns data.asset metadata with an opaque id.",
+        "parameters": [path_param("asid"), query_param("uri", "Local file URI or path")], "responses": ok_response()
+    }});
+    spec["paths"]["/api/assets/{assetId}/download"] = json!({"get": {
+        "summary": "Save one authenticated asset, including binary files",
+        "description": "Requires device authentication and asset_download capability. Rechecks the indexed directory boundary and limits content to 10 MiB. Returns attachment content disposition; preview-only restrictions remain on the content endpoint.",
+        "parameters": [path_param("assetId")], "responses": ok_response()
+    }});
     spec
+}
+
+fn audio_asset_endpoint() -> Value {
+    json!({
+        "get": {
+            "summary": "Resolve an audio tool output inside the agent session directory",
+            "description": "Requires device authentication and agent_audio_assets capability. Resolves a relative, absolute or file:// URI inside the server-owned session directory, verifies audio bytes and returns data.asset metadata with an opaque id. GET /api/assets/{id}/content rechecks containment, requires authentication and limits content to 10 MiB. Web URIs, non-audio files and paths outside the directory return 404. Video is not supported.",
+            "parameters": [path_param("asid"), query_param("uri", "Audio file URI or path")],
+            "responses": ok_response()
+        }
+    })
 }
 
 fn task_steps_schema() -> Value {
@@ -1158,7 +1181,7 @@ fn asset_schema() -> Value {
             "id": { "type": "string" },
             "path": { "type": "string" },
             "name": { "type": "string" },
-            "kind": { "type": "string", "enum": ["image", "markdown", "text", "pdf", "binary"] },
+            "kind": { "type": "string", "enum": ["image", "audio", "video", "markdown", "text", "pdf", "binary"] },
             "mime": { "type": "string" },
             "size": { "type": "integer" },
             "modified_unix_ms": { "type": "integer" },
@@ -1583,6 +1606,23 @@ pub const DOCS_HTML: &str = r#"<!doctype html>
   </body>
 </html>
 "#;
+
+fn lazygit_endpoints() -> Value {
+    json!({
+        "get": {
+            "summary": "Check whether lazygit can open for this pane",
+            "description": "Requires a paired device. Checks an executable lazygit on the Gateway host's PATH and the source pane's canonical Git checkout. No process is launched. Announced as pane_lazygit.",
+            "parameters": [path_param("sessionId"), path_param("paneId")],
+            "responses": ok_response()
+        },
+        "post": {
+            "summary": "Open lazygit in a dedicated terminal tab",
+            "description": "No client command or cwd is accepted. Creates an unfocused tab in the source pane's workspace and checkout, starts the installed lazygit once, and returns data.target with session_id, workspace_id, tab_id and pane_id plus started. A false started means inspect the created target, not automatically repeat the launch. Desktop focus is preserved.",
+            "parameters": [path_param("sessionId"), path_param("paneId")],
+            "responses": ok_response()
+        }
+    })
+}
 
 #[cfg(test)]
 mod history_contract_tests {
