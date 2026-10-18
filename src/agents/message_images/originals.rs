@@ -246,6 +246,7 @@ fn normalize(
     asid: &str,
     source: String,
     root: Option<&Path>,
+    user_attachment: bool,
     budget: &mut usize,
     originals_dir: Option<&Path>,
 ) -> Normalized {
@@ -275,15 +276,21 @@ fn normalize(
             Err(reason) => return failed(reason),
         }
     } else {
-        root.and_then(|root| hosted_file(&source, root))
-            .or_else(|| {
-                let uploads = crate::platform::uploads::uploads_dir().ok()?;
-                let uploads = std::fs::canonicalize(uploads).ok()?;
-                let path = super::resolve_image_path(&source, &uploads)?;
-                let modified = std::fs::metadata(&path).ok()?.modified().ok()?;
-                (!crate::platform::uploads::upload_expired(modified, std::time::SystemTime::now()))
-                    .then_some((path, uploads))
-            })
+        root.and_then(|root| {
+            if user_attachment {
+                super::account_file(&source, root)
+            } else {
+                hosted_file(&source, root)
+            }
+        })
+        .or_else(|| {
+            let uploads = crate::platform::uploads::uploads_dir().ok()?;
+            let uploads = std::fs::canonicalize(uploads).ok()?;
+            let path = super::resolve_image_path(&source, &uploads)?;
+            let modified = std::fs::metadata(&path).ok()?.modified().ok()?;
+            (!crate::platform::uploads::upload_expired(modified, std::time::SystemTime::now()))
+                .then_some((path, uploads))
+        })
     };
     let Some((path, fence)) = resolved else {
         return failed("reference_not_authorized_or_unavailable");
@@ -359,7 +366,9 @@ async fn attach_with_originals_dir(
                     (source, label)
                 })
                 .collect::<Vec<_>>();
-            inputs.push((index, None, sources));
+            let user_attachment = item.role == crate::agents::domain::TimelineRole::User
+                && matches!(&item.part, AgentPart::Text { .. });
+            inputs.push((index, None, sources, user_attachment));
         }
         if let AgentPart::Tool(call) = &mut item.part {
             if let Some(Value::Array(content)) = &call.content {
@@ -380,7 +389,7 @@ async fn attach_with_originals_dir(
                             .and_then(|uri| uri.as_str().map(str::to_owned))
                         {
                             part["uri"] = Value::Null;
-                            inputs.push((index, Some(position), vec![(uri, false)]));
+                            inputs.push((index, Some(position), vec![(uri, false)], false));
                         }
                     }
                 }
@@ -399,7 +408,7 @@ async fn attach_with_originals_dir(
         let mut budget = RESPONSE_WORK_BYTES;
         inputs
             .into_iter()
-            .map(|(index, position, sources)| {
+            .map(|(index, position, sources, user_attachment)| {
                 let sources = sources
                     .into_iter()
                     .map(|(source, label)| {
@@ -414,6 +423,7 @@ async fn attach_with_originals_dir(
                                 &asid,
                                 source,
                                 root.as_deref(),
+                                user_attachment,
                                 &mut budget,
                                 originals_dir.as_deref(),
                             )
@@ -1099,6 +1109,71 @@ mod tests {
             .0,
             StatusCode::NOT_FOUND
         );
+    }
+
+    #[tokio::test]
+    async fn structured_user_cache_images_get_previews_but_assistant_paths_do_not() {
+        let (scratch, root) = workspace();
+        let path = scratch.0.join("clipboard.png");
+        let original = png(20, 30, 42);
+        std::fs::write(&path, &original).unwrap();
+        let state = crate::test_state("admin", vec![crate::test_device("phone", "token")]);
+        let mut rows = vec![item(vec![path.to_string_lossy().into_owned()])];
+        attach(&state, "user", Some(root.clone()), &mut rows).await;
+        let asset = &rows[0].image_assets.as_ref().unwrap()[0];
+        assert!(asset.unavailable_reason.is_none());
+        assert_eq!(rows[0].attachments.as_ref().unwrap()[0], asset.src);
+        assert_eq!(asset.mime, "image/png");
+        assert_eq!(
+            bytes(
+                read(
+                    &state,
+                    &asset.asset_id,
+                    "original",
+                    crate::bearer_headers("token")
+                )
+                .await
+            )
+            .await,
+            original
+        );
+        let thumbnail = bytes(
+            read(
+                &state,
+                &asset.asset_id,
+                "thumbnail",
+                crate::bearer_headers("token"),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(image::load_from_memory(&thumbnail).unwrap().width(), 20);
+        let mut assistant = vec![item(vec![path.to_string_lossy().into_owned()])];
+        assistant[0].role = TimelineRole::Assistant;
+        attach(&state, "assistant", Some(root), &mut assistant).await;
+        assert_eq!(
+            assistant[0].image_assets.as_ref().unwrap()[0]
+                .unavailable_reason
+                .as_deref(),
+            Some("reference_not_authorized_or_unavailable")
+        );
+        #[cfg(unix)]
+        {
+            // /etc is outside the account, cache/temp and workspace roots.
+            std::fs::remove_file(&path).unwrap();
+            std::os::unix::fs::symlink("/etc/passwd", &path).unwrap();
+            assert_eq!(
+                content(
+                    State(state),
+                    RoutePath((asset.asset_id.clone(), "thumbnail".into())),
+                    crate::bearer_headers("token")
+                )
+                .await
+                .unwrap_err()
+                .0,
+                StatusCode::NOT_FOUND
+            );
+        }
     }
 
     #[tokio::test]

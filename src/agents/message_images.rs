@@ -248,7 +248,14 @@ async fn resolve_agent_file(
     let root = session_root(&state, &asid).await.ok_or_else(not_found)?;
     let owned_root = root.clone();
     let resolved = tokio::task::spawn_blocking(move || {
-        let (path, fence) = hosted_file(&query.uri, &owned_root)?;
+        let (path, fence) = if expected.is_none() {
+            // A deliberate file open has the same account-home/cache policy
+            // as the terminal's exact-path lookup. Passive image discovery
+            // continues to use only the session/generated-image fences.
+            account_file(&query.uri, &owned_root)?
+        } else {
+            hosted_file(&query.uri, &owned_root)?
+        };
         let name = path.file_name()?.to_string_lossy().into_owned();
         let kind = sniff_asset_type(&read_asset_head(&path), &name);
         if expected.is_some_and(|expected| kind.kind != expected) {
@@ -556,16 +563,56 @@ fn html_image_sources(text: &str, out: &mut Vec<String>) {
 /// directory, not the workspace, so a later read still refuses a path that
 /// has been swapped out of it.
 pub(crate) fn hosted_file(src: &str, session_root: &Path) -> Option<(PathBuf, PathBuf)> {
+    resolve_in_fences(src, hosted_roots(session_root))
+}
+
+fn hosted_roots(session_root: &Path) -> Vec<PathBuf> {
     let mut fences = vec![session_root.to_path_buf()];
     if let Some(generated) = generated_images_root() {
         if fences.iter().all(|fence| fence != &generated) {
             fences.push(generated);
         }
     }
+    fences
+}
+
+fn resolve_in_fences(src: &str, fences: Vec<PathBuf>) -> Option<(PathBuf, PathBuf)> {
     fences.into_iter().find_map(|fence| {
         let path = resolve_image_path(src, &fence)?;
         Some((path, fence))
     })
+}
+
+fn explicit_file(
+    src: &str,
+    mut fences: Vec<PathBuf>,
+    home: Option<&Path>,
+    candidates: impl IntoIterator<Item = PathBuf>,
+) -> Option<(PathBuf, PathBuf)> {
+    fences.extend(
+        crate::platform::assets::preview_lookup_roots(Vec::new(), "", home, candidates)
+            .into_iter()
+            .map(|root| root.path),
+    );
+    resolve_in_fences(src, fences)
+}
+
+/// Explicit file opens and structured user attachments share the terminal's
+/// existing account-artifact policy. Prose and tool output do not use it.
+fn account_file(src: &str, session_root: &Path) -> Option<(PathBuf, PathBuf)> {
+    let home = dirs::home_dir();
+    let candidates = [
+        Some(std::env::temp_dir()),
+        Some(PathBuf::from("/tmp")),
+        dirs::cache_dir(),
+        home.as_ref().map(|home| home.join(".cache")),
+    ];
+    explicit_file(
+        src,
+        hosted_roots(session_root),
+        home.as_deref(),
+        candidates.into_iter().flatten(),
+    )
 }
 
 fn generated_images_root() -> Option<PathBuf> {
@@ -852,7 +899,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn file_outputs_resolve_video_and_download_binary_without_widening_the_root() {
+    async fn file_outputs_resolve_and_recheck_the_selected_fence_on_download() {
         use crate::platform::assets::{asset_content, asset_download};
         use crate::{bearer_headers, test_device, test_state};
         use axum::extract::{Path as RoutePath, Query, State};
@@ -867,6 +914,20 @@ mod tests {
         state
             .message_images
             .remember_root("agent-files", root.to_str());
+        assert_eq!(
+            file_asset(
+                State(state.clone()),
+                RoutePath("agent-files".into()),
+                Query(AudioAssetQuery {
+                    uri: "out/archive.bin".into()
+                }),
+                HeaderMap::new(),
+            )
+            .await
+            .unwrap_err()
+            .0,
+            StatusCode::UNAUTHORIZED
+        );
         for (uri, kind, bytes) in [
             ("out/clip.mp4", "video", video.as_slice()),
             ("out/archive.bin", "binary", binary.as_slice()),
@@ -940,19 +1001,77 @@ mod tests {
                 );
             }
         }
-        for uri in ["../outside.bin", "https://example.invalid/archive.bin"] {
-            assert_eq!(
-                file_asset(
-                    State(state.clone()),
-                    RoutePath("agent-files".into()),
-                    Query(AudioAssetQuery { uri: uri.into() }),
-                    bearer_headers("token")
-                )
-                .await
-                .unwrap_err()
-                .0,
-                StatusCode::NOT_FOUND
-            );
+        assert_eq!(
+            file_asset(
+                State(state.clone()),
+                RoutePath("agent-files".into()),
+                Query(AudioAssetQuery {
+                    uri: "https://example.invalid/archive.bin".into()
+                }),
+                bearer_headers("token")
+            )
+            .await
+            .unwrap_err()
+            .0,
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[test]
+    fn explicit_file_opens_account_artifacts_without_widening_passive_discovery() {
+        let (scratch, session) = workspace();
+        let home = scratch.path().join("home");
+        let desktop = home.join("Desktop");
+        let generated = scratch.path().join("generated");
+        let cache = scratch.path().join("cache");
+        for directory in [&desktop, &generated, &cache] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        let outside = scratch.path().join("private.md");
+        std::fs::write(&outside, "not authorized").unwrap();
+        let fences = vec![session.clone(), generated.clone()];
+        for (path, fence) in [
+            (desktop.join("report.md"), home.clone()),
+            (session.join("report.md"), session.clone()),
+            (generated.join("image.png"), generated.clone()),
+            (cache.join("preview.png"), cache.clone()),
+        ] {
+            std::fs::write(&path, "fixture").unwrap();
+            for source in [
+                path.to_string_lossy().into_owned(),
+                format!("file://{}", path.display()),
+            ] {
+                assert_eq!(
+                    explicit_file(&source, fences.clone(), Some(&home), [cache.clone()]),
+                    Some((path.clone(), fence.clone()))
+                );
+            }
+        }
+        let desktop_file = desktop.join("report.md");
+        assert!(hosted_file(desktop_file.to_str().unwrap(), &session).is_none());
+        assert!(explicit_file(
+            outside.to_str().unwrap(),
+            fences.clone(),
+            Some(&home),
+            [PathBuf::from("/"), scratch.path().to_path_buf()]
+        )
+        .is_none());
+        #[cfg(unix)]
+        {
+            let link = desktop.join("escape.md");
+            std::os::unix::fs::symlink(&outside, &link).unwrap();
+            assert!(explicit_file(
+                link.to_str().unwrap(),
+                fences.clone(),
+                Some(&home),
+                [cache.clone()]
+            )
+            .is_none());
+            // A file replaced after resolution is rechecked against its
+            // selected home fence before any original or derivative read.
+            std::fs::remove_file(&desktop_file).unwrap();
+            std::os::unix::fs::symlink(&outside, &desktop_file).unwrap();
+            assert!(originals::open_fenced(&desktop_file, &home).is_err());
         }
     }
 
