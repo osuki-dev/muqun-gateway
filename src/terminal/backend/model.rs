@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fmt;
 use std::future::Future;
 use std::path::PathBuf;
@@ -147,6 +148,9 @@ impl AgentStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pane {
+    /// Adapter-verified server/root-process incarnation, never serialized by compat.
+    /// Absence explicitly denies adoption of captures from a previous gateway run.
+    pub(crate) history_identity: Option<String>,
     pub id: PaneId,
     /// Native terminal identifier when it differs from the pane identifier.
     /// Herdr exposes both; tmux uses the pane id for both roles.
@@ -199,6 +203,10 @@ pub struct Pane {
     /// has to treat absence as "put it wherever you would have".
     pub cursor_x: Option<u32>,
     pub cursor_y: Option<u32>,
+    /// The pid of the pane's shell (tmux `#{pane_pid}`, Herdr `shell_pid`).
+    /// Gateway-internal: assistant tokens are issued to the pane whose shell
+    /// is an ancestor of the calling process. Never serialised to clients.
+    pub shell_pid: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -223,6 +231,10 @@ pub struct StartAgent {
     pub executable: Option<PathBuf>,
     pub args: Vec<String>,
     pub timeout_ms: u64,
+    /// Variables the agent must start with, for a pane that was not created
+    /// with them. A backend that types the launch line prefixes it with
+    /// `env`; one that cannot refuses nothing and reports it in `env_applied`.
+    pub env: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -231,6 +243,9 @@ pub struct StartedAgent {
     pub target: Option<String>,
     pub instance_id: Option<String>,
     pub argv: Option<Vec<String>>,
+    /// False when `StartAgent::env` was non-empty and this backend could not
+    /// hand it to the agent.
+    pub env_applied: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -315,6 +330,8 @@ pub struct CreateWorkspace {
     pub cwd: Option<PathBuf>,
     pub label: Option<String>,
     pub focus: bool,
+    /// Environment for the workspace's first pane, as on [`SplitPane::env`].
+    pub env: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -323,6 +340,17 @@ pub struct CreateTab {
     pub cwd: Option<PathBuf>,
     pub label: Option<String>,
     pub focus: bool,
+    /// Environment for the tab's first pane, as on [`SplitPane::env`].
+    pub env: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+/// The pane-creating call an `env` would ride on, for
+/// [`TerminalBackend::applies_pane_env`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaneEnvVia {
+    Workspace,
+    Tab,
+    Split,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -475,6 +503,21 @@ pub trait TerminalBackend: Send + Sync {
         Box::pin(async { Ok(true) })
     }
     fn start_agent<'a>(&'a self, request: &'a StartAgent) -> BackendFuture<'a, StartedAgent>;
+    /// Whether `start_agent` may be handed the agent's first prompt among
+    /// its arguments. False -- the default -- for a backend whose start waits
+    /// for the agent to sit idle at its input (Herdr's readiness wait), which
+    /// an agent already working on a prompt would not do; it gets the prompt
+    /// typed once it is up.
+    fn takes_launch_prompt(&self) -> bool {
+        false
+    }
+    /// Whether `env` on this kind of creation reaches the new pane. False --
+    /// the default, and the answer of a backend too old for it -- means the
+    /// backend leaves `env` out and the caller has to deliver the variables
+    /// some other way (`StartAgent::env`).
+    fn applies_pane_env(&self, _via: PaneEnvVia) -> BackendFuture<'_, bool> {
+        Box::pin(async { Ok(false) })
+    }
     fn list_worktrees<'a>(&'a self, _cwd: &'a PathBuf) -> BackendFuture<'a, Vec<Worktree>> {
         Box::pin(async { Err(BackendError::Unsupported("worktrees")) })
     }

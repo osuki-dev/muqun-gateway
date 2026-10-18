@@ -122,6 +122,7 @@ pub(crate) fn setup(
     let mut config = match existing {
         Some(install) => install.config,
         None => Config {
+            history: Default::default(),
             server_id,
             label: hostname_label(),
             listen: listen.clone(),
@@ -132,10 +133,16 @@ pub(crate) fn setup(
             sessions: Vec::new(),
             autostart_backends: Vec::new(),
             agent_commands: BTreeMap::new(),
+            agent_launch_args: BTreeMap::new(),
+            agent_env: Default::default(),
+            agent_trust_folders: true,
             rich_agent_pushes: false,
             opencode: agents::OpencodeConfig::default(),
             deepseek: agents::DeepseekConfig::default(),
             t3: agents::T3Config::default(),
+            store: crate::platform::config::StoreConfig::default(),
+            mcp: crate::platform::config::McpConfig::default(),
+            fleet: Default::default(),
         },
     };
     config.listen = listen;
@@ -527,6 +534,19 @@ pub(crate) fn import_herdr_plugin(
                 .agent_commands
                 .entry(kind.clone())
                 .or_insert_with(|| command.clone());
+        }
+        for (kind, args) in &target.config.agent_launch_args {
+            merged
+                .agent_launch_args
+                .entry(kind.clone())
+                .or_insert_with(|| args.clone());
+        }
+        for (key, value) in &target.config.agent_env.0 {
+            merged
+                .agent_env
+                .0
+                .entry(key.clone())
+                .or_insert_with(|| value.clone());
         }
         merged.rich_agent_pushes |= target.config.rich_agent_pushes;
         for session in &target.config.sessions {

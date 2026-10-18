@@ -120,6 +120,80 @@ impl OpencodeClient {
         self.handle_resp(resp, "POST", path).await
     }
 
+    pub async fn put_with_query(
+        &self,
+        path: &str,
+        query: &[(String, String)],
+        body: &Value,
+    ) -> Result<Value, AgentError> {
+        let url = format!("{}{path}", self.endpoint.url);
+        let req = self.authed_req(self.http.put(&url).query(query).json(body));
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| AgentError::Network(e.to_string()))?;
+        self.handle_resp(resp, "PUT", path).await
+    }
+
+    /// `PUT /api/experimental/session/{id}/instructions/entries/{key}`: a
+    /// durable per-session instruction. `Ok(false)` when this OpenCode has
+    /// no such route (404).
+    pub async fn set_session_instruction(
+        &self,
+        session_id: &str,
+        key: &str,
+        text: &str,
+    ) -> Result<bool, AgentError> {
+        let path = format!("/api/experimental/session/{session_id}/instructions/entries/{key}");
+        let url = format!("{}{path}", self.endpoint.url);
+        let req = self.authed_req(self.http.put(&url).json(&json!({ "value": text })));
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| AgentError::Network(e.to_string()))?;
+        if resp.status() == StatusCode::NOT_FOUND {
+            return Ok(false);
+        }
+        self.handle_resp(resp, "PUT", &path).await?;
+        Ok(true)
+    }
+
+    /// Removing an entry that is not there (404) is done too.
+    pub async fn remove_session_instruction(
+        &self,
+        session_id: &str,
+        key: &str,
+    ) -> Result<(), AgentError> {
+        let path = format!("/api/experimental/session/{session_id}/instructions/entries/{key}");
+        let url = format!("{}{path}", self.endpoint.url);
+        let resp = self
+            .authed_req(self.http.delete(&url))
+            .send()
+            .await
+            .map_err(|e| AgentError::Network(e.to_string()))?;
+        if resp.status() == StatusCode::NOT_FOUND {
+            return Ok(());
+        }
+        self.handle_resp(resp, "DELETE", &path).await?;
+        Ok(())
+    }
+
+    /// `PUT /api/experimental/mcp/{name}`: add (or replace) an MCP server
+    /// for `directory` and connect it, until the service restarts.
+    pub async fn add_mcp_server(
+        &self,
+        name: &str,
+        config: &Value,
+        directory: Option<&str>,
+    ) -> Result<Value, AgentError> {
+        self.put_with_query(
+            &format!("/api/experimental/mcp/{name}"),
+            &location_query(directory),
+            &json!({ "config": config }),
+        )
+        .await
+    }
+
     pub async fn patch(&self, path: &str, body: &Value) -> Result<Value, AgentError> {
         let url = format!("{}{path}", self.endpoint.url);
         let req = self.authed_req(self.http.patch(&url).json(body));

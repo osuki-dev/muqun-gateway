@@ -8,8 +8,8 @@ use serde_json::Value;
 
 use super::history::{parse_cursor, HistoryError, HistoryScope, MAX_HISTORY_LIMIT};
 use crate::{
-    api_error, backend, backend_api_error, content_envelope, find_session, require_device,
-    terminal_backend, ApiResult, AppState,
+    api_error, backend_api_error, content_envelope, find_session, require_device, terminal_backend,
+    ApiResult, AppState,
 };
 
 #[derive(Debug, Default, Deserialize)]
@@ -38,7 +38,6 @@ pub(crate) async fn pane_history(
         .await
         .map_err(backend_api_error)?;
     let live = panes.iter().any(|pane| pane.id.as_str() == pane_id);
-    let listing = backend::compat::pane_list(panes);
     state
         .scrollback
         .lock()
@@ -49,7 +48,7 @@ pub(crate) async fn pane_history(
                 "failed to lock captured history",
             )
         })?
-        .observe_listing(&session_id, &listing);
+        .observe_native_listing(&session_id, &panes);
     if !live {
         return Err(if query.before.is_some() {
             history_error(HistoryError::Gone)
@@ -57,9 +56,11 @@ pub(crate) async fn pane_history(
             api_error(StatusCode::NOT_FOUND, "pane_not_found", "pane not found")
         });
     }
-    let page = super::history::read_page(state.history.as_ref(), scope, query.before.as_deref())
-        .await
-        .map_err(history_error)?;
+    let mut page =
+        super::history::read_page(state.history.as_ref(), scope, query.before.as_deref())
+            .await
+            .map_err(history_error)?;
+    super::exit_marker::strip_history_page(&mut page);
     Ok(Json(content_envelope(page)))
 }
 
@@ -272,6 +273,33 @@ mod tests {
         assert_eq!(native.1["data"]["availability"], "not_captured");
         assert_eq!(native.1["data"]["rows"], json!([]));
         assert!(native.1["data"]["next_before"].is_null());
+    }
+
+    #[tokio::test]
+    async fn captured_history_does_not_serve_exit_marker_rows() {
+        let fixture = Fixture::new().await;
+        {
+            // Row 12 is an `exec.run` exit marker; it scrolls into history.
+            let row = |i: usize| match i {
+                12 => "\u{1f}muqun-exit:t_1:0\u{1f}".to_owned(),
+                _ => format!("row {i}"),
+            };
+            let mut store = fixture.state.scrollback.lock().unwrap();
+            for top in 8..14 {
+                let frame = (top..top + 4).map(row).collect::<Vec<_>>().join("\n");
+                store.record_frame("s", "p", "recent_unwrapped", "text", &frame);
+            }
+        }
+        let (status, body) = get(
+            fixture.app(),
+            "/api/sessions/s/panes/p/history?limit=500",
+            Some("token"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let rows = body["data"]["rows"].to_string();
+        assert!(rows.contains("row 11"), "{rows}");
+        assert!(!rows.contains("muqun-exit"), "{rows}");
     }
 
     #[tokio::test]
@@ -512,7 +540,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires tmux; creates only a private socket/server"]
-    async fn captured_history_real_isolated_tmux_pages_and_resize_reset() {
+    async fn captured_history_real_isolated_tmux_sqlite_restart_pages_and_resize_reset() {
         struct IsolatedTmux {
             directory: PathBuf,
             socket: PathBuf,
@@ -596,11 +624,24 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         };
         let panes = backend.list_panes().await.unwrap();
+        assert!(
+            pane.history_identity.is_some(),
+            "native server/root incarnation was not verified"
+        );
+        let old_repository = std::sync::Arc::new(
+            super::super::history_sqlite::SqliteHistoryRepository::open(
+                state.db.clone(),
+                &state.config,
+                state.scrollback.clone(),
+            )
+            .await,
+        );
+        state.history = old_repository.clone();
         state
             .scrollback
             .lock()
             .unwrap()
-            .observe_listing("s", &backend::compat::pane_list(panes));
+            .observe_native_listing("s", &panes);
         for top in 0..8 {
             std::fs::write(&control, format!("{top}\n")).unwrap();
             let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
@@ -650,6 +691,49 @@ mod tests {
         let cursor = first.1["data"]["next_before"].as_str().unwrap();
         let second = get(app(), &format!("{uri}&before={cursor}"), Some("token")).await;
         assert_eq!(second.1["data"]["rows"], json!(["row 3", "row 4"]));
+        // Join the actual storage worker; do not use a timed guess that it closed.
+        state.history = std::sync::Arc::new(
+            super::super::history_memory::MemoryHistoryRepository::new(state.scrollback.clone()),
+        );
+        std::sync::Arc::try_unwrap(old_repository)
+            .ok()
+            .unwrap()
+            .close()
+            .await;
+        state.scrollback =
+            std::sync::Arc::new(std::sync::Mutex::new(scrollback::ScrollbackStore::default()));
+        state.generation = crate::new_generation();
+        state.history = std::sync::Arc::new(
+            super::super::history_sqlite::SqliteHistoryRepository::open(
+                state.db.clone(),
+                &state.config,
+                state.scrollback.clone(),
+            )
+            .await,
+        );
+        let app = || {
+            crate::terminal::routes::mount(Router::new())
+                .layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    encrypted_transport,
+                ))
+                .layer(middleware::from_fn(security_headers))
+                .with_state(state.clone())
+        };
+        let gone = get(app(), &format!("{uri}&before={cursor}"), Some("token")).await;
+        assert_eq!(gone.0, StatusCode::GONE);
+        let recovered = get(app(), &uri, Some("token")).await;
+        assert_eq!(recovered.0, StatusCode::OK);
+        assert_eq!(recovered.1["data"]["rows"], first.1["data"]["rows"]);
+        assert_eq!(
+            state
+                .scrollback
+                .lock()
+                .unwrap()
+                .depth("s", pane.id.as_str()),
+            0
+        );
+        let cursor = recovered.1["data"]["next_before"].as_str().unwrap();
         let resized = ProcessCommand::new("tmux")
             .arg("-S")
             .arg(&isolated.socket)
@@ -668,5 +752,104 @@ mod tests {
         let gone = get(app(), &format!("{uri}&before={cursor}"), Some("token")).await;
         assert_eq!(gone.0, StatusCode::GONE);
         assert_eq!(gone.1["error"]["code"], "history_cursor_gone");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires real Herdr; launches only a fixture HOME/config/private socket"]
+    async fn real_isolated_herdr_native_identity_survives_gateway_adapter_restart() {
+        use super::super::backend::{CreateWorkspace, HerdrBackend, TerminalBackend};
+        use std::process::{Command as ProcessCommand, Stdio};
+        struct Server(std::process::Child);
+        impl Drop for Server {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        struct Directory(PathBuf);
+        impl Drop for Directory {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        // A short base, like the tmux test's: a socket path must fit `sun_path`.
+        let base = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+            .join(".cache/tmp/opencode");
+        let fixture = Directory(
+            if base.is_dir() {
+                base
+            } else {
+                std::env::temp_dir()
+            }
+            .join(format!("hist-{}", uuid::Uuid::new_v4().simple())),
+        );
+        std::fs::create_dir_all(&fixture.0).unwrap();
+        let config_path = fixture.0.join("herdr.toml");
+        std::fs::write(&config_path, "").unwrap();
+        let socket = fixture.0.join("herdr.sock");
+        let mut command = ProcessCommand::new("herdr");
+        for name in [
+            "TMUX",
+            "HERDR_SESSION",
+            "HERDR_SOCKET_PATH",
+            "HERDR_CLIENT_SOCKET_PATH",
+            "HERDR_PANE_ID",
+            "HERDR_TAB_ID",
+            "HERDR_WORKSPACE_ID",
+            "HERDR_ENV",
+        ] {
+            command.env_remove(name);
+        }
+        command
+            .env("HOME", &fixture.0)
+            .env("XDG_CONFIG_HOME", fixture.0.join("config"))
+            .env("HERDR_CONFIG_PATH", &config_path)
+            .env("HERDR_SOCKET_PATH", &socket)
+            .current_dir(&fixture.0)
+            .arg("server")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(std::fs::File::create(fixture.0.join("herdr-stderr.log")).unwrap());
+        let _server = Server(command.spawn().unwrap());
+        let backend = HerdrBackend::new(&socket);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if backend.metadata().await.is_ok() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "isolated Herdr never became ready"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        backend
+            .create_workspace(&CreateWorkspace {
+                cwd: Some(fixture.0.clone()),
+                label: Some("history-identity-qa".into()),
+                focus: false,
+                env: None,
+            })
+            .await
+            .unwrap();
+        let first = backend.list_panes().await.unwrap();
+        assert!(!first.is_empty());
+        for pane in &first {
+            assert!(
+                pane.history_identity.is_some(),
+                "Herdr peer/root process identity was not verified"
+            );
+        }
+        let restarted_adapter = HerdrBackend::new(&socket);
+        let second = restarted_adapter.list_panes().await.unwrap();
+        for pane in first {
+            let second = second.iter().find(|current| current.id == pane.id).unwrap();
+            assert_eq!(pane.history_identity, second.history_identity);
+            assert!(!super::super::backend::compat::pane_get(second.clone())
+                .to_string()
+                .contains("history_identity"));
+        }
     }
 }

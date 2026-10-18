@@ -25,6 +25,9 @@ use crate::agents::ports::agent::{
     append_attachment_paths, AgentError, AgentFuture, AgentPort, AttachmentMode, FileDiffItem,
 };
 
+/// The title a thread is created with; read back, it means "untitled".
+pub(crate) const NEW_THREAD_TITLE: &str = "New thread";
+
 pub struct T3Driver {
     client: Arc<T3Client>,
     /// The T3 runtime mode new threads get: the permission policy
@@ -253,7 +256,7 @@ impl AgentPort for T3Driver {
                 None => self.default_model().await?,
             };
             let thread_id = new_id();
-            let title = "New thread";
+            let title = NEW_THREAD_TITLE;
             self.client
                 .dispatch(commands::thread_create(
                     &thread_id,

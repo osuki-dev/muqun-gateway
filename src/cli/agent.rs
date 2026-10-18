@@ -657,7 +657,7 @@ fn confirm(prompt: &str) -> anyhow::Result<bool> {
 /// `command` as `PATH` resolves it.
 // TODO(windows): honour PATHEXT so `t3` finds `t3.cmd` / `t3.exe`.
 pub(crate) fn which(command: &str) -> Option<PathBuf> {
-    crate::tasks::find_on_path(command)
+    crate::agents::tasks::find_on_path(command)
 }
 
 #[cfg(test)]

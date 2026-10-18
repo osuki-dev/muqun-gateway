@@ -231,6 +231,38 @@ pub struct AgentRuntime {
     /// Serialize startup commands; OpenCode owns the background service.
     start_lock: Mutex<()>,
     supervising: AtomicBool,
+    /// Where OpenCode's `MUQUN_MCP_*` environment comes from; set once the
+    /// token store exists (the runtime is built before it).
+    mcp: std::sync::OnceLock<McpWiring>,
+}
+
+/// What the gateway needs to mint OpenCode's assistant token.
+struct McpWiring {
+    tokens: Arc<dyn crate::mcp::tokens::AssistantTokenStore>,
+    /// The `/mcp` URL OpenCode is given.
+    url: String,
+}
+
+/// The environment that lets an agent started by the gateway reach `/mcp`.
+pub(crate) struct McpEnv {
+    token_id: String,
+    token: String,
+    url: String,
+}
+
+impl McpEnv {
+    fn vars(&self) -> [(&'static str, &str); 2] {
+        [
+            ("MUQUN_MCP_TOKEN", &self.token),
+            ("MUQUN_MCP_URL", &self.url),
+        ]
+    }
+
+    fn apply(&self, command: &mut tokio::process::Command) {
+        for (name, value) in self.vars() {
+            command.env(name, value);
+        }
+    }
 }
 
 impl AgentRuntime {
@@ -268,7 +300,33 @@ impl AgentRuntime {
             origin: RwLock::new(AgentOrigin::None),
             start_lock: Mutex::new(()),
             supervising: AtomicBool::new(false),
+            mcp: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Let the OpenCode service this runtime starts reach `/mcp` at `url`.
+    /// Not called when `mcp.enabled` is false.
+    pub(crate) fn enable_mcp(
+        &self,
+        tokens: Arc<dyn crate::mcp::tokens::AssistantTokenStore>,
+        url: String,
+    ) {
+        let _ = self.mcp.set(McpWiring { tokens, url });
+    }
+
+    /// A fresh OpenCode agent token and the ids of the earlier ones (revoked
+    /// by [`settle_agent_tokens`] once the start is known to have worked), or
+    /// `None` when MCP is not wired or minting failed -- OpenCode then starts
+    /// as it always did.
+    async fn opencode_mcp_env(&self) -> Option<(McpEnv, Vec<String>)> {
+        let wiring = self.mcp.get()?;
+        match issue_agent_env(wiring.tokens.as_ref(), &wiring.url).await {
+            Ok(minted) => Some(minted),
+            Err(err) => {
+                tracing::warn!("could not mint OpenCode's MCP token: {err}");
+                None
+            }
+        }
     }
 
     /// A runtime that will never attach an agent, for tests and for a build
@@ -1083,12 +1141,120 @@ impl AgentRuntime {
             "no OpenCode service found, starting one"
         );
 
-        launch_service(tokio::process::Command::new(&binary)).await?;
-        wait_for_service().await
+        let mcp = self.opencode_mcp_env().await;
+        let started = async {
+            launch_service(
+                tokio::process::Command::new(&binary),
+                mcp.as_ref().map(|(env, _)| env),
+            )
+            .await?;
+            wait_for_service().await
+        }
+        .await;
+        if let (Some((env, previous)), Some(wiring)) = (&mcp, self.mcp.get()) {
+            settle_agent_tokens(wiring.tokens.as_ref(), env, previous, started.is_ok()).await;
+        }
+        started
     }
 }
 
-async fn launch_service(mut command: tokio::process::Command) -> anyhow::Result<()> {
+/// Once the start outcome is known: on success the earlier agent tokens are
+/// revoked; on failure the token just minted is, and the earlier ones stay.
+async fn settle_agent_tokens(
+    tokens: &dyn crate::mcp::tokens::AssistantTokenStore,
+    minted: &McpEnv,
+    previous: &[String],
+    started: bool,
+) {
+    let doomed: &[String] = if started {
+        previous
+    } else {
+        std::slice::from_ref(&minted.token_id)
+    };
+    for id in doomed {
+        if let Err(err) = tokens.revoke(id).await {
+            tracing::warn!("could not revoke an OpenCode MCP token: {err}");
+        }
+    }
+}
+
+/// Mint a new OpenCode token; the ids of the live earlier ones come back so
+/// they can be revoked once the new one is in use.
+async fn issue_agent_env(
+    tokens: &dyn crate::mcp::tokens::AssistantTokenStore,
+    url: &str,
+) -> anyhow::Result<(McpEnv, Vec<String>)> {
+    use crate::mcp::tokens::{TokenBinding, NO_EXPIRY};
+    let binding = TokenBinding::Agent {
+        agent_id: "opencode".into(),
+    };
+    let previous = tokens
+        .list()
+        .await?
+        .into_iter()
+        .filter(|row| row.binding == binding)
+        .map(|row| row.id)
+        .collect();
+    let issued = tokens.issue(binding, "opencode".into(), NO_EXPIRY).await?;
+    let env = McpEnv {
+        token_id: issued.session.token_id,
+        token: issued.token,
+        url: url.to_owned(),
+    };
+    Ok((env, previous))
+}
+
+/// `opencode service set env NAME VALUE`: the daemon loads its saved service
+/// env, not the environment of the process that starts it.
+fn service_set_args(name: &str, value: &str) -> [String; 5] {
+    ["service", "set", "env", name, value].map(str::to_owned)
+}
+
+/// A command for the same program, environment and directory as `like`.
+fn sibling_command(like: &tokio::process::Command) -> tokio::process::Command {
+    let like = like.as_std();
+    let mut command = tokio::process::Command::new(like.get_program());
+    for (name, value) in like.get_envs() {
+        match value {
+            Some(value) => command.env(name, value),
+            None => command.env_remove(name),
+        };
+    }
+    if let Some(dir) = like.get_current_dir() {
+        command.current_dir(dir);
+    }
+    command
+}
+
+/// Hand the daemon its MCP env through its saved service configuration. A
+/// failure is logged and the start goes on without it.
+async fn save_service_env(like: &tokio::process::Command, mcp: &McpEnv) {
+    for (name, value) in mcp.vars() {
+        let mut command = sibling_command(like);
+        command
+            .args(service_set_args(name, value))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+        match tokio::time::timeout(STARTUP_WAIT, command.status()).await {
+            Ok(Ok(status)) if status.success() => {}
+            _ => {
+                tracing::warn!("`opencode service set env {name}` failed; starting without it");
+                return;
+            }
+        }
+    }
+}
+
+async fn launch_service(
+    mut command: tokio::process::Command,
+    mcp: Option<&McpEnv>,
+) -> anyhow::Result<()> {
+    if let Some(mcp) = mcp {
+        save_service_env(&command, mcp).await;
+        mcp.apply(&mut command);
+    }
     // `serve --service` bypasses saved service env; the CLI owns that setup.
     command
         .args(["service", "start"])
@@ -1462,21 +1628,87 @@ mod tests {
             "test \"$#\" -eq 2 && test \"$1\" = service && test \"$2\" = start",
             "opencode",
         ]);
-        launch_service(command)
+        launch_service(command, None)
             .await
             .expect("service start arguments");
 
         let mut failing = tokio::process::Command::new("sh");
         failing.args(["-c", "exit 7", "opencode"]);
-        let err = launch_service(failing).await.expect_err("failed startup");
+        let err = launch_service(failing, None)
+            .await
+            .expect_err("failed startup");
         assert!(err.to_string().contains("exited with"), "{err}");
+    }
+
+    #[test]
+    fn a_sibling_command_runs_with_the_same_environment() {
+        let mut like = tokio::process::Command::new("opencode");
+        like.env("XDG_CONFIG_HOME", "/x")
+            .env_remove("OPENCODE_CONFIG");
+        let copy = sibling_command(&like);
+        assert_eq!(copy.as_std().get_program(), "opencode");
+        let envs: Vec<_> = copy.as_std().get_envs().collect();
+        assert_eq!(envs.len(), 2);
+        assert!(envs.contains(&(
+            std::ffi::OsStr::new("XDG_CONFIG_HOME"),
+            Some(std::ffi::OsStr::new("/x"))
+        )));
+        assert!(envs.contains(&(std::ffi::OsStr::new("OPENCODE_CONFIG"), None)));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_new_mcp_token_replaces_the_old_only_once_the_start_worked() {
+        let state = crate::test_state("admin", Vec::new());
+        let tokens = state.mcp_tokens.as_ref();
+        const URL: &str = "http://127.0.0.1:23999/mcp";
+        let (first, none) = issue_agent_env(tokens, URL).await.unwrap();
+        assert!(none.is_empty());
+        assert_eq!(first.url, URL);
+        // An agent token does not expire; the next start replaces it.
+        let rows = tokens.list().await.unwrap();
+        assert_eq!(rows[0].expires_ms, None);
+
+        // A failed start revokes the new token and leaves the old one.
+        let (second, previous) = issue_agent_env(tokens, URL).await.unwrap();
+        assert_eq!(previous, std::slice::from_ref(&first.token_id));
+        settle_agent_tokens(tokens, &second, &previous, false).await;
+        assert!(tokens.resolve(&first.token).await.unwrap().live().is_some());
+        assert!(tokens
+            .resolve(&second.token)
+            .await
+            .unwrap()
+            .live()
+            .is_none());
+
+        // A good start retires the earlier tokens.
+        let (third, previous) = issue_agent_env(tokens, URL).await.unwrap();
+        assert_eq!(previous, std::slice::from_ref(&first.token_id));
+        settle_agent_tokens(tokens, &third, &previous, true).await;
+        assert!(tokens.resolve(&first.token).await.unwrap().live().is_none());
+        assert!(tokens.resolve(&third.token).await.unwrap().live().is_some());
+
+        // `launch_service` also passes both variables in the process env
+        // (sh exits 0 only if it sees them). `sh` has no `service set`, so
+        // those steps fail and are skipped.
+        let mut command = tokio::process::Command::new("sh");
+        command.args([
+            "-c",
+            "test \"$MUQUN_MCP_TOKEN\" = \"$1\" && test \"$MUQUN_MCP_URL\" = \"$2\"",
+            "opencode",
+            &third.token,
+            &third.url,
+        ]);
+        launch_service(command, Some(&third))
+            .await
+            .expect("env reaches the child");
     }
 
     #[tokio::test]
     async fn startup_reports_a_missing_executable() {
         let missing =
             std::env::temp_dir().join(format!("missing-opencode-{}", uuid::Uuid::new_v4()));
-        let err = launch_service(tokio::process::Command::new(missing))
+        let err = launch_service(tokio::process::Command::new(missing), None)
             .await
             .expect_err("missing binary");
         assert!(
@@ -1558,7 +1790,12 @@ mod tests {
         )
         .unwrap();
 
-        launch_service(service.command().into())
+        let mcp = McpEnv {
+            token_id: "t".into(),
+            token: "private-test-token".into(),
+            url: "http://127.0.0.1:1/mcp".into(),
+        };
+        launch_service(service.command().into(), Some(&mcp))
             .await
             .expect("start private service");
         let registration_path = service.root.join("state/opencode/service.json");
@@ -1569,6 +1806,9 @@ mod tests {
         assert!(environment
             .split(|byte| *byte == 0)
             .any(|entry| entry == b"MUQUN_STARTUP_TEST=saved-service-env"));
+        assert!(environment
+            .split(|byte| *byte == 0)
+            .any(|entry| entry == b"MUQUN_MCP_TOKEN=private-test-token"));
         let endpoint = OpencodeEndpoint {
             url: first.url.clone(),
             password: first.password,
@@ -1577,7 +1817,7 @@ mod tests {
         };
         assert!(endpoint.probe_healthy(&probe_client()).await);
 
-        launch_service(service.command().into())
+        launch_service(service.command().into(), None)
             .await
             .expect("reuse private service");
         let second: super::super::adapters::opencode::OpencodeServiceRegistration =

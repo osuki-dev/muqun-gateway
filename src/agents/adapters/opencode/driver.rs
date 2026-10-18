@@ -484,8 +484,17 @@ impl AgentPort for OpencodeDriver {
     fn get_session<'a>(&'a self, session_id: &'a str) -> AgentFuture<'a, AgentSessionInfo> {
         Box::pin(async move {
             let raw = self.client.get_session(session_id).await?;
-            mapper::map_session(&raw)
-                .ok_or_else(|| AgentError::SessionNotFound(session_id.to_string()))
+            let mut info = mapper::map_session(&raw)
+                .ok_or_else(|| AgentError::SessionNotFound(session_id.to_string()))?;
+            // A failed session's reason is on its failed message only.
+            if info.status == crate::agents::domain::AgentSessionStatus::Failed
+                && info.error.is_none()
+            {
+                if let Ok(messages) = self.client.get_messages(session_id, 5).await {
+                    info.error = mapper::last_failure(&messages);
+                }
+            }
+            Ok(info)
         })
     }
 
@@ -506,6 +515,61 @@ impl AgentPort for OpencodeDriver {
             self.client
                 .send_prompt(session_id, text, attachments, delivery)
                 .await?;
+            Ok(())
+        })
+    }
+
+    fn adds_mcp_servers(&self) -> bool {
+        true
+    }
+
+    fn set_session_instruction<'a>(
+        &'a self,
+        session_id: &'a str,
+        key: &'a str,
+        text: &'a str,
+    ) -> AgentFuture<'a, bool> {
+        Box::pin(async move {
+            self.client
+                .set_session_instruction(session_id, key, text)
+                .await
+        })
+    }
+
+    fn remove_session_instruction<'a>(
+        &'a self,
+        session_id: &'a str,
+        key: &'a str,
+    ) -> AgentFuture<'a, ()> {
+        Box::pin(async move {
+            self.client
+                .remove_session_instruction(session_id, key)
+                .await
+        })
+    }
+
+    fn mcp_server_connected<'a>(
+        &'a self,
+        name: &'a str,
+        directory: Option<&'a str>,
+    ) -> AgentFuture<'a, bool> {
+        Box::pin(async move {
+            let servers = self.client.get_mcp(directory).await?;
+            Ok(servers.iter().any(|server| {
+                server.get("name").and_then(Value::as_str) == Some(name)
+                    && server.pointer("/status/status").and_then(Value::as_str) == Some("connected")
+            }))
+        })
+    }
+
+    fn add_mcp_server<'a>(
+        &'a self,
+        name: &'a str,
+        config: &'a Value,
+        directory: Option<&'a str>,
+    ) -> AgentFuture<'a, ()> {
+        Box::pin(async move {
+            self.client.add_mcp_server(name, config, directory).await?;
             Ok(())
         })
     }

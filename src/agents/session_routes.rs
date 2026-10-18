@@ -1,6 +1,7 @@
 //! Multiplexer session agent HTTP routes: task orchestration, agent dispatch,
 //! prompt delivery, approval responses, and agent event history.
 
+use std::collections::BTreeMap;
 use std::path::{Path as FsPath, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -18,15 +19,15 @@ use super::agent_events;
 use super::approvals;
 use super::tasks;
 use crate::{
-    api_error, approval_data, backend_agent_list, backend_api_error, content_envelope,
-    find_session, interrupt_pane, is_scannable_root, pane_agent_and_root,
+    api_error, approval_data, backend_agent_list, backend_api_error, backend_api_parts,
+    content_envelope, find_session, interrupt_pane, is_scannable_root, pane_agent_and_root,
     platform::i18n,
     read_pane_approval, read_pane_visible_text, require_device, send_pane_keys,
     session_asset_roots,
     terminal::{backend, native, shortcuts},
     terminal_backend, validate_agent_args, validate_text, ApiResult, AppState, BackendCreateTab,
     BackendCreateWorkspace, BackendError, BackendPaneId, BackendSplitDirection, BackendSplitPane,
-    BackendStartAgent, BackendWorkspaceId, BackendWorktreeRequest, Pane, SessionConfig,
+    BackendStartAgent, BackendWorkspaceId, BackendWorktreeRequest, Pane, PaneEnvVia, SessionConfig,
     MAX_WORKSPACE_LABEL_CHARS,
 };
 
@@ -321,6 +322,8 @@ pub(crate) async fn create_task(
     }
 
     let mut steps = tasks::StepLog::new();
+    let agent_env = state.config.agent_env.usable();
+    let pane_env = pane_env(&agent_env);
     let label = body
         .workspace_label
         .clone()
@@ -328,13 +331,29 @@ pub(crate) async fn create_task(
 
     let place = match body.branch_name.as_deref() {
         Some(branch) => {
-            match prepare_worktree(&session, &repo_path, branch, label.as_deref(), &mut steps).await
+            match prepare_worktree(
+                &session,
+                &repo_path,
+                branch,
+                label.as_deref(),
+                &pane_env,
+                &mut steps,
+            )
+            .await
             {
                 Ok(place) => place,
                 Err(err) => return Ok(task_failure(err, &steps)),
             }
         }
-        None => match prepare_workspace(&session, &repo_path, label.as_deref(), &mut steps).await {
+        None => match prepare_workspace(
+            &session,
+            &repo_path,
+            label.as_deref(),
+            &pane_env,
+            &mut steps,
+        )
+        .await
+        {
             Ok(place) => place,
             Err(err) => return Ok(task_failure(err, &steps)),
         },
@@ -355,13 +374,30 @@ pub(crate) async fn create_task(
 
     let mut prompt_target = place.pane_id.clone();
     let agent_command = tasks::agent_command(&body.agent, &state.config.agent_commands);
+    let agent_cwd = place
+        .worktree_path
+        .as_deref()
+        .map(FsPath::new)
+        .unwrap_or(&repo_path);
+    let mut agent_args = tasks::agent_launch_args(
+        &body.agent,
+        &trusted_folders(&state, Some(agent_cwd)),
+        &state.config.agent_launch_args,
+    );
+    agent_args.extend(body.agent_args.iter().flatten().cloned());
+    trust_claude_folder(&state, &body.agent, Some(agent_cwd)).await;
     match start_backend_agent(
         &session,
         &place.pane_id,
         &body.agent,
         &agent_command,
-        body.agent_args.as_deref().unwrap_or_default(),
+        &agent_args,
         timeout_ms,
+        if place.env_applied {
+            BTreeMap::new()
+        } else {
+            agent_env
+        },
     )
     .await
     {
@@ -374,6 +410,12 @@ pub(crate) async fn create_task(
                     "argv": value.pointer("/result/argv").cloned()
                 }),
             );
+            if value.pointer("/result/env_applied") == Some(&json!(false)) {
+                steps.skipped(
+                    "env",
+                    "this terminal backend could not give agent_env to the agent's pane",
+                );
+            }
             payload["agent_started"] = json!(true);
             if let Some(target) = value.pointer("/result/target").and_then(Value::as_str) {
                 prompt_target = target.to_owned();
@@ -482,28 +524,224 @@ pub(crate) async fn spawn_agent(
         }
     };
 
-    let mut steps = tasks::StepLog::new();
-    let place = spawn_place(&session, body.tab_id.as_deref(), cwd.as_deref(), &mut steps).await?;
+    let launched = launch_agent(
+        &state,
+        &session,
+        &body.agent,
+        cwd.as_deref(),
+        body.tab_id.as_deref(),
+        body.prompt.as_deref(),
+    )
+    .await?;
+    Ok(task_partial(launched.payload, &launched.steps))
+}
 
-    let mut payload = json!({
-        "session_id": session_id,
+/// What [`launch_agent`] made: the spawn route's answer, before its steps
+/// are folded in, and the steps themselves.
+pub(crate) struct AgentLaunch {
+    pub(crate) payload: Value,
+    pub(crate) steps: tasks::StepLog,
+}
+
+/// The first half of [`launch_agent`]: the pane exists, nothing runs in it
+/// yet.
+#[derive(Clone)]
+pub(crate) struct PlacedAgent {
+    pub(crate) place: SpawnPlace,
+    pub(crate) payload: Value,
+    pub(crate) steps: tasks::StepLog,
+}
+
+/// The spawn route after its checks: a pane (a split of `tab_id`, or a tab
+/// of its own), the agent started in it with its launch arguments and
+/// `agent_env`, and `prompt` given to it -- on its command line where the
+/// agent and the backend allow (see [`start_agent_in_place`]), else typed and
+/// submitted once it is up. Shared with the task
+/// ledger's terminal delegations (`TaskService::delegate`), so both start an
+/// agent the same way. An `Err` means nothing was created; a failed agent or
+/// prompt step leaves the pane and says so in `steps`.
+pub(crate) async fn launch_agent(
+    state: &AppState,
+    session: &SessionConfig,
+    agent: &str,
+    cwd: Option<&str>,
+    tab_id: Option<&str>,
+    prompt: Option<&str>,
+) -> ApiResult<AgentLaunch> {
+    let placed = place_agent(state, session, agent, cwd, tab_id).await?;
+    Ok(start_placed_agent(state, session, agent, cwd, placed, prompt).await)
+}
+
+/// [`launch_agent`]'s pane: made in about the time one backend call takes,
+/// so a caller can answer with it before the agent is up.
+pub(crate) async fn place_agent(
+    state: &AppState,
+    session: &SessionConfig,
+    agent: &str,
+    cwd: Option<&str>,
+    tab_id: Option<&str>,
+) -> Result<PlacedAgent, PlaceAgentError> {
+    let mut steps = tasks::StepLog::new();
+    let agent_env = state.config.agent_env.usable();
+    let pane_env = pane_env(&agent_env);
+    let place = spawn_place(session, tab_id, cwd, &pane_env, &mut steps).await?;
+    let payload = json!({
+        "session_id": session.id,
         "pane_id": place.pane_id,
         "tab_id": place.tab_id,
-        "agent": body.agent,
+        "agent": agent,
         "cwd": cwd,
         "agent_started": false,
         "prompt_submitted": false,
     });
+    Ok(PlacedAgent {
+        place,
+        payload,
+        steps,
+    })
+}
 
+/// Why [`place_agent`] made no pane. A caller that answers HTTP converts it
+/// with `?` (or [`From`]) and gets the spawn route's status, code and message;
+/// one that does not matches on it instead of reading that answer back.
+#[derive(Debug)]
+pub(crate) enum PlaceAgentError {
+    /// The `tab_id` asked for names a tab with no pane to split.
+    TabNotFound,
+    /// The backend made the tab but did not list a pane in it.
+    PaneNotReported,
+    /// The backend refused or failed a pane call.
+    Backend(BackendError),
+}
+
+impl PlaceAgentError {
+    /// The status, wire code and caller-safe message this is answered with.
+    fn api_parts(&self) -> (StatusCode, &'static str, &str) {
+        match self {
+            Self::TabNotFound => (
+                StatusCode::NOT_FOUND,
+                "tab_not_found",
+                "that tab has no pane to split",
+            ),
+            Self::PaneNotReported => (
+                StatusCode::BAD_GATEWAY,
+                "backend_malformed_response",
+                "terminal backend did not return the created pane",
+            ),
+            Self::Backend(error) => backend_api_parts(error),
+        }
+    }
+}
+
+impl std::fmt::Display for PlaceAgentError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.api_parts().2)
+    }
+}
+
+impl From<BackendError> for PlaceAgentError {
+    fn from(error: BackendError) -> Self {
+        Self::Backend(error)
+    }
+}
+
+impl From<PlaceAgentError> for (StatusCode, Json<Value>) {
+    fn from(error: PlaceAgentError) -> Self {
+        match error {
+            // Logs the adapter's diagnostic as every backend answer does.
+            PlaceAgentError::Backend(error) => backend_api_error(error),
+            other => {
+                let (status, code, message) = other.api_parts();
+                api_error(status, code, message)
+            }
+        }
+    }
+}
+
+/// [`launch_agent`]'s second half: start the agent in the placed pane with
+/// `prompt`, typing it once the agent is up when it could not go on the
+/// command line. Takes as long as the agent takes to start.
+pub(crate) async fn start_placed_agent(
+    state: &AppState,
+    session: &SessionConfig,
+    agent: &str,
+    cwd: Option<&str>,
+    placed: PlacedAgent,
+    prompt: Option<&str>,
+) -> AgentLaunch {
+    let (mut launch, started) =
+        start_agent_in_place(state, session, agent, cwd, placed, prompt, false).await;
+    if let Some(started) = started {
+        type_agent_prompt(session, &started, prompt, &mut launch).await;
+    }
+    launch
+}
+
+/// Where a started agent takes its prompt.
+pub(crate) struct StartedAgent {
+    pane_id: String,
+    prompt_target: String,
+}
+
+/// Start the agent in the placed pane. Claude Code and Codex get `prompt`
+/// as their command line's last argument (`-- <prompt>`) on a backend that
+/// takes one: a goal typed into a TUI's input box can sit there unsent. Any
+/// other agent, or backend, is handed back to have it typed
+/// ([`type_agent_prompt`]).
+///
+/// Beside the launch, the agent when it started and its prompt (if any) is
+/// still to be typed; `None` when it did not start or its prompt went with it
+/// (the launch's steps say which).
+pub(crate) async fn start_agent_in_place(
+    state: &AppState,
+    session: &SessionConfig,
+    agent: &str,
+    cwd: Option<&str>,
+    placed: PlacedAgent,
+    prompt: Option<&str>,
+    for_task: bool,
+) -> (AgentLaunch, Option<StartedAgent>) {
+    let PlacedAgent {
+        place,
+        mut payload,
+        mut steps,
+    } = placed;
+    let agent_env = state.config.agent_env.usable();
     let mut prompt_target = place.pane_id.clone();
-    let agent_command = tasks::agent_command(&body.agent, &state.config.agent_commands);
+    let agent_command = tasks::agent_command(agent, &state.config.agent_commands);
+    // Without a `cwd` the agent runs wherever the new pane opened, which
+    // the backend reports; Codex needs it to pre-trust the folder.
+    let agent_cwd = cwd.map(PathBuf::from).or(place.cwd.clone());
+    let mut agent_args = tasks::agent_launch_args(
+        agent,
+        &trusted_folders(state, agent_cwd.as_deref()),
+        &state.config.agent_launch_args,
+    );
+    // The muqun server for the agent's own process, never its config.
+    agent_args.extend(crate::mcp::inject::terminal_args(&state.config, agent).await);
+    // A task's agent is told, out of band, how to report the task's end.
+    if for_task {
+        agent_args.extend(crate::mcp::inject::terminal_task_args(&state.config, agent).await);
+    }
+    let launch_prompt = prompt
+        .filter(|_| terminal_backend(session).takes_launch_prompt())
+        .and_then(|prompt| Some((prompt, tasks::launch_prompt_args(agent, prompt)?)));
+    if let Some((_, args)) = &launch_prompt {
+        agent_args.extend(args.iter().cloned());
+    }
+    trust_claude_folder(state, agent, agent_cwd.as_deref()).await;
     match start_backend_agent(
-        &session,
+        session,
         &place.pane_id,
-        &body.agent,
+        agent,
         &agent_command,
-        &[],
+        &agent_args,
         tasks::DEFAULT_AGENT_START_TIMEOUT_MS,
+        if place.env_applied {
+            BTreeMap::new()
+        } else {
+            agent_env
+        },
     )
     .await
     {
@@ -511,11 +749,17 @@ pub(crate) async fn spawn_agent(
             steps.ok(
                 "agent",
                 json!({
-                    "kind": body.agent,
+                    "kind": agent,
                     "pane_id": place.pane_id,
                     "argv": value.pointer("/result/argv").cloned()
                 }),
             );
+            if value.pointer("/result/env_applied") == Some(&json!(false)) {
+                steps.skipped(
+                    "env",
+                    "this terminal backend could not give agent_env to the agent's pane",
+                );
+            }
             payload["agent_started"] = json!(true);
             if let Some(target) = value.pointer("/result/target").and_then(Value::as_str) {
                 prompt_target = target.to_owned();
@@ -529,11 +773,32 @@ pub(crate) async fn spawn_agent(
             steps.failed("agent", err.code(), &err.message());
             // The pane is real and the user can type in it, so this is a 207
             // rather than an error that implies nothing was created.
-            return Ok(task_partial(payload, &steps));
+            return (AgentLaunch { payload, steps }, None);
         }
     }
+    if let Some((prompt, _)) = launch_prompt {
+        steps.ok("prompt", json!({ "bytes": prompt.len(), "via": "argv" }));
+        payload["prompt_submitted"] = json!(true);
+        return (AgentLaunch { payload, steps }, None);
+    }
+    let started = StartedAgent {
+        pane_id: place.pane_id,
+        prompt_target,
+    };
+    (AgentLaunch { payload, steps }, Some(started))
+}
 
-    match body.prompt.as_deref() {
+/// Type `prompt` into a started agent, retrying until it is ready, and
+/// submit it; recorded in `launch`.
+pub(crate) async fn type_agent_prompt(
+    session: &SessionConfig,
+    started: &StartedAgent,
+    prompt: Option<&str>,
+    launch: &mut AgentLaunch,
+) {
+    let AgentLaunch { payload, steps } = launch;
+    let prompt_target = &started.prompt_target;
+    match prompt {
         None => steps.skipped("prompt", "no prompt was given"),
         Some(prompt) => {
             // An agent that has just been launched is not a named agent yet --
@@ -550,14 +815,14 @@ pub(crate) async fn spawn_agent(
                 if attempt > 0 {
                     tokio::time::sleep(SPAWN_PROMPT_INTERVAL).await;
                 }
-                submitted = submit_agent_prompt(&session, &prompt_target, prompt).await;
+                submitted = submit_agent_prompt(session, prompt_target, prompt).await;
                 if !submitted.as_ref().is_err_and(|err| err.can_retry_prompt()) {
                     break;
                 }
             }
             match submitted {
                 Ok(_) => {
-                    schedule_submit_keypress(session.clone(), place.pane_id.clone());
+                    schedule_submit_keypress(session.clone(), started.pane_id.clone());
                     steps.ok("prompt", json!({ "bytes": prompt.len() }));
                     payload["prompt_submitted"] = json!(true);
                 }
@@ -565,8 +830,6 @@ pub(crate) async fn spawn_agent(
             }
         }
     }
-
-    Ok(task_partial(payload, &steps))
 }
 
 pub(crate) async fn agents(
@@ -820,9 +1083,40 @@ pub(crate) async fn answer_pane_approval(
 }
 
 /// Where a spawned agent will run.
+/// `agent_env` in the shape pane creation takes; `None` when there is none,
+/// so a backend without pane environments is never asked for one.
+type PaneEnv = Option<serde_json::Map<String, Value>>;
+
+fn pane_env(env: &BTreeMap<String, String>) -> PaneEnv {
+    (!env.is_empty()).then(|| {
+        env.iter()
+            .map(|(key, value)| (key.clone(), Value::String(value.clone())))
+            .collect()
+    })
+}
+
+#[derive(Clone)]
 pub(crate) struct SpawnPlace {
     pub(crate) pane_id: String,
     pub(crate) tab_id: Option<String>,
+    /// The new pane's working directory, as the backend reports it.
+    pub(crate) cwd: Option<PathBuf>,
+    /// Whether the pane was created with `agent_env` (see [`TaskPlace`]).
+    pub(crate) env_applied: bool,
+}
+
+/// What to pass as `env` when creating a pane `via` this call, and whether
+/// the variables will reach it. A backend that cannot set them there -- tmux
+/// older than 3.2 for a session, 3.0 for a window or split -- gets no `env`,
+/// and the agent's launch carries them instead.
+async fn pane_env_for(session: &SessionConfig, via: PaneEnvVia, env: &PaneEnv) -> (PaneEnv, bool) {
+    let Some(env) = env else {
+        return (None, true);
+    };
+    match terminal_backend(session).applies_pane_env(via).await {
+        Ok(true) => (Some(env.clone()), true),
+        _ => (None, false),
+    }
 }
 
 /// Make somewhere for the agent to run: a split of the named tab, or a tab of
@@ -836,12 +1130,13 @@ async fn spawn_place(
     session: &SessionConfig,
     tab_id: Option<&str>,
     cwd: Option<&str>,
+    env: &PaneEnv,
     steps: &mut tasks::StepLog,
-) -> ApiResult<SpawnPlace> {
+) -> Result<SpawnPlace, PlaceAgentError> {
     let Some(tab_id) = tab_id else {
-        return spawn_in_new_tab(session, cwd, None, steps).await;
+        return spawn_in_new_tab(session, cwd, None, env, steps).await;
     };
-    spawn_beside(session, tab_id, cwd, steps).await
+    spawn_beside(session, tab_id, cwd, env, steps).await
 }
 
 /// A task that asked for no particular tab, and the fallback for one whose tab
@@ -850,8 +1145,10 @@ async fn spawn_in_new_tab(
     session: &SessionConfig,
     cwd: Option<&str>,
     workspace_id: Option<&str>,
+    env: &PaneEnv,
     steps: &mut tasks::StepLog,
-) -> ApiResult<SpawnPlace> {
+) -> Result<SpawnPlace, PlaceAgentError> {
+    let (env, env_applied) = pane_env_for(session, PaneEnvVia::Tab, env).await;
     let backend = terminal_backend(session);
     let tab = backend
         .create_tab(&BackendCreateTab {
@@ -859,26 +1156,24 @@ async fn spawn_in_new_tab(
             cwd: cwd.map(PathBuf::from),
             label: None,
             focus: false,
+            env,
         })
-        .await
-        .map_err(backend_api_error)?;
-    let pane_id = backend
+        .await?;
+    let pane = backend
         .list_panes()
-        .await
-        .map_err(backend_api_error)?
+        .await?
         .into_iter()
         .find(|pane| pane.tab_id == tab.id)
-        .map(|pane| pane.id.as_str().to_owned())
-        .ok_or_else(|| {
-            api_error(
-                StatusCode::BAD_GATEWAY,
-                "backend_malformed_response",
-                "terminal backend did not return the created pane",
-            )
-        })?;
+        .ok_or(PlaceAgentError::PaneNotReported)?;
+    let pane_id = pane.id.as_str().to_owned();
     let tab_id = Some(tab.id.as_str().to_owned());
     steps.ok("pane", json!({ "pane_id": pane_id, "tab_id": tab_id }));
-    Ok(SpawnPlace { pane_id, tab_id })
+    Ok(SpawnPlace {
+        pane_id,
+        tab_id,
+        cwd: pane.cwd,
+        env_applied,
+    })
 }
 
 /// A task placed beside what the reader was already looking at.
@@ -886,15 +1181,12 @@ async fn spawn_beside(
     session: &SessionConfig,
     tab_id: &str,
     cwd: Option<&str>,
+    env: &PaneEnv,
     steps: &mut tasks::StepLog,
-) -> ApiResult<SpawnPlace> {
-    let host = pane_in_tab(session, tab_id).await.ok_or_else(|| {
-        api_error(
-            StatusCode::NOT_FOUND,
-            "tab_not_found",
-            "that tab has no pane to split",
-        )
-    })?;
+) -> Result<SpawnPlace, PlaceAgentError> {
+    let host = pane_in_tab(session, tab_id)
+        .await
+        .ok_or(PlaceAgentError::TabNotFound)?;
     // Repeated downward splits can leave an assistant only five rows tall:
     // even its own transcript no longer renders the response there. Keep a
     // normal 24-row terminal for both halves, or use a background tab in the
@@ -904,7 +1196,7 @@ async fn spawn_beside(
             "split",
             "not enough terminal rows; using a tab in the same workspace",
         );
-        return spawn_in_new_tab(session, cwd, Some(host.workspace_id.as_str()), steps).await;
+        return spawn_in_new_tab(session, cwd, Some(host.workspace_id.as_str()), env, steps).await;
     }
     // A split that Ghostty refuses -- a tab already carrying as many panes as
     // its layout will hold, which is the ordinary state of a tab someone works
@@ -912,13 +1204,14 @@ async fn spawn_beside(
     // the request was "start this agent". So a refusal falls back to a tab of
     // its own, recorded as such rather than passed off as the split that was
     // asked for.
+    let (split_env, env_applied) = pane_env_for(session, PaneEnvVia::Split, env).await;
     let split = terminal_backend(session)
         .split_pane(&BackendSplitPane {
             pane_id: host.id.clone(),
             direction: BackendSplitDirection::Down,
             ratio: None,
             cwd: cwd.map(PathBuf::from),
-            env: None,
+            env: split_env,
         })
         .await;
     let pane = match split {
@@ -928,7 +1221,8 @@ async fn spawn_beside(
                 "split",
                 &format!("{err} -- starting in a tab of its own instead"),
             );
-            return spawn_in_new_tab(session, cwd, Some(host.workspace_id.as_str()), steps).await;
+            return spawn_in_new_tab(session, cwd, Some(host.workspace_id.as_str()), env, steps)
+                .await;
         }
     };
     let pane_id = pane.id.as_str().to_owned();
@@ -939,6 +1233,8 @@ async fn spawn_beside(
     Ok(SpawnPlace {
         pane_id,
         tab_id: Some(tab_id.to_owned()),
+        cwd: pane.cwd,
+        env_applied,
     })
 }
 
@@ -963,6 +1259,9 @@ pub(crate) struct TaskPlace {
     pub(crate) pane_id: String,
     pub(crate) worktree_path: Option<String>,
     pub(crate) reused: bool,
+    /// Whether the pane was created with `agent_env`. A worktree pane Herdr
+    /// made or reopened was not, so the variables have to ride the launch.
+    pub(crate) env_applied: bool,
 }
 
 /// The no-branch case: a workspace on the repo as it stands.
@@ -970,15 +1269,18 @@ async fn prepare_workspace(
     session: &SessionConfig,
     repo_path: &FsPath,
     label: Option<&str>,
+    env: &PaneEnv,
     steps: &mut tasks::StepLog,
 ) -> Result<TaskPlace, HerdrCallError> {
     steps.skipped("worktree", "no branch_name was given");
+    let (env, env_applied) = pane_env_for(session, PaneEnvVia::Workspace, env).await;
     let backend = terminal_backend(session);
     let workspace = match backend
         .create_workspace(&BackendCreateWorkspace {
             cwd: Some(repo_path.to_owned()),
             label: label.map(str::to_owned),
             focus: false,
+            env,
         })
         .await
     {
@@ -1001,6 +1303,7 @@ async fn prepare_workspace(
         pane_id: pane.id.as_str().to_owned(),
         worktree_path: None,
         reused: false,
+        env_applied,
     };
     steps.ok(
         "workspace",
@@ -1022,6 +1325,7 @@ async fn prepare_worktree(
     repo_path: &FsPath,
     branch: &str,
     label: Option<&str>,
+    env: &PaneEnv,
     steps: &mut tasks::StepLog,
 ) -> Result<TaskPlace, HerdrCallError> {
     let backend = terminal_backend(session);
@@ -1054,6 +1358,7 @@ async fn prepare_worktree(
                     pane_id: placement.pane_id.as_str().to_owned(),
                     worktree_path: Some(path.clone()),
                     reused: true,
+                    env_applied: false,
                 };
                 steps.ok(
                     "worktree",
@@ -1082,6 +1387,7 @@ async fn prepare_worktree(
                 pane_id: placement.pane_id.as_str().to_owned(),
                 worktree_path: path.clone(),
                 reused: false,
+                env_applied: false,
             };
             steps.ok(
                 "worktree",
@@ -1094,7 +1400,7 @@ async fn prepare_worktree(
             Ok(place)
         }
         Err(BackendError::Unsupported(_)) => {
-            prepare_worktree_with_git(session, repo_path, branch, label, steps).await
+            prepare_worktree_with_git(session, repo_path, branch, label, env, steps).await
         }
         Err(err) => {
             let err = backend_call_error("worktree.create", err);
@@ -1112,6 +1418,7 @@ async fn prepare_worktree_with_git(
     repo_path: &FsPath,
     branch: &str,
     label: Option<&str>,
+    env: &PaneEnv,
     steps: &mut tasks::StepLog,
 ) -> Result<TaskPlace, HerdrCallError> {
     let repo = repo_path.to_owned();
@@ -1148,12 +1455,14 @@ async fn prepare_worktree_with_git(
         json!({ "path": path, "branch": branch, "reused": !added.created }),
     );
 
+    let (env, env_applied) = pane_env_for(session, PaneEnvVia::Workspace, env).await;
     let backend = terminal_backend(session);
     let created = match backend
         .create_workspace(&BackendCreateWorkspace {
             cwd: Some(PathBuf::from(&path)),
             label: label.map(str::to_owned),
             focus: false,
+            env,
         })
         .await
     {
@@ -1169,6 +1478,7 @@ async fn prepare_worktree_with_git(
                 pane_id: pane.id.as_str().to_owned(),
                 worktree_path: Some(path.clone()),
                 reused: !added.created,
+                env_applied,
             })
             .ok_or_else(|| HerdrCallError::malformed("workspace.create")),
     };
@@ -1304,6 +1614,44 @@ pub(crate) async fn submit_agent_prompt(
         })
 }
 
+/// The folders an agent started in `cwd` is told to trust on its command
+/// line (Codex's `-c projects=…`): none with `agent_trust_folders` off, else
+/// [`tasks::trusted_folders`], bounded to the user's home.
+fn trusted_folders(state: &AppState, cwd: Option<&FsPath>) -> Vec<PathBuf> {
+    match (state.config.agent_trust_folders, cwd, dirs::home_dir()) {
+        (true, Some(cwd), Some(home)) => tasks::trusted_folders(cwd, &home),
+        _ => Vec::new(),
+    }
+}
+
+/// Claude Code's folder trust, which lives in its user config rather than
+/// in a flag (Codex's is in its launch arguments): set for `cwd` before
+/// `claude` starts there, unless `agent_trust_folders` is off. Bounded by
+/// [`tasks::trust_folder_for_claude`].
+async fn trust_claude_folder(state: &AppState, agent: &str, cwd: Option<&FsPath>) {
+    let (Some(cwd), Some(home), "claude", true) = (
+        cwd,
+        dirs::home_dir(),
+        agent,
+        state.config.agent_trust_folders,
+    ) else {
+        return;
+    };
+    // Where the agent's Claude Code reads it: its `agent_env`, then ours.
+    let config_dir = state
+        .config
+        .agent_env
+        .usable()
+        .remove("CLAUDE_CONFIG_DIR")
+        .or_else(|| std::env::var("CLAUDE_CONFIG_DIR").ok());
+    let config = tasks::claude_config_file(config_dir.as_deref(), &home);
+    let cwd = cwd.to_path_buf();
+    let trust = move || tasks::trust_folder_for_claude(&config, &home, &cwd);
+    if let Err(error) = tokio::task::spawn_blocking(trust).await {
+        tracing::debug!(%error, "claude folder trust skipped");
+    }
+}
+
 async fn start_backend_agent(
     session: &SessionConfig,
     pane_id: &str,
@@ -1311,6 +1659,7 @@ async fn start_backend_agent(
     command: &str,
     args: &[String],
     timeout_ms: u64,
+    env: BTreeMap<String, String>,
 ) -> Result<Value, HerdrCallError> {
     let started = terminal_backend(session)
         .start_agent(&BackendStartAgent {
@@ -1320,12 +1669,16 @@ async fn start_backend_agent(
             executable: tasks::find_on_path(command),
             args: args.to_vec(),
             timeout_ms,
+            env,
         })
         .await
         .map_err(|err| backend_call_error("agent.start", err))?;
-    Ok(
-        json!({ "result": { "argv": started.argv, "instance_id": started.instance_id, "target": started.target } }),
-    )
+    Ok(json!({ "result": {
+        "argv": started.argv,
+        "instance_id": started.instance_id,
+        "target": started.target,
+        "env_applied": started.env_applied,
+    } }))
 }
 
 /// Belt and braces for a paste-vs-keypress race in agent TUIs: when the prompt
@@ -1735,7 +2088,24 @@ fn decision_named(name: &str) -> ApiResult<approvals::Decision> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agents::tasks;
     use crate::*;
+
+    #[test]
+    fn folder_trust_off_trusts_no_folder() {
+        // This checkout: inside home wherever the tests run from one.
+        let cwd = FsPath::new(env!("CARGO_MANIFEST_DIR"));
+        let inside_home = dirs::home_dir().is_some_and(|home| {
+            let (cwd, home) = (cwd.canonicalize().unwrap(), home.canonicalize().unwrap());
+            cwd != home && cwd.starts_with(home)
+        });
+        for (trust_folders, trusted) in [(false, false), (true, inside_home)] {
+            let mut state = test_state("admin", Vec::new());
+            state.config.agent_trust_folders = trust_folders;
+            let folders = trusted_folders(&state, Some(cwd));
+            assert_eq!(!folders.is_empty(), trusted, "{trust_folders}");
+        }
+    }
 
     #[test]
     fn agent_splits_preserve_a_readable_terminal() {

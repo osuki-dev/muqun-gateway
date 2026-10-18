@@ -12,11 +12,14 @@ use serde_json::Value;
 pub(crate) mod agents;
 pub(crate) mod cli;
 pub(crate) mod connectivity;
+pub(crate) mod fleet;
+pub(crate) mod mcp;
 pub(crate) mod platform;
+pub(crate) mod tasks;
 pub(crate) mod terminal;
 
 // Backward-compatible re-exports at crate root
-pub(crate) use agents::{agent_events, approvals, tasks};
+pub(crate) use agents::{agent_events, approvals};
 pub(crate) use cli::*;
 pub(crate) use connectivity::push::*;
 pub(crate) use connectivity::{authority, gateway_listener, transport};
@@ -37,10 +40,10 @@ pub(crate) use terminal::{
     supervision,
 };
 
-use authority::{hash_token, identify_device, DeviceRecord, PendingPairing};
+use authority::{hash_token, identify_device, DeviceKind, DeviceRecord, PendingPairing};
 use backend::{
     BackendError, CreateTab as BackendCreateTab, CreateWorkspace as BackendCreateWorkspace,
-    OutputFormat as BackendOutputFormat, OutputSource as BackendOutputSource, Pane,
+    OutputFormat as BackendOutputFormat, OutputSource as BackendOutputSource, Pane, PaneEnvVia,
     PaneId as BackendPaneId, ReadPane as BackendReadPane, SendTextMode as BackendSendTextMode,
     SplitDirection as BackendSplitDirection, SplitPane as BackendSplitPane,
     StartAgent as BackendStartAgent, TabId as BackendTabId, WorkspaceId as BackendWorkspaceId,
@@ -90,6 +93,21 @@ pub(crate) struct AppState {
     /// resolved for a client, so the asset content route can serve them. See
     /// `agents::message_images`.
     pub(crate) message_images: Arc<agents::message_images::MessageImages>,
+    /// The shared SQLite store, for tests that build a store of their own on
+    /// it. The gateway hands it to each domain's store at composition and
+    /// never reads it back. See `platform::store::sqlite`.
+    #[cfg(test)]
+    pub(crate) db: Arc<platform::store::sqlite::SqliteStore>,
+    /// The assistant tokens `/mcp` accepts, kept in `db`. See `mcp::tokens`.
+    pub(crate) mcp_tokens: Arc<dyn mcp::tokens::AssistantTokenStore>,
+    /// This machine's manifest and its cached toolchain probes. See `fleet`.
+    pub(crate) fleet: Arc<fleet::FleetService>,
+    /// The owner's other gateways and the accept switch. See `fleet::peers`.
+    pub(crate) peers: Arc<fleet::peers::PeerService>,
+    /// Tasks: delegated agent work and `exec.run` commands. See `tasks::service`.
+    pub(crate) tasks: Arc<tasks::service::TaskService>,
+    /// Every task change the service records, for the event socket.
+    pub(crate) task_events: tokio::sync::broadcast::Sender<tasks::events::TaskDomainEvent>,
 }
 
 /// A fresh instance generation. Opaque to clients: they compare it for

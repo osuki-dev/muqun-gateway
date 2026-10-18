@@ -301,6 +301,62 @@ advertised: an older gateway ignores the parameter.
 
 ---
 
+### Terminal agents launched for remote dispatch
+
+`POST /api/sessions/{id}/tasks` and `POST /api/sessions/{id}/spawn` start a
+CLI agent (Codex, Claude Code, ...) in a terminal pane. Whoever asked is on a
+phone and cannot answer an approval or a "trust this folder?" prompt in that
+pane, so these agents start with their own bypass flags by default:
+
+| Kind | Default launch arguments |
+|---|---|
+| `codex` | `--dangerously-bypass-approvals-and-sandbox -c projects={"<dir>"={trust_level="trusted"}, ...}` -- the task directory, its git checkout and, for a linked worktree, the main checkout, each only when strictly inside the user's home; left out with `"agent_trust_folders": false`. The path goes in the TOML value, not the key: Codex's `-c` splits keys on every `.`. The value replaces Codex's whole `projects` table for that run. |
+| `claude` | `--dangerously-skip-permissions` |
+| any other | none |
+
+Claude Code and Codex started this way also get the muqun MCP server on their
+launch line (`--mcp-config …`, `-c mcp_servers.muqun.…`) unless
+`mcp.inject_into_agents` is off; see [docs/mcp.md](mcp.md#host-setup). Their
+configuration files are not written for this (folder trust, below, is a
+separate write).
+
+`config.json` changes this per kind: a non-empty list replaces the defaults,
+an empty list turns them off. A task's own `agent_args` come after them.
+
+Claude Code keeps folder trust in its own config, not in a flag. Before
+`claude` starts in a directory, the gateway sets
+`projects["<dir>"].hasTrustDialogAccepted = true` in
+`$CLAUDE_CONFIG_DIR/.claude.json` (`CLAUDE_CONFIG_DIR` from `agent_env`, else
+the gateway's environment) or `~/.claude.json`. Only that key is written,
+other keys keep their values and order, and only for a directory strictly
+inside the user's home, named without `..`. It is on by default, as the
+owner's choice for agents started from their phone; `"agent_trust_folders":
+false` in `config.json` leaves that file alone and drops Codex's `-c projects=…`.
+
+```json
+{
+  "agent_launch_args": { "codex": [], "claude": ["--permission-mode", "acceptEdits"] },
+  "agent_env": { "HTTPS_PROXY": "http://127.0.0.1:7890", "HTTP_PROXY": "http://127.0.0.1:7890" }
+}
+```
+
+`agent_env` is for what the owner's interactive shell sets but the gateway's
+own environment (started by systemd or launchd) lacks -- typically a proxy,
+without which the agent fails with "Connection refused". The variables are set
+on the pane the agent starts in: tmux `-e KEY=VALUE` on `new-session` (tmux
+3.2+) and on `new-window` / `split-window` (3.0+), Herdr's `env` on
+`tab.create`, `workspace.create` and `pane.split`. When the backend cannot set
+a pane's environment -- an older tmux, or a worktree pane that Herdr's
+`worktree.create` / `worktree.open` made -- the variables go on the launch
+instead: tmux, which types the launch line itself, prefixes it with
+`env 'KEY=VALUE' ...` (so they also show in that pane's scrollback). Herdr's
+`agent.start` takes no environment, so there the task's `steps` record `env`
+as skipped. Names must be `[A-Za-z_][A-Za-z0-9_]*`; others are ignored with a
+warning naming the key. Values are never logged, but they are not secret from
+the host: `tmux -e KEY=VALUE` and the `env` prefix put them on a command line,
+which any local user can read in the process list while it runs. Put nothing
+in `agent_env` that must stay hidden from other accounts on the machine.
+
 ## Session lifecycle
 
 ### `GET /api/agent-sessions`
@@ -1305,6 +1361,47 @@ tail it cannot place.
 
 `?after=<seq>` → `{"items": [...], "status": "busy", "resync": false, "latest_seq": 42}`.
 
+### Task plumbing in the transcript
+
+A session a task is (or was) bound to ([docs/mcp.md](mcp.md#finishing-a-delegation))
+is served without the gateway's task plumbing -- on the snapshot, the
+timeline, the event replay, the SSE stream, `/api/ws` and `GET …/inbox`.
+Every other session is served as it is:
+
+- A user `text` row (or a `synthetic` row) that ends with the completion
+  instruction an older gateway sent with a goal (goals now go alone) is served
+  with the instruction cut, and is left out when it was only the instruction. Any wording the gateway has sent is recognised, by the
+  instruction's fixed opening (`When the whole task is finished, `) and its
+  closing placeholder line, never by the goal.
+- Each turn's last assistant message is served without the one marker the
+  task ledger read the turn's end from: over the message's `text` rows
+  joined, the last `MUQUN_TASK_DONE:` or `MUQUN_TASK_BLOCKED:` below any
+  restated instruction that starts a line (after bullets and markup) or
+  follows the agent's words on it, and is not a placeholder -- cut from the
+  marker to its line's end, the words before it kept -- unless it sits in a
+  code fence as rendered. Any other marker stays. A row left with nothing else is left out. While the
+  session runs a turn, a last line that can only be the start of a marker (or
+  is bare list or emphasis markup, such as `- `) is held back too, so the
+  marker never shows mid-turn. An `agent.timeline.upsert` whose rows are all
+  left with nothing arrives as `agent.timeline.removed` for them. `seq` keeps
+  counting, so a client may see a gap where a row was left out.
+- The agent's own `tasks.complete` call (under any host prefix, such as
+  `muqun_tasks_complete`) and the notice OpenCode leaves for the task's
+  per-session instruction (`Instructions updated: …muqun-task`) are left out.
+- OpenCode's Code Mode plumbing is left out: an `execute` tool row (held while
+  its code is not known yet and the turn runs) whose whole code is
+  `[return] search({query: '<string>'[, limit: <integer>]})[;]` for a muqun
+  tool (a query starting `muqun`, or naming `tasks.`, `fleet.` or
+  `exec.run`) and did not fail -- anything more is the agent's own work and
+  is shown -- and the notice whose first line is "The Code Mode tool catalog
+  has changed." followed only by the catalog listing.
+- An inbox item (`GET …/inbox`, the snapshot's `inbox`,
+  `agent.inbox.changed`) is cut the same way as a user row: OpenCode holds
+  the instruction there for a moment before the turn runs.
+
+The agent's own transcript, the mirror and the task follower keep the raw text
+(the marker is read from it); the task's `summary` is still the marker's line.
+
 ### WebSocket events: `GET /api/ws`
 
 One WebSocket per device carrying the agent events of **any number of
@@ -1424,9 +1521,11 @@ Server → client:
 | Frame | Meaning |
 |---|---|
 | `{"t":"hello","connection_id":"<uuid>","protocol":1,"generation":"<id>"}` | First frame, always. `generation` is the gateway instance generation (see Conventions); a client that finds it changed since its last socket is talking to a restarted gateway. Older gateways omit it. |
-| `{"t":"subscribed","asid":"ses_1"}` · `{"t":"subscribed","all":true}` | The subscription is in effect: every event published from here on reaches this socket. Start catch-up after this, not before. |
+| `{"t":"subscribed","asid":"ses_1"}` · `{"t":"subscribed","all":true}` · `{"t":"subscribed","tasks":true}` | The subscription is in effect: matching events published from here on reach this socket. Start catch-up after this, not before. |
 | `{"t":"event","asid":"ses_1","seq":12,"event":"agent.timeline.upsert","data":{…}}` | One domain event. `event` is the SSE `event:` name and `data` is the SSE `data:` payload **byte for byte**, embedded as JSON rather than as a string. `asid` and `seq` repeat the event's own (`asid` is `""` and `seq` 0 for `agent.worktree.changed` and `agent.resync`). |
-| `{"t":"resync","asid":"ses_1"}` | This socket fell behind the gateway's event backlog; refetch that session. `asid` `""` means every session. One per subscribed session, or a single `""` under `subscribe_all`. |
+| `{"t":"task","asid":null,"seq":12,"event":"task.updated","data":{…}}` | One full `TaskView` on a `subscribe_tasks` socket. |
+| `{"t":"defaults","default_cwd":"/home/user/project"}` | On a `subscribe_tasks` socket: the directory a task this device opens without `cwd` runs in (`"~"`, the home directory, when it has no usable previous one; `null` when unknown). See **Task updates** below. |
+| `{"t":"resync","asid":"ses_1"}` | This socket fell behind the gateway's event backlog; refetch that session. `asid` `""` means every session. One per subscribed session, or a single `""` under `subscribe_all`. With `"tasks":true` it is about task updates instead: refetch `GET /api/tasks`. |
 | `{"t":"pong"}` | Answer to `ping`. |
 | `{"t":"error","code":"…"}` | Sent immediately before the gateway closes the socket (close code 1008). |
 
@@ -1436,7 +1535,8 @@ Client → server:
 |---|---|
 | `{"t":"subscribe","asid":"ses_1"}` | Add a session. The id is not looked up, so subscribing to a session that does not exist yet is allowed, and a subscription survives the agent restarting. Idempotent. |
 | `{"t":"unsubscribe","asid":"ses_1"}` | Drop a session. No acknowledgement. |
-| `{"t":"subscribe_all"}` | Every session, for the life of the connection. `unsubscribe` does not narrow it; reconnect to narrow. |
+| `{"t":"subscribe_all"}` | Every session. `unsubscribe` does not narrow it; `subscribe_tasks` switches to task-only delivery. |
+| `{"t":"subscribe_tasks"}` | Task updates only. Replaces the socket's session subscriptions; a later `subscribe` or `subscribe_all` switches back to session delivery. That request's `subscribed` acknowledgement includes `"tasks":false` to report that `t:"task"` delivery ended (for example, `{"t":"subscribed","asid":"ses_1","tasks":false}` or `{"t":"subscribed","all":true,"tasks":false}`). Under `subscribe_all`, task updates still arrive as `t:"event"`. |
 | `{"t":"ping"}` | Application-level liveness; answered with `pong`. |
 
 Unknown extra fields are ignored. An unknown `t` is `unknown_type` and a
@@ -1460,6 +1560,69 @@ reach every SSE stream.
 | Sockets per gateway | 64. Past it the upgrade is `429 too_many_connections`. |
 | Server heartbeat | A WebSocket ping every 25 s; two unanswered pings drop the socket. Any client frame counts as an answer. |
 | Revocation | Checked every 5 s; a revoked device's socket is closed without an `error` frame, as its SSE stream is. |
+
+**Task updates.** A socket that sent `subscribe_all` also receives one
+`{"t":"event","asid":null,"seq":<n>,"event":"task.updated","data":<TaskView>}`
+frame for every change to a task (capability `task_ledger`; see `docs/mcp.md`),
+and one for its parent task, whose `children` counts moved, when it has one. A
+socket subscribed to individual sessions does not get them. `data` is the whole
+task, so a client keeps the newest frame per `task_id`. A socket that falls
+behind the task events gets one `{"t":"resync","asid":"","tasks":true}` frame:
+refetch `GET /api/tasks` (a client that ignores `tasks` reads it as a resync
+of every session, which also covers it). Refetch `GET /api/tasks` after a
+reconnect as well.
+
+When `task_ws_subscription` is advertised, `subscribe_tasks` receives the same
+task views with `"t":"task"`, and no
+agent-session or pane traffic. It still receives the initial `hello` and a
+`{"t":"subscribed","tasks":true}` acknowledgement. Task lag uses the same
+task resync frame.
+
+When `task_defaults` is advertised, a `subscribe_tasks` socket is also told
+where a task this device opens without `cwd` (`POST /api/tasks`) will run,
+so the app can show it before the user sends: one
+`{"t":"defaults","default_cwd":…}` frame right after the `subscribed`
+acknowledgement, another after each task resync frame, and a new one
+whenever a task the device opens changes the answer. `default_cwd` is the
+directory of the device's newest task while that is still a directory, else
+the home directory -- always named from `~` when it is under home (`"~"`,
+`"~/src/app"`), so no user name is shown; `POST /api/tasks` expands `~` in
+`cwd`. `null` only when the task store cannot be read. `GET
+/api/tasks/defaults` answers `{"default_cwd": …}` by the same rule for a
+client without the socket.
+
+**Task fields and outcomes** (capability `task_outcome`; full contract in
+`docs/mcp.md`):
+
+- `TaskView.title` (always a string): the task's `label`; else, for a session
+  delegation, the first sentence of the name the agent session gave itself
+  (an untitled session's placeholder -- its asid, `New thread`, `DeepSeek
+  Agent Session` -- or the goal restated or cut short is not used); else the goal's first sentence -- cut to 60 characters with
+  `…`, back to a word boundary when that keeps at least 30 characters. An
+  open task's follows the session's name as it changes; an ended one keeps
+  the name it had when it ended. Show it instead of the raw `goal`.
+- Agent sessions (`GET /api/agent-sessions`, …) never carry an empty
+  `title`: until the provider names one it reads as before -- OpenCode's
+  asid, `DeepSeek Agent Session`, T3's `New thread`. A task's `title` never
+  takes such a placeholder; it keeps the goal's first sentence until the
+  session is really named.
+- `tasks.complete` takes `outcome`: `done` (default) or `blocked`. A blocked
+  agent -- a missing file, an unclear request, a permission it cannot get --
+  may instead print `MUQUN_TASK_BLOCKED: <one-line reason>`, beside
+  `MUQUN_TASK_DONE: <one-line summary>`. Either moves the task to `waiting`
+  with the reason as `summary` (events carry source `tasks_complete_blocked` or
+  `marker_blocked`). It stays open: the user answers in the session or pane
+  and the agent goes on, or the device confirms or cancels it. Going idle
+  does not turn a blocked task into `idle_unconfirmed`; a new reason
+  replaces the old one.
+- The second line of a task card: `progress` while the task works, `summary`
+  once it pauses or ends (`progress` is absent then). For a `waiting` task
+  `summary` is what the user is asked -- "Needs you · <summary>": a blocked
+  agent's reason; for a pending permission request, its prompt; for a
+  question form, the last line of the agent's last message when that came
+  after the turn's last tool call (the agent asked in its own words), else
+  the form's title; for a terminal agent on a menu, the screen's last
+  meaningful line.
 
 **Catch-up is unchanged.** The socket delivers live events only. After a
 (re)connect, re-subscribe, wait for `subscribed`, then catch up each session
@@ -1890,6 +2053,86 @@ Fields are tagged by `type`; all of them carry `key`, `title`, `description?`,
 
 A field is hidden unless every `when` condition holds against the current
 answers. `custom` means a value outside `options` is allowed.
+
+---
+
+## Linked gateways (`fleet_peers`)
+
+Another of the owner's computers is a paired device of `kind: "gateway"`
+(`GET /api/pairings` shows the kind). Its token reaches only the task routes
+(`POST /api/tasks`, `GET /api/tasks` without `root`, `GET /api/tasks/{id}`,
+`POST /api/tasks/{id}/cancel`), `subscribe_tasks` on `/api/ws`,
+`GET /api/fleet/self` and `DELETE /api/pairings/{its own id}`; everything
+else answers `403 peer_forbidden`.
+
+The owner -- an app device, or the admin token (the `muqun-gateway peers`
+CLI) -- links and manages them; a gateway token gets `403 peer_forbidden`
+on all of these:
+
+| Route | Body | Answer |
+|---|---|---|
+| `POST /api/pair/pending` (on the computer to be linked) | `{device_name, kind: "gateway", server_id?}` | `{request_id, code, expires_in_ms}` for `POST /api/peers` on the other side; `400 invalid_request` for any other `kind`; `409 pairing_in_progress` while another pairing is pending, `429 pairing_rate_limited`. A minted code lives one minute (`expires_in_ms` says so): unclaimed by then (the link failed), it is neither shown by `GET /api/pair/pending` nor claimable, and a new pairing -- a phone's, or the next mint -- takes its slot. |
+| `DELETE /api/pair/pending/{request_id}` (same computer, same token that minted it) | none | `{cancelled: true}`: the minted code is gone and the slot free, for when `POST /api/peers` on the other side failed. Only the device (or the admin token) that minted it may; any other pending pairing, an expired one, or none is `404 pairing_not_found`. |
+| `GET /api/peers` | none | `{accept_delegations, peers: [{peer_id, server_id, name, url, reachable, last_seen_ms}]}`; a peer not heard from for a minute is pinged first (3 s), and one that no longer knows this gateway is forgotten and left out. |
+| `POST /api/peers` | `{url, name, request_id, code}` (`name` may not be `self`, in any case) | The new peer. `502 peer_unreachable`; `409 name_conflict` (`name` is this computer's own label, any case; checked before the claim, so the code stays good), `409 peer_refused` (`error.reason`: `pairing_code_expired`, `invalid_pairing_code`, `pairing_not_requested`, `invalid_token` or `refused`), `peer_conflict`, `peer_name_taken`; `400 peer_is_self`, `invalid_request`. |
+| `PATCH /api/peers/{peer_id}` | `{name?, url?}`, at least one (`name` not `self`; `url` as for `POST`) | The changed peer. A new `url` (its address changed) is proven first with one call carrying this link's token: `502 peer_unreachable` when nothing answers there, `409 peer_refused` when what answers does not know the link; neither keeps it. `400 invalid_request`, `409 peer_name_taken`, `409 name_conflict` (this computer's own label), `404 peer_not_found`. |
+| `DELETE /api/peers/{peer_id}` | none | `{remote_revoked, counterpart_found, counterpart_revoked}`; this gateway forgets the peer, asks it to revoke this gateway's device, and revokes the peer's own login here (below). `404 peer_not_found`. |
+| `PUT /api/fleet/settings` | `{accept_delegations}` | `{accept_delegations}`, written to `config.json` (`fleet.accept_delegations`). |
+
+A peer's name is what `fleet.describe`/`fleet.list` show and what
+`POST /api/tasks` `mentions` must use (see
+[mcp.md](mcp.md#opening-a-task-from-the-device)). More than 8 names, or a
+name that is neither a linked computer's nor `self`, is `400
+invalid_mentions` and nothing is created; the app sends the task again,
+once, without `mentions`.
+
+`POST /api/pair/request` and `POST /api/pair/pending` take an optional
+`server_id`, the claiming gateway's own, kept on its device record. Nothing
+checks it, so it never replaces or evicts a device; its only use is that
+`DELETE /api/peers/{id}` also revokes the gateway devices here whose
+`server_id` is that peer's (its login into this computer), so one call
+unlinks both directions. A peer forgotten after a `401`/`403` keeps its login
+here; its open mirrors fail (`reason: "peer_unlinked"`), as they do on
+`DELETE /api/peers/{id}`.
+`DELETE /api/peers/{id}` (the admin token or an app device only) answers
+`{"remote_revoked", "counterpart_found", "counterpart_revoked"}`: whether the
+peer confirmed it revoked this gateway's token, whether a login of the peer's
+was here, and whether it is revoked (found but not revoked: the device list
+could not be written). Each runs whatever the other did; the peer is forgotten
+either way, and if its row cannot be removed the `500 peer_store_failed`
+still carries the three fields.
+
+A delegation to a linked computer is a mirror here with `binding: {kind:
+"peer", peer_id, peer_server_id, remote_task_id, peer_name}`: `peer_server_id`
+is the id that computer gave for itself, which the phone knows it by, and
+`remote_task_id` is empty while a create that got no answer has not found its
+task there yet (`tasks.delegate` then carries a `note` saying so). The create
+carries a `client_ref`, which the task over there keeps and shows in its view
+(with `created_ms`), and that is how it is found.
+
+A mirror's view also carries `reason`, made when the view is (nothing
+stored), for the app to word in its own copy; the `summary` stays a plain
+line. On a `failed` mirror: `peer_unlinked` (unlinked here, or the other
+computer no longer takes this one's token), `peer_lost_task` (the other
+computer no longer has the task), `peer_not_confirmed` (a create that got no
+answer never turned up there). On an open mirror: `peer_unreachable` while
+its computer has not answered in the last 2 minutes. Absent otherwise, and on
+every task that is not a mirror. (`delegation_loop` is never a view reason:
+that delegation creates nothing; it is the MCP error code.) A task
+another computer opened here (`origin: "peer"`) can be confirmed from the phone
+like a device's; its `requested_by` is `{kind: "gateway", id, name, server_id?}`,
+where `server_id` is the id that computer gave for itself when it paired here,
+when its device record has one.
+
+At the device limit, a gateway's `POST /api/pair/claim` makes room only by
+dropping the oldest gateway device, never one of the owner's apps; with no
+gateway device to drop it answers `409 device_cap`.
+
+**Operator note:** a gateway build older than this one does not know
+`kind` and reads a gateway device as an ordinary app device, with full
+device access. After rolling a gateway back below this version, revoke its
+gateway devices (`muqun-gateway revoke <device id>`, or `manage`'s Devices
+view, where they show as `name (gateway)`).
 
 ---
 

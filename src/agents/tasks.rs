@@ -156,6 +156,266 @@ pub fn agent_command(kind: &str, overrides: &BTreeMap<String, String>) -> String
         .unwrap_or_else(|| kind.to_owned())
 }
 
+/// Codex's flag that skips every approval prompt and its sandbox.
+pub const CODEX_BYPASS_FLAG: &str = "--dangerously-bypass-approvals-and-sandbox";
+/// Claude Code's flag that skips every permission prompt.
+pub const CLAUDE_BYPASS_FLAG: &str = "--dangerously-skip-permissions";
+
+/// The arguments an agent the gateway launches starts with, before any the
+/// caller adds.
+///
+/// An agent started from a phone has nobody at the terminal to answer an
+/// approval or a "trust this folder?" prompt, so the built-in defaults start
+/// it with its own bypass flags. `agent_launch_args` in `config.json`
+/// replaces them per kind; an empty list turns them off:
+///
+/// ```json
+/// { "agent_launch_args": { "codex": [], "claude": ["--permission-mode", "acceptEdits"] } }
+/// ```
+///
+/// For Codex, `trusted` ([`trusted_folders`]: the task directory and its
+/// checkout) is also marked trusted for this run. Codex's `-c` splits its
+/// key on every `.`, so a path cannot be spelled in the key
+/// (`projects."/a.b".trust_level` would not parse as meant); the path goes in
+/// the TOML *value* instead, as a table. That value replaces Codex's whole
+/// `projects` table for the run, so other per-project settings in its config
+/// do not apply to an agent started this way.
+pub fn agent_launch_args(
+    kind: &str,
+    trusted: &[PathBuf],
+    overrides: &BTreeMap<String, Vec<String>>,
+) -> Vec<String> {
+    if let Some(args) = overrides.get(kind) {
+        return args.clone();
+    }
+    match kind {
+        "claude" => vec![CLAUDE_BYPASS_FLAG.to_owned()],
+        "codex" => {
+            let mut args = vec![CODEX_BYPASS_FLAG.to_owned()];
+            if !trusted.is_empty() {
+                args.push("-c".to_owned());
+                args.push(codex_trust_override(trusted));
+            }
+            args
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// What the kinds with built-in defaults start with under this config, one
+/// line each (`codex: --dangerously-… ; folder trust on`), for the startup
+/// log and `manage`'s Settings view: the owner should not have to read the
+/// docs to learn that their agents skip their own prompts.
+pub fn launch_defaults(
+    overrides: &BTreeMap<String, Vec<String>>,
+    trust_folders: bool,
+) -> Vec<String> {
+    let trust = if trust_folders { "on" } else { "off" };
+    ["codex", "claude"]
+        .into_iter()
+        .map(|kind| {
+            let args = agent_launch_args(kind, &[], overrides);
+            let args = if args.is_empty() {
+                "no flags".to_owned()
+            } else {
+                args.join(" ")
+            };
+            format!("{kind}: {args}; folder trust {trust}")
+        })
+        .collect()
+}
+
+/// `cwd`, resolved, when an agent may be told to trust it: a directory
+/// strictly inside `home`, named without `..`.
+fn inside_home(cwd: &Path, home: &Path) -> Option<PathBuf> {
+    if cwd
+        .components()
+        .any(|part| part == std::path::Component::ParentDir)
+    {
+        return None;
+    }
+    let (cwd, home) = (cwd.canonicalize().ok()?, home.canonicalize().ok()?);
+    (cwd != home && cwd.starts_with(&home)).then_some(cwd)
+}
+
+/// The folders an agent started in `cwd` is told to trust: `cwd` itself,
+/// the checkout it is in, and -- for a linked worktree, whose `.git` is a
+/// file -- the main checkout, which is what Codex keys trust on. Each one
+/// strictly inside `home`, like Claude Code's ([`trust_folder_for_claude`]);
+/// none at all when `cwd` is not.
+pub fn trusted_folders(cwd: &Path, home: &Path) -> Vec<PathBuf> {
+    let Some(cwd) = inside_home(cwd, home) else {
+        return Vec::new();
+    };
+    trust_roots(&cwd)
+        .into_iter()
+        .filter(|root| inside_home(root, home).is_some())
+        .collect()
+}
+
+/// `projects={"/a"={trust_level="trusted"}, ...}` for Codex's `-c`.
+fn codex_trust_override(paths: &[PathBuf]) -> String {
+    let entries = paths
+        .iter()
+        .map(|path| {
+            format!(
+                "{}={{trust_level=\"trusted\"}}",
+                toml_string(&path.to_string_lossy())
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("projects={{{entries}}}")
+}
+
+/// A TOML basic string.
+fn toml_string(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for c in value.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if c.is_control() => out.push_str(&format!("\\u{:04X}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// `cwd`, the checkout it is in and a linked worktree's main checkout,
+/// unbounded ([`trusted_folders`] bounds them).
+fn trust_roots(cwd: &Path) -> Vec<PathBuf> {
+    let mut roots = vec![cwd.to_path_buf()];
+    let Some(top) = cwd.ancestors().find(|dir| dir.join(".git").exists()) else {
+        return roots;
+    };
+    roots.push(top.to_path_buf());
+    let main = std::fs::read_to_string(top.join(".git"))
+        .ok()
+        .and_then(|text| {
+            let gitdir = text.trim().strip_prefix("gitdir:")?.trim().to_owned();
+            let (main, _) = gitdir.split_once("/.git/worktrees/")?;
+            Some(PathBuf::from(main))
+        });
+    roots.extend(main);
+    let mut unique = Vec::with_capacity(roots.len());
+    for root in roots {
+        if !unique.contains(&root) {
+            unique.push(root);
+        }
+    }
+    unique
+}
+
+/// The arguments that give `kind` its first prompt on its command line, for
+/// the kinds whose CLI takes one (`claude [options] [prompt]`, `codex
+/// [OPTIONS] [PROMPT]`); `None` for the others, which have it typed. `--`
+/// keeps a prompt that starts with `-` or names a subcommand (`review`) a
+/// prompt, and stops an option that takes several values from eating it.
+///
+/// Also `None` for a prompt with a control character other than a newline:
+/// the launch line is pasted at a shell, and a shell without bracketed paste
+/// reads a Tab, an Esc or a Ctrl-C there as a key, which could edit the line
+/// or leave the quote. And for one with a backslash: `shell_word` quotes it
+/// for sh, bash, zsh and fish alike, but a pane may run a shell with escape
+/// rules of its own, and a goal from a device or an MCP caller is not worth
+/// that bet. Such a prompt is typed into the agent instead.
+pub fn launch_prompt_args(kind: &str, prompt: &str) -> Option<[String; 2]> {
+    let plain = !prompt
+        .chars()
+        .any(|c| c == '\\' || (c.is_control() && c != '\n'));
+    (plain && matches!(kind, "claude" | "codex")).then(|| ["--".to_owned(), prompt.to_owned()])
+}
+
+/// Claude Code's user config: `$CLAUDE_CONFIG_DIR/.claude.json` when that is
+/// set (`config_dir`), else `~/.claude.json`.
+pub fn claude_config_file(config_dir: Option<&str>, home: &Path) -> PathBuf {
+    match config_dir.filter(|dir| !dir.is_empty()) {
+        Some(dir) => Path::new(dir).join(".claude.json"),
+        None => home.join(".claude.json"),
+    }
+}
+
+/// Mark `cwd` trusted for Claude Code in its user config `config`, so an
+/// agent started there from a phone does not stop at "Do you trust the
+/// files in this folder?" with nobody at the terminal to answer. Only
+/// `projects["<cwd>"].hasTrustDialogAccepted` is set; every other key is
+/// kept, in its order.
+///
+/// Bounded: only a directory strictly inside `home`, named without `..`,
+/// once resolved. Nothing is written when the flag is already set, and
+/// nothing at all when the file cannot be read or is not a JSON object
+/// (Claude Code has not been set up).
+pub fn trust_folder_for_claude(config: &Path, home: &Path, cwd: &Path) {
+    let Some(cwd) = inside_home(cwd, home) else {
+        return;
+    };
+    let Ok(text) = std::fs::read_to_string(config) else {
+        return;
+    };
+    let Some(trusted) = with_trust(&text, &cwd.to_string_lossy()) else {
+        return;
+    };
+    if let Err(error) = replace_file(config, &trusted) {
+        tracing::debug!(%error, "claude folder trust not written");
+    }
+}
+
+/// A JSON object read in order, its values kept as they were written.
+type RawObject = indexmap::IndexMap<String, Box<serde_json::value::RawValue>>;
+
+/// `text` (Claude Code's config) with `projects[key].hasTrustDialogAccepted`
+/// set; `None` when it is already set or `text` is not a JSON object. Keys
+/// keep their order, and every value off that path its exact text.
+fn with_trust(text: &str, key: &str) -> Option<String> {
+    use serde_json::value::{to_raw_value, RawValue};
+    const FLAG: &str = "hasTrustDialogAccepted";
+    let object = |raw: Option<&Box<RawValue>>| -> RawObject {
+        raw.and_then(|raw| serde_json::from_str(raw.get()).ok())
+            .unwrap_or_default()
+    };
+    let mut root: RawObject = serde_json::from_str(text).ok()?;
+    let mut projects = object(root.get("projects"));
+    let mut project = object(projects.get(key));
+    if project.get(FLAG).map(|flag| flag.get()) == Some("true") {
+        return None;
+    }
+    project.insert(FLAG.to_owned(), to_raw_value(&true).ok()?);
+    projects.insert(key.to_owned(), to_raw_value(&project).ok()?);
+    root.insert("projects".to_owned(), to_raw_value(&projects).ok()?);
+    let mut text = serde_json::to_string_pretty(&root).ok()?;
+    text.push('\n');
+    Some(text)
+}
+
+/// Write `text` to `path` -- to its target, when it is a symlink -- through
+/// a sibling file renamed over it, so a reader never sees half a file. The
+/// sibling is private (0600) from the start, synced before the rename, and
+/// given the file's own permissions.
+fn replace_file(path: &Path, text: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let path = path.canonicalize()?;
+    let permissions = std::fs::metadata(&path)?.permissions();
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let temp = path.with_file_name(format!(".{name}.muqun-{}", uuid::Uuid::new_v4().simple()));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let written = options.open(&temp).and_then(|mut file| {
+        file.write_all(text.as_bytes())?;
+        file.sync_all()?;
+        std::fs::set_permissions(&temp, permissions)?;
+        std::fs::rename(&temp, &path)
+    });
+    if written.is_err() {
+        std::fs::remove_file(&temp).ok();
+    }
+    written
+}
+
 /// Whether a kind is one the gateway will offer and accept.
 pub fn is_known_agent_kind(kind: &str, overrides: &BTreeMap<String, String>) -> bool {
     AGENT_KINDS.contains(&kind) || overrides.contains_key(kind)
@@ -657,6 +917,229 @@ mod tests {
         assert!(resolve_repo_path(root.to_str().unwrap(), &[]).is_none());
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_launched_agent_starts_with_its_bypass_flags_unless_config_says_otherwise() {
+        let none = BTreeMap::new();
+        let w = [PathBuf::from("/w")];
+        assert_eq!(
+            agent_launch_args("claude", &w, &none),
+            ["--dangerously-skip-permissions"]
+        );
+        assert_eq!(
+            agent_launch_args("codex", &[], &none),
+            ["--dangerously-bypass-approvals-and-sandbox"]
+        );
+        assert!(agent_launch_args("gemini", &w, &none).is_empty());
+
+        let mut overrides = BTreeMap::new();
+        overrides.insert("codex".to_owned(), Vec::new());
+        overrides.insert("claude".to_owned(), vec!["--permission-mode".to_owned()]);
+        overrides.insert("gemini".to_owned(), vec!["--yolo".to_owned()]);
+        assert!(agent_launch_args("codex", &w, &overrides).is_empty());
+        assert_eq!(
+            agent_launch_args("claude", &[], &overrides),
+            ["--permission-mode"]
+        );
+        assert_eq!(agent_launch_args("gemini", &[], &overrides), ["--yolo"]);
+        // What the startup log and `manage` announce.
+        assert_eq!(
+            launch_defaults(&none, true),
+            [
+                "codex: --dangerously-bypass-approvals-and-sandbox; folder trust on",
+                "claude: --dangerously-skip-permissions; folder trust on"
+            ]
+        );
+        assert_eq!(
+            launch_defaults(&overrides, false),
+            [
+                "codex: no flags; folder trust off",
+                "claude: --permission-mode; folder trust off"
+            ]
+        );
+
+        // The first prompt rides on the command line only where the CLI takes
+        // one, after `--` so it is never read as an option or a subcommand.
+        for (kind, prompt, args) in [
+            ("claude", "-fix it", Some(["--", "-fix it"])),
+            ("codex", "review", Some(["--", "review"])),
+            ("gemini", "fix it", None),
+            // A newline is fine; other controls would be keys at the shell.
+            ("claude", "a\nb", Some(["--", "a\nb"])),
+            ("claude", "a\tb", None),
+            ("codex", "a\u{1b}[201~b", None),
+            ("codex", "a\rb", None),
+            // Quotes, `$` and backticks are data inside the quoted word
+            // (`shell_word`'s own table runs it through bash, zsh and fish);
+            // a backslash is typed instead.
+            ("claude", "it's $HOME `id`", Some(["--", "it's $HOME `id`"])),
+            ("claude", r"x\'; touch /tmp/pwned; echo \'", None),
+            ("codex", r"C:\dir", None),
+        ] {
+            assert_eq!(
+                launch_prompt_args(kind, prompt),
+                args.map(|args| args.map(str::to_owned)),
+                "{kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn claude_trusts_the_task_folder_through_its_user_config() {
+        let home = {
+            let home = temp_dir("claude-trust");
+            std::fs::create_dir_all(&home).unwrap();
+            home.canonicalize().unwrap()
+        };
+        let cwd = home.join("proj");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let key = cwd.to_string_lossy().into_owned();
+        let config = home.join(".claude.json");
+        let trusted = json!({ "hasTrustDialogAccepted": true });
+        // (file before, file after); `None` is no file / left as it was.
+        for (before, after) in [
+            // Other keys and projects kept; the entry made.
+            (
+                Some(json!({ "numStartups": 3, "projects": { "/other": { "x": 1 } } })),
+                Some(json!({ "numStartups": 3,
+                             "projects": { "/other": { "x": 1 }, key.as_str(): trusted } })),
+            ),
+            // An entry of its own keeps its fields.
+            (
+                Some(json!({ "projects": { key.as_str(): { "allowedTools": ["a"],
+                                                           "hasTrustDialogAccepted": false } } })),
+                Some(json!({ "projects": { key.as_str(): { "allowedTools": ["a"],
+                                                           "hasTrustDialogAccepted": true } } })),
+            ),
+            (
+                Some(json!({ "projects": "?" })),
+                Some(json!({ "projects": { key.as_str(): trusted } })),
+            ),
+            // Claude Code not set up: nothing written.
+            (None, None),
+        ] {
+            std::fs::remove_file(&config).ok();
+            if let Some(before) = &before {
+                std::fs::write(&config, before.to_string()).unwrap();
+            }
+            trust_folder_for_claude(&config, &home, &cwd);
+            let now = std::fs::read_to_string(&config).ok();
+            let now = now.map(|text| serde_json::from_str::<Value>(&text).unwrap());
+            assert_eq!(now, after, "{before:?}");
+        }
+
+        // Already trusted, not JSON, or a folder it may not trust (outside
+        // home, home itself, named with `..`): the file is left as it was.
+        let compact = json!({ "projects": { key.as_str(): trusted } }).to_string();
+        let outside = temp_dir("claude-trust-outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        for (text, folder) in [
+            (compact.as_str(), cwd.clone()),
+            ("{ broken", cwd.clone()),
+            ("{}", outside.clone()),
+            ("{}", home.clone()),
+            ("{}", cwd.join("..").join("proj")),
+        ] {
+            std::fs::write(&config, text).unwrap();
+            trust_folder_for_claude(&config, &home, &folder);
+            assert_eq!(
+                std::fs::read_to_string(&config).unwrap(),
+                text,
+                "{folder:?}"
+            );
+        }
+
+        // A symlinked config is written at its target, in its key order and
+        // with its mode.
+        let target = home.join("dotfiles.json");
+        std::fs::write(&target, r#"{"zeta":1,"alpha":2}"#).unwrap();
+        std::fs::remove_file(&config).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::os::unix::fs::symlink(&target, &config).unwrap();
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+            trust_folder_for_claude(&config, &home, &cwd);
+            assert!(config.symlink_metadata().unwrap().is_symlink());
+            let mode = std::fs::metadata(&target).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o640);
+            let written = std::fs::read_to_string(&target).unwrap();
+            let at = |key: &str| written.find(&format!("\"{key}\"")).unwrap();
+            assert!(at("zeta") < at("alpha") && at("alpha") < at("projects"));
+        }
+
+        assert_eq!(
+            claude_config_file(Some("/c"), &home),
+            Path::new("/c/.claude.json")
+        );
+        assert_eq!(claude_config_file(Some(""), &home), config);
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&outside).ok();
+    }
+
+    #[test]
+    fn codex_trusts_the_task_directory_through_a_toml_value_not_a_dotted_key() {
+        // Not a checkout: only the directory itself.
+        let dir = temp_dir("trust-plain").join("my.project \"x\"");
+        std::fs::create_dir_all(&dir).unwrap();
+        let args = agent_launch_args("codex", std::slice::from_ref(&dir), &BTreeMap::new());
+        assert_eq!(
+            args[..2],
+            ["--dangerously-bypass-approvals-and-sandbox", "-c"]
+        );
+        let quoted = dir
+            .to_string_lossy()
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"");
+        assert_eq!(
+            args[2],
+            format!(r#"projects={{"{quoted}"={{trust_level="trusted"}}}}"#)
+        );
+        assert_eq!(args.len(), 3);
+    }
+
+    #[test]
+    fn codex_also_trusts_the_checkout_and_a_linked_worktree_s_main_checkout_inside_home() {
+        let base = temp_dir("trust-git");
+        std::fs::create_dir_all(&base).unwrap();
+        let base = base.canonicalize().unwrap();
+        let main = base.join("main");
+        std::fs::create_dir_all(main.join(".git/worktrees/wt")).unwrap();
+        let worktree = base.join("wt");
+        std::fs::create_dir_all(worktree.join("src")).unwrap();
+        std::fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", main.join(".git/worktrees/wt").display()),
+        )
+        .unwrap();
+        let sub = worktree.join("src");
+        assert_eq!(
+            trust_roots(&sub),
+            [sub.clone(), worktree.clone(), main.clone()]
+        );
+        assert_eq!(trust_roots(&main), std::slice::from_ref(&main));
+        // Only what lies strictly inside home is trusted, as for Claude Code.
+        for (home, trusted) in [
+            (
+                base.clone(),
+                vec![sub.clone(), worktree.clone(), main.clone()],
+            ),
+            (worktree.clone(), vec![sub.clone()]),
+            (sub.clone(), vec![]),
+            (main.clone(), vec![]),
+        ] {
+            assert_eq!(trusted_folders(&sub, &home), trusted, "{home:?}");
+        }
+        let args = agent_launch_args("codex", &trusted_folders(&sub, &base), &BTreeMap::new());
+        assert_eq!(args[2].matches("trust_level").count(), 3);
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn a_toml_string_escapes_what_toml_requires() {
+        assert_eq!(toml_string(r#"a"b\c"#), r#""a\"b\\c""#);
+        assert_eq!(toml_string("a\tb"), r#""a\u0009b""#);
     }
 
     #[test]

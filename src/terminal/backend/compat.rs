@@ -226,6 +226,7 @@ mod tests {
     #[test]
     fn tmux_entities_keep_the_existing_mobile_envelope() {
         let response = pane_list(vec![Pane {
+            history_identity: None,
             id: PaneId::new("%9"),
             terminal_id: Some("%9".into()),
             workspace_id: WorkspaceId::new("$0"),
@@ -245,6 +246,7 @@ mod tests {
             alternate_on: Some(true),
             cursor_x: Some(3),
             cursor_y: Some(7),
+            shell_pid: None,
         }]);
 
         assert_eq!(response["result"]["type"], "pane_list");
@@ -324,6 +326,7 @@ mod tests {
     #[test]
     fn the_snapshot_does_not_invent_agents_from_panes() {
         let pane = Pane {
+            history_identity: None,
             id: PaneId::new("%9"),
             terminal_id: Some("%9".into()),
             workspace_id: WorkspaceId::new("$0"),
@@ -343,6 +346,7 @@ mod tests {
             alternate_on: Some(false),
             cursor_x: None,
             cursor_y: None,
+            shell_pid: None,
         };
         let snap = snapshot(Vec::new(), Vec::new(), vec![pane], &[]);
         assert_eq!(snap["result"]["type"], "session_snapshot");
@@ -357,6 +361,7 @@ mod tests {
     #[test]
     fn creation_envelopes_include_the_initial_terminal() {
         let pane = Pane {
+            history_identity: None,
             id: PaneId::new("%1"),
             terminal_id: Some("%1".into()),
             workspace_id: WorkspaceId::new("$1"),
@@ -376,6 +381,7 @@ mod tests {
             alternate_on: Some(false),
             cursor_x: None,
             cursor_y: None,
+            shell_pid: None,
         };
         let tab = Tab {
             id: TabId::new("@1"),

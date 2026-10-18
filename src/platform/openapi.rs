@@ -17,7 +17,7 @@ fn agents_plane_schema() -> Value {
                     "type": "object",
                     "required": ["id", "name", "kind", "status", "enabled", "features", "models", "modes"],
                     "properties": {
-                        "id": { "type": "string", "enum": ["opencode", "deepseek"] },
+                        "id": { "type": "string", "enum": ["opencode", "deepseek", "t3"] },
                         "name": { "type": "string" },
                         "kind": { "type": "string" },
                         "status": { "type": "string", "enum": ["connected", "reachable", "offline", "disabled", "not_installed", "unconfigured"] },
@@ -95,6 +95,18 @@ pub fn openapi_spec() -> Value {
             "description": "Token-protected mobile API for controlling local terminal workspaces through a configured tmux or Herdr backend. Human-readable text is localized: send X-Muqun-Locale (or Accept-Language) with one of `en`, `zh-TW`, `zh-CN`, `ja`, `ko`, `de`, `fr`, `es`, `pt`, `ru`, `vi`, `th`. Error `code` values, decision names and other wire vocabulary are the same bytes in every locale."
         },
         "components": {
+            "schemas": {
+                "TaskState": task_state_schema(),
+                "TaskView": task_view_schema(),
+                "TaskEvent": task_event_schema(),
+                "TokenBinding": {
+                    "type": "object",
+                    "description": "`pane` (session_id, pane_id) or `agent` (agent_id)",
+                    "required": ["kind"],
+                    "properties": { "kind": { "type": "string", "enum": ["pane", "agent"] } },
+                    "additionalProperties": true
+                }
+            },
             "securitySchemes": {
                 "bearerAuth": {
                     "type": "http",
@@ -347,7 +359,7 @@ pub fn openapi_spec() -> Value {
             "/api/sessions/{sessionId}/tasks": {
                 "post": {
                     "summary": "Start a new task: a checkout, a workspace, an agent, and the first prompt",
-                    "description": "With `branch_name`, the task gets its own git worktree; without it, the task runs in the repo as it stands. `repo_path` must be, or be inside, a workspace this session already has open -- anything else is 403, and a symlink out of one resolves to the outside path and fails there too. `branch_name` is held to letters, digits, dot, underscore, dash and slash, with `..`, a leading dash, and dot-leading segments refused, so it can only ever be a ref and never an argument. The agent is started, then the gateway waits for it to become interactive before the prompt is sent. Asking twice for the same branch reuses the existing checkout rather than making a second one.",
+                    "description": "With `branch_name`, the task gets its own git worktree; without it, the task runs in the repo as it stands. `repo_path` must be, or be inside, a workspace this session already has open -- anything else is 403, and a symlink out of one resolves to the outside path and fails there too. `branch_name` is held to letters, digits, dot, underscore, dash and slash, with `..`, a leading dash, and dot-leading segments refused, so it can only ever be a ref and never an argument. The agent is started, then the gateway waits for it to become interactive before the prompt is sent. Asking twice for the same branch reuses the existing checkout rather than making a second one. Nobody is at the terminal to answer an approval prompt, so `codex` starts with `--dangerously-bypass-approvals-and-sandbox` plus a `-c projects=...` override that trusts the task directory, and `claude` with `--dangerously-skip-permissions`; `agent_launch_args` in config.json replaces these per kind (an empty list turns them off), and `agent_args` follow them. `agent_env` in config.json is set in the new pane's environment (values are never logged).",
                     "parameters": [path_param("sessionId")],
                     "requestBody": json_body(json!({
                         "type": "object",
@@ -358,7 +370,7 @@ pub fn openapi_spec() -> Value {
                             "agent": { "type": "string", "description": "Agent kind from GET /api/agents/catalog" },
                             "prompt": { "type": "string", "description": "Sent once the agent is interactive" },
                             "workspace_label": { "type": "string" },
-                            "agent_args": { "type": "array", "items": { "type": "string" } },
+                            "agent_args": { "type": "array", "items": { "type": "string" }, "description": "Appended after the launch defaults (see agent_launch_args)" },
                             "startup_timeout_ms": { "type": "integer", "description": "How long to wait for the agent to become interactive, 3001 to 300000, default 30000" }
                         }
                     })),
@@ -368,7 +380,7 @@ pub fn openapi_spec() -> Value {
             "/api/sessions/{sessionId}/spawn": {
                 "post": {
                     "summary": "Start an agent in a new pane, without describing a repository",
-                    "description": "The light half of task dispatch: run this agent, here. The agent must be one this gateway offers -- a Herdr kind or a profile in agents.json -- and cwd, when given, must be a directory this session already works in, exactly the fence repo_path is under; anything else is 403. With tab_id the pane is split off whatever that tab has focused, so a second agent lands beside the first; without it the agent gets a tab of its own. GET recent-cwds answers with the directories cwd will accept. The reply names the pane and says whether the agent came up and whether the prompt landed; a 207 means the pane exists and something after it did not, which is not the same as nothing having happened.",
+                    "description": "The light half of task dispatch: run this agent, here. The agent must be one this gateway offers -- a Herdr kind or a profile in agents.json -- and cwd, when given, must be a directory this session already works in, exactly the fence repo_path is under; anything else is 403. With tab_id the pane is split off whatever that tab has focused, so a second agent lands beside the first; without it the agent gets a tab of its own. GET recent-cwds answers with the directories cwd will accept. The reply names the pane and says whether the agent came up and whether the prompt landed; a 207 means the pane exists and something after it did not, which is not the same as nothing having happened. The agent starts with the same launch defaults and `agent_env` as task dispatch.",
                     "parameters": [path_param("sessionId")],
                     "requestBody": json_body(json!({
                         "type": "object",
@@ -749,12 +761,503 @@ pub fn openapi_spec() -> Value {
         "description": "Requires device authentication and agent_file_assets capability. Resolves audio, video, images, documents and binary files inside the server-owned directory. Web URLs, path escapes and symlinks outside the root are refused. Returns data.asset metadata with an opaque id.",
         "parameters": [path_param("asid"), query_param("uri", "Local file URI or path")], "responses": ok_response()
     }});
+    for (path, item) in tasks_fleet_mcp_paths() {
+        spec["paths"][path] = item;
+    }
     spec["paths"]["/api/assets/{assetId}/download"] = json!({"get": {
         "summary": "Save one authenticated asset, including binary files",
         "description": "Requires device authentication and asset_download capability. Rechecks the indexed directory boundary and limits content to 10 MiB. Returns attachment content disposition; preview-only restrictions remain on the content endpoint.",
         "parameters": [path_param("assetId")], "responses": ok_response()
     }});
     spec
+}
+
+fn task_view_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["task_id", "state", "kind", "goal", "summary", "exit_code", "binding", "updated_ms", "parent_task_id", "origin", "label", "requested_by", "children"],
+        "properties": {
+            "task_id": { "type": "string", "description": "`t_` followed by 22 URL-safe characters" },
+            "state": { "$ref": "#/components/schemas/TaskState" },
+            "kind": { "type": "string", "enum": ["delegation", "command"] },
+            "goal": { "type": "string", "description": "The delegated goal, or the command line of a command task" },
+            "summary": { "type": ["string", "null"], "description": "A delegation's result as one line of at most 240 characters: the agent's own summary when done, a hint (its last message) when idle_unconfirmed, and when failed the error the agent, provider or backend gave (never a bare word); a command's exit code and output tail" },
+            "progress": { "type": "string", "description": "Only while the task is working (not paused, waiting or ended), and once something is known (task_ledger_complete): what it is doing now, one line of at most 120 characters -- a session agent's current tool call or the start of its latest message, a terminal agent's last prose line. Updates are published as task.updated at most every 2 s per task, a held-back line when the 2 s are up; kept in memory, so absent after a gateway restart until the agent moves again" },
+            "exit_code": { "type": ["integer", "null"] },
+            "peer_reachable": { "type": "boolean", "description": "A mirror only (binding peer): its computer answered within the last 2 minutes" },
+            "peer_last_seen_ms": { "type": "integer", "description": "A mirror only: when its computer last answered; absent if it never did" },
+            "reason": { "type": "string", "enum": ["peer_unlinked", "peer_lost_task", "peer_not_confirmed", "peer_unreachable"], "description": "A mirror only, made when the view is: why a failed mirror failed (peer_unlinked, peer_lost_task, peer_not_confirmed) or why an open one is stuck (peer_unreachable); the app words it, the summary stays plain prose" },
+            "binding": {
+                "type": "object",
+                "description": "What the task runs in. `kind` is `none`, `agent_session` (with agent_id, asid), `pane` (with session_id, pane_id, tab_id; plus agent_id, the terminal agent kind, for a delegation to a terminal agent -- absent for a command), or `peer` (fleet_peers: a mirror of task remote_task_id on linked computer peer_id, whose own server id is peer_server_id; peer_name is that computer's name when the mirror was made, a display fallback; remote_task_id is empty while a create that got no answer has not found its task there yet)",
+                "required": ["kind"],
+                "properties": { "kind": { "type": "string", "enum": ["none", "agent_session", "pane", "peer"] } },
+                "additionalProperties": true
+            },
+            "created_ms": { "type": "integer" },
+            "updated_ms": { "type": "integer" },
+            "client_ref": { "type": "string", "description": "The requester's own reference for the task (POST /api/tasks client_ref), when it gave one" },
+            "parent_task_id": { "type": ["string", "null"], "description": "The open task this one was started from, when the gateway could tell" },
+            "origin": { "type": "string", "enum": ["device", "agent", "mcp", "peer"], "description": "device: POST /api/tasks; peer: POST /api/tasks by another of the owner's computers (fleet_peers); agent: started by work the gateway tracks (its agent service, or the pane of an open task); mcp: any other MCP host. Tasks stored before origins existed are mcp" },
+            "label": { "type": ["string", "null"], "description": "A short title the requester gave" },
+            "mentions": { "type": "array", "items": { "type": "string" }, "description": "Only when there are any: the computers the user named when opening the task, as this gateway names them, or self" },
+            "requested_by": {
+                "description": "The device that opened the task (origin device), or the computer (origin peer, kind gateway, named from its device record); otherwise null",
+                "oneOf": [
+                    { "type": "null" },
+                    {
+                        "type": "object",
+                        "required": ["kind", "id", "name"],
+                        "properties": {
+                            "kind": { "type": "string", "enum": ["device", "gateway"] },
+                            "id": { "type": "string" },
+                            "name": { "type": "string" },
+                            "server_id": { "type": "string", "description": "kind gateway: the id that computer gave for itself when it paired here, when known" }
+                        }
+                    }
+                ]
+            },
+            "children": {
+                "type": "object",
+                "description": "Direct children, counted when the view is made. active: not finished and not waiting",
+                "required": ["total", "active", "waiting", "failed"],
+                "properties": {
+                    "total": { "type": "integer" },
+                    "active": { "type": "integer" },
+                    "waiting": { "type": "integer" },
+                    "failed": { "type": "integer" }
+                }
+            }
+        }
+    })
+}
+
+fn task_state_schema() -> Value {
+    json!({
+        "type": "string",
+        "enum": ["queued", "dispatching", "working", "waiting", "idle_unconfirmed", "done", "failed", "cancelled"],
+        "description": "done, failed and cancelled are terminal. A delegation is done only on an explicit signal (task_ledger_complete: the agent's tasks.complete call or MUQUN_TASK_DONE marker, or POST /api/tasks/{id}/complete); an agent that stops without one is idle_unconfirmed, a pause whose summary is a hint"
+    })
+}
+
+fn task_event_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["task_id", "seq", "at_ms", "from", "to", "source", "note"],
+        "properties": {
+            "task_id": { "type": "string" },
+            "seq": { "type": "integer" },
+            "at_ms": { "type": "integer" },
+            "from": { "oneOf": [{ "$ref": "#/components/schemas/TaskState" }, { "type": "null" }] },
+            "to": { "$ref": "#/components/schemas/TaskState" },
+            "source": { "type": "string" },
+            "note": { "type": ["string", "null"] }
+        }
+    })
+}
+
+fn json_ok(description: &str, schema: Value) -> Value {
+    json!({
+        "200": {
+            "description": description,
+            "content": { "application/json": { "schema": schema } }
+        },
+        "401": { "description": "Missing or invalid authorization" },
+        "403": { "description": "Invalid token" }
+    })
+}
+
+/// `/api/tasks*`, `/api/fleet/self`, the peer routes (`/api/peers*`,
+/// `POST /api/pair/pending`, `/api/fleet/settings`) and `/api/mcp/tokens*`. The last pair is
+/// mounted only while `mcp.enabled` is true (the default).
+fn tasks_fleet_mcp_paths() -> Vec<(&'static str, Value)> {
+    let task_view = || json!({ "$ref": "#/components/schemas/TaskView" });
+    let not_found = |mut responses: Value, text: &str| {
+        responses["404"] = json!({ "description": text });
+        responses
+    };
+    let mut list_responses = json_ok(
+        "Tasks, newest update first",
+        json!({
+            "type": "object",
+            "required": ["tasks"],
+            "properties": { "tasks": { "type": "array", "items": task_view() } }
+        }),
+    );
+    list_responses["400"] = json!({ "description": "invalid_request: an unknown state name, a limit that is not a positive integer, or an empty root" });
+    let mut create_responses = json_ok(
+        "The new task's view, plus where to open it: the agent session (asid), or for a terminal agent the pane it runs in (pane_id). A terminal agent's task answers dispatching as soon as its pane exists, and moves to working or failed once the agent is started in the background",
+        json!({
+            "allOf": [task_view(), {
+                "type": "object",
+                "properties": {
+                    "asid": { "type": ["string", "null"], "description": "Present unless the agent is a terminal agent" },
+                    "pane_id": { "type": "string", "description": "Present for a terminal agent (binding.kind pane)" }
+                }
+            }]
+        }),
+    );
+    create_responses["400"] = json!({ "description": "invalid_request (empty or oversized goal, oversized label, empty name), invalid_directory, directory_not_found, not_a_directory, unknown_model, invalid_mentions (too many mentions, or one naming no linked computer)" });
+    create_responses["502"] = json!({ "description": "agent_error: the agent could not start the session or take the prompt, or no pane could be made for a terminal agent" });
+    create_responses["403"] = json!({ "description": "delegations_disabled: another of the owner's computers (fleet_peers) asked while this computer takes no work from other computers (fleet.accept_delegations); checked before the body. Its task otherwise opens as a device's does, with origin peer and requested_by named from its device record" });
+    create_responses["503"] = json!({ "description": "agent_unavailable: the agent is not attached (a session agent is never started in a pane) or a terminal agent is not on PATH; no_terminal: no terminal session answers" });
+    let read_responses = not_found(
+        json_ok(
+            "The task and its state history, oldest first",
+            json!({
+                "type": "object",
+                "required": ["task", "events"],
+                "properties": {
+                    "task": task_view(),
+                    "events": { "type": "array", "items": { "$ref": "#/components/schemas/TaskEvent" } }
+                }
+            }),
+        ),
+        "task_not_found",
+    );
+    let cancel_responses = not_found(
+        json_ok(
+            "The task after the cancel; cancelling a finished task changes nothing",
+            task_view(),
+        ),
+        "task_not_found",
+    );
+    let mut complete_responses = not_found(
+        json_ok(
+            "The task, now done; a task already done is answered as it stands",
+            task_view(),
+        ),
+        "task_not_found",
+    );
+    complete_responses["400"] = json!({ "description": "invalid_request: the body is not a JSON object with an optional string summary" });
+    complete_responses["409"] = json!({ "description": "task_not_confirmable: the task was not opened on a device (origin device), or it is neither idle_unconfirmed nor waiting" });
+    let mut issue_responses = json_ok(
+        "A fresh pane-bound assistant token. The token is shown only here",
+        json!({
+            "type": "object",
+            "required": ["token", "token_id", "expires_ms", "binding"],
+            "properties": {
+                "token": { "type": "string" },
+                "token_id": { "type": "string" },
+                "expires_ms": { "type": ["integer", "null"], "description": "null for an agent token, which does not expire" },
+                "binding": { "$ref": "#/components/schemas/TokenBinding" }
+            }
+        }),
+    );
+    issue_responses["400"] = json!({ "description": "invalid_request" });
+    issue_responses["404"] = json!({ "description": "None of ancestor_pids is the shell of a pane the gateway manages" });
+    let revoke_responses = not_found(
+        json!({
+            "204": { "description": "Revoked; /mcp refuses the token from the next call" },
+            "401": { "description": "Missing or invalid authorization" },
+            "403": { "description": "Invalid token" }
+        }),
+        "token_not_found",
+    );
+    vec![
+        (
+            "/api/tasks",
+            json!({ "get": {
+                "summary": "List tasks. Requires the task_ledger capability and a device token",
+                "parameters": [
+                    query_param("state", "Comma list of task states; empty is no filter"),
+                    query_param("limit", "Page size, default 50, at most 200"),
+                    query_param("root", "Only this task and its descendants (task_ledger_create); an unknown id lists nothing")
+                ],
+                "responses": list_responses
+            }, "post": {
+                "summary": "Open a delegation from the device: a new agent session with the goal as its first prompt, or, for a terminal agent from the agent catalog (codex, claude, ...), a new pane running it with the goal as its first prompt (on the command line for codex and claude on tmux, else typed in). Requires the task_ledger_create capability and a device token (or, fleet_peers, another computer's gateway token); a terminal agent needs task_ledger_pane",
+                "requestBody": json_body(json!({
+                    "type": "object",
+                    "required": ["goal"],
+                    "properties": {
+                        "goal": { "type": "string", "description": "At most 32 KiB" },
+                        "agent_id": { "type": "string", "description": "An attached agent (opencode, ...) or a terminal agent kind from GET /api/agents/catalog (codex, claude, ...). Default: the primary agent" },
+                        "cwd": { "type": "string", "description": "Absolute directory (~ expands); default: the home directory" },
+                        "mode": { "type": "string", "description": "Ignored for a terminal agent" },
+                        "model": { "type": "string", "description": "A model id from the agent's catalog, or provider_id/model_id. Ignored for a terminal agent, as is variant" },
+                        "variant": { "type": "string", "description": "The model's variant (reasoning effort), applied when the session is created so the first turn uses it. Applied only together with model (ignored otherwise); must be one of the model's catalog variants when it lists any" },
+                        "label": { "type": "string", "description": "A short title, at most 200 characters" },
+                        "client_ref": { "type": "string", "description": "The requester's own reference, 1 to 128 of A-Z, a-z, 0-9, - and _, echoed in the task's view: how another computer whose create got no answer finds the task" },
+                        "mentions": { "type": "array", "items": { "type": "string" }, "maxItems": 8, "description": "The computers the user named: linked computers' names (any case) or self; more than 8, or a name that is neither, is 400 invalid_mentions. Kept on the task, never added to the goal" }
+                    }
+                })),
+                "responses": create_responses
+            }}),
+        ),
+        (
+            "/api/tasks/{id}",
+            json!({ "get": {
+                "summary": "Read one task and its state history",
+                "parameters": [path_param("id")],
+                "responses": read_responses
+            }}),
+        ),
+        (
+            "/api/tasks/{id}/cancel",
+            json!({ "post": {
+                "summary": "Interrupt the agent or send Ctrl-C to the command",
+                "parameters": [path_param("id")],
+                "responses": cancel_responses
+            }}),
+        ),
+        (
+            "/api/tasks/{id}/complete",
+            json!({ "post": {
+                "summary": "Confirm that a delegation the device opened, paused (idle_unconfirmed) or waiting on the user, is finished: it becomes done and task.updated is published. Requires the task_ledger_complete capability and a device token",
+                "parameters": [path_param("id")],
+                "requestBody": {
+                    "required": false,
+                    "content": { "application/json": { "schema": {
+                        "type": "object",
+                        "properties": {
+                            "summary": { "type": "string", "description": "The new summary, one line, cut to 240 characters; without it the task keeps its hint" }
+                        }
+                    }}}
+                },
+                "responses": complete_responses
+            }}),
+        ),
+        (
+            "/api/fleet/self",
+            json!({ "get": {
+                "summary": "This machine's capability manifest. Requires the fleet capability",
+                "responses": json_ok("The manifest", json!({
+                    "type": "object",
+                    "required": ["machineId", "label", "hostname", "os", "arch", "gatewayVersion", "agents", "terminal", "toolchains", "tasks", "suitableFor"],
+                    "properties": {
+                        "machineId": { "type": "string" },
+                        "label": { "type": "string" },
+                        "hostname": { "type": "string" },
+                        "os": { "type": "string" },
+                        "arch": { "type": "string" },
+                        "gatewayVersion": { "type": "string" },
+                        "agents": { "type": "array", "items": { "type": "object" } },
+                        "terminal": { "type": "array", "items": { "type": "object" } },
+                        "toolchains": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "required": ["id", "version", "path"],
+                                "properties": {
+                                    "id": { "type": "string" },
+                                    "version": { "type": ["string", "null"] },
+                                    "path": { "type": ["string", "null"] }
+                                }
+                            }
+                        },
+                        "tasks": {
+                            "type": "object",
+                            "properties": { "active": { "type": "integer" }, "waiting": { "type": "integer" } }
+                        },
+                        "suitableFor": { "type": "array", "items": { "type": "string" } }
+                    }
+                }))
+            }}),
+        ),
+        (
+            "/api/mcp/tokens",
+            json!({
+                "post": {
+                    "summary": "Issue an assistant token for the pane the caller runs in. Requires the admin token (the `muqun-gateway mcp token-helper` command uses it); present only while mcp.enabled is true",
+                    "requestBody": json_body(json!({
+                        "type": "object",
+                        "required": ["ancestor_pids"],
+                        "properties": {
+                            "ancestor_pids": { "type": "array", "items": { "type": "integer" }, "description": "The caller's own pid first, then its parent, and so on up" },
+                            "label": { "type": "string" }
+                        }
+                    })),
+                    "responses": issue_responses
+                },
+                "get": {
+                    "summary": "List assistant tokens, never the tokens themselves. Requires a device token",
+                    "responses": json_ok("Issued tokens", json!({
+                        "type": "object",
+                        "required": ["tokens"],
+                        "properties": { "tokens": { "type": "array", "items": {
+                            "type": "object",
+                            "required": ["id", "binding", "label", "issued_ms", "expires_ms", "last_used_ms", "revoked_ms"],
+                            "properties": {
+                                "id": { "type": "string" },
+                                "binding": { "$ref": "#/components/schemas/TokenBinding" },
+                                "label": { "type": "string" },
+                                "issued_ms": { "type": "integer" },
+                                "expires_ms": { "type": ["integer", "null"], "description": "null for an agent token, which does not expire" },
+                                "last_used_ms": { "type": ["integer", "null"] },
+                                "revoked_ms": { "type": ["integer", "null"] }
+                            }
+                        }}}
+                    }))
+                }
+            }),
+        ),
+        (
+            "/api/mcp/tokens/{id}",
+            json!({ "delete": {
+                "summary": "Revoke an assistant token. Requires a device token",
+                "parameters": [path_param("id")],
+                "responses": revoke_responses
+            }}),
+        ),
+        (
+            "/api/pair/pending",
+            json!({ "post": {
+                "summary": "Mint a pairing code on the owner's behalf for a device not in front of this computer: another gateway being linked (kind gateway). Requires the admin token or an app device; another gateway's token is refused (peer_forbidden). Requires the fleet_peers capability",
+                "requestBody": json_body(json!({
+                    "type": "object",
+                    "required": ["device_name"],
+                    "properties": {
+                        "device_name": { "type": "string", "description": "At most 80 characters, no control characters" },
+                        "kind": { "type": "string", "enum": ["gateway"], "description": "Must be gateway; an app pairs in front of the screen" },
+                        "server_id": { "type": "string", "description": "kind gateway: the claiming gateway's own server id, kept on its device record so DELETE /api/peers/{id} on this computer can revoke it; never used to replace or evict a device" }
+                    }
+                })),
+                "responses": with_errors(json_ok("What POST /api/pair/claim takes", json!({
+                    "type": "object",
+                    "required": ["request_id", "code", "expires_in_ms"],
+                    "properties": {
+                        "request_id": { "type": "string" },
+                        "code": { "type": "string" },
+                        "expires_in_ms": { "type": "integer" }
+                    }
+                })), &[
+                    ("400", "invalid_request, invalid_device_name"),
+                    ("409", "pairing_in_progress: another pairing is pending (a minted code lives a minute only: then it is neither shown nor claimable)"),
+                    ("429", "pairing_rate_limited"),
+                ])
+            }}),
+        ),
+        (
+            "/api/pair/pending/{request_id}",
+            json!({ "delete": {
+                "summary": "Take back a code minted with POST /api/pair/pending (the link attempt failed), freeing the pending slot. Only the device token (or the admin token) that minted it; another gateway's token is refused (peer_forbidden)",
+                "parameters": [path_param("request_id")],
+                "responses": with_errors(json_ok("Cancelled", json!({
+                    "type": "object",
+                    "required": ["cancelled"],
+                    "properties": { "cancelled": { "type": "boolean" } }
+                })), &[
+                    ("404", "pairing_not_found: no code of this caller's with that request_id is pending"),
+                ])
+            }}),
+        ),
+        (
+            "/api/peers",
+            json!({
+                "get": {
+                    "summary": "The accept switch and this computer's linked gateways; a peer not heard from for a minute is pinged first. Requires the fleet_peers capability and the admin token or an app device",
+                    "responses": json_ok("Peers", json!({
+                        "type": "object",
+                        "required": ["accept_delegations", "peers"],
+                        "properties": {
+                            "accept_delegations": { "type": "boolean" },
+                            "peers": { "type": "array", "items": peer_view() }
+                        }
+                    }))
+                },
+                "post": {
+                    "summary": "Pair this gateway with the one at url through a code minted there (POST /api/pair/pending), and remember it as name",
+                    "requestBody": json_body(json!({
+                        "type": "object",
+                        "required": ["url", "name", "request_id", "code"],
+                        "properties": {
+                            "url": { "type": "string", "description": "http:// or https://, at most 512 bytes; the address the phone uses for it" },
+                            "name": { "type": "string" },
+                            "request_id": { "type": "string" },
+                            "code": { "type": "string" }
+                        }
+                    })),
+                    "responses": with_errors(json_ok("The new peer", peer_view()), &[
+                        ("400", "invalid_request; peer_is_self: the url is this gateway"),
+                        ("409", "name_conflict: name is this computer's own (checked before the claim, so the code stays good). peer_refused: the other gateway refused the code; error.reason is pairing_code_expired, invalid_pairing_code, pairing_not_requested, invalid_token or refused. peer_name_taken: another peer has that name. peer_conflict: a peer giving the same id is already linked (remove it first)"),
+                        ("502", "peer_unreachable: nothing answered at url"),
+                    ])
+                }
+            }),
+        ),
+        (
+            "/api/peers/{id}",
+            json!({
+                "patch": {
+                    "summary": "Rename a linked gateway and/or change the address it is reached at; a new url is proven with one call carrying the link's token before it is kept",
+                    "parameters": [path_param("id")],
+                    "requestBody": json_body(json!({
+                        "type": "object",
+                        "minProperties": 1,
+                        "properties": {
+                            "name": { "type": "string" },
+                            "url": { "type": "string", "description": "http:// or https://, at most 512 bytes" }
+                        }
+                    })),
+                    "responses": with_errors(json_ok("The changed peer", peer_view()), &[
+                        ("400", "invalid_request"),
+                        ("404", "peer_not_found"),
+                        ("409", "peer_name_taken: another peer has that name. name_conflict: this computer's own name. peer_refused: what answers at the new url does not know this link (error.reason)"),
+                        ("502", "peer_unreachable: nothing answered at the new url"),
+                    ])
+                },
+                "delete": {
+                    "summary": "Unlink a gateway: forget it here, ask it to revoke this gateway's token, and revoke the gateway devices here that paired as its server_id. Each revoke is best effort and runs whatever the other did. The admin token or an app device only",
+                    "parameters": [path_param("id")],
+                    "responses": {
+                        "200": { "description": "Unlinked", "content": { "application/json": { "schema": {
+                            "type": "object",
+                            "required": ["remote_revoked", "counterpart_found", "counterpart_revoked"],
+                            "properties": {
+                                "remote_revoked": { "type": "boolean", "description": "The peer confirmed it revoked this gateway's token" },
+                                "counterpart_found": { "type": "boolean", "description": "A gateway device here paired as the peer's server_id" },
+                                "counterpart_revoked": { "type": "boolean", "description": "A gateway device here that paired as the peer's server_id was found and revoked" }
+                            }
+                        } } } },
+                        "401": { "description": "Missing or invalid authorization" },
+                        "403": { "description": "Invalid token, or peer_forbidden" },
+                        "404": { "description": "peer_not_found" }
+                    }
+                }
+            }),
+        ),
+        (
+            "/api/fleet/settings",
+            json!({ "put": {
+                "summary": "The accept switch: whether linked gateways may open tasks here. Written to config.json (fleet.accept_delegations). Requires the fleet_peers capability and the admin token or an app device",
+                "requestBody": json_body(json!({
+                    "type": "object",
+                    "required": ["accept_delegations"],
+                    "properties": { "accept_delegations": { "type": "boolean" } }
+                })),
+                "responses": with_errors(json_ok("The switch as it now stands", json!({
+                    "type": "object",
+                    "required": ["accept_delegations"],
+                    "properties": { "accept_delegations": { "type": "boolean" } }
+                })), &[("400", "invalid_request")])
+            }}),
+        ),
+    ]
+}
+
+/// `responses` plus the named error statuses.
+fn with_errors(mut responses: Value, errors: &[(&str, &str)]) -> Value {
+    for (status, description) in errors {
+        responses[*status] = json!({ "description": description });
+    }
+    responses
+}
+
+/// A linked gateway as `/api/peers*` answers it: never its token.
+fn peer_view() -> Value {
+    json!({
+        "type": "object",
+        "required": ["peer_id", "server_id", "name", "url", "reachable", "last_seen_ms"],
+        "properties": {
+            "peer_id": { "type": "string", "description": "This gateway's own id for the link" },
+            "server_id": { "type": "string", "description": "The id the other gateway gave for itself; display data, never a key" },
+            "name": { "type": "string" },
+            "url": { "type": "string" },
+            "reachable": { "type": "boolean", "description": "It answered within the last 2 minutes" },
+            "last_seen_ms": { "type": ["integer", "null"] }
+        }
+    })
 }
 
 fn audio_asset_endpoint() -> Value {
@@ -1627,6 +2130,38 @@ fn lazygit_endpoints() -> Value {
 #[cfg(test)]
 mod history_contract_tests {
     use super::*;
+
+    #[test]
+    fn tasks_fleet_and_mcp_token_paths_are_in_the_spec() {
+        let spec = openapi_spec();
+        for (path, method) in [
+            ("/api/tasks", "get"),
+            ("/api/tasks/{id}", "get"),
+            ("/api/tasks/{id}/cancel", "post"),
+            ("/api/tasks/{id}/complete", "post"),
+            ("/api/fleet/self", "get"),
+            ("/api/mcp/tokens", "post"),
+            ("/api/mcp/tokens", "get"),
+            ("/api/mcp/tokens/{id}", "delete"),
+            ("/api/pair/pending", "post"),
+            ("/api/pair/pending/{request_id}", "delete"),
+            ("/api/peers", "get"),
+            ("/api/peers", "post"),
+            ("/api/peers/{id}", "patch"),
+            ("/api/peers/{id}", "delete"),
+            ("/api/fleet/settings", "put"),
+        ] {
+            assert!(spec["paths"][path][method].is_object(), "{method} {path}");
+        }
+        assert_eq!(
+            spec["paths"]["/api/mcp/tokens/{id}"]["delete"]["responses"]["204"]["description"],
+            "Revoked; /mcp refuses the token from the next call"
+        );
+        assert!(spec["components"]["schemas"]["TaskState"]["enum"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("idle_unconfirmed")));
+    }
 
     #[test]
     fn captured_history_openapi_capability_and_bounded_contract_are_explicit() {
