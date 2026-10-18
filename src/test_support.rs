@@ -50,6 +50,11 @@ pub(crate) fn test_config(token: &str) -> Config {
         opencode: agents::OpencodeConfig::default(),
         deepseek: agents::DeepseekConfig::default(),
         t3: agents::T3Config::default(),
+        codex: agents::runtime::CodexConfig {
+            enabled: false,
+            binary: None,
+        },
+        agent_runtime: crate::platform::config::AgentRuntimeConfig { enabled: false },
         store: crate::platform::config::StoreConfig::default(),
         mcp: crate::platform::config::McpConfig::default(),
         fleet: Default::default(),
@@ -601,6 +606,7 @@ pub(crate) struct FakeHerdr {
     /// `shell_pid` that `pane.process_info` answers with); unset, both
     /// methods answer a bare `ok` as before.
     panes: Arc<Mutex<Option<Value>>>,
+    agents: Arc<Mutex<Option<Value>>>,
 }
 
 impl FakeHerdr {
@@ -615,6 +621,8 @@ impl FakeHerdr {
         let recorded = Arc::clone(&calls);
         let panes: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
         let listed = Arc::clone(&panes);
+        let agents: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
+        let listed_agents = agents.clone();
         let screens: Vec<String> = screens.into_iter().map(str::to_owned).collect();
         let serving = tokio::spawn(async move {
             let mut reads = 0usize;
@@ -645,6 +653,9 @@ impl FakeHerdr {
                             .unwrap_or_default();
                         reads += 1;
                         json!({ "read": { "text": screen, "revision": reads } })
+                    }
+                    ("agent.list", _) if listed_agents.lock().unwrap().is_some() => {
+                        json!({"agents": listed_agents.lock().unwrap().clone().unwrap()})
                     }
                     ("agent.list", _) => {
                         let agents = match advance_after {
@@ -699,7 +710,12 @@ impl FakeHerdr {
             serving,
             calls,
             panes,
+            agents,
         }
+    }
+
+    pub(crate) fn set_agents(&self, agents: Value) {
+        *self.agents.lock().unwrap() = Some(agents);
     }
 
     /// Answer `pane.list` (and `pane.process_info`) from `panes` from now on.
@@ -1160,6 +1176,24 @@ impl agents::ports::agent::AgentPort for FakeAgent {
             Ok(session)
         })
     }
+    fn fork_session<'a>(
+        &'a self,
+        session_id: &'a str,
+        message_id: Option<&'a str>,
+    ) -> agents::ports::agent::AgentFuture<'a, agents::domain::AgentSessionInfo> {
+        Box::pin(async move {
+            let mut info = self.get_session(session_id).await?;
+            if self.failing {
+                return self.fail();
+            }
+            self.record(&format!(
+                "fork_session {session_id} {}",
+                message_id.unwrap_or("whole")
+            ));
+            info.asid = agents::domain::AgentSessionId(format!("{}_fork", self.kind));
+            Ok(info)
+        })
+    }
     fn get_session<'a>(
         &'a self,
         session_id: &'a str,
@@ -1233,9 +1267,12 @@ impl agents::ports::agent::AgentPort for FakeAgent {
         &'a self,
         _query: &'a str,
         _limit: usize,
-        _directory: Option<&'a str>,
+        directory: Option<&'a str>,
     ) -> agents::ports::agent::AgentFuture<'a, Vec<serde_json::Value>> {
-        Box::pin(async { Ok(Vec::new()) })
+        Box::pin(async move {
+            self.record(&format!("find_files:{}", directory.unwrap_or("")));
+            Ok(Vec::new())
+        })
     }
     fn reply_permission<'a>(
         &'a self,

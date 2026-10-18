@@ -145,41 +145,12 @@ fn record_endpoint(file: std::path::PathBuf, url: &str) -> Option<FileRecord> {
     Some(FileRecord(file))
 }
 
-/// On SIGTERM or SIGINT, remove `files`, then exit: a gateway stopped by its
-/// service manager leaves no stale address or identity behind.
-pub(crate) fn remove_on_stop(files: Vec<std::path::PathBuf>) {
-    #[cfg(unix)]
-    {
-        let on_stop = files;
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(async move {
-                use tokio::signal::unix::{signal, SignalKind};
-                let (Ok(mut term), Ok(mut int)) = (
-                    signal(SignalKind::terminate()),
-                    signal(SignalKind::interrupt()),
-                ) else {
-                    return;
-                };
-                tokio::select! {
-                    _ = term.recv() => {}
-                    _ = int.recv() => {}
-                }
-                for file in &on_stop {
-                    let _ = std::fs::remove_file(file);
-                }
-                std::process::exit(0);
-            });
-        }
-    }
-    #[cfg(not(unix))]
-    let _ = files;
-}
-
 /// A file this gateway process keeps (its loopback address, its identity),
 /// removed when this is dropped.
 pub(crate) struct FileRecord(std::path::PathBuf);
 
 impl FileRecord {
+    #[cfg(test)]
     pub(crate) fn path(&self) -> &std::path::Path {
         &self.0
     }
@@ -409,6 +380,16 @@ async fn serve(
             Ok(session) => session,
             Err(refusal) => return refusal.into_response(),
         };
+    if let tokens::TokenBinding::Task { task_id } = &session.binding {
+        if !matches!(issue::task_authority(&state, task_id).await, Ok(Some(_))) {
+            return crate::api_error(
+                axum::http::StatusCode::FORBIDDEN,
+                "task_not_available",
+                "Task token authority is unavailable",
+            )
+            .into_response();
+        }
+    }
     let in_task = tools::started_for_task(&state, &session).await;
     let service = StreamableHttpService::new(
         move || Ok(tools::MuqunMcp::new(state.clone(), session.clone()).in_task(in_task)),

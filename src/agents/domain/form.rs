@@ -114,6 +114,9 @@ pub enum FormField {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FormRequest {
+    /// Answering is optional while the agent continues; not a blocking tool callback.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub nonblocking: bool,
     pub id: String,
     pub asid: AgentSessionId,
     pub title: String,

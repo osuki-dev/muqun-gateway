@@ -32,6 +32,10 @@ pub(crate) enum McpCommand {
         /// its identity file is.
         #[arg(long, value_name = "DIR")]
         state_dir: Option<PathBuf>,
+        /// Immutable task authority for a shared Codex thread. Issuance still
+        /// requires this gateway's admin credential and an eligible task.
+        #[arg(long, value_name = "TASK_ID")]
+        task_id: Option<String>,
     },
     /// Revoke assistant tokens. A running gateway sees it on the next call.
     #[command(group(clap::ArgGroup::new("which").required(true).args(["all", "id"])))]
@@ -153,6 +157,10 @@ fn helper_outcome(status: u16, body: &Value) -> Result<(), (i32, String)> {
     match status {
         200 => Ok(()),
         404 if body["error"]["code"] == "pane_not_found" => Err((2, NOT_IN_PANE.into())),
+        404 if body["error"]["code"] == "task_not_available" => Err((
+            2,
+            "muqun: this task cannot obtain an assistant token".into(),
+        )),
         404 => Err((1, MCP_DISABLED.into())),
         other => Err((
             1,
@@ -166,6 +174,7 @@ fn token_helper(
     config_dir: Option<PathBuf>,
     url: Option<String>,
     state_dir: Option<PathBuf>,
+    task_id: Option<String>,
 ) -> anyhow::Result<()> {
     let fail = |code: i32, message: String| -> ! {
         eprintln!("{message}");
@@ -206,8 +215,12 @@ fn token_helper(
         tracing::warn!("{refused}");
         fail(1, refused);
     }
-    let pids = ancestor_chain(std::process::id(), MAX_ANCESTORS, parent_pid);
-    let body = json!({ "ancestor_pids": pids });
+    let body = match task_id {
+        Some(task_id) => json!({ "task_id": task_id }),
+        None => {
+            json!({ "ancestor_pids": ancestor_chain(std::process::id(), MAX_ANCESTORS, parent_pid) })
+        }
+    };
     let (status, value) = match admin_request(&config, "POST", "/api/mcp/tokens", Some(&body)) {
         Ok(reply) => reply,
         Err(error) if error.is::<GatewayNotRunning>() => {
@@ -260,7 +273,8 @@ pub(crate) async fn run_mcp_command(command: McpCommand) -> anyhow::Result<()> {
             config_dir,
             url,
             state_dir,
-        } => token_helper(bearer, config_dir, url, state_dir)?,
+            task_id,
+        } => token_helper(bearer, config_dir, url, state_dir, task_id)?,
         McpCommand::Revoke { all, id } => revoke(all, id).await?,
         McpCommand::Enable { host, project, url } => {
             let url = url.unwrap_or_else(default_url);
@@ -415,5 +429,32 @@ mod tests {
         assert!(bearer);
         assert_eq!(config_dir, Some(PathBuf::from("/tmp/demo/config")));
         assert_eq!(url.as_deref(), Some("http://127.0.0.1:23847/mcp"));
+    }
+
+    #[test]
+    fn shared_thread_helper_accepts_an_explicit_task_without_a_pid_override() {
+        use clap::Parser as _;
+        let id = crate::tasks::domain::TaskId::new().0;
+        let cli = crate::Cli::try_parse_from([
+            "muqun-gateway",
+            "mcp",
+            "token-helper",
+            "--task-id",
+            &id,
+            "--url",
+            "http://127.0.0.1:23847/mcp",
+        ])
+        .unwrap();
+        assert!(matches!(cli.command, crate::cli::Command::Mcp {
+            command: McpCommand::TokenHelper { task_id: Some(actual), .. }
+        } if actual == id));
+        assert!(crate::Cli::try_parse_from([
+            "muqun-gateway",
+            "mcp",
+            "token-helper",
+            "--ancestor-pid",
+            "123"
+        ])
+        .is_err());
     }
 }

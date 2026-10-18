@@ -1875,6 +1875,7 @@ fn part_schema() -> Value {
                 "items": object_schema(&[("text", "string"), ("done", "boolean")], &["text", "done"])
             },
             "text": { "type": "string", "description": "status and prompt: the line's content" },
+            "attachments": { "type": "array", "items": { "type": "string" }, "description": "prompt: optional verified image data URIs, declared by codex_transcript_images_v1; 2 MiB per decoded image and 8 MiB encoded total per response. Exact producer conversation binding is required. Text and ranges stay unchanged." },
             "spinner": { "type": "boolean", "description": "status: the line is one of the agent's animated frames" },
             "approval_id": { "type": "string", "description": "approval: what POST .../approval answers. Only a source that reports approval state can raise one; a pane read through a marker dictionary carries its menu on the approvals endpoint instead" },
             "prompt": { "type": "string", "description": "approval: the question, written by the gateway from the protocol's own action name and never quoted out of a terminal" },

@@ -55,6 +55,12 @@ pub struct AgentQuery {
     pub agent_id: Option<String>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+pub struct AgentSnapshotQuery {
+    #[serde(default)]
+    pub refresh: bool,
+}
+
 /// What a session list answers when the caller does not say.
 ///
 /// The app already asks for fifty; a caller that asks for nothing used to get
@@ -186,6 +192,7 @@ pub struct AgentVcsDiffQuery {
 
 #[derive(Debug, Deserialize)]
 pub struct AgentFilesQuery {
+    pub agent_id: Option<String>,
     pub query: Option<String>,
     pub limit: Option<usize>,
     pub directory: Option<String>,
@@ -235,6 +242,12 @@ pub struct CreateAgentSessionBody {
     pub mode: Option<String>,
     #[serde(default)]
     pub agent_id: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ForkSessionBody {
+    pub message_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -350,6 +363,11 @@ pub fn mount(router: Router<AppState>) -> Router<AppState> {
         .route(
             "/api/agents/{agent_id}/sessions/{asid}",
             delete(delete_agent_session_scoped),
+        )
+        .route("/api/agent-sessions/{asid}/fork", post(fork_agent_session))
+        .route(
+            "/api/agents/{agent_id}/sessions/{asid}/fork",
+            post(fork_agent_session_scoped),
         )
         .route(
             "/api/agent-sessions/{asid}/children",
@@ -782,15 +800,31 @@ async fn do_get_agent_session(
     asid: &str,
     headers: &HeaderMap,
 ) -> ApiResult<Response> {
+    do_read_agent_session(state, asid, false, headers).await
+}
+
+async fn do_read_agent_session(
+    state: &AppState,
+    asid: &str,
+    refresh: bool,
+    headers: &HeaderMap,
+) -> ApiResult<Response> {
     require_device(state, headers)?;
-
     let manager = session_manager_or_err(state, asid).await?;
-
-    let mut snapshot = manager
-        .sessions()
-        .get_snapshot(&AgentSessionId(asid.to_string()))
-        .await
-        .map_err(|e| api_error(StatusCode::NOT_FOUND, "session_not_found", &e.to_string()))?;
+    let id = AgentSessionId(asid.to_string());
+    let mut snapshot = if refresh {
+        manager
+            .sessions()
+            .refresh_snapshot(&id)
+            .await
+            .map_err(agent_error)?
+    } else {
+        manager
+            .sessions()
+            .get_snapshot(&id)
+            .await
+            .map_err(agent_error)?
+    };
     let directory = snapshot.info.directory.clone();
     let plumbing = for_session(state, asid).await;
     hide_in_items(&mut snapshot.timeline, plumbing);
@@ -885,8 +919,14 @@ async fn do_switch_mode(
     Ok(Json(content_envelope(json!({ "ok": true }))))
 }
 
+enum FileSearchScope<'a> {
+    Session(&'a str),
+    Agent(Option<&'a str>),
+}
+
 async fn do_find_agent_files(
     state: &AppState,
+    scope: FileSearchScope<'_>,
     query: &str,
     limit: usize,
     directory: Option<&str>,
@@ -894,15 +934,40 @@ async fn do_find_agent_files(
 ) -> ApiResult<Json<Value>> {
     require_device(state, headers)?;
 
-    let Some(manager) = state.agent_runtime.manager().await else {
-        return Err(api_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "agent_unavailable",
-            "No agent is available",
-        ));
+    let (manager, directory) = match scope {
+        FileSearchScope::Session(asid) => {
+            let manager = session_manager_or_err(state, asid).await?;
+            let info = manager
+                .agent()
+                .get_session(asid)
+                .await
+                .map_err(agent_error)?;
+            let directory = info
+                .directory
+                .filter(|path| std::path::Path::new(path).is_absolute())
+                .ok_or_else(|| {
+                    api_error(
+                        StatusCode::BAD_REQUEST,
+                        "workspace_unknown",
+                        "The selected session has no workspace directory",
+                    )
+                })?;
+            (manager, Some(directory))
+        }
+        FileSearchScope::Agent(agent_id) => {
+            let manager = match agent_id {
+                Some(id) => agent_manager_or_err(state, id).await?,
+                None => state.agent_runtime.manager().await.ok_or_else(|| {
+                    api_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "agent_unavailable",
+                        "No agent is available",
+                    )
+                })?,
+            };
+            (manager, expand_directory_param(directory))
+        }
     };
-
-    let directory = expand_directory_param(directory);
     let directory = directory.as_deref();
     require_directory(directory)?;
 
@@ -910,7 +975,7 @@ async fn do_find_agent_files(
         .agent()
         .find_files(query, limit, directory)
         .await
-        .map_err(|e| api_error(StatusCode::BAD_GATEWAY, "fs_error", &e.to_string()))?;
+        .map_err(agent_error)?;
 
     let hits: Vec<Value> = files
         .iter()
@@ -955,7 +1020,8 @@ async fn do_send_agent_prompt(
         )
         .await
         .map_err(|e| match e {
-            super::ports::agent::AgentError::InvalidRequest(_) => agent_error(e),
+            super::ports::agent::AgentError::InvalidRequest(_)
+            | super::ports::agent::AgentError::TerminalInteraction(_) => agent_error(e),
             _ => api_error(StatusCode::BAD_GATEWAY, "agent_error", &e.to_string()),
         })?;
 
@@ -997,7 +1063,10 @@ async fn do_interrupt_agent_session(
         .prompts()
         .interrupt(&AgentSessionId(asid.to_string()))
         .await
-        .map_err(|e| api_error(StatusCode::BAD_GATEWAY, "agent_error", &e.to_string()))?;
+        .map_err(|e| match e {
+            super::ports::agent::AgentError::TerminalInteraction(_) => agent_error(e),
+            _ => api_error(StatusCode::BAD_GATEWAY, "agent_error", &e.to_string()),
+        })?;
 
     Ok(Json(content_envelope(json!({ "interrupted": true }))))
 }
@@ -1016,7 +1085,10 @@ async fn do_switch_agent_model(
         .sessions()
         .switch_model(&AgentSessionId(asid.to_string()), &model)
         .await
-        .map_err(|e| api_error(StatusCode::BAD_GATEWAY, "agent_error", &e.to_string()))?;
+        .map_err(|e| match e {
+            super::ports::agent::AgentError::TerminalInteraction(_) => agent_error(e),
+            _ => api_error(StatusCode::BAD_GATEWAY, "agent_error", &e.to_string()),
+        })?;
 
     Ok(Json(content_envelope(json!({ "switched": true }))))
 }
@@ -1631,9 +1703,10 @@ async fn create_agent_session_global(
 async fn get_agent_session_global(
     State(state): State<AppState>,
     Path(asid): Path<String>,
+    Query(query): Query<AgentSnapshotQuery>,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
-    do_get_agent_session(&state, &asid, &headers).await
+    do_read_agent_session(&state, &asid, query.refresh, &headers).await
 }
 
 async fn get_agent_session_events_global(
@@ -1670,6 +1743,7 @@ async fn find_agent_files_root_global(
 ) -> ApiResult<Json<Value>> {
     do_find_agent_files(
         &state,
+        FileSearchScope::Agent(query.agent_id.as_deref()),
         query.query.as_deref().unwrap_or(""),
         query.limit.unwrap_or(20),
         query.directory.as_deref(),
@@ -1680,12 +1754,13 @@ async fn find_agent_files_root_global(
 
 async fn find_agent_files_global(
     State(state): State<AppState>,
-    Path(_asid): Path<String>,
+    Path(asid): Path<String>,
     Query(query): Query<AgentFilesQuery>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     do_find_agent_files(
         &state,
+        FileSearchScope::Session(&asid),
         query.query.as_deref().unwrap_or(""),
         query.limit.unwrap_or(20),
         query.directory.as_deref(),
@@ -1787,9 +1862,10 @@ async fn create_agent_session_legacy(
 async fn get_agent_session_legacy(
     State(state): State<AppState>,
     Path((_session_id, asid)): Path<(String, String)>,
+    Query(query): Query<AgentSnapshotQuery>,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
-    do_get_agent_session(&state, &asid, &headers).await
+    do_read_agent_session(&state, &asid, query.refresh, &headers).await
 }
 
 async fn get_agent_session_events_legacy(
@@ -1827,6 +1903,7 @@ async fn find_agent_files_root_legacy(
 ) -> ApiResult<Json<Value>> {
     do_find_agent_files(
         &state,
+        FileSearchScope::Agent(query.agent_id.as_deref()),
         query.query.as_deref().unwrap_or(""),
         query.limit.unwrap_or(20),
         query.directory.as_deref(),
@@ -1837,12 +1914,13 @@ async fn find_agent_files_root_legacy(
 
 async fn find_agent_files_legacy(
     State(state): State<AppState>,
-    Path((_session_id, _asid)): Path<(String, String)>,
+    Path((_session_id, asid)): Path<(String, String)>,
     Query(query): Query<AgentFilesQuery>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     do_find_agent_files(
         &state,
+        FileSearchScope::Session(&asid),
         query.query.as_deref().unwrap_or(""),
         query.limit.unwrap_or(20),
         query.directory.as_deref(),
@@ -2050,6 +2128,17 @@ fn agent_error(err: super::ports::agent::AgentError) -> (StatusCode, Json<Value>
     // as its own field so the app can offer to forget the session rather than
     // parse a sentence.
     match &err {
+        super::ports::agent::AgentError::SessionNotFound(_) => {
+            api_error(StatusCode::NOT_FOUND, "session_not_found", &err.to_string())
+        }
+        super::ports::agent::AgentError::TerminalInteraction(runtime) => (
+            StatusCode::CONFLICT,
+            Json(
+                json!({ "error": { "code": "agent_terminal_interaction_required",
+                "message": "Native interaction is unavailable; use the current terminal binding when provided",
+                "runtime": runtime } }),
+            ),
+        ),
         super::ports::agent::AgentError::WorkspaceMissing(directory) => {
             workspace_missing(directory)
         }
@@ -2197,6 +2286,95 @@ async fn do_delete_agent_session(
         state.agent_runtime.forget_session_route(asid).await;
     }
     Ok(Json(content_envelope(json!({ "deleted": true }))))
+}
+
+async fn fork_agent_session(
+    State(state): State<AppState>,
+    Path(asid): Path<String>,
+    headers: HeaderMap,
+    body: Option<Json<ForkSessionBody>>,
+) -> ApiResult<Json<Value>> {
+    do_fork_agent_session(
+        &state,
+        &asid,
+        None,
+        body.map(|Json(body)| body).unwrap_or_default(),
+        &headers,
+    )
+    .await
+}
+
+async fn fork_agent_session_scoped(
+    State(state): State<AppState>,
+    Path((agent_id, asid)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Option<Json<ForkSessionBody>>,
+) -> ApiResult<Json<Value>> {
+    do_fork_agent_session(
+        &state,
+        &asid,
+        Some(&agent_id),
+        body.map(|Json(body)| body).unwrap_or_default(),
+        &headers,
+    )
+    .await
+}
+
+async fn do_fork_agent_session(
+    state: &AppState,
+    asid: &str,
+    agent_id: Option<&str>,
+    body: ForkSessionBody,
+    headers: &HeaderMap,
+) -> ApiResult<Json<Value>> {
+    require_device(state, headers)?;
+    validate_text(asid)?;
+    if asid.len() > 128
+        || matches!(asid, "." | "..")
+        || !asid
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+        || asid.trim().is_empty()
+        || body
+            .message_id
+            .as_ref()
+            .is_some_and(|id| id.trim().is_empty())
+    {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_session",
+            "Session and message identities must not be empty",
+        ));
+    }
+    if let Some(id) = &body.message_id {
+        validate_text(id)?;
+    }
+    let manager = match agent_id {
+        Some(agent_id) => agent_manager_or_err(state, agent_id).await?,
+        None => session_manager_or_err(state, asid).await?,
+    };
+    let source = manager
+        .agent()
+        .get_session(asid)
+        .await
+        .map_err(agent_error)?;
+    if source.asid.0 != asid {
+        return Err(api_error(
+            StatusCode::CONFLICT,
+            "session_changed",
+            "The selected agent returned a different session",
+        ));
+    }
+    let session = manager
+        .sessions()
+        .fork_session(asid, body.message_id.as_deref())
+        .await
+        .map_err(agent_error)?;
+    state
+        .agent_runtime
+        .record_session_route(&session.asid.0, manager.agent().kind())
+        .await;
+    Ok(Json(content_envelope(json!(session))))
 }
 
 async fn rename_agent_session(
@@ -2994,6 +3172,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_rejected_session_resume_is_not_a_missing_session() {
+        use super::super::ports::agent::AgentError;
+        let (status, Json(body)) = agent_error(AgentError::RequestFailed(
+            "thread already has an active writer".into(),
+        ));
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(body["error"]["code"], "agent_error");
+        let (status, Json(body)) = agent_error(AgentError::SessionNotFound("gone".into()));
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"]["code"], "session_not_found");
+    }
+
     /// A folder that has been deleted is a 404 that names it, never a 502 --
     /// and the path is its own field so the app can offer to forget the
     /// session rather than parse a sentence out of the message.
@@ -3280,6 +3471,40 @@ mod tests {
         assert_eq!(bare.into_mode(), "plan");
     }
 
+    #[tokio::test]
+    async fn explicit_snapshot_refresh_requires_app_device_before_provider_lookup() {
+        let state = crate::test_support::test_state(
+            "admin",
+            vec![crate::test_support::test_peer_device("peer", "peer-token")],
+        );
+        for (headers, status, code) in [
+            (
+                HeaderMap::new(),
+                StatusCode::UNAUTHORIZED,
+                "missing_authorization",
+            ),
+            (
+                crate::test_support::bearer_headers("admin"),
+                StatusCode::FORBIDDEN,
+                "invalid_token",
+            ),
+            (
+                crate::test_support::bearer_headers("peer-token"),
+                StatusCode::FORBIDDEN,
+                "peer_forbidden",
+            ),
+        ] {
+            let refusal = do_read_agent_session(&state, "fixture", true, &headers)
+                .await
+                .unwrap_err();
+            assert_eq!(refusal.0, status);
+            assert_eq!(
+                crate::test_support::error_body(&refusal)["error"]["code"],
+                code
+            );
+        }
+    }
+
     async fn create_refusal(body: Value) -> (StatusCode, Value) {
         let state = crate::test_support::test_state(
             "admin",
@@ -3346,6 +3571,73 @@ mod tests {
             state.agent_runtime.attach_for_test(agent.manager()).await;
         }
         state
+    }
+
+    #[tokio::test]
+    async fn fork_route_authenticates_selects_exact_provider_and_registers_new_session() {
+        let codex = FakeAgent::new("codex").with_sessions(&[("source", 1)]);
+        let codex_calls = codex.calls.clone();
+        let opencode = FakeAgent::new("opencode").with_sessions(&[("source", 1)]);
+        let calls = opencode.calls.clone();
+        let state = state_with(vec![codex, opencode]).await;
+        for (headers, expected) in [
+            (HeaderMap::new(), StatusCode::UNAUTHORIZED),
+            (
+                crate::test_support::bearer_headers("wrong"),
+                StatusCode::FORBIDDEN,
+            ),
+        ] {
+            assert_eq!(
+                do_fork_agent_session(
+                    &state,
+                    "source",
+                    Some("opencode"),
+                    ForkSessionBody::default(),
+                    &headers
+                )
+                .await
+                .unwrap_err()
+                .0,
+                expected
+            );
+        }
+        assert!(calls.lock().unwrap().is_empty() && codex_calls.lock().unwrap().is_empty());
+        let Json(body) = do_fork_agent_session(
+            &state,
+            "source",
+            Some("opencode"),
+            ForkSessionBody {
+                message_id: Some("boundary".into()),
+            },
+            &device_headers(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(body["data"]["asid"], "opencode_fork");
+        assert_eq!(body["data"]["agent_id"], "opencode");
+        assert_eq!(*calls.lock().unwrap(), ["fork_session source boundary"]);
+        assert!(codex_calls.lock().unwrap().is_empty());
+        let manager = state
+            .agent_runtime
+            .manager_for_session("opencode_fork")
+            .await
+            .unwrap();
+        assert_eq!(manager.agent().kind(), "opencode");
+        assert!(manager
+            .mirror()
+            .get_snapshot(&AgentSessionId("opencode_fork".into()))
+            .await
+            .is_some());
+        assert!(do_fork_agent_session(
+            &state,
+            "missing",
+            Some("codex"),
+            ForkSessionBody::default(),
+            &device_headers()
+        )
+        .await
+        .is_err());
+        assert!(codex_calls.lock().unwrap().is_empty());
     }
 
     async fn body_json(response: Response) -> Value {
@@ -4021,6 +4313,56 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn file_mentions_use_the_session_owner_and_directory_not_the_primary_provider() {
+        let primary = FakeAgent::new("opencode");
+        let primary_calls = primary.calls.clone();
+        let mut selected = FakeAgent::new("codex").with_sessions(&[("selected", 1)]);
+        let directory = crate::test_support::asset_test_dir("agent-file-scope");
+        selected.sessions[0].directory = Some(directory.as_path().to_string_lossy().into_owned());
+        let selected_calls = selected.calls.clone();
+        let state = state_with(vec![primary, selected]).await;
+        let _ = do_find_agent_files(
+            &state,
+            FileSearchScope::Session("selected"),
+            "name",
+            10,
+            Some("/wrong-project"),
+            &device_headers(),
+        )
+        .await
+        .unwrap();
+        assert!(!primary_calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|call| call.starts_with("find_files:")));
+        assert!(selected_calls
+            .lock()
+            .unwrap()
+            .contains(&format!("find_files:{}", directory.as_path().display())));
+        let _ = do_find_agent_files(
+            &state,
+            FileSearchScope::Agent(Some("codex")),
+            "name",
+            10,
+            Some(directory.as_path().to_str().unwrap()),
+            &device_headers(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            selected_calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|call| call.starts_with("find_files:"))
+                .count(),
+            2
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     /// The directory-scoped routes expand `~` before the missing-folder check,
     /// so a `~/…` that is gone is the usual 404 naming the absolute path.
     #[tokio::test]
@@ -4028,6 +4370,7 @@ mod tests {
         let state = state_with(vec![FakeAgent::new("opencode")]).await;
         let refusal = do_find_agent_files(
             &state,
+            FileSearchScope::Agent(None),
             "x",
             10,
             Some("~/muqun-no-such-dir-for-tests"),
@@ -4047,9 +4390,16 @@ mod tests {
         );
 
         // And one that exists is let through.
-        let Json(_) = do_find_agent_files(&state, "x", 10, Some("~"), &device_headers())
-            .await
-            .expect("home is a workspace the agent can search");
+        let Json(_) = do_find_agent_files(
+            &state,
+            FileSearchScope::Agent(None),
+            "x",
+            10,
+            Some("~"),
+            &device_headers(),
+        )
+        .await
+        .expect("home is a workspace the agent can search");
     }
 
     #[tokio::test]

@@ -164,6 +164,11 @@ pub fn map_session(thread: &Value, projects: &HashMap<String, String>) -> Option
     Some(AgentSessionInfo {
         asid: AgentSessionId(id.to_string()),
         backend_session_id: String::new(),
+        runtime: None,
+        context_usage: None,
+        git_info: None,
+        agent_name: None,
+        agent_role: None,
         agent_id: String::new(),
         title,
         mode: None,
@@ -534,6 +539,7 @@ pub fn map_form(thread_id: &str, activity: &Value) -> Option<FormRequest> {
         })
         .collect();
     Some(FormRequest {
+        nonblocking: false,
         id: request_id.to_string(),
         asid: AgentSessionId(thread_id.to_string()),
         title: s(activity, "summary")

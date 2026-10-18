@@ -211,6 +211,9 @@ pub struct Pane {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Agent {
+    /// Producer conversation identity. Internal only: never serialized by
+    /// the compatibility API and never inferred from the working directory.
+    pub conversation_id: Option<String>,
     /// Opaque identity of this process/conversation, never a reusable pane id.
     pub instance_id: Option<String>,
     pub target: String,

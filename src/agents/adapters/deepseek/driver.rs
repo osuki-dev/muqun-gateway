@@ -110,6 +110,11 @@ impl AgentPort for DeepseekDriver {
                 asid: AgentSessionId(session_id.to_string()),
                 agent_id: String::new(),
                 backend_session_id: session_id.to_string(),
+                runtime: None,
+                context_usage: None,
+                git_info: None,
+                agent_name: None,
+                agent_role: None,
                 title: "New DeepSeek Session".to_string(),
                 mode: mode.map(str::to_string),
                 model: selected_model,
@@ -429,9 +434,14 @@ impl AgentPort for DeepseekDriver {
     fn fork_session<'a>(
         &'a self,
         session_id: &'a str,
-        _message_id: Option<&'a str>,
+        message_id: Option<&'a str>,
     ) -> AgentFuture<'a, AgentSessionInfo> {
         Box::pin(async move {
+            if message_id.is_some() {
+                return Err(AgentError::Unsupported(
+                    "DeepSeek message-boundary fork".into(),
+                ));
+            }
             let res = self.client.fork(session_id).await?;
             let new_id = res
                 .get("sessionId")
@@ -443,6 +453,11 @@ impl AgentPort for DeepseekDriver {
                 asid: AgentSessionId(new_id.to_string()),
                 agent_id: String::new(),
                 backend_session_id: new_id.to_string(),
+                runtime: None,
+                context_usage: None,
+                git_info: None,
+                agent_name: None,
+                agent_role: None,
                 title: "Forked Session".to_string(),
                 mode: None,
                 model: None,
@@ -482,6 +497,16 @@ mod tests {
         ));
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         (driver, server)
+    }
+
+    #[tokio::test]
+    async fn message_boundary_fork_is_rejected_instead_of_silently_copying_whole_session() {
+        let (driver, server) = rpc_server(axum::Router::new()).await;
+        assert!(matches!(
+            driver.fork_session("source", Some("message")).await,
+            Err(AgentError::Unsupported(_))
+        ));
+        server.abort();
     }
 
     #[tokio::test]

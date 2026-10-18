@@ -9,7 +9,7 @@ use axum::routing::{delete, post};
 use axum::{Json, Router};
 use serde_json::{json, Value};
 
-use super::issue::{issue_for_process, IssueRequest};
+use super::issue::{issue_for_caller, IssueRequest};
 use crate::{api_error, require_admin, require_device, ApiResult, AppState};
 
 pub(crate) fn mount(router: Router<AppState>) -> Router<AppState> {
@@ -45,7 +45,7 @@ async fn issue(
                 "invalid request",
             )
         })?;
-    let issued = issue_for_process(&state, request).await?;
+    let issued = issue_for_caller(&state, request).await?;
     Ok(Json(json!({
         "token": issued.token,
         "token_id": issued.session.token_id,
@@ -108,6 +108,245 @@ mod tests {
         let mut state = test_state("admin", vec![test_device("d1", "device")]);
         state.config.sessions[0].socket_path = herdr.session("default").socket_path;
         state
+    }
+
+    async fn codex_task(state: &AppState) -> crate::tasks::domain::TaskId {
+        use crate::tasks::domain::*;
+        state
+            .tasks
+            .insert_for_test(&Task {
+                id: TaskId::new(),
+                kind: TaskKind::Delegation,
+                goal: "synthetic shared task".into(),
+                cwd: None,
+                binding: TaskBinding::Pane {
+                    session_id: "default".into(),
+                    pane_id: "%4".into(),
+                    tab_id: None,
+                    shell_pid: None,
+                    agent_id: Some("codex".into()),
+                    agent_job: None,
+                    model: None,
+                    variant: None,
+                },
+                state: TaskState::Working,
+                summary: None,
+                exit_code: None,
+                created_by: TaskPrincipal {
+                    kind: PrincipalKind::Device,
+                    id: "d1".into(),
+                },
+                created_ms: now_ms(),
+                updated_ms: now_ms(),
+                seq: 0,
+                parent: None,
+                origin: TaskOrigin::Device,
+                label: None,
+                requester_name: None,
+                session_title: None,
+                mentions: Vec::new(),
+                client_ref: None,
+                requester_server_id: None,
+                reopened_ms: None,
+                reopen_count: 0,
+            })
+            .await
+    }
+
+    #[tokio::test]
+    async fn immutable_task_tokens_require_admin_and_end_with_task_authority() {
+        use crate::tasks::domain::{TaskChange, TaskState};
+        let state = test_state(
+            "admin",
+            vec![
+                test_device("d1", "device"),
+                crate::test_support::test_peer_device("p", "peer"),
+            ],
+        );
+        let task = codex_task(&state).await;
+        let request = json!({"task_id": task.0});
+        for bearer in ["", "device", "peer"] {
+            assert_ne!(
+                call(
+                    &state,
+                    "POST",
+                    "/api/mcp/tokens",
+                    bearer,
+                    Some(request.clone())
+                )
+                .await
+                .0,
+                StatusCode::OK
+            );
+        }
+        let (status, issued) = call(
+            &state,
+            "POST",
+            "/api/mcp/tokens",
+            "admin",
+            Some(request.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{issued}");
+        assert_eq!(issued["binding"], json!({"kind":"task", "task_id": task.0}));
+        let token = issued["token"].as_str().unwrap();
+        assert_eq!(mcp_status(&state, token).await, StatusCode::OK);
+        assert_eq!(
+            call(
+                &state,
+                "POST",
+                "/api/mcp/tokens",
+                token,
+                Some(request.clone())
+            )
+            .await
+            .0,
+            StatusCode::FORBIDDEN
+        );
+        // Explicit revocation still acts immediately, even though the task lives.
+        state
+            .mcp_tokens
+            .revoke(issued["token_id"].as_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(mcp_status(&state, token).await, StatusCode::FORBIDDEN);
+        let (_, renewed) = call(
+            &state,
+            "POST",
+            "/api/mcp/tokens",
+            "admin",
+            Some(request.clone()),
+        )
+        .await;
+        let token = renewed["token"].as_str().unwrap();
+        state
+            .tasks
+            .move_to(
+                &task,
+                TaskChange {
+                    to: TaskState::Cancelled,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(mcp_status(&state, token).await, StatusCode::FORBIDDEN);
+        assert_eq!(
+            call(&state, "POST", "/api/mcp/tokens", "admin", Some(request))
+                .await
+                .0,
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn task_renewal_preserves_finished_followups_but_not_deleted_or_unrelated_tasks() {
+        use crate::tasks::domain::{TaskChange, TaskState};
+        let state = test_state("admin", Vec::new());
+        let task = codex_task(&state).await;
+        let request = json!({"task_id": task.0});
+        for bad in [
+            json!({"task_id": task.0, "ancestor_pids": [1]}),
+            json!({"task_id":"../task"}),
+            json!({"task_id":"t_".to_owned() + &"a".repeat(100)}),
+        ] {
+            assert_eq!(
+                call(&state, "POST", "/api/mcp/tokens", "admin", Some(bad))
+                    .await
+                    .0,
+                StatusCode::BAD_REQUEST
+            );
+        }
+        state
+            .tasks
+            .move_to(
+                &task,
+                TaskChange {
+                    to: TaskState::Done,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let (status, issued) = call(
+            &state,
+            "POST",
+            "/api/mcp/tokens",
+            "admin",
+            Some(request.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let token = issued["token"].as_str().unwrap();
+        assert_eq!(mcp_status(&state, token).await, StatusCode::OK);
+        let id = task.0.clone();
+        let session = state
+            .mcp_tokens
+            .resolve(token)
+            .await
+            .unwrap()
+            .live()
+            .unwrap();
+        let complete = crate::mcp::lineage::Call {
+            tool: "tasks.complete",
+            args: Vec::new(),
+        };
+        assert_eq!(
+            crate::mcp::lineage::own_task(&state, &session, &complete, None).await,
+            None
+        );
+        let finished = state.tasks.task(&task).await.unwrap().unwrap();
+        state
+            .tasks
+            .reopen(&finished, finished.updated_ms + 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            crate::mcp::lineage::own_task(&state, &session, &complete, None).await,
+            Some(task.clone())
+        );
+        state
+            .db
+            .call(move |db| {
+                db.execute("DELETE FROM tasks WHERE id = ?", [&id])?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(mcp_status(&state, token).await, StatusCode::FORBIDDEN);
+        assert_eq!(crate::mcp::issue::sweep_task_tokens(&state).await, 1);
+        assert!(state.mcp_tokens.list().await.unwrap().is_empty());
+        assert_eq!(
+            call(&state, "POST", "/api/mcp/tokens", "admin", Some(request))
+                .await
+                .0,
+            StatusCode::NOT_FOUND
+        );
+        let other = codex_task(&state).await;
+        let id = other.0.clone();
+        state
+            .db
+            .call(move |db| {
+                db.execute(
+                    "UPDATE tasks SET binding = replace(binding, 'codex', 'claude') WHERE id = ?",
+                    [&id],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            call(
+                &state,
+                "POST",
+                "/api/mcp/tokens",
+                "admin",
+                Some(json!({"task_id":other.0}))
+            )
+            .await
+            .0,
+            StatusCode::NOT_FOUND
+        );
     }
 
     fn app(state: &AppState) -> Router {

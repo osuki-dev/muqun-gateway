@@ -19,15 +19,23 @@ The retired `herdr.gateway` identifier remains only for migration compatibility.
 - `src/agents/`: agents plane.
   - `domain/`: neutral agent entities: sessions, timeline, permissions, forms.
   - `ports/`: `AgentPort` (`ports/agent.rs`) and `SessionMirrorPort`.
-  - `adapters/`: OpenCode, DeepSeek, T3 Code (`adapters/t3/`, Effect RPC over
-    a WebSocket; wire reference in `docs/t3-protocol.md`), and the in-memory
+  - `adapters/`: OpenCode, DeepSeek, Codex (`adapters/codex/`, private app-server
+    stdio or verified shared-daemon Unix WebSocket; wire reference in `docs/codex-protocol.md`), T3 Code (`adapters/t3/`,
+    Effect RPC over a WebSocket; wire reference in `docs/t3-protocol.md`), and the in-memory
     mirror adapter. Each adapter's event stream is folded into domain events
-    by a module under `manager/` (`deepseek.rs`, `t3.rs`).
+    by a module under `manager/` (`deepseek.rs`, `t3.rs`, `codex.rs`).
   - `manager.rs`, `runtime.rs`, `use_cases/`: agent supervision and the
     session/prompt/interaction services. `runtime/t3.rs` holds T3's config
     block, its pairing-token-to-bearer credential (persisted by
     `platform/store.rs` as `t3-credential.json`, 0600), and its attach and
-    discovery.
+    discovery. `runtime/codex.rs` adopts a verified existing Codex daemon connection
+    or owns a private fallback child and its lifecycle;
+    `adapters/codex/native_sessions.rs` retains accepted native session IDs scoped
+    to the verified Codex home in the shared SQLite store. Selected unloaded
+    sessions can request official same-ID resume after restart; this evidence
+    grants neither runtime ownership nor permission to replay a prompt.
+    service agents default on for Codex and OpenCode, with the master
+    `agent_runtime.enabled` switch independent of terminal-agent dispatch.
   - `routes.rs`: the OpenCode-style agent-session API (global and legacy paths).
   - `session_routes.rs`: terminal-multiplexer agent orchestration -- task
     dispatch, agent spawn, prompt delivery, approvals, and agent event history.
@@ -324,7 +332,7 @@ local fallback service. Older and future major versions are refused.
 Gateway absorbs upstream mappings without requiring an existing App update.
 The legacy session-list/children arrays remain; the additive page endpoint is
 gated by `agent_session_pages_v1` and per-agent `sessionPagination` (OpenCode
-only). It preserves provider cursors and order without automatically following
+and Codex). It preserves provider page order without automatically following
 pages. The current App's fifty-session request does not become full pagination.
 See [Agent API](docs/agent-api.md#get-apiagent-sessionspage) for the contract.
 
@@ -339,6 +347,25 @@ and HTTP-backed reverse-proxy paths are preserved; **0.2.1-alpha.2** native
 HTTPS Origin/Cookie handling and optional asynchronous questions with late
 answers remain unsupported. Do not generalize that limitation to every HTTPS
 reverse proxy or to ordinary blocking forms.
+
+Codex targets stable **rust-v0.162.1**. Its default-enabled service adapter runs
+a verified existing daemon connection on Unix, falling back to one private
+`codex app-server --listen stdio://` child from the existing `PATH`
+and CLI authentication/configuration; Gateway never installs or logs in for the
+owner. `codex.enabled: false` disables it; `agent_runtime.enabled: false` disables
+all service agents without changing terminal Codex routes or their permission
+flags. Primary preference is `opencode`, `deepseek`, `t3`, `codex`. Model/effort
+selection is ephemeral Gateway-local next-turn state, pending until authoritative
+normalization confirms application; it is not a fabricated pre-turn upstream
+update. Unsupported optional features remain false. See
+[Codex protocol reference](docs/codex-protocol.md) for mappings and limits.
+
+T3 negotiates protocol **1 or 2** from the public descriptor, with missing meaning
+1 and unknown/malformed values unsupported. V2 uses a pinned nightly-source
+baseline, not a claim of live certification. Revert is advertised only for known
+protocol 1, never V2 or unknown. See [T3 protocol reference](docs/t3-protocol.md).
+Real Codex and paired App/macOS checks for this phase are deferred by user
+instruction; source/fixture evidence does not replace the required acceptance.
 
 ## Engineering conventions
 

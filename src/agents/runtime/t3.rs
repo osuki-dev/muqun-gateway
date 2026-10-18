@@ -12,7 +12,7 @@
 //! is spent and is never written back to `config.json`.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
@@ -107,6 +107,7 @@ pub(super) struct T3State {
     warned_no_credential: AtomicBool,
     /// So is "the server speaks a protocol this gateway cannot".
     warned_unsupported: AtomicBool,
+    protocol: AtomicU64,
 }
 
 impl T3State {
@@ -129,11 +130,21 @@ impl T3State {
             exchanged: Mutex::new(None),
             warned_no_credential: AtomicBool::new(false),
             warned_unsupported: AtomicBool::new(false),
+            protocol: AtomicU64::new(0),
         }
     }
 
     pub(super) fn wanted(&self) -> bool {
         self.wanted
+    }
+
+    pub(super) fn features(&self) -> crate::discovery::AgentFeatures {
+        let protocol = self.protocol.load(Ordering::Relaxed);
+        if matches!(protocol, 1 | 2) {
+            t3_features_for_protocol(protocol)
+        } else {
+            t3_features()
+        }
     }
 
     /// The server URL, as the owner gave it or T3's default.
@@ -236,17 +247,9 @@ impl T3State {
                 Some(T3Credential::Bearer(grant.token))
             }
             Err(err) => {
-                // A network failure leaves the token unspent; anything else
-                // means the server has refused it, and asking again every few
-                // seconds with the same token would only fill the log.
-                if matches!(err, crate::agents::ports::AgentError::Network(_)) {
-                    *self.pairing.lock().await = Some(pairing);
-                } else {
-                    tracing::warn!(
-                        %err,
-                        "the T3 pairing token was refused; run `t3 pair` for a new one"
-                    );
-                }
+                // A lost reply can follow consumption. Never automatically
+                // submit an ambiguous one-time exchange a second time.
+                tracing::warn!(%err, "T3 pairing failed or its outcome is unknown; run `t3 pair` for a new token");
                 None
             }
         }
@@ -259,13 +262,18 @@ impl T3State {
 
 /// The feature flags the App reads for the `t3` agent.
 pub(super) fn t3_features() -> crate::discovery::AgentFeatures {
+    // Safe intersection until a server descriptor has selected a protocol.
+    t3_features_for_protocol(0)
+}
+
+fn t3_features_for_protocol(protocol: u64) -> crate::discovery::AgentFeatures {
     crate::discovery::AgentFeatures {
         streaming: true,
         reasoning_effort: false,
         model_selection: true,
         tool_approvals: true,
         worktrees: false,
-        revert: true,
+        revert: protocol == 1,
         // T3 rolls whole turns back in one step; there is no staged state.
         staged_revert: false,
         inbox: false,
@@ -279,7 +287,13 @@ pub(super) fn t3_features() -> crate::discovery::AgentFeatures {
         background_shells: false,
         attachments: true,
         attachments_by_path: true,
-        extra: std::collections::BTreeMap::new(),
+        extra: std::collections::BTreeMap::from([
+            ("sessionPagination".into(), serde_json::json!(false)),
+            ("sessionRename".into(), serde_json::json!(true)),
+            ("sessionDelete".into(), serde_json::json!(true)),
+            ("sessionFork".into(), serde_json::json!(false)),
+            ("orchestrationProtocols".into(), serde_json::json!([1, 2])),
+        ]),
     }
 }
 
@@ -314,6 +328,12 @@ impl AgentRuntime {
             return false;
         }
         self.t3.warned_unsupported.store(false, Ordering::Relaxed);
+        self.t3
+            .protocol
+            .store(descriptor.protocol_version(), Ordering::Relaxed);
+        let endpoint = endpoint
+            .with_descriptor(&descriptor)
+            .expect("supported descriptor");
         let Some(credential) = self.t3.credential(&endpoint, &http).await else {
             if !self.t3.warned_no_credential.swap(true, Ordering::Relaxed) {
                 tracing::warn!(
@@ -324,7 +344,9 @@ impl AgentRuntime {
             }
             return false;
         };
-        let endpoint = T3Endpoint::new(endpoint.url, credential);
+        let endpoint = T3Endpoint::new(endpoint.url, credential)
+            .with_descriptor(&descriptor)
+            .expect("supported descriptor checked before credential exchange");
         let manager = AgentManager::connect_t3(
             endpoint,
             self.t3.runtime_mode(),
@@ -354,7 +376,7 @@ impl AgentRuntime {
             reason: None,
             models: Vec::new(),
             modes: Vec::new(),
-            features: t3_features(),
+            features: self.t3.features(),
         };
         if !self.t3.wanted() {
             return info;
@@ -374,6 +396,7 @@ impl AgentRuntime {
         // speaking a newer orchestration protocol is `unsupported`.
         match self.t3.endpoint().describe(&probe_client()).await {
             Ok(descriptor) => {
+                info.features = t3_features_for_protocol(descriptor.protocol_version());
                 info.status = if let Some(reason) = descriptor.unsupported_reason() {
                     info.reason = Some(reason);
                     AgentAvailability::Unsupported
@@ -432,6 +455,13 @@ mod tests {
         }
         assert_eq!(v["attachments"], true);
         assert_eq!(v["attachmentsByPath"], true);
+        assert_eq!(v["sessionPagination"], false);
+        assert_eq!(
+            v["revert"], false,
+            "safe intersection until protocol selected"
+        );
+        assert!(super::t3_features_for_protocol(1).revert);
+        assert!(!super::t3_features_for_protocol(2).revert);
     }
 
     use super::*;
@@ -571,6 +601,7 @@ mod tests {
     async fn fake_t3() -> String {
         use axum::routing::{get, post};
         let app = axum::Router::new()
+            .route("/.well-known/t3/environment",get(||async {axum::Json(serde_json::json!({"environmentId":"fixture","label":"test","serverVersion":"0.0.45","orchestrationProtocolVersion":1}))}))
             .route(
                 "/oauth/token",
                 post(|body: String| async move {
@@ -651,7 +682,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_unreachable_server_leaves_the_pairing_token_unspent() {
+    async fn a_failed_exchange_is_never_automatically_retried() {
         let state = T3State::with_env(
             T3Config {
                 url: Some("http://127.0.0.1:9".into()),
@@ -665,10 +696,47 @@ mod tests {
             state.credential(&state.endpoint(), &probe_client()).await,
             None
         );
-        assert_eq!(
-            state.pairing.lock().await.as_deref(),
-            Some("once"),
-            "a network failure did not consume it"
+        assert!(state.pairing.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_consumed_pairing_token_with_a_lost_reply_is_not_reexchanged() {
+        use axum::routing::{get, post};
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::Arc;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let app=axum::Router::new()
+            .route("/.well-known/t3/environment",get(||async {axum::Json(serde_json::json!({"environmentId":"lost-reply-fixture","label":"fixture","serverVersion":"0.0.45","orchestrationProtocolVersion":1}))}))
+            .route("/oauth/token",post(move||{
+                let calls=observed.clone();async move {
+                    calls.fetch_add(1,Ordering::Relaxed);
+                    // The stand-in accepted/consumed the token, then lost its
+                    // HTTP response. No real credentials or agents are used.
+                    axum::body::Body::from_stream(futures::stream::once(async {
+                        Err::<Vec<u8>,std::io::Error>(std::io::Error::other("fixture lost reply"))
+                    }))
+                }
+            }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let state = T3State::with_env(
+            T3Config {
+                url: Some(url),
+                pairing_token: Some("fixture-once".into()),
+                ..Default::default()
+            },
+            None,
+            env_of(&[]),
         );
+        let http = probe_client();
+        assert_eq!(state.credential(&state.endpoint(), &http).await, None);
+        assert_eq!(state.credential(&state.endpoint(), &http).await, None);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert!(state.pairing.lock().await.is_none());
+        server.abort();
     }
 }

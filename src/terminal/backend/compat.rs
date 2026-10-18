@@ -270,6 +270,7 @@ mod tests {
     fn the_snapshots_agents_are_the_agent_list_itself() {
         let agents = vec![
             Agent {
+                conversation_id: None,
                 instance_id: Some("inst_7f3c".into()),
                 target: "herdr://agent/inst_7f3c".into(),
                 pane_id: PaneId::new("%9"),
@@ -285,6 +286,7 @@ mod tests {
             // A tmux agent: no instance identity, and the keys are present and
             // null rather than missing, so the app reads one shape.
             Agent {
+                conversation_id: None,
                 instance_id: None,
                 target: "%12".into(),
                 pane_id: PaneId::new("%12"),

@@ -1299,6 +1299,7 @@ fn pane_from_fields(fields: Vec<String>) -> Result<Pane, BackendError> {
 fn agent_from_pane(pane: Pane) -> Option<Agent> {
     let kind = pane.agent.clone()?;
     Some(Agent {
+        conversation_id: None,
         instance_id: None,
         target: pane.id.as_str().to_owned(),
         pane_id: pane.id,

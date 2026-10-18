@@ -188,6 +188,11 @@ pub fn map_session(val: &Value) -> Option<AgentSessionInfo> {
         // repeat `asid`. It is set for an agent that really does key
         // sessions differently.
         backend_session_id: String::new(),
+        runtime: None,
+        context_usage: None,
+        git_info: None,
+        agent_name: None,
+        agent_role: None,
         title,
         mode,
         model,
@@ -1162,6 +1167,7 @@ pub fn map_form_request(val: &Value, asid: &AgentSessionId) -> Option<FormReques
     }
 
     Some(FormRequest {
+        nonblocking: false,
         id: id.to_string(),
         asid: asid.clone(),
         title,

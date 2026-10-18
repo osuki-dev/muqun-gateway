@@ -349,7 +349,8 @@ pub async fn build_terminal_plane_discovery(state: &AppState) -> TerminalPlaneDi
 /// Build combined discovery planes
 pub async fn build_discovery_planes(state: &AppState) -> DiscoveryPlanes {
     let terminal = build_terminal_plane_discovery(state).await;
-    let agents = state.agent_runtime.discover_agents().await;
+    let mut agents = state.agent_runtime.discover_agents().await;
+    agents.order_for_picker();
     // The SSH plane is the app's transport, not a gateway subsystem: the phone
     // opens its own SSH connection and tunnels this gateway's loopback port, so
     // the same HTTP API answers on the far side. These flags only tell the app
@@ -368,7 +369,34 @@ pub async fn build_discovery_planes(state: &AppState) -> DiscoveryPlanes {
     }
 }
 
+/// Usable providers precede unavailable ones; Codex then OpenCode lead the
+/// ready group. An unavailable Codex does not displace an existing fallback.
+pub(crate) fn order_agents(agents: &mut [AgentDiscoveryInfo]) {
+    let preference = crate::agents::runtime::AGENT_PREFERENCE;
+    agents.sort_by_key(|agent| {
+        let ready = agent.enabled
+            && matches!(
+                agent.status,
+                AgentAvailability::Connected | AgentAvailability::Reachable
+            );
+        let rank = if agent.id == "codex" && !ready {
+            usize::MAX
+        } else {
+            preference
+                .iter()
+                .position(|id| *id == agent.id)
+                .unwrap_or(preference.len())
+        };
+        (!ready, rank)
+    });
+}
+
 impl AgentPlaneDiscovery {
+    /// Use the runtime's ordering for HTTP discovery as well as CLI discovery.
+    fn order_for_picker(&mut self) {
+        order_agents(&mut self.agents);
+    }
+
     /// Drop what only a paired device should learn: where each agent
     /// listens and which version it runs.
     pub fn redact_endpoints(&mut self) {
@@ -453,6 +481,105 @@ pub fn transports_discovery(mcp_helper: Option<&str>) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn picker_prefers_ready_codex_then_opencode_without_changing_provider_metadata() {
+        for status in [AgentAvailability::Connected, AgentAvailability::Reachable] {
+            let mut plane = crate::agents::AgentRuntime::disabled()
+                .discover_agents()
+                .await;
+            let codex = plane.agents.iter_mut().find(|a| a.id == "codex").unwrap();
+            codex.enabled = true;
+            codex.status = status;
+            let metadata: BTreeMap<_, _> = plane
+                .agents
+                .iter()
+                .map(|agent| (agent.id.clone(), serde_json::to_value(agent).unwrap()))
+                .collect();
+            plane.order_for_picker();
+            assert_eq!(
+                plane
+                    .agents
+                    .iter()
+                    .map(|a| a.id.as_str())
+                    .collect::<Vec<_>>(),
+                ["codex", "opencode", "deepseek", "t3"]
+            );
+            for agent in &plane.agents {
+                assert_eq!(serde_json::to_value(agent).unwrap(), metadata[&agent.id]);
+            }
+            let once = serde_json::to_value(&plane).unwrap();
+            plane.order_for_picker();
+            assert_eq!(serde_json::to_value(&plane).unwrap(), once);
+        }
+    }
+
+    #[tokio::test]
+    async fn picker_does_not_promote_unavailable_or_disabled_codex() {
+        for (status, enabled) in [
+            (AgentAvailability::Offline, true),
+            (AgentAvailability::Disabled, false),
+            (AgentAvailability::NotInstalled, true),
+            (AgentAvailability::Unconfigured, true),
+            (AgentAvailability::Unsupported, true),
+            (AgentAvailability::Connected, false),
+            (AgentAvailability::Reachable, false),
+        ] {
+            let mut plane = crate::agents::AgentRuntime::disabled()
+                .discover_agents()
+                .await;
+            let codex = plane.agents.iter_mut().find(|a| a.id == "codex").unwrap();
+            codex.enabled = enabled;
+            codex.status = status;
+            let opencode = plane
+                .agents
+                .iter_mut()
+                .find(|a| a.id == "opencode")
+                .unwrap();
+            opencode.enabled = true;
+            opencode.status = AgentAvailability::Connected;
+            plane.order_for_picker();
+            assert_eq!(
+                plane
+                    .agents
+                    .iter()
+                    .map(|a| a.id.as_str())
+                    .collect::<Vec<_>>(),
+                ["opencode", "deepseek", "t3", "codex"]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn picker_prefers_connected_fallback_over_unavailable_primary_choices() {
+        let mut plane = crate::agents::AgentRuntime::disabled()
+            .discover_agents()
+            .await;
+        let t3 = plane.agents.iter_mut().find(|a| a.id == "t3").unwrap();
+        t3.enabled = true;
+        t3.status = AgentAvailability::Connected;
+        plane.order_for_picker();
+        assert_eq!(plane.agents[0].id, "t3");
+        assert_eq!(plane.agents.last().unwrap().id, "codex");
+    }
+
+    #[tokio::test]
+    async fn picker_without_codex_preserves_other_provider_order_and_entries() {
+        let mut plane = crate::agents::AgentRuntime::disabled()
+            .discover_agents()
+            .await;
+        plane.agents.retain(|a| a.id != "codex");
+        plane.agents.reverse();
+        plane.order_for_picker();
+        assert_eq!(
+            plane
+                .agents
+                .iter()
+                .map(|a| a.id.as_str())
+                .collect::<Vec<_>>(),
+            ["opencode", "deepseek", "t3"]
+        );
+    }
 
     #[tokio::test]
     async fn session_pages_discovery_preserves_runtime_provider_flags() {

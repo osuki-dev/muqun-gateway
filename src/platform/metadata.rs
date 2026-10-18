@@ -49,6 +49,11 @@ pub(crate) const API_CAPABILITIES: &[&str] = &[
     "agent_sessions",
     // Single-provider session pages; support is separately declared per agent.
     "agent_session_pages_v1",
+    "agent_session_fork_v1",
+    "agent_session_runtime_v1",
+    "codex_shared_daemon_v1",
+    "codex_shared_task_start_v1",
+    "agent_session_refresh_v1",
     "agent_session_delete_scoped",
     "capabilities_discovery",
     "agent_discovery",
@@ -81,6 +86,7 @@ pub(crate) const API_CAPABILITIES: &[&str] = &[
     // Segment-aware captured pagination in both memory and SQLite storage modes.
     "pane_captured_history_segments_v1",
     "pane_parts",
+    "codex_transcript_images_v1",
     "pane_parts_native",
     "pane_shortcuts",
     // The same three Changes routes on a terminal pane, in its cwd.

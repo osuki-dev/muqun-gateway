@@ -5,7 +5,7 @@ pub mod permission;
 pub mod session;
 pub mod timeline;
 
-pub use events::AgentDomainEvent;
+pub use events::{AgentDomainEvent, FormResolutionReason};
 pub use form::{FormField, FormOption, FormRequest, FormWhen};
 pub use model::{
     AgentCatalog, CatalogDefaults, CommandInfo, McpServerInfo, ModeInfo, ModelInfo,
@@ -14,8 +14,10 @@ pub use model::{
 pub use permission::{PermissionDecision, PermissionOption, PermissionRequest};
 pub use session::{
     AgentErrorInfo, AgentProject, AgentSessionId, AgentSessionInfo, AgentSessionStatus, ModelRef,
-    RevertState, SessionCursor, SessionForkInfo, SessionPage, SessionQuery, SessionRevertInfo,
-    TokensUsage, WorktreeState,
+    RevertState, RuntimeInteraction, RuntimeReason, RuntimeSource, RuntimeTerminal,
+    SessionContextUsage, SessionCursor, SessionForkInfo, SessionGitInfo, SessionPage, SessionQuery,
+    SessionRevertInfo, SessionRuntime, TerminalRuntimeStatus, TokensUsage, TranscriptSource,
+    WorktreeState,
 };
 pub use timeline::{
     part_item_id, push_input_partial, reasoning_item_id, text_item_id, tool_item_id, AgentPart,
@@ -30,6 +32,27 @@ mod contract_tests {
     use super::*;
     use crate::agents::domain::timeline::MAX_TOOL_INPUT_PARTIAL_BYTES;
     use serde_json::{json, Value};
+
+    #[test]
+    fn form_resolution_reason_is_optional_and_preserves_the_legacy_wire_shape() {
+        let old = json!({"type":"agent.form.resolved","asid":"session","form_id":"form","seq":1});
+        let event: AgentDomainEvent = serde_json::from_value(old.clone()).unwrap();
+        assert_eq!(serde_json::to_value(event).unwrap(), old);
+        for (reason, word) in [
+            (FormResolutionReason::Answered, "answered"),
+            (FormResolutionReason::Expired, "expired"),
+        ] {
+            let event = AgentDomainEvent::FormResolved {
+                asid: AgentSessionId("session".into()),
+                form_id: "form".into(),
+                reason: Some(reason),
+                seq: 1,
+            };
+            let value = serde_json::to_value(event).unwrap();
+            assert_eq!(value["reason"], word);
+            assert_eq!(value["type"], "agent.form.resolved");
+        }
+    }
 
     fn keys(value: &Value) -> Vec<String> {
         value
@@ -58,6 +81,11 @@ mod contract_tests {
             asid: AgentSessionId("ses_1".into()),
             agent_id: String::new(),
             backend_session_id: "ses_1".into(),
+            runtime: None,
+            context_usage: None,
+            git_info: None,
+            agent_name: None,
+            agent_role: None,
             title: "t".into(),
             mode: Some("build".into()),
             model: Some(ModelRef {
@@ -263,6 +291,11 @@ mod contract_tests {
             asid: AgentSessionId("ses_1".into()),
             agent_id: String::new(),
             backend_session_id: String::new(),
+            runtime: None,
+            context_usage: None,
+            git_info: None,
+            agent_name: None,
+            agent_role: None,
             title: "t".into(),
             mode: None,
             model: None,

@@ -211,6 +211,7 @@ impl DeepseekEventContext {
     async fn resolve_form(&self, asid: &AgentSessionId, form_id: &str) {
         let seq = self.mirror.resolve_form(asid, form_id).await;
         self.emit(AgentDomainEvent::FormResolved {
+            reason: None,
             asid: asid.clone(),
             form_id: form_id.to_string(),
             seq,
@@ -305,6 +306,7 @@ async fn handle_events_frame(frame: EventsFrame, ctx: &DeepseekEventContext) {
                 for PendingQuestion { asid, request, .. } in questions {
                     let seq = mirror.resolve_form(&asid, &request.id).await;
                     let _ = tx.send(AgentDomainEvent::FormResolved {
+                        reason: None,
                         asid,
                         form_id: request.id,
                         seq,

@@ -1551,8 +1551,12 @@ impl TaskService {
 /// Whether a delegation to agent `kind` starts it in a terminal pane: a
 /// terminal agent from the catalog that no session runtime serves. A
 /// session agent (OpenCode, DeepSeek, T3) never is: unattached, it is
-/// unavailable.
+/// unavailable. Explicit Codex task requests retain their existing terminal
+/// route, independent of the private Codex agent-session adapter's readiness.
 pub(crate) async fn runs_in_pane(state: &AppState, kind: &str) -> bool {
+    if kind == "codex" {
+        return pane_agent::is_terminal_agent(state, kind);
+    }
     !AGENT_PREFERENCE.contains(&kind)
         && state.agent_runtime.manager_for_agent(kind).await.is_none()
         && pane_agent::is_terminal_agent(state, kind)
@@ -1611,6 +1615,7 @@ pub(crate) async fn start_terminal_agent(
         placed.clone(),
         Some(&goal),
         Some(TaskLaunch {
+            task_id: &task.id.0,
             out_of_band: true,
             model_args: &model_args,
         }),
@@ -1640,6 +1645,7 @@ pub(crate) async fn start_terminal_agent(
             placed,
             Some(&goal),
             Some(TaskLaunch {
+                task_id: &task.id.0,
                 out_of_band: false,
                 model_args: &model_args,
             }),
@@ -1669,6 +1675,9 @@ pub(crate) async fn start_terminal_agent(
         return;
     }
     let mut to = change(TaskState::Working);
+    // Preserve the shared-start refusal in the existing task event history.
+    // A usable terminal launch must not imply it acquired native RPC control.
+    to.note = shared_session_fallback_note(&launched.steps.value());
     let mut binding = task.binding.clone();
     if let TaskBinding::Pane {
         shell_pid,
@@ -3240,6 +3249,17 @@ fn failed_step(steps: &Value) -> Option<String> {
     ))
 }
 
+fn shared_session_fallback_note(steps: &Value) -> Option<String> {
+    let step = steps
+        .as_array()?
+        .iter()
+        .find(|step| step["step"] == "shared_session" && step["status"] == "skipped")?;
+    let reason = one_line(step["reason"].as_str()?, 512);
+    Some(format!(
+        "Started in terminal mode: {reason}. Continue in the linked terminal."
+    ))
+}
+
 fn command_error(error: anyhow::Error) -> TaskError {
     if error.to_string() == run_command::NO_TERMINAL {
         TaskError::NoTerminal
@@ -3497,6 +3517,24 @@ mod tests {
     use crate::test_support::{test_device, test_state, FakeAgent};
 
     const ASID: &str = "opencode_new";
+
+    #[test]
+    fn shared_launch_fallback_is_reported_without_claiming_native_control() {
+        let mut steps = crate::agents::tasks::StepLog::new();
+        steps.skipped("env", "unrelated");
+        assert!(shared_session_fallback_note(&steps.value()).is_none());
+        steps.skipped(
+            "shared_session",
+            "per-invocation folder trust is unavailable",
+        );
+        assert_eq!(
+            shared_session_fallback_note(&steps.value()).as_deref(),
+            Some("Started in terminal mode: per-invocation folder trust is unavailable. Continue in the linked terminal.")
+        );
+        let mut shared = crate::agents::tasks::StepLog::new();
+        shared.ok("shared_session", json!({"transport":"local_shared_daemon"}));
+        assert!(shared_session_fallback_note(&shared.value()).is_none());
+    }
 
     fn assistant(id: &str) -> TaskPrincipal {
         TaskPrincipal {

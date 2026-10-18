@@ -140,6 +140,8 @@ pub(crate) fn setup(
             opencode: agents::OpencodeConfig::default(),
             deepseek: agents::DeepseekConfig::default(),
             t3: agents::T3Config::default(),
+            codex: agents::runtime::CodexConfig::default(),
+            agent_runtime: crate::platform::config::AgentRuntimeConfig::default(),
             store: crate::platform::config::StoreConfig::default(),
             mcp: crate::platform::config::McpConfig::default(),
             fleet: Default::default(),

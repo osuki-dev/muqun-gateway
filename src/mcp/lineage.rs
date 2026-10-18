@@ -6,6 +6,8 @@
 //!
 //! - **Pane-bound token**: the open task whose pane the caller runs in (an
 //!   assistant started by `exec.run`).
+//! - **Task-bound token**: the immutable task selected by the authenticated
+//!   launch helper, even when a shared daemon has no task-pane ancestry.
 //! - **Agent-bound token** (the agent service the gateway runs; every one of
 //!   its sessions shares the token): among the open delegations to that
 //!   agent, the one whose session is running this very call right now -- its
@@ -52,7 +54,9 @@ pub(crate) async fn requested(
 ) -> Requested {
     let parent = parent_of(state, &session.binding, call).await;
     let origin = match (&session.binding, &parent) {
-        (TokenBinding::Agent { .. }, _) | (_, Some(_)) => TaskOrigin::Agent,
+        (TokenBinding::Agent { .. } | TokenBinding::Task { .. }, _) | (_, Some(_)) => {
+            TaskOrigin::Agent
+        }
         _ => TaskOrigin::Mcp,
     };
     Requested {
@@ -88,7 +92,9 @@ pub(crate) async fn requested_for_forwarding(
         forwarding: ForwardingContext::Resolved,
         by: session.principal(),
         origin: match (&session.binding, &parent) {
-            (TokenBinding::Agent { .. }, _) | (_, Some(_)) => TaskOrigin::Agent,
+            (TokenBinding::Agent { .. } | TokenBinding::Task { .. }, _) | (_, Some(_)) => {
+                TaskOrigin::Agent
+            }
             _ => TaskOrigin::Mcp,
         },
         parent,
@@ -103,6 +109,13 @@ async fn forwarding_parent(
     call: &Call<'_>,
 ) -> Result<Option<TaskId>, crate::tasks::service::TaskError> {
     use crate::tasks::service::TaskError;
+    if let TokenBinding::Task { task_id } = binding {
+        return super::issue::task_authority(state, task_id)
+            .await
+            .map_err(|_| TaskError::LineageUnresolved)?
+            .map(|task| Some(task.id))
+            .ok_or(TaskError::LineageUnresolved);
+    }
     // The store caps pages at 1000. A full page is deliberately refused;
     // it must never become a partial set on which authorization succeeds.
     const LIMIT: usize = 1000;
@@ -120,6 +133,7 @@ async fn forwarding_parent(
             limit: LIMIT,
             ..Default::default()
         },
+        TokenBinding::Task { .. } => unreachable!("task authority resolved above"),
     };
     let candidates = state
         .tasks
@@ -229,6 +243,21 @@ pub(crate) async fn caller_session(
             })
         }
         TokenBinding::Agent { agent_id } => agent_id,
+        TokenBinding::Task { task_id } => {
+            let task = super::issue::task_authority(state, task_id).await.ok()??;
+            let TaskBinding::Pane {
+                session_id,
+                pane_id,
+                ..
+            } = task.binding
+            else {
+                return None;
+            };
+            return Some(NoticeTarget::Pane {
+                session_id,
+                pane_id,
+            });
+        }
     };
     let manager = state.agent_runtime.manager_for_agent(agent_id).await?;
     let busy = state.tasks.busy_sessions();
@@ -267,6 +296,12 @@ fn runs(item: &TimelineItem, call: &Call<'_>) -> bool {
 }
 
 async fn parent_of(state: &AppState, binding: &TokenBinding, call: &Call<'_>) -> Option<TaskId> {
+    if let TokenBinding::Task { task_id } = binding {
+        return super::issue::task_authority(state, task_id)
+            .await
+            .ok()?
+            .map(|task| task.id);
+    }
     match <[Task; 1]>::try_from(fitting(state, binding, call).await) {
         Ok([task]) => Some(task.id),
         Err(tasks) if tasks.is_empty() => finished_parent(state, binding, call).await,
@@ -364,6 +399,15 @@ pub(crate) async fn own_task(
 
 /// The open tasks `binding` could be calling from (see the module docs).
 async fn fitting(state: &AppState, binding: &TokenBinding, call: &Call<'_>) -> Vec<Task> {
+    if let TokenBinding::Task { task_id } = binding {
+        return super::issue::task_authority(state, task_id)
+            .await
+            .ok()
+            .flatten()
+            .filter(|task| OPEN_STATES.contains(&task.state))
+            .into_iter()
+            .collect();
+    }
     let filter = match binding {
         TokenBinding::Pane {
             session_id,
@@ -376,6 +420,7 @@ async fn fitting(state: &AppState, binding: &TokenBinding, call: &Call<'_>) -> V
             agent_id: Some(agent_id.clone()),
             ..open(MAX_CANDIDATES)
         },
+        TokenBinding::Task { .. } => unreachable!("task authority resolved above"),
     };
     let candidates = match state.tasks.open_tasks(filter).await {
         Ok(tasks) => tasks,
@@ -385,7 +430,7 @@ async fn fitting(state: &AppState, binding: &TokenBinding, call: &Call<'_>) -> V
         }
     };
     match binding {
-        TokenBinding::Pane { .. } => candidates,
+        TokenBinding::Pane { .. } | TokenBinding::Task { .. } => candidates,
         TokenBinding::Agent { agent_id } => calling(state, agent_id, candidates, call).await,
     }
 }
@@ -568,6 +613,84 @@ mod tests {
             label: "claude".into(),
             expires_ms: None,
         }
+    }
+
+    #[tokio::test]
+    async fn shared_task_authority_never_moves_to_another_assignment_in_the_same_pane() {
+        let state = test_state("admin", Vec::new());
+        let binding = TaskBinding::Pane {
+            session_id: "default".into(),
+            pane_id: "%4".into(),
+            tab_id: None,
+            shell_pid: None,
+            agent_id: Some("codex".into()),
+            agent_job: None,
+            model: None,
+            variant: None,
+        };
+        let mine = working(&state, binding.clone()).await;
+        let other = working(&state, binding).await;
+        let token = AssistantSession {
+            token_id: "task-token".into(),
+            binding: TokenBinding::Task {
+                task_id: mine.0.clone(),
+            },
+            label: "codex".into(),
+            expires_ms: None,
+        };
+        let call = delegate("same arguments in either session");
+        assert_eq!(
+            requested(&state, &token, &call).await.parent,
+            Some(mine.clone())
+        );
+        assert_eq!(
+            own_task(&state, &token, &call, None).await,
+            Some(mine.clone())
+        );
+        assert_eq!(own_task(&state, &token, &call, Some(&other)).await, None);
+        state
+            .tasks
+            .move_to(
+                &mine,
+                TaskChange {
+                    to: TaskState::Done,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(own_task(&state, &token, &call, None).await, None);
+        // Completion does not erase the original forwarding ancestry or let a
+        // subsequent assignment in the pane become this credential's parent.
+        let requested = requested_for_forwarding(&state, &token, &call)
+            .await
+            .unwrap();
+        assert_eq!(requested.parent, Some(mine.clone()));
+        assert_eq!(requested.by.id, format!("task:{}", mine.0));
+        assert_eq!(
+            state.tasks.task(&mine).await.unwrap().unwrap().state,
+            TaskState::Done
+        );
+        let finished = state.tasks.task(&mine).await.unwrap().unwrap();
+        assert!(state
+            .tasks
+            .reopen(&finished, finished.updated_ms + 1)
+            .await
+            .is_err());
+        assert_eq!(own_task(&state, &token, &call, None).await, None);
+        assert_eq!(own_task(&state, &token, &call, Some(&other)).await, None);
+        state
+            .db
+            .call(move |db| {
+                db.execute("DELETE FROM tasks WHERE id = ?", [&mine.0])?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(requested_for_forwarding(&state, &token, &call)
+            .await
+            .is_err());
+        assert_eq!(own_task(&state, &token, &call, None).await, None);
     }
 
     async fn state_with(timelines: &[(&str, Vec<TimelineItem>)]) -> AppState {
