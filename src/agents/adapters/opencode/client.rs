@@ -42,7 +42,7 @@ fn message_list(res: Value) -> Vec<Value> {
     items.reverse();
     items
 }
-const SESSION_LIST_TIMEOUT: Duration = Duration::from_secs(15);
+const SESSION_LIST_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// OpenCode's cursor is opaque. Neither page order nor cursor values are
 /// reconstructed locally; absent and null cursor fields both mean no cursor.
@@ -61,7 +61,7 @@ pub struct OpencodeClient {
 impl OpencodeClient {
     pub fn new(endpoint: OpencodeEndpoint) -> Self {
         let http = Client::builder()
-            .timeout(Duration::from_secs(15))
+            .timeout(Duration::from_secs(60))
             .build()
             .unwrap_or_default();
         Self { endpoint, http }
@@ -1729,7 +1729,7 @@ mod tests {
                 let recorded = recorded.clone();
                 async move {
                     let index = recorded.fetch_add(1, Ordering::SeqCst);
-                    tokio::time::sleep(Duration::from_secs(8)).await;
+                    tokio::time::sleep(SESSION_LIST_TIMEOUT / 2 + Duration::from_secs(1)).await;
                     session_page(index, 1, Some("next"))
                 }
             }),
@@ -1746,7 +1746,8 @@ mod tests {
         assert!(
             matches!(client.list_sessions(None, &SessionListFilter::default()).await, Err(AgentError::Protocol(message)) if message.contains("total time budget"))
         );
-        assert!(started.elapsed() < Duration::from_secs(17));
+        assert!(started.elapsed() >= SESSION_LIST_TIMEOUT);
+        assert!(started.elapsed() < SESSION_LIST_TIMEOUT + Duration::from_secs(2));
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         task.abort();
     }

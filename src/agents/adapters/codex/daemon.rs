@@ -252,7 +252,7 @@ async fn connect_verified_limited(
             .shared_identity = Some(identity);
         Ok((client, events))
     };
-    let (client, events) = tokio::time::timeout(Duration::from_secs(3), connect)
+    let (client, events) = tokio::time::timeout(Duration::from_secs(60), connect)
         .await
         .map_err(|_| unavailable("Codex daemon connection timed out"))??;
     if let Err(error) = client.initialize().await {

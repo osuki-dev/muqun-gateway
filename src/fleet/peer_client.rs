@@ -26,8 +26,8 @@ use crate::platform::server::{
 use crate::tasks::domain::TaskState;
 use crate::{now_unix_ms, transport};
 
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const CLAIM_AAD: &[u8] = b"POST /api/pair/claim";
 
 /// Why a call to a peer did not answer what was asked.

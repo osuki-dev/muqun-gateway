@@ -235,7 +235,7 @@ impl T3Endpoint {
     pub async fn describe(&self, http: &Client) -> Result<EnvironmentDescriptor, AgentError> {
         let resp = http
             .get(format!("{}{WELL_KNOWN_PATH}", self.url))
-            .timeout(Duration::from_millis(2500))
+            .timeout(Duration::from_secs(60))
             .send()
             .await
             .map_err(|e| AgentError::Network(short(&e.to_string())))?;
@@ -312,7 +312,7 @@ impl T3Endpoint {
         ];
         let resp = http
             .post(format!("{}{TOKEN_PATH}", self.url))
-            .timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(60))
             .form(&form)
             .send()
             .await
@@ -350,7 +350,7 @@ impl T3Endpoint {
     ) -> Result<String, AgentError> {
         let resp = http
             .post(format!("{}{TICKET_PATH}", self.url))
-            .timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(60))
             .bearer_auth(bearer)
             .send()
             .await
@@ -381,7 +381,7 @@ impl T3Endpoint {
     pub async fn session_state(&self, http: &Client, bearer: &str) -> Result<Value, AgentError> {
         let resp = http
             .get(format!("{}{SESSION_PATH}", self.url))
-            .timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(60))
             .bearer_auth(bearer)
             .send()
             .await

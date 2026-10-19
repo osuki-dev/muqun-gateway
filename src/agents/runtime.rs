@@ -64,9 +64,9 @@ const MAX_SESSION_ROUTES: usize = 4096;
 /// How long an agent discovery result is reused.
 const DISCOVERY_TTL: Duration = Duration::from_secs(10);
 /// The longest a request may wait on upstream probing.
-const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(3);
+const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(60);
 /// The longest one agent may take to say whether it owns a session.
-const SESSION_LOOKUP_TIMEOUT: Duration = Duration::from_secs(3);
+const SESSION_LOOKUP_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The entry of `map` for the most preferred agent present.
 fn pick_primary<T>(map: &BTreeMap<String, T>) -> Option<&T> {
@@ -1887,7 +1887,7 @@ fn running_binary_path(_pid: u32) -> Option<std::path::PathBuf> {
 
 fn probe_client() -> reqwest::Client {
     reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(60))
         .build()
         .unwrap_or_default()
 }

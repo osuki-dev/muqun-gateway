@@ -23,7 +23,7 @@ fn exhausted() -> AgentError {
 impl Budget {
     pub fn new() -> Self {
         Self {
-            deadline: tokio::time::Instant::now() + Duration::from_secs(20),
+            deadline: tokio::time::Instant::now() + Duration::from_secs(60),
             pages: 0,
             bytes: 0,
             byte_limit: MAX_BYTES,
