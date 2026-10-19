@@ -38,6 +38,20 @@ fn update_cli_is_explicit_and_version_is_side_effect_free() {
     assert!(String::from_utf8(channel_help.stdout)
         .unwrap()
         .contains("--channel"));
+    let bootstrap_help = invoke(&["bootstrap-preview", "--help"]);
+    assert!(bootstrap_help.status.success());
+    assert!(String::from_utf8(bootstrap_help.stdout)
+        .unwrap()
+        .lines()
+        .any(|line| line == "Usage: muqun-gateway bootstrap-preview"));
+    assert!(!invoke(&["bootstrap-preview", "--target", "/tmp/other"])
+        .status
+        .success());
+    assert!(
+        !invoke(&["bootstrap-preview", "--url", "https://example.com"])
+            .status
+            .success()
+    );
     for args in [
         &["update", "--version", "v0.1.0"][..],
         &["update", "--url", "http://127.0.0.1/"][..],

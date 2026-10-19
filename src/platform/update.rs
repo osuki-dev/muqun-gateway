@@ -588,11 +588,60 @@ async fn executable_version(path: &Path) -> Result<String> {
 
 #[cfg(unix)]
 pub(crate) async fn apply(plan: Plan) -> Result<String> {
+    apply_install(plan, false).await
+}
+
+/// No caller-supplied executable or source: bootstrap targets only the existing
+/// standalone installation and validates it before reading config or taking locks.
+pub(crate) fn bootstrap_destination() -> Result<PathBuf> {
+    let home = dirs::home_dir().context("cannot resolve HOME")?;
+    let install_dir = std::env::var_os("MUQUN_GATEWAY_INSTALL_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".local/bin"));
+    let exe = install_dir.join("muqun-gateway");
+    validate_destination(&exe, &home, &install_dir)?;
+    Ok(exe)
+}
+
+pub(crate) async fn bootstrap_preview() -> Result<String> {
+    let exe = bootstrap_destination()?;
+    anyhow::ensure!(
+        matches!(
+            Version::parse(env!("CARGO_PKG_VERSION"))?.1,
+            Stability::Preview(_)
+        ),
+        "bootstrap must run from a verified preview release image"
+    );
+    let current = executable_version(&exe).await?;
+    let plan = check_preview(&client()?, &current).await?;
+    validate_bootstrap_plan(&plan, env!("CARGO_PKG_VERSION"))?;
+    apply_install(plan, true).await
+}
+
+fn validate_bootstrap_plan(plan: &Plan, bootstrap_version: &str) -> Result<()> {
+    anyhow::ensure!(
+        matches!(Version::parse(bootstrap_version)?.1, Stability::Preview(_))
+            && plan.tag == format!("v{bootstrap_version}"),
+        "preview changed or bootstrap image does not match the selected official preview; rerun the installer (nothing changed)"
+    );
+    anyhow::ensure!(
+        plan.available(),
+        "installed version is already the same or newer; bootstrap never downgrades"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn apply_install(plan: Plan, bootstrap: bool) -> Result<String> {
     use std::os::unix::fs::MetadataExt as _;
     let Some(binary) = plan.binary else {
         return Ok(plan.summary());
     };
-    let exe = super::setup::executable_path()?;
+    let exe = if bootstrap {
+        bootstrap_destination()?
+    } else {
+        super::setup::executable_path()?
+    };
     let home = dirs::home_dir().context("cannot resolve HOME")?;
     let install_dir = std::env::var_os("MUQUN_GATEWAY_INSTALL_DIR")
         .map(PathBuf::from)
@@ -626,7 +675,11 @@ pub(crate) async fn apply(plan: Plan) -> Result<String> {
     // as an exact hard-link backup through readiness/rollback.
     tokio::task::spawn_blocking(move || {
         let _update_lock = _update_lock;
-        let controller = Controller::acquire(Action::Restart)?;
+        let controller = if bootstrap {
+            Controller::acquire_for_bootstrap()?
+        } else {
+            Controller::acquire(Action::Restart)?
+        };
         anyhow::ensure!(controller.exe() == exe, "lifecycle executable changed during update");
         let now = validate_destination(&exe, &home, &install_dir)?;
         anyhow::ensure!(now.dev() == before.dev() && now.ino() == before.ino() && now.len() == before.len() && now.mtime() == before.mtime(),
@@ -822,6 +875,105 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    #[test]
+    fn bootstrap_plan_requires_matching_preview_and_forward_upgrade() {
+        let make = |installed| {
+            let mut release = complete_release("v0.14.1-preview.2");
+            release.prerelease = true;
+            plan_channel(release, installed, target().unwrap(), Channel::Preview).unwrap()
+        };
+        let plan = make("0.14.0");
+        assert!(validate_bootstrap_plan(&plan, "0.14.1-preview.2").is_ok());
+        for wrong in ["0.14.0", "0.14.1-preview.1", "0.14.1-preview.3"] {
+            assert!(validate_bootstrap_plan(&plan, wrong).is_err());
+        }
+        for installed in ["0.14.1-preview.2", "0.14.1-preview.3", "0.14.1", "0.15.0"] {
+            assert!(validate_bootstrap_plan(&make(installed), "0.14.1-preview.2").is_err());
+        }
+    }
+
+    #[test]
+    fn bootstrap_controller_uses_fixed_existing_target_and_preserves_stopped_install() {
+        const CHILD: &str = "MUQUN_TEST_BOOTSTRAP_CONTROLLER";
+        if std::env::var_os(CHILD).is_some() {
+            let exe = bootstrap_destination().unwrap();
+            let parent = exe.parent().unwrap();
+            let original = fs::read(&exe).unwrap();
+            let config = crate::config_dir().unwrap().join("config.json");
+            fs::copy(
+                PathBuf::from(std::env::var_os("MUQUN_GATEWAY_CONFIG_DIR").unwrap())
+                    .join("config.json"),
+                &config,
+            )
+            .unwrap();
+            let identity = fs::read(&config).unwrap();
+            let _lock = update_lock(parent).unwrap();
+            assert!(update_lock(parent).is_err());
+            let controller = Controller::acquire_for_bootstrap().unwrap();
+            assert_eq!(controller.exe(), exe);
+            assert_ne!(
+                controller.exe(),
+                super::super::setup::executable_path().unwrap()
+            );
+            assert!(!controller.was_running);
+            assert!(Controller::acquire_for_bootstrap().is_err());
+            let staged = parent.join("verified-fixture");
+            fs::write(&staged, b"replacement fixture").unwrap();
+            install(
+                &exe,
+                &staged,
+                &parent.join(BACKUP),
+                controller.was_running,
+                |_| panic!("stopped install must not start or stop"),
+            )
+            .unwrap();
+            assert_eq!(fs::read(&exe).unwrap(), b"replacement fixture");
+            assert_ne!(original, fs::read(&exe).unwrap());
+            assert_eq!(fs::read(&config).unwrap(), identity);
+            assert!(!parent.join(BACKUP).exists());
+            drop(controller);
+            // A removed or symlinked destination fails before config/lifecycle work.
+            fs::remove_file(&exe).unwrap();
+            assert!(bootstrap_destination().is_err());
+            symlink(&staged, &exe).unwrap();
+            assert!(bootstrap_destination().is_err());
+            return;
+        }
+        let fixture = Fixture::new();
+        let home = fixture.0.join("home");
+        let parent = home.join(".local/bin");
+        let config = fixture.0.join("config");
+        let state = fixture.0.join("state");
+        let tools = fixture.0.join("tools");
+        for dir in [&parent, &config, &state, &tools] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        let exe = parent.join("muqun-gateway");
+        fs::write(&exe, b"old fixture image").unwrap();
+        fs::set_permissions(&exe, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(config.join("config.json"), serde_json::to_vec(&serde_json::json!({
+            "server_id": "bootstrap-fixture", "label": "test", "listen": "127.0.0.1:0", "public_url": "http://127.0.0.1:0", "token_hash": "fixture", "sessions": []
+        })).unwrap()).unwrap();
+        for name in ["systemctl", "launchctl", "tmux", "tailscale"] {
+            let path = tools.join(name);
+            fs::write(&path, b"#!/bin/sh\nexit 1\n").unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "platform::update::tests::bootstrap_controller_uses_fixed_existing_target_and_preserves_stopped_install", "--nocapture"])
+            .env_clear().env(CHILD, "1").env("HOME", &home)
+            .env("MUQUN_GATEWAY_CONFIG_DIR", &config).env("MUQUN_GATEWAY_STATE_DIR", &state)
+            .env("XDG_CONFIG_HOME", home.join(".config")).env("XDG_DATA_HOME", home.join(".local/share"))
+            .env("PATH", format!("{}:/usr/bin:/bin", tools.display()))
+            .current_dir(&fixture.0).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]

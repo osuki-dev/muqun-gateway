@@ -234,8 +234,11 @@ The retired `herdr.gateway` identifier remains only for migration compatibility.
   installation and releases. The plugin manifest/fetch step are retired;
   import compatibility and historical fixtures remain.
   Existing installs delegate to the identified protected updater without shell
-  overwrite or a second restart; older installs are refused with manual migration
-  guidance. Fresh installs pin one selected-channel tag for HTTPS binary/checksum downloads
+  overwrite or a second restart. For protected updaters predating channels, explicit
+  preview installation verifies a new preview helper and invokes its fixed-target
+  bootstrap, reusing update/lifecycle locks, service-owner validation and rollback.
+  Truly legacy installs remain refused with manual migration guidance. Fresh
+  installs pin one selected-channel tag for HTTPS binary/checksum downloads
   in private staging and verify SHA256 (integrity, not signing). Native
   ELF/Mach-O architecture is checked before staged execution; a time/output-bounded
   `--version` probe must match the pinned tag before publication. Fresh installs

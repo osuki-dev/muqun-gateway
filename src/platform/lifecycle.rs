@@ -133,6 +133,21 @@ pub(crate) struct Controller {
 
 impl Controller {
     pub(crate) fn acquire(action: Action) -> anyhow::Result<Self> {
+        Self::acquire_inner(action, false)
+    }
+
+    /// A verified preview helper updates the fixed standalone installation, not
+    /// its temporary staging image. There is no arbitrary target override.
+    pub(crate) fn acquire_for_bootstrap() -> anyhow::Result<Self> {
+        Self::acquire_inner(Action::Restart, true)
+    }
+
+    fn acquire_inner(action: Action, bootstrap: bool) -> anyhow::Result<Self> {
+        let destination = if bootstrap {
+            Some(super::update::bootstrap_destination()?)
+        } else {
+            None
+        };
         // Validate configuration before creating state or changing any process.
         load_config(None)?;
         let state = state_dir()?;
@@ -143,7 +158,10 @@ impl Controller {
             .map(supervision::gateway_supervisor)
             .transpose()?
             .flatten();
-        let paths = setup::service_paths()?;
+        let mut paths = setup::service_paths()?;
+        if let Some(destination) = destination {
+            paths.exe = destination;
+        }
         let owner = if service::state()? != service::ServiceState::NotInstalled {
             service::ensure_current_install(&paths)?;
             if let Some(pid) = pid {
