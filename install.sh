@@ -22,6 +22,7 @@ set -eu
 
 REPO="osuki-dev/muqun-gateway"
 channel=stable
+bootstrap=0
 case "$#" in
   0) ;;
   2) [ "$1" = --channel ] || { echo 'Usage: install.sh [--channel stable|preview]' >&2; exit 1; }
@@ -163,27 +164,32 @@ if [ -e "$binary" ]; then
      printf '%s\n' "$update_help" | grep -Fq 'Usage: muqun-gateway update [OPTIONS]' &&
      printf '%s\n' "$update_help" | grep -Fq 'newer stable official release (never downgrades)' &&
      printf '%s\n' "$update_help" | grep -Fq -- '--check'; then
-    stage_ok
-    stage "Run protected update"
-    info "Using the installed verified updater (with lifecycle rollback)."
-    if [ "$channel" = preview ]; then
-      printf '%s\n' "$update_help" | grep -Fq -- '--channel' || die "This updater does not support preview. Upgrade to a channel-capable stable release first; existing installation retained."
-      "$binary" update --channel preview || die "Protected preview update failed; no shell replacement or restart was attempted."
+    if [ "$channel" = preview ] && ! printf '%s\n' "$update_help" | grep -Fq -- '--channel'; then
+      bootstrap=1
+      info "This installed updater predates channels. Downloading a verified preview helper for the protected transition."
     else
-      "$binary" update || die "Protected update failed; no shell replacement or restart was attempted."
+      stage_ok
+      stage "Run protected update"
+      info "Using the installed verified updater (with lifecycle rollback)."
+      if [ "$channel" = preview ]; then
+        "$binary" update --channel preview || die "Protected preview update failed; no shell replacement or restart was attempted."
+      else
+        "$binary" update || die "Protected update failed; no shell replacement or restart was attempted."
+      fi
+      stage_ok
+      green "Summary: protected updater finished."
+      echo "Running state and setup left to the updater."
+      echo "Open the pairing QR any time with: $binary manage"
+      exit 0
     fi
-    stage_ok
-    green "Summary: protected updater finished."
-    echo "Running state and setup left to the updater."
-    echo "Open the pairing QR any time with: $binary manage"
-    exit 0
-  fi
+  else
   die "This install lacks the protected updater; the existing binary was retained.
   Back up your Gateway config and state before a manual migration. Build a
   reviewed release from source, or verify its tagged binary against the matching
   .sha256 asset, then stop the Gateway through its existing service owner before
   replacing it. Preserve config/state and keep the old image for manual recovery.
   Do not delete the old binary to bypass this check."
+  fi
 fi
 
 if [ -z "$target" ]; then
@@ -345,9 +351,10 @@ chmod 755 "$staging/$asset"
 # Only this staged native image is probed, with no input, bounded output and
 # a five-second wall deadline. Reap both the probe and its watchdog on every
 # exit; never print untrusted version output or fall back to publication.
+probe_staged() {
 (
   ulimit -c 0 && ulimit -f 1 || exit 1
-  exec "$staging/$asset" --version
+  exec "$staging/$asset" "$@"
 ) </dev/null > "$staging/version" 2>/dev/null &
 probe_pid=$!
 (
@@ -363,13 +370,28 @@ probe_status=0
 wait "$probe_pid" || probe_status=$?
 probe_pid=""
 stop_probe
-[ "$probe_status" = 0 ] || die "Staged binary version probe failed or timed out; nothing installed."
+[ "$probe_status" = 0 ]
+}
+probe_staged --version || die "Staged binary version probe failed or timed out; nothing installed."
 [ "$(wc -c < "$staging/version")" -le 256 ] || die "Staged binary version output exceeded its bound; nothing installed."
 awk -v expected="muqun-gateway ${tag#v}" '
   NR != 1 || $0 != expected { bad = 1 }
   END { exit (NR != 1 || bad) }
 ' "$staging/version" || die "Staged binary version does not match $tag; nothing installed."
 stage_ok
+if [ "$bootstrap" = 1 ]; then
+  stage "Run protected preview bootstrap"
+  probe_staged bootstrap-preview --help &&
+    grep -Fxq 'Usage: muqun-gateway bootstrap-preview' "$staging/version" || die "This preview predates protected bootstrap support. A newer preview is needed; the existing installation was retained."
+  # The verified helper has a fixed, validated standalone destination. It owns
+  # update/lifecycle locks, replacement and rollback. Never publish it here or
+  # enter the fresh-install setup path for an existing installation.
+  "$staging/$asset" bootstrap-preview || die "Protected preview bootstrap failed; follow its diagnostic above. No shell replacement, setup or restart was attempted."
+  stage_ok
+  green "Summary: protected preview bootstrap finished."
+  echo "Open the pairing QR any time with: $binary manage"
+  exit 0
+fi
 stage "Publish verified binary"
 # A concurrent installer must not clobber an image published since our check.
 # Hard-link publication refuses existing files; also refuse directory/symlink

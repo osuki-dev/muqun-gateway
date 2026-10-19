@@ -71,7 +71,7 @@ impl DeepseekEndpoint {
     /// (401/403 included) means we cannot use the service.
     pub async fn probe_healthy(&self, client: &Client) -> bool {
         let probe_url = format!("{}/api/session/modelCatalog", self.url);
-        let mut req = client.post(&probe_url).timeout(Duration::from_millis(1500));
+        let mut req = client.post(&probe_url).timeout(Duration::from_secs(60));
         if let Some(cookie) = self.auth_cookie() {
             req = req.header("Cookie", cookie);
         }
@@ -134,7 +134,7 @@ impl DeepseekEndpoint {
         let secret = secret.or_else(super::auth::load_local_secret);
 
         let client = Client::builder()
-            .timeout(Duration::from_millis(800))
+            .timeout(Duration::from_secs(60))
             .build()
             .unwrap_or_default();
 

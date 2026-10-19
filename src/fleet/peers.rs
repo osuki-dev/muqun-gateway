@@ -49,9 +49,9 @@ ALTER TABLE peers ADD COLUMN unauthorized INTEGER NOT NULL DEFAULT 0;
 pub(crate) const REACHABLE_FOR: Duration = Duration::from_secs(120);
 /// How long a ping's answer (reachability, capabilities) is good for.
 pub(crate) const CHECK_EVERY: Duration = Duration::from_secs(60);
-const PING_TIMEOUT: Duration = Duration::from_secs(3);
+const PING_TIMEOUT: Duration = Duration::from_secs(60);
 /// A first manifest runs the peer's toolchain probes, which take a few seconds.
-const MANIFEST_TIMEOUT: Duration = Duration::from_secs(10);
+const MANIFEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Clone, PartialEq)]
 pub(crate) struct Peer {

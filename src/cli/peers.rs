@@ -13,7 +13,7 @@ use crate::fleet::peers::same_name;
 
 /// Linking claims a code over there (Argon2id on both sides) and makes a
 /// first call; give it more than a local request's two seconds.
-const LINK_TIMEOUT: Duration = Duration::from_secs(30);
+const LINK_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Subcommand)]
 pub(crate) enum PeersCommand {

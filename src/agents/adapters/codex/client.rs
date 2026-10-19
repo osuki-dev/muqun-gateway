@@ -24,7 +24,7 @@ pub(super) const MAX_HISTORY_WIRE_WORK_BYTES: usize = 3 * MAX_HISTORY_FRAME_BYTE
 const MAX_PENDING: usize = 32;
 const MAX_SERVER_REQUEST_BYTES: usize = 8 * 1024 * 1024;
 const QUEUE_SIZE: usize = 16;
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone)]
 pub enum CodexEvent {

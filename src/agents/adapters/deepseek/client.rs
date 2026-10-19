@@ -120,7 +120,7 @@ pub struct DeepseekClient {
 impl DeepseekClient {
     pub fn new(endpoint: DeepseekEndpoint) -> Self {
         let http = Client::builder()
-            .timeout(Duration::from_secs(15))
+            .timeout(Duration::from_secs(60))
             .build()
             .unwrap_or_default();
         Self { endpoint, http }

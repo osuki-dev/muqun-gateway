@@ -389,7 +389,7 @@ impl T3Client {
 
     pub fn with_config(endpoint: T3Endpoint, rpc_config: RpcConfig) -> Self {
         let http = Client::builder()
-            .timeout(Duration::from_secs(30))
+            .timeout(Duration::from_secs(60))
             .build()
             .unwrap_or_default();
         let auth = Arc::new(RwLock::new(match &endpoint.credential {

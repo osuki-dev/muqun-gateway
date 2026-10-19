@@ -61,6 +61,9 @@ pub(crate) enum Command {
     Restart,
     Status,
     Manage,
+    /// Installer-only protected transition from a pre-channel standalone binary.
+    #[command(hide = true)]
+    BootstrapPreview,
     /// Check or manually install a newer stable official release (never downgrades).
     Update {
         /// Only check; do not download binaries or change running state.
@@ -227,6 +230,10 @@ pub(crate) async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Command::Restart => crate::restart_gateway(true)?,
         Command::Status => status()?,
         Command::Manage => manage()?,
+        Command::BootstrapPreview => {
+            println!("Verifying the installed image and official preview before downtime; the existing owner controls any restart.");
+            println!("{}", crate::platform::update::bootstrap_preview().await?);
+        }
         Command::Update { check, channel } => {
             let plan = crate::platform::update::check_channel(channel).await?;
             println!("{}", plan.summary());

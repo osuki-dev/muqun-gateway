@@ -312,8 +312,8 @@ pub struct RpcConfig {
 impl Default for RpcConfig {
     fn default() -> Self {
         Self {
-            request_timeout: Duration::from_secs(30),
-            connect_timeout: Duration::from_secs(15),
+            request_timeout: Duration::from_secs(60),
+            connect_timeout: Duration::from_secs(60),
             ping_interval: Duration::from_secs(5),
             backoff_initial: Duration::from_millis(500),
             backoff_max: Duration::from_secs(10),
