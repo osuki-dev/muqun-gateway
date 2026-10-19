@@ -339,6 +339,10 @@ case "$*" in
     *) exit 2;;
   esac;;
 'update') [ "$MOCK_EXISTING" != modern-failed ] || exit 1;;
+'bootstrap-preview --help')
+  [ "$MOCK_FAULT" != no-bootstrap ] || exit 0
+  printf '%s\n' 'Usage: muqun-gateway bootstrap-preview';;
+'bootstrap-preview') [ "$MOCK_FAULT" != bootstrap-failed ] || exit 1;;
 'service status') echo "service: $MOCK_SERVICE"; echo "gateway: $MOCK_GATEWAY";;
 'backend list') printf '%b' "$MOCK_BACKENDS";;
 esac
@@ -597,10 +601,12 @@ esac
         .to_string_lossy()
         .starts_with(".muqun-gateway-install.")));
     if let Some(existing) = case.existing {
-        assert!(
-            downloads.is_empty(),
-            "existing install downloaded assets: {downloads}"
-        );
+        if !(case.preview && existing.starts_with("modern")) {
+            assert!(
+                downloads.is_empty(),
+                "existing install downloaded assets: {downloads}"
+            );
+        }
         match existing {
             "symlink" => assert!(destination.is_symlink()),
             "directory" => assert!(destination.is_dir()),
@@ -845,17 +851,42 @@ fn installer_delegates_modern_updates_without_shell_restart_or_replacement() {
 
 #[test]
 fn preview_installer_selects_latest_complete_and_requires_capable_updater() {
-    let failure = security_case(DownloadCase {
+    let calls = security_case(DownloadCase {
         preview: true,
         existing: Some("modern"),
+        tag: Some("v0.13.0-preview.10"),
         ..Default::default()
     })
-    .unwrap_err();
-    assert!(
-        failure.contains("channel-capable stable release"),
-        "{failure}"
+    .unwrap();
+    assert_eq!(
+        calls,
+        "update --help\n--version\nbootstrap-preview --help\nbootstrap-preview\n"
     );
-    assert!(!failure.contains("\nupdate\n"));
+    for fault in [
+        "no-bootstrap",
+        "bootstrap-failed",
+        "corrupt",
+        "wrong-version",
+        "wrong-platform",
+    ] {
+        let failure = security_case(DownloadCase {
+            preview: true,
+            existing: Some("modern"),
+            tag: Some("v0.13.0-preview.10"),
+            fault: Some(fault),
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert!(!failure.contains("setup --backend"), "{fault}: {failure}");
+        assert!(!failure.contains("\nstart\n"), "{fault}: {failure}");
+        assert!(!failure.contains("\nstop\n"), "{fault}: {failure}");
+        if fault != "bootstrap-failed" {
+            assert!(
+                !failure.contains("\nbootstrap-preview\n"),
+                "{fault}: {failure}"
+            );
+        }
+    }
     let calls = security_case(DownloadCase {
         preview: true,
         existing: Some("channel"),

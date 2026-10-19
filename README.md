@@ -648,13 +648,18 @@ all four platform binaries and their checksums. Drafts and incomplete releases
 are excluded. It pins the selected tag before downloading; it never falls back
 to stable when no preview exists. Metadata searches are bounded to ten pages
 of 100 releases, at 1 MiB per page; an incomplete search fails without installing.
-Fresh preview installation requires Python 3 for JSON parsing. Stable has no
-new prerequisite. Until the hosted installer and a channel-capable release are
-published, these commands are available only in this source checkout/build.
+Fresh preview installation and bootstrap from a pre-channel updater require
+Python 3 for JSON parsing. Stable has no new prerequisite.
 
-An existing installation must already have a channel-capable protected updater.
-Otherwise the installer refuses preview and asks you to upgrade stable first;
-it never overwrites an old updater from the shell. Preview uses the existing
+An existing channel-capable installation uses its protected updater. If its
+protected updater predates channels, the installer verifies the selected preview
+image, then asks that image's protected bootstrap command to perform the transition.
+The helper validates the fixed standalone destination and official release again,
+preserving update/lifecycle locks, service ownership and rollback. The shell never
+overwrites the image, reruns setup, or restarts the service itself. This needs a
+preview containing bootstrap support; `v0.14.1-preview.1` does not have it. No new
+stable release is required. Truly legacy installations without the protected
+updater still require manual migration. Preview uses the existing
 binary, service, config, and pairings. It does not create a second instance, and
 running test code on a working installation can affect that installation.
 
@@ -675,6 +680,16 @@ checkout and the same `GITHUB_RUN_NUMBER`. Human-written `release-notes/unreleas
 is included with the source SHA and exact build version. Reruns never overwrite
 existing tags or releases. Publication requires an explicit release request;
 ordinary pushes do not publish previews.
+
+For bootstrap rollout, first publish an explicitly authorized preview containing
+the helper from the reviewed branch and verify its complete binary/checksum matrix.
+Then merge this installer into main: the hosted `gateway.sh` redirects to main's
+`install.sh`, so no separate website deployment is needed. If main is merged first,
+the new installer safely refuses an older preview until the helper release is
+available. Publishing only the script cannot add the bootstrap command to an older
+preview. If a newer preview appears between the
+shell download and the helper's check, bootstrap refuses without replacement;
+rerun the installer to select the new image.
 
 ### Stable updates
 
