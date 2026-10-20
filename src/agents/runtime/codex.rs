@@ -8,10 +8,10 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt;
-use tokio::sync::{mpsc, Mutex, Notify};
+use tokio::sync::{Mutex, Notify};
 
 use super::{AgentOrigin, AgentRuntime};
-use crate::agents::adapters::codex::{CodexClient, CodexEvent};
+use crate::agents::adapters::codex::{CodexClient, CodexEvents};
 use crate::agents::manager::AgentManager;
 use crate::agents::ports::agent::AgentError;
 
@@ -444,7 +444,7 @@ struct ChildExit {
     failure: Mutex<Option<AgentError>>,
 }
 
-type ChildConnection = (Arc<CodexClient>, mpsc::Receiver<CodexEvent>, Arc<ChildExit>);
+type ChildConnection = (Arc<CodexClient>, CodexEvents, Arc<ChildExit>);
 impl ChildExit {
     async fn wait(&self) -> Result<(), AgentError> {
         loop {
@@ -622,13 +622,7 @@ pub(crate) mod tests {
     async fn five_second_cleanup(
         make_tree: impl FnOnce(u32) -> crate::agents::adapters::codex::process_tree::ProcessTree,
         orphan_before_observation: bool,
-    ) -> (
-        Arc<CodexClient>,
-        mpsc::Receiver<CodexEvent>,
-        Arc<ChildExit>,
-        i32,
-        i32,
-    ) {
+    ) -> (Arc<CodexClient>, CodexEvents, Arc<ChildExit>, i32, i32) {
         let mut command = tokio::process::Command::new("/bin/sh");
         let ready_file =
             std::env::temp_dir().join(format!("gateway-codex-shutdown-{}", uuid::Uuid::new_v4()));
@@ -935,13 +929,7 @@ pub(crate) mod tests {
     #[cfg(target_os = "linux")]
     async fn fake_tree(
         graceful: bool,
-    ) -> (
-        Arc<CodexClient>,
-        mpsc::Receiver<CodexEvent>,
-        Arc<ChildExit>,
-        i32,
-        i32,
-    ) {
+    ) -> (Arc<CodexClient>, CodexEvents, Arc<ChildExit>, i32, i32) {
         let mut command = tokio::process::Command::new("/bin/sh");
         command.args(["-c",if graceful {r#"
             setsid /bin/sleep 60 </dev/null >/dev/null 2>&1 & tool=$!

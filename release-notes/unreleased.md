@@ -22,6 +22,13 @@
   Codex each item with files gains the same `attachments` and `image_assets`
   fields a transcript user message has, so the App can show image thumbnails
   for a prompt that is still waiting.
+- Codex sessions no longer drop to read-only history when output streams
+  quickly. A fast answer arrives as hundreds of small text updates at once, and
+  the Gateway closed its Codex connection whenever more than 16 of them were
+  waiting, so the App showed the live session as saved history in the middle of
+  a turn until it reconnected. Consecutive updates to the same text are now
+  combined while they wait, without losing, reordering or skipping any text or
+  approvals. No App update or configuration change is needed.
 
 - Add an explicit Gateway preview channel for the installer and protected updater.
   Stable remains the default; preview automatically selects the newest complete

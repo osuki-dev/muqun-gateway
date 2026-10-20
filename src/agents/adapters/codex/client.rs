@@ -1,5 +1,7 @@
+mod events;
 #[cfg(unix)]
 pub(crate) mod websocket;
+pub use events::CodexEvents;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -23,7 +25,9 @@ pub(super) const MAX_HISTORY_FRAME_BYTES: usize = 256 * 1024 * 1024;
 pub(super) const MAX_HISTORY_WIRE_WORK_BYTES: usize = 3 * MAX_HISTORY_FRAME_BYTES;
 const MAX_PENDING: usize = 32;
 const MAX_SERVER_REQUEST_BYTES: usize = 8 * 1024 * 1024;
-const QUEUE_SIZE: usize = 16;
+// Slots for distinct events. Contiguous text deltas share one slot (see
+// `events`), so a token stream costs a slot per interruption, not per token.
+const QUEUE_SIZE: usize = 64;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone)]
@@ -102,7 +106,7 @@ struct State {
     disconnect_reason: std::sync::OnceLock<&'static str>,
     history_capacity: std::sync::OnceLock<HistoryCapacity>,
     cancel: CancellationToken,
-    events: mpsc::Sender<CodexEvent>,
+    events: events::EventSender,
 }
 
 fn locked<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -335,11 +339,7 @@ fn diagnostic_method(method: &str) -> &'static str {
 }
 
 impl CodexClient {
-    pub(crate) fn from_io_at<R, W>(
-        reader: R,
-        writer: W,
-        cwd: String,
-    ) -> (Arc<Self>, mpsc::Receiver<CodexEvent>)
+    pub(crate) fn from_io_at<R, W>(reader: R, writer: W, cwd: String) -> (Arc<Self>, CodexEvents)
     where
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
@@ -360,7 +360,7 @@ impl CodexClient {
         self.configured_provider.get().map(String::as_str)
     }
 
-    pub fn from_io<R, W>(reader: R, writer: W) -> (Arc<Self>, mpsc::Receiver<CodexEvent>)
+    pub fn from_io<R, W>(reader: R, writer: W) -> (Arc<Self>, CodexEvents)
     where
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
@@ -368,16 +368,12 @@ impl CodexClient {
         Self::with_timeout(reader, writer, REQUEST_TIMEOUT)
     }
 
-    fn with_timeout<R, W>(
-        reader: R,
-        mut writer: W,
-        timeout: Duration,
-    ) -> (Arc<Self>, mpsc::Receiver<CodexEvent>)
+    fn with_timeout<R, W>(reader: R, mut writer: W, timeout: Duration) -> (Arc<Self>, CodexEvents)
     where
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
     {
-        let (events, rx) = mpsc::channel(QUEUE_SIZE);
+        let (events, rx) = events::channel(QUEUE_SIZE);
         let (outgoing, mut writes) = mpsc::channel::<WritePacket>(MAX_PENDING);
         let state = Arc::new(State {
             generation: uuid::Uuid::new_v4().to_string(),
@@ -1479,7 +1475,7 @@ mod tests {
         timeout: Duration,
     ) -> (
         Arc<CodexClient>,
-        mpsc::Receiver<CodexEvent>,
+        CodexEvents,
         Arc<WriteProbe>,
         tokio::io::DuplexStream,
         String,

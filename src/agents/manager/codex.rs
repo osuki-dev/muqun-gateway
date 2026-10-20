@@ -6,7 +6,7 @@ use tokio::sync::{broadcast, mpsc};
 
 use super::AgentManager;
 use crate::agents::adapters::codex::inbox::InboxSignal;
-use crate::agents::adapters::codex::{mapper, CodexClient, CodexDriver, CodexEvent};
+use crate::agents::adapters::codex::{mapper, CodexClient, CodexDriver, CodexEvent, CodexEvents};
 use crate::agents::adapters::memory_mirror::MemoryMirror;
 use crate::agents::domain::*;
 use crate::agents::ports::{agent::AgentPort, mirror::SessionMirrorPort};
@@ -797,7 +797,7 @@ impl Context {
 impl AgentManager {
     pub fn connect_codex(
         client: Arc<CodexClient>,
-        events: mpsc::Receiver<CodexEvent>,
+        events: CodexEvents,
         tx: broadcast::Sender<AgentDomainEvent>,
     ) -> Self {
         Self::connect_codex_observed(client, events, tx, None)
@@ -805,7 +805,7 @@ impl AgentManager {
 
     pub(crate) fn connect_codex_observed(
         client: Arc<CodexClient>,
-        events: mpsc::Receiver<CodexEvent>,
+        events: CodexEvents,
         tx: broadcast::Sender<AgentDomainEvent>,
         observer: Option<Arc<crate::agents::terminal_runtime::TerminalRuntime>>,
     ) -> Self {
@@ -814,7 +814,7 @@ impl AgentManager {
 
     pub(crate) fn connect_codex_recoverable(
         client: Arc<CodexClient>,
-        mut events: mpsc::Receiver<CodexEvent>,
+        mut events: CodexEvents,
         tx: broadcast::Sender<AgentDomainEvent>,
         observer: Option<Arc<crate::agents::terminal_runtime::TerminalRuntime>>,
         native_sessions: Option<
@@ -914,6 +914,7 @@ mod tests {
     use crate::agents::ports::agent::AgentError;
     use serde_json::json;
     use std::time::Duration;
+    use tokio::sync::mpsc;
 
     /// A private Codex fixture driven through the manager's own pump, with the
     /// queue's signals published by hand so each step can be checked.
@@ -2126,7 +2127,7 @@ mod tests {
 
     struct ModelPageRpc {
         client: Arc<CodexClient>,
-        events: Option<mpsc::Receiver<CodexEvent>>,
+        events: Option<CodexEvents>,
         requests: mpsc::Receiver<Value>,
         writer: Arc<tokio::sync::Mutex<tokio::io::WriteHalf<tokio::io::DuplexStream>>>,
         task: tokio::task::JoinHandle<()>,
@@ -2998,5 +2999,115 @@ mod tests {
             .unwrap()
             .is_empty());
         manager.shutdown();
+    }
+
+    /// The manager's stalled-consumer case: a burst of reasoning and answer
+    /// deltas, an approval in the middle, all offered while the event pump is
+    /// busy elsewhere. The connection stays live, the projection matches the
+    /// uncoalesced stream exactly and the approval is still actionable.
+    #[tokio::test]
+    async fn delta_burst_behind_a_busy_event_pump_projects_every_delta_in_order() {
+        use tokio::io::AsyncWriteExt;
+        let mut fixture = Fixture::new(|request| match request["method"].as_str() {
+            Some("model/list") => json!({"data":[]}),
+            _ => panic!("burst projection must not send commands"),
+        })
+        .await;
+        fixture.ready().await;
+        let mut events = fixture.events.take().unwrap();
+        let driver = Arc::new(CodexDriver::new(fixture.client.clone()));
+        let mirror = Arc::new(MemoryMirror::for_agent("codex"));
+        let (tx, _domain) = broadcast::channel(4096);
+        let context = Context {
+            driver,
+            mirror: mirror.clone(),
+            tx,
+            stopped: Arc::new(Mutex::new(false)),
+            threads: tokio::sync::Mutex::new(HashSet::new()),
+        };
+        let thread = golden()["thread"].clone();
+        let id = thread["id"].as_str().unwrap().to_owned();
+        let asid = AgentSessionId(id.clone());
+        context.session(&thread, 0).await;
+
+        let delta = |method: &str, item: &str, delta: String| {
+            let mut params =
+                json!({"threadId":id,"turnId":"synthetic-turn","itemId":item,"delta":delta});
+            if method == "item/reasoning/summaryTextDelta" {
+                params["summaryIndex"] = json!(0);
+            }
+            json!({"method":method,"params":params})
+        };
+        let mut frames = vec![
+            json!({"method":"turn/started","params":{"threadId":id,"turn":{"id":"synthetic-turn","status":"inProgress"}}}),
+        ];
+        let (mut reasoning, mut answer) = (String::new(), String::new());
+        for n in 0..300 {
+            let text = format!("r{n} ");
+            reasoning.push_str(&text);
+            frames.push(delta(
+                "item/reasoning/summaryTextDelta",
+                "synthetic-reasoning",
+                text,
+            ));
+        }
+        for n in 0..1_200 {
+            if n == 600 {
+                frames.push(json!({"id":77,"method":"item/commandExecution/requestApproval","params":{"threadId":id,"turnId":"synthetic-turn","itemId":"synthetic-tool","command":"true"}}));
+            }
+            let text = format!("w{n} ");
+            answer.push_str(&text);
+            frames.push(delta("item/agentMessage/delta", "synthetic-message", text));
+        }
+        let writer = fixture.writer.clone();
+        // Not awaited before the read below: a dropped connection stops
+        // reading, which would otherwise leave this writer blocked forever.
+        tokio::spawn(async move {
+            let mut bytes = Vec::new();
+            for frame in frames {
+                bytes.extend(serde_json::to_vec(&frame).unwrap());
+                bytes.push(b'\n');
+            }
+            let _ = writer.lock().await.write_all(&bytes).await;
+        });
+        // Its reply is behind the whole burst on the wire.
+        let barrier = tokio::time::timeout(
+            Duration::from_secs(5),
+            fixture.client.call("model/list", json!({})),
+        )
+        .await
+        .unwrap();
+        assert!(
+            barrier.is_ok() && fixture.client.is_ready(),
+            "burst closed the connection"
+        );
+
+        let mut queued = 0;
+        while let Ok(event) = events.try_recv() {
+            queued += 1;
+            context.event(event).await;
+        }
+        assert!(queued < 16, "the burst occupied {queued} queue slots");
+        let snapshot = mirror.get_snapshot(&asid).await.unwrap();
+        let text = |reasoning_row: bool| {
+            snapshot
+                .timeline
+                .iter()
+                .find_map(|row| match &row.part {
+                    AgentPart::Reasoning { text, .. } if reasoning_row => Some(text.clone()),
+                    AgentPart::Text { text } if !reasoning_row => Some(text.clone()),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        assert_eq!(text(true), reasoning);
+        assert_eq!(text(false), answer);
+        assert_eq!(
+            snapshot.permissions.len(),
+            1,
+            "approval must stay actionable"
+        );
+        assert_eq!(snapshot.info.status, AgentSessionStatus::Busy);
+        assert!(fixture.client.is_ready());
     }
 }

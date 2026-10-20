@@ -5,12 +5,10 @@ use std::sync::Arc;
 #[cfg(unix)]
 use std::time::Duration;
 
-use tokio::sync::mpsc;
-
-use super::{CodexClient, CodexEvent};
+use super::{CodexClient, CodexEvents};
 use crate::agents::ports::agent::AgentError;
 
-type Connection = (Arc<CodexClient>, mpsc::Receiver<CodexEvent>);
+type Connection = (Arc<CodexClient>, CodexEvents);
 
 #[cfg(unix)]
 #[derive(Clone, PartialEq, Eq)]

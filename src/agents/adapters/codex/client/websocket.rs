@@ -69,7 +69,7 @@ impl CodexClient {
         socket: WebSocketStream<UnixStream>,
         home: std::path::PathBuf,
         shared_socket: std::path::PathBuf,
-    ) -> (Arc<Self>, mpsc::Receiver<CodexEvent>) {
+    ) -> (Arc<Self>, CodexEvents) {
         Self::from_websocket_with_parent(
             socket,
             home,
@@ -85,8 +85,8 @@ impl CodexClient {
         shared_socket: std::path::PathBuf,
         parent: Option<CancellationToken>,
         read_limit: usize,
-    ) -> (Arc<Self>, mpsc::Receiver<CodexEvent>) {
-        let (events, rx) = mpsc::channel(QUEUE_SIZE);
+    ) -> (Arc<Self>, CodexEvents) {
+        let (events, rx) = events::channel(QUEUE_SIZE);
         let (outgoing, mut writes) = mpsc::channel::<WritePacket>(MAX_PENDING);
         let state = Arc::new(State {
             generation: uuid::Uuid::new_v4().to_string(),
@@ -159,6 +159,10 @@ impl CodexClient {
                                     tracing::warn!(connection = %pump.generation, frame_bytes, reason, "Codex RPC frame rejected by router");
                                     break reason;
                                 }
+                                // Mirror the stdio pump: one socket read can buffer
+                                // hundreds of messages. Let the event consumer run
+                                // between them rather than route them all first.
+                                tokio::task::yield_now().await;
                             }
                             Some(Ok(Message::Text(text))) => {
                                 tracing::warn!(connection = %pump.generation, frame_bytes = text.len(), limit_bytes = pump.read_limit,
@@ -233,11 +237,7 @@ pub(crate) mod tests {
         }
     }
 
-    async fn diagnostic_peer() -> (
-        Arc<CodexClient>,
-        mpsc::Receiver<CodexEvent>,
-        WebSocketStream<UnixStream>,
-    ) {
+    async fn diagnostic_peer() -> (Arc<CodexClient>, CodexEvents, WebSocketStream<UnixStream>) {
         use tokio_tungstenite::tungstenite::protocol::{Role, WebSocketConfig};
         let (left, right) = UnixStream::pair().unwrap();
         let config = WebSocketConfig::default()
@@ -447,9 +447,84 @@ pub(crate) mod tests {
         );
     }
 
+    /// A fast turn streams roughly one `item/agentMessage/delta` per token,
+    /// and the daemon's socket buffer delivers them as one burst. A consumer
+    /// that is momentarily parked (mirror lock, scheduling) must not turn
+    /// that burst into a lost connection, and no text may be lost or moved.
+    #[tokio::test]
+    async fn shared_delta_burst_behind_a_stalled_consumer_keeps_the_connection() {
+        let (client, mut events, mut server) = diagnostic_peer().await;
+        locked(&client.state.subscribed).insert("synthetic-thread".into(), 0);
+        let mut expected = String::new();
+        for n in 0..1_200 {
+            let delta = format!("word{n} ");
+            expected.push_str(&delta);
+            let frame = json!({"method":"item/agentMessage/delta","params":{"threadId":"synthetic-thread","turnId":"synthetic-turn","itemId":"synthetic-message","delta":delta}});
+            server
+                .feed(Message::Text(frame.to_string().into()))
+                .await
+                .unwrap();
+        }
+        server.flush().await.unwrap();
+        // The reply follows the whole burst on the wire, so it is routed only
+        // after every delta has been offered to the (unread) event queue.
+        let call = tokio::spawn({
+            let client = client.clone();
+            async move { client.call("model/list", json!({})).await }
+        });
+        let request = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match server.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        break serde_json::from_str::<Value>(&text).unwrap()
+                    }
+                    Some(Ok(_)) => continue,
+                    other => panic!("server lost the client: {other:?}"),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        server
+            .send(Message::Text(
+                json!({"id":request["id"],"result":{"data":[]}})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        let reply = tokio::time::timeout(Duration::from_secs(5), call)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            reply.is_ok(),
+            "burst closed the connection: {:?}",
+            client.state.disconnect_reason.get()
+        );
+        assert!(client.is_ready());
+        let mut text = String::new();
+        let mut queued = 0;
+        while let Ok(event) = events.try_recv() {
+            queued += 1;
+            let CodexEvent::Notification { method, params } = event else {
+                panic!("unexpected event");
+            };
+            assert_eq!(method, "item/agentMessage/delta");
+            assert_eq!(params["itemId"], "synthetic-message");
+            text.push_str(params["delta"].as_str().unwrap());
+        }
+        assert_eq!(text, expected, "deltas lost, duplicated or reordered");
+        assert!(
+            queued < QUEUE_SIZE,
+            "a run of one item's deltas holds {queued} slots"
+        );
+        client.stop();
+    }
+
     pub(crate) struct Fixture {
         pub(crate) client: Arc<CodexClient>,
-        pub(crate) events: mpsc::Receiver<CodexEvent>,
+        pub(crate) events: CodexEvents,
         requests: Arc<Mutex<Vec<Value>>>,
         pub(crate) send: mpsc::Sender<Value>,
         disconnected: Arc<AtomicBool>,
@@ -754,7 +829,7 @@ pub(crate) mod tests {
             let (tx, _) = tokio::sync::broadcast::channel(32);
             let manager = AgentManager::connect_codex(
                 fixture.client.clone(),
-                std::mem::replace(&mut fixture.events, mpsc::channel(1).1),
+                std::mem::replace(&mut fixture.events, events::channel(1).1),
                 tx,
             );
             let asid = AgentSessionId(ID.into());
@@ -932,7 +1007,7 @@ pub(crate) mod tests {
                 .await
                 .unwrap()
                 .is_empty());
-            let mut events = std::mem::replace(&mut fixture.events, mpsc::channel(1).1);
+            let mut events = std::mem::replace(&mut fixture.events, events::channel(1).1);
             tokio::time::timeout(Duration::from_secs(2), async {
                 loop {
                     if let Some(CodexEvent::Notification { method, params }) = events.recv().await {
@@ -1912,7 +1987,7 @@ pub(crate) mod tests {
             let (tx, _events) = tokio::sync::broadcast::channel(64);
             let manager = AgentManager::connect_codex_recoverable(
                 fixture.client.clone(),
-                std::mem::replace(&mut fixture.events, mpsc::channel(1).1),
+                std::mem::replace(&mut fixture.events, events::channel(1).1),
                 tx,
                 Some(crate::agents::terminal_runtime::TerminalRuntime::new(&[
                     herdr.session(),
@@ -1995,7 +2070,7 @@ pub(crate) mod tests {
         let (tx, _events) = tokio::sync::broadcast::channel(64);
         let manager = AgentManager::connect_codex(
             fixture.client.clone(),
-            std::mem::replace(&mut fixture.events, mpsc::channel(1).1),
+            std::mem::replace(&mut fixture.events, events::channel(1).1),
             tx,
         );
         manager.view_session(ID, 1).await.unwrap();
@@ -2039,7 +2114,7 @@ pub(crate) mod tests {
         let (tx, _events) = tokio::sync::broadcast::channel(64);
         let manager = AgentManager::connect_codex_recoverable(
             fixture.client.clone(),
-            std::mem::replace(&mut fixture.events, mpsc::channel(1).1),
+            std::mem::replace(&mut fixture.events, events::channel(1).1),
             tx,
             Some(crate::agents::terminal_runtime::TerminalRuntime::new(&[])),
             Some(registry),
@@ -2300,7 +2375,7 @@ pub(crate) mod tests {
         let (tx, mut updates) = tokio::sync::broadcast::channel(64);
         let manager = AgentManager::connect_codex_observed(
             fixture.client.clone(),
-            std::mem::replace(&mut fixture.events, mpsc::channel(1).1),
+            std::mem::replace(&mut fixture.events, events::channel(1).1),
             tx,
             Some(crate::agents::terminal_runtime::TerminalRuntime::new(&[])),
         );
@@ -2535,7 +2610,7 @@ pub(crate) mod tests {
             let (tx, _) = tokio::sync::broadcast::channel(64);
             let manager = AgentManager::connect_codex(
                 fixture.client.clone(),
-                std::mem::replace(&mut fixture.events, mpsc::channel(1).1),
+                std::mem::replace(&mut fixture.events, events::channel(1).1),
                 tx,
             );
             state.agent_runtime.attach_for_test(Arc::new(manager)).await;
