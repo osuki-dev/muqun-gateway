@@ -18,9 +18,20 @@ pub(super) fn text_input(text: &str) -> Vec<Value> {
     }
 }
 
-pub(super) async fn prepare(text: &str, attachments: &[String]) -> Result<Vec<Value>, AgentError> {
+/// A checked prompt: the Codex `UserInput` list, and its uploads as OpenCode
+/// lists a prompt's files (`{uri, name, mime?}`), for the Gateway inbox.
+#[derive(Debug, Default)]
+pub(super) struct Prepared {
+    pub input: Vec<Value>,
+    pub files: Vec<Value>,
+}
+
+pub(super) async fn prepare(text: &str, attachments: &[String]) -> Result<Prepared, AgentError> {
     if attachments.is_empty() {
-        return Ok(text_input(text));
+        return Ok(Prepared {
+            input: text_input(text),
+            files: Vec::new(),
+        });
     }
     if attachments.len() > MAX_ATTACHMENTS {
         return Err(invalid("at most 16 uploads are allowed"));
@@ -28,7 +39,7 @@ pub(super) async fn prepare(text: &str, attachments: &[String]) -> Result<Vec<Va
     let uploads = crate::uploads_dir().map_err(|_| invalid("upload directory unavailable"))?;
     let text = text.to_owned();
     let attachments = attachments.to_vec();
-    tokio::task::spawn_blocking(move || upload_input(&text, &attachments, &uploads))
+    tokio::task::spawn_blocking(move || upload_parts(&text, &attachments, &uploads))
         .await
         .map_err(|_| invalid("upload inspection failed"))?
 }
@@ -37,11 +48,35 @@ fn invalid(reason: &str) -> AgentError {
     AgentError::InvalidRequest(format!("Codex attachment: {reason}"))
 }
 
+#[cfg(test)]
 fn upload_input(
     text: &str,
     attachments: &[String],
     uploads: &Path,
 ) -> Result<Vec<Value>, AgentError> {
+    upload_parts(text, attachments, uploads).map(|prepared| prepared.input)
+}
+
+fn file_entry(path: &str, mime: Option<&str>) -> Value {
+    let name = Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("attachment");
+    let uri = reqwest::Url::from_file_path(path)
+        .map(String::from)
+        .unwrap_or_else(|()| format!("file://{path}"));
+    let mut entry = json!({ "uri": uri, "name": name });
+    if let Some(mime) = mime {
+        entry["mime"] = json!(mime);
+    }
+    entry
+}
+
+fn upload_parts(
+    text: &str,
+    attachments: &[String],
+    uploads: &Path,
+) -> Result<Prepared, AgentError> {
     if attachments.len() > MAX_ATTACHMENTS {
         return Err(invalid("at most 16 uploads are allowed"));
     }
@@ -50,6 +85,7 @@ fn upload_input(
     let checked = checked_attachments(AttachmentMode::NativeUploads, attachments, uploads)?;
     let mut images = Vec::new();
     let mut documents = Vec::new();
+    let mut files = Vec::new();
     let mut total = 0_u64;
     for path in checked {
         let mut options = std::fs::OpenOptions::new();
@@ -76,7 +112,8 @@ fn upload_input(
             .read_to_end(&mut head)
             .map_err(|_| invalid("upload is unreadable"))?;
         match sniff_upload_kind(&head).map(|kind| kind.mime) {
-            Some("image/png" | "image/jpeg" | "image/webp" | "image/gif") => {
+            Some(mime @ ("image/png" | "image/jpeg" | "image/webp" | "image/gif")) => {
+                files.push(file_entry(&path, Some(mime)));
                 // The verified daemon/private app-server is on the same host.
                 // Official localImage loads image bytes; a text path does not.
                 images.push(json!({"type":"localImage","path":path}));
@@ -97,13 +134,14 @@ fn upload_input(
                 {
                     return Err(invalid("image bytes do not match a supported format"));
                 }
+                files.push(file_entry(&path, None));
                 documents.push(path);
             }
         }
     }
     let mut input = text_input(&append_attachment_paths(text, &documents));
     input.extend(images);
-    Ok(input)
+    Ok(Prepared { input, files })
 }
 
 #[cfg(test)]
@@ -164,6 +202,25 @@ mod tests {
         assert_eq!(
             upload_input("", std::slice::from_ref(&png), &root).unwrap(),
             vec![json!({"type":"localImage","path":png})]
+        );
+        // The inbox lists every upload in the order given, as OpenCode does.
+        let files = upload_parts("inspect", &[png.clone(), document.clone()], &root)
+            .unwrap()
+            .files;
+        let name = |path: &str| {
+            Path::new(path)
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_owned()
+        };
+        assert_eq!(
+            files,
+            vec![
+                json!({"uri":format!("file://{png}"),"name":name(&png),"mime":"image/png"}),
+                json!({"uri":format!("file://{document}"),"name":name(&document)}),
+            ]
         );
     }
 

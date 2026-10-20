@@ -6,6 +6,7 @@ use tokio::sync::Mutex;
 
 use super::{
     budget::{next_cursor, Budget},
+    inbox::{Delivery, Inbox, InboxSignal, Queued},
     mapper, CodexClient,
 };
 use crate::agents::domain::*;
@@ -50,6 +51,45 @@ pub struct CodexDriver {
     history_preparations: Arc<tokio::sync::Semaphore>,
     /// Set only when the downloaded Codex command catalog contributed rows.
     slash_catalog: std::sync::atomic::AtomicBool,
+    /// Prompts waiting for a thread's turn to end. Changed only while holding
+    /// `mutations`, so a delivery and a cancel never race for one item.
+    inbox: std::sync::Mutex<Inbox>,
+    inbox_signals: Option<tokio::sync::mpsc::UnboundedSender<InboxSignal>>,
+}
+
+/// Why a prompt did not reach Codex. `Unknown` means it may have: the request
+/// was written and no definite answer came back. It is never resent.
+enum SendFailure {
+    NotSent(AgentError),
+    Unknown(AgentError),
+}
+
+impl SendFailure {
+    /// Codex answered with an error, so the input was not accepted. Anything
+    /// else after the request was written is an unknown outcome.
+    fn after_write(error: AgentError) -> Self {
+        match error {
+            AgentError::RequestFailed(_) => Self::NotSent(error),
+            _ => Self::Unknown(error),
+        }
+    }
+
+    fn into_error(self) -> AgentError {
+        match self {
+            Self::NotSent(error) | Self::Unknown(error) => error,
+        }
+    }
+}
+
+fn inbox_item_not_found(id: &str) -> AgentError {
+    AgentError::InboxItemNotFound(format!("Codex inbox item {id} is not queued"))
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 struct PendingModel {
@@ -131,7 +171,135 @@ impl CodexDriver {
             history_state: std::sync::Mutex::new(HistoryState::default()),
             history_preparations: Arc::new(tokio::sync::Semaphore::new(4)),
             slash_catalog: std::sync::atomic::AtomicBool::new(false),
+            inbox: std::sync::Mutex::new(Inbox::default()),
+            inbox_signals: None,
         }
+    }
+
+    /// Where queue changes are published. Without it the queue still works,
+    /// but nothing reaches the mirror or the stream.
+    pub(crate) fn observe_inbox(
+        &mut self,
+        signals: tokio::sync::mpsc::UnboundedSender<InboxSignal>,
+    ) {
+        self.inbox_signals = Some(signals);
+    }
+
+    fn signal(&self, signal: InboxSignal) {
+        if let Some(signals) = &self.inbox_signals {
+            let _ = signals.send(signal);
+        }
+    }
+
+    fn queue(&self) -> std::sync::MutexGuard<'_, Inbox> {
+        self.inbox.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    pub(crate) fn inbox_items(&self, thread: &str) -> Vec<Value> {
+        self.queue().items(thread)
+    }
+
+    /// A deleted thread's queue goes with it, without publishing.
+    pub(crate) fn clear_inbox(&self, thread: &str) {
+        self.queue().clear(thread);
+    }
+
+    /// Record a send attempt's outcome for a queued item. Called while still
+    /// holding `mutations`, so no other delivery can pick the same item.
+    fn settle(
+        &self,
+        thread: &str,
+        id: &str,
+        result: Result<(), SendFailure>,
+    ) -> Result<(), AgentError> {
+        match result {
+            Ok(()) => {
+                self.queue().remove(thread, id);
+                self.signal(InboxSignal::Changed(thread.into()));
+                Ok(())
+            }
+            Err(SendFailure::NotSent(error)) => {
+                tracing::warn!(
+                    %error,
+                    "Codex did not accept a queued prompt; it stays in the inbox"
+                );
+                Err(error)
+            }
+            Err(SendFailure::Unknown(error)) => {
+                tracing::warn!(
+                    %error,
+                    "A queued Codex prompt may have been delivered; removed and not resent"
+                );
+                self.queue().remove(thread, id);
+                self.signal(InboxSignal::Changed(thread.into()));
+                self.signal(InboxSignal::Uncertain(thread.into()));
+                Err(error)
+            }
+        }
+    }
+
+    /// After a turn completed normally, hand the next queued prompt to Codex
+    /// as a new turn. Interrupted or failed turns never call this.
+    pub(crate) fn deliver_queued(self: &Arc<Self>, thread: &str) {
+        // Not checked here: a prompt queued while this completion was in
+        // flight is pushed under `mutations`, which `deliver_next` waits for.
+        let driver = self.clone();
+        let thread = thread.to_owned();
+        tokio::spawn(async move { driver.deliver_next(&thread).await });
+    }
+
+    async fn deliver_next(&self, thread: &str) {
+        let _guard = self.mutations.lock().await;
+        // Another prompt (or another client) already started the next turn.
+        if self.client.active_turn(thread).is_some() {
+            return;
+        }
+        let Some(item) = self.queue().next(thread).cloned() else {
+            return;
+        };
+        let result = self.start_turn_locked(thread, item.input).await;
+        let _ = self.settle(thread, &item.id, result);
+    }
+
+    /// "Send now": steer it into the running turn, or start a turn with it.
+    async fn send_queued_now(&self, thread: &str, id: &str) -> Result<(), AgentError> {
+        self.prepare_shared_interaction(thread).await?;
+        let _guard = self.mutations.lock().await;
+        let input = self
+            .queue()
+            .get(thread, id)
+            .map(|item| item.input.clone())
+            .ok_or_else(|| inbox_item_not_found(id))?;
+        let result = match self.client.active_turn(thread) {
+            Some(turn) => self.steer_locked(thread, &turn, input).await,
+            None => self.start_turn_locked(thread, input).await,
+        };
+        self.settle(thread, id, result)
+    }
+
+    /// Steer an owned live turn. Caller holds `mutations`.
+    async fn steer_locked(
+        &self,
+        thread: &str,
+        turn: &str,
+        input: Vec<Value>,
+    ) -> Result<(), SendFailure> {
+        self.require_native_interaction(thread)
+            .await
+            .map_err(SendFailure::NotSent)?;
+        if !self.loaded.lock().await.contains(thread) {
+            return Err(SendFailure::NotSent(AgentError::Unsupported(
+                "Codex steering requires an owned live thread".into(),
+            )));
+        }
+        if !self.client.is_ready() {
+            return Err(SendFailure::NotSent(AgentError::NotAvailable(
+                "Codex is not connected; nothing was sent".into(),
+            )));
+        }
+        self.steer(thread, turn, input)
+            .await
+            .map_err(SendFailure::after_write)
     }
 
     pub(crate) fn observe_terminals(
@@ -1069,6 +1237,69 @@ impl CodexDriver {
     async fn submit_turn(&self, id: &str, input: Vec<Value>) -> Result<(), AgentError> {
         self.prepare_shared_interaction(id).await?;
         let _guard = self.mutations.lock().await;
+        self.start_turn_locked(id, input)
+            .await
+            .map_err(SendFailure::into_error)
+    }
+
+    /// Caller holds `mutations`. Everything before `turn/start` is written
+    /// fails as `NotSent`.
+    async fn start_turn_locked(&self, id: &str, input: Vec<Value>) -> Result<(), SendFailure> {
+        self.prepare_turn_locked(id)
+            .await
+            .map_err(SendFailure::NotSent)?;
+        let mut params = json!({"threadId":id,"input":input});
+        let model = self
+            .next_models
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(id)
+            .filter(|choice| choice.accepted_revision.is_none())
+            .map(|choice| choice.model.clone());
+        if let Some(model) = model {
+            let thread = self.read_thread(id).await.map_err(SendFailure::NotSent)?;
+            if thread["modelProvider"] != model.provider_id {
+                return Err(SendFailure::NotSent(AgentError::InvalidRequest(
+                    "Codex thread provider changed; select a matching configured model".into(),
+                )));
+            }
+            params["model"] = json!(model.model_id);
+            if let Some(effort) = model.variant {
+                params["effort"] = json!(effort);
+            }
+        }
+        let revision = self
+            .metadata_revision(id)
+            .await
+            .map_err(SendFailure::NotSent)?;
+        if !self.client.is_ready() {
+            return Err(SendFailure::NotSent(AgentError::NotAvailable(
+                "Codex is not connected; nothing was sent".into(),
+            )));
+        }
+        let response = self
+            .client
+            .call("turn/start", params)
+            .await
+            .map_err(SendFailure::after_write)?;
+        mapper::string(&response["turn"], "id").map_err(SendFailure::Unknown)?;
+        self.record_native_acceptance(id).await;
+        if let Some(choice) = self
+            .next_models
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get_mut(id)
+        {
+            if choice.accepted_revision.is_none() {
+                choice.accepted_revision = Some(revision);
+            }
+        }
+        self.spawn_metadata_refresh(id, revision);
+        Ok(())
+    }
+
+    /// Ownership and idleness checks, and resuming an unloaded thread.
+    async fn prepare_turn_locked(&self, id: &str) -> Result<(), AgentError> {
         self.require_native_interaction(id).await?;
         if self.client.active_turn(id).is_some() {
             return Err(AgentError::InvalidRequest(
@@ -1093,41 +1324,6 @@ impl CodexDriver {
             }
             self.selected_response(resumed).await?;
         }
-        let mut params = json!({"threadId":id,"input":input});
-        let model = self
-            .next_models
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .get(id)
-            .filter(|choice| choice.accepted_revision.is_none())
-            .map(|choice| choice.model.clone());
-        if let Some(model) = model {
-            let thread = self.read_thread(id).await?;
-            if thread["modelProvider"] != model.provider_id {
-                return Err(AgentError::InvalidRequest(
-                    "Codex thread provider changed; select a matching configured model".into(),
-                ));
-            }
-            params["model"] = json!(model.model_id);
-            if let Some(effort) = model.variant {
-                params["effort"] = json!(effort);
-            }
-        }
-        let revision = self.metadata_revision(id).await?;
-        let response = self.client.call("turn/start", params).await?;
-        mapper::string(&response["turn"], "id")?;
-        self.record_native_acceptance(id).await;
-        if let Some(choice) = self
-            .next_models
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .get_mut(id)
-        {
-            if choice.accepted_revision.is_none() {
-                choice.accepted_revision = Some(revision);
-            }
-        }
-        self.spawn_metadata_refresh(id, revision);
         Ok(())
     }
 
@@ -1608,16 +1804,49 @@ impl AgentPort for CodexDriver {
         delivery: Option<&'a str>,
     ) -> AgentFuture<'a, ()> {
         Box::pin(async move {
-            if delivery.is_some_and(|mode| mode != "steer") {
-                return unsupported("Codex queued inbox delivery");
-            }
+            let delivery = match delivery {
+                None => None,
+                Some(mode) => Some(Delivery::parse(mode).ok_or_else(|| {
+                    AgentError::InvalidRequest("delivery must be steer or queue".into())
+                })?),
+            };
             validate_id(id)?;
             if text.is_empty() && attachments.is_empty() {
                 return Err(AgentError::InvalidRequest("empty Codex prompt".into()));
             }
             // Validate uploads before any rejoin/resume or prompt mutation.
-            let input = super::input::prepare(text, attachments).await?;
-            if delivery == Some("steer") {
+            let prepared = super::input::prepare(text, attachments).await?;
+            let input = prepared.input;
+            if delivery == Some(Delivery::Queue) {
+                self.prepare_shared_interaction(id).await?;
+                let _guard = self.mutations.lock().await;
+                self.require_native_interaction(id).await?;
+                if self.client.active_turn(id).is_none() {
+                    // Idle: nothing to wait for, so it starts now, as an idle
+                    // OpenCode session delivers a queued prompt at once.
+                    return self
+                        .start_turn_locked(id, input)
+                        .await
+                        .map_err(SendFailure::into_error);
+                }
+                if !self.loaded.lock().await.contains(id) {
+                    return unsupported("Codex queued delivery requires an owned live thread");
+                }
+                self.queue().push(
+                    id,
+                    Queued {
+                        id: format!("inbox_{}", uuid::Uuid::new_v4().simple()),
+                        created_ms: now_ms(),
+                        delivery: Delivery::Queue,
+                        text: text.to_owned(),
+                        files: prepared.files,
+                        input,
+                    },
+                )?;
+                self.signal(InboxSignal::Changed(id.into()));
+                return Ok(());
+            }
+            if delivery == Some(Delivery::Steer) {
                 self.prepare_shared_interaction(id).await?;
                 let _guard = self.mutations.lock().await;
                 self.require_native_interaction(id).await?;
@@ -1769,6 +1998,7 @@ impl AgentPort for CodexDriver {
             drop(_history_read);
             self.forget_thread(id).await;
             self.clear_usage(id).await;
+            self.clear_inbox(id);
             Ok(())
         })
     }
@@ -2174,6 +2404,58 @@ impl AgentPort for CodexDriver {
                     Ok(())
                 })),
             })
+        })
+    }
+
+    fn get_inbox<'a>(&'a self, session_id: &'a str) -> AgentFuture<'a, Vec<Value>> {
+        Box::pin(async move {
+            validate_id(session_id)?;
+            Ok(self.inbox_items(session_id))
+        })
+    }
+
+    fn cancel_inbox_item<'a>(
+        &'a self,
+        session_id: &'a str,
+        inbox_id: &'a str,
+    ) -> AgentFuture<'a, ()> {
+        Box::pin(async move {
+            validate_id(session_id)?;
+            // Waits for an in-flight delivery: a delivered item is not cancelled.
+            let _guard = self.mutations.lock().await;
+            self.queue()
+                .remove(session_id, inbox_id)
+                .ok_or_else(|| inbox_item_not_found(inbox_id))?;
+            self.signal(InboxSignal::Changed(session_id.into()));
+            Ok(())
+        })
+    }
+
+    fn set_inbox_delivery<'a>(
+        &'a self,
+        session_id: &'a str,
+        inbox_id: &'a str,
+        delivery: &'a str,
+    ) -> AgentFuture<'a, ()> {
+        Box::pin(async move {
+            validate_id(session_id)?;
+            match Delivery::parse(delivery) {
+                Some(Delivery::Steer) => self.send_queued_now(session_id, inbox_id).await,
+                Some(Delivery::Queue) => {
+                    let _guard = self.mutations.lock().await;
+                    if !self
+                        .queue()
+                        .set_delivery(session_id, inbox_id, Delivery::Queue)
+                    {
+                        return Err(inbox_item_not_found(inbox_id));
+                    }
+                    self.signal(InboxSignal::Changed(session_id.into()));
+                    Ok(())
+                }
+                None => Err(AgentError::InvalidRequest(
+                    "delivery must be steer or queue".into(),
+                )),
+            }
         })
     }
 

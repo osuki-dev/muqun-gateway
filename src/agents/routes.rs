@@ -884,6 +884,7 @@ async fn do_read_agent_session(
     }
     message_images::attach_to_items(state, asid, directory.as_deref(), &mut snapshot.timeline)
         .await;
+    message_images::attach_to_inbox(state, asid, &mut snapshot.inbox).await;
 
     // A session the reader is sitting on is polled and mostly unchanged; the
     // whole snapshot is the expensive thing to send twice.
@@ -2241,6 +2242,9 @@ fn agent_error(err: super::ports::agent::AgentError) -> (StatusCode, Json<Value>
         super::ports::agent::AgentError::InvalidRequest(message) => {
             api_error(StatusCode::BAD_REQUEST, "invalid_request", message)
         }
+        super::ports::agent::AgentError::InboxItemNotFound(message) => {
+            api_error(StatusCode::NOT_FOUND, "inbox_item_not_found", message)
+        }
         super::ports::agent::AgentError::HistoryCursorLost => api_error(
             StatusCode::CONFLICT,
             "history_cursor_lost",
@@ -3074,6 +3078,7 @@ async fn get_agent_inbox(
     if for_session(&state, &asid).await.task {
         hide_in_inbox(&mut items);
     }
+    message_images::attach_to_inbox(&state, &asid, &mut items).await;
     Ok(Json(content_envelope(json!({ "items": items }))))
 }
 

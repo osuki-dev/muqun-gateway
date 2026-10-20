@@ -5,6 +5,7 @@ mod budget;
 pub mod client;
 pub(crate) mod daemon;
 mod driver;
+pub(crate) mod inbox;
 mod input;
 mod items;
 mod launch;
@@ -16,7 +17,7 @@ pub(crate) mod rollout_projection;
 pub(crate) mod rollout_tail;
 pub(crate) mod usage;
 
-pub use client::{CodexClient, CodexEvent};
+pub use client::{CodexClient, CodexEvent, CodexEvents};
 pub use driver::CodexDriver;
 
 pub const KIND: &str = "codex";

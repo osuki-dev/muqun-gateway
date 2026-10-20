@@ -57,6 +57,9 @@ pub enum AgentError {
     /// was read in this process, it was evicted, or the history changed
     /// under it. Not exhaustion: the app re-reads the snapshot and pages on.
     HistoryCursorLost,
+    /// The inbox item is not queued: unknown, cancelled or already delivered.
+    /// The App refetches the inbox.
+    InboxItemNotFound(String),
 }
 
 impl fmt::Display for AgentError {
@@ -75,6 +78,7 @@ impl fmt::Display for AgentError {
             Self::HistoryCursorLost => f.write_str(
                 "The earlier-history cursor for this session is gone; read the snapshot again",
             ),
+            Self::InboxItemNotFound(msg) => write!(f, "Inbox item not found: {msg}"),
             Self::TerminalInteraction(_) => write!(
                 f,
                 "Native interaction is unavailable; use the current terminal binding when provided"

@@ -294,7 +294,7 @@ id, label, version and configuration.
   | `worktrees` | yes | no | no | no |
   | `revert` | yes | no | only known protocol 1 | no |
   | `stagedRevert` | yes | no | no | no |
-  | `inbox` | yes | no | no | no |
+  | `inbox` | yes | no | no | yes (Gateway queue) |
   | `modes` | yes | yes (presets) | no | no |
   | `skills` | yes | no | no | no |
   | `slashCommands` | yes | no | no | no |
@@ -1314,6 +1314,28 @@ taken from the last assistant message, or `null`.
 
 Items are OpenCode's verbatim, i.e. camelCase:
 `{id, sessionID, timeCreated, type: "user"|"synthetic"|"compaction"|"move", payload, delivery}`.
+A user item's `payload` is `{text, files?: [{uri, name?, mime?}]}`.
+
+Codex has no inbox of its own; the Gateway holds one per thread, in memory
+(lost on a Gateway restart or a reconnect to Codex), with items in the same
+shape (`type: "user"`, ids `inbox_…`). `delivery: "queue"` on a prompt waits
+behind the running turn, or starts at once when the session is idle. The next
+item (oldest one marked `steer` first, then the oldest `queue` item) is sent as a new
+turn only when a turn completes normally; after an interrupted or failed turn
+the queue waits for the user. `…/steer` sends an item now: `turn/steer` into the
+running turn, or a new turn. A refused send keeps the item; an unknown outcome
+removes it, never resends it, and publishes `agent.resync` with reason
+`codex_queued_delivery_outcome_unknown`.
+
+On the way out (this route, the snapshot's `inbox`, `agent.inbox.changed`), an
+item with `payload.files` also carries the two fields a transcript user row has
+for its files: `attachments` (one source per file; an authorized file becomes
+`/api/agent-images/{id}/original`) and `image_assets` (keyed by those sources,
+with `thumbnail_url`, `preview_url`, `download_url`, `version_url`). `payload`
+itself is unchanged.
+
+An unknown, cancelled or already delivered item answers
+`404 inbox_item_not_found` (Codex); refetch the inbox.
 
 ---
 

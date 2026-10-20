@@ -86,7 +86,8 @@ pages retain their 100-row bound. Primary/live/control decoder bounds do not inc
 Outbound frames and ordinary accepted inbound frames retain the 4-MiB limit. There are 32
 pending RPCs/server callbacks (callbacks also share an 8 MiB payload bound),
 32 scheduled metadata-read workers,
-16 queued events, 4,096 explicitly loaded
+64 queued events (contiguous text/output deltas for the same item part
+share one queued event, so content and order are preserved), 4,096 explicitly loaded
 threads, 8,192 item-order anchors, and 512 parts in each reasoning summary/raw
 array (with equally bounded delta indices). A request/write has a 20-second deadline.
 Stderr is continuously drained through a fixed 8 KiB buffer and discarded
@@ -425,8 +426,9 @@ Per-provider flags declare only the implemented features. File-restoring revert
 and staged revert remain false: Codex's transcript-only `thread/revert` does
 not restore workspace files. Compaction is supported through the stable
 `thread/compact/start`, for owned native idle sessions only (see
-`codex-capabilities.md`). Worktrees, modes, inbox, background shells,
-durable instructions and runtime MCP injection remain unsupported.
+`codex-capabilities.md`). The inbox is a Gateway-owned queue (see
+`agent-api.md`, Inbox). Worktrees, modes, background shells, durable
+instructions and runtime MCP injection remain unsupported.
 
 ## Acceptance evidence and limits
 
@@ -536,8 +538,9 @@ array, and the answer is normal text inside the
 with the exact `expectedTurnId`. It never invents a JSON-RPC question callback,
 resumes an unrelated runtime, starts a replacement turn after a race, or retries
 ambiguous delivery. Ordinary active-turn follow-ups also support `delivery:
-"steer"`; queue delivery remains unsupported. Discovery reports `promptSteering`
-and `asyncQuestions`, independently of `inbox: false`.
+"steer"`, and `delivery: "queue"` waits in the Gateway's inbox until the turn
+completes normally. Discovery reports `promptSteering` and `asyncQuestions`,
+independently of `inbox`.
 
 A question remains pending until the steering response or a committed matching
 user reply confirms acceptance. In-flight claims prevent duplicate writes.

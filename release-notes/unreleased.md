@@ -2,6 +2,34 @@
 
 ## Changes and fixes
 
+- **Codex has a "Waiting to send" inbox.** A prompt sent to a busy Codex
+  session with `delivery: "queue"` now waits in a Gateway-owned queue instead
+  of being refused, and Codex declares `features.inbox: true`. When the running
+  turn completes normally, the Gateway starts the next waiting prompt as a new
+  turn, one per turn and in order. After an interrupted or failed turn nothing
+  is sent automatically; the queue waits until you send again, tap "send now"
+  (`POST …/inbox/{id}/steer`, which steers the running turn or starts one) or
+  cancel. Every queue change arrives as `agent.inbox.changed` with the same
+  replay and resync behavior as OpenCode. A prompt Codex refused stays queued;
+  one whose delivery outcome is unknown is removed, never resent, and the
+  session gets a `codex_queued_delivery_outcome_unknown` resync. The queue is
+  held in memory and does not survive a Gateway restart or a reconnect to Codex.
+  An unknown or already delivered inbox item now answers
+  `404 inbox_item_not_found`.
+
+- **Queued prompts carry their attachments.** Inbox items list their files in
+  `payload.files` (`uri`, `name`, `mime` when known), and for both OpenCode and
+  Codex each item with files gains the same `attachments` and `image_assets`
+  fields a transcript user message has, so the App can show image thumbnails
+  for a prompt that is still waiting.
+- Codex sessions no longer drop to read-only history when output streams
+  quickly. A fast answer arrives as hundreds of small text updates at once, and
+  the Gateway closed its Codex connection whenever more than 16 of them were
+  waiting, so the App showed the live session as saved history in the middle of
+  a turn until it reconnected. Consecutive updates to the same text are now
+  combined while they wait, without losing, reordering or skipping any text or
+  approvals. No App update or configuration change is needed.
+
 - Add an explicit Gateway preview channel for the installer and protected updater.
   Stable remains the default; preview automatically selects the newest complete
   `X.Y.Z-preview.N` release. Existing protected updaters that predate channels can
@@ -219,6 +247,11 @@ protocol 1 and everything documented for it.
 - **A newer App with an older gateway.** Unchanged. `backends[].capabilities` is
   absent, and the App falls back to the top-level list plus the backend `kind`
   and `version` that `/health` has always carried.
+- **Codex inbox.** Apps that predate it ignore Codex's new `inbox: true` and
+  keep steering follow-ups as before. Newer Apps on an older Gateway see
+  `inbox: false` and keep the steer-only path. Showing queued Codex prompts,
+  and thumbnails on any queued prompt, needs an App that reads the inbox for
+  Codex and the new item fields.
 - No capability, field, or endpoint was removed or renamed.
 
 ## Upgrade
