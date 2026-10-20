@@ -86,7 +86,8 @@ pages retain their 100-row bound. Primary/live/control decoder bounds do not inc
 Outbound frames and ordinary accepted inbound frames retain the 4-MiB limit. There are 32
 pending RPCs/server callbacks (callbacks also share an 8 MiB payload bound),
 32 scheduled metadata-read workers,
-16 queued events, 4,096 explicitly loaded
+64 queued events (contiguous text/output deltas for the same item part
+share one queued event, so content and order are preserved), 4,096 explicitly loaded
 threads, 8,192 item-order anchors, and 512 parts in each reasoning summary/raw
 array (with equally bounded delta indices). A request/write has a 20-second deadline.
 Stderr is continuously drained through a fixed 8 KiB buffer and discarded

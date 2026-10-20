@@ -92,9 +92,9 @@ fn image_only_native_user_items_keep_their_attachments() {
 
 pub(crate) struct Fixture {
     pub client: Arc<CodexClient>,
-    pub events: Option<mpsc::Receiver<CodexEvent>>,
+    pub events: Option<CodexEvents>,
     pub requests: mpsc::Receiver<Value>,
-    pub(super) writer: Arc<Mutex<WriteHalf<tokio::io::DuplexStream>>>,
+    pub(crate) writer: Arc<Mutex<WriteHalf<tokio::io::DuplexStream>>>,
     task: tokio::task::JoinHandle<()>,
 }
 
