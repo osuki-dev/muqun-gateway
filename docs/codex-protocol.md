@@ -425,8 +425,9 @@ Per-provider flags declare only the implemented features. File-restoring revert
 and staged revert remain false: Codex's transcript-only `thread/revert` does
 not restore workspace files. Compaction is supported through the stable
 `thread/compact/start`, for owned native idle sessions only (see
-`codex-capabilities.md`). Worktrees, modes, inbox, background shells,
-durable instructions and runtime MCP injection remain unsupported.
+`codex-capabilities.md`). The inbox is a Gateway-owned queue (see
+`agent-api.md`, Inbox). Worktrees, modes, background shells, durable
+instructions and runtime MCP injection remain unsupported.
 
 ## Acceptance evidence and limits
 
@@ -536,8 +537,9 @@ array, and the answer is normal text inside the
 with the exact `expectedTurnId`. It never invents a JSON-RPC question callback,
 resumes an unrelated runtime, starts a replacement turn after a race, or retries
 ambiguous delivery. Ordinary active-turn follow-ups also support `delivery:
-"steer"`; queue delivery remains unsupported. Discovery reports `promptSteering`
-and `asyncQuestions`, independently of `inbox: false`.
+"steer"`, and `delivery: "queue"` waits in the Gateway's inbox until the turn
+completes normally. Discovery reports `promptSteering` and `asyncQuestions`,
+independently of `inbox`.
 
 A question remains pending until the steering response or a committed matching
 user reply confirms acceptance. In-flight claims prevent duplicate writes.

@@ -103,7 +103,7 @@ impl Fixture {
         Self::new_reply(move |r| Ok(handler(r))).await
     }
 
-    async fn new_reply(
+    pub(crate) async fn new_reply(
         handler: impl Fn(&Value) -> Result<Value, Value> + Send + Sync + 'static,
     ) -> Self {
         Self::new_reply_in_cwd(handler, None, None).await
@@ -1549,7 +1549,7 @@ async fn collaboration_fanout_is_bounded_before_mapping_large_prompts() {
 }
 
 #[tokio::test]
-async fn owned_active_thread_can_steer_and_answer_async_questions_without_queue_or_new_turn() {
+async fn owned_active_thread_can_steer_queue_and_answer_async_questions_without_new_turn() {
     let mut fixture = Fixture::new(|request| match request["method"].as_str().unwrap() {
         "thread/start" | "thread/read" => json!({"thread":golden()["thread"]}),
         "turn/start" => json!({"turn":{"id":"active-turn","status":"inProgress"}}),
@@ -1585,10 +1585,12 @@ async fn owned_active_thread_can_steer_and_answer_async_questions_without_queue_
         )
         .await
         .unwrap();
-    assert!(driver
-        .send_prompt(&session.asid.0, "unsupported queue", &[], Some("queue"))
+    // Queued behind the active turn: held by the Gateway, not sent.
+    driver
+        .send_prompt(&session.asid.0, "after this turn", &[], Some("queue"))
         .await
-        .is_err());
+        .unwrap();
+    assert_eq!(driver.inbox_items(&session.asid.0).len(), 1);
     assert_eq!(
         driver
             .get_pending_forms(&session.asid.0)

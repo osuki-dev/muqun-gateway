@@ -333,9 +333,73 @@ pub(crate) async fn attach_to_items(
     state.message_images.attach(&root, items);
 }
 
+/// Give queued prompts the fields a transcript user row carries for its files,
+/// so the App shows them with the same thumbnails: `attachments`, the sources
+/// (an authorized image becomes its `/api/agent-images/{id}/original` URL),
+/// and `image_assets`, keyed by those sources. Read from `payload.files[].uri`
+/// for OpenCode and Codex alike; `payload` stays exactly as the agent sent it.
+pub(crate) async fn attach_to_inbox(state: &AppState, asid: &str, items: &mut [serde_json::Value]) {
+    let mut rows = Vec::new();
+    for (index, item) in items.iter().enumerate() {
+        let Some(files) = item
+            .pointer("/payload/files")
+            .and_then(serde_json::Value::as_array)
+        else {
+            continue;
+        };
+        let sources: Vec<String> = files
+            .iter()
+            .filter_map(|file| {
+                file.get("uri")
+                    .and_then(serde_json::Value::as_str)
+                    .or_else(|| file.as_str())
+                    .map(str::to_owned)
+            })
+            .collect();
+        if sources.is_empty() {
+            continue;
+        }
+        rows.push((
+            index,
+            TimelineItem {
+                id: String::new(),
+                message_id: String::new(),
+                role: crate::agents::domain::TimelineRole::User,
+                part: AgentPart::Text {
+                    text: String::new(),
+                },
+                seq: 0,
+                updated_ms: 0,
+                ordinal: 0,
+                attachments: Some(sources),
+                image_assets: None,
+            },
+        ));
+    }
+    if rows.is_empty() {
+        return;
+    }
+    let (indexes, mut rows): (Vec<_>, Vec<_>) = rows.into_iter().unzip();
+    attach_to_items(state, asid, None, &mut rows).await;
+    for (index, row) in indexes.into_iter().zip(rows) {
+        let Some(item) = items[index].as_object_mut() else {
+            continue;
+        };
+        if let Some(attachments) = row.attachments {
+            item.insert("attachments".into(), serde_json::json!(attachments));
+        }
+        if let Some(assets) = row.image_assets {
+            item.insert("image_assets".into(), serde_json::json!(assets));
+        }
+    }
+}
+
 /// The same, for an event on its way to a stream or a replay.
 pub(crate) async fn attach_to_event(state: &AppState, event: &mut AgentDomainEvent) {
     match event {
+        AgentDomainEvent::InboxChanged { asid, items, .. } => {
+            attach_to_inbox(state, &asid.0, items).await;
+        }
         AgentDomainEvent::SessionUpdated { asid, info, .. } => {
             state
                 .message_images
@@ -801,6 +865,36 @@ pub(crate) fn image_dimensions(head: &[u8]) -> Option<(u32, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn queued_prompt_files_get_the_transcript_attachment_fields() {
+        let state = crate::test_state("admin", vec![crate::test_device("phone", "token")]);
+        let uploads = crate::ensure_uploads_dir().unwrap().canonicalize().unwrap();
+        let image = uploads.join(format!("{}.png", uuid::Uuid::new_v4()));
+        std::fs::write(&image, b"\x89PNG\r\n\x1a\nsynthetic").unwrap();
+        let uri = format!("file://{}", image.display());
+        let payload = serde_json::json!({
+            "text": "Look",
+            "files": [{"uri": uri, "name": "a.png", "mime": "image/png"}]
+        });
+        let mut items = vec![
+            serde_json::json!({"id":"queued","type":"user","payload":payload,"delivery":"queue"}),
+            serde_json::json!({"id":"text","type":"user","payload":{"text":"No files"},"delivery":"queue"}),
+        ];
+        attach_to_inbox(&state, "inbox-session", &mut items).await;
+        let _ = std::fs::remove_file(&image);
+        // The payload is the agent's own; the App reads the added fields.
+        assert_eq!(items[0]["payload"], payload);
+        let source = items[0]["attachments"][0].as_str().unwrap();
+        assert!(source.starts_with("/api/agent-images/") && source.ends_with("/original"));
+        let asset = &items[0]["image_assets"][0];
+        assert_eq!(asset["src"], source);
+        assert_eq!(asset["mime"], "image/png");
+        assert!(asset["thumbnail_url"]
+            .as_str()
+            .is_some_and(|url| url.ends_with("/thumbnail")));
+        assert!(items[1].get("attachments").is_none() && items[1].get("image_assets").is_none());
+    }
 
     #[tokio::test]
     async fn agent_audio_is_authenticated_fenced_and_served_by_opaque_id() {

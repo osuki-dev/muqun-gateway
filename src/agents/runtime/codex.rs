@@ -329,7 +329,8 @@ pub(super) fn features() -> crate::discovery::AgentFeatures {
         worktrees: false,
         revert: false,
         staged_revert: false,
-        inbox: false,
+        // The Gateway owns Codex's queue (`adapters/codex/inbox.rs`).
+        inbox: true,
         modes: false,
         skills: false,
         slash_commands: false,
@@ -1149,9 +1150,11 @@ pub(crate) mod tests {
                 && !features.staged_revert
                 && !features.worktrees
                 && !features.modes
-                && !features.inbox
                 && !features.background_shells
         );
+        // Only a Gateway that holds Codex's queue may claim an inbox; older
+        // Apps ignore the flag and keep steering.
+        assert!(features.inbox);
         assert_eq!(features.extra["sessionPagination"], true);
         assert_eq!(
             super::super::AGENT_PREFERENCE,

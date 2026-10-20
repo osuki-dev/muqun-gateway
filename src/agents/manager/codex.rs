@@ -5,6 +5,7 @@ use serde_json::Value;
 use tokio::sync::{broadcast, mpsc};
 
 use super::AgentManager;
+use crate::agents::adapters::codex::inbox::InboxSignal;
 use crate::agents::adapters::codex::{mapper, CodexClient, CodexDriver, CodexEvent};
 use crate::agents::adapters::memory_mirror::MemoryMirror;
 use crate::agents::domain::*;
@@ -35,6 +36,23 @@ impl Context {
         }
         self.mirror.stamp_event(&mut event);
         let _ = self.tx.send(event);
+    }
+
+    /// Publish the Gateway-owned queue through the mirror, so it is replayed
+    /// and resynced exactly like OpenCode's inbox.
+    async fn inbox(&self, signal: InboxSignal) {
+        match signal {
+            InboxSignal::Changed(thread) => {
+                let asid = AgentSessionId(thread);
+                let items = self.driver.inbox_items(&asid.0);
+                let (seq, items) = self.mirror.set_inbox(&asid, items).await;
+                self.emit(AgentDomainEvent::InboxChanged { asid, items, seq });
+            }
+            InboxSignal::Uncertain(thread) => self.emit(AgentDomainEvent::Resync {
+                asid: AgentSessionId(thread),
+                reason: "codex_queued_delivery_outcome_unknown".into(),
+            }),
+        }
     }
 
     async fn session(&self, thread: &Value, revision: u64) {
@@ -504,6 +522,7 @@ impl Context {
             }
             "thread/deleted" => {
                 self.driver.clear_usage(thread).await;
+                self.driver.clear_inbox(thread);
                 self.clear_requests(thread, None).await;
                 self.driver.forget_thread(thread).await;
                 self.threads.lock().await.remove(thread);
@@ -601,6 +620,11 @@ impl Context {
                     }
                 }
                 self.clear_requests(thread, ended_turn).await;
+                // Only a normal completion hands Codex the next queued prompt.
+                // After an interrupt or failure the queue waits for the user.
+                if params["turn"]["status"] == "completed" {
+                    self.driver.deliver_queued(thread);
+                }
             }
             "serverRequest/resolved" => {
                 if let Some(id) = self.driver.client().request_id(&params["requestId"]) {
@@ -802,6 +826,8 @@ impl AgentManager {
         let mut driver = CodexDriver::new(client.clone());
         driver.observe_terminals(observer);
         driver.restore_native_sessions(native_sessions);
+        let (inbox_tx, mut inbox_rx) = mpsc::unbounded_channel();
+        driver.observe_inbox(inbox_tx);
         let driver = Arc::new(driver);
         let mirror = Arc::new(MemoryMirror::for_agent("codex"));
         let stopped = Arc::new(Mutex::new(false));
@@ -833,6 +859,22 @@ impl AgentManager {
                 loop {
                     tokio::select! { biased; _ = cancel.cancelled() => break, _ = tick.tick() => {} }
                     tokio::select! { biased; _ = cancel.cancelled() => break, _ = context.observe_rollouts() => {} }
+                }
+            });
+        }
+        {
+            let context = context.clone();
+            let cancel = client.cancel_token();
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => break,
+                        signal = inbox_rx.recv() => match signal {
+                            Some(signal) => context.inbox(signal).await,
+                            None => break,
+                        },
+                    }
                 }
             });
         }
@@ -869,8 +911,371 @@ impl AgentManager {
 mod tests {
     use super::*;
     use crate::agents::adapters::codex::tests::{golden, Fixture};
+    use crate::agents::ports::agent::AgentError;
     use serde_json::json;
     use std::time::Duration;
+
+    /// A private Codex fixture driven through the manager's own pump, with the
+    /// queue's signals published by hand so each step can be checked.
+    struct Queue {
+        fixture: Fixture,
+        driver: Arc<CodexDriver>,
+        context: Context,
+        mirror: Arc<MemoryMirror>,
+        signals: mpsc::UnboundedReceiver<InboxSignal>,
+        events: broadcast::Receiver<AgentDomainEvent>,
+        sent: Arc<std::sync::Mutex<Vec<Value>>>,
+        /// How the fixture answers `turn/steer`: "ok", "reject" or "mismatch".
+        steer: Arc<std::sync::Mutex<&'static str>>,
+        thread: String,
+    }
+
+    impl Queue {
+        async fn new() -> Self {
+            let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let steer = Arc::new(std::sync::Mutex::new("ok"));
+            let (seen, steering) = (sent.clone(), steer.clone());
+            let mut fixture = Fixture::new_reply(move |request| {
+                let method = request["method"].as_str().unwrap();
+                if matches!(method, "turn/start" | "turn/steer") {
+                    seen.lock().unwrap().push(request.clone());
+                }
+                Ok(match method {
+                    "thread/start" | "thread/read" => json!({"thread":golden()["thread"]}),
+                    "turn/start" => json!({"turn":{"id":"accepted","status":"inProgress"}}),
+                    "turn/steer" => match *steering.lock().unwrap() {
+                        "reject" => return Err(json!({"code":-32600,"message":"no active turn"})),
+                        "mismatch" => json!({"turnId":"another-turn"}),
+                        _ => json!({"turnId":request["params"]["expectedTurnId"]}),
+                    },
+                    other => panic!("unexpected RPC {other}"),
+                })
+            })
+            .await;
+            fixture.ready().await;
+            let (signal_tx, signals) = mpsc::unbounded_channel();
+            let mut driver = CodexDriver::new(fixture.client.clone());
+            driver.observe_inbox(signal_tx);
+            let driver = Arc::new(driver);
+            let session = driver.create_session(None, None, None).await.unwrap();
+            let mirror = Arc::new(MemoryMirror::for_agent("codex"));
+            mirror.update_session(session.clone()).await;
+            let (tx, events) = broadcast::channel(256);
+            let context = Context {
+                driver: driver.clone(),
+                mirror: mirror.clone(),
+                tx,
+                stopped: Arc::new(Mutex::new(false)),
+                threads: tokio::sync::Mutex::new(HashSet::new()),
+            };
+            Self {
+                fixture,
+                driver,
+                context,
+                mirror,
+                signals,
+                events,
+                sent,
+                steer,
+                thread: session.asid.0,
+            }
+        }
+
+        async fn notify(&mut self, method: &str, params: Value) {
+            self.fixture
+                .send(json!({"method":method,"params":params}))
+                .await;
+            loop {
+                let event = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    self.fixture.events.as_mut().unwrap().recv(),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                let done =
+                    matches!(&event, CodexEvent::Notification { method: m, .. } if m == method);
+                self.context.event(event).await;
+                if done {
+                    break;
+                }
+            }
+        }
+
+        async fn turn_started(&mut self, turn: &str) {
+            let thread = self.thread.clone();
+            self.notify(
+                "turn/started",
+                json!({"threadId":thread,"turn":{"id":turn,"status":"inProgress"}}),
+            )
+            .await;
+        }
+
+        async fn turn_completed(&mut self, turn: &str, status: &str) {
+            let thread = self.thread.clone();
+            self.notify(
+                "turn/completed",
+                json!({"threadId":thread,"turn":{"id":turn,"status":status}}),
+            )
+            .await;
+        }
+
+        async fn send(&self, text: &str, delivery: Option<&str>) -> Result<(), AgentError> {
+            self.driver
+                .send_prompt(&self.thread, text, &[], delivery)
+                .await
+        }
+
+        /// Publish what the driver signalled; return the mirror's queue.
+        async fn publish(&mut self) -> (Vec<Value>, Vec<InboxSignal>) {
+            let mut signals = Vec::new();
+            while let Ok(signal) = self.signals.try_recv() {
+                signals.push(signal.clone());
+                self.context.inbox(signal).await;
+            }
+            let asid = AgentSessionId(self.thread.clone());
+            (self.mirror.inbox(&asid).await, signals)
+        }
+
+        /// Prompt texts Codex received, in order (`turn/start` and `turn/steer`).
+        fn delivered(&self) -> Vec<(String, String)> {
+            self.sent
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|request| {
+                    (
+                        request["method"].as_str().unwrap().to_owned(),
+                        request["params"]["input"][0]["text"]
+                            .as_str()
+                            .unwrap_or("")
+                            .to_owned(),
+                    )
+                })
+                .collect()
+        }
+
+        async fn wait_delivered(&self, count: usize) {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while self.sent.lock().unwrap().len() < count {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("queued prompt delivered");
+        }
+    }
+
+    fn texts(items: &[Value]) -> Vec<&str> {
+        items
+            .iter()
+            .map(|item| item["payload"]["text"].as_str().unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn codex_inbox_waits_for_the_active_turn_and_drains_one_item_per_completed_turn() {
+        let mut q = Queue::new().await;
+        let uploads = crate::ensure_uploads_dir().unwrap().canonicalize().unwrap();
+        let image = uploads.join(format!("{}.png", uuid::Uuid::new_v4()));
+        std::fs::write(&image, b"\x89PNG\r\n\x1a\nsynthetic").unwrap();
+        let image = image.to_str().unwrap().to_owned();
+
+        // Idle: a queued prompt has nothing to wait for and starts at once.
+        q.send("start", Some("queue")).await.unwrap();
+        assert_eq!(q.delivered(), [("turn/start".into(), "start".into())]);
+        assert!(q.publish().await.0.is_empty());
+
+        q.turn_started("t1").await;
+        q.send("first", Some("queue")).await.unwrap();
+        q.driver
+            .send_prompt(
+                &q.thread,
+                "second",
+                std::slice::from_ref(&image),
+                Some("queue"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            q.delivered().len(),
+            1,
+            "nothing is sent while the turn runs"
+        );
+        let (items, _) = q.publish().await;
+        assert_eq!(texts(&items), ["first", "second"]);
+        assert!(items.iter().all(|item| item["delivery"] == "queue"
+            && item["type"] == "user"
+            && item["sessionID"] == q.thread.as_str()));
+        assert_eq!(items[1]["payload"]["files"][0]["mime"], "image/png");
+        assert_eq!(
+            items[1]["payload"]["files"][0]["uri"],
+            format!("file://{image}")
+        );
+        // The stream carries the whole list with the mirror's sequence.
+        let mut published = None;
+        while let Ok(event) = q.events.try_recv() {
+            if let AgentDomainEvent::InboxChanged { items, seq, .. } = event {
+                published = Some((items, seq));
+            }
+        }
+        let (published, seq) = published.expect("agent.inbox.changed");
+        assert_eq!(published, items);
+        let asid = AgentSessionId(q.thread.clone());
+        assert!(matches!(
+            q.mirror
+                .get_events_after(&asid, seq - 1)
+                .await
+                .unwrap()
+                .first(),
+            Some(AgentDomainEvent::InboxChanged { .. })
+        ));
+
+        q.turn_completed("t1", "completed").await;
+        q.wait_delivered(2).await;
+        assert_eq!(q.delivered()[1], ("turn/start".into(), "first".into()));
+        // Delivery is published once Codex accepted it.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while texts(&q.publish().await.0) != ["second"] {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        q.turn_started("t2").await;
+        q.turn_completed("t2", "completed").await;
+        q.wait_delivered(3).await;
+        let last = q.sent.lock().unwrap()[2]["params"]["input"].clone();
+        assert_eq!(last[1], json!({"type":"localImage","path":image}));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !q.publish().await.0.is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let _ = std::fs::remove_file(&image);
+    }
+
+    #[tokio::test]
+    async fn codex_inbox_is_not_delivered_after_an_interrupted_or_failed_turn() {
+        let mut q = Queue::new().await;
+        q.send("start", None).await.unwrap();
+        q.turn_started("t1").await;
+        q.send("kept", Some("queue")).await.unwrap();
+        q.turn_completed("t1", "interrupted").await;
+        // A new turn the user starts goes ahead of the waiting item.
+        q.send("again", None).await.unwrap();
+        q.turn_started("t2").await;
+        q.turn_completed("t2", "failed").await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            q.delivered(),
+            [
+                ("turn/start".into(), "start".into()),
+                ("turn/start".into(), "again".into())
+            ]
+        );
+        let (items, _) = q.publish().await;
+        assert_eq!(texts(&items), ["kept"]);
+
+        // "Send now" with no turn running starts one with it.
+        let id = items[0]["id"].as_str().unwrap();
+        q.driver
+            .set_inbox_delivery(&q.thread, id, "steer")
+            .await
+            .unwrap();
+        assert_eq!(q.delivered()[2], ("turn/start".into(), "kept".into()));
+        assert!(q.publish().await.0.is_empty());
+    }
+
+    #[tokio::test]
+    async fn codex_inbox_send_now_steers_and_cancel_needs_a_queued_item() {
+        let mut q = Queue::new().await;
+        q.send("start", None).await.unwrap();
+        q.turn_started("t1").await;
+        q.send("a", Some("queue")).await.unwrap();
+        q.send("b", Some("queue")).await.unwrap();
+        let (items, _) = q.publish().await;
+        let (a, b) = (
+            items[0]["id"].as_str().unwrap().to_owned(),
+            items[1]["id"].as_str().unwrap().to_owned(),
+        );
+
+        q.driver
+            .set_inbox_delivery(&q.thread, &b, "steer")
+            .await
+            .unwrap();
+        assert_eq!(q.delivered()[1], ("turn/steer".into(), "b".into()));
+        assert_eq!(q.sent.lock().unwrap()[1]["params"]["expectedTurnId"], "t1");
+        assert_eq!(texts(&q.publish().await.0), ["a"]);
+
+        q.driver.cancel_inbox_item(&q.thread, &a).await.unwrap();
+        assert!(q.publish().await.0.is_empty());
+        for result in [
+            q.driver.cancel_inbox_item(&q.thread, &a).await,
+            q.driver.set_inbox_delivery(&q.thread, &a, "queue").await,
+            q.driver.set_inbox_delivery(&q.thread, &b, "steer").await,
+        ] {
+            assert!(matches!(result, Err(AgentError::InboxItemNotFound(_))));
+        }
+        assert!(matches!(
+            q.send("x", Some("later")).await,
+            Err(AgentError::InvalidRequest(_))
+        ));
+        q.turn_completed("t1", "completed").await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(q.delivered().len(), 2, "a cancelled item is never sent");
+    }
+
+    #[tokio::test]
+    async fn codex_inbox_keeps_a_refused_item_and_never_resends_an_ambiguous_one() {
+        let mut q = Queue::new().await;
+        q.send("start", None).await.unwrap();
+        q.turn_started("t1").await;
+        q.send("refused", Some("queue")).await.unwrap();
+        q.send("unknown", Some("queue")).await.unwrap();
+        let (items, _) = q.publish().await;
+        let refused = items[0]["id"].as_str().unwrap().to_owned();
+        let unknown = items[1]["id"].as_str().unwrap().to_owned();
+
+        // Codex answered with an error: nothing was accepted, so it stays.
+        *q.steer.lock().unwrap() = "reject";
+        assert!(q
+            .driver
+            .set_inbox_delivery(&q.thread, &refused, "steer")
+            .await
+            .is_err());
+        let (items, signals) = q.publish().await;
+        assert_eq!(texts(&items), ["refused", "unknown"]);
+        assert!(signals.is_empty());
+
+        // An answer that does not prove where the input went: removed, a
+        // resync is published, and it is not sent again.
+        *q.steer.lock().unwrap() = "mismatch";
+        assert!(q
+            .driver
+            .set_inbox_delivery(&q.thread, &unknown, "steer")
+            .await
+            .is_err());
+        let (items, signals) = q.publish().await;
+        assert_eq!(texts(&items), ["refused"]);
+        assert!(signals.contains(&InboxSignal::Uncertain(q.thread.clone())));
+        let mut resync = false;
+        while let Ok(event) = q.events.try_recv() {
+            resync |= matches!(&event, AgentDomainEvent::Resync { reason, .. }
+                if reason == "codex_queued_delivery_outcome_unknown");
+        }
+        assert!(resync);
+        assert_eq!(
+            q.delivered()
+                .iter()
+                .filter(|(_, text)| text == "unknown")
+                .count(),
+            1
+        );
+    }
 
     #[tokio::test]
     async fn persisted_observation_emits_metadata_before_redacted_rows_and_fences_rotation() {

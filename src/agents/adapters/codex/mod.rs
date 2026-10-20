@@ -5,6 +5,7 @@ mod budget;
 pub mod client;
 pub(crate) mod daemon;
 mod driver;
+pub(crate) mod inbox;
 mod input;
 mod items;
 mod launch;
