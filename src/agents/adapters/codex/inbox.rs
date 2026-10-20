@@ -98,13 +98,13 @@ impl Inbox {
         Ok(())
     }
 
-    /// The item a normally completed turn hands to Codex next: the oldest
-    /// queued item, else the oldest one marked to send now.
+    /// The item a normally completed turn hands to Codex next: the oldest one
+    /// marked to send now (the App shows it as "Next"), else the oldest queued.
     pub(crate) fn next(&self, thread: &str) -> Option<&Queued> {
         let queue = self.queues.get(thread)?;
         queue
             .iter()
-            .find(|item| item.delivery == Delivery::Queue)
+            .find(|item| item.delivery == Delivery::Steer)
             .or_else(|| queue.first())
     }
 
@@ -164,17 +164,17 @@ mod tests {
     }
 
     #[test]
-    fn next_delivers_queued_items_in_order_before_send_now_items() {
+    fn next_delivers_send_now_items_before_queued_items_in_order() {
         let mut inbox = Inbox::default();
-        inbox.push("t", item("steer", Delivery::Steer)).unwrap();
         inbox.push("t", item("first", Delivery::Queue)).unwrap();
         inbox.push("t", item("second", Delivery::Queue)).unwrap();
+        inbox.push("t", item("steer", Delivery::Steer)).unwrap();
         let mut order = Vec::new();
         while let Some(next) = inbox.next("t").map(|item| item.id.clone()) {
             inbox.remove("t", &next).unwrap();
             order.push(next);
         }
-        assert_eq!(order, ["first", "second", "steer"]);
+        assert_eq!(order, ["steer", "first", "second"]);
         assert!(inbox.items("t").is_empty());
         assert!(!inbox.clear("t"), "an emptied queue leaves no entry");
     }

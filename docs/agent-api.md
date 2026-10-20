@@ -1320,7 +1320,7 @@ Codex has no inbox of its own; the Gateway holds one per thread, in memory
 (lost on a Gateway restart or a reconnect to Codex), with items in the same
 shape (`type: "user"`, ids `inbox_…`). `delivery: "queue"` on a prompt waits
 behind the running turn, or starts at once when the session is idle. The next
-item (oldest `queue` item first, then any left marked `steer`) is sent as a new
+item (oldest one marked `steer` first, then the oldest `queue` item) is sent as a new
 turn only when a turn completes normally; after an interrupted or failed turn
 the queue waits for the user. `…/steer` sends an item now: `turn/steer` into the
 running turn, or a new turn. A refused send keeps the item; an unknown outcome
