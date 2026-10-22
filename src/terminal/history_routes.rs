@@ -21,8 +21,9 @@ pub(crate) struct HistoryQuery {
     source: Option<String>,
 }
 
-/// `GET /api/history/storage`: which storage this Gateway runs with and,
-/// for SQLite, what it holds -- read from counters, never a query here.
+/// `GET /api/history/storage`: which storage this Gateway runs with, whether
+/// it captures at all and, for SQLite, what it holds -- read from counters,
+/// never a query here.
 /// The admin token (`manage`) or a device.
 pub(crate) async fn history_storage(
     State(state): State<AppState>,
@@ -31,7 +32,10 @@ pub(crate) async fn history_storage(
     if crate::require_admin(&state.config, &headers).is_err() {
         require_device(&state, &headers)?;
     }
-    let mut answer = serde_json::json!({ "storage": state.config.history.storage });
+    let mut answer = serde_json::json!({
+        "storage": state.config.history.storage,
+        "capture": state.config.history.capture,
+    });
     if let Some(stats) = state.history.stats() {
         if let (Some(answer), Value::Object(stats)) =
             (answer.as_object_mut(), serde_json::json!(stats))
@@ -369,12 +373,19 @@ mod tests {
         let mut fixture = Fixture::new().await;
         let uri = "/api/history/storage";
         let memory = get(fixture.app(), uri, Some("token")).await;
-        assert_eq!(memory, (StatusCode::OK, json!({ "storage": "memory" })));
+        assert_eq!(
+            memory,
+            (
+                StatusCode::OK,
+                json!({ "storage": "memory", "capture": false })
+            )
+        );
         assert_eq!(
             get(fixture.app(), uri, None).await.0,
             StatusCode::UNAUTHORIZED
         );
         fixture.state.config.history.storage = crate::platform::config::HistoryStorage::Sqlite;
+        fixture.state.config.history.capture = true;
         fixture.state.history = std::sync::Arc::new(
             super::super::history_sqlite::SqliteHistoryRepository::open(
                 fixture.state.db.clone(),
@@ -386,8 +397,8 @@ mod tests {
         let (status, sqlite) = get(fixture.app(), uri, Some("admin")).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(
-            (&sqlite["storage"], &sqlite["healthy"]),
-            (&json!("sqlite"), &json!(true))
+            (&sqlite["storage"], &sqlite["capture"], &sqlite["healthy"]),
+            (&json!("sqlite"), &json!(true), &json!(true))
         );
         assert!(
             sqlite["checkpoints"].is_u64() && sqlite["wal_bytes"].is_u64(),

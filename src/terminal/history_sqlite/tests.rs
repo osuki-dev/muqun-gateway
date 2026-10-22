@@ -2,6 +2,7 @@ use super::super::backend::{AgentStatus, Pane, PaneId, TabId, WorkspaceId};
 use super::super::history::read_page;
 use super::super::history::read_segment_page;
 use super::*;
+use crate::platform::config::HistoryStorage;
 use crate::platform::store::db_key::DbKey;
 use crate::platform::store::sqlite::ALL_MIGRATIONS;
 use serde_json::json;
@@ -1504,6 +1505,67 @@ async fn default_memory_does_not_touch_the_history_tables() {
     assert_eq!(
         sql_i64(&db, "SELECT count(*) FROM history_captures").await,
         0
+    );
+}
+
+#[tokio::test]
+async fn capture_off_neither_folds_writes_prunes_nor_serves_stored_checkpoints() {
+    let fixture = Fixture::new();
+    let repository_on = fixture.open(captures(Some("A"), true)).await;
+    persisted(&repository_on).await;
+    repository_on.close().await;
+    let db = fixture.db();
+    // Past retention: a running write loop would prune these on its first pass.
+    db.call(|c| {
+        Ok(c.execute_batch(
+            "UPDATE history_captures SET updated=0; UPDATE history_segments SET changed_ms=0",
+        )?)
+    })
+    .await
+    .unwrap();
+    let stored = (
+        sql_i64(&db, "SELECT count(*) FROM history_captures").await,
+        sql_i64(&db, "SELECT count(*) FROM history_segments").await,
+    );
+    assert!(stored.0 > 0 && stored.1 > 0);
+
+    // SQLite storage selected, capture left at its default.
+    assert!(!fixture.config.history.capture);
+    let fold = Arc::new(Mutex::new(ScrollbackStore::new(false)));
+    {
+        let mut store = fold.lock().unwrap();
+        store.observe_native_listing("default", &[pane(Some("A"))]);
+        for top in 0..8 {
+            let frame = (top..top + 4)
+                .map(|n| format!("row {n}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            store.record_frame("default", "p", "recent_unwrapped", "text", &frame);
+        }
+        assert_eq!(store.depth("default", "p"), 0, "nothing folded");
+    }
+    let repository = repository(&fixture.config, db.clone(), fold).await;
+    assert!(repository.stats().is_none());
+    let page = read_page(repository.as_ref(), scope(), None).await.unwrap();
+    assert_eq!(
+        (&page["availability"], &page["rows"]),
+        (&json!("not_captured"), &json!([]))
+    );
+    let segmented = read_segment_page(repository.as_ref(), scope(), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        (&segmented["availability"], &segmented["segments"]),
+        (&json!("not_captured"), &json!([]))
+    );
+    // Long enough for a write or prune pass, were there a loop.
+    tokio::time::sleep(FLUSH_TICK * 3).await;
+    assert_eq!(
+        (
+            sql_i64(&db, "SELECT count(*) FROM history_captures").await,
+            sql_i64(&db, "SELECT count(*) FROM history_segments").await,
+        ),
+        stored
     );
 }
 

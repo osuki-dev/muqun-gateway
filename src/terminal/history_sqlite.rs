@@ -23,7 +23,7 @@ use super::history::{
 use super::history_memory::MemoryHistoryRepository;
 use super::history_segments::{Segment, SegmentPosition, MAX_SEGMENTS, RETENTION_MS};
 use super::scrollback::{ProjectionStamp, ScrollbackStore, MAX_PANE_BYTES, MAX_PANE_LINES};
-use crate::platform::config::{Config, HistoryStorage};
+use crate::platform::config::Config;
 use crate::platform::store::sqlite::{Migration, SqliteStore};
 
 pub(crate) const MIGRATION: Migration = Migration {
@@ -107,17 +107,18 @@ pub(crate) struct SqliteHistoryRepository {
 }
 
 /// The shared store's migration creates the `history` tables either way;
-/// memory selection only skips every runtime read and write of them.
+/// memory selection, or `history.capture` off, skips every runtime read and
+/// write of them -- including pruning, so rows stored before capture was
+/// turned off stay as they were.
 pub(crate) async fn repository(
     config: &Config,
     db: Arc<SqliteStore>,
     captures: Arc<Mutex<ScrollbackStore>>,
 ) -> Arc<dyn HistoryRepository> {
-    match config.history.storage {
-        HistoryStorage::Memory => Arc::new(MemoryHistoryRepository::new(captures)),
-        HistoryStorage::Sqlite => {
-            Arc::new(SqliteHistoryRepository::open(db, config, captures).await)
-        }
+    if config.history.checkpoints() {
+        Arc::new(SqliteHistoryRepository::open(db, config, captures).await)
+    } else {
+        Arc::new(MemoryHistoryRepository::new(captures))
     }
 }
 

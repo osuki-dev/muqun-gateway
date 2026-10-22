@@ -7,6 +7,17 @@ announces `planes.terminal.features.capturedHistory`.
 This is independent of `backends[].features.pagedHistory`, which still describes
 **native** ranged `/output` reads. No App UI or App support is implied.
 
+**Capture is off by default.** `history.capture` in `config.json` (default
+`false`) decides whether the Gateway folds anything at all. Off, every pane is
+answered exactly as the backend gives it (no amended scroll depth), both history
+routes answer an empty `not_captured` page, nothing is written to SQLite, and
+checkpoints stored earlier are left untouched -- neither served nor pruned --
+until capture is turned back on. Everything below describes capture on:
+
+```json
+{"history": {"capture": true}}
+```
+
 `GET /api/sessions/{session_id}/panes/{pane_id}/history`
 
 Uses the same device authentication and encrypted transport as the other pane
@@ -225,8 +236,11 @@ restart Gateway. Changing storage requires a controlled restart; it is not a
 live toggle.
 
 ```json
-{"history": {"storage": "sqlite"}}
+{"history": {"storage": "sqlite", "capture": true}}
 ```
+
+Without `capture: true`, SQLite storage is selected but idle (see the top of
+this page).
 
 The accepted storage values are `memory` (default) and `sqlite`; unknown values
 are rejected. Omitting the block keeps existing config files compatible and
@@ -235,13 +249,13 @@ takes the default, which is one constant (`DEFAULT_HISTORY_STORAGE` in
 default.
 
 `GET /api/history/storage` (the admin token or a device) answers which storage
-runs -- as read from `config.json` at startup, like the capability below -- and,
-for SQLite, `healthy`, `checkpoints` (stored read shapes, not segment count) and
+runs and whether `capture` is on -- as read from `config.json` at startup, like
+the capability below -- and, for SQLite with capture on, `healthy`, `checkpoints` (stored read shapes, not segment count) and
 `wal_bytes`, from counters the write loop keeps, never a query on the request.
 `manage` shows them beside the setting while Gateway runs, for example
 `SQLite · 12 checkpoints · WAL 1.2 MiB`. The
 additional capability `pane_captured_history_sqlite_checkpoint` is announced
-only while `history.storage` is `sqlite` on a platform that can verify process
+only while `history.storage` is `sqlite` and `history.capture` is on, on a platform that can verify process
 identity (Linux, macOS): it means the checkpoints are
 **enabled** on this Gateway, not that every disk write has succeeded. With
 `memory` it is absent, and an App must not offer checkpoint-backed history.

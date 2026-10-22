@@ -789,12 +789,13 @@ pub fn openapi_spec() -> Value {
         }
     });
     spec["paths"]["/api/history/storage"] = json!({ "get": {
-        "summary": "Which captured-history storage this Gateway runs with (memory or sqlite, from config.json at startup) and, for sqlite, what it holds, from counters the write loop keeps. Requires the admin token or a device",
+        "summary": "Which captured-history storage this Gateway runs with (memory or sqlite, from config.json at startup), whether it captures at all, and, for sqlite with capture on, what it holds, from counters the write loop keeps. Requires the admin token or a device",
         "responses": json_ok("The storage", json!({
             "type": "object",
             "required": ["storage"],
             "properties": {
                 "storage": { "type": "string", "enum": ["memory", "sqlite"] },
+                "capture": { "type": "boolean", "description": "history.capture: whether panes without backend scrollback are folded into captured history. Off by default; off, every pane history route answers not_captured" },
                 "healthy": { "type": "boolean", "description": "sqlite only: the last write pass worked (a failing store retries on its own)" },
                 "checkpoints": { "type": "integer", "description": "sqlite only: stored checkpoints, one per pane and format" },
                 "wal_bytes": { "type": "integer", "description": "sqlite only: the store's WAL file, as of the last write pass" }

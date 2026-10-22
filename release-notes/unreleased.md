@@ -2,6 +2,16 @@
 
 ## Changes and fixes
 
+- **Captured terminal history is off by default.** The Gateway no longer folds
+  what it reads of panes Herdr keeps no scrollback for (Claude Code and other
+  alternate-screen programs), in memory or in SQLite checkpoints: it only ever
+  kept the stretches it happened to watch. Panes are now answered exactly as
+  Herdr gives them, and the `/history` and `/history/segments` routes answer an
+  empty `not_captured` page. Checkpoints already in the store are kept, not
+  served. Set `"history": {"capture": true}` in `config.json` and restart to
+  restore the previous behavior; `GET /api/history/storage` reports `capture`.
+  No App update is needed.
+
 - **Codex has a "Waiting to send" inbox.** A prompt sent to a busy Codex
   session with `delivery: "queue"` now waits in a Gateway-owned queue instead
   of being refused, and Codex declares `features.inbox: true`. When the running
