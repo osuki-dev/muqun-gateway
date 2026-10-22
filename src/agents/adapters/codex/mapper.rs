@@ -152,22 +152,38 @@ pub fn item(thread: &str, turn: &str, value: &Value, at_ms: u64) -> Vec<Timeline
             let mut text = value["text"].as_str().unwrap_or_default().to_owned();
             // Questions remain transcript content without a live control owner.
             // Only native events can create actionable forms in the manager.
+            let mut questions = String::new();
             for question in value["questions"].as_array().into_iter().flatten() {
                 if let Some(title) = question["title"].as_str() {
-                    if !text.is_empty() {
-                        text.push_str("\n\n");
+                    if !questions.is_empty() {
+                        questions.push_str("\n\n");
                     }
-                    text.push_str(title);
+                    questions.push_str(title);
                     for option in question["options"]
                         .as_array()
                         .into_iter()
                         .flatten()
                         .filter_map(Value::as_str)
                     {
-                        text.push_str("\n- ");
-                        text.push_str(option);
+                        questions.push_str("\n- ");
+                        questions.push_str(option);
                     }
                 }
+            }
+            // Codex may already project the structured questions into this item's
+            // text. Suppress only the exact complete block at paragraph boundaries;
+            // unrelated prose and partial question text must still retain questions.
+            let already_present = !questions.is_empty()
+                && text.match_indices(&questions).any(|(start, block)| {
+                    let end = start + block.len();
+                    (start == 0 || text[..start].ends_with("\n\n"))
+                        && (end == text.len() || text[end..].starts_with("\n\n"))
+                });
+            if !questions.is_empty() && !already_present {
+                if !text.is_empty() {
+                    text.push_str("\n\n");
+                }
+                text.push_str(&questions);
             }
             vec![(text_item_id(&message, 0), AgentPart::Text { text })]
         }
@@ -577,6 +593,94 @@ mod tests {
     use super::{commands_from_catalog, map_skills};
     use crate::command_catalog::CatalogCommand;
     use serde_json::json;
+
+    fn question_fixture() -> serde_json::Value {
+        serde_json::from_str(include_str!("fixtures/async-question.json")).unwrap()
+    }
+
+    fn mapped_question_text(value: &serde_json::Value) -> String {
+        let rows = super::item("synthetic-thread", "synthetic-turn", value, 10);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].message_id,
+            super::message_id(
+                "synthetic-thread",
+                "synthetic-turn",
+                "synthetic-async-question"
+            )
+        );
+        assert_eq!(rows[0].id, super::text_item_id(&rows[0].message_id, 0));
+        let crate::agents::domain::AgentPart::Text { text } = &rows[0].part else {
+            panic!("expected transcript text");
+        };
+        text.clone()
+    }
+
+    #[test]
+    fn async_question_projection_preserves_already_rendered_complete_block() {
+        let mut value = question_fixture();
+        let block = value["text"].as_str().unwrap().to_owned();
+        for text in [
+            block.clone(),
+            format!("Please choose.\n\n{block}"),
+            format!("{block}\n\nI will wait."),
+        ] {
+            value["text"] = json!(text);
+            assert_eq!(mapped_question_text(&value), text);
+        }
+    }
+
+    #[test]
+    fn async_question_projection_keeps_questions_missing_from_native_text() {
+        let mut value = question_fixture();
+        let block = value["text"].as_str().unwrap().to_owned();
+        for text in [
+            String::new(),
+            "Please choose.".into(),
+            "Which garden should we visit?".into(),
+            format!("Quoted: {block}"),
+            format!("{block} is the proposal."),
+        ] {
+            value["text"] = json!(text);
+            let expected = if text.is_empty() {
+                block.clone()
+            } else {
+                format!("{text}\n\n{block}")
+            };
+            assert_eq!(mapped_question_text(&value), expected);
+        }
+    }
+
+    #[test]
+    fn async_question_projection_matches_all_questions_as_one_block() {
+        let mut value = question_fixture();
+        let first = value["text"].as_str().unwrap().to_owned();
+        value["questions"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"title":"When should we leave?","options":["Morning","Afternoon"]}));
+        let block = format!("{first}\n\nWhen should we leave?\n- Morning\n- Afternoon");
+        assert_eq!(mapped_question_text(&value), format!("{first}\n\n{block}"));
+        value["text"] = json!(block);
+        assert_eq!(mapped_question_text(&value), block);
+    }
+
+    #[test]
+    fn async_question_projection_does_not_deduplicate_native_text() {
+        let mut value = question_fixture();
+        let block = value["text"].as_str().unwrap().to_owned();
+        let repeated = format!("{block}\n\n{block}");
+        value["text"] = json!(repeated);
+        assert_eq!(mapped_question_text(&value), repeated);
+        value["questions"] = json!([]);
+        assert_eq!(mapped_question_text(&value), repeated);
+        value["text"] = json!(block);
+        let first = super::item("thread", "turn", &value, 0);
+        value["id"] = json!("another-item");
+        let second = super::item("thread", "turn", &value, 0);
+        assert_ne!(first[0].id, second[0].id);
+        assert_eq!(first[0].part, second[0].part);
+    }
 
     #[test]
     fn command_catalog_rows_keep_their_names_and_descriptions() {

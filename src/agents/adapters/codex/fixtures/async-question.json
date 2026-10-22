@@ -1,0 +1,17 @@
+{
+  "type": "agentMessage",
+  "id": "synthetic-async-question",
+  "text": "Which garden should we visit?\n- Riverside garden\n- Hilltop garden\n- Courtyard garden",
+  "phase": "final_answer",
+  "delivery": "async",
+  "questions": [
+    {
+      "title": "Which garden should we visit?",
+      "options": [
+        "Riverside garden",
+        "Hilltop garden",
+        "Courtyard garden"
+      ]
+    }
+  ]
+}
