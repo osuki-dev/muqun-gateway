@@ -239,6 +239,7 @@ pub(crate) async fn run(config_path: Option<String>) -> anyhow::Result<()> {
     let app = connectivity::routes::mount(app);
     let app = agents::session_routes::mount(app);
     let app = agents::routes::mount(app);
+    let app = agents::transcripts::routes::mount(app);
     let app = terminal::routes::mount(app);
     let app = platform::uploads::mount(app);
     let app = platform::assets::mount(app);

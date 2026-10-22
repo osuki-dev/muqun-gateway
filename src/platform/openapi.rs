@@ -852,7 +852,98 @@ pub fn openapi_spec() -> Value {
         "description": "Requires device authentication and asset_download capability. Rechecks the indexed directory boundary and limits content to 10 MiB. Returns attachment content disposition; preview-only restrictions remain on the content endpoint.",
         "parameters": [path_param("assetId")], "responses": ok_response()
     }});
+    for (path, item) in agent_transcript_paths() {
+        spec["paths"][path] = item;
+    }
     spec
+}
+
+/// `agent_transcripts_v1`: a terminal agent's on-disk transcript, read-only.
+fn agent_transcript_paths() -> Vec<(&'static str, Value)> {
+    let agent = json!({
+        "name": "agent", "in": "path", "required": true,
+        "description": "Herdr's agent_session.agent value; one of the agent_transcripts list in /health and /api/discovery",
+        "schema": { "type": "string" }
+    });
+    let session = json!({
+        "name": "session_id", "in": "path", "required": true,
+        "description": "Herdr's agent_session.value; for claude a lowercase hyphenated UUID",
+        "schema": { "type": "string" }
+    });
+    let cwd = query_param("cwd", "The pane's working directory, a hint for where the transcript lives. Only ever names a directory inside the agent's own root; without it the root's projects are searched.");
+    let errors = [
+        (
+            "400",
+            "invalid_session_id, invalid_cursor, or an unknown query parameter",
+        ),
+        (
+            "404",
+            "transcript_agent_unsupported or transcript_not_found",
+        ),
+        (
+            "410",
+            "transcript_cursor_gone: the file was replaced or truncated; restart without before",
+        ),
+        ("500", "transcript_unreadable"),
+    ];
+    let head = object_schema(
+        &[
+            ("lines", "integer"),
+            ("entries", "integer"),
+            ("bytes", "integer"),
+            ("mtime_ms", "integer"),
+            ("malformed_lines", "integer"),
+        ],
+        &["lines", "entries", "bytes", "mtime_ms", "malformed_lines"],
+    );
+    let mut page_data = object_schema(
+        &[
+            ("agent", "string"),
+            ("session_id", "string"),
+            ("has_more", "boolean"),
+            ("skipped_lines", "integer"),
+        ],
+        &[
+            "agent",
+            "session_id",
+            "items",
+            "order",
+            "has_more",
+            "next_before",
+            "skipped_lines",
+            "head",
+        ],
+    );
+    page_data["properties"]["items"] = json!({ "type": "array", "description": "Agent timeline items (the shape GET /api/agent-sessions/{asid}/timeline serves), oldest first. Message ids sort in file order." });
+    page_data["properties"]["order"] = json!({ "const": "oldest-to-newest" });
+    page_data["properties"]["next_before"] = json!({ "type": ["string", "null"], "description": "Cursor for the next older page; null on the oldest" });
+    page_data["properties"]["head"] = head.clone();
+    let mut head_data = head;
+    head_data["properties"]["agent"] = json!({ "type": "string" });
+    head_data["properties"]["session_id"] = json!({ "type": "string" });
+    vec![
+        (
+            "/api/agents/transcripts/{agent}/{session_id}",
+            json!({ "get": {
+                "summary": "Page a terminal agent's transcript, newest page first",
+                "description": "Requires agent_transcripts_v1. Read-only. The first page (no before) holds the newest entries; pass next_before for older ones. A cursor is a line position bound to the file's identity, so it stays valid while the agent appends. Sidechain (sub-agent) threads are excluded; thinking is a reasoning marker without text; images are [Image #n] attachment placeholders; tool calls are paired with their results, and a call without a recorded result is running. Tool output is capped at 64 KiB and each input string at 16 KiB, with truncated set.",
+                "parameters": [agent.clone(), session.clone(),
+                    query_param("before", "Opaque cursor from next_before"),
+                    { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 200, "default": 50 }, "description": "Entries (transcript lines) per page; values outside the range are clamped" },
+                    cwd.clone()],
+                "responses": with_errors(json_ok("One page", content_envelope_schema(page_data)), &errors)
+            } }),
+        ),
+        (
+            "/api/agents/transcripts/{agent}/{session_id}/head",
+            json!({ "get": {
+                "summary": "How big a terminal agent's transcript is now",
+                "description": "Requires agent_transcripts_v1. Cheap: indexes only lines appended since the last read. Poll it and fetch the newest page when lines or bytes change.",
+                "parameters": [agent, session, cwd],
+                "responses": with_errors(json_ok("The transcript's size", content_envelope_schema(head_data)), &errors)
+            } }),
+        ),
+    ]
 }
 
 fn task_view_schema() -> Value {
@@ -2500,5 +2591,25 @@ mod history_contract_tests {
         assert_eq!(schema["includes_live_viewport"]["const"], false);
         assert_eq!(schema["complete_archive"]["const"], false);
         assert!(crate::API_CAPABILITIES.contains(&"pane_captured_history"));
+    }
+    #[test]
+    fn agent_transcript_routes_are_documented_and_announced() {
+        let spec = openapi_spec();
+        let page = &spec["paths"]["/api/agents/transcripts/{agent}/{session_id}"]["get"];
+        let head = &spec["paths"]["/api/agents/transcripts/{agent}/{session_id}/head"]["get"];
+        for (operation, statuses) in [
+            (page, ["200", "400", "401", "403", "404", "410", "500"]),
+            (head, ["200", "400", "401", "403", "404", "410", "500"]),
+        ] {
+            assert!(operation["description"]
+                .as_str()
+                .unwrap()
+                .contains("agent_transcripts_v1"));
+            for status in statuses {
+                assert!(operation["responses"].get(status).is_some(), "{status}");
+            }
+        }
+        assert!(crate::API_CAPABILITIES.contains(&"agent_transcripts_v1"));
+        assert_eq!(crate::agents::transcripts::supported_agents(), ["claude"]);
     }
 }
