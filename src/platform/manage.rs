@@ -1566,6 +1566,9 @@ fn history_storage_caption(config: &crate::Config) -> Option<String> {
     if status != 200 || value["storage"] != "sqlite" {
         return None;
     }
+    if value["capture"] == false {
+        return Some("capture off (config.json › history.capture)".into());
+    }
     let count = value["checkpoints"].as_u64()?;
     let wal = value["wal_bytes"].as_u64()?;
     let wal = if wal < 1024 * 1024 {

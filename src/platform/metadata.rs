@@ -356,7 +356,7 @@ pub(crate) async fn gateway_metadata(
             // Not when this gateway's agents cannot reach /mcp (its loopback
             // listener could not be bound).
             state.config.mcp.enabled && crate::mcp::serves_agents(&state.config.listen),
-            state.config.history.storage == crate::platform::config::HistoryStorage::Sqlite,
+            state.config.history.checkpoints(),
         ),
         "planes": planes,
         "serverId": state.config.server_id,
@@ -1240,12 +1240,18 @@ mod tests {
             "sqlite storage announces checkpoints only where identity is verifiable"
         );
         assert!(!gateway_capabilities(false, false, false).contains(&HISTORY_CHECKPOINT_CAPABILITY));
-        for (storage, announced) in [
-            (crate::platform::config::HistoryStorage::Memory, false),
-            (crate::platform::config::HistoryStorage::Sqlite, true),
+        for (storage, capture, announced) in [
+            (crate::platform::config::HistoryStorage::Memory, true, false),
+            (
+                crate::platform::config::HistoryStorage::Sqlite,
+                false,
+                false,
+            ),
+            (crate::platform::config::HistoryStorage::Sqlite, true, true),
         ] {
             let mut state = crate::test_state("admin", Vec::new());
             state.config.history.storage = storage;
+            state.config.history.capture = capture;
             let meta = gateway_metadata(&state, false).await.unwrap();
             for capability in [
                 "pane_captured_history",
@@ -1263,7 +1269,7 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|c| c == HISTORY_CHECKPOINT_CAPABILITY);
-            assert_eq!(listed, announced && supported, "{storage:?}");
+            assert_eq!(listed, announced && supported, "{storage:?} {capture}");
         }
     }
 

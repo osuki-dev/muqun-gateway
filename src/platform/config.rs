@@ -273,11 +273,26 @@ impl Default for HistoryStorage {
 pub(crate) struct HistoryConfig {
     #[serde(default)]
     pub(crate) storage: HistoryStorage,
+    /// Whether the gateway folds what it reads of panes Herdr keeps no
+    /// scrollback for into captured history (memory, and SQLite checkpoints
+    /// when `storage` is `sqlite`). Off by default: an alternate-screen agent
+    /// repaints in place and only watched stretches were ever kept, so the
+    /// capture did not serve its main case. Off, panes are answered exactly as
+    /// Herdr gives them, history routes answer `not_captured`, and stored
+    /// checkpoints are left untouched -- neither read nor pruned -- until it
+    /// is turned back on.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub(crate) capture: bool,
 }
 
 impl HistoryConfig {
     fn is_default(&self) -> bool {
-        self.storage == DEFAULT_HISTORY_STORAGE
+        self.storage == DEFAULT_HISTORY_STORAGE && !self.capture
+    }
+
+    /// Whether SQLite checkpoints are read and written: both switches on.
+    pub(crate) fn checkpoints(&self) -> bool {
+        self.capture && self.storage == HistoryStorage::Sqlite
     }
 }
 
@@ -696,6 +711,29 @@ mod tests {
                 assert!(parsed.is_err());
             }
         }
+    }
+
+    #[test]
+    fn history_capture_defaults_off_and_roundtrips_when_on() {
+        let base = json!({"server_id":"s", "label":"fixture", "listen":"127.0.0.1:23847", "public_url":"", "token_hash":"fixture", "sessions":[]});
+        let mut configured = base.clone();
+        configured["history"] = json!({"storage":"sqlite"});
+        let sqlite: Config = serde_json::from_value(configured.clone()).unwrap();
+        assert!(!sqlite.history.capture && !sqlite.history.checkpoints());
+        assert!(serde_json::to_value(sqlite).unwrap()["history"]
+            .get("capture")
+            .is_none());
+        configured["history"]["capture"] = json!(true);
+        let on: Config = serde_json::from_value(configured).unwrap();
+        assert!(on.history.checkpoints());
+        assert_eq!(
+            serde_json::to_value(on).unwrap()["history"],
+            json!({"storage":"sqlite","capture":true})
+        );
+        let mut memory = base;
+        memory["history"] = json!({"capture":true});
+        let memory: Config = serde_json::from_value(memory).unwrap();
+        assert!(memory.history.capture && !memory.history.checkpoints());
     }
 
     #[test]

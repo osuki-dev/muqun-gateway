@@ -193,9 +193,6 @@ use super::history_segments::{
 use serde_json::Value;
 
 /// Rows kept per pane and source, matching the ceiling on a single read.
-/// Whether the gateway keeps rows for panes the backend reports no scrollback for.
-pub const SCROLLBACK_ENABLED: bool = true;
-
 pub const MAX_PANE_LINES: usize = 5_000;
 
 /// Bytes kept per pane and source. A row carrying escape sequences has no
@@ -1071,6 +1068,10 @@ pub struct ScrollbackStore {
     /// Signalled with every bump of `version`: what the checkpoint writer
     /// sleeps on, so an idle gateway does not wake it.
     changed: std::sync::Arc<tokio::sync::Notify>,
+    /// `history.capture` off: no pane is kept, so nothing is folded, amended
+    /// or offered as history. `Default` leaves capture on for the fold's own
+    /// tests; the server builds the store with [`Self::new`].
+    capture_off: bool,
 }
 
 #[derive(Debug)]
@@ -1141,6 +1142,14 @@ fn is_editor_command(command: Option<&str>) -> bool {
 }
 
 impl ScrollbackStore {
+    /// The server's store: folding only when `history.capture` is on.
+    pub(crate) fn new(capture: bool) -> Self {
+        Self {
+            capture_off: !capture,
+            ..Self::default()
+        }
+    }
+
     /// Learn from a Herdr answer which panes have scrollback of their own that
     /// this store must stay out of, versus which are frozen and need it.
     ///
@@ -1307,7 +1316,7 @@ impl ScrollbackStore {
     /// A pane nobody has reported on yet answers `false`: not knowing is a
     /// reason to stay out of the way, not a reason to guess.
     fn keeps(&self, session_id: &str, pane_id: &str) -> bool {
-        if !SCROLLBACK_ENABLED {
+        if self.capture_off {
             return false;
         }
 
@@ -4209,6 +4218,33 @@ mod tests {
         let held_before = store.window("k", 100).unwrap();
         store.record("k", &screen(&["1", "2", "3", "4", "5", "6"]), false);
         assert_eq!(store.window("k", 100).unwrap(), held_before);
+    }
+
+    #[test]
+    fn capture_off_answers_every_read_as_the_backend_gave_it() {
+        let mut store = ScrollbackStore::new(false);
+        observe_agent_pane(&mut store);
+        for top in 0..10 {
+            let screen = agent_screen(top * 3, top);
+            let served = store.serve_read(
+                AGENT_SESSION,
+                AGENT_PANE,
+                "recent_unwrapped",
+                "text",
+                &screen,
+                MAX_PANE_LINES,
+            );
+            assert_eq!(served, screen);
+        }
+        assert!(agent_window(&store, MAX_PANE_LINES).is_none());
+        assert_eq!(store.depth(AGENT_SESSION, AGENT_PANE), 0);
+        let pane = json!({
+            "pane_id": AGENT_PANE,
+            "scroll": {"max_offset_from_bottom": 0, "viewport_rows": AGENT_SCREEN_ROWS, "alternate_on": true},
+        });
+        let mut amended = pane.clone();
+        store.amend(AGENT_SESSION, &mut amended);
+        assert_eq!(amended, pane);
     }
 
     #[test]
