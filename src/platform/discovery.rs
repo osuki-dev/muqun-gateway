@@ -453,6 +453,8 @@ pub async fn build_discovery(state: &AppState, _sealed: bool, authenticated: boo
         "generation": &*state.generation,
         "serverId": state.config.server_id,
         "label": state.config.label,
+        // Terminal agents whose transcripts `agent_transcripts_v1` serves.
+        "agent_transcripts": crate::agents::transcripts::supported_agents(),
         // What `POST /api/uploads` takes, for the app to say on a 413. Two
         // numbers, the same for everyone.
         "uploads": {

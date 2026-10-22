@@ -760,6 +760,42 @@ Marks the session read. Unread is `info.time_idle > info.time_viewed`.
 `?sanitize=true|false` (default `true`) → the exported transcript
 (`{info, messages}`), for a share sheet. There is no session sharing in v2.
 
+### Terminal agent transcripts
+
+Gated by `agent_transcripts_v1`; the agents with a reader are listed as
+`agent_transcripts` (for example `["claude"]`) in `/health` and
+`/api/discovery`. A terminal agent such as Claude Code keeps no pageable
+scrollback, but Herdr reports its `agent_session` (`agent`, `value`) per pane
+and the agent writes its conversation to disk. These read-only routes serve
+that file as the same timeline items the session routes use.
+
+- `GET /api/agents/transcripts/{agent}/{session_id}?before=&limit=&cwd=` →
+  `data: { agent, session_id, items, order: "oldest-to-newest", has_more,
+  next_before, skipped_lines, head }`. The first page (no `before`) is the
+  newest; `next_before` continues older and is `null` on the oldest page.
+  `limit` counts transcript entries (default 50, clamped to 1..200). `cwd` is
+  the pane's working directory, a hint only; without it the agent's root is
+  searched.
+- `GET /api/agents/transcripts/{agent}/{session_id}/head?cwd=` →
+  `data: { agent, session_id, lines, entries, bytes, mtime_ms,
+  malformed_lines }`. Cheap; poll it and refetch the newest page when `lines`
+  or `bytes` change. Items keep their ids across reads, so upsert by `id`.
+
+A cursor is a line position bound to the file's identity: valid while the
+agent appends, `410 transcript_cursor_gone` once the file is replaced or
+truncated. Other refusals: `404 transcript_agent_unsupported`,
+`400 invalid_session_id`, `400 invalid_cursor`, `404 transcript_not_found`.
+
+Claude Code mapping: main-thread `user`/`assistant` lines (sidechains are
+excluded), one message per assistant `message.id` across its lines; message
+ids are `tx_claude_<line>` and sort in file order. `tool_use` is paired with
+its `tool_result` by id (`completed`, or `failed` on `is_error`; `running`
+while no result is recorded). Thinking is a `reasoning` part with empty text;
+images are `[Image #n]` attachments; compact summaries are `compaction`
+parts, `isMeta` text is `synthetic`, and `system` text and `summary` lines
+are `system` parts. Tool output is capped at 64 KiB and input strings at
+16 KiB, with `truncated` set.
+
 ---
 
 ## Prompting and control

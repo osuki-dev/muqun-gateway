@@ -14,6 +14,7 @@ pub mod runtime;
 pub mod session_routes;
 pub mod tasks;
 pub(crate) mod terminal_runtime;
+pub(crate) mod transcripts;
 pub mod use_cases;
 pub mod ws_routes;
 

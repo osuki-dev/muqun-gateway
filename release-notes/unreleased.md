@@ -12,6 +12,17 @@
   restore the previous behavior; `GET /api/history/storage` reports `capture`.
   No App update is needed.
 
+- **Claude Code history for terminal panes.** Herdr keeps no scrollback for
+  Claude Code's repainting screen, so the Gateway now reads Claude Code's own
+  session transcript (`~/.claude/projects/<project>/<session>.jsonl`, or under
+  `CLAUDE_CONFIG_DIR`) read-only and serves it as ordinary timeline pages:
+  `GET /api/agents/transcripts/claude/{session_id}` (newest page first, with
+  an older-page cursor) and `.../head` for cheap change polling. Announced as
+  `agent_transcripts_v1` with `agent_transcripts: ["claude"]`; the session id
+  is the pane's Herdr `agent_session` value. Large transcripts are indexed
+  once and then only extended as they grow. No configuration change is
+  needed; the App needs an update to show it.
+
 - **Codex has a "Waiting to send" inbox.** A prompt sent to a busy Codex
   session with `delivery: "queue"` now waits in a Gateway-owned queue instead
   of being refused, and Codex declares `features.inbox: true`. When the running
