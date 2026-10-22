@@ -769,6 +769,24 @@ scrollback, but Herdr reports its `agent_session` (`agent`, `value`) per pane
 and the agent writes its conversation to disk. These read-only routes serve
 that file as the same timeline items the session routes use.
 
+The session id comes from the pane's agent entry in terminal
+`GET /api/sessions/{session_id}/agents` and the `agents` array of
+`GET /api/sessions/{session_id}/snapshot`, which
+forward Herdr's identity in Herdr's own shape:
+
+```json
+{ "instance_id": "…", "pane_id": "w1:p1", "agent": "claude", "agent_status": "idle",
+  "agent_session": { "kind": "id", "agent": "claude", "value": "0b5e7c1d-1111-4222-8333-944455556666" } }
+```
+
+`agent_session` is present only when Herdr reported an `id`-kind session for
+that same agent; otherwise the key is absent (never `null`), as it is on tmux.
+Use `agent_session.agent` as `{agent}` and `agent_session.value` as
+`{session_id}` when `agent` is listed in `agent_transcripts`, and the pane's
+`cwd` as the hint. The field ships with `agent_transcripts_v1`; a Gateway
+that advertises the capability without it (0.14.1-preview.4 only) simply has
+no transcript to offer for any pane.
+
 - `GET /api/agents/transcripts/{agent}/{session_id}?before=&limit=&cwd=` →
   `data: { agent, session_id, items, order: "oldest-to-newest", has_more,
   next_before, skipped_lines, head }`. The first page (no `before`) is the
