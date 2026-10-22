@@ -307,7 +307,7 @@ impl CodexState {
         } else if self.config.resolve_binary().is_err() {
             info.status = AgentAvailability::NotInstalled;
             info.reason = Some(
-                "Install/configure Codex 0.162.1 or newer on this host, or disable codex.enabled"
+                "Install/configure Codex 0.163.0 or newer on this host, or disable codex.enabled"
                     .into(),
             );
         } else {
@@ -382,7 +382,7 @@ pub(super) fn features() -> crate::discovery::AgentFeatures {
             ("mcpElicitation".into(), serde_json::json!(false)),
             (
                 "protocolBaseline".into(),
-                serde_json::json!("rust-v0.162.1"),
+                serde_json::json!("rust-v0.163.0"),
             ),
         ]),
     }
@@ -648,7 +648,7 @@ pub(crate) mod tests {
             printf '%s\n' "$tool" > "$READY_FILE"
             while IFS= read -r line; do
                 case "$line" in
-                    *'"method":"initialize"'*) printf '%s\n' '{"id":1,"result":{"userAgent":"codex_cli_rs/0.162.1 (synthetic fixture)"}}' ;;
+                    *'"method":"initialize"'*) printf '%s\n' '{"id":1,"result":{"userAgent":"codex_cli_rs/0.163.0 (synthetic fixture)"}}' ;;
                     *'"method":"account/read"'*) printf '%s\n' '{"id":2,"result":{"account":null,"requiresOpenaiAuth":false}}' ;;
                     *'"method":"config/read"'*) printf '%s\n' '{"id":3,"result":{"config":{"model_provider":null}}}' ;;
                     *'"method":"synthetic/pids"'*) printf '{"id":4,"result":{"root":%s,"tool":%s}}\n' "$$" "$tool" ;;
@@ -935,7 +935,7 @@ pub(crate) mod tests {
             setsid /bin/sleep 60 </dev/null >/dev/null 2>&1 & tool=$!
             while IFS= read -r line; do
                 case "$line" in
-                    *'"method":"initialize"'*) printf '%s\n' '{"id":1,"result":{"userAgent":"codex_cli_rs/0.162.1 (synthetic fixture)"}}' ;;
+                    *'"method":"initialize"'*) printf '%s\n' '{"id":1,"result":{"userAgent":"codex_cli_rs/0.163.0 (synthetic fixture)"}}' ;;
                     *'"method":"account/read"'*) printf '%s\n' '{"id":2,"result":{"account":null,"requiresOpenaiAuth":false}}' ;;
                     *'"method":"config/read"'*) printf '%s\n' '{"id":3,"result":{"config":{"model_provider":null}}}' ;;
                     *'"method":"synthetic/pids"'*) printf '{"id":4,"result":{"root":%s,"tool":%s}}\n' "$$" "$tool" ;;
@@ -947,7 +947,7 @@ pub(crate) mod tests {
             setsid /bin/sleep 60 </dev/null >/dev/null 2>&1 & tool=$!
             while IFS= read -r line; do
                 case "$line" in
-                    *'"method":"initialize"'*) printf '%s\n' '{"id":1,"result":{"userAgent":"codex_cli_rs/0.162.1 (synthetic fixture)"}}' ;;
+                    *'"method":"initialize"'*) printf '%s\n' '{"id":1,"result":{"userAgent":"codex_cli_rs/0.163.0 (synthetic fixture)"}}' ;;
                     *'"method":"account/read"'*) printf '%s\n' '{"id":2,"result":{"account":null,"requiresOpenaiAuth":false}}' ;;
                     *'"method":"config/read"'*) printf '%s\n' '{"id":3,"result":{"config":{"model_provider":null}}}' ;;
                     *'"method":"synthetic/pids"'*) printf '{"id":4,"result":{"root":%s,"tool":%s}}\n' "$$" "$tool" ;;
@@ -1211,7 +1211,7 @@ pub(crate) mod tests {
             i=0; while [ "$i" -lt 20000 ]; do printf '%s\n' 'synthetic discarded diagnostic' >&2; i=$((i+1)); done
             while IFS= read -r line; do
                 case "$line" in
-                    *'"method":"initialize"'*) printf '%s\n' '{"id":1,"result":{"userAgent":"codex_cli_rs/0.162.1 (synthetic fixture)"}}' ;;
+                    *'"method":"initialize"'*) printf '%s\n' '{"id":1,"result":{"userAgent":"codex_cli_rs/0.163.0 (synthetic fixture)"}}' ;;
                     *'"method":"account/read"'*) printf '%s\n' '{"id":2,"result":{"account":null,"requiresOpenaiAuth":false}}' ;;
                     *'"method":"config/read"'*) printf '%s\n' '{"id":3,"result":{"config":{"model_provider":null}}}' ;;
                     *'"method":"synthetic/pid"'*) printf '{"id":4,"result":{"pid":%s}}\n' "$$" ;;

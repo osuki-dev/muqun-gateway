@@ -43,6 +43,7 @@ pub(crate) const API_CAPABILITIES: &[&str] = &[
     "agent_events",
     "multi_agent",
     "agent_forms",
+    "agent_compaction_references_v1",
     "agent_lifecycle_notifications",
     "agent_mcp",
     "agent_models",

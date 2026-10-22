@@ -137,7 +137,13 @@ impl AgentPort for DeepseekDriver {
 
     fn probe(&self) -> AgentFuture<'_, bool> {
         Box::pin(async move {
-            let req_client = reqwest::Client::new();
+            let Ok(req_client) = reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(std::time::Duration::from_secs(60))
+                .build()
+            else {
+                return Ok(false);
+            };
             Ok(self.client.endpoint.probe_healthy(&req_client).await)
         })
     }

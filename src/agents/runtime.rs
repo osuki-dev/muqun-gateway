@@ -1887,9 +1887,10 @@ fn running_binary_path(_pid: u32) -> Option<std::path::PathBuf> {
 
 fn probe_client() -> reqwest::Client {
     reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(60))
         .build()
-        .unwrap_or_default()
+        .expect("agent probe HTTP client configuration is valid")
 }
 
 /// Poll the registration file until the service answers its health probe, or

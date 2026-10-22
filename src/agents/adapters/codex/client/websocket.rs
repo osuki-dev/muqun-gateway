@@ -681,7 +681,7 @@ pub(crate) mod tests {
                                 }
                             }
                              let result = match request["method"].as_str() {
-                                Some("initialize") => Ok(json!({"userAgent":"codex-tui/0.162.1", "codexHome":home_path})),
+                                Some("initialize") => Ok(json!({"userAgent":"codex-tui/0.163.0", "codexHome":home_path})),
                                 Some("account/read") => Ok(json!({"requiresOpenaiAuth":false,"account":null})),
                                  _ => locked(&handler)(&request),
                              };
@@ -2895,7 +2895,7 @@ pub(crate) mod tests {
                 panic!()
             };
             let request: Value = serde_json::from_str(&text).unwrap();
-            server.send(Message::Text(json!({"id":request["id"],"result":{"userAgent":"codex-tui/0.162.1","codexHome":"/"}}).to_string().into())).await.unwrap();
+            server.send(Message::Text(json!({"id":request["id"],"result":{"userAgent":"codex-tui/0.163.0","codexHome":"/"}}).to_string().into())).await.unwrap();
             assert!(!matches!(server.next().await, Some(Ok(Message::Text(_)))));
         });
         assert!(client

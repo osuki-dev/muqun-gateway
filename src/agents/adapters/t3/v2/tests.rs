@@ -7,6 +7,40 @@ pub fn fixture() -> Value {
     serde_json::from_str(include_str!("../fixtures/v2/projection.json")).unwrap()
 }
 
+#[test]
+fn asynchronous_questions_are_nonblocking_in_forms_and_timeline() {
+    let mut snapshot = fixture();
+    let question = snapshot["projection"]["turnItems"][1].clone();
+    snapshot["projection"]["visibleTurnItems"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({
+            "position":2,"visibility":"local","sourceThreadId":"thread",
+            "sourceItemId":"form-item","item":question
+        }));
+    let projection = &snapshot["projection"];
+    let forms = mapper::forms("thread", projection);
+    assert_eq!(forms.len(), 1);
+    assert!(forms[0].nonblocking);
+    // The same projection must give identical interaction semantics in both views.
+    let rows = mapper::timeline("thread", projection, 1);
+    let form = rows
+        .iter()
+        .find_map(|row| match &row.part {
+            AgentPart::Form { request } => Some(request),
+            _ => None,
+        })
+        .expect("question timeline row");
+    assert!(form.nonblocking);
+
+    let mut live = snapshot.clone();
+    live["projection"]["runtimeRequests"][1]["responseCapability"] =
+        json!({"type":"live", "providerSessionId":"provider-session"});
+    assert!(!mapper::forms("thread", &live["projection"])[0].nonblocking);
+    live["projection"]["runtimeRequests"][1]["status"] = json!("resolved");
+    assert!(mapper::forms("thread", &live["projection"]).is_empty());
+}
+
 pub(crate) fn local_window(ids: &[&str], sequence: u64) -> Value {
     let mut snapshot = fixture();
     snapshot["snapshotSequence"] = json!(sequence);

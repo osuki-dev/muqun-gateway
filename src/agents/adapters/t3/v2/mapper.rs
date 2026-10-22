@@ -221,7 +221,12 @@ pub fn forms(thread_id: &str, projection: &Value) -> Vec<FormRequest> {
             if string(item, "type") != Some("user_input_request") {
                 return None;
             }
-            form(thread_id, item)
+            let mut form = form(thread_id, item)?;
+            form.nonblocking = request
+                .pointer("/responseCapability/type")
+                .and_then(Value::as_str)
+                == Some("message");
+            Some(form)
         })
         .collect()
 }
@@ -362,12 +367,16 @@ pub fn timeline(thread_id: &str, projection: &Value, seq: u64) -> Vec<TimelineIt
                 let Some(request_id) = string(item, "requestId") else {
                     continue;
                 };
-                if pending_request(projection, request_id).is_none() {
-                    continue;
-                }
-                let Some(request) = form(thread_id, item) else {
+                let Some((runtime_request, _)) = pending_request(projection, request_id) else {
                     continue;
                 };
+                let Some(mut request) = form(thread_id, item) else {
+                    continue;
+                };
+                request.nonblocking = runtime_request
+                    .pointer("/responseCapability/type")
+                    .and_then(Value::as_str)
+                    == Some("message");
                 AgentPart::Form { request }
             }
             "file_change" => AgentPart::Diff {

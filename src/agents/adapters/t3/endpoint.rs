@@ -1,7 +1,7 @@
 //! Where a T3 Code server is and how the gateway proves itself to it.
 //!
 //! The auth flow, as observed against `t3 serve` 0.0.42 and still current in
-//! 0.0.45 (protocol 1) and the pinned 0.0.46 nightly (protocol 2). The public
+//! 0.0.45 (protocol 1) and stable 0.1.1 (protocol 2). The public
 //! descriptor selects the protocol before any one-time pairing exchange.
 //!
 //! The flow:

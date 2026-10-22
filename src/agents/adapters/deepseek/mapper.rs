@@ -570,6 +570,7 @@ pub fn map_record(event: &Value) -> Vec<TimelineItem> {
                         Some(summary)
                     },
                     recent: None,
+                    keep_message_id: None,
                     tokens: data.get("usage").and_then(map_usage),
                     cost: None,
                     error: None,
