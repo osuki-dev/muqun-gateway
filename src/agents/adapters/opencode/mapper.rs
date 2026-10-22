@@ -599,6 +599,12 @@ fn map_compaction_message(msg: &Value) -> AgentPart {
         recent: msg
             .get("recent")
             .and_then(Value::as_str)
+            .or_else(|| msg.pointer("/metadata/recent").and_then(Value::as_str))
+            .map(str::to_string),
+        keep_message_id: msg
+            .pointer("/metadata/keepID")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
             .map(str::to_string),
         tokens: msg.get("tokens").map(map_tokens),
         cost: msg.get("cost").and_then(Value::as_f64),
@@ -2421,6 +2427,34 @@ mod catalog_tests {
                 assert_eq!(*cost, Some(0.25));
             }
             other => panic!("expected a compaction part, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn compaction_preserves_21_references_and_legacy_retained_text() {
+        for (metadata, recent, keep) in [
+            (json!({"keepID":"msg_retained"}), None, Some("msg_retained")),
+            (json!({"recent":"legacy tail"}), Some("legacy tail"), None),
+            (json!({"keepID":42,"recent":false}), None, None),
+        ] {
+            let msg = json!({"id":"compact", "type":"compaction", "status":"completed",
+                "summary":"summary", "metadata":metadata});
+            let live = map_message(&msg, &AgentSessionId("session".into()));
+            let history = map_messages_to_timeline(&[msg], &AgentSessionId("session".into()));
+            for rows in [live, history] {
+                let AgentPart::Compaction {
+                    recent: actual,
+                    keep_message_id,
+                    summary,
+                    ..
+                } = &rows[0].part
+                else {
+                    panic!("expected compaction");
+                };
+                assert_eq!(actual.as_deref(), recent);
+                assert_eq!(keep_message_id.as_deref(), keep);
+                assert_eq!(summary.as_deref(), Some("summary"));
+            }
         }
     }
 

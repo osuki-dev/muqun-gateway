@@ -120,9 +120,10 @@ pub struct DeepseekClient {
 impl DeepseekClient {
     pub fn new(endpoint: DeepseekEndpoint) -> Self {
         let http = Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(60))
             .build()
-            .unwrap_or_default();
+            .expect("DeepSeek HTTP client configuration is valid");
         Self { endpoint, http }
     }
 
@@ -781,6 +782,58 @@ pub(crate) mod tests {
 
     fn client_for(url: String) -> DeepseekClient {
         DeepseekClient::new(DeepseekEndpoint::new(url, None, None))
+    }
+
+    #[tokio::test]
+    async fn credentialed_rpc_does_not_follow_redirects() {
+        use axum::{routing::post, Router};
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let redirect_to = format!("{url}/destination");
+        let app = Router::new()
+            .route(
+                "/api/model/catalog",
+                post(move || {
+                    let to = redirect_to.clone();
+                    async move {
+                        (
+                            axum::http::StatusCode::TEMPORARY_REDIRECT,
+                            [("location", to)],
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/destination",
+                post(move || {
+                    let calls = observed.clone();
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        "unexpected redirect"
+                    }
+                }),
+            );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = DeepseekClient::new(DeepseekEndpoint::new(
+            url,
+            None,
+            Some(base64::Engine::encode(
+                &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+                [7u8; 32],
+            )),
+        ));
+        assert!(client
+            .call_remote("model", "catalog", json!({}))
+            .await
+            .is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        server.abort();
     }
 
     use std::sync::{Arc, Mutex};

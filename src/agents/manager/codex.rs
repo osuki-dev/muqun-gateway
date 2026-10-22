@@ -897,7 +897,7 @@ impl AgentManager {
             mirror,
             tx,
             endpoint.into(),
-            Some("0.162.1".into()),
+            Some("0.163.0".into()),
             Arc::new(move || ready.is_ready()),
             Arc::new(move || {
                 *stopped.lock().unwrap_or_else(|p| p.into_inner()) = true;

@@ -1,6 +1,6 @@
 {
   "initialize": {
-    "userAgent": "codex_cli_rs/0.162.1 (synthetic fixture)",
+    "userAgent": "codex_cli_rs/0.163.0 (synthetic fixture)",
     "codexHome": "/synthetic/codex-home",
     "platformFamily": "unix",
     "platformOs": "linux"
@@ -26,7 +26,7 @@
     "status": {"type": "idle"},
     "path": null,
     "cwd": "/synthetic/workspace",
-    "cliVersion": "0.162.1",
+    "cliVersion": "0.163.0",
     "originator": "synthetic-fixture",
     "source": "appServer",
     "threadSource": null,

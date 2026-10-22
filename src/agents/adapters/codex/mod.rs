@@ -1,4 +1,4 @@
-//! Shared-daemon adapter. Codex 0.162.1 is the oldest accepted app-server.
+//! Shared-daemon adapter. Codex 0.163.0 is the oldest accepted app-server.
 mod account_limits;
 mod async_questions;
 mod budget;
@@ -22,10 +22,10 @@ pub use driver::CodexDriver;
 
 pub const KIND: &str = "codex";
 /// Oldest Codex app-server this Gateway will drive. Newer releases stay connected.
-pub const VERSION: &str = "0.162.1";
-const MINIMUM_VERSION: (u64, u64, u64) = (0, 162, 1);
+pub const VERSION: &str = "0.163.0";
+const MINIMUM_VERSION: (u64, u64, u64) = (0, 163, 0);
 
-/// Whether `user_agent` names Codex 0.162.1 or anything newer.
+/// Whether `user_agent` names Codex 0.163.0 or anything newer.
 pub(crate) fn accepts_server_version(user_agent: &str) -> bool {
     user_agent
         .split(|c: char| !c.is_ascii_digit() && c != '.')

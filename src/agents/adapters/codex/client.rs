@@ -555,7 +555,7 @@ impl CodexClient {
         if !super::accepts_server_version(agent) {
             self.stop();
             return Err(AgentError::Unsupported(
-                "Codex app-server version; expected 0.162.1 or newer".into(),
+                "Codex app-server version; expected 0.163.0 or newer".into(),
             ));
         }
         let actual = response["codexHome"]

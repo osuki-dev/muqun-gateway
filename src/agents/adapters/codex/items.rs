@@ -317,6 +317,7 @@ pub(super) fn parts(message: &str, id: &str, value: &Value) -> Vec<(String, Agen
                     reason: None,
                     summary: None,
                     recent: None,
+                    keep_message_id: None,
                     tokens: None,
                     cost: None,
                     error: None,

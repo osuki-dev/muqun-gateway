@@ -48,6 +48,13 @@ impl DeepseekEndpoint {
 
     /// Extract the HTTP Host/Authority header value (e.g. "127.0.0.1:3080").
     pub fn authority(&self) -> String {
+        if let Ok(url) = reqwest::Url::parse(&self.url) {
+            if matches!(url.scheme(), "http" | "https") {
+                if let Some((_, authority)) = url.origin().ascii_serialization().split_once("://") {
+                    return authority.to_string();
+                }
+            }
+        }
         let u = self
             .url
             .trim_start_matches("http://")
@@ -58,9 +65,22 @@ impl DeepseekEndpoint {
     /// Compute the authority-bound signed session cookie if a secret is available.
     pub fn auth_cookie(&self) -> Option<String> {
         if let Some(ref sec) = self.secret {
-            super::auth::generate_dsh_cookie(&self.authority(), sec)
+            let authority_cookie = super::auth::generate_dsh_cookie(&self.authority(), sec)
                 .ok()
-                .map(|(n, v)| format!("{n}={v}"))
+                .map(|(n, v)| format!("{n}={v}"))?;
+            if self.url.starts_with("https://") {
+                // Native TLS uses the canonical HTTPS origin as its audience.
+                // An HTTPS reverse proxy to an HTTP listener still uses Host.
+                // Both cookies go only to the configured endpoint; the listener
+                // selects its own audience, never an HTTP fallback after refusal.
+                let url = reqwest::Url::parse(&self.url).ok()?;
+                let (name, value) =
+                    super::auth::generate_dsh_cookie(&url.origin().ascii_serialization(), sec)
+                        .ok()?;
+                Some(format!("{name}={value}; {authority_cookie}"))
+            } else {
+                Some(authority_cookie)
+            }
         } else {
             None
         }
@@ -134,9 +154,10 @@ impl DeepseekEndpoint {
         let secret = secret.or_else(super::auth::load_local_secret);
 
         let client = Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(60))
             .build()
-            .unwrap_or_default();
+            .expect("DeepSeek HTTP client configuration is valid");
 
         for url in candidate_urls {
             let endpoint = Self::new(url, token.clone(), secret.clone());
@@ -232,6 +253,32 @@ mod tests {
         let ep_ssl = DeepseekEndpoint::new("https://dsh.example.com", None, None);
         assert_eq!(ep_ssl.ws_url, "wss://dsh.example.com/api/remote.mux");
         assert_eq!(ep_ssl.authority(), "dsh.example.com");
+    }
+
+    #[test]
+    fn https_cookies_bind_native_tls_and_proxy_audiences_separately() {
+        use base64::prelude::*;
+        let secret = BASE64_URL_SAFE_NO_PAD.encode([7u8; 32]);
+        let endpoint =
+            DeepseekEndpoint::new("https://DSH.example:443/prefix", None, Some(secret.clone()));
+        let cookies = endpoint.auth_cookie().unwrap();
+        let decoded: Vec<serde_json::Value> = cookies
+            .split("; ")
+            .map(|cookie| {
+                let (_, value) = cookie.split_once('=').unwrap();
+                let body = value.split('.').nth(1).unwrap();
+                serde_json::from_slice(&BASE64_URL_SAFE_NO_PAD.decode(body).unwrap()).unwrap()
+            })
+            .collect();
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0]["authority"], "https://dsh.example");
+        assert_eq!(decoded[1]["authority"], "dsh.example");
+        assert_ne!(
+            cookies.split("; ").next().unwrap().split('=').next(),
+            cookies.split("; ").nth(1).unwrap().split('=').next()
+        );
+        let http = DeepseekEndpoint::new("http://127.0.0.1:3080/prefix", None, Some(secret));
+        assert!(!http.auth_cookie().unwrap().contains(';'));
     }
 
     #[test]

@@ -388,7 +388,7 @@ impl SharedCodexDaemon {
                     };
                     let result = match request["method"].as_str().unwrap() {
                         "initialize" => {
-                            json!({"userAgent":"codex_cli_rs/0.162.1 (synthetic fixture)","codexHome":home})
+                            json!({"userAgent":"codex_cli_rs/0.163.0 (synthetic fixture)","codexHome":home})
                         }
                         "account/read" => json!({"account":null,"requiresOpenaiAuth":false}),
                         "config/read" => json!({"config":{"model_provider":null}}),

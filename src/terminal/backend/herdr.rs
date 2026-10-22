@@ -74,7 +74,7 @@ mod collaboration_submission_tests {
 
     #[test]
     fn modern_herdr_never_gets_the_legacy_extra_enter() {
-        for version in ["0.9.0", "v0.9.1", "0.10.0", "1.0.0", "0.9.0+build"] {
+        for version in ["0.9.0", "v0.9.1", "0.9.5", "0.10.0", "1.0.0", "0.9.0+build"] {
             assert!(herdr_owns_prompt_submission(Some(version)), "{version}");
         }
         for version in [

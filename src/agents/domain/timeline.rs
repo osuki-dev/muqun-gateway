@@ -194,6 +194,10 @@ pub enum AgentPart {
         summary: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         recent: Option<String>,
+        /// First retained upstream message, scoped to this session. The message
+        /// may be outside the loaded page; never interpret the ID as text.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        keep_message_id: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         tokens: Option<TokensUsage>,
         #[serde(skip_serializing_if = "Option::is_none")]
