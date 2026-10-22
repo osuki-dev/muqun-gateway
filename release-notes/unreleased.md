@@ -19,7 +19,10 @@
   `GET /api/agents/transcripts/claude/{session_id}` (newest page first, with
   an older-page cursor) and `.../head` for cheap change polling. Announced as
   `agent_transcripts_v1` with `agent_transcripts: ["claude"]`; the session id
-  is the pane's Herdr `agent_session` value. Large transcripts are indexed
+  is the pane's Herdr `agent_session` value, forwarded on the pane's agent
+  entry in `/agents` and `/snapshot` as `agent_session` (`kind`, `agent`,
+  `value`); 0.14.1-preview.4 advertised the routes but did not forward it, so
+  the App found no transcript there. Large transcripts are indexed
   once and then only extended as they grow. No configuration change is
   needed; the App needs an update to show it.
 

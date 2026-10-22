@@ -266,6 +266,37 @@ mod tests {
             .collect()
     }
 
+    /// The App reads a pane's transcript by the `agent_session` on its agent
+    /// entry, so the entry Herdr's report becomes must name a transcript the
+    /// route can find.
+    #[tokio::test]
+    async fn a_serialized_agent_session_opens_its_transcript() {
+        let fixture = Fixture::new();
+        let herdr = FakeHerdr::start(vec![], None);
+        herdr.set_agents(json!([{
+            "pane_id": "w1:p1", "terminal_id": "t1", "agent": "claude",
+            "agent_status": "idle", "cwd": "/w/proj",
+            "agent_session": {"kind": "id", "agent": "claude", "value": SESSION},
+        }]));
+        let list = backend_agent_list(&herdr.session()).await.unwrap();
+        let session = &list["result"]["agents"][0]["agent_session"];
+        assert_eq!(session["kind"], "id");
+        let (agent, id) = (
+            session["agent"].as_str().unwrap(),
+            session["value"].as_str().unwrap(),
+        );
+
+        let (status, page) = get(
+            fixture.app(),
+            &format!("/api/agents/transcripts/{agent}/{id}"),
+            Some("token"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(page["data"]["session_id"], SESSION);
+        assert_eq!(texts(&page).last().unwrap(), "Answer two.");
+    }
+
     #[tokio::test]
     async fn pages_walk_back_from_the_newest_entry() {
         let fixture = Fixture::new();
