@@ -192,7 +192,7 @@ fn pane(value: Pane) -> Value {
 }
 
 fn agent(value: &Agent) -> Value {
-    let mut entry = json!({
+    json!({
         "instance_id": value.instance_id,
         "target": value.target,
         "pane_id": value.pane_id.as_str(),
@@ -204,14 +204,7 @@ fn agent(value: &Agent) -> Value {
         "state_change_seq": value.state_change_seq,
         "shell_pid": value.shell_pid,
         "pending_user_input": value.pending_user_input,
-    });
-    // Herdr's own `agent_session` shape, and only when Herdr reported one for
-    // this very agent: the key is absent, never null, otherwise. It is what
-    // the App passes to `/api/agents/transcripts/{agent}/{session_id}`.
-    if let (Some(kind), Some(id)) = (&value.kind, &value.conversation_id) {
-        entry["agent_session"] = json!({ "kind": "id", "agent": kind, "value": id });
-    }
-    entry
+    })
 }
 
 fn agent_status(status: AgentStatus) -> &'static str {
@@ -277,7 +270,7 @@ mod tests {
     fn the_snapshots_agents_are_the_agent_list_itself() {
         let agents = vec![
             Agent {
-                conversation_id: Some("0b5e7c1d-1111-4222-8333-944455556666".into()),
+                conversation_id: None,
                 instance_id: Some("inst_7f3c".into()),
                 target: "herdr://agent/inst_7f3c".into(),
                 pane_id: PaneId::new("%9"),
@@ -324,11 +317,6 @@ mod tests {
         assert_eq!(first["agent_status"], "working");
         assert_eq!(first["pending_user_input"], true);
         assert_eq!(first["shell_pid"], 4242);
-        assert_eq!(
-            first["agent_session"],
-            json!({"kind": "id", "agent": "claude", "value": "0b5e7c1d-1111-4222-8333-944455556666"}),
-            "Herdr's session identity reaches the app in Herdr's own shape"
-        );
 
         let second = &snap["result"]["agents"][1];
         assert!(
@@ -337,10 +325,6 @@ mod tests {
         );
         assert_eq!(second["target"], "%12");
         assert!(second["pending_user_input"].is_null());
-        assert!(
-            second.get("agent_session").is_none(),
-            "no session identity is absent, not null"
-        );
         let mut resolved = agents[0].clone();
         resolved.pending_user_input = Some(false);
         assert_eq!(
