@@ -646,52 +646,84 @@ impl Worktree {
     }
 }
 
+/// One inventory answer lists at most this many checkouts and says when it
+/// stopped. Generous: a repository with hundreds of worktrees is ordinary.
+pub const MAX_WORKTREES: usize = 512;
+
+/// A `.git` file or a `gitdir` back-pointer is one short line; anything
+/// longer is not one and is not read further.
+const MAX_GITDIR_FILE_BYTES: u64 = 4096;
+
+/// The verified checkouts of one repository, in `git worktree list` order
+/// (the main checkout first).
+#[derive(Debug, Clone, Default)]
+pub struct WorktreeInventory {
+    pub worktrees: Vec<Worktree>,
+    /// Entries git reported, before verification.
+    pub total: usize,
+    /// The list stopped at [`MAX_WORKTREES`] with entries left unchecked, or
+    /// git's output stopped at [`MAX_OUTPUT_BYTES`].
+    pub truncated: bool,
+}
+
 /// Git's authoritative inventory, NUL-delimited so unusual path names survive.
 /// Missing, bare or replaced checkouts are omitted. Every accepted checkout
-/// must still point at this repository's canonical common directory.
-pub async fn worktrees(toplevel: &Path) -> Result<Vec<Worktree>, GitError> {
-    tokio::time::timeout(GIT_TIMEOUT, read_worktrees(toplevel))
+/// must still belong to this repository's canonical common directory, which
+/// is checked on disk ([`repository_checkout_of`]) rather than by running git
+/// once per entry. Never fails on size: past [`MAX_WORKTREES`] it is cut and
+/// says so.
+pub async fn worktrees(toplevel: &Path) -> Result<WorktreeInventory, GitError> {
+    tokio::time::timeout(GIT_TIMEOUT, read_worktrees(toplevel, MAX_WORKTREES))
         .await
         .map_err(|_| GitError::Timeout)?
 }
 
-async fn read_worktrees(toplevel: &Path) -> Result<Vec<Worktree>, GitError> {
+/// The canonical `selected` checkout when it is a checkout of `toplevel`'s
+/// repository, by the same check the inventory applies, so a selection need
+/// not be among the entries one inventory answer lists. `None` for an alias,
+/// a subdirectory, a missing directory or another repository.
+pub async fn repository_checkout(
+    toplevel: &Path,
+    selected: &Path,
+) -> Result<Option<PathBuf>, GitError> {
+    let common = tokio::time::timeout(GIT_TIMEOUT, common_directory(toplevel))
+        .await
+        .map_err(|_| GitError::Timeout)??;
+    Ok(repository_checkout_of(selected, &common).filter(|path| path == selected))
+}
+
+async fn read_worktrees(toplevel: &Path, limit: usize) -> Result<WorktreeInventory, GitError> {
     let common = common_directory(toplevel).await?;
     let output = run(toplevel, &["worktree", "list", "--porcelain", "-z"], &[0]).await?;
+    let mut fields: Vec<&[u8]> = output.stdout.split(|byte| *byte == 0).collect();
     if output.capped {
-        return Err(GitError::Failed(
-            "worktree inventory exceeded its output limit".into(),
-        ));
+        // The last field was cut mid-way; every entry before it is whole.
+        fields.pop();
     }
-    let mut entries = Vec::new();
+    let mut inventory = WorktreeInventory {
+        truncated: output.capped,
+        ..WorktreeInventory::default()
+    };
     let mut entry: Option<Worktree> = None;
     let mut bare = false;
-    for field in output.stdout.split(|byte| *byte == 0) {
+    for field in fields {
         if field.is_empty() {
-            if let Some(mut candidate) = entry.take() {
-                if !bare {
-                    if let Ok(path) = std::fs::canonicalize(&candidate.path) {
-                        if path.is_dir()
-                            && common_directory(&path).await.ok().as_ref() == Some(&common)
-                            && repository_root(&path).await?.as_ref() == Some(&path)
-                        {
-                            candidate.path = path;
-                            entries.push(candidate);
-                        }
-                    }
+            if let Some(mut candidate) = entry.take().filter(|_| !bare) {
+                if inventory.worktrees.len() >= limit {
+                    inventory.truncated = true;
+                } else if let Some(path) = repository_checkout_of(&candidate.path, &common) {
+                    candidate.path = path;
+                    inventory.worktrees.push(candidate);
                 }
             }
             bare = false;
             continue;
         }
-        let field = std::str::from_utf8(field)
-            .map_err(|_| GitError::Failed("worktree inventory is not UTF-8".into()))?;
+        // A path that is not UTF-8 does not survive this and is omitted
+        // below, as a missing checkout is; it does not fail the inventory.
+        let field = String::from_utf8_lossy(field);
         if let Some(path) = field.strip_prefix("worktree ") {
-            if entries.len() >= 128 {
-                return Err(GitError::Failed(
-                    "worktree inventory exceeded its entry limit".into(),
-                ));
-            }
+            inventory.total += 1;
             entry = Some(Worktree {
                 path: path.into(),
                 branch: None,
@@ -711,7 +743,55 @@ async fn read_worktrees(toplevel: &Path) -> Result<Vec<Worktree>, GitError> {
             }
         }
     }
-    Ok(entries)
+    Ok(inventory)
+}
+
+/// The canonical `path` when it is a checkout of the repository whose
+/// canonical common directory is `common`, read from disk without running git:
+///
+/// - the main checkout: its `.git` is `common`, as a directory or as a
+///   `gitdir:` file (a separate git directory);
+/// - a linked checkout: its `.git` file names an administrative directory in
+///   `<common>/worktrees/` whose `gitdir` file points back at this `.git`, the
+///   pair `git worktree list` itself is built from.
+///
+/// A directory replaced by another repository, or by a symlink to one, fails
+/// both, as does a subdirectory (it has no `.git`).
+fn repository_checkout_of(path: &Path, common: &Path) -> Option<PathBuf> {
+    let path = std::fs::canonicalize(path).ok()?;
+    if !path.is_dir() {
+        return None;
+    }
+    let dot_git = path.join(".git");
+    if dot_git.is_dir() {
+        return (std::fs::canonicalize(&dot_git).ok()? == common).then_some(path);
+    }
+    let named = read_gitdir_line(&dot_git)?;
+    let admin = std::fs::canonicalize(path.join(named.strip_prefix("gitdir: ")?)).ok()?;
+    if admin == common {
+        return Some(path);
+    }
+    if admin.parent()? != common.join("worktrees") {
+        return None;
+    }
+    // Relative under `worktree.useRelativePaths`, to the admin directory.
+    let back = std::fs::canonicalize(admin.join(read_gitdir_line(&admin.join("gitdir"))?)).ok()?;
+    (back == std::fs::canonicalize(&dot_git).ok()?).then_some(path)
+}
+
+/// One `.git`/`gitdir` file's single line, without its one trailing newline
+/// (any other whitespace belongs to the path).
+fn read_gitdir_line(file: &Path) -> Option<String> {
+    use std::io::Read as _;
+    let mut bytes = Vec::new();
+    std::fs::File::open(file)
+        .ok()?
+        .take(MAX_GITDIR_FILE_BYTES)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    let text = String::from_utf8(bytes).ok()?;
+    let line = text.strip_suffix('\n').unwrap_or(&text);
+    (!line.is_empty()).then(|| line.to_owned())
 }
 
 async fn common_directory(toplevel: &Path) -> Result<PathBuf, GitError> {
@@ -3305,6 +3385,8 @@ mod tests {
         assert_eq!(body["data"]["current"], json!(repo));
         let entries = body["data"]["worktrees"].as_array().unwrap();
         assert_eq!(entries.len(), 3);
+        assert_eq!(body["data"]["truncated"], false);
+        assert_eq!(body["data"]["total"], 3);
         assert!(entries
             .iter()
             .any(|entry| entry["path"] == json!(linked) && entry["branch"] == "feature"));
@@ -3403,6 +3485,106 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(foreign_root).unwrap();
+    }
+
+    fn add_worktree(repo: &Path, path: &Path) {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["worktree", "add", "-q", "--detach", "--no-checkout"])
+            .arg(path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[tokio::test]
+    async fn worktree_inventory_lists_past_the_old_limit_and_says_when_it_cuts() {
+        let (root, repo) = git_test_repo("many-worktrees");
+        let repo = std::fs::canonicalize(repo).unwrap();
+        let linked: Vec<PathBuf> = (0..130)
+            .map(|index| root.join(format!("linked-{index:03}")))
+            .collect();
+        for path in &linked {
+            add_worktree(&repo, path);
+        }
+
+        let all = read_worktrees(&repo, MAX_WORKTREES).await.unwrap();
+        assert_eq!(all.total, 131);
+        assert!(!all.truncated);
+        assert_eq!(all.worktrees.len(), 131);
+        assert_eq!(all.worktrees[0].path, repo);
+        let last = std::fs::canonicalize(linked.last().unwrap()).unwrap();
+        assert!(all.worktrees.iter().any(|entry| entry.path == last));
+
+        let cut = read_worktrees(&repo, 100).await.unwrap();
+        assert_eq!(cut.total, 131);
+        assert!(cut.truncated);
+        assert_eq!(cut.worktrees.len(), 100);
+        assert_eq!(cut.worktrees[0].path, repo);
+        assert!(!cut.worktrees.iter().any(|entry| entry.path == last));
+        // A selection does not depend on where an inventory answer stops.
+        assert_eq!(
+            repository_checkout(&repo, &last).await.unwrap(),
+            Some(last.clone())
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn worktree_inventory_omits_missing_and_foreign_checkouts() {
+        let (root, repo) = git_test_repo("omitted-worktrees");
+        let repo = std::fs::canonicalize(repo).unwrap();
+        let (foreign_root, foreign_repo) = git_test_repo("omitted-worktrees-foreign");
+        let missing = root.join("missing");
+        let redirected = root.join("redirected");
+        let kept = root.join("kept");
+        for path in [&missing, &redirected, &kept] {
+            add_worktree(&repo, path);
+        }
+        let foreign_linked = foreign_root.join("linked");
+        add_worktree(&foreign_repo, &foreign_linked);
+        std::fs::remove_dir_all(&missing).unwrap();
+        // The registered checkout now names another repository's admin
+        // directory: it is not this repository's any more.
+        let foreign_gitdir = std::fs::read(foreign_linked.join(".git")).unwrap();
+        std::fs::write(redirected.join(".git"), &foreign_gitdir).unwrap();
+
+        let inventory = read_worktrees(&repo, MAX_WORKTREES).await.unwrap();
+        assert_eq!(inventory.total, 4);
+        assert!(!inventory.truncated);
+        let paths: Vec<&PathBuf> = inventory
+            .worktrees
+            .iter()
+            .map(|entry| &entry.path)
+            .collect();
+        assert_eq!(paths, [&repo, &std::fs::canonicalize(&kept).unwrap()]);
+
+        // A copy of a linked checkout's `.git` file does not make another
+        // directory that checkout: the admin directory points back elsewhere.
+        let impostor = root.join("impostor");
+        std::fs::create_dir(&impostor).unwrap();
+        std::fs::copy(kept.join(".git"), impostor.join(".git")).unwrap();
+        let impostor = std::fs::canonicalize(impostor).unwrap();
+        assert_eq!(repository_checkout(&repo, &impostor).await.unwrap(), None);
+        let redirected = std::fs::canonicalize(redirected).unwrap();
+        assert_eq!(repository_checkout(&repo, &redirected).await.unwrap(), None);
+        assert_eq!(
+            repository_checkout(&repo, &repo.join("src")).await.unwrap(),
+            None
+        );
+        assert_eq!(
+            repository_checkout(&repo, &repo).await.unwrap(),
+            Some(repo.clone())
+        );
+
         std::fs::remove_dir_all(root).unwrap();
         std::fs::remove_dir_all(foreign_root).unwrap();
     }

@@ -2041,10 +2041,35 @@ fn git_worktrees_path() -> Value {
     json!({
         "get": {
             "summary": "List available Git-linked checkouts of this pane's repository",
-            "description": "Paired-device read, announced as git_worktrees. Uses Git's authoritative worktree inventory and verifies canonical checkout/common-directory identity. Missing, bare, replaced and fenced-out checkouts are omitted. The content envelope data contains current (canonical pane checkout path or null) and worktrees (path, branch, head, detached). Outside a checkout the list is empty. Selecting a worktree on git/status or git/diff never checks out a branch or moves a pane. The existing vcs/discard route always targets the pane's original checkout; lazygit can select a verified linked checkout when pane_lazygit_worktree is advertised.",
+            "description": "Paired-device read, announced as git_worktrees. Uses Git's authoritative worktree inventory, main checkout first, and verifies each entry's canonical checkout/common-directory identity on disk (a linked checkout's .git file and its administrative directory's gitdir back-pointer) without running git per entry. Missing, bare, replaced and fenced-out checkouts are omitted. The content envelope data contains current (canonical pane checkout path or null), worktrees (path, branch, head, detached; at most 512), truncated (true when the list stopped at 512 with entries unchecked, or Git's output hit its size cap) and total (entries Git reported, before verification). A large inventory is cut, never refused. Outside a checkout the list is empty. A worktree selection on git/status, git/diff or lazygit is verified by the same check on its own, so it need not be within the listed 512. Selecting a worktree on git/status or git/diff never checks out a branch or moves a pane. The existing vcs/discard route always targets the pane's original checkout; lazygit can select a verified linked checkout when pane_lazygit_worktree is advertised.",
             "parameters": [path_param("sessionId"), path_param("paneId")],
             "responses": {
-                "200": { "description": "Versioned content envelope with current and worktrees" },
+                "200": {
+                    "description": "Versioned content envelope with current, worktrees, truncated and total",
+                    "content": { "application/json": { "schema": content_envelope_schema(json!({
+                        "type": "object",
+                        "required": ["current", "worktrees", "truncated", "total"],
+                        "properties": {
+                            "current": { "type": ["string", "null"], "description": "Canonical checkout of the pane, or null outside one" },
+                            "worktrees": {
+                                "type": "array",
+                                "maxItems": 512,
+                                "items": {
+                                    "type": "object",
+                                    "required": ["path", "branch", "head", "detached"],
+                                    "properties": {
+                                        "path": { "type": "string" },
+                                        "branch": { "type": ["string", "null"] },
+                                        "head": { "type": ["string", "null"] },
+                                        "detached": { "type": "boolean" }
+                                    }
+                                }
+                            },
+                            "truncated": { "type": "boolean", "description": "The list stopped at 512 with entries unchecked, or Git's output hit its size cap. Absent from older Gateways: treat as false" },
+                            "total": { "type": "integer", "minimum": 0, "description": "Entries Git reported, before verification omitted missing, bare or foreign ones" }
+                        }
+                    })) } }
+                },
                 "403": { "description": "Paired device required" },
                 "504": { "description": "Git inventory timed out" }
             }
