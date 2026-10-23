@@ -736,9 +736,11 @@ pub fn sanitize(value: &str) -> String {
 // Pane skills
 //
 // The skills a pane's agent can be asked to run by name, for a composer that
-// lists them apart from the slash commands. Only agents whose prompt runs a
-// skill typed at the start of a line have a profile: listing a skill the
-// client cannot deliver would be offering a button that does nothing.
+// lists them apart from the slash commands. The client only names a skill;
+// how the agent's prompt takes one is the gateway's (`PaneSkills::line`).
+// Only agents whose prompt runs a skill typed at the start of a line have a
+// profile: listing a skill the gateway cannot deliver would be offering a
+// button that does nothing.
 // ---------------------------------------------------------------------------
 
 /// The most skills one answer carries.
@@ -760,7 +762,8 @@ struct SkillProfile {
     /// `Layout::Skills` workspace directories are where a repo's skills are
     /// read from.
     table: &'static str,
-    /// What the agent's prompt reads as "run this skill" at the start of a line.
+    /// What the agent's prompt reads as "run this skill" at the start of a
+    /// line. Internal: the client never types it.
     prefix: &'static str,
     user: &'static [UserSkills],
     /// Whether the user's skill wins a name both define. False means the
@@ -823,13 +826,61 @@ pub struct PaneSkill {
     pub source: &'static str,
 }
 
-/// The skills a pane's agent can run, and how to type one.
+/// The skills a pane's agent can run, and how the gateway types one.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct PaneSkills {
     /// `None` for an agent with no typed skill invocation; `skills` is then
-    /// empty.
-    pub prefix: Option<&'static str>,
+    /// empty. Never on the wire.
+    prefix: Option<&'static str>,
     pub skills: Vec<PaneSkill>,
+}
+
+/// The longest `args` a skill line carries, in bytes.
+pub const MAX_SKILL_ARGS_BYTES: usize = 4_096;
+
+impl PaneSkills {
+    /// Whether this agent takes a skill typed into its prompt at all.
+    pub fn deliverable(&self) -> bool {
+        self.prefix.is_some()
+    }
+
+    /// The line that runs `name` in this agent's prompt (`/name args` for
+    /// Claude Code and Qoder, `$name args` for Codex), or `None` when the
+    /// agent takes no typed skill or `name` is not one of its listed skills.
+    /// `args` must already be a single line (`skill_args_ok`).
+    pub fn line(&self, name: &str, args: Option<&str>) -> Option<String> {
+        let prefix = self.prefix?;
+        let skill = self.skills.iter().find(|skill| skill.name == name)?;
+        Some(match args.map(str::trim).filter(|args| !args.is_empty()) {
+            Some(args) => format!("{prefix}{} {args}", skill.name),
+            None => format!("{prefix}{}", skill.name),
+        })
+    }
+}
+
+/// A skill name the gateway will type: one plain token,
+/// `^[A-Za-z0-9][A-Za-z0-9._:-]*$`, at most 128 bytes.
+pub fn skill_token(value: &str) -> bool {
+    let mut chars = value.chars();
+    value.len() <= 128
+        && chars.next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '-'))
+}
+
+/// Skill arguments the gateway will type after the name: one line, no control
+/// characters, at most `MAX_SKILL_ARGS_BYTES`.
+pub fn skill_args_ok(value: &str) -> bool {
+    value.len() <= MAX_SKILL_ARGS_BYTES && !value.chars().any(char::is_control)
+}
+
+/// Whether `@` file mentions mean anything to this pane's agent: the composer
+/// descriptor's `file_mentions`, false for an agent with no descriptor (a
+/// plain shell or an unknown program). Reads the command catalog cache, so
+/// call it off the async runtime.
+pub fn file_mentions(agent: Option<&str>) -> bool {
+    descriptor(agent, None)
+        .and_then(|composer| composer["file_mentions"].as_bool())
+        .unwrap_or(false)
 }
 
 /// The skills this pane's agent can run, read from the gateway user's skill
@@ -901,6 +952,8 @@ fn pane_skills_in(
     } else {
         workspace.into_iter().chain(user).collect::<Vec<_>>()
     };
+    // A name the gateway would not type is not offered.
+    skills.retain(|skill| skill_token(&skill.name));
     // Stable, so the first one read under a name -- the one that wins -- is
     // the one kept.
     skills.sort_by(|a, b| a.name.cmp(&b.name));
@@ -1607,30 +1660,73 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
+    /// The client names a skill; the gateway builds the agent's own line, and
+    /// only for a listed skill of an agent that takes one typed.
     #[test]
-    fn only_agents_that_run_a_typed_skill_get_a_prefix_and_a_list() {
+    fn only_agents_that_run_a_typed_skill_get_a_list_and_a_line() {
         let home = workspace("skills-prefix");
         let repo = home.join("repo");
         std::fs::create_dir_all(repo.join(".git")).unwrap();
         for dir in [".claude", ".agents", ".codex", ".qoder", ".opencode"] {
             skill(&repo, &format!("{dir}/skills"), "probe", "---\n---\n");
+            skill(&repo, &format!("{dir}/skills"), "_hidden", "---\n---\n");
         }
-        for (agent, prefix) in [
-            ("Claude Code", Some("/")),
-            ("codex", Some("$")),
-            ("qoder", Some("/")),
+        for (agent, line) in [
+            ("Claude Code", Some("/probe fix the build")),
+            ("codex", Some("$probe fix the build")),
+            ("qoder", Some("/probe fix the build")),
             ("opencode", None),
             ("aider", None),
         ] {
             let found = pane(agent, &repo, &home);
-            assert_eq!(found.prefix, prefix, "{agent}");
-            assert_eq!(found.skills.is_empty(), prefix.is_none(), "{agent}");
+            assert_eq!(found.deliverable(), line.is_some(), "{agent}");
+            assert_eq!(found.skills.is_empty(), line.is_none(), "{agent}");
+            // A name the gateway would not type is never offered.
+            assert!(found.skills.iter().all(|s| s.name != "_hidden"), "{agent}");
+            assert_eq!(
+                found.line("probe", Some("  fix the build ")).as_deref(),
+                line,
+                "{agent}"
+            );
+            assert_eq!(found.line("unlisted", None), None, "{agent}");
         }
+        assert_eq!(
+            pane("codex", &repo, &home)
+                .line("probe", Some(" "))
+                .as_deref(),
+            Some("$probe")
+        );
         assert_eq!(
             pane_skills_in(None, Some(&repo), Some(&home), |_| None),
             PaneSkills::default()
         );
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn skill_names_and_args_the_gateway_types_are_one_plain_line() {
+        for ok in ["commit", "ship-it", "a1", "pkg:task", "v1.2_x"] {
+            assert!(skill_token(ok), "{ok}");
+        }
+        let long = "a".repeat(129);
+        for bad in ["", "-x", "_x", ".x", "a b", "a/b", "a\nb", "ä", &long] {
+            assert!(!skill_token(bad), "{bad:?}");
+        }
+        assert!(skill_args_ok("fix the build, then push"));
+        assert!(skill_args_ok(""));
+        for bad in ["a\nb", "a\rb", "a\tb", "\u{1b}[2J"] {
+            assert!(!skill_args_ok(bad), "{bad:?}");
+        }
+        assert!(!skill_args_ok(&"a".repeat(MAX_SKILL_ARGS_BYTES + 1)));
+    }
+
+    #[test]
+    fn file_mentions_follow_the_agent_table_and_are_off_for_a_shell() {
+        for agent in ["claude", "codex", "opencode", "qoder"] {
+            assert!(file_mentions(Some(agent)), "{agent}");
+        }
+        assert!(!file_mentions(None));
+        assert!(!file_mentions(Some("definitely-not-an-agent")));
     }
 
     #[test]

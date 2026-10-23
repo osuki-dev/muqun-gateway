@@ -2491,8 +2491,23 @@ impl AgentPort for CodexDriver {
                     "Codex file search query is too long".into(),
                 ));
             }
+            // A bare `@`: Codex's fuzzy search matches nothing for an empty
+            // query, so answer the way OpenCode's empty query does -- the
+            // shallowest files of the session's directory -- with the same
+            // fenced walk a pane's `@` uses.
             if query.is_empty() {
-                return Ok(Vec::new());
+                let base = std::path::PathBuf::from(root);
+                let hits = tokio::task::spawn_blocking(move || {
+                    crate::composer::search_files(&base, "", limit)
+                })
+                .await
+                .unwrap_or_default();
+                return Ok(hits
+                    .into_iter()
+                    .map(|hit| format!("{}/{}", root.trim_end_matches('/'), hit.path))
+                    .filter(|path| skill_path_ok(path))
+                    .map(|path| json!({"path": path, "type": "file"}))
+                    .collect());
             }
             let response = self
                 .client

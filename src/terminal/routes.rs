@@ -3290,20 +3290,12 @@ pub(crate) async fn pane_shortcuts(
         .filter(|value| !value.is_empty());
 
     let mut body = shortcuts::resolve(agent, title, cwd);
-    // The skills this agent runs by name, apart from its slash commands.
-    // Reading skill directories is blocking filesystem work, so it runs off
-    // the async runtime; a failure is an empty list, never a failed answer.
-    let skills = {
-        let agent = agent.map(str::to_owned);
-        let cwd = cwd.map(std::path::PathBuf::from);
-        tokio::task::spawn_blocking(move || composer::pane_skills(agent.as_deref(), cwd.as_deref()))
-            .await
-            .unwrap_or_default()
-    };
+    // The skills this agent runs by name, apart from its slash commands. The
+    // client only names one (`POST .../agents/{target}/skill`); how the agent
+    // takes it stays here.
+    let (skills, file_mentions) = pane_skills_and_mentions(pane).await;
     body["skills"] = json!(skills.skills);
-    if let Some(prefix) = skills.prefix {
-        body["skill_prefix"] = json!(prefix);
-    }
+    body["file_mentions"] = json!(file_mentions);
     // Pane state rather than table state, so `KEYMAP_VERSION` does not move
     // with it; it is part of the body, so the ETag does. Best effort: a probe
     // that fails leaves the field out and the client keeps the backend's
@@ -3315,6 +3307,29 @@ pub(crate) async fn pane_shortcuts(
         body["keyboard"] = json!({ "extended": extended });
     }
     Ok(agents::routes::json_etag_response(&headers, body))
+}
+
+/// The skills this pane's agent can run, and whether `@` file mentions mean
+/// anything to it. One reading for the shortcuts answer and the skill route,
+/// so the route refuses exactly what the list leaves out. Reading skill
+/// directories and the command catalog is blocking filesystem work, so it
+/// runs off the async runtime; a failure is no skills, never a failed answer.
+pub(crate) async fn pane_skills_and_mentions(pane: &Value) -> (composer::PaneSkills, bool) {
+    let (agent, _) = shortcuts::pane_identity(pane);
+    let agent = agent.map(str::to_owned);
+    let cwd = pane
+        .get("cwd")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from);
+    tokio::task::spawn_blocking(move || {
+        (
+            composer::pane_skills(agent.as_deref(), cwd.as_deref()),
+            composer::file_mentions(agent.as_deref()),
+        )
+    })
+    .await
+    .unwrap_or_default()
 }
 
 pub(crate) async fn send_pane_keys(
@@ -4805,8 +4820,10 @@ mod tests {
         let body: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["keyboard"], json!({ "extended": true }));
         assert_eq!(body["version"], shortcuts::KEYMAP_VERSION);
-        // A pane with no agent always carries the list, empty, and no prefix.
+        // A pane with no agent always carries the list, empty, offers no file
+        // mentions, and never says how a skill is typed.
         assert_eq!(body["skills"], json!([]));
+        assert_eq!(body["file_mentions"], json!(false));
         assert!(body.get("skill_prefix").is_none());
     }
 

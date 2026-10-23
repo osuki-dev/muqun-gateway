@@ -1701,6 +1701,54 @@ async fn codex_skill_turn_carries_the_skill_file_and_file_search_stays_in_the_wo
         .is_err());
 }
 
+/// A bare `@` (empty query) lists the session directory's files, as OpenCode
+/// does, without asking Codex's fuzzy search, which matches nothing for it.
+#[tokio::test]
+async fn codex_bare_mention_lists_the_session_directory() {
+    let mut fixture = Fixture::new(|request| match request["method"].as_str().unwrap() {
+        "fuzzyFileSearch" => panic!("an empty query must not reach fuzzyFileSearch"),
+        _ => json!({}),
+    })
+    .await;
+    fixture.ready().await;
+    let root = std::env::temp_dir().join(format!(
+        "codex-bare-mention-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    std::fs::write(root.join("README.md"), "").unwrap();
+    std::fs::write(root.join("src/main.rs"), "").unwrap();
+    std::fs::write(root.join(".git/HEAD"), "").unwrap();
+    let root = std::fs::canonicalize(&root).unwrap();
+    let directory = root.to_str().unwrap().to_owned();
+
+    let driver = CodexDriver::new(fixture.client.clone());
+    let files = driver.find_files("  ", 8, Some(&directory)).await.unwrap();
+    let paths: Vec<&str> = files.iter().filter_map(|f| f["path"].as_str()).collect();
+    assert_eq!(
+        paths,
+        [
+            format!("{directory}/README.md"),
+            format!("{directory}/src/main.rs")
+        ]
+    );
+    assert!(files.iter().all(|f| f["type"] == "file"));
+    assert_eq!(
+        driver
+            .find_files("", 1, Some(&directory))
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
 async fn assert_command_is_rejected_without_a_turn(name: &str) {
     let mut fixture = Fixture::new(|request| match request["method"].as_str().unwrap() {
         "thread/read" | "thread/resume" => json!({"thread":golden()["thread"]}),
