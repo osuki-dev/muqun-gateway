@@ -2,6 +2,18 @@
 
 ## Changes and fixes
 
+- **Listing worktrees no longer fails past 128 checkouts.** A repository with
+  more than 128 worktrees answered `GET …/git/worktrees` with `502 git_failed`
+  (the App's "Could not list worktrees"), and every attempt logged
+  `worktree inventory exceeded its entry limit`. The inventory now lists up to
+  512 checkouts, main checkout first, and says when it cut: the envelope's
+  `data` gains `truncated` and `total` (entries Git reported). Listing is also
+  faster: each checkout is verified by reading its `.git` file and the
+  repository's back-pointer instead of running git twice per checkout. A
+  `worktree` selection on `git/status`, `git/diff` and lazygit is verified the
+  same way on its own, so any checkout of the repository can be selected.
+  The new fields are optional; no App update is needed.
+
 - **Captured terminal history is off by default.** The Gateway no longer folds
   what it reads of panes Herdr keeps no scrollback for (Claude Code and other
   alternate-screen programs), in memory or in SQLite checkpoints: it only ever

@@ -3007,8 +3007,10 @@ pub(crate) struct GitStatusQuery {
     pub(crate) worktree: Option<String>,
 }
 
-/// A selected directory must be an exact canonical entry in this pane's Git
-/// inventory. Never accept arbitrary directories or resolve client aliases.
+/// A selected directory must be the exact canonical path of a checkout of
+/// this pane's repository, checked as the Git inventory checks its entries,
+/// so a selection past the inventory's cap still resolves. Never accept
+/// arbitrary directories or resolve client aliases.
 pub(crate) async fn selected_git_worktree(
     checkout: Option<PathBuf>,
     selected: Option<&str>,
@@ -3023,14 +3025,11 @@ pub(crate) async fn selected_git_worktree(
             "this pane is not inside a git checkout",
         ));
     };
-    let inventory = git::worktrees(&checkout).await.map_err(git_error)?;
-    inventory
-        .into_iter()
-        .find(|entry| {
-            entry.path.as_os_str() == std::ffi::OsStr::new(selected)
-                && is_scannable_root(&entry.path)
-        })
-        .map(|entry| Some(entry.path))
+    git::repository_checkout(&checkout, FsPath::new(selected))
+        .await
+        .map_err(git_error)?
+        .filter(|path| is_scannable_root(path))
+        .map(Some)
         .ok_or_else(|| {
             api_error(
                 StatusCode::FORBIDDEN,
@@ -3053,11 +3052,13 @@ pub(crate) async fn pane_git_worktrees(
     };
     let inventory = match checkout.as_ref() {
         Some(checkout) => git::worktrees(checkout).await.map_err(git_error)?,
-        None => Vec::new(),
+        None => git::WorktreeInventory::default(),
     };
     Ok(Json(content_envelope(json!({
         "current": checkout,
-        "worktrees": inventory.iter().filter(|entry| is_scannable_root(&entry.path)).map(git::Worktree::to_json).collect::<Vec<_>>(),
+        "worktrees": inventory.worktrees.iter().filter(|entry| is_scannable_root(&entry.path)).map(git::Worktree::to_json).collect::<Vec<_>>(),
+        "truncated": inventory.truncated,
+        "total": inventory.total,
     }))))
 }
 
