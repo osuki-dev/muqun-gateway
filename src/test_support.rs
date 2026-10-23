@@ -646,6 +646,9 @@ pub(crate) struct FakeHerdr {
     /// methods answer a bare `ok` as before.
     panes: Arc<Mutex<Option<Value>>>,
     agents: Arc<Mutex<Option<Value>>>,
+    /// What `pane.get` and `agent.get` answer once set: one pane running an
+    /// agent.
+    pane: Arc<Mutex<Option<Value>>>,
 }
 
 impl FakeHerdr {
@@ -662,6 +665,8 @@ impl FakeHerdr {
         let listed = Arc::clone(&panes);
         let agents: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
         let listed_agents = agents.clone();
+        let pane: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
+        let one_pane = pane.clone();
         let screens: Vec<String> = screens.into_iter().map(str::to_owned).collect();
         let serving = tokio::spawn(async move {
             let mut reads = 0usize;
@@ -726,6 +731,14 @@ impl FakeHerdr {
                             "active_pane_id": "w1:p9",
                         }
                     }),
+                    ("pane.get" | "agent.get", _) if one_pane.lock().unwrap().is_some() => {
+                        let pane = one_pane.lock().unwrap().clone().unwrap();
+                        if method == "pane.get" {
+                            json!({ "pane": pane })
+                        } else {
+                            json!({ "agent": pane })
+                        }
+                    }
                     ("pane.get", _) => json!({
                         "pane": {
                             "pane_id": request["params"]["pane_id"],
@@ -750,7 +763,13 @@ impl FakeHerdr {
             calls,
             panes,
             agents,
+            pane,
         }
+    }
+
+    /// Answer `pane.get` and `agent.get` with `pane` from now on.
+    pub(crate) fn set_pane(&self, pane: Value) {
+        *self.pane.lock().unwrap() = Some(pane);
     }
 
     pub(crate) fn set_agents(&self, agents: Value) {

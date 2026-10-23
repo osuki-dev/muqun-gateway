@@ -95,8 +95,9 @@ pub(crate) const API_CAPABILITIES: &[&str] = &[
     "codex_transcript_images_v1",
     "pane_parts_native",
     "pane_shortcuts",
-    // `skills` and `skill_prefix` on the shortcuts answer: the skills the
-    // pane's agent runs by name, apart from its slash commands.
+    // `skills` and `file_mentions` on the shortcuts answer, and
+    // `POST /api/sessions/{id}/agents/{target}/skill`: the skills the pane's
+    // agent runs, named by the client and typed by the gateway.
     "pane_skills",
     // The same three Changes routes on a terminal pane, in its cwd.
     "pane_vcs_files",

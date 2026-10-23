@@ -305,27 +305,62 @@ merged into suggestions.
 
 ### Pane skills
 
-Skills are a separate list on the pane shortcuts answer (`GET
-.../panes/{paneId}/shortcuts`), announced as `pane_skills`:
+In every composer `$` is the App's skills entry, the same for every agent; `/`
+is the agent's own commands and `@` files or computers. The App never types an
+agent's skill syntax: it lists the skills and names one, and how the agent
+runs it is the gateway's job. Both halves are announced as `pane_skills`.
+
+The pane shortcuts answer (`GET .../panes/{paneId}/shortcuts`) carries the list
+and whether `@` file mentions mean anything to the pane's agent:
 
 ```json
 {
-  "skill_prefix": "/",
   "skills": [
     { "name": "commit", "description": "Commit the current changes", "source": "user" },
     { "name": "release", "description": "", "source": "workspace" }
-  ]
+  ],
+  "file_mentions": true
 }
 ```
 
-`skill_prefix` is what starts a line that runs a skill in the agent's own
-prompt, and is present only for an agent that has one:
+`file_mentions` is the pane agent's composer descriptor value, false for a
+plain shell or an unknown program.
 
-| Agent | `skill_prefix` | User directories | Workspace directories | A name both define |
-| --- | --- | --- | --- | --- |
-| Claude Code | `/` | `$CLAUDE_CONFIG_DIR/skills`, default `~/.claude/skills` | `.claude/skills` | user wins |
-| Codex | `$` | `~/.agents/skills`, `$CODEX_HOME/skills` (default `~/.codex/skills`) | `.codex/skills`, `.agents/skills` | workspace wins |
-| Qoder | `/` | `~/.qoder/skills` | `.qoder/skills`, `.agents/skills` | user wins |
+`POST /api/sessions/{sessionId}/agents/{target}/skill` runs one:
+
+```json
+{ "skill": "commit", "args": "only the docs" }
+```
+
+`skill` must be a name the list carries right now (one token,
+`^[A-Za-z0-9][A-Za-z0-9._:-]*$`, at most 128 bytes); `args` is optional, one
+line of at most 4096 bytes without control characters. The gateway types the
+agent's own line, submits it through the same path as `.../send` once (an
+ambiguous delivery is never retried), and answers as `.../send` does.
+Refusals:
+
+| Status | `error.code` | When |
+| --- | --- | --- |
+| 400 | `invalid_skill` | `skill` is not one plain token |
+| 400 | `invalid_args` | `args` spans lines, has a control character or is too long |
+| 409 | `skills_unsupported` | the agent takes no skill from the gateway (OpenCode, unknown agents, plain shells) |
+| 404 | `skill_not_found` | the pane's list has no skill by that name |
+
+A target that is not a live agent, and a failed delivery, answer as
+`.../send` does.
+
+Where each agent's skills are read from, and which side wins a name both
+define:
+
+| Agent | User directories | Workspace directories | A name both define |
+| --- | --- | --- | --- |
+| Claude Code | `$CLAUDE_CONFIG_DIR/skills`, default `~/.claude/skills` | `.claude/skills` | user wins |
+| Codex | `~/.agents/skills`, `$CODEX_HOME/skills` (default `~/.codex/skills`) | `.codex/skills`, `.agents/skills` | workspace wins |
+| Qoder | `~/.qoder/skills` | `.qoder/skills`, `.agents/skills` | user wins |
+
+Claude Code's documented skill locations are `.claude/skills` directories
+(personal, project and nested); `.agents/skills` is not one of them, so it is
+not read for Claude Code.
 
 Workspace directories are read in the pane's cwd and each parent up to its
 checkout root (only the cwd outside a checkout, never the home directory),
@@ -334,10 +369,11 @@ nearest first. Each skill is a `<dir>/SKILL.md` whose front matter `name` and
 unusable `name`. Every manifest must canonicalize inside its fence: the home
 directory for a user directory (so a skill linked between agents' directories
 is read), the directory level it was found under for a workspace one. Entries
-are deduplicated by name, sorted by name and capped at 500; an unreadable
-directory or manifest is skipped.
+are deduplicated by name, sorted by name and capped at 500; a name the
+gateway would not type is left out, and an unreadable directory or manifest
+is skipped.
 
-OpenCode has no `skill_prefix` and always answers `skills: []`: its skills
+OpenCode always answers `skills: []`: its skills
 reach the model through its `skill` tool, and its prompt's `@` skill reference
 is a picker mark that text typed into the pane cannot make. Unknown agents and
 plain shells answer the same way.

@@ -117,6 +117,15 @@ pub(crate) struct AgentSendBody {
     pub(crate) text: String,
 }
 
+/// Run one of the pane agent's listed skills by name. The client never types
+/// the agent's own skill syntax; the gateway does.
+#[derive(Deserialize)]
+pub(crate) struct AgentSkillBody {
+    pub(crate) skill: String,
+    #[serde(default)]
+    pub(crate) args: Option<String>,
+}
+
 /// How a client answers a pending approval: by option number, or by what the
 /// answer means. `fingerprint` is optimistic concurrency -- send back the one
 /// the approval was read with and a menu that changed underneath rejects the
@@ -162,6 +171,10 @@ pub fn mount(router: Router<AppState>) -> Router<AppState> {
         .route(
             "/api/sessions/{session_id}/agents/{target}/send",
             post(send_agent),
+        )
+        .route(
+            "/api/sessions/{session_id}/agents/{target}/skill",
+            post(run_agent_skill),
         )
         .route(
             "/api/sessions/{session_id}/panes/{pane_id}/approval",
@@ -1063,6 +1076,82 @@ pub(crate) async fn send_agent(
         .map_err(|err| err.into_api_error("agent.prompt"))?;
     schedule_submit_keypress(session.clone(), target);
     Ok(Json(result))
+}
+
+/// Run one of a pane agent's skills: `{skill, args?}` in, the same answer as
+/// `.../send` out.
+///
+/// The skill must be one the pane's shortcuts answer lists right now (the same
+/// reading, `pane_skills_and_mentions`), so this route never carries arbitrary
+/// text. The gateway builds the agent's own line (`/name args` for Claude Code
+/// and Qoder, `$name args` for Codex) and submits it through the send route's
+/// path, once: an ambiguous delivery is reported, never retried.
+pub(crate) async fn run_agent_skill(
+    State(state): State<AppState>,
+    Path((session_id, target)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(body): Json<AgentSkillBody>,
+) -> ApiResult<Json<Value>> {
+    require_device(&state, &headers)?;
+    check_skill_request(&body)?;
+    let session = find_session(&state.config, &session_id)?;
+    // The target must be a live agent; its pane is what the list is read from.
+    let agent = terminal_backend(session)
+        .get_agent(&target)
+        .await
+        .map_err(backend_api_error)?;
+    let pane = crate::pane_get(session, agent.pane_id.as_str()).await?;
+    let (skills, _) = crate::pane_skills_and_mentions(&pane).await;
+    let line = skill_line(&skills, &body)?;
+    let result = submit_agent_prompt(session, &target, &line)
+        .await
+        .map_err(|err| err.into_api_error("agent.prompt"))?;
+    schedule_submit_keypress(session.clone(), target);
+    Ok(Json(result))
+}
+
+/// The shape of a skill request, before anything is read: one plain token for
+/// `skill`, one bounded line for `args`.
+fn check_skill_request(body: &AgentSkillBody) -> ApiResult<()> {
+    if !crate::composer::skill_token(&body.skill) {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_skill",
+            "skill must be one name of letters, digits, '.', '_', ':' or '-'",
+        ));
+    }
+    if body
+        .args
+        .as_deref()
+        .is_some_and(|args| !crate::composer::skill_args_ok(args))
+    {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_args",
+            "args must be one line of at most 4096 bytes without control characters",
+        ));
+    }
+    Ok(())
+}
+
+/// The line that runs `body.skill` for this agent, or why it cannot run.
+fn skill_line(skills: &crate::composer::PaneSkills, body: &AgentSkillBody) -> ApiResult<String> {
+    if !skills.deliverable() {
+        return Err(api_error(
+            StatusCode::CONFLICT,
+            "skills_unsupported",
+            "This pane's agent does not take skills from the gateway",
+        ));
+    }
+    skills
+        .line(&body.skill, body.args.as_deref())
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::NOT_FOUND,
+                "skill_not_found",
+                "This pane's agent has no skill by that name",
+            )
+        })
 }
 
 /// Whether the pane is blocked on a permission menu, and what it is asking.
@@ -2279,6 +2368,122 @@ mod tests {
     use super::*;
     use crate::agents::tasks;
     use crate::*;
+
+    async fn run_skill(
+        state: &AppState,
+        skill: &str,
+        args: Option<&str>,
+    ) -> Result<Value, (StatusCode, String)> {
+        run_agent_skill(
+            State(state.clone()),
+            Path(("default".to_owned(), "w1:p1".to_owned())),
+            bearer_headers("device-token"),
+            Json(AgentSkillBody {
+                skill: skill.to_owned(),
+                args: args.map(str::to_owned),
+            }),
+        )
+        .await
+        .map(|Json(value)| value)
+        .map_err(|(status, Json(body))| {
+            (status, body["error"]["code"].as_str().unwrap().to_owned())
+        })
+    }
+
+    /// The skill route types only a skill the pane's list carries, in its
+    /// agent's own syntax, through the send path; everything else is refused
+    /// before anything reaches the pane.
+    #[tokio::test]
+    async fn a_pane_skill_runs_only_when_listed_and_in_its_agents_syntax() {
+        let repo = std::env::temp_dir().join(format!(
+            "skill-route-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        for dir in [".claude/skills", ".agents/skills", ".opencode/skills"] {
+            let skill = repo.join(dir).join("probe-skill");
+            std::fs::create_dir_all(&skill).unwrap();
+            std::fs::write(skill.join("SKILL.md"), "---\ndescription: probe\n---\n").unwrap();
+        }
+        let herdr = FakeHerdr::start(vec![""], None);
+        let mut state = test_state("admin", vec![test_device("phone-1", "device-token")]);
+        state.config.sessions = vec![herdr.session()];
+        let pane = |agent: &str| {
+            json!({
+                "pane_id": "w1:p1",
+                "workspace_id": "w1",
+                "tab_id": "w1:t1",
+                "agent": agent,
+                "cwd": repo.to_str().unwrap(),
+            })
+        };
+        let refused = |status: StatusCode, code: &str| Err((status, code.to_owned()));
+
+        herdr.set_pane(pane("claude"));
+        // The list the route checks against is the one the shortcuts answer
+        // carries, and that answer never says how a skill is typed.
+        let shortcuts = crate::pane_shortcuts(
+            State(state.clone()),
+            Path(("default".to_owned(), "w1:p1".to_owned())),
+            bearer_headers("device-token"),
+        )
+        .await
+        .unwrap();
+        let shortcuts = axum::body::to_bytes(shortcuts.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let shortcuts: Value = serde_json::from_slice(&shortcuts).unwrap();
+        assert!(shortcuts["skills"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|skill| skill["name"] == "probe-skill"));
+        assert_eq!(shortcuts["file_mentions"], json!(true));
+        assert!(shortcuts.get("skill_prefix").is_none());
+        assert!(run_skill(&state, "probe-skill", Some("fix the build"))
+            .await
+            .is_ok());
+        assert_eq!(
+            run_skill(&state, "not-listed", None).await,
+            refused(StatusCode::NOT_FOUND, "skill_not_found")
+        );
+        assert_eq!(
+            run_skill(&state, "probe skill", None).await,
+            refused(StatusCode::BAD_REQUEST, "invalid_skill")
+        );
+        assert_eq!(
+            run_skill(&state, "probe-skill", Some("a\nb")).await,
+            refused(StatusCode::BAD_REQUEST, "invalid_args")
+        );
+        herdr.set_pane(pane("codex"));
+        assert!(run_skill(&state, "probe-skill", None).await.is_ok());
+        herdr.set_pane(pane("opencode"));
+        assert_eq!(
+            run_skill(&state, "probe-skill", None).await,
+            refused(StatusCode::CONFLICT, "skills_unsupported")
+        );
+
+        let prompts: Vec<Value> = herdr
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| call["method"] == "agent.prompt")
+            .map(|call| call["params"].clone())
+            .collect();
+        assert_eq!(
+            prompts,
+            [
+                json!({ "target": "w1:p1", "text": "/probe-skill fix the build" }),
+                json!({ "target": "w1:p1", "text": "$probe-skill" }),
+            ]
+        );
+        std::fs::remove_dir_all(&repo).ok();
+    }
 
     /// What a backend error answers on these routes: a refusal is the
     /// request's fault, a target gone since it was listed is not found, and

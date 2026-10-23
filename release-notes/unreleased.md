@@ -2,20 +2,33 @@
 
 ## Changes and fixes
 
-- **A pane's skills are listed apart from its slash commands.** The pane
-  shortcuts answer (`GET /api/sessions/{id}/panes/{pane}/shortcuts`) gains
-  `skills` -- `[{name, description, source}]`, `source` `user` or
-  `workspace` -- and `skill_prefix`, so the App can offer the skills the
-  pane's agent can run. Claude Code (`/`) reads `~/.claude/skills` (or
-  `$CLAUDE_CONFIG_DIR/skills`) and `.claude/skills`; Codex (`$`) reads
+- **A terminal pane's skills run from the App's `$`, like an agent
+  session's.** `$` is the App's skills entry for every agent; the App lists
+  a pane's skills and names one, and how the agent's prompt takes it is the
+  gateway's job. The pane shortcuts answer
+  (`GET /api/sessions/{id}/panes/{pane}/shortcuts`) gains `skills` --
+  `[{name, description, source}]`, `source` `user` or `workspace` -- and
+  `file_mentions`, whether `@` file mentions mean anything to the pane's
+  agent. The new `POST /api/sessions/{id}/agents/{target}/skill`
+  (`{skill, args?}`) runs a listed skill: the gateway types the agent's own
+  line and submits it exactly as `.../send` does, once. A name the list does
+  not carry is `404 skill_not_found`, an agent the gateway delivers no skill
+  to `409 skills_unsupported`, a malformed name or multi-line argument `400
+  invalid_skill` / `invalid_args`. Claude Code reads `~/.claude/skills` (or
+  `$CLAUDE_CONFIG_DIR/skills`) and `.claude/skills`; Codex reads
   `~/.agents/skills`, `$CODEX_HOME/skills` (default `~/.codex/skills`),
-  `.agents/skills` and `.codex/skills`; Qoder (`/`) reads `~/.qoder/skills`,
+  `.agents/skills` and `.codex/skills`; Qoder reads `~/.qoder/skills`,
   `.qoder/skills` and `.agents/skills`. Repository directories are read in the
   pane's directory and each parent up to its checkout root. OpenCode, whose
   skills are loaded by the model rather than typed, other agents and plain
-  shells answer an empty list without a prefix. Slash commands are unchanged.
-  Announced as `pane_skills`; the fields are additive and older Apps ignore
-  them.
+  shells list none. Slash commands are unchanged. Announced as `pane_skills`;
+  the fields and the route are additive and older Apps ignore them.
+
+- **`@` in a Codex session lists files before anything is typed.** A bare
+  `@` (`GET /api/agent-sessions/{asid}/files` with an empty `query`) answered
+  no files for Codex, whose fuzzy search matches nothing for an empty query.
+  It now answers the shallowest files of the session's directory, as an
+  OpenCode session does; a typed query still goes to Codex's own search.
 
 - **Listing worktrees no longer fails past 128 checkouts.** A repository with
   more than 128 worktrees answered `GET …/git/worktrees` with `502 git_failed`
