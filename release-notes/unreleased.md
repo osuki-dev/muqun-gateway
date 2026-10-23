@@ -2,6 +2,21 @@
 
 ## Changes and fixes
 
+- **A pane's skills are listed apart from its slash commands.** The pane
+  shortcuts answer (`GET /api/sessions/{id}/panes/{pane}/shortcuts`) gains
+  `skills` -- `[{name, description, source}]`, `source` `user` or
+  `workspace` -- and `skill_prefix`, so the App can offer the skills the
+  pane's agent can run. Claude Code (`/`) reads `~/.claude/skills` (or
+  `$CLAUDE_CONFIG_DIR/skills`) and `.claude/skills`; Codex (`$`) reads
+  `~/.agents/skills`, `$CODEX_HOME/skills` (default `~/.codex/skills`),
+  `.agents/skills` and `.codex/skills`; Qoder (`/`) reads `~/.qoder/skills`,
+  `.qoder/skills` and `.agents/skills`. Repository directories are read in the
+  pane's directory and each parent up to its checkout root. OpenCode, whose
+  skills are loaded by the model rather than typed, other agents and plain
+  shells answer an empty list without a prefix. Slash commands are unchanged.
+  Announced as `pane_skills`; the fields are additive and older Apps ignore
+  them.
+
 - **Listing worktrees no longer fails past 128 checkouts.** A repository with
   more than 128 worktrees answered `GET …/git/worktrees` with `502 git_failed`
   (the App's "Could not list worktrees"), and every attempt logged

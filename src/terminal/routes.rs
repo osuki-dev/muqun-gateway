@@ -3264,7 +3264,7 @@ pub(crate) async fn pane_get(session: &SessionConfig, pane_id: &str) -> ApiResul
         .unwrap_or_default())
 }
 
-/// The key row and slash commands for whatever this pane is running.
+/// The key row, slash commands and skills for whatever this pane is running.
 ///
 /// Resolving this here rather than in the client means a client picks up a new
 /// agent when the developer updates the gateway, without shipping a new build.
@@ -3290,6 +3290,20 @@ pub(crate) async fn pane_shortcuts(
         .filter(|value| !value.is_empty());
 
     let mut body = shortcuts::resolve(agent, title, cwd);
+    // The skills this agent runs by name, apart from its slash commands.
+    // Reading skill directories is blocking filesystem work, so it runs off
+    // the async runtime; a failure is an empty list, never a failed answer.
+    let skills = {
+        let agent = agent.map(str::to_owned);
+        let cwd = cwd.map(std::path::PathBuf::from);
+        tokio::task::spawn_blocking(move || composer::pane_skills(agent.as_deref(), cwd.as_deref()))
+            .await
+            .unwrap_or_default()
+    };
+    body["skills"] = json!(skills.skills);
+    if let Some(prefix) = skills.prefix {
+        body["skill_prefix"] = json!(prefix);
+    }
     // Pane state rather than table state, so `KEYMAP_VERSION` does not move
     // with it; it is part of the body, so the ETag does. Best effort: a probe
     // that fails leaves the field out and the client keeps the backend's
@@ -4791,6 +4805,9 @@ mod tests {
         let body: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["keyboard"], json!({ "extended": true }));
         assert_eq!(body["version"], shortcuts::KEYMAP_VERSION);
+        // A pane with no agent always carries the list, empty, and no prefix.
+        assert_eq!(body["skills"], json!([]));
+        assert!(body.get("skill_prefix").is_none());
     }
 
     /// On tmux the answer is live pane state: off until the program in the

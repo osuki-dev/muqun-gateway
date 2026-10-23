@@ -1,11 +1,10 @@
 //! Terminal composer capabilities and file mention search.
 //!
 //! Slash commands come exclusively from the downloaded agent-command catalog.
-//! Workspace skills and commands are not merged into the command suggestions.
+//! Workspace skills and commands are not merged into the command suggestions;
+//! the skills a pane's agent can run are a separate list (`pane_skills`).
 
-use std::path::Path;
-#[cfg(test)]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 
@@ -414,12 +413,10 @@ const QODER_COMMANDS: &[BuiltinCommand] = &[
 /// Where each agent reads workspace-local commands from. `.agents/skills` is
 /// the cross-agent convention and appears under every agent that honours it;
 /// the rest are that agent's own directories. Nothing here is guessed: each
-/// path appears in the shipped binary of the agent it is listed under.
-const CLAUDE_WORKSPACE: &[WorkspaceDir] = &[
-    skills(".claude/skills"),
-    skills(".agents/skills"),
-    commands(".claude/commands"),
-];
+/// path is one the agent it is listed under loads from. Claude Code mentions
+/// `.agents/skills` only to import it into `.claude/skills`; its loader reads
+/// `.claude/skills` alone, so the cross-agent directory is not listed for it.
+const CLAUDE_WORKSPACE: &[WorkspaceDir] = &[skills(".claude/skills"), commands(".claude/commands")];
 const CODEX_WORKSPACE: &[WorkspaceDir] = &[skills(".codex/skills"), skills(".agents/skills")];
 const OPENCODE_WORKSPACE: &[WorkspaceDir] = &[
     skills(".opencode/skills"),
@@ -499,7 +496,8 @@ pub fn table_with_id(id: &str) -> Option<&'static CommandTable> {
 // Workspace discovery
 //
 // Read-only, budgeted, and fenced: every path read has to canonicalize inside
-// the workspace root, which is the same rule the asset content endpoint is
+// its root -- the workspace root for a repo's directories, the home directory
+// for the user's own -- which is the same rule the asset content endpoint is
 // gated on.
 // ---------------------------------------------------------------------------
 
@@ -509,7 +507,6 @@ const MAX_WORKSPACE_COMMANDS: usize = 64;
 /// Front matter is at the head of the file, so refusing to read further loses
 /// nothing. Without a cap, a symlink to `/dev/zero` in a skills directory turns
 /// one request into an unbounded read.
-#[cfg(test)]
 const MAX_COMMAND_FILE_BYTES: u64 = 64 * 1024;
 pub const MAX_DESCRIPTION_CHARS: usize = 160;
 
@@ -541,12 +538,29 @@ pub fn workspace_commands(root: &Path, dirs: &[WorkspaceDir]) -> Vec<WorkspaceCo
             continue;
         };
         match dir.layout {
-            Layout::Skills => collect_skills(&path, root, &mut found),
+            Layout::Skills => {
+                let mut skills = Vec::new();
+                collect_skills(
+                    &path,
+                    root,
+                    MAX_WORKSPACE_COMMANDS - found.len(),
+                    &mut skills,
+                );
+                found.extend(skills.into_iter().map(|skill| WorkspaceCommand {
+                    name: format!("/{}", skill.name),
+                    description: if skill.description.is_empty() {
+                        "Workspace skill".to_owned()
+                    } else {
+                        skill.description
+                    },
+                    args_hint: skill.args_hint,
+                }));
+            }
             Layout::Commands => collect_commands(&path, root, &mut found),
         }
     }
     // One name, one command: the first directory listed for an agent wins, so a
-    // repo's `.claude/skills` beats the same name under `.agents/skills`.
+    // repo's `.opencode/skills` beats the same name under `.agents/skills`.
     found.sort_by(|a, b| a.name.cmp(&b.name));
     found.dedup_by(|a, b| a.name == b.name);
     found
@@ -556,27 +570,33 @@ pub fn workspace_commands(root: &Path, dirs: &[WorkspaceDir]) -> Vec<WorkspaceCo
 /// claimed, it has to canonicalize to something inside the root. Canonicalizing
 /// first is what closes symlink escapes -- a link inside the root that points
 /// outside it resolves to the outside path, and fails here.
-#[cfg(test)]
 fn fenced(path: &Path, root: &Path) -> Option<PathBuf> {
     let canonical = std::fs::canonicalize(path).ok()?;
     (canonical != root && canonical.starts_with(root)).then_some(canonical)
 }
 
-#[cfg(test)]
-fn collect_skills(dir: &Path, root: &Path, out: &mut Vec<WorkspaceCommand>) {
+/// One skill directory's manifest, read but not yet placed on the wire.
+struct FoundSkill {
+    name: String,
+    description: String,
+    #[cfg_attr(not(test), allow(dead_code))]
+    args_hint: Option<String>,
+}
+
+/// Every `<name>/SKILL.md` under `dir`, at most `limit` of them, each fenced
+/// inside `root`. An unreadable directory or manifest is skipped, never an
+/// error: one broken skill must not hide the rest.
+fn collect_skills(dir: &Path, root: &Path, limit: usize, out: &mut Vec<FoundSkill>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
+    let mut taken = 0;
     for entry in entries.flatten() {
-        if out.len() >= MAX_WORKSPACE_COMMANDS {
+        if taken >= limit {
             return;
         }
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
-        if !file_type.is_dir() {
-            continue;
-        }
+        // A skill directory may be a link; the fence below decides whether
+        // its target may be read.
         let Some(fallback) = command_name(&entry.file_name().to_string_lossy()) else {
             continue;
         };
@@ -592,14 +612,10 @@ fn collect_skills(dir: &Path, root: &Path, out: &mut Vec<WorkspaceCommand>) {
         let name = field(&text, "name")
             .and_then(|value| command_name(&value))
             .unwrap_or(fallback);
-        let description = field(&text, "description").unwrap_or_default();
-        out.push(WorkspaceCommand {
-            name: format!("/{name}"),
-            description: if description.is_empty() {
-                "Workspace skill".to_owned()
-            } else {
-                description
-            },
+        taken += 1;
+        out.push(FoundSkill {
+            name,
+            description: field(&text, "description").unwrap_or_default(),
             args_hint: field(&text, "argument-hint"),
         });
     }
@@ -645,7 +661,6 @@ fn collect_commands(dir: &Path, root: &Path, out: &mut Vec<WorkspaceCommand>) {
 }
 
 /// A name typed into a live agent, so it may only be a name.
-#[cfg(test)]
 fn command_name(value: &str) -> Option<String> {
     let value = value.trim();
     if value.is_empty()
@@ -661,7 +676,6 @@ fn command_name(value: &str) -> Option<String> {
 
 /// Regular files only, and small ones. A fifo here would block the request
 /// forever, and the workspace root is chosen by whoever created the pane.
-#[cfg(test)]
 fn read_head(path: &Path) -> Option<String> {
     let meta = std::fs::metadata(path).ok()?;
     if !meta.is_file() || meta.len() > MAX_COMMAND_FILE_BYTES {
@@ -672,11 +686,13 @@ fn read_head(path: &Path) -> Option<String> {
 
 /// Reads one flat string key out of a file's YAML front matter. Deliberately
 /// not a YAML parser: these are flat string keys, and pulling in a parser to
-/// read them would be the larger risk.
-#[cfg(test)]
+/// read them would be the larger risk. A folded or literal block (`key: >`,
+/// `key: |-`, ...) is joined into one line, since skill descriptions are
+/// commonly written that way.
 pub fn field(text: &str, key: &str) -> Option<String> {
     let rest = text.strip_prefix("---")?;
-    for line in rest.lines() {
+    let mut lines = rest.lines();
+    while let Some(line) = lines.next() {
         let trimmed = line.trim();
         if trimmed == "---" {
             break;
@@ -687,7 +703,17 @@ pub fn field(text: &str, key: &str) -> Option<String> {
         else {
             continue;
         };
-        let value = sanitize(value);
+        let value = if matches!(value.trim(), ">" | ">-" | ">+" | "|" | "|-" | "|+") {
+            lines
+                .take_while(|next| next.starts_with([' ', '\t']) || next.trim().is_empty())
+                .map(str::trim)
+                .filter(|next| !next.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ")
+        } else {
+            value.to_owned()
+        };
+        let value = sanitize(&value);
         return (!value.is_empty()).then_some(value);
     }
     None
@@ -704,6 +730,227 @@ pub fn sanitize(value: &str) -> String {
         .filter(|c| !c.is_control())
         .take(MAX_DESCRIPTION_CHARS)
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Pane skills
+//
+// The skills a pane's agent can be asked to run by name, for a composer that
+// lists them apart from the slash commands. Only agents whose prompt runs a
+// skill typed at the start of a line have a profile: listing a skill the
+// client cannot deliver would be offering a button that does nothing.
+// ---------------------------------------------------------------------------
+
+/// The most skills one answer carries.
+const MAX_PANE_SKILLS: usize = 500;
+/// How many manifests one answer may read, duplicates included: the same skill
+/// is often linked into several agents' directories.
+const MAX_SKILL_READS: usize = 2_000;
+
+/// A user-level skills directory: `<base>/skills`, where `base` is `$env` when
+/// that is set and `~/<home>` otherwise.
+struct UserSkills {
+    env: Option<&'static str>,
+    home: &'static str,
+}
+
+/// How one agent family takes a skill typed into its prompt.
+struct SkillProfile {
+    /// The `CommandTable` id this profile extends; that table's
+    /// `Layout::Skills` workspace directories are where a repo's skills are
+    /// read from.
+    table: &'static str,
+    /// What the agent's prompt reads as "run this skill" at the start of a line.
+    prefix: &'static str,
+    user: &'static [UserSkills],
+    /// Whether the user's skill wins a name both define. False means the
+    /// workspace's does.
+    user_wins: bool,
+}
+
+/// Claude Code runs a skill as `/name`, loads `$CLAUDE_CONFIG_DIR/skills`
+/// (default `~/.claude/skills`), and lets a personal skill beat a project one
+/// of the same name. Codex takes `$name` as a skill mention, loads
+/// `~/.agents/skills` and, as its older home, `$CODEX_HOME/skills`, and names
+/// no precedence (both appear in its own picker), so the workspace's wins.
+/// Qoder runs a skill as `/name` from `~/.qoder/skills`, the user's winning.
+///
+/// OpenCode has no profile: its skills reach the model through its `skill`
+/// tool, and the only typed reference is an `@` picker entry its prompt keeps
+/// as a mark rather than as text, which text typed into the pane cannot make.
+const SKILL_PROFILES: &[SkillProfile] = &[
+    SkillProfile {
+        table: "claude",
+        prefix: "/",
+        user: &[UserSkills {
+            env: Some("CLAUDE_CONFIG_DIR"),
+            home: ".claude",
+        }],
+        user_wins: true,
+    },
+    SkillProfile {
+        table: "codex",
+        prefix: "$",
+        user: &[
+            UserSkills {
+                env: None,
+                home: ".agents",
+            },
+            UserSkills {
+                env: Some("CODEX_HOME"),
+                home: ".codex",
+            },
+        ],
+        user_wins: false,
+    },
+    SkillProfile {
+        table: "qoder",
+        prefix: "/",
+        user: &[UserSkills {
+            env: None,
+            home: ".qoder",
+        }],
+        user_wins: true,
+    },
+];
+
+/// One skill as it goes out on the wire.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct PaneSkill {
+    pub name: String,
+    pub description: String,
+    /// `user` or `workspace`.
+    pub source: &'static str,
+}
+
+/// The skills a pane's agent can run, and how to type one.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct PaneSkills {
+    /// `None` for an agent with no typed skill invocation; `skills` is then
+    /// empty.
+    pub prefix: Option<&'static str>,
+    pub skills: Vec<PaneSkill>,
+}
+
+/// The skills this pane's agent can run, read from the gateway user's skill
+/// directories and the pane's workspace. Blocking filesystem work: call it off
+/// the async runtime.
+pub fn pane_skills(agent: Option<&str>, cwd: Option<&Path>) -> PaneSkills {
+    let home = dirs::home_dir().and_then(|home| std::fs::canonicalize(home).ok());
+    pane_skills_in(agent, cwd, home.as_deref(), |key| std::env::var_os(key))
+}
+
+fn pane_skills_in(
+    agent: Option<&str>,
+    cwd: Option<&Path>,
+    home: Option<&Path>,
+    env: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> PaneSkills {
+    let Some(table) = table_for(agent) else {
+        return PaneSkills::default();
+    };
+    let Some(profile) = SKILL_PROFILES.iter().find(|entry| entry.table == table.id) else {
+        return PaneSkills::default();
+    };
+
+    let mut budget = MAX_SKILL_READS;
+    let mut user = Vec::new();
+    for dir in profile.user {
+        let base = match dir.env.and_then(&env).filter(|value| !value.is_empty()) {
+            Some(value) => PathBuf::from(value),
+            None => match home {
+                Some(home) => home.join(dir.home),
+                None => continue,
+            },
+        };
+        let Ok(base) = std::fs::canonicalize(&base) else {
+            continue;
+        };
+        // The user's skills are commonly links between agents' directories
+        // (`~/.claude/skills/x -> ~/.agents/skills/x`), so the fence is the
+        // home directory rather than the skills directory; a base its variable
+        // puts outside home is its own fence.
+        let root = match home {
+            Some(home) if base.starts_with(home) => home.to_path_buf(),
+            _ => base.clone(),
+        };
+        let Some(path) = fenced(&base.join("skills"), &root) else {
+            continue;
+        };
+        read_into(&path, &root, "user", &mut budget, &mut user);
+    }
+
+    let mut workspace = Vec::new();
+    for level in cwd
+        .map(|cwd| workspace_levels(cwd, home))
+        .unwrap_or_default()
+    {
+        for dir in table.workspace {
+            if dir.layout != Layout::Skills {
+                continue;
+            }
+            let Some(path) = fenced(&level.join(dir.path), &level) else {
+                continue;
+            };
+            read_into(&path, &level, "workspace", &mut budget, &mut workspace);
+        }
+    }
+
+    let mut skills = if profile.user_wins {
+        user.into_iter().chain(workspace).collect::<Vec<_>>()
+    } else {
+        workspace.into_iter().chain(user).collect::<Vec<_>>()
+    };
+    // Stable, so the first one read under a name -- the one that wins -- is
+    // the one kept.
+    skills.sort_by(|a, b| a.name.cmp(&b.name));
+    skills.dedup_by(|a, b| a.name == b.name);
+    skills.truncate(MAX_PANE_SKILLS);
+    PaneSkills {
+        prefix: Some(profile.prefix),
+        skills,
+    }
+}
+
+fn read_into(
+    dir: &Path,
+    root: &Path,
+    source: &'static str,
+    budget: &mut usize,
+    out: &mut Vec<PaneSkill>,
+) {
+    let mut found = Vec::new();
+    collect_skills(dir, root, *budget, &mut found);
+    *budget -= found.len();
+    out.extend(found.into_iter().map(|skill| PaneSkill {
+        name: skill.name,
+        description: skill.description,
+        source,
+    }));
+}
+
+/// The directories a repo's skills are read from for a pane in `cwd`, nearest
+/// first: the directory itself and every parent up to its checkout root, the
+/// way Claude Code and Codex walk them. Outside a checkout, only `cwd`. Never
+/// the home directory, whose skills are the user's own.
+fn workspace_levels(cwd: &Path, home: Option<&Path>) -> Vec<PathBuf> {
+    let Ok(cwd) = std::fs::canonicalize(cwd) else {
+        return Vec::new();
+    };
+    let mut levels = Vec::new();
+    let mut dir = cwd.as_path();
+    while Some(dir) != home {
+        levels.push(dir.to_path_buf());
+        if dir.join(".git").exists() {
+            return levels;
+        }
+        let Some(parent) = dir.parent() else {
+            break;
+        };
+        dir = parent;
+    }
+    levels.truncate(1);
+    levels
 }
 
 // ---------------------------------------------------------------------------
@@ -1165,7 +1412,7 @@ mod tests {
         );
         skill(
             &root,
-            ".agents/skills",
+            ".claude/skills",
             "dev-workflow",
             "---\nname: dev-workflow\ndescription: The card-backed development flow\n---\n",
         );
@@ -1239,6 +1486,7 @@ mod tests {
         std::fs::create_dir_all(root.join(".agents/skills")).unwrap();
         std::os::unix::fs::symlink(outside.join("secret"), root.join(".agents/skills/borrowed"))
             .unwrap();
+        assert!(workspace_commands(&root, CODEX_WORKSPACE).is_empty());
         // And one command file is a link out of it.
         std::fs::create_dir_all(root.join(".claude/commands")).unwrap();
         std::os::unix::fs::symlink(
@@ -1314,6 +1562,162 @@ mod tests {
         );
         assert!(field("no front matter\n", "description").is_none());
         assert!(field("---\ndescription:\n---\n", "description").is_none());
+    }
+
+    // -- pane skills --------------------------------------------------------
+
+    fn pane(agent: &str, cwd: &Path, home: &Path) -> PaneSkills {
+        pane_skills_in(Some(agent), Some(cwd), Some(home), |_| None)
+    }
+
+    fn listed(found: &PaneSkills) -> Vec<(&str, &str)> {
+        found
+            .skills
+            .iter()
+            .map(|skill| (skill.name.as_str(), skill.source))
+            .collect()
+    }
+
+    #[test]
+    fn a_skill_reads_its_name_and_a_block_description_from_front_matter() {
+        let home = workspace("skills-home");
+        skill(
+            &home,
+            ".claude/skills",
+            "dir-name",
+            "---\nname: ship-it\ndescription: >-\n  Cut a release\n  and publish it.\nother: x\n---\nbody\n",
+        );
+        skill(&home, ".claude/skills", "bare", "no front matter\n");
+        let found = pane_skills_in(Some("claude"), None, Some(&home), |_| None);
+        assert_eq!(
+            found.skills,
+            vec![
+                PaneSkill {
+                    name: "bare".into(),
+                    description: String::new(),
+                    source: "user",
+                },
+                PaneSkill {
+                    name: "ship-it".into(),
+                    description: "Cut a release and publish it.".into(),
+                    source: "user",
+                },
+            ]
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn only_agents_that_run_a_typed_skill_get_a_prefix_and_a_list() {
+        let home = workspace("skills-prefix");
+        let repo = home.join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        for dir in [".claude", ".agents", ".codex", ".qoder", ".opencode"] {
+            skill(&repo, &format!("{dir}/skills"), "probe", "---\n---\n");
+        }
+        for (agent, prefix) in [
+            ("Claude Code", Some("/")),
+            ("codex", Some("$")),
+            ("qoder", Some("/")),
+            ("opencode", None),
+            ("aider", None),
+        ] {
+            let found = pane(agent, &repo, &home);
+            assert_eq!(found.prefix, prefix, "{agent}");
+            assert_eq!(found.skills.is_empty(), prefix.is_none(), "{agent}");
+        }
+        assert_eq!(
+            pane_skills_in(None, Some(&repo), Some(&home), |_| None),
+            PaneSkills::default()
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn a_name_both_define_goes_to_the_side_the_agent_prefers() {
+        let home = workspace("skills-precedence");
+        let repo = home.join("repo");
+        let cwd = repo.join("packages/app");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        // Claude Code: a personal skill beats a project one.
+        skill(
+            &home,
+            ".claude/skills",
+            "deploy",
+            "---\ndescription: mine\n---\n",
+        );
+        skill(
+            &repo,
+            ".claude/skills",
+            "deploy",
+            "---\ndescription: repo\n---\n",
+        );
+        skill(&repo, ".claude/skills", "lint", "---\n---\n");
+        let claude = pane("claude", &cwd, &home);
+        assert_eq!(
+            listed(&claude),
+            vec![("deploy", "user"), ("lint", "workspace")]
+        );
+        assert_eq!(claude.skills[0].description, "mine");
+
+        // Codex names no precedence, so the workspace's wins, and the level
+        // nearest the pane beats the checkout root.
+        skill(&home, ".agents/skills", "deploy", "---\n---\n");
+        skill(
+            &repo,
+            ".agents/skills",
+            "deploy",
+            "---\ndescription: root\n---\n",
+        );
+        skill(
+            &cwd,
+            ".agents/skills",
+            "deploy",
+            "---\ndescription: near\n---\n",
+        );
+        let codex = pane("codex", &cwd, &home);
+        assert_eq!(listed(&codex), vec![("deploy", "workspace")]);
+        assert_eq!(codex.skills[0].description, "near");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn a_skill_linked_out_of_its_fence_is_skipped() {
+        let home = workspace("skills-fence");
+        let outside = workspace("skills-fence-outside");
+        skill(&outside, "", "secret", "---\ndescription: not yours\n---\n");
+        let repo = home.join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+
+        // In the user's directories the fence is home: a link between agents'
+        // directories is read, a link out of home is not.
+        skill(&home, ".agents/skills", "shared", "---\n---\n");
+        std::fs::create_dir_all(home.join(".claude/skills")).unwrap();
+        std::os::unix::fs::symlink(
+            home.join(".agents/skills/shared"),
+            home.join(".claude/skills/shared"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(outside.join("secret"), home.join(".claude/skills/secret"))
+            .unwrap();
+        // In a workspace the fence is the directory it was found under, so a
+        // link from the repo into home is skipped too.
+        std::fs::create_dir_all(repo.join(".claude/skills")).unwrap();
+        std::os::unix::fs::symlink(
+            home.join(".agents/skills/shared"),
+            repo.join(".claude/skills/borrowed"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(outside.join("secret"), repo.join(".claude/skills/leak"))
+            .unwrap();
+
+        assert_eq!(
+            listed(&pane("claude", &repo, &home)),
+            vec![("shared", "user")]
+        );
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&outside).ok();
     }
 
     // -- the descriptor -----------------------------------------------------
