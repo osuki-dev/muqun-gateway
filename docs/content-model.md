@@ -303,6 +303,45 @@ returns an empty `slash_commands` array; an agent with neither a profile nor a
 catalog has no composer descriptor. Workspace skills and command files are not
 merged into suggestions.
 
+### Pane skills
+
+Skills are a separate list on the pane shortcuts answer (`GET
+.../panes/{paneId}/shortcuts`), announced as `pane_skills`:
+
+```json
+{
+  "skill_prefix": "/",
+  "skills": [
+    { "name": "commit", "description": "Commit the current changes", "source": "user" },
+    { "name": "release", "description": "", "source": "workspace" }
+  ]
+}
+```
+
+`skill_prefix` is what starts a line that runs a skill in the agent's own
+prompt, and is present only for an agent that has one:
+
+| Agent | `skill_prefix` | User directories | Workspace directories | A name both define |
+| --- | --- | --- | --- | --- |
+| Claude Code | `/` | `$CLAUDE_CONFIG_DIR/skills`, default `~/.claude/skills` | `.claude/skills` | user wins |
+| Codex | `$` | `~/.agents/skills`, `$CODEX_HOME/skills` (default `~/.codex/skills`) | `.codex/skills`, `.agents/skills` | workspace wins |
+| Qoder | `/` | `~/.qoder/skills` | `.qoder/skills`, `.agents/skills` | user wins |
+
+Workspace directories are read in the pane's cwd and each parent up to its
+checkout root (only the cwd outside a checkout, never the home directory),
+nearest first. Each skill is a `<dir>/SKILL.md` whose front matter `name` and
+`description` are used, the directory name standing in for a missing or
+unusable `name`. Every manifest must canonicalize inside its fence: the home
+directory for a user directory (so a skill linked between agents' directories
+is read), the directory level it was found under for a workspace one. Entries
+are deduplicated by name, sorted by name and capped at 500; an unreadable
+directory or manifest is skipped.
+
+OpenCode has no `skill_prefix` and always answers `skills: []`: its skills
+reach the model through its `skill` tool, and its prompt's `@` skill reference
+is a picker mark that text typed into the pane cannot make. Unknown agents and
+plain shells answer the same way.
+
 The catalog parser bounds download size, command count, names, descriptions and
 argument hints. An invalid download is refused before replacing a cached file.
 An installed CLI version, a downloaded command catalog and a verified protocol

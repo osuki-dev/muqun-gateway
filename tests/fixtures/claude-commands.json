@@ -183,10 +183,6 @@
       "path": ".claude/skills"
     },
     {
-      "layout": "skills",
-      "path": ".agents/skills"
-    },
-    {
       "layout": "commands",
       "path": ".claude/commands"
     }
