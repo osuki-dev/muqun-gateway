@@ -63,10 +63,6 @@ pub(crate) const API_CAPABILITIES: &[&str] = &[
     "agent_timeline",
     // Older timeline pages; adapter support is separately declared per agent.
     "agent_timeline_earlier_v1",
-    // `GET /api/agents/transcripts/{agent}/{session_id}` (and `/head`): a
-    // terminal agent's on-disk transcript as timeline pages. Which agents
-    // have a reader is the separate `agent_transcripts` list.
-    "agent_transcripts_v1",
     "agent_vcs",
     // `vcs/files`, `vcs/file` and `vcs/discard` on an agent session: git in
     // the session's directory, for every agent.
@@ -365,7 +361,6 @@ pub(crate) async fn gateway_metadata(
         "planes": planes,
         "serverId": state.config.server_id,
         "label": state.config.label,
-        "agent_transcripts": crate::agents::transcripts::supported_agents(),
         "transportSecurity": {
             "protection": transport_protection(&state.config),
             // Was hardcoded `false`, on a gateway whose default is

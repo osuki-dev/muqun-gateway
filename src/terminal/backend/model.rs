@@ -211,11 +211,8 @@ pub struct Pane {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Agent {
-    /// Producer conversation identity: Herdr's `agent_session.value`, kept
-    /// only when its `kind` is `id` and its `agent` matches `kind` below.
-    /// Never inferred from the working directory. Serialized by the
-    /// compatibility API as `agent_session` (`{kind: "id", agent, value}`), the
-    /// key the App reads a terminal agent's transcript by.
+    /// Producer conversation identity. Internal only: never serialized by
+    /// the compatibility API and never inferred from the working directory.
     pub conversation_id: Option<String>,
     /// Opaque identity of this process/conversation, never a reusable pane id.
     pub instance_id: Option<String>,

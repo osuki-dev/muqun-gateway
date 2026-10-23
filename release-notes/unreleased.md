@@ -12,19 +12,14 @@
   restore the previous behavior; `GET /api/history/storage` reports `capture`.
   No App update is needed.
 
-- **Claude Code history for terminal panes.** Herdr keeps no scrollback for
-  Claude Code's repainting screen, so the Gateway now reads Claude Code's own
-  session transcript (`~/.claude/projects/<project>/<session>.jsonl`, or under
-  `CLAUDE_CONFIG_DIR`) read-only and serves it as ordinary timeline pages:
-  `GET /api/agents/transcripts/claude/{session_id}` (newest page first, with
-  an older-page cursor) and `.../head` for cheap change polling. Announced as
-  `agent_transcripts_v1` with `agent_transcripts: ["claude"]`; the session id
-  is the pane's Herdr `agent_session` value, forwarded on the pane's agent
-  entry in `/agents` and `/snapshot` as `agent_session` (`kind`, `agent`,
-  `value`); 0.14.1-preview.4 advertised the routes but did not forward it, so
-  the App found no transcript there. Large transcripts are indexed
-  once and then only extended as they grow. No configuration change is
-  needed; the App needs an update to show it.
+- **Terminal agent transcripts are removed again.** The
+  `GET /api/agents/transcripts/{agent}/{session_id}` and `.../head` routes,
+  the `agent_transcripts_v1` capability, the `agent_transcripts` field of
+  `/health` and `/api/discovery`, and the `agent_session` field on pane agent
+  entries in `/agents` and `/snapshot`, all added in 0.14.1-preview.4 and
+  preview.5, are gone because no client reads them: the App dropped its
+  read-only Claude Code conversation view. The Gateway no longer opens Claude
+  Code's session files. No configuration change is needed.
 
 - **Codex has a "Waiting to send" inbox.** A prompt sent to a busy Codex
   session with `delivery: "queue"` now waits in a Gateway-owned queue instead
@@ -276,7 +271,11 @@ protocol 1 and everything documented for it.
   `inbox: false` and keep the steer-only path. Showing queued Codex prompts,
   and thumbnails on any queued prompt, needs an App that reads the inbox for
   Codex and the new item fields.
-- No capability, field, or endpoint was removed or renamed.
+- **Transcripts, against 0.14.1-preview.4 or preview.5.** An App that asked
+  for a terminal agent's transcript sees `agent_transcripts_v1` absent and
+  keeps showing the terminal; pane agent entries no longer carry
+  `agent_session`. Nothing a stable release served was removed.
+- Apart from that, no capability, field, or endpoint was removed or renamed.
 
 ## Upgrade
 

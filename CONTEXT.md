@@ -45,13 +45,6 @@ The retired `herdr.gateway` identifier remains only for migration compatibility.
     dispatch, agent spawn, prompt delivery, approvals, and agent event history.
   - `tasks.rs`, `agent_events.rs`, `approvals.rs`: task step logs, the agent
     status transition ring, and approval classification.
-  - `transcripts/`: read-only transcripts of terminal agents (Claude Code
-    first) as timeline pages, behind `agent_transcripts_v1`. One
-    `TranscriptReader` per agent (root, session-id shape, locate, line
-    classification, projection); a shared path fence, line-offset index
-    cache, tail paging with identity-bound cursors, and the `head` probe.
-    Agents with a native adapter never use it. See
-    [Agent API](docs/agent-api.md#terminal-agent-transcripts).
 - `src/terminal/`: terminal control plane.
   - `backend/model.rs`: backend-neutral entities, commands, errors, and the
     `TerminalBackend` port. The port is the test surface for synchronous terminal
