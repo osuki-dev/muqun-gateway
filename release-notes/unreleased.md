@@ -2,6 +2,12 @@
 
 ## Changes and fixes
 
+- **Muqun tool activity remains visible in agent conversations.** Pending,
+  running, completed and failed Muqun MCP calls now reach the App's tool UI
+  across OpenCode, DeepSeek, T3 and Codex. Catalog discovery and pending
+  `execute` calls remain visible too. Task completion markers and internal
+  instructions retain their existing sanitation.
+
 - **Optional Home task collection for Muqun 4.0.** Gateways advertise
   `home_task_summary_v1` and `home_task_collector_v1`. An App can subscribe to
   bounded task snapshots and changes on its existing encrypted WebSocket, or

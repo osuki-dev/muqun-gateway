@@ -4232,7 +4232,7 @@ mod tests {
                 let end = (offset+r["params"]["limit"].as_u64().unwrap() as usize).min(181);
                 let rows: Vec<_> = (offset..end).map(|n| {
                     let item = if n == 180 {
-                        json!({"type":"dynamicToolCall","id":"hidden","tool":"muqun.tasks.list","arguments":{},"status":"completed"})
+                        json!({"type":"dynamicToolCall","id":"muqun-tool","tool":"muqun.tasks.list","arguments":{},"status":"completed"})
                     } else {
                         json!({"type":"agentMessage","id":format!("item-{}",181-n),"text":"synthetic"})
                     };
@@ -4273,11 +4273,10 @@ mod tests {
         let Json(last) = do_load_earlier_timeline(&state, &id, &device_headers())
             .await
             .unwrap();
-        assert_eq!(
-            last["data"]["items"],
-            json!([]),
-            "internal tool row is filtered"
-        );
+        let last_items = last["data"]["items"].as_array().unwrap();
+        assert_eq!(last_items.len(), 1);
+        assert_eq!(last_items[0]["part"]["name"], "muqun.tasks.list");
+        assert_eq!(last_items[0]["part"]["status"], "completed");
         assert_eq!(last["data"]["exhausted"], false);
         let Json(end) = do_load_earlier_timeline(&state, &id, &device_headers())
             .await

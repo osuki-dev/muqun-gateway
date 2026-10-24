@@ -1932,19 +1932,16 @@ tail it cannot place.
 
 ### Task plumbing in the transcript
 
-Every session is served without the muqun MCP server's tool rows -- on the
-snapshot, the timeline, the event replay, the SSE stream and `/api/ws`: a
-tool row named for that server under any host's prefix (`muqun_tasks_wait`,
-`mcp__muqun__exec.run`, `muqun.fleet.list`, …), any tool it has or will
-have, in every state (pending, running, completed, failed). They are
-internal; what a person sees of a delegation is its row on Home, the
-parent's `progress` (`Waiting for mini · 3 min`) and the result line the
-gateway tells the parent session ([mcp.md](mcp.md#being-told-how-a-delegation-ended)).
-A tool of the same name with no server prefix, or another server's, stays.
-The agent's own prose is untouched.
+Muqun MCP tool calls are visible in every session on snapshots, timelines,
+event replay, SSE and `/api/ws`, including pending, streaming, running,
+completed and failed calls. Provider-specific names remain intact, including
+OpenCode's `muqun_tasks_wait`, DeepSeek and T3 tool names, and Codex's
+`muqun:exec.run` and dynamic tool names. Catalog discovery and `execute`
+calls remain visible even before their code is known. Skill-loading rows
+retain their existing presentation policy.
 
 A session a task is (or was) bound to ([docs/mcp.md](mcp.md#finishing-a-delegation))
-is also served without the rest of the gateway's task plumbing, there and
+is served without the gateway's task plumbing, there and
 on `GET …/inbox`:
 
 - A user `text` row (or a `synthetic` row) that ends with the completion
@@ -1966,13 +1963,8 @@ on `GET …/inbox`:
   counting, so a client may see a gap where a row was left out.
 - The notice OpenCode leaves for the task's per-session instruction
   (`Instructions updated: …muqun-task`) is left out.
-- OpenCode's Code Mode plumbing is left out: an `execute` tool row (held while
-  its code is not known yet and the turn runs) whose whole code is
-  `[return] search({query: '<string>'[, limit: <integer>]})[;]` for a muqun
-  tool (a query starting `muqun`, or naming `tasks.`, `fleet.` or
-  `exec.run`) and did not fail -- anything more is the agent's own work and
-  is shown -- and the notice whose first line is "The Code Mode tool catalog
-  has changed." followed only by the catalog listing.
+- OpenCode's notice whose first line is "The Code Mode tool catalog has
+  changed." followed only by the catalog listing is left out.
 - An inbox item (`GET …/inbox`, the snapshot's `inbox`,
   `agent.inbox.changed`) is cut the same way as a user row: OpenCode holds
   the instruction there for a moment before the turn runs.
