@@ -20,6 +20,8 @@ const MAX_HISTORY_ITEMS: usize = 2000;
 const MAX_HISTORY_RETAINED_BYTES: usize = 32 * 1024 * 1024;
 // Leave room to insert an older authoritative prefix before a live/tail anchor.
 const FIRST_ITEM_POSITION: u64 = 1 << 63;
+// Live observation can skip items that a later authoritative page fills in.
+const ITEM_POSITION_STEP: u64 = 1 << 32;
 
 pub struct CodexDriver {
     client: Arc<CodexClient>,
@@ -663,7 +665,7 @@ impl CodexDriver {
                 .filter(|((t, u, _), _)| t == thread && u == turn)
                 .map(|(_, position)| *position)
                 .max()
-                .map(|position| position.checked_add(1))
+                .map(|position| position.checked_add(ITEM_POSITION_STEP))
                 .unwrap_or(Some(FIRST_ITEM_POSITION))
                 .ok_or_else(|| {
                     AgentError::Protocol("Codex item-order range exhausted; resync required".into())
@@ -713,57 +715,91 @@ impl CodexDriver {
                 "Codex history item-order capacity exhausted; page not consumed".into(),
             ));
         }
-        // Preserve a shared anchor when a larger or newer tail is requested.
-        // Provider array order is authoritative even when Unix clocks regress.
-        let anchor = ids.iter().enumerate().find_map(|(index, id)| {
-            order
-                .get(&key(id))
-                .map(|p| p.checked_sub(index as u64).ok_or_else(range_error))
-        });
-        let base = if let Some(base) = anchor {
-            base?
-        } else if prefix {
-            order
-                .iter()
-                .filter(|((t, u, _), _)| t == thread && u == turn)
-                .map(|(_, p)| *p)
-                .min()
-                .map(|p| p.checked_sub(ids.len() as u64))
-                .unwrap_or(Some(FIRST_ITEM_POSITION))
-                .ok_or_else(range_error)?
-        } else {
-            order
-                .iter()
-                .filter(|((t, u, _), _)| t == thread && u == turn)
-                .map(|(_, p)| *p)
-                .max()
-                .map(|p| p.checked_add(1))
-                .unwrap_or(Some(FIRST_ITEM_POSITION))
-                .ok_or_else(range_error)?
-        };
-        let end = base
-            .checked_add(ids.len() as u64 - 1)
-            .ok_or_else(range_error)?;
-        // Never renumber a live or already displayed row. Conflicting anchors
-        // and occupied positions fail rather than silently moving the viewport.
-        for ((t, u, id), position) in order.iter() {
-            if t != thread || u != turn || *position < base || *position > end {
+        let mut positions: Vec<_> = ids.iter().map(|id| order.get(&key(id)).copied()).collect();
+        let anchors: Vec<_> = positions.iter().flatten().copied().collect();
+        if anchors.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(range_error());
+        }
+        let mut occupied: std::collections::BTreeSet<u64> = order
+            .iter()
+            .filter(|((t, u, _), _)| t == thread && u == turn)
+            .map(|(_, p)| *p)
+            .collect();
+        let mut cursor = 0;
+        while cursor < positions.len() {
+            if positions[cursor].is_some() {
+                cursor += 1;
                 continue;
             }
-            if ids.get((*position - base) as usize) != Some(id) {
+            let start = cursor;
+            while cursor < positions.len() && positions[cursor].is_none() {
+                cursor += 1;
+            }
+            let count = cursor - start;
+            let mut left = start.checked_sub(1).and_then(|i| positions[i]);
+            let mut right = positions.get(cursor).copied().flatten();
+            // A disjoint page belongs before/after the retained range. An
+            // overlapping page uses all known anchors, not a contiguous offset.
+            match (left, right) {
+                (None, None) if prefix => right = occupied.first().copied(),
+                (None, None) => left = occupied.last().copied(),
+                (None, Some(upper)) => left = occupied.range(..upper).next_back().copied(),
+                (Some(lower), None) => {
+                    right = occupied
+                        .range((std::ops::Bound::Excluded(lower), std::ops::Bound::Unbounded))
+                        .next()
+                        .copied()
+                }
+                _ => {}
+            }
+            let step = i128::from(ITEM_POSITION_STEP);
+            let count = count as i128;
+            let (base, stride, upper) = match (left, right) {
+                (Some(lower), Some(upper)) => {
+                    let gap = i128::from(upper) - i128::from(lower);
+                    (i128::from(lower), gap / (count + 1), i128::from(upper))
+                }
+                (None, Some(upper)) => {
+                    let stride = step.min((i128::from(upper) + 1) / (count + 1));
+                    (
+                        i128::from(upper) - stride * (count + 1),
+                        stride,
+                        i128::from(upper),
+                    )
+                }
+                (Some(lower), None) => (i128::from(lower), step, i128::from(u64::MAX) + 1),
+                (None, None) => (
+                    i128::from(FIRST_ITEM_POSITION) - step,
+                    step,
+                    i128::from(u64::MAX) + 1,
+                ),
+            };
+            if stride < 1 {
                 return Err(range_error());
             }
-        }
-        for (index, id) in ids.iter().enumerate() {
-            if order
-                .get(&key(id))
-                .is_some_and(|p| *p != base + index as u64)
-            {
-                return Err(range_error());
+            let mut previous = base;
+            for (offset, slot) in positions[start..cursor].iter_mut().enumerate() {
+                let mut candidate = (base + stride * (offset as i128 + 1)).max(previous + 1);
+                while candidate < upper
+                    && u64::try_from(candidate).is_ok_and(|p| occupied.contains(&p))
+                {
+                    candidate += 1;
+                }
+                if candidate >= upper {
+                    return Err(range_error());
+                }
+                let position = u64::try_from(candidate).map_err(|_| range_error())?;
+                occupied.insert(position);
+                *slot = Some(position);
+                previous = candidate;
             }
         }
-        for (index, id) in ids.iter().enumerate() {
-            order.entry(key(id)).or_insert(base + index as u64);
+        // Commit only after every run is valid: failed pages cannot poison the
+        // retained order or change an already displayed row's sort key.
+        for (id, position) in ids.iter().zip(positions) {
+            order
+                .entry(key(id))
+                .or_insert(position.expect("all runs assigned"));
         }
         Ok(())
     }
@@ -2918,6 +2954,50 @@ mod history_tests {
         assert_eq!(
             all.iter().map(|row| &row.id).collect::<HashSet<_>>().len(),
             303
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_history_can_fill_items_missing_between_live_anchors() {
+        let mut fixture = Fixture::new(|_| panic!("order tests never make RPCs")).await;
+        fixture.ready().await;
+        let driver = CodexDriver::new(fixture.client.clone());
+        let first = driver.item_position("thread", "turn", "first").unwrap();
+        let last = driver.item_position("thread", "turn", "last").unwrap();
+        driver
+            .set_history_order(
+                "thread",
+                "turn",
+                &["first".into(), "middle".into(), "last".into()],
+            )
+            .unwrap();
+        let middle = driver.item_position("thread", "turn", "middle").unwrap();
+        assert!(first < middle && middle < last);
+        assert_eq!(
+            driver.item_position("thread", "turn", "first").unwrap(),
+            first
+        );
+        assert_eq!(
+            driver.item_position("thread", "turn", "last").unwrap(),
+            last
+        );
+        driver
+            .set_history_order_at(
+                "thread",
+                "turn",
+                &[
+                    "older".into(),
+                    "first".into(),
+                    "middle".into(),
+                    "last".into(),
+                ],
+                true,
+            )
+            .unwrap();
+        assert!(driver.item_position("thread", "turn", "older").unwrap() < first);
+        assert_eq!(
+            driver.item_position("thread", "turn", "middle").unwrap(),
+            middle
         );
     }
 
