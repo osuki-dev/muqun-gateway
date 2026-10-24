@@ -932,6 +932,7 @@ async fn sqlite_retention_and_quota_eviction_do_not_resurrect_unchanged_polled_p
             worker.read(ansi_stamp).await.unwrap().is_none(),
             "text change renewed ANSI retention"
         );
+        let ansi_observed_after = now_seconds();
         fold.lock().unwrap().record_frame(
             "default",
             "p",
@@ -939,12 +940,14 @@ async fn sqlite_retention_and_quota_eviction_do_not_resurrect_unchanged_polled_p
             "ansi",
             &ansi_frame(8),
         );
+        let ansi_observed_before = now_seconds();
         passes(&worker, now + 2).await;
         let ansi_stamp = fold.lock().unwrap().projection_stamp(&scopes[1]).unwrap();
         assert!(worker.read(ansi_stamp.clone()).await.unwrap().is_some());
-        assert_eq!(
-            updated(&worker, worker.key(&ansi_stamp).unwrap()).await,
-            now_seconds()
+        assert!(
+            (ansi_observed_after..=ansi_observed_before)
+                .contains(&updated(&worker, worker.key(&ansi_stamp).unwrap()).await),
+            "ANSI age must reflect observation, not the later flush or assertion"
         );
         assert_eq!(
             updated(&worker, worker.key(&text_stamp).unwrap()).await,
