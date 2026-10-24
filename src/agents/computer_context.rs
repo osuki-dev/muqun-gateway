@@ -113,56 +113,29 @@ pub(crate) async fn prepare(
     )
     .await
     .map_err(|_| ComputerContextError::NotReady)?;
-    if agent.kind() == "codex" {
-        static ROTATING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-        let _rotation = ROTATING.lock().await;
-        let tokens = state.mcp_tokens.as_ref();
-        let rows = tokens
-            .list()
+    if agent.kind() == "codex"
+        && !has_codex_runtime(state.mcp_tokens.as_ref()).await?
+        && (!agent
+            .refresh_session_mcp(asid)
             .await
-            .map_err(|_| ComputerContextError::NotReady)?;
-        let legacy: Vec<_> = rows.iter().filter(|row| {
-            row.label == "codex (runtime)"
-                && matches!(&row.binding, crate::mcp::tokens::TokenBinding::Agent {agent_id} if agent_id == "codex")
-        }).map(|row| row.id.clone()).collect();
-        if !legacy.is_empty() {
-            let previous: Vec<_> = rows.into_iter().map(|row| row.id).collect();
-            // An old cached helper credential is still authenticated, but no
-            // longer has remote authority. Reload through the supported API
-            // before delivery, then retire it only after fresh issuance.
-            if !agent
-                .refresh_session_mcp(asid)
-                .await
-                .map_err(|_| ComputerContextError::NotReady)?
-            {
-                return Err(ComputerContextError::NotReady);
-            }
-            finish_codex_rotation(tokens, &previous, &legacy).await?;
-        }
+            .map_err(|_| ComputerContextError::NotReady)?
+            || !has_codex_runtime(state.mcp_tokens.as_ref()).await?)
+    {
+        return Err(ComputerContextError::NotReady);
     }
     require_ready(agent, asid, directory).await
 }
 
-async fn finish_codex_rotation(
+async fn has_codex_runtime(
     tokens: &dyn crate::mcp::tokens::AssistantTokenStore,
-    previous: &[String],
-    legacy: &[String],
-) -> Result<(), ComputerContextError> {
+) -> Result<bool, ComputerContextError> {
     let rows = tokens
         .list()
         .await
         .map_err(|_| ComputerContextError::NotReady)?;
-    if !rows.iter().any(|row| !previous.contains(&row.id)
-        && matches!(&row.binding, crate::mcp::tokens::TokenBinding::Runtime {agent_id} if agent_id == "codex")) {
-        return Err(ComputerContextError::NotReady);
-    }
-    for id in legacy {
-        tokens
-            .revoke(id)
-            .await
-            .map_err(|_| ComputerContextError::NotReady)?;
-    }
-    Ok(())
+    Ok(rows.iter().any(|row| {
+        matches!(&row.binding, crate::mcp::tokens::TokenBinding::Runtime {agent_id} if agent_id == "codex")
+    }))
 }
 
 pub(crate) async fn require_ready(
@@ -191,11 +164,13 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     #[tokio::test]
-    async fn codex_rotation_requires_fresh_runtime_authority_before_retiring_legacy() {
-        use crate::mcp::tokens::{Resolved, TokenBinding};
+    async fn codex_preparation_requires_runtime_authority_and_reuses_it() {
+        use crate::mcp::tokens::TokenBinding;
         let state = test_state("synthetic-admin", Vec::new());
-        let tokens = state.mcp_tokens.as_ref();
-        let legacy = tokens
+        let mut agent = FakeAgent::new("codex");
+        agent.mcp = Some(Arc::new(Mutex::new(FakeMcp::default())));
+        state
+            .mcp_tokens
             .issue(
                 TokenBinding::Agent {
                     agent_id: "codex".into(),
@@ -205,29 +180,14 @@ mod tests {
             )
             .await
             .unwrap();
-        let unrelated = tokens
-            .issue(
-                TokenBinding::Agent {
-                    agent_id: "opencode".into(),
-                },
-                "opencode".into(),
-                60_000,
-            )
-            .await
-            .unwrap();
-        let old_ids = vec![
-            legacy.session.token_id.clone(),
-            unrelated.session.token_id.clone(),
-        ];
-        let retiring = vec![legacy.session.token_id.clone()];
-        assert!(finish_codex_rotation(tokens, &old_ids, &retiring)
-            .await
-            .is_err());
-        assert!(matches!(
-            tokens.resolve(&legacy.token).await.unwrap(),
-            Resolved::Live(_)
-        ));
-        let runtime = tokens
+        assert_eq!(
+            prepare(&state, &agent, "thread-a", None).await.unwrap_err(),
+            ComputerContextError::NotReady
+        );
+        assert_eq!(*agent.calls.lock().unwrap(), ["refresh_mcp thread-a"]);
+        assert!(agent.prompts.lock().unwrap().is_empty());
+        state
+            .mcp_tokens
             .issue(
                 TokenBinding::Runtime {
                     agent_id: "codex".into(),
@@ -237,21 +197,10 @@ mod tests {
             )
             .await
             .unwrap();
-        finish_codex_rotation(tokens, &old_ids, &retiring)
-            .await
-            .unwrap();
-        assert_eq!(
-            tokens.resolve(&legacy.token).await.unwrap(),
-            Resolved::Invalid
-        );
-        assert!(matches!(
-            tokens.resolve(&runtime.token).await.unwrap(),
-            Resolved::Live(_)
-        ));
-        assert!(matches!(
-            tokens.resolve(&unrelated.token).await.unwrap(),
-            Resolved::Live(_)
-        ));
+        agent.calls.lock().unwrap().clear();
+        prepare(&state, &agent, "thread-a", None).await.unwrap();
+        prepare(&state, &agent, "thread-b", None).await.unwrap();
+        assert!(agent.calls.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

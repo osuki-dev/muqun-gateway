@@ -64,6 +64,11 @@ request is checked in this order and refused at the first failure:
 4. The token resolves to a live assistant token. An expired one is
    `401 token_expired`; an unknown or revoked one is `403 invalid_token`; a
    store failure is `500 token_store_unavailable`.
+5. A managed native Codex credential from before explicit runtime grants
+   (`codex (runtime)` with an agent binding) answers
+   `401 token_refresh_required` before any tool executes. Its official header
+   helper must obtain a new runtime grant; it cannot fall back to legacy
+   authority if that grant is refused.
 
 An assistant token authorises `/mcp` and nothing else, and a paired device's
 token is not an assistant token. Each call is served for the session its token
@@ -134,6 +139,15 @@ When a token expires, `/mcp` answers 401 so the host fetches a new one:
 - Codex caches the helper's headers per connection and, after a 401 or 403,
   runs `http_headers_helper` again once and retries if the headers changed
   (Codex MCP documentation).
+
+The same refresh path migrates cached managed native Codex credentials after
+an upgrade, without requiring another computer reference or prompt. Old
+managed native credentials remain inert until their existing seven-day expiry
+and normal pruning: they always require refresh before a tool can execute,
+even after another client obtains its replacement. No new migration state is
+stored. Failed runtime issuance cannot fall back to legacy authority. Explicit
+revocation still returns `403 invalid_token`; pane, task, other-provider and
+user-managed credentials keep their existing behavior.
 
 `MUQUN_MCP_URL` and the default URL `mcp enable` uses are
 `http://<listen host>:<port>/mcp`, with `127.0.0.1` for a wildcard listen

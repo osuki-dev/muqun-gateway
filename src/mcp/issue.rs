@@ -130,8 +130,8 @@ pub(crate) async fn issue_for_caller(
 ) -> Result<IssuedToken, (StatusCode, Json<Value>)> {
     if let Some(agent_id) = request.agent_id {
         // This endpoint already requires the local admin credential. Merely
-        // knowing an agent's name is not authority. Remote forwarding still
-        // resolves the caller's task lineage, as for OpenCode service tokens.
+        // knowing an agent's name is not authority. The store checks retained
+        // restrictions before issuing an explicit runtime grant.
         if !super::inject::enabled(&state.config)
             || agent_id != "codex"
             || state

@@ -1170,6 +1170,14 @@ pub(crate) fn fake_session(asid: &str, updated_ms: u64) -> agents::domain::Agent
 }
 
 impl agents::ports::agent::AgentPort for FakeAgent {
+    fn refresh_session_mcp<'a>(
+        &'a self,
+        asid: &'a str,
+    ) -> agents::ports::agent::AgentFuture<'a, bool> {
+        self.record(&format!("refresh_mcp {asid}"));
+        Box::pin(async { Ok(false) })
+    }
+
     fn adds_mcp_servers(&self) -> bool {
         self.mcp.is_some()
     }
