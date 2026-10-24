@@ -2,6 +2,22 @@
 
 ## Changes and fixes
 
+- **Muqun tool activity remains visible in agent conversations.** Pending,
+  running, completed and failed Muqun MCP calls now reach the App's tool UI
+  across OpenCode, DeepSeek, T3 and Codex. Catalog discovery and pending
+  `execute` calls remain visible too. Task completion markers and internal
+  instructions retain their existing sanitation.
+
+- **Optional Home task collection for Muqun 4.0.** Gateways advertise
+  `home_task_summary_v1` and `home_task_collector_v1`. An App can subscribe to
+  bounded task snapshots and changes on its existing encrypted WebSocket, or
+  explicitly grant another paired Gateway read access for that App. Grants
+  include task summaries and the owner's default folder, never full goals,
+  transcripts or command authority. Revocation and device removal stop access.
+  Older Apps keep their existing paths. The new grant table migrates automatically
+  on Gateway startup; installing this version requires the usual Gateway restart.
+  Full paired-device acceptance is still pending.
+
 - **A terminal pane's skills run from the App's `$`, like an agent
   session's.** `$` is the App's skills entry for every agent; the App lists
   a pane's skills and names one, and how the agent's prompt takes it is the
@@ -352,3 +368,13 @@ These results do not establish macOS or paired-agent acceptance.
 Capability announcement was exercised against a live tmux session over HTTP; no
 Herdr was installed on the machine the change was written on, so the Herdr side
 of the switch is covered by unit tests and not by a live run.
+
+
+## Home stream recovery and conversation WebSocket reads
+
+- Add capability-gated conversation snapshot, delta and earlier-page requests to the authenticated App WebSocket, reusing the HTTP projection and filtering logic. Peer collectors cannot read private conversations.
+- Replay an individual source overview after a revision gap without restarting task subscriptions.
+- Isolate failed session providers and workspaces in opted-in overview subscriptions; keep healthy sections available. Older Apps keep conservative fallback behavior.
+- Bound and cancel in-flight work on disconnect, drain replaced Home workers, and preserve the existing encrypted transport and authorization checks.
+
+Restart the Gateway and update the App to enable these optional capabilities. Existing HTTP clients remain compatible.

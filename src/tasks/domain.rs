@@ -166,6 +166,9 @@ pub(crate) enum ForwardingContext {
     #[default]
     Unknown,
     Resolved,
+    /// An explicitly registered local runtime credential. Its scope is the
+    /// owner's linked computers, independently of optional task attribution.
+    Runtime,
 }
 
 /// Who asks for a new task, on whose behalf, and under which task.
@@ -184,16 +187,40 @@ pub(crate) struct Requested {
 }
 
 impl Requested {
-    /// An MCP host's request with no parent.
+    /// An authenticated local runtime owner's request with no parent.
     #[cfg(test)]
     pub(crate) fn mcp(by: TaskPrincipal) -> Self {
         Self {
-            forwarding: ForwardingContext::Unknown,
+            forwarding: ForwardingContext::Runtime,
             by,
             origin: TaskOrigin::Mcp,
             parent: None,
             name: None,
             server_id: None,
+        }
+    }
+}
+
+/// Stored ancestry evidence used by forwarding and runtime registration.
+pub(crate) enum ForwardingAncestry<'a> {
+    Parent(&'a TaskId),
+    Local,
+    Remote,
+    Unknown,
+}
+
+impl Task {
+    pub(crate) fn forwarding_ancestry(&self) -> ForwardingAncestry<'_> {
+        if self.origin == TaskOrigin::Peer || self.created_by.kind == PrincipalKind::Gateway {
+            ForwardingAncestry::Remote
+        } else if let Some(parent) = &self.parent {
+            ForwardingAncestry::Parent(parent)
+        } else if self.created_by.kind == PrincipalKind::Assistant
+            && !self.created_by.id.starts_with("runtime:")
+        {
+            ForwardingAncestry::Unknown
+        } else {
+            ForwardingAncestry::Local
         }
     }
 }

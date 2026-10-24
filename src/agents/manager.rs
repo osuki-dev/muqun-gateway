@@ -444,6 +444,7 @@ impl AgentManager {
         stream_connected: Arc<dyn Fn() -> bool + Send + Sync>,
         shutdown_handle: Arc<dyn Fn() + Send + Sync>,
     ) -> Self {
+        mirror.publish_history_to(events_tx.clone());
         Self {
             session_service: Arc::new(SessionService::with_memory_mirror(
                 agent.clone(),

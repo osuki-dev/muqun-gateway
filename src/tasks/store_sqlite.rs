@@ -53,6 +53,8 @@ UPDATE task_notices SET told_seq = (SELECT seq FROM tasks WHERE tasks.id = task_
 ", "
 ALTER TABLE tasks ADD COLUMN reopened_ms INTEGER;
 ALTER TABLE tasks ADD COLUMN reopen_count INTEGER NOT NULL DEFAULT 0;
+", "
+CREATE TABLE task_runtime_restrictions(agent_id TEXT PRIMARY KEY);
 "],
 };
 
@@ -343,6 +345,10 @@ impl TaskStore for SqliteTaskStore {
                 AND child.state NOT IN ('done', 'failed', 'cancelled'))";
             let tx = c.transaction()?;
             let before = before_ms as i64;
+            // A finished ledger task is not proof that its provider session
+            // (or provider-native children) has been deleted. Keep authority
+            // restrictions when ordinary task retention forgets the evidence.
+            retain_runtime_restrictions(&tx)?;
             tx.execute(
                 &format!(
                     "DELETE FROM task_events WHERE task_id IN (SELECT id FROM tasks WHERE {ENDED})"
@@ -498,6 +504,62 @@ fn load(c: &Connection, id: &TaskId) -> anyhow::Result<Option<Task>> {
     )
     .optional()?
     .transpose()
+}
+
+/// Called in the same store transaction that issues an owner runtime token.
+/// Retained provider sessions can resume after their tasks finish, so all
+/// states participate. A bounded ancestry walk fails closed on missing/cyclic
+/// records. Task origin policy is shared with the execution service.
+pub(crate) fn runtime_registration_allowed(c: &Connection, agent_id: &str) -> anyhow::Result<bool> {
+    if c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM task_runtime_restrictions WHERE agent_id = ?1)",
+        [agent_id],
+        |row| row.get::<_, bool>(0),
+    )? {
+        return Ok(false);
+    }
+    let mut query = c.prepare(&format!("SELECT {TASK_COLUMNS} FROM tasks WHERE json_extract(binding, '$.kind') = 'agent_session' AND json_extract(binding, '$.agent_id') = ?1"))?;
+    let rows = query.query_map([agent_id], read_row)?;
+    for row in rows {
+        let mut task = row??;
+        let mut visited = std::collections::HashSet::new();
+        for depth in 0..64 {
+            if depth == 63 || !visited.insert(task.id.clone()) {
+                return Ok(false);
+            }
+            match task.forwarding_ancestry() {
+                super::domain::ForwardingAncestry::Local => break,
+                super::domain::ForwardingAncestry::Remote
+                | super::domain::ForwardingAncestry::Unknown => return Ok(false),
+                super::domain::ForwardingAncestry::Parent(parent) => {
+                    let Some(parent) = load(c, parent)? else {
+                        return Ok(false);
+                    };
+                    task = parent;
+                }
+            }
+        }
+    }
+    Ok(true)
+}
+
+fn retain_runtime_restrictions(c: &Connection) -> anyhow::Result<()> {
+    let agents = {
+        let mut query = c.prepare("SELECT DISTINCT json_extract(binding, '$.agent_id') FROM tasks WHERE json_extract(binding, '$.kind') = 'agent_session'")?;
+        let agents = query
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        agents
+    };
+    for agent in agents {
+        if !runtime_registration_allowed(c, &agent)? {
+            c.execute(
+                "INSERT OR IGNORE INTO task_runtime_restrictions(agent_id) VALUES(?1)",
+                [agent],
+            )?;
+        }
+    }
+    Ok(())
 }
 
 fn read_row(r: &Row<'_>) -> rusqlite::Result<anyhow::Result<Task>> {
@@ -707,6 +769,68 @@ mod tests {
         assert_eq!(events[0].from, None);
         assert_eq!(events[2].from, Some(TaskState::Dispatching));
         assert!(events.windows(2).all(|w| w[0].seq < w[1].seq));
+    }
+
+    #[tokio::test]
+    async fn runtime_registration_retains_restricted_ancestry_after_task_purge() {
+        let db = temp_store("runtime-restrictions");
+        let store = SqliteTaskStore::new(db.clone());
+        let mut remote = task("peer");
+        remote.origin = TaskOrigin::Peer;
+        remote.created_by.kind = PrincipalKind::Gateway;
+        remote.state = TaskState::Done;
+        let remote = store.insert(&remote).await.unwrap();
+        let mut child = task("legacy-agent");
+        child.parent = Some(remote.id);
+        child.binding = TaskBinding::AgentSession {
+            agent_id: "codex".into(),
+            asid: "retained-provider-child".into(),
+        };
+        child.state = TaskState::Cancelled;
+        store.insert(&child).await.unwrap();
+        assert!(!db
+            .call(|c| runtime_registration_allowed(c, "codex"))
+            .await
+            .unwrap());
+        assert!(db
+            .call(|c| runtime_registration_allowed(c, "opencode"))
+            .await
+            .unwrap());
+        assert_eq!(store.purge_ended(now_ms() + 1).await.unwrap(), 2);
+        // The provider session is not deleted by ledger retention. Neither
+        // cancellation nor clearing old tasks may silently elevate its grant.
+        assert!(!db
+            .call(|c| runtime_registration_allowed(c, "codex"))
+            .await
+            .unwrap());
+        assert!(db
+            .call(|c| runtime_registration_allowed(c, "opencode"))
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn runtime_registration_accepts_owner_roots_and_refuses_broken_ancestry() {
+        let db = temp_store("runtime-roots");
+        let store = SqliteTaskStore::new(db.clone());
+        let mut owned = task("runtime:codex");
+        owned.binding = TaskBinding::AgentSession {
+            agent_id: "codex".into(),
+            asid: "owned".into(),
+        };
+        store.insert(&owned).await.unwrap();
+        assert!(db
+            .call(|c| runtime_registration_allowed(c, "codex"))
+            .await
+            .unwrap());
+        let mut orphan = task("runtime:codex");
+        orphan.binding = owned.binding;
+        orphan.parent = Some(TaskId("missing-parent".into()));
+        store.insert(&orphan).await.unwrap();
+        assert!(!db
+            .call(|c| runtime_registration_allowed(c, "codex"))
+            .await
+            .unwrap());
     }
 
     #[tokio::test]

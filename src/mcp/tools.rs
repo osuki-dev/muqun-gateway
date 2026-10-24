@@ -183,6 +183,10 @@ fn task_error(error: TaskError) -> CallToolResult {
                 "Your task was handed to this computer by another one, so it cannot hand work on to {name}: one hop only. Do it here, or finish with tasks.complete (outcome blocked) and say what needs {name}."
             ),
         ),
+        TaskError::DelegationScopeUnsupported => fail(
+            "delegation_scope_unsupported",
+            "This delivery cannot isolate computer credentials. Nothing was started. Use a supported task-bound terminal delivery.",
+        ),
         TaskError::LineageUnresolved => fail(
             "lineage_unresolved",
             "The calling session or its task ancestry could not be resolved. Nothing was forwarded. Continue locally or ask the user to start the work from their own session.",
@@ -385,6 +389,7 @@ impl DelegateArgs {
             None => None,
         };
         Ok(DelegateRequest {
+            computer_ids: Vec::new(),
             delivery: None,
             goal: self.goal,
             cwd,
@@ -567,7 +572,7 @@ impl MuqunMcp {
     ) -> Result<CallToolResult, ErrorData> {
         let (command, cwd) = (args.command.clone(), args.cwd.clone());
         let config = &self.state.config;
-        let peers = self.state.peers.names();
+        let peers = self.state.peers.selectors();
         if !is_self(
             args.machine.as_deref(),
             &config.server_id,
@@ -660,7 +665,7 @@ impl MuqunMcp {
         let goal = args.goal.clone();
         let machine = args.machine.clone();
         let config = &self.state.config;
-        let peers = self.state.peers.names();
+        let peers = self.state.peers.selectors();
         let request = match args.request(&config.server_id, &config.label, &peers) {
             Ok(request) => request,
             Err(refused) => return Ok(refused),
@@ -917,7 +922,8 @@ async fn task_of(
             session_id,
             pane_id,
         } => state.tasks.open_task_of_pane(session_id, pane_id).await,
-        crate::mcp::tokens::TokenBinding::Agent { .. } => None,
+        crate::mcp::tokens::TokenBinding::Agent { .. }
+        | crate::mcp::tokens::TokenBinding::Runtime { .. } => None,
         crate::mcp::tokens::TokenBinding::Task { task_id } => {
             super::issue::task_authority(state, task_id)
                 .await
@@ -944,7 +950,8 @@ pub(crate) async fn started_for_task(state: &AppState, session: &AssistantSessio
             session_id,
             pane_id,
         } => state.tasks.open_task_in_pane(session_id, pane_id).await,
-        crate::mcp::tokens::TokenBinding::Agent { .. } => false,
+        crate::mcp::tokens::TokenBinding::Agent { .. }
+        | crate::mcp::tokens::TokenBinding::Runtime { .. } => false,
         crate::mcp::tokens::TokenBinding::Task { task_id } => {
             super::issue::task_authority(state, task_id)
                 .await
@@ -1261,8 +1268,8 @@ mod tests {
             .contains("MUQUN_TASK_DONE:"));
     }
 
-    /// A device's delegation whose OpenCode session is mid-`tasks.delegate`:
-    /// what that call starts is filed under the device's task.
+    /// A legacy shared credential cannot turn observed task attribution into
+    /// authorization to start another session with owner-level credentials.
     #[tokio::test]
     async fn a_delegation_from_a_tracked_agent_session_names_its_parent() {
         let state = test_state("admin", Vec::new());
@@ -1321,10 +1328,9 @@ mod tests {
             terminal: None,
         };
         let (error, _, body) = answer(mcp.tasks_delegate(Parameters(args)).await);
-        assert!(!error, "{body}");
-        assert_eq!(body["parent_task_id"], parent.task_id, "{body}");
-        assert_eq!(body["origin"], "agent");
-        assert_eq!(body["requested_by"], Value::Null);
+        assert!(error, "{body}");
+        assert_eq!(body["error"], "delegation_scope_unsupported");
+        assert!(!parent.task_id.is_empty());
     }
 
     /// An agent learns the linked computers from fleet.describe and

@@ -139,7 +139,23 @@ pub(crate) enum ClientFrame {
     Unsubscribe(String),
     SubscribeAll,
     SubscribeTasks,
+    SubscribeHome(crate::fleet::home::Subscription),
+    UnsubscribeHome,
+    History(HistoryRequest),
+    ResyncHomeOverview(String),
     Ping,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct HistoryRequest {
+    pub request_id: String,
+    pub asid: String,
+    pub operation: String,
+    #[serde(default)]
+    pub refresh: bool,
+    #[serde(default)]
+    pub after: u64,
 }
 
 #[derive(Deserialize)]
@@ -168,6 +184,46 @@ impl ClientFrame {
             "unsubscribe" => Ok(Self::Unsubscribe(asid()?)),
             "subscribe_all" => Ok(Self::SubscribeAll),
             "subscribe_tasks" => Ok(Self::SubscribeTasks),
+            "subscribe_home" => {
+                let home: crate::fleet::home::Subscription = serde_json::from_value(
+                    value
+                        .get("home")
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::json!({})),
+                )
+                .map_err(|_| FrameError::InvalidFrame)?;
+                if !home.valid() {
+                    return Err(FrameError::InvalidFrame);
+                }
+                Ok(Self::SubscribeHome(home))
+            }
+            "history_request" => {
+                let request: HistoryRequest = serde_json::from_value(
+                    value
+                        .get("request")
+                        .cloned()
+                        .ok_or(FrameError::InvalidFrame)?,
+                )
+                .map_err(|_| FrameError::InvalidFrame)?;
+                validate_asid(&request.asid)?;
+                validate_asid(&request.request_id)?;
+                if request.request_id.len() > 128
+                    || !["snapshot", "earlier", "delta"].contains(&request.operation.as_str())
+                    || request.after > 9_007_199_254_740_991
+                {
+                    return Err(FrameError::InvalidFrame);
+                }
+                Ok(Self::History(request))
+            }
+            "resync_home_overview" => {
+                let id = value
+                    .get("source_id")
+                    .and_then(Value::as_str)
+                    .ok_or(FrameError::InvalidFrame)?;
+                validate_asid(id)?;
+                Ok(Self::ResyncHomeOverview(id.to_owned()))
+            }
+            "unsubscribe_home" => Ok(Self::UnsubscribeHome),
             "ping" => Ok(Self::Ping),
             _ => Err(FrameError::UnknownType),
         }
@@ -439,6 +495,10 @@ impl Subscriptions {
                 self.tasks_only = true;
                 Ok(Some(subscribed_tasks_frame()))
             }
+            ClientFrame::SubscribeHome(_)
+            | ClientFrame::UnsubscribeHome
+            | ClientFrame::History(_)
+            | ClientFrame::ResyncHomeOverview(_) => Ok(None),
             ClientFrame::Ping => Ok(Some(PONG_FRAME.to_owned())),
         }
     }
@@ -755,6 +815,12 @@ impl Connection {
         let peer = device.kind == PrincipalKind::Gateway;
         // The `defaults` frame last sent, once one was.
         let mut defaults_sent: Option<Option<String>> = None;
+        let mut home_workers = tokio::task::JoinSet::new();
+        let (_home_keepalive, mut home_rx) = tokio::sync::mpsc::channel::<Value>(64);
+        let mut home_grant: Option<(String, String)> = None;
+        let mut overview_snapshots = std::collections::HashMap::<String, Value>::new();
+        let mut history_workers = tokio::task::JoinSet::<(String, Value)>::new();
+        let mut history_ids = std::collections::HashSet::<String>::new();
 
         loop {
             tokio::select! {
@@ -763,7 +829,10 @@ impl Connection {
                     return;
                 }
                 _ = recheck.tick() => {
-                    if !still_paired(&state, &device_id) {
+                    if !still_paired(&state, &device_id) || match &home_grant {
+                        Some((grant, audience)) => !crate::fleet::home_grants::allowed(&state, &device_id, grant, audience).await,
+                        None => false,
+                    } {
                         // Closed without an `error` frame, as the SSE stream
                         // closes without an event: a revoked device is not
                         // owed an explanation, and a legitimate client learns
@@ -779,6 +848,41 @@ impl Connection {
                     unanswered_pings += 1;
                     if self.write(Message::Ping(Default::default())).await.is_err() {
                         return;
+                    }
+                }
+                response = history_workers.join_next(), if !history_workers.is_empty() => {
+                    if matches!(&response, Some(Err(_))) { return; }
+                    if let Some(Ok((request_id, frame))) = response {
+                        history_ids.remove(&request_id);
+                        if !still_paired(&state, &device_id) { return; }
+                        if self.send(&frame.to_string()).await.is_err() { return; }
+                    }
+                }
+                _ = home_workers.join_next(), if !home_workers.is_empty() => {
+                    if home_workers.is_empty() {
+                        let frame = serde_json::json!({"t":"home_status", "source_id":state.config.server_id, "status":"unavailable"});
+                        if self.send(&frame.to_string()).await.is_err() { return; }
+                    }
+                }
+                frame = home_rx.recv(), if !home_workers.is_empty() => {
+                    if let Some(frame) = frame {
+                        if let Some((grant, audience)) = &home_grant {
+                            if !crate::fleet::home_grants::allowed(&state, &device_id, grant, audience).await { return; }
+                        }
+                        if frame["t"] == "home_status" {
+                            if let Some(id) = frame["source_id"].as_str() { overview_snapshots.remove(id); }
+                        }
+                        if frame["t"] == "home_overview" {
+                            if let Some(id) = frame["source_id"].as_str() {
+                                let mut snapshot = frame.clone();
+                                if snapshot.get("overview").is_none() {
+                                    snapshot["overview"] = overview_snapshots.get(id).map(|old| old["overview"].clone()).unwrap_or(Value::Null);
+                                }
+                                snapshot["snapshot"] = Value::Bool(true);
+                                overview_snapshots.insert(id.to_owned(), snapshot);
+                            }
+                        }
+                        if self.send(&frame.to_string()).await.is_err() { return; }
                     }
                 }
                 inbound = self.socket.recv() => {
@@ -820,6 +924,74 @@ impl Connection {
                         }
                         frame => Ok(frame),
                     });
+                    if let Ok(ClientFrame::History(request)) = &frame {
+                        if peer { self.fail(FrameError::PeerForbidden).await; return; }
+                        if !still_paired(&state, &device_id) { return; }
+                        if history_workers.len() >= 32 || !history_ids.insert(request.request_id.clone()) {
+                            let reply = serde_json::json!({"t":"history_response", "request_id":request.request_id, "source_id":state.config.server_id, "asid":request.asid, "status":429, "body":{"error":{"code":"history_busy","message":"History request limit reached"}}});
+                            if self.send(&reply.to_string()).await.is_err() { return; }
+                            continue;
+                        }
+                        let request = request.clone();
+                        let state = state.clone();
+                        history_workers.spawn(async move {
+                            let result = tokio::time::timeout(Duration::from_secs(30), super::routes::socket_history(&state, &request.asid, &request.operation, request.refresh, request.after)).await;
+                            let (mut status, mut body) = match result {
+                                Ok(Ok(axum::Json(body))) => (200, body),
+                                Ok(Err((status, axum::Json(body)))) => (status.as_u16(), body),
+                                Err(_) => (504, serde_json::json!({"error":{"code":"history_timeout","message":"History request timed out; refresh before retrying"}})),
+                            };
+                            if body.to_string().len() > 16 * 1024 * 1024 {
+                                status = 413;
+                                body = serde_json::json!({"error":{"code":"history_response_too_large","message":"History response exceeds the socket budget"}});
+                            }
+                            let frame = serde_json::json!({"t":"history_response", "request_id":request.request_id, "source_id":state.config.server_id, "asid":request.asid, "status":status, "body":body});
+                            (request.request_id, frame)
+                        });
+                        continue;
+                    }
+                    if let Ok(ClientFrame::ResyncHomeOverview(id)) = &frame {
+                        if peer { self.fail(FrameError::PeerForbidden).await; return; }
+                        if let Some(snapshot) = overview_snapshots.get(id) {
+                            if self.send(&snapshot.to_string()).await.is_err() { return; }
+                        }
+                        continue;
+                    }
+                    if let Ok(ClientFrame::SubscribeHome(home)) = &frame {
+                        let grant = if peer {
+                            let (Some(grant), Some(audience)) = (&home.grant_id, &home.audience) else {
+                                self.fail(FrameError::PeerForbidden).await; return;
+                            };
+                            if !home.sources.is_empty() || !crate::fleet::home_grants::allowed(&state, &device_id, grant, audience).await {
+                                self.fail(FrameError::PeerForbidden).await; return;
+                            }
+                            Some((grant.clone(), audience.clone()))
+                        } else {
+                            if home.grant_id.is_some() || home.audience.is_some() { self.fail(FrameError::InvalidFrame).await; return; }
+                            None
+                        };
+                        home_workers.shutdown().await;
+                        overview_snapshots.clear();
+                        let (home_tx, receiver) = tokio::sync::mpsc::channel(64);
+                        home_rx = receiver;
+                        home_grant = grant;
+                        if self.send(r#"{"t":"subscribed","home":true}"#).await.is_err() { return; }
+                        home_workers.spawn(crate::fleet::home::local(state.clone(), home_tx.clone(), home_grant.as_ref().map(|(g,a)| (device_id.clone(),g.clone(),a.clone())), device_id.clone()));
+                        if home.overview {
+                            home_workers.spawn(crate::fleet::home_overview::local(state.clone(), home_tx.clone(), home_grant.as_ref().map(|(g,a)| (device_id.clone(),g.clone(),a.clone())), home.overview_sections));
+                        }
+                        for source in &home.sources {
+                            home_workers.spawn(crate::fleet::home::remote(state.clone(), source.clone(), device_id.clone(), home.overview, home.overview_sections, home_tx.clone()));
+                        }
+                        continue;
+                    }
+                    if matches!(frame, Ok(ClientFrame::UnsubscribeHome)) {
+                        home_workers.shutdown().await;
+                        overview_snapshots.clear();
+                        home_rx = tokio::sync::mpsc::channel(64).1;
+                        home_grant = None;
+                        continue;
+                    }
                     match frame.and_then(|frame| subscriptions.apply(&frame)) {
                         Ok(Some(reply)) => {
                             if self.send(&reply).await.is_err() {

@@ -8,6 +8,7 @@ use base64::Engine as _;
 
 pub(crate) mod db_key;
 pub(crate) mod sqlite;
+pub(crate) mod t3_credentials;
 
 use super::manage::{revoke_managed_device, truncate};
 use super::state_lock;

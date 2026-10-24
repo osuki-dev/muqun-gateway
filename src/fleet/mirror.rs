@@ -1060,7 +1060,50 @@ mod tests {
             .lock()
             .unwrap()
             .push(test_peer_device("coding-1", "peer-token"));
-        let url = serve(peer_router(mini.clone())).await;
+        // Exercise mirror/reconnect behavior independently of provider
+        // credential injection. The receiver fixture records an isolated
+        // assignment; the real shared-provider route's preflight refusal is
+        // covered in tasks::routes. No provider credential is minted here.
+        let receiver = mini.clone();
+        let router = peer_router(mini.clone()).layer(axum::middleware::from_fn(
+            move |request: axum::extract::Request, next: axum::middleware::Next| {
+                let receiver = receiver.clone();
+                async move {
+                    use axum::response::IntoResponse as _;
+                    if request.method() != axum::http::Method::POST
+                        || request.uri().path() != "/api/tasks"
+                    {
+                        return next.run(request).await;
+                    }
+                    let caller = match crate::platform::http::require_device_or_peer(
+                        &receiver,
+                        request.headers(),
+                    ) {
+                        Ok(caller) => caller,
+                        Err(error) => return error.into_response(),
+                    };
+                    let body = axum::body::to_bytes(request.into_body(), 32768)
+                        .await
+                        .unwrap();
+                    let body: Value = serde_json::from_slice(&body).unwrap();
+                    let mut task = mirror(TaskState::Working, None);
+                    task.origin = TaskOrigin::Peer;
+                    task.created_by = TaskPrincipal {
+                        kind: PrincipalKind::Gateway,
+                        id: caller.device_id,
+                    };
+                    task.binding = TaskBinding::AgentSession {
+                        agent_id: "opencode".into(),
+                        asid: "ses_mini".into(),
+                    };
+                    task.goal = body["goal"].as_str().unwrap().to_owned();
+                    task.client_ref = body["client_ref"].as_str().map(str::to_owned);
+                    let task = receiver.tasks.record(&task).await.unwrap();
+                    axum::Json(receiver.tasks.present(&task).await).into_response()
+                }
+            },
+        ));
+        let url = serve(router).await;
         let coding = named(output_state(&herdr), "srv-coding", "coding");
         coding
             .peers

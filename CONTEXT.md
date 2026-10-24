@@ -27,7 +27,9 @@ The retired `herdr.gateway` identifier remains only for migration compatibility.
   - `manager.rs`, `runtime.rs`, `use_cases/`: agent supervision and the
     session/prompt/interaction services. `runtime/t3.rs` holds T3's config
     block, its pairing-token-to-bearer credential (persisted by
-    `platform/store.rs` as `t3-credential.json`, 0600), and its attach and
+    `platform/store/t3_credentials.rs` in SQLCipher when store encryption is
+    enabled; the legacy private `t3-credential.json` is imported and removed
+    only after verified persistence), and its attach and
     discovery. `runtime/codex.rs` adopts a verified existing Codex daemon connection
     or owns a private fallback child and its lifecycle;
     `adapters/codex/native_sessions.rs` retains accepted native session IDs scoped

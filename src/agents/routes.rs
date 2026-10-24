@@ -253,6 +253,11 @@ pub struct ForkSessionBody {
 #[derive(Debug, Deserialize)]
 pub struct SendAgentPromptBody {
     pub text: String,
+    /// Correlation only. A successful or lost reply never licenses a repeated send.
+    #[serde(default)]
+    pub client_ref: Option<String>,
+    #[serde(default)]
+    pub computer_ids: Vec<String>,
     pub attachments: Option<Vec<String>>,
     pub delivery: Option<String>,
     #[serde(default)]
@@ -861,6 +866,17 @@ async fn do_read_agent_session(
     headers: &HeaderMap,
 ) -> ApiResult<Response> {
     require_device(state, headers)?;
+    Ok(json_etag_response(
+        headers,
+        socket_read_agent_session(state, asid, refresh).await?.0,
+    ))
+}
+
+async fn socket_read_agent_session(
+    state: &AppState,
+    asid: &str,
+    refresh: bool,
+) -> ApiResult<Json<Value>> {
     let manager = session_manager_or_err(state, asid).await?;
     let id = AgentSessionId(asid.to_string());
     let mut snapshot = if refresh {
@@ -888,10 +904,28 @@ async fn do_read_agent_session(
 
     // A session the reader is sitting on is polled and mostly unchanged; the
     // whole snapshot is the expensive thing to send twice.
-    Ok(json_etag_response(
-        headers,
-        content_envelope(json!(snapshot)),
-    ))
+    Ok(Json(content_envelope(json!(snapshot))))
+}
+
+/// Called only after the socket has authenticated an App principal. Reuses the
+/// exact HTTP projection, including hidden internal rows and image attachment.
+pub(crate) async fn socket_history(
+    state: &AppState,
+    asid: &str,
+    operation: &str,
+    refresh: bool,
+    after: u64,
+) -> ApiResult<Json<Value>> {
+    match operation {
+        "snapshot" => socket_read_agent_session(state, asid, refresh).await,
+        "earlier" => socket_load_earlier_timeline(state, asid).await,
+        "delta" => socket_get_agent_session_timeline(state, asid, after).await,
+        _ => Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_operation",
+            "Unknown history operation",
+        )),
+    }
 }
 
 async fn do_get_agent_session_events(
@@ -947,6 +981,10 @@ async fn do_load_earlier_timeline(
     headers: &HeaderMap,
 ) -> ApiResult<Json<Value>> {
     require_device(state, headers)?;
+    socket_load_earlier_timeline(state, asid).await
+}
+
+async fn socket_load_earlier_timeline(state: &AppState, asid: &str) -> ApiResult<Json<Value>> {
     let manager = session_manager_or_err(state, asid).await?;
     let mut items = manager
         .sessions()
@@ -971,7 +1009,14 @@ async fn do_get_agent_session_timeline(
     headers: &HeaderMap,
 ) -> ApiResult<Json<Value>> {
     require_device(state, headers)?;
+    socket_get_agent_session_timeline(state, asid, after_seq).await
+}
 
+async fn socket_get_agent_session_timeline(
+    state: &AppState,
+    asid: &str,
+    after_seq: u64,
+) -> ApiResult<Json<Value>> {
     let manager = session_manager_or_err(state, asid).await?;
 
     let (mut items, status, resync, latest_seq) = manager
@@ -1100,12 +1145,48 @@ async fn do_send_agent_prompt(
 
     validate_text(&body.text)?;
 
+    if body.client_ref.as_ref().is_some_and(|value| {
+        value.is_empty()
+            || value.len() > 128
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    }) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": {
+                "code": "invalid_client_ref", "message": "client_ref must be 1 to 128 of A-Z, a-z, 0-9, - and _", "delivery": "not_sent"
+            }})),
+        ));
+    }
+
+    let context = super::computer_context::context(state, &body.computer_ids)
+        .await
+        .map_err(super::computer_context::ComputerContextError::before_dispatch)?;
+    let text = if let Some(context) = context {
+        let info = manager
+            .sessions()
+            .get_session(asid)
+            .await
+            .map_err(agent_error)?;
+        super::computer_context::prepare(
+            state,
+            manager.agent().as_ref(),
+            asid,
+            info.directory.as_deref(),
+        )
+        .await
+        .map_err(super::computer_context::ComputerContextError::before_dispatch)?;
+        format!("{}\n\n{}", body.text, context)
+    } else {
+        body.text
+    };
     let attachments = body.attachments.as_deref().unwrap_or(&[]);
     manager
         .prompts()
         .send_prompt(
             &AgentSessionId(asid.to_string()),
-            &body.text,
+            &text,
             attachments,
             body.delivery.as_deref(),
         )
@@ -1116,7 +1197,11 @@ async fn do_send_agent_prompt(
             _ => api_error(StatusCode::BAD_GATEWAY, "agent_error", &e.to_string()),
         })?;
 
-    Ok(Json(content_envelope(json!({ "submitted": true }))))
+    let mut accepted = json!({ "submitted": true });
+    if let Some(client_ref) = body.client_ref {
+        accepted["client_ref"] = json!(client_ref);
+    }
+    Ok(Json(content_envelope(accepted)))
 }
 
 async fn do_revert_agent_session(
@@ -3734,6 +3819,69 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn computer_reference_preflight_never_submits_and_keeps_provider_details_private() {
+        use crate::test_support::FakeMcp;
+        for (mcp, code) in [
+            (None, "computer_tools_unavailable"),
+            (
+                Some(std::sync::Arc::new(std::sync::Mutex::new(FakeMcp {
+                    refuse: true,
+                    ..Default::default()
+                }))),
+                "computer_tools_not_ready",
+            ),
+        ] {
+            let mut agent = FakeAgent::new("opencode").with_sessions(&[("conversation", 1)]);
+            agent.mcp = mcp;
+            let prompts = agent.prompts.clone();
+            let state = state_with(vec![agent]).await;
+            let body = serde_json::from_value(json!({
+                "text": "Inspect", "computer_ids": [state.config.server_id], "client_ref": "prompt-one"
+            })).unwrap();
+            let (status, Json(refusal)) =
+                do_send_agent_prompt(&state, "conversation", body, &device_headers())
+                    .await
+                    .unwrap_err();
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(refusal["error"]["code"], code);
+            assert_eq!(refusal["error"]["delivery"], "not_sent");
+            assert!(prompts.lock().unwrap().is_empty());
+            assert!(!refusal.to_string().contains("Bearer"));
+        }
+    }
+
+    #[tokio::test]
+    async fn prompt_correlation_is_optional_bounded_and_does_not_claim_idempotency() {
+        let agent = FakeAgent::new("opencode").with_sessions(&[("conversation", 1)]);
+        let prompts = agent.prompts.clone();
+        let state = state_with(vec![agent]).await;
+        for client_ref in ["", "bad ref", "../bad", &"x".repeat(129)] {
+            let body = serde_json::from_value(json!({"text": "Inspect", "client_ref": client_ref}))
+                .unwrap();
+            let (_, Json(refusal)) =
+                do_send_agent_prompt(&state, "conversation", body, &device_headers())
+                    .await
+                    .unwrap_err();
+            assert_eq!(refusal["error"]["code"], "invalid_client_ref");
+            assert_eq!(refusal["error"]["delivery"], "not_sent");
+        }
+        assert!(prompts.lock().unwrap().is_empty());
+        for value in [
+            json!({"text": "Inspect"}),
+            json!({"text": "Inspect", "client_ref": "prompt-one"}),
+        ] {
+            let body = serde_json::from_value(value.clone()).unwrap();
+            let Json(accepted) =
+                do_send_agent_prompt(&state, "conversation", body, &device_headers())
+                    .await
+                    .unwrap();
+            assert_eq!(accepted["data"]["submitted"], true);
+            assert_eq!(accepted["data"]["client_ref"], value["client_ref"]);
+        }
+        assert_eq!(prompts.lock().unwrap().len(), 2);
+    }
+
     async fn create_refusal(body: Value) -> (StatusCode, Value) {
         let state = crate::test_support::test_state(
             "admin",
@@ -4084,7 +4232,7 @@ mod tests {
                 let end = (offset+r["params"]["limit"].as_u64().unwrap() as usize).min(181);
                 let rows: Vec<_> = (offset..end).map(|n| {
                     let item = if n == 180 {
-                        json!({"type":"dynamicToolCall","id":"hidden","tool":"muqun.tasks.list","arguments":{},"status":"completed"})
+                        json!({"type":"dynamicToolCall","id":"muqun-tool","tool":"muqun.tasks.list","arguments":{},"status":"completed"})
                     } else {
                         json!({"type":"agentMessage","id":format!("item-{}",181-n),"text":"synthetic"})
                     };
@@ -4125,11 +4273,10 @@ mod tests {
         let Json(last) = do_load_earlier_timeline(&state, &id, &device_headers())
             .await
             .unwrap();
-        assert_eq!(
-            last["data"]["items"],
-            json!([]),
-            "internal tool row is filtered"
-        );
+        let last_items = last["data"]["items"].as_array().unwrap();
+        assert_eq!(last_items.len(), 1);
+        assert_eq!(last_items[0]["part"]["name"], "muqun.tasks.list");
+        assert_eq!(last_items[0]["part"]["status"], "completed");
         assert_eq!(last["data"]["exhausted"], false);
         let Json(end) = do_load_earlier_timeline(&state, &id, &device_headers())
             .await
@@ -4199,9 +4346,34 @@ mod tests {
             // Contiguous below the rows held: the record at the cut may be a
             // tool result, joined onto the call just before it, so the last
             // row sits at most two seqs under the cut.
-            let last = items.last().unwrap()["seq"].as_u64().unwrap();
+            let producer_index = |item: &Value| -> u64 {
+                item["message_id"]
+                    .as_str()
+                    .unwrap()
+                    .strip_prefix('s')
+                    .unwrap()
+                    .parse()
+                    .unwrap()
+            };
+            let last = producer_index(items.last().unwrap());
             assert!(last < lowest && lowest - last <= 2, "{last} under {lowest}");
-            lowest = items[0]["seq"].as_u64().unwrap();
+            lowest = producer_index(&items[0]);
+            // Public seq is the accepted mirror revision, not the producer's
+            // chronological record number. Responses and retained rows agree.
+            let retained = manager
+                .mirror()
+                .get_snapshot(&AgentSessionId("s".into()))
+                .await
+                .unwrap();
+            for item in items {
+                let row = retained
+                    .timeline
+                    .iter()
+                    .find(|row| row.id == item["id"])
+                    .unwrap();
+                assert_eq!(row.seq, item["seq"].as_u64().unwrap());
+                assert!(row.seq > 0 && row.seq <= retained.seq);
+            }
             let mut older: Vec<String> = items
                 .iter()
                 .map(|item| item["id"].as_str().unwrap().to_owned())

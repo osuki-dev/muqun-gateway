@@ -428,7 +428,10 @@ not restore workspace files. Compaction is supported through the stable
 `thread/compact/start`, for owned native idle sessions only (see
 `codex-capabilities.md`). The inbox is a Gateway-owned queue (see
 `agent-api.md`, Inbox). Worktrees, modes, background shells, durable
-instructions and runtime MCP injection remain unsupported.
+instructions remain unsupported. Native computer-tool preparation uses the
+official configuration read/write and MCP reload APIs; see [MCP](mcp.md#native-codex-conversations-and-computer-references).
+Configuration reads retain only the Muqun entry and writable-layer metadata
+for this operation, continuing to discard unrelated credentials.
 
 ## Acceptance evidence and limits
 

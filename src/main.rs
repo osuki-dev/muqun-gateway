@@ -105,6 +105,7 @@ pub(crate) struct AppState {
     pub(crate) tasks: Arc<tasks::service::TaskService>,
     /// Every task change the service records, for the event socket.
     pub(crate) task_events: tokio::sync::broadcast::Sender<tasks::events::TaskDomainEvent>,
+    pub(crate) home_overview: Arc<fleet::home_overview::OverviewCache>,
 }
 
 /// A fresh instance generation. Opaque to clients: they compare it for

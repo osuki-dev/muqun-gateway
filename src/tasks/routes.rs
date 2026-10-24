@@ -163,6 +163,8 @@ async fn defaults(
 
 #[derive(Debug, Deserialize)]
 struct CreateBody {
+    #[serde(default)]
+    computer_ids: Vec<String>,
     /// Required for a delegation (checked there); a command has `command`.
     #[serde(default)]
     goal: String,
@@ -349,6 +351,7 @@ impl CreateBody {
             machine: None,
             label,
             mentions,
+            computer_ids: self.computer_ids,
             client_ref: self.client_ref,
             session_id: self.session_id,
             attachments: self.attachments,
@@ -435,6 +438,39 @@ async fn create(
     } else {
         None
     };
+    if !body.computer_ids.is_empty() {
+        if !crate::mcp::inject::enabled(&state.config) {
+            return Err(
+                crate::agents::computer_context::ComputerContextError::Unavailable
+                    .before_dispatch(),
+            );
+        }
+        if caller.kind == DeviceKind::Gateway {
+            return Err(refused(
+                "invalid_mentions",
+                "Forwarded tasks cannot add computer references",
+            ));
+        }
+        crate::agents::computer_context::context(&state, &body.computer_ids)
+            .await
+            .map_err(crate::agents::computer_context::ComputerContextError::before_dispatch)?;
+        let peers = state.peers.list().await.map_err(|_| invalid_request())?;
+        body.mentions = body
+            .computer_ids
+            .iter()
+            .map(|id| {
+                if id == &state.config.server_id {
+                    "self".to_owned()
+                } else {
+                    peers
+                        .iter()
+                        .find(|peer| &peer.server_id == id)
+                        .map(|peer| peer.name.clone())
+                        .unwrap_or_default()
+                }
+            })
+            .collect();
+    }
     let request = body.request(previous_cwd.as_deref(), &state.peers.names())?;
     // A delivery the device named needs an agent that can do it: a session
     // adapter attached for `session`, a known terminal agent for `pane`
@@ -552,6 +588,14 @@ const MAX_COMMAND_BYTES: usize = 16 * 1024;
 
 fn create_failed(error: TaskError) -> (StatusCode, Json<Value>) {
     match error {
+        TaskError::DelegationScopeUnsupported => (
+            StatusCode::CONFLICT,
+            Json(json!({"error": {
+                "code": "delegation_scope_unsupported",
+                "message": "This agent cannot isolate computer credentials for delegated work; choose a supported terminal delivery",
+                "delivery": "not_sent"
+            }})),
+        ),
         TaskError::NoTerminal => api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "no_terminal",
@@ -1665,8 +1709,8 @@ mod tests {
         assert_eq!(created.lock().unwrap()[1], None);
     }
 
-    /// Another of the owner's computers opens a task here like a phone, is
-    /// named on it as a gateway, and is refused while the switch is off.
+    /// Enabling incoming work does not authorize handing the local runtime
+    /// credential to a remote session. This adapter has no scoped delivery.
     #[tokio::test]
     async fn another_computer_opens_a_task_unless_the_switch_is_off() {
         let state = with_agent().await;
@@ -1681,8 +1725,8 @@ mod tests {
         for (accept, status, check) in [
             (
                 true,
-                StatusCode::OK,
-                json!({ "origin": "peer", "requested_by": { "kind": "gateway", "id": "coding-1", "name": "gateway coding-1", "server_id": "srv-coding" } }),
+                StatusCode::CONFLICT,
+                json!({ "error": { "code": "delegation_scope_unsupported" } }),
             ),
             (
                 false,

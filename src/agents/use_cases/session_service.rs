@@ -303,11 +303,30 @@ impl SessionService {
         &self,
         asid: &AgentSessionId,
     ) -> Result<Vec<crate::agents::domain::TimelineItem>, AgentError> {
-        let items = self.agent.load_earlier_timeline(&asid.0, 80).await?;
-        if !items.is_empty() {
-            self.mirror.upsert_timeline_items(asid, items.clone()).await;
+        if let Some(memory) = &self.memory {
+            let gate = memory.history_gate(asid).await;
+            let _read = gate.lock().await;
+            let revision = memory
+                .history_read_revision(asid)
+                .await
+                .ok_or(AgentError::HistoryCursorLost)?;
+            let prepared = self.agent.prepare_earlier_timeline(&asid.0, 80).await?;
+            return memory
+                .accept_earlier_history(asid, &gate, revision, prepared.items, prepared.commit)
+                .await;
         }
-        Ok(items)
+        let prepared = self.agent.prepare_earlier_timeline(&asid.0, 80).await?;
+        if prepared.commit.is_some() {
+            return Err(AgentError::Unsupported(
+                "stateful history requires atomic mirror acceptance".into(),
+            ));
+        }
+        if !prepared.items.is_empty() {
+            self.mirror
+                .upsert_timeline_items(asid, prepared.items.clone())
+                .await;
+        }
+        Ok(prepared.items)
     }
 
     /// Re-read the permissions and forms OpenCode still considers pending.

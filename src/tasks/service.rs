@@ -191,6 +191,7 @@ struct LiveLine {
 const UNBOUND_RECHECK: Duration = Duration::from_secs(30);
 
 pub(crate) struct DelegateRequest {
+    pub computer_ids: Vec<String>,
     pub goal: String,
     pub cwd: Option<String>,
     pub agent_id: Option<String>,
@@ -363,6 +364,8 @@ pub(crate) enum TaskError {
     DelegationLoop(String),
     /// The caller or an ancestor could not be established reliably.
     LineageUnresolved,
+    /// A shared provider cannot isolate credentials for restricted work.
+    DelegationScopeUnsupported,
     /// The linked computer refused the task with its own error code.
     PeerRefused {
         machine: String,
@@ -421,6 +424,7 @@ impl std::fmt::Display for TaskError {
                 f,
                 "caller lineage could not be resolved; nothing was forwarded"
             ),
+            Self::DelegationScopeUnsupported => write!(f, "This agent cannot isolate computer credentials for delegated work; use a scoped terminal delivery"),
             Self::PeerRefused { machine, code } => write!(f, "{machine} refused the task ({code})"),
             Self::AgentUnavailable(agent) => write!(f, "agent '{agent}' is not available"),
             Self::UnknownModel(model) => write!(f, "unknown model '{model}'"),
@@ -1170,6 +1174,9 @@ impl TaskService {
         if by.origin == TaskOrigin::Peer || by.by.kind == PrincipalKind::Gateway {
             return Err(TaskError::DelegationLoop(machine.to_owned()));
         }
+        if by.forwarding == crate::tasks::domain::ForwardingContext::Runtime {
+            return Ok(());
+        }
         if by.by.kind == PrincipalKind::Assistant
             && by.forwarding != crate::tasks::domain::ForwardingContext::Resolved
         {
@@ -1184,19 +1191,21 @@ impl TaskService {
             if !visited.insert(id.clone()) {
                 return Err(TaskError::LineageUnresolved);
             }
-            match self.store.get(&id).await {
-                Ok(Some(task)) if task.origin == TaskOrigin::Peer => {
-                    return Err(TaskError::DelegationLoop(machine.to_owned()));
+            let task = self
+                .store
+                .get(&id)
+                .await
+                .map_err(|_| TaskError::LineageUnresolved)?
+                .ok_or(TaskError::LineageUnresolved)?;
+            match task.forwarding_ancestry() {
+                super::domain::ForwardingAncestry::Parent(parent) => next = Some(parent.clone()),
+                super::domain::ForwardingAncestry::Local => return Ok(()),
+                super::domain::ForwardingAncestry::Remote => {
+                    return Err(TaskError::DelegationLoop(machine.to_owned()))
                 }
-                Ok(Some(task))
-                    if task.parent.is_none()
-                        && task.created_by.kind == PrincipalKind::Assistant
-                        && matches!(task.origin, TaskOrigin::Agent | TaskOrigin::Mcp) =>
-                {
-                    return Err(TaskError::LineageUnresolved);
+                super::domain::ForwardingAncestry::Unknown => {
+                    return Err(TaskError::LineageUnresolved)
                 }
-                Ok(Some(task)) => next = task.parent,
-                _ => return Err(TaskError::LineageUnresolved),
             }
         }
         Err(TaskError::LineageUnresolved)
@@ -1233,7 +1242,7 @@ impl TaskService {
             request.machine.as_deref(),
             &self.machine_id,
             &state.config.label,
-            &state.peers.names(),
+            &state.peers.selectors(),
         ) {
             if !request.attachments.is_empty() {
                 return Err(TaskError::AttachmentsUnsupported);
@@ -1258,6 +1267,17 @@ impl TaskService {
                 None => runs_in_pane(state, kind).await,
             };
             if in_pane {
+                // Restricted work must not inherit a shared owner's runtime
+                // credential. Only these launchers install a bound helper.
+                if self
+                    .allow_forwarding(&by, "linked computers")
+                    .await
+                    .is_err()
+                    && (!matches!(kind, "codex" | "claude")
+                        || !crate::mcp::inject::enabled(&state.config))
+                {
+                    return Err(TaskError::DelegationScopeUnsupported);
+                }
                 if !request.attachments.is_empty() {
                     return Err(TaskError::AttachmentsUnsupported);
                 }
@@ -1266,6 +1286,23 @@ impl TaskService {
         }
         let manager = agent_for(state, request.agent_id.as_deref()).await?;
         let agent_id = manager.agent().kind();
+        // No supported session adapter currently supplies a credential bound
+        // to this new task. Refuse before registration, task or session creation.
+        if self
+            .allow_forwarding(&by, "shared agent runtime")
+            .await
+            .is_err()
+        {
+            return Err(TaskError::DelegationScopeUnsupported);
+        }
+        if !request.computer_ids.is_empty()
+            && (!manager.agent().adds_mcp_servers() || !crate::mcp::inject::enabled(&state.config))
+        {
+            return Err(crate::agents::ports::agent::AgentError::InvalidRequest(
+                "Computer tools are unavailable for this agent".into(),
+            )
+            .into());
+        }
         // Checked before anything is made: a reference the prompt would
         // refuse is a refusal here, never a failed task and a stray session.
         if !request.attachments.is_empty() {
@@ -1324,6 +1361,26 @@ impl TaskService {
                 reopen_count: 0,
             })
             .await?;
+        // Configure the shared provider before starting a native thread so its
+        // initial tool catalog includes Muqun. No extra MCP process is started.
+        if manager.agent().adds_mcp_servers() && crate::mcp::inject::enabled(&state.config) {
+            if let Err(error) = crate::mcp::inject::prepare_session_agent(
+                &state.config,
+                state.mcp_tokens.as_ref(),
+                manager.agent().as_ref(),
+                request.cwd.as_deref(),
+            )
+            .await
+            {
+                if !request.computer_ids.is_empty() {
+                    let error = TaskError::from(error);
+                    self.record_failure(&task, noted(TaskState::Failed, error.to_string()))
+                        .await;
+                    return Err(error);
+                }
+                tracing::debug!("Codex computer tools unavailable; continuing ordinary task");
+            }
+        }
         let created = manager
             .sessions()
             .create_session(
@@ -1393,16 +1450,24 @@ impl TaskService {
             self.bind_session(&asid.0, &task.id);
             // The goal alone: how to say it ended is the MCP server's, which
             // the agent's service is given now if it does not have it.
-            crate::mcp::inject::ensure_session_agent(
-                &state.config,
-                state.mcp_tokens.as_ref(),
-                manager.agent().as_ref(),
-                request.cwd.as_deref(),
-            )
-            .await;
+            let context = crate::agents::computer_context::context(state, &request.computer_ids)
+                .await
+                .map_err(crate::agents::ports::agent::AgentError::from)?;
+            let goal = if let Some(context) = context {
+                crate::agents::computer_context::require_ready(
+                    manager.agent().as_ref(),
+                    &asid.0,
+                    request.cwd.as_deref(),
+                )
+                .await
+                .map_err(crate::agents::ports::agent::AgentError::from)?;
+                format!("{}\n\n{}", request.goal, context)
+            } else {
+                request.goal.clone()
+            };
             manager
                 .prompts()
-                .send_prompt(&asid, &request.goal, &request.attachments, None)
+                .send_prompt(&asid, &goal, &request.attachments, None)
                 .await?;
             let task = self
                 .store()
@@ -1460,6 +1525,10 @@ impl TaskService {
         by: Requested,
         request: DelegateRequest,
     ) -> Result<TaskView, TaskError> {
+        let computer_context =
+            crate::agents::computer_context::context(state, &request.computer_ids)
+                .await
+                .map_err(crate::agents::ports::agent::AgentError::from)?;
         let kind = request.agent_id.clone().unwrap_or_default();
         if !pane_agent::is_available(state, &kind) {
             return Err(TaskError::AgentUnavailable(kind));
@@ -1583,7 +1652,10 @@ impl TaskService {
         let state = state.clone();
         let start = TerminalStart {
             cwd: request.cwd.clone(),
-            goal: request.goal.clone(),
+            goal: computer_context.map_or_else(
+                || request.goal.clone(),
+                |context| format!("{}\n\n{}", request.goal, context),
+            ),
             model_args,
         };
         tokio::spawn(async move {
@@ -3629,6 +3701,7 @@ mod tests {
 
     fn request(machine: Option<&str>) -> DelegateRequest {
         DelegateRequest {
+            computer_ids: Vec::new(),
             delivery: None,
             goal: "fix the build".into(),
             cwd: Some("/work".into()),
@@ -4619,6 +4692,7 @@ mod tests {
         use crate::tasks::domain::ForwardingContext;
         let (state, id) = delegated(FakeAgent::new("opencode")).await;
         let mut by = Requested::mcp(assistant("a"));
+        by.forwarding = ForwardingContext::Unknown;
         assert!(matches!(
             state.tasks.allow_forwarding(&by, "mini").await,
             Err(TaskError::LineageUnresolved)
@@ -5548,8 +5622,8 @@ mod tests {
         let (state, parent) = delegated(FakeAgent::new("opencode")).await;
         let mut updates = state.task_events.subscribe();
         let by = Requested {
-            forwarding: crate::tasks::domain::ForwardingContext::Unknown,
-            by: assistant("agent:opencode"),
+            forwarding: crate::tasks::domain::ForwardingContext::Runtime,
+            by: assistant("runtime:opencode"),
             origin: TaskOrigin::Agent,
             parent: Some(parent.clone()),
             name: None,
