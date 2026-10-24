@@ -861,6 +861,17 @@ async fn do_read_agent_session(
     headers: &HeaderMap,
 ) -> ApiResult<Response> {
     require_device(state, headers)?;
+    Ok(json_etag_response(
+        headers,
+        socket_read_agent_session(state, asid, refresh).await?.0,
+    ))
+}
+
+async fn socket_read_agent_session(
+    state: &AppState,
+    asid: &str,
+    refresh: bool,
+) -> ApiResult<Json<Value>> {
     let manager = session_manager_or_err(state, asid).await?;
     let id = AgentSessionId(asid.to_string());
     let mut snapshot = if refresh {
@@ -888,10 +899,28 @@ async fn do_read_agent_session(
 
     // A session the reader is sitting on is polled and mostly unchanged; the
     // whole snapshot is the expensive thing to send twice.
-    Ok(json_etag_response(
-        headers,
-        content_envelope(json!(snapshot)),
-    ))
+    Ok(Json(content_envelope(json!(snapshot))))
+}
+
+/// Called only after the socket has authenticated an App principal. Reuses the
+/// exact HTTP projection, including hidden internal rows and image attachment.
+pub(crate) async fn socket_history(
+    state: &AppState,
+    asid: &str,
+    operation: &str,
+    refresh: bool,
+    after: u64,
+) -> ApiResult<Json<Value>> {
+    match operation {
+        "snapshot" => socket_read_agent_session(state, asid, refresh).await,
+        "earlier" => socket_load_earlier_timeline(state, asid).await,
+        "delta" => socket_get_agent_session_timeline(state, asid, after).await,
+        _ => Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_operation",
+            "Unknown history operation",
+        )),
+    }
 }
 
 async fn do_get_agent_session_events(
@@ -947,6 +976,10 @@ async fn do_load_earlier_timeline(
     headers: &HeaderMap,
 ) -> ApiResult<Json<Value>> {
     require_device(state, headers)?;
+    socket_load_earlier_timeline(state, asid).await
+}
+
+async fn socket_load_earlier_timeline(state: &AppState, asid: &str) -> ApiResult<Json<Value>> {
     let manager = session_manager_or_err(state, asid).await?;
     let mut items = manager
         .sessions()
@@ -971,7 +1004,14 @@ async fn do_get_agent_session_timeline(
     headers: &HeaderMap,
 ) -> ApiResult<Json<Value>> {
     require_device(state, headers)?;
+    socket_get_agent_session_timeline(state, asid, after_seq).await
+}
 
+async fn socket_get_agent_session_timeline(
+    state: &AppState,
+    asid: &str,
+    after_seq: u64,
+) -> ApiResult<Json<Value>> {
     let manager = session_manager_or_err(state, asid).await?;
 
     let (mut items, status, resync, latest_seq) = manager

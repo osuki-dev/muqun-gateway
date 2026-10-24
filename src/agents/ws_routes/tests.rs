@@ -1211,3 +1211,63 @@ async fn home_collector_combines_local_and_remote_sources_on_one_app_socket() {
     assert_eq!(delta["tasks"][0]["task_id"], "task-1");
     assert_eq!(delta["snapshot"], false);
 }
+
+#[tokio::test]
+async fn history_rpc_returns_scoped_errors_and_keeps_the_socket_alive() {
+    let state = test_state("admin", vec![test_device("phone", TOKEN)]);
+    let source_id = state.config.server_id.clone();
+    let addr = serve(state).await;
+    let (mut client, _) = connect(addr, &bearer()).await.unwrap();
+    next_json(&mut client).await;
+    send_text(&mut client, r#"{"t":"history_request","request":{"request_id":"read-1","asid":"missing","operation":"snapshot"}}"#).await;
+    let frame = next_json(&mut client).await;
+    assert_eq!(frame["t"], "history_response");
+    assert_eq!(frame["request_id"], "read-1");
+    assert_eq!(frame["source_id"], source_id);
+    assert_eq!(frame["asid"], "missing");
+    assert!(frame["status"].as_u64().unwrap() >= 400);
+    send_text(&mut client, r#"{"t":"ping"}"#).await;
+    assert_eq!(next_json(&mut client).await["t"], "pong");
+}
+
+#[tokio::test]
+async fn peer_cannot_use_history_rpc_to_read_private_conversations() {
+    let state = test_state("admin", vec![test_peer_device("reader", TOKEN)]);
+    let addr = serve(state).await;
+    let (mut client, _) = connect(addr, &bearer()).await.unwrap();
+    next_json(&mut client).await;
+    send_text(&mut client, r#"{"t":"history_request","request":{"request_id":"read-1","asid":"private","operation":"earlier"}}"#).await;
+    assert_eq!(next_json(&mut client).await["code"], "peer_forbidden");
+}
+
+#[tokio::test]
+async fn overview_resync_replays_only_its_snapshot_without_restarting_tasks() {
+    let state = test_state("admin", vec![test_device("phone", TOKEN)]);
+    let source_id = state.config.server_id.clone();
+    let addr = serve(state).await;
+    let (mut client, _) = connect(addr, &bearer()).await.unwrap();
+    next_json(&mut client).await;
+    send_text(
+        &mut client,
+        r#"{"t":"subscribe_home","home":{"overview":true,"overview_sections":true}}"#,
+    )
+    .await;
+    assert_eq!(next_json(&mut client).await["home"], true);
+    let mut original = Value::Null;
+    for _ in 0..2 {
+        let frame = next_json(&mut client).await;
+        if frame["t"] == "home_overview" {
+            original = frame;
+        }
+    }
+    assert!(!original.is_null());
+    send_text(
+        &mut client,
+        &json!({"t":"resync_home_overview","source_id":source_id}).to_string(),
+    )
+    .await;
+    let replay = next_json(&mut client).await;
+    assert_eq!(replay, original);
+    send_text(&mut client, r#"{"t":"ping"}"#).await;
+    assert_eq!(next_json(&mut client).await["t"], "pong");
+}

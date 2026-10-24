@@ -362,3 +362,13 @@ These results do not establish macOS or paired-agent acceptance.
 Capability announcement was exercised against a live tmux session over HTTP; no
 Herdr was installed on the machine the change was written on, so the Herdr side
 of the switch is covered by unit tests and not by a live run.
+
+
+## Home stream recovery and conversation WebSocket reads
+
+- Add capability-gated conversation snapshot, delta and earlier-page requests to the authenticated App WebSocket, reusing the HTTP projection and filtering logic. Peer collectors cannot read private conversations.
+- Replay an individual source overview after a revision gap without restarting task subscriptions.
+- Isolate failed session providers and workspaces in opted-in overview subscriptions; keep healthy sections available. Older Apps keep conservative fallback behavior.
+- Bound and cancel in-flight work on disconnect, drain replaced Home workers, and preserve the existing encrypted transport and authorization checks.
+
+Restart the Gateway and update the App to enable these optional capabilities. Existing HTTP clients remain compatible.

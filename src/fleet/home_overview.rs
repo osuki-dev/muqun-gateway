@@ -27,7 +27,7 @@ impl OverviewCache {
                 return value.clone();
             }
         }
-        let value = tokio::time::timeout(Duration::from_secs(4), collect(state))
+        let value = tokio::time::timeout(Duration::from_secs(12), collect(state))
             .await
             .unwrap_or(Value::Null);
         let value = if value.to_string().len() > 128 * 1024 {
@@ -99,9 +99,20 @@ async fn collect(state: &AppState) -> Value {
         return Value::Null;
     }
     let mut sessions = Vec::new();
-    for manager in managers {
-        let Ok(rows) = manager.sessions().list_sessions(&query).await else {
-            return Value::Null;
+    let mut unavailable_providers = Vec::new();
+    let mut unavailable_workspaces = Vec::new();
+    let results = futures::future::join_all(managers.iter().map(|manager| async {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            manager.sessions().list_sessions(&query),
+        )
+        .await
+    }))
+    .await;
+    for (manager, result) in managers.iter().zip(results) {
+        let Ok(Ok(rows)) = result else {
+            unavailable_providers.push(manager.agent().kind().to_owned());
+            continue;
         };
         for row in rows
             .into_iter()
@@ -119,21 +130,29 @@ async fn collect(state: &AppState) -> Value {
     });
     sessions.truncate(MAX_SESSIONS);
     let mut workspaces = Vec::new();
-    for session in &state.config.sessions {
+    let results = futures::future::join_all(state.config.sessions.iter().map(|session| async {
         let backend = crate::terminal_backend(session);
-        let (panes, agents) = tokio::join!(backend.list_panes(), crate::backend_agents(session));
-        let (Ok(panes), Ok(agents)) = (panes, agents) else {
-            return Value::Null;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(backend.list_panes(), crate::backend_agents(session))
+        })
+        .await
+    }))
+    .await;
+    for (session, result) in state.config.sessions.iter().zip(results) {
+        let Ok((Ok(panes), Ok(agents))) = result else {
+            unavailable_workspaces.push(session.id.clone());
+            continue;
         };
         if panes.len() > MAX_PANES || agents.len() > MAX_PANES {
-            return Value::Null;
+            unavailable_workspaces.push(session.id.clone());
+            continue;
         }
         workspaces.push(json!({
             "sessionId": session.id,
             "agents": pane_rows(panes, &agents),
         }));
     }
-    json!({"workspaces": workspaces, "sessions": sessions})
+    json!({"workspaces": workspaces, "sessions": sessions, "unavailableProviders": unavailable_providers, "unavailableWorkspaces": unavailable_workspaces})
 }
 
 /// Independent topic on the authenticated agent socket. Slow discovery never blocks tasks.
@@ -141,6 +160,7 @@ pub(crate) async fn local(
     state: AppState,
     sender: tokio::sync::mpsc::Sender<Value>,
     peer_grant: Option<(String, String, String)>,
+    sections: bool,
 ) {
     let generation = uuid::Uuid::new_v4().to_string();
     let mut revision = 0_u64;
@@ -161,11 +181,22 @@ pub(crate) async fn local(
             None => true,
             Some((_, grant, _)) => super::home_grants::overview_allowed(&state, grant).await,
         };
-        let overview = if allowed {
+        let mut overview = if allowed {
             state.home_overview.read(&state).await
         } else {
             Value::Null
         };
+        if !sections
+            && ["unavailableProviders", "unavailableWorkspaces"]
+                .iter()
+                .any(|key| {
+                    overview[*key]
+                        .as_array()
+                        .is_some_and(|items| !items.is_empty())
+                })
+        {
+            overview = Value::Null;
+        }
         // Recheck after the potentially slow collection before disclosing metadata.
         if let Some((reader, grant, audience)) = &peer_grant {
             if !super::home_grants::allowed(&state, reader, grant, audience).await {
@@ -183,5 +214,30 @@ pub(crate) async fn local(
             return;
         }
         previous = overview;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::{test_state, FakeAgent};
+
+    #[tokio::test]
+    async fn a_failed_provider_does_not_discard_healthy_provider_sessions() {
+        let state = test_state("admin", vec![]);
+        for agent in [
+            FakeAgent::new("codex").failing(),
+            FakeAgent::new("opencode").with_sessions(&[("healthy", 1)]),
+        ] {
+            state
+                .agent_runtime
+                .attach_for_test(std::sync::Arc::new(
+                    crate::agents::manager::AgentManager::for_test(std::sync::Arc::new(agent)),
+                ))
+                .await;
+        }
+        let overview = collect(&state).await;
+        assert_eq!(overview["unavailableProviders"], json!(["codex"]));
+        assert_eq!(overview["sessions"][0]["asid"], "healthy");
     }
 }

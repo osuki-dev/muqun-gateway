@@ -29,6 +29,8 @@ pub(crate) struct Subscription {
     pub sources: Vec<Source>,
     #[serde(default)]
     pub overview: bool,
+    #[serde(default)]
+    pub overview_sections: bool,
     /// Only peer callers use a grant/audience, and only for the local source.
     pub grant_id: Option<String>,
     pub audience: Option<String>,
@@ -213,6 +215,7 @@ pub(crate) async fn remote(
     source: Source,
     audience: String,
     overview: bool,
+    overview_sections: bool,
     sender: mpsc::Sender<Value>,
 ) {
     let Some(peer) = state.peers.get(&source.peer_id).await else {
@@ -257,6 +260,21 @@ pub(crate) async fn remote(
     };
     if overview_supported {
         request["home"]["overview"] = json!(true);
+        let sections_supported = overview_sections
+            && (peer
+                .capabilities
+                .iter()
+                .any(|c| c == "home_overview_sections_v1")
+                || tokio::time::timeout(std::time::Duration::from_secs(3), client.negotiate())
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+                    .is_some_and(|caps| {
+                        caps.names.iter().any(|c| c == "home_overview_sections_v1")
+                    }));
+        if sections_supported {
+            request["home"]["overview_sections"] = json!(true);
+        }
     }
     let Ok(mut feed) = client.subscribe_home(&request.to_string()).await else {
         let _ = sender.send(status("unavailable")).await;
