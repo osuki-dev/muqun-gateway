@@ -7,12 +7,14 @@
 //! owner gave (or T3's default loopback port when they gave none) is tried.
 //!
 //! The credential is a one-time pairing token from `t3 pair`, which the
-//! gateway exchanges once for a bearer and keeps in `t3-credential.json`
-//! under the state directory. The pairing token is forgotten as soon as it
-//! is spent and is never written back to `config.json`.
+//! gateway exchanges once for a bearer. With store encryption enabled, the
+//! bearer is kept in SQLCipher and the legacy private JSON file is migrated.
+//! The pairing token is forgotten as soon as it is spent and is never written
+//! back to `config.json`.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
@@ -21,6 +23,7 @@ use super::{probe_client, AgentOrigin, AgentRuntime};
 use crate::agents::adapters::t3::{self, T3Credential, T3Endpoint};
 use crate::agents::manager::AgentManager;
 use crate::platform::store::{read_t3_credential_at, write_t3_credential_at, T3StoredCredential};
+use crate::platform::store::{sqlite::SqliteStore, t3_credentials::T3Credentials};
 
 /// Where a T3 Code server listens when the owner names no URL.
 pub const DEFAULT_T3_URL: &str = "http://127.0.0.1:3773";
@@ -101,6 +104,7 @@ pub(super) struct T3State {
     pairing: Mutex<Option<String>>,
     /// Where the bearer is kept; `None` keeps it in memory only.
     state_dir: Option<PathBuf>,
+    credential_store: OnceLock<T3Credentials>,
     /// A bearer obtained this run, when it could not be stored.
     exchanged: Mutex<Option<String>>,
     /// "Nothing to authenticate with" is said once, not every poll.
@@ -127,6 +131,7 @@ impl T3State {
             pairing: Mutex::new(config.pairing_token.clone()),
             config,
             state_dir,
+            credential_store: OnceLock::new(),
             exchanged: Mutex::new(None),
             warned_no_credential: AtomicBool::new(false),
             warned_unsupported: AtomicBool::new(false),
@@ -160,23 +165,29 @@ impl T3State {
         T3Endpoint::new(self.url(), T3Credential::None)
     }
 
-    fn stored_bearer(&self, url: &str) -> Option<String> {
-        let dir = self.state_dir.as_ref()?;
-        match read_t3_credential_at(dir) {
-            Ok(Some(stored)) if stored.url == url => Some(stored.token),
+    async fn stored_bearer(&self, url: &str) -> Result<Option<String>, ()> {
+        let stored = match self.credential_store.get() {
+            Some(store) => store.load().await,
+            None => match self.state_dir.as_ref() {
+                Some(dir) => read_t3_credential_at(dir),
+                None => return Ok(None),
+            },
+        };
+        match stored {
+            Ok(Some(stored)) if stored.url == url => Ok(Some(stored.token)),
             Ok(Some(_)) => {
                 tracing::info!("the stored T3 credential belongs to another server; ignoring it");
-                None
+                Ok(None)
             }
-            Ok(None) => None,
+            Ok(None) => Ok(None),
             Err(err) => {
                 tracing::warn!("could not read the stored T3 credential: {err:#}");
-                None
+                Err(())
             }
         }
     }
 
-    fn persist(&self, url: &str, token: &str) {
+    async fn persist(&self, url: &str, token: &str) {
         let Some(dir) = self.state_dir.as_ref() else {
             return;
         };
@@ -185,7 +196,11 @@ impl T3State {
             token: token.to_string(),
             saved_at_ms: crate::platform::store::now_unix_ms() as u64,
         };
-        match write_t3_credential_at(dir, &stored) {
+        let result = match self.credential_store.get() {
+            Some(store) => store.save(&stored).await,
+            None => write_t3_credential_at(dir, &stored),
+        };
+        match result {
             Ok(()) => tracing::info!("stored the T3 credential"),
             Err(err) => tracing::warn!(
                 "could not store the T3 credential ({err:#}); it is kept for this run only, \
@@ -201,7 +216,12 @@ impl T3State {
         self.config.token.is_some()
             || self.exchanged.lock().await.is_some()
             || self.pairing.lock().await.is_some()
-            || self.stored_bearer(&self.url()).is_some()
+            || self
+                .stored_bearer(&self.url())
+                .await
+                .ok()
+                .flatten()
+                .is_some()
     }
 
     /// The credential to attach with: the configured bearer, else a stored
@@ -217,7 +237,12 @@ impl T3State {
         }
         let remembered = match self.exchanged.lock().await.clone() {
             Some(token) => Some(token),
-            None => self.stored_bearer(&endpoint.url),
+            None => match self.stored_bearer(&endpoint.url).await {
+                Ok(stored) => stored,
+                // A broken store is not evidence that credentials are absent.
+                // Do not spend a new one-time pairing token or overwrite it.
+                Err(()) => return None,
+            },
         };
         if let Some(token) = remembered {
             match endpoint.session_state(http, &token).await {
@@ -243,7 +268,7 @@ impl T3State {
                     "paired with the T3 server"
                 );
                 *self.exchanged.lock().await = Some(grant.token.clone());
-                self.persist(&endpoint.url, &grant.token);
+                self.persist(&endpoint.url, &grant.token).await;
                 Some(T3Credential::Bearer(grant.token))
             }
             Err(err) => {
@@ -299,6 +324,18 @@ fn t3_features_for_protocol(protocol: u64) -> crate::discovery::AgentFeatures {
 }
 
 impl AgentRuntime {
+    /// Attach only to the encrypted store, before supervision can authenticate.
+    /// Configuration with store encryption explicitly off retains the private
+    /// legacy file; it must not be advertised as encryption at rest.
+    pub(crate) fn persist_t3_credentials(&self, db: Arc<SqliteStore>) {
+        if let Some(directory) = self.t3.state_dir.clone() {
+            let _ = self
+                .t3
+                .credential_store
+                .set(T3Credentials::new(db, directory));
+        }
+    }
+
     /// One supervision pass for T3. Returns whether it is attached and well.
     pub(super) async fn supervise_t3(&self) -> bool {
         if !self.t3.wanted() {
@@ -587,15 +624,75 @@ mod tests {
             env_of(&[]),
         );
         assert_eq!(
-            state.stored_bearer("http://127.0.0.1:9").as_deref(),
+            state
+                .stored_bearer("http://127.0.0.1:9")
+                .await
+                .unwrap()
+                .as_deref(),
             Some("stored")
         );
-        assert_eq!(state.stored_bearer("http://127.0.0.1:10"), None);
+        assert_eq!(
+            state.stored_bearer("http://127.0.0.1:10").await.unwrap(),
+            None
+        );
         // Port 9 refuses: an unreachable server does not make a stored
         // bearer invalid, so it is still what the gateway attaches with.
         let credential = state.credential(&state.endpoint(), &probe_client()).await;
         assert_eq!(credential, Some(T3Credential::Bearer("stored".into())));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_encrypted_store_does_not_spend_pairing_or_use_plaintext() {
+        use crate::platform::store::{db_key::DbKey, t3_credentials};
+        let dir = crate::test_state_dir().join(format!("t3-rt-store-{}", uuid::Uuid::new_v4()));
+        let db = SqliteStore::open(
+            &dir.join("fixture.sqlite3"),
+            Some(DbKey::random()),
+            &[t3_credentials::MIGRATION],
+        )
+        .unwrap();
+        write_t3_credential_at(
+            &dir,
+            &T3StoredCredential {
+                url: "http://127.0.0.1:9".into(),
+                token: "synthetic-legacy".into(),
+                saved_at_ms: 0,
+            },
+        )
+        .unwrap();
+        let state = T3State::with_env(
+            T3Config {
+                enabled: true,
+                url: Some("http://127.0.0.1:9".into()),
+                pairing_token: Some("synthetic-once".into()),
+                ..Default::default()
+            },
+            Some(dir.clone()),
+            env_of(&[]),
+        );
+        assert!(state
+            .credential_store
+            .set(T3Credentials::new(db.clone(), dir.clone()))
+            .is_ok());
+        db.call(|db| {
+            db.execute_batch("DROP TABLE t3_credentials")?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            state.credential(&state.endpoint(), &probe_client()).await,
+            None
+        );
+        assert_eq!(
+            state.pairing.lock().await.as_deref(),
+            Some("synthetic-once")
+        );
+        assert_eq!(
+            read_t3_credential_at(&dir).unwrap().unwrap().token,
+            "synthetic-legacy"
+        );
     }
 
     /// A stand-in for the two T3 routes pairing touches.

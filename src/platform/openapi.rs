@@ -665,15 +665,17 @@ pub fn openapi_spec() -> Value {
             "/api/agent-sessions/{asid}/prompt": {
                 "post": {
                     "summary": "Send a prompt to an AI agent session",
-                    "description": "Submits a user prompt to the agent, optionally specifying model override and reasoning effort.",
+                    "description": "Submits one prompt to the selected session. Model and mode are session state. Computer references negotiate agent_computer_context_v1 and supply context, never credentials or execution authority. client_ref is correlation only, not an idempotency key; do not repeat a submission whose outcome is unknown.",
                     "parameters": [path_param("asid")],
                     "requestBody": json_body(json!({
                         "type": "object",
-                        "required": ["parts"],
+                        "required": ["text"],
                         "properties": {
-                            "parts": { "type": "array", "items": { "type": "object" } },
-                            "model": { "type": "string" },
-                            "reasoning_effort": { "type": "string", "description": "Reasoning effort tier supported by the model (dynamic string from third-party provider)" }
+                            "text": { "type": "string" },
+                            "computer_ids": { "type": "array", "maxItems": 8, "items": { "type": "string", "minLength": 1, "maxLength": 256 }, "description": "Immutable machine IDs from the destination Gateway; names are display data only" },
+                            "attachments": { "type": "array", "items": { "type": "string" }, "description": "Attachment references owned by this Gateway" },
+                            "delivery": { "type": "string", "enum": ["steer", "queue"] },
+                            "client_ref": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9_-]+$", "description": "Optional submission correlation, echoed on success; not a retry or deduplication guarantee" }
                         }
                     })),
                     "responses": ok_response()
@@ -1073,6 +1075,7 @@ fn tasks_fleet_mcp_paths() -> Vec<(&'static str, Value)> {
                         "kind": { "type": "string", "enum": ["delegation", "command"], "description": "command: run `command` as a command task (a visible pane, no agent) and answer with its exit_code, stdout_tail and pane_id once it ended within timeout_s; goal is then not needed. Another computer's command (exec.run with machine) runs only in a directory inside this computer's home" },
                         "command": { "type": "string", "description": "kind command: the shell command, at most 16 KiB" },
                         "timeout_s": { "type": "integer", "description": "kind command: how long the create waits for it, 1..=45 (default 30)" },
+                        "computer_ids": { "type": "array", "maxItems": 8, "items": { "type": "string" }, "description": "Optional immutable computer IDs, negotiated with agent_computer_context_v1; never computer names" },
                         "attachments": { "type": "array", "items": { "type": "string" }, "maxItems": 16, "description": "Files sent with the goal, as POST /api/agent-sessions/{asid}/prompt takes them (uploaded asset references or file paths on this computer), handed to the agent with its first prompt. A session agent on this computer only: with a terminal agent or another computer it is 400 attachments_unsupported" },
                         "session_id": { "type": "string", "description": "For a terminal agent: the terminal session to start it in, by its config id (a tmux session or Herdr). Default: the first that answers. One this computer has no session for is 400 terminal_unknown" },
                         "label": { "type": "string", "description": "A short title, at most 200 characters" },
@@ -1179,9 +1182,15 @@ fn tasks_fleet_mcp_paths() -> Vec<(&'static str, Value)> {
                     "summary": "Issue an assistant token for the pane the caller runs in. Requires the admin token (the `muqun-gateway mcp token-helper` command uses it); present only while mcp.enabled is true",
                     "requestBody": json_body(json!({
                         "type": "object",
-                        "required": ["ancestor_pids"],
+                        "oneOf": [
+                            { "required": ["ancestor_pids"], "not": { "anyOf": [{ "required": ["task_id"] }, { "required": ["agent_id"] }] } },
+                            { "required": ["task_id"], "not": { "anyOf": [{ "required": ["ancestor_pids"] }, { "required": ["agent_id"] }] } },
+                            { "required": ["agent_id"], "not": { "anyOf": [{ "required": ["ancestor_pids"] }, { "required": ["task_id"] }] } }
+                        ],
                         "properties": {
                             "ancestor_pids": { "type": "array", "items": { "type": "integer" }, "description": "The caller's own pid first, then its parent, and so on up" },
+                            "task_id": { "type": "string", "description": "An eligible immutable Codex task ID; requires admin authentication" },
+                            "agent_id": { "type": "string", "enum": ["codex"], "description": "Attached native Codex runtime; requires admin authentication and automatic injection enabled" },
                             "label": { "type": "string" }
                         }
                     })),

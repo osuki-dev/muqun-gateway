@@ -32,6 +32,7 @@ pub(crate) struct IssueRequest {
     pub ancestor_pids: Option<Vec<u32>>,
     /// Admin-selected immutable task authority, never inferred from a daemon PID.
     pub task_id: Option<String>,
+    pub agent_id: Option<String>,
     #[serde(default)]
     pub label: Option<String>,
 }
@@ -46,9 +47,10 @@ impl IssueRequest {
     /// Whether the request is within [`MAX_LABEL_CHARS`] and
     /// [`MAX_ANCESTOR_PIDS`].
     pub(crate) fn within_bounds(&self) -> bool {
-        let binding_valid = match (&self.ancestor_pids, &self.task_id) {
-            (Some(pids), None) => pids.len() <= MAX_ANCESTOR_PIDS,
-            (None, Some(id)) => valid_task_id(id),
+        let binding_valid = match (&self.ancestor_pids, &self.task_id, &self.agent_id) {
+            (Some(pids), None, None) => pids.len() <= MAX_ANCESTOR_PIDS,
+            (None, Some(id), None) => valid_task_id(id),
+            (None, None, Some(id)) => id == "codex",
             _ => false,
         };
         binding_valid
@@ -126,6 +128,40 @@ pub(crate) async fn issue_for_caller(
     state: &AppState,
     request: IssueRequest,
 ) -> Result<IssuedToken, (StatusCode, Json<Value>)> {
+    if let Some(agent_id) = request.agent_id {
+        // This endpoint already requires the local admin credential. Merely
+        // knowing an agent's name is not authority. Remote forwarding still
+        // resolves the caller's task lineage, as for OpenCode service tokens.
+        if !super::inject::enabled(&state.config)
+            || agent_id != "codex"
+            || state
+                .agent_runtime
+                .manager_for_agent(&agent_id)
+                .await
+                .is_none()
+        {
+            return Err(api_error(
+                StatusCode::FORBIDDEN,
+                "agent_not_available",
+                "Agent tools are unavailable",
+            ));
+        }
+        return state
+            .mcp_tokens
+            .issue(
+                TokenBinding::Runtime { agent_id },
+                "codex (runtime)".into(),
+                PANE_TOKEN_TTL_MS,
+            )
+            .await
+            .map_err(|_| {
+                api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "token_store_unavailable",
+                    "the assistant token store is unavailable",
+                )
+            });
+    }
     if let Some(task_id) = request.task_id {
         if !matches!(task_authority(state, &task_id).await, Ok(Some(_))) {
             return Err(api_error(
@@ -199,7 +235,9 @@ pub(crate) async fn sweep_closed_panes(state: &AppState) -> usize {
                 session_id,
                 pane_id,
             } => Some((row.id, session_id, pane_id)),
-            TokenBinding::Agent { .. } | TokenBinding::Task { .. } => None,
+            TokenBinding::Agent { .. }
+            | TokenBinding::Runtime { .. }
+            | TokenBinding::Task { .. } => None,
         })
         .collect();
     if pane_tokens.is_empty() {
@@ -268,6 +306,57 @@ pub(crate) fn spawn_sweeper(state: AppState) {
 mod tests {
     use super::*;
     use crate::backend::{AgentStatus, PaneId, TabId, WorkspaceId};
+
+    #[test]
+    fn service_authority_is_exclusive_and_not_an_arbitrary_agent_selector() {
+        for value in [
+            serde_json::json!({"agent_id":"opencode"}),
+            serde_json::json!({"agent_id":"codex","ancestor_pids":[1]}),
+            serde_json::json!({"agent_id":"codex","task_id":"t_1234567890123456789012"}),
+        ] {
+            assert!(!serde_json::from_value::<IssueRequest>(value)
+                .unwrap()
+                .within_bounds());
+        }
+        assert!(
+            serde_json::from_value::<IssueRequest>(serde_json::json!({"agent_id":"codex"}))
+                .unwrap()
+                .within_bounds()
+        );
+    }
+
+    #[tokio::test]
+    async fn service_tokens_require_a_live_runtime_expire_and_are_revoked_when_disabled() {
+        use crate::test_support::{test_state, FakeAgent};
+        let mut state = test_state("synthetic-admin", Vec::new());
+        let request = || {
+            serde_json::from_value::<IssueRequest>(serde_json::json!({"agent_id":"codex"})).unwrap()
+        };
+        assert!(issue_for_caller(&state, request()).await.is_err());
+        state
+            .agent_runtime
+            .attach_for_test(std::sync::Arc::new(
+                crate::agents::manager::AgentManager::for_test(std::sync::Arc::new(
+                    FakeAgent::new("codex"),
+                )),
+            ))
+            .await;
+        let issued = issue_for_caller(&state, request()).await.unwrap();
+        assert_eq!(
+            issued.session.binding,
+            TokenBinding::Runtime {
+                agent_id: "codex".into()
+            }
+        );
+        assert!(issued.session.expires_ms.is_some());
+        state.config.mcp.inject_into_agents = false;
+        assert!(issue_for_caller(&state, request()).await.is_err());
+        super::super::inject::startup_cleanup(&state.config, state.mcp_tokens.as_ref()).await;
+        assert_eq!(
+            state.mcp_tokens.resolve(&issued.token).await.unwrap(),
+            super::super::tokens::Resolved::Invalid
+        );
+    }
 
     fn pane_with_pid(id: &str, pid: u32) -> Pane {
         Pane {

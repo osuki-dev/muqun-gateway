@@ -36,6 +36,9 @@ pub(crate) enum McpCommand {
         /// requires this gateway's admin credential and an eligible task.
         #[arg(long, value_name = "TASK_ID")]
         task_id: Option<String>,
+        /// Service agent authority, independent of terminal process ancestry.
+        #[arg(long, conflicts_with = "task_id", value_parser = ["codex"])]
+        agent_id: Option<String>,
     },
     /// Revoke assistant tokens. A running gateway sees it on the next call.
     #[command(group(clap::ArgGroup::new("which").required(true).args(["all", "id"])))]
@@ -175,6 +178,7 @@ fn token_helper(
     url: Option<String>,
     state_dir: Option<PathBuf>,
     task_id: Option<String>,
+    agent_id: Option<String>,
 ) -> anyhow::Result<()> {
     let fail = |code: i32, message: String| -> ! {
         eprintln!("{message}");
@@ -215,11 +219,13 @@ fn token_helper(
         tracing::warn!("{refused}");
         fail(1, refused);
     }
-    let body = match task_id {
-        Some(task_id) => json!({ "task_id": task_id }),
-        None => {
+    let body = match (task_id, agent_id) {
+        (Some(task_id), None) => json!({ "task_id": task_id }),
+        (None, Some(agent_id)) => json!({ "agent_id": agent_id }),
+        (None, None) => {
             json!({ "ancestor_pids": ancestor_chain(std::process::id(), MAX_ANCESTORS, parent_pid) })
         }
+        _ => anyhow::bail!("choose task or agent authority, not both"),
     };
     let (status, value) = match admin_request(&config, "POST", "/api/mcp/tokens", Some(&body)) {
         Ok(reply) => reply,
@@ -274,7 +280,8 @@ pub(crate) async fn run_mcp_command(command: McpCommand) -> anyhow::Result<()> {
             url,
             state_dir,
             task_id,
-        } => token_helper(bearer, config_dir, url, state_dir, task_id)?,
+            agent_id,
+        } => token_helper(bearer, config_dir, url, state_dir, task_id, agent_id)?,
         McpCommand::Revoke { all, id } => revoke(all, id).await?,
         McpCommand::Enable { host, project, url } => {
             let url = url.unwrap_or_else(default_url);

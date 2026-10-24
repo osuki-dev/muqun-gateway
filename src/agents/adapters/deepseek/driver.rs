@@ -131,6 +131,23 @@ impl DeepseekDriver {
 }
 
 impl AgentPort for DeepseekDriver {
+    fn adds_mcp_servers(&self) -> bool {
+        true
+    }
+
+    fn mcp_server_connected<'a>(
+        &'a self,
+        name: &'a str,
+        _directory: Option<&'a str>,
+    ) -> AgentFuture<'a, bool> {
+        Box::pin(async move {
+            if name != "muqun" {
+                return Ok(false);
+            }
+            super::mcp::connected(&self.client).await
+        })
+    }
+
     fn kind(&self) -> &'static str {
         "deepseek"
     }

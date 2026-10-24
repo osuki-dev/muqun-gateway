@@ -11,8 +11,8 @@ use super::{
 };
 use crate::agents::domain::*;
 use crate::agents::ports::agent::{
-    AgentError, AgentFuture, AgentPort, AttachmentMode, FileDiffItem, PreparedTerminalLaunch,
-    PreparedTimeline,
+    AgentError, AgentFuture, AgentPort, AttachmentMode, FileDiffItem, HistoryCommit,
+    PreparedTerminalLaunch, PreparedTimeline,
 };
 
 const MAX_SESSIONS: usize = 4096;
@@ -23,6 +23,29 @@ const FIRST_ITEM_POSITION: u64 = 1 << 63;
 // Live observation can skip items that a later authoritative page fills in.
 const ITEM_POSITION_STEP: u64 = 1 << 32;
 
+type ItemOrder = HashMap<(String, String, String), u64>;
+
+#[derive(Debug)]
+enum OrderError {
+    RebaseRequired,
+    Invalid(AgentError),
+}
+
+impl From<AgentError> for OrderError {
+    fn from(error: AgentError) -> Self {
+        Self::Invalid(error)
+    }
+}
+
+impl OrderError {
+    fn into_agent(self) -> AgentError {
+        match self {
+            Self::RebaseRequired => AgentError::HistoryCursorLost,
+            Self::Invalid(error) => error,
+        }
+    }
+}
+
 pub struct CodexDriver {
     client: Arc<CodexClient>,
     account_limits: super::account_limits::Cache,
@@ -32,7 +55,8 @@ pub struct CodexDriver {
     loaded: Mutex<HashSet<String>>,
     /// Serializes explicit mutations, not the stream or read-only RPC calls.
     mutations: Arc<Mutex<()>>,
-    order: std::sync::Mutex<HashMap<(String, String, String), u64>>,
+    order: std::sync::Mutex<ItemOrder>,
+    order_epochs: std::sync::Mutex<HashMap<String, u64>>,
     next_models: Arc<std::sync::Mutex<HashMap<String, PendingModel>>>,
     metadata_versions: Arc<Mutex<HashMap<String, u64>>>,
     next_metadata_version: std::sync::atomic::AtomicU64,
@@ -160,6 +184,7 @@ impl CodexDriver {
             loaded: Mutex::new(HashSet::new()),
             mutations: Arc::new(Mutex::new(())),
             order: std::sync::Mutex::new(HashMap::new()),
+            order_epochs: std::sync::Mutex::new(HashMap::new()),
             next_models: Arc::new(std::sync::Mutex::new(HashMap::new())),
             metadata_versions: Arc::new(Mutex::new(HashMap::new())),
             next_metadata_version: std::sync::atomic::AtomicU64::new(1),
@@ -653,7 +678,6 @@ impl CodexDriver {
         let mut order = self.order.lock().unwrap_or_else(|p| p.into_inner());
         let key = (thread.to_string(), turn.to_string(), item.to_string());
         if order.len() >= 8192 && !order.contains_key(&key) {
-            self.client.stop();
             return Err(AgentError::NotAvailable(
                 "Codex item-order capacity exhausted; resync required".into(),
             ));
@@ -675,6 +699,7 @@ impl CodexDriver {
         Ok(position)
     }
 
+    #[cfg(test)]
     fn set_history_order(
         &self,
         thread: &str,
@@ -684,6 +709,7 @@ impl CodexDriver {
         self.set_history_order_at(thread, turn, ids, false)
     }
 
+    #[cfg(test)]
     fn set_history_order_at(
         &self,
         thread: &str,
@@ -691,18 +717,33 @@ impl CodexDriver {
         ids: &[String],
         prefix: bool,
     ) -> Result<(), AgentError> {
+        Self::assign_history_order(
+            &mut self.order.lock().unwrap_or_else(|p| p.into_inner()),
+            thread,
+            turn,
+            ids,
+            prefix,
+        )
+        .map_err(OrderError::into_agent)
+    }
+
+    fn assign_history_order(
+        order: &mut ItemOrder,
+        thread: &str,
+        turn: &str,
+        ids: &[String],
+        prefix: bool,
+    ) -> Result<(), OrderError> {
         if ids.is_empty() {
             return Ok(());
         }
-        let mut order = self.order.lock().unwrap_or_else(|p| p.into_inner());
+
         let key = |id: &str| (thread.to_string(), turn.to_string(), id.to_string());
-        let range_error = || {
-            AgentError::Protocol(
-                "Codex item-order range exhausted or changed; resync required".into(),
-            )
-        };
+        let range_error = || OrderError::RebaseRequired;
         if ids.iter().collect::<HashSet<_>>().len() != ids.len() {
-            return Err(range_error());
+            return Err(
+                AgentError::Protocol("duplicate Codex canonical item identity".into()).into(),
+            );
         }
         let new_ids: HashSet<_> = ids
             .iter()
@@ -713,7 +754,8 @@ impl CodexDriver {
             // transport failure. Leave the old order/cursor and primary intact.
             return Err(AgentError::RequestFailed(
                 "Codex history item-order capacity exhausted; page not consumed".into(),
-            ));
+            )
+            .into());
         }
         let mut positions: Vec<_> = ids.iter().map(|id| order.get(&key(id)).copied()).collect();
         let anchors: Vec<_> = positions.iter().flatten().copied().collect();
@@ -804,12 +846,110 @@ impl CodexDriver {
         Ok(())
     }
 
+    /// A complete producer array supplies order before any missing items are
+    /// projected. Arrival order alone cannot place items missed during reconnect.
+    #[cfg(test)]
+    fn ordered_turn_items(
+        &self,
+        thread: &str,
+        turn: &str,
+        items: &[Value],
+    ) -> Result<Vec<TimelineItem>, AgentError> {
+        let ids = items
+            .iter()
+            .map(|item| mapper::string(item, "id"))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.set_history_order(thread, turn, &ids)?;
+        let mut rows = Vec::new();
+        for item in items {
+            rows.extend(self.ordered_items(thread, turn, item, 0)?);
+        }
+        Ok(rows)
+    }
+
+    /// Complete turn arrays can repair provisional live order. Their rows and
+    /// the projection commit are accepted together by the mirror.
+    pub(crate) fn prepare_completed_turn<'a>(
+        &'a self,
+        thread: &'a str,
+        turn: &str,
+        items: &[Value],
+        full: bool,
+    ) -> Result<PreparedTimeline<'a>, AgentError> {
+        let (mut order, epoch) = self.order_candidate(thread);
+        let ids = items
+            .iter()
+            .map(|item| mapper::string(item, "id"))
+            .collect::<Result<Vec<_>, _>>()?;
+        if ids.iter().collect::<HashSet<_>>().len() != ids.len() {
+            return Err(AgentError::Protocol(
+                "duplicate Codex completion item identity".into(),
+            ));
+        }
+        if full {
+            Self::rebase_prepared_order(thread, turn, &ids, &mut order)?;
+        } else {
+            // A summary is not canonical turn order. Retain known positions
+            // and append previously unseen items without erasing other rows.
+            for id in &ids {
+                let key = (thread.to_owned(), turn.to_owned(), id.clone());
+                if order.contains_key(&key) {
+                    continue;
+                }
+                let position = order
+                    .iter()
+                    .filter(|((t, u, _), _)| t == thread && u == turn)
+                    .map(|(_, p)| *p)
+                    .max()
+                    .map(|p| p.checked_add(ITEM_POSITION_STEP))
+                    .unwrap_or(Some(FIRST_ITEM_POSITION))
+                    .ok_or(AgentError::HistoryCursorLost)?;
+                order.insert(key, position);
+            }
+        }
+        let mut rows = Vec::new();
+        for (item, id) in items.iter().zip(ids) {
+            let position = order[&(thread.to_owned(), turn.to_owned(), id)];
+            rows.extend(self.project_item(thread, turn, item, 0, position)?);
+        }
+        let fresh_ids = rows.iter().map(|item| item.id.clone()).collect();
+        let replace_groups = rows
+            .iter()
+            .filter(|item| {
+                matches!(&item.part, AgentPart::Tool(call)
+                    if call.metadata.as_ref().is_some_and(|m| m["type"] == "collabAgentToolCall"))
+            })
+            .map(|item| item.message_id.clone())
+            .collect();
+        Ok(PreparedTimeline {
+            items: rows,
+            commit: Some(Box::new(move || {
+                let mut accepted =
+                    self.accept_order_candidate(thread, (order, epoch), fresh_ids, None)?;
+                accepted.replace_groups = replace_groups;
+                Ok(accepted)
+            })),
+        })
+    }
+
     pub(crate) fn ordered_items(
         &self,
         thread: &str,
         turn: &str,
         item: &Value,
         at_ms: u64,
+    ) -> Result<Vec<TimelineItem>, AgentError> {
+        let position = self.item_position(thread, turn, &mapper::string(item, "id")?)?;
+        self.project_item(thread, turn, item, at_ms, position)
+    }
+
+    fn project_item(
+        &self,
+        thread: &str,
+        turn: &str,
+        item: &Value,
+        at_ms: u64,
+        position: u64,
     ) -> Result<Vec<TimelineItem>, AgentError> {
         // A reasoning item past the part limit is kept to its first parts
         // rather than costing the connection.
@@ -846,8 +986,6 @@ impl CodexDriver {
                 "Codex collaboration target limit exceeded; resync required".into(),
             ));
         }
-        let id = mapper::string(item, "id")?;
-        let position = self.item_position(thread, turn, &id)?;
         let mut rows = mapper::item(thread, turn, item, at_ms);
         for row in &mut rows {
             row.message_id = mapper::order_group(thread, turn, position);
@@ -904,14 +1042,23 @@ impl CodexDriver {
             .remove(id);
         self.metadata_versions.lock().await.remove(id);
         let _history_read = self.history.lock().await;
-        let history = self.history_state.lock().unwrap_or_else(|p| p.into_inner());
-        // Native unload ends control ownership, not the historical viewport.
-        // Keep anchors while pagination/mirror rows can still refer to them.
-        if !history.pages.contains_key(id) {
+        let retained = self
+            .history_state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .pages
+            .contains_key(id);
+        // Never hold history_state while acquiring order: acceptance locks in
+        // the opposite order. Native unload keeps retained history anchors.
+        if !retained {
             self.order
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .retain(|(thread, _, _), _| thread != id);
+            self.order_epochs
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(id);
         }
     }
 
@@ -1429,12 +1576,239 @@ impl CodexDriver {
         Ok(())
     }
 
+    fn order_candidate(&self, thread: &str) -> (ItemOrder, u64) {
+        let accepted = self.order.lock().unwrap_or_else(|p| p.into_inner());
+        let epoch = self
+            .order_epochs
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(thread)
+            .copied()
+            .unwrap_or(0);
+        (
+            accepted
+                .iter()
+                .filter(|((t, _, _), _)| t == thread)
+                .map(|(key, value)| (key.clone(), *value))
+                .collect(),
+            epoch,
+        )
+    }
+
+    fn rebase_prepared_order(
+        thread: &str,
+        turn: &str,
+        ids: &[String],
+        order: &mut ItemOrder,
+    ) -> Result<HashMap<String, String>, AgentError> {
+        let unique: HashSet<_> = ids.iter().collect();
+        if unique.len() != ids.len() {
+            return Err(AgentError::Protocol(
+                "duplicate Codex canonical item identity".into(),
+            ));
+        }
+        let key = |id: &str| (thread.to_string(), turn.to_string(), id.to_string());
+        let new_count = ids
+            .iter()
+            .filter(|id| !order.contains_key(&key(id)))
+            .count();
+        if order.len() + new_count > 8192 {
+            return Err(AgentError::RequestFailed(
+                "Codex history item-order capacity exhausted; page not consumed".into(),
+            ));
+        }
+        let mut extra: Vec<_> = order
+            .iter()
+            .filter(|((t, u, id), _)| t == thread && u == turn && !unique.contains(id))
+            .map(|((_, _, id), position)| (id.clone(), *position))
+            .collect();
+        extra.sort_by_key(|(_, position)| *position);
+        let all = ids
+            .iter()
+            .cloned()
+            .chain(extra.into_iter().map(|(id, _)| id));
+        let mut changes = HashMap::new();
+        for (index, id) in all.enumerate() {
+            let position = FIRST_ITEM_POSITION + (index as u64) * ITEM_POSITION_STEP;
+            if let Some(old) = order
+                .insert(key(&id), position)
+                .filter(|old| *old != position)
+            {
+                changes.insert(
+                    mapper::order_group(thread, turn, old),
+                    mapper::order_group(thread, turn, position),
+                );
+            }
+        }
+        Ok(changes)
+    }
+
+    async fn prepare_history_order(
+        &self,
+        thread: &str,
+        turn: &str,
+        ids: &[String],
+        prefix: bool,
+        order: &mut ItemOrder,
+        budget: &mut Budget,
+    ) -> Result<HashMap<String, String>, AgentError> {
+        match Self::assign_history_order(order, thread, turn, ids, prefix) {
+            Ok(()) => return Ok(HashMap::new()),
+            Err(OrderError::RebaseRequired) => {}
+            Err(OrderError::Invalid(error)) => return Err(error),
+        }
+        // Repair only the affected turn. Nothing accepted is mutated while
+        // fetching, and the ordinary page cursor remains unconsumed on failure.
+        let mut canonical = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut seen = HashSet::new();
+        loop {
+            let response = budget.call(&self.client,"thread/items/list",json!({"threadId":thread,"turnId":turn,"sortDirection":"asc","limit":100,"cursor":cursor})).await?;
+            let rows = response["data"]
+                .as_array()
+                .ok_or_else(|| AgentError::Protocol("invalid Codex canonical turn page".into()))?;
+            if rows.len() > 100 {
+                return Err(AgentError::Protocol(
+                    "oversized Codex canonical turn page".into(),
+                ));
+            }
+            budget.rows(rows.len())?;
+            for row in rows {
+                if row["turnId"] != turn {
+                    return Err(AgentError::Protocol(
+                        "Codex canonical turn identity mismatch".into(),
+                    ));
+                }
+                canonical.push(mapper::string(&row["item"], "id")?);
+            }
+            if canonical.len() > 8192 {
+                return Err(AgentError::RequestFailed(
+                    "Codex canonical turn item limit exceeded".into(),
+                ));
+            }
+            cursor = next_cursor(&response, &mut seen)?;
+            if cursor.is_none() {
+                break;
+            }
+            if rows.is_empty() {
+                return Err(AgentError::Protocol(
+                    "empty continuing Codex canonical turn page".into(),
+                ));
+            }
+        }
+        let available: HashSet<_> = canonical.iter().collect();
+        if ids.iter().any(|id| !available.contains(id)) {
+            return Err(AgentError::HistoryCursorLost);
+        }
+        Self::rebase_prepared_order(thread, turn, &canonical, order)
+    }
+
+    fn accept_history_order(
+        &self,
+        thread: &str,
+        expected: Option<u64>,
+        page: HistoryPage,
+        candidate: (ItemOrder, u64),
+        fresh_ids: HashSet<String>,
+    ) -> Result<HistoryCommit, AgentError> {
+        self.accept_order_candidate(thread, candidate, fresh_ids, Some((expected, page)))
+    }
+
+    fn accept_order_candidate(
+        &self,
+        thread: &str,
+        (mut candidate, expected_epoch): (ItemOrder, u64),
+        fresh_ids: HashSet<String>,
+        history: Option<(Option<u64>, HistoryPage)>,
+    ) -> Result<HistoryCommit, AgentError> {
+        let mut accepted = self.order.lock().unwrap_or_else(|p| p.into_inner());
+        let mut epochs = self.order_epochs.lock().unwrap_or_else(|p| p.into_inner());
+        if epochs.get(thread).copied().unwrap_or(0) != expected_epoch {
+            return Err(AgentError::HistoryCursorLost);
+        }
+        if epochs.len() >= MAX_SESSIONS && !epochs.contains_key(thread) {
+            return Err(AgentError::RequestFailed(
+                "Codex ordering session retention exhausted".into(),
+            ));
+        }
+        let next_epoch = expected_epoch
+            .checked_add(1)
+            .ok_or_else(|| AgentError::NotAvailable("Codex ordering revision exhausted".into()))?;
+        let new_count = candidate
+            .keys()
+            .filter(|key| !accepted.contains_key(*key))
+            .count();
+        if accepted.len() + new_count > 8192 {
+            return Err(AgentError::RequestFailed(
+                "Codex history item-order capacity exhausted; page not consumed".into(),
+            ));
+        }
+        // Live observations after the read started are retained, never deleted
+        // by a historical snapshot. Their provisional relative order is kept.
+        let mut live: Vec<_> = accepted
+            .iter()
+            .filter(|((t, _, _), _)| t == thread)
+            .filter(|(key, _)| !candidate.contains_key(*key))
+            .map(|(key, p)| (key.clone(), *p))
+            .collect();
+        live.sort_by_key(|(key, p)| (key.1.clone(), *p));
+        for (key, _) in live {
+            let position = candidate
+                .iter()
+                .filter(|((t, u, _), _)| t == &key.0 && u == &key.1)
+                .map(|(_, p)| *p)
+                .max()
+                .map(|p| p.checked_add(ITEM_POSITION_STEP))
+                .unwrap_or(Some(FIRST_ITEM_POSITION))
+                .ok_or_else(|| {
+                    AgentError::RequestFailed("Codex live order capacity exhausted".into())
+                })?;
+            candidate.insert(key, position);
+        }
+        let mut changes = HashMap::new();
+        for ((t, u, id), new) in &candidate {
+            if let Some(old) = accepted
+                .get(&(t.clone(), u.clone(), id.clone()))
+                .filter(|old| *old != new)
+            {
+                changes.insert(
+                    mapper::order_group(t, u, *old),
+                    mapper::order_group(t, u, *new),
+                );
+            }
+        }
+        // This hook is invoked under the mirror write lock. After cursor
+        // validation there are no awaits or fallible operations before publish.
+        if let Some((expected, page)) = history {
+            self.accept_history(thread, expected, page)?;
+        } else {
+            // Prepared older rows must use the same projection after a live
+            // canonical completion. In-flight candidates are fenced by epoch.
+            let mut retained = self.history_state.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(page) = retained.pages.get_mut(thread) {
+                for item in &mut page.remaining {
+                    if let Some(next) = changes.get(&item.message_id) {
+                        item.message_id.clone_from(next);
+                    }
+                }
+            }
+        }
+        accepted.extend(candidate);
+        epochs.insert(thread.to_owned(), next_epoch);
+        Ok(HistoryCommit {
+            order: changes,
+            fresh_ids,
+            replace_groups: Default::default(),
+        })
+    }
+
     async fn read_history_batch(
         &self,
         id: &str,
         limit: usize,
         state: &mut HistoryPage,
         budget: &mut Budget,
+        order: &mut ItemOrder,
     ) -> Result<Vec<TimelineItem>, AgentError> {
         let mut items = Vec::new();
         while items.len() < limit {
@@ -1499,7 +1873,14 @@ impl CodexDriver {
                         .push(mapper::string(&row["item"], "id")?);
                 }
                 for (turn, ids) in ids_by_turn {
-                    self.set_history_order_at(id, &turn, &ids, state.started)?;
+                    let changes = self
+                        .prepare_history_order(id, &turn, &ids, state.started, order, budget)
+                        .await?;
+                    for row in state.remaining.iter_mut().chain(items.iter_mut()) {
+                        if let Some(next) = changes.get(&row.message_id) {
+                            row.message_id.clone_from(next);
+                        }
+                    }
                 }
                 state.pending = page["data"]
                     .as_array_mut()
@@ -1524,7 +1905,7 @@ impl CodexDriver {
             for row in pending {
                 let turn = mapper::string(&row, "turnId")?;
                 state.remaining.extend(
-                    self.ordered_items(
+                    self.project_item(
                         id,
                         &turn,
                         &row["item"],
@@ -1532,6 +1913,15 @@ impl CodexDriver {
                             .as_u64()
                             .or_else(|| row["completedAtMs"].as_u64())
                             .unwrap_or(0),
+                        *order
+                            .get(&(
+                                id.to_string(),
+                                turn.clone(),
+                                mapper::string(&row["item"], "id")?,
+                            ))
+                            .ok_or_else(|| {
+                                AgentError::Protocol("missing prepared Codex item order".into())
+                            })?,
                     )?,
                 );
             }
@@ -1726,6 +2116,49 @@ impl AgentPort for CodexDriver {
             arguments.extend(config.ui_args);
             arguments.extend(["resume".into(), session.asid.0.clone()]);
             Ok(PreparedTerminalLaunch { session, arguments })
+        })
+    }
+
+    fn adds_mcp_servers(&self) -> bool {
+        true
+    }
+
+    fn refresh_session_mcp<'a>(&'a self, asid: &'a str) -> AgentFuture<'a, bool> {
+        Box::pin(async move {
+            self.client
+                .call("config/mcpServer/reload", Value::Null)
+                .await?;
+            super::mcp::connected(&self.client, Some(asid)).await
+        })
+    }
+
+    fn session_mcp_connected<'a>(
+        &'a self,
+        asid: &'a str,
+        _directory: Option<&'a str>,
+    ) -> AgentFuture<'a, bool> {
+        Box::pin(async move { super::mcp::connected(&self.client, Some(asid)).await })
+    }
+
+    fn mcp_server_connected<'a>(
+        &'a self,
+        _name: &'a str,
+        _directory: Option<&'a str>,
+    ) -> AgentFuture<'a, bool> {
+        Box::pin(async move { super::mcp::connected(&self.client, None).await })
+    }
+
+    fn add_mcp_server<'a>(
+        &'a self,
+        name: &'a str,
+        config: &'a Value,
+        directory: Option<&'a str>,
+    ) -> AgentFuture<'a, ()> {
+        Box::pin(async move {
+            if name != "muqun" {
+                return unsupported("MCP server registration");
+            }
+            super::mcp::prepare(&self.client, config, directory).await
         })
     }
 
@@ -2260,6 +2693,20 @@ impl AgentPort for CodexDriver {
         limit: usize,
     ) -> AgentFuture<'a, Vec<TimelineItem>> {
         Box::pin(async move {
+            let prepared = self.prepare_earlier_timeline(session_id, limit).await?;
+            if let Some(commit) = prepared.commit {
+                commit()?;
+            }
+            Ok(prepared.items)
+        })
+    }
+
+    fn prepare_earlier_timeline<'a>(
+        &'a self,
+        session_id: &'a str,
+        limit: usize,
+    ) -> AgentFuture<'a, PreparedTimeline<'a>> {
+        Box::pin(async move {
             if limit == 0 || limit > MAX_HISTORY_ITEMS {
                 return Err(AgentError::InvalidRequest(
                     "Codex history limit exceeds 2000 mapped rows".into(),
@@ -2282,15 +2729,21 @@ impl AgentPort for CodexDriver {
                 && page.pending.is_empty()
                 && page.remaining.is_empty()
             {
-                return Ok(Vec::new());
+                return Ok(PreparedTimeline::ready(Vec::new()));
             }
             let expected = Some(page.revision);
             let mut budget = Budget::new();
+            let (mut order, epoch) = self.order_candidate(session_id);
             let items = self
-                .read_history_batch(session_id, limit, &mut page, &mut budget)
+                .read_history_batch(session_id, limit, &mut page, &mut budget, &mut order)
                 .await?;
-            self.accept_history(session_id, expected, page)?;
-            Ok(items)
+            let fresh_ids = items.iter().map(|item| item.id.clone()).collect();
+            Ok(PreparedTimeline {
+                items,
+                commit: Some(Box::new(move || {
+                    self.accept_history_order(session_id, expected, page, (order, epoch), fresh_ids)
+                })),
+            })
         })
     }
 
@@ -2313,6 +2766,22 @@ impl AgentPort for CodexDriver {
                 ));
             }
             self.compact_session(session_id, delivery).await.map(|_| ())
+        })
+    }
+
+    fn mcp_call_timeline<'a>(
+        &'a self,
+        id: &'a str,
+        limit: usize,
+    ) -> AgentFuture<'a, Option<Vec<TimelineItem>>> {
+        Box::pin(async move {
+            let metadata = self.read_thread(id).await?;
+            if metadata["status"]["type"] == "idle" {
+                return Ok(None);
+            }
+            super::mcp::call_timeline(&self.client, id, limit, metadata["historyMode"].as_str())
+                .await
+                .map(Some)
         })
     }
 
@@ -2381,9 +2850,10 @@ impl AgentPort for CodexDriver {
             // history lock (delete holds mutations before clearing history).
             let _history_read = self.history.lock().await;
             let mut page = HistoryPage::default();
+            let (mut order, epoch) = self.order_candidate(id);
             let items = match thread["historyMode"].as_str() {
                 Some("paginated") => {
-                    self.read_history_batch(id, limit, &mut page, &mut budget)
+                    self.read_history_batch(id, limit, &mut page, &mut budget, &mut order)
                         .await?
                 }
                 Some("legacy") => {
@@ -2404,13 +2874,18 @@ impl AgentPort for CodexDriver {
                     })?;
                     for turn in turns {
                         let turn_id = mapper::string(turn, "id")?;
+                        if turn.get("itemsView").is_some_and(|view| view != "full") {
+                            return Err(AgentError::Protocol(
+                                "incomplete Codex legacy turn".into(),
+                            ));
+                        }
                         if let Some(rows) = turn["items"].as_array() {
                             budget.rows(rows.len())?;
                             let ids = rows
                                 .iter()
                                 .map(|row| mapper::string(row, "id"))
                                 .collect::<Result<Vec<_>, _>>()?;
-                            self.set_history_order(id, &turn_id, &ids)?;
+                            Self::rebase_prepared_order(id, &turn_id, &ids, &mut order)?;
                             for row in rows {
                                 page.pending.push(json!({"turnId":turn_id,"item":row,
                                     "startedAtMs":turn["startedAt"].as_u64().unwrap_or(0).saturating_mul(1000)}));
@@ -2418,7 +2893,7 @@ impl AgentPort for CodexDriver {
                         }
                     }
                     page.started = true;
-                    self.read_history_batch(id, limit, &mut page, &mut budget)
+                    self.read_history_batch(id, limit, &mut page, &mut budget, &mut order)
                         .await?
                 }
                 _ => return unsupported("Codex thread history storage mode"),
@@ -2429,15 +2904,17 @@ impl AgentPort for CodexDriver {
                 self.seed_usage(id, prepared.usage.as_ref(), prepared.external())
                     .await;
             }
+            let fresh_ids = items.iter().map(|item| item.id.clone()).collect();
             Ok(PreparedTimeline {
                 items,
                 commit: Some(Box::new(move || {
                     let _permit = permit;
-                    self.accept_history(id, expected, page)?;
+                    let accepted =
+                        self.accept_history_order(id, expected, page, (order, epoch), fresh_ids)?;
                     if let Some(prepared) = prepared {
                         self.rollouts.install(id, prepared);
                     }
-                    Ok(())
+                    Ok(accepted)
                 })),
             })
         })
@@ -2852,7 +3329,7 @@ mod history_tests {
                         61
                     );
                 } else {
-                    assert!(matches!(result, Err(AgentError::NotAvailable(_))));
+                    assert!(matches!(result, Err(AgentError::HistoryCursorLost)));
                     let current = memory.get_snapshot(&id).await.unwrap();
                     assert_eq!(current.seq, held.seq);
                     assert_eq!(
@@ -2867,6 +3344,39 @@ mod history_tests {
                 .unwrap()
                 .is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn codex_mcp_probe_skips_idle_history_and_preserves_app_cursor() {
+        let active = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (state, count) = (active.clone(), reads.clone());
+        let mut fixture = Fixture::new(move |r| match r["method"].as_str().unwrap() {
+            "thread/read" => {
+                let mut thread = golden()["thread"].clone();
+                thread["status"] = json!({"type": if state.load(std::sync::atomic::Ordering::SeqCst) { "active" } else { "idle" }});
+                json!({"thread":thread})
+            }
+            "thread/items/list" => {
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                history_fixture_page(r, 241, false)
+            }
+            _ => panic!("unexpected MCP probe mutation"),
+        }).await;
+        fixture.ready().await;
+        let driver = CodexDriver::new(fixture.client.clone());
+        let id = golden()["thread"]["id"].as_str().unwrap().to_owned();
+        assert!(driver.mcp_call_timeline(&id, 20).await.unwrap().is_none());
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 0);
+        active.store(true, std::sync::atomic::Ordering::SeqCst);
+        driver.get_timeline(&id, 100).await.unwrap();
+        driver.load_earlier_timeline(&id, 80).await.unwrap();
+        assert!(driver.mcp_call_timeline(&id, 20).await.unwrap().is_some());
+        assert_eq!(
+            driver.load_earlier_timeline(&id, 80).await.unwrap().len(),
+            61
+        );
+        assert_eq!(driver.history_preparations.available_permits(), 4);
     }
 
     #[tokio::test]
@@ -2955,6 +3465,326 @@ mod history_tests {
             all.iter().map(|row| &row.id).collect::<HashSet<_>>().len(),
             303
         );
+    }
+
+    #[tokio::test]
+    async fn history_order_repair_is_staged_and_commits_with_live_content_and_cursor() {
+        use crate::agents::adapters::memory_mirror::MemoryMirror;
+        use crate::agents::ports::mirror::SessionMirrorPort;
+        let mut fixture = Fixture::new(|request| {
+            assert_eq!(request["method"], "thread/items/list");
+            let params = &request["params"];
+            let (ids,next) = if params["sortDirection"] == "asc" {
+                assert_eq!(params["turnId"], "turn");
+                (vec!["first", "second", "third"], Value::Null)
+            } else if params["cursor"] == "older" {
+                (vec!["first"], Value::Null)
+            } else { (vec!["third", "second"],json!("older")) };
+            json!({"data":ids.into_iter().map(|id| json!({"turnId":"turn","item":{"id":id,"type":"agentMessage","text":id}})).collect::<Vec<_>>(),"nextCursor":next})
+        }).await;
+        fixture.ready().await;
+        let driver = CodexDriver::new(fixture.client.clone());
+        let mirror = MemoryMirror::for_agent("codex");
+        let asid = AgentSessionId("thread".into());
+        let mut live = Vec::new();
+        for id in ["third", "first", "second"] {
+            live.extend(
+                driver
+                    .ordered_items(
+                        "thread",
+                        "turn",
+                        &json!({"id":id,"type":"agentMessage","text":id}),
+                        0,
+                    )
+                    .unwrap(),
+            );
+        }
+        mirror.upsert_timeline_items(&asid, live.clone()).await;
+        let gate = mirror.history_gate(&asid).await;
+        let before_read = mirror.history_read_revision(&asid).await.unwrap();
+        let original = driver.order_candidate("thread");
+        let (mut candidate, epoch) = original.clone();
+        let mut page = HistoryPage::default();
+        let items = driver
+            .read_history_batch("thread", 2, &mut page, &mut Budget::new(), &mut candidate)
+            .await
+            .unwrap();
+        assert_eq!(
+            driver.order_candidate("thread"),
+            original,
+            "preparation cannot mutate live order"
+        );
+        assert!(
+            driver.history_state.lock().unwrap().pages.is_empty(),
+            "unaccepted cursor is private"
+        );
+        let mut newest = live[0].clone();
+        newest.part = AgentPart::Text {
+            text: "new content during history read".into(),
+        };
+        mirror
+            .upsert_timeline_items(&asid, vec![newest.clone()])
+            .await;
+        let fresh_ids = items.iter().map(|item| item.id.clone()).collect();
+        assert!(mirror
+            .initialize_prepared_history(
+                &asid,
+                &gate,
+                before_read,
+                items,
+                Some(Box::new(|| driver.accept_history_order(
+                    "thread",
+                    None,
+                    page,
+                    (candidate, epoch),
+                    fresh_ids
+                )))
+            )
+            .await
+            .unwrap());
+        let snapshot = mirror.get_snapshot(&asid).await.unwrap();
+        assert_eq!(
+            snapshot
+                .timeline
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                live[1].id.as_str(),
+                live[2].id.as_str(),
+                live[0].id.as_str()
+            ]
+        );
+        assert_eq!(
+            snapshot.timeline[2].part, newest.part,
+            "ordering cannot replace newer text"
+        );
+        assert_eq!(
+            driver.history_state.lock().unwrap().pages["thread"]
+                .cursor
+                .as_deref(),
+            Some("older")
+        );
+        let revision = mirror.history_read_revision(&asid).await.unwrap();
+        let earlier = driver.prepare_earlier_timeline("thread", 2).await.unwrap();
+        let accepted = mirror
+            .accept_earlier_history(&asid, &gate, revision, earlier.items, earlier.commit)
+            .await
+            .unwrap();
+        assert_eq!(accepted.len(), 1);
+        assert!(accepted[0].id.contains("/first:"));
+        assert!(accepted[0].seq > 0);
+        assert!(driver.history_state.lock().unwrap().pages["thread"]
+            .cursor
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn canonical_completion_replaces_provisional_child_rows_atomically() {
+        use crate::agents::adapters::memory_mirror::MemoryMirror;
+        use crate::agents::ports::mirror::SessionMirrorPort;
+        let mut fixture = Fixture::new(|_| panic!("completion must not read history")).await;
+        fixture.ready().await;
+        let driver = CodexDriver::new(fixture.client.clone());
+        let mirror = MemoryMirror::for_agent("codex");
+        let (events, mut receiver) = tokio::sync::broadcast::channel(16);
+        mirror.publish_history_to(events);
+        let asid = AgentSessionId("thread".into());
+        let mut spawn = json!({
+            "type":"collabAgentToolCall", "id":"spawn", "tool":"spawnAgent",
+            "status":"inProgress", "receiverThreadIds":[], "agentsStates":{}
+        });
+        let provisional = driver.ordered_items("thread", "turn", &spawn, 0).unwrap();
+        assert_eq!(provisional.len(), 1);
+        mirror
+            .upsert_timeline_items(&asid, provisional.clone())
+            .await;
+        let unrelated = driver
+            .ordered_items(
+                "thread",
+                "turn",
+                &json!({
+                    "type":"agentMessage", "id":"text", "text":"keep"
+                }),
+                0,
+            )
+            .unwrap();
+        mirror.upsert_timeline_items(&asid, unrelated.clone()).await;
+        let before = mirror.get_snapshot(&asid).await.unwrap();
+        spawn["status"] = json!("completed");
+        spawn["receiverThreadIds"] = json!(["child-a", "child-b"]);
+        let prepared = driver
+            .prepare_completed_turn("thread", "turn", &[spawn], true)
+            .unwrap();
+        assert_eq!(prepared.items.len(), 2);
+        let children: Vec<_> = prepared.items.iter().map(|row| row.id.clone()).collect();
+        mirror.accept_live_history(&asid, prepared).await.unwrap();
+        let accepted = mirror.get_snapshot(&asid).await.unwrap();
+        assert_eq!(accepted.timeline.len(), 3);
+        assert!(!accepted
+            .timeline
+            .iter()
+            .any(|row| row.id == provisional[0].id));
+        assert!(children
+            .iter()
+            .all(|id| accepted.timeline.iter().any(|row| &row.id == id)));
+        assert!(accepted
+            .timeline
+            .iter()
+            .any(|row| row.id == unrelated[0].id));
+        let removed = receiver.try_recv().unwrap();
+        let upsert = receiver.try_recv().unwrap();
+        assert!(
+            matches!(&removed, AgentDomainEvent::TimelineRemoved { ids, .. } if ids == &vec![provisional[0].id.clone()])
+        );
+        assert!(
+            matches!(&upsert, AgentDomainEvent::TimelineUpsert { items, .. } if items.iter().all(|row| row.id != provisional[0].id))
+        );
+        assert!(removed.seq() < upsert.seq());
+        assert_eq!(
+            mirror.get_events_after(&asid, before.seq).await,
+            Some(vec![removed, upsert])
+        );
+    }
+
+    #[tokio::test]
+    async fn canonical_completion_commits_rows_references_and_replay_and_fences_old_reads() {
+        use crate::agents::adapters::memory_mirror::MemoryMirror;
+        use crate::agents::ports::mirror::SessionMirrorPort;
+        let mut fixture = Fixture::new(|_| panic!("completion must not read history")).await;
+        fixture.ready().await;
+        let driver = CodexDriver::new(fixture.client.clone());
+        let mirror = MemoryMirror::for_agent("codex");
+        let (events, mut receiver) = tokio::sync::broadcast::channel(16);
+        mirror.publish_history_to(events);
+        let asid = AgentSessionId("thread".into());
+        let values: Vec<_> = ["first", "second", "third"]
+            .into_iter()
+            .map(|id| json!({"id":id,"type":"agentMessage","text":id}))
+            .collect();
+        let mut live = Vec::new();
+        for index in [2, 0, 1] {
+            live.extend(
+                driver
+                    .ordered_items("thread", "turn", &values[index], 0)
+                    .unwrap(),
+            );
+        }
+        mirror.upsert_timeline_items(&asid, live.clone()).await;
+        mirror
+            .add_permission(PermissionRequest {
+                id: "approval".into(),
+                asid: asid.clone(),
+                action: "execute".into(),
+                resources: vec![],
+                save: vec![],
+                prompt: "Run".into(),
+                tool: None,
+                source_message_id: Some(live[0].message_id.clone()),
+                source_tool_call_id: None,
+                metadata: None,
+                message: None,
+                options: vec![],
+            })
+            .await;
+        let before = mirror.get_snapshot(&asid).await.unwrap();
+        let obsolete = driver
+            .prepare_completed_turn(
+                "thread",
+                "turn",
+                &[values[2].clone(), values[0].clone(), values[1].clone()],
+                true,
+            )
+            .unwrap();
+        let prepared = driver
+            .prepare_completed_turn("thread", "turn", &values, true)
+            .unwrap();
+        mirror.accept_live_history(&asid, prepared).await.unwrap();
+        let accepted = mirror.get_snapshot(&asid).await.unwrap();
+        assert_eq!(
+            accepted
+                .timeline
+                .iter()
+                .map(|row| row.id.clone())
+                .collect::<Vec<_>>(),
+            vec![live[1].id.clone(), live[2].id.clone(), live[0].id.clone()]
+        );
+        assert_eq!(
+            accepted.permissions[0].source_message_id,
+            Some(accepted.timeline[2].message_id.clone())
+        );
+        let timeline = receiver.try_recv().unwrap();
+        let permission = receiver.try_recv().unwrap();
+        assert!(
+            matches!(&timeline, AgentDomainEvent::TimelineUpsert {items, ..} if items == &accepted.timeline)
+        );
+        assert!(
+            matches!(&permission, AgentDomainEvent::PermissionPending { request, .. } if request == &accepted.permissions[0])
+        );
+        assert!(timeline.seq() > before.seq && permission.seq() > timeline.seq());
+        assert_eq!(
+            mirror.get_events_after(&asid, before.seq).await,
+            Some(vec![timeline, permission])
+        );
+        assert!(matches!(
+            mirror.accept_live_history(&asid, obsolete).await,
+            Err(AgentError::HistoryCursorLost)
+        ));
+        assert_eq!(
+            mirror.get_snapshot(&asid).await.unwrap().timeline,
+            accepted.timeline
+        );
+        assert!(receiver.try_recv().is_err());
+        let partial = driver
+            .prepare_completed_turn(
+                "thread",
+                "turn",
+                &[values[2].clone(), values[0].clone()],
+                false,
+            )
+            .unwrap();
+        mirror.accept_live_history(&asid, partial).await.unwrap();
+        assert_eq!(
+            mirror
+                .get_snapshot(&asid)
+                .await
+                .unwrap()
+                .timeline
+                .iter()
+                .map(|row| row.id.clone())
+                .collect::<Vec<_>>(),
+            accepted
+                .timeline
+                .iter()
+                .map(|row| row.id.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn canonical_completion_orders_items_missed_before_the_first_live_event() {
+        let mut fixture = Fixture::new(|_| panic!("pure ordering test")).await;
+        fixture.ready().await;
+        let driver = CodexDriver::new(fixture.client.clone());
+        let values: Vec<_> = ["older-a", "older-b", "live-c"]
+            .into_iter()
+            .map(|id| json!({"id":id,"type":"agentMessage","text":id}))
+            .collect();
+        let live = driver
+            .ordered_items("thread", "turn", &values[2], 0)
+            .unwrap();
+        let rows = driver
+            .ordered_turn_items("thread", "turn", &values)
+            .unwrap();
+        assert_eq!(rows[2].message_id, live[0].message_id);
+        assert!(rows
+            .windows(2)
+            .all(|pair| pair[0].sort_key() < pair[1].sort_key()));
+        let ids = values
+            .iter()
+            .map(|item| item["id"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        driver.set_history_order("thread", "turn", &ids).unwrap();
     }
 
     #[tokio::test]

@@ -44,7 +44,8 @@ A pane-bound token says which pane's assistant made a call, so its work is
 attributed to that pane and only it can wait on or cancel that work. It is
 attribution, not isolation: any process running as the same user that can
 read the gateway's `pairing.json` can mint a token for any pane, and every
-OpenCode session shares the one agent-bound principal `agent:opencode`.
+OpenCode sessions share their registered runtime principal `runtime:opencode`
+(legacy registrations retain `agent:opencode`).
 
 ## Endpoint and authentication
 
@@ -89,13 +90,17 @@ issued it.
   writes it into the helper command whenever that directory is not the
   default, because hosts may run the helper without your environment (Codex
   does), and `MUQUN_GATEWAY_CONFIG_DIR` would then be lost.
-- **Agent-bound** (the OpenCode service the gateway starts). The gateway issues
-  a token bound to the agent `opencode` that does not expire (`expires_ms` is
-  `null`), hands it to the service with `opencode service set
-  env`, and also sets it in the service's process environment, as
-  `MUQUN_MCP_TOKEN` and `MUQUN_MCP_URL`. The next OpenCode start the gateway
-  makes replaces it (the old one is revoked only after the start worked), and
-  `mcp revoke` ends it.
+- **Registered runtime** credentials use `kind: "runtime"` and principal
+  `runtime:<provider>`. Codex helpers issue seven-day tokens. OpenCode runtime
+  API registration uses a 30-day token per directory scope; preparation replaces
+  revoked/expired credentials even when the provider reports connected.
+  Gateway-owned OpenCode and DeepSeek environment credentials have no wall-clock
+  expiry: successful process replacement retires the predecessor, failed
+  replacement retires only its candidate, and explicit revoke ends it.
+  Renewal depends on the host's supported mechanism; it is not universal.
+- **Legacy agent-bound** credentials retain their original ownership and do not
+  acquire runtime forwarding authority implicitly. New runtime credentials do
+  not silently take ownership of tasks created by a legacy principal.
 - **Task-bound** (Codex tasks using the shared daemon). The per-thread
   `muqun-gateway mcp token-helper --task-id <id>` configuration selects one
   immutable stored task instead of relying on the daemon's process ancestry.
@@ -115,10 +120,10 @@ issued it.
   manages, `export MUQUN_MCP_TOKEN=$(muqun-gateway mcp token-helper --bearer)`
   before starting it; the token is then bound to that pane.
 
-Existing pane and agent token records remain compatible. New task records use
-the existing token binding column with `kind: "task"`; older Gateway binaries
-cannot deserialize that binding. Before downgrading, use a compatible store
-backup or remove the task-token rows while still running compatible tooling.
+Existing pane and legacy agent token records remain readable. New task and
+runtime records use `kind: "task"` or `kind: "runtime"`; older Gateway binaries
+cannot deserialize those bindings. Before downgrading, use a compatible store
+backup or remove incompatible token rows while still running compatible tooling.
 Revocation alone retains the rows and is not a storage rollback.
 
 When a token expires, `/mcp` answers 401 so the host fetches a new one:
@@ -201,7 +206,7 @@ Error codes:
 | `machine_unreachable` | `fleet.describe` or `tasks.delegate` named a linked computer that does not answer now; nothing was started there. |
 | `children_open` | `tasks.complete` (done) on a task with a sub-task that has not ended -- working, paused (`idle_unconfirmed`) or `waiting`: the message names each ("mini is still on 'Checking Xcode version'; wait for it or cancel it."). `outcome: "blocked"` is still taken. A done marker line, or the owner confirming from the phone, still ends such a task: the rule is the agent's tool call only. |
 | `delegation_loop` | Remote delegation or execution named a linked computer from a task another computer handed here (itself or an ancestor `origin: "peer"`); nothing is forwarded. |
-| `lineage_unresolved` | Remote forwarding could not establish a unique caller and intact ancestry, including failed, ambiguous, timed-out or truncated evidence. Nothing was forwarded. Local work remains available; inspect the caller context before another attempt. |
+| `lineage_unresolved` | A legacy credential has no explicit remote grant, or a bound credential's stored ancestry is missing, ambiguous or unavailable. Nothing was forwarded. Reconnect a legacy host through supported registration; shared runtime execution never inspects provider history. |
 | `delegations_disabled` | `tasks.delegate` named a linked computer whose owner switched off work from other computers. |
 | `unauthorized` | `tasks.delegate` or `fleet.describe` named a linked computer that no longer takes this one's token ("mini no longer accepts this computer; link again from your phone"); the link is kept, marked `unauthorized`, until the owner's phone links it again. |
 | *the computer's own code* | `tasks.delegate`: the linked computer refused the task (for example `directory_not_found`, `agent_unavailable`); an argument it refused (`invalid_request`, `unknown_model`, `unknown_variant`) is `invalid_arguments`. The message names the computer. |
@@ -1027,3 +1032,83 @@ because the phone uses them regardless.
   does not answer until it is back.
 - Remote files: `cwd` and `@`-mentioned files are always on the computer the
   task runs on; nothing is copied between computers.
+
+## Native Codex conversations and computer references
+
+`agent_computer_context_v1` adds `computer_ids` (at most eight immutable
+Gateway server IDs) to task creation and native-session prompts. The Gateway
+resolves these IDs against its current links; names are display data, not
+routing keys. Unknown or revoked links reject delivery. Forwarded tasks may
+not introduce another hop. Ordinary prompts without references remain usable
+when computer tools are unavailable.
+
+The Gateway still serves one stateless `/mcp` endpoint per installation. No
+MCP subprocess is installed or started for a conversation. Native Codex uses
+one `mcp_servers.muqun` entry in its host configuration. With automatic
+injection enabled, a missing entry is added through Codex's version-checked
+configuration API; a conflicting or disabled entry is preserved and reported.
+The entry contains only the local URL and the identity-verifying credential
+helper, never a bearer token. Other MCP entries and configuration are retained.
+Codex's official MCP reload refreshes loaded threads without restarting them,
+resuming them elsewhere, or replaying a prompt. Before a referenced-computer
+prompt is delivered, the selected thread must advertise `exec.run` and
+`fleet.list`; checking only the host-wide catalog is insufficient.
+
+The `--agent-id codex` helper requires local administrator authentication and
+an attached Codex runtime, and issues a seven-day runtime credential.
+This is owner-level provider authority, not isolation between conversations.
+Execution authorization never reads provider histories. Shared calls return
+task handles for `tasks.read` and `tasks.wait`, without guessed notifications.
+Incoming restricted work cannot inherit a shared runtime grant; unsupported
+delivery is refused before dispatch. Registration also rejects retained
+restricted sessions, preserving that restriction across task retention.
+Existing terminal task-bound
+helpers retain their narrower task authority. Disabling automatic injection
+rejects helper renewal; startup cleanup revokes native Codex runtime tokens.
+Expired/revoked rows use the existing retention sweep. A completed conversation
+does not stop the shared Gateway service or revoke other conversations' access.
+
+A configured entry, passing fixture tests, or a populated global tool catalog
+is not end-to-end acceptance. Validate a real isolated App conversation,
+actual local and linked-computer `exec.run`, follow-up, disabled/revoked
+credentials, unchanged terminal focus, and no automatic resend after an
+ambiguous delivery. Five-device acceptance remains a separate release gate.
+
+## DeepSeek Harness
+
+When Gateway starts DeepSeek with MCP injection enabled, it passes one managed
+`--patch` overlay to the official `@deepseek-ai/dsh-mcp-client` plugin. The
+overlay adds the host-level `muqun` server; sessions inherit its tools. It does
+not install a plugin per conversation or start another MCP server. The overlay
+contains environment expressions, not credentials. Launcher options precede
+DeepSeek's application arguments.
+
+The child receives a DeepSeek-bound assistant token in its environment. This
+service credential follows the existing OpenCode service lifetime: it has no
+wall-clock expiry and remains usable when a Gateway restart adopts the same
+live service. A successful replacement retires earlier DeepSeek credentials;
+a failed start retires only the new credential. The owning Gateway also revokes
+the token when the child exits. After a Gateway restart, the next replacement
+or explicit revoke retires the adopted process's token. Disabling MCP injection
+and restarting Gateway revokes the managed DeepSeek service credentials.
+
+Before accepting a computer-reference prompt, Gateway reads the official
+`pluginInventory/list` endpoint and requires the unique managed entry to be
+enabled, active, and the official MCP module. `failOnStartupError` ensures that
+initial connection/discovery failure does not masquerade as an active plugin.
+This is plugin activation evidence, not a guarantee that a subsequent network
+operation will succeed or that a custom preset permits every inherited tool.
+
+A running service that was started without the overlay is adopted for ordinary
+chat but refuses computer-reference prompts with a restart explanation. Gateway
+does not replace its configuration or kill/restart it while sending a message.
+There is no upstream runtime MCP-registration RPC used for DeepSeek.
+
+Validation on 2026-10-24 used an isolated Gateway and the published DSH
+0.2.1-rc.2 package, without a model API credential. The official plugin became
+active, discovered all eight Gateway tools, and a host-side probe invoked its
+real `fleet.list` tool and received the isolated Gateway's machine identity.
+After the Gateway-owned DSH process exited, the same MCP credential changed
+from HTTP 200 to HTTP 403 (revoked). This verifies the client transport and
+process-lifetime revocation, not a model-generated turn, an App/device flow,
+or a linked-computer command. Those acceptance checks remain outstanding.

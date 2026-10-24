@@ -767,11 +767,33 @@ Marks the session read. Unread is `info.time_idle > info.time_viewed`.
 ### `POST /api/agent-sessions/{asid}/prompt`
 
 ```json
-{ "text": "…", "attachments": ["/abs/path or file:// or https:// or data:"], "delivery": "steer" }
+{ "text": "…", "attachments": ["/abs/path or file:// or https:// or data:"], "delivery": "steer", "computer_ids": ["opaque-machine-id"], "client_ref": "prompt-opaque-reference" }
 ```
 
 `delivery` is `steer` (run at the next step boundary) or `queue` (wait behind
 what is already queued). Returns `{"submitted": true}`.
+
+`computer_ids` is optional and requires `agent_computer_context_v1`. It contains
+up to eight immutable machine IDs from this Gateway's linked-computer inventory,
+never names, URLs, MCP settings, tokens, or a permission grant. Duplicate IDs are
+collapsed; an unknown, revoked, or malformed reference refuses the whole prompt
+before dispatch. The selected Gateway and route's `asid` identify the destination.
+The Gateway prepares provider tools and credentials; the App does not register an
+MCP server or understand provider-specific configuration.
+
+`client_ref` is optional, 1–128 ASCII letters, digits, `_` or `-`, and is echoed
+beside `submitted` on success. It correlates one submission; it is **not** an
+idempotency guarantee. A missing reply is an unknown outcome, not permission to
+submit again. Task creation has its separate existing `client_ref` for read-only
+reconciliation through the task ledger.
+
+Computer-tool preflight failures use `invalid_computer_references` (400),
+`computer_tools_unavailable` (503), or `computer_tools_not_ready` (503). Their
+envelope includes `error.delivery: "not_sent"` only when no prompt was dispatched.
+Clients preserve the draft and show the refusal without automatically retrying.
+Unknown error codes with this exact marker remain explicit rejections; an absent
+marker, timeout, or generic upstream failure must not be interpreted as proof of
+non-delivery. Responses may add fields without changing these semantics.
 
 There is no model or mode field: **OpenCode model and mode are session state in
 v2**. Switch first, then prompt where the corresponding capability is supported.

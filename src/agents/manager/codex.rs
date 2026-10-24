@@ -419,6 +419,18 @@ impl Context {
                 .await
             }
             CodexEvent::Request { id, method, params } => {
+                let acceptance = match params["threadId"].as_str() {
+                    Some(thread) => Some(
+                        self.mirror
+                            .timeline_commit_gate(&AgentSessionId(thread.into()))
+                            .await,
+                    ),
+                    None => None,
+                };
+                let _acceptance = match &acceptance {
+                    Some(gate) => Some(gate.lock().await),
+                    None => None,
+                };
                 if let Some(request) = self.driver.permission(&id, &method, &params) {
                     self.ensure(&request.asid.0).await;
                     if !self.driver.client().is_ready() {
@@ -467,6 +479,8 @@ impl Context {
             return;
         }
         let asid = AgentSessionId(thread.into());
+        let acceptance = self.mirror.timeline_commit_gate(&asid).await;
+        let _acceptance = acceptance.lock().await;
         // Ownership ends when the private server unloads the runtime. History
         // remains readable, but callbacks and the loaded marker are no longer live.
         if method == "thread/closed"
@@ -575,10 +589,21 @@ impl Context {
                 // completion is too old to mutate the live turn's lifecycle.
                 if let Some(turn) = params["turn"]["id"].as_str() {
                     if let Some(items) = params["turn"]["items"].as_array() {
-                        for item in items {
-                            if let Ok(items) = self.driver.ordered_items(thread, turn, item, 0) {
-                                self.upsert(&asid, items).await;
-                            }
+                        let full = params["turn"]
+                            .get("itemsView")
+                            .is_none_or(|view| view == "full");
+                        let accepted = match self
+                            .driver
+                            .prepare_completed_turn(thread, turn, items, full)
+                        {
+                            Ok(prepared) => self.mirror.accept_live_history(&asid, prepared).await,
+                            Err(error) => Err(error),
+                        };
+                        if accepted.is_err() {
+                            self.emit(AgentDomainEvent::Resync {
+                                asid: asid.clone(),
+                                reason: "codex_completion_history_unavailable".into(),
+                            });
                         }
                     }
                 }

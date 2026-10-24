@@ -64,6 +64,7 @@ pub(crate) const API_CAPABILITIES: &[&str] = &[
     "home_overview_resync_v1",
     "home_overview_sections_v1",
     "agent_history_ws_v1",
+    "agent_computer_context_v1",
     "agent_discovery",
     "agent_spawn",
     "agent_timeline",

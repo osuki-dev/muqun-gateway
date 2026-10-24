@@ -27,6 +27,7 @@ pub(crate) const ALL_MIGRATIONS: &[Migration] = &[
     crate::fleet::peers::MIGRATION,
     crate::fleet::home_grants::MIGRATION,
     crate::terminal::history_sqlite::MIGRATION,
+    super::t3_credentials::MIGRATION,
 ];
 
 type Boxed = Box<dyn Any + Send>;

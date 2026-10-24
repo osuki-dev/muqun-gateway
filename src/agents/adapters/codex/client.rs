@@ -84,6 +84,7 @@ struct Pending {
     diagnostic_method: &'static str,
     turn_thread: Option<String>,
     selection_config: bool,
+    mcp_config: bool,
     attaches_thread: bool,
     attach_expected: Option<String>,
 }
@@ -299,6 +300,7 @@ fn read_only_request(method: &str, params: &Value) -> bool {
     matches!(
         method,
         "config/read"
+            | "mcpServerStatus/list"
             | "account/rateLimits/read"
             | "model/list"
             | "skills/list"
@@ -874,6 +876,7 @@ impl CodexClient {
                     reply,
                     diagnostic_method: diagnostic_method(method),
                     selection_config: method == "config/read",
+                    mcp_config: method == "config/read" && params["includeLayers"] == true,
                     attach_expected: (method == "thread/resume")
                         .then(|| params["threadId"].as_str().unwrap_or("").to_owned()),
                     attaches_thread: matches!(
@@ -1346,7 +1349,9 @@ fn route_frame(state: &State, mut value: Value, frame_bytes: usize) -> Result<()
                 }
             }
             let result = result.map(|mut value| {
-                if pending.selection_config {
+                if pending.mcp_config {
+                    value = super::mcp::registration_read(&value);
+                } else if pending.selection_config {
                     let mut selected = serde_json::Map::new();
                     for key in ["model_provider", "model", "model_reasoning_effort"] {
                         if let Some(field) = value["config"].get(key) {

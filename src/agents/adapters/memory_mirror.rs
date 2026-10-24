@@ -137,6 +137,7 @@ struct SessionState {
     /// Metadata and live deltas do not prove that initial history was read.
     history_initialized: bool,
     history_gate: Arc<tokio::sync::Mutex<()>>,
+    timeline_commit_gate: Arc<tokio::sync::Mutex<()>>,
     history_removal_generation: u64,
 }
 
@@ -156,8 +157,34 @@ impl SessionState {
             placeholder: false,
             history_initialized: false,
             history_gate: Arc::new(tokio::sync::Mutex::new(())),
+            timeline_commit_gate: Arc::new(tokio::sync::Mutex::new(())),
             history_removal_generation: 0,
         }
+    }
+
+    fn apply_history_order(
+        &mut self,
+        order: &HashMap<String, String>,
+    ) -> (Vec<TimelineItem>, Vec<PermissionRequest>) {
+        let mut changed = Vec::new();
+        for item in self.timeline.values_mut() {
+            if let Some(next) = order.get(&item.message_id) {
+                item.message_id.clone_from(next);
+                changed.push(item.clone());
+            }
+        }
+        let mut permissions = Vec::new();
+        for request in self.permissions.values_mut() {
+            if let Some(next) = request
+                .source_message_id
+                .as_ref()
+                .and_then(|id| order.get(id))
+            {
+                request.source_message_id = Some(next.clone());
+                permissions.push(request.clone());
+            }
+        }
+        (changed, permissions)
     }
 
     fn next_seq(&mut self) -> u64 {
@@ -237,6 +264,9 @@ pub struct MemoryMirror {
     /// The owning agent's `kind()`, stamped on every session this mirror
     /// holds so snapshots and `agent.session.updated` events carry `agent_id`.
     agent_id: Arc<str>,
+    /// History writes publish while holding the mirror write lock, so replay
+    /// and live readers observe the same accepted revision and projection.
+    history_events: Arc<std::sync::OnceLock<tokio::sync::broadcast::Sender<AgentDomainEvent>>>,
 }
 
 /// One existing session incarnation and removal boundary, captured before a
@@ -391,7 +421,116 @@ impl MemoryMirror {
         Self {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             agent_id: Arc::from(agent_id),
+            history_events: Arc::default(),
         }
+    }
+
+    pub(crate) fn publish_history_to(
+        &self,
+        events: tokio::sync::broadcast::Sender<AgentDomainEvent>,
+    ) {
+        let _ = self.history_events.set(events);
+    }
+
+    fn history_event(&self, state: &mut SessionState, event: AgentDomainEvent) {
+        state.push_event(event.clone());
+        if let Some(events) = self.history_events.get() {
+            let _ = events.send(event);
+        }
+    }
+
+    fn history_permissions(
+        &self,
+        state: &mut SessionState,
+        asid: &AgentSessionId,
+        permissions: Vec<PermissionRequest>,
+    ) {
+        for request in permissions {
+            let seq = state.next_seq();
+            self.history_event(
+                state,
+                AgentDomainEvent::PermissionPending {
+                    asid: asid.clone(),
+                    request,
+                    seq,
+                },
+            );
+        }
+    }
+
+    /// The Codex event pump holds the session projection gate across preparation
+    /// and this commit. No network read or cancellable await separates adapter
+    /// publication from retained rows, pending references and replay events.
+    pub(crate) async fn accept_live_history(
+        &self,
+        asid: &AgentSessionId,
+        prepared: crate::agents::ports::agent::PreparedTimeline<'_>,
+    ) -> Result<(), crate::agents::ports::agent::AgentError> {
+        let mut sessions = self.sessions.write().await;
+        let state = Self::entry(
+            &self.agent_id,
+            &mut sessions,
+            asid,
+            AgentSessionStatus::Busy,
+        );
+        let changes = match prepared.commit {
+            Some(commit) => commit()?,
+            None => Default::default(),
+        };
+        let (reordered, permissions) = state.apply_history_order(&changes.order);
+        let mut rows = prepared.items;
+        let replaced: std::collections::HashSet<_> =
+            rows.iter().map(|item| item.id.clone()).collect();
+        let removed: std::collections::HashSet<_> = state
+            .timeline
+            .values()
+            .filter(|item| {
+                changes.replace_groups.contains(&item.message_id) && !replaced.contains(&item.id)
+            })
+            .map(|item| item.id.clone())
+            .collect();
+        if !removed.is_empty() {
+            for id in &removed {
+                state.timeline.remove(id);
+            }
+            state.history_removal_generation = state.history_removal_generation.wrapping_add(1);
+            let seq = state.next_seq();
+            let mut ids: Vec<_> = removed.iter().cloned().collect();
+            ids.sort();
+            self.history_event(
+                state,
+                AgentDomainEvent::TimelineRemoved {
+                    asid: asid.clone(),
+                    ids,
+                    seq,
+                },
+            );
+        }
+        rows.extend(
+            reordered
+                .into_iter()
+                .filter(|item| !replaced.contains(&item.id) && !removed.contains(&item.id)),
+        );
+        if !rows.is_empty() {
+            let seq = state.next_seq();
+            for item in &mut rows {
+                item.seq = seq;
+                if let AgentPart::Tool(call) = &mut item.part {
+                    truncate_tool_output(call);
+                }
+                state.insert_item(item.clone());
+            }
+            self.history_event(
+                state,
+                AgentDomainEvent::TimelineUpsert {
+                    asid: asid.clone(),
+                    items: rows,
+                    seq,
+                },
+            );
+        }
+        self.history_permissions(state, asid, permissions);
+        Ok(())
     }
 
     /// Drop sessions nothing has touched for a long time, and the oldest ones
@@ -433,6 +572,33 @@ impl MemoryMirror {
     pub async fn is_placeholder(&self, asid: &AgentSessionId) -> bool {
         let sessions = self.sessions.read().await;
         sessions.get(asid).map(|s| s.placeholder).unwrap_or(true)
+    }
+
+    /// Serializes provider projection plus mirror acceptance, never network reads.
+    pub(crate) async fn timeline_commit_gate(
+        &self,
+        asid: &AgentSessionId,
+    ) -> Arc<tokio::sync::Mutex<()>> {
+        let mut sessions = self.sessions.write().await;
+        Self::entry(
+            &self.agent_id,
+            &mut sessions,
+            asid,
+            AgentSessionStatus::Idle,
+        )
+        .timeline_commit_gate
+        .clone()
+    }
+
+    async fn existing_timeline_commit_gate(
+        &self,
+        asid: &AgentSessionId,
+    ) -> Option<Arc<tokio::sync::Mutex<()>>> {
+        self.sessions
+            .read()
+            .await
+            .get(asid)
+            .map(|state| state.timeline_commit_gate.clone())
     }
 
     pub(crate) async fn history_gate(&self, asid: &AgentSessionId) -> Arc<tokio::sync::Mutex<()>> {
@@ -494,6 +660,11 @@ impl MemoryMirror {
         items: Vec<TimelineItem>,
         commit: Option<crate::agents::ports::agent::TimelineCommit<'_>>,
     ) -> Result<bool, crate::agents::ports::agent::AgentError> {
+        let acceptance = self.existing_timeline_commit_gate(asid).await;
+        let _acceptance = match &acceptance {
+            Some(gate) => Some(gate.lock().await),
+            None => None,
+        };
         let mut sessions = self.sessions.write().await;
         let Some(state) = sessions.get_mut(asid) else {
             return Ok(false);
@@ -509,9 +680,11 @@ impl MemoryMirror {
         }
         // Both fences have passed. The adapter's one-shot synchronous commit
         // and mirror acceptance share this write lock and one uncancellable poll.
-        if let Some(commit) = commit {
-            commit()?;
-        }
+        let changes = match commit {
+            Some(commit) => commit()?,
+            None => Default::default(),
+        };
+        let (reordered, permissions) = state.apply_history_order(&changes.order);
         let mut accepted: Vec<_> = items
             .into_iter()
             .filter(|item| {
@@ -521,6 +694,13 @@ impl MemoryMirror {
                     .is_none_or(|current| current.seq <= before_read.0)
             })
             .collect();
+        let replaced: std::collections::HashSet<_> =
+            accepted.iter().map(|item| item.id.clone()).collect();
+        accepted.extend(
+            reordered
+                .into_iter()
+                .filter(|item| !replaced.contains(&item.id)),
+        );
         if !accepted.is_empty() {
             let seq = state.next_seq();
             for item in &mut accepted {
@@ -530,14 +710,95 @@ impl MemoryMirror {
                 }
                 state.insert_item(item.clone());
             }
-            state.push_event(AgentDomainEvent::TimelineUpsert {
-                asid: asid.clone(),
-                items: accepted,
-                seq,
-            });
+            self.history_event(
+                state,
+                AgentDomainEvent::TimelineUpsert {
+                    asid: asid.clone(),
+                    items: accepted,
+                    seq,
+                },
+            );
         }
+        self.history_permissions(state, asid, permissions);
         state.history_initialized = true;
         Ok(true)
+    }
+
+    /// Accept an older page and its cursor in one uncancellable write. A
+    /// candidate from a removed/recreated session cannot enter the new one.
+    pub(crate) async fn accept_earlier_history(
+        &self,
+        asid: &AgentSessionId,
+        gate: &Arc<tokio::sync::Mutex<()>>,
+        before_read: (u64, u64),
+        items: Vec<TimelineItem>,
+        commit: Option<crate::agents::ports::agent::TimelineCommit<'_>>,
+    ) -> Result<Vec<TimelineItem>, crate::agents::ports::agent::AgentError> {
+        use crate::agents::ports::agent::AgentError;
+        let acceptance = self.existing_timeline_commit_gate(asid).await;
+        let _acceptance = match &acceptance {
+            Some(gate) => Some(gate.lock().await),
+            None => None,
+        };
+        let mut sessions = self.sessions.write().await;
+        let state = sessions
+            .get_mut(asid)
+            .ok_or(AgentError::HistoryCursorLost)?;
+        if !Arc::ptr_eq(gate, &state.history_gate)
+            || state.history_removal_generation != before_read.1
+        {
+            return Err(AgentError::HistoryCursorLost);
+        }
+        let changes = match commit {
+            Some(commit) => commit()?,
+            None => Default::default(),
+        };
+        let (reordered, permissions) = state.apply_history_order(&changes.order);
+        let mut accepted = Vec::with_capacity(items.len());
+        let mut updated = Vec::new();
+        for mut item in items {
+            if let Some(current) = state
+                .timeline
+                .get(&item.id)
+                .filter(|current| current.seq > before_read.0)
+            {
+                accepted.push(current.clone());
+                continue;
+            }
+            if let AgentPart::Tool(call) = &mut item.part {
+                truncate_tool_output(call);
+            }
+            updated.push(item);
+        }
+        let replaced: std::collections::HashSet<_> =
+            updated.iter().map(|item| item.id.clone()).collect();
+        updated.extend(
+            reordered
+                .into_iter()
+                .filter(|item| !replaced.contains(&item.id)),
+        );
+        if !updated.is_empty() {
+            let seq = state.next_seq();
+            for item in &mut updated {
+                item.seq = seq;
+                state.insert_item(item.clone());
+            }
+            let updated_ids: std::collections::HashSet<_> =
+                updated.iter().map(|item| item.id.clone()).collect();
+            accepted.retain(|item| !updated_ids.contains(&item.id));
+            accepted.extend(updated.iter().cloned());
+            self.history_event(
+                state,
+                AgentDomainEvent::TimelineUpsert {
+                    asid: asid.clone(),
+                    items: updated,
+                    seq,
+                },
+            );
+        }
+        self.history_permissions(state, asid, permissions);
+        accepted.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
+        Ok(accepted)
     }
 
     /// Upstream metadata cannot erase read markers the Gateway owns.
@@ -1398,6 +1659,13 @@ impl MemoryMirror {
         Option<crate::agents::ports::mirror::AgentSessionSnapshot>,
         crate::agents::ports::agent::AgentError,
     > {
+        let acceptance = self
+            .existing_timeline_commit_gate(&snapshot.info.asid)
+            .await;
+        let _acceptance = match &acceptance {
+            Some(gate) => Some(gate.lock().await),
+            None => None,
+        };
         let mut sessions = self.sessions.write().await;
         let asid = snapshot.info.asid.clone();
         if sessions.get(&asid).map(|s| s.current_seq) != expected
@@ -1411,9 +1679,29 @@ impl MemoryMirror {
         }
         // No await after this commit: a rejected adapter token cannot alter the
         // mirror, and cancellation cannot split pagination from accepted rows.
-        if let Some(commit) = commit {
-            commit()?;
+        let changes = match commit {
+            Some(commit) => commit()?,
+            None => Default::default(),
+        };
+        for item in &mut snapshot.timeline {
+            if !changes.fresh_ids.contains(&item.id) {
+                if let Some(next) = changes.order.get(&item.message_id) {
+                    item.message_id.clone_from(next);
+                }
+            }
         }
+        for request in &mut snapshot.permissions {
+            if let Some(next) = request
+                .source_message_id
+                .as_ref()
+                .and_then(|id| changes.order.get(id))
+            {
+                request.source_message_id = Some(next.clone());
+            }
+        }
+        snapshot
+            .timeline
+            .sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
         if let Some(previous) = sessions.get(&asid) {
             snapshot.info.time_viewed = previous.info.time_viewed;
             snapshot.info.time_idle = previous.info.time_idle;
@@ -1730,6 +2018,80 @@ impl SessionMirrorPort for MemoryMirror {
 mod tests {
     use super::*;
     use crate::agents::domain::{AgentPart, AgentSessionInfo, AgentSessionStatus, TimelineRole};
+
+    #[tokio::test]
+    async fn earlier_history_acceptance_preserves_newer_live_rows_and_commits_atomically() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let mirror = MemoryMirror::for_agent("codex");
+        let asid = AgentSessionId("history-transaction".into());
+        let gate = mirror.history_gate(&asid).await;
+        let revision = mirror.history_read_revision(&asid).await.unwrap();
+        let stale = text_item("same:t0", "same", "old history");
+        let live = text_item("same:t0", "same", "new live text");
+        mirror
+            .upsert_timeline_items(&asid, vec![live.clone()])
+            .await;
+        let committed = AtomicBool::new(false);
+        let rows = mirror
+            .accept_earlier_history(
+                &asid,
+                &gate,
+                revision,
+                vec![stale, text_item("older:t0", "older", "older text")],
+                Some(Box::new(|| {
+                    committed.store(true, Ordering::SeqCst);
+                    Ok(Default::default())
+                })),
+            )
+            .await
+            .unwrap();
+        assert!(committed.load(Ordering::SeqCst));
+        assert_eq!(
+            rows.iter().find(|row| row.id == live.id).unwrap().part,
+            live.part
+        );
+        assert!(
+            rows.iter().all(|row| row.seq > 0),
+            "return accepted, stamped rows"
+        );
+        let snapshot = mirror.get_snapshot(&asid).await.unwrap();
+        let error = mirror
+            .accept_earlier_history(
+                &asid,
+                &gate,
+                revision,
+                vec![text_item("rejected:t0", "rejected", "must not appear")],
+                Some(Box::new(|| {
+                    Err(crate::agents::ports::agent::AgentError::HistoryCursorLost)
+                })),
+            )
+            .await;
+        assert!(error.is_err());
+        assert_eq!(
+            mirror.get_snapshot(&asid).await.unwrap().timeline,
+            snapshot.timeline
+        );
+        mirror.remove_session(&asid).await;
+        let _replacement = mirror.history_gate(&asid).await;
+        committed.store(false, Ordering::SeqCst);
+        assert!(mirror
+            .accept_earlier_history(
+                &asid,
+                &gate,
+                revision,
+                rows,
+                Some(Box::new(|| {
+                    committed.store(true, Ordering::SeqCst);
+                    Ok(Default::default())
+                }))
+            )
+            .await
+            .is_err());
+        assert!(
+            !committed.load(Ordering::SeqCst),
+            "obsolete incarnation cannot consume a cursor"
+        );
+    }
 
     fn info(asid: &AgentSessionId, title: &str) -> AgentSessionInfo {
         let mut info = placeholder_session(asid, AgentSessionStatus::Idle);

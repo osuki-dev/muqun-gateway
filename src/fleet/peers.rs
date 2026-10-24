@@ -425,7 +425,7 @@ pub(crate) struct PeerService {
     store: Arc<dyn PeerStore>,
     accept: AtomicBool,
     config_path: Option<PathBuf>,
-    names: RwLock<Vec<String>>,
+    names: RwLock<Vec<[String; 3]>>,
     /// When each peer's manifest was last asked for, answered or not; in
     /// memory, so the first look after a restart asks again.
     manifests_at: Mutex<HashMap<String, u64>>,
@@ -475,7 +475,10 @@ impl PeerService {
             return;
         };
         if let Ok(mut names) = self.names.write() {
-            *names = peers.into_iter().map(|peer| peer.name).collect();
+            *names = peers
+                .into_iter()
+                .map(|peer| [peer.name, peer.peer_id, peer.server_id])
+                .collect();
         }
     }
 
@@ -492,9 +495,12 @@ impl PeerService {
     /// gave for itself (`machineId` in `fleet.list`).
     pub(crate) async fn resolve(&self, machine: &str) -> Option<Peer> {
         let peers = self.store.list().await.ok()?;
-        peers.into_iter().find(|peer| {
-            same_name(&peer.name, machine) || peer.peer_id == machine || peer.server_id == machine
-        })
+        peers
+            .iter()
+            .find(|peer| peer.server_id == machine)
+            .or_else(|| peers.iter().find(|peer| peer.peer_id == machine))
+            .or_else(|| peers.iter().find(|peer| same_name(&peer.name, machine)))
+            .cloned()
     }
 
     /// Whether `peer` answers, as far as is known without asking it now:
@@ -980,7 +986,16 @@ impl PeerService {
     pub(crate) fn names(&self) -> Vec<String> {
         self.names
             .read()
-            .map(|names| names.clone())
+            .map(|names| names.iter().map(|entry| entry[0].clone()).collect())
+            .unwrap_or_default()
+    }
+
+    /// Names and immutable IDs share one cache snapshot. An own display label
+    /// must never shadow the ID of a linked computer.
+    pub(crate) fn selectors(&self) -> Vec<String> {
+        self.names
+            .read()
+            .map(|entries| entries.iter().flatten().cloned().collect())
             .unwrap_or_default()
     }
 

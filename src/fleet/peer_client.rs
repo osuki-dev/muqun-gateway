@@ -59,7 +59,6 @@ impl std::fmt::Display for PeerError {
 }
 
 /// What `/api/pair/claim` hands a newly paired device.
-#[derive(Debug)]
 pub(crate) struct Claimed {
     pub server_id: String,
     #[allow(dead_code)] // the name a link defaults to once the reconciler omits one
@@ -67,6 +66,55 @@ pub(crate) struct Claimed {
     pub token: String,
     pub device_id: String,
     pub transport_key: Option<String>,
+}
+
+impl std::fmt::Debug for Claimed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Claimed")
+            .field("server_id", &self.server_id)
+            .field("device_id", &self.device_id)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Secrets may cross a network only inside the existing authenticated
+/// envelope or certificate-validated TLS. Literal loopback is the sole
+/// plaintext exception for local development; names, private addresses and
+/// tailnet addresses do not prove an encrypted route. Never resolve a name
+/// here and then trust a second DNS resolution made by the HTTP client.
+fn require_protected_transport(base: &str, sealed: bool) -> Result<(), PeerError> {
+    let url = reqwest::Url::parse(base)
+        .ok()
+        .filter(|url| {
+            matches!(url.scheme(), "http" | "https")
+                && url.host_str().is_some()
+                && url.username().is_empty()
+                && url.password().is_none()
+                && url.query().is_none()
+                && url.fragment().is_none()
+        })
+        .ok_or_else(|| PeerError::Unreachable("invalid peer URL".into()))?;
+    let loopback = url
+        .host_str()
+        .and_then(|host| {
+            host.trim_matches(['[', ']'])
+                .parse::<std::net::IpAddr>()
+                .ok()
+        })
+        .is_some_and(|ip| match ip {
+            std::net::IpAddr::V4(ip) => ip.is_loopback(),
+            std::net::IpAddr::V6(ip) => {
+                ip.is_loopback() || ip.to_ipv4_mapped().is_some_and(|ip| ip.is_loopback())
+            }
+        });
+    if sealed || url.scheme() == "https" || loopback {
+        Ok(())
+    } else {
+        Err(PeerError::Refused {
+            status: 426,
+            code: "transport_encryption_required".into(),
+        })
+    }
 }
 
 /// The most a peer's answer may weigh. A sealed page of 200 task views is
@@ -199,6 +247,9 @@ pub(crate) async fn claim(
     pairing_key: Option<&str>,
     transport_required: bool,
 ) -> Result<Claimed, PeerError> {
+    // A response sealed with material derived from a code sent in the clear
+    // does not protect credentials from an observer who captured that code.
+    require_protected_transport(url, pairing_key.is_some())?;
     let claim = json!({ "request_id": request_id, "code": code });
     let pairing_material = pairing_key
         .map(|key| {
@@ -340,6 +391,7 @@ impl PeerClient {
         path: &str,
         body: Option<&Value>,
     ) -> Result<Value, PeerError> {
+        require_protected_transport(&self.base, self.material.is_some())?;
         if let Some(material) = &self.material {
             return self.sealed(material, method, path, body).await;
         }
@@ -580,6 +632,7 @@ impl PeerClient {
     }
 
     async fn open_task_socket(&self, subscription: &str) -> Result<TaskFeed, PeerError> {
+        require_protected_transport(&self.base, self.material.is_some())?;
         let mut request = ws_url(&self.base)?
             .into_client_request()
             .map_err(|_| PeerError::Unreachable("not a socket url".into()))?;
@@ -1005,7 +1058,7 @@ mod tests {
     use crate::{generate_token, AppState, TransportEncryptionMode};
 
     #[tokio::test]
-    async fn manual_pairing_accepts_an_http_hostname() {
+    async fn hostname_discovery_does_not_authorize_a_plaintext_code_claim() {
         let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let received = calls.clone();
         let url = serve(axum::Router::new().fallback(axum::routing::post(
@@ -1036,7 +1089,17 @@ mod tests {
             !offer.transport_required,
             "an answer that names no mode cannot demand a sealed claim answer"
         );
-        let claimed = claim(&named_http, "fixture-request", "2345-6789", None, false)
+        assert_eq!(
+            claim(&named_http, "fixture-request", "2345-6789", None, false)
+                .await
+                .unwrap_err(),
+            PeerError::Refused {
+                status: 426,
+                code: "transport_encryption_required".into(),
+            }
+        );
+        // Local fixtures may explicitly use a literal loopback address.
+        let claimed = claim(&url, "fixture-request", "2345-6789", None, false)
             .await
             .unwrap();
         assert_eq!(claimed.device_id, "fixture-device");
@@ -1056,6 +1119,96 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn credentials_require_a_protected_channel_without_trusting_dns_or_private_ranges() {
+        for base in [
+            "http://localhost:23847",
+            "http://127.0.0.1.example.test:23847",
+            "http://192.168.1.12:23847",
+            "http://100.64.0.12:23847",
+            "http://[fd00::12]:23847",
+            "http://gateway.example.test",
+        ] {
+            assert_eq!(
+                require_protected_transport(base, false),
+                Err(PeerError::Refused {
+                    status: 426,
+                    code: "transport_encryption_required".into(),
+                }),
+                "{base}"
+            );
+            assert!(require_protected_transport(base, true).is_ok());
+        }
+        for base in [
+            "http://127.0.0.1:23847",
+            "http://[::1]:23847",
+            "http://[::ffff:127.0.0.1]:23847",
+            "https://gateway.example.test",
+        ] {
+            assert!(require_protected_transport(base, false).is_ok(), "{base}");
+        }
+        for base in [
+            "file:///tmp/gateway",
+            "https://name:secret@gateway.example.test",
+            "https://gateway.example.test?token=secret",
+            "https://gateway.example.test#secret",
+        ] {
+            assert!(require_protected_transport(base, true).is_err(), "{base}");
+        }
+    }
+
+    #[tokio::test]
+    async fn insecure_http_and_socket_calls_are_refused_before_sending_credentials() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let received = calls.clone();
+        let base = serve(axum::Router::new().fallback(axum::routing::any(move || {
+            received.fetch_add(1, Ordering::SeqCst);
+            async { axum::Json(json!({})) }
+        })))
+        .await
+        .replace("127.0.0.1", "localhost");
+        let client = PeerClient {
+            http: http(),
+            base,
+            token: "synthetic-secret".into(),
+            device_id: "synthetic-device".into(),
+            material: None,
+            transport_version: 1,
+        };
+        let refused = PeerError::Refused {
+            status: 426,
+            code: "transport_encryption_required".into(),
+        };
+        assert_eq!(client.ping().await.unwrap_err(), refused);
+        assert_eq!(
+            client
+                .create_task(&json!({"goal":"sensitive task"}))
+                .await
+                .unwrap_err(),
+            refused
+        );
+        assert!(matches!(client.subscribe_tasks().await, Err(error) if error == refused));
+        assert!(
+            matches!(client.subscribe_home(r#"{"t":"subscribe_home"}"#).await, Err(error) if error == refused)
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn claimed_credentials_are_absent_from_debug_output() {
+        let claimed = Claimed {
+            server_id: "server".into(),
+            label: "fixture".into(),
+            token: "synthetic-bearer".into(),
+            device_id: "device".into(),
+            transport_key: Some("synthetic-key".into()),
+        };
+        let debug = format!("{claimed:?}");
+        assert!(!debug.contains("synthetic-bearer") && !debug.contains("synthetic-key"));
     }
 
     #[tokio::test]
@@ -1172,6 +1325,7 @@ mod tests {
             .await
         };
 
+        let url = url.replace("127.0.0.1", "localhost");
         let claimed = claim(&url, "mint-1", "2345-6789", Some(&pairing_key), false)
             .await
             .unwrap();

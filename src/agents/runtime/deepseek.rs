@@ -7,7 +7,7 @@
 //! does not signal it either. The next start adopts the live port. Nothing
 //! here stops the harness when the gateway stops.
 //!
-//! Discovery and status never call [`spawn_detached`]. A missing runner is
+//! Discovery and status never spawn a process. A missing runner is
 //! reported and left alone; the rest of the gateway keeps running.
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -41,6 +41,7 @@ pub(crate) struct SpawnSlot {
     pub(crate) url: Option<String>,
     running: Option<Arc<AtomicBool>>,
     pub(crate) retry_at: Option<tokio::time::Instant>,
+    pending_mcp: Option<(super::McpEnv, Vec<String>)>,
 }
 
 impl SpawnSlot {
@@ -258,6 +259,7 @@ impl AgentRuntime {
     }
 
     async fn supervise_deepseek_with_override(&self, env_endpoint: Option<&str>) -> bool {
+        self.settle_deepseek_mcp().await;
         if self.keep_if_healthy("deepseek").await {
             return true;
         }
@@ -277,6 +279,12 @@ impl AgentRuntime {
                 return false;
             }
             if slot.exited() {
+                if let (Some(wiring), Some((minted, previous))) =
+                    (self.mcp.get(), slot.pending_mcp.take())
+                {
+                    super::settle_agent_tokens(wiring.tokens.as_ref(), &minted, &previous, false)
+                        .await;
+                }
                 slot.running = None;
                 slot.retry_at = Some(now + STARTUP_WAIT);
                 return false;
@@ -323,17 +331,40 @@ impl AgentRuntime {
                 }
                 false
             }
-            Decision::Spawn(launch) => {
-                match spawn_detached(&launch).await {
+            Decision::Spawn(mut launch) => {
+                let minted = self.prepare_deepseek_mcp(&mut launch).await;
+                let retirement = self
+                    .mcp
+                    .get()
+                    .zip(minted.as_ref())
+                    .map(|(wiring, (env, _))| (wiring.tokens.clone(), env.token_id.clone()));
+                match spawn_detached_with_mcp(
+                    &launch,
+                    minted.as_ref().map(|(env, _)| env),
+                    retirement,
+                )
+                .await
+                {
                     Ok(running) => {
                         tracing::info!(
                             url = %launch.url,
                             program = %launch.program,
                             "started DeepSeek Harness; it keeps running after the gateway stops"
                         );
-                        self.deepseek_spawn.lock().await.note(launch.url, running);
+                        let mut slot = self.deepseek_spawn.lock().await;
+                        slot.note(launch.url, running);
+                        slot.pending_mcp = minted;
                     }
                     Err(err) => {
+                        if let (Some(wiring), Some((env, previous))) = (self.mcp.get(), minted) {
+                            super::settle_agent_tokens(
+                                wiring.tokens.as_ref(),
+                                &env,
+                                &previous,
+                                false,
+                            )
+                            .await;
+                        }
                         tracing::warn!(%err, "could not start DeepSeek Harness");
                         self.deepseek_spawn.lock().await.retry_at = Some(now + STARTUP_WAIT);
                     }
@@ -341,6 +372,78 @@ impl AgentRuntime {
                 false
             }
         }
+    }
+
+    /// HTTP readiness can precede MCP activation. Keep both generations until
+    /// the official plugin has discovered tools; never turn a slow startup
+    /// into a permanent 401 by revoking its credential on the first probe.
+    async fn settle_deepseek_mcp(&self) {
+        let Some(wiring) = self.mcp.get() else { return };
+        let url = {
+            let slot = self.deepseek_spawn.lock().await;
+            if slot.pending_mcp.is_none() || slot.exited() {
+                return;
+            }
+            slot.url.clone()
+        };
+        let Some(endpoint) = url.and_then(|url| self.normalized_deepseek_endpoint(&url)) else {
+            return;
+        };
+        let client = crate::agents::adapters::deepseek::client::DeepseekClient::new(endpoint);
+        if !crate::agents::adapters::deepseek::mcp::connected(&client)
+            .await
+            .unwrap_or(false)
+        {
+            return;
+        }
+        let pending = self.deepseek_spawn.lock().await.pending_mcp.take();
+        if let Some((env, previous)) = pending {
+            super::settle_agent_tokens(wiring.tokens.as_ref(), &env, &previous, true).await;
+        }
+    }
+
+    async fn prepare_deepseek_mcp(
+        &self,
+        launch: &mut Launch,
+    ) -> Option<(super::McpEnv, Vec<String>)> {
+        let wiring = self.mcp.get()?;
+        let path = crate::state_dir().ok()?.join("mcp-deepseek.patch.yml");
+        let write_path = path.clone();
+        let written = tokio::task::spawn_blocking(move || {
+            crate::write_secret_file(
+                &write_path,
+                crate::agents::adapters::deepseek::mcp::OVERLAY.as_bytes(),
+            )
+        })
+        .await;
+        if !matches!(written, Ok(Ok(()))) {
+            tracing::warn!("DeepSeek MCP overlay could not be written");
+            return None;
+        }
+        let minted = match super::issue_agent_env_for(
+            wiring.tokens.as_ref(),
+            &wiring.url,
+            "deepseek",
+            "deepseek (service)",
+        )
+        .await
+        {
+            Ok(minted) => minted,
+            Err(_) => {
+                tracing::warn!("DeepSeek MCP credentials could not be prepared");
+                return None;
+            }
+        };
+        // Launcher options must precede app-owned flags such as --no-open.
+        let Some(at) = launch.args.iter().position(|arg| arg == "web") else {
+            super::settle_agent_tokens(wiring.tokens.as_ref(), &minted.0, &minted.1, false).await;
+            return None;
+        };
+        launch.args.splice(
+            at + 1..at + 1,
+            ["--patch".into(), path.to_string_lossy().into_owned()],
+        );
+        Some(minted)
     }
 
     async fn healthy_deepseek_with_override(
@@ -431,13 +534,26 @@ fn detach_session(command: &mut Command) {
 /// Spawn `launch` and return a flag that becomes false when the child exits.
 /// Unit tests record the launch and do not exec: the user's harness must
 /// not be started by `cargo test`.
+#[cfg(test)]
 pub(crate) async fn spawn_detached(launch: &Launch) -> std::io::Result<Arc<AtomicBool>> {
+    spawn_detached_with_mcp(launch, None, None).await
+}
+
+async fn spawn_detached_with_mcp(
+    launch: &Launch,
+    mcp: Option<&super::McpEnv>,
+    retirement: Option<(Arc<dyn crate::mcp::tokens::AssistantTokenStore>, String)>,
+) -> std::io::Result<Arc<AtomicBool>> {
     // `mut` is required by `Command::spawn` in the release build. Tests never spawn.
     #[allow(unused_mut)]
     let mut command = command_for(launch);
+    if let Some(mcp) = mcp {
+        mcp.apply(&mut command);
+    }
     #[cfg(test)]
     {
         drop(command);
+        drop(retirement);
         record_test_spawn(launch);
         Ok(Arc::new(AtomicBool::new(true)))
     }
@@ -448,6 +564,9 @@ pub(crate) async fn spawn_detached(launch: &Launch) -> std::io::Result<Arc<Atomi
         let flag = Arc::clone(&running);
         tokio::spawn(async move {
             let _ = child.wait().await;
+            if let Some((tokens, id)) = retirement {
+                let _ = tokens.revoke(&id).await;
+            }
             flag.store(false, Ordering::SeqCst);
         });
         Ok(running)
@@ -471,6 +590,133 @@ fn test_spawns() -> &'static std::sync::Mutex<Vec<Launch>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn slow_mcp_activation_keeps_credentials_until_discovery_succeeds() {
+        use axum::{routing::post, Json, Router};
+        use serde_json::json;
+        let ready = Arc::new(AtomicBool::new(false));
+        let status = ready.clone();
+        let app = Router::new().route(
+            "/api/pluginInventory/list",
+            post(move || {
+                let ready = status.load(Ordering::SeqCst);
+                async move {
+                    Json(json!({"result": {"ok": true, "value": {"entries": [{
+                        "entryId": crate::agents::adapters::deepseek::mcp::ENTRY_ID,
+                        "moduleName": crate::agents::adapters::deepseek::mcp::MODULE,
+                        "enabled": true, "fiberPhase": if ready { "active" } else { "loading" }
+                    }]}}}))
+                }
+            }),
+        );
+        let (client, server) =
+            crate::agents::adapters::deepseek::client::tests::rpc_server(app).await;
+        let state = crate::test_state("synthetic-admin", Vec::new());
+        let runtime = AgentRuntime::disabled();
+        runtime.enable_mcp(
+            state.mcp_tokens.clone(),
+            "http://127.0.0.1:23999/mcp".into(),
+        );
+        let tokens = state.mcp_tokens.as_ref();
+        let (old, _) = super::super::issue_agent_env_for(
+            tokens,
+            "http://127.0.0.1:23999/mcp",
+            "deepseek",
+            "deepseek (service)",
+        )
+        .await
+        .unwrap();
+        let (new, previous) = super::super::issue_agent_env_for(
+            tokens,
+            "http://127.0.0.1:23999/mcp",
+            "deepseek",
+            "deepseek (service)",
+        )
+        .await
+        .unwrap();
+        let new_token = new.token.clone();
+        {
+            let mut slot = runtime.deepseek_spawn.lock().await;
+            slot.note(client.endpoint.url.clone(), Arc::new(AtomicBool::new(true)));
+            slot.pending_mcp = Some((new, previous));
+        }
+        runtime.settle_deepseek_mcp().await;
+        assert!(runtime.deepseek_spawn.lock().await.pending_mcp.is_some());
+        assert!(tokens.resolve(&old.token).await.unwrap().live().is_some());
+        assert!(tokens.resolve(&new_token).await.unwrap().live().is_some());
+        ready.store(true, Ordering::SeqCst);
+        runtime.settle_deepseek_mcp().await;
+        assert!(runtime.deepseek_spawn.lock().await.pending_mcp.is_none());
+        assert!(tokens.resolve(&old.token).await.unwrap().live().is_none());
+        assert!(tokens.resolve(&new_token).await.unwrap().live().is_some());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn mcp_overlay_uses_child_env_and_preserves_other_agent_credentials() {
+        let state = crate::test_state("synthetic-admin", Vec::new());
+        let tokens = state.mcp_tokens.as_ref();
+        let runtime = AgentRuntime::disabled();
+        let url = "http://127.0.0.1:23999/mcp";
+        runtime.enable_mcp(state.mcp_tokens.clone(), url.into());
+        let (opencode, _) = super::super::issue_agent_env(tokens, url).await.unwrap();
+        for runner in [Runner::Dsh, Runner::Bunx, Runner::Npx] {
+            let mut launch = launch(runner, &target(None));
+            let (env, previous) = runtime.prepare_deepseek_mcp(&mut launch).await.unwrap();
+            assert!(!previous.contains(&opencode.token_id));
+            let web = launch.args.iter().position(|arg| arg == "web").unwrap();
+            assert_eq!(launch.args[web + 1], "--patch");
+            assert_eq!(launch.args[web + 3], "--no-open");
+            let overlay = tokio::fs::read_to_string(&launch.args[web + 2])
+                .await
+                .unwrap();
+            assert!(!overlay.contains(&env.token));
+            assert!(!launch.display().contains(&env.token));
+            let mut command = command_for(&launch);
+            env.apply(&mut command);
+            let vars: std::collections::HashMap<_, _> = command.as_std().get_envs().collect();
+            assert_eq!(
+                vars.get(std::ffi::OsStr::new("MUQUN_MCP_TOKEN")),
+                Some(&Some(std::ffi::OsStr::new(&env.token)))
+            );
+            super::super::settle_agent_tokens(tokens, &env, &previous, true).await;
+            assert_eq!(
+                tokens
+                    .list()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .filter(|row| row.label == "deepseek (service)")
+                    .count(),
+                1
+            );
+        }
+        assert!(tokens
+            .resolve(&opencode.token)
+            .await
+            .unwrap()
+            .live()
+            .is_some());
+        let mut off = state.config.clone();
+        off.mcp.inject_into_agents = false;
+        crate::mcp::inject::startup_cleanup(&off, tokens).await;
+        assert!(!tokens
+            .list()
+            .await
+            .unwrap()
+            .iter()
+            .any(|row| row.label == "deepseek (service)"));
+    }
+
+    #[tokio::test]
+    async fn disabled_mcp_adds_no_overlay_or_credentials() {
+        let runtime = AgentRuntime::disabled();
+        let mut launch = launch(Runner::Dsh, &target(None));
+        let before = launch.clone();
+        assert!(runtime.prepare_deepseek_mcp(&mut launch).await.is_none());
+        assert_eq!(launch, before);
+    }
 
     fn lookup<'a>(present: &'a [&'a str]) -> impl Fn(&str) -> bool + 'a {
         move |name| present.contains(&name)
