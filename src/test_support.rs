@@ -193,6 +193,7 @@ pub(crate) fn test_state(admin_token: &str, devices: Vec<DeviceRecord>) -> AppSt
         peers,
         tasks,
         task_events,
+        home_overview: Default::default(),
         db,
     }
 }

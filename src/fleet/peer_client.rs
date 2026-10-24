@@ -798,7 +798,7 @@ impl TaskFeed {
         loop {
             let frame = self.next_plaintext().await?;
             match frame["t"].as_str() {
-                Some("home") => return Some(frame),
+                Some("home" | "home_overview") => return Some(frame),
                 Some("home_status") => return None,
                 Some("error") => return None,
                 _ => {}

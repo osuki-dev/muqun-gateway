@@ -876,8 +876,11 @@ impl Connection {
                         home_grant = grant;
                         if self.send(r#"{"t":"subscribed","home":true}"#).await.is_err() { return; }
                         home_workers.spawn(crate::fleet::home::local(state.clone(), home_tx.clone(), home_grant.as_ref().map(|(g,a)| (device_id.clone(),g.clone(),a.clone())), device_id.clone()));
+                        if home.overview {
+                            home_workers.spawn(crate::fleet::home_overview::local(state.clone(), home_tx.clone(), home_grant.as_ref().map(|(g,a)| (device_id.clone(),g.clone(),a.clone()))));
+                        }
                         for source in &home.sources {
-                            home_workers.spawn(crate::fleet::home::remote(state.clone(), source.clone(), device_id.clone(), home_tx.clone()));
+                            home_workers.spawn(crate::fleet::home::remote(state.clone(), source.clone(), device_id.clone(), home.overview, home_tx.clone()));
                         }
                         continue;
                     }

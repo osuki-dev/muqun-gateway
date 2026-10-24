@@ -60,6 +60,7 @@ pub(crate) const API_CAPABILITIES: &[&str] = &[
     "capabilities_discovery",
     crate::fleet::home::CAPABILITY,
     crate::fleet::home::COLLECTOR_CAPABILITY,
+    crate::fleet::home_overview::CAPABILITY,
     "agent_discovery",
     "agent_spawn",
     "agent_timeline",

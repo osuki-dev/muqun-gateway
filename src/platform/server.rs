@@ -184,6 +184,7 @@ pub(crate) async fn run(config_path: Option<String>) -> anyhow::Result<()> {
         peers,
         tasks,
         task_events,
+        home_overview: Default::default(),
         db,
     };
     // A registration handed to a session agent's service outlives a switch

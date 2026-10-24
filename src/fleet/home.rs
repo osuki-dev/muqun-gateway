@@ -27,6 +27,8 @@ pub(crate) struct Source {
 pub(crate) struct Subscription {
     #[serde(default)]
     pub sources: Vec<Source>,
+    #[serde(default)]
+    pub overview: bool,
     /// Only peer callers use a grant/audience, and only for the local source.
     pub grant_id: Option<String>,
     pub audience: Option<String>,
@@ -210,6 +212,7 @@ pub(crate) async fn remote(
     state: AppState,
     source: Source,
     audience: String,
+    overview: bool,
     sender: mpsc::Sender<Value>,
 ) {
     let Some(peer) = state.peers.get(&source.peer_id).await else {
@@ -228,8 +231,33 @@ pub(crate) async fn remote(
     let Ok(client) = super::peer_client::PeerClient::for_peer(&peer) else {
         return;
     };
-    let request =
+    let mut request =
         json!({"t":"subscribe_home", "home":{"grant_id":source.grant_id,"audience":audience}});
+    // A live task feed keeps last_seen fresh, so its stored capability list
+    // can predate an upgrade indefinitely. Probe once for a newly requested
+    // optional topic rather than assuming a healthy link has current features.
+    let overview_supported = if !overview {
+        false
+    } else if peer
+        .capabilities
+        .iter()
+        .any(|c| c == super::home_overview::CAPABILITY)
+    {
+        true
+    } else {
+        tokio::time::timeout(std::time::Duration::from_secs(3), client.negotiate())
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .is_some_and(|caps| {
+                caps.names
+                    .iter()
+                    .any(|c| c == super::home_overview::CAPABILITY)
+            })
+    };
+    if overview_supported {
+        request["home"]["overview"] = json!(true);
+    }
     let Ok(mut feed) = client.subscribe_home(&request.to_string()).await else {
         let _ = sender.send(status("unavailable")).await;
         return;

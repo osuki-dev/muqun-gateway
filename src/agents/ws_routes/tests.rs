@@ -264,6 +264,10 @@ type Client =
 /// The route behind the same transport middleware the gateway runs.
 async fn serve(state: AppState) -> std::net::SocketAddr {
     let app = super::mount(Router::new())
+        .route(
+            "/api/capabilities",
+            axum::routing::get(crate::platform::routes::api_capabilities),
+        )
         .layer(
             CompressionLayer::new()
                 .compress_when(DefaultPredicate::new().and(SizeAbove::new(COMPRESSION_MIN_BYTES))),
@@ -1051,6 +1055,7 @@ async fn home_summary_is_sealed_bounded_and_does_not_replace_session_subscriptio
     assert_eq!(snapshot["t"], "home");
     assert_eq!(snapshot["snapshot"], true);
     assert_eq!(snapshot["tasks"], json!([]));
+    assert!(snapshot.get("overview").is_none());
     tasks.send(task_update(1)).unwrap();
     let delta = app.recv(&mut client).await;
     assert_eq!(delta["snapshot"], false);
@@ -1138,6 +1143,14 @@ async fn home_collector_combines_local_and_remote_sources_on_one_app_socket() {
     );
     source.db.call(|db| { db.execute("INSERT INTO home_summary_grants VALUES ('grant','owner','collector-login','phone')", [])?; Ok(()) }).await.unwrap();
     let source_addr = serve(source.clone()).await;
+    source
+        .db
+        .call(|db| {
+            db.execute("INSERT INTO home_overview_grants VALUES ('grant')", [])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
     let collector = named(
         test_state("admin", vec![test_device("phone", TOKEN)]),
         "collector",
@@ -1156,6 +1169,7 @@ async fn home_collector_combines_local_and_remote_sources_on_one_app_socket() {
             transport_min_version: 1,
             added_ms: 1,
             last_seen_ms: Some(crate::tasks::domain::now_ms()),
+            // Simulate a healthy link whose capability cache predates the upgrade.
             capabilities: vec![crate::fleet::home::CAPABILITY.into()],
             manifest: None,
             unauthorized: false,
@@ -1164,16 +1178,33 @@ async fn home_collector_combines_local_and_remote_sources_on_one_app_socket() {
     let addr = serve(collector).await;
     let (mut client, _) = connect(addr, &bearer()).await.unwrap();
     next_json(&mut client).await;
-    send_text(&mut client, r#"{"t":"subscribe_home","home":{"sources":[{"peer_id":"linked-source","grant_id":"grant"}]}}"#).await;
+    send_text(&mut client, r#"{"t":"subscribe_home","home":{"overview":true,"sources":[{"peer_id":"linked-source","grant_id":"grant"}]}}"#).await;
     assert_eq!(next_json(&mut client).await["home"], true);
-    let a = next_json(&mut client).await;
-    let b = next_json(&mut client).await;
-    let ids: BTreeSet<_> = [
-        a["source_id"].as_str().unwrap(),
-        b["source_id"].as_str().unwrap(),
-    ]
-    .into();
-    assert_eq!(ids, BTreeSet::from(["source", "collector"]));
+    let mut topics = BTreeSet::new();
+    for _ in 0..4 {
+        let frame = next_json(&mut client).await;
+        let topic = frame["t"].as_str().unwrap().to_owned();
+        let source = frame["source_id"].as_str().unwrap().to_owned();
+        assert_eq!(frame["snapshot"], true);
+        if topic == "home_overview" {
+            assert!(frame.get("overview").is_some());
+            assert!(frame.get("fresh").is_some());
+            assert!(frame.get("tasks").is_none());
+        } else {
+            assert_eq!(topic, "home");
+            assert!(frame.get("overview").is_none());
+        }
+        topics.insert((source, topic));
+    }
+    assert_eq!(
+        topics,
+        BTreeSet::from([
+            ("source".into(), "home".into()),
+            ("collector".into(), "home".into()),
+            ("source".into(), "home_overview".into()),
+            ("collector".into(), "home_overview".into()),
+        ])
+    );
     source.task_events.send(task_update(1)).unwrap();
     let delta = next_json(&mut client).await;
     assert_eq!(delta["source_id"], "source");
