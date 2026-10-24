@@ -2,6 +2,16 @@
 
 ## Changes and fixes
 
+- **Optional Home task collection for Muqun 4.0.** Gateways advertise
+  `home_task_summary_v1` and `home_task_collector_v1`. An App can subscribe to
+  bounded task snapshots and changes on its existing encrypted WebSocket, or
+  explicitly grant another paired Gateway read access for that App. Grants
+  include task summaries and the owner's default folder, never full goals,
+  transcripts or command authority. Revocation and device removal stop access.
+  Older Apps keep their existing paths. The new grant table migrates automatically
+  on Gateway startup; installing this version requires the usual Gateway restart.
+  Full paired-device acceptance is still pending.
+
 - **A terminal pane's skills run from the App's `$`, like an agent
   session's.** `$` is the App's skills entry for every agent; the App lists
   a pane's skills and names one, and how the agent's prompt takes it is the

@@ -139,6 +139,8 @@ pub(crate) enum ClientFrame {
     Unsubscribe(String),
     SubscribeAll,
     SubscribeTasks,
+    SubscribeHome(crate::fleet::home::Subscription),
+    UnsubscribeHome,
     Ping,
 }
 
@@ -168,6 +170,20 @@ impl ClientFrame {
             "unsubscribe" => Ok(Self::Unsubscribe(asid()?)),
             "subscribe_all" => Ok(Self::SubscribeAll),
             "subscribe_tasks" => Ok(Self::SubscribeTasks),
+            "subscribe_home" => {
+                let home: crate::fleet::home::Subscription = serde_json::from_value(
+                    value
+                        .get("home")
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::json!({})),
+                )
+                .map_err(|_| FrameError::InvalidFrame)?;
+                if !home.valid() {
+                    return Err(FrameError::InvalidFrame);
+                }
+                Ok(Self::SubscribeHome(home))
+            }
+            "unsubscribe_home" => Ok(Self::UnsubscribeHome),
             "ping" => Ok(Self::Ping),
             _ => Err(FrameError::UnknownType),
         }
@@ -439,6 +455,7 @@ impl Subscriptions {
                 self.tasks_only = true;
                 Ok(Some(subscribed_tasks_frame()))
             }
+            ClientFrame::SubscribeHome(_) | ClientFrame::UnsubscribeHome => Ok(None),
             ClientFrame::Ping => Ok(Some(PONG_FRAME.to_owned())),
         }
     }
@@ -755,6 +772,9 @@ impl Connection {
         let peer = device.kind == PrincipalKind::Gateway;
         // The `defaults` frame last sent, once one was.
         let mut defaults_sent: Option<Option<String>> = None;
+        let mut home_workers = tokio::task::JoinSet::new();
+        let (_home_keepalive, mut home_rx) = tokio::sync::mpsc::channel::<Value>(64);
+        let mut home_grant: Option<(String, String)> = None;
 
         loop {
             tokio::select! {
@@ -763,7 +783,10 @@ impl Connection {
                     return;
                 }
                 _ = recheck.tick() => {
-                    if !still_paired(&state, &device_id) {
+                    if !still_paired(&state, &device_id) || match &home_grant {
+                        Some((grant, audience)) => !crate::fleet::home_grants::allowed(&state, &device_id, grant, audience).await,
+                        None => false,
+                    } {
                         // Closed without an `error` frame, as the SSE stream
                         // closes without an event: a revoked device is not
                         // owed an explanation, and a legitimate client learns
@@ -779,6 +802,20 @@ impl Connection {
                     unanswered_pings += 1;
                     if self.write(Message::Ping(Default::default())).await.is_err() {
                         return;
+                    }
+                }
+                _ = home_workers.join_next(), if !home_workers.is_empty() => {
+                    if home_workers.is_empty() {
+                        let frame = serde_json::json!({"t":"home_status", "source_id":state.config.server_id, "status":"unavailable"});
+                        if self.send(&frame.to_string()).await.is_err() { return; }
+                    }
+                }
+                frame = home_rx.recv(), if !home_workers.is_empty() => {
+                    if let Some(frame) = frame {
+                        if let Some((grant, audience)) = &home_grant {
+                            if !crate::fleet::home_grants::allowed(&state, &device_id, grant, audience).await { return; }
+                        }
+                        if self.send(&frame.to_string()).await.is_err() { return; }
                     }
                 }
                 inbound = self.socket.recv() => {
@@ -820,6 +857,36 @@ impl Connection {
                         }
                         frame => Ok(frame),
                     });
+                    if let Ok(ClientFrame::SubscribeHome(home)) = &frame {
+                        let grant = if peer {
+                            let (Some(grant), Some(audience)) = (&home.grant_id, &home.audience) else {
+                                self.fail(FrameError::PeerForbidden).await; return;
+                            };
+                            if !home.sources.is_empty() || !crate::fleet::home_grants::allowed(&state, &device_id, grant, audience).await {
+                                self.fail(FrameError::PeerForbidden).await; return;
+                            }
+                            Some((grant.clone(), audience.clone()))
+                        } else {
+                            if home.grant_id.is_some() || home.audience.is_some() { self.fail(FrameError::InvalidFrame).await; return; }
+                            None
+                        };
+                        home_workers.abort_all();
+                        let (home_tx, receiver) = tokio::sync::mpsc::channel(64);
+                        home_rx = receiver;
+                        home_grant = grant;
+                        if self.send(r#"{"t":"subscribed","home":true}"#).await.is_err() { return; }
+                        home_workers.spawn(crate::fleet::home::local(state.clone(), home_tx.clone(), home_grant.as_ref().map(|(g,a)| (device_id.clone(),g.clone(),a.clone())), device_id.clone()));
+                        for source in &home.sources {
+                            home_workers.spawn(crate::fleet::home::remote(state.clone(), source.clone(), device_id.clone(), home_tx.clone()));
+                        }
+                        continue;
+                    }
+                    if matches!(frame, Ok(ClientFrame::UnsubscribeHome)) {
+                        home_workers.abort_all();
+                        home_rx = tokio::sync::mpsc::channel(64).1;
+                        home_grant = None;
+                        continue;
+                    }
                     match frame.and_then(|frame| subscriptions.apply(&frame)) {
                         Ok(Some(reply)) => {
                             if self.send(&reply).await.is_err() {

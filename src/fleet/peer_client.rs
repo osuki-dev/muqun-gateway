@@ -565,12 +565,21 @@ impl PeerClient {
     /// confirmed the subscription, so no change after this returns is missed.
     /// What changed before it is the feed's first item, a `Resync`.
     pub(crate) async fn subscribe_tasks(&self) -> Result<TaskFeed, PeerError> {
-        tokio::time::timeout(REQUEST_TIMEOUT, self.open_task_socket())
+        tokio::time::timeout(
+            REQUEST_TIMEOUT,
+            self.open_task_socket(r#"{"t":"subscribe_tasks"}"#),
+        )
+        .await
+        .unwrap_or_else(|_| Err(PeerError::Unreachable("socket timed out".into())))
+    }
+
+    pub(crate) async fn subscribe_home(&self, request: &str) -> Result<TaskFeed, PeerError> {
+        tokio::time::timeout(REQUEST_TIMEOUT, self.open_task_socket(request))
             .await
             .unwrap_or_else(|_| Err(PeerError::Unreachable("socket timed out".into())))
     }
 
-    async fn open_task_socket(&self) -> Result<TaskFeed, PeerError> {
+    async fn open_task_socket(&self, subscription: &str) -> Result<TaskFeed, PeerError> {
         let mut request = ws_url(&self.base)?
             .into_client_request()
             .map_err(|_| PeerError::Unreachable("not a socket url".into()))?;
@@ -637,14 +646,16 @@ impl PeerClient {
         if hello["t"] != "hello" {
             return Err(PeerError::Unreachable("no hello".into()));
         }
-        feed.send(r#"{"t":"subscribe_tasks"}"#).await?;
+        feed.send(subscription).await?;
         loop {
             let frame = feed
                 .next_plaintext()
                 .await
                 .ok_or_else(|| PeerError::Unreachable("socket closed".into()))?;
             match frame["t"].as_str() {
-                Some("subscribed") if frame["tasks"] == true => return Ok(feed),
+                Some("subscribed") if frame["tasks"] == true || frame["home"] == true => {
+                    return Ok(feed)
+                }
                 // Refused for what this token is; any other error (another
                 // socket of this device took the slot) is a socket that ended.
                 Some("error") if frame["code"] == "peer_forbidden" => {
@@ -782,6 +793,19 @@ pub(crate) struct TaskFeed {
 }
 
 impl TaskFeed {
+    /// Summary consumers share the existing authenticated wire codec and heartbeat.
+    pub(crate) async fn next_home(&mut self) -> Option<Value> {
+        loop {
+            let frame = self.next_plaintext().await?;
+            match frame["t"].as_str() {
+                Some("home") => return Some(frame),
+                Some("home_status") => return None,
+                Some("error") => return None,
+                _ => {}
+            }
+        }
+    }
+
     /// When anything last arrived on the socket.
     pub(crate) fn heard(&self) -> Instant {
         self.heard

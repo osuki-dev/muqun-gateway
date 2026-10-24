@@ -1030,3 +1030,153 @@ async fn a_peer_receives_only_its_tasks_in_snapshots_updates_and_reconnected_his
         }
     }
 }
+
+#[tokio::test]
+async fn home_summary_is_sealed_bounded_and_does_not_replace_session_subscriptions() {
+    let (device, material) = encrypted_device();
+    let state = test_state("admin", vec![device]);
+    let tasks = state.task_events.clone();
+    let runtime = state.agent_runtime.clone();
+    let addr = serve(state).await;
+    let (headers, nonce) = sealed_upgrade_headers(&material);
+    let (mut client, _) = connect(addr, &headers).await.unwrap();
+    let mut app = AppCodec::open(&mut client, &material, &nonce).await;
+    app.send(&mut client, r#"{"t":"subscribe","asid":"session"}"#)
+        .await;
+    assert_eq!(app.recv(&mut client).await["t"], "subscribed");
+    app.send(&mut client, r#"{"t":"subscribe_home","home":{}}"#)
+        .await;
+    assert_eq!(app.recv(&mut client).await["home"], true);
+    let snapshot = app.recv(&mut client).await;
+    assert_eq!(snapshot["t"], "home");
+    assert_eq!(snapshot["snapshot"], true);
+    assert_eq!(snapshot["tasks"], json!([]));
+    tasks.send(task_update(1)).unwrap();
+    let delta = app.recv(&mut client).await;
+    assert_eq!(delta["snapshot"], false);
+    assert_eq!(delta["revision"], 2);
+    assert_eq!(delta["tasks"][0]["title"], "t");
+    assert!(delta["tasks"][0].get("goal").is_none());
+    assert!(delta["tasks"][0].get("stdout_tail").is_none());
+    app.send(&mut client, r#"{"t":"unsubscribe_home"}"#).await;
+    runtime.publish_for_test(status_event("session", 1));
+    // Worker shutdown may report source status, but never ends the session subscription.
+    loop {
+        let frame = app.recv(&mut client).await;
+        if frame["t"] == "event" {
+            assert_eq!(frame["asid"], "session");
+            break;
+        }
+    }
+}
+
+#[tokio::test]
+async fn home_summary_peer_grants_are_audience_bound_and_revocation_stops_delivery() {
+    let mut state = test_state(
+        "admin",
+        vec![
+            test_device("owner", "owner-token"),
+            test_peer_device("reader", TOKEN),
+        ],
+    );
+    state.ws_connections = Arc::new(WsRegistry::with_timings(WsTimings {
+        device_recheck: Duration::from_millis(10),
+        ..Default::default()
+    }));
+    state
+        .db
+        .call(|db| {
+            db.execute(
+                "INSERT INTO home_summary_grants VALUES ('grant','owner','reader','audience')",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let addr = serve(state.clone()).await;
+    let (mut denied, _) = connect(addr, &bearer()).await.unwrap();
+    next_json(&mut denied).await;
+    send_text(
+        &mut denied,
+        r#"{"t":"subscribe_home","home":{"grant_id":"grant","audience":"other"}}"#,
+    )
+    .await;
+    assert_eq!(next_json(&mut denied).await["code"], "peer_forbidden");
+    let (mut client, _) = connect(addr, &bearer()).await.unwrap();
+    next_json(&mut client).await;
+    send_text(
+        &mut client,
+        r#"{"t":"subscribe_home","home":{"grant_id":"grant","audience":"audience"}}"#,
+    )
+    .await;
+    assert_eq!(next_json(&mut client).await["home"], true);
+    assert_eq!(next_json(&mut client).await["snapshot"], true);
+    state
+        .db
+        .call(|db| {
+            db.execute("DELETE FROM home_summary_grants", [])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert!(closes(&mut client).await);
+}
+
+#[tokio::test]
+async fn home_collector_combines_local_and_remote_sources_on_one_app_socket() {
+    let source = named(
+        test_state(
+            "admin",
+            vec![
+                test_device("owner", "owner-token"),
+                test_peer_device("collector-login", "peer-token"),
+            ],
+        ),
+        "source",
+        "Source",
+    );
+    source.db.call(|db| { db.execute("INSERT INTO home_summary_grants VALUES ('grant','owner','collector-login','phone')", [])?; Ok(()) }).await.unwrap();
+    let source_addr = serve(source.clone()).await;
+    let collector = named(
+        test_state("admin", vec![test_device("phone", TOKEN)]),
+        "collector",
+        "Collector",
+    );
+    collector
+        .peers
+        .store_for_test(crate::fleet::peers::Peer {
+            peer_id: "linked-source".into(),
+            server_id: "source".into(),
+            name: "Source".into(),
+            url: format!("http://{source_addr}"),
+            token: "peer-token".into(),
+            device_id: "collector-login".into(),
+            transport_key: None,
+            transport_min_version: 1,
+            added_ms: 1,
+            last_seen_ms: Some(crate::tasks::domain::now_ms()),
+            capabilities: vec![crate::fleet::home::CAPABILITY.into()],
+            manifest: None,
+            unauthorized: false,
+        })
+        .await;
+    let addr = serve(collector).await;
+    let (mut client, _) = connect(addr, &bearer()).await.unwrap();
+    next_json(&mut client).await;
+    send_text(&mut client, r#"{"t":"subscribe_home","home":{"sources":[{"peer_id":"linked-source","grant_id":"grant"}]}}"#).await;
+    assert_eq!(next_json(&mut client).await["home"], true);
+    let a = next_json(&mut client).await;
+    let b = next_json(&mut client).await;
+    let ids: BTreeSet<_> = [
+        a["source_id"].as_str().unwrap(),
+        b["source_id"].as_str().unwrap(),
+    ]
+    .into();
+    assert_eq!(ids, BTreeSet::from(["source", "collector"]));
+    source.task_events.send(task_update(1)).unwrap();
+    let delta = next_json(&mut client).await;
+    assert_eq!(delta["source_id"], "source");
+    assert_eq!(delta["tasks"][0]["task_id"], "task-1");
+    assert_eq!(delta["snapshot"], false);
+}

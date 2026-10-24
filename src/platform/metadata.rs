@@ -58,6 +58,8 @@ pub(crate) const API_CAPABILITIES: &[&str] = &[
     "agent_session_refresh_v1",
     "agent_session_delete_scoped",
     "capabilities_discovery",
+    crate::fleet::home::CAPABILITY,
+    crate::fleet::home::COLLECTOR_CAPABILITY,
     "agent_discovery",
     "agent_spawn",
     "agent_timeline",

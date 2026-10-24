@@ -1,6 +1,62 @@
 # Home summary aggregation and failover
 
-Status: architecture proposal, implementation not started.
+Status: task-summary v1 implemented on the feature branch; paired-device acceptance
+and release performance measurements are pending. The sections after the
+implementation record describe the broader target architecture, not a claim that
+every proposed optimization is already shipped.
+
+## Implementation record: task-summary v1
+
+The shipped protocol names are `home_task_summary_v1` and
+`home_task_collector_v1`. The App subscribes through its existing `/api/ws`
+connection. A subscription owns a local task projection and, when requested,
+authorized peer streams. Each source sends an initial snapshot, then changed
+tasks and removals with a generation and monotonic revision. Reconnect starts
+a new generation and snapshot; there is no retained replay cursor in v1.
+There are at most 16 remote sources and 100 tasks per source; title and progress
+text are bounded. The source performs a 60-second reconciliation without sending
+unchanged data. Subscriptions stop when Home is inactive or the App backgrounds.
+
+Source-owned SQLite grants bind the approving App, exact paired reader device,
+and receiving App audience. Existing encrypted transport and identity pins are
+reused. A reader cannot recursively request more peers. Revocation, unpairing,
+or credential replacement invalidates access. Setup requires existing Gateway
+peer links; no network sweep or automatic peer pairing is performed.
+
+The App chooses its preferred approved collector, tries approved backups after
+connection failure or missing initial snapshots, and falls back to direct reads.
+Partial coverage retains direct reads for uncovered sources. A single computer
+has no aggregation settings, peer work or collector retry timer. Direct summary
+mode still uses the same local projection and capability detection.
+
+| Data | Current v1 path | Display owner |
+| --- | --- | --- |
+| Task title, state, progress, binding and child counts | Local or collected summary | Shared Home task projection |
+| Default working folder | Summary under the approving App's identity | Existing default-folder store |
+| Agent sessions, discovery and attention details | Existing direct reads | Existing session and attention stores |
+| Stage conversation/terminal activity | Existing direct subscriptions | Existing identity-bound Stage overlay |
+| Full goals, transcripts, files, commands and approvals | Existing direct detail paths | Original source Gateway |
+
+Classic, Editorial and Stage select from the same Home task store. Full ledger
+details remain in their original store. Equal task content retains object identity
+so unrelated selectors do not need a new value. Collector loss preserves newer
+cached task state until a direct read catches up, but stops presenting cached
+progress as live. Task waiting state never manufactures an approval form; task
+completion, agent busy state and pending input remain separate concepts.
+
+Peer transport reuses `PeerClient`, handshake, framing and heartbeat code. V1
+does not merge the summary stream with the pre-existing task-mirror worker's
+physical socket: their independent lifetimes protect active task mirroring.
+Consequently this reduces Home task fan-out, not every App connection. Sessions
+and Stage activity may still maintain direct sockets. Shared peer workers,
+session/attention aggregation and replay retention are future work, requiring
+separate measurements and authorization design.
+
+Loopback tests cover encrypted snapshots/deltas, two-Gateway collection,
+audience isolation and revocation. App tests cover ordering, gaps, failover,
+late frames, single-computer mode, detail preservation and Stage task semantics.
+These tests do not substitute for real multi-computer device acceptance or
+measured battery savings.
 
 ## Objective and ownership
 
