@@ -2,6 +2,15 @@
 
 ## Changes and fixes
 
+- **Command observation failures keep the task handle.** If `exec.run` has
+  already sent a command, a temporary pane observation failure now returns
+  its recorded handle instead of an error that could invite a duplicate run.
+  Linked-computer observers keep following that command, and concurrent reads
+  can recover a completed result after its successful tab closes. Ownership
+  checks use fresh proof for the requested pane and refuse unknown or changed
+  identities; they no longer enrich every other Herdr pane. Failed and
+  cancelled tabs keep their existing retention policy.
+
 - **Muqun tool activity remains visible in agent conversations.** Pending,
   running, completed and failed Muqun MCP calls now reach the App's tool UI
   across OpenCode, DeepSeek, T3 and Codex. Catalog discovery and pending

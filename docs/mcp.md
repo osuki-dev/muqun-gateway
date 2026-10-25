@@ -210,6 +210,13 @@ says `"truncated": true` when it left older ones out. `tasks.wait` and
 | `tasks.cancel` | `task_id` | The task view after the cancel. Interrupt a task you created. |
 | `tasks.complete` | `summary`: what was done -- or, blocked, why the agent stopped -- one line (non-empty, at most 32 KiB; stored cut to 240 characters); `outcome?`: `done` (default) or `blocked`; `task_id?`: default, the task the calling session works on | The task view: `done` with that summary, or, for `outcome: "blocked"`, `waiting` with the reason as its `summary` (see [Blocked](#blocked)). Say how the task you were given ended: finished, or stopped because you need the user (a missing file, an unclear request, a permission you cannot get). Only the session working on the task may complete it (see [Finishing a delegation](#finishing-a-delegation)); any other task, none found, or a task that has already ended is `task_not_found`, whose message tells the agent to print the `MUQUN_TASK_DONE: <one-line summary>` (or `MUQUN_TASK_BLOCKED: <one-line reason>`) line instead. A task already `waiting` that is blocked again is answered as it stands. |
 
+After a command has been dispatched, a temporary observation failure preserves
+its `task_id` and latest recorded state, with a null `exit_code` until its exit
+is confirmed. Use `tasks.wait` on that handle; do not resend the command. The
+peer's single observer keeps checking the same command without executing it
+again. A completed command's recorded result remains available if another
+observer has already closed its successful tab.
+
 Error codes:
 
 | Code | When |

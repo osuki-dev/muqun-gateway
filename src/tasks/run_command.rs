@@ -33,8 +33,8 @@ const LABEL_CHARS: usize = 24;
 const SOURCE: &str = "run_command";
 /// The error `start` gives when no configured session's backend answers.
 pub(crate) const NO_TERMINAL: &str = "no reachable terminal session";
-/// The error when the task's pane closed or now runs another shell.
-const PANE_GONE: &str = "the task's pane is gone";
+/// The pane is missing, changed, or cannot provide its bound shell identity.
+const PANE_UNVERIFIED: &str = "the task's pane identity could not be verified";
 
 pub(crate) struct RunRequest {
     pub cwd: PathBuf,
@@ -90,27 +90,30 @@ async fn launch(
         .context("create the command tab")?;
     // The new pane and its shell pid, which binds the task to this shell
     // rather than to an id tmux may hand out again after a restart.
-    let listed = backend.list_panes().await;
     let tab_id = tab.id.clone();
-    let found = match (tab.active_pane_id.clone(), listed) {
-        (Some(pane_id), Ok(panes)) => {
-            let shell_pid = panes
-                .iter()
-                .find(|pane| pane.id == pane_id)
-                .and_then(|pane| pane.shell_pid);
-            Ok((pane_id, shell_pid))
-        }
-        (Some(pane_id), Err(error)) => {
-            tracing::warn!("exec.run: no shell pid for the new pane: {error}");
-            Ok((pane_id, None))
-        }
-        (None, listed) => listed.context("list panes").and_then(|panes| {
-            panes
-                .into_iter()
-                .find(|pane| pane.tab_id == tab.id)
-                .map(|pane| (pane.id, pane.shell_pid))
-                .ok_or_else(|| anyhow!("the new tab has no pane"))
-        }),
+    let found = match tab.active_pane_id.clone() {
+        Some(pane_id) => backend
+            .get_pane(&pane_id)
+            .await
+            .context("read the new pane")
+            .and_then(|pane| {
+                if pane.id == pane_id {
+                    Ok((pane_id, pane.shell_pid))
+                } else {
+                    Err(anyhow!("the new tab returned another pane"))
+                }
+            }),
+        None => backend
+            .list_panes()
+            .await
+            .context("list panes")
+            .and_then(|panes| {
+                panes
+                    .into_iter()
+                    .find(|pane| pane.tab_id == tab.id)
+                    .map(|pane| (pane.id, pane.shell_pid))
+                    .ok_or_else(|| anyhow!("the new tab has no pane"))
+            }),
     };
     let (pane_id, shell_pid) = match found {
         Ok(found) => found,
@@ -187,7 +190,20 @@ async fn launch(
     let task = store
         .transition(&task.id, change(TaskState::Working))
         .await?;
-    poll(state, store, &task, deadline).await
+    match poll(state, store, &task, deadline).await {
+        Ok(handle) => Ok(handle),
+        Err(error) => {
+            // Dispatch already happened. Losing observation must not lose the
+            // handle or invite the caller to execute the command again.
+            tracing::warn!(task = %task.id.0, %error, "exec.run: command started but observation failed");
+            Ok(RunHandle {
+                duration_ms: now_ms().saturating_sub(task.created_ms),
+                task,
+                exit_code: None,
+                stdout_tail: String::new(),
+            })
+        }
+    }
 }
 
 /// A peer cannot poll this pane itself. Keep observing after its create
@@ -212,8 +228,7 @@ pub(crate) fn follow_peer_command(state: &AppState, task: &Task) {
                 Ok(handle) if !handle.task.state.is_terminal() => {}
                 Ok(_) => break,
                 Err(error) => {
-                    tracing::debug!(task = %id.0, %error, "peer command observer stopped");
-                    break;
+                    tracing::debug!(task = %id.0, %error, "peer command observation unavailable");
                 }
             }
             tokio::time::sleep(POLL_INTERVAL).await;
@@ -238,14 +253,51 @@ pub(crate) async fn poll(
     task: &Task,
     deadline: Instant,
 ) -> anyhow::Result<RunHandle> {
+    let current = store
+        .get(&task.id)
+        .await?
+        .ok_or_else(|| anyhow!("task not found"))?;
+    match observe(state, store, &current, deadline).await {
+        Ok(handle) => Ok(handle),
+        Err(error) => {
+            // Another observer may have persisted the result and closed the
+            // pane while this one still held its Working snapshot.
+            match store.get(&task.id).await? {
+                Some(current) if current.state.is_terminal() => Ok(recorded_result(current)),
+                _ => Err(error),
+            }
+        }
+    }
+}
+
+fn recorded_result(task: Task) -> RunHandle {
+    let stdout_tail = task
+        .summary
+        .as_deref()
+        .and_then(|summary| summary.split_once('\n'))
+        .filter(|(first, _)| {
+            task.exit_code
+                .is_some_and(|code| *first == format!("exit {code}"))
+        })
+        .map(|(_, output)| tail(output))
+        .unwrap_or_default();
+    RunHandle {
+        exit_code: task.exit_code,
+        stdout_tail,
+        duration_ms: task.updated_ms.saturating_sub(task.created_ms),
+        task,
+    }
+}
+
+async fn observe(
+    state: &AppState,
+    store: &dyn TaskStore,
+    task: &Task,
+    deadline: Instant,
+) -> anyhow::Result<RunHandle> {
     let duration_ms = || now_ms().saturating_sub(task.created_ms);
     if task.state.is_terminal() {
-        return Ok(RunHandle {
-            task: task.clone(),
-            exit_code: task.exit_code,
-            stdout_tail: String::new(),
-            duration_ms: task.updated_ms.saturating_sub(task.created_ms),
-        });
+        return Ok(recorded_result(task.clone()));
     }
     let (backend, pane_id, tab_id) = pane_of(state, task).await?;
     let read = ReadPane {
@@ -360,7 +412,7 @@ async fn pane_of(
     let backend = terminal_backend(session);
     let pane_id = PaneId::new(pane_id);
     if !may_touch(backend.as_ref(), &pane_id, *shell_pid).await {
-        return Err(anyhow!(PANE_GONE));
+        return Err(anyhow!(PANE_UNVERIFIED));
     }
     Ok((backend, pane_id, tab_id.as_deref().map(TabId::new)))
 }
@@ -553,6 +605,207 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_observation_failure_after_dispatch_preserves_the_handle_and_recovers() {
+        let screens = screens("echo hi", "hi\n", 0);
+        let herdr = FakeHerdr::start(screens.iter().map(String::as_str).collect(), None);
+        herdr.set_panes(new_pane(100));
+        herdr.set_process_shells([Some(100), None, None, None, Some(100)]);
+        let state = output_state(&herdr);
+        let store = SqliteTaskStore::new(state.db.clone());
+        let mut by = principal();
+        by.origin = TaskOrigin::Peer;
+        let handle = launch(
+            &state,
+            &store,
+            by,
+            request("echo hi", Duration::from_secs(5)),
+            TaskId(ID.into()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(handle.task.state, TaskState::Working);
+        assert_eq!(handle.exit_code, None);
+        assert!(
+            methods(&herdr, "pane.read").is_empty(),
+            "unknown proof never grants a read"
+        );
+        let keys = herdr.enters().len();
+        interrupt(&state, &handle.task).await;
+        assert_eq!(
+            herdr.enters().len(),
+            keys,
+            "unknown proof never grants an interrupt"
+        );
+        follow_peer_command(&state, &handle.task);
+        tokio::time::timeout(Duration::from_secs(4), async {
+            loop {
+                let task = store.get(&handle.task.id).await.unwrap().unwrap();
+                if task.state == TaskState::Done {
+                    assert_eq!(task.exit_code, Some(0));
+                    assert_eq!(task.summary.as_deref(), Some("exit 0\nhi\n"));
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            herdr.enters().len(),
+            1,
+            "observation recovery never redispatches"
+        );
+        assert_eq!(methods(&herdr, "tab.close").len(), 1);
+        assert_eq!(
+            methods(&herdr, "pane.list").len(),
+            0,
+            "launch and polls only ask for their own pane"
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_observers_release_ownership_when_the_task_ends_or_disappears() {
+        for outcome in ["cancelled", "deleted", "pane gone"] {
+            let echo = format!("$ {}\n", command_line("sleep 60", ID));
+            let herdr = FakeHerdr::start(vec![&echo], None);
+            herdr.set_panes(new_pane(100));
+            let state = output_state(&herdr);
+            let store = SqliteTaskStore::new(state.db.clone());
+            let mut by = principal();
+            by.origin = TaskOrigin::Peer;
+            let handle = launch(
+                &state,
+                &store,
+                by,
+                request("sleep 60", Duration::ZERO),
+                TaskId(ID.into()),
+            )
+            .await
+            .unwrap();
+            follow_peer_command(&state, &handle.task);
+            assert!(!state.tasks.claim_follow(&handle.task.id));
+            match outcome {
+                "cancelled" => {
+                    state
+                        .tasks
+                        .cancel(&state, &handle.task.created_by, &handle.task.id)
+                        .await
+                        .unwrap();
+                }
+                "deleted" => {
+                    state
+                        .db
+                        .call(|c| {
+                            c.execute("DELETE FROM tasks WHERE id = ?1", [ID])?;
+                            Ok(())
+                        })
+                        .await
+                        .unwrap();
+                }
+                _ => {
+                    herdr.set_panes(json!([]));
+                    crate::tasks::driver::reconcile(&state).await;
+                    assert_eq!(
+                        store.get(&handle.task.id).await.unwrap().unwrap().state,
+                        TaskState::Failed
+                    );
+                }
+            }
+            tokio::time::timeout(Duration::from_secs(4), async {
+                loop {
+                    if state.tasks.claim_follow(&handle.task.id) {
+                        state.tasks.release_follow(&handle.task.id);
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                herdr
+                    .enters()
+                    .iter()
+                    .filter(|call| call["params"]["keys"] == json!(["enter"]))
+                    .count(),
+                1
+            );
+            assert!(
+                methods(&herdr, "tab.close").is_empty(),
+                "ending observation does not discard the tab: {outcome}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pane_authority_is_targeted_and_refuses_unknown_changed_or_missing_proof() {
+        let herdr = FakeHerdr::start(vec![], None);
+        herdr.set_panes(new_pane(100));
+        let backend = terminal_backend(&herdr.session());
+        let pane = PaneId::new("w1:p9");
+        assert!(may_touch(backend.as_ref(), &pane, Some(100)).await);
+        assert!(!may_touch(backend.as_ref(), &pane, Some(200)).await);
+        herdr.set_process_shells([None]);
+        assert!(!may_touch(backend.as_ref(), &pane, Some(100)).await);
+        herdr.set_panes(json!([]));
+        assert!(!may_touch(backend.as_ref(), &pane, None).await);
+        herdr.set_pane(json!({"pane_id": "w1:other", "workspace_id": "w1", "tab_id": "w1:t9"}));
+        assert!(
+            !may_touch(backend.as_ref(), &pane, None).await,
+            "another returned id grants no authority"
+        );
+        assert!(methods(&herdr, "pane.list").is_empty());
+        assert!(methods(&herdr, "pane.read").is_empty());
+        assert!(methods(&herdr, "pane.send_keys").is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_stale_command_poll_returns_the_observers_persisted_result() {
+        let screens = screens("echo hi", "hi\n", 0);
+        let herdr = FakeHerdr::start(screens.iter().map(String::as_str).collect(), None);
+        herdr.set_panes(new_pane(100));
+        let state = output_state(&herdr);
+        let store = SqliteTaskStore::new(state.db.clone());
+        let mut by = principal();
+        by.origin = TaskOrigin::Peer;
+        let handle = launch(
+            &state,
+            &store,
+            by,
+            request("echo hi", Duration::ZERO),
+            TaskId(ID.into()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(handle.task.state, TaskState::Working);
+        // A driver's observer can settle the command before a concurrent
+        // create/wait poll reaches the backend with its Working snapshot.
+        crate::tasks::driver::reconcile(&state).await;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if store.get(&handle.task.id).await.unwrap().unwrap().state == TaskState::Done {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        // Reflect the successful observer's tab.close in the fake backend.
+        herdr.set_panes(json!([]));
+        let reads = methods(&herdr, "pane.read").len();
+        let result = poll(&state, &store, &handle.task, Instant::now())
+            .await
+            .unwrap();
+        assert_eq!(result.task.state, TaskState::Done);
+        assert_eq!(result.exit_code, Some(0));
+        assert_eq!(result.stdout_tail, "hi\n");
+        assert_eq!(methods(&herdr, "pane.read").len(), reads);
+        assert_eq!(methods(&herdr, "tab.close").len(), 1);
+        assert_eq!(herdr.enters().len(), 1, "the command is never sent twice");
+    }
+
+    #[tokio::test]
     async fn past_the_deadline_without_a_marker_the_task_is_still_working() {
         let echo = format!("$ {}\n", command_line("sleep 60", ID));
         let (herdr, store, handle) = run(
@@ -648,7 +901,7 @@ mod tests {
         let Err(error) = poll(&state, &store, &task, Instant::now()).await else {
             panic!("a reused pane must not be read");
         };
-        assert_eq!(error.to_string(), "the task's pane is gone");
+        assert_eq!(error.to_string(), PANE_UNVERIFIED);
         let reads = methods(&herdr, "pane.read").len();
         interrupt(&state, &task).await;
         assert!(methods(&herdr, "pane.send_keys")

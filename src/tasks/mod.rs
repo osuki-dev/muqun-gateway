@@ -31,17 +31,19 @@ pub(crate) fn same_pane(panes: &[Pane], pane_id: &str, shell_pid: Option<u32>) -
     }
 }
 
-/// Whether a key may be sent to (or output read from) a task's pane: it is
-/// [`same_pane`], or -- for a task bound by id alone, as rows from before the
-/// shell pid existed are -- the backend could not list its panes.
+/// Whether a key may be sent to (or output read from) a task's pane.
+/// Obtain fresh proof for only this pane: enriching every pane's process
+/// information adds unrelated work and makes ownership depend on that fanout.
+/// An unavailable pane or missing proof for a bound shell never grants authority.
 pub(crate) async fn may_touch(
     backend: &dyn TerminalBackend,
     pane_id: &PaneId,
     shell_pid: Option<u32>,
 ) -> bool {
-    let same = match backend.list_panes().await {
-        Ok(panes) => same_pane(&panes, pane_id.as_str(), shell_pid),
-        Err(_) => None,
-    };
-    same == Some(true) || (same.is_none() && shell_pid.is_none())
+    match backend.get_pane(pane_id).await {
+        Ok(pane) => {
+            same_pane(std::slice::from_ref(&pane), pane_id.as_str(), shell_pid) == Some(true)
+        }
+        Err(_) => false,
+    }
 }
