@@ -351,7 +351,9 @@ impl SessionService {
                 .ok_or(AgentError::HistoryCursorLost)?;
             let prepared = self.agent.prepare_earlier_timeline(&asid.0, 80).await?;
             let exhausted = prepared.items.is_empty();
-            let fetched = memory
+            let source_ids: std::collections::HashSet<_> =
+                prepared.items.iter().map(|row| row.id.clone()).collect();
+            let mut fetched = memory
                 .accept_earlier_window_history(
                     asid,
                     &gate,
@@ -360,8 +362,9 @@ impl SessionService {
                     prepared.commit,
                 )
                 .await?;
+            fetched.retain(|row| source_ids.contains(&row.id));
             let page = memory
-                .history_page(asid, cursor, &boundary, &fetched, exhausted)
+                .fetched_history_page(asid, cursor, &boundary, fetched, exhausted)
                 .await?;
             if !page.items.is_empty() || page.exhausted {
                 return Ok(page);

@@ -120,6 +120,37 @@ impl MemoryMirror {
             .clone())
     }
 
+    /// A provider may backfill a newly discovered row on either side of the
+    /// reader boundary (for example when Codex establishes canonical ordering).
+    /// Return every mapped source row: filtering it by the old boundary would
+    /// permanently hide it on the first traversal. Only the cursor moves back.
+    pub(crate) async fn fetched_history_page(
+        &self,
+        asid: &AgentSessionId,
+        cursor: &str,
+        boundary: &TimelineItem,
+        mut items: Vec<TimelineItem>,
+        exhausted: bool,
+    ) -> Result<HistoryPage, AgentError> {
+        let sessions = self.sessions.read().await;
+        let state = sessions.get(asid).ok_or(AgentError::HistoryCursorLost)?;
+        if state.cursor(boundary) != cursor {
+            return Err(AgentError::HistoryCursorLost);
+        }
+        let boundary = state.timeline.get(&boundary.id).unwrap_or(boundary);
+        items.sort_unstable_by(|a, b| a.sort_key().cmp(&b.sort_key()));
+        let next = items
+            .iter()
+            .find(|row| row.sort_key() < boundary.sort_key())
+            .map(|row| state.cursor(row))
+            .unwrap_or_else(|| cursor.to_owned());
+        Ok(HistoryPage {
+            history_cursor: Some(next),
+            exhausted: exhausted && items.is_empty(),
+            items,
+        })
+    }
+
     /// Only clone rows being returned. `fetched` also covers provider pages
     /// older than the bounded mirror: a single reader can page beyond its cap.
     pub(crate) async fn history_page(
@@ -348,5 +379,36 @@ mod tests {
         // An evicted older boundary must fail explicitly, never skip to the
         // shared provider cursor another reader has already advanced.
         assert!(mirror.history_boundary(&id, &cursor).await.is_err());
+    }
+    #[tokio::test]
+    async fn provider_backfill_after_the_boundary_is_not_lost_on_first_traversal() {
+        let (mirror, id) = fixture(200).await;
+        let entry = mirror.history_window(&id, None).await.unwrap();
+        let cursor = entry.history_cursor.unwrap();
+        let boundary = mirror.history_boundary(&id, &cursor).await.unwrap();
+        let mut discovered = row(150);
+        discovered.id = "newly-discovered-canonical-row".into();
+        let page = mirror
+            .fetched_history_page(
+                &id,
+                &cursor,
+                &boundary,
+                vec![discovered.clone(), row(20)],
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            page.items.iter().map(|row| &row.id).collect::<Vec<_>>(),
+            vec![&row(20).id, &discovered.id]
+        );
+        assert_ne!(page.history_cursor.as_ref().unwrap(), &cursor);
+        let page = mirror
+            .fetched_history_page(&id, &cursor, &boundary, vec![discovered], false)
+            .await
+            .unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.history_cursor.as_deref(), Some(cursor.as_str()));
+        assert!(!page.exhausted);
     }
 }

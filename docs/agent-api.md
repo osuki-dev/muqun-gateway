@@ -619,8 +619,10 @@ Both transports call the same service. Existing snapshot/earlier APIs are unchan
 
 For providers supporting older history, opening a window returns the newest 100
 rows and `history_cursor` alongside the ordinary snapshot fields. A page request
-sends `{ "cursor": "..." }` and returns at most 80 older rows, `history_cursor`
-and `exhausted`. Filtering can yield no visible rows without exhaustion. Keep one
+sends `{ "cursor": "..." }` and returns at most 80 source rows, `history_cursor`
+and `exhausted`. Provider backfills may include newly discovered rows after the
+boundary; upsert every returned row, while the cursor only moves backward.
+Filtering can yield no visible rows without exhaustion. Keep one
 cursor per reader, computer and session; never share it through a global store.
 Passing that cursor to the window endpoint resynchronizes the reader's loaded
 range, including its oldest boundary. Omit it when reopening at the latest page.
