@@ -801,6 +801,16 @@ impl AgentRuntime {
         &self,
         mut found: crate::discovery::AgentPlaneDiscovery,
     ) -> crate::discovery::AgentPlaneDiscovery {
+        for agent in &mut found.agents {
+            let supported = self
+                .manager_for_agent(&agent.id)
+                .await
+                .is_some_and(|manager| manager.agent().adds_mcp_servers());
+            agent
+                .features
+                .extra
+                .insert("computerTools".into(), serde_json::json!(supported));
+        }
         if self
             .manager_for_agent("codex")
             .await
@@ -1499,7 +1509,7 @@ async fn settle_agent_tokens(
     };
     for id in doomed {
         if let Err(err) = tokens.revoke(id).await {
-            tracing::warn!("could not revoke an OpenCode MCP token: {err}");
+            tracing::warn!("could not revoke an agent MCP token: {err}");
         }
     }
 }
@@ -1510,9 +1520,18 @@ async fn issue_agent_env(
     tokens: &dyn crate::mcp::tokens::AssistantTokenStore,
     url: &str,
 ) -> anyhow::Result<(McpEnv, Vec<String>)> {
+    issue_agent_env_for(tokens, url, "opencode", "opencode").await
+}
+
+async fn issue_agent_env_for(
+    tokens: &dyn crate::mcp::tokens::AssistantTokenStore,
+    url: &str,
+    agent_id: &str,
+    label: &str,
+) -> anyhow::Result<(McpEnv, Vec<String>)> {
     use crate::mcp::tokens::{TokenBinding, NO_EXPIRY};
-    let binding = TokenBinding::Agent {
-        agent_id: "opencode".into(),
+    let binding = TokenBinding::Runtime {
+        agent_id: agent_id.into(),
     };
     let previous = tokens
         .list()
@@ -1521,7 +1540,7 @@ async fn issue_agent_env(
         .filter(|row| row.binding == binding)
         .map(|row| row.id)
         .collect();
-    let issued = tokens.issue(binding, "opencode".into(), NO_EXPIRY).await?;
+    let issued = tokens.issue(binding, label.into(), NO_EXPIRY).await?;
     let env = McpEnv {
         token_id: issued.session.token_id,
         token: issued.token,

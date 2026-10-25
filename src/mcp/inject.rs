@@ -315,48 +315,79 @@ async fn claude_file(url: &str, helper: &str) -> Option<std::path::PathBuf> {
     private_file("mcp-claude.json", &text).await
 }
 
-/// Before a delegation to `agent`'s session in `directory`: register the
-/// muqun server with the service when it takes one at runtime and does not
-/// have it connected. A failure is logged; the task goes on (the marker
-/// still ends it).
-pub(crate) async fn ensure_session_agent(
+/// Registration is serialized across new tasks and existing-session replies.
+/// Callers requiring computer tools must propagate a refusal before sending.
+pub(crate) async fn prepare_session_agent(
     config: &crate::Config,
     tokens: &dyn AssistantTokenStore,
     agent: &dyn AgentPort,
     directory: Option<&str>,
-) {
+) -> Result<(), crate::agents::ports::agent::AgentError> {
+    use crate::agents::ports::agent::AgentError;
     if !enabled(config) || !agent.adds_mcp_servers() {
-        return;
+        return Err(AgentError::InvalidRequest(
+            "Computer tools are unavailable for this agent".into(),
+        ));
     }
-    // One registration at a time, so two delegations do not both mint.
-    static REGISTERING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-    let _one = REGISTERING.lock().await;
+    // Serialize mutations within a provider, without letting an unavailable
+    // provider stall registration for a different one.
+    static CODEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    static DEEPSEEK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    static OTHER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let registering = match agent.kind() {
+        "codex" => &CODEX,
+        "deepseek" => &DEEPSEEK,
+        _ => &OTHER,
+    };
+    let _one = registering.lock().await;
+    // DSH's official MCP client is loaded once by a launcher overlay. There
+    // is no supported runtime registration RPC. Never mint a useless token
+    // or restart a user's adopted service while preparing a message.
+    if agent.kind() == "deepseek" {
+        return if agent.mcp_server_connected(SERVER_NAME, directory).await? {
+            Ok(())
+        } else {
+            Err(crate::agents::adapters::deepseek::mcp::unavailable())
+        };
+    }
+    if agent.kind() == "codex" {
+        let url = super::local_url(&config.listen);
+        let server = json!({
+            "url": url,
+            "http_headers_helper": format!("{} --agent-id codex", hosts::helper_for_url(&url)),
+        });
+        return agent.add_mcp_server(SERVER_NAME, &server, directory).await;
+    }
+    let binding = TokenBinding::Runtime {
+        agent_id: agent.kind().to_owned(),
+    };
+    // Connectivity alone does not prove that the registered credential is
+    // current. A revoked, expired or legacy grant must be replaced too.
+    let label = runtime_label(directory);
+    let previous: Vec<String> = tokens
+        .list()
+        .await
+        .map_err(|_| AgentError::Protocol("Could not read computer tool credentials".into()))?
+        .into_iter()
+        .filter(|row| row.binding == binding && row.label == label)
+        .map(|row| row.id)
+        .collect();
     match agent.mcp_server_connected(SERVER_NAME, directory).await {
-        Ok(true) => return,
+        Ok(true) if !previous.is_empty() => return Ok(()),
+        Ok(true) => {}
         Ok(false) => {}
         Err(error) => {
             tracing::debug!(%error, "could not read the agent's MCP servers");
-            return;
+            return Err(error);
         }
     }
-    let binding = TokenBinding::Agent {
-        agent_id: agent.kind().to_owned(),
-    };
-    // A token per directory: a registration elsewhere keeps its own.
-    let label = runtime_label(directory);
-    let previous: Vec<String> = match tokens.list().await {
-        Ok(rows) => rows
-            .into_iter()
-            .filter(|row| row.binding == binding && row.label == label)
-            .map(|row| row.id)
-            .collect(),
-        Err(_) => Vec::new(),
-    };
     let issued = match tokens.issue(binding, label, RUNTIME_TOKEN_TTL_MS).await {
         Ok(issued) => issued,
         Err(error) => {
             tracing::warn!(%error, "could not mint the agent's MCP token");
-            return;
+            return Err(AgentError::Protocol(
+                "Could not prepare computer tool credentials".into(),
+            ));
         }
     };
     let server = json!({
@@ -377,8 +408,12 @@ pub(crate) async fn ensure_session_agent(
             let error = redact_bearer(&error.to_string());
             tracing::warn!(error, "the agent did not take the muqun MCP server");
             let _ = tokens.revoke(&issued.session.token_id).await;
+            return Err(AgentError::Protocol(
+                "The agent did not accept computer tools".into(),
+            ));
         }
     }
+    Ok(())
 }
 
 /// The label of the token registered for `directory`: [`RUNTIME_LABEL`]
@@ -421,7 +456,11 @@ pub(crate) async fn startup_cleanup(config: &crate::Config, tokens: &dyn Assista
         // With injection on, only the token minted before tokens were per
         // directory (its label bare) goes; off, every one does.
         let doomed = rows.into_iter().filter(|row| {
-            row.label == RUNTIME_LABEL || (!on && row.label.starts_with(RUNTIME_LABEL))
+            row.label == RUNTIME_LABEL
+                || (!on
+                    && (row.label.starts_with(RUNTIME_LABEL)
+                        || row.label == "codex (runtime)"
+                        || row.label == "deepseek (service)"))
         });
         for row in doomed {
             let _ = tokens.revoke(&row.id).await;
@@ -477,6 +516,27 @@ mod tests {
     }
     use crate::test_support::{test_state, FakeAgent, FakeMcp};
 
+    #[tokio::test]
+    async fn deepseek_reuses_the_host_plugin_without_minting_per_session_tokens() {
+        let state = test_state("synthetic-admin", Vec::new());
+        let mut agent = FakeAgent::new("deepseek");
+        let mcp = std::sync::Arc::new(std::sync::Mutex::new(FakeMcp::default()));
+        agent.mcp = Some(mcp.clone());
+        assert!(
+            prepare_session_agent(&state.config, state.mcp_tokens.as_ref(), &agent, None)
+                .await
+                .is_err()
+        );
+        mcp.lock().unwrap().connected = true;
+        for directory in [None, Some("/first"), Some("/second")] {
+            prepare_session_agent(&state.config, state.mcp_tokens.as_ref(), &agent, directory)
+                .await
+                .unwrap();
+        }
+        assert!(state.mcp_tokens.list().await.unwrap().is_empty());
+        assert_eq!(mcp.lock().unwrap().added, 0);
+    }
+
     #[test]
     fn a_refusal_that_echoes_the_request_does_not_log_the_token() {
         assert_eq!(
@@ -502,20 +562,20 @@ mod tests {
         let mcp = std::sync::Arc::new(std::sync::Mutex::new(FakeMcp::default()));
         agent.mcp = Some(mcp.clone());
         // Not connected: one token for this directory, the server added.
-        ensure_session_agent(&state.config, tokens, &agent, Some("/a")).await;
+        let _ = prepare_session_agent(&state.config, tokens, &agent, Some("/a")).await;
         assert_eq!(live(runtime_label(Some("/a"))).await, 1);
         assert_eq!(mcp.lock().unwrap().added, 1);
         // Connected: nothing minted, nothing added.
-        ensure_session_agent(&state.config, tokens, &agent, Some("/a")).await;
+        let _ = prepare_session_agent(&state.config, tokens, &agent, Some("/a")).await;
         assert_eq!(mcp.lock().unwrap().added, 1);
         // Another directory gets its own token; the first one's stays.
         mcp.lock().unwrap().connected = false;
-        ensure_session_agent(&state.config, tokens, &agent, Some("/b")).await;
+        let _ = prepare_session_agent(&state.config, tokens, &agent, Some("/b")).await;
         assert_eq!(live(runtime_label(Some("/a"))).await, 1);
         assert_eq!(live(runtime_label(Some("/b"))).await, 1);
         // Re-registering a directory replaces only its own token.
         mcp.lock().unwrap().connected = false;
-        ensure_session_agent(&state.config, tokens, &agent, Some("/b")).await;
+        let _ = prepare_session_agent(&state.config, tokens, &agent, Some("/b")).await;
         assert_eq!(live(runtime_label(Some("/b"))).await, 1);
         // The service refusing: the token just minted is revoked.
         {
@@ -523,13 +583,13 @@ mod tests {
             fake.connected = false;
             fake.refuse = true;
         }
-        ensure_session_agent(&state.config, tokens, &agent, Some("/c")).await;
+        let _ = prepare_session_agent(&state.config, tokens, &agent, Some("/c")).await;
         assert_eq!(live(runtime_label(Some("/c"))).await, 0);
         // Injection off: no call at all.
         let mut off = state.config.clone();
         off.mcp.inject_into_agents = false;
         mcp.lock().unwrap().refuse = false;
-        ensure_session_agent(&off, tokens, &agent, Some("/d")).await;
+        let _ = prepare_session_agent(&off, tokens, &agent, Some("/d")).await;
         assert_eq!(live(runtime_label(Some("/d"))).await, 0);
     }
 

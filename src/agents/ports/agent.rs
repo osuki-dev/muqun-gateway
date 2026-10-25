@@ -18,7 +18,18 @@ pub struct PreparedTimeline<'a> {
     pub(crate) commit: Option<TimelineCommit<'a>>,
 }
 
-pub(crate) type TimelineCommit<'a> = Box<dyn FnOnce() -> Result<(), AgentError> + Send + 'a>;
+#[derive(Default)]
+pub(crate) struct HistoryCommit {
+    /// Old accepted group to new accepted group, applied once to retained rows.
+    pub order: std::collections::HashMap<String, String>,
+    /// Candidate rows already carry the new projection, even if a position was reused.
+    pub fresh_ids: std::collections::HashSet<String>,
+    /// Canonical live groups whose provisional row identities are replaced.
+    pub replace_groups: std::collections::HashSet<String>,
+}
+
+pub(crate) type TimelineCommit<'a> =
+    Box<dyn FnOnce() -> Result<HistoryCommit, AgentError> + Send + 'a>;
 
 impl PreparedTimeline<'_> {
     pub fn ready(items: Vec<TimelineItem>) -> Self {
@@ -218,6 +229,19 @@ pub trait AgentPort: Send + Sync {
         false
     }
 
+    /// Check the selected thread's catalog, not only the provider's global catalog.
+    fn session_mcp_connected<'a>(
+        &'a self,
+        _asid: &'a str,
+        directory: Option<&'a str>,
+    ) -> AgentFuture<'a, bool> {
+        self.mcp_server_connected("muqun", directory)
+    }
+
+    fn refresh_session_mcp<'a>(&'a self, _asid: &'a str) -> AgentFuture<'a, bool> {
+        Box::pin(async { Ok(false) })
+    }
+
     /// Whether the MCP server `name` is connected for `directory`.
     fn mcp_server_connected<'a>(
         &'a self,
@@ -228,8 +252,8 @@ pub trait AgentPort: Send + Sync {
     }
 
     /// Register (or replace) the MCP server `name` with `config` for
-    /// `directory` until the service restarts; no configuration file is
-    /// written.
+    /// `directory`. OpenCode keeps runtime configuration; Codex registers one
+    /// missing host entry with a version fence and preserves existing entries.
     fn add_mcp_server<'a>(
         &'a self,
         _name: &'a str,
@@ -360,6 +384,21 @@ pub trait AgentPort: Send + Sync {
         })
     }
 
+    /// Read evidence for an MCP caller without publishing App pagination.
+    /// None means the provider authoritatively reports no active turn; stale
+    /// mirror tool rows must not override that answer. Errors remain errors.
+    fn mcp_call_timeline<'a>(
+        &'a self,
+        session_id: &'a str,
+        limit: usize,
+    ) -> AgentFuture<'a, Option<Vec<TimelineItem>>> {
+        Box::pin(async move {
+            self.prepare_timeline(session_id, limit)
+                .await
+                .map(|prepared| Some(prepared.items))
+        })
+    }
+
     /// The next older page after `get_timeline`, or an empty page when this
     /// supporting agent has no further history. Unsupported adapters must not
     /// present an empty page as successful exhaustion. The newest page stays
@@ -370,6 +409,20 @@ pub trait AgentPort: Send + Sync {
         _limit: usize,
     ) -> AgentFuture<'a, Vec<TimelineItem>> {
         Box::pin(async { Err(AgentError::Unsupported("timeline earlier".into())) })
+    }
+
+    /// Prepare an older page without consuming stateful pagination. The
+    /// session service accepts it under the same mirror boundary as its rows.
+    fn prepare_earlier_timeline<'a>(
+        &'a self,
+        session_id: &'a str,
+        limit: usize,
+    ) -> AgentFuture<'a, PreparedTimeline<'a>> {
+        Box::pin(async move {
+            self.load_earlier_timeline(session_id, limit)
+                .await
+                .map(PreparedTimeline::ready)
+        })
     }
 
     /// Delete a session

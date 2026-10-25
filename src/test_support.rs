@@ -193,6 +193,7 @@ pub(crate) fn test_state(admin_token: &str, devices: Vec<DeviceRecord>) -> AppSt
         peers,
         tasks,
         task_events,
+        home_overview: Default::default(),
         db,
     }
 }
@@ -646,6 +647,7 @@ pub(crate) struct FakeHerdr {
     /// methods answer a bare `ok` as before.
     panes: Arc<Mutex<Option<Value>>>,
     agents: Arc<Mutex<Option<Value>>>,
+    process_shells: Arc<Mutex<VecDeque<Option<u32>>>>,
     /// What `pane.get` and `agent.get` answer once set: one pane running an
     /// agent.
     pane: Arc<Mutex<Option<Value>>>,
@@ -665,6 +667,8 @@ impl FakeHerdr {
         let listed = Arc::clone(&panes);
         let agents: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
         let listed_agents = agents.clone();
+        let process_shells = Arc::new(Mutex::new(VecDeque::<Option<u32>>::new()));
+        let shells = process_shells.clone();
         let pane: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
         let one_pane = pane.clone();
         let screens: Vec<String> = screens.into_iter().map(str::to_owned).collect();
@@ -687,7 +691,15 @@ impl FakeHerdr {
                             all.iter()
                                 .find(|p| p["pane_id"] == request["params"]["pane_id"])
                         });
-                        json!({ "process_info": { "shell_pid": pane.map(|p| p["shell_pid"].clone()) } })
+                        let shell = shells
+                            .lock()
+                            .unwrap()
+                            .pop_front()
+                            .map(|pid| json!(pid))
+                            .unwrap_or_else(|| {
+                                pane.map(|p| p["shell_pid"].clone()).unwrap_or(Value::Null)
+                            });
+                        json!({ "process_info": { "shell_pid": shell } })
                     }
                     ("pane.read", _) => {
                         let screen = screens
@@ -739,6 +751,10 @@ impl FakeHerdr {
                             json!({ "agent": pane })
                         }
                     }
+                    ("pane.get", Some(panes)) => json!({
+                        "pane": panes.as_array().and_then(|panes| panes.iter()
+                            .find(|pane| pane["pane_id"] == request["params"]["pane_id"]))
+                    }),
                     ("pane.get", _) => json!({
                         "pane": {
                             "pane_id": request["params"]["pane_id"],
@@ -763,8 +779,14 @@ impl FakeHerdr {
             calls,
             panes,
             agents,
+            process_shells,
             pane,
         }
+    }
+
+    /// Script successive fresh shell identity proofs; fall back to `panes` afterwards.
+    pub(crate) fn set_process_shells(&self, shells: impl IntoIterator<Item = Option<u32>>) {
+        *self.process_shells.lock().unwrap() = shells.into_iter().collect();
     }
 
     /// Answer `pane.get` and `agent.get` with `pane` from now on.
@@ -1169,6 +1191,14 @@ pub(crate) fn fake_session(asid: &str, updated_ms: u64) -> agents::domain::Agent
 }
 
 impl agents::ports::agent::AgentPort for FakeAgent {
+    fn refresh_session_mcp<'a>(
+        &'a self,
+        asid: &'a str,
+    ) -> agents::ports::agent::AgentFuture<'a, bool> {
+        self.record(&format!("refresh_mcp {asid}"));
+        Box::pin(async { Ok(false) })
+    }
+
     fn adds_mcp_servers(&self) -> bool {
         self.mcp.is_some()
     }

@@ -10,7 +10,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use serde_json::Value;
 
-use super::tokens::{AssistantSession, AssistantTokenStore, Resolved};
+use super::tokens::{AssistantSession, AssistantTokenStore, Resolved, TokenBinding};
 use crate::{api_error, bearer_token};
 
 /// Headers a reverse proxy adds. Tailscale Serve forwards to `127.0.0.1`, so a
@@ -61,6 +61,20 @@ pub(crate) async fn authenticate(
     }
     let token = bearer_token(headers)?;
     match tokens.resolve(token).await {
+        Ok(Resolved::Live(session))
+            if session.label == "codex (runtime)"
+                && matches!(&session.binding, TokenBinding::Agent { agent_id } if agent_id == "codex") =>
+        {
+            // Old shared native credentials remain inert until their existing
+            // expiry, and must refresh before entering any tool.
+            // HTTP 401 lets the official header helper obtain an explicit
+            // runtime grant; a tool-level error would leave it cached forever.
+            Err(api_error(
+                StatusCode::UNAUTHORIZED,
+                "token_refresh_required",
+                "Refresh the managed MCP credential before calling tools",
+            ))
+        }
         Ok(Resolved::Live(session)) => Ok(session),
         Ok(Resolved::Expired) => Err(api_error(
             StatusCode::UNAUTHORIZED,
@@ -87,6 +101,186 @@ pub(crate) async fn authenticate(
 mod tests {
     use super::*;
     use axum::http::HeaderValue;
+
+    #[tokio::test]
+    async fn managed_codex_refresh_preserves_other_cached_clients_and_explicit_revocation() {
+        let state = crate::test_support::test_state("synthetic-admin", Vec::new());
+        let tokens = state.mcp_tokens.as_ref();
+        let legacy = tokens
+            .issue(
+                TokenBinding::Agent {
+                    agent_id: "codex".into(),
+                },
+                "codex (runtime)".into(),
+                60_000,
+            )
+            .await
+            .unwrap();
+        let second_cached = tokens
+            .issue(
+                legacy.session.binding.clone(),
+                legacy.session.label.clone(),
+                60_000,
+            )
+            .await
+            .unwrap();
+        let explicitly_revoked = tokens
+            .issue(
+                legacy.session.binding.clone(),
+                legacy.session.label.clone(),
+                60_000,
+            )
+            .await
+            .unwrap();
+        assert!(tokens
+            .revoke(&explicitly_revoked.session.token_id)
+            .await
+            .unwrap());
+        let mut untouched = Vec::new();
+        for (binding, label) in [
+            (
+                TokenBinding::Agent {
+                    agent_id: "opencode".into(),
+                },
+                "codex (runtime)",
+            ),
+            (
+                TokenBinding::Agent {
+                    agent_id: "codex".into(),
+                },
+                "user-managed",
+            ),
+            (
+                TokenBinding::Pane {
+                    session_id: "terminal".into(),
+                    pane_id: "pane".into(),
+                },
+                "codex (runtime)",
+            ),
+            (
+                TokenBinding::Task {
+                    task_id: "retained-task".into(),
+                },
+                "codex (runtime)",
+            ),
+        ] {
+            untouched.push(tokens.issue(binding, label.into(), 60_000).await.unwrap());
+        }
+        let peer = Some("127.0.0.1:12345".parse().unwrap());
+        let headers = crate::bearer_headers(&legacy.token);
+        let (status, body) = authenticate(tokens, peer, &headers).await.unwrap_err();
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body.0["error"]["code"], "token_refresh_required");
+        // A retained restricted session blocks the new grant. Authentication
+        // never deletes old records just to force renewal past this guard.
+        state
+            .db
+            .call(|db| {
+                db.execute(
+                    "INSERT INTO task_runtime_restrictions(agent_id) VALUES('codex')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(tokens
+            .issue(
+                TokenBinding::Runtime {
+                    agent_id: "codex".into()
+                },
+                "codex (runtime)".into(),
+                60_000
+            )
+            .await
+            .is_err());
+        assert!(matches!(
+            tokens.resolve(&legacy.token).await.unwrap(),
+            Resolved::Live(_)
+        ));
+        state
+            .db
+            .call(|db| {
+                db.execute(
+                    "DELETE FROM task_runtime_restrictions WHERE agent_id = 'codex'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let runtime = tokens
+            .issue(
+                TokenBinding::Runtime {
+                    agent_id: "codex".into(),
+                },
+                "codex (runtime)".into(),
+                60_000,
+            )
+            .await
+            .unwrap();
+        assert!(
+            authenticate(tokens, peer, &crate::bearer_headers(&runtime.token))
+                .await
+                .is_ok()
+        );
+        // Both cached clients need the helper handshake after the first one
+        // issues its replacement. Neither legacy credential authenticates.
+        for old in [&legacy, &second_cached] {
+            let (status, body) = authenticate(tokens, peer, &crate::bearer_headers(&old.token))
+                .await
+                .unwrap_err();
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+            assert_eq!(body.0["error"]["code"], "token_refresh_required");
+        }
+        let (status, body) = authenticate(
+            tokens,
+            peer,
+            &crate::bearer_headers(&explicitly_revoked.token),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body.0["error"]["code"], "invalid_token");
+        for token in untouched {
+            assert!(matches!(
+                tokens.resolve(&token.token).await.unwrap(),
+                Resolved::Live(_)
+            ));
+        }
+        // Explicit administrator revocation remains final for that credential.
+        tokens.revoke(&legacy.session.token_id).await.unwrap();
+        assert_eq!(
+            tokens.resolve(&legacy.token).await.unwrap(),
+            Resolved::Invalid
+        );
+        assert_eq!(
+            tokens.resolve(&second_cached.token).await.unwrap(),
+            Resolved::Live(second_cached.session.clone())
+        );
+        tokens.revoke_all().await.unwrap();
+        assert_eq!(
+            tokens.resolve(&second_cached.token).await.unwrap(),
+            Resolved::Invalid
+        );
+        assert_eq!(
+            tokens.resolve(&runtime.token).await.unwrap(),
+            Resolved::Invalid
+        );
+        assert!(tokens.purge_dead(u64::MAX >> 1).await.unwrap() > 0);
+        let remaining = state
+            .db
+            .call(|db| {
+                Ok(
+                    db.query_row("SELECT COUNT(*) FROM assistant_tokens", [], |row| {
+                        row.get::<_, i64>(0)
+                    })?,
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(remaining, 0);
+    }
 
     #[test]
     fn only_loopback_peers_are_loopback() {

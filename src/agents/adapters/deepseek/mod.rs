@@ -3,6 +3,7 @@ pub mod client;
 pub mod driver;
 pub mod endpoint;
 pub mod mapper;
+pub(crate) mod mcp;
 pub mod stream;
 
 pub use driver::DeepseekDriver;

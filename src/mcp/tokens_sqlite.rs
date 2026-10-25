@@ -34,6 +34,10 @@ impl AssistantTokenStore for SqliteTokenStore {
         ttl_ms: u64,
     ) -> TaskFuture<'a, IssuedToken> {
         Box::pin(self.db.call(move |c| {
+            let tx = c.transaction()?;
+            if let TokenBinding::Runtime { agent_id } = &binding {
+                anyhow::ensure!(crate::tasks::store_sqlite::runtime_registration_allowed(&tx, agent_id)?, "runtime_scope_conflict: retained delegated sessions require isolated credentials");
+            }
             let token = crate::generate_token();
             let issued_ms = now_ms();
             let stored_expiry = issued_ms.saturating_add(ttl_ms).min(NO_EXPIRY);
@@ -43,7 +47,7 @@ impl AssistantTokenStore for SqliteTokenStore {
                 binding,
                 label,
             };
-            c.execute(
+            tx.execute(
                 "INSERT INTO assistant_tokens(id, token_hash, binding, owner_key, label, issued_ms, expires_ms) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     session.token_id,
@@ -55,6 +59,7 @@ impl AssistantTokenStore for SqliteTokenStore {
                     stored_expiry as i64,
                 ],
             )?;
+            tx.commit()?;
             Ok(IssuedToken { token, session })
         }))
     }
@@ -182,7 +187,7 @@ mod tests {
         SqliteStore::open(
             &crate::test_state_dir().join(format!("{name}-{}.sqlite3", uuid::Uuid::new_v4())),
             None,
-            &[MIGRATION],
+            &[crate::tasks::store_sqlite::MIGRATION, MIGRATION],
         )
         .unwrap()
     }

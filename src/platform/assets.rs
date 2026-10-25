@@ -431,23 +431,10 @@ pub(crate) fn sniff_asset_type(bytes: &[u8], name: &str) -> AssetType {
             mime,
         };
     }
-    if bytes.len() >= 12
-        && &bytes[4..8] == b"ftyp"
-        && matches!(
-            &bytes[8..12],
-            b"isom" | b"iso2" | b"mp41" | b"mp42" | b"avc1" | b"qt  " | b"M4V "
-        )
-        && name.rsplit_once('.').is_some_and(|(_, ext)| {
-            matches!(ext.to_ascii_lowercase().as_str(), "mp4" | "mov" | "m4v")
-        })
-    {
+    if let Some(video) = crate::platform::video::sniff_video_container(bytes) {
         return AssetType {
             kind: AssetKind::Video,
-            mime: if &bytes[8..12] == b"qt  " {
-                "video/quicktime"
-            } else {
-                "video/mp4"
-            },
+            mime: video.mime,
         };
     }
     if !looks_textual(bytes) {
@@ -1840,7 +1827,7 @@ mod tests {
     }
 
     #[test]
-    fn audio_signatures_are_previewable_and_video_containers_are_not() {
+    fn audio_signatures_do_not_mistake_incomplete_containers_for_audio() {
         for (bytes, mime) in [
             (&b"RIFF\x24\x00\x00\x00WAVEfmt "[..], "audio/wav"),
             (&b"fLaC\x00\x00\x00\x22"[..], "audio/flac"),

@@ -35,7 +35,13 @@ pub(crate) enum TokenBinding {
         session_id: String,
         pane_id: String,
     },
+    /// Legacy service credential. It has no authority to forward remotely.
     Agent {
+        agent_id: String,
+    },
+    /// Explicit owner registration for a shared local provider. All of its
+    /// sessions share this authority; it is never a per-session identity.
+    Runtime {
         agent_id: String,
     },
     /// One immutable delegation, independent of a shared daemon's ancestry.
@@ -52,6 +58,7 @@ impl TokenBinding {
                 pane_id,
             } => format!("pane:{session_id}\u{1f}{pane_id}"),
             Self::Agent { agent_id } => format!("agent:{agent_id}"),
+            Self::Runtime { agent_id } => format!("runtime:{agent_id}"),
             Self::Task { task_id } => format!("task:{task_id}"),
         }
     }

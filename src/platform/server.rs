@@ -143,6 +143,9 @@ pub(crate) async fn run(config_path: Option<String>) -> anyhow::Result<()> {
         ),
         crate::platform::config::StoreEncryption::Off => err,
     })?;
+    if config.store.encryption == crate::platform::config::StoreEncryption::File {
+        agent_runtime.persist_t3_credentials(db.clone());
+    }
     agent_runtime.restore_native_codex_sessions(db.clone());
     agent_runtime.persist_session_routes(db.clone()).await;
     let task_events = tokio::sync::broadcast::channel(crate::tasks::events::TASK_EVENT_CAPACITY).0;
@@ -184,6 +187,7 @@ pub(crate) async fn run(config_path: Option<String>) -> anyhow::Result<()> {
         peers,
         tasks,
         task_events,
+        home_overview: Default::default(),
         db,
     };
     // A registration handed to a session agent's service outlives a switch
@@ -191,7 +195,7 @@ pub(crate) async fn run(config_path: Option<String>) -> anyhow::Result<()> {
     crate::mcp::inject::startup_cleanup(&state.config, state.mcp_tokens.as_ref()).await;
     // After the token store exists, so the first OpenCode start already gets
     // its MCP environment.
-    if state.config.mcp.enabled {
+    if state.config.mcp.enabled && state.config.mcp.inject_into_agents {
         // The listen address, or the loopback listener bound beside it.
         state.agent_runtime.enable_mcp(
             state.mcp_tokens.clone(),

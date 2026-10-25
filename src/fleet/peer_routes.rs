@@ -23,7 +23,7 @@ const MAX_URL_BYTES: usize = 512;
 const MAX_CODE_CHARS: usize = 16;
 
 pub(crate) fn mount(router: Router<AppState>) -> Router<AppState> {
-    router
+    super::home_grants::mount(router)
         .route("/api/peers", get(list).post(link))
         .route("/api/peers/{peer_id}", patch(rename).delete(unlink))
         .route("/api/fleet/settings", put(settings))

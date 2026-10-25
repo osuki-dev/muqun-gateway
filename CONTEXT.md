@@ -27,7 +27,9 @@ The retired `herdr.gateway` identifier remains only for migration compatibility.
   - `manager.rs`, `runtime.rs`, `use_cases/`: agent supervision and the
     session/prompt/interaction services. `runtime/t3.rs` holds T3's config
     block, its pairing-token-to-bearer credential (persisted by
-    `platform/store.rs` as `t3-credential.json`, 0600), and its attach and
+    `platform/store/t3_credentials.rs` in SQLCipher when store encryption is
+    enabled; the legacy private `t3-credential.json` is imported and removed
+    only after verified persistence), and its attach and
     discovery. `runtime/codex.rs` adopts a verified existing Codex daemon connection
     or owns a private fallback child and its lifecycle;
     `adapters/codex/native_sessions.rs` retains accepted native session IDs scoped
@@ -215,6 +217,10 @@ The retired `herdr.gateway` identifier remains only for migration compatibility.
     automatic update polling, downgrades or history database.
   - `metadata.rs`: capabilities, health metadata, and session liveness ordering.
   - `uploads.rs`, `assets.rs`: phone uploads and the workspace asset index.
+    `video.rs` shares bounded content-based container recognition across upload
+    acceptance, authenticated readback, and workspace/session metadata. Container
+    recognition does not promise device codec support; filenames and client MIME
+    never authorize a video upload.
   - `git.rs`: read-only, bounded `git` for one pane's checkout -- the
     branch line, the changed-file list with totals, and one file's unified patch
     a page at a time -- behind the `pane_context` and `git_diff` capabilities.

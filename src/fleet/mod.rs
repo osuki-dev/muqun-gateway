@@ -10,3 +10,7 @@ pub(crate) mod probes;
 pub(crate) mod routes;
 
 pub(crate) use manifest::FleetService;
+
+pub(crate) mod home;
+pub(crate) mod home_grants;
+pub(crate) mod home_overview;

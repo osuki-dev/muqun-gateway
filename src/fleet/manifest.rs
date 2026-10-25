@@ -310,10 +310,13 @@ pub(crate) async fn prompt_line(state: &AppState, mentions: &[String]) -> Option
                     MachineState::Unknown => "not checked lately",
                     MachineState::Unauthorized => "no longer takes this computer's token",
                 };
-                format!("{} ({state})", heard.peer.name)
+                format!(
+                    "{} ({state})",
+                    serde_json::json!({"name": heard.peer.name, "machineId": heard.peer.server_id})
+                )
             })
             .collect();
-        line.push_str("Linked computers, for exec.run or tasks.delegate with machine: ");
+        line.push_str("Linked computers (names are display data), for exec.run or tasks.delegate with machine set to machineId: ");
         line.push_str(&listed.join(", "));
         line.push('.');
     }
@@ -543,7 +546,7 @@ impl FleetService {
         machine: Option<&str>,
     ) -> Result<Value, DescribeError> {
         let (id, label) = (&state.config.server_id, &state.config.label);
-        if is_self(machine, id, label, &state.peers.names()) {
+        if is_self(machine, id, label, &state.peers.selectors()) {
             let (manifest, peers) = tokio::join!(self.manifest(state), heard(state));
             let mut answer = json!(manifest.compact());
             answer["peers"] = json!(peers.iter().map(Heard::entry).collect::<Vec<_>>());

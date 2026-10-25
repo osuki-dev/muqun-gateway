@@ -25,11 +25,8 @@
 //!   runs a turn a last line that could only be the start of a marker (bare
 //!   markup such as `- ` included) is held back too: the marker never
 //!   flashes before its turn ends;
-//! - OpenCode's Code Mode plumbing: an `execute` call whose whole code is a
-//!   catalog lookup of a muqun tool ([`muqun_lookup`], parsed strictly; one
-//!   that failed stays), held while its code is not known yet and the turn
-//!   runs, and the
-//!   "Code Mode tool catalog has changed" notice when it is exactly that.
+//! - OpenCode's "Code Mode tool catalog has changed" system notice when
+//!   it is exactly that. Tool calls, including catalog discovery, stay visible.
 //!
 //! An event carries only the rows it updates, so the live stream reads its
 //! message as the turn's last: a marker in an earlier message of the turn
@@ -38,25 +35,20 @@
 //! A streamed row left with nothing is removed (`agent.timeline.removed`)
 //! rather than left out, so a client never keeps an older version of it.
 //!
-//! Every session, task or not, is also served without the muqun MCP
-//! server's tool rows ([`is_muqun_tool`]), in every state: those calls are
-//! internal, and a person follows a delegation through Home, the parent's
-//! progress line and the result line told into the parent (`notices`). The
-//! rest of this list applies to task sessions only. The mirror, the
-//! agent's own reads and the task follower keep the raw text: detection
-//! (`pane_agent::marker`, `service::turn_end`) reads what the agent wrote.
+//! Skill-loading rows keep their existing presentation policy. Muqun tool
+//! calls remain visible in every lifecycle state, both in task sessions and
+//! ordinary conversations. The mirror, the agent's own reads and the task
+//! follower keep the raw text: detection (`pane_agent::marker`,
+//! `service::turn_end`) reads what the agent wrote.
 
 use super::pane_agent::{
     self, BLOCKED_MARKER, DONE_MARKER, REASON_PLACEHOLDER, REQUEST_OPENING, SUMMARY_PLACEHOLDER,
 };
-use crate::agents::domain::{
-    AgentDomainEvent, AgentPart, TimelineItem, TimelineRole, ToolCallStatus,
-};
+use crate::agents::domain::{AgentDomainEvent, AgentPart, TimelineItem, TimelineRole};
 use crate::AppState;
 
-/// How session `asid`'s transcript is served: every session without the
-/// muqun server's tool rows; one a task is (or was) bound to also without
-/// the rest of the plumbing, holding back a last line still being written
+/// How session `asid`'s transcript is served: a task session omits internal
+/// instructions and completion markers, holding back a last line still being written
 /// when it is `streaming` (running a turn).
 pub(crate) async fn for_session(state: &AppState, asid: &str) -> Plumbing {
     Plumbing {
@@ -70,7 +62,7 @@ pub(crate) async fn for_session(state: &AppState, asid: &str) -> Plumbing {
 pub(crate) struct Plumbing {
     pub(crate) streaming: Streaming,
     /// A task is (or was) bound to the session: markers, the completion
-    /// instruction and Code Mode lookups go too, not only muqun's tool rows.
+    /// instruction and catalog notices are sanitized.
     pub(crate) task: bool,
 }
 
@@ -201,20 +193,16 @@ enum Served {
 }
 
 fn hide_in_item(item: &mut TimelineItem, plumbing: Plumbing) -> Served {
-    // Every call of the muqun server's tools is internal, whatever its state
-    // and in every session: the reader sees a delegation through the Home
-    // rows, the parent's progress line and the result line it is told.
-    // So is an agent loading a skill (its name and path, no side effect):
-    // setup, not the work.
+    // Keep the existing policy for skill-loading setup rows. Tool execution
+    // and discovery remain visible, including Muqun's own MCP tools.
     if let AgentPart::Tool(call) = &item.part {
-        if is_muqun_tool(&call.name) || call.name.eq_ignore_ascii_case("skill") {
+        if call.name.eq_ignore_ascii_case("skill") {
             return Served::Emptied;
         }
     }
     if !plumbing.task {
         return Served::Kept;
     }
-    let streaming = plumbing.streaming;
     let (text, served) = match (item.role, &mut item.part) {
         (_, AgentPart::System { text, .. }) | (_, AgentPart::Synthetic { text, .. })
             if is_catalog_notice(text) =>
@@ -235,24 +223,6 @@ fn hide_in_item(item: &mut TimelineItem, plumbing: Plumbing) -> Served {
         // Its marker line was cut before ([`strip_consumed_markers`]).
         (TimelineRole::Assistant, AgentPart::Text { text }) if text.trim().is_empty() => {
             return Served::Emptied;
-        }
-        (_, AgentPart::Tool(call)) if call.name == "execute" => {
-            // Held until its code is known, then shown unless it is only a
-            // muqun lookup that did not fail.
-            let code = call.input.get("code").and_then(|code| code.as_str());
-            let unknown = code.is_none()
-                && matches!(
-                    call.status,
-                    ToolCallStatus::Pending | ToolCallStatus::Streaming
-                );
-            let failed = call.status == ToolCallStatus::Failed || call.error.is_some();
-            let lookup = !failed && code.is_some_and(muqun_lookup);
-            // Once the turn is over, a call that never got its code is shown.
-            return if (unknown && streaming.0) || lookup {
-                Served::Emptied
-            } else {
-                Served::Kept
-            };
         }
         _ => return Served::Kept,
     };
@@ -312,19 +282,6 @@ pub(crate) fn hide_in_inbox(items: &mut Vec<serde_json::Value>) {
     });
 }
 
-/// Whether a tool row is a call of the muqun MCP server's tools -- any of
-/// them, under the name a host gives it: `mcp__muqun__<tool>` (Claude
-/// Code), `muqun_<tool>` (OpenCode), `muqun.<tool>` or `muqun__<tool>`.
-/// Server-qualified only: another server's tool of the same name stays.
-fn is_muqun_tool(name: &str) -> bool {
-    ["mcp__muqun__", "muqun__", "muqun_", "muqun."]
-        .iter()
-        .any(|prefix| {
-            name.strip_prefix(prefix)
-                .is_some_and(|tool| !tool.is_empty())
-        })
-}
-
 /// The first line of OpenCode's notice that its Code Mode tool catalog
 /// changed (the muqun tools joining it); the catalog listing follows it
 /// under a `# Code Mode` heading.
@@ -350,151 +307,6 @@ fn is_catalog_notice(text: &str) -> bool {
     let (first, rest) = text.split_once('\n').unwrap_or((text, ""));
     let rest = rest.trim_start();
     CATALOG_NOTICE.contains(&first.trim()) && (rest.is_empty() || rest.starts_with("# Code Mode\n"))
-}
-
-/// Whether `code` (an OpenCode Code Mode `execute` call) is only a catalog
-/// lookup of a muqun tool, read strictly as the whole code:
-/// `[return] [await] search({query: <string>[, limit: <integer>]})[;]`, or
-/// the same bound to a name and returned --
-/// `const|let|var <id> = [await] search({...})[;] [return <id>[;]]` --
-/// keys in any order, each once, the query a plain quoted string (no
-/// escapes, no template) that starts with `muqun` or names `tasks.`,
-/// `fleet.` or `exec.run`. Anything else -- another statement, a chained
-/// call, an operator, another key, returning something else -- is the
-/// agent's own work and is shown.
-fn muqun_lookup(code: &str) -> bool {
-    let mut at = Cursor(code.trim());
-    let bound = if at.word("const") || at.word("let") || at.word("var") {
-        let rest = at.0.trim_start();
-        if rest.starts_with(['"', '\'']) {
-            return false;
-        }
-        match at.key() {
-            Some(name) if at.eat("=") && !at.0.trim_start().starts_with('=') => Some(name),
-            _ => return false,
-        }
-    } else {
-        if at.word("return") && !at.0.starts_with(char::is_whitespace) {
-            return false;
-        }
-        None
-    };
-    at.word("await");
-    let (mut query, mut limit) = (None, false);
-    let parsed = at.eat("search")
-        && at.eat("(")
-        && at.eat("{")
-        && loop {
-            let key = at.key();
-            if !at.eat(":") {
-                break false;
-            }
-            match key {
-                Some("query") if query.is_none() => match at.string() {
-                    Some(text) => query = Some(text),
-                    None => break false,
-                },
-                Some("limit") if !limit && at.integer() => limit = true,
-                _ => break false,
-            }
-            let comma = at.eat(",");
-            if at.eat("}") {
-                break true;
-            }
-            if !comma {
-                break false;
-            }
-        }
-        && at.eat(")");
-    at.eat(";");
-    if let Some(name) = bound {
-        if at.word("return")
-            && !(at.word(name) && at.0.trim_start().trim_start_matches(';').trim().is_empty())
-        {
-            return false;
-        }
-        at.eat(";");
-    }
-    let ours = |query: &str| {
-        let query = query.trim().to_ascii_lowercase();
-        query.starts_with("muqun")
-            || ["tasks.", "fleet.", "exec.run"]
-                .iter()
-                .any(|id| query.contains(id))
-    };
-    parsed && at.0.trim().is_empty() && query.is_some_and(ours)
-}
-
-/// A tiny reader over the rest of a code text, skipping whitespace before
-/// each token.
-struct Cursor<'a>(&'a str);
-
-impl<'a> Cursor<'a> {
-    /// Takes `token` if the rest starts with it.
-    fn eat(&mut self, token: &str) -> bool {
-        let rest = self.0.trim_start();
-        match rest.strip_prefix(token) {
-            Some(rest) => {
-                self.0 = rest;
-                true
-            }
-            None => false,
-        }
-    }
-
-    /// Takes `word` if it is a whole word at the start.
-    fn word(&mut self, word: &str) -> bool {
-        let rest = self.0.trim_start();
-        let whole = rest
-            .strip_prefix(word)
-            .is_some_and(|after| !after.starts_with(|c: char| c.is_alphanumeric() || c == '_'));
-        if whole {
-            self.0 = &rest[word.len()..];
-        }
-        whole
-    }
-
-    /// An object key: a name, or one in plain quotes.
-    fn key(&mut self) -> Option<&'a str> {
-        let rest = self.0.trim_start();
-        if rest.starts_with(['"', '\'']) {
-            return self.string();
-        }
-        let end = rest
-            .find(|c: char| !(c.is_alphanumeric() || c == '_'))
-            .unwrap_or(rest.len());
-        (end > 0).then(|| {
-            self.0 = &rest[end..];
-            &rest[..end]
-        })
-    }
-
-    /// A string literal in `'` or `"` without escapes.
-    fn string(&mut self) -> Option<&'a str> {
-        let rest = self.0.trim_start();
-        let quote = rest.chars().next().filter(|c| matches!(c, '"' | '\''))?;
-        let body = &rest[1..];
-        let end = body.find(quote)?;
-        let text = &body[..end];
-        if text.contains(['\\', '\n']) {
-            return None;
-        }
-        self.0 = &body[end + 1..];
-        Some(text)
-    }
-
-    /// An integer literal.
-    fn integer(&mut self) -> bool {
-        let rest = self.0.trim_start();
-        let end = rest
-            .find(|c: char| !c.is_ascii_digit())
-            .unwrap_or(rest.len());
-        if end == 0 {
-            return false;
-        }
-        self.0 = &rest[end..];
-        true
-    }
 }
 
 /// `text` without the completion instruction it ends with, if it ends with
@@ -608,20 +420,6 @@ mod tests {
         ))
     }
 
-    /// A finished muqun tool call `name` whose result was `output`.
-    fn answered(name: &str, output: &str) -> AgentPart {
-        AgentPart::Tool(crate::agents::adapters::opencode::mapper::map_tool_call(
-            &serde_json::json!({ "type": "tool", "id": "c", "name": name,
-                "state": { "status": "completed", "input": {},
-                    "content": [{ "type": "text", "text": output }] } }),
-        ))
-    }
-
-    /// A finished Code Mode `execute` call running `code`.
-    fn execute(code: &str) -> AgentPart {
-        tool("execute", "completed", code.into())
-    }
-
     #[test]
     fn the_reader_gets_the_goal_and_the_answer_without_the_plumbing() {
         use TimelineRole::{Assistant, System, User};
@@ -709,48 +507,6 @@ mod tests {
                 Some("All green.\n---"),
             ),
             (
-                "a catalog lookup for a muqun tool",
-                Assistant,
-                execute("return search({query:'muqun tasks complete',limit:1});"),
-                None,
-            ),
-            (
-                "a lookup by tool id",
-                Assistant,
-                execute(r#"search({ "query": "tasks.complete" })"#),
-                None,
-            ),
-            (
-                "a lookup bound to a name and returned",
-                Assistant,
-                execute("const t = search({query:'muqun'});\nreturn t;"),
-                None,
-            ),
-            (
-                "the owner's lookup",
-                Assistant,
-                execute(r#"const x = search({query:"muqun fleet.describe exec.run tasks.complete tasks.read",limit:10}); return x;"#),
-                None,
-            ),
-            (
-                "a lookup followed by another call",
-                Assistant,
-                execute("const t = search({query:'muqun'});\nreturn run(t);"),
-                Some("const t = search({query:'muqun'});\nreturn run(t);"),
-            ),
-            (
-                "an agent loading a skill",
-                Assistant,
-                tool("skill", "completed", serde_json::json!({ "name": "a-workflow" })),
-                None,
-            ),
-            (
-                "a lookup of another tool",
-                Assistant,
-                execute("return search({query:'browser tabs'});"),
-                Some("return search({query:'browser tabs'});"),
-            ),
-            (
                 "the catalog notice",
                 System,
                 AgentPart::System {
@@ -760,66 +516,6 @@ mod tests {
                     description: None,
                 },
                 None,
-            ),
-            (
-                "the agent reporting the task's end",
-                Assistant,
-                tool("muqun_tasks_complete", "completed", serde_json::Value::Null),
-                None,
-            ),
-            (
-                "Claude Code's name for it",
-                Assistant,
-                tool("mcp__muqun__tasks.complete", "completed", serde_json::Value::Null),
-                None,
-            ),
-            (
-                "a report that failed",
-                Assistant,
-                tool("muqun_tasks_complete", "error", serde_json::Value::Null),
-                None,
-            ),
-            (
-                "a report the tool answered with an error",
-                Assistant,
-                answered("muqun_tasks_complete", r#"{"error":"task_not_found","message":"x"}"#),
-                None,
-            ),
-            (
-                "a report the turn left without a result",
-                Assistant,
-                tool("muqun_tasks_complete", "running", serde_json::Value::Null),
-                None,
-            ),
-            (
-                "asking whether this session has a task",
-                Assistant,
-                tool("muqun_tasks_read", "completed", serde_json::Value::Null),
-                None,
-            ),
-            (
-                "another server's tool of that name",
-                Assistant,
-                tool("todo_tasks_complete", "completed", serde_json::Value::Null),
-                Some("<code>"),
-            ),
-            (
-                "every other muqun tool too",
-                Assistant,
-                tool("muqun_tasks_delegate", "completed", serde_json::Value::Null),
-                None,
-            ),
-            (
-                "a wait, however many",
-                Assistant,
-                tool("mcp__muqun__tasks.wait", "running", serde_json::Value::Null),
-                None,
-            ),
-            (
-                "a tool of that name from no server",
-                Assistant,
-                tool("tasks_complete", "completed", serde_json::Value::Null),
-                Some("<code>"),
             ),
             (
                 "the task's per-session instruction notice",
@@ -840,18 +536,6 @@ mod tests {
                 },
                 Some("The Code Mode tool catalog has changed.\nAlso: run the migration."),
             ),
-            (
-                "a fleet lookup",
-                Assistant,
-                execute("return search({ limit: 3, query: \"fleet.self\" })"),
-                None,
-            ),
-            (
-                "an exec.run lookup",
-                Assistant,
-                execute("search({'query':'exec.run'});"),
-                None,
-            ),
         ] {
             let mut items = vec![item(role, part)];
             hide_in_items(&mut items, Streaming(false));
@@ -864,91 +548,6 @@ mod tests {
             });
             assert_eq!(got, served, "{name}");
         }
-        // Real work shaped like a lookup is shown; a lookup still being
-        // written is held until its code is known.
-        for (name, part, hidden) in [
-            (
-                "chained",
-                execute("search({query:'muqun'}).then(r => tools.fleet.exec({}))"),
-                false,
-            ),
-            (
-                "and-ed",
-                execute("search({query:'muqun'}) && await tools.bash.run('x')"),
-                false,
-            ),
-            (
-                "work before the query",
-                execute("search({limit: await tools.x(), query:'muqun'})"),
-                false,
-            ),
-            (
-                "a template query",
-                execute("search({query: `muqun${await run()}`})"),
-                false,
-            ),
-            (
-                "a built query",
-                execute("search({query:'muqun'+await run()})"),
-                false,
-            ),
-            (
-                "an extra key",
-                execute("search({query:'muqun', all: true})"),
-                false,
-            ),
-            (
-                "search in a string",
-                execute("log('search({query:\\'muqun\\'})')"),
-                false,
-            ),
-            (
-                "another statement",
-                execute("search({query:'muqun'}); rm()"),
-                false,
-            ),
-            (
-                "return without semicolon",
-                execute("return search({query:'muqun tasks'})"),
-                true,
-            ),
-            (
-                "another tool",
-                tool("bash", "completed", "search({query:'muqun'})".into()),
-                false,
-            ),
-            (
-                "code not a string",
-                tool("execute", "completed", serde_json::json!(1)),
-                false,
-            ),
-            (
-                "a failed lookup",
-                tool("execute", "error", "search({query:'muqun'})".into()),
-                false,
-            ),
-            (
-                "still streaming",
-                tool("execute", "streaming", serde_json::Value::Null),
-                true,
-            ),
-            (
-                "a report still running",
-                tool("muqun_tasks_complete", "running", serde_json::Value::Null),
-                true,
-            ),
-        ] {
-            let mut items = vec![item(Assistant, part)];
-            hide_in_items(&mut items, Streaming(true));
-            assert_eq!(items.is_empty(), hidden, "{name}");
-        }
-        // A call that never got its code is shown once the turn is over.
-        let mut items = vec![item(
-            Assistant,
-            tool("execute", "pending", serde_json::Value::Null),
-        )];
-        hide_in_items(&mut items, Streaming(false));
-        assert_eq!(items.len(), 1, "pending after the turn");
         // Only the marker line the ledger reads goes; others stay in view.
         for (written, served) in [
             (
@@ -1047,7 +646,7 @@ mod tests {
         hide_in_inbox(&mut inbox);
         let texts: Vec<_> = inbox.iter().map(|item| &item["payload"]["text"]).collect();
         assert_eq!(texts, ["fix the build", "and the tests"]);
-        // A streaming `execute` arrives as a removal until its code is known.
+        // A streaming execute stays visible before its code is known.
         let mut event = AgentDomainEvent::TimelineUpsert {
             asid: crate::agents::domain::AgentSessionId("s".into()),
             items: vec![item(
@@ -1058,7 +657,7 @@ mod tests {
         };
         hide_in_event(&mut event, Streaming(true));
         assert!(
-            matches!(&event, AgentDomainEvent::TimelineRemoved { seq: 6, .. }),
+            matches!(&event, AgentDomainEvent::TimelineUpsert { seq: 6, items, .. } if items.len() == 1),
             "{event:?}"
         );
         // A streamed row left with nothing is removed, not left stale.
@@ -1074,27 +673,123 @@ mod tests {
         );
     }
 
-    /// A session no task is bound to -- a person's own, which delegates too
-    /// -- loses the muqun server's tool rows and nothing else.
     #[test]
-    fn any_session_is_served_without_muqun_tool_rows() {
-        use TimelineRole::Assistant;
+    fn provider_tool_rows_survive_history_and_live_serving_in_every_state() {
+        use crate::agents::{adapters, domain::ToolCallStatus};
+        use serde_json::json;
+        let mut parts: Vec<AgentPart> = [
+            "muqun_tasks_delegate",
+            "muqun_tasks_wait",
+            "muqun_tasks_read",
+            "muqun_tasks_list",
+            "muqun_tasks_cancel",
+            "muqun_tasks_complete",
+            "muqun_fleet_list",
+            "muqun_fleet_describe",
+            "muqun_exec_run",
+            "mcp__muqun__tasks.complete",
+            "muqun__tasks.complete",
+            "muqun.tasks.complete",
+            "todo_tasks_complete",
+            "tasks_complete",
+        ]
+        .map(|name| tool(name, "completed", json!({"goal": "inspect"})))
+        .into();
+        parts.push(AgentPart::Tool(
+            adapters::deepseek::mapper::project_tool_call(
+                "deepseek-call".into(),
+                "mcp__muqun__tasks.wait".into(),
+                json!({"id": "task"}),
+                Some(json!({"error": "task_not_found"})),
+                true,
+            ),
+        ));
+        for payload in [
+            json!({"toolCallId": "t3-call", "data": {
+                "toolName": "mcp__muqun__exec.run", "command": "pwd",
+                "rawOutput": {"content": "output"}
+            }}),
+            json!({"toolCallId": "t3-call", "toolName": "muqun.tasks.read"}),
+        ] {
+            parts.push(AgentPart::Tool(
+                adapters::t3::mapper::map_tool(&json!({
+                    "id": "activity", "kind": "tool.completed", "payload": payload
+                }))
+                .unwrap(),
+            ));
+        }
+        for value in [
+            json!({"type": "mcpToolCall", "id": "codex-call", "server": "muqun",
+                "tool": "exec.run", "arguments": {"command": "pwd"},
+                "status": "completed", "result": {"output": "output"}}),
+            json!({"type": "dynamicToolCall", "id": "codex-call",
+                "tool": "muqun.tasks.list", "arguments": {}, "status": "completed"}),
+        ] {
+            let rows = adapters::codex::mapper::item("thread", "turn", &value, 1);
+            assert_eq!(rows.len(), 1);
+            assert!(matches!(&rows[0].part, AgentPart::Tool(_)));
+            parts.push(rows[0].part.clone());
+        }
+        for code in [
+            json!("return search({query:'muqun tasks complete',limit:1});"),
+            json!("const t = search({query:'muqun'}); return t;"),
+            json!("search({query:'fleet.list exec.run'})"),
+            serde_json::Value::Null,
+        ] {
+            parts.push(tool("execute", "completed", code));
+        }
+        for part in parts {
+            for status in [
+                ToolCallStatus::Pending,
+                ToolCallStatus::Streaming,
+                ToolCallStatus::Running,
+                ToolCallStatus::Completed,
+                ToolCallStatus::Failed,
+            ] {
+                let mut row = item(TimelineRole::Assistant, part.clone());
+                if let AgentPart::Tool(call) = &mut row.part {
+                    call.set_state(status);
+                }
+                for task in [false, true] {
+                    for streaming in [false, true] {
+                        let plumbing = Plumbing {
+                            task,
+                            streaming: Streaming(streaming),
+                        };
+                        let original = vec![row.clone()];
+                        let mut history = original.clone();
+                        hide_in_items(&mut history, plumbing);
+                        assert_eq!(history, original, "history: {task}/{streaming}/{status:?}");
+                        let mut event = AgentDomainEvent::TimelineUpsert {
+                            asid: crate::agents::domain::AgentSessionId("s".into()),
+                            items: original,
+                            seq: 42,
+                        };
+                        let raw = event.clone();
+                        hide_in_event(&mut event, plumbing);
+                        assert_eq!(event, raw, "live: {task}/{streaming}/{status:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_sessions_keep_markers_and_skill_loading_keeps_its_policy() {
         let mut items = vec![
             item(
-                Assistant,
-                tool("muqun_tasks_delegate", "completed", serde_json::Value::Null),
+                TimelineRole::Assistant,
+                tool("skill", "completed", serde_json::Value::Null),
             ),
-            item(
-                Assistant,
-                tool("muqun_tasks_wait", "running", serde_json::Value::Null),
-            ),
-            item(Assistant, text("MUQUN_TASK_DONE: kept here")),
+            item(TimelineRole::Assistant, text("MUQUN_TASK_DONE: kept here")),
         ];
-        let own = Plumbing {
-            streaming: Streaming(false),
-            task: false,
-        };
-        hide_in_items(&mut items, own);
+        hide_in_items(
+            &mut items,
+            Plumbing {
+                streaming: Streaming(false),
+                task: false,
+            },
+        );
         assert_eq!(items.len(), 1);
         assert!(matches!(&items[0].part, AgentPart::Text { text } if text.contains("kept here")));
     }
