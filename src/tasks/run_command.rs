@@ -672,7 +672,11 @@ mod tests {
                 if task.state == TaskState::Done {
                     assert_eq!(task.exit_code, Some(0));
                     assert_eq!(task.summary.as_deref(), Some("exit 0\nhi\n"));
-                    break;
+                    // Done is persisted before the observer awaits tab.close.
+                    // Wait for both effects before inspecting cleanup below.
+                    if !methods(&herdr, "tab.close").is_empty() {
+                        break;
+                    }
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
@@ -812,7 +816,9 @@ mod tests {
         crate::tasks::driver::reconcile(&state).await;
         tokio::time::timeout(Duration::from_secs(3), async {
             loop {
-                if store.get(&handle.task.id).await.unwrap().unwrap().state == TaskState::Done {
+                if store.get(&handle.task.id).await.unwrap().unwrap().state == TaskState::Done
+                    && !methods(&herdr, "tab.close").is_empty()
+                {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
