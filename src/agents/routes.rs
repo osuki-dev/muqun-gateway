@@ -490,6 +490,14 @@ pub fn mount(router: Router<AppState>) -> Router<AppState> {
             "/api/agent-sessions/{asid}/timeline/earlier",
             post(load_earlier_timeline_global),
         )
+        .route(
+            "/api/agent-sessions/{asid}/timeline/window",
+            get(history_window_global),
+        )
+        .route(
+            "/api/agent-sessions/{asid}/timeline/page",
+            post(history_page_global),
+        )
         .route("/api/agent-sessions/{asid}/mode", post(switch_mode_global))
         .route("/api/agent-files", get(find_agent_files_root_global))
         .route(
@@ -915,8 +923,11 @@ pub(crate) async fn socket_history(
     operation: &str,
     refresh: bool,
     after: u64,
+    cursor: Option<&str>,
 ) -> ApiResult<Json<Value>> {
     match operation {
+        "window" => socket_history_window(state, asid, cursor, refresh).await,
+        "page" => socket_history_page(state, asid, cursor).await,
         "snapshot" => socket_read_agent_session(state, asid, refresh).await,
         "earlier" => socket_load_earlier_timeline(state, asid).await,
         "delta" => socket_get_agent_session_timeline(state, asid, after).await,
@@ -926,6 +937,103 @@ pub(crate) async fn socket_history(
             "Unknown history operation",
         )),
     }
+}
+
+#[derive(Default, Deserialize)]
+struct HistoryWindowQuery {
+    cursor: Option<String>,
+    #[serde(default)]
+    refresh: bool,
+}
+
+async fn history_window_global(
+    State(state): State<AppState>,
+    Path(asid): Path<String>,
+    Query(query): Query<HistoryWindowQuery>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    require_device(&state, &headers)?;
+    socket_history_window(&state, &asid, query.cursor.as_deref(), query.refresh).await
+}
+
+async fn history_page_global(
+    State(state): State<AppState>,
+    Path(asid): Path<String>,
+    headers: HeaderMap,
+    Json(query): Json<HistoryWindowQuery>,
+) -> ApiResult<Json<Value>> {
+    require_device(&state, &headers)?;
+    socket_history_page(&state, &asid, query.cursor.as_deref()).await
+}
+
+fn validate_history_cursor(cursor: Option<&str>) -> ApiResult<()> {
+    if cursor.is_some_and(|cursor| cursor.is_empty() || cursor.len() > 4096) {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_cursor",
+            "Invalid history cursor",
+        ));
+    }
+    Ok(())
+}
+
+async fn socket_history_window(
+    state: &AppState,
+    asid: &str,
+    cursor: Option<&str>,
+    refresh: bool,
+) -> ApiResult<Json<Value>> {
+    validate_history_cursor(cursor)?;
+    let manager = session_manager_or_err(state, asid).await?;
+    if !manager.agent().supports_earlier_timeline() {
+        // Providers without older paging must retain the complete cached
+        // snapshot; otherwise opening a bounded window would hide history.
+        return socket_read_agent_session(state, asid, refresh).await;
+    }
+    let mut window = manager
+        .sessions()
+        .history_window(&AgentSessionId(asid.to_owned()), cursor, refresh)
+        .await
+        .map_err(agent_error)?;
+    let snapshot = &mut window.snapshot;
+    let plumbing = for_session(state, asid).await;
+    hide_in_items(&mut snapshot.timeline, plumbing);
+    if plumbing.task {
+        hide_in_inbox(&mut snapshot.inbox);
+    }
+    message_images::attach_to_items(
+        state,
+        asid,
+        snapshot.info.directory.as_deref(),
+        &mut snapshot.timeline,
+    )
+    .await;
+    message_images::attach_to_inbox(state, asid, &mut snapshot.inbox).await;
+    Ok(Json(content_envelope(json!(window))))
+}
+
+async fn socket_history_page(
+    state: &AppState,
+    asid: &str,
+    cursor: Option<&str>,
+) -> ApiResult<Json<Value>> {
+    validate_history_cursor(cursor)?;
+    let cursor = cursor.ok_or_else(|| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_cursor",
+            "A history cursor is required",
+        )
+    })?;
+    let manager = session_manager_or_err(state, asid).await?;
+    let mut page = manager
+        .sessions()
+        .history_page(&AgentSessionId(asid.to_owned()), cursor)
+        .await
+        .map_err(agent_error)?;
+    hide_in_items(&mut page.items, for_session(state, asid).await);
+    message_images::attach_to_items(state, asid, None, &mut page.items).await;
+    Ok(Json(content_envelope(json!(page))))
 }
 
 async fn do_get_agent_session_events(
@@ -4285,11 +4393,43 @@ mod tests {
         assert_eq!(end["data"]["exhausted"], true);
         let snapshot = manager
             .mirror()
-            .get_snapshot(&AgentSessionId(id))
+            .get_snapshot(&AgentSessionId(id.clone()))
             .await
             .unwrap();
         assert_eq!(snapshot.timeline.len(), 181);
         assert_eq!(&snapshot.timeline[81..], &held_tail);
+        manager
+            .mirror()
+            .mark_history_initialized(&AgentSessionId(id.clone()))
+            .await;
+        let Json(window) = socket_history_window(&state, &id, None, false)
+            .await
+            .unwrap();
+        assert_eq!(window["data"]["timeline"].as_array().unwrap().len(), 100);
+        let cursor = window["data"]["history_cursor"].as_str().unwrap();
+        let Json(page) = socket_history_page(&state, &id, Some(cursor))
+            .await
+            .unwrap();
+        assert_eq!(page["data"]["items"].as_array().unwrap().len(), 80);
+        let Json(retry) = socket_history_page(&state, &id, Some(cursor))
+            .await
+            .unwrap();
+        assert_eq!(retry["data"], page["data"]);
+        let cursor = page["data"]["history_cursor"].as_str().unwrap();
+        let Json(last) = socket_history_page(&state, &id, Some(cursor))
+            .await
+            .unwrap();
+        assert_eq!(last["data"]["items"].as_array().unwrap().len(), 1);
+        assert_eq!(last["data"]["items"][0]["part"]["name"], "muqun.tasks.list");
+        let cursor = last["data"]["history_cursor"].as_str().unwrap();
+        let Json(end) = socket_history_page(&state, &id, Some(cursor))
+            .await
+            .unwrap();
+        assert_eq!(end["data"]["exhausted"], true);
+        let Json(reopen) = socket_history_window(&state, &id, None, false)
+            .await
+            .unwrap();
+        assert_eq!(reopen["data"]["timeline"].as_array().unwrap().len(), 100);
     }
 
     /// The DeepSeek owner pages like the Codex one: each pull is one older

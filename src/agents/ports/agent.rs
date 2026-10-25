@@ -146,6 +146,11 @@ pub trait AgentPort: Send + Sync {
     /// Agent identifier (e.g. "opencode", "claude")
     fn kind(&self) -> &'static str;
 
+    /// A bounded entry is safe only when older provider rows remain reachable.
+    fn supports_earlier_timeline(&self) -> bool {
+        false
+    }
+
     /// Optional account rate windows, unrelated to context tokens or billing.
     fn account_limits(
         &self,

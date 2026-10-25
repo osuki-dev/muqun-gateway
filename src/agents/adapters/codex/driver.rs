@@ -2162,6 +2162,10 @@ impl AgentPort for CodexDriver {
         })
     }
 
+    fn supports_earlier_timeline(&self) -> bool {
+        true
+    }
+
     fn kind(&self) -> &'static str {
         super::KIND
     }
@@ -3314,7 +3318,7 @@ mod history_tests {
                 let mut snapshot = held.clone();
                 snapshot.timeline = prepared.items;
                 let result = memory
-                    .refresh_prepared_snapshot(snapshot, seq, incarnation, prepared.commit)
+                    .refresh_prepared_history(snapshot, (seq, incarnation), prepared.commit)
                     .await;
                 if case == "incarnation" {
                     assert!(

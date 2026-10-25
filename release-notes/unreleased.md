@@ -2,6 +2,20 @@
 
 ## Changes and fixes
 
+- **Long agent conversations open at the latest messages.** Apps supporting
+  `agent_history_window_v1` request the newest 100 timeline rows and load older
+  pages on demand. Each reader keeps its own position across reconnects;
+  provider backfills are retained without skipping or duplicating messages.
+  Expired history boundaries are reported explicitly so the App can reload.
+
+- **History reads and refreshes do less work.** An ordered in-memory index serves
+  recent and earlier pages without sorting the entire conversation. Provider
+  refreshes merge into retained history without copying the whole timeline.
+  Existing Apps retain their previous endpoints. The window behavior requires
+  the matching App update; the indexing optimization needs only a Gateway
+  restart. Herdr requirements are unchanged (0.9.0+ for collaboration), and
+  these history changes introduce no database migration.
+
 - **Commands without a final output newline finish normally.** `printf`,
   `cat` and similar commands no longer remain Working after they exit. The
   output tail preserves their final line, spaces and exit code without

@@ -610,6 +610,34 @@ Returns `AgentSessionSnapshot`:
 prompt raised while the event stream was down is not lost. `timeline` is ordered
 by `(message_id, ordinal)`.
 
+### Reader-owned history windows
+
+`agent_history_window_v1` adds `GET /api/agent-sessions/{asid}/timeline/window`
+and `POST /api/agent-sessions/{asid}/timeline/page`. Authenticated `history_request`
+frames use operations `window` and `page` with the same optional `cursor` field.
+Both transports call the same service. Existing snapshot/earlier APIs are unchanged.
+
+For providers supporting older history, opening a window returns the newest 100
+rows and `history_cursor` alongside the ordinary snapshot fields. A page request
+sends `{ "cursor": "..." }` and returns at most 80 source rows, `history_cursor`
+and `exhausted`. Provider backfills may include newly discovered rows after the
+boundary; upsert every returned row, while the cursor only moves backward.
+Filtering can yield no visible rows without exhaustion. Keep one
+cursor per reader, computer and session; never share it through a global store.
+Passing that cursor to the window endpoint resynchronizes the reader's loaded
+range, including its oldest boundary. Omit it when reopening at the latest page.
+Providers without older paging retain their existing full snapshot and omit the
+cursor, so cached history does not become inaccessible.
+
+Cursors are scoped to the session incarnation and removal generation. Invalid,
+evicted or obsolete boundaries return `409 history_cursor_lost`, not exhaustion.
+Recover with a new window; do not silently jump to another reader's provider
+cursor. Ordinary cached retries return the same page. Older source reads are
+serialized and committed through the existing provider/mirror transaction.
+Historical rows do not become new live output for other subscribers; canonical
+ordering corrections still propagate. A reader can continue past the mirror's
+retention cap, but a lagging reader whose boundary was evicted must resynchronize.
+
 ### `POST /api/agent-sessions/{asid}/timeline/earlier`
 
 Gate remote history pulls on **both** global capability

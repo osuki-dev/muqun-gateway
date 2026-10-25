@@ -244,22 +244,26 @@ impl SessionService {
         &self,
         asid: &AgentSessionId,
     ) -> Result<AgentSessionSnapshot, AgentError> {
+        self.refresh_history(asid).await?;
+        self.mirror.get_snapshot(asid).await.ok_or_else(|| {
+            AgentError::NotAvailable("Session changed during refresh; refresh again".into())
+        })
+    }
+
+    async fn refresh_history(&self, asid: &AgentSessionId) -> Result<(), AgentError> {
         let _permit = self
             .refresh_slots
             .try_acquire()
             .map_err(|_| AgentError::NotAvailable("Session refresh capacity exhausted".into()))?;
         tokio::time::timeout(
             std::time::Duration::from_secs(30),
-            self.refresh_snapshot_inner(asid),
+            self.refresh_history_inner(asid),
         )
         .await
         .map_err(|_| AgentError::NotAvailable("Session refresh timed out".into()))?
     }
 
-    async fn refresh_snapshot_inner(
-        &self,
-        asid: &AgentSessionId,
-    ) -> Result<AgentSessionSnapshot, AgentError> {
+    async fn refresh_history_inner(&self, asid: &AgentSessionId) -> Result<(), AgentError> {
         self.agent.prepare_selected_session(&asid.0).await?;
         let memory = self
             .memory
@@ -268,18 +272,7 @@ impl SessionService {
         let (expected, incarnation) = memory.snapshot_read_revision(asid).await;
         let info = self.get_session(&asid.0).await?;
         let prepared = self.agent.prepare_timeline(&asid.0, 100).await?;
-        let fresh = prepared.items;
-        let mut timeline = fresh.clone();
-        if let Some(held) = self.mirror.get_snapshot(asid).await {
-            let fresh_ids: std::collections::HashSet<_> =
-                fresh.iter().map(|item| item.id.clone()).collect();
-            timeline.extend(
-                held.timeline
-                    .into_iter()
-                    .filter(|item| !fresh_ids.contains(&item.id)),
-            );
-            timeline.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
-        }
+        let timeline = prepared.items;
         let permissions = self.agent.get_pending_permissions(&asid.0).await?;
         let forms = self.agent.get_pending_forms(&asid.0).await?;
         let snapshot = AgentSessionSnapshot {
@@ -291,11 +284,88 @@ impl SessionService {
             seq: 0,
         };
         memory
-            .refresh_prepared_snapshot(snapshot, expected, incarnation, prepared.commit)
+            .refresh_prepared_history(snapshot, (expected, incarnation), prepared.commit)
             .await?
             .ok_or_else(|| {
                 AgentError::NotAvailable("Session changed during refresh; refresh again".into())
             })
+    }
+
+    /// New readers receive only the newest page. A reader resync names its
+    /// oldest retained row so that corrections preserve its loaded window.
+    pub(crate) async fn history_window(
+        &self,
+        asid: &AgentSessionId,
+        cursor: Option<&str>,
+        refresh: bool,
+    ) -> Result<crate::agents::adapters::memory_mirror::history_window::HistoryWindow, AgentError>
+    {
+        let memory = self
+            .memory
+            .as_ref()
+            .ok_or_else(|| AgentError::Unsupported("history windows".into()))?;
+        if refresh {
+            self.refresh_history(asid).await?;
+        } else if !memory.history_initialized(asid).await {
+            self.get_snapshot(asid).await?;
+        } else {
+            self.agent.prepare_selected_session(&asid.0).await?;
+        }
+        let mut window = memory.history_window(asid, cursor).await?;
+        self.observe_runtime(&mut window.snapshot.info).await;
+        Ok(window)
+    }
+
+    pub(crate) async fn history_page(
+        &self,
+        asid: &AgentSessionId,
+        cursor: &str,
+    ) -> Result<crate::agents::adapters::memory_mirror::history_window::HistoryPage, AgentError>
+    {
+        let memory = self
+            .memory
+            .as_ref()
+            .ok_or_else(|| AgentError::Unsupported("history windows".into()))?;
+        let gate = memory.history_gate(asid).await;
+        let _read = gate.lock().await;
+        let boundary = memory.history_boundary(asid, cursor).await?;
+        let cached = memory
+            .history_page(asid, cursor, &boundary, &[], false)
+            .await?;
+        if !cached.items.is_empty() {
+            return Ok(cached);
+        }
+        // A refresh may rewind the provider cursor into already cached rows.
+        // Bound the work per request without treating overlap as end of history.
+        for _ in 0..4 {
+            let revision = memory
+                .history_read_revision(asid)
+                .await
+                .ok_or(AgentError::HistoryCursorLost)?;
+            let prepared = self.agent.prepare_earlier_timeline(&asid.0, 80).await?;
+            let exhausted = prepared.items.is_empty();
+            let source_ids: std::collections::HashSet<_> =
+                prepared.items.iter().map(|row| row.id.clone()).collect();
+            let mut fetched = memory
+                .accept_earlier_window_history(
+                    asid,
+                    &gate,
+                    revision,
+                    prepared.items,
+                    prepared.commit,
+                )
+                .await?;
+            fetched.retain(|row| source_ids.contains(&row.id));
+            let page = memory
+                .fetched_history_page(asid, cursor, &boundary, fetched, exhausted)
+                .await?;
+            if !page.items.is_empty() || page.exhausted {
+                return Ok(page);
+            }
+        }
+        memory
+            .history_page(asid, cursor, &boundary, &[], false)
+            .await
     }
 
     /// One older history page, kept in the mirror so a later snapshot still has it.

@@ -1,4 +1,7 @@
-use std::collections::{BTreeMap, HashMap, VecDeque};
+pub(crate) mod history_window;
+mod timeline;
+
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -121,7 +124,7 @@ struct ReplayEvent {
 
 struct SessionState {
     info: AgentSessionInfo,
-    timeline: BTreeMap<String, TimelineItem>,
+    timeline: timeline::Timeline,
     permissions: HashMap<String, PermissionRequest>,
     forms: HashMap<String, FormRequest>,
     inbox: Vec<serde_json::Value>,
@@ -136,6 +139,8 @@ struct SessionState {
     placeholder: bool,
     /// Metadata and live deltas do not prove that initial history was read.
     history_initialized: bool,
+    history_epoch: String,
+    history_frontier: Option<TimelineItem>,
     history_gate: Arc<tokio::sync::Mutex<()>>,
     timeline_commit_gate: Arc<tokio::sync::Mutex<()>>,
     history_removal_generation: u64,
@@ -145,7 +150,7 @@ impl SessionState {
     fn new(info: AgentSessionInfo) -> Self {
         Self {
             info,
-            timeline: BTreeMap::new(),
+            timeline: timeline::Timeline::default(),
             permissions: HashMap::new(),
             forms: HashMap::new(),
             inbox: Vec::new(),
@@ -156,6 +161,8 @@ impl SessionState {
             touched_ms: now_ms(),
             placeholder: false,
             history_initialized: false,
+            history_epoch: uuid::Uuid::new_v4().to_string(),
+            history_frontier: None,
             history_gate: Arc::new(tokio::sync::Mutex::new(())),
             timeline_commit_gate: Arc::new(tokio::sync::Mutex::new(())),
             history_removal_generation: 0,
@@ -166,13 +173,21 @@ impl SessionState {
         &mut self,
         order: &HashMap<String, String>,
     ) -> (Vec<TimelineItem>, Vec<PermissionRequest>) {
+        if order.is_empty() {
+            return (Vec::new(), Vec::new());
+        }
         let mut changed = Vec::new();
-        for item in self.timeline.values_mut() {
+        if let Some(frontier) = &mut self.history_frontier {
+            if let Some(next) = order.get(&frontier.message_id) {
+                frontier.message_id.clone_from(next);
+            }
+        }
+        self.timeline.update_each(|item| {
             if let Some(next) = order.get(&item.message_id) {
                 item.message_id.clone_from(next);
                 changed.push(item.clone());
             }
-        }
+        });
         let mut permissions = Vec::new();
         for request in self.permissions.values_mut() {
             if let Some(next) = request
@@ -221,28 +236,16 @@ impl SessionState {
     /// `(message_id, ordinal)`, and message ids sort by creation, so the
     /// first keys are the oldest rows.
     fn trim_timeline(&mut self) {
-        while self.timeline.len() > MAX_TIMELINE_ITEMS {
-            let Some(oldest) = self
-                .timeline
-                .values()
-                .min_by(|a, b| a.sort_key().cmp(&b.sort_key()))
-                .map(|it| it.id.clone())
-            else {
-                break;
-            };
-            self.timeline.remove(&oldest);
-        }
+        self.timeline.trim(MAX_TIMELINE_ITEMS);
     }
 
     fn insert_item(&mut self, item: TimelineItem) {
-        self.timeline.insert(item.id.clone(), item);
+        self.timeline.insert(item);
         self.trim_timeline();
     }
 
     fn ordered_timeline(&self) -> Vec<TimelineItem> {
-        let mut items: Vec<TimelineItem> = self.timeline.values().cloned().collect();
-        items.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
-        items
+        self.timeline.ordered().cloned().collect()
     }
 
     /// The next free ordinal within a message, used for a streamed tool call --
@@ -734,6 +737,31 @@ impl MemoryMirror {
         items: Vec<TimelineItem>,
         commit: Option<crate::agents::ports::agent::TimelineCommit<'_>>,
     ) -> Result<Vec<TimelineItem>, crate::agents::ports::agent::AgentError> {
+        self.accept_earlier_history_inner(asid, gate, before_read, items, commit, true)
+            .await
+    }
+
+    pub(crate) async fn accept_earlier_window_history(
+        &self,
+        asid: &AgentSessionId,
+        gate: &Arc<tokio::sync::Mutex<()>>,
+        before_read: (u64, u64),
+        items: Vec<TimelineItem>,
+        commit: Option<crate::agents::ports::agent::TimelineCommit<'_>>,
+    ) -> Result<Vec<TimelineItem>, crate::agents::ports::agent::AgentError> {
+        self.accept_earlier_history_inner(asid, gate, before_read, items, commit, false)
+            .await
+    }
+
+    async fn accept_earlier_history_inner(
+        &self,
+        asid: &AgentSessionId,
+        gate: &Arc<tokio::sync::Mutex<()>>,
+        before_read: (u64, u64),
+        items: Vec<TimelineItem>,
+        commit: Option<crate::agents::ports::agent::TimelineCommit<'_>>,
+        publish_new: bool,
+    ) -> Result<Vec<TimelineItem>, crate::agents::ports::agent::AgentError> {
         use crate::agents::ports::agent::AgentError;
         let acceptance = self.existing_timeline_commit_gate(asid).await;
         let _acceptance = match &acceptance {
@@ -754,6 +782,9 @@ impl MemoryMirror {
             None => Default::default(),
         };
         let (reordered, permissions) = state.apply_history_order(&changes.order);
+        if let Some(oldest) = items.iter().min_by_key(|row| row.sort_key()) {
+            state.history_frontier = Some(oldest.clone());
+        }
         let mut accepted = Vec::with_capacity(items.len());
         let mut updated = Vec::new();
         for mut item in items {
@@ -768,7 +799,15 @@ impl MemoryMirror {
             if let AgentPart::Tool(call) = &mut item.part {
                 truncate_tool_output(call);
             }
-            updated.push(item);
+            if !publish_new && !state.timeline.contains_key(&item.id) {
+                // Paging is not live output. Other readers must not receive
+                // this row through either events or the delta catch-up path.
+                item.seq = 0;
+                state.insert_item(item.clone());
+                accepted.push(item);
+            } else {
+                updated.push(item);
+            }
         }
         let replaced: std::collections::HashSet<_> =
             updated.iter().map(|item| item.id.clone()).collect();
@@ -1215,7 +1254,7 @@ impl MemoryMirror {
         let now = now_ms();
         let seq = state.next_seq();
 
-        let item = if let Some(item) = state.timeline.get_mut(item_id) {
+        let item = if let Some(item) = state.timeline.update(item_id, |item| {
             match &mut item.part {
                 AgentPart::Text { text: existing } if !is_reasoning => {
                     if append {
@@ -1235,7 +1274,9 @@ impl MemoryMirror {
             }
             item.updated_ms = now;
             item.seq = seq;
-            item.clone()
+            Some(item.clone())
+        }) {
+            item?
         } else {
             let part = if is_reasoning {
                 AgentPart::Reasoning {
@@ -1295,18 +1336,18 @@ impl MemoryMirror {
         let seq = state.next_seq();
         let ordinal = state.next_ordinal_for(message_id);
 
-        let existing = state.timeline.get_mut(&item_id);
+        let existing = state.timeline.update(&item_id, |item| {
+            let AgentPart::Tool(ref mut call) = item.part else {
+                return None;
+            };
+            patch.apply(call);
+            truncate_tool_output(call);
+            item.updated_ms = now;
+            item.seq = seq;
+            Some(item.clone())
+        });
         let item = match existing {
-            Some(item) => {
-                let AgentPart::Tool(ref mut call) = item.part else {
-                    return None;
-                };
-                patch.apply(call);
-                truncate_tool_output(call);
-                item.updated_ms = now;
-                item.seq = seq;
-                item.clone()
-            }
+            Some(item) => item?,
             None => {
                 let mut call = ToolCall {
                     id: tool_call_id.to_string(),
@@ -1362,7 +1403,7 @@ impl MemoryMirror {
         let mut sessions = self.sessions.write().await;
         let state = sessions.get_mut(asid)?;
         let mut changed = Vec::new();
-        for item in state.timeline.values_mut() {
+        state.timeline.update_each(|item| {
             if let AgentPart::Tool(ref mut call) = item.part {
                 if matches!(
                     call.state,
@@ -1373,14 +1414,14 @@ impl MemoryMirror {
                     changed.push(item.clone());
                 }
             }
-        }
+        });
         if changed.is_empty() {
             return None;
         }
         let seq = state.next_seq();
         for item in changed.iter_mut() {
             item.seq = seq;
-            state.timeline.insert(item.id.clone(), item.clone());
+            state.timeline.insert(item.clone());
         }
         let event = AgentDomainEvent::TimelineUpsert {
             asid: asid.clone(),
@@ -1649,16 +1690,42 @@ impl MemoryMirror {
         }
     }
 
+    #[cfg(test)]
     pub(crate) async fn refresh_prepared_snapshot(
         &self,
-        mut snapshot: crate::agents::ports::mirror::AgentSessionSnapshot,
+        snapshot: AgentSessionSnapshot,
         expected: Option<u64>,
         incarnation: Option<Arc<tokio::sync::Mutex<()>>>,
         commit: Option<crate::agents::ports::agent::TimelineCommit<'_>>,
-    ) -> Result<
-        Option<crate::agents::ports::mirror::AgentSessionSnapshot>,
-        crate::agents::ports::agent::AgentError,
-    > {
+    ) -> Result<Option<AgentSessionSnapshot>, crate::agents::ports::agent::AgentError> {
+        let asid = snapshot.info.asid.clone();
+        match self
+            .commit_refresh(snapshot, (expected, incarnation), commit, false)
+            .await?
+        {
+            Some(()) => Ok(self.get_snapshot(&asid).await),
+            None => Ok(None),
+        }
+    }
+
+    /// Merge the provider's newest page in place. Older retained rows do not
+    /// need to be cloned into a replacement snapshot or returned to this caller.
+    pub(crate) async fn refresh_prepared_history(
+        &self,
+        snapshot: AgentSessionSnapshot,
+        revision: (Option<u64>, Option<Arc<tokio::sync::Mutex<()>>>),
+        commit: Option<crate::agents::ports::agent::TimelineCommit<'_>>,
+    ) -> Result<Option<()>, crate::agents::ports::agent::AgentError> {
+        self.commit_refresh(snapshot, revision, commit, true).await
+    }
+
+    async fn commit_refresh(
+        &self,
+        mut snapshot: AgentSessionSnapshot,
+        (expected, incarnation): (Option<u64>, Option<Arc<tokio::sync::Mutex<()>>>),
+        commit: Option<crate::agents::ports::agent::TimelineCommit<'_>>,
+        preserve_history: bool,
+    ) -> Result<Option<()>, crate::agents::ports::agent::AgentError> {
         let acceptance = self
             .existing_timeline_commit_gate(&snapshot.info.asid)
             .await;
@@ -1699,20 +1766,30 @@ impl MemoryMirror {
                 request.source_message_id = Some(next.clone());
             }
         }
-        snapshot
-            .timeline
-            .sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
         if let Some(previous) = sessions.get(&asid) {
             snapshot.info.time_viewed = previous.info.time_viewed;
             snapshot.info.time_idle = previous.info.time_idle;
         }
         let state = Self::entry(&self.agent_id, &mut sessions, &asid, snapshot.info.status);
-        state.info = snapshot.info.clone();
+        state.info = snapshot.info;
         state.placeholder = false;
         state.history_initialized = true;
-        state.timeline.clear();
-        for item in &snapshot.timeline {
-            state.insert_item(item.clone());
+        state.history_frontier = None;
+        if preserve_history {
+            // The old path rebased retained rows after combining them with the
+            // fresh page. Do the same in place before fresh IDs replace them.
+            if !changes.order.is_empty() {
+                state.timeline.update_each(|item| {
+                    if let Some(next) = changes.order.get(&item.message_id) {
+                        item.message_id.clone_from(next);
+                    }
+                });
+            }
+        } else {
+            state.timeline.clear();
+        }
+        for item in snapshot.timeline {
+            state.insert_item(item);
         }
         state.permissions = snapshot
             .permissions
@@ -1724,12 +1801,11 @@ impl MemoryMirror {
             .iter()
             .map(|p| (p.id.clone(), p.clone()))
             .collect();
-        snapshot.inbox = state.inbox.clone();
-        snapshot.seq = state.next_seq();
+        let seq = state.next_seq();
         state.event_log.clear();
         state.event_log_bytes = 0;
-        state.replay_floor = snapshot.seq;
-        Ok(Some(snapshot))
+        state.replay_floor = seq;
+        Ok(Some(()))
     }
 
     /// The session's info as held, without the rest of its snapshot.
