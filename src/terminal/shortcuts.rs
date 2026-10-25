@@ -291,6 +291,7 @@ const CLAUDE_KEYS: &[Shortcut] = &[
 /// extended keys (its pane stays in `VT10x`).
 const CODEX_KEYS: &[Shortcut] = &[
     key("⇧TAB", "shift+tab", "Cycle approval mode"),
+    key("⇧←", "shift+left", "Shift left"),
     key("⌃J", "ctrl+j", "Newline without sending"),
     key("⌃E", "ctrl+e", "Explain"),
     key("⌃R", "ctrl+r", "Transcript"),
