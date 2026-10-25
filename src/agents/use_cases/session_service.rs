@@ -244,22 +244,26 @@ impl SessionService {
         &self,
         asid: &AgentSessionId,
     ) -> Result<AgentSessionSnapshot, AgentError> {
+        self.refresh_history(asid).await?;
+        self.mirror.get_snapshot(asid).await.ok_or_else(|| {
+            AgentError::NotAvailable("Session changed during refresh; refresh again".into())
+        })
+    }
+
+    async fn refresh_history(&self, asid: &AgentSessionId) -> Result<(), AgentError> {
         let _permit = self
             .refresh_slots
             .try_acquire()
             .map_err(|_| AgentError::NotAvailable("Session refresh capacity exhausted".into()))?;
         tokio::time::timeout(
             std::time::Duration::from_secs(30),
-            self.refresh_snapshot_inner(asid),
+            self.refresh_history_inner(asid),
         )
         .await
         .map_err(|_| AgentError::NotAvailable("Session refresh timed out".into()))?
     }
 
-    async fn refresh_snapshot_inner(
-        &self,
-        asid: &AgentSessionId,
-    ) -> Result<AgentSessionSnapshot, AgentError> {
+    async fn refresh_history_inner(&self, asid: &AgentSessionId) -> Result<(), AgentError> {
         self.agent.prepare_selected_session(&asid.0).await?;
         let memory = self
             .memory
@@ -268,18 +272,7 @@ impl SessionService {
         let (expected, incarnation) = memory.snapshot_read_revision(asid).await;
         let info = self.get_session(&asid.0).await?;
         let prepared = self.agent.prepare_timeline(&asid.0, 100).await?;
-        let fresh = prepared.items;
-        let mut timeline = fresh.clone();
-        if let Some(held) = self.mirror.get_snapshot(asid).await {
-            let fresh_ids: std::collections::HashSet<_> =
-                fresh.iter().map(|item| item.id.clone()).collect();
-            timeline.extend(
-                held.timeline
-                    .into_iter()
-                    .filter(|item| !fresh_ids.contains(&item.id)),
-            );
-            timeline.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
-        }
+        let timeline = prepared.items;
         let permissions = self.agent.get_pending_permissions(&asid.0).await?;
         let forms = self.agent.get_pending_forms(&asid.0).await?;
         let snapshot = AgentSessionSnapshot {
@@ -291,7 +284,7 @@ impl SessionService {
             seq: 0,
         };
         memory
-            .refresh_prepared_snapshot(snapshot, expected, incarnation, prepared.commit)
+            .refresh_prepared_history(snapshot, (expected, incarnation), prepared.commit)
             .await?
             .ok_or_else(|| {
                 AgentError::NotAvailable("Session changed during refresh; refresh again".into())
@@ -312,7 +305,7 @@ impl SessionService {
             .as_ref()
             .ok_or_else(|| AgentError::Unsupported("history windows".into()))?;
         if refresh {
-            self.refresh_snapshot(asid).await?;
+            self.refresh_history(asid).await?;
         } else if !memory.history_initialized(asid).await {
             self.get_snapshot(asid).await?;
         } else {

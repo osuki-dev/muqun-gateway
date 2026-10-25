@@ -3318,7 +3318,7 @@ mod history_tests {
                 let mut snapshot = held.clone();
                 snapshot.timeline = prepared.items;
                 let result = memory
-                    .refresh_prepared_snapshot(snapshot, seq, incarnation, prepared.commit)
+                    .refresh_prepared_history(snapshot, (seq, incarnation), prepared.commit)
                     .await;
                 if case == "incarnation" {
                     assert!(

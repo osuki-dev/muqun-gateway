@@ -81,18 +81,22 @@ impl MemoryMirror {
     ) -> Result<HistoryWindow, AgentError> {
         let sessions = self.sessions.read().await;
         let state = sessions.get(asid).ok_or(AgentError::HistoryCursorLost)?;
-        let mut rows: Vec<_> = state.timeline.values().collect();
-        rows.sort_unstable_by_key(|row| row.sort_key());
-        let start = match cursor {
+        let rows: Vec<_> = match cursor {
             Some(cursor) => {
                 let anchor = state.anchor(cursor)?;
-                rows.iter()
-                    .position(|row| row.id == anchor.id)
-                    .ok_or(AgentError::HistoryCursorLost)?
+                // A retained frontier permits paging, but cannot reconstruct a
+                // resync whose rows have already left the cache.
+                if !state.timeline.contains_key(&anchor.id) {
+                    return Err(AgentError::HistoryCursorLost);
+                }
+                state.timeline.from(anchor).collect()
             }
-            None => rows.len().saturating_sub(WINDOW_ROWS),
+            None => {
+                let mut rows: Vec<_> = state.timeline.ordered().rev().take(WINDOW_ROWS).collect();
+                rows.reverse();
+                rows
+            }
         };
-        let rows = &rows[start..];
         Ok(HistoryWindow {
             history_cursor: rows.first().map(|row| state.cursor(row)),
             snapshot: AgentSessionSnapshot {
@@ -171,15 +175,18 @@ impl MemoryMirror {
         let boundary = state.timeline.get(&boundary.id).unwrap_or(boundary);
         let mut rows: Vec<_> = state
             .timeline
-            .values()
-            .chain(
-                fetched
-                    .iter()
-                    .filter(|row| !state.timeline.contains_key(&row.id)),
-            )
-            .filter(|row| row.sort_key() < boundary.sort_key())
+            .before(boundary)
+            .rev()
+            .take(PAGE_ROWS)
             .collect();
-        rows.sort_unstable_by_key(|row| row.sort_key());
+        rows.reverse();
+        if !fetched.is_empty() {
+            rows.extend(fetched.iter().filter(|row| {
+                !state.timeline.contains_key(&row.id) && row.sort_key() < boundary.sort_key()
+            }));
+            // Only the bounded page and any uncached provider rows participate.
+            rows.sort_unstable_by_key(|row| row.sort_key());
+        }
         let rows = &rows[rows.len().saturating_sub(PAGE_ROWS)..];
         Ok(HistoryPage {
             history_cursor: rows
@@ -410,5 +417,108 @@ mod tests {
         assert_eq!(page.items.len(), 1);
         assert_eq!(page.history_cursor.as_deref(), Some(cursor.as_str()));
         assert!(!page.exhausted);
+    }
+    #[tokio::test]
+    async fn refresh_merges_newest_rows_and_rebases_retained_history_without_losing_reader_boundaries(
+    ) {
+        use crate::agents::ports::agent::HistoryCommit;
+        let (mirror, id) = fixture(1000).await;
+        let initial = mirror.history_window(&id, None).await.unwrap();
+        let revision = mirror.snapshot_read_revision(&id).await;
+        let mut fresh = row(950);
+        fresh.part = AgentPart::Text {
+            text: "refreshed".into(),
+        };
+        fresh.message_id = "canonical-newest".into();
+        let snapshot = AgentSessionSnapshot {
+            info: initial.snapshot.info.clone(),
+            timeline: vec![fresh.clone()],
+            permissions: vec![],
+            forms: vec![],
+            inbox: vec![],
+            seq: 0,
+        };
+        let commit = HistoryCommit {
+            order: [
+                (row(10).message_id, "message-000011-before".into()),
+                (fresh.message_id.clone(), "must-not-rebase-fresh".into()),
+            ]
+            .into(),
+            fresh_ids: [fresh.id.clone()].into(),
+            ..Default::default()
+        };
+        mirror
+            .refresh_prepared_history(snapshot.clone(), revision, Some(Box::new(|| Ok(commit))))
+            .await
+            .unwrap()
+            .unwrap();
+        let all = mirror.get_snapshot(&id).await.unwrap();
+        assert_eq!(all.timeline.len(), 1000);
+        assert_eq!(
+            all.timeline
+                .iter()
+                .find(|item| item.id == row(10).id)
+                .unwrap()
+                .message_id,
+            "message-000011-before"
+        );
+        assert_eq!(
+            all.timeline
+                .iter()
+                .find(|item| item.id == fresh.id)
+                .unwrap(),
+            &fresh
+        );
+        let resynced = mirror
+            .history_window(&id, initial.history_cursor.as_deref())
+            .await
+            .unwrap();
+        assert!(resynced
+            .snapshot
+            .timeline
+            .iter()
+            .any(|item| item.id == row(900).id));
+        assert!(all
+            .timeline
+            .windows(2)
+            .all(|pair| pair[0].sort_key() < pair[1].sort_key()));
+        assert!(mirror
+            .get_events_after(&id, initial.snapshot.seq)
+            .await
+            .is_none());
+        assert!(mirror
+            .get_events_after(&id, all.seq)
+            .await
+            .unwrap()
+            .is_empty());
+
+        // A stale read and a refused provider commit must not change either
+        // retained history or the ordered index.
+        let revision = mirror.snapshot_read_revision(&id).await;
+        mirror
+            .update_status(&id, crate::agents::domain::AgentSessionStatus::Busy, None)
+            .await;
+        assert!(mirror
+            .refresh_prepared_history(
+                snapshot.clone(),
+                revision,
+                Some(Box::new(|| panic!("stale read committed")))
+            )
+            .await
+            .unwrap()
+            .is_none());
+        let revision = mirror.snapshot_read_revision(&id).await;
+        assert!(mirror
+            .refresh_prepared_history(
+                snapshot,
+                revision,
+                Some(Box::new(|| Err(AgentError::HistoryCursorLost)))
+            )
+            .await
+            .is_err());
+        assert_eq!(
+            mirror.get_snapshot(&id).await.unwrap().timeline,
+            all.timeline
+        );
     }
 }
