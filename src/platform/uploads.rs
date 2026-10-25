@@ -120,7 +120,7 @@ pub(crate) async fn upload_file(
         ));
     }
     let Some(kind) = sniff_upload_kind(&bytes)
-        .or_else(|| sniff_video_upload_kind(&bytes, &client_name))
+        .or_else(|| sniff_video_upload_kind(&bytes))
         .or_else(|| sniff_office_upload_kind(&bytes))
         .or_else(|| sniff_document_upload_kind(&bytes, &client_name))
     else {
@@ -318,7 +318,7 @@ pub(crate) fn sniff_stored_upload(path: &FsPath, stored_name: &str) -> Option<Up
     if let Some(kind) = sniff_upload_kind(&head) {
         return Some(kind);
     }
-    if let Some(kind) = sniff_video_upload_kind(&head, stored_name) {
+    if let Some(kind) = sniff_video_upload_kind(&head) {
         return Some(kind);
     }
     // A zip's central directory sits at the tail, so the office probe is the
@@ -409,32 +409,12 @@ pub(crate) fn sniff_upload_kind(bytes: &[u8]) -> Option<UploadKind> {
     None
 }
 
-/// An MP4 or QuickTime movie: the same `ftyp` brands and name extensions the
-/// asset preview accepts (`assets::sniff_asset_type`), so an upload the
-/// gateway stores is one it can also play back.
-pub(crate) fn sniff_video_upload_kind(bytes: &[u8], client_name: &str) -> Option<UploadKind> {
-    if bytes.len() < 12 || &bytes[4..8] != b"ftyp" {
-        return None;
-    }
-    let brand = &bytes[8..12];
-    if !matches!(
-        brand,
-        b"isom" | b"iso2" | b"mp41" | b"mp42" | b"avc1" | b"qt  " | b"M4V "
-    ) {
-        return None;
-    }
-    let extension = client_name.rsplit_once('.')?.1.to_ascii_lowercase();
-    match (brand, extension.as_str()) {
-        (b"qt  ", "mov") => Some(UploadKind {
-            extension: "mov",
-            mime: "video/quicktime",
-        }),
-        (_, "mp4" | "m4v" | "mov") => Some(UploadKind {
-            extension: "mp4",
-            mime: "video/mp4",
-        }),
-        _ => None,
-    }
+/// Upload, stored read and session assets use the same content recognizer.
+pub(crate) fn sniff_video_upload_kind(bytes: &[u8]) -> Option<UploadKind> {
+    crate::platform::video::sniff_video_container(bytes).map(|video| UploadKind {
+        extension: video.extension,
+        mime: video.mime,
+    })
 }
 
 /// Recognise modern Office/OpenDocument containers without extracting them.
@@ -1033,25 +1013,15 @@ mod tests {
             .route("/api/uploads/{file_name}", get(upload_content))
             .with_state(state);
 
-        for (name, bytes, mime) in [
-            (
-                "recording.mp4",
-                b"\x00\x00\x00\x18ftypisom\x00\x00\x00\x00isommp42\x00\x00\x00\x08mdat".as_slice(),
-                "video/mp4",
-            ),
-            (
-                "recording.mov",
-                b"\x00\x00\x00\x14ftypqt  \x00\x00\x00\x00qt  \x00\x00\x00\x08mdat".as_slice(),
-                "video/quicktime",
-            ),
-        ] {
+        for (name, bytes, expected) in crate::platform::video::test_video_containers() {
+            let mime = expected.mime;
             let boundary = "muqun-video-boundary";
             let mut body = format!(
                 "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; \
-                 filename=\"{name}\"\r\n\r\n"
+                 filename=\"{name}.txt\"\r\n\r\n"
             )
             .into_bytes();
-            body.extend_from_slice(bytes);
+            body.extend_from_slice(&bytes);
             body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
             let response = app
                 .clone()
@@ -1077,6 +1047,10 @@ mod tests {
             )
             .unwrap();
             assert_eq!(stored["mime"], mime);
+            assert!(stored["path"]
+                .as_str()
+                .unwrap()
+                .ends_with(&format!(".{}", expected.extension)));
             let url = stored["url"].as_str().unwrap();
 
             for (authorization, expected) in [
@@ -1117,7 +1091,7 @@ mod tests {
                     .await
                     .unwrap()
                     .as_ref(),
-                bytes
+                bytes.as_slice()
             );
         }
     }

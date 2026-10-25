@@ -22,6 +22,7 @@ pub mod store;
 pub(crate) mod update;
 pub mod uploads;
 pub mod vcs_routes;
+pub(crate) mod video;
 
 #[allow(unused_imports)]
 pub use openapi::{openapi_spec, DOCS_HTML};

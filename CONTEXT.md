@@ -217,6 +217,10 @@ The retired `herdr.gateway` identifier remains only for migration compatibility.
     automatic update polling, downgrades or history database.
   - `metadata.rs`: capabilities, health metadata, and session liveness ordering.
   - `uploads.rs`, `assets.rs`: phone uploads and the workspace asset index.
+    `video.rs` shares bounded content-based container recognition across upload
+    acceptance, authenticated readback, and workspace/session metadata. Container
+    recognition does not promise device codec support; filenames and client MIME
+    never authorize a video upload.
   - `git.rs`: read-only, bounded `git` for one pane's checkout -- the
     branch line, the changed-file list with totals, and one file's unified patch
     a page at a time -- behind the `pane_context` and `git_diff` capabilities.

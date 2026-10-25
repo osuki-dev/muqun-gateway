@@ -999,7 +999,7 @@ mod tests {
         use axum::extract::{Path as RoutePath, Query, State};
         use axum::http::{HeaderMap, StatusCode};
         let (scratch, root) = workspace();
-        let video = b"\x00\x00\x00\x20ftypisom\x00\x00\x00\x00";
+        let video = b"\x00\x00\x00\x10ftypisom\x00\x00\x00\x00";
         let binary = b"\x00\xff\x00\xff";
         std::fs::write(root.join("out/clip.mp4"), video).unwrap();
         std::fs::write(root.join("out/archive.bin"), binary).unwrap();
