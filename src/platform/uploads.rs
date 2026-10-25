@@ -318,6 +318,9 @@ pub(crate) fn sniff_stored_upload(path: &FsPath, stored_name: &str) -> Option<Up
     if let Some(kind) = sniff_upload_kind(&head) {
         return Some(kind);
     }
+    if let Some(kind) = sniff_video_upload_kind(&head, stored_name) {
+        return Some(kind);
+    }
     // A zip's central directory sits at the tail, so the office probe is the
     // one that needs the whole file -- and only when the head says zip.
     if head.starts_with(b"PK\x03\x04") {
@@ -1019,6 +1022,106 @@ mod tests {
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
+    #[tokio::test]
+    async fn uploaded_videos_read_back_the_same_bytes_only_with_device_authentication() {
+        use tower::ServiceExt as _;
+
+        let token = "video-device-token";
+        let state = test_state("admin", vec![test_device("video-phone", token)]);
+        let app = Router::new()
+            .route(UPLOADS_PATH, post(upload_file))
+            .route("/api/uploads/{file_name}", get(upload_content))
+            .with_state(state);
+
+        for (name, bytes, mime) in [
+            (
+                "recording.mp4",
+                b"\x00\x00\x00\x18ftypisom\x00\x00\x00\x00isommp42\x00\x00\x00\x08mdat".as_slice(),
+                "video/mp4",
+            ),
+            (
+                "recording.mov",
+                b"\x00\x00\x00\x14ftypqt  \x00\x00\x00\x00qt  \x00\x00\x00\x08mdat".as_slice(),
+                "video/quicktime",
+            ),
+        ] {
+            let boundary = "muqun-video-boundary";
+            let mut body = format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; \
+                 filename=\"{name}\"\r\n\r\n"
+            )
+            .into_bytes();
+            body.extend_from_slice(bytes);
+            body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(UPLOADS_PATH)
+                        .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
+                        .header(
+                            axum::http::header::CONTENT_TYPE,
+                            format!("multipart/form-data; boundary={boundary}"),
+                        )
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{name}");
+            let stored: Value = serde_json::from_slice(
+                &axum::body::to_bytes(response.into_body(), 1 << 16)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(stored["mime"], mime);
+            let url = stored["url"].as_str().unwrap();
+
+            for (authorization, expected) in [
+                (None, StatusCode::UNAUTHORIZED),
+                (Some("Bearer invalid-device-token"), StatusCode::FORBIDDEN),
+            ] {
+                let mut request = Request::builder().uri(url);
+                if let Some(authorization) = authorization {
+                    request = request.header(axum::http::header::AUTHORIZATION, authorization);
+                }
+                let response = app
+                    .clone()
+                    .oneshot(request.body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), expected, "{name}");
+            }
+
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(url)
+                        .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{name}");
+            assert_eq!(response.headers()["content-type"], mime);
+            assert_eq!(
+                response.headers()["cache-control"],
+                "private, no-store, max-age=0"
+            );
+            assert_eq!(
+                axum::body::to_bytes(response.into_body(), 1 << 16)
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                bytes
+            );
+        }
+    }
+
     /// Retention is a property of the file's age, not of whether the hourly
     /// sweep happened to have run: a file the sweeper would take reads as gone.
     #[test]
@@ -1080,6 +1183,27 @@ mod tests {
             sniff_stored_upload(&markdown, "d.md").unwrap().mime,
             "text/markdown; charset=utf-8"
         );
+
+        for (name, bytes, mime) in [
+            (
+                "recording.mp4",
+                b"\x00\x00\x00\x18ftypisom\x00\x00\x00\x00isommp42".as_slice(),
+                "video/mp4",
+            ),
+            (
+                "recording.mov",
+                b"\x00\x00\x00\x14ftypqt  \x00\x00\x00\x00qt  ".as_slice(),
+                "video/quicktime",
+            ),
+        ] {
+            let video = dir.join(name);
+            std::fs::write(&video, bytes).unwrap();
+            assert_eq!(sniff_stored_upload(&video, name).unwrap().mime, mime);
+        }
+
+        let fake_video = dir.join("fake.mp4");
+        std::fs::write(&fake_video, b"not a video\0").unwrap();
+        assert!(sniff_stored_upload(&fake_video, "fake.mp4").is_none());
 
         // Nothing the gateway would have refused at upload time is served.
         let elf = dir.join("e.png");
