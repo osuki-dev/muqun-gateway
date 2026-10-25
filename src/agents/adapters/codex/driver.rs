@@ -2162,6 +2162,10 @@ impl AgentPort for CodexDriver {
         })
     }
 
+    fn supports_earlier_timeline(&self) -> bool {
+        true
+    }
+
     fn kind(&self) -> &'static str {
         super::KIND
     }

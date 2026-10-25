@@ -1,3 +1,5 @@
+pub(crate) mod history_window;
+
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -136,6 +138,8 @@ struct SessionState {
     placeholder: bool,
     /// Metadata and live deltas do not prove that initial history was read.
     history_initialized: bool,
+    history_epoch: String,
+    history_frontier: Option<TimelineItem>,
     history_gate: Arc<tokio::sync::Mutex<()>>,
     timeline_commit_gate: Arc<tokio::sync::Mutex<()>>,
     history_removal_generation: u64,
@@ -156,6 +160,8 @@ impl SessionState {
             touched_ms: now_ms(),
             placeholder: false,
             history_initialized: false,
+            history_epoch: uuid::Uuid::new_v4().to_string(),
+            history_frontier: None,
             history_gate: Arc::new(tokio::sync::Mutex::new(())),
             timeline_commit_gate: Arc::new(tokio::sync::Mutex::new(())),
             history_removal_generation: 0,
@@ -167,6 +173,11 @@ impl SessionState {
         order: &HashMap<String, String>,
     ) -> (Vec<TimelineItem>, Vec<PermissionRequest>) {
         let mut changed = Vec::new();
+        if let Some(frontier) = &mut self.history_frontier {
+            if let Some(next) = order.get(&frontier.message_id) {
+                frontier.message_id.clone_from(next);
+            }
+        }
         for item in self.timeline.values_mut() {
             if let Some(next) = order.get(&item.message_id) {
                 item.message_id.clone_from(next);
@@ -734,6 +745,31 @@ impl MemoryMirror {
         items: Vec<TimelineItem>,
         commit: Option<crate::agents::ports::agent::TimelineCommit<'_>>,
     ) -> Result<Vec<TimelineItem>, crate::agents::ports::agent::AgentError> {
+        self.accept_earlier_history_inner(asid, gate, before_read, items, commit, true)
+            .await
+    }
+
+    pub(crate) async fn accept_earlier_window_history(
+        &self,
+        asid: &AgentSessionId,
+        gate: &Arc<tokio::sync::Mutex<()>>,
+        before_read: (u64, u64),
+        items: Vec<TimelineItem>,
+        commit: Option<crate::agents::ports::agent::TimelineCommit<'_>>,
+    ) -> Result<Vec<TimelineItem>, crate::agents::ports::agent::AgentError> {
+        self.accept_earlier_history_inner(asid, gate, before_read, items, commit, false)
+            .await
+    }
+
+    async fn accept_earlier_history_inner(
+        &self,
+        asid: &AgentSessionId,
+        gate: &Arc<tokio::sync::Mutex<()>>,
+        before_read: (u64, u64),
+        items: Vec<TimelineItem>,
+        commit: Option<crate::agents::ports::agent::TimelineCommit<'_>>,
+        publish_new: bool,
+    ) -> Result<Vec<TimelineItem>, crate::agents::ports::agent::AgentError> {
         use crate::agents::ports::agent::AgentError;
         let acceptance = self.existing_timeline_commit_gate(asid).await;
         let _acceptance = match &acceptance {
@@ -754,6 +790,9 @@ impl MemoryMirror {
             None => Default::default(),
         };
         let (reordered, permissions) = state.apply_history_order(&changes.order);
+        if let Some(oldest) = items.iter().min_by_key(|row| row.sort_key()) {
+            state.history_frontier = Some(oldest.clone());
+        }
         let mut accepted = Vec::with_capacity(items.len());
         let mut updated = Vec::new();
         for mut item in items {
@@ -768,7 +807,15 @@ impl MemoryMirror {
             if let AgentPart::Tool(call) = &mut item.part {
                 truncate_tool_output(call);
             }
-            updated.push(item);
+            if !publish_new && !state.timeline.contains_key(&item.id) {
+                // Paging is not live output. Other readers must not receive
+                // this row through either events or the delta catch-up path.
+                item.seq = 0;
+                state.insert_item(item.clone());
+                accepted.push(item);
+            } else {
+                updated.push(item);
+            }
         }
         let replaced: std::collections::HashSet<_> =
             updated.iter().map(|item| item.id.clone()).collect();
@@ -1710,6 +1757,7 @@ impl MemoryMirror {
         state.info = snapshot.info.clone();
         state.placeholder = false;
         state.history_initialized = true;
+        state.history_frontier = None;
         state.timeline.clear();
         for item in &snapshot.timeline {
             state.insert_item(item.clone());

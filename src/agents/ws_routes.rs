@@ -156,6 +156,8 @@ pub(crate) struct HistoryRequest {
     pub refresh: bool,
     #[serde(default)]
     pub after: u64,
+    #[serde(default)]
+    pub cursor: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -208,7 +210,12 @@ impl ClientFrame {
                 validate_asid(&request.asid)?;
                 validate_asid(&request.request_id)?;
                 if request.request_id.len() > 128
-                    || !["snapshot", "earlier", "delta"].contains(&request.operation.as_str())
+                    || !["snapshot", "earlier", "delta", "window", "page"]
+                        .contains(&request.operation.as_str())
+                    || request
+                        .cursor
+                        .as_ref()
+                        .is_some_and(|c| c.is_empty() || c.len() > 4096)
                     || request.after > 9_007_199_254_740_991
                 {
                     return Err(FrameError::InvalidFrame);
@@ -935,7 +942,7 @@ impl Connection {
                         let request = request.clone();
                         let state = state.clone();
                         history_workers.spawn(async move {
-                            let result = tokio::time::timeout(Duration::from_secs(30), super::routes::socket_history(&state, &request.asid, &request.operation, request.refresh, request.after)).await;
+                            let result = tokio::time::timeout(Duration::from_secs(30), super::routes::socket_history(&state, &request.asid, &request.operation, request.refresh, request.after, request.cursor.as_deref())).await;
                             let (mut status, mut body) = match result {
                                 Ok(Ok(axum::Json(body))) => (200, body),
                                 Ok(Err((status, axum::Json(body)))) => (status.as_u16(), body),

@@ -298,6 +298,80 @@ impl SessionService {
             })
     }
 
+    /// New readers receive only the newest page. A reader resync names its
+    /// oldest retained row so that corrections preserve its loaded window.
+    pub(crate) async fn history_window(
+        &self,
+        asid: &AgentSessionId,
+        cursor: Option<&str>,
+        refresh: bool,
+    ) -> Result<crate::agents::adapters::memory_mirror::history_window::HistoryWindow, AgentError>
+    {
+        let memory = self
+            .memory
+            .as_ref()
+            .ok_or_else(|| AgentError::Unsupported("history windows".into()))?;
+        if refresh {
+            self.refresh_snapshot(asid).await?;
+        } else if !memory.history_initialized(asid).await {
+            self.get_snapshot(asid).await?;
+        } else {
+            self.agent.prepare_selected_session(&asid.0).await?;
+        }
+        let mut window = memory.history_window(asid, cursor).await?;
+        self.observe_runtime(&mut window.snapshot.info).await;
+        Ok(window)
+    }
+
+    pub(crate) async fn history_page(
+        &self,
+        asid: &AgentSessionId,
+        cursor: &str,
+    ) -> Result<crate::agents::adapters::memory_mirror::history_window::HistoryPage, AgentError>
+    {
+        let memory = self
+            .memory
+            .as_ref()
+            .ok_or_else(|| AgentError::Unsupported("history windows".into()))?;
+        let gate = memory.history_gate(asid).await;
+        let _read = gate.lock().await;
+        let boundary = memory.history_boundary(asid, cursor).await?;
+        let cached = memory
+            .history_page(asid, cursor, &boundary, &[], false)
+            .await?;
+        if !cached.items.is_empty() {
+            return Ok(cached);
+        }
+        // A refresh may rewind the provider cursor into already cached rows.
+        // Bound the work per request without treating overlap as end of history.
+        for _ in 0..4 {
+            let revision = memory
+                .history_read_revision(asid)
+                .await
+                .ok_or(AgentError::HistoryCursorLost)?;
+            let prepared = self.agent.prepare_earlier_timeline(&asid.0, 80).await?;
+            let exhausted = prepared.items.is_empty();
+            let fetched = memory
+                .accept_earlier_window_history(
+                    asid,
+                    &gate,
+                    revision,
+                    prepared.items,
+                    prepared.commit,
+                )
+                .await?;
+            let page = memory
+                .history_page(asid, cursor, &boundary, &fetched, exhausted)
+                .await?;
+            if !page.items.is_empty() || page.exhausted {
+                return Ok(page);
+            }
+        }
+        memory
+            .history_page(asid, cursor, &boundary, &[], false)
+            .await
+    }
+
     /// One older history page, kept in the mirror so a later snapshot still has it.
     pub async fn load_earlier_timeline(
         &self,
