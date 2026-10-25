@@ -215,7 +215,9 @@ its `task_id` and latest recorded state, with a null `exit_code` until its exit
 is confirmed. Use `tasks.wait` on that handle; do not resend the command. The
 peer's single observer keeps checking the same command without executing it
 again. A completed command's recorded result remains available if another
-observer has already closed its successful tab.
+observer has already closed its successful tab. Commands do not need to end
+stdout with a newline: the output tail preserves the last line and the task
+still receives its exit code.
 
 Error codes:
 

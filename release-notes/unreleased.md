@@ -2,6 +2,11 @@
 
 ## Changes and fixes
 
+- **Commands without a final output newline finish normally.** `printf`,
+  `cat` and similar commands no longer remain Working after they exit. The
+  output tail preserves their final line, spaces and exit code without
+  requiring callers to add a newline.
+
 - **Command observation failures keep the task handle.** If `exec.run` has
   already sent a command, a temporary pane observation failure now returns
   its recorded handle instead of an error that could invite a duplicate run.

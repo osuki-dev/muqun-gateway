@@ -2,9 +2,11 @@
 //! the readers that find it again or hide it from clients.
 //!
 //! The typed line is [`command_line`]: the command runs in an inner `sh`, and
-//! an outer `sh` then prints one line `\x1fmuqun-exit:<task id>:<code>\x1f`.
-//! tmux drops C0 controls it does not interpret, so on tmux the `\x1f`
-//! delimiters are gone and the line is the bare `muqun-exit:<task id>:<code>`:
+//! an outer `sh` then prints `\x1fmuqun-exit:<task id>:<code>\x1f` and a
+//! newline. The marker can share the command's last output line when that
+//! output has no final newline. tmux drops C0 controls it does not interpret,
+//! so its `\x1f` delimiters are gone and the marker is bare
+//! `muqun-exit:<task id>:<code>`:
 //! readers accept both.
 
 use std::borrow::Cow;
@@ -76,14 +78,27 @@ fn run_window(text: &str) -> Option<(&str, bool)> {
     }
 }
 
-/// The marker line for `job_id` in `window`: the first after the echo, or the
+/// The marker for `job_id` in `window`: the first after the echo, or the
 /// last in a window the echo has scrolled out of. Its byte offset and code.
 fn marker_in(window: &str, job_id: &str, after_echo: bool) -> Option<(usize, i32)> {
     let mut offset = 0;
     let mut found = None;
     for line in window.split_inclusive('\n') {
-        if let Some((_, code)) = parse_marker(line).filter(|(id, _)| *id == job_id) {
-            found = Some((offset, code));
+        let marker = line.match_indices(TAG).find_map(|(at, _)| {
+            let (id, code) = parse_marker(&line[at..])?;
+            if id != job_id {
+                return None;
+            }
+            let start = line[..at].strip_suffix(MARKER).map_or(at, str::len);
+            // A bare inline suffix still being written may have more status
+            // digits to come. Trust a complete line or its closing delimiter.
+            if start > 0 && !line.ends_with('\n') && !line.trim_end().ends_with(MARKER) {
+                return None;
+            }
+            Some((start, code))
+        });
+        if let Some((start, code)) = marker {
+            found = Some((offset + start, code));
             if after_echo {
                 break;
             }
@@ -100,7 +115,7 @@ pub(crate) fn find_exit_after_command(text: &str, job_id: &str) -> Option<i32> {
 }
 
 /// What the command printed: the window of [`run_window`] up to this run's
-/// marker line (or to the end while it is still running).
+/// marker (or to the end while it is still running).
 pub(crate) fn output_after_command<'a>(text: &'a str, job_id: &str) -> &'a str {
     let Some((window, after_echo)) = run_window(text) else {
         return "";
@@ -202,6 +217,77 @@ mod tests {
         assert_eq!(
             output_after_command("line 1\nline 2", "t_abc"),
             "line 1\nline 2"
+        );
+    }
+
+    #[test]
+    fn real_commands_without_a_final_newline_keep_their_output_and_exit_status() {
+        let file = crate::test_state_dir().join(format!("marker-{}.txt", uuid::Uuid::new_v4()));
+        std::fs::write(&file, "{\"value\":\"cat without newline\"}").unwrap();
+        let cat = format!("cat {}", shell_word(file.to_str().unwrap()));
+        for (command, expected, code) in [
+            ("printf hello", "hello", 0),
+            ("printf 'hello\\n'", "hello\n", 0),
+            ("printf '  padded  '", "  padded  ", 0),
+            ("printf '文🐈'", "文🐈", 0),
+            ("printf ''; exit 3", "", 3),
+            ("printf tail; exit 7", "tail", 7),
+            (cat.as_str(), "{\"value\":\"cat without newline\"}", 0),
+        ] {
+            let line = command_line(command, "t_abc");
+            let output = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&line)
+                .output()
+                .unwrap();
+            let output = String::from_utf8(output.stdout).unwrap();
+            for captured in [output.clone(), output.replace(MARKER, "")] {
+                for text in [captured.clone(), format!("$ {line}\n{captured}$ ")] {
+                    assert_eq!(
+                        find_exit_after_command(&text, "t_abc"),
+                        Some(code),
+                        "{command}: {text:?}"
+                    );
+                    assert_eq!(
+                        output_after_command(&text, "t_abc"),
+                        expected,
+                        "{command}: {text:?}"
+                    );
+                }
+            }
+        }
+        std::fs::remove_file(file).unwrap();
+    }
+
+    #[test]
+    fn inline_markers_require_the_complete_matching_nonce_and_status() {
+        let echo = format!("$ {}\n", command_line("printf hello", "t_abc"));
+        for output in [
+            "hellomuqun-exit:t_other:0\n",
+            "hellomuqun-exit:t_abc_more:0\n",
+            "hellomuqun-exit:t_abc:0 trailing prose\n",
+            "hellomuqun-exit:t_abc:0'\n",
+            "hellomuqun-exit:t_abc:0.0\n",
+            "hellomuqun-exit:t_abc:2147483648\n",
+            "hellomuqun-exit:t_abc:\n",
+            "hellomuqun-exit:t_abc:-\n",
+            "hellomuqun-exit:t_abc:2",
+            "hellomuqun-exit:t_abc:%d\n",
+        ] {
+            let text = format!("{echo}{output}");
+            assert_eq!(find_exit_after_command(&text, "t_abc"), None, "{output:?}");
+            assert_eq!(output_after_command(&text, "t_abc"), output, "{output:?}");
+        }
+        let text =
+            format!("oldmuqun-exit:t_abc:9\n{echo}muqun-exit:t_other:0muqun-exit:t_abc:7\n$ ");
+        assert_eq!(find_exit_after_command(&text, "t_abc"), Some(7));
+        assert_eq!(output_after_command(&text, "t_abc"), "muqun-exit:t_other:0");
+        let complete = format!("{echo}hello{MARKER}muqun-exit:t_abc:0{MARKER}");
+        assert_eq!(find_exit_after_command(&complete, "t_abc"), Some(0));
+        assert_eq!(output_after_command(&complete, "t_abc"), "hello");
+        assert_eq!(
+            strip_exit_markers("prose muqun-exit:t_other:0\n"),
+            "prose muqun-exit:t_other:0\n"
         );
     }
 

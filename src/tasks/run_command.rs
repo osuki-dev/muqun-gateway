@@ -569,6 +569,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_real_command_without_a_final_newline_completes_with_exact_output() {
+        let command = "printf no-newline";
+        let line = command_line(command, ID);
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&line)
+            .output()
+            .unwrap();
+        let captured = String::from_utf8(output.stdout).unwrap();
+        let screen = format!("$ {line}\n{captured}$ ");
+        let (herdr, store, handle) = run(vec![screen], command, Duration::from_secs(2)).await;
+        assert_eq!(handle.task.state, TaskState::Done);
+        assert_eq!(handle.exit_code, Some(0));
+        assert_eq!(handle.stdout_tail, "no-newline");
+        assert_eq!(
+            store
+                .get(&handle.task.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .summary
+                .as_deref(),
+            Some("exit 0\nno-newline")
+        );
+        assert_eq!(herdr.enters().len(), 1);
+        assert_eq!(methods(&herdr, "tab.close").len(), 1);
+    }
+
+    #[tokio::test]
     async fn a_peer_command_finishes_after_create_returned_without_another_wait() {
         let screens = screens("echo hi", "hi\n", 0);
         let herdr = FakeHerdr::start(screens.iter().map(String::as_str).collect(), None);
