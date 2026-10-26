@@ -46,6 +46,7 @@ pub(crate) const API_CAPABILITIES: &[&str] = &[
     "agent_compaction_references_v1",
     "agent_lifecycle_notifications",
     "agent_mcp",
+    crate::mcp::files::CAPABILITY,
     "agent_models",
     "agent_permissions",
     "agent_sessions",

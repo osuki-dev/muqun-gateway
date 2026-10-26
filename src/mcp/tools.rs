@@ -303,6 +303,14 @@ pub(crate) struct DescribeArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub(crate) struct PresentFileArgs {
+    /// Exact regular file inside the computer's home (absolute or ~/). Hidden paths and symlinks are refused. Maximum 25 MiB.
+    pub path: String,
+    /// This computer (self), or a linked computer name or ID.
+    pub machine: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub(crate) struct ExecRunArgs {
     /// Absolute working directory on this computer; with machine, a directory on that computer inside its home ("~" allowed).
     pub cwd: String,
@@ -560,6 +568,52 @@ impl MuqunMcp {
                 ),
             },
         )
+    }
+
+    #[tool(
+        name = "files.present",
+        description = "Return a clickable file card to the Muqun App. Explicitly hand off one image, video, PDF or document on this computer, or a linked computer with machine (including external drives). Creates a private 48-hour snapshot, up to 25 MiB (videos 64 MiB); protected files are refused and reading requires the App's pairing with that computer. No public URL or credentials are returned. Use this after producing a file the user wants to view; do not export secrets."
+    )]
+    async fn present_file(
+        &self,
+        Parameters(args): Parameters<PresentFileArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let config = &self.state.config;
+        if is_self(
+            args.machine.as_deref(),
+            &config.server_id,
+            &config.label,
+            &self.state.peers.selectors(),
+        ) {
+            return Ok(match super::files::present(&self.state, args.path).await {
+                Ok(value) => ok(value),
+                Err(message) => fail("file_unavailable", message),
+            });
+        }
+        let machine = args.machine.as_deref().unwrap_or_default();
+        let call = lineage::Call {
+            tool: "files.present",
+            args: vec![("path", &args.path), ("machine", machine)],
+        };
+        let by = match lineage::requested_for_forwarding(&self.state, &self.session, &call).await {
+            Ok(by) => by,
+            Err(error) => return Ok(task_error(error)),
+        };
+        if let Err(error) = self.state.tasks.allow_forwarding(&by, machine).await {
+            return Ok(task_error(error));
+        }
+        let Some(peer) = self.state.peers.resolve(machine).await else {
+            return Ok(fail("unknown_machine", "Computer is not linked"));
+        };
+        let client = match crate::fleet::peer_client::PeerClient::for_peer(&peer) {
+            Ok(client) => client,
+            Err(_) => return Ok(fail("unavailable", "Computer is unavailable")),
+        };
+        Ok(match client.json(reqwest::Method::POST, "/api/mcp/files/present", Some(&json!({"path": args.path}))).await {
+            Ok(value) if value["server_id"].as_str() == Some(peer.server_id.as_str()) => ok(value),
+            Ok(_) => fail("identity_mismatch", "Computer identity did not match"),
+            Err(_) => fail("unavailable", "File unavailable; check the computer connection, permissions and Gateway version"),
+        })
     }
 
     #[tool(
@@ -1719,6 +1773,7 @@ mod tests {
             names,
             [
                 "exec.run",
+                "files.present",
                 "fleet.describe",
                 "fleet.list",
                 "tasks.cancel",

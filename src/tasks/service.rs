@@ -1170,7 +1170,11 @@ impl TaskService {
 
     /// Refuse peer ancestry and any unresolved lineage before forwarding.
     /// This is a workflow boundary, not a sandbox for same-user shell code.
-    async fn allow_forwarding(&self, by: &Requested, machine: &str) -> Result<(), TaskError> {
+    pub(crate) async fn allow_forwarding(
+        &self,
+        by: &Requested,
+        machine: &str,
+    ) -> Result<(), TaskError> {
         if by.origin == TaskOrigin::Peer || by.by.kind == PrincipalKind::Gateway {
             return Err(TaskError::DelegationLoop(machine.to_owned()));
         }

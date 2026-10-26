@@ -10,6 +10,7 @@
 //! - `hosts.rs`: the config `muqun-gateway mcp enable <host>` writes or prints.
 
 pub(crate) mod auth;
+pub(crate) mod files;
 pub(crate) mod hosts;
 pub(crate) mod inject;
 pub(crate) mod issue;
@@ -351,11 +352,11 @@ pub(crate) fn local_url(listen: &str) -> String {
 }
 
 pub(crate) fn mount(router: Router<AppState>) -> Router<AppState> {
-    token_routes::mount(
+    files::mount(token_routes::mount(
         router
             .route(MCP_PATH, any(serve))
             .route("/mcp/identity", axum::routing::post(identity)),
-    )
+    ))
 }
 
 /// The request reaches rmcp unread, so axum's `DefaultBodyLimit` does not

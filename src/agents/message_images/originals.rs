@@ -174,7 +174,7 @@ pub(super) fn publish_original(
 /// Open an authorized inode, not a path subsequently re-opened after checking.
 /// O_NOFOLLOW applies to the leaf; canonical equality rejects parent/leaf swaps
 /// detectable across the open. Same-user shell access is not an OS sandbox.
-pub(super) fn open_fenced(path: &Path, root: &Path) -> std::io::Result<std::fs::File> {
+pub(crate) fn open_fenced(path: &Path, root: &Path) -> std::io::Result<std::fs::File> {
     let canonical = std::fs::canonicalize(path)?;
     if canonical != path || canonical == root || !canonical.starts_with(root) {
         return Err(std::io::Error::other("image outside scope"));

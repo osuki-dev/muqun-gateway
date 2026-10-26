@@ -33,6 +33,8 @@ use crate::{
 };
 
 mod originals;
+#[cfg(not(unix))]
+pub(crate) use originals::open_fenced;
 mod previews;
 mod versions;
 pub(crate) use originals::content as image_content;
