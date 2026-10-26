@@ -288,6 +288,16 @@ pub struct TimelineItem {
     /// wrote it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_assets: Option<Vec<MessageImageAsset>>,
+    /// Measured throughput of this settled assistant message, never session totals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<MessageGeneration>,
+}
+
+/// Optional normalized metrics supported by `agent_message_generation_v1`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "scope", rename_all = "snake_case")]
+pub enum MessageGeneration {
+    Message { tokens_per_second: f64 },
 }
 
 /// One image a text part embeds, as the gateway can serve it.

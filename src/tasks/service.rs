@@ -3733,6 +3733,7 @@ mod tests {
             ordinal: 0,
             attachments: None,
             image_assets: None,
+            generation: None,
         }
     }
 
@@ -3774,6 +3775,7 @@ mod tests {
     #[test]
     fn a_provider_failure_is_worded_for_a_person() {
         let error = |name: &str, message: &str, status: Option<u16>| AgentErrorInfo {
+            retry_after_ms: None,
             name: name.into(),
             message: message.into(),
             status,
@@ -5680,6 +5682,7 @@ mod tests {
         use AgentSessionStatus::{Failed, Interrupted};
         use TaskState::*;
         let error = crate::agents::domain::AgentErrorInfo {
+            retry_after_ms: None,
             name: "ProviderError".into(),
             message: "rate limited:\n try again later".into(),
             status: Some(429),

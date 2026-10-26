@@ -404,6 +404,7 @@ mod tests {
             ordinal: 0,
             attachments: Some(vec![source]),
             image_assets: None,
+            generation: None,
         }
     }
     async fn register(

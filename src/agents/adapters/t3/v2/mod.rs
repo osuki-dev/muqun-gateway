@@ -2,6 +2,7 @@
 //! the v0.0.46-nightly.20261013.3042 (5d6e4192) it was written against.
 //! These are V2 commands and projections, not V1-shaped wire payloads.
 pub mod commands;
+pub mod inbox;
 pub mod mapper;
 pub mod projection;
 

@@ -41,6 +41,9 @@ pub struct AgentErrorInfo {
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<u16>,
+    /// Provider-supplied retry timing; older Apps may ignore this hint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

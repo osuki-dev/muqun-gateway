@@ -461,7 +461,11 @@ exchange's result is unknown.
 The default is `start_immediately` when no root work is active, otherwise
 `queue_after_active`. It never silently steers, restarts or interrupts work.
 A concurrent rejection is returned, not retried under another mode.
-Explicit App delivery modes are currently unsupported. Interrupt targets the
+Explicit `queue` uses the same queued/start decision; explicit `steer` uses
+`steer_active` with `targetRunId` after checking the active root's matching live
+provider session and `supportsActiveSteering`. Queueing during a run requires
+`supportsQueuedMessages`. A provider advertising only interrupt/restart steering
+is refused. Interrupt targets the
 current authoritative **root run ID**, not a V1 turn or provider subrun.
 Rename uses `thread.metadata.update`; model changes use
 `thread.model-selection.set`. Pinned upstream planning explicitly performs
@@ -563,9 +567,16 @@ neutral parts as other agents.
 ### Honest optional capabilities and remaining acceptance
 
 Attachments remain **ByPath**, with native wire `attachments: []`. No native
-upload, worktree, inbox, mode, staged-revert, compaction or shell-control feature
+upload, worktree, mode, staged-revert, compaction or shell-control feature
 is claimed. `sessionPagination` is false: internal V2 history loading is not the
 App's session-page port. `orchestrationProtocols: [1,2]` is additive metadata.
+
+V2 declares `inbox` and `inboxEdit`: native queued runs supply the shared App
+inbox. Native cancel/edit/promote commands retain run identity; edits omit
+attachments to retain the native list. Promotion requires active native steering
+and the authoritative root run id. No Gateway queue or automatic retry is added.
+These commands are checked against released v0.1.2 (`044f072`); real paired App
+acceptance remains separate from protocol fixture tests.
 
 V2 **revert is disabled** and returns Unsupported. Upstream
 `checkpoint.rollback` takes exact `scopeId`, `checkpointId`, `restoreFiles`,

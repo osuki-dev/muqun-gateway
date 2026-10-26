@@ -2,6 +2,16 @@
 
 ## Changes and fixes
 
+- **DeepSeek skills, commands and queued replies work from the App.** The
+  Gateway reads each session's real catalog and preserves native command
+  results. T3 V2 also supports queued follow-ups; OpenCode retry timing is
+  preserved. Update the App for Home queue controls and session-scoped catalogs.
+
+- **Completed DeepSeek replies can show generation speed.** The optional
+  per-message metric uses native token counts and timestamps; unavailable or
+  incomplete measurements remain hidden. Restart the Gateway after updating.
+  These changes do not alter existing Herdr requirements or require re-pairing.
+
 - **Long agent conversations open at the latest messages.** Apps supporting
   `agent_history_window_v1` request the newest 100 timeline rows and load older
   pages on demand. Each reader keeps its own position across reconnects;

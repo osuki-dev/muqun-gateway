@@ -586,6 +586,7 @@ mod tests {
             ordinal: 0,
             attachments: None,
             image_assets: None,
+            generation: None,
         };
         let mut agent = FakeAgent::new("opencode").with_timeline(vec![reply]);
         agent.sessions = vec![idle, busy, fake_session("ses_quiet", 1)];
@@ -652,6 +653,7 @@ mod tests {
         let mut failed = fake_session("ses_failed", 1);
         failed.status = crate::agents::domain::AgentSessionStatus::Failed;
         failed.error = Some(crate::agents::domain::AgentErrorInfo {
+            retry_after_ms: None,
             name: "ProviderError".into(),
             message: "quota\nexceeded".into(),
             status: None,

@@ -4,7 +4,127 @@ use crate::agents::domain::{AgentPart, PermissionDecision};
 use serde_json::{json, Value};
 
 pub fn fixture() -> Value {
-    serde_json::from_str(include_str!("../fixtures/v2/projection.json")).unwrap()
+    let mut snapshot: Value =
+        serde_json::from_str(include_str!("../fixtures/v2/projection.json")).unwrap();
+    snapshot["projection"]["providerSessions"][0]["capabilities"] = json!({"turns":{
+        "supportsQueuedMessages":true,"supportsActiveSteering":true,"supportsSteeringByInterruptRestart":true
+    }});
+    snapshot
+}
+
+fn queued_snapshot() -> Value {
+    let mut snapshot = fixture();
+    snapshot["projection"]["runs"].as_array_mut().unwrap().push(json!({
+        "id":"queued-run","threadId":"thread","ordinal":3,"status":"queued","queuePosition":1,"userMessageId":"queued-message"
+    }));
+    snapshot["projection"]["messages"].as_array_mut().unwrap().push(json!({
+        "id":"queued-message","threadId":"thread","runId":"queued-run","role":"user","text":"later","attachments":[]
+    }));
+    snapshot
+}
+
+#[test]
+fn steering_requires_the_active_root_provider_and_its_native_capability() {
+    let snapshot = queued_snapshot();
+    let p = &snapshot["projection"];
+    assert_eq!(
+        inbox::dispatch_mode(p, Some("steer")).unwrap(),
+        json!({"type":"steer_active","targetRunId":"root-run"})
+    );
+    assert_eq!(inbox::items(p).unwrap()[0]["id"], "queued-run");
+    assert_eq!(inbox::items(p).unwrap()[0]["payload"]["text"], "later");
+    let mut no_queue = snapshot.clone();
+    no_queue["projection"]["providerSessions"][0]["capabilities"]["turns"]
+        ["supportsQueuedMessages"] = json!(false);
+    assert!(matches!(
+        inbox::dispatch_mode(&no_queue["projection"], Some("queue")),
+        Err(AgentError::Unsupported(_))
+    ));
+    let mut idle = snapshot.clone();
+    idle["projection"]["runs"][0]["status"] = json!("completed");
+    assert_eq!(
+        inbox::dispatch_mode(&idle["projection"], Some("queue")).unwrap()["type"],
+        "start_immediately"
+    );
+    assert_eq!(
+        inbox::dispatch_mode(&idle["projection"], Some("steer")).unwrap()["type"],
+        "start_immediately"
+    );
+    for mutation in ["unsupported", "replaced-session", "non-root", "finished"] {
+        let mut broken = snapshot.clone();
+        match mutation {
+            "unsupported" => {
+                broken["projection"]["providerSessions"][0]["capabilities"]["turns"]
+                    ["supportsActiveSteering"] = json!(false)
+            }
+            "replaced-session" => {
+                broken["projection"]["providerThreads"][0]["providerSessionId"] = json!("other")
+            }
+            "non-root" => broken["projection"]["nodes"][0]["parentNodeId"] = json!("parent"),
+            _ => broken["projection"]["runs"][0]["status"] = json!("completed"),
+        }
+        assert!(
+            inbox::steer_target(&broken["projection"]).is_err(),
+            "{mutation}"
+        );
+    }
+    let mut finished = snapshot.clone();
+    finished["projection"]["runs"][1]["status"] = json!("running");
+    assert!(matches!(
+        inbox::queued_run(&finished["projection"], "queued-run"),
+        Err(AgentError::InboxItemNotFound(_))
+    ));
+}
+
+#[tokio::test]
+async fn native_queue_operations_keep_run_identity_and_never_restart() {
+    let server = fake_server(Some(2)).await;
+    *server.state.snapshot.lock().unwrap() = queued_snapshot();
+    let client = client(&server);
+    let driver = T3Driver::from_client(client.clone());
+    assert_eq!(
+        driver.get_inbox("thread").await.unwrap()[0]["id"],
+        "queued-run"
+    );
+    driver
+        .edit_inbox_item("thread", "queued-run", "changed")
+        .await
+        .unwrap();
+    driver
+        .set_inbox_delivery("thread", "queued-run", "steer")
+        .await
+        .unwrap();
+    driver
+        .cancel_inbox_item("thread", "queued-run")
+        .await
+        .unwrap();
+    server.state.snapshot.lock().unwrap()["projection"]["runs"][0]["status"] = json!("completed");
+    driver
+        .set_inbox_delivery("thread", "queued-run", "steer")
+        .await
+        .unwrap();
+    assert!(matches!(
+        driver.cancel_inbox_item("thread", "gone").await,
+        Err(AgentError::InboxItemNotFound(_))
+    ));
+    let seen = server.state.seen.lock().unwrap().clone();
+    let commands: Vec<_> = seen
+        .iter()
+        .filter(|row| row["rpc"] == "orchestration.dispatchCommand")
+        .map(|row| &row["payload"])
+        .collect();
+    assert_eq!(commands.len(), 4);
+    assert_eq!(commands[0]["text"], "changed");
+    assert!(
+        commands[0].get("attachments").is_none(),
+        "text edits retain upstream attachments"
+    );
+    assert_eq!(commands[1]["queuedRunId"], "queued-run");
+    assert_eq!(commands[1]["targetRunId"], "root-run");
+    assert_eq!(commands[2]["runId"], "queued-run");
+    assert_eq!(commands[3]["type"], "queued-run.start");
+    assert_eq!(commands[3]["runId"], "queued-run");
+    client.shutdown();
 }
 
 #[test]
@@ -1023,7 +1143,7 @@ fn validate_v2_command_shape(command: &Value) {
             assert!(command["attachments"].is_array());
             assert!(matches!(
                 command["dispatchMode"]["type"].as_str(),
-                Some("start_immediately" | "queue_after_active")
+                Some("start_immediately" | "queue_after_active" | "steer_active")
             ));
             assert!(
                 command.get("message").is_none(),
@@ -1031,6 +1151,14 @@ fn validate_v2_command_shape(command: &Value) {
             );
         }
         "run.interrupt" => assert!(command["runId"].is_string()),
+        "queued-run.cancel" | "queued-run.edit" | "queued-run.start" => {
+            assert!(command["runId"].is_string())
+        }
+        "queued-message.promote-to-steer" => {
+            assert!(command["queuedRunId"].is_string());
+            assert!(command["targetRunId"].is_string());
+            assert!(command.get("runId").is_none());
+        }
         "runtime-request.respond" => assert!(command["requestId"].is_string()),
         "thread.model-selection.set" => {
             assert!(command["modelSelection"]["instanceId"].is_string());
@@ -1319,12 +1447,10 @@ async fn approval_form_and_optional_limits_keep_the_existing_app_api() {
         driver.revert_session("thread", "arbitrary-message").await,
         Err(AgentError::Unsupported(_))
     ));
-    assert!(matches!(
-        driver
-            .send_prompt("thread", "text", &[], Some("steer"))
-            .await,
-        Err(AgentError::Unsupported(_))
-    ));
+    driver
+        .send_prompt("thread", "text", &[], Some("steer"))
+        .await
+        .unwrap();
     let rows = driver.get_timeline("thread", 0).await.unwrap();
     assert_eq!(rows.len(), 3);
     let seen = server.state.seen.lock().unwrap().clone();
@@ -1332,7 +1458,7 @@ async fn approval_form_and_optional_limits_keep_the_existing_app_api() {
         seen.iter()
             .filter(|row| row["rpc"] == "orchestration.dispatchCommand")
             .count(),
-        2
+        3
     );
     assert!(seen
         .iter()

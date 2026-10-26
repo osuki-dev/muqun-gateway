@@ -53,6 +53,8 @@ pub(crate) const API_CAPABILITIES: &[&str] = &[
     // Single-provider session pages; support is separately declared per agent.
     "agent_session_pages_v1",
     "agent_session_fork_v1",
+    "agent_session_catalog_v1",
+    "agent_message_generation_v1",
     "agent_session_runtime_v1",
     "codex_shared_daemon_v1",
     "codex_shared_task_start_v1",

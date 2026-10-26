@@ -42,6 +42,42 @@ pub struct T3Driver {
 }
 
 impl T3Driver {
+    async fn mutate_queued(
+        &self,
+        session: &str,
+        item: &str,
+        kind: &str,
+        text: Option<&str>,
+    ) -> Result<(), AgentError> {
+        if !self.client.is_v2() {
+            return Err(AgentError::Unsupported("T3 V1 inbox".into()));
+        }
+        let session = validate_id(session, "session id")?;
+        let item = validate_id(item, "queued run id")?;
+        let snapshot = self.client.thread_snapshot(&session, None).await?;
+        let projection = &snapshot["projection"];
+        v2::inbox::queued_run(projection, &item)?;
+        let mut command =
+            serde_json::json!({"type":kind,"commandId":new_id(),"threadId":session,"runId":item});
+        if kind == "queued-message.promote-to-steer" {
+            if v2::projection::has_active_run(projection) {
+                command.as_object_mut().unwrap().remove("runId");
+                command["queuedRunId"] = serde_json::json!(item);
+                command["targetRunId"] = serde_json::json!(v2::inbox::steer_target(projection)?);
+            } else {
+                command["type"] = serde_json::json!("queued-run.start");
+            }
+        }
+        if let Some(text) = text {
+            command["text"] = serde_json::json!(text);
+        }
+        // The server arbitrates a claim or active-run race. Never retry or
+        // re-create the message when the reply is lost or the command refused.
+        self.client.dispatch(command).await?;
+        self.watcher.watch(&session);
+        Ok(())
+    }
+
     pub fn new(endpoint: T3Endpoint) -> Self {
         Self::from_client(Arc::new(T3Client::new(endpoint)))
     }
@@ -156,6 +192,68 @@ impl T3Driver {
 }
 
 impl AgentPort for T3Driver {
+    fn get_inbox<'a>(&'a self, session: &'a str) -> AgentFuture<'a, Vec<Value>> {
+        Box::pin(async move {
+            if !self.client.is_v2() {
+                return Err(AgentError::Unsupported("T3 V1 inbox".into()));
+            }
+            let id = validate_id(session, "session id")?;
+            let snapshot = self.client.thread_snapshot(&id, None).await?;
+            self.watcher.watch(&id);
+            v2::inbox::items(&snapshot["projection"])
+        })
+    }
+
+    fn cancel_inbox_item<'a>(&'a self, session: &'a str, item: &'a str) -> AgentFuture<'a, ()> {
+        Box::pin(async move {
+            self.mutate_queued(session, item, "queued-run.cancel", None)
+                .await
+        })
+    }
+
+    fn edit_inbox_item<'a>(
+        &'a self,
+        session: &'a str,
+        item: &'a str,
+        text: &'a str,
+    ) -> AgentFuture<'a, ()> {
+        Box::pin(async move {
+            let text = bounded_prompt(text)?;
+            if text.trim().is_empty() {
+                return Err(AgentError::InvalidRequest(
+                    "queue text must not be empty".into(),
+                ));
+            }
+            self.mutate_queued(session, item, "queued-run.edit", Some(text))
+                .await
+        })
+    }
+
+    fn set_inbox_delivery<'a>(
+        &'a self,
+        session: &'a str,
+        item: &'a str,
+        delivery: &'a str,
+    ) -> AgentFuture<'a, ()> {
+        Box::pin(async move {
+            match delivery {
+                "steer" => {
+                    self.mutate_queued(session, item, "queued-message.promote-to-steer", None)
+                        .await
+                }
+                "queue" => {
+                    if !self.client.is_v2() {
+                        return Err(AgentError::Unsupported("T3 V1 inbox".into()));
+                    }
+                    let snapshot = self.client.thread_snapshot(session, None).await?;
+                    v2::inbox::queued_run(&snapshot["projection"], item)?;
+                    Ok(())
+                }
+                _ => Err(AgentError::InvalidRequest("unknown delivery mode".into())),
+            }
+        })
+    }
+
     fn kind(&self) -> &'static str {
         super::KIND
     }
@@ -372,19 +470,12 @@ impl AgentPort for T3Driver {
                 // Default delivery never interrupts or restarts a root run.
                 // A concurrent upstream rejection remains an error, not an
                 // excuse to submit the prompt again with another mode.
-                if delivery.is_some_and(|value| !value.trim().is_empty()) {
-                    return Err(AgentError::Unsupported("explicit T3 delivery mode".into()));
-                }
+                let mode = v2::inbox::dispatch_mode(&thread, delivery)?;
                 let model = info.model.as_ref().map(mapper::model_selection_from_ref);
-                self.client
-                    .dispatch(v2::commands::message_dispatch(
-                        &id,
-                        &new_id(),
-                        text,
-                        model.as_ref(),
-                        v2::projection::has_active_run(&thread),
-                    ))
-                    .await?;
+                let mut command =
+                    v2::commands::message_dispatch(&id, &new_id(), text, model.as_ref(), false);
+                command["dispatchMode"] = mode;
+                self.client.dispatch(command).await?;
                 self.watcher.watch(&id);
                 return Ok(());
             }

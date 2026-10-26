@@ -24,6 +24,7 @@ use crate::agents::domain::{
     reasoning_item_id, text_item_id, AgentDomainEvent, AgentErrorInfo, AgentPart, AgentSessionId,
     AgentSessionStatus, CompactionStatus, SessionQuery, TimelineItem, ToolCallStatus,
 };
+use crate::agents::ports::agent::AgentPort;
 use crate::agents::ports::mirror::SessionMirrorPort;
 
 /// How long after a new `$events` generation opens before a pending prompt
@@ -57,6 +58,25 @@ pub(crate) struct DeepseekEventContext {
 }
 
 impl DeepseekEventContext {
+    async fn inbox_projection(&self, asid: &AgentSessionId, projections: &Value) {
+        match crate::agents::adapters::deepseek::inbox::items(&asid.0, projections) {
+            Ok(items) if self.mirror.inbox(asid).await != items => {
+                let (seq, items) = self.mirror.set_inbox(asid, items).await;
+                self.emit(AgentDomainEvent::InboxChanged {
+                    asid: asid.clone(),
+                    items,
+                    seq,
+                });
+            }
+            Ok(_) => {}
+            Err(crate::agents::ports::agent::AgentError::Unsupported(_)) => {}
+            Err(_) => self.emit(AgentDomainEvent::Resync {
+                asid: asid.clone(),
+                reason: "deepseek_inbox_projection_invalid".into(),
+            }),
+        }
+    }
+
     pub(crate) fn new(
         driver: Arc<DeepseekDriver>,
         mirror: Arc<MemoryMirror>,
@@ -112,12 +132,8 @@ impl DeepseekEventContext {
             return;
         }
         self.remember_tool_owners(asid, &items).await;
-        let seq = self.mirror.upsert_timeline_items(asid, items.clone()).await;
-        self.emit(AgentDomainEvent::TimelineUpsert {
-            asid: asid.clone(),
-            items,
-            seq,
-        });
+        let event = self.mirror.record_timeline_upsert(asid, items).await;
+        self.emit(event);
     }
 
     async fn upsert_tool(
@@ -449,6 +465,12 @@ async fn handle_emit(event: &str, args: &[Value], ctx: &DeepseekEventContext) {
             )
             .await;
         }
+        "commands/change" | "plugin-manager/changed" => {
+            ctx.emit(AgentDomainEvent::Resync {
+                asid: AgentSessionId(String::new()),
+                reason: "agent_catalog_changed".into(),
+            });
+        }
         "api-session/activity" => {
             if let Some(asid) = session_arg(0) {
                 if !ctx.mirror.is_placeholder(&asid).await {
@@ -485,6 +507,9 @@ async fn handle_follow_frame(asid: &AgentSessionId, frame: &Value, ctx: &Deepsee
 async fn handle_snapshot(asid: &AgentSessionId, frame: &Value, ctx: &DeepseekEventContext) {
     let header = frame.get("header").cloned().unwrap_or(Value::Null);
     let projections = frame.get("projections").cloned().unwrap_or(Value::Null);
+    if projections.pointer("/values/inbox").is_some() {
+        ctx.inbox_projection(asid, &projections).await;
+    }
     if let Some(mut info) = mapper::map_snapshot_session(&asid.0, &header, &projections) {
         let seq = ctx.mirror.update_session(info.clone()).await;
         ctx.mirror.overlay_read_markers(&mut info).await;
@@ -534,7 +559,7 @@ async fn handle_session_event(asid: &AgentSessionId, event: &Value, ctx: &Deepse
             ctx.finish_attempt(asid).await;
             ctx.set_status(asid, status, error).await;
         }
-        "user/message" | "compaction/summary" => {
+        "user/message" | "compaction/summary" | "command/run" => {
             ctx.upsert_items(asid, mapper::map_record(event)).await;
         }
         "assistant/message" | "assistant/attempt" => {
@@ -572,8 +597,12 @@ async fn handle_session_event(asid: &AgentSessionId, event: &Value, ctx: &Deepse
             )
             .await;
         }
-        "tool/result" => {
-            let Some(result) = mapper::map_tool_result(&data) else {
+        "tool/result" | "command/done" => {
+            let Some(result) = (if event_type == "command/done" {
+                mapper::map_command_result(&data)
+            } else {
+                mapper::map_tool_result(&data)
+            }) else {
                 return;
             };
             let Some(owner) = ctx.tool_owner(asid, &result.call_id).await else {
@@ -598,6 +627,12 @@ async fn handle_session_event(asid: &AgentSessionId, event: &Value, ctx: &Deepse
                 },
             )
             .await;
+        }
+        "agent-preset/selected" => {
+            ctx.emit(AgentDomainEvent::Resync {
+                asid: asid.clone(),
+                reason: "agent_catalog_changed".into(),
+            });
         }
         "session/title" => {
             ctx.patch_session(
@@ -658,17 +693,27 @@ async fn handle_session_event(asid: &AgentSessionId, event: &Value, ctx: &Deepse
             });
         }
         // Audit-only pairs and bookkeeping the app has no row for.
-        "approval/asked"
-        | "approval/decided"
-        | "approval/policy"
-        | "step/start"
-        | "step/end"
-        | "request/header"
-        | "request/context"
-        | "system/message"
-        | "developer/message"
-        | "session/end-seed"
-        | "agent/inbox/spliced" => {}
+        "approval/asked" | "approval/decided" | "approval/policy" | "step/start" | "step/end"
+        | "request/header" | "request/context" | "system/message" | "developer/message"
+        | "session/end-seed" => {}
+        "agent/inbox/spliced" => {
+            // Read the committed projection rather than applying an old replay
+            // splice to a newer baseline. This also observes claim/edit/remove.
+            match ctx.driver.get_inbox(&asid.0).await {
+                Ok(items) => {
+                    let (seq, items) = ctx.mirror.set_inbox(asid, items).await;
+                    ctx.emit(AgentDomainEvent::InboxChanged {
+                        asid: asid.clone(),
+                        items,
+                        seq,
+                    });
+                }
+                Err(_) => ctx.emit(AgentDomainEvent::Resync {
+                    asid: asid.clone(),
+                    reason: "deepseek_inbox_refresh_failed".into(),
+                }),
+            }
+        }
         other => {
             tracing::trace!(event = other, "deepseek session event not mapped");
         }
@@ -887,10 +932,101 @@ async fn apply_stream_chunk(asid: &AgentSessionId, chunk: &Value, ctx: &Deepseek
 
 #[cfg(test)]
 mod tests {
-    //! Frame shapes here follow the DeepSeek source: `SessionFollowFrame`
-    //! and `SessionControlFrame` in dsh-api-session-controller's
-    //! `types.d.ts`, the `$events` frames in dsh-api-gateway's
-    //! `openRemoteEvents`/`startRemoteEvent`, and `StreamChunk` in dsh-llm.
+    #[tokio::test]
+    async fn catalog_changes_emit_the_provider_neutral_resync_contract() {
+        let (ctx, mut rx) = ctx();
+        for name in ["commands/change", "plugin-manager/changed"] {
+            handle_emit(name, &[], &ctx).await;
+            assert_eq!(
+                serde_json::to_value(rx.recv().await.unwrap()).unwrap(),
+                json!({"type":"agent.resync","asid":"","reason":"agent_catalog_changed"})
+            );
+        }
+        handle_session_event(
+            &AgentSessionId("session".into()),
+            &json!({"type":"agent-preset/selected","data":{}}),
+            &ctx,
+        )
+        .await;
+        assert_eq!(
+            serde_json::to_value(rx.recv().await.unwrap()).unwrap(),
+            json!({"type":"agent.resync","asid":"session","reason":"agent_catalog_changed"})
+        );
+    }
+
+    #[tokio::test]
+    async fn settled_message_metrics_reach_live_and_snapshot_with_the_same_revision() {
+        let (ctx, mut rx) = ctx();
+        let asid = AgentSessionId("session".into());
+        let mut message = json!({"type":"assistant/message","seq":999,"time":1500,"data":{
+            "message":{"content":[{"type":"text","text":"done"}]},
+            "usage":{"outputTokens":25},
+            "stream":[{"type":"text-chunks","time0":1000,"index":0,"dt":[],"texts":["done"]}]
+        }});
+        let mut plain = message.clone();
+        plain["data"].as_object_mut().unwrap().remove("stream");
+        ctx.upsert_items(&asid, mapper::map_record(&plain)).await;
+        let first = rx.recv().await.unwrap();
+        // The native row identity and text stay unchanged: metadata must still
+        // advance the Gateway row revision and survive both live and replay.
+        message["data"]["usage"]["outputTokens"] = json!(50);
+        ctx.upsert_items(&asid, mapper::map_record(&message)).await;
+        let second = rx.recv().await.unwrap();
+        let AgentDomainEvent::TimelineUpsert { items, seq, .. } = &second else {
+            panic!("timeline upsert")
+        };
+        assert!(second.seq() > first.seq());
+        assert_eq!(items[0].seq, *seq);
+        assert!(items[0].generation.is_some());
+        let snapshot = ctx.mirror.get_snapshot(&asid).await.unwrap();
+        assert_eq!(snapshot.timeline[0], items[0]);
+        assert_eq!(
+            ctx.mirror
+                .get_events_after(&asid, first.seq())
+                .await
+                .unwrap()[0],
+            second
+        );
+    }
+
+    #[tokio::test]
+    async fn command_events_update_existing_tool_cards_without_starting_a_turn() {
+        let (ctx, mut rx) = ctx();
+        follow(
+            &ctx,
+            "session",
+            event(
+                "command/run",
+                3,
+                json!({"commandId":"cmd","name":"review","args":" --all"}),
+            ),
+        )
+        .await;
+        follow(
+            &ctx,
+            "session",
+            event(
+                "command/done",
+                4,
+                json!({"commandId":"cmd","kind":"success","text":"done"}),
+            ),
+        )
+        .await;
+        let snapshot = ctx
+            .mirror
+            .get_snapshot(&AgentSessionId("session".into()))
+            .await
+            .unwrap();
+        assert_eq!(snapshot.timeline.len(), 1);
+        let AgentPart::Tool(call) = &snapshot.timeline[0].part else {
+            panic!("expected command card")
+        };
+        assert_eq!(call.state, ToolCallStatus::Completed);
+        assert_eq!(call.output, Some(json!("done")));
+        assert!(!drain(&mut rx).contains(&"agent.status.changed".to_string()));
+    }
+    // Frame shapes follow the released SessionFollowFrame and SessionControlFrame,
+    // the API gateway's $events frames, and dsh-llm StreamChunk.
     use super::*;
     use crate::agents::adapters::deepseek::DeepseekEndpoint;
     use crate::agents::domain::PermissionDecision;
@@ -917,6 +1053,34 @@ mod tests {
             )),
             rx,
         )
+    }
+
+    #[tokio::test]
+    async fn inbox_baselines_replace_pending_rows_and_failed_refresh_preserves_them() {
+        let (ctx, mut rx) = ctx();
+        let asid = AgentSessionId("session".into());
+        let p = json!({"values":{"inbox":{"next-turn":[{"id":"queued","content":[{"type":"text","text":"later"}]}],"next-step":[]}}});
+        ctx.inbox_projection(&asid, &p).await;
+        assert_eq!(ctx.mirror.inbox(&asid).await.len(), 1);
+        assert_eq!(drain(&mut rx), vec!["agent.inbox.changed"]);
+        handle_session_event(
+            &asid,
+            &json!({"type":"agent/inbox/spliced","data":{}}),
+            &ctx,
+        )
+        .await;
+        assert_eq!(
+            ctx.mirror.inbox(&asid).await.len(),
+            1,
+            "a failed canonical refresh cannot invent delivery"
+        );
+        assert_eq!(drain(&mut rx), vec!["agent.resync"]);
+        ctx.inbox_projection(
+            &asid,
+            &json!({"values":{"inbox":{"next-turn":[],"next-step":[]}}}),
+        )
+        .await;
+        assert!(ctx.mirror.inbox(&asid).await.is_empty());
     }
 
     fn drain(rx: &mut broadcast::Receiver<AgentDomainEvent>) -> Vec<String> {

@@ -1157,6 +1157,7 @@ mod tests {
             ordinal: seq as _,
             attachments: None,
             image_assets: None,
+            generation: None,
         }
     }
 
@@ -1861,6 +1862,7 @@ mod tests {
                 ordinal: 0,
                 attachments: None,
                 image_assets: None,
+                generation: None,
             }],
         );
         state.agent_runtime.attach_for_test(agent.manager()).await;
