@@ -456,6 +456,11 @@ pub trait TerminalBackend: Send + Sync {
     fn list_workspaces(&self) -> BackendFuture<'_, Vec<Workspace>>;
     fn list_tabs(&self) -> BackendFuture<'_, Vec<Tab>>;
     fn list_panes(&self) -> BackendFuture<'_, Vec<Pane>>;
+    /// Topology presence for backend ordering, without optional per-pane
+    /// process, PTY geometry or history-incarnation enrichment.
+    fn list_panes_for_liveness(&self) -> BackendFuture<'_, Vec<Pane>> {
+        self.list_panes()
+    }
     fn list_agents(&self) -> BackendFuture<'_, Vec<Agent>>;
     fn get_pane<'a>(&'a self, id: &'a PaneId) -> BackendFuture<'a, Pane>;
     fn get_agent<'a>(&'a self, target: &'a str) -> BackendFuture<'a, Agent>;

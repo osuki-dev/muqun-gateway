@@ -2,6 +2,12 @@
 
 ## Changes and fixes
 
+- **Opening a terminal avoids inspecting every other pane first.** Health
+  checks now read Herdr's pane topology without enriching each pane's process
+  and terminal details. This reduces cold connection work on computers with
+  many panes. Terminal snapshots retain their full metadata and identity checks;
+  no App update or re-pairing is required. Restart the Gateway after updating.
+
 - **DeepSeek skills, commands and queued replies work from the App.** The
   Gateway reads each session's real catalog and preserves native command
   results. T3 V2 also supports queued follow-ups; OpenCode retry timing is

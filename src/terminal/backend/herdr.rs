@@ -431,14 +431,7 @@ impl TerminalBackend for HerdrBackend {
 
     fn list_panes(&self) -> BackendFuture<'_, Vec<Pane>> {
         Box::pin(async move {
-            let response = self.request("pane.list", json!({})).await?;
-            let panes = response
-                .pointer("/result/panes")
-                .and_then(Value::as_array)
-                .ok_or(BackendError::InvalidResponse("pane list"))?
-                .iter()
-                .map(pane_from_json)
-                .collect::<Result<Vec<Pane>, BackendError>>()?;
+            let panes = self.list_panes_for_liveness().await?;
             // One `pane.process_info` per pane, all in flight at once: the
             // approval watcher lists every 1.5s, and N round trips of 0.1ms
             // each are cheap in parallel and still cheap in series, but there
@@ -447,6 +440,19 @@ impl TerminalBackend for HerdrBackend {
                 futures::future::join_all(panes.into_iter().map(|pane| self.complete_pane(pane)))
                     .await,
             )
+        })
+    }
+
+    fn list_panes_for_liveness(&self) -> BackendFuture<'_, Vec<Pane>> {
+        Box::pin(async move {
+            let response = self.request("pane.list", json!({})).await?;
+            response
+                .pointer("/result/panes")
+                .and_then(Value::as_array)
+                .ok_or(BackendError::InvalidResponse("pane list"))?
+                .iter()
+                .map(pane_from_json)
+                .collect()
         })
     }
 
@@ -1690,6 +1696,25 @@ mod tests {
         socket_path: PathBuf,
         calls: Arc<Mutex<Vec<Value>>>,
         task: tokio::task::JoinHandle<()>,
+    }
+
+    #[tokio::test]
+    async fn liveness_reads_only_topology_while_display_reads_still_enrich_panes() {
+        let fake = FakeHerdr::start();
+        let backend = HerdrBackend::new(fake.socket_path.clone());
+        assert_eq!(backend.list_panes_for_liveness().await.unwrap().len(), 1);
+        {
+            let calls = fake.calls.lock().unwrap();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0]["method"], "pane.list");
+        }
+        assert_eq!(backend.list_panes().await.unwrap().len(), 1);
+        assert!(fake
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|call| call["method"] == "pane.process_info"));
     }
 
     #[tokio::test]

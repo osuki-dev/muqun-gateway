@@ -697,7 +697,7 @@ pub(crate) async fn ordered_sessions(state: &AppState) -> Vec<&SessionConfig> {
             let probe = async {
                 match backend.probe_reachable().await {
                     Ok(false) => Err(BackendError::Unavailable),
-                    _ => backend.list_panes().await,
+                    _ => backend.list_panes_for_liveness().await,
                 }
             };
             session_liveness(Box::pin(probe), SESSION_PROBE_TIMEOUT).await
