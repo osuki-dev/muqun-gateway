@@ -177,7 +177,7 @@ The retired `herdr.gateway` identifier remains only for migration compatibility.
   revoke its gateway devices: an older build reads them as app devices.
 - `src/mcp/`: the gateway as an MCP server for local agents: `/mcp` on the
   existing listener (loopback, proxy-header refusal, assistant token in
-  `auth.rs`), the eight tools in `tools.rs` (which file what they start under
+  `auth.rs`), the tools in `tools.rs` (which file what they start under
   the calling task through `lineage.rs`), assistant tokens (`tokens.rs`,
   `tokens_sqlite.rs`, pane-bound issue and sweep in `issue.rs`,
   `/api/mcp/tokens*` in `token_routes.rs`), per-host client config in

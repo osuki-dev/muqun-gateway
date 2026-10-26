@@ -915,6 +915,7 @@ mod tests {
             ordinal: 0,
             attachments: Some(sources),
             image_assets: None,
+            generation: None,
         }
     }
     async fn read(state: &AppState, id: &str, variant: &str, headers: HeaderMap) -> Response {

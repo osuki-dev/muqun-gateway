@@ -35,7 +35,9 @@ libc = "0.2.191"
 # a broad codec attack surface -- for a QR renderer this gateway never calls.
 # The separate image dependency above intentionally enables only three codecs.
 qrcode = { version = "0.14.1", default-features = false }
-reqwest = { version = "0.12.28", default-features = false, features = ["json", "rustls-tls", "stream"] }
+# Reqwest 0.13 gates query/form serialization separately; OpenCode uses queries
+# and T3 pairing exchanges use form bodies. Rustls validates platform trust roots.
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "query", "form", "rustls", "stream"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.154", features = ["raw_value"] }
 sha2 = "0.11.1"
@@ -46,18 +48,18 @@ tokio-stream = "0.1.18"
 # there indistinguishable from an idle stream.
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", default-features = false, features = ["ansi", "env-filter", "fmt", "smallvec", "std", "tracing-log"] }
-uuid = { version = "1.28.0", features = ["v4"] }
+uuid = { version = "1.29.0", features = ["v4"] }
 argon2 = { version = "0.6.0", default-features = false, features = ["alloc"] }
 # `rustls-tls-webpki-roots`: a linked peer at an `https://` URL is followed
-# over `wss://` (`fleet::peer_client::TaskFeed`), with the same rustls and
-# webpki roots reqwest already uses.
+# over `wss://` (`fleet::peer_client::TaskFeed`), with rustls and bundled
+# webpki roots. Reqwest separately uses the platform certificate verifier.
 tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
 # `CancellationToken` for the T3 Code RPC connection actor: one token stops
 # the socket task, its ping timer and every subscription together. Already in
 # the tree through reqwest, so this adds no compiled crate.
 tokio-util = "0.7.20"
-rmcp = { version = "3", features = ["server", "transport-streamable-http-server", "macros"] }
-rusqlite = { version = "0.40", features = ["bundled-sqlcipher-vendored-openssl"] }
+rmcp = { version = "3.7.0", features = ["server", "transport-streamable-http-server", "macros"] }
+rusqlite = { version = "0.41.0", features = ["bundled-sqlcipher-vendored-openssl"] }
 hex = "0.4"
 # `ServiceExt::oneshot`: `/mcp` drives a per-request rmcp service with it, and
 # tests drive a Router. Already in the tree through axum.

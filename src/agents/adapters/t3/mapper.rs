@@ -113,6 +113,7 @@ pub fn map_status(thread: &Value) -> (AgentSessionStatus, Option<String>, Option
     };
     let error = if matches!(turn_state, Some("error")) || matches!(session_status, Some("error")) {
         Some(AgentErrorInfo {
+            retry_after_ms: None,
             name: "ProviderError".into(),
             message: last_error
                 .unwrap_or("the provider reported an error")
@@ -298,6 +299,7 @@ pub fn map_message(message: &Value, seq: u64) -> Option<TimelineItem> {
             Some(attachments)
         },
         image_assets: None,
+        generation: None,
     })
 }
 
@@ -615,6 +617,7 @@ pub fn map_tool(activity: &Value) -> Option<ToolCall> {
     let created = ms(activity, "createdAt");
     let error = match state {
         ToolCallStatus::Failed => Some(AgentErrorInfo {
+            retry_after_ms: None,
             name: if kind == "tool.denied" {
                 "ToolDenied"
             } else {
@@ -787,6 +790,7 @@ pub fn map_activity(
         ordinal: seq,
         attachments: None,
         image_assets: None,
+        generation: None,
     })
 }
 

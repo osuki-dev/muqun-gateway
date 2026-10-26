@@ -64,6 +64,7 @@ pub fn session(
             })
             .unwrap_or("the provider reported an error");
         info.error = Some(crate::agents::domain::AgentErrorInfo {
+            retry_after_ms: None,
             name: "ProviderError".into(),
             message: crate::agents::adapters::t3::endpoint::short(message),
             status: None,
@@ -491,6 +492,7 @@ pub fn timeline(thread_id: &str, projection: &Value, seq: u64) -> Vec<TimelineIt
             updated_ms: string(item, "updatedAt").and_then(ms_from_iso).unwrap_or(0),
             attachments: None,
             image_assets: None,
+            generation: None,
         });
     }
     result

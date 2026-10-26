@@ -246,15 +246,52 @@ async fn resolve_agent_file(
         return Err(not_found());
     }
     let root = session_root(&state, &asid).await.ok_or_else(not_found)?;
-    let owned_root = root.clone();
-    let resolved = tokio::task::spawn_blocking(move || {
+    let asset = explicit_asset(&state, query.uri, root, expected).await?;
+    Ok(axum::Json(content_envelope(
+        serde_json::json!({ "asset": asset }),
+    )))
+}
+
+/// One explicit-open policy and asset descriptor for local and remote files.
+/// Reads still go through the existing authenticated asset endpoints.
+pub(crate) async fn explicit_asset(
+    state: &AppState,
+    uri: String,
+    root: PathBuf,
+    expected: Option<AssetKind>,
+) -> ApiResult<serde_json::Value> {
+    if uri.len() > 8192 || uri.chars().any(char::is_control) {
+        return Err(api_error(
+            axum::http::StatusCode::BAD_REQUEST,
+            "invalid_path",
+            "Invalid file path",
+        ));
+    }
+    let not_found = || {
+        api_error(
+            axum::http::StatusCode::NOT_FOUND,
+            "file_unavailable",
+            "File is unavailable or outside the allowed file locations",
+        )
+    };
+    static READS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+    let permit = READS.try_acquire().map_err(|_| {
+        api_error(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "file_busy",
+            "File access is busy; try again",
+        )
+    })?;
+    let owned_root = root;
+    let read = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
         let (path, fence) = if expected.is_none() {
             // A deliberate file open has the same account-home/cache policy
             // as the terminal's exact-path lookup. Passive image discovery
             // continues to use only the session/generated-image fences.
-            account_file(&query.uri, &owned_root)?
+            account_file(&uri, &owned_root)?
         } else {
-            hosted_file(&query.uri, &owned_root)?
+            hosted_file(&uri, &owned_root)?
         };
         let name = path.file_name()?.to_string_lossy().into_owned();
         let kind = sniff_asset_type(&read_asset_head(&path), &name);
@@ -263,9 +300,17 @@ async fn resolve_agent_file(
         }
         let metadata = std::fs::metadata(&path).ok()?;
         Some((path, fence, name, kind, metadata.len()))
-    })
-    .await
-    .unwrap_or_default();
+    });
+    let resolved = tokio::time::timeout(std::time::Duration::from_secs(10), read)
+        .await
+        .map_err(|_| {
+            api_error(
+                axum::http::StatusCode::GATEWAY_TIMEOUT,
+                "file_timeout",
+                "File access timed out; check this computer's file permissions or drive",
+            )
+        })?
+        .unwrap_or_default();
     let (path, fence, name, kind, size) = resolved.ok_or_else(not_found)?;
     let id = asset_id(&path);
     state.message_images.remember_served(
@@ -294,9 +339,7 @@ async fn resolve_agent_file(
     }
     asset["download_url"] = format!("/api/agent-images/{}/download", entry.id).into();
     asset["version_url"] = format!("/api/agent-images/{}/version", entry.id).into();
-    Ok(axum::Json(content_envelope(
-        serde_json::json!({ "asset": asset }),
-    )))
+    Ok(asset)
 }
 
 /// Attach `image_assets` to items of one session. `directory` is used when the
@@ -373,6 +416,7 @@ pub(crate) async fn attach_to_inbox(state: &AppState, asid: &str, items: &mut [s
                 ordinal: 0,
                 attachments: Some(sources),
                 image_assets: None,
+                generation: None,
             },
         ));
     }
@@ -1226,6 +1270,7 @@ mod tests {
             ordinal: 0,
             attachments: None,
             image_assets: None,
+            generation: None,
         }
     }
 

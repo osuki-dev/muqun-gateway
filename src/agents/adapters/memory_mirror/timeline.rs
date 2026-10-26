@@ -128,6 +128,7 @@ mod tests {
             updated_ms: 0,
             attachments: None,
             image_assets: None,
+            generation: None,
         }
     }
 

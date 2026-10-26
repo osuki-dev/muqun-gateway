@@ -2,11 +2,10 @@ use serde_json::{json, Value};
 
 use crate::agents::domain::{
     reasoning_item_id, text_item_id, tool_item_id, AgentCatalog, AgentErrorInfo, AgentPart,
-    AgentSessionId, AgentSessionInfo, AgentSessionStatus, CatalogDefaults, CommandInfo,
-    CompactionStatus, FormField, FormOption, FormRequest, ModeInfo, ModelInfo, ModelRef,
-    ModelVariantInfo, PermissionDecision, PermissionOption, PermissionRequest, ProviderInfo,
-    ProviderModelInfo, SkillInfo, TimelineItem, TimelineRole, TokensUsage, ToolCall,
-    ToolCallStatus, ToolTime,
+    AgentSessionId, AgentSessionInfo, AgentSessionStatus, CatalogDefaults, CompactionStatus,
+    FormField, FormOption, FormRequest, ModeInfo, ModelInfo, ModelRef, ModelVariantInfo,
+    PermissionDecision, PermissionOption, PermissionRequest, ProviderInfo, ProviderModelInfo,
+    TimelineItem, TimelineRole, TokensUsage, ToolCall, ToolCallStatus, ToolTime,
 };
 
 /// The title of a DeepSeek session it has not named.
@@ -28,8 +27,9 @@ pub fn map_session(raw: &Value) -> Option<AgentSessionInfo> {
 
     let projections_values = raw.get("projections").and_then(|p| p.get("values"));
 
-    let cwd = raw
-        .get("cwd")
+    let cwd = projections_values
+        .and_then(|values| values.get("workingDirectory"))
+        .or_else(|| raw.get("cwd"))
         .or_else(|| projections_values.and_then(|v| v.get("cwd")))
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
@@ -272,20 +272,9 @@ pub fn map_catalog(raw: &Value, presets: Option<&Value>) -> AgentCatalog {
         models,
         modes,
         mcp: vec![],
-        skills: vec![SkillInfo {
-            id: "deepseek".to_string(),
-            name: "deepseek".to_string(),
-            description: "DeepSeek tools".to_string(),
-            slash: true,
-            autoinvoke: true,
-        }],
+        skills: vec![],
         providers,
-        commands: vec![CommandInfo {
-            name: "help".to_string(),
-            description: Some("Show available help".to_string()),
-            mode: None,
-            template: None,
-        }],
+        commands: vec![],
         defaults: CatalogDefaults {
             model: default_model_ref,
             mode: default_mode,
@@ -378,6 +367,7 @@ pub fn map_tool_result(data: &Value) -> Option<ToolResult> {
         Some(Value::String(text))
     };
     let error = data.get("error").map(|e| AgentErrorInfo {
+        retry_after_ms: None,
         name: e
             .get("name")
             .and_then(Value::as_str)
@@ -397,6 +387,28 @@ pub fn map_tool_result(data: &Value) -> Option<ToolResult> {
         output,
         is_error,
         error,
+    })
+}
+
+/// Commands are host handlers, not model prompts. Reuse the tool-card result
+/// join with a separate identity namespace from actual tool calls.
+pub fn map_command_result(data: &Value) -> Option<ToolResult> {
+    let id = data.get("commandId")?.as_str()?;
+    let kind = data.get("kind")?.as_str()?;
+    if !matches!(kind, "success" | "error") {
+        return None;
+    }
+    let text = data.get("text").and_then(Value::as_str);
+    let content = text
+        .map(|text| json!([{"type":"text","text":text}]))
+        .unwrap_or_else(|| json!([]));
+    let is_error = kind == "error";
+    Some(ToolResult {
+        call_id: format!("command:{id}"),
+        content,
+        output: text.map(|text| json!(text)),
+        is_error,
+        error: is_error.then(|| map_error_message(text.unwrap_or("Command failed"))),
     })
 }
 
@@ -524,6 +536,7 @@ fn map_content_blocks(
             ordinal,
             attachments: None,
             image_assets: None,
+            generation: None,
         });
     }
     items
@@ -541,6 +554,26 @@ pub fn map_record(event: &Value) -> Vec<TimelineItem> {
     };
     let message_id = record_message_id(seq);
     match event_type {
+        "command/run" => {
+            let (Some(id), Some(name)) = (
+                data.get("commandId").and_then(Value::as_str),
+                data.get("name").and_then(Value::as_str),
+            ) else {
+                return Vec::new();
+            };
+            let input = data
+                .get("args")
+                .and_then(Value::as_str)
+                .map(|args| json!({"arguments":args}))
+                .unwrap_or_else(|| json!({}));
+            map_content_blocks(
+                &message_id,
+                TimelineRole::System,
+                &json!([{"type":"tool-call","id":format!("command:{id}"),"name":format!("/{name}"),"input":input}]),
+                seq,
+                time,
+            )
+        }
         "user/message" => {
             let role = message_role(data.get("role").and_then(Value::as_str).unwrap_or("user"));
             let blocks = data.get("content").cloned().unwrap_or(Value::Null);
@@ -553,7 +586,16 @@ pub fn map_record(event: &Value) -> Vec<TimelineItem> {
         "assistant/message" => {
             let message = data.get("message").unwrap_or(data);
             let blocks = message.get("content").cloned().unwrap_or(Value::Null);
-            map_content_blocks(&message_id, TimelineRole::Assistant, &blocks, seq, time)
+            let mut items =
+                map_content_blocks(&message_id, TimelineRole::Assistant, &blocks, seq, time);
+            if let Some(item) = items
+                .iter_mut()
+                .rev()
+                .find(|item| matches!(item.part, AgentPart::Text { .. }))
+            {
+                item.generation = super::metrics::message_generation(event);
+            }
+            items
         }
         "compaction/summary" => {
             let summary = content_text(data.get("summary").unwrap_or(&Value::Null));
@@ -580,6 +622,7 @@ pub fn map_record(event: &Value) -> Vec<TimelineItem> {
                 ordinal: 0,
                 attachments: None,
                 image_assets: None,
+                generation: None,
             }]
         }
         _ => Vec::new(),
@@ -614,9 +657,15 @@ pub fn map_timeline_records_carrying(
             continue;
         };
         let event_type = event.get("type").and_then(Value::as_str).unwrap_or("");
-        if event_type == "tool/result" {
+        if matches!(event_type, "tool/result" | "command/done") {
             let time = event.get("time").and_then(Value::as_u64).unwrap_or(0);
-            let Some(result) = event.get("data").and_then(map_tool_result) else {
+            let Some(result) = event.get("data").and_then(|data| {
+                if event_type == "command/done" {
+                    map_command_result(data)
+                } else {
+                    map_tool_result(data)
+                }
+            }) else {
                 continue;
             };
             if !apply_to_call(&mut items, &result, time) {
@@ -759,6 +808,7 @@ pub fn map_turn_end(data: &Value) -> (AgentSessionStatus, Option<AgentErrorInfo>
         Some("error") => {
             let failure = data.pointer("/reason/error");
             let error = AgentErrorInfo {
+                retry_after_ms: None,
                 name: failure
                     .and_then(|f| f.get("code"))
                     .and_then(Value::as_str)
@@ -780,6 +830,7 @@ pub fn map_turn_end(data: &Value) -> (AgentSessionStatus, Option<AgentErrorInfo>
 /// `api-session/error` carries only a message.
 pub fn map_error_message(message: &str) -> AgentErrorInfo {
     AgentErrorInfo {
+        retry_after_ms: None,
         name: "AgentError".to_string(),
         message: message.to_string(),
         status: None,
@@ -1024,6 +1075,28 @@ pub fn question_answers(questions: &Value, answers: &Value) -> Value {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_command_results_join_their_cards_across_history_pages() {
+        let run = json!({"type":"event","event":{"type":"command/run","seq":4,"time":100,"data":{"commandId":"cmd","name":"review","args":" --all","source":{"kind":"user"}}}});
+        let done = json!({"type":"event","event":{"type":"command/done","seq":8,"time":110,"data":{"commandId":"cmd","kind":"error","text":"refused"}}});
+        let together = super::map_timeline_records(&json!({"records":[run.clone(),done.clone()]}));
+        assert_eq!(together.len(), 1);
+        let AgentPart::Tool(call) = &together[0].part else {
+            panic!("expected command card")
+        };
+        assert_eq!(call.id, "command:cmd");
+        assert_eq!(call.name, "/review");
+        assert_eq!(call.state, ToolCallStatus::Failed);
+        assert_eq!(call.output, Some(json!("refused")));
+        let mut carried = Vec::new();
+        assert!(
+            super::map_timeline_records_carrying(&json!({"records":[done]}), &mut carried)
+                .is_empty()
+        );
+        let older = super::map_timeline_records_carrying(&json!({"records":[run]}), &mut carried);
+        assert_eq!(older, together);
+        assert!(carried.is_empty());
+    }
     use super::*;
 
     /// A page cut between a call and its result: mapped on its own, the

@@ -54,6 +54,7 @@ pub fn map_error(val: &Value) -> Option<AgentErrorInfo> {
         return None;
     }
     Some(AgentErrorInfo {
+        retry_after_ms: obj.get("retryAfterMs").and_then(Value::as_u64),
         name,
         message,
         status: obj
@@ -428,6 +429,7 @@ fn map_message_with_budget(
                 ordinal: $ordinal,
                 attachments: $attachments,
                 image_assets: attachment_assets.take(),
+                generation: None,
             })
         };
     }
@@ -1524,6 +1526,27 @@ fn config_model_ref(val: &Value) -> Option<ModelRef> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn retry_timing_is_optional_and_older_error_payloads_still_decode() {
+        use serde_json::json;
+        for value in [json!(2500), json!(-1), json!("2500"), json!(null)] {
+            let error = super::map_error(
+                &json!({"type":"provider.rate_limit","message":"wait","retryAfterMs":value}),
+            )
+            .unwrap();
+            assert_eq!(error.retry_after_ms, value.as_u64());
+            let encoded = serde_json::to_value(error).unwrap();
+            assert_eq!(
+                encoded
+                    .get("retry_after_ms")
+                    .and_then(serde_json::Value::as_u64),
+                value.as_u64()
+            );
+        }
+        let old: crate::agents::domain::AgentErrorInfo =
+            serde_json::from_value(json!({"name":"error","message":"wait","status":429})).unwrap();
+        assert_eq!(old.retry_after_ms, None);
+    }
     use super::*;
     use serde_json::json;
 

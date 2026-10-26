@@ -267,6 +267,14 @@ impl DeepseekClient {
                 // workspace or job is a rejected request, not a lost session.
                 if code == "session/not-found" {
                     Err(AgentError::SessionNotFound(session_id_of(&args_for_id)))
+                } else if code == "session/queue-item-not-found" {
+                    Err(AgentError::InboxItemNotFound(
+                        args_for_id
+                            .pointer("/request/itemId")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .into(),
+                    ))
                 } else {
                     Err(AgentError::RequestFailed(format!(
                         "upstream rejected: {}",
@@ -579,6 +587,29 @@ impl DeepseekClient {
         self.call_remote("session", "projections", args).await
     }
 
+    pub async fn update_queue(
+        &self,
+        session: &str,
+        item: &str,
+        action: Value,
+    ) -> Result<(), AgentError> {
+        let result = self
+            .call_remote(
+                "session",
+                "updateQueue",
+                json!({"request":{
+                    "sessionId":session,"itemId":item,"action":action
+                }}),
+            )
+            .await?;
+        if result.get("accepted").and_then(Value::as_bool) != Some(true) {
+            return Err(AgentError::Protocol(
+                "DeepSeek queue acceptance is unknown".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// List the Agent presets `session/create` accepts: `agentPresets/list`.
     pub async fn agent_presets(&self) -> Result<Value, AgentError> {
         self.call_remote("agentPresets", "list", json!({})).await
@@ -587,6 +618,25 @@ impl DeepseekClient {
     /// Fetch available model catalog: `session/modelCatalog`
     pub async fn model_catalog(&self) -> Result<Value, AgentError> {
         self.call_remote("session", "modelCatalog", json!({})).await
+    }
+
+    pub async fn skills(&self, session: &str) -> Result<Value, AgentError> {
+        self.call_remote("skills", "list", json!({"request":{"sessionId":session}}))
+            .await
+    }
+
+    pub async fn commands(&self, session: &str) -> Result<Value, AgentError> {
+        self.call_remote("commands", "list", json!({"agentId":session}))
+            .await
+    }
+
+    pub async fn execute_command(&self, session: &str, line: &str) -> Result<Value, AgentError> {
+        self.call_remote(
+            "commands",
+            "execute",
+            json!({"agentId":session,"line":line,"submittedAttachments":[]}),
+        )
+        .await
     }
 
     /// Switch active model for session: `session/selectModel`

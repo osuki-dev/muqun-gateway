@@ -10,6 +10,7 @@
 //! - `hosts.rs`: the config `muqun-gateway mcp enable <host>` writes or prints.
 
 pub(crate) mod auth;
+pub(crate) mod files;
 pub(crate) mod hosts;
 pub(crate) mod inject;
 pub(crate) mod issue;
@@ -351,17 +352,20 @@ pub(crate) fn local_url(listen: &str) -> String {
 }
 
 pub(crate) fn mount(router: Router<AppState>) -> Router<AppState> {
-    token_routes::mount(
+    files::mount(token_routes::mount(
         router
             .route(MCP_PATH, any(serve))
             .route("/mcp/identity", axum::routing::post(identity)),
-    )
+    ))
 }
 
 /// The request reaches rmcp unread, so axum's `DefaultBodyLimit` does not
 /// apply; rmcp enforces this limit itself while streaming the body (413).
 fn config() -> StreamableHttpServerConfig {
+    // Native agent clients send no browser Origin. Keep the SDK
+    // loopback Host fence and reject all browser-originated calls.
     StreamableHttpServerConfig::default()
+        .enforce_origin_validation()
         .with_legacy_session_mode(false)
         .with_json_response(true)
         .with_sse_keep_alive(None)
@@ -628,6 +632,31 @@ mod tests {
             &send(&state, remote).await,
             StatusCode::FORBIDDEN,
             "mcp_loopback_only",
+        );
+    }
+
+    #[tokio::test]
+    async fn browser_origins_and_nonlocal_hosts_are_refused_with_valid_tokens() {
+        let state = crate::test_state("admin", Vec::new());
+        let token = issue(&state).await;
+        for origin in ["https://attacker.invalid", "null", "http://localhost:3000"] {
+            let request = post("127.0.0.1:5", Some(&token), &[("origin", origin)]);
+            assert_eq!(
+                app(&state).oneshot(request).await.unwrap().status(),
+                StatusCode::FORBIDDEN
+            );
+        }
+        let mut request = post("127.0.0.1:5", Some(&token), &[]);
+        request
+            .headers_mut()
+            .insert("host", "attacker.invalid".parse().unwrap());
+        assert_eq!(
+            app(&state).oneshot(request).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            send(&state, post("127.0.0.1:5", Some(&token), &[])).await.0,
+            StatusCode::OK
         );
     }
 

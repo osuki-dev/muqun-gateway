@@ -220,6 +220,7 @@ pub(super) async fn call_timeline(
                     ordinal: 0,
                     attachments: None,
                     image_assets: None,
+                    generation: None,
                 });
             }
         }

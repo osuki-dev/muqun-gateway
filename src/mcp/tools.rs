@@ -249,6 +249,15 @@ pub(crate) async fn with_reminder(state: &AppState, mut answer: Value, child: &T
     let Ok(Some(task)) = state.tasks.task(child).await else {
         return answer;
     };
+    let (source, machine) = match &task.binding {
+        TaskBinding::Peer {
+            peer_server_id,
+            peer_name,
+            ..
+        } => (peer_server_id.as_str(), peer_name.as_str()),
+        _ => (state.config.server_id.as_str(), state.config.label.as_str()),
+    };
+    super::files::attach_output(&mut answer, source, machine);
     if !REPORTED_STATES.contains(&task.state) {
         return answer;
     }
@@ -299,6 +308,14 @@ fn directory(cwd: &str) -> Result<PathBuf, CallToolResult> {
 pub(crate) struct DescribeArgs {
     /// The computer to describe: "self" (default), or a linked computer's name (from `peers`) or machineId (from fleet.list).
     #[serde(default)]
+    pub machine: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub(crate) struct PresentFileArgs {
+    /// Exact regular file inside the computer's home (absolute or ~/). Hidden paths and symlinks are refused. Maximum 25 MiB.
+    pub path: String,
+    /// This computer (self), or a linked computer name or ID.
     pub machine: Option<String>,
 }
 
@@ -563,6 +580,55 @@ impl MuqunMcp {
     }
 
     #[tool(
+        name = "files.present",
+        description = "Share a file from this computer or a linked computer with machine. Uses the same file permissions and preview/download handling as opening a local session file. Any file type can be downloaded; supported types can also be previewed. The App must be paired with the source computer. No public URL or credentials are returned."
+    )]
+    async fn present_file(
+        &self,
+        Parameters(args): Parameters<PresentFileArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let config = &self.state.config;
+        if is_self(
+            args.machine.as_deref(),
+            &config.server_id,
+            &config.label,
+            &self.state.peers.selectors(),
+        ) {
+            return Ok(match super::files::present(&self.state, args.path).await {
+                Ok(value) => ok(value),
+                Err(_) => fail(
+                    "file_unavailable",
+                    "File unavailable; check this computer’s file permissions and the path",
+                ),
+            });
+        }
+        let machine = args.machine.as_deref().unwrap_or_default();
+        let call = lineage::Call {
+            tool: "files.present",
+            args: vec![("path", &args.path), ("machine", machine)],
+        };
+        let by = match lineage::requested_for_forwarding(&self.state, &self.session, &call).await {
+            Ok(by) => by,
+            Err(error) => return Ok(task_error(error)),
+        };
+        if let Err(error) = self.state.tasks.allow_forwarding(&by, machine).await {
+            return Ok(task_error(error));
+        }
+        let Some(peer) = self.state.peers.resolve(machine).await else {
+            return Ok(fail("unknown_machine", "Computer is not linked"));
+        };
+        let client = match crate::fleet::peer_client::PeerClient::for_peer(&peer) {
+            Ok(client) => client,
+            Err(_) => return Ok(fail("unavailable", "Computer is unavailable")),
+        };
+        Ok(match client.json(reqwest::Method::POST, "/api/mcp/files/present", Some(&json!({"path": args.path}))).await {
+            Ok(value) if value["server_id"].as_str() == Some(peer.server_id.as_str()) => ok(value),
+            Ok(_) => fail("identity_mismatch", "Computer identity did not match"),
+            Err(_) => fail("unavailable", "File unavailable; check the computer connection, permissions and Gateway version"),
+        })
+    }
+
+    #[tool(
         name = "exec.run",
         description = "Run a shell command in a visible terminal pane on this computer, or (machine) on a linked computer, and return its exit code and output tail. Blocks up to timeout_s (max 45); if still running, returns a task_id for tasks.wait. For a command or a short script on another computer use this first, before your own SSH and not tasks.delegate: it is visible, recorded, interruptible and approved there, and no agent is started."
     )]
@@ -591,7 +657,11 @@ impl MuqunMcp {
         };
         let by = lineage::requested(&self.state, &self.session, &call).await;
         let run = self.state.tasks.run(&self.state, by, request).await;
-        reply(run.map(command_result))
+        reply(run.map(|handle| {
+            let mut result = command_result(handle);
+            super::files::attach_output(&mut result, &config.server_id, &config.label);
+            result
+        }))
     }
 
     /// `exec.run` with `machine`: a command task on that computer, mirrored
@@ -645,13 +715,16 @@ impl MuqunMcp {
             TaskBinding::Peer { peer_name, .. } => peer_name.clone(),
             _ => machine,
         };
-        Ok(ok(json!({
-            "task_id": run.task.task_id,
-            "state": run.task.state,
-            "exit_code": run.exit_code,
-            "stdout_tail": run.stdout_tail,
-            "machine": machine,
-        })))
+        let server_id = match &run.task.binding {
+            TaskBinding::Peer { peer_server_id, .. } => peer_server_id.as_str(),
+            _ => "",
+        };
+        let mut result = json!({
+            "task_id": run.task.task_id, "state":run.task.state,
+            "exit_code":run.exit_code, "stdout_tail":run.stdout_tail, "machine":machine,
+        });
+        super::files::attach_output(&mut result, server_id, &machine);
+        Ok(ok(result))
     }
 
     #[tool(
@@ -1084,6 +1157,7 @@ mod tests {
             ordinal: seq as _,
             attachments: None,
             image_assets: None,
+            generation: None,
         }
     }
 
@@ -1719,6 +1793,7 @@ mod tests {
             names,
             [
                 "exec.run",
+                "files.present",
                 "fleet.describe",
                 "fleet.list",
                 "tasks.cancel",
@@ -1787,6 +1862,7 @@ mod tests {
                 ordinal: 0,
                 attachments: None,
                 image_assets: None,
+                generation: None,
             }],
         );
         state.agent_runtime.attach_for_test(agent.manager()).await;

@@ -892,6 +892,17 @@ No body → `{"interrupted": true}`. Status goes to `interrupted`.
 A slash command from the catalog's `commands`. A leading `/` on `name` is
 stripped; `arguments` fills `$ARGUMENTS`. Returns `{"submitted": true}`.
 
+DeepSeek commands execute the receiving session's native plugin handler through
+`commands/execute`, not a model prompt. Its response additionally contains
+`command_result: {command_id, kind: "success"|"error", text?, source_event_seq?}`.
+An executed handler failure remains HTTP 200 with `kind: "error"`; clients must
+show that failure instead of treating `submitted` as success. Unknown commands
+are refused; an ambiguous response is never resubmitted. `delivery` has no
+queueing meaning for these immediate handlers. Durable `command/run` and
+`command/done` events populate existing tool cards, including results joined
+across history pages. Clients must not append a second success message from
+the direct response.
+
 Codex exposes only `/compact` from its downloaded command catalog, backed by
 `thread/compact/start` on an owned, idle session. It takes no arguments or
 `delivery` override. Missing/invalid catalogs, or catalogs with no supported
@@ -912,6 +923,12 @@ is what the slash menu wants; `false` appends the skill and leaves the session
 idle. Returns `{"status": "ok"}` — OpenCode answers `204`, and what the user
 sees is the timeline row below, not this reply. An unknown id is `404` from
 OpenCode and comes back as `agent_error`.
+
+DeepSeek rechecks the skill in that exact session's native `skills/list`, then
+sends the official `/name` prompt with queue delivery. It neither reads the
+instruction file nor invents a `skills/activate` RPC. `resume: false` is
+unsupported because the native prompt starts work; unknown/deleted skills are
+refused before a prompt is sent.
 
 The activation is a `skill` message. It reaches the timeline live, from
 `session.skill.activated`, as an `AgentPart::Skill` row under
@@ -1359,12 +1376,35 @@ taken from the last assistant message, or `null`.
 |---|---|---|
 | `GET /api/agent-sessions/{asid}/inbox` | — | `{"items": [ …Session.Inbox.Info… ]}` |
 | `DELETE /api/agent-sessions/{asid}/inbox/{inbox_id}` | — | `{"cancelled": true}` |
+| `PATCH /api/agent-sessions/{asid}/inbox/{inbox_id}` | `{"text":"replacement"}` | `{"edited": true, "inbox_id":"…"}` |
 | `POST /api/agent-sessions/{asid}/inbox/{inbox_id}/steer` | — | `{"delivery": "steer", "inbox_id": "…"}` |
 | `POST /api/agent-sessions/{asid}/inbox/{inbox_id}/queue` | — | `{"delivery": "queue", "inbox_id": "…"}` |
 
 Items are OpenCode's verbatim, i.e. camelCase:
 `{id, sessionID, timeCreated, type: "user"|"synthetic"|"compaction"|"move", payload, delivery}`.
 A user item's `payload` is `{text, files?: [{uri, name?, mime?}]}`.
+
+DeepSeek Harness exposes its durable `inbox` projection through this same shape:
+`next-turn` is `queue`, `next-step` is `steer`, and ids are native MessageIds.
+Edit, cancellation and send-now call `session/updateQueue` with `edit`, `remove`
+and `steer`; there is no native steer-to-queue demotion. A claim race is returned
+without recreating the message. Reconnect snapshots and durable inbox splice
+events refresh the canonical projection. Unavailable or malformed reads do not
+clear pending items.
+
+T3 protocol 2 exposes native queued runs as user items, with run ids as inbox ids.
+Edit and cancellation use `queued-run.edit` and `queued-run.cancel`; send-now
+uses `queued-message.promote-to-steer` with the current authoritative root run.
+When idle, send-now starts that same queued run with `queued-run.start`.
+New prompts accept `queue` and `steer`: steering requires the matching live
+provider session's `supportsActiveSteering`, queueing during a run requires
+`supportsQueuedMessages`. Neither operation falls back to restarting a run.
+An already queued item stays queued when `/queue` is requested. T3 V1 has no
+inbox operations. The optional `inboxEdit` capability identifies native text
+editing support; edits require nonblank text and preserve T3 attachments.
+
+OpenCode structured errors can additionally carry optional `retry_after_ms`,
+copied from the provider's `retryAfterMs`; absent or invalid hints stay omitted.
 
 Codex has no inbox of its own; the Gateway holds one per thread, in memory
 (lost on a Gateway restart or a reconnect to Codex), with items in the same
@@ -1619,7 +1659,8 @@ Errors shared by the three routes:
 
 ### `GET /api/agent-catalog`
 
-`?directory=` · `?agent_id=` (one agent's catalog; absent merges all attached) · ETag + `304`. `data`:
+`?directory=` · `?agent_id=` (one agent's catalog; absent merges all attached) ·
+`?asid=` (optional exact native session) · ETag + `304`. `data`:
 
 ```json
 {
@@ -1633,6 +1674,25 @@ Errors shared by the three routes:
   "defaults": { "model?": {"provider_id", "model_id", "variant?"}, "mode?": "build" }
 }
 ```
+
+Capability `agent_session_catalog_v1` identifies the `asid` contract. When supplied,
+only that session's owning provider is queried; a conflicting `agent_id` is
+`400 agent_session_mismatch`. DeepSeek validates a supplied directory against
+the session's current projected working directory, then calls real
+`skills/list` and `commands/list` with the native session id. Without `asid`,
+DeepSeek returns models/presets with empty skills and commands. It never chooses
+one of several same-directory sessions or fills a missing list with placeholders.
+The Gateway does not cache these scoped catalogs. App caches must include `asid`.
+
+DeepSeek's instance capability flags become true only after a native list method
+answers successfully. A preset-specific failure empties that request's list
+without revoking capabilities observed in another session. Empty successful
+lists clear removed entries, including removal of the last skill. Native
+`commands/change`, `plugin-manager/changed` and `agent-preset/selected` cause
+`agent.resync` with reason `agent_catalog_changed`. The public rc.3 stream
+has no `skills/change`; re-entry and explicit refresh must also reread the catalog.
+Skills are cold-readable; the native Agent lookup for commands may resume a cold
+session, so command discovery is not described as cold-safe.
 
 `providers[].name` is the display name (T3's own `displayName`, else a
 built-in one such as "Claude Code" for `claudeAgent`; OpenCode's name, else the
@@ -1957,6 +2017,32 @@ tail it cannot place.
 ### `GET /api/agent-sessions/{asid}/timeline`
 
 `?after=<seq>` → `{"items": [...], "status": "busy", "resync": false, "latest_seq": 42}`.
+
+### Optional completed-message generation throughput
+
+`agent_message_generation_v1` declares the optional `TimelineItem.generation`
+shape `{ "scope": "message", "tokens_per_second": 123.4 }`. It rides the
+existing snapshot, timeline and `agent.timeline.upsert` contracts. The value
+is finite and positive; absence means unavailable. Render it once after the
+associated assistant message, never as an estimate during streaming. Other
+providers currently omit it.
+
+DeepSeek reads only a settled, uninterrupted `assistant/message`: its own
+`usage.outputTokens`, the first nonempty text/reasoning/tool delta in its
+embedded `stream`, and the event's original Session completion timestamp.
+The rate is output tokens divided by the recorded first-token-to-completion
+seconds, matching upstream's per-message decode interval. It includes output
+reasoning/tool tokens when the provider reports them. It is attached only to
+the last text row of that message; a response containing only tools has no
+text footer. Attempt-only records, missing usage/timing, malformed or
+nonmonotonic timestamps and zero-length intervals produce no metric.
+`sessionStats.decodeTokens/decodeMs` are whole-session totals and are never
+used as a fallback. Gateway arrival times and App stream clocks are not used.
+
+Sources (DeepSeek Harness `dsh-v0.2.1-rc.3`, also verified against installed
+`0.2.1-rc.2`): [message decode readings](https://github.com/deepseek-ai/deepseek-harness/blob/dsh-v0.2.1-rc.3/packages/client/ui-chat/src/client/contract/turn-metrics.ts),
+[embedded stream timestamps and first-token predicate](https://github.com/deepseek-ai/deepseek-harness/blob/dsh-v0.2.1-rc.3/packages/llm/llm/src/assistant-stream.ts),
+and [whole-session statistics](https://github.com/deepseek-ai/deepseek-harness/blob/dsh-v0.2.1-rc.3/packages/session/session-stats/README.md).
 
 ### Task plumbing in the transcript
 

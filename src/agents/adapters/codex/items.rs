@@ -41,6 +41,7 @@ fn tool(value: &Value, name: String, input: Value, output: Option<Value>) -> Too
         error: value["error"]["message"]
             .as_str()
             .map(|message| AgentErrorInfo {
+                retry_after_ms: None,
                 name: "CodexToolError".into(),
                 message: message.into(),
                 status: None,

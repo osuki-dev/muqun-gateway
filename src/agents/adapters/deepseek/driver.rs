@@ -1,5 +1,6 @@
 use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use super::client::{
@@ -78,6 +79,8 @@ pub struct DeepseekDriver {
     /// calls consume successive disjoint pages.
     history: tokio::sync::Mutex<()>,
     cursors: std::sync::Mutex<HistoryCursors>,
+    skills_available: AtomicBool,
+    commands_available: AtomicBool,
 }
 
 impl DeepseekDriver {
@@ -86,6 +89,8 @@ impl DeepseekDriver {
             client: Arc::new(DeepseekClient::new(endpoint)),
             history: tokio::sync::Mutex::new(()),
             cursors: std::sync::Mutex::new(HistoryCursors::default()),
+            skills_available: AtomicBool::new(false),
+            commands_available: AtomicBool::new(false),
         }
     }
 
@@ -99,6 +104,8 @@ impl DeepseekDriver {
             client: Arc::new(client),
             history: tokio::sync::Mutex::new(()),
             cursors: std::sync::Mutex::new(HistoryCursors::default()),
+            skills_available: AtomicBool::new(false),
+            commands_available: AtomicBool::new(false),
         }
     }
 
@@ -131,6 +138,170 @@ impl DeepseekDriver {
 }
 
 impl AgentPort for DeepseekDriver {
+    fn skills_listed(&self) -> bool {
+        self.skills_available.load(Ordering::Relaxed)
+    }
+    fn slash_commands_listed(&self) -> bool {
+        self.commands_available.load(Ordering::Relaxed)
+    }
+
+    fn get_catalog_for_session<'a>(
+        &'a self,
+        session: Option<&'a str>,
+        directory: Option<&'a str>,
+    ) -> AgentFuture<'a, AgentCatalog> {
+        Box::pin(async move {
+            let mut catalog = self.get_catalog(directory).await?;
+            let Some(session) = session else {
+                return Ok(catalog);
+            };
+            let info = self.get_session(session).await?;
+            if directory.is_some_and(|directory| info.directory.as_deref() != Some(directory)) {
+                return Err(AgentError::InvalidRequest(
+                    "catalog directory differs from the DeepSeek session".into(),
+                ));
+            }
+            let (skills, commands) =
+                tokio::join!(self.client.skills(session), self.client.commands(session));
+            // A preset-specific failure empties this catalog; it cannot revoke
+            // an instance method already observed in another session.
+            if let Ok(skills) = skills.and_then(|raw| super::catalog::skills(&raw)) {
+                catalog.skills = skills;
+                self.skills_available.store(true, Ordering::Relaxed);
+            }
+            if let Ok(commands) = commands.and_then(|raw| super::catalog::commands(&raw)) {
+                catalog.commands = commands;
+                self.commands_available.store(true, Ordering::Relaxed);
+            }
+            Ok(catalog)
+        })
+    }
+
+    fn activate_skill<'a>(
+        &'a self,
+        session: &'a str,
+        name: &'a str,
+        resume: Option<bool>,
+    ) -> AgentFuture<'a, ()> {
+        Box::pin(async move {
+            if resume == Some(false) {
+                return Err(AgentError::Unsupported(
+                    "DeepSeek deferred skill activation".into(),
+                ));
+            }
+            let skills = super::catalog::skills(&self.client.skills(session).await?)?;
+            if !skills.iter().any(|skill| skill.id == name) {
+                return Err(AgentError::InvalidRequest(
+                    "DeepSeek skill is no longer available in this session".into(),
+                ));
+            }
+            self.client
+                .send_prompt(session, &format!("/{name}"), &[], Some("queue"))
+                .await?;
+            Ok(())
+        })
+    }
+
+    fn execute_command<'a>(
+        &'a self,
+        session: &'a str,
+        name: &'a str,
+        arguments: &'a str,
+        delivery: Option<&'a str>,
+    ) -> AgentFuture<'a, Value> {
+        Box::pin(async move {
+            if !super::catalog::command_name(name)
+                || delivery.is_some_and(|mode| !matches!(mode, "queue" | "steer"))
+            {
+                return Err(AgentError::InvalidRequest(
+                    "invalid DeepSeek command invocation".into(),
+                ));
+            }
+            let line = if arguments.is_empty() {
+                format!("/{name}")
+            } else {
+                format!("/{name} {arguments}")
+            };
+            super::catalog::execution(&self.client.execute_command(session, &line).await?)
+        })
+    }
+
+    fn run_command<'a>(
+        &'a self,
+        session: &'a str,
+        name: &'a str,
+        arguments: &'a str,
+        delivery: Option<&'a str>,
+    ) -> AgentFuture<'a, ()> {
+        Box::pin(async move {
+            let result = self
+                .execute_command(session, name, arguments, delivery)
+                .await?;
+            if result["command_result"]["kind"] == "error" {
+                return Err(AgentError::RequestFailed(
+                    result["command_result"]["text"]
+                        .as_str()
+                        .unwrap_or("command failed")
+                        .into(),
+                ));
+            }
+            Ok(())
+        })
+    }
+
+    fn get_inbox<'a>(&'a self, session: &'a str) -> AgentFuture<'a, Vec<Value>> {
+        Box::pin(async move {
+            super::inbox::items(session, &self.client.get_projections(session).await?)
+        })
+    }
+
+    fn cancel_inbox_item<'a>(&'a self, session: &'a str, item: &'a str) -> AgentFuture<'a, ()> {
+        Box::pin(async move {
+            self.client
+                .update_queue(session, item, serde_json::json!({"kind":"remove"}))
+                .await
+        })
+    }
+
+    fn edit_inbox_item<'a>(
+        &'a self,
+        session: &'a str,
+        item: &'a str,
+        text: &'a str,
+    ) -> AgentFuture<'a, ()> {
+        Box::pin(async move {
+            if text.trim().is_empty() {
+                return Err(AgentError::InvalidRequest(
+                    "queue text must not be empty".into(),
+                ));
+            }
+            self.client
+                .update_queue(
+                    session,
+                    item,
+                    serde_json::json!({"kind":"edit","content":[{"type":"text","text":text}]}),
+                )
+                .await
+        })
+    }
+
+    fn set_inbox_delivery<'a>(
+        &'a self,
+        session: &'a str,
+        item: &'a str,
+        delivery: &'a str,
+    ) -> AgentFuture<'a, ()> {
+        Box::pin(async move {
+            // The native mutation is a strict promotion. There is no demotion API.
+            if delivery != "steer" {
+                return Err(AgentError::Unsupported("DeepSeek inbox demotion".into()));
+            }
+            self.client
+                .update_queue(session, item, serde_json::json!({"kind":"steer"}))
+                .await
+        })
+    }
+
     fn adds_mcp_servers(&self) -> bool {
         true
     }
@@ -693,6 +864,237 @@ impl AgentPort for DeepseekDriver {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn plugin_catalog_uses_exact_session_and_never_guesses_from_directory() {
+        use axum::{routing::post, Json, Router};
+        use serde_json::json;
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let sink = seen.clone();
+        let command_seen = seen.clone();
+        let phase = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let skill_phase = phase.clone();
+        let command_phase = phase.clone();
+        let app=Router::new()
+            .route("/api/session/modelCatalog",post(||async{Json(json!({"result":{"ok":true,"value":{"groups":[]}}}))}))
+            .route("/api/agentPresets/list",post(||async{Json(json!({"result":{"ok":true,"value":{"presets":[]}}}))}))
+            .route("/api/session/list",post(||async{Json(json!({"result":{"ok":true,"value":[{"sessionId":"a","cwd":"/old"},{"sessionId":"b","cwd":"/qa"}]}}))}))
+            .route("/api/session/projections",post(||async{Json(json!({"result":{"ok":true,"value":{"values":{"workingDirectory":"/qa"}}}}))}))
+            .route("/api/skills/list",post(move|Json(body):Json<Value>|{
+                sink.lock().unwrap().push(body.clone());
+                let phase=skill_phase.load(Ordering::Relaxed);
+                async move {let session=&body["payload"]["args"]["request"]["sessionId"];
+                    if phase==1 { return Json(json!({"result":{"ok":true,"value":{"skills":[]}}})); }
+                    if phase==2 { return Json(json!({"result":{"ok":false,"error":{"code":"gateway/internal","message":"preset registry unavailable"}}})); }
+                    Json(json!({"result":{"ok":true,"value":{"skills":[{"name":format!("skill-{}",session.as_str().unwrap()),"description":"native","modelInvocable":false}]}}}))}
+            }))
+            .route("/api/commands/list",post(move|Json(body):Json<Value>|{
+                let sink=command_seen.clone(); sink.lock().unwrap().push(body.clone());
+                let phase=command_phase.load(Ordering::Relaxed);
+                async move {let session=body["payload"]["args"]["agentId"].as_str().unwrap();
+                    if phase==2 { return Json(json!({"result":{"ok":false,"error":{"code":"gateway/internal","message":"preset registry unavailable"}}})); }
+                    Json(json!({"result":{"ok":true,"value":[{"name":format!("command-{session}"),"description":"native"}]}}))}
+            }));
+        let (driver, server) = rpc_server(app).await;
+        assert!(driver
+            .get_catalog(Some("/qa"))
+            .await
+            .unwrap()
+            .skills
+            .is_empty());
+        assert!(!driver.skills_listed() && !driver.slash_commands_listed());
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "directory-only reads never select a native session"
+        );
+        let a = driver
+            .get_catalog_for_session(Some("a"), Some("/qa"))
+            .await
+            .unwrap();
+        let b = driver
+            .get_catalog_for_session(Some("b"), Some("/qa"))
+            .await
+            .unwrap();
+        assert_eq!(a.skills[0].id, "skill-a");
+        assert_eq!(b.skills[0].id, "skill-b");
+        assert_eq!(a.commands[0].name, "command-a");
+        assert_eq!(b.commands[0].name, "command-b");
+        assert!(driver.skills_listed() && driver.slash_commands_listed());
+        phase.store(1, Ordering::Relaxed);
+        assert!(
+            driver
+                .get_catalog_for_session(Some("a"), Some("/qa"))
+                .await
+                .unwrap()
+                .skills
+                .is_empty(),
+            "removing the last skill clears the catalog"
+        );
+        phase.store(2, Ordering::Relaxed);
+        let unavailable = driver
+            .get_catalog_for_session(Some("b"), Some("/qa"))
+            .await
+            .unwrap();
+        assert!(unavailable.skills.is_empty() && unavailable.commands.is_empty());
+        assert!(
+            driver.skills_listed() && driver.slash_commands_listed(),
+            "one preset failure cannot revoke instance capabilities"
+        );
+        assert!(matches!(
+            driver
+                .get_catalog_for_session(Some("a"), Some("/wrong"))
+                .await,
+            Err(AgentError::InvalidRequest(_))
+        ));
+        assert!(matches!(
+            driver
+                .get_catalog_for_session(Some("missing"), Some("/qa"))
+                .await,
+            Err(AgentError::SessionNotFound(_))
+        ));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn skills_use_verified_slash_prompts_and_commands_never_fall_back_to_prompts() {
+        use axum::{routing::post, Json, Router};
+        use serde_json::json;
+        let calls = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let prompts = calls.clone();
+        let commands = calls.clone();
+        let app=Router::new()
+            .route("/api/skills/list",post(||async{Json(json!({"result":{"ok":true,"value":{"skills":[{"name":"review","description":"Review","modelInvocable":false}]}}}))}))
+            .route("/api/session/prompt",post(move|Json(body):Json<Value>|{prompts.lock().unwrap().push(body);async{Json(json!({"result":{"ok":true,"value":{"accepted":true}}}))}}))
+            .route("/api/commands/execute",post(move|Json(body):Json<Value>|{
+                commands.lock().unwrap().push(body.clone());async move {
+                    let args=&body["payload"]["args"];
+                    let value=match args["line"].as_str().unwrap(){
+                        "/failed details"=>json!({"commandId":"failure","result":{"kind":"error","text":"permission refused"}}),
+                        "/unknown"=>Value::Null,
+                        "/ambiguous"=>json!({}),
+                        _=>json!({"commandId":"success","result":{"kind":"success","text":"done","sourceEventSeq":12}}),
+                    };Json(json!({"result":{"ok":true,"value":value}}))
+                }
+            }));
+        let (driver, server) = rpc_server(app).await;
+        driver
+            .activate_skill("native", "review", None)
+            .await
+            .unwrap();
+        assert!(driver
+            .activate_skill("native", "unknown", None)
+            .await
+            .is_err());
+        assert!(driver
+            .activate_skill("native", "review", Some(false))
+            .await
+            .is_err());
+        let success = driver
+            .execute_command("native", "review", "raw  input", Some("queue"))
+            .await
+            .unwrap();
+        assert_eq!(success["command_result"]["kind"], "success");
+        assert_eq!(success["command_result"]["source_event_seq"], 12);
+        let failed = driver
+            .execute_command("native", "failed", "details", None)
+            .await
+            .unwrap();
+        assert_eq!(failed["command_result"]["kind"], "error");
+        assert!(driver
+            .execute_command("native", "unknown", "", None)
+            .await
+            .is_err());
+        assert!(driver
+            .execute_command("native", "ambiguous", "", None)
+            .await
+            .is_err());
+        assert!(driver
+            .execute_command("native", "x\ninjected", "", None)
+            .await
+            .is_err());
+        let calls = calls.lock().unwrap();
+        assert_eq!(
+            calls.len(),
+            5,
+            "one skill prompt and four native command attempts; no retry or fallback"
+        );
+        assert_eq!(
+            calls[0]["payload"]["args"]["request"]["content"],
+            json!([{"type":"text","text":"/review"}])
+        );
+        assert_eq!(calls[0]["payload"]["args"]["request"]["mode"], "queue");
+        assert_eq!(
+            calls[1]["payload"]["args"],
+            json!({"agentId":"native","line":"/review raw  input","submittedAttachments":[]})
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn durable_inbox_mutations_use_native_identity_and_never_retry_failures() {
+        use axum::{routing::post, Json, Router};
+        use serde_json::json;
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let sent = seen.clone();
+        let app = Router::new()
+            .route("/api/session/projections", post(|| async {
+                Json(json!({"result":{"ok":true,"value":{"values":{"inbox":{
+                    "next-turn":[{"id":"queued","content":[{"type":"text","text":"later"}]}],"next-step":[]}}}}}))
+            }))
+            .route("/api/session/updateQueue", post(move |Json(body):Json<Value>| {
+                sent.lock().unwrap().push(body.clone());
+                async move {
+                    let request=&body["payload"]["args"]["request"];
+                    if request["itemId"]=="gone" {
+                        Json(json!({"result":{"ok":false,"error":{"code":"session/queue-item-not-found","message":"claimed"}}}))
+                    } else if request["itemId"]=="ambiguous" {
+                        Json(json!({"result":{"ok":true,"value":{}}}))
+                    } else { Json(json!({"result":{"ok":true,"value":{"accepted":true}}})) }
+                }
+            }));
+        let (driver, server) = rpc_server(app).await;
+        assert_eq!(driver.get_inbox("s").await.unwrap()[0]["id"], "queued");
+        driver
+            .edit_inbox_item("s", "queued", "changed")
+            .await
+            .unwrap();
+        driver.cancel_inbox_item("s", "queued").await.unwrap();
+        driver
+            .set_inbox_delivery("s", "queued", "steer")
+            .await
+            .unwrap();
+        assert!(matches!(
+            driver.cancel_inbox_item("s", "gone").await,
+            Err(AgentError::InboxItemNotFound(_))
+        ));
+        assert!(driver
+            .set_inbox_delivery("s", "ambiguous", "steer")
+            .await
+            .is_err());
+        assert!(matches!(
+            driver.set_inbox_delivery("s", "queued", "queue").await,
+            Err(AgentError::Unsupported(_))
+        ));
+        assert!(driver.edit_inbox_item("s", "queued", " ").await.is_err());
+        let seen = seen.lock().unwrap();
+        assert_eq!(
+            seen.len(),
+            5,
+            "each mutation has one attempt; unsupported modes send nothing"
+        );
+        let requests: Vec<_> = seen
+            .iter()
+            .map(|body| &body["payload"]["args"]["request"])
+            .collect();
+        assert_eq!(
+            requests[0]["action"],
+            json!({"kind":"edit","content":[{"type":"text","text":"changed"}]})
+        );
+        assert_eq!(requests[1]["action"]["kind"], "remove");
+        assert_eq!(requests[2]["action"]["kind"], "steer");
+        assert!(requests.iter().all(|request| request["sessionId"] == "s"));
+        server.abort();
+    }
+
     async fn rpc_server(app: axum::Router) -> (DeepseekDriver, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let driver = DeepseekDriver::new(DeepseekEndpoint::new(
@@ -963,6 +1365,8 @@ mod tests {
             client: Arc::new(client),
             history: tokio::sync::Mutex::new(()),
             cursors: std::sync::Mutex::new(HistoryCursors::default()),
+            skills_available: AtomicBool::new(false),
+            commands_available: AtomicBool::new(false),
         };
         let seq_of = |item: &TimelineItem| item.seq;
         // A limit the message count never reaches: the bytes end the walk.

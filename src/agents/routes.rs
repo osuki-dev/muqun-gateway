@@ -34,6 +34,8 @@ pub struct AgentDirectoriesQuery {
 #[derive(Debug, Deserialize)]
 pub struct AgentSessionsQuery {
     pub directory: Option<String>,
+    /// Exact native session context for plugin catalogs; unused by list reads.
+    pub asid: Option<String>,
     /// List the children of one session.
     pub parent_id: Option<String>,
     /// `true` lists top-level sessions only, leaving out every subagent
@@ -458,7 +460,7 @@ pub fn mount(router: Router<AppState>) -> Router<AppState> {
         .route("/api/agent-sessions/{asid}/inbox", get(get_agent_inbox))
         .route(
             "/api/agent-sessions/{asid}/inbox/{inbox_id}",
-            delete(cancel_agent_inbox_item),
+            delete(cancel_agent_inbox_item).patch(edit_agent_inbox_item),
         )
         .route(
             "/api/agent-sessions/{asid}/inbox/{inbox_id}/steer",
@@ -1840,7 +1842,31 @@ pub async fn get_global_agent_catalog(
     require_device(&state, &headers)?;
     query.directory = expand_directory_param(query.directory.as_deref());
 
-    let all_managers = managers_for_read(&state, query.agent_id.as_deref()).await?;
+    let all_managers = if let Some(asid) = query.asid.as_deref() {
+        validate_text(asid)?;
+        if asid.trim().is_empty() {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_asid",
+                "asid must not be empty",
+            ));
+        }
+        let manager = session_manager_or_err(&state, asid).await?;
+        if query
+            .agent_id
+            .as_deref()
+            .is_some_and(|agent| agent != manager.agent().kind())
+        {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "agent_session_mismatch",
+                "asid belongs to another agent",
+            ));
+        }
+        vec![manager]
+    } else {
+        managers_for_read(&state, query.agent_id.as_deref()).await?
+    };
 
     require_directory(query.directory.as_deref())?;
 
@@ -1852,13 +1878,18 @@ pub async fn get_global_agent_catalog(
     let mut merged_commands = Vec::new();
     let mut primary_defaults = None;
 
-    let catalogs = futures::future::join_all(
-        all_managers
-            .iter()
-            .map(|manager| manager.sessions().get_catalog(query.directory.as_deref())),
-    )
+    let catalogs = futures::future::join_all(all_managers.iter().map(|manager| {
+        manager
+            .sessions()
+            .get_catalog_for_session(query.asid.as_deref(), query.directory.as_deref())
+    }))
     .await;
-    for cat in catalogs.into_iter().flatten() {
+    for result in catalogs {
+        let cat = match result {
+            Ok(cat) => cat,
+            Err(error) if query.asid.is_some() => return Err(agent_error(error)),
+            Err(_) => continue,
+        };
         if primary_defaults.is_none() {
             primary_defaults = Some(cat.defaults);
         }
@@ -3244,12 +3275,12 @@ async fn run_agent_session_command(
     if !arguments.is_empty() {
         validate_text(&arguments)?;
     }
-    manager
+    let result = manager
         .agent()
-        .run_command(&asid, name, &arguments, body.delivery.as_deref())
+        .execute_command(&asid, name, &arguments, body.delivery.as_deref())
         .await
         .map_err(agent_error)?;
-    Ok(Json(content_envelope(json!({ "submitted": true }))))
+    Ok(Json(content_envelope(result)))
 }
 
 async fn get_agent_inbox(
@@ -3291,6 +3322,37 @@ async fn cancel_agent_inbox_item(
         .upsert_inbox_item(&AgentSessionId(asid), &inbox_id, None)
         .await;
     Ok(Json(content_envelope(json!({ "cancelled": true }))))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EditInboxBody {
+    text: String,
+}
+
+async fn edit_agent_inbox_item(
+    State(state): State<AppState>,
+    Path((asid, inbox_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(body): Json<EditInboxBody>,
+) -> ApiResult<Json<Value>> {
+    let manager = session_manager_or_err!(&state, &headers, &asid);
+    validate_text(&body.text)?;
+    if body.text.trim().is_empty() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "text must not be empty",
+        ));
+    }
+    manager
+        .agent()
+        .edit_inbox_item(&asid, &inbox_id, &body.text)
+        .await
+        .map_err(agent_error)?;
+    Ok(Json(content_envelope(
+        json!({"edited":true,"inbox_id":inbox_id}),
+    )))
 }
 
 async fn steer_agent_inbox_item(
@@ -3911,6 +3973,21 @@ mod tests {
                 "device_repair_required",
             ),
         ] {
+            let edit_refusal = edit_agent_inbox_item(
+                State(state.clone()),
+                Path(("fixture".into(), "queued".into())),
+                headers.clone(),
+                Json(EditInboxBody {
+                    text: "changed".into(),
+                }),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(edit_refusal.0, status);
+            assert_eq!(
+                crate::test_support::error_body(&edit_refusal)["error"]["code"],
+                code
+            );
             let limits_refusal =
                 get_account_limits(State(state.clone()), Path("codex".into()), headers.clone())
                     .await
@@ -5511,6 +5588,7 @@ mod tests {
         let state = state_with(vec![opencode, deepseek]).await;
 
         let query = |agent_id: Option<&str>| AgentSessionsQuery {
+            asid: None,
             directory: None,
             parent_id: None,
             roots: None,
@@ -5574,6 +5652,44 @@ mod tests {
             crate::test_support::error_body(&refusal)["error"]["code"],
             "invalid_agent"
         );
+    }
+
+    #[tokio::test]
+    async fn session_catalog_selects_only_its_owner_and_rejects_mismatched_providers() {
+        let mut opencode = FakeAgent::new("opencode").with_sessions(&[("oc-session", 1)]);
+        opencode.catalog = catalog_with(vec![mode("opencode-mode")]);
+        let mut deepseek = FakeAgent::new("deepseek").with_sessions(&[("ds-session", 1)]);
+        deepseek.catalog = catalog_with(vec![mode("deepseek-mode")]);
+        let state = state_with(vec![opencode, deepseek]).await;
+        let query = |agent: Option<&str>| {
+            serde_json::from_value::<AgentSessionsQuery>(
+                json!({"asid":"ds-session","agent_id":agent}),
+            )
+            .unwrap()
+        };
+        let response =
+            get_global_agent_catalog(State(state.clone()), Query(query(None)), device_headers())
+                .await
+                .unwrap();
+        let data = body_json(response).await;
+        assert_eq!(data["data"]["modes"].as_array().unwrap().len(), 1);
+        assert_eq!(data["data"]["modes"][0]["id"], "deepseek-mode");
+        let denied = get_global_agent_catalog(
+            State(state.clone()),
+            Query(query(Some("opencode"))),
+            device_headers(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(denied.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            crate::test_support::error_body(&denied)["error"]["code"],
+            "agent_session_mismatch"
+        );
+        let denied = get_global_agent_catalog(State(state), Query(query(None)), HeaderMap::new())
+            .await
+            .unwrap_err();
+        assert_eq!(denied.0, StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
@@ -5651,7 +5767,8 @@ mod tests {
 
     #[tokio::test]
     async fn vcs_files_and_file_answer_from_git_for_any_agent() {
-        let (state, root, _repo) = vcs_state("agent-vcs-files").await;
+        // Keep fixture construction out of this multi-route test's large future.
+        let (state, root, _repo) = Box::pin(vcs_state("agent-vcs-files")).await;
         let files = |asid: &str, mode: Option<&str>| {
             get_agent_vcs_files(
                 State(state.clone()),
@@ -5845,6 +5962,7 @@ mod tests {
             ordinal: 0,
             attachments: None,
             image_assets: None,
+            generation: None,
         };
         manager
             .mirror()

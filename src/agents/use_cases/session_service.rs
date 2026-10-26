@@ -443,6 +443,14 @@ impl SessionService {
         self.agent.get_catalog(directory).await
     }
 
+    pub async fn get_catalog_for_session(
+        &self,
+        session: Option<&str>,
+        directory: Option<&str>,
+    ) -> Result<AgentCatalog, AgentError> {
+        self.agent.get_catalog_for_session(session, directory).await
+    }
+
     pub async fn get_vcs_diff(
         &self,
         asid: &AgentSessionId,

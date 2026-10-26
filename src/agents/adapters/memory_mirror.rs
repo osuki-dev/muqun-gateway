@@ -1298,6 +1298,7 @@ impl MemoryMirror {
                 part,
                 attachments: None,
                 image_assets: None,
+                generation: None,
             };
             state.insert_item(item.clone());
             item
@@ -1382,6 +1383,7 @@ impl MemoryMirror {
                     ordinal,
                     attachments: None,
                     image_assets: None,
+                    generation: None,
                 };
                 state.insert_item(item.clone());
                 item
@@ -2190,6 +2192,7 @@ mod tests {
             ordinal: 0,
             attachments: None,
             image_assets: None,
+            generation: None,
         }
     }
 
@@ -2539,6 +2542,7 @@ mod tests {
         // A read that says the session failed keeps the reason the failure
         // event gave.
         let error = AgentErrorInfo {
+            retry_after_ms: None,
             name: "provider.auth".into(),
             message: "Key limit exceeded".into(),
             status: Some(403),

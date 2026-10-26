@@ -1344,6 +1344,7 @@ async fn committing_a_rollback_takes_the_rows_after_it_off_the_timeline() {
         ordinal: 0,
         attachments: None,
         image_assets: None,
+        generation: None,
     };
     ctx.mirror
         .upsert_timeline_items(

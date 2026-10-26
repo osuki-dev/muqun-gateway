@@ -337,6 +337,16 @@ pub trait AgentPort: Send + Sync {
     /// Fetch available catalog (models, agents, MCP)
     fn get_catalog<'a>(&'a self, directory: Option<&'a str>) -> AgentFuture<'a, AgentCatalog>;
 
+    /// Providers whose plugins are session-scoped must use the exact native
+    /// session, never infer its preset from a shared working directory.
+    fn get_catalog_for_session<'a>(
+        &'a self,
+        _session_id: Option<&'a str>,
+        directory: Option<&'a str>,
+    ) -> AgentFuture<'a, AgentCatalog> {
+        self.get_catalog(directory)
+    }
+
     /// Whether the latest catalog read actually received a skills list.
     /// Stays false when the host has no skills method or the call failed.
     fn skills_listed(&self) -> bool {
@@ -517,6 +527,20 @@ pub trait AgentPort: Send + Sync {
     }
 
     /// Run a slash command in session
+    fn execute_command<'a>(
+        &'a self,
+        session_id: &'a str,
+        name: &'a str,
+        arguments: &'a str,
+        delivery: Option<&'a str>,
+    ) -> AgentFuture<'a, serde_json::Value> {
+        Box::pin(async move {
+            self.run_command(session_id, name, arguments, delivery)
+                .await?;
+            Ok(serde_json::json!({"submitted":true}))
+        })
+    }
+
     fn run_command<'a>(
         &'a self,
         _session_id: &'a str,
@@ -599,6 +623,15 @@ pub trait AgentPort: Send + Sync {
     }
 
     /// Inbox operations
+    fn edit_inbox_item<'a>(
+        &'a self,
+        _session_id: &'a str,
+        _inbox_id: &'a str,
+        _text: &'a str,
+    ) -> AgentFuture<'a, ()> {
+        Box::pin(async { Err(AgentError::Unsupported("edit_inbox_item".into())) })
+    }
+
     fn get_inbox<'a>(&'a self, _session_id: &'a str) -> AgentFuture<'a, Vec<serde_json::Value>> {
         Box::pin(async { Err(AgentError::Unsupported("get_inbox".into())) })
     }

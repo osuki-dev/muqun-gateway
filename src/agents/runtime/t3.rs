@@ -301,7 +301,7 @@ fn t3_features_for_protocol(protocol: u64) -> crate::discovery::AgentFeatures {
         revert: protocol == 1,
         // T3 rolls whole turns back in one step; there is no staged state.
         staged_revert: false,
-        inbox: false,
+        inbox: protocol == 2,
         // Attachments arrive as host paths in the prompt text; the driver
         // answers `Unsupported` for a mode, skills, commands, compaction and
         // shells.
@@ -313,6 +313,7 @@ fn t3_features_for_protocol(protocol: u64) -> crate::discovery::AgentFeatures {
         attachments: true,
         attachments_by_path: true,
         extra: std::collections::BTreeMap::from([
+            ("inboxEdit".into(), serde_json::Value::Bool(protocol == 2)),
             ("sessionPagination".into(), serde_json::json!(false)),
             ("timelineEarlier".into(), serde_json::json!(false)),
             ("sessionRename".into(), serde_json::json!(true)),

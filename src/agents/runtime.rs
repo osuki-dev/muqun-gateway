@@ -859,11 +859,17 @@ impl AgentRuntime {
                     .find(|(h, _)| h == id)
                     .map(|(_, m)| m)
                     .filter(|manager| *id != "codex" || manager.stream_connected());
-                let features = if *id == "codex" {
+                let mut features = if *id == "codex" {
                     codex::connection_features(manager.map(|m| m.endpoint_url()), &[])
                 } else {
                     features
                 };
+                if *id == "deepseek" {
+                    features.skills =
+                        manager.is_some_and(|manager| manager.agent().skills_listed());
+                    features.slash_commands =
+                        manager.is_some_and(|manager| manager.agent().slash_commands_listed());
+                }
                 AgentDiscoveryInfo {
                     id: id.to_string(),
                     name: name.to_string(),
@@ -942,6 +948,9 @@ impl AgentRuntime {
                 .iter()
                 .any(|m| m.supports_reasoning || !m.reasoning_effort_tiers.is_empty());
             let has_models = !models.is_empty();
+            let mut features = deepseek_features(supports_reasoning, has_models);
+            features.skills = m.agent().skills_listed();
+            features.slash_commands = m.agent().slash_commands_listed();
 
             AgentDiscoveryInfo {
                 id: "deepseek".to_string(),
@@ -952,7 +961,7 @@ impl AgentRuntime {
                 endpoint: Some(m.endpoint_url().to_string()),
                 version: m.version(),
                 reason: None,
-                features: deepseek_features(supports_reasoning, has_models),
+                features,
                 models,
                 modes,
             }
@@ -1947,10 +1956,9 @@ fn deepseek_features(
         worktrees: false,
         revert: false,
         staged_revert: false,
-        inbox: false,
-        // Presets are the modes; attachments arrive as host paths in the
-        // prompt text, and the driver leaves skills, commands, compaction and
-        // shells at `Unsupported`.
+        inbox: true,
+        // Session-scoped catalog reads enable skills/commands only after their
+        // native methods actually answer. Compaction and shells stay unavailable.
         modes: true,
         skills: false,
         slash_commands: false,
@@ -1959,6 +1967,7 @@ fn deepseek_features(
         attachments: true,
         attachments_by_path: true,
         extra: std::collections::BTreeMap::from([
+            ("inboxEdit".into(), serde_json::Value::Bool(true)),
             ("modeSwitching".into(), serde_json::Value::Bool(false)),
             ("sessionRename".into(), serde_json::json!(true)),
             ("sessionDelete".into(), serde_json::json!(false)),

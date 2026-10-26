@@ -519,6 +519,21 @@ async fn apply_v2_snapshot(asid: &AgentSessionId, snapshot: &Value, ctx: &T3Even
     );
     let permissions = v2::mapper::permissions(&asid.0, projection);
     let forms = v2::mapper::forms(&asid.0, projection);
+    match v2::inbox::items(projection) {
+        Ok(items) if ctx.mirror.inbox(asid).await != items => {
+            let (seq, items) = ctx.mirror.set_inbox(asid, items).await;
+            ctx.emit(AgentDomainEvent::InboxChanged {
+                asid: asid.clone(),
+                items,
+                seq,
+            });
+        }
+        Ok(_) => {}
+        Err(_) => ctx.emit(AgentDomainEvent::Resync {
+            asid: asid.clone(),
+            reason: "t3_inbox_projection_invalid".into(),
+        }),
+    }
     if let Some(held) = ctx.mirror.get_snapshot(asid).await {
         let complete = snapshot["gatewayCompleteCoverage"].as_bool() == Some(true);
         let fresh: HashSet<_> = timeline.iter().map(|row| row.id.as_str()).collect();
