@@ -112,7 +112,11 @@ pub(super) fn message_generation(event: &Value) -> Option<MessageGeneration> {
         return None;
     }
     let output = data.pointer("/usage/outputTokens")?.as_f64()?;
-    if !output.is_finite() || output <= 0.0 {
+    if !output.is_finite()
+        || output <= 0.0
+        || output > MAX_SAFE_INTEGER as f64
+        || output.fract() != 0.0
+    {
         return None;
     }
     let completed = timestamp(event.get("time")?)?;
@@ -191,6 +195,19 @@ mod tests {
                 })
             ));
         }
+    }
+
+    #[test]
+    fn output_token_count_must_be_a_positive_safe_integer_even_for_long_decodes() {
+        for count in [json!(1.5), json!(9007199254740992u64), json!(1e308)] {
+            let mut event = message();
+            event["time"] = json!(10_000);
+            event["data"]["usage"]["outputTokens"] = count;
+            assert!(message_generation(&event).is_none(), "{event}");
+        }
+        let mut event = message();
+        event["data"]["usage"]["outputTokens"] = json!(MAX_SAFE_INTEGER);
+        assert!(message_generation(&event).is_some());
     }
 
     #[test]
