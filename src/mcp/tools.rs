@@ -249,6 +249,15 @@ pub(crate) async fn with_reminder(state: &AppState, mut answer: Value, child: &T
     let Ok(Some(task)) = state.tasks.task(child).await else {
         return answer;
     };
+    let (source, machine) = match &task.binding {
+        TaskBinding::Peer {
+            peer_server_id,
+            peer_name,
+            ..
+        } => (peer_server_id.as_str(), peer_name.as_str()),
+        _ => (state.config.server_id.as_str(), state.config.label.as_str()),
+    };
+    super::files::attach_output(&mut answer, source, machine);
     if !REPORTED_STATES.contains(&task.state) {
         return answer;
     }
@@ -572,7 +581,7 @@ impl MuqunMcp {
 
     #[tool(
         name = "files.present",
-        description = "Return a clickable file card to the Muqun App. Explicitly hand off one image, video, PDF or document on this computer, or a linked computer with machine (including external drives). Creates a private 48-hour snapshot, up to 25 MiB (videos 64 MiB); protected files are refused and reading requires the App's pairing with that computer. No public URL or credentials are returned. Use this after producing a file the user wants to view; do not export secrets."
+        description = "Share a file from this computer or a linked computer with machine. Uses the same file permissions and preview/download handling as opening a local session file. Any file type can be downloaded; supported types can also be previewed. The App must be paired with the source computer. No public URL or credentials are returned."
     )]
     async fn present_file(
         &self,
@@ -587,7 +596,10 @@ impl MuqunMcp {
         ) {
             return Ok(match super::files::present(&self.state, args.path).await {
                 Ok(value) => ok(value),
-                Err(message) => fail("file_unavailable", message),
+                Err(_) => fail(
+                    "file_unavailable",
+                    "File unavailable; check this computer’s file permissions and the path",
+                ),
             });
         }
         let machine = args.machine.as_deref().unwrap_or_default();
@@ -645,7 +657,11 @@ impl MuqunMcp {
         };
         let by = lineage::requested(&self.state, &self.session, &call).await;
         let run = self.state.tasks.run(&self.state, by, request).await;
-        reply(run.map(command_result))
+        reply(run.map(|handle| {
+            let mut result = command_result(handle);
+            super::files::attach_output(&mut result, &config.server_id, &config.label);
+            result
+        }))
     }
 
     /// `exec.run` with `machine`: a command task on that computer, mirrored
@@ -699,13 +715,16 @@ impl MuqunMcp {
             TaskBinding::Peer { peer_name, .. } => peer_name.clone(),
             _ => machine,
         };
-        Ok(ok(json!({
-            "task_id": run.task.task_id,
-            "state": run.task.state,
-            "exit_code": run.exit_code,
-            "stdout_tail": run.stdout_tail,
-            "machine": machine,
-        })))
+        let server_id = match &run.task.binding {
+            TaskBinding::Peer { peer_server_id, .. } => peer_server_id.as_str(),
+            _ => "",
+        };
+        let mut result = json!({
+            "task_id": run.task.task_id, "state":run.task.state,
+            "exit_code":run.exit_code, "stdout_tail":run.stdout_tail, "machine":machine,
+        });
+        super::files::attach_output(&mut result, server_id, &machine);
+        Ok(ok(result))
     }
 
     #[tool(
