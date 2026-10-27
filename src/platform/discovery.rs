@@ -16,6 +16,8 @@ use crate::{ordered_sessions, session_capabilities, session_metadata, AppState};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentAvailability {
+    /// Health has no live upstream observation; full discovery can probe it.
+    Unknown,
     Connected,
     Reachable,
     Offline,
@@ -351,6 +353,21 @@ pub async fn build_discovery_planes(state: &AppState) -> DiscoveryPlanes {
     let terminal = build_terminal_plane_discovery(state).await;
     let mut agents = state.agent_runtime.discover_agents().await;
     agents.order_for_picker();
+    discovery_planes(terminal, agents)
+}
+
+/// Health reports local runtime readiness, never provider catalogs or probes.
+/// Full provider discovery remains on `/api/discovery` and `/api/capabilities`.
+pub async fn build_health_planes(state: &AppState) -> DiscoveryPlanes {
+    let terminal = build_terminal_plane_discovery(state).await;
+    let agents = state.agent_runtime.health_snapshot().await;
+    discovery_planes(terminal, agents)
+}
+
+fn discovery_planes(
+    terminal: TerminalPlaneDiscovery,
+    agents: AgentPlaneDiscovery,
+) -> DiscoveryPlanes {
     // The SSH plane is the app's transport, not a gateway subsystem: the phone
     // opens its own SSH connection and tunnels this gateway's loopback port, so
     // the same HTTP API answers on the far side. These flags only tell the app

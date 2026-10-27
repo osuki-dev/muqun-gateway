@@ -20,7 +20,7 @@ fn agents_plane_schema() -> Value {
                         "id": { "type": "string", "enum": ["opencode", "deepseek", "t3"] },
                         "name": { "type": "string" },
                         "kind": { "type": "string" },
-                        "status": { "type": "string", "enum": ["connected", "reachable", "offline", "disabled", "not_installed", "unconfigured"] },
+                        "status": { "type": "string", "enum": ["connected", "reachable", "offline", "disabled", "not_installed", "unconfigured", "unsupported", "unknown"] },
                         "enabled": { "type": "boolean" },
                         "endpoint": { "type": "string", "description": "Omitted when unknown or for an unauthenticated caller" },
                         "version": { "type": "string", "description": "Omitted when unknown or for an unauthenticated caller" },
@@ -121,7 +121,7 @@ pub fn openapi_spec() -> Value {
             "/health": {
                 "get": {
                     "summary": "Gateway health",
-                    "description": "Also carries the top-level instance generation (generation), the same value /api/discovery, every pane read and every streamed output frame carry.",
+                    "description": "Authenticated Gateway identity, transport facts and live terminal compatibility. The agent plane is a local runtime readiness snapshot, with unknown for enabled unattached providers and empty model/mode catalogs; it does not probe providers. Use /api/discovery for complete provider discovery. Also carries the top-level instance generation (generation), the same value /api/discovery, every pane read and every streamed output frame carry.",
                     "responses": ok_response()
                 }
             },

@@ -174,6 +174,14 @@ a linked gateway and the admin token get the document with those removed.
 Nothing in the document is served unauthenticated -- it names the computer's
 id, label, version and configuration.
 
+`GET /health` and `GET /api/meta` retain the same plane structure, but their
+agent plane is a local runtime snapshot: they do not probe upstream providers
+or read model catalogs. Attached providers report their current readiness;
+an enabled provider without an attachment reports `unknown`, not an inferred
+offline or unsupported verdict. Their `models` and `modes` arrays are empty.
+Use the explicit discovery routes above for complete provider features and
+catalogs. Terminal liveness, compatibility and transport facts remain live.
+
 ```json
 {
   "supported": true,

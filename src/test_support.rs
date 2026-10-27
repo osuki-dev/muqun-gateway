@@ -1076,6 +1076,8 @@ pub(crate) struct FakeAgent {
     pub sessions: Vec<agents::domain::AgentSessionInfo>,
     pub failing: bool,
     pub catalog: agents::domain::AgentCatalog,
+    /// Hold catalog reads to exercise callers that must not wait on providers.
+    pub catalog_gate: Option<Arc<tokio::sync::Notify>>,
     pub timeline: Vec<agents::domain::TimelineItem>,
     /// A session's own timeline, in place of `timeline`, by asid.
     pub session_timelines: HashMap<String, Vec<agents::domain::TimelineItem>>,
@@ -1115,6 +1117,7 @@ impl FakeAgent {
             sessions: Vec::new(),
             failing: false,
             catalog: Default::default(),
+            catalog_gate: None,
             timeline: Vec::new(),
             session_timelines: HashMap::new(),
             permissions: Arc::default(),
@@ -1434,6 +1437,9 @@ impl agents::ports::agent::AgentPort for FakeAgent {
         _directory: Option<&'a str>,
     ) -> agents::ports::agent::AgentFuture<'a, agents::domain::AgentCatalog> {
         Box::pin(async move {
+            if let Some(gate) = &self.catalog_gate {
+                gate.notified().await;
+            }
             if self.failing {
                 return self.fail();
             }
