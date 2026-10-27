@@ -2,6 +2,13 @@
 
 ## Changes and fixes
 
+- **Terminal snapshots avoid repeating the same device-directory scan.**
+  Herdr pane listings index terminal device paths once per backend instead of
+  scanning `/dev` for every pane. Each shell's current controlling terminal,
+  opened device number and native history identity remain verified. This
+  reduces work on hosts with many panes without reusing stale pane metadata.
+  Restart the Gateway after updating; no App update or re-pairing is needed.
+
 - **Terminal health checks no longer wait for AI provider catalogs.** Opening
   a terminal now reads local agent readiness instead of refreshing unrelated
   model catalogs or probing providers when their discovery cache expires.
