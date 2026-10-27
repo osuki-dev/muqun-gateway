@@ -2,6 +2,14 @@
 
 ## Changes and fixes
 
+- **macOS publication uses one verified Developer ID signing stage.** Preview
+  and stable pipelines share the existing signing identity and verify both
+  architectures before publishing checksums over the signed bytes. Publication
+  requires a workflow-restricted signing runner; missing configuration blocks
+  publication rather than falling back to unsigned Mac binaries. See
+  `docs/macos-signing.md` before enabling this infrastructure-dependent change.
+  App pairing and Herdr compatibility are unchanged.
+
 - **Terminal health checks no longer wait for AI provider catalogs.** Opening
   a terminal now reads local agent readiness instead of refreshing unrelated
   model catalogs or probing providers when their discovery cache expires.

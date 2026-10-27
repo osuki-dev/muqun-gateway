@@ -1,0 +1,87 @@
+name: sign-macos
+
+on:
+  workflow_call:
+    inputs:
+      artifact-prefix:
+        required: true
+        type: string
+      source-sha:
+        required: true
+        type: string
+      version:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  policy:
+    runs-on: ubuntu-latest
+    env:
+      SOURCE_SHA: ${{ inputs.source-sha }}
+      VERSION: ${{ inputs.version }}
+      PREFIX: ${{ inputs.artifact-prefix }}
+      MACOS_SIGNING_RUNNER_GROUP: ${{ vars.MACOS_SIGNING_RUNNER_GROUP }}
+      MACOS_SIGNING_IDENTITY_SHA1: ${{ vars.MACOS_SIGNING_IDENTITY_SHA1 }}
+      MACOS_SIGNING_TEAM_ID: ${{ vars.MACOS_SIGNING_TEAM_ID }}
+    steps:
+      # This workflow and its script always come from protected main, never
+      # from an artifact, PR, fork, or the caller's arbitrary checkout.
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Require configured signer and reviewed source
+        run: |
+          set -euo pipefail
+          [[ "$PREFIX" == preview || "$PREFIX" == release ]]
+          python3 scripts/sign-macos-artifacts.py --check-context --source-sha "$SOURCE_SHA" --version "$VERSION"
+          git merge-base --is-ancestor "$SOURCE_SHA" origin/main
+
+  sign:
+    needs: policy
+    # The server-side runner group MUST restrict workflow access to this
+    # exact reusable workflow@refs/heads/main. Labels alone are insufficient.
+    runs-on:
+      group: ${{ vars.MACOS_SIGNING_RUNNER_GROUP }}
+      labels: [self-hosted, macOS, muqun-gateway-signer]
+    concurrency:
+      group: gateway-developer-id-signing
+      cancel-in-progress: false
+    env:
+      SOURCE_SHA: ${{ inputs.source-sha }}
+      VERSION: ${{ inputs.version }}
+      MACOS_SIGNING_IDENTITY_SHA1: ${{ vars.MACOS_SIGNING_IDENTITY_SHA1 }}
+      MACOS_SIGNING_TEAM_ID: ${{ vars.MACOS_SIGNING_TEAM_ID }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: ${{ inputs.artifact-prefix }}-*-apple-darwin
+          merge-multiple: true
+          path: ${{ runner.temp }}/gateway-unsigned-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Sign and verify both architectures without executing artifacts
+        run: |
+          set -euo pipefail
+          git merge-base --is-ancestor "$SOURCE_SHA" origin/main
+          python3 scripts/sign-macos-artifacts.py --source-sha "$SOURCE_SHA" --version "$VERSION" \
+            --input "$RUNNER_TEMP/gateway-unsigned-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
+            --output "$RUNNER_TEMP/gateway-signed-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
+            --audit "$RUNNER_TEMP/gateway-signing-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT.json"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact-prefix }}-signed-macos
+          path: ${{ runner.temp }}/gateway-signed-${{ github.run_id }}-${{ github.run_attempt }}/*
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact-prefix }}-macos-signing-audit
+          path: ${{ runner.temp }}/gateway-signing-${{ github.run_id }}-${{ github.run_attempt }}.json
+          if-no-files-found: error

@@ -1,53 +1,44 @@
 name: release
 
-# Build the gateway for macOS and Linux on every version tag and attach the
-# binaries to the GitHub release. The plugin's build step then downloads the
-# matching binary instead of compiling from source, so installing needs no Rust
-# toolchain.
-#
-# Linux targets are statically linked against musl (built via `cross`) so the
-# binary has no glibc version dependency and runs on any Linux, old or new. A
-# glibc build made on a newer runner would fail on older hosts with
-# "GLIBC_2.xx not found". macOS builds natively with cargo.
 on:
   push:
     tags: ['v*']
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: stable-publication
+  cancel-in-progress: false
 
 jobs:
-  # The release is created once, here, before any binary is built.
-  #
-  # It used to be created by whichever matrix job got there first, which is a
-  # race four ways: on v0.7.0 two macOS jobs both called it a new release, the
-  # loser was handed an id that stopped existing a moment later, and its upload
-  # failed with a 404 -- so the tag shipped with three of its four binaries and
-  # the missing one was `aarch64-apple-darwin`, which is every Apple Silicon
-  # Mac. `install.sh` then finds no prebuilt binary for the commonest target and
-  # falls back to telling people to build from source.
-  #
-  # With the release already there, every matrix job takes the "it exists"
-  # path and only uploads, which was never the racy part.
-  release:
+  prepare:
     if: ${{ !contains(github.ref_name, '-') }}
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
-      - name: Require release notes
+      - name: Require reviewed stable version and release notes
+        id: version
         env:
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo 'Expected vX.Y.Z'; exit 1; }
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
           test -s "release-notes/$RELEASE_TAG.md"
-      - name: Create the release
-        uses: softprops/action-gh-release@v2
-        with:
-          body_path: release-notes/${{ github.ref_name }}.md
+          python3 - <<'PY'
+          import os, re
+          from pathlib import Path
+          version = os.environ['RELEASE_TAG'][1:]
+          manifest = Path('Cargo.toml').read_text()
+          assert re.search(r'^version = "' + re.escape(version) + r'"$', manifest, re.M)
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write('version=' + version + '\n')
+          PY
 
   build:
-    needs: release
+    needs: prepare
     strategy:
       fail-fast: false
       matrix:
@@ -67,40 +58,70 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-
       - name: Add Rust target
         if: matrix.builder == 'cargo'
         run: rustup target add ${{ matrix.target }}
-
       - name: Install cross
         if: matrix.builder == 'cross'
-        run: cargo install cross --locked
-
-      - name: Build (cargo)
-        if: matrix.builder == 'cargo'
-        run: cargo build --release --locked --target ${{ matrix.target }}
-
-      - name: Build (cross, static musl)
-        if: matrix.builder == 'cross'
-        run: cross build --release --locked --target ${{ matrix.target }}
-
-      - name: Stage binary
-        run: cp "target/${{ matrix.target }}/release/muqun-gateway" "muqun-gateway-${{ matrix.target }}"
-
-      - name: Stage SHA256 integrity checksum (not publisher signing)
+        run: cargo install cross --locked --version 0.2.5
+      - name: Build
+        run: ${{ matrix.builder }} build --release --locked --target ${{ matrix.target }}
+      - name: Stage build artifacts
         shell: bash
         run: |
           set -euo pipefail
           binary="muqun-gateway-${{ matrix.target }}"
-          if command -v sha256sum >/dev/null 2>&1; then
-            sha256sum "$binary" > "$binary.sha256"
-          else
-            shasum -a 256 "$binary" > "$binary.sha256"
-          fi
-
-      - name: Attach to release
-        uses: softprops/action-gh-release@v2
+          cp "target/${{ matrix.target }}/release/muqun-gateway" "$binary"
+          shasum -a 256 "$binary" > "$binary.sha256"
+      - uses: actions/upload-artifact@v4
         with:
-          files: |
+          name: release-${{ matrix.target }}
+          path: |
             muqun-gateway-${{ matrix.target }}
             muqun-gateway-${{ matrix.target }}.sha256
+          if-no-files-found: error
+
+  sign:
+    needs: [prepare, build]
+    uses: osuki-dev/muqun-gateway/.github/workflows/sign-macos.yml@main
+    with:
+      artifact-prefix: release
+      source-sha: ${{ github.sha }}
+      version: ${{ needs.prepare.outputs.version }}
+
+  publish:
+    needs: [prepare, build, sign]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*-unknown-linux-musl
+          merge-multiple: true
+          path: artifacts
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-signed-macos
+          path: artifacts
+      - name: Validate complete signed matrix before publication
+        run: |
+          set -euo pipefail
+          cd artifacts
+          for target in aarch64-apple-darwin x86_64-apple-darwin x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
+            test -s "muqun-gateway-$target"
+            test -s "muqun-gateway-$target.sha256"
+            sha256sum --check "muqun-gateway-$target.sha256"
+          done
+          test "$(find . -maxdepth 1 -type f | wc -l)" -eq 8
+      - name: Publish once without replacing existing assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          gh release create "$RELEASE_TAG" --verify-tag --draft --title "$RELEASE_TAG" \
+            --notes-file "release-notes/$RELEASE_TAG.md"
+          gh release upload "$RELEASE_TAG" artifacts/*
+          gh release edit "$RELEASE_TAG" --draft=false --latest=true

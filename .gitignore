@@ -1,5 +1,6 @@
 # Build output
 /target
+__pycache__/
 
 # The gateway's own secrets live in the config/state dirs, never the repo,
 # but ignore any that get symlinked or copied in during local testing.

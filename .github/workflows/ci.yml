@@ -35,6 +35,9 @@ jobs:
       - name: Format
         run: cargo fmt --all -- --check
 
+      - name: Signing policy and artifact boundary tests
+        run: python3 -m unittest discover -s scripts/tests -v
+
       - name: Clippy
         run: cargo clippy --all-targets --locked -- -D warnings
 

@@ -81,8 +81,16 @@ jobs:
             muqun-gateway-${{ matrix.target }}.sha256
           if-no-files-found: error
 
-  publish:
+  sign:
     needs: [checks, build]
+    uses: osuki-dev/muqun-gateway/.github/workflows/sign-macos.yml@main
+    with:
+      artifact-prefix: preview
+      source-sha: ${{ github.sha }}
+      version: ${{ needs.checks.outputs.version }}
+
+  publish:
+    needs: [checks, build, sign]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -92,8 +100,12 @@ jobs:
           ref: ${{ github.sha }}
       - uses: actions/download-artifact@v4
         with:
-          pattern: preview-*
+          pattern: preview-*-unknown-linux-musl
           merge-multiple: true
+          path: artifacts
+      - uses: actions/download-artifact@v4
+        with:
+          name: preview-signed-macos
           path: artifacts
       - name: Validate complete matrix and publish once
         env:
