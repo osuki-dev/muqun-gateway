@@ -1089,6 +1089,7 @@ pub(crate) struct FakeAgent {
     pub prompts: Arc<Mutex<Vec<String>>>,
     /// The attachments every prompt carried.
     pub attached: Arc<Mutex<Vec<Vec<String>>>>,
+    pub deliveries: Arc<Mutex<Vec<Option<String>>>>,
     /// Sessions answered the way OpenCode answers a deleted one: a plain
     /// HTTP 404 rather than `SessionNotFound`.
     pub http_404: Vec<String>,
@@ -1121,6 +1122,7 @@ impl FakeAgent {
             created_with: Arc::default(),
             prompts: Arc::default(),
             attached: Arc::default(),
+            deliveries: Arc::default(),
             http_404: Vec::new(),
             session_deletion: false,
             mcp: None,
@@ -1363,9 +1365,13 @@ impl agents::ports::agent::AgentPort for FakeAgent {
         _session_id: &'a str,
         text: &'a str,
         attachments: &'a [String],
-        _delivery: Option<&'a str>,
+        delivery: Option<&'a str>,
     ) -> agents::ports::agent::AgentFuture<'a, ()> {
         self.record("send_prompt");
+        self.deliveries
+            .lock()
+            .unwrap()
+            .push(delivery.map(str::to_owned));
         self.prompts.lock().unwrap().push(text.to_owned());
         self.attached.lock().unwrap().push(attachments.to_vec());
         Box::pin(async { Ok(()) })

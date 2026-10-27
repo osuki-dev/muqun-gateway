@@ -23,6 +23,11 @@ pub struct AgentSessionSnapshot {
 }
 
 pub trait SessionMirrorPort: Send + Sync {
+    /// Live compaction only, never inferred from an old summary in history.
+    fn is_compacting<'a>(&'a self, _asid: &'a AgentSessionId) -> MirrorFuture<'a, bool> {
+        Box::pin(async { false })
+    }
+
     /// Get snapshot for a session if cached
     fn get_snapshot<'a>(
         &'a self,

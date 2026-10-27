@@ -7,12 +7,12 @@ use crate::agents::ports::mirror::SessionMirrorPort;
 
 pub struct PromptService {
     agent: Arc<dyn AgentPort>,
-    _mirror: Arc<dyn SessionMirrorPort>,
+    mirror: Arc<dyn SessionMirrorPort>,
 }
 
 impl PromptService {
-    pub fn new(agent: Arc<dyn AgentPort>, _mirror: Arc<dyn SessionMirrorPort>) -> Self {
-        Self { agent, _mirror }
+    pub fn new(agent: Arc<dyn AgentPort>, mirror: Arc<dyn SessionMirrorPort>) -> Self {
+        Self { agent, mirror }
     }
 
     pub async fn send_prompt(
@@ -22,6 +22,9 @@ impl PromptService {
         attachments: &[String],
         delivery: Option<&str>,
     ) -> Result<(), AgentError> {
+        // All adapters receive the same intent. Providers with a native inbox
+        // own their queue; Codex implements that contract in its adapter.
+        let delivery = compaction_delivery(delivery, self.mirror.is_compacting(asid).await);
         if attachments.is_empty() {
             return self
                 .agent
@@ -44,6 +47,16 @@ impl PromptService {
 
     pub async fn interrupt(&self, asid: &AgentSessionId) -> Result<(), AgentError> {
         self.agent.interrupt(&asid.0).await
+    }
+}
+
+fn compaction_delivery(delivery: Option<&str>, compacting: bool) -> Option<&str> {
+    if compacting && matches!(delivery, None | Some("steer" | "queue")) {
+        Some("queue")
+    } else {
+        // Preserve invalid input so the adapter refuses it, rather than
+        // accidentally legitimizing it while the session is compacting.
+        delivery
     }
 }
 
@@ -110,6 +123,59 @@ pub(crate) fn checked_attachments(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn compaction_delivery_is_provider_neutral_and_clears_on_completion_or_idle() {
+        use crate::agents::{
+            adapters::memory_mirror::MemoryMirror,
+            domain::{AgentSessionStatus, CompactionStatus},
+        };
+        for provider in ["codex", "opencode", "deepseek", "t3"] {
+            let mirror = Arc::new(MemoryMirror::for_agent(provider));
+            let agent = Arc::new(crate::test_support::FakeAgent::new(provider));
+            let service = PromptService::new(agent.clone(), mirror.clone());
+            let id = AgentSessionId("session".into());
+            assert_eq!(
+                compaction_delivery(Some("steer"), mirror.is_compacting(&id).await),
+                Some("steer")
+            );
+            mirror
+                .record_compaction(&id, CompactionStatus::Started, None, None)
+                .await;
+            for delivery in [None, Some("steer"), Some("queue")] {
+                assert_eq!(
+                    compaction_delivery(delivery, mirror.is_compacting(&id).await),
+                    Some("queue")
+                );
+            }
+            for delivery in [None, Some("steer"), Some("queue")] {
+                service
+                    .send_prompt(&id, "keep this message", &[], delivery)
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(
+                *agent.deliveries.lock().unwrap(),
+                vec![Some("queue".into()); 3]
+            );
+            assert_eq!(compaction_delivery(Some("invalid"), true), Some("invalid"));
+            mirror
+                .record_compaction(&id, CompactionStatus::Completed, None, None)
+                .await;
+            assert!(!mirror.is_compacting(&id).await);
+            mirror
+                .record_compaction(&id, CompactionStatus::Running, None, None)
+                .await;
+            mirror
+                .update_status(&id, AgentSessionStatus::Retry, None)
+                .await;
+            assert!(mirror.is_compacting(&id).await);
+            mirror
+                .update_status(&id, AgentSessionStatus::Idle, None)
+                .await;
+            assert!(!mirror.is_compacting(&id).await);
+        }
+    }
 
     struct Scratch(std::path::PathBuf);
 

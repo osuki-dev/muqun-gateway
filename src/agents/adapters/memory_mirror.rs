@@ -128,6 +128,7 @@ struct SessionState {
     permissions: HashMap<String, PermissionRequest>,
     forms: HashMap<String, FormRequest>,
     inbox: Vec<serde_json::Value>,
+    compacting: bool,
     event_log: VecDeque<ReplayEvent>,
     event_log_bytes: usize,
     /// Last discarded sequence, even when the replay log is now empty.
@@ -154,6 +155,7 @@ impl SessionState {
             permissions: HashMap::new(),
             forms: HashMap::new(),
             inbox: Vec::new(),
+            compacting: false,
             event_log: VecDeque::new(),
             event_log_bytes: 0,
             replay_floor: 0,
@@ -883,6 +885,9 @@ impl MemoryMirror {
         );
         let previous_status = state.info.status;
         state.info.status = status;
+        if !matches!(status, AgentSessionStatus::Busy | AgentSessionStatus::Retry) {
+            state.compacting = false;
+        }
         if error.is_some() {
             state.info.error = error.clone();
         } else if status != AgentSessionStatus::Failed {
@@ -1176,6 +1181,11 @@ impl MemoryMirror {
             &mut sessions,
             asid,
             AgentSessionStatus::Busy,
+        );
+        state.compacting = matches!(
+            status,
+            crate::agents::domain::CompactionStatus::Started
+                | crate::agents::domain::CompactionStatus::Running
         );
         let seq = state.next_seq();
         let event = AgentDomainEvent::CompactionChanged {
@@ -1914,6 +1924,16 @@ impl ToolPatch {
 }
 
 impl SessionMirrorPort for MemoryMirror {
+    fn is_compacting<'a>(&'a self, asid: &'a AgentSessionId) -> MirrorFuture<'a, bool> {
+        Box::pin(async move {
+            self.sessions
+                .read()
+                .await
+                .get(asid)
+                .is_some_and(|state| state.compacting)
+        })
+    }
+
     fn get_snapshot<'a>(
         &'a self,
         asid: &'a AgentSessionId,

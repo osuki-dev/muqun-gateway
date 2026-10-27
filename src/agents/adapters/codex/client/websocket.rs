@@ -98,6 +98,7 @@ impl CodexClient {
             pending: Mutex::new(HashMap::new()),
             requests: Mutex::new(HashMap::new()),
             turns: Mutex::new(HashMap::new()),
+            compactions: Mutex::new(HashMap::new()),
             completed_turns: Mutex::new(HashMap::new()),
             lifecycle_completed_turns: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),

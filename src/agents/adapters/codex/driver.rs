@@ -218,6 +218,29 @@ impl CodexDriver {
         }
     }
 
+    /// Caller holds `mutations`; all queue receipts use one publication path.
+    fn enqueue_prompt(
+        &self,
+        thread: &str,
+        text: &str,
+        files: Vec<Value>,
+        input: Vec<Value>,
+    ) -> Result<(), AgentError> {
+        self.queue().push(
+            thread,
+            Queued {
+                id: format!("inbox_{}", uuid::Uuid::new_v4().simple()),
+                created_ms: now_ms(),
+                delivery: Delivery::Queue,
+                text: text.to_owned(),
+                files,
+                input,
+            },
+        )?;
+        self.signal(InboxSignal::Changed(thread.into()));
+        Ok(())
+    }
+
     fn queue(&self) -> std::sync::MutexGuard<'_, Inbox> {
         self.inbox.lock().unwrap_or_else(|p| p.into_inner())
     }
@@ -297,6 +320,10 @@ impl CodexDriver {
             .get(thread, id)
             .map(|item| item.input.clone())
             .ok_or_else(|| inbox_item_not_found(id))?;
+        if self.client.is_compacting(thread) {
+            // Keep the visible receipt until a turn can accept it.
+            return Ok(());
+        }
         let result = match self.client.active_turn(thread) {
             Some(turn) => self.steer_locked(thread, &turn, input).await,
             None => self.start_turn_locked(thread, input).await,
@@ -2290,7 +2317,9 @@ impl AgentPort for CodexDriver {
             // Validate uploads before any rejoin/resume or prompt mutation.
             let prepared = super::input::prepare(text, attachments).await?;
             let input = prepared.input;
-            if delivery == Some(Delivery::Queue) {
+            // Compaction cannot consume steering yet. Publish the accepted
+            // prompt through the ordinary inbox instead of hiding it upstream.
+            if delivery == Some(Delivery::Queue) || self.client.is_compacting(id) {
                 self.prepare_shared_interaction(id).await?;
                 let _guard = self.mutations.lock().await;
                 self.require_native_interaction(id).await?;
@@ -2305,19 +2334,7 @@ impl AgentPort for CodexDriver {
                 if !self.loaded.lock().await.contains(id) {
                     return unsupported("Codex queued delivery requires an owned live thread");
                 }
-                self.queue().push(
-                    id,
-                    Queued {
-                        id: format!("inbox_{}", uuid::Uuid::new_v4().simple()),
-                        created_ms: now_ms(),
-                        delivery: Delivery::Queue,
-                        text: text.to_owned(),
-                        files: prepared.files,
-                        input,
-                    },
-                )?;
-                self.signal(InboxSignal::Changed(id.into()));
-                return Ok(());
+                return self.enqueue_prompt(id, text, prepared.files, input);
             }
             if delivery == Some(Delivery::Steer) {
                 self.prepare_shared_interaction(id).await?;
@@ -2325,6 +2342,10 @@ impl AgentPort for CodexDriver {
                 self.require_native_interaction(id).await?;
                 if !self.loaded.lock().await.contains(id) {
                     return unsupported("Codex steering requires an owned live thread");
+                }
+                // Compaction may have begun while preparing the interaction.
+                if self.client.is_compacting(id) {
+                    return self.enqueue_prompt(id, text, prepared.files, input);
                 }
                 let turn = self.client.active_turn(id).ok_or_else(|| {
                     AgentError::InvalidRequest(

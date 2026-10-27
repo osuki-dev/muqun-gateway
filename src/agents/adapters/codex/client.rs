@@ -99,6 +99,8 @@ struct State {
     pending: Mutex<HashMap<u64, Pending>>,
     requests: Mutex<HashMap<String, ServerRequest>>,
     turns: Mutex<HashMap<String, String>>,
+    /// Active compaction, bound to both turn and item identity.
+    compactions: Mutex<HashMap<String, (String, String)>>,
     completed_turns: Mutex<HashMap<String, String>>,
     // Only completions of observed active turns authorize lifecycle cleanup.
     lifecycle_completed_turns: Mutex<HashMap<String, String>>,
@@ -164,6 +166,7 @@ impl State {
         locked(&self.requests).clear();
         locked(&self.subscribed).clear();
         locked(&self.turns).clear();
+        locked(&self.compactions).clear();
         locked(&self.completed_turns).clear();
         locked(&self.lifecycle_completed_turns).clear();
     }
@@ -387,6 +390,7 @@ impl CodexClient {
             pending: Mutex::new(HashMap::new()),
             requests: Mutex::new(HashMap::new()),
             turns: Mutex::new(HashMap::new()),
+            compactions: Mutex::new(HashMap::new()),
             completed_turns: Mutex::new(HashMap::new()),
             lifecycle_completed_turns: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
@@ -1010,6 +1014,13 @@ impl CodexClient {
             revision,
         })
     }
+    pub(crate) fn is_compacting(&self, thread: &str) -> bool {
+        let turns = locked(&self.state.turns);
+        locked(&self.state.compactions)
+            .get(thread)
+            .is_some_and(|(turn, _)| turns.get(thread) == Some(turn))
+    }
+
     pub fn active_turn(&self, thread: &str) -> Option<String> {
         locked(&self.state.turns).get(thread).cloned()
     }
@@ -1231,6 +1242,7 @@ fn route_frame(state: &State, mut value: Value, frame_bytes: usize) -> Result<()
                     }
                     completed.insert(thread.into(), turn.into());
                     turns.remove(thread);
+                    locked(&state.compactions).remove(thread);
                 }
                 drop(turns);
                 // Keep the separate response fence even for an unobserved turn:
@@ -1249,6 +1261,32 @@ fn route_frame(state: &State, mut value: Value, frame_bytes: usize) -> Result<()
                         !(r.params["threadId"] == thread && r.params["turnId"] == turn)
                     });
                 }
+            } else if matches!(method, "item/started" | "item/completed")
+                && params["item"]["type"] == "contextCompaction"
+            {
+                if let (Some(turn), Some(item)) =
+                    (params["turnId"].as_str(), params["item"]["id"].as_str())
+                {
+                    let turns = locked(&state.turns);
+                    if turns.get(thread).map(String::as_str) == Some(turn) {
+                        let mut compactions = locked(&state.compactions);
+                        if method == "item/started" {
+                            if compactions.len() >= 4096 && !compactions.contains_key(thread) {
+                                return Err(AgentError::Protocol(
+                                    "Codex compaction capacity exhausted".into(),
+                                ));
+                            }
+                            compactions.insert(thread.into(), (turn.into(), item.into()));
+                        } else if compactions
+                            .get(thread)
+                            .is_some_and(|(held_turn, held_item)| {
+                                held_turn == turn && held_item == item
+                            })
+                        {
+                            compactions.remove(thread);
+                        }
+                    }
+                }
             } else if method == "serverRequest/resolved" {
                 if let Some(key) = state.request_id(&params["requestId"]) {
                     let mut requests = locked(&state.requests);
@@ -1264,6 +1302,7 @@ fn route_frame(state: &State, mut value: Value, frame_bytes: usize) -> Result<()
             {
                 locked(&state.subscribed).remove(thread);
                 locked(&state.turns).remove(thread);
+                locked(&state.compactions).remove(thread);
                 locked(&state.completed_turns).remove(thread);
                 locked(&state.lifecycle_completed_turns).remove(thread);
                 locked(&state.requests).retain(|_, r| r.params["threadId"] != thread);

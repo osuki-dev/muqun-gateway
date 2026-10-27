@@ -1100,6 +1100,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn compaction_turns_default_and_steered_prompts_into_visible_queue_receipts() {
+        let mut q = Queue::new().await;
+        q.send("start", None).await.unwrap();
+        q.turn_started("t1").await;
+        let compact = json!({"threadId":q.thread,"turnId":"t1",
+            "item":{"id":"compact","type":"contextCompaction"}});
+        q.notify("item/started", compact.clone()).await;
+        q.send("steered during compaction", Some("steer"))
+            .await
+            .unwrap();
+        q.send("default during compaction", None).await.unwrap();
+        let (items, _) = q.publish().await;
+        assert_eq!(
+            texts(&items),
+            ["steered during compaction", "default during compaction"]
+        );
+        assert!(items.iter().all(|item| item["delivery"] == "queue"));
+        assert_eq!(q.delivered().len(), 1);
+        q.driver
+            .set_inbox_delivery(&q.thread, items[0]["id"].as_str().unwrap(), "steer")
+            .await
+            .unwrap();
+        assert_eq!(
+            q.delivered().len(),
+            1,
+            "send now must not bypass compaction"
+        );
+        // A stale item completion must not release the current compaction.
+        let mut stale = compact.clone();
+        stale["item"]["id"] = json!("old-compact");
+        q.notify("item/completed", stale).await;
+        assert!(q.driver.client().is_compacting(&q.thread));
+        q.notify("item/completed", compact).await;
+        assert!(!q.driver.client().is_compacting(&q.thread));
+        q.turn_completed("t1", "completed").await;
+        q.wait_delivered(2).await;
+        assert_eq!(
+            q.delivered()[1],
+            ("turn/start".into(), "steered during compaction".into())
+        );
+    }
+
+    #[tokio::test]
     async fn codex_inbox_waits_for_the_active_turn_and_drains_one_item_per_completed_turn() {
         let mut q = Queue::new().await;
         let uploads = crate::ensure_uploads_dir().unwrap().canonicalize().unwrap();

@@ -1384,6 +1384,17 @@ Items are OpenCode's verbatim, i.e. camelCase:
 `{id, sessionID, timeCreated, type: "user"|"synthetic"|"compaction"|"move", payload, delivery}`.
 A user item's `payload` is `{text, files?: [{uri, name?, mime?}]}`.
 
+Prompt delivery is provider-neutral. While the Gateway has observed live
+compaction, the common prompt service requests `queue`, including when the
+caller omitted delivery or requested `steer`. Each adapter implements that
+intent using its native inbox or its Gateway-owned queue. Unsupported delivery
+must be refused explicitly; a successful submission alone is not a queued
+receipt. Apps render the acknowledged inbox item, including its text and stable
+identity, through the same UI for every provider. An optimistic row must not
+hide its acknowledged queue status. Historical compaction summaries do not
+establish live compaction, and completion, failure or an inactive session clears
+the observed state. Unknown delivery outcomes are never retried automatically.
+
 DeepSeek Harness exposes its durable `inbox` projection through this same shape:
 `next-turn` is `queue`, `next-step` is `steer`, and ids are native MessageIds.
 Edit, cancellation and send-now call `session/updateQueue` with `edit`, `remove`
@@ -1416,6 +1427,9 @@ the queue waits for the user. `…/steer` sends an item now: `turn/steer` into t
 running turn, or a new turn. A refused send keeps the item; an unknown outcome
 removes it, never resends it, and publishes `agent.resync` with reason
 `codex_queued_delivery_outcome_unknown`.
+During an observed `contextCompaction` item, default and steered prompts join
+that same queue. Send-now leaves the receipt queued until compaction ends;
+normal successful turn completion drains it as described above.
 
 On the way out (this route, the snapshot's `inbox`, `agent.inbox.changed`), an
 item with `payload.files` also carries the two fields a transcript user row has
