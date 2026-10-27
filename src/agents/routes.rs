@@ -29,6 +29,8 @@ use crate::{
 pub struct AgentDirectoriesQuery {
     /// What the user has typed: `~/Work/mu`, `/ho`, `~/.co`.
     pub prefix: Option<String>,
+    /// Case-insensitive folder-name keyword search beneath the user's home.
+    pub query: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -360,6 +362,10 @@ pub fn mount(router: Router<AppState>) -> Router<AppState> {
         .route(
             "/api/agent-sessions/{asid}/file-asset",
             get(message_images::file_asset),
+        )
+        .route(
+            "/api/agent-sessions/{asid}/file-source",
+            get(message_images::file_source),
         )
         .route(
             "/api/agent-images/{id}/{variant}",
@@ -1710,8 +1716,12 @@ async fn do_list_agent_directories(
     require_device(state, headers)?;
 
     let home = dirs::home_dir();
-    let completion =
-        super::directories::complete(query.prefix.as_deref().unwrap_or(""), home.as_deref()).await;
+    let completion = if let Some(keyword) = query.query.as_deref().filter(|q| !q.trim().is_empty())
+    {
+        super::directories::search(keyword, home.as_deref()).await
+    } else {
+        super::directories::complete(query.prefix.as_deref().unwrap_or(""), home.as_deref()).await
+    };
     let mut body = content_envelope(json!(completion.directories));
     body["home"] = json!(home.map(|h| h.to_string_lossy().into_owned()));
     body["truncated"] = json!(completion.truncated);

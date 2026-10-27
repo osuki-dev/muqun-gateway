@@ -841,6 +841,11 @@ pub fn openapi_spec() -> Value {
         "description": "Requires device authentication and agent_file_assets capability. Resolves audio, video, images, documents and binary files inside the server-owned directory. Web URLs, path escapes and symlinks outside the root are refused. Returns data.asset metadata with an opaque id.",
         "parameters": [path_param("asid"), query_param("uri", "Local file URI or path")], "responses": ok_response()
     }});
+    spec["paths"]["/api/agent-sessions/{asid}/file-source"] = json!({"get": {
+        "summary": "Resolve an explicit file or request a computer choice",
+        "description": "Requires paired App authentication and agent_file_source_selection_v1. Uses the ordinary file-asset policy. If an absolute host reference is unavailable here, returns data.file_source {state: choose_computer, path}. This is a source choice, never a grant or a remote file probe. The selected computer authenticates its own paired caller and applies its explicit-file policy before returning bytes. Other failures retain their status.",
+        "parameters": [path_param("asid"), query_param("uri", "Local file URI or path")], "responses": ok_response()
+    }});
     spec["paths"]["/api/agent-images/{id}/{variant}"] = json!({"get": {
         "summary": "Read an authorized original or optional WebP derivative",
         "description": "Requires paired App authentication and agent_image_previews_v1. Registration and original canonical-file scope are rechecked even on cache hits. Legacy original/download stream authorized files in 64 KiB chunks with weak metadata ETag and single Range; these unversioned URLs do not fix content across requests. With agent_image_versions_v1, variant=version lazily returns data.asset {id,version,etag,size,mime,name,url,download_url} for a fixed original; use its returned versioned URLs and strong If-Match for multipart consistency. Existing sealed transport has a bounded collector, so large consumers still need small ranges (e.g. 8 MiB). thumbnail/preview return bounded WebP (384/1600 edge; source <=25 MiB), or 415 without replacing the original. No arbitrary path query. Private/no-store and existing pairing transport rules apply.",

@@ -227,6 +227,47 @@ pub(crate) async fn file_asset(
     resolve_agent_file(state, asid, query, headers, None).await
 }
 
+/// Source selection is a Gateway decision. It never probes other computers or
+/// grants access: the chosen computer applies the same explicit-file policy.
+pub(crate) async fn file_source(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    axum::extract::Path(asid): axum::extract::Path<String>,
+    axum::extract::Query(query): axum::extract::Query<AudioAssetQuery>,
+    headers: axum::http::HeaderMap,
+) -> ApiResult<axum::Json<serde_json::Value>> {
+    require_device(&state, &headers)?;
+    let reference = absolute_file_reference(&query.uri);
+    match (
+        resolve_agent_file(state, asid, query, headers, None).await,
+        reference,
+    ) {
+        (Err((axum::http::StatusCode::NOT_FOUND, _)), Some(path)) => {
+            Ok(axum::Json(content_envelope(serde_json::json!({
+                "file_source": {"state":"choose_computer", "path":path}
+            }))))
+        }
+        (result, _) => result,
+    }
+}
+
+fn absolute_file_reference(uri: &str) -> Option<String> {
+    let path = if let Some(rest) = strip_prefix_ignore_case(uri, "file://") {
+        let rest = rest.strip_prefix("localhost").unwrap_or(rest);
+        if !rest.starts_with('/') {
+            return None;
+        }
+        percent_decode(rest)?
+    } else {
+        uri.to_owned()
+    };
+    ((path.starts_with('/') || path.starts_with("~/"))
+        && !path.starts_with("//")
+        && !path.starts_with("/api/")
+        && path.len() <= 8192
+        && !path.chars().any(char::is_control))
+    .then_some(path)
+}
+
 async fn resolve_agent_file(
     state: AppState,
     asid: String,
@@ -909,6 +950,72 @@ pub(crate) fn image_dimensions(head: &[u8]) -> Option<(u32, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_source_selection_accepts_host_paths_not_urls_or_relative_guesses() {
+        assert_eq!(
+            absolute_file_reference("file:///Users/me/a%20b.pdf").as_deref(),
+            Some("/Users/me/a b.pdf")
+        );
+        assert_eq!(
+            absolute_file_reference("~/Desktop/report").as_deref(),
+            Some("~/Desktop/report")
+        );
+        for bad in [
+            "https://host/file",
+            "file://other/path",
+            "//host/path",
+            "relative/file",
+            "/api/uploads/file",
+            "file:///tmp/%00secret",
+        ] {
+            assert_eq!(absolute_file_reference(bad), None, "{bad}");
+        }
+    }
+
+    #[tokio::test]
+    async fn file_source_selection_is_authenticated_and_preserves_local_file_policy() {
+        use axum::{
+            extract::{Path as RoutePath, Query, State},
+            http::{HeaderMap, HeaderValue, StatusCode},
+        };
+        let root = crate::test_support::asset_test_dir("source-selection");
+        let state = crate::test_state("admin", vec![crate::test_device("phone", "token")]);
+        state.message_images.remember_root("session", root.to_str());
+        let path = root.join("report.txt");
+        let call = |headers| {
+            file_source(
+                State(state.clone()),
+                RoutePath("session".into()),
+                Query(AudioAssetQuery {
+                    uri: path.to_string_lossy().into_owned(),
+                }),
+                headers,
+            )
+        };
+        assert_eq!(
+            call(HeaderMap::new()).await.unwrap_err().0,
+            StatusCode::UNAUTHORIZED
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", HeaderValue::from_static("Bearer wrong"));
+        assert_eq!(
+            call(headers.clone()).await.unwrap_err().0,
+            StatusCode::FORBIDDEN
+        );
+        headers.insert("authorization", HeaderValue::from_static("Bearer token"));
+        let missing = call(headers.clone()).await.unwrap().0;
+        assert_eq!(missing["data"]["file_source"]["state"], "choose_computer");
+        assert_eq!(
+            missing["data"]["file_source"]["path"],
+            path.to_string_lossy().as_ref()
+        );
+        std::fs::write(&path, "report").unwrap();
+        let local = call(headers).await.unwrap().0;
+        assert_eq!(local["data"]["asset"]["name"], "report.txt");
+        assert!(local["data"].get("file_source").is_none());
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     #[tokio::test]
     async fn queued_prompt_files_get_the_transcript_attachment_fields() {

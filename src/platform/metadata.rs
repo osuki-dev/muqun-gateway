@@ -81,6 +81,8 @@ pub(crate) const API_CAPABILITIES: &[&str] = &[
     "assets",
     "agent_audio_assets",
     "agent_file_assets",
+    "agent_file_source_selection_v1",
+    "agent_directory_search_v1",
     "agent_image_previews_v1",
     "agent_image_versions_v1",
     "asset_download",
