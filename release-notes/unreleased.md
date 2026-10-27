@@ -2,6 +2,13 @@
 
 ## Changes and fixes
 
+- **Terminal health checks no longer wait for AI provider catalogs.** Opening
+  a terminal now reads local agent readiness instead of refreshing unrelated
+  model catalogs or probing providers when their discovery cache expires.
+  Explicit agent discovery keeps its complete catalogs and features. Existing
+  App pairing and Herdr requirements are unchanged; restart the Gateway after
+  updating.
+
 - **Opening a terminal avoids inspecting every other pane first.** Health
   checks now read Herdr's pane topology without enriching each pane's process
   and terminal details. This reduces cold connection work on computers with

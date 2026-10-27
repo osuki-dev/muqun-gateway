@@ -356,7 +356,7 @@ pub(crate) async fn gateway_metadata(
         }
         backends.push(metadata);
     }
-    let planes = discovery::build_discovery_planes(state).await;
+    let planes = discovery::build_health_planes(state).await;
     Ok(json!({
         "ok": true,
         "gatewayVersion": env!("CARGO_PKG_VERSION"),
