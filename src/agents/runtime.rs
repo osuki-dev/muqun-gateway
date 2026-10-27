@@ -904,6 +904,23 @@ impl AgentRuntime {
         }
     }
 
+    /// Cheap health facts from the supervisor's current attachments. An
+    /// enabled provider without an attachment has not been probed by this
+    /// request, so do not turn that absence into an offline verdict. Catalog
+    /// reads belong to explicit discovery, even after its cache expires.
+    pub(crate) async fn health_snapshot(&self) -> crate::discovery::AgentPlaneDiscovery {
+        use crate::discovery::AgentAvailability;
+        let mut found = self.attached_snapshot().await;
+        for agent in &mut found.agents {
+            if agent.status == AgentAvailability::Offline
+                && self.manager_for_agent(&agent.id).await.is_none()
+            {
+                agent.status = AgentAvailability::Unknown;
+            }
+        }
+        self.fence_codex_discovery(found).await
+    }
+
     /// One discovery pass, uncached and with no TTL or timeout. The routes go
     /// through `discover_agents`; this is for the `agent` CLI only.
     pub(crate) async fn probe_agents(&self) -> crate::discovery::AgentPlaneDiscovery {
@@ -3009,6 +3026,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn health_does_not_wait_on_cold_or_expired_provider_catalogs() {
+        use crate::discovery::AgentAvailability;
+        let mut state = crate::test_state("admin", vec![crate::test_device("phone", "device")]);
+        state.config.sessions.clear();
+        let runtime = AgentRuntime::with_all_configs(
+            OpencodeConfig {
+                enabled: true,
+                autostart: false,
+                binary: None,
+            },
+            DeepseekConfig::default(),
+            T3Config::default(),
+            CodexConfig {
+                enabled: false,
+                binary: None,
+            },
+            None,
+        );
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let mut agent = crate::FakeAgent::new("opencode");
+        agent.catalog_gate = Some(gate.clone());
+        runtime
+            .install(
+                "opencode",
+                AgentManager::for_test(Arc::new(agent)),
+                AgentOrigin::Adopted,
+            )
+            .await;
+        state.agent_runtime = runtime.clone();
+
+        for expired in [false, true] {
+            if expired {
+                gate.notify_one();
+                runtime.discover_agents().await;
+                runtime.discovery_cache.write().await.as_mut().unwrap().0 =
+                    tokio::time::Instant::now() - DISCOVERY_TTL;
+            }
+            assert!(
+                tokio::time::timeout(Duration::from_millis(25), runtime.discover_agents())
+                    .await
+                    .is_err(),
+                "explicit discovery still waits for the blocked provider"
+            );
+            let health = tokio::time::timeout(
+                Duration::from_millis(250),
+                crate::platform::routes::health(
+                    crate::State(state.clone()),
+                    crate::bearer_headers("device"),
+                ),
+            )
+            .await
+            .expect("health never waits for agent catalogs")
+            .unwrap()
+            .0;
+            let agents = health["planes"]["agents"]["agents"].as_array().unwrap();
+            assert_eq!(
+                agents
+                    .iter()
+                    .find(|agent| agent["id"] == "opencode")
+                    .unwrap()["status"],
+                "connected"
+            );
+            assert!(agents
+                .iter()
+                .all(|agent| agent["models"].as_array().unwrap().is_empty()));
+            assert!(health["capabilities"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("multi_agent")));
+        }
+
+        runtime.managers.write().await.clear();
+        *runtime.manager.write().await = None;
+        let snapshot = runtime.health_snapshot().await;
+        assert_eq!(
+            snapshot
+                .agents
+                .iter()
+                .find(|agent| agent.id == "opencode")
+                .unwrap()
+                .status,
+            AgentAvailability::Unknown
+        );
+        assert!(!snapshot.supported);
+    }
+
+    #[tokio::test]
     async fn closed_codex_is_not_available_or_advertised_from_cached_discovery() {
         use crate::agents::adapters::codex::tests::Fixture;
         let mut fixture = Fixture::new(|_| serde_json::json!({})).await;
@@ -3051,6 +3155,16 @@ mod tests {
         // fenced by the driver's exact client instance before writing any RPC.
         assert!(runtime.manager_for_agent("codex").await.is_some());
         assert!(!runtime.status_for("codex").await.unwrap().available);
+        let health = runtime.health_snapshot().await;
+        assert_eq!(
+            health
+                .agents
+                .iter()
+                .find(|agent| agent.id == "codex")
+                .unwrap()
+                .status,
+            crate::discovery::AgentAvailability::Offline
+        );
         let found = runtime.discover_agents().await;
         let codex = found.agents.iter().find(|a| a.id == "codex").unwrap();
         assert_eq!(codex.status, crate::discovery::AgentAvailability::Offline);
