@@ -193,6 +193,9 @@ pub struct HerdrBackend {
     /// is a scan of `/dev`; asking whether the cached answer still holds is
     /// one syscall, which is what every listing pays instead.
     terminals: Mutex<HashMap<u32, (u64, PathBuf)>>,
+    /// A bulk listing resolves every shell's tty. Index the device directory
+    /// once for that backend instead of scanning it again for each pane.
+    terminal_devices: std::sync::OnceLock<HashMap<u64, PathBuf>>,
 }
 
 impl HerdrBackend {
@@ -206,6 +209,7 @@ impl HerdrBackend {
             request_timeout,
             process_info: AtomicBool::new(true),
             terminals: Mutex::new(HashMap::new()),
+            terminal_devices: std::sync::OnceLock::new(),
         }
     }
 
@@ -432,6 +436,9 @@ impl TerminalBackend for HerdrBackend {
     fn list_panes(&self) -> BackendFuture<'_, Vec<Pane>> {
         Box::pin(async move {
             let panes = self.list_panes_for_liveness().await?;
+            if !panes.is_empty() {
+                self.terminal_devices.get_or_init(tty::device_paths);
+            }
             // One `pane.process_info` per pane, all in flight at once: the
             // approval watcher lists every 1.5s, and N round trips of 0.1ms
             // each are cheap in parallel and still cheap in series, but there
@@ -1004,13 +1011,19 @@ impl HerdrBackend {
             match terminals.get(&pid) {
                 Some((known, path)) if *known == device => path.clone(),
                 _ => {
-                    let path = tty::device_path(device)?;
+                    let path = self
+                        .terminal_devices
+                        .get()
+                        .and_then(|paths| paths.get(&device))
+                        .filter(|path| tty::is_device(path, device))
+                        .cloned()
+                        .or_else(|| tty::device_path(device))?;
                     terminals.insert(pid, (device, path.clone()));
                     path
                 }
             }
         };
-        let grid = tty::window_size(&path);
+        let grid = tty::window_size(&path, device);
         if grid.is_none() {
             if let Ok(mut terminals) = self.terminals.lock() {
                 terminals.remove(&pid);
@@ -1065,6 +1078,7 @@ fn unknown_method(error: &BackendError) -> bool {
 /// A pty's size, asked of the pty itself.
 #[cfg(unix)]
 mod tty {
+    use std::collections::HashMap;
     use std::os::fd::AsRawFd as _;
     use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, OpenOptionsExt as _};
     use std::path::{Path, PathBuf};
@@ -1126,14 +1140,42 @@ mod tty {
         })
     }
 
+    pub fn device_paths() -> HashMap<u64, PathBuf> {
+        let mut paths = HashMap::new();
+        for directory in ["/dev/pts", "/dev"] {
+            let Ok(entries) = std::fs::read_dir(directory) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                if let Ok(metadata) = entry.metadata() {
+                    if metadata.file_type().is_char_device() {
+                        paths.entry(metadata.rdev()).or_insert_with(|| entry.path());
+                    }
+                }
+            }
+        }
+        paths
+    }
+
+    pub fn is_device(path: &Path, device: u64) -> bool {
+        std::fs::metadata(path).is_ok_and(|metadata| {
+            metadata.file_type().is_char_device() && metadata.rdev() == device
+        })
+    }
+
     /// `TIOCGWINSZ` on the terminal at `path`: columns then rows, or `None`
     /// where it cannot be opened, is not a terminal, or has no size yet.
-    pub fn window_size(path: &Path) -> Option<(u32, u32)> {
+    pub fn window_size(path: &Path, device: u64) -> Option<(u32, u32)> {
         let terminal = std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOCTTY | libc::O_NONBLOCK)
             .open(path)
             .ok()?;
+        // The index is only a path hint. Verify the opened descriptor, too:
+        // a tty can disappear or its path can be reused after indexing it.
+        if terminal.metadata().ok()?.rdev() != device {
+            return None;
+        }
         let mut size = libc::winsize {
             ws_row: 0,
             ws_col: 0,
@@ -1151,6 +1193,7 @@ mod tty {
 
 #[cfg(not(unix))]
 mod tty {
+    use std::collections::HashMap;
     use std::path::{Path, PathBuf};
 
     pub fn controlling_terminal(_pid: u32) -> Option<u64> {
@@ -1161,7 +1204,15 @@ mod tty {
         None
     }
 
-    pub fn window_size(_path: &Path) -> Option<(u32, u32)> {
+    pub fn device_paths() -> HashMap<u64, PathBuf> {
+        HashMap::new()
+    }
+
+    pub fn is_device(_path: &Path, _device: u64) -> bool {
+        false
+    }
+
+    pub fn window_size(_path: &Path, _device: u64) -> Option<(u32, u32)> {
         None
     }
 }
@@ -2083,6 +2134,7 @@ mod tests {
     #[test]
     fn a_pane_is_as_wide_as_the_terminal_its_shell_runs_on() {
         use std::os::fd::FromRawFd as _;
+        use std::os::unix::fs::MetadataExt as _;
         use std::os::unix::process::CommandExt as _;
 
         let mut master: libc::c_int = -1;
@@ -2118,7 +2170,11 @@ mod tests {
                     .into_owned(),
             )
         };
-        assert_eq!(tty::window_size(&slave_path), Some((31, 59)));
+        let device = std::fs::metadata(&slave_path).unwrap().rdev();
+        assert_eq!(tty::window_size(&slave_path, device), Some((31, 59)));
+        assert_eq!(tty::window_size(&slave_path, device.wrapping_add(1)), None);
+        let index = tty::device_paths();
+        assert!(tty::is_device(index.get(&device).unwrap(), device));
 
         // A child whose controlling terminal is that pty, the way a shell in
         // a pane has herdr's pty: a session of its own, with the slave as its
@@ -2148,10 +2204,19 @@ mod tests {
         let mut child = command.spawn().expect("spawn a child on the pty");
 
         let backend = HerdrBackend::new("/nonexistent/herdr.sock");
+        // A stale index hint must fall back to live resolution, never report
+        // another device's grid for this shell.
+        backend
+            .terminal_devices
+            .set(HashMap::from([(device, PathBuf::from("/dev/null"))]))
+            .unwrap();
         let grid = backend.pane_grid(child.id());
         // Asked twice: the second answer comes through the cache and must be
         // the same one.
         let again = backend.pane_grid(child.id());
+        let indexed = HerdrBackend::new("/nonexistent/herdr.sock");
+        indexed.terminal_devices.set(index).unwrap();
+        assert_eq!(indexed.pane_grid(child.id()), Some((31, 59)));
         let _ = child.kill();
         let _ = child.wait();
         // SAFETY: `master` is still open and owned here.
@@ -2162,6 +2227,55 @@ mod tests {
         // A pid without a terminal -- or one this process may not ask about
         // -- is not a width.
         assert_eq!(backend.pane_grid(u32::MAX - 1), None);
+    }
+
+    /// Read-only host benchmark: run in release mode on the same machine to
+    /// separate device-directory work from Herdr RPC and HTTP transport.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "read-only host performance measurement"]
+    fn terminal_device_lookup_benchmark() {
+        let paths = tty::device_paths();
+        let devices: Vec<u64> = paths
+            .iter()
+            .filter(|(_, path)| {
+                path.parent() == Some(std::path::Path::new("/dev/pts"))
+                    || path
+                        .file_name()
+                        .is_some_and(|name| name.to_string_lossy().starts_with("ttys"))
+            })
+            .map(|(device, _)| *device)
+            .collect();
+        for run in 0..2 {
+            let started = std::time::Instant::now();
+            let before: Vec<_> = devices
+                .iter()
+                .map(|device| tty::device_path(*device))
+                .collect();
+            let repeated_scan = started.elapsed();
+            let started = std::time::Instant::now();
+            let indexed = tty::device_paths();
+            let after: Vec<_> = devices
+                .iter()
+                .map(|device| {
+                    indexed
+                        .get(device)
+                        .filter(|path| tty::is_device(path, *device))
+                        .cloned()
+                })
+                .collect();
+            let indexed_scan = started.elapsed();
+            assert_eq!(
+                before.iter().filter(|path| path.is_some()).count(),
+                after.iter().filter(|path| path.is_some()).count()
+            );
+            println!(
+                "run={run} devices={} repeated_scan_us={} indexed_scan_us={}",
+                devices.len(),
+                repeated_scan.as_micros(),
+                indexed_scan.as_micros()
+            );
+        }
     }
 
     #[test]
