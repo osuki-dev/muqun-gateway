@@ -24,6 +24,7 @@ use crate::agents::domain::{
 };
 use crate::agents::ports::agent::{
     append_attachment_paths, AgentError, AgentFuture, AgentPort, AttachmentMode, FileDiffItem,
+    PreparedTimeline,
 };
 
 /// The title a thread is created with; read back, it means "untitled".
@@ -754,20 +755,15 @@ impl AgentPort for T3Driver {
         limit: usize,
     ) -> AgentFuture<'a, Vec<TimelineItem>> {
         Box::pin(async move {
+            if self.client.is_v2() {
+                let prepared = self.prepare_timeline(session_id, limit).await?;
+                if let Some(commit) = prepared.commit {
+                    commit()?;
+                }
+                return Ok(prepared.items);
+            }
             let id = validate_id(session_id, "session id")?;
             let detail = self.client.timeline_snapshot(&id, limit).await?;
-            if self.client.is_v2() {
-                self.watcher.watch(&id);
-                let mut items = v2::mapper::timeline(
-                    &id,
-                    &detail["projection"],
-                    detail["snapshotSequence"].as_u64().unwrap_or(0),
-                );
-                if limit > 0 && items.len() > limit {
-                    items.drain(..items.len() - limit);
-                }
-                return Ok(items);
-            }
             let thread = detail
                 .get("thread")
                 .ok_or_else(|| AgentError::Protocol("thread snapshot without thread".into()))?;
@@ -777,6 +773,89 @@ impl AgentPort for T3Driver {
                 items.drain(..items.len() - limit);
             }
             Ok(items)
+        })
+    }
+
+    fn prepare_timeline<'a>(
+        &'a self,
+        session_id: &'a str,
+        limit: usize,
+    ) -> AgentFuture<'a, PreparedTimeline<'a>> {
+        Box::pin(async move {
+            if !self.client.is_v2() {
+                return self
+                    .get_timeline(session_id, limit)
+                    .await
+                    .map(PreparedTimeline::ready);
+            }
+            let id = validate_id(session_id, "session id")?;
+            let prepared = self.client.prepare_timeline_snapshot(&id, limit).await?;
+            let detail = &prepared.detail;
+            let mut items = v2::mapper::timeline(
+                &id,
+                &detail["projection"],
+                detail["snapshotSequence"].as_u64().unwrap_or(0),
+            );
+            if limit > 0 && items.len() > limit {
+                items.drain(..items.len() - limit);
+            }
+            Ok(PreparedTimeline {
+                items,
+                commit: Some(Box::new(move || {
+                    let commit = self.client.commit_timeline(&id, prepared, true)?;
+                    self.watcher.watch(&id);
+                    Ok(commit)
+                })),
+            })
+        })
+    }
+
+    fn load_earlier_timeline<'a>(
+        &'a self,
+        session_id: &'a str,
+        limit: usize,
+    ) -> AgentFuture<'a, Vec<TimelineItem>> {
+        Box::pin(async move {
+            let prepared = self.prepare_earlier_timeline(session_id, limit).await?;
+            if let Some(commit) = prepared.commit {
+                commit()?;
+            }
+            Ok(prepared.items)
+        })
+    }
+
+    fn prepare_earlier_timeline<'a>(
+        &'a self,
+        session_id: &'a str,
+        limit: usize,
+    ) -> AgentFuture<'a, PreparedTimeline<'a>> {
+        Box::pin(async move {
+            if !self.client.is_v2() {
+                return Err(AgentError::Unsupported("T3 V1 earlier history".into()));
+            }
+            if limit == 0 || limit > 2000 {
+                return Err(AgentError::InvalidRequest(
+                    "T3 history page limit must be between 1 and 2000".into(),
+                ));
+            }
+            let id = validate_id(session_id, "session id")?;
+            let Some(prepared) = self.client.prepare_earlier_snapshot(&id, limit).await? else {
+                return Ok(PreparedTimeline::ready(Vec::new()));
+            };
+            let detail = &prepared.detail;
+            let anchor = detail["gatewayHistoryAnchorId"].as_str();
+            let mut items = v2::mapper::timeline(
+                &id,
+                &detail["projection"],
+                detail["snapshotSequence"].as_u64().unwrap_or(0),
+            );
+            items.retain(|row| Some(row.id.as_str()) != anchor);
+            Ok(PreparedTimeline {
+                items,
+                commit: Some(Box::new(move || {
+                    self.client.commit_timeline(&id, prepared, true)
+                })),
+            })
         })
     }
 

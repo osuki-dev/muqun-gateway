@@ -478,6 +478,8 @@ async fn apply_thread_snapshot_coverage(
 }
 
 async fn apply_v2_snapshot(asid: &AgentSessionId, snapshot: &Value, ctx: &T3EventContext) {
+    let gate = ctx.mirror.timeline_commit_gate(asid).await;
+    let _acceptance = gate.lock().await;
     let snapshot = match ctx
         .driver
         .client()
@@ -495,6 +497,39 @@ async fn apply_v2_snapshot(asid: &AgentSessionId, snapshot: &Value, ctx: &T3Even
         }
     };
     let snapshot = &snapshot;
+    if snapshot["gatewayRollbackRefresh"] == true
+        && ctx.driver.client().mirrored_sequence(&asid.0)
+            < snapshot["snapshotSequence"].as_u64().unwrap_or(0)
+        && ctx
+            .mirror
+            .get_snapshot(asid)
+            .await
+            .is_some_and(|held| !held.timeline.is_empty())
+    {
+        ctx.driver
+            .client()
+            .require_timeline_refresh(&asid.0, snapshot["snapshotSequence"].as_u64().unwrap_or(0));
+        ctx.emit(AgentDomainEvent::Resync {
+            asid: asid.clone(),
+            reason: "timeline_order_unresolved".into(),
+        });
+        return;
+    }
+    if snapshot["gatewayOrderCommitted"] != true
+        && ctx
+            .mirror
+            .get_snapshot(asid)
+            .await
+            .is_some_and(|held| !held.timeline.is_empty())
+    {
+        // LRU replacement must not relabel a reader's retained window. A
+        // user refresh accepts the new incarnation under the mirror gate.
+        ctx.emit(AgentDomainEvent::Resync {
+            asid: asid.clone(),
+            reason: "timeline_order_unresolved".into(),
+        });
+        return;
+    }
     let projection = &snapshot["projection"];
     let roots = ctx.roots.lock().await.clone();
     let Some(mut info) = v2::mapper::session(&projection["thread"], Some(projection), &roots)
@@ -578,6 +613,13 @@ async fn apply_v2_snapshot(asid: &AgentSessionId, snapshot: &Value, ctx: &T3Even
         }
     }
     ctx.upsert_items(asid, timeline).await;
+    if let Some(generation) = snapshot["gatewayTimelineGeneration"].as_str() {
+        ctx.driver.client().accept_live_generation(
+            &asid.0,
+            generation,
+            snapshot["snapshotSequence"].as_u64().unwrap_or(0),
+        );
+    }
     for request in permissions {
         let seq = ctx.mirror.add_permission(request.clone()).await;
         ctx.emit(AgentDomainEvent::PermissionPending {
@@ -1048,6 +1090,32 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["A", "B", "C", "D", "E"]
         );
+    }
+
+    #[tokio::test]
+    async fn a_replaced_order_cache_requires_refresh_without_reordering_the_reader() {
+        let (ctx, mut rx) = ctx();
+        let asid = AgentSessionId("thread".into());
+        apply_v2_snapshot(&asid, &v2_window(&["A", "B"], 10, false), &ctx).await;
+        let before = ctx.mirror.get_snapshot(&asid).await.unwrap();
+        drain(&mut rx);
+        // Same boundary as an inactive LRU eviction: the mirror stays visible.
+        ctx.driver.client().forget_timeline("thread").await;
+        apply_v2_snapshot(&asid, &v2_window(&["B", "C"], 20, false), &ctx).await;
+        let after = ctx.mirror.get_snapshot(&asid).await.unwrap();
+        assert_eq!(
+            after
+                .timeline
+                .iter()
+                .map(|row| (&row.id, &row.message_id))
+                .collect::<Vec<_>>(),
+            before
+                .timeline
+                .iter()
+                .map(|row| (&row.id, &row.message_id))
+                .collect::<Vec<_>>()
+        );
+        assert!(drain(&mut rx).iter().any(|event| matches!(event, AgentDomainEvent::Resync { reason, .. } if reason == "timeline_order_unresolved")));
     }
 
     #[tokio::test]

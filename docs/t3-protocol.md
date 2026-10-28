@@ -538,22 +538,34 @@ markers are neither App contract fields nor persisted credential formats.
 Conflicting overlaps or a fresh partial window with no shared identity produce
 an explicit ordering/resync error: bridging history or a complete read is needed;
 the Gateway never guesses ordering from text, timestamps or workspace paths.
-The cache is bounded to 128 thread orders, 20,000 rows per thread and 32 MiB of
-canonical retained row payloads, separate from the wire-read budget.
+The cache uses LRU retention for 128 thread orders and a 32 MiB serialized-data
+budget, including native rows awaiting delivery. In-flight HTTP preparations pin
+their incarnation. Evicting an inactive order never relabels a retained mirror
+window: live reconciliation asks for resync until an explicit refresh atomically
+accepts its replacement. A 20,000-row or 8 MiB order window compacts old payloads
+while retaining the incoming rows and prefix/tail anchors. Older cuts that lost
+their canonical replacement payload require refresh; they cannot replace newer
+text or resurrect rows removed by accepted complete coverage.
 
-Cycles, oversized cursors, and cumulative page/row/byte budgets fail explicitly
-(64 pages, 20,000 rows, 16 MiB of actual bounded-snapshot/history response bytes).
-Each response is read under the remaining byte allowance, including chunked,
-pretty-printed and escaped JSON; reserialization is not a wire-byte estimate.
-Reaching the page budget before satisfying **any** requested limit fails unless
-the server has confirmed end of history. A bounded snapshot upserts its window without
-deleting held older rows. Only complete coverage or explicit deletion permits
-removal. A newly confirmed run with `status: "rolled_back"` in the authoritative
-projection triggers a complete historical read before reconciliation (even
-when the refresh covers a queued `run.updated` event); V2 removes turn items rather
-than assigning them a nonexistent rolled-back item status. If that complete
-read exceeds its budget or fails, the stream asks for resync rather than
-guessing which old rows disappeared. V1 windowed snapshots receive the
+V2 implements the existing earlier-timeline API with the native opaque cursor.
+Rows from a large native page that did not fit the requested visible tail are
+delivered before requesting its next cursor. Dropping a prepared read consumes
+neither these pending rows nor the upstream cursor. Only verified native end
+with no pending rows returns successful exhaustion. An older prefix page never
+claims deletion authority over newer retained rows.
+
+Cycles and oversized cursors still fail explicitly. A walk is bounded to 64
+pages and 16 MiB of actual response bytes, but a useful partial window retains
+`hasMoreHistory` and its unconsumed cursor instead of refusing the session.
+Each response is read under the remaining wire allowance, including chunked,
+pretty-printed and escaped JSON; an individual response over 16 MiB remains
+refused. A bounded snapshot upserts its window without deleting held older rows.
+Only complete coverage or explicit deletion permits removal. A newly confirmed
+`rolled_back` run in a partial projection requests explicit refresh while keeping
+the reader's old window, rather than forcing a whole-conversation download.
+The refresh fences older in-flight cuts and accepts a fresh canonical window;
+partial coverage never pretends to identify every remotely deleted row.
+V1 windowed snapshots receive the
 same preservation safeguard.
 
 For live changes, the current implementation refreshes the authoritative

@@ -836,16 +836,10 @@ impl ListenerTask {
                 .any(|run| !watched.rollback_runs.contains(run))
         });
         if new_rollback && snapshot["hasMoreHistory"] == true {
-            let prior = snapshot["snapshotSequence"].as_u64().unwrap_or(0);
-            snapshot = self.client.timeline_snapshot(id, 0).await?;
-            if snapshot["snapshotSequence"]
-                .as_u64()
-                .is_none_or(|sequence| sequence < prior)
-            {
-                return Err(crate::agents::ports::agent::AgentError::Protocol(
-                    "rollback snapshot behind live control state".into(),
-                ));
-            }
+            // A bounded window cannot prove deletion of retained older rows.
+            // Ask for explicit refresh instead of downloading the whole
+            // conversation and reconnecting forever at a cumulative budget.
+            snapshot["gatewayRollbackRefresh"] = Value::Bool(true);
         }
         if let Some(watched) = self.threads.get_mut(id) {
             watched.rollback_runs = rolled_back;

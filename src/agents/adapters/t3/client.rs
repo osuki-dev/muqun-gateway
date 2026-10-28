@@ -14,7 +14,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use reqwest::Client;
 use serde_json::{json, Value};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
 use super::endpoint::{
@@ -22,6 +22,9 @@ use super::endpoint::{
 };
 use super::rpc::{RpcConfig, RpcConnection, RpcError, Subscription};
 use crate::agents::ports::agent::AgentError;
+
+mod history;
+use history::HistoryCursor;
 
 pub const RPC_DISPATCH: &str = "orchestration.dispatchCommand";
 pub const RPC_GET_TURN_DIFF: &str = "orchestration.getTurnDiff";
@@ -371,6 +374,63 @@ struct Auth {
 struct TimelineState {
     generation: String,
     order: super::v2::projection::TimelineOrder,
+    revision: u64,
+    committed: bool,
+    mirror_sequence: u64,
+    used: std::time::Instant,
+    readers: Arc<()>,
+    history: Option<HistoryCursor>,
+}
+
+impl TimelineState {
+    fn retained_bytes(&self) -> usize {
+        self.order.retained_bytes().saturating_add(
+            self.history
+                .as_ref()
+                .map_or(0, HistoryCursor::retained_bytes),
+        )
+    }
+}
+
+pub(crate) struct PreparedT3Timeline {
+    pub detail: Value,
+    generation: String,
+    revision: u64,
+    order: super::v2::projection::TimelineOrder,
+    _reader: Arc<()>,
+    history: Option<HistoryCursor>,
+}
+
+/// Cache pressure evicts inactive incarnations, never an in-flight read. The
+/// mirror keeps its old window until refresh accepts a replacement incarnation.
+fn reserve_timeline_space(
+    orders: &mut std::collections::HashMap<String, TimelineState>,
+    id: &str,
+    bytes: usize,
+) -> Result<(), AgentError> {
+    while orders.len() + usize::from(!orders.contains_key(id)) > 128
+        || orders
+            .iter()
+            .filter(|(thread, _)| thread.as_str() != id)
+            .map(|(_, state)| state.retained_bytes())
+            .fold(bytes, usize::saturating_add)
+            > 2 * MAX_HTTP_BODY
+    {
+        let oldest = orders
+            .iter()
+            .filter(|(thread, state)| {
+                thread.as_str() != id && Arc::strong_count(&state.readers) == 1
+            })
+            .min_by_key(|(_, state)| state.used)
+            .map(|(thread, _)| thread.clone());
+        let Some(oldest) = oldest else {
+            return Err(AgentError::NotAvailable(
+                "T3 history readers are busy; retry the read".into(),
+            ));
+        };
+        orders.remove(&oldest);
+    }
+    Ok(())
 }
 
 pub struct T3Client {
@@ -379,7 +439,7 @@ pub struct T3Client {
     auth: Arc<RwLock<Auth>>,
     rpc: RpcConnection,
     cancel: CancellationToken,
-    timeline_orders: Mutex<std::collections::HashMap<String, TimelineState>>,
+    timeline_orders: std::sync::Mutex<std::collections::HashMap<String, TimelineState>>,
 }
 
 impl T3Client {
@@ -442,7 +502,7 @@ impl T3Client {
             auth,
             rpc,
             cancel,
-            timeline_orders: Mutex::new(std::collections::HashMap::new()),
+            timeline_orders: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -462,20 +522,24 @@ impl T3Client {
                 "T3 client closed; reload required".into(),
             ));
         }
-        let mut orders = self.timeline_orders.lock().await;
-        if orders.len() >= 128 && !orders.contains_key(id) {
-            return Err(AgentError::Protocol(
-                "V2 timeline order cache exceeds thread budget".into(),
-            ));
-        }
-        Ok(orders
-            .entry(id.into())
-            .or_insert_with(|| TimelineState {
-                generation: new_id(),
-                order: Default::default(),
-            })
-            .generation
-            .clone())
+        let mut orders = self
+            .timeline_orders
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let bytes = orders.get(id).map_or(0, TimelineState::retained_bytes);
+        reserve_timeline_space(&mut orders, id, bytes)?;
+        let state = orders.entry(id.into()).or_insert_with(|| TimelineState {
+            generation: new_id(),
+            order: Default::default(),
+            revision: 0,
+            committed: false,
+            mirror_sequence: 0,
+            used: std::time::Instant::now(),
+            readers: Arc::new(()),
+            history: None,
+        });
+        state.used = std::time::Instant::now();
+        Ok(state.generation.clone())
     }
 
     #[cfg(test)]
@@ -500,11 +564,27 @@ impl T3Client {
     pub async fn order_snapshot_in_generation(
         &self,
         id: &str,
-        mut detail: Value,
+        detail: Value,
         generation: &str,
         live: bool,
     ) -> Result<Value, AgentError> {
-        let mut orders = self.timeline_orders.lock().await;
+        let prepared = self.prepare_order_snapshot(id, detail, generation, live)?;
+        let detail = prepared.detail.clone();
+        self.commit_timeline(id, prepared, false)?;
+        Ok(detail)
+    }
+
+    fn prepare_order_snapshot(
+        &self,
+        id: &str,
+        mut detail: Value,
+        generation: &str,
+        live: bool,
+    ) -> Result<PreparedT3Timeline, AgentError> {
+        let orders = self
+            .timeline_orders
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         if self.cancel.is_cancelled() {
             return Err(AgentError::NotAvailable(
                 "T3 client closed; reload required".into(),
@@ -523,29 +603,113 @@ impl T3Client {
         }
         let mut order = state.order.clone();
         order.install(&mut detail)?;
-        let bytes = orders
-            .iter()
-            .filter(|(thread, _)| thread.as_str() != id)
-            .map(|(_, state)| state.order.retained_bytes())
-            .fold(order.retained_bytes(), usize::saturating_add);
-        if bytes > 2 * MAX_HTTP_BODY {
-            return Err(AgentError::Protocol(
-                "V2 timeline order cache exceeds memory budget".into(),
+        detail["gatewayTimelineGeneration"] = Value::String(generation.into());
+        detail["gatewayOrderCommitted"] = Value::Bool(state.committed);
+        Ok(PreparedT3Timeline {
+            detail,
+            generation: generation.into(),
+            revision: state.revision,
+            order,
+            _reader: state.readers.clone(),
+            history: None,
+        })
+    }
+
+    pub(crate) fn commit_timeline(
+        &self,
+        id: &str,
+        prepared: PreparedT3Timeline,
+        accepted_by_mirror: bool,
+    ) -> Result<crate::agents::ports::agent::HistoryCommit, AgentError> {
+        if self.cancel.is_cancelled() {
+            return Err(AgentError::NotAvailable(
+                "T3 client closed; reload required".into(),
             ));
         }
+        let mut orders = self
+            .timeline_orders
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let state = orders
+            .get(id)
+            .filter(|state| {
+                state.generation == prepared.generation && state.revision == prepared.revision
+            })
+            .ok_or(AgentError::HistoryCursorLost)?;
+        let committed = state.committed || accepted_by_mirror;
+        let mirror_sequence = if accepted_by_mirror {
+            state
+                .mirror_sequence
+                .max(prepared.detail["snapshotSequence"].as_u64().unwrap_or(0))
+        } else {
+            state.mirror_sequence
+        };
+        let history = if accepted_by_mirror {
+            prepared.history.or_else(|| state.history.clone())
+        } else {
+            state.history.clone()
+        };
+        let bytes = prepared
+            .order
+            .retained_bytes()
+            .saturating_add(history.as_ref().map_or(0, HistoryCursor::retained_bytes));
+        reserve_timeline_space(&mut orders, id, bytes)?;
         orders.insert(
             id.into(),
             TimelineState {
-                generation: generation.into(),
-                order,
+                generation: prepared.generation,
+                order: prepared.order,
+                revision: prepared.revision + 1,
+                committed,
+                mirror_sequence,
+                used: std::time::Instant::now(),
+                readers: prepared._reader,
+                history,
             },
         );
-        detail["gatewayTimelineGeneration"] = Value::String(generation.into());
-        Ok(detail)
+        Ok(Default::default())
+    }
+
+    pub(crate) fn accept_live_generation(&self, id: &str, generation: &str, sequence: u64) {
+        if let Some(state) = self
+            .timeline_orders
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get_mut(id)
+            .filter(|state| state.generation == generation)
+        {
+            state.committed = true;
+            state.mirror_sequence = state.mirror_sequence.max(sequence);
+        }
+    }
+
+    pub(crate) fn mirrored_sequence(&self, id: &str) -> u64 {
+        self.timeline_orders
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(id)
+            .map_or(0, |state| state.mirror_sequence)
+    }
+
+    pub(crate) fn require_timeline_refresh(&self, id: &str, sequence: u64) {
+        if let Some(state) = self
+            .timeline_orders
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get_mut(id)
+        {
+            state.order.invalidate_before(sequence);
+            state.revision += 1;
+            state.committed = false;
+            state.history = None;
+        }
     }
 
     pub async fn forget_timeline(&self, id: &str) {
-        self.timeline_orders.lock().await.remove(id);
+        self.timeline_orders
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(id);
     }
 
     pub async fn create_project(
@@ -756,17 +920,18 @@ impl T3Client {
 
     async fn get_json(&self, path: String) -> Result<Value, AgentError> {
         self.get_json_counted(path, MAX_HTTP_BODY)
-            .await
+            .await?
             .map(|(value, _)| value)
+            .ok_or_else(|| AgentError::Protocol("T3 response exceeds byte budget".into()))
     }
 
     async fn get_json_counted(
         &self,
         path: String,
         remaining: usize,
-    ) -> Result<(Value, usize), AgentError> {
+    ) -> Result<Option<(Value, usize)>, AgentError> {
         if remaining == 0 {
-            return Err(AgentError::Protocol("history exceeds byte budget".into()));
+            return Ok(None);
         }
         let bearer = self.bearer().await?;
         let mut request = self
@@ -776,12 +941,43 @@ impl T3Client {
         if self.is_v2() && path.starts_with("/api/orchestration/") {
             request = request.header("x-t3-orchestration-protocol", "2");
         }
-        let resp = request
+        let mut resp = request
             .send()
             .await
             .map_err(|e| AgentError::Network(short(&e.to_string())))?;
         let status = resp.status();
-        let body = read_bounded(resp, MAX_HTTP_BODY.min(remaining)).await?;
+        let cap = MAX_HTTP_BODY.min(remaining);
+        if resp
+            .content_length()
+            .is_some_and(|length| length > cap as u64)
+        {
+            return if cap < MAX_HTTP_BODY {
+                Ok(None)
+            } else {
+                Err(AgentError::Protocol(
+                    "T3 response exceeds byte budget".into(),
+                ))
+            };
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = resp
+            .chunk()
+            .await
+            .map_err(|e| AgentError::Network(short(&e.to_string())))?
+        {
+            if chunk.len() > cap - body.len() {
+                // A cumulative walk may stop before this page and retain its
+                // cursor. An individual oversized response remains refused.
+                return if cap < MAX_HTTP_BODY {
+                    Ok(None)
+                } else {
+                    Err(AgentError::Protocol(
+                        "T3 response exceeds byte budget".into(),
+                    ))
+                };
+            }
+            body.extend_from_slice(&chunk);
+        }
         if status.as_u16() == 401 {
             return Err(AgentError::NotAvailable(
                 "the stored T3 credential was rejected; pair again".into(),
@@ -793,7 +989,7 @@ impl T3Client {
         }
         let value = serde_json::from_slice(&body)
             .map_err(|e| AgentError::Protocol(short(&e.to_string())))?;
-        Ok((value, body.len()))
+        Ok(Some((value, body.len())))
     }
 
     /// Historical rows only. Page sequences never replace live control state.
@@ -805,54 +1001,43 @@ impl T3Client {
         if !self.is_v2() {
             return self.thread_snapshot(thread_id, None).await;
         }
+        let prepared = self.prepare_timeline_snapshot(thread_id, limit).await?;
+        let detail = prepared.detail.clone();
+        self.commit_timeline(thread_id, prepared, false)?;
+        Ok(detail)
+    }
+
+    pub(crate) async fn prepare_timeline_snapshot(
+        &self,
+        thread_id: &str,
+        limit: usize,
+    ) -> Result<PreparedT3Timeline, AgentError> {
         let id = validate_id(thread_id, "session id")?;
         let generation = self.timeline_generation(&id).await?;
-        let (mut detail, mut bytes) = self
+        let _reader = self
+            .timeline_orders
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&id)
+            .filter(|state| state.generation == generation)
+            .ok_or(AgentError::HistoryCursorLost)?
+            .readers
+            .clone();
+        let (detail, bytes) = self
             .get_json_counted(
                 format!("{HTTP_THREAD_SNAPSHOT}/{id}/bounded"),
                 MAX_HTTP_BODY,
             )
-            .await?;
+            .await?
+            .ok_or_else(|| {
+                AgentError::Protocol("T3 bounded snapshot exceeds byte budget".into())
+            })?;
         super::v2::projection::validate_snapshot(&detail, &id)?;
-        let mut seen = std::collections::HashSet::new();
-        for _ in 0..64 {
-            let count = super::v2::mapper::timeline(thread_id, &detail["projection"], 0).len();
-            if limit > 0 && count >= limit {
-                break;
-            }
-            if detail.get("hasMoreHistory").and_then(Value::as_bool) != Some(true) {
-                break;
-            }
-            let cursor = detail
-                .get("historyCursor")
-                .and_then(Value::as_str)
-                .ok_or_else(|| AgentError::Protocol("history has no cursor".into()))?
-                .to_string();
-            if cursor.len() > 8192 || !seen.insert(cursor.clone()) {
-                return Err(AgentError::Protocol(
-                    "invalid or repeated history cursor".into(),
-                ));
-            }
-            let id = validate_id(thread_id, "session id")?;
-            let mut url = reqwest::Url::parse(&format!(
-                "{}{HTTP_THREAD_SNAPSHOT}/{id}/history",
-                self.endpoint.url
-            ))
-            .map_err(|_| AgentError::Protocol("invalid endpoint".into()))?;
-            url.query_pairs_mut().append_pair("cursor", &cursor);
-            let path = format!("{}?{}", url.path(), url.query().unwrap_or(""));
-            let (page, consumed) = self.get_json_counted(path, MAX_HTTP_BODY - bytes).await?;
-            bytes += consumed;
-            super::v2::projection::merge_history(&mut detail, &page)?;
-        }
-        if detail.get("hasMoreHistory").and_then(Value::as_bool) == Some(true)
-            && (limit == 0
-                || super::v2::mapper::timeline(thread_id, &detail["projection"], 0).len() < limit)
-        {
-            return Err(AgentError::Protocol("history exceeds page budget".into()));
-        }
-        self.order_snapshot_in_generation(thread_id, detail, &generation, false)
-            .await
+        let detail = self.walk_history(&id, detail, limit, bytes).await?;
+        let (cursor, detail) = HistoryCursor::select(detail, limit)?;
+        let mut prepared = self.prepare_order_snapshot(thread_id, detail, &generation, false)?;
+        prepared.history = Some(cursor);
+        Ok(prepared)
     }
 }
 

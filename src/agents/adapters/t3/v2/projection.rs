@@ -216,9 +216,8 @@ pub fn merge_history(detail: &mut Value, page: &Value) -> Result<(), AgentError>
         row["position"] = Value::from(position as u64);
     }
     *held = merged;
-    if held.len() > 20_000 {
-        return Err(AgentError::Protocol("history exceeds row budget".into()));
-    }
+    // Wire bytes bound this walk. A row count is not end-of-history and must
+    // not discard a valid page solely because messages contain many items.
     detail["historyCursor"] = page["nextCursor"].clone();
     detail["hasMoreHistory"] = page["hasMoreHistory"].clone();
     Ok(())
@@ -237,7 +236,7 @@ fn identity(row: &Value) -> Result<RowIdentity, AgentError> {
     ))
 }
 
-fn chronological_rows(rows: &[Value]) -> Result<Vec<Value>, AgentError> {
+pub(crate) fn chronological_rows(rows: &[Value]) -> Result<Vec<Value>, AgentError> {
     let mut result = rows.to_vec();
     let mut ids = HashSet::new();
     let mut positions = HashSet::new();
@@ -257,7 +256,7 @@ fn chronological_rows(rows: &[Value]) -> Result<Vec<Value>, AgentError> {
 
 #[derive(Clone)]
 struct OrderedRow {
-    row: Value,
+    row: Option<Value>,
     label: u64,
     sequence: u64,
 }
@@ -273,29 +272,48 @@ pub struct TimelineOrder {
     // A complete projection is deletion authority for every absent identity.
     // One per-incarnation watermark replaces an unbounded tombstone list.
     complete_sequence: Option<u64>,
+    complete_ids: HashSet<RowIdentity>,
+    oldest_supported_sequence: u64,
 }
 
 impl TimelineOrder {
+    pub fn canonical_row(&self, source_thread: &str, source_item: &str) -> Option<Value> {
+        self.rows
+            .get(&(source_thread.to_owned(), source_item.to_owned()))?
+            .row
+            .clone()
+    }
+
+    pub fn invalidate_before(&mut self, sequence: u64) {
+        self.oldest_supported_sequence = self.oldest_supported_sequence.max(sequence);
+    }
+
     pub fn install(&mut self, detail: &mut Value) -> Result<(), AgentError> {
         let sequence = detail["snapshotSequence"]
             .as_u64()
             .ok_or_else(|| AgentError::Protocol("missing sequence".into()))?;
+        if sequence < self.oldest_supported_sequence {
+            return Err(AgentError::HistoryCursorLost);
+        }
         let mut incoming = chronological_rows(rows(&detail["projection"], "visibleTurnItems"))?;
         if self
             .complete_sequence
             .is_some_and(|complete| sequence <= complete)
         {
             incoming.retain(|row| {
-                self.rows
-                    .contains_key(&identity(row).expect("validated identity"))
+                self.complete_ids
+                    .contains(&identity(row).expect("validated identity"))
             });
         }
         let incoming_ids: Vec<_> = incoming.iter().map(identity).collect::<Result<_, _>>()?;
-        let complete = detail["hasMoreHistory"] != true && sequence >= self.latest_sequence;
+        let complete = detail["hasMoreHistory"] != true
+            && detail["gatewayHistoricalPrefix"] != true
+            && sequence >= self.latest_sequence;
         if complete {
             let retained: HashSet<_> = incoming_ids.iter().cloned().collect();
             self.order.retain(|id| retained.contains(id));
             self.rows.retain(|id, _| retained.contains(id));
+            self.complete_ids = retained;
             self.complete_sequence = Some(sequence);
         }
         let overlaps: Vec<_> = incoming_ids
@@ -380,7 +398,7 @@ impl TimelineOrder {
                 self.rows.insert(
                     id.clone(),
                     OrderedRow {
-                        row: incoming[index].clone(),
+                        row: Some(incoming[index].clone()),
                         label,
                         sequence,
                     },
@@ -389,19 +407,16 @@ impl TimelineOrder {
             }
             start = end;
         }
-        if self.order.len() > 20_000 {
-            return Err(AgentError::Protocol(
-                "V2 order cache exceeds row budget".into(),
-            ));
-        }
         let mut normalized = Vec::with_capacity(incoming.len());
-        for (id, row) in incoming_ids.into_iter().zip(incoming) {
-            let held = self.rows.get_mut(&id).expect("installed identity");
+        for (id, row) in incoming_ids.iter().zip(incoming) {
+            let held = self.rows.get_mut(id).expect("installed identity");
             if sequence >= held.sequence {
-                held.row = row;
+                held.row = Some(row);
                 held.sequence = sequence;
             }
-            let mut row = held.row.clone();
+            // A compacted anchor still fixes order, but cannot invent a newer
+            // payload for an old in-flight page. Keep the reader's old window.
+            let mut row = held.row.clone().ok_or(AgentError::HistoryCursorLost)?;
             row["position"] = Value::from(held.label);
             normalized.push(row);
         }
@@ -410,7 +425,32 @@ impl TimelineOrder {
         // Historical callers may merge stale rows, but cannot carry full
         // deletion authority into a later mirror reconciliation.
         detail["gatewayCompleteCoverage"] = Value::Bool(complete);
+        self.compact(&incoming_ids);
         Ok(())
+    }
+
+    fn compact(&mut self, incoming: &[RowIdentity]) {
+        const WINDOW_ROWS: usize = 20_000;
+        const WINDOW_BYTES: usize = 8 * 1024 * 1024;
+        const EDGE_ANCHORS: usize = 128;
+        if self.order.len() <= WINDOW_ROWS && self.retained_bytes() <= WINDOW_BYTES {
+            return;
+        }
+        let incoming: HashSet<_> = incoming.iter().cloned().collect();
+        let mut keep = incoming.clone();
+        keep.extend(self.order.iter().take(EDGE_ANCHORS).cloned());
+        keep.extend(self.order.iter().rev().take(EDGE_ANCHORS).cloned());
+        self.order.retain(|id| keep.contains(id));
+        self.rows.retain(|id, _| keep.contains(id));
+        for (id, row) in &mut self.rows {
+            if !incoming.contains(id) {
+                row.row = None;
+            }
+        }
+        // Current cursor reads can keep joining at the prefix. An older cut
+        // whose canonical replacements were compacted must refresh instead of
+        // replacing newer text or fabricating exhaustion.
+        self.oldest_supported_sequence = self.latest_sequence;
     }
 
     pub fn is_stale(&self, detail: &Value) -> bool {
@@ -420,10 +460,21 @@ impl TimelineOrder {
     }
 
     pub fn retained_bytes(&self) -> usize {
-        self.rows
+        let payload = self
+            .rows
             .values()
-            .map(|row| serde_json::to_vec(&row.row).map_or(usize::MAX, |bytes| bytes.len()))
-            .fold(0, usize::saturating_add)
+            .filter_map(|row| row.row.as_ref())
+            .map(|row| serde_json::to_vec(row).map_or(usize::MAX, |bytes| bytes.len()))
+            .fold(0, usize::saturating_add);
+        self.rows
+            .keys()
+            .chain(self.complete_ids.iter())
+            .fold(payload, |bytes, id| {
+                bytes
+                    .saturating_add(id.0.len())
+                    .saturating_add(id.1.len())
+                    .saturating_add(64)
+            })
     }
 }
 

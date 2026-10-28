@@ -163,12 +163,13 @@ fn asynchronous_questions_are_nonblocking_in_forms_and_timeline() {
 
 pub(crate) fn local_window(ids: &[&str], sequence: u64) -> Value {
     let mut snapshot = fixture();
+    let template = snapshot["projection"]["visibleTurnItems"][0].clone();
     snapshot["snapshotSequence"] = json!(sequence);
     snapshot["projection"]["visibleTurnItems"] = Value::Array(
         ids.iter()
             .enumerate()
             .map(|(position, id)| {
-                let mut row = fixture()["projection"]["visibleTurnItems"][0].clone();
+                let mut row = template.clone();
                 row["position"] = json!(position);
                 row["sourceThreadId"] = json!("thread");
                 row["sourceItemId"] = json!(id);
@@ -499,9 +500,10 @@ async fn history_finishing_after_live_refresh_keeps_live_payload_and_order() {
 }
 
 #[tokio::test]
-async fn history_page_budget_requires_count_or_verified_end_for_nonzero_limits() {
+async fn history_work_budget_keeps_a_valid_partial_window_and_opaque_cursor() {
     for (mapped, end, limit, success) in [
-        (false, None, 100, false),
+        (false, None, 100, true),
+        (true, None, 100, true),
         (true, None, 66, true),
         (true, Some(64), 100, true),
     ] {
@@ -526,13 +528,201 @@ async fn history_page_budget_requires_count_or_verified_end_for_nonzero_limits()
             64
         );
         if let Ok(snapshot) = result {
-            assert!(
-                mapper::timeline("thread", &snapshot["projection"], 0).len() >= limit
-                    || snapshot["hasMoreHistory"] == false
-            );
+            assert!(!mapper::timeline("thread", &snapshot["projection"], 0).is_empty());
+            if end.is_none() {
+                assert_eq!(snapshot["hasMoreHistory"], true);
+                assert_eq!(snapshot["historyCursor"], "page:64");
+            }
         }
         client.shutdown();
     }
+}
+
+#[tokio::test]
+async fn inactive_thread_and_payload_pressure_do_not_refuse_the_next_session() {
+    let server = fake_server(Some(2)).await;
+    let client = client(&server);
+    let first = client.timeline_generation("first").await.unwrap();
+    let prepared = client.prepare_timeline_snapshot("thread", 1).await.unwrap();
+    let pinned = prepared.detail["gatewayTimelineGeneration"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    for n in 0..129 {
+        client
+            .timeline_generation(&format!("thread-{n}"))
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        client.timeline_generation("thread").await.unwrap(),
+        pinned,
+        "a prepared read pins its incarnation"
+    );
+    client.commit_timeline("thread", prepared, true).unwrap();
+    assert_ne!(client.timeline_generation("first").await.unwrap(), first);
+    for n in 0..4 {
+        let mut detail = local_window(&["large"], n);
+        detail["projection"]["visibleTurnItems"][0]["item"]["text"] =
+            json!("x".repeat(9 * 1024 * 1024));
+        client
+            .order_snapshot(&format!("large-{n}"), detail)
+            .await
+            .unwrap();
+    }
+    client.shutdown();
+}
+
+#[tokio::test]
+async fn discarded_history_preparations_preserve_pending_native_rows_and_cursor() {
+    let server = fake_server(Some(2)).await;
+    let client = client(&server);
+    let driver = T3Driver::from_client(client.clone());
+    drop(driver.prepare_timeline("thread", 1).await.unwrap());
+    assert!(matches!(
+        driver.load_earlier_timeline("thread", 1).await,
+        Err(AgentError::HistoryCursorLost)
+    ));
+    let newest = driver.get_timeline("thread", 1).await.unwrap();
+    assert_eq!(newest.len(), 1);
+    let prepared = driver.prepare_earlier_timeline("thread", 1).await.unwrap();
+    let older_id = prepared.items[0].id.clone();
+    assert!(
+        older_id.contains("parent:user-item"),
+        "unserved rows of the bounded native page precede its cursor"
+    );
+    assert_ne!(older_id, newest[0].id);
+    drop(prepared);
+    let repeated = driver.prepare_earlier_timeline("thread", 1).await.unwrap();
+    assert_eq!(
+        repeated.items[0].id, older_id,
+        "cancellation must not consume the native page tail"
+    );
+    repeated.commit.unwrap()().unwrap();
+    let oldest = driver.load_earlier_timeline("thread", 1).await.unwrap();
+    assert_eq!(
+        oldest.len(),
+        1,
+        "upstream reads: {:?}",
+        server.state.seen.lock().unwrap()
+    );
+    assert!(driver
+        .load_earlier_timeline("thread", 1)
+        .await
+        .unwrap()
+        .is_empty());
+    let current = client
+        .order_live_snapshot("thread", fixture())
+        .await
+        .unwrap();
+    let mapped = mapper::timeline("thread", &current["projection"], 0);
+    assert_eq!(
+        mapped.last().unwrap().message_id,
+        newest[0].message_id,
+        "paging must not relabel the visible tail"
+    );
+    client.shutdown();
+}
+
+#[tokio::test]
+async fn cancelled_reads_release_lru_pins_and_rollback_fences_old_http_cuts() {
+    let server = fake_server(Some(2)).await;
+    let client = client(&server);
+    let generation = client.timeline_generation("thread").await.unwrap();
+    server.state.snapshot.lock().unwrap()["holdBoundedResponse"] = json!(true);
+    let reader = client.clone();
+    let read = tokio::spawn(async move { reader.prepare_timeline_snapshot("thread", 1).await });
+    server.state.bounded_started.notified().await;
+    for n in 0..129 {
+        client
+            .timeline_generation(&format!("reading-{n}"))
+            .await
+            .unwrap();
+    }
+    read.abort();
+    assert!(matches!(read.await, Err(error) if error.is_cancelled()));
+    server.state.bounded_release.notify_waiters();
+    for n in 0..129 {
+        client
+            .timeline_generation(&format!("released-{n}"))
+            .await
+            .unwrap();
+    }
+    assert_ne!(
+        client.timeline_generation("thread").await.unwrap(),
+        generation
+    );
+    let reader = client.clone();
+    let late = tokio::spawn(async move { reader.prepare_timeline_snapshot("thread", 1).await });
+    server.state.bounded_started.notified().await;
+    client.require_timeline_refresh("thread", 20);
+    server.state.bounded_release.notify_waiters();
+    assert!(matches!(
+        late.await.unwrap(),
+        Err(AgentError::HistoryCursorLost)
+    ));
+    client.shutdown();
+}
+
+#[tokio::test]
+async fn byte_work_budget_does_not_consume_the_page_that_did_not_fit() {
+    let server = fake_server(Some(2)).await;
+    {
+        let mut snapshot = server.state.snapshot.lock().unwrap();
+        snapshot["historyCursor"] = json!("page:0");
+        snapshot["historyFixture"] = json!({"mapped":true,"endAt":4,"paddingBytes":4*1024*1024});
+    }
+    let client = client(&server);
+    let prepared = client
+        .prepare_timeline_snapshot("thread", 100)
+        .await
+        .unwrap();
+    assert_eq!(prepared.detail["hasMoreHistory"], true);
+    assert_eq!(prepared.detail["historyCursor"], "page:2");
+    client.commit_timeline("thread", prepared, true).unwrap();
+    let older = client
+        .prepare_earlier_snapshot("thread", 1)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(older.detail["projection"]["visibleTurnItems"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|row| row["sourceItemId"] == "older-2"));
+    client.shutdown();
+}
+
+#[test]
+fn large_valid_pages_and_rolling_windows_keep_prefix_and_tail_order_anchors() {
+    let ids: Vec<_> = (0..20_100).map(|n| format!("row-{n}")).collect();
+    let refs: Vec<_> = ids.iter().map(String::as_str).collect();
+    let mut detail = local_window(&["tail"], 1);
+    let page = local_window(&refs, 1);
+    projection::merge_history(&mut detail, &json!({"snapshotSequence":1,"items":page["projection"]["visibleTurnItems"],"nextCursor":"older","hasMoreHistory":true})).unwrap();
+    let mut order = projection::TimelineOrder::default();
+    order.install(&mut detail).unwrap();
+    let prefix = detail["projection"]["visibleTurnItems"][0]["position"].clone();
+    let tail = detail["projection"]["visibleTurnItems"]
+        .as_array()
+        .unwrap()
+        .last()
+        .unwrap()["position"]
+        .clone();
+    let mut live = local_window(&["tail", "new"], 2);
+    order.install(&mut live).unwrap();
+    assert_eq!(live["projection"]["visibleTurnItems"][0]["position"], tail);
+    let mut older = local_window(&["older", "row-0"], 2);
+    older["gatewayHistoricalPrefix"] = json!(true);
+    order.install(&mut older).unwrap();
+    assert_eq!(
+        older["projection"]["visibleTurnItems"][1]["position"],
+        prefix
+    );
+    assert!(
+        order.retained_bytes() < 1024 * 1024,
+        "old payloads are not retained with the anchored windows"
+    );
 }
 
 #[tokio::test]
@@ -1262,8 +1452,19 @@ async fn snapshot_replay_live_dedup_filtered_sequences_and_decode_resync() {
     let rolled_back = next_projection(&mut received).await;
     assert_eq!(rolled_back["snapshotSequence"], 50);
     assert_eq!(
-        rolled_back["hasMoreHistory"], false,
-        "rollback must load complete visibility before removing rows"
+        rolled_back["hasMoreHistory"], true,
+        "rollback cannot claim deletion authority from a bounded window"
+    );
+    assert_eq!(rolled_back["gatewayRollbackRefresh"], true);
+    assert!(
+        !server
+            .state
+            .seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|row| row["http"] == "history"),
+        "rollback must not force a whole-conversation download"
     );
     assert!(!mapper::timeline("thread", &rolled_back["projection"], 50)
         .iter()
