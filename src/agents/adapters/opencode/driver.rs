@@ -182,7 +182,7 @@ struct EarlierCursor {
     exhausted: bool,
 }
 
-/// The most messages an earlier read asks for in all.
+/// Maximum caller-requested page size, not a total conversation limit.
 const MAX_HISTORY_MESSAGES: usize = 2000;
 /// How many older messages one `load_earlier_timeline` adds.
 const EARLIER_PAGE_MESSAGES: usize = 80;
@@ -936,10 +936,16 @@ impl AgentPort for OpencodeDriver {
             let Some(cursor) = cursor else {
                 return Err(AgentError::HistoryCursorLost);
             };
-            if cursor.exhausted || cursor.held >= MAX_HISTORY_MESSAGES {
+            if cursor.exhausted {
                 return Ok(Vec::new());
             }
-            let asked = (cursor.held + limit.min(EARLIER_PAGE_MESSAGES)).min(MAX_HISTORY_MESSAGES);
+            // The upstream only supports growing newest windows. Keep its byte
+            // budget in get_messages_capped, but never mistake a local count
+            // ceiling for the verified end of the conversation.
+            let asked = cursor
+                .held
+                .checked_add(limit.min(EARLIER_PAGE_MESSAGES))
+                .ok_or_else(|| AgentError::Protocol("History window overflow".into()))?;
             let messages = self.client.get_messages_capped(session_id, asked).await?;
             let Some(cut) = messages
                 .iter()
@@ -1228,8 +1234,8 @@ mod tests {
                         assert_eq!(query.get("order").map(String::as_str), Some("desc"));
                         let limit: usize = query["limit"].parse().unwrap();
                         seen.lock().unwrap().push(limit);
-                        // 300 messages, newest first as `order=desc` answers.
-                        let page: Vec<Value> = (0..300)
+                        // More than the old 2,000-message ceiling, newest first.
+                        let page: Vec<Value> = (0..2300)
                             .rev()
                             .take(limit)
                             .map(|n| serde_json::json!({ "id": format!("m-{n}"), "type": "user", "text": format!("message {n}") }))
@@ -1252,13 +1258,14 @@ mod tests {
         };
 
         let tail = driver.get_timeline("s", 100).await.unwrap();
-        assert_eq!(ids(&tail).first().map(String::as_str), Some("m-200"));
-        assert_eq!(ids(&tail).last().map(String::as_str), Some("m-299"));
-        // The refetch of the newest few: the cursor stays at m-200.
+        assert_eq!(ids(&tail).first().map(String::as_str), Some("m-2200"));
+        assert_eq!(ids(&tail).last().map(String::as_str), Some("m-2299"));
+        // The refetch of the newest few: the cursor stays at m-2200.
         assert_eq!(driver.get_timeline("s", 5).await.unwrap().len(), 5);
 
-        let mut lowest = 200;
-        for expected in [120, 40, 0] {
+        let mut lowest = 2200usize;
+        while lowest > 0 {
+            let expected = lowest.saturating_sub(80);
             let batch = driver.load_earlier_timeline("s", 80).await.unwrap();
             let batch_ids = ids(&batch);
             assert_eq!(
@@ -1280,7 +1287,9 @@ mod tests {
             driver.load_earlier_timeline("never", 80).await,
             Err(AgentError::HistoryCursorLost)
         ));
-        assert_eq!(*asked.lock().unwrap(), vec![100, 5, 180, 260, 340]);
+        let mut expected_reads = vec![100, 5];
+        expected_reads.extend((180..=2340).step_by(80));
+        assert_eq!(*asked.lock().unwrap(), expected_reads);
         server.abort();
     }
     use serde_json::json;
