@@ -667,6 +667,12 @@ impl Context {
                     return;
                 };
                 if method == "item/completed" {
+                    if params["item"]["type"] == "contextCompaction"
+                        && self.driver.client().active_turn(thread).as_deref() == Some(turn)
+                        && !self.driver.client().is_compacting(thread)
+                    {
+                        self.driver.deliver_deferred_steering(thread);
+                    }
                     for id in self
                         .driver
                         .observe_async_answers(thread, turn, &params["item"])
@@ -1100,7 +1106,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn compaction_turns_default_and_steered_prompts_into_visible_queue_receipts() {
+    async fn compaction_preserves_steering_and_drains_it_before_the_turn_finishes() {
         let mut q = Queue::new().await;
         q.send("start", None).await.unwrap();
         q.turn_started("t1").await;
@@ -1116,8 +1122,9 @@ mod tests {
             texts(&items),
             ["steered during compaction", "default during compaction"]
         );
-        assert!(items.iter().all(|item| item["delivery"] == "queue"));
+        assert!(items.iter().all(|item| item["delivery"] == "steer"));
         assert_eq!(q.delivered().len(), 1);
+        q.send("wait for next turn", Some("queue")).await.unwrap();
         q.driver
             .set_inbox_delivery(&q.thread, items[0]["id"].as_str().unwrap(), "steer")
             .await
@@ -1134,11 +1141,24 @@ mod tests {
         assert!(q.driver.client().is_compacting(&q.thread));
         q.notify("item/completed", compact).await;
         assert!(!q.driver.client().is_compacting(&q.thread));
-        q.turn_completed("t1", "completed").await;
-        q.wait_delivered(2).await;
+        q.wait_delivered(3).await;
         assert_eq!(
             q.delivered()[1],
-            ("turn/start".into(), "steered during compaction".into())
+            ("turn/steer".into(), "steered during compaction".into())
+        );
+        assert_eq!(
+            q.delivered()[2],
+            ("turn/steer".into(), "default during compaction".into())
+        );
+        assert_eq!(
+            texts(&q.driver.inbox_items(&q.thread)),
+            ["wait for next turn"]
+        );
+        q.turn_completed("t1", "completed").await;
+        q.wait_delivered(4).await;
+        assert_eq!(
+            q.delivered()[3],
+            ("turn/start".into(), "wait for next turn".into())
         );
     }
 

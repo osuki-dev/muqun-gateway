@@ -247,13 +247,14 @@ impl CodexDriver {
         text: &str,
         files: Vec<Value>,
         input: Vec<Value>,
+        delivery: Delivery,
     ) -> Result<(), AgentError> {
         self.queue().push(
             thread,
             Queued {
                 id: format!("inbox_{}", uuid::Uuid::new_v4().simple()),
                 created_ms: now_ms(),
-                delivery: Delivery::Queue,
+                delivery,
                 text: text.to_owned(),
                 files,
                 input,
@@ -333,6 +334,30 @@ impl CodexDriver {
         let _ = self.settle(thread, &item.id, result);
     }
 
+    /// Compaction postpones steering; it must not turn it into next-turn work.
+    pub(crate) fn deliver_deferred_steering(self: &Arc<Self>, thread: &str) {
+        let driver = self.clone();
+        let thread = thread.to_owned();
+        tokio::spawn(async move {
+            let _guard = driver.mutations.lock().await;
+            while !driver.client.is_compacting(&thread) {
+                let Some(item) = driver.queue().next(&thread).cloned() else {
+                    break;
+                };
+                if item.delivery != Delivery::Steer {
+                    break;
+                }
+                let result = match driver.client.active_turn(&thread) {
+                    Some(turn) => driver.steer_locked(&thread, &turn, item.input).await,
+                    None => driver.start_turn_locked(&thread, item.input).await,
+                };
+                if driver.settle(&thread, &item.id, result).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+
     /// "Send now": steer it into the running turn, or start a turn with it.
     async fn send_queued_now(&self, thread: &str, id: &str) -> Result<(), AgentError> {
         self.prepare_shared_interaction(thread).await?;
@@ -343,7 +368,9 @@ impl CodexDriver {
             .map(|item| item.input.clone())
             .ok_or_else(|| inbox_item_not_found(id))?;
         if self.client.is_compacting(thread) {
-            // Keep the visible receipt until a turn can accept it.
+            // Preserve the requested mode while compaction blocks delivery.
+            self.queue().set_delivery(thread, id, Delivery::Steer);
+            self.signal(InboxSignal::Changed(thread.into()));
             return Ok(());
         }
         let result = match self.client.active_turn(thread) {
@@ -2486,7 +2513,13 @@ impl AgentPort for CodexDriver {
                 if !self.loaded.lock().await.contains(id) {
                     return unsupported("Codex queued delivery requires an owned live thread");
                 }
-                return self.enqueue_prompt(id, text, prepared.files, input);
+                return self.enqueue_prompt(
+                    id,
+                    text,
+                    prepared.files,
+                    input,
+                    delivery.unwrap_or(Delivery::Steer),
+                );
             }
             if delivery == Some(Delivery::Steer) {
                 self.prepare_shared_interaction(id).await?;
@@ -2497,7 +2530,7 @@ impl AgentPort for CodexDriver {
                 }
                 // Compaction may have begun while preparing the interaction.
                 if self.client.is_compacting(id) {
-                    return self.enqueue_prompt(id, text, prepared.files, input);
+                    return self.enqueue_prompt(id, text, prepared.files, input, Delivery::Steer);
                 }
                 let turn = self.client.active_turn(id).ok_or_else(|| {
                     AgentError::InvalidRequest(
