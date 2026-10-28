@@ -415,6 +415,10 @@ const LARGE_BODY_PERMITS: usize = 8;
 
 static HUGE_BODIES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(HUGE_BODY_PERMITS);
 static LARGE_BODIES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(LARGE_BODY_PERMITS);
+// Legacy whole-file upload reads remain compatible up to the advertised file
+// maximum. Only one large sealed response may occupy memory while draining;
+// ranged reads use the ordinary, much smaller response path instead.
+static LARGE_FILE_RESPONSES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
 
 /// The devices with a large body in flight, one each on top of the pool,
 /// keyed by device id *and* the peer's IP address: the id is a clear header
@@ -428,6 +432,8 @@ static DEVICES_WITH_LARGE_BODIES: std::sync::LazyLock<
 /// name: a copied id from one address claims at most this many.
 const MAX_LARGE_BODIES_PER_IP: usize = 2;
 static LARGE_BODIES_BY_IP: std::sync::LazyLock<std::sync::Mutex<HashMap<std::net::IpAddr, usize>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+static UPLOAD_BODIES_BY_IP: IpCounts =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
 /// The sealed path has to read a body before its envelope can be opened,
@@ -457,10 +463,8 @@ static PREAUTH_SEALED_BY_DEVICE: std::sync::LazyLock<
 
 /// The longest any large body may take to arrive in all.
 const LARGE_BODY_READ_TIMEOUT: Duration = Duration::from_secs(180);
-/// A large body has to keep arriving: under this many bytes in any window
-/// of [`LARGE_BODY_RATE_WINDOW`] ends it, so a trickle cannot keep a place.
-const LARGE_BODY_RATE_WINDOW: Duration = Duration::from_secs(10);
-const LARGE_BODY_MIN_BYTES_PER_WINDOW: usize = 64 * 1024 * 10;
+/// A body must make progress; the absolute admission deadline bounds trickles.
+const LARGE_BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// A place among the large bodies in flight. Owned by the body it admits
 /// ([`GatedBody`]): released when that body is fully consumed or dropped,
@@ -477,6 +481,7 @@ struct LargeBodyPlace {
     _permit: tokio::sync::SemaphorePermit<'static>,
     slot: String,
     ip: Option<std::net::IpAddr>,
+    by_ip: &'static IpCounts,
 }
 
 impl Drop for LargeBodyPlace {
@@ -485,7 +490,7 @@ impl Drop for LargeBodyPlace {
             devices.remove(&self.slot);
         }
         if let Some(ip) = self.ip {
-            release_count(&LARGE_BODIES_BY_IP, ip);
+            release_count(self.by_ip, ip);
         }
     }
 }
@@ -585,6 +590,15 @@ fn slot_key(device_id: &str, peer: Option<&SocketAddr>) -> String {
     }
 }
 
+fn body_slot(plaintext_limit: usize, device_id: &str, peer: Option<&SocketAddr>) -> String {
+    let class = if plaintext_limit > 25 * 1024 * 1024 {
+        "upload"
+    } else {
+        "message"
+    };
+    format!("{class}:{}", slot_key(device_id, peer))
+}
+
 /// A place for the pre-authentication read of a sealed body of up to
 /// `plaintext_limit` bytes from `peer`, naming the clear `device_id`, or
 /// `None` when the route takes only the ordinary limit. From the route's
@@ -610,7 +624,7 @@ pub(crate) fn preauth_sealed_permit(
     if !take_count(by_ip, ip, MAX_PREAUTH_SEALED_PER_IP) {
         return Err(busy());
     }
-    let device_key = slot_key(device_id, peer);
+    let device_key = body_slot(plaintext_limit, device_id, peer);
     let taken = PREAUTH_SEALED_BY_DEVICE
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -647,25 +661,25 @@ pub(crate) fn large_body_permit(
     if plaintext_limit <= MAX_REQUEST_BODY_BYTES {
         return Ok(None);
     }
-    let gate = if plaintext_limit > 25 * 1024 * 1024 {
-        &HUGE_BODIES
+    let (gate, by_ip) = if plaintext_limit > 25 * 1024 * 1024 {
+        (&HUGE_BODIES, &UPLOAD_BODIES_BY_IP)
     } else {
-        &LARGE_BODIES
+        (&LARGE_BODIES, &LARGE_BODIES_BY_IP)
     };
     // The pool permit is dropped with `permit` on every refusal below.
     let permit = gate.try_acquire().map_err(|_| busy())?;
     let ip = peer.map(|peer| counted_address(peer.ip()));
-    if !take_count(&LARGE_BODIES_BY_IP, ip, MAX_LARGE_BODIES_PER_IP) {
+    if !take_count(by_ip, ip, MAX_LARGE_BODIES_PER_IP) {
         return Err(busy());
     }
-    let slot = slot_key(device_id, peer);
+    let slot = body_slot(plaintext_limit, device_id, peer);
     let taken = DEVICES_WITH_LARGE_BODIES
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .insert(slot.clone());
     if !taken {
         if let Some(ip) = ip {
-            release_count(&LARGE_BODIES_BY_IP, ip);
+            release_count(by_ip, ip);
         }
         return Err(busy());
     }
@@ -674,6 +688,7 @@ pub(crate) fn large_body_permit(
             _permit: permit,
             slot,
             ip,
+            by_ip,
         }),
     }))
 }
@@ -688,9 +703,8 @@ fn peer_of(extensions: &axum::http::Extensions) -> Option<SocketAddr> {
 
 /// `body` with `permit` bound to it: the place is given up when the body
 /// is fully consumed or dropped. The body is bounded in time as well: it
-/// ends in an error past [`LARGE_BODY_READ_TIMEOUT`] in all, or when fewer
-/// than [`LARGE_BODY_MIN_BYTES_PER_WINDOW`] arrived in a window of
-/// [`LARGE_BODY_RATE_WINDOW`], and the error gives the place up too.
+/// ends at its admission deadline or after [`LARGE_BODY_IDLE_TIMEOUT`] with
+/// no nonempty data frame. Slow continuous progress has no minimum byte rate.
 pub(crate) fn gated_body(body: Body, permit: Option<LargeBodyPermit>) -> Body {
     match permit {
         Some(permit) => {
@@ -698,9 +712,8 @@ pub(crate) fn gated_body(body: Body, permit: Option<LargeBodyPermit>) -> Body {
             Body::from_stream(GatedBody {
                 inner: body.into_data_stream(),
                 deadline: now + LARGE_BODY_READ_TIMEOUT,
-                window_start: now,
-                window_bytes: 0,
-                timer: Box::pin(tokio::time::sleep_until(now + LARGE_BODY_RATE_WINDOW)),
+                last_progress: now,
+                timer: Box::pin(tokio::time::sleep_until(now + LARGE_BODY_IDLE_TIMEOUT)),
                 _permit: permit,
             })
         }
@@ -711,30 +724,22 @@ pub(crate) fn gated_body(body: Body, permit: Option<LargeBodyPermit>) -> Body {
 struct GatedBody {
     inner: axum::body::BodyDataStream,
     deadline: tokio::time::Instant,
-    window_start: tokio::time::Instant,
-    window_bytes: usize,
-    /// Fires at the end of the current window or at the deadline,
-    /// whichever is first, so a body that sends nothing is still judged.
+    last_progress: tokio::time::Instant,
+    /// Fires at the idle deadline or absolute deadline, whichever is first.
     timer: std::pin::Pin<Box<tokio::time::Sleep>>,
     _permit: LargeBodyPermit,
 }
 
 impl GatedBody {
-    /// Judge the body at `now`: over the deadline, or a window that closed
-    /// short of its bytes, ends it. A window that closed with enough opens
-    /// the next one.
+    /// A stalled body expires independently of the absolute admission budget.
     fn judge(&mut self, now: tokio::time::Instant) -> Result<(), axum::BoxError> {
         if now >= self.deadline {
-            return Err("the request body was not received in time".into());
+            return Err(Box::new(BodyReadTimeout));
         }
-        if now >= self.window_start + LARGE_BODY_RATE_WINDOW {
-            if self.window_bytes < LARGE_BODY_MIN_BYTES_PER_WINDOW {
-                return Err("the request body arrived too slowly".into());
-            }
-            self.window_start = now;
-            self.window_bytes = 0;
+        if now >= self.last_progress + LARGE_BODY_IDLE_TIMEOUT {
+            return Err(Box::new(BodyReadTimeout));
         }
-        let next = (self.window_start + LARGE_BODY_RATE_WINDOW).min(self.deadline);
+        let next = (self.last_progress + LARGE_BODY_IDLE_TIMEOUT).min(self.deadline);
         self.timer.as_mut().reset(next);
         Ok(())
     }
@@ -752,7 +757,9 @@ impl futures::Stream for GatedBody {
         let now = tokio::time::Instant::now();
         match std::pin::Pin::new(&mut self.inner).poll_next(cx) {
             Poll::Ready(Some(Ok(bytes))) => {
-                self.window_bytes = self.window_bytes.saturating_add(bytes.len());
+                if !bytes.is_empty() {
+                    self.last_progress = now;
+                }
                 if let Err(error) = self.judge(now) {
                     return Poll::Ready(Some(Err(error)));
                 }
@@ -767,9 +774,7 @@ impl futures::Stream for GatedBody {
                     }
                     // Re-armed by `judge`: register the new timer.
                     if self.timer.as_mut().poll(cx).is_ready() {
-                        return Poll::Ready(Some(Err(
-                            "the request body was not received in time".into()
-                        )));
+                        return Poll::Ready(Some(Err(Box::new(BodyReadTimeout))));
                     }
                 }
                 Poll::Pending
@@ -778,9 +783,57 @@ impl futures::Stream for GatedBody {
     }
 }
 
+#[derive(Debug)]
+struct BodyReadTimeout;
+
+impl std::fmt::Display for BodyReadTimeout {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("the request body was not received in time")
+    }
+}
+
+impl std::error::Error for BodyReadTimeout {}
+
+fn error_has<E: std::error::Error + 'static>(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut source = Some(error);
+    while let Some(error) = source {
+        if error.is::<E>() {
+            return true;
+        }
+        source = error.source();
+    }
+    false
+}
+
+pub(crate) fn body_read_timed_out(error: &(dyn std::error::Error + 'static)) -> bool {
+    error_has::<BodyReadTimeout>(error)
+}
+
+fn body_read_error(error: axum::Error) -> (StatusCode, Json<serde_json::Value>) {
+    if body_read_timed_out(&error) {
+        api_error(
+            StatusCode::REQUEST_TIMEOUT,
+            "body_timeout",
+            "the request body was not received in time",
+        )
+    } else if error_has::<http_body_util::LengthLimitError>(&error) {
+        api_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "body_too_large",
+            "the request body is too large",
+        )
+    } else {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "body_read_failed",
+            "the request body could not be received",
+        )
+    }
+}
+
 pub(crate) fn plaintext_body_limit(path: &str) -> usize {
     if path == UPLOADS_PATH {
-        MAX_VIDEO_UPLOAD_BYTES
+        super::uploads::MAX_UPLOAD_BODY_BYTES
     } else if crate::platform::config::takes_large_body(path) {
         crate::MAX_PROMPT_BODY_BYTES
     } else {
@@ -909,6 +962,8 @@ pub(crate) async fn encrypted_transport(
     let websocket = is_websocket_upgrade(request.headers());
     match decrypt_transport_request(&state, request).await {
         Ok((request, material, aad, request_nonce)) => {
+            let upload_read = request.method() == axum::http::Method::GET
+                && request.uri().path().starts_with("/api/uploads/");
             let version = request
                 .extensions()
                 .get::<EncryptedStreamContext>()
@@ -947,7 +1002,15 @@ pub(crate) async fn encrypted_transport(
                 );
                 return response;
             }
-            encrypt_transport_response(response, &material, &aad, &request_nonce, version).await
+            encrypt_transport_response(
+                response,
+                &material,
+                &aad,
+                &request_nonce,
+                version,
+                upload_read,
+            )
+            .await
         }
         Err(error) => error.into_response(),
     }
@@ -1027,13 +1090,7 @@ pub(crate) async fn decrypt_transport_request(
     } else {
         read.await
     }
-    .map_err(|_| {
-        api_error(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "body_too_large",
-            "the request body is too large",
-        )
-    })?;
+    .map_err(body_read_error)?;
     let envelope_bytes = match parts.headers.get(TRANSPORT_ENVELOPE_HEADER) {
         Some(value) => transport::decode_key(value.to_str().unwrap_or_default()).map_err(|_| {
             api_error(
@@ -1235,25 +1292,47 @@ pub(crate) async fn encrypt_transport_response(
     aad: &str,
     request_nonce: &str,
     version: u8,
+    upload_read: bool,
 ) -> Response {
     let (parts, body) = response.into_parts();
+    let ordinary_limit = MAX_VIDEO_CONTENT_BYTES as usize + MAX_REQUEST_BODY_BYTES;
+    let large_file = upload_read
+        && parts
+            .headers
+            .get("content-length")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+            .is_some_and(|length| length > ordinary_limit as u64);
+    let permit = if large_file {
+        match LARGE_FILE_RESPONSES.try_acquire() {
+            Ok(permit) => Some(permit),
+            Err(_) => return busy().into_response(),
+        }
+    } else {
+        None
+    };
+    let response_limit = if large_file {
+        MAX_VIDEO_UPLOAD_BYTES
+    } else {
+        ordinary_limit
+    };
     // A response is buffered as plaintext and sealed afterwards, so the bound
     // is on what a handler can produce: an asset preview is the largest, and
     // every other route answers JSON well under the request limit.
-    let body = match to_bytes(
-        body,
-        MAX_VIDEO_CONTENT_BYTES as usize + MAX_REQUEST_BODY_BYTES,
-    )
-    .await
-    {
+    let body = match to_bytes(body, response_limit).await {
         Ok(body) => body,
-        Err(_) => {
+        Err(error) => {
+            let code = if error_has::<http_body_util::LengthLimitError>(&error) {
+                "response_too_large"
+            } else {
+                "response_read_failed"
+            };
             return api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "response_too_large",
-                "failed to encrypt response",
+                code,
+                "failed to read encrypted response",
             )
-            .into_response()
+            .into_response();
         }
     };
     // `content-encoding` describes the bytes being sealed, not the response
@@ -1303,7 +1382,23 @@ pub(crate) async fn encrypt_transport_response(
         axum::http::HeaderName::from_static(TRANSPORT_HEADER),
         HeaderValue::from_static("1"),
     );
-    response
+    if let Some(permit) = permit {
+        let (parts, body) = response.into_parts();
+        let bytes = match to_bytes(body, sealed_body_ceiling(response_limit)).await {
+            Ok(bytes) => bytes,
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
+        let stream = async_stream::stream! {
+            let _permit = permit;
+            for offset in (0..bytes.len()).step_by(super::assets::ASSET_CONTENT_CHUNK_BYTES) {
+                let end = (offset + super::assets::ASSET_CONTENT_CHUNK_BYTES).min(bytes.len());
+                yield Ok::<_, std::convert::Infallible>(bytes.slice(offset..end));
+            }
+        };
+        Response::from_parts(parts, Body::from_stream(stream))
+    } else {
+        response
+    }
 }
 
 /// Refuse a request that arrived under a name this gateway does not answer to.
@@ -1681,6 +1776,138 @@ fn cgroup_stat_mb(key: &str) -> Option<u64> {
 mod tests {
     use crate::*;
 
+    #[test]
+    fn upload_admission_does_not_take_the_devices_interactive_slot() {
+        let id = uuid::Uuid::new_v4().to_string();
+        let upload =
+            super::preauth_sealed_permit(platform::uploads::MAX_UPLOAD_BODY_BYTES, None, &id)
+                .unwrap();
+        assert!(
+            super::preauth_sealed_permit(platform::uploads::MAX_UPLOAD_BODY_BYTES, None, &id)
+                .is_err()
+        );
+        let message = super::preauth_sealed_permit(MAX_PROMPT_BODY_BYTES, None, &id).unwrap();
+        drop((upload, message));
+        let upload =
+            super::large_body_permit(platform::uploads::MAX_UPLOAD_BODY_BYTES, &id, None).unwrap();
+        assert!(
+            super::large_body_permit(platform::uploads::MAX_UPLOAD_BODY_BYTES, &id, None).is_err()
+        );
+        let message = super::large_body_permit(MAX_PROMPT_BODY_BYTES, &id, None).unwrap();
+        drop((upload, message));
+        assert!(
+            super::large_body_permit(platform::uploads::MAX_UPLOAD_BODY_BYTES, &id, None).is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn body_deadlines_size_and_broken_reads_have_distinct_refusals() {
+        use axum::body::{to_bytes, Body, Bytes};
+        let stream = futures::stream::once(async { Err::<Bytes, _>(super::BodyReadTimeout) });
+        let error = to_bytes(Body::from_stream(stream), 100).await.unwrap_err();
+        assert_eq!(super::body_read_error(error).0, StatusCode::REQUEST_TIMEOUT);
+        let error = to_bytes(Body::from("too long"), 1).await.unwrap_err();
+        assert_eq!(
+            super::body_read_error(error).0,
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+        let stream = futures::stream::once(async {
+            Err::<Bytes, _>(std::io::Error::from(std::io::ErrorKind::UnexpectedEof))
+        });
+        let error = to_bytes(Body::from_stream(stream), 100).await.unwrap_err();
+        assert_eq!(super::body_read_error(error).0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_progress_is_not_a_rate_failure_but_idle_and_total_remain_bounded() {
+        use axum::body::{to_bytes, Body, Bytes};
+        let permit = || {
+            Some(super::LargeBodyPermit {
+                _place: std::sync::Arc::new(()),
+            })
+        };
+        let progress = || {
+            Body::from_stream(async_stream::stream! {
+                for _ in 0..400 {
+                    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                    yield Ok::<_, std::io::Error>(Bytes::from_static(b"x"));
+                }
+            })
+        };
+        let body = super::gated_body(
+            Body::from_stream(async_stream::stream! {
+                for _ in 0..12 {
+                    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                    yield Ok::<_, std::io::Error>(Bytes::from_static(b"x"));
+                }
+            }),
+            permit(),
+        );
+        assert_eq!(to_bytes(body, 1000).await.unwrap().len(), 12);
+        let body = super::gated_body(
+            Body::from_stream(futures::stream::pending::<Result<Bytes, std::io::Error>>()),
+            permit(),
+        );
+        assert_eq!(
+            super::body_read_error(to_bytes(body, 1000).await.unwrap_err()).0,
+            StatusCode::REQUEST_TIMEOUT
+        );
+        let body = super::gated_body(progress(), permit());
+        assert_eq!(
+            super::body_read_error(to_bytes(body, 1000).await.unwrap_err()).0,
+            StatusCode::REQUEST_TIMEOUT
+        );
+    }
+
+    #[tokio::test]
+    async fn accepted_video_readback_is_sealed_and_holds_its_budget_until_drained() {
+        use axum::body::{to_bytes, Body};
+        use base64::Engine as _;
+        let size = 33 * 1024 * 1024;
+        let response = axum::response::Response::builder()
+            .header("content-length", size)
+            .body(Body::from(vec![7; size]))
+            .unwrap();
+        let key = [19; 32];
+        let response = super::encrypt_transport_response(
+            response,
+            &key,
+            "GET /api/uploads/fixture.mp4",
+            "fixture-nonce",
+            2,
+            true,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            super::LARGE_FILE_RESPONSES.try_acquire().is_err(),
+            "buffer budget belongs to the response body"
+        );
+        let bytes = to_bytes(
+            response.into_body(),
+            super::sealed_body_ceiling(platform::uploads::MAX_VIDEO_UPLOAD_BYTES),
+        )
+        .await
+        .unwrap();
+        assert!(super::LARGE_FILE_RESPONSES.try_acquire().is_ok());
+        let envelope: transport::Envelope = serde_json::from_slice(&bytes).unwrap();
+        let plain = transport::open(
+            &key,
+            transport::Direction::Response,
+            b"GET /api/uploads/fixture.mp4\nfixture-nonce",
+            &envelope,
+            now_unix_ms(),
+        )
+        .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&plain).unwrap();
+        assert_eq!(payload["status"], 200);
+        let file = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(payload["body"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(file.len(), size);
+        assert!(file.iter().all(|byte| *byte == 7));
+    }
+
     /// What a dual-stack listener reports for an IPv4 client is the mapped
     /// `::ffff:a.b.c.d`; masking it to a /64 like native IPv6 would put every
     /// IPv4 client in one bucket and make the per-address limits global.
@@ -1975,7 +2202,10 @@ mod tests {
     /// on any route buffer 25 MiB.
     #[test]
     fn every_other_route_is_held_to_the_small_body_limit() {
-        assert_eq!(plaintext_body_limit(UPLOADS_PATH), MAX_VIDEO_UPLOAD_BYTES);
+        assert_eq!(
+            plaintext_body_limit(UPLOADS_PATH),
+            platform::uploads::MAX_UPLOAD_BODY_BYTES
+        );
         for path in [
             "/api/sessions/default/panes/%1/send-text",
             "/api/pair/claim",

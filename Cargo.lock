@@ -1670,6 +1670,7 @@ dependencies = [
  "hex",
  "hkdf",
  "hmac",
+ "http-body-util",
  "image",
  "indexmap",
  "libc",

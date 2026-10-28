@@ -4,7 +4,6 @@ use std::path::{Path as FsPath, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use anyhow::Context as _;
-use axum::body::Body;
 use axum::extract::multipart::{MultipartError, MultipartRejection};
 use axum::extract::{DefaultBodyLimit, Multipart, Path, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -15,7 +14,6 @@ use serde_json::{json, Value};
 
 use crate::{
     api_error, looks_textual, read_asset_head, require_device, state_dir, ApiResult, AppState,
-    ASSET_CONTENT_CHUNK_BYTES,
 };
 
 /// The one route allowed a body bigger than [`MAX_REQUEST_BODY_BYTES`]. Named
@@ -34,6 +32,8 @@ pub(crate) const MAX_UPLOAD_BYTES: usize = 25 * 1024 * 1024;
 /// much per upload in flight, and about 1.4 times it for a sealed one
 /// while its envelope is opened.
 pub(crate) const MAX_VIDEO_UPLOAD_BYTES: usize = 64 * 1024 * 1024;
+/// A file's advertised maximum excludes bounded multipart framing.
+pub(crate) const MAX_UPLOAD_BODY_BYTES: usize = MAX_VIDEO_UPLOAD_BYTES + 64 * 1024;
 /// The client's own file name is only ever echoed back, never used to build a
 /// path, so this is a display cap rather than a safety one.
 pub(crate) const MAX_UPLOAD_NAME_CHARS: usize = 120;
@@ -132,11 +132,16 @@ pub(crate) async fn upload_file(
     };
     // The route's body limit is the video ceiling; everything else keeps the
     // smaller one, decided by what the content turned out to be.
-    if !kind.mime.starts_with("video/") && bytes.len() > MAX_UPLOAD_BYTES {
+    let maximum = if kind.mime.starts_with("video/") {
+        MAX_VIDEO_UPLOAD_BYTES
+    } else {
+        MAX_UPLOAD_BYTES
+    };
+    if bytes.len() > maximum {
         return Err(api_error(
             StatusCode::PAYLOAD_TOO_LARGE,
             "upload_too_large",
-            "a file that is not a video may be at most 25 MiB",
+            &format!("this file may be at most {} MiB", maximum / (1024 * 1024)),
         ));
     }
 
@@ -226,27 +231,13 @@ pub(crate) async fn upload_content(
         tracing::warn!("failed to open upload {}: {err}", path.display());
         upload_not_found()
     })?;
-    let stream = async_stream::stream! {
-        let mut file = file;
-        let mut buffer = vec![0u8; ASSET_CONTENT_CHUNK_BYTES];
-        loop {
-            match tokio::io::AsyncReadExt::read(&mut file, &mut buffer).await {
-                Ok(0) => break,
-                Ok(read) => yield Ok::<_, std::io::Error>(
-                    axum::body::Bytes::copy_from_slice(&buffer[..read]),
-                ),
-                Err(err) => {
-                    yield Err(err);
-                    break;
-                }
-            }
-        }
-    };
+    let metadata = file.metadata().await.map_err(|_| upload_not_found())?;
+    let range = super::file_ranges::FileRange::select(&metadata, &headers)?;
+    let body = range.body(file).await.map_err(|_| upload_not_found())?;
 
-    Response::builder()
-        .status(StatusCode::OK)
+    range
+        .headers(Response::builder())
         .header("content-type", kind.mime)
-        .header("content-length", metadata.len())
         .header(
             "content-disposition",
             format!("inline; filename=\"{name}\""),
@@ -255,7 +246,7 @@ pub(crate) async fn upload_content(
         // on top of the blanket `no-store` the security headers apply, so it
         // cannot land in a shared cache on the way back either.
         .header("cache-control", "private, no-store, max-age=0")
-        .body(Body::from_stream(stream))
+        .body(body)
         .map_err(|err| {
             tracing::warn!("failed to build upload response: {err}");
             api_error(
@@ -336,11 +327,18 @@ pub(crate) fn sniff_stored_upload(path: &FsPath, stored_name: &str) -> Option<Up
 /// oversized upload surfaces here as a length-limit error rather than as a
 /// fully buffered file the gateway then has to measure.
 pub(crate) fn upload_body_error(err: MultipartError) -> (StatusCode, Json<Value>) {
+    if super::server::body_read_timed_out(&err) {
+        return api_error(
+            StatusCode::REQUEST_TIMEOUT,
+            "body_timeout",
+            "the upload body was not received in time",
+        );
+    }
     if err.status() == StatusCode::PAYLOAD_TOO_LARGE {
         return api_error(
             StatusCode::PAYLOAD_TOO_LARGE,
             "upload_too_large",
-            "the upload must be at most 25 MiB",
+            "the upload exceeds its body limit (files: 25 MiB; videos: 64 MiB)",
         );
     }
     api_error(
@@ -800,7 +798,7 @@ pub(crate) fn mount(router: Router<AppState>) -> Router<AppState> {
         // get their own ceiling while every JSON route keeps the small one.
         .route(
             UPLOADS_PATH,
-            post(upload_file).layer(DefaultBodyLimit::max(MAX_VIDEO_UPLOAD_BYTES)),
+            post(upload_file).layer(DefaultBodyLimit::max(MAX_UPLOAD_BODY_BYTES)),
         )
         // Reading one back. The app needs this to draw the user's own
         // attachment in the transcript: the timeline item carries the host

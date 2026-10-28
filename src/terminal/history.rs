@@ -272,10 +272,16 @@ impl HistorySnapshot {
             let mut bytes = 0;
             while start > 0 && end - start < scope.limit {
                 let next = capture.rows[start - 1].len() + 1;
-                if next > MAX_PAGE_BYTES {
+                // A retained row is indivisible on the existing wire contract.
+                // Give a large row its own page rather than rejecting every page
+                // in the capture. Its hard bound remains the pane byte budget.
+                if next > super::scrollback::MAX_PANE_BYTES + 1 {
                     return Err(HistoryError::TooLarge);
                 }
                 if bytes + next > MAX_PAGE_BYTES {
+                    if start == end {
+                        start -= 1;
+                    }
                     break;
                 }
                 bytes += next;
@@ -683,8 +689,11 @@ mod tests {
         *repository.capture.lock().unwrap() =
             Some((Uuid::new_v4(), vec!["x".repeat(MAX_PAGE_BYTES)]));
         assert_eq!(
-            read_page(&repository, scope(), None).await,
-            Err(HistoryError::TooLarge)
+            read_page(&repository, scope(), None).await.unwrap()["rows"][0]
+                .as_str()
+                .unwrap()
+                .len(),
+            MAX_PAGE_BYTES
         );
         *repository.capture.lock().unwrap() =
             Some((Uuid::new_v4(), vec!["x".repeat(MAX_PAGE_BYTES / 2); 3]));
@@ -692,5 +701,22 @@ mod tests {
             read_page(&repository, scope(), None).await.unwrap()["row_count"],
             1
         );
+    }
+
+    #[tokio::test]
+    async fn a_large_old_row_is_lossless_and_does_not_block_the_current_page() {
+        let repository = FakeRepository::new();
+        let large = "界".repeat(MAX_PAGE_BYTES);
+        *repository.capture.lock().unwrap() = Some((
+            Uuid::new_v4(),
+            vec![large.clone(), "current one".into(), "current two".into()],
+        ));
+        let page = read_page(&repository, scope(), None).await.unwrap();
+        assert_eq!(page["rows"], json!(["current one", "current two"]));
+        let older = read_page(&repository, scope(), page["next_before"].as_str())
+            .await
+            .unwrap();
+        assert_eq!(older["rows"], json!([large]));
+        assert!(older["next_before"].is_null());
     }
 }

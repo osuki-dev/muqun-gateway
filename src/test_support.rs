@@ -482,6 +482,8 @@ pub(crate) fn asset_listing_state(root: &FsPath, entries: Vec<AssetEntry>) -> Ap
 
 pub(crate) fn asset_listing_query(kind: Option<&str>, limit: usize) -> AssetsQuery {
     AssetsQuery {
+        cursor: None,
+        query: None,
         since: None,
         limit: Some(limit),
         kind: kind.map(str::to_owned),

@@ -2,6 +2,22 @@
 
 ## Changes and fixes
 
+- **Files can page and search beyond the first result window.** New Apps use
+  `session_asset_pages` to follow scoped cursors and search names or paths.
+  Existing Apps retain their array response. Workspace scan and provenance
+  boundaries remain enforced and index exhaustion is explicit.
+- **Large file handoffs and busy uploads give consistent results.** Accepted
+  videos remain readable over encrypted transport; bounded range reads allow
+  large asset downloads without unlimited buffering. Uploads and short messages
+  have separate admission budgets, multipart framing no longer consumes the
+  advertised file allowance, and slow reads report timeouts instead of size
+  errors. New Apps can detect `bounded_file_ranges`; existing upload reads
+  remain compatible. No re-pairing or data migration is required.
+- **Long terminal history rows no longer block every page.** A large retained
+  row occupies its own bounded page without losing its text or hiding newer
+  rows. Terminal input budgets are now discoverable; paste submission semantics
+  are unchanged. Restart the Gateway after updating.
+
 - **Terminal snapshots avoid repeating the same device-directory scan.**
   Herdr pane listings index terminal device paths once per backend instead of
   scanning `/dev` for every pane. Each shell's current controlling terminal,

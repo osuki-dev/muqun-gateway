@@ -2,6 +2,16 @@ use super::super::backend::{AgentStatus, Pane, PaneId, TabId, WorkspaceId};
 use super::super::history::read_page;
 use super::super::history::read_segment_page;
 use super::*;
+
+#[test]
+fn checkpoint_rows_allow_a_large_lossless_row_within_the_existing_pane_budget() {
+    let rows = vec![
+        "界".repeat(super::super::history::MAX_PAGE_BYTES),
+        "current output".to_owned(),
+    ];
+    assert_eq!(decode_rows(&encode_rows(&rows)).unwrap(), rows);
+    assert!(decode_rows(&encode_rows(&["x".repeat(MAX_PANE_BYTES + 1)])).is_err());
+}
 use crate::platform::config::HistoryStorage;
 use crate::platform::store::db_key::DbKey;
 use crate::platform::store::sqlite::ALL_MIGRATIONS;
@@ -1662,12 +1672,12 @@ async fn quotas_evict_closed_panes_before_open_ones() {
 }
 
 #[tokio::test]
-async fn an_oversized_projection_is_skipped_and_the_others_are_still_written() {
+async fn large_retained_rows_and_other_formats_are_both_checkpointed() {
     let fixture = Fixture::new();
     let fold = captures(Some("A"), false);
     {
         let mut store = fold.lock().unwrap();
-        // One text row past a page's bound scrolls into history.
+        // A retained row larger than the usual page target remains checkpointable.
         let big = "x".repeat(300 * 1024);
         store.record_frame(
             "default",
@@ -1686,7 +1696,7 @@ async fn an_oversized_projection_is_skipped_and_the_others_are_still_written() {
     assert!(checkpoints.healthy.load(Ordering::Acquire));
     assert_eq!(
         record_count(&checkpoints).await,
-        1,
-        "the ANSI shape is stored"
+        2,
+        "both the large text row and the ANSI shape are stored"
     );
 }

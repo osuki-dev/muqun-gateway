@@ -3,6 +3,7 @@
 pub mod assets;
 pub mod config;
 pub mod discovery;
+pub(crate) mod file_ranges;
 pub mod git;
 pub mod http;
 pub mod i18n;

@@ -88,6 +88,8 @@ pub(crate) const API_CAPABILITIES: &[&str] = &[
     "asset_download",
     "device_revocation",
     "file_uploads",
+    "session_asset_pages",
+    "bounded_file_ranges",
     "git_diff",
     "git_worktrees",
     "pane_lazygit",
