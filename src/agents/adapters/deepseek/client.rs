@@ -51,6 +51,28 @@ struct ModelSelection {
     reasoning_effort: Option<String>,
 }
 
+// Keep local response-budget exhaustion distinct from upstream/network errors.
+// Only read-only history pagination may adapt and retry this condition.
+enum RpcReadError {
+    TooLarge,
+    Agent(AgentError),
+}
+
+impl From<AgentError> for RpcReadError {
+    fn from(error: AgentError) -> Self {
+        Self::Agent(error)
+    }
+}
+
+impl From<RpcReadError> for AgentError {
+    fn from(error: RpcReadError) -> Self {
+        match error {
+            RpcReadError::TooLarge => Self::Protocol("upstream response too large".into()),
+            RpcReadError::Agent(error) => error,
+        }
+    }
+}
+
 pub(super) enum ReadError {
     TooLarge,
     Network,
@@ -172,6 +194,18 @@ impl DeepseekClient {
         args: Value,
         response_cap: usize,
     ) -> Result<Value, AgentError> {
+        self.call_remote_read(namespace, method, args, response_cap)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn call_remote_read(
+        &self,
+        namespace: &str,
+        method: &str,
+        args: Value,
+        response_cap: usize,
+    ) -> Result<Value, RpcReadError> {
         let url = format!("{}/api/{namespace}/{method}", self.endpoint.url);
         let rpc_id = format!("req_{}", Uuid::new_v4().simple());
         let full_method = format!("{namespace}/{method}");
@@ -216,23 +250,22 @@ impl DeepseekClient {
                 truncate_for_log(&snippet, ERROR_SNIPPET_BYTES)
             );
             if status == reqwest::StatusCode::NOT_FOUND && namespace == "session" {
-                return Err(AgentError::SessionNotFound(session_id_of(&args_for_id)));
+                return Err(AgentError::SessionNotFound(session_id_of(&args_for_id)).into());
             }
             return Err(AgentError::RequestFailed(format!(
                 "upstream returned HTTP {}",
                 status.as_u16()
-            )));
+            ))
+            .into());
         }
 
         let bytes = read_capped(resp, response_cap).await.map_err(|e| {
             tracing::warn!(target: "deepseek", "{full_method}: reading response failed: {e}");
             match e {
-                ReadError::TooLarge => {
-                    AgentError::Protocol("upstream response too large".to_string())
-                }
-                ReadError::Network => {
-                    AgentError::Network("reading upstream response failed".to_string())
-                }
+                ReadError::TooLarge => RpcReadError::TooLarge,
+                ReadError::Network => RpcReadError::Agent(AgentError::Network(
+                    "reading upstream response failed".to_string(),
+                )),
             }
         })?;
 
@@ -266,7 +299,7 @@ impl DeepseekClient {
                 // Only a missing session is `SessionNotFound`; a missing preset,
                 // workspace or job is a rejected request, not a lost session.
                 if code == "session/not-found" {
-                    Err(AgentError::SessionNotFound(session_id_of(&args_for_id)))
+                    Err(AgentError::SessionNotFound(session_id_of(&args_for_id)).into())
                 } else if code == "session/queue-item-not-found" {
                     Err(AgentError::InboxItemNotFound(
                         args_for_id
@@ -274,12 +307,14 @@ impl DeepseekClient {
                             .and_then(Value::as_str)
                             .unwrap_or("")
                             .into(),
-                    ))
+                    )
+                    .into())
                 } else {
                     Err(AgentError::RequestFailed(format!(
                         "upstream rejected: {}",
                         sanitize_code(code)
-                    )))
+                    ))
+                    .into())
                 }
             }
         } else {
@@ -484,18 +519,30 @@ impl DeepseekClient {
         let mut records = Vec::new();
         let mut retained_bytes = 0;
         let has_more = loop {
-            let page = self
-                .call_remote(
-                    "session",
-                    "page",
-                    json!({ "request": {
-                "address": { "kind": "session", "sessionId": session_id },
-                "throughSeq": through_seq,
-                "beforeSeq": before_seq,
-                "maxMessages": remaining.min(HISTORY_PAGE_MESSAGES),
-            } }),
-                )
-                .await?;
+            let mut page_size = remaining.min(HISTORY_PAGE_MESSAGES);
+            let page = loop {
+                let result = self
+                    .call_remote_read(
+                        "session",
+                        "page",
+                        json!({ "request": {
+                    "address": { "kind": "session", "sessionId": session_id },
+                    "throughSeq": through_seq,
+                    "beforeSeq": before_seq,
+                    "maxMessages": page_size,
+                } }),
+                        MAX_RESPONSE_BYTES,
+                    )
+                    .await;
+                match result {
+                    Ok(page) => break page,
+                    Err(RpcReadError::TooLarge) if page_size > 1 => {
+                        // Same frozen cut, no state consumed and no mutation.
+                        page_size = (page_size / 2).max(1);
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            };
             let page_records = page
                 .get("records")
                 .and_then(Value::as_array)
@@ -1023,6 +1070,61 @@ pub(crate) mod tests {
         (app, calls)
     }
 
+    #[tokio::test]
+    async fn oversized_history_pages_shrink_without_gaps_or_changing_the_cut() {
+        let (app, calls) = paged_history(16 * 1024);
+        let (client, server) = rpc_server(app).await;
+        let mut cut = None;
+        let mut delivered = Vec::new();
+        loop {
+            let walk = client
+                .read_history("s", cut, 100, INITIAL_HISTORY_RETAINED_BYTES)
+                .await
+                .unwrap();
+            delivered.splice(0..0, seqs(&walk.page));
+            if !walk.has_more {
+                break;
+            }
+            cut = Some((walk.through_seq, walk.earliest_seq.unwrap()));
+        }
+        assert_eq!(delivered, (0..360).collect::<Vec<_>>());
+        let calls = calls.lock().unwrap();
+        assert_eq!(
+            &calls[..3],
+            &[(359, 360, 50), (359, 360, 25), (359, 360, 12)]
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn one_oversized_history_message_stops_at_one_without_claiming_exhaustion() {
+        use axum::{routing::post, Json, Router};
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let seen = calls.clone();
+        let app = Router::new().route(
+            "/api/session/page",
+            post(move |Json(body): Json<Value>| {
+                let seen = seen.clone();
+                async move {
+                    let request = body.pointer("/payload/args/request").unwrap();
+                    assert_eq!(request["throughSeq"], 1);
+                    assert_eq!(request["beforeSeq"], 2);
+                    seen.lock()
+                        .unwrap()
+                        .push(request["maxMessages"].as_u64().unwrap());
+                    Json(json!({"padding": "x".repeat(MAX_RESPONSE_BYTES + 1)}))
+                }
+            }),
+        );
+        let (client, server) = rpc_server(app).await;
+        assert!(
+            matches!(client.read_history("s", Some((1, 2)), 50, INITIAL_HISTORY_RETAINED_BYTES).await,
+            Err(AgentError::Protocol(message)) if message == "upstream response too large")
+        );
+        assert_eq!(*calls.lock().unwrap(), vec![50, 25, 12, 6, 3, 1]);
+        server.abort();
+    }
+
     fn seqs(page: &Value) -> Vec<i64> {
         page["records"]
             .as_array()
@@ -1035,7 +1137,7 @@ pub(crate) mod tests {
     /// A walk keeps what fits its budget and says `hasMore` rather than
     /// failing; the next walk, given the cut and the oldest seq delivered,
     /// continues just below it, and the pages tile the log with no gap or
-    /// overlap down to seq 0. `get_page` itself never fails for size.
+    /// overlap down to seq 0. A single indivisible oversized message still errors.
     #[tokio::test]
     async fn a_walk_stops_within_its_budget_and_the_next_continues_below_it() {
         let (app, calls) = paged_history(0);
