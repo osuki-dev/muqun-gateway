@@ -335,22 +335,22 @@ impl CodexDriver {
     }
 
     /// Compaction postpones steering; it must not turn it into next-turn work.
-    pub(crate) fn deliver_deferred_steering(self: &Arc<Self>, thread: &str) {
+    pub(crate) fn deliver_deferred_steering(self: &Arc<Self>, thread: &str, turn: &str) {
         let driver = self.clone();
         let thread = thread.to_owned();
+        let turn = turn.to_owned();
         tokio::spawn(async move {
             let _guard = driver.mutations.lock().await;
-            while !driver.client.is_compacting(&thread) {
+            while !driver.client.is_compacting(&thread)
+                && driver.client.active_turn(&thread).as_deref() == Some(turn.as_str())
+            {
                 let Some(item) = driver.queue().next(&thread).cloned() else {
                     break;
                 };
                 if item.delivery != Delivery::Steer {
                     break;
                 }
-                let result = match driver.client.active_turn(&thread) {
-                    Some(turn) => driver.steer_locked(&thread, &turn, item.input).await,
-                    None => driver.start_turn_locked(&thread, item.input).await,
-                };
+                let result = driver.steer_locked(&thread, &turn, item.input).await;
                 if driver.settle(&thread, &item.id, result).is_err() {
                     break;
                 }

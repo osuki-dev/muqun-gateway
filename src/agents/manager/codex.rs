@@ -671,7 +671,7 @@ impl Context {
                         && self.driver.client().active_turn(thread).as_deref() == Some(turn)
                         && !self.driver.client().is_compacting(thread)
                     {
-                        self.driver.deliver_deferred_steering(thread);
+                        self.driver.deliver_deferred_steering(thread, turn);
                     }
                     for id in self
                         .driver
