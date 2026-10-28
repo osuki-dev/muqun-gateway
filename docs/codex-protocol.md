@@ -531,11 +531,15 @@ questions from the exact currently active turn. Paginated storage uses
 `thread/items/list` filtered by `turnId`; legacy storage uses a single
 `thread/turns/list` page with `itemsView: full`, requiring the returned active turn
 identity to match. Recovery runs separately from opening the timeline, with one
-in-flight scan per thread and at most four scans per adapter. Each scan uses its
+scheduled scan per thread/turn ownership and at most four scans per adapter.
+Further selected sessions wait in FIFO order; stale queued requests are discarded
+when their loaded thread, active turn, or ownership changes. Queue size is bounded
+by the loaded-session capacity, with at most four stale in-flight requests.
+Each scan uses its
 own identity-verified, history-only connection, so it cannot occupy the foreground
 history reader or issue prompts, callbacks, or mutations. There is no item-count
 or page-count cutoff. A 60-second deadline and 32 MiB wire-work budget bound each
-attempt; failure or exhaustion leaves the timeline available and publishes no
+attempt, including reader connection and initialization; failure or exhaustion leaves the timeline available and publishes no
 partial question result. A later selected refresh can attempt recovery again. Committed answer envelopes are applied before
 question forms; bounded answer identities also prevent a concurrent TUI answer from
 being resurrected by recovery. Turn changes, completion, disconnect, or an unload/rejoin

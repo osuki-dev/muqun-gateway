@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use serde_json::{json, Value};
@@ -53,7 +53,7 @@ pub struct CodexDriver {
     native_sessions: Option<Arc<super::native_sessions::NativeSessions>>,
     /// Only explicitly created, forked or submitted-to threads are resumed.
     loaded: Arc<Mutex<HashSet<String>>>,
-    question_recoveries: Arc<Mutex<HashSet<String>>>,
+    question_recoveries: Arc<Mutex<QuestionRecoveries>>,
     /// Serializes explicit mutations, not the stream or read-only RPC calls.
     mutations: Arc<Mutex<()>>,
     order: std::sync::Mutex<ItemOrder>,
@@ -117,6 +117,25 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct QuestionRecoveryKey {
+    thread: String,
+    turn: String,
+    ownership: u64,
+}
+
+struct QuestionRecovery {
+    key: QuestionRecoveryKey,
+    history_mode: Option<String>,
+}
+
+#[derive(Default)]
+struct QuestionRecoveries {
+    scheduled: HashSet<QuestionRecoveryKey>,
+    pending: VecDeque<QuestionRecovery>,
+    workers: usize,
 }
 
 struct PendingModel {
@@ -184,7 +203,7 @@ impl CodexDriver {
             terminal_runtime: None,
             native_sessions: None,
             loaded: Arc::new(Mutex::new(HashSet::new())),
-            question_recoveries: Arc::new(Mutex::new(HashSet::new())),
+            question_recoveries: Arc::new(Mutex::new(QuestionRecoveries::default())),
             mutations: Arc::new(Mutex::new(())),
             order: std::sync::Mutex::new(HashMap::new()),
             order_epochs: std::sync::Mutex::new(HashMap::new()),
@@ -1169,29 +1188,96 @@ impl CodexDriver {
         let Some(ownership) = self.client.subscription_revision(id) else {
             return;
         };
-        if !self.client.is_shared() || !self.loaded.lock().await.contains(id) {
+        let loaded = self.loaded.lock().await;
+        if !self.client.is_shared() || !loaded.contains(id) {
             return;
         }
-        let mut running = self.question_recoveries.lock().await;
-        if running.len() >= 4 || !running.insert(id.to_owned()) {
+        let mut queue = self.question_recoveries.lock().await;
+        // At most one valid pending request per loaded thread; stale requests
+        // cannot accumulate as sessions close or change turns. Loaded threads
+        // are already bounded by MAX_SESSIONS, plus at most four running reads.
+        let mut stale = Vec::new();
+        queue.pending.retain(|request| {
+            let key = &request.key;
+            let valid = loaded.contains(&key.thread)
+                && self.client.subscription_revision(&key.thread) == Some(key.ownership)
+                && self.client.active_turn(&key.thread).as_deref() == Some(key.turn.as_str());
+            if !valid {
+                stale.push(key.clone());
+            }
+            valid
+        });
+        for key in stale {
+            queue.scheduled.remove(&key);
+        }
+        let key = QuestionRecoveryKey {
+            thread: id.into(),
+            turn,
+            ownership,
+        };
+        if queue.scheduled.contains(&key) {
             return;
         }
-        drop(running);
+        // Keep a single queued generation even if notifications advanced this
+        // thread while stale ownership checks above were being evaluated.
+        let mut superseded = Vec::new();
+        queue.pending.retain(|request| {
+            if request.key.thread == id {
+                superseded.push(request.key.clone());
+                false
+            } else {
+                true
+            }
+        });
+        for key in superseded {
+            queue.scheduled.remove(&key);
+        }
+        queue.scheduled.insert(key.clone());
+        queue.pending.push_back(QuestionRecovery {
+            key,
+            history_mode: history_mode.map(str::to_owned),
+        });
+        if queue.workers >= 4 {
+            return;
+        }
+        queue.workers += 1;
+        drop(queue);
+        drop(loaded);
         let client = self.client.clone();
         let loaded = self.loaded.clone();
-        let running = self.question_recoveries.clone();
-        let id = id.to_owned();
-        let mode = history_mode.map(str::to_owned);
+        let queue = self.question_recoveries.clone();
         tokio::spawn(async move {
-            tokio::select! {
-                _ = client.cancel_token().cancelled_owned() => {},
-                result = Self::recover_async_questions(&client, &loaded, &id, &turn, ownership, mode.as_deref()) => {
-                    if let Err(error) = result {
-                        tracing::debug!(%error, "Codex optional question recovery incomplete; timeline remains available");
+            loop {
+                let request = {
+                    let mut state = queue.lock().await;
+                    let Some(request) = state.pending.pop_front() else {
+                        state.workers -= 1;
+                        return;
+                    };
+                    request
+                };
+                let key = &request.key;
+                // Include connection establishment and initialization in the
+                // attempt deadline, not just the subsequent page calls.
+                tokio::select! {
+                    _ = client.cancel_token().cancelled_owned() => {},
+                    result = tokio::time::timeout(std::time::Duration::from_secs(60), Self::recover_async_questions(
+                        &client, &loaded, &key.thread, &key.turn, key.ownership, request.history_mode.as_deref()
+                    )) => {
+                        if !matches!(result, Ok(Ok(()))) {
+                            tracing::debug!("Codex optional question recovery incomplete; timeline remains available");
+                        }
                     }
                 }
+                let mut state = queue.lock().await;
+                state.scheduled.remove(key);
+                if client.cancel_token().is_cancelled() {
+                    state.pending.clear();
+                    state.scheduled.clear();
+                    state.workers -= 1;
+                    return;
+                }
             }
-            running.lock().await.remove(&id);
         });
     }
 
@@ -1206,6 +1292,12 @@ impl CodexDriver {
         ownership: u64,
         history_mode: Option<&str>,
     ) -> Result<(), AgentError> {
+        if client.subscription_revision(id) != Some(ownership)
+            || client.active_turn(id).as_deref() != Some(turn)
+            || !loaded.lock().await.contains(id)
+        {
+            return Ok(());
+        }
         let mut budget = Budget::question_recovery();
         let reader = client.question_history_reader().await?;
         let mut cursor = None;
@@ -3144,7 +3236,7 @@ mod history_tests {
             driver.prepare_selected_session("live").await.unwrap();
             driver.get_timeline("live", 10).await.unwrap();
             tokio::time::timeout(std::time::Duration::from_secs(10), async {
-                while !driver.question_recoveries.lock().await.is_empty() {
+                while !driver.question_recoveries.lock().await.scheduled.is_empty() {
                     tokio::task::yield_now().await;
                 }
             })
@@ -3201,7 +3293,7 @@ mod history_tests {
             driver
                 .schedule_question_recovery("live", Some("paginated"))
                 .await;
-            assert_eq!(driver.question_recoveries.lock().await.len(), 1);
+            assert_eq!(driver.question_recoveries.lock().await.scheduled.len(), 1);
             assert_eq!(
                 fixture
                     .requests
@@ -3247,7 +3339,7 @@ mod history_tests {
             }
             gate.notify_one();
             tokio::time::timeout(std::time::Duration::from_secs(2), async {
-                while !driver.question_recoveries.lock().await.is_empty() {
+                while !driver.question_recoveries.lock().await.scheduled.is_empty() {
                     tokio::task::yield_now().await;
                 }
             })
@@ -3261,6 +3353,84 @@ mod history_tests {
             }
             assert_eq!(recovered, usize::from(scenario == "pending"), "{scenario}");
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn question_recovery_queues_fifth_session_without_reselection() {
+        use super::super::CodexEvent;
+        use crate::agents::adapters::codex::client::websocket::tests::Fixture as SharedFixture;
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let mut fixture = SharedFixture::with_deferred(|request| match request["method"].as_str().unwrap() {
+            "thread/read" | "thread/resume" => json!({"thread":{"id":request["params"]["threadId"],"historyMode":"paginated","status":{"type":"active","activeFlags":[]}}}),
+            "thread/turns/list" => json!({"data":[{"id":"turn","status":"inProgress"}]}),
+            "thread/items/list" => json!({"data":[{"turnId":request["params"]["turnId"],"item":{"id":"q","type":"agentMessage","questions":[{"title":"Pending?"}]}}],"nextCursor":null}),
+            other => panic!("unexpected RPC {other}"),
+        }, Some(("thread/items/list", gate.clone()))).await;
+        let driver = CodexDriver::new(fixture.client.clone());
+        for n in 0..5 {
+            driver
+                .prepare_selected_session(&format!("thread-{n}"))
+                .await
+                .unwrap();
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while fixture
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|r| r["method"] == "thread/items/list")
+                .count()
+                < 4
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        {
+            let state = driver.question_recoveries.lock().await;
+            assert_eq!(state.workers, 4);
+            assert_eq!(state.pending.len(), 1);
+            assert_eq!(state.scheduled.len(), 5);
+        }
+        fixture.send.send(json!({"method":"turn/started","params":{"threadId":"thread-4","turn":{"id":"next-turn","status":"inProgress"}}})).await.unwrap();
+        loop {
+            let event =
+                tokio::time::timeout(std::time::Duration::from_secs(2), fixture.events.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            if matches!(event, CodexEvent::Notification {method, ..} if method == "turn/started") {
+                break;
+            }
+        }
+        driver
+            .schedule_question_recovery("thread-4", Some("paginated"))
+            .await;
+        assert_eq!(driver.question_recoveries.lock().await.pending.len(), 1);
+        gate.notify_waiters();
+        // A permit is retained even if the fifth worker has not reached its
+        // fixture gate yet. No new selection/refresh is needed to trigger it.
+        gate.notify_one();
+        let mut recovered = HashMap::new();
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while recovered.len() < 5 {
+                if let Some(CodexEvent::RecoveredQuestions { thread, turn, .. }) =
+                    fixture.events.recv().await
+                {
+                    recovered.insert(thread, turn);
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            recovered.get("thread-4").map(String::as_str),
+            Some("next-turn")
+        );
+        assert!(fixture.client.is_ready());
     }
 
     #[tokio::test]
