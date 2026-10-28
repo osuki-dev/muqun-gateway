@@ -151,7 +151,6 @@ mod tests {
         tests::{golden, Fixture},
         CodexDriver,
     };
-    use crate::agents::adapters::memory_mirror::MemoryMirror;
     use crate::agents::domain::AgentSessionId;
     use crate::agents::ports::agent::AgentPort;
     use crate::agents::use_cases::PromptService;
@@ -317,7 +316,7 @@ mod tests {
         let driver = Arc::new(CodexDriver::new(fixture.client.clone()));
         assert_eq!(driver.attachment_mode(), AttachmentMode::NativeUploads);
         let session = driver.create_session(None, None, None).await.unwrap();
-        let service = PromptService::new(driver.clone(), Arc::new(MemoryMirror::new()));
+        let service = PromptService::new(driver.clone());
         for bad in [
             "https://example.test/x.png",
             "data:image/png;base64,eA==",
