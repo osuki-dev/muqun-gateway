@@ -1685,7 +1685,7 @@ mod tests {
                         items.extend((0..1700).map(|n| json!({"id":format!("filler-{n}"),"type":"agentMessage","text":"History"})));
                     }
                     items.push(question.clone());
-                    json!({"data":[{"id":"turn","status":"inProgress","itemsView":"full","items":items}]})
+                    json!({"data":[{"id":"turn","status":"inProgress","itemsView":"full","items":items}],"nextCursor":null})
                 },
                 "thread/turns/list" => json!({"data":[{"id":"turn","status":"inProgress"}]}),
                 "thread/items/list" if request["params"]["turnId"] == "turn" => {
