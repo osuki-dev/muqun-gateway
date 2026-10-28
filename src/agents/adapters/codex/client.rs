@@ -521,6 +521,22 @@ impl CodexClient {
         self.state.ready.load(Ordering::Acquire) && !self.state.cancel.is_cancelled()
     }
 
+    /// Recovery must not consume the foreground history reader's fail-fast slot.
+    /// This connection has the existing history-only role: no subscriptions,
+    /// prompts, callbacks or mutations, and the same verified daemon identity.
+    pub(super) async fn question_history_reader(&self) -> Result<Arc<Self>, AgentError> {
+        #[cfg(unix)]
+        {
+            let identity = self.shared_identity.as_ref().ok_or_else(history_error)?;
+            super::daemon::connect_history(identity, self.cancel_token(), super::budget::MAX_BYTES)
+                .await
+        }
+        #[cfg(not(unix))]
+        Err(AgentError::NotAvailable(
+            "Codex shared question recovery requires Unix".into(),
+        ))
+    }
+
     pub(crate) fn recovered_questions(
         &self,
         ownership: u64,

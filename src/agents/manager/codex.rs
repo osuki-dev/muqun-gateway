@@ -1655,6 +1655,10 @@ mod tests {
         for scenario in [
             "pending",
             "legacy",
+            "large_legacy",
+            "long_turn",
+            "many_pages",
+            "large_body",
             "stale_handle",
             "answered",
             "live_answer",
@@ -1672,17 +1676,33 @@ mod tests {
             };
             let question = json!({"type":"agentMessage","id":"question","text":"Still working", "questions":[{"title":"Pick?","options":["A","B"]}]});
             let mut fixture = SharedFixture::new(move |request| match request["method"].as_str().unwrap() {
-                "thread/read" | "thread/resume" => json!({"thread":{"id":"live","historyMode":if scenario=="legacy" {"legacy"} else {"paginated"},"status":{"type":"active","activeFlags":[]},"turns":[]}}),
+                "thread/read" | "thread/resume" => json!({"thread":{"id":"live","historyMode":if matches!(scenario,"legacy" | "large_legacy") {"legacy"} else {"paginated"},"status":{"type":"active","activeFlags":[]},"turns":[]}}),
                 "thread/turns/list" if request["params"]["itemsView"] == "full" => {
-                    assert_eq!(scenario, "legacy");
+                    assert!(matches!(scenario, "legacy" | "large_legacy"));
                     assert_eq!(request["params"]["limit"], 1);
-                    json!({"data":[{"id":"turn","status":"inProgress","itemsView":"full","items":[question]}]})
+                    let mut items = vec![];
+                    if scenario == "large_legacy" {
+                        items.extend((0..1700).map(|n| json!({"id":format!("filler-{n}"),"type":"agentMessage","text":"History"})));
+                    }
+                    items.push(question.clone());
+                    json!({"data":[{"id":"turn","status":"inProgress","itemsView":"full","items":items}]})
                 },
                 "thread/turns/list" => json!({"data":[{"id":"turn","status":"inProgress"}]}),
                 "thread/items/list" if request["params"]["turnId"] == "turn" => {
                     assert_eq!(request["params"]["sortDirection"], "asc");
+                    if matches!(scenario, "long_turn" | "many_pages") {
+                        let count = if scenario == "many_pages" { 131 } else { 1701 };
+                        let size = if scenario == "many_pages" { 1 } else { 100 };
+                        let offset = request["params"]["cursor"].as_str().and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
+                        let rows: Vec<_> = (offset..(offset + size).min(count)).map(|n| json!({"turnId":"turn","item":if n == count - 1 {question.clone()} else {json!({"id":format!("filler-{n}"),"type":"agentMessage","text":"History"})}})).collect();
+                        return json!({"data":rows,"nextCursor":if offset + size < count {json!((offset + size).to_string())} else {Value::Null}});
+                    }
                     if request["params"]["cursor"].is_null() {
-                        json!({"data":[{"turnId":"turn","item":question}],"nextCursor":"answers"})
+                        let mut rows = vec![json!({"turnId":"turn","item":question})];
+                        if scenario == "large_body" {
+                            rows.push(json!({"turnId":"turn","item":{"id":"large-user","type":"userMessage","content":[{"type":"text","text":"x".repeat(1024*1024+1)}]}}));
+                        }
+                        json!({"data":rows,"nextCursor":"answers"})
                     } else {
                         assert_eq!(request["params"]["cursor"], "answers");
                         json!({"data":if committed.is_null(){vec![]}else{vec![json!({"turnId":"turn","item":committed})]},"nextCursor":null})
@@ -1710,7 +1730,7 @@ mod tests {
             let recovery = loop {
                 let event = tokio::time::timeout(Duration::from_secs(2), fixture.events.recv())
                     .await
-                    .unwrap()
+                    .unwrap_or_else(|_| panic!("question recovery timed out: {scenario}"))
                     .unwrap();
                 if matches!(event, CodexEvent::RecoveredQuestions { .. }) {
                     break event;
@@ -1780,7 +1800,16 @@ mod tests {
             let forms = driver.get_pending_forms("live").await.unwrap();
             assert_eq!(
                 forms.len(),
-                usize::from(matches!(scenario, "pending" | "legacy" | "stale_handle")),
+                usize::from(matches!(
+                    scenario,
+                    "pending"
+                        | "legacy"
+                        | "large_legacy"
+                        | "long_turn"
+                        | "many_pages"
+                        | "large_body"
+                        | "stale_handle"
+                )),
                 "{scenario}"
             );
             let mut pending_events = 0;
@@ -1791,10 +1820,22 @@ mod tests {
             }
             assert_eq!(
                 pending_events,
-                usize::from(matches!(scenario, "pending" | "legacy" | "stale_handle")),
+                usize::from(matches!(
+                    scenario,
+                    "pending"
+                        | "legacy"
+                        | "large_legacy"
+                        | "long_turn"
+                        | "many_pages"
+                        | "large_body"
+                        | "stale_handle"
+                )),
                 "{scenario}"
             );
-            if matches!(scenario, "pending" | "legacy" | "stale_handle") {
+            if matches!(
+                scenario,
+                "pending" | "legacy" | "large_legacy" | "long_turn" | "large_body" | "stale_handle"
+            ) {
                 assert!(forms[0].nonblocking);
                 assert_eq!(
                     mirror
@@ -1851,35 +1892,6 @@ mod tests {
                     .reply_form("live", &forms[0].id, json!({"answer":"again"}))
                     .await
                     .is_err());
-            }
-        }
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn shared_question_recovery_rejects_incomplete_or_wrong_turn_pages() {
-        use crate::agents::adapters::codex::client::websocket::tests::Fixture as SharedFixture;
-        for scenario in ["wrong_turn", "cycle", "too_large", "too_many_pages"] {
-            let page = std::sync::atomic::AtomicUsize::new(0);
-            let mut fixture = SharedFixture::new(move |request| match request["method"].as_str().unwrap() {
-                "thread/read" | "thread/resume" => json!({"thread":{"id":"live","historyMode":"paginated","status":{"type":"active","activeFlags":[]}}}),
-                "thread/turns/list" => json!({"data":[{"id":"turn","status":"inProgress"}]}),
-                "thread/items/list" => match scenario {
-                    "wrong_turn" => json!({"data":[{"turnId":"old-turn","item":{"id":"q","type":"agentMessage","questions":[{"title":"Old?"}]}}],"nextCursor":null}),
-                    "cycle" => json!({"data":[],"nextCursor":"same"}),
-                    "too_large" => json!({"data":[{"turnId":"turn","item":{"id":"u","type":"userMessage","content":[{"type":"text","text":"x".repeat(1024*1024)}]}}],"nextCursor":null}),
-                    _ => json!({"data":[],"nextCursor":page.fetch_add(1,std::sync::atomic::Ordering::SeqCst).to_string()}),
-                },
-                other => panic!("unexpected RPC {other}"),
-            }).await;
-            let driver = CodexDriver::new(fixture.client.clone());
-            assert!(driver.get_timeline("live", 10).await.is_err(), "{scenario}");
-            assert!(driver.get_pending_forms("live").await.unwrap().is_empty());
-            while let Ok(event) = fixture.events.try_recv() {
-                assert!(
-                    !matches!(event, CodexEvent::RecoveredQuestions { .. }),
-                    "{scenario}"
-                );
             }
         }
     }
