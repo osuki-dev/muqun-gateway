@@ -592,10 +592,14 @@ impl Context {
                         let full = params["turn"]
                             .get("itemsView")
                             .is_none_or(|view| view == "full");
-                        let accepted = match self
-                            .driver
-                            .prepare_completed_turn(thread, turn, items, full)
-                        {
+                        let accepted = match self.driver.prepare_completed_turn(
+                            thread,
+                            turn,
+                            items,
+                            full,
+                            params["turn"]["itemsView"] == "full"
+                                && params["turn"]["status"] == "completed",
+                        ) {
                             Ok(prepared) => self.mirror.accept_live_history(&asid, prepared).await,
                             Err(error) => Err(error),
                         };
@@ -623,6 +627,7 @@ impl Context {
                 }) else {
                     return;
                 };
+                self.driver.finish_provisional_turn(thread, ended_turn);
                 self.set_status(thread, mapper::status(&params["turn"]["status"]))
                     .await;
                 let ended_turn = Some(ended_turn);
@@ -672,6 +677,9 @@ impl Context {
                         && !self.driver.client().is_compacting(thread)
                     {
                         self.driver.deliver_deferred_steering(thread, turn);
+                    }
+                    if let Some(id) = params["item"]["id"].as_str() {
+                        self.driver.complete_text_item(thread, turn, id);
                     }
                     for id in self
                         .driver
@@ -786,6 +794,9 @@ impl Context {
                     .append_text_delta(&asid, &id, &order_group, ordinal, delta, reasoning)
                     .await
                 {
+                    if !reasoning {
+                        self.driver.observe_text_delta(thread, turn, item);
+                    }
                     if let Some(item) = self.mirror.get_timeline_item(&asid, &id).await {
                         self.emit(AgentDomainEvent::TimelineUpsert {
                             asid,

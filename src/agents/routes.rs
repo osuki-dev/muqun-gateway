@@ -2670,7 +2670,7 @@ async fn do_delete_agent_session(
     require_device(state, headers)?;
     let manager = if let Some(agent_id) = agent_id {
         if asid.is_empty()
-            || asid.len() > 128
+            || asid.len() > 4096
             || matches!(asid, "." | "..")
             || !asid.bytes().all(|byte| {
                 byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':')
@@ -2775,7 +2775,7 @@ async fn do_fork_agent_session(
 ) -> ApiResult<Json<Value>> {
     require_device(state, headers)?;
     validate_text(asid)?;
-    if asid.len() > 128
+    if asid.len() > 4096
         || matches!(asid, "." | "..")
         || !asid
             .bytes()

@@ -62,7 +62,10 @@ fn client_frames_parse_and_anything_else_is_refused() {
         ClientFrame::parse(r#"{"t":"subscribe","asid":""}"#),
         Err(FrameError::InvalidAsid)
     );
-    let long = format!(r#"{{"t":"subscribe","asid":"{}"}}"#, "a".repeat(129));
+    let long = format!(
+        r#"{{"t":"subscribe","asid":"{}"}}"#,
+        "a".repeat(MAX_ASID_BYTES + 1)
+    );
     assert_eq!(ClientFrame::parse(&long), Err(FrameError::InvalidAsid));
     assert_eq!(
         ClientFrame::parse(r#"{"t":"subscribe","asid":"a\nb"}"#),
@@ -1270,4 +1273,17 @@ async fn overview_resync_replays_only_its_snapshot_without_restarting_tasks() {
     assert_eq!(replay, original);
     send_text(&mut client, r#"{"t":"ping"}"#).await;
     assert_eq!(next_json(&mut client).await["t"], "pong");
+}
+
+#[test]
+fn composite_provider_child_identity_survives_socket_frames() {
+    let id = format!("thread:provider:cursor:{}%3Atask%0Achild", "a".repeat(160));
+    for frame in [
+        serde_json::json!({"t":"subscribe","asid":id}),
+        serde_json::json!({"t":"history_request","request":{"request_id":"read-child","asid":id,"operation":"window"}}),
+    ] {
+        assert!(ClientFrame::parse(&frame.to_string()).is_ok());
+    }
+    assert!(validate_asid(&"x".repeat(MAX_ASID_BYTES + 1)).is_err());
+    assert!(validate_asid("child\ncontrol").is_err());
 }

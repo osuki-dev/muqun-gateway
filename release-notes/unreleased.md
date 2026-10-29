@@ -2,6 +2,19 @@
 
 ## Changes and fixes
 
+- **T3 native subagent sessions retain their identities.** Composite child IDs
+  receive stable URL-safe public IDs at the Gateway boundary. HTTP and RPC
+  requests recover the original IDs without a process-local mapping, so
+  Gateway restarts preserve links. History and subscriptions use the same public
+  IDs. Subagent cards retain the
+  upstream execution status. File changes without a diff body, including failed
+  edits, remain tool activities instead of misleading empty successful diffs.
+
+- **T3 completion clears the running indicator.** Authoritative V2 run states
+  now update the live status as well as session metadata, so completed replies
+  do not leave the App showing Thinking. Stop renders its confirmed result
+  without duplicating the control request as a second stopped notice.
+
 - **Files can page and search beyond the first result window.** New Apps use
   `session_asset_pages` to follow scoped cursors and search names or paths.
   Existing Apps retain their array response. Workspace scan and provenance
@@ -384,7 +397,7 @@ through this gateway, as before: **revert and the VCS diff are not available
 for T3 sessions** (`features.revert` is false on protocol 2), and V1 threads
 the server migrated show their message text only. Update every machine that
 runs `t3 serve` (upstream pingdotgg/t3code#14871): a 0.0.x server keeps
-protocol 1 and everything documented for it.
+protocol 1 and must be upgraded before connecting to this Gateway.
 
 ## App compatibility
 
@@ -452,3 +465,11 @@ of the switch is covered by unit tests and not by a live run.
 - Bound and cancel in-flight work on disconnect, drain replaced Home workers, and preserve the existing encrypted transport and authorization checks.
 
 Restart the Gateway and update the App to enable these optional capabilities. Existing HTTP clients remain compatible.
+
+## T3 V2-only integration
+
+T3 Code must advertise orchestration protocol 2. Legacy protocol 1 support has
+been removed before public release; old servers receive an upgrade message before
+a pairing credential is exchanged. App-facing session APIs stay unchanged. Stop
+now reads only the current thread control snapshot, avoiding an unrelated project
+list request that could delay or prevent interruption.

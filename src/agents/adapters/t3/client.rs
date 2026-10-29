@@ -17,9 +17,7 @@ use serde_json::{json, Value};
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
-use super::endpoint::{
-    read_bounded, short, BearerGrant, T3Credential, T3Endpoint, T3Protocol, MAX_HTTP_BODY,
-};
+use super::endpoint::{read_bounded, short, BearerGrant, T3Credential, T3Endpoint, MAX_HTTP_BODY};
 use super::rpc::{RpcConfig, RpcConnection, RpcError, Subscription};
 use crate::agents::ports::agent::AgentError;
 
@@ -27,8 +25,6 @@ mod history;
 use history::HistoryCursor;
 
 pub const RPC_DISPATCH: &str = "orchestration.dispatchCommand";
-pub const RPC_GET_TURN_DIFF: &str = "orchestration.getTurnDiff";
-pub const RPC_GET_FULL_THREAD_DIFF: &str = "orchestration.getFullThreadDiff";
 pub const RPC_SEARCH_THREADS: &str = "orchestration.searchThreads";
 pub const RPC_SUBSCRIBE_SHELL: &str = "orchestration.subscribeShell";
 pub const RPC_SUBSCRIBE_THREAD: &str = "orchestration.subscribeThread";
@@ -50,24 +46,35 @@ pub const INTERACTION_MODES: [&str; 2] = ["default", "plan"];
 pub const DEFAULT_INTERACTION_MODE: &str = "default";
 
 const CLIENT_LABEL: &str = "muqun-gateway";
-const MAX_ID_LEN: usize = 128;
+const MAX_ID_LEN: usize = 4096;
 const MAX_PROMPT_CHARS: usize = 120_000;
 
-/// A validated opaque id: T3 ids are UUIDs the client mints, but the server
-/// only requires a trimmed non-empty string, so this accepts the characters a
-/// URL path segment and a JSON string can carry safely and nothing else.
+/// T3 also emits composite provider-native IDs containing percent-encoded
+/// fragments. Preserve these opaque IDs; encode them separately for HTTP paths.
 pub fn validate_id(id: &str, what: &str) -> Result<String, AgentError> {
     let trimmed = id.trim();
-    if trimmed.is_empty() || trimmed.len() > MAX_ID_LEN {
+    if trimmed.is_empty() || trimmed.len() > MAX_ID_LEN || matches!(trimmed, "." | "..") {
         return Err(AgentError::RequestFailed(format!("invalid {what}")));
     }
     if !trimmed
         .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'))
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':' | '%'))
     {
         return Err(AgentError::RequestFailed(format!("invalid {what}")));
     }
+    if what == "session id" {
+        return Ok(super::session_identity::public_id(
+            &super::session_identity::native_id(trimmed)?,
+        ));
+    }
     Ok(trimmed.to_string())
+}
+
+fn thread_snapshot_path(id: &str) -> Result<String, AgentError> {
+    Ok(format!(
+        "{HTTP_THREAD_SNAPSHOT}/{}/bounded",
+        super::session_identity::path_segment(id)?
+    ))
 }
 
 pub fn new_id() -> String {
@@ -202,163 +209,6 @@ impl ModelSelection {
             instance_id: instance_id.to_string(),
             model: model.to_string(),
             options,
-        })
-    }
-}
-
-/// Builders for the orchestration commands this adapter dispatches. Each
-/// returns the JSON body of `orchestration.dispatchCommand`.
-pub mod commands {
-    use super::*;
-
-    pub fn project_create(project_id: &str, title: &str, workspace_root: &str) -> Value {
-        json!({
-            "type": "project.create",
-            "commandId": new_id(),
-            "projectId": project_id,
-            "title": title,
-            "workspaceRoot": workspace_root,
-            "createdAt": now_iso(),
-        })
-    }
-
-    pub fn thread_create(
-        thread_id: &str,
-        project_id: &str,
-        title: &str,
-        model: &ModelSelection,
-        runtime_mode: &str,
-        interaction_mode: &str,
-    ) -> Value {
-        json!({
-            "type": "thread.create",
-            "commandId": new_id(),
-            "threadId": thread_id,
-            "projectId": project_id,
-            "title": title,
-            "modelSelection": model.to_value(),
-            "runtimeMode": runtime_mode,
-            "interactionMode": interaction_mode,
-            "branch": null,
-            "worktreePath": null,
-            "createdAt": now_iso(),
-        })
-    }
-
-    pub fn turn_start(
-        thread_id: &str,
-        message_id: &str,
-        text: &str,
-        model: Option<&ModelSelection>,
-        runtime_mode: &str,
-        interaction_mode: &str,
-    ) -> Value {
-        let mut v = json!({
-            "type": "thread.turn.start",
-            "commandId": new_id(),
-            "threadId": thread_id,
-            "message": {
-                "messageId": message_id,
-                "role": "user",
-                "text": text,
-                "attachments": [],
-            },
-            "runtimeMode": runtime_mode,
-            "interactionMode": interaction_mode,
-            "createdAt": now_iso(),
-        });
-        if let Some(m) = model {
-            v["modelSelection"] = m.to_value();
-        }
-        v
-    }
-
-    pub fn turn_interrupt(thread_id: &str) -> Value {
-        json!({
-            "type": "thread.turn.interrupt",
-            "commandId": new_id(),
-            "threadId": thread_id,
-            "createdAt": now_iso(),
-        })
-    }
-
-    /// `decision` is one of `accept`, `acceptForSession`, `acceptAlways`,
-    /// `decline`, `cancel`.
-    pub fn approval_respond(thread_id: &str, request_id: &str, decision: &str) -> Value {
-        json!({
-            "type": "thread.approval.respond",
-            "commandId": new_id(),
-            "threadId": thread_id,
-            "requestId": request_id,
-            "decision": decision,
-            "createdAt": now_iso(),
-        })
-    }
-
-    pub fn user_input_respond(thread_id: &str, request_id: &str, answers: Value) -> Value {
-        json!({
-            "type": "thread.user-input.respond",
-            "commandId": new_id(),
-            "threadId": thread_id,
-            "requestId": request_id,
-            "answers": answers,
-            "createdAt": now_iso(),
-        })
-    }
-
-    pub fn checkpoint_revert(thread_id: &str, turn_count: u64) -> Value {
-        json!({
-            "type": "thread.checkpoint.revert",
-            "commandId": new_id(),
-            "threadId": thread_id,
-            "turnCount": turn_count,
-            "createdAt": now_iso(),
-        })
-    }
-
-    pub fn thread_delete(thread_id: &str) -> Value {
-        json!({
-            "type": "thread.delete",
-            "commandId": new_id(),
-            "threadId": thread_id,
-        })
-    }
-
-    pub fn thread_rename(thread_id: &str, title: &str) -> Value {
-        json!({
-            "type": "thread.meta.update",
-            "commandId": new_id(),
-            "threadId": thread_id,
-            "title": title,
-        })
-    }
-
-    pub fn thread_set_model(thread_id: &str, model: &ModelSelection) -> Value {
-        json!({
-            "type": "thread.meta.update",
-            "commandId": new_id(),
-            "threadId": thread_id,
-            "modelSelection": model.to_value(),
-        })
-    }
-
-    pub fn runtime_mode_set(thread_id: &str, runtime_mode: &str) -> Value {
-        json!({
-            "type": "thread.runtime-mode.set",
-            "commandId": new_id(),
-            "threadId": thread_id,
-            "runtimeMode": runtime_mode,
-            "createdAt": now_iso(),
-        })
-    }
-
-    pub fn interaction_mode_set(thread_id: &str, interaction_mode: &str) -> Value {
-        json!({
-            "type": "thread.interaction-mode.set",
-            "commandId": new_id(),
-            "threadId": thread_id,
-            "interactionMode": interaction_mode,
-            "createdAt": now_iso(),
         })
     }
 }
@@ -508,10 +358,6 @@ impl T3Client {
 
     pub fn http(&self) -> &Client {
         &self.http
-    }
-
-    pub fn is_v2(&self) -> bool {
-        self.endpoint.protocol == T3Protocol::V2
     }
 
     /// Capture before starting I/O. A forgotten/recreated thread gets a new
@@ -718,11 +564,6 @@ impl T3Client {
         title: &str,
         root: &str,
     ) -> Result<(), AgentError> {
-        if !self.is_v2() {
-            self.dispatch(commands::project_create(id, title, root))
-                .await?;
-            return Ok(());
-        }
         let bearer = self.bearer().await?;
         let response = self
             .http
@@ -786,7 +627,10 @@ impl T3Client {
     /// Dispatch one orchestration command; returns the event sequence the
     /// command committed at. Acceptance means the intent was recorded, not
     /// that the provider finished acting on it.
-    pub async fn dispatch(&self, command: Value) -> Result<u64, AgentError> {
+    pub async fn dispatch(&self, mut command: Value) -> Result<u64, AgentError> {
+        if let Some(id) = command.get("threadId").and_then(Value::as_str) {
+            command["threadId"] = json!(super::session_identity::native_id(id)?);
+        }
         let kind = command
             .get("type")
             .and_then(Value::as_str)
@@ -799,47 +643,21 @@ impl T3Client {
         Ok(result.get("sequence").and_then(Value::as_u64).unwrap_or(0))
     }
 
-    pub async fn get_turn_diff(
-        &self,
-        thread_id: &str,
-        from: u64,
-        to: u64,
-    ) -> Result<Value, AgentError> {
-        self.rpc
-            .request(
-                RPC_GET_TURN_DIFF,
-                json!({ "threadId": thread_id, "fromTurnCount": from, "toTurnCount": to }),
-            )
-            .await
-            .map_err(map_rpc_error)
-    }
-
-    pub async fn get_full_thread_diff(
-        &self,
-        thread_id: &str,
-        to: u64,
-    ) -> Result<Value, AgentError> {
-        self.rpc
-            .request(
-                RPC_GET_FULL_THREAD_DIFF,
-                json!({ "threadId": thread_id, "toTurnCount": to }),
-            )
-            .await
-            .map_err(map_rpc_error)
-    }
-
     pub async fn search_threads(&self, query: &str, limit: usize) -> Result<Value, AgentError> {
         let q: String = query.trim().chars().take(200).collect();
         if q.chars().count() < 2 {
             return Ok(json!({ "matches": [] }));
         }
-        self.rpc
+        let mut result = self
+            .rpc
             .request(
                 RPC_SEARCH_THREADS,
                 json!({ "query": q, "limit": limit.clamp(1, 50) }),
             )
             .await
-            .map_err(map_rpc_error)
+            .map_err(map_rpc_error)?;
+        super::session_identity::expose(&mut result);
+        Ok(result)
     }
 
     /// Subscribe to the shell: first a `snapshot` (or a replay after
@@ -866,13 +684,14 @@ impl T3Client {
         thread_id: &str,
         after_sequence: Option<u64>,
     ) -> Result<Subscription, AgentError> {
+        let native = super::session_identity::native_id(thread_id)?;
         let mut payload = json!({
-            "threadId": thread_id,
+            "threadId": native,
             "reasoningMessages": true,
             "requestCompletionMarker": true,
         });
-        if self.is_v2() {
-            payload = json!({"threadId":thread_id,"requestCompletionMarker":true,"acceptBoundedSnapshot":true});
+        {
+            payload = json!({"threadId":native,"requestCompletionMarker":true,"acceptBoundedSnapshot":true});
         }
         if let Some(seq) = after_sequence {
             payload["afterSequence"] = json!(seq);
@@ -896,25 +715,13 @@ impl T3Client {
     pub async fn thread_snapshot(
         &self,
         thread_id: &str,
-        turn_limit: Option<usize>,
+        _turn_limit: Option<usize>,
     ) -> Result<Value, AgentError> {
         let id = validate_id(thread_id, "session id")?;
-        if self.is_v2() {
-            let detail = self
-                .get_json(format!("{HTTP_THREAD_SNAPSHOT}/{id}/bounded"))
-                .await?;
+        {
+            let detail = self.get_json(thread_snapshot_path(&id)?).await?;
             super::v2::projection::validate_snapshot(&detail, &id)?;
-            return Ok(detail);
-        }
-        let mut path = format!("{HTTP_THREAD_SNAPSHOT}/{id}?reasoningMessages=true");
-        if let Some(limit) = turn_limit {
-            path.push_str(&format!("&turnLimit={}", limit.max(1)));
-        }
-        match self.get_json(path).await {
-            Err(AgentError::RequestFailed(msg)) if msg.starts_with("HTTP 404") => {
-                Err(AgentError::SessionNotFound(thread_id.to_string()))
-            }
-            other => other,
+            Ok(detail)
         }
     }
 
@@ -938,7 +745,7 @@ impl T3Client {
             .http
             .get(format!("{}{path}", self.endpoint.url))
             .bearer_auth(&bearer);
-        if self.is_v2() && path.starts_with("/api/orchestration/") {
+        if path.starts_with("/api/orchestration/") {
             request = request.header("x-t3-orchestration-protocol", "2");
         }
         let mut resp = request
@@ -987,8 +794,9 @@ impl T3Client {
             tracing::debug!(%status, path = %path.split('?').next().unwrap_or(""), "t3 http read failed");
             return Err(AgentError::RequestFailed(format!("HTTP {status}")));
         }
-        let value = serde_json::from_slice(&body)
+        let mut value = serde_json::from_slice(&body)
             .map_err(|e| AgentError::Protocol(short(&e.to_string())))?;
+        super::session_identity::expose(&mut value);
         Ok(Some((value, body.len())))
     }
 
@@ -998,9 +806,6 @@ impl T3Client {
         thread_id: &str,
         limit: usize,
     ) -> Result<Value, AgentError> {
-        if !self.is_v2() {
-            return self.thread_snapshot(thread_id, None).await;
-        }
         let prepared = self.prepare_timeline_snapshot(thread_id, limit).await?;
         let detail = prepared.detail.clone();
         self.commit_timeline(thread_id, prepared, false)?;
@@ -1024,10 +829,7 @@ impl T3Client {
             .readers
             .clone();
         let (detail, bytes) = self
-            .get_json_counted(
-                format!("{HTTP_THREAD_SNAPSHOT}/{id}/bounded"),
-                MAX_HTTP_BODY,
-            )
+            .get_json_counted(thread_snapshot_path(&id)?, MAX_HTTP_BODY)
             .await?
             .ok_or_else(|| {
                 AgentError::Protocol("T3 bounded snapshot exceeds byte budget".into())
@@ -1155,7 +957,26 @@ mod tests {
         assert!(validate_id("", "thread").is_err());
         assert!(validate_id("a/b", "thread").is_err());
         assert!(validate_id("a b", "thread").is_err());
-        assert!(validate_id(&"x".repeat(200), "thread").is_err());
+        assert!(validate_id(&"x".repeat(MAX_ID_LEN + 1), "thread").is_err());
+    }
+
+    #[test]
+    fn provider_native_child_ids_keep_encoded_fragments() {
+        let id = format!(
+            "thread:provider:cursor:native-thread:{}%3Atask%3Achild%0Aitem",
+            "a".repeat(150)
+        );
+        assert_eq!(validate_id(&id, "thread").unwrap(), id);
+        assert_eq!(
+            thread_snapshot_path(&id).unwrap(),
+            format!(
+                "{HTTP_THREAD_SNAPSHOT}/{}/bounded",
+                id.replace('%', "%25").replace(':', "%3A")
+            )
+        );
+        for invalid in [".", "..", "a/b", "a?b", "a#b", "a\\b", "a\nb"] {
+            assert!(validate_id(invalid, "thread").is_err());
+        }
     }
 
     #[test]
@@ -1184,51 +1005,15 @@ mod tests {
     }
 
     #[test]
-    fn command_builders_match_the_captured_wire_shapes() {
-        let ms = ModelSelection {
-            instance_id: "claudeAgent".into(),
-            model: "claude-haiku-4-5".into(),
-            options: vec![],
-        };
-        let c = commands::thread_create("t1", "p1", "title", &ms, "full-access", "default");
-        for key in [
-            "type",
-            "commandId",
-            "threadId",
-            "projectId",
-            "title",
-            "modelSelection",
-            "runtimeMode",
-            "interactionMode",
-            "branch",
-            "worktreePath",
-            "createdAt",
-        ] {
-            assert!(c.get(key).is_some(), "thread.create lacks {key}");
-        }
-        assert_eq!(c["type"], "thread.create");
-        assert!(c["branch"].is_null());
-        let t = commands::turn_start("t1", "m1", "hi", None, "full-access", "default");
-        assert_eq!(t["message"]["role"], "user");
-        assert_eq!(t["message"]["attachments"], json!([]));
-        assert!(t.get("modelSelection").is_none());
-        let a = commands::approval_respond("t1", "r1", "accept");
-        assert_eq!(a["decision"], "accept");
-        let r = commands::checkpoint_revert("t1", 0);
-        assert_eq!(r["turnCount"], 0);
-        assert!(commands::thread_delete("t1").get("createdAt").is_none());
-    }
-
-    #[test]
     fn attached_paths_ride_in_the_turn_text_not_its_attachments() {
         let text = crate::agents::ports::agent::append_attachment_paths(
             "look",
             &["/up/a.png".to_string(), "/up/b.pdf".to_string()],
         );
-        let t = commands::turn_start("t1", "m1", &text, None, "full-access", "default");
-        assert_eq!(t["message"]["attachments"], json!([]));
+        let t = super::super::v2::commands::message_dispatch("t1", "m1", &text, None, false);
+        assert_eq!(t["attachments"], json!([]));
         assert_eq!(
-            t["message"]["text"],
+            t["text"],
             "look\n\nAttached files (on this host):\n- /up/a.png\n- /up/b.pdf"
         );
     }

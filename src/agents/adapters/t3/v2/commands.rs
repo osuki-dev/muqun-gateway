@@ -52,3 +52,8 @@ pub fn set_model(id: &str, model: &ModelSelection) -> Value {
 pub fn rename(id: &str, title: &str) -> Value {
     json!({"type":"thread.metadata.update","commandId":new_id(),"threadId":id,"title":title})
 }
+
+/// Delete the selected thread through the V2 orchestration ingress.
+pub fn thread_delete(id: &str) -> Value {
+    json!({"type":"thread.delete","commandId":new_id(),"threadId":id})
+}

@@ -58,6 +58,8 @@ pub struct CodexDriver {
     mutations: Arc<Mutex<()>>,
     order: std::sync::Mutex<ItemOrder>,
     order_epochs: std::sync::Mutex<HashMap<String, u64>>,
+    /// Text seen only as live deltas, scoped to the runtime subscription.
+    provisional_text: std::sync::Mutex<HashMap<(String, String, String), Option<u64>>>,
     next_models: Arc<std::sync::Mutex<HashMap<String, PendingModel>>>,
     metadata_versions: Arc<Mutex<HashMap<String, u64>>>,
     next_metadata_version: std::sync::atomic::AtomicU64,
@@ -207,6 +209,7 @@ impl CodexDriver {
             mutations: Arc::new(Mutex::new(())),
             order: std::sync::Mutex::new(HashMap::new()),
             order_epochs: std::sync::Mutex::new(HashMap::new()),
+            provisional_text: Default::default(),
             next_models: Arc::new(std::sync::Mutex::new(HashMap::new())),
             metadata_versions: Arc::new(Mutex::new(HashMap::new())),
             next_metadata_version: std::sync::atomic::AtomicU64::new(1),
@@ -943,6 +946,34 @@ impl CodexDriver {
         Ok(rows)
     }
 
+    pub(crate) fn observe_text_delta(&self, thread: &str, turn: &str, item: &str) {
+        let mut pending = self
+            .provisional_text
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        // Match the existing order retention budget. Missing bookkeeping may
+        // preserve an obsolete bubble, but must never reject valid output.
+        if pending.len() < 8192 {
+            pending
+                .entry((thread.into(), turn.into(), item.into()))
+                .or_insert_with(|| self.client.subscription_revision(thread));
+        }
+    }
+
+    pub(crate) fn complete_text_item(&self, thread: &str, turn: &str, item: &str) {
+        self.provisional_text
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&(thread.into(), turn.into(), item.into()));
+    }
+
+    pub(crate) fn finish_provisional_turn(&self, thread: &str, turn: &str) {
+        self.provisional_text
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|(t, u, _), _| t != thread || u != turn);
+    }
+
     /// Complete turn arrays can repair provisional live order. Their rows and
     /// the projection commit are accepted together by the mirror.
     pub(crate) fn prepare_completed_turn<'a>(
@@ -951,6 +982,7 @@ impl CodexDriver {
         turn: &str,
         items: &[Value],
         full: bool,
+        canonical_completed: bool,
     ) -> Result<PreparedTimeline<'a>, AgentError> {
         let (mut order, epoch) = self.order_candidate(thread);
         let ids = items
@@ -984,12 +1016,12 @@ impl CodexDriver {
             }
         }
         let mut rows = Vec::new();
-        for (item, id) in items.iter().zip(ids) {
-            let position = order[&(thread.to_owned(), turn.to_owned(), id)];
+        for (item, id) in items.iter().zip(&ids) {
+            let position = order[&(thread.to_owned(), turn.to_owned(), id.clone())];
             rows.extend(self.project_item(thread, turn, item, 0, position)?);
         }
         let fresh_ids = rows.iter().map(|item| item.id.clone()).collect();
-        let replace_groups = rows
+        let replace_groups: HashSet<_> = rows
             .iter()
             .filter(|item| {
                 matches!(&item.part, AgentPart::Tool(call)
@@ -997,11 +1029,39 @@ impl CodexDriver {
             })
             .map(|item| item.message_id.clone())
             .collect();
+        let turn = turn.to_owned();
+        let ownership = self.client.subscription_revision(thread);
         Ok(PreparedTimeline {
             items: rows,
             commit: Some(Box::new(move || {
+                let mut pending = self
+                    .provisional_text
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                let mut replace_groups = replace_groups;
+                // Only an explicitly complete successful turn can prove that
+                // an unfinished producer was discarded (for example by steer).
+                // Recheck ownership at mirror acceptance, not just preparation.
+                let prune = full
+                    && canonical_completed
+                    && self.client.subscription_revision(thread) == ownership
+                    && self.client.is_current_turn_completion(thread, &turn);
+                if prune {
+                    for (key @ (t, u, id), observed) in pending.iter() {
+                        if t == thread && u == &turn && *observed == ownership && !ids.contains(id)
+                        {
+                            if let Some(position) = order.get(key) {
+                                replace_groups
+                                    .insert(mapper::order_group(thread, &turn, *position));
+                            }
+                        }
+                    }
+                }
                 let mut accepted =
                     self.accept_order_candidate(thread, (order, epoch), fresh_ids, None)?;
+                if prune {
+                    pending.retain(|(t, u, _), _| t != thread || u != &turn);
+                }
                 accepted.replace_groups = replace_groups;
                 Ok(accepted)
             })),
@@ -1110,6 +1170,10 @@ impl CodexDriver {
     }
 
     pub(crate) async fn forget_thread(&self, id: &str) {
+        self.provisional_text
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|(thread, _, _), _| thread != id);
         self.clear_async_questions(id).await;
         self.loaded.lock().await.remove(id);
         self.next_models
@@ -4049,7 +4113,7 @@ mod history_tests {
         spawn["status"] = json!("completed");
         spawn["receiverThreadIds"] = json!(["child-a", "child-b"]);
         let prepared = driver
-            .prepare_completed_turn("thread", "turn", &[spawn], true)
+            .prepare_completed_turn("thread", "turn", &[spawn], true, false)
             .unwrap();
         assert_eq!(prepared.items.len(), 2);
         let children: Vec<_> = prepared.items.iter().map(|row| row.id.clone()).collect();
@@ -4129,10 +4193,11 @@ mod history_tests {
                 "turn",
                 &[values[2].clone(), values[0].clone(), values[1].clone()],
                 true,
+                false,
             )
             .unwrap();
         let prepared = driver
-            .prepare_completed_turn("thread", "turn", &values, true)
+            .prepare_completed_turn("thread", "turn", &values, true, false)
             .unwrap();
         mirror.accept_live_history(&asid, prepared).await.unwrap();
         let accepted = mirror.get_snapshot(&asid).await.unwrap();
@@ -4175,6 +4240,7 @@ mod history_tests {
                 "thread",
                 "turn",
                 &[values[2].clone(), values[0].clone()],
+                false,
                 false,
             )
             .unwrap();

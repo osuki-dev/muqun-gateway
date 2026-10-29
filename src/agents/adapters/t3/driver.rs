@@ -11,8 +11,8 @@ use std::sync::Arc;
 use serde_json::Value;
 
 use super::client::{
-    bounded_prompt, commands, new_id, validate_id, ModelSelection, T3Client,
-    DEFAULT_INTERACTION_MODE, DEFAULT_RUNTIME_MODE, RUNTIME_MODES,
+    bounded_prompt, new_id, validate_id, ModelSelection, T3Client, DEFAULT_INTERACTION_MODE,
+    DEFAULT_RUNTIME_MODE, RUNTIME_MODES,
 };
 use super::endpoint::T3Endpoint;
 use super::mapper;
@@ -23,8 +23,7 @@ use crate::agents::domain::{
     PermissionRequest, SessionQuery, TimelineItem,
 };
 use crate::agents::ports::agent::{
-    append_attachment_paths, AgentError, AgentFuture, AgentPort, AttachmentMode, FileDiffItem,
-    PreparedTimeline,
+    append_attachment_paths, AgentError, AgentFuture, AgentPort, AttachmentMode, PreparedTimeline,
 };
 
 /// The title a thread is created with; read back, it means "untitled".
@@ -50,9 +49,6 @@ impl T3Driver {
         kind: &str,
         text: Option<&str>,
     ) -> Result<(), AgentError> {
-        if !self.client.is_v2() {
-            return Err(AgentError::Unsupported("T3 V1 inbox".into()));
-        }
         let session = validate_id(session, "session id")?;
         let item = validate_id(item, "queued run id")?;
         let snapshot = self.client.thread_snapshot(&session, None).await?;
@@ -120,27 +116,13 @@ impl T3Driver {
         thread_id: &str,
     ) -> Result<(AgentSessionInfo, Value), AgentError> {
         let detail = self.client.thread_snapshot(thread_id, None).await?;
-        if self.client.is_v2() {
+        {
             let projection = detail["projection"].clone();
             let roots = mapper::project_roots(&self.client.shell_snapshot().await?);
             let info = v2::mapper::session(&projection["thread"], Some(&projection), &roots)
                 .ok_or_else(|| AgentError::Protocol("invalid V2 thread".into()))?;
-            return Ok((info, projection));
+            Ok((info, projection))
         }
-        let thread = detail
-            .get("thread")
-            .cloned()
-            .ok_or_else(|| AgentError::Protocol("thread snapshot without thread".into()))?;
-        let roots = match self.client.shell_snapshot().await {
-            Ok(shell) => mapper::project_roots(&shell),
-            Err(e) => {
-                tracing::debug!(error = %e, "t3 shell snapshot unavailable; session without directory");
-                Default::default()
-            }
-        };
-        let info = mapper::map_session(&thread, &roots)
-            .ok_or_else(|| AgentError::Protocol("thread snapshot missing id".into()))?;
-        Ok((info, thread))
     }
 
     /// Find the project whose workspace root is `directory`, or create one.
@@ -193,11 +175,27 @@ impl T3Driver {
 }
 
 impl AgentPort for T3Driver {
+    fn revert_session<'a>(
+        &'a self,
+        _session_id: &'a str,
+        _message_id: &'a str,
+    ) -> AgentFuture<'a, ()> {
+        Box::pin(async {
+            Err(AgentError::Unsupported(
+                "V2 message-targeted conversation and file revert".into(),
+            ))
+        })
+    }
+    fn get_vcs_diff<'a>(
+        &'a self,
+        _session_id: &'a str,
+        _mode: &'a str,
+    ) -> AgentFuture<'a, Vec<crate::agents::ports::agent::FileDiffItem>> {
+        Box::pin(async { Err(AgentError::Unsupported("V2 cumulative file diff".into())) })
+    }
+
     fn get_inbox<'a>(&'a self, session: &'a str) -> AgentFuture<'a, Vec<Value>> {
         Box::pin(async move {
-            if !self.client.is_v2() {
-                return Err(AgentError::Unsupported("T3 V1 inbox".into()));
-            }
             let id = validate_id(session, "session id")?;
             let snapshot = self.client.thread_snapshot(&id, None).await?;
             self.watcher.watch(&id);
@@ -243,9 +241,6 @@ impl AgentPort for T3Driver {
                         .await
                 }
                 "queue" => {
-                    if !self.client.is_v2() {
-                        return Err(AgentError::Unsupported("T3 V1 inbox".into()));
-                    }
                     let snapshot = self.client.thread_snapshot(session, None).await?;
                     v2::inbox::queued_run(&snapshot["projection"], item)?;
                     Ok(())
@@ -299,11 +294,7 @@ impl AgentPort for T3Driver {
     ) -> AgentFuture<'a, Vec<AgentSessionInfo>> {
         Box::pin(async move {
             let shell = self.client.shell_snapshot().await?;
-            let mut sessions = if self.client.is_v2() {
-                v2::mapper::shell_sessions(&shell)
-            } else {
-                mapper::map_shell_sessions(&shell)
-            };
+            let mut sessions = { v2::mapper::shell_sessions(&shell) };
             sessions.retain(|s| query.keeps_parent(s.parent_id.as_deref()));
             if let Some(dir) = query.directory.as_deref().map(|d| d.trim_end_matches('/')) {
                 sessions.retain(|s| {
@@ -382,17 +373,8 @@ impl AgentPort for T3Driver {
             let thread_id = new_id();
             let title = NEW_THREAD_TITLE;
             self.client
-                .dispatch(if self.client.is_v2() {
+                .dispatch({
                     v2::commands::thread_create(
-                        &thread_id,
-                        &project_id,
-                        title,
-                        &selection,
-                        runtime_mode,
-                        interaction_mode,
-                    )
-                } else {
-                    commands::thread_create(
                         &thread_id,
                         &project_id,
                         title,
@@ -467,7 +449,7 @@ impl AgentPort for T3Driver {
             let text = append_attachment_paths(text, attachments);
             let text = bounded_prompt(&text)?;
             let (info, thread) = self.session_from_snapshot(&id).await?;
-            if self.client.is_v2() {
+            {
                 // Default delivery never interrupts or restarts a root run.
                 // A concurrent upstream rejection remains an error, not an
                 // excuse to submit the prompt again with another mode.
@@ -478,89 +460,30 @@ impl AgentPort for T3Driver {
                 command["dispatchMode"] = mode;
                 self.client.dispatch(command).await?;
                 self.watcher.watch(&id);
-                return Ok(());
+                Ok(())
             }
-            let runtime_mode = thread
-                .get("runtimeMode")
-                .and_then(Value::as_str)
-                .unwrap_or(DEFAULT_RUNTIME_MODE)
-                .to_string();
-            let interaction_mode = thread
-                .get("interactionMode")
-                .and_then(Value::as_str)
-                .unwrap_or(DEFAULT_INTERACTION_MODE)
-                .to_string();
-            let model = info.model.as_ref().map(mapper::model_selection_from_ref);
-            self.client
-                .dispatch(commands::turn_start(
-                    &id,
-                    &new_id(),
-                    text,
-                    model.as_ref(),
-                    &runtime_mode,
-                    &interaction_mode,
-                ))
-                .await?;
-            Ok(())
-        })
-    }
-
-    /// `message_id` is a T3 checkpoint turn count (`0` = before the first
-    /// turn), a timeline message id, or the synthetic `turn:<turnId>` message
-    /// id activities are filed under. T3 rolls back whole turns, so a message
-    /// resolves to the turn count before the turn it belongs to.
-    fn revert_session<'a>(
-        &'a self,
-        session_id: &'a str,
-        message_id: &'a str,
-    ) -> AgentFuture<'a, ()> {
-        Box::pin(async move {
-            if self.client.is_v2() {
-                return Err(AgentError::Unsupported(
-                    "V2 message-targeted conversation and file revert".into(),
-                ));
-            }
-            let id = validate_id(session_id, "session id")?;
-            let target = mapper::t3_message_id(message_id.trim());
-            let turn_count = if let Ok(n) = target.parse::<u64>() {
-                n
-            } else {
-                let (_, thread) = self.session_from_snapshot(&id).await?;
-                mapper::revert_turn_count(&thread, target).ok_or_else(|| {
-                    AgentError::RequestFailed("no checkpoint for that message".into())
-                })?
-            };
-            self.client
-                .dispatch(commands::checkpoint_revert(&id, turn_count))
-                .await?;
-            Ok(())
         })
     }
 
     fn interrupt<'a>(&'a self, session_id: &'a str) -> AgentFuture<'a, ()> {
         Box::pin(async move {
             let id = validate_id(session_id, "session id")?;
-            if self.client.is_v2() {
-                let (_, projection) = self.session_from_snapshot(&id).await?;
-                let run = v2::mapper::interrupt_run(&projection)?;
+            {
+                let snapshot = self.client.thread_snapshot(&id, None).await?;
+                let run = v2::mapper::interrupt_run(&snapshot["projection"])?;
                 self.client
                     .dispatch(v2::commands::interrupt(&id, run))
                     .await?;
-                return Ok(());
+                Ok(())
             }
-            self.client.dispatch(commands::turn_interrupt(&id)).await?;
-            Ok(())
         })
     }
 
     fn switch_model<'a>(&'a self, session_id: &'a str, model: &'a ModelRef) -> AgentFuture<'a, ()> {
         Box::pin(async move {
             let id = validate_id(session_id, "session id")?;
-            let (_, thread) = self.session_from_snapshot(&id).await?;
             let config = self.client.get_config().await?;
-            if !self.client.is_v2() {
-                validate_model_driver(&thread, model, &config)?;
-            } else if !v2::projection::rows(&config, "providers")
+            if !v2::projection::rows(&config, "providers")
                 .iter()
                 .any(|provider| {
                     v2::projection::string(provider, "instanceId") == Some(&model.provider_id)
@@ -576,11 +499,7 @@ impl AgentPort for T3Driver {
             }
             let selection = mapper::model_selection_from_ref(model);
             self.client
-                .dispatch(if self.client.is_v2() {
-                    v2::commands::set_model(&id, &selection)
-                } else {
-                    commands::thread_set_model(&id, &selection)
-                })
+                .dispatch(v2::commands::set_model(&id, &selection))
                 .await?;
             Ok(())
         })
@@ -617,46 +536,14 @@ impl AgentPort for T3Driver {
             if message.is_some_and(|value| !value.trim().is_empty()) {
                 return Err(AgentError::Unsupported("approval reason".into()));
             }
-            if self.client.is_v2() {
+            {
                 let (_, projection) = self.session_from_snapshot(&id).await?;
                 let choice = v2::mapper::approval_decision(&projection, &request, decision)?;
                 self.client
                     .dispatch(v2::commands::respond(&id, &request, Some(choice), None))
                     .await?;
-                return Ok(());
+                Ok(())
             }
-            // Prefer the decisions the request itself offered; a label is
-            // not necessarily a valid reply, but the decision ids are.
-            let offered: Vec<Value> = match self.session_from_snapshot(&id).await {
-                Ok((_, thread)) => thread
-                    .get("activities")
-                    .and_then(Value::as_array)
-                    .and_then(|items| {
-                        items.iter().find(|a| {
-                            a.get("kind").and_then(Value::as_str) == Some("approval.requested")
-                                && a.get("payload")
-                                    .and_then(|p| p.get("requestId"))
-                                    .and_then(Value::as_str)
-                                    == Some(request.as_str())
-                        })
-                    })
-                    .and_then(|a| {
-                        a.get("payload")
-                            .and_then(|p| p.get("options"))
-                            .and_then(Value::as_array)
-                    })
-                    .cloned()
-                    .unwrap_or_default(),
-                Err(e) => {
-                    tracing::debug!(error = %e, "t3 approval options unavailable; using defaults");
-                    vec![]
-                }
-            };
-            let t3_decision = mapper::decision_to_t3(decision, &offered);
-            self.client
-                .dispatch(commands::approval_respond(&id, &request, t3_decision))
-                .await?;
-            Ok(())
         })
     }
 
@@ -669,23 +556,14 @@ impl AgentPort for T3Driver {
         Box::pin(async move {
             let id = validate_id(session_id, "session id")?;
             let request = validate_id(form_id, "form id")?;
-            if self.client.is_v2() {
+            {
                 let (_, projection) = self.session_from_snapshot(&id).await?;
                 v2::mapper::validate_answers(&projection, &request, &answers)?;
                 self.client
                     .dispatch(v2::commands::respond(&id, &request, None, Some(answers)))
                     .await?;
-                return Ok(());
+                Ok(())
             }
-            if !answers.is_object() {
-                return Err(AgentError::RequestFailed(
-                    "answers must be an object".into(),
-                ));
-            }
-            self.client
-                .dispatch(commands::user_input_respond(&id, &request, answers))
-                .await?;
-            Ok(())
         })
     }
 
@@ -696,32 +574,6 @@ impl AgentPort for T3Driver {
         })
     }
 
-    /// `working` and `branch` both answer the thread's cumulative diff up to
-    /// its latest checkpoint, which is what T3 keeps; `committed` has no
-    /// T3 counterpart.
-    fn get_vcs_diff<'a>(
-        &'a self,
-        session_id: &'a str,
-        mode: &'a str,
-    ) -> AgentFuture<'a, Vec<FileDiffItem>> {
-        Box::pin(async move {
-            let id = validate_id(session_id, "session id")?;
-            if self.client.is_v2() {
-                return Err(AgentError::Unsupported("V2 cumulative file diff".into()));
-            }
-            if !matches!(mode, "working" | "branch") {
-                return Err(AgentError::Unsupported(format!("vcs diff mode {mode}")));
-            }
-            let (_, thread) = self.session_from_snapshot(&id).await?;
-            let Some(turn) = mapper::latest_checkpoint_turn(&thread) else {
-                return Ok(vec![]);
-            };
-            let result = self.client.get_full_thread_diff(&id, turn).await?;
-            let diff = result.get("diff").and_then(Value::as_str).unwrap_or("");
-            Ok(mapper::map_unified_diff(diff))
-        })
-    }
-
     fn get_pending_permissions<'a>(
         &'a self,
         session_id: &'a str,
@@ -729,11 +581,7 @@ impl AgentPort for T3Driver {
         Box::pin(async move {
             let id = validate_id(session_id, "session id")?;
             let (_, thread) = self.session_from_snapshot(&id).await?;
-            Ok(if self.client.is_v2() {
-                v2::mapper::permissions(&id, &thread)
-            } else {
-                mapper::map_pending_permissions(&id, &thread)
-            })
+            Ok(v2::mapper::permissions(&id, &thread))
         })
     }
 
@@ -741,11 +589,7 @@ impl AgentPort for T3Driver {
         Box::pin(async move {
             let id = validate_id(session_id, "session id")?;
             let (_, thread) = self.session_from_snapshot(&id).await?;
-            Ok(if self.client.is_v2() {
-                v2::mapper::forms(&id, &thread)
-            } else {
-                mapper::map_pending_forms(&id, &thread)
-            })
+            Ok(v2::mapper::forms(&id, &thread))
         })
     }
 
@@ -755,24 +599,13 @@ impl AgentPort for T3Driver {
         limit: usize,
     ) -> AgentFuture<'a, Vec<TimelineItem>> {
         Box::pin(async move {
-            if self.client.is_v2() {
+            {
                 let prepared = self.prepare_timeline(session_id, limit).await?;
                 if let Some(commit) = prepared.commit {
                     commit()?;
                 }
-                return Ok(prepared.items);
+                Ok(prepared.items)
             }
-            let id = validate_id(session_id, "session id")?;
-            let detail = self.client.timeline_snapshot(&id, limit).await?;
-            let thread = detail
-                .get("thread")
-                .ok_or_else(|| AgentError::Protocol("thread snapshot without thread".into()))?;
-            self.watcher.watch(&id);
-            let mut items = mapper::map_thread_timeline(&id, thread);
-            if limit > 0 && items.len() > limit {
-                items.drain(..items.len() - limit);
-            }
-            Ok(items)
         })
     }
 
@@ -782,12 +615,6 @@ impl AgentPort for T3Driver {
         limit: usize,
     ) -> AgentFuture<'a, PreparedTimeline<'a>> {
         Box::pin(async move {
-            if !self.client.is_v2() {
-                return self
-                    .get_timeline(session_id, limit)
-                    .await
-                    .map(PreparedTimeline::ready);
-            }
             let id = validate_id(session_id, "session id")?;
             let prepared = self.client.prepare_timeline_snapshot(&id, limit).await?;
             let detail = &prepared.detail;
@@ -830,9 +657,6 @@ impl AgentPort for T3Driver {
         limit: usize,
     ) -> AgentFuture<'a, PreparedTimeline<'a>> {
         Box::pin(async move {
-            if !self.client.is_v2() {
-                return Err(AgentError::Unsupported("T3 V1 earlier history".into()));
-            }
             if limit == 0 || limit > 2000 {
                 return Err(AgentError::InvalidRequest(
                     "T3 history page limit must be between 1 and 2000".into(),
@@ -862,7 +686,9 @@ impl AgentPort for T3Driver {
     fn delete_session<'a>(&'a self, session_id: &'a str) -> AgentFuture<'a, ()> {
         Box::pin(async move {
             let id = validate_id(session_id, "session id")?;
-            self.client.dispatch(commands::thread_delete(&id)).await?;
+            self.client
+                .dispatch(v2::commands::thread_delete(&id))
+                .await?;
             self.client.forget_timeline(&id).await;
             self.watcher.unwatch(&id);
             Ok(())
@@ -877,78 +703,16 @@ impl AgentPort for T3Driver {
                 return Err(AgentError::RequestFailed("invalid title".into()));
             }
             self.client
-                .dispatch(if self.client.is_v2() {
-                    v2::commands::rename(&id, title)
-                } else {
-                    commands::thread_rename(&id, title)
-                })
+                .dispatch(v2::commands::rename(&id, title))
                 .await?;
             Ok(())
         })
     }
 }
 
-/// T3 binds a started thread to its driver; changing metadata across drivers
-/// succeeds upstream but makes the next turn fail. Reject before writing it.
-fn validate_model_driver(
-    thread: &Value,
-    model: &ModelRef,
-    config: &Value,
-) -> Result<(), AgentError> {
-    let Some(bound) = thread
-        .pointer("/session/providerName")
-        .and_then(Value::as_str)
-    else {
-        return Ok(());
-    };
-    let driver = config
-        .get("providers")
-        .and_then(Value::as_array)
-        .and_then(|providers| {
-            providers
-                .iter()
-                .find(|p| p.get("instanceId").and_then(Value::as_str) == Some(&model.provider_id))
-        })
-        .and_then(|p| p.get("driver").and_then(Value::as_str))
-        .ok_or_else(|| {
-            AgentError::RequestFailed("the selected provider is not in the T3 catalog".into())
-        })?;
-    if bound != driver {
-        return Err(AgentError::RequestFailed(format!(
-            "This T3 session uses {bound}. Start a new session to use {driver}."
-        )));
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_started_thread_cannot_change_drivers_but_can_change_model_or_instance() {
-        let config = serde_json::json!({"providers": [
-            {"instanceId":"codex", "driver":"codex"},
-            {"instanceId":"codex-alt", "driver":"codex"},
-            {"instanceId":"claudeAgent", "driver":"claudeAgent"}
-        ]});
-        let thread = serde_json::json!({"session":{"providerName":"codex"}});
-        let model = |provider: &str| ModelRef {
-            provider_id: provider.into(),
-            model_id: "cheap-model".into(),
-            variant: None,
-        };
-        assert!(validate_model_driver(&thread, &model("codex"), &config).is_ok());
-        assert!(validate_model_driver(&thread, &model("codex-alt"), &config).is_ok());
-        assert!(validate_model_driver(&thread, &model("claudeAgent"), &config).is_err());
-        assert!(validate_model_driver(&thread, &model("unknown"), &config).is_err());
-        assert!(validate_model_driver(
-            &serde_json::json!({"session":null}),
-            &model("claudeAgent"),
-            &config
-        )
-        .is_ok());
-    }
 
     /// A `tokio::test`: constructing a driver spawns the RPC actor.
     #[tokio::test]
@@ -1081,7 +845,7 @@ mod tests {
             "a protocol this gateway speaks"
         );
 
-        let driver = T3Driver::new(endpoint);
+        let driver = Arc::new(T3Driver::new(endpoint));
         assert!(driver.probe().await.unwrap(), "healthy");
         let sessions = driver
             .list_sessions(&SessionQuery::default())
@@ -1091,6 +855,33 @@ mod tests {
         eprintln!("{} sessions in {} projects", sessions.len(), projects.len());
         for session in sessions.iter().take(3) {
             assert!(!session.asid.0.is_empty());
+        }
+        if let Ok(id) = std::env::var("T3_PROBE_SESSION") {
+            let info = driver
+                .get_session(&id)
+                .await
+                .expect("read selected session");
+            assert_eq!(info.asid.0, id);
+            let timeline = driver
+                .prepare_timeline(&id, 100)
+                .await
+                .expect("read selected timeline");
+            eprintln!(
+                "selected session timeline prepared: {:?}",
+                timeline.items.len()
+            );
+            drop(timeline);
+            let mirror = Arc::new(crate::agents::adapters::memory_mirror::MemoryMirror::new());
+            let service =
+                crate::agents::use_cases::session_service::SessionService::with_memory_mirror(
+                    driver.clone(),
+                    mirror,
+                );
+            let window = service
+                .history_window(&crate::agents::domain::AgentSessionId(id), None, true)
+                .await
+                .expect("selected child full history window");
+            eprintln!("selected window rows: {}", window.snapshot.timeline.len());
         }
         driver.client().shutdown();
     }
@@ -1172,18 +963,59 @@ mod tests {
             .iter()
             .any(|i| i.role == crate::agents::domain::TimelineRole::User));
         assert!(timeline.iter().any(|i| matches!(&i.part, crate::agents::domain::AgentPart::Text { text } if text.to_lowercase().contains("pong"))));
-        let diff = driver.get_vcs_diff(&id, "working").await.expect("diff");
-        assert!(diff.is_empty(), "nothing was written");
+        assert!(matches!(
+            driver.get_vcs_diff(&id, "working").await,
+            Err(AgentError::Unsupported(_))
+        ));
         assert!(driver
             .get_pending_permissions(&id)
             .await
             .unwrap()
             .is_empty());
+        driver
+            .send_prompt(&id, "Write a detailed 2000-word explanation of sorting algorithms. Do not use tools or change files.", &[], None)
+            .await
+            .expect("start isolated stop check");
+        let mut active = false;
+        for _ in 0..30 {
+            let snapshot = driver.client.thread_snapshot(&id, None).await.unwrap();
+            if v2::mapper::interrupt_run(&snapshot["projection"]).is_ok() {
+                active = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+        assert!(active, "isolated run became interruptible");
+        driver.interrupt(&id).await.expect("interrupt live V2 run");
+        let mut interrupted = false;
+        for _ in 0..30 {
+            let info = driver.get_session(&id).await.unwrap();
+            if info.outcome.as_deref() == Some("interrupted") {
+                interrupted = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+        assert!(interrupted, "server confirmed interruption");
         driver.delete_session(&id).await.expect("delete");
-        assert!(matches!(
-            driver.get_session(&id).await,
-            Err(AgentError::SessionNotFound(_))
-        ));
+        let mut removed = false;
+        for _ in 0..30 {
+            if !driver
+                .list_sessions(&SessionQuery::default())
+                .await
+                .unwrap()
+                .iter()
+                .any(|session| session.asid.0 == id)
+            {
+                removed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+        assert!(
+            removed,
+            "deleted test thread disappeared from the live list"
+        );
         driver.client().shutdown();
         let _ = std::fs::remove_dir_all(&dir);
     }

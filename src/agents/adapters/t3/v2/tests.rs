@@ -1515,8 +1515,8 @@ fn client(server: &FakeServer) -> Arc<T3Client> {
 }
 
 #[tokio::test]
-async fn both_protocols_use_one_bearer_ticket_transport_with_exact_header_and_query() {
-    for protocol in [None, Some(1), Some(2)] {
+async fn v2_uses_bearer_ticket_transport_with_exact_header_and_query() {
+    for protocol in [Some(2)] {
         let server = fake_server(protocol).await;
         let client = client(&server);
         client.get_config().await.unwrap();
@@ -1551,9 +1551,9 @@ async fn both_protocols_use_one_bearer_ticket_transport_with_exact_header_and_qu
 }
 
 #[tokio::test]
-async fn unknown_protocols_fail_before_any_pairing_exchange() {
-    for protocol in [0, 3, 999] {
-        let server = fake_server(Some(protocol)).await;
+async fn legacy_and_unknown_protocols_fail_before_any_pairing_exchange() {
+    for protocol in [None, Some(0), Some(1), Some(3), Some(999)] {
+        let server = fake_server(protocol).await;
         let endpoint = T3Endpoint::new(&server.url, T3Credential::Pairing("fixture-once".into()));
         assert!(endpoint
             .exchange_pairing(&reqwest::Client::new(), "fixture-once", "fixture")
@@ -1567,6 +1567,25 @@ async fn unknown_protocols_fail_before_any_pairing_exchange() {
             .iter()
             .any(|row| row.get("exchange").is_some()));
     }
+}
+
+#[tokio::test]
+async fn interrupt_uses_only_current_thread_control_state() {
+    let server = fake_server(Some(2)).await;
+    let client = client(&server);
+    let driver = T3Driver::from_client(client.clone());
+    driver.interrupt("thread").await.unwrap();
+    let seen = server.state.seen.lock().unwrap().clone();
+    assert!(seen.iter().any(|row| row["http"] == "bounded"));
+    assert!(!seen.iter().any(|row| row["http"] == "shell"));
+    let dispatched: Vec<_> = seen
+        .iter()
+        .filter(|row| row["rpc"] == "orchestration.dispatchCommand")
+        .collect();
+    assert_eq!(dispatched.len(), 1);
+    assert_eq!(dispatched[0]["payload"]["type"], "run.interrupt");
+    assert_eq!(dispatched[0]["payload"]["runId"], "root-run");
+    client.shutdown();
 }
 
 #[tokio::test]
@@ -1774,5 +1793,96 @@ async fn opaque_history_cursor_cycles_fail_with_a_bounded_read() {
             .count(),
         1
     );
+    client.shutdown();
+}
+
+#[test]
+fn subagent_status_and_child_identity_are_preserved() {
+    let mut snapshot = fixture();
+    snapshot["projection"]["visibleTurnItems"] = json!([{
+        "position":1,"visibility":"local","sourceThreadId":"thread","sourceItemId":"child-item",
+        "item":{"id":"child-item","threadId":"thread","type":"subagent","status":"completed",
+        "childThreadId":"thread:provider:cursor:native-thread:child%3Atask","title":"Audit","result":"Finished"}
+    }]);
+    let rows = mapper::timeline("thread", &snapshot["projection"], 10);
+    let tool = rows
+        .iter()
+        .find_map(|row| match &row.part {
+            AgentPart::Tool(tool) => Some(tool),
+            _ => None,
+        })
+        .expect("subagent tool");
+    assert_eq!(
+        tool.child_session_id.as_deref(),
+        Some("thread:provider:cursor:native-thread:child%3Atask")
+    );
+    assert_eq!(tool.metadata.as_ref().unwrap()["status"], "completed");
+    assert_eq!(tool.output.as_ref().unwrap(), "Finished");
+}
+
+#[test]
+fn omitted_and_failed_file_changes_do_not_become_empty_successful_diffs() {
+    for status in ["completed", "failed", "running"] {
+        let mut snapshot = fixture();
+        snapshot["projection"]["visibleTurnItems"] = json!([{
+            "position":1,"visibility":"local","sourceThreadId":"thread","sourceItemId":"edit",
+            "item":{"id":"edit","threadId":"thread","type":"file_change","status":status,
+            "fileName":"src/example.ts","additions":1,"deletions":0}
+        }]);
+        let rows = mapper::timeline("thread", &snapshot["projection"], 10);
+        let tool = rows
+            .iter()
+            .find_map(|row| match &row.part {
+                AgentPart::Tool(tool) => Some(tool),
+                _ => None,
+            })
+            .expect("file edit retains its execution state without fabricating a diff");
+        assert_eq!(tool.input["file_path"], "src/example.ts");
+        assert_eq!(tool.metadata.as_ref().unwrap()["additions"], 1);
+        assert_eq!(
+            tool.state,
+            match status {
+                "completed" => crate::agents::domain::ToolCallStatus::Completed,
+                "failed" => crate::agents::domain::ToolCallStatus::Failed,
+                _ => crate::agents::domain::ToolCallStatus::Running,
+            }
+        );
+    }
+}
+
+#[tokio::test]
+async fn opaque_child_identity_round_trips_http_and_mutation_without_app_rules() {
+    let server = fake_server(Some(2)).await;
+    let native = "thread:provider:child%3Atask%0Aitem";
+    let public = super::super::session_identity::public_id(native);
+    {
+        let mut snapshot = server.state.snapshot.lock().unwrap();
+        snapshot["hasMoreHistory"] = json!(false);
+        snapshot["projection"]["thread"]["id"] = json!(native);
+        snapshot["projection"]["thread"]["lineage"] = json!({"parentThreadId":native});
+        snapshot["projection"]["visibleTurnItems"] = json!([{
+            "position":1,"visibility":"local","sourceThreadId":native,"sourceItemId":"child",
+            "item":{"id":"child","threadId":native,"type":"subagent","status":"completed","childThreadId":native,"result":"done"}
+        }]);
+    }
+    let client = client(&server);
+    let snapshot = client.thread_snapshot(&public, None).await.unwrap();
+    assert_eq!(snapshot["projection"]["thread"]["id"], public);
+    assert_eq!(
+        snapshot["projection"]["thread"]["lineage"]["parentThreadId"],
+        public
+    );
+    let driver = T3Driver::from_client(client.clone());
+    let info = driver.get_session(&public).await.unwrap();
+    assert_eq!(info.asid.0, public);
+    let prepared = driver.prepare_timeline(&public, 100).await.unwrap();
+    assert!(prepared.items.iter().any(|row| matches!(&row.part, AgentPart::Tool(call) if call.child_session_id.as_deref() == Some(public.as_str()))));
+    drop(prepared);
+    client.dispatch(json!({"type":"thread.metadata.update","commandId":"rename-child","threadId":public,"title":"QA"})).await.unwrap();
+    let seen = server.state.seen.lock().unwrap();
+    assert!(seen
+        .iter()
+        .any(|row| row["rpc"] == "orchestration.dispatchCommand"
+            && row["payload"]["threadId"] == native));
     client.shutdown();
 }

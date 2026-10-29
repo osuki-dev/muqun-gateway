@@ -145,7 +145,7 @@ impl T3State {
 
     pub(super) fn features(&self) -> crate::discovery::AgentFeatures {
         let protocol = self.protocol.load(Ordering::Relaxed);
-        if matches!(protocol, 1 | 2) {
+        if protocol == 2 {
             t3_features_for_protocol(protocol)
         } else {
             t3_features()
@@ -298,7 +298,7 @@ fn t3_features_for_protocol(protocol: u64) -> crate::discovery::AgentFeatures {
         model_selection: true,
         tool_approvals: true,
         worktrees: false,
-        revert: protocol == 1,
+        revert: false,
         // T3 rolls whole turns back in one step; there is no staged state.
         staged_revert: false,
         inbox: protocol == 2,
@@ -499,7 +499,7 @@ mod tests {
             v["revert"], false,
             "safe intersection until protocol selected"
         );
-        assert!(super::t3_features_for_protocol(1).revert);
+        assert!(!super::t3_features_for_protocol(1).revert);
         assert!(!super::t3_features_for_protocol(2).revert);
     }
 
@@ -700,7 +700,7 @@ mod tests {
     async fn fake_t3() -> String {
         use axum::routing::{get, post};
         let app = axum::Router::new()
-            .route("/.well-known/t3/environment",get(||async {axum::Json(serde_json::json!({"environmentId":"fixture","label":"test","serverVersion":"0.0.45","orchestrationProtocolVersion":1}))}))
+            .route("/.well-known/t3/environment",get(||async {axum::Json(serde_json::json!({"environmentId":"fixture","label":"test","serverVersion":"0.0.45","orchestrationProtocolVersion":2}))}))
             .route(
                 "/oauth/token",
                 post(|body: String| async move {
@@ -806,7 +806,7 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let observed = calls.clone();
         let app=axum::Router::new()
-            .route("/.well-known/t3/environment",get(||async {axum::Json(serde_json::json!({"environmentId":"lost-reply-fixture","label":"fixture","serverVersion":"0.0.45","orchestrationProtocolVersion":1}))}))
+            .route("/.well-known/t3/environment",get(||async {axum::Json(serde_json::json!({"environmentId":"lost-reply-fixture","label":"fixture","serverVersion":"0.0.45","orchestrationProtocolVersion":2}))}))
             .route("/oauth/token",post(move||{
                 let calls=observed.clone();async move {
                     calls.fetch_add(1,Ordering::Relaxed);

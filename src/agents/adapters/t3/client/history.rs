@@ -104,8 +104,9 @@ impl T3Client {
                 ));
             }
             let mut url = reqwest::Url::parse(&format!(
-                "{}{HTTP_THREAD_SNAPSHOT}/{id}/history",
-                self.endpoint.url
+                "{}{HTTP_THREAD_SNAPSHOT}/{}/history",
+                self.endpoint.url,
+                super::super::session_identity::path_segment(id)?
             ))
             .map_err(|_| AgentError::Protocol("invalid endpoint".into()))?;
             url.query_pairs_mut().append_pair("cursor", &cursor);

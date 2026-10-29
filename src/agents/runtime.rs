@@ -3335,7 +3335,7 @@ mod tests {
 
     /// A T3 server that answers only its public descriptor.
     async fn fake_t3_descriptor() -> String {
-        fake_t3_serving(r#"{"environmentId":"env","label":"t3","serverVersion":"0.9.1"}"#).await
+        fake_t3_serving(r#"{"environmentId":"env","label":"t3","serverVersion":"0.9.1","orchestrationProtocolVersion":2}"#).await
     }
 
     /// A T3 server that answers `descriptor` at its well-known path.
@@ -3427,7 +3427,7 @@ mod tests {
             assert_eq!(t3.status, crate::discovery::AgentAvailability::Unsupported);
             assert_eq!(
                 t3.reason.as_deref(),
-                Some("T3 server speaks orchestration protocol 3; this gateway supports 1 and 2")
+                Some("T3 server speaks orchestration protocol 3; this gateway requires protocol 2; upgrade T3 Code")
             );
             assert_eq!(t3.version.as_deref(), Some("0.0.45"));
             assert!(t3.models.is_empty());
@@ -3443,34 +3443,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_t3_server_on_protocol_1_is_attached() {
+    async fn a_t3_server_on_protocol_1_is_rejected() {
         let url = fake_t3_serving(t3_descriptor_speaking(1)).await;
         let runtime = t3_runtime(T3Config {
             url: Some(url),
             token: Some("bearer".into()),
             ..Default::default()
         });
-        assert!(runtime.supervise_t3().await);
-        let manager = runtime.manager_for_agent("t3").await.expect("attached");
-        assert_eq!(manager.version().as_deref(), Some("0.0.45"));
+        assert!(!runtime.supervise_t3().await);
+        assert!(runtime.manager_for_agent("t3").await.is_none());
         let t3 = runtime.t3_discovery().await;
-        assert_eq!(t3.status, crate::discovery::AgentAvailability::Connected);
-        assert!(t3.reason.is_none());
-        assert!(
-            t3.features.revert,
-            "known protocol 1 supports one-step revert"
-        );
-        let snapshot = runtime.attached_snapshot().await;
-        assert!(
-            snapshot
-                .agents
-                .iter()
-                .find(|a| a.id == "t3")
-                .unwrap()
-                .features
-                .revert
-        );
-        manager.shutdown();
+        assert_eq!(t3.status, crate::discovery::AgentAvailability::Unsupported);
+        assert!(t3.reason.as_deref().unwrap().contains("upgrade T3 Code"));
+        assert!(!t3.features.revert);
     }
 
     #[tokio::test]

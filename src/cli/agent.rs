@@ -914,7 +914,7 @@ mod tests {
             .route(
                 "/.well-known/t3/environment",
                 get(|| async {
-                    r#"{"environmentId":"env","label":"t3","serverVersion":"0.0.44"}"#
+                    r#"{"environmentId":"env","label":"t3","serverVersion":"0.1.3","orchestrationProtocolVersion":2}"#
                 }),
             )
             .route(

@@ -27,6 +27,7 @@ pub mod driver;
 pub mod endpoint;
 pub mod mapper;
 pub mod rpc;
+pub(crate) mod session_identity;
 pub mod stream;
 pub mod v2;
 
@@ -38,9 +39,8 @@ pub use stream::{T3StreamEvent, T3StreamListener};
 /// The agent id the runtime registers this adapter under.
 pub const KIND: &str = "t3";
 
-/// The orchestration wire version this adapter was written against. A
-/// descriptor that omits the field means protocol 1.
-pub const ORCHESTRATION_PROTOCOL_VERSION: u64 = 1;
+/// The only supported orchestration protocol. Legacy descriptors are rejected.
+pub const ORCHESTRATION_PROTOCOL_VERSION: u64 = 2;
 
 /// Upper bound on any HTTP body or WebSocket frame this adapter will parse.
 /// Thread snapshots carry every message and activity of a thread, so this is
