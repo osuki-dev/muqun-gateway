@@ -331,7 +331,7 @@ struct SharedCodexDaemon {
 }
 
 impl SharedCodexDaemon {
-    fn new(install: &Install) -> Self {
+    fn new(install: &Install, stale_alias: bool) -> Self {
         use futures::{SinkExt as _, StreamExt as _};
         use std::os::unix::ffi::OsStrExt as _;
         use std::os::unix::fs::{symlink, DirBuilderExt as _, MetadataExt as _};
@@ -362,6 +362,10 @@ impl SharedCodexDaemon {
         assert_eq!(metadata.mode() & 0o777, 0o700);
         let socket = directory.join(hex::encode(Sha256::digest(alias.as_os_str().as_bytes())));
         assert!(!socket.exists(), "fixture socket must be unique");
+        if stale_alias {
+            // A reboot retains the home alias while removing its temporary target.
+            symlink(&socket, &alias).unwrap();
+        }
         let path = socket.clone();
         let root = install.root.clone();
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -369,13 +373,15 @@ impl SharedCodexDaemon {
         let disconnected = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let closed = disconnected.clone();
         let task = tokio::spawn(async move {
-            // No alias exists until the real Gateway invokes daemon start.
+            // A stale alias must still let the real Gateway invoke daemon start.
             while !root.join("fake-codex.argv").exists() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
             let listener = tokio::net::UnixListener::bind(&path).unwrap();
             fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
-            symlink(&path, &alias).unwrap();
+            if !stale_alias {
+                symlink(&path, &alias).unwrap();
+            }
             fs::write(root.join("fake-codex.socket-ready"), "ready").unwrap();
             loop {
                 let (stream, _) = listener.accept().await.unwrap();
@@ -436,7 +442,7 @@ async fn codex_shared_daemon_starts_from_config_and_survives_gateway_sigterm() {
     use std::sync::atomic::Ordering;
     use tokio_tungstenite::tungstenite::Message;
 
-    for use_path_defaults in [false, true] {
+    for (use_path_defaults, stale_alias) in [(false, false), (true, false), (true, true)] {
         let install = Install::new();
         let executable = configure_fake_codex(&install, true);
         if use_path_defaults {
@@ -452,7 +458,7 @@ async fn codex_shared_daemon_starts_from_config_and_survives_gateway_sigterm() {
             config.as_object_mut().unwrap().remove("agent_runtime");
             fs::write(path, serde_json::to_vec(&config).unwrap()).unwrap();
         }
-        let daemon = SharedCodexDaemon::new(&install);
+        let daemon = SharedCodexDaemon::new(&install, stale_alias);
         let mut gateway = foreground_gateway(&install);
         let deadline = Instant::now() + Duration::from_secs(8);
         while !install.root.join("fake-codex.ready").exists()

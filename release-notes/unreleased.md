@@ -2,6 +2,12 @@
 
 ## Changes and fixes
 
+- **Codex starts again after a host reboot.** A retained official socket link
+  whose temporary target disappeared now triggers Codex's idempotent shared
+  daemon start command instead of a repeated protection error. Existing path,
+  ownership and permission checks remain enforced. Restart the Gateway after
+  updating; no Codex downgrade, re-pairing or session migration is required.
+
 - **T3 native subagent sessions retain their identities.** Composite child IDs
   receive stable URL-safe public IDs at the Gateway boundary. HTTP and RPC
   requests recover the original IDs without a process-local mapping, so

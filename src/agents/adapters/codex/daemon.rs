@@ -117,14 +117,13 @@ fn verified_socket_in(
         Err(_) => return Err(unavailable("Codex daemon socket cannot be inspected")),
     };
     let uid = unsafe { libc::geteuid() };
-    let check = || -> std::io::Result<(PathBuf, PathBuf)> {
+    let check = || -> std::io::Result<Option<(PathBuf, PathBuf)>> {
         let home = std::fs::canonicalize(home)?;
         let parent = std::fs::canonicalize(alias.parent().expect("fixed child path"))?;
         let parent_meta = std::fs::metadata(&parent)?;
         let safe_parent = parent_meta.is_dir()
             && (parent_meta.uid() == 0 || parent_meta.uid() == uid)
             && (parent_meta.mode() & 0o022 == 0 || parent_meta.mode() & 0o1000 != 0);
-        let directory_meta = std::fs::symlink_metadata(directory)?;
         let hash = Sha256::digest(
             parent
                 .join("app-server-control.sock")
@@ -132,24 +131,40 @@ fn verified_socket_in(
                 .as_bytes(),
         );
         let physical = directory.join(hex::encode(hash));
-        let metadata = std::fs::symlink_metadata(&physical)?;
         if !safe_parent
             || !alias_metadata.file_type().is_symlink()
             || std::fs::read_link(&alias)? != physical
-            || !directory_meta.is_dir()
+        {
+            return Err(std::io::ErrorKind::PermissionDenied.into());
+        }
+        // The home alias survives a reboot; its /tmp target does not. Validate
+        // the alias before treating only a missing official target as absent,
+        // so supervision can invoke Codex's own idempotent daemon start command.
+        let directory_meta = match std::fs::symlink_metadata(directory) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        if !directory_meta.is_dir()
             || directory_meta.uid() != uid
             || directory_meta.mode() & 0o777 != 0o700
-            || !metadata.file_type().is_socket()
+        {
+            return Err(std::io::ErrorKind::PermissionDenied.into());
+        }
+        let metadata = match std::fs::symlink_metadata(&physical) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        if !metadata.file_type().is_socket()
             || metadata.uid() != uid
             || metadata.mode() & 0o777 != 0o600
         {
             return Err(std::io::ErrorKind::PermissionDenied.into());
         }
-        Ok((home, physical))
+        Ok(Some((home, physical)))
     };
-    check()
-        .map(Some)
-        .map_err(|_| unavailable("Codex daemon socket ownership or protection check failed"))
+    check().map_err(|_| unavailable("Codex daemon socket ownership or protection check failed"))
 }
 
 #[cfg(unix)]
@@ -333,6 +348,57 @@ pub(crate) mod tests {
         assert!(connect_existing().await.unwrap().is_none());
         let directory = TestDirectory::new();
         assert!(connect_at(&directory.0).await.unwrap().is_none());
+    }
+
+    #[test]
+    fn stale_official_alias_after_reboot_is_absent_not_unsafe() {
+        let root = TestDirectory::new();
+        let home = root.0.join("home");
+        let parent = home.join("app-server-control");
+        let protected = root.0.join("p");
+        std::fs::create_dir_all(&parent).unwrap();
+        let alias = parent.join("app-server-control.sock");
+        let physical = protected.join(hex::encode(Sha256::digest(alias.as_os_str().as_bytes())));
+        symlink(&physical, &alias).unwrap();
+
+        // Reboot clears the temporary directory but retains the home alias.
+        assert!(verified_socket_in(&home, &protected).unwrap().is_none());
+        std::fs::create_dir(&protected).unwrap();
+        std::fs::set_permissions(&protected, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // The directory can also survive while only the socket disappears.
+        assert!(verified_socket_in(&home, &protected).unwrap().is_none());
+
+        let listener = UnixListener::bind(&physical).unwrap();
+        std::fs::set_permissions(&physical, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            verified_socket_in(&home, &protected).unwrap(),
+            Some((home, physical))
+        );
+        drop(listener);
+    }
+
+    #[test]
+    fn missing_socket_does_not_bypass_alias_or_directory_protection() {
+        let root = TestDirectory::new();
+        let home = root.0.join("home");
+        let parent = home.join("app-server-control");
+        let protected = root.0.join("p");
+        std::fs::create_dir_all(&parent).unwrap();
+        let alias = parent.join("app-server-control.sock");
+        let physical = protected.join(hex::encode(Sha256::digest(alias.as_os_str().as_bytes())));
+        symlink(root.0.join("foreign.sock"), &alias).unwrap();
+        assert!(verified_socket_in(&home, &protected).is_err());
+        std::fs::remove_file(&alias).unwrap();
+        symlink(&physical, &alias).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(verified_socket_in(&home, &protected).is_err());
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::create_dir(&protected).unwrap();
+        std::fs::set_permissions(&protected, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(verified_socket_in(&home, &protected).is_err());
+        std::fs::remove_dir(&protected).unwrap();
+        symlink(root.0.join("missing"), &protected).unwrap();
+        assert!(verified_socket_in(&home, &protected).is_err());
     }
 
     #[tokio::test]
