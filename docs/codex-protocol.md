@@ -35,17 +35,21 @@ upstream default home when `CODEX_HOME` is absent), verifies its official
 hashed alias under the fixed system temporary root, the current-user-owned
 0700 directory and 0600 socket, and the connected peer UID. The WebSocket
 handshake runs over that Unix socket. Initialization verifies both the pinned
-version and exact canonical `codexHome`. Gateway never creates, starts,
+version and exact canonical `codexHome`. Gateway never creates the socket itself,
 restarts, updates or stops the shared daemon. An adopted connection reports
 origin `adopted` and endpoint `unix://shared-codex-app-server`, without exposing
 its host path. `codex_shared_daemon_v1` and the agent's `sharedDaemon` feature
 advertise this support (Unix only). Existing Gateway authentication is unchanged.
 
-When no compatible verified daemon is available, Gateway runs
+When the official daemon socket is absent, Gateway runs
 `codex app-server daemon start` once. That official command starts the shared
 daemon if the socket is absent and leaves an already-running daemon unchanged,
 so a Codex opened later in a terminal joins the same socket and the same
-threads. Gateway does not start a private `codex app-server`, and it never
+threads. A valid home alias whose temporary target disappeared after reboot is
+also absent: the alias and any existing parent directory must still pass the
+ownership, path and protection checks before startup is allowed. Unsafe or
+foreign endpoints remain errors; the Gateway does not delete or repair them.
+Gateway does not start a private `codex app-server`, and it never
 stops or restarts the daemon. A dropped connection is adopted again on the
 next pass. No remote-dispatch bypass flags, trust edits, global config writes,
 credential-file reads/copies, browser login or package installation are
