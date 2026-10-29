@@ -380,10 +380,15 @@ pub fn timeline(thread_id: &str, projection: &Value, seq: u64) -> Vec<TimelineIt
                     == Some("message");
                 AgentPart::Form { request }
             }
-            "file_change" => AgentPart::Diff {
-                file: string(item, "fileName").unwrap_or("").to_string(),
-                diff: string(item, "diffStr").unwrap_or("").to_string(),
-            },
+            "file_change"
+                if string(item, "status") == Some("completed")
+                    && string(item, "diffStr").is_some_and(|diff| !diff.is_empty()) =>
+            {
+                AgentPart::Diff {
+                    file: string(item, "fileName").unwrap_or("").to_string(),
+                    diff: string(item, "diffStr").unwrap_or("").to_string(),
+                }
+            }
             "todo_list" => AgentPart::Todo {
                 items: rows(item, "steps")
                     .iter()
@@ -394,7 +399,7 @@ pub fn timeline(thread_id: &str, projection: &Value, seq: u64) -> Vec<TimelineIt
                     .collect(),
             },
             kind @ ("command_execution" | "dynamic_tool" | "file_search" | "web_search"
-            | "subagent") => {
+            | "subagent" | "file_change") => {
                 let state = match string(item, "status") {
                     Some("completed") => ToolCallStatus::Completed,
                     Some("failed" | "cancelled" | "interrupted") => ToolCallStatus::Failed,
@@ -407,6 +412,7 @@ pub fn timeline(thread_id: &str, projection: &Value, seq: u64) -> Vec<TimelineIt
                         "command_execution" => "shell",
                         "dynamic_tool" => string(item, "toolName").unwrap_or("tool"),
                         "subagent" => "subagent",
+                        "file_change" => "edit",
                         other => other,
                     }
                     .into(),
@@ -417,6 +423,9 @@ pub fn timeline(thread_id: &str, projection: &Value, seq: u64) -> Vec<TimelineIt
                         }
                         "dynamic_tool" => item.get("input").cloned().unwrap_or(Value::Null),
                         "subagent" => json!({"prompt":item.get("prompt")}),
+                        "file_change" => {
+                            json!({"file_path":item.get("fileName"),"old_string":item.get("oldStr"),"new_string":item.get("newStr")})
+                        }
                         _ => json!({"pattern":item.get("pattern"),"patterns":item.get("patterns")}),
                     },
                     output: item
@@ -425,7 +434,13 @@ pub fn timeline(thread_id: &str, projection: &Value, seq: u64) -> Vec<TimelineIt
                         .or_else(|| item.get("result"))
                         .cloned(),
                     content: None,
-                    metadata: Some(json!({"exit":item.get("exitCode")})),
+                    metadata: Some(if kind == "file_change" {
+                        json!({"status":item.get("status"),"additions":item.get("additions"),"deletions":item.get("deletions")})
+                    } else if kind == "subagent" {
+                        json!({"status":item.get("status")})
+                    } else {
+                        json!({"exit":item.get("exitCode")})
+                    }),
                     state,
                     status: state,
                     error: None,
@@ -440,7 +455,10 @@ pub fn timeline(thread_id: &str, projection: &Value, seq: u64) -> Vec<TimelineIt
                     },
                 })
             }
-            "system_notice" | "run_interrupt_request" | "run_interrupt_result" => {
+            // The request is a control acknowledgement, not confirmation that
+            // execution stopped. Render the result once it actually arrives.
+            "run_interrupt_request" => continue,
+            "system_notice" | "run_interrupt_result" => {
                 role = TimelineRole::System;
                 AgentPart::System {
                     text: string(item, "message").unwrap_or("").to_string(),

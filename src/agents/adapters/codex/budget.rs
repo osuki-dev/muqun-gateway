@@ -5,12 +5,13 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 pub const MAX_PAGES: usize = 128;
-const MAX_BYTES: usize = 32 * 1024 * 1024;
+pub(super) const MAX_BYTES: usize = 32 * 1024 * 1024;
 const MAX_ROWS: usize = 20_000;
 
 pub struct Budget {
     deadline: tokio::time::Instant,
     pages: usize,
+    page_limit: Option<usize>,
     bytes: usize,
     byte_limit: usize,
     rows: usize,
@@ -25,9 +26,18 @@ impl Budget {
         Self {
             deadline: tokio::time::Instant::now() + Duration::from_secs(60),
             pages: 0,
+            page_limit: Some(MAX_PAGES),
             bytes: 0,
             byte_limit: MAX_BYTES,
             rows: 0,
+        }
+    }
+    /// Optional current-turn recovery is bounded by time and wire work, not
+    /// conversation length. An incomplete scan never publishes pending forms.
+    pub fn question_recovery() -> Self {
+        Self {
+            page_limit: None,
+            ..Self::new()
         }
     }
     pub async fn call(
@@ -36,11 +46,16 @@ impl Budget {
         method: &str,
         params: Value,
     ) -> Result<Value, AgentError> {
-        if self.pages >= MAX_PAGES || tokio::time::Instant::now() >= self.deadline {
+        if self.page_limit.is_some_and(|limit| self.pages >= limit)
+            || tokio::time::Instant::now() >= self.deadline
+        {
             return Err(exhausted());
         }
         self.pages += 1;
-        if client.is_shared() && super::client::image_history_request(method, &params) {
+        if self.page_limit.is_some()
+            && client.is_shared()
+            && super::client::image_history_request(method, &params)
+        {
             self.byte_limit = super::client::MAX_HISTORY_WIRE_WORK_BYTES;
         }
         let (value, bytes) = tokio::time::timeout_at(

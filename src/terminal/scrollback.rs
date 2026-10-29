@@ -1882,7 +1882,7 @@ impl ScrollbackStore {
         let count = buffer.lines.len().saturating_sub(buffer.screen);
         let rows = || buffer.lines.iter().take(count);
         if rows().map(|row| row.len()).sum::<usize>() > MAX_PANE_BYTES
-            || rows().any(|row| row.len() + 1 > super::history::MAX_PAGE_BYTES)
+            || rows().any(|row| row.len() > MAX_PANE_BYTES)
         {
             return Err(super::history::HistoryError::TooLarge);
         }
@@ -2260,7 +2260,7 @@ impl ScrollbackStore {
         if segments
             .iter()
             .flat_map(|s| &s.rows)
-            .any(|r| r.len() + 1 > super::history::MAX_PAGE_BYTES)
+            .any(|r| r.len() > MAX_PANE_BYTES)
         {
             return Err(super::history::HistoryError::TooLarge);
         }
@@ -2293,7 +2293,7 @@ impl ScrollbackStore {
             && segments
                 .iter()
                 .flat_map(|s| &s.rows)
-                .any(|r| r.len() + 1 > super::history::MAX_PAGE_BYTES)
+                .any(|r| r.len() > MAX_PANE_BYTES)
         {
             return Err(super::history::HistoryError::TooLarge);
         }

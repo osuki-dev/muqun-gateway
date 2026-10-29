@@ -1157,6 +1157,23 @@ entry is explicitly **not** a claim that an authorized original URL exists.
 `GET /api/agent-sessions/{asid}/file-asset?uri=…` retains its original contract
 and adds these same optional preview/download URLs to `data.asset`.
 
+With `agent_file_source_selection_v1`, an explicit open can instead use
+`GET /api/agent-sessions/{asid}/file-source?uri=…`. It applies that same policy
+and returns `data.asset` when the file is available. An unavailable absolute
+host reference returns `data.file_source = {state: "choose_computer", path}`;
+relative paths, remote URLs and other errors retain the original behavior.
+The Gateway decides when source selection is needed. The App only presents its
+paired computers and transports the chosen path to that computer's existing
+`POST /api/mcp/files/present` endpoint. Despite its historical name, this endpoint
+does not require the path to have appeared in an MCP result. It authorizes and
+resolves an explicit open using the ordinary file policy.
+
+No computer is probed automatically, and the App's credential for one computer
+is never forwarded to another. A choice is not a file permission grant. The
+target Gateway applies its own pairing, filesystem scope and operating-system
+permissions on metadata resolution and reads. Existing peer delegation controls
+remain server-enforced and distinct from a paired phone opening a file directly.
+
 `GET /api/agent-images/{id}/{variant}` accepts only `original`, `download`,
 `thumbnail`, or `preview`. All require an existing paired App device and the
 normal encrypted transport when required by pairing; URLs contain no credentials.
@@ -1392,6 +1409,17 @@ Items are OpenCode's verbatim, i.e. camelCase:
 `{id, sessionID, timeCreated, type: "user"|"synthetic"|"compaction"|"move", payload, delivery}`.
 A user item's `payload` is `{text, files?: [{uri, name?, mime?}]}`.
 
+Prompt delivery is provider-neutral. While the Gateway has observed live
+compaction, the common prompt service requests `queue`, including when the
+caller omitted delivery or requested `steer`. Each adapter implements that
+intent using its native inbox or its Gateway-owned queue. Unsupported delivery
+must be refused explicitly; a successful submission alone is not a queued
+receipt. Apps render the acknowledged inbox item, including its text and stable
+identity, through the same UI for every provider. An optimistic row must not
+hide its acknowledged queue status. Historical compaction summaries do not
+establish live compaction, and completion, failure or an inactive session clears
+the observed state. Unknown delivery outcomes are never retried automatically.
+
 DeepSeek Harness exposes its durable `inbox` projection through this same shape:
 `next-turn` is `queue`, `next-step` is `steer`, and ids are native MessageIds.
 Edit, cancellation and send-now call `session/updateQueue` with `edit`, `remove`
@@ -1424,6 +1452,9 @@ the queue waits for the user. `…/steer` sends an item now: `turn/steer` into t
 running turn, or a new turn. A refused send keeps the item; an unknown outcome
 removes it, never resends it, and publishes `agent.resync` with reason
 `codex_queued_delivery_outcome_unknown`.
+During an observed `contextCompaction` item, default and steered prompts join
+that same queue. Send-now leaves the receipt queued until compaction ends;
+normal successful turn completion drains it as described above.
 
 On the way out (this route, the snapshot's `inbox`, `agent.inbox.changed`), an
 item with `payload.files` also carries the two fields a transcript user row has
@@ -1774,6 +1805,19 @@ archive, no hidden flag. So a project OpenCode has ever seen is in this list for
 good, and `missing` is the whole of what the gateway can say about it.
 
 ### `GET /api/agent-directories`
+
+With capability `agent_directory_search_v1`, `?query=keyword` searches folder
+names case-insensitively beneath the current user's home. A nonempty query takes
+precedence over `prefix`. The shared App workspace picker uses this for Home,
+agent sessions, and the session list; selecting a result passes its full path.
+Search skips dot directories, the dependency/build exclusions below, and
+`Library`, `AppData`, `Applications`, `vendor`, and `venv`. Directory symlinks
+are selectable and searched, including workspaces on external disks; canonical
+directory identities prevent cycles and repeated traversal. Results retain the
+home-relative linked path. It reads at most 10,000 entries, descends at most eight levels, spends
+at most 250 ms, and returns at most 30 results. Bounds set `truncated`; results
+are suggestions, not an exhaustive filesystem index. No file contents are read.
+Explicit path completion remains available independently of keyword search.
 
 `?prefix=` is what the user has typed, completed one level at a time. Local
 filesystem only, nothing cached.

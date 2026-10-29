@@ -475,7 +475,12 @@ pub async fn build_discovery(state: &AppState, _sealed: bool, authenticated: boo
         "uploads": {
             "maxBytes": crate::platform::uploads::MAX_UPLOAD_BYTES,
             "maxVideoBytes": crate::platform::uploads::MAX_VIDEO_UPLOAD_BYTES,
+            "timeoutMs": 180_000,
+            "idleTimeoutMs": 60_000,
+            "maxConcurrentPerDevice": 1,
         },
+        "fileRanges": { "maxBytes": crate::platform::file_ranges::MAX_FILE_RANGE_BYTES, "validator": "x-muqun-file-version" },
+        "terminalInput": { "maxTextBytes": crate::MAX_SEND_TEXT_BYTES, "maxKeys": crate::MAX_SEND_KEYS },
         "planes": planes,
         // Not redacted for anyone: a path and a protocol number say nothing
         // an unauthenticated caller could not learn by trying the upgrade.

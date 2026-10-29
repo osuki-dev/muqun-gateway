@@ -450,7 +450,7 @@ impl AgentManager {
                 agent.clone(),
                 mirror.clone(),
             )),
-            prompt_service: Arc::new(PromptService::new(agent.clone(), mirror.clone())),
+            prompt_service: Arc::new(PromptService::new(agent.clone())),
             interaction_service: Arc::new(InteractionService::new(agent.clone(), mirror.clone())),
             agent,
             mirror,

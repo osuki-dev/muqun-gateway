@@ -30,13 +30,13 @@ use std::path::{Path as FsPath, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
-use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse as _, Json, Response};
 use axum::routing::get;
 use axum::Router;
-use serde::Deserialize;
+use base64::Engine as _;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use super::uploads::{sniff_upload_kind, uploads_dir, MAX_UPLOAD_NAME_CHARS};
@@ -292,6 +292,7 @@ impl AssetIndex {
     }
 
     /// Newest first, cut to one page.
+    #[cfg(test)]
     pub(crate) fn session_assets(
         &self,
         session_id: &str,
@@ -1021,6 +1022,10 @@ pub(crate) fn asset_json(entry: &AssetEntry, asset_type: AssetType) -> Value {
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct AssetsQuery {
+    #[serde(default)]
+    pub(crate) cursor: Option<String>,
+    #[serde(default)]
+    pub(crate) query: Option<String>,
     /// Unix milliseconds, matching every `modified_unix_ms` on the wire; only
     /// files modified strictly after this are returned, so a client can poll
     /// for what is new without re-reading the list.
@@ -1071,6 +1076,7 @@ pub(crate) fn asset_kind_filter(kind: Option<&str>) -> Vec<String> {
 /// Sniffing is the cost here, so a candidate is read once and the walk stops
 /// the moment the page is full. Without a filter the candidates are already the
 /// page, which is the old work and the old cost exactly.
+#[cfg(test)]
 pub(crate) fn asset_page(entries: Vec<AssetEntry>, kinds: &[String], limit: usize) -> Vec<Value> {
     let mut page: Vec<Value> = Vec::new();
     for entry in entries {
@@ -1084,6 +1090,105 @@ pub(crate) fn asset_page(entries: Vec<AssetEntry>, kinds: &[String], limit: usiz
         page.push(asset_json(&entry, asset_type));
     }
     page
+}
+
+#[derive(Serialize, Deserialize)]
+struct AssetCursor {
+    generation: String,
+    binding: String,
+    modified: u128,
+    id: String,
+}
+
+fn paged_assets(
+    mut entries: Vec<AssetEntry>,
+    kinds: &[String],
+    search: &str,
+    cursor: Option<&str>,
+    limit: usize,
+    binding: &str,
+    generation: &str,
+) -> ApiResult<(Vec<Value>, Option<String>)> {
+    use sha2::{Digest, Sha256};
+    let binding = hex::encode(Sha256::digest(binding.as_bytes()));
+    let invalid = || {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_asset_cursor",
+            "invalid cursor for this asset query",
+        )
+    };
+    let cursor: Option<AssetCursor> = cursor
+        .map(|cursor| {
+            if cursor.len() > 2048 {
+                return Err(invalid());
+            }
+            let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(cursor)
+                .map_err(|_| invalid())?;
+            let cursor: AssetCursor = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+            if cursor.generation != generation {
+                return Err(api_error(
+                    StatusCode::GONE,
+                    "asset_cursor_expired",
+                    "Gateway restarted; refresh the asset list",
+                ));
+            }
+            if cursor.binding != binding || cursor.id.len() > 128 {
+                return Err(invalid());
+            }
+            Ok(cursor)
+        })
+        .transpose()?;
+    entries.sort_by(|left, right| {
+        right
+            .modified_unix_ms
+            .cmp(&left.modified_unix_ms)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    let mut page = Vec::new();
+    let mut last = None;
+    let mut more = false;
+    for entry in entries {
+        if cursor.as_ref().is_some_and(|cursor| {
+            entry.modified_unix_ms > cursor.modified
+                || (entry.modified_unix_ms == cursor.modified && entry.id <= cursor.id)
+        }) {
+            continue;
+        }
+        if !search.is_empty()
+            && !entry.name.to_lowercase().contains(search)
+            && !entry.path.to_string_lossy().to_lowercase().contains(search)
+        {
+            continue;
+        }
+        let kind = sniff_asset_type(&read_asset_head(&entry.path), &entry.name);
+        if !kinds.is_empty() && !kinds.iter().any(|filter| filter == kind.kind.as_str()) {
+            continue;
+        }
+        if page.len() == limit {
+            more = true;
+            break;
+        }
+        last = Some((entry.modified_unix_ms, entry.id.clone()));
+        page.push(asset_json(&entry, kind));
+    }
+    let next = if more {
+        last.map(|(modified, id)| {
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+                serde_json::to_vec(&AssetCursor {
+                    generation: generation.to_owned(),
+                    binding,
+                    modified,
+                    id,
+                })
+                .expect("asset cursor serializes"),
+            )
+        })
+    } else {
+        None
+    };
+    Ok((page, next))
 }
 
 /// List what one tab produced recently, newest first.
@@ -1162,6 +1267,9 @@ pub(crate) async fn session_assets(
             "session_id": session_id,
             "tab_id": tab_id,
             "assets": assets,
+            "next_cursor": null,
+            "truncated": false,
+            "inventory_limited": false,
             "path": query.path,
         }))));
     }
@@ -1174,30 +1282,59 @@ pub(crate) async fn session_assets(
         .clamp(1, ASSET_LIST_MAX_LIMIT);
     let since = query.since.map(u128::from);
     let kinds = asset_kind_filter(query.kind.as_deref());
-    // Unfiltered, the index cuts the page and only that page is sniffed:
-    // metadata came from the scan, and reading a handful of file heads is cheap
-    // where reading every file in the workspace would not be. A `kind` filter
-    // has to be given the whole workspace in order instead, because the index
-    // does not know what a file is -- its bytes do -- and the page has to be
-    // filled from the newest matches rather than from whatever the newest
-    // handful of files happened to be.
-    let entries = {
+    let search = query
+        .query
+        .as_deref()
+        .unwrap_or_default()
+        .trim()
+        .to_lowercase();
+    if search.len() > 1024 {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_asset_query",
+            "asset search must be at most 1024 bytes",
+        ));
+    }
+    let (entries, inventory_limited) = {
         let index = lock_assets(&state)?;
-        if kinds.is_empty() {
-            index.session_assets(&session_id, &scope, since, limit)
-        } else {
-            index.session_assets_ordered(&session_id, &scope, since)
-        }
+        (
+            index.session_assets_ordered(&session_id, &scope, since),
+            index.entries.len() >= MAX_INDEXED_ASSETS,
+        )
     };
+    let binding = serde_json::to_string(&(&session_id, &tab_id, since, &kinds, &search))
+        .expect("asset query serializes");
+    let generation = state.generation.to_string();
+    let cursor = query.cursor.clone();
     let filter = kinds.clone();
-    let assets = tokio::task::spawn_blocking(move || asset_page(entries, &filter, limit))
-        .await
-        .unwrap_or_default();
+    let (assets, next_cursor) = tokio::task::spawn_blocking(move || {
+        paged_assets(
+            entries,
+            &filter,
+            &search,
+            cursor.as_deref(),
+            limit,
+            &binding,
+            &generation,
+        )
+    })
+    .await
+    .map_err(|_| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "asset_list_failed",
+            "failed to list assets",
+        )
+    })??;
 
     Ok(Json(content_envelope(json!({
         "session_id": session_id,
         "tab_id": tab_id,
         "assets": assets,
+        "next_cursor": next_cursor,
+        "truncated": next_cursor.is_some(),
+        "inventory_limited": inventory_limited,
+        "query": query.query.as_deref().unwrap_or_default().trim(),
         "limit": limit,
         "since": since.map(|since| since as u64),
         // The allow-list that was actually applied, empty when there was none.
@@ -1244,7 +1381,7 @@ async fn asset_response(
     // out of the directory since is a 404.
     if entry.is_none() {
         if let Some(image) = state.message_images.served(&asset_id) {
-            return serve_message_image(asset_id, image, download).await;
+            return serve_message_image(asset_id, image, download, headers).await;
         }
     }
     if entry.is_none() {
@@ -1295,7 +1432,7 @@ async fn asset_response(
         return Err(asset_not_found());
     };
 
-    stream_asset(entry, path, download).await
+    stream_asset(entry, path, download, headers).await
 }
 
 /// `asset_content` for an image named in agent text. See `message_images`.
@@ -1303,6 +1440,7 @@ async fn serve_message_image(
     asset_id: String,
     image: crate::agents::message_images::ServedImage,
     download: bool,
+    headers: HeaderMap,
 ) -> ApiResult<Response> {
     let root = image.root.clone();
     let stored = image.path.clone();
@@ -1328,13 +1466,18 @@ async fn serve_message_image(
         tab_id: None,
         pane_id: None,
     };
-    stream_asset(entry, path, download).await
+    stream_asset(entry, path, download, headers).await
 }
 
 /// The read itself, once a path has passed its gate: size cap, sniff, stream.
-async fn stream_asset(entry: AssetEntry, path: PathBuf, download: bool) -> ApiResult<Response> {
+async fn stream_asset(
+    entry: AssetEntry,
+    path: PathBuf,
+    download: bool,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
     let metadata = std::fs::metadata(&path).map_err(|_| asset_not_found())?;
-    if metadata.len() > MAX_VIDEO_CONTENT_BYTES {
+    if !headers.contains_key("range") && metadata.len() > MAX_VIDEO_CONTENT_BYTES {
         return Err(api_error(
             StatusCode::PAYLOAD_TOO_LARGE,
             "asset_too_large",
@@ -1360,7 +1503,7 @@ async fn stream_asset(entry: AssetEntry, path: PathBuf, download: bool) -> ApiRe
     } else {
         MAX_ASSET_CONTENT_BYTES
     };
-    if metadata.len() > limit {
+    if !headers.contains_key("range") && metadata.len() > limit {
         return Err(api_error(
             StatusCode::PAYLOAD_TOO_LARGE,
             "asset_too_large",
@@ -1388,27 +1531,13 @@ async fn stream_asset(entry: AssetEntry, path: PathBuf, download: bool) -> ApiRe
         tracing::warn!("failed to open asset {}: {err}", path.display());
         asset_not_found()
     })?;
-    let stream = async_stream::stream! {
-        let mut file = file;
-        let mut buffer = vec![0u8; ASSET_CONTENT_CHUNK_BYTES];
-        loop {
-            match tokio::io::AsyncReadExt::read(&mut file, &mut buffer).await {
-                Ok(0) => break,
-                Ok(read) => yield Ok::<_, std::io::Error>(
-                    axum::body::Bytes::copy_from_slice(&buffer[..read]),
-                ),
-                Err(err) => {
-                    yield Err(err);
-                    break;
-                }
-            }
-        }
-    };
+    let metadata = file.metadata().await.map_err(|_| asset_not_found())?;
+    let range = super::file_ranges::FileRange::select(&metadata, &headers)?;
+    let body = range.body(file).await.map_err(|_| asset_not_found())?;
 
-    Response::builder()
-        .status(StatusCode::OK)
+    range
+        .headers(Response::builder())
         .header("content-type", asset_type.mime)
-        .header("content-length", metadata.len())
         .header(
             "content-disposition",
             format!(
@@ -1419,7 +1548,7 @@ async fn stream_asset(entry: AssetEntry, path: PathBuf, download: bool) -> ApiRe
         )
         .header("x-asset-kind", asset_type.kind.as_str())
         .header("x-content-schema-version", CONTENT_SCHEMA_VERSION)
-        .body(Body::from_stream(stream))
+        .body(body)
         .map_err(|err| {
             tracing::warn!("failed to build asset response: {err}");
             api_error(
@@ -1485,6 +1614,70 @@ pub(crate) fn mount(router: Router<AppState>) -> Router<AppState> {
 #[cfg(test)]
 mod tests {
     use crate::*;
+
+    #[test]
+    fn asset_keyset_pages_search_the_full_index_and_bind_their_query() {
+        use super::paged_assets;
+        let root = PathBuf::from("/work/cursor-contract");
+        let entries: Vec<_> = (0..451)
+            .map(|i| test_asset_entry(&root.join(format!("file-{i}.txt")), &root, 1000))
+            .collect();
+        let mut cursor = None;
+        let mut ids = std::collections::HashSet::new();
+        loop {
+            let (page, next) = paged_assets(
+                entries.clone(),
+                &[],
+                "",
+                cursor.as_deref(),
+                200,
+                "scope",
+                "generation",
+            )
+            .unwrap();
+            for item in page {
+                assert!(ids.insert(item["id"].as_str().unwrap().to_owned()));
+            }
+            let Some(next) = next else {
+                break;
+            };
+            assert_eq!(
+                paged_assets(
+                    entries.clone(),
+                    &[],
+                    "",
+                    Some(&next),
+                    200,
+                    "other scope",
+                    "generation"
+                )
+                .unwrap_err()
+                .0,
+                StatusCode::BAD_REQUEST
+            );
+            assert_eq!(
+                paged_assets(
+                    entries.clone(),
+                    &[],
+                    "",
+                    Some(&next),
+                    200,
+                    "scope",
+                    "restart"
+                )
+                .unwrap_err()
+                .0,
+                StatusCode::GONE
+            );
+            cursor = Some(next);
+        }
+        assert_eq!(ids.len(), 451);
+        let (page, next) =
+            paged_assets(entries, &[], "file-450", None, 200, "search", "generation").unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0]["name"], "file-450.txt");
+        assert!(next.is_none());
+    }
 
     #[test]
     fn every_pane_in_one_checkout_resolves_to_its_directory() {

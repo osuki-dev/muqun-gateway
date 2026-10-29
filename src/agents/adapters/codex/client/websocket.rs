@@ -98,6 +98,7 @@ impl CodexClient {
             pending: Mutex::new(HashMap::new()),
             requests: Mutex::new(HashMap::new()),
             turns: Mutex::new(HashMap::new()),
+            compactions: Mutex::new(HashMap::new()),
             completed_turns: Mutex::new(HashMap::new()),
             lifecycle_completed_turns: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
@@ -525,7 +526,7 @@ pub(crate) mod tests {
     pub(crate) struct Fixture {
         pub(crate) client: Arc<CodexClient>,
         pub(crate) events: CodexEvents,
-        requests: Arc<Mutex<Vec<Value>>>,
+        pub(crate) requests: Arc<Mutex<Vec<Value>>>,
         pub(crate) send: mpsc::Sender<Value>,
         disconnected: Arc<AtomicBool>,
         connections: Arc<AtomicU64>,
@@ -606,7 +607,7 @@ pub(crate) mod tests {
             Self::with_deferred(handler, None).await
         }
 
-        async fn with_deferred(
+        pub(crate) async fn with_deferred(
             handler: impl Fn(&Value) -> Value + Send + 'static,
             deferred: Option<(&'static str, Arc<tokio::sync::Notify>)>,
         ) -> Self {
@@ -1162,14 +1163,14 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn adaptive_one_item_pages_preserve_selected_active_turn_recovery_beyond_sixteen_items() {
+    async fn question_recovery_accepts_short_pages_independent_of_foreground_reader_limit() {
         const ID: &str = "00000000-0000-4000-8000-000000000053";
-        let fixture = Fixture::new(|request| match request["method"].as_str().unwrap() {
+        let mut fixture = Fixture::new(|request| match request["method"].as_str().unwrap() {
             "thread/read" | "thread/resume" => json!({"thread":{"id":ID,"historyMode":"paginated","status":{"type":"active","activeFlags":[]}}}),
             "thread/turns/list" => json!({"data":[{"id":"active-turn","status":"inProgress"}],"nextCursor":null}),
             "thread/items/list" => {
                 assert_eq!(request["params"]["turnId"], "active-turn");
-                assert_eq!(request["params"]["limit"], 1);
+                assert_eq!(request["params"]["limit"], 100);
                 let start = request["params"]["cursor"].as_str().map(|s|s.parse::<usize>().unwrap()).unwrap_or(0);
                 let end = (start+1).min(17);
                 json!({"data":(start..end).map(|n|json!({"turnId":"active-turn","item":{
@@ -1182,6 +1183,15 @@ pub(crate) mod tests {
         fixture.client.history.lock().await.item_limit = Some(1);
         let driver = CodexDriver::new(fixture.client.clone());
         driver.prepare_selected_session(ID).await.unwrap();
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(2), fixture.events.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            if matches!(event, CodexEvent::RecoveredQuestions { .. }) {
+                break;
+            }
+        }
         assert_eq!(
             locked(&fixture.requests)
                 .iter()

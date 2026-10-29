@@ -359,7 +359,7 @@ struct SeenProjection {
     content: Option<[u8; 32]>,
     /// When this scope last changed the database.
     written: Instant,
-    /// This revision was over the bounds (a row past 256 KiB, say): not
+    /// This revision was over the bounds (a row past the pane byte budget, say): not
     /// stored, not tried again until the projection changes, said once.
     oversized: bool,
 }
@@ -1134,17 +1134,14 @@ fn decode_rows(mut encoded: &[u8]) -> anyhow::Result<Vec<String>> {
         let length = u32::from_le_bytes(encoded[..4].try_into()?) as usize;
         encoded = &encoded[4..];
         anyhow::ensure!(
-            length < super::history::MAX_PAGE_BYTES && length <= encoded.len(),
+            length <= MAX_PANE_BYTES && length <= encoded.len(),
             "invalid stored row"
         );
         rows.push(std::str::from_utf8(&encoded[..length])?.to_owned());
         encoded = &encoded[length..];
     }
     anyhow::ensure!(
-        rows.len() <= MAX_PANE_LINES
-            && rows
-                .iter()
-                .all(|r| r.len() < super::history::MAX_PAGE_BYTES),
+        rows.len() <= MAX_PANE_LINES && rows.iter().all(|r| r.len() <= MAX_PANE_BYTES),
         "invalid stored projection"
     );
     anyhow::ensure!(

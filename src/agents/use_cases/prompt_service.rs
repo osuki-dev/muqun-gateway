@@ -3,16 +3,14 @@ use std::sync::Arc;
 
 use crate::agents::domain::AgentSessionId;
 use crate::agents::ports::agent::{append_attachment_paths, AgentError, AgentPort, AttachmentMode};
-use crate::agents::ports::mirror::SessionMirrorPort;
 
 pub struct PromptService {
     agent: Arc<dyn AgentPort>,
-    _mirror: Arc<dyn SessionMirrorPort>,
 }
 
 impl PromptService {
-    pub fn new(agent: Arc<dyn AgentPort>, _mirror: Arc<dyn SessionMirrorPort>) -> Self {
-        Self { agent, _mirror }
+    pub fn new(agent: Arc<dyn AgentPort>) -> Self {
+        Self { agent }
     }
 
     pub async fn send_prompt(
@@ -22,6 +20,8 @@ impl PromptService {
         attachments: &[String],
         delivery: Option<&str>,
     ) -> Result<(), AgentError> {
+        // All adapters receive the same intent. Providers with a native inbox
+        // own their queue; Codex implements that contract in its adapter.
         if attachments.is_empty() {
             return self
                 .agent
@@ -110,6 +110,25 @@ pub(crate) fn checked_attachments(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn prompt_delivery_preserves_intent_for_every_provider() {
+        for provider in ["codex", "opencode", "deepseek", "t3"] {
+            let agent = Arc::new(crate::test_support::FakeAgent::new(provider));
+            let service = PromptService::new(agent.clone());
+            let id = AgentSessionId("session".into());
+            for delivery in [None, Some("steer"), Some("queue")] {
+                service
+                    .send_prompt(&id, "keep this message", &[], delivery)
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(
+                *agent.deliveries.lock().unwrap(),
+                vec![None, Some("steer".into()), Some("queue".into())]
+            );
+        }
+    }
 
     struct Scratch(std::path::PathBuf);
 

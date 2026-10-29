@@ -67,8 +67,8 @@ pub const MAX_CONNECTIONS_PER_DEVICE: usize = 4;
 /// Open sockets across all devices. Past it a new upgrade is refused with
 /// `429 too_many_connections`, since no other device's socket is ours to cut.
 pub const MAX_CONNECTIONS_TOTAL: usize = 64;
-/// Longest a single asid may be. Real ids are around thirty bytes.
-const MAX_ASID_BYTES: usize = 128;
+/// Provider-native child identities can contain long encoded ancestry.
+const MAX_ASID_BYTES: usize = 4096;
 
 /// The timers one connection runs on. A value, not constants, so a test can
 /// run the revocation and heartbeat paths in milliseconds.

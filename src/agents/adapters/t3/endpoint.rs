@@ -1,8 +1,7 @@
 //! Where a T3 Code server is and how the gateway proves itself to it.
 //!
-//! The auth flow, as observed against `t3 serve` 0.0.42 and still current in
-//! 0.0.45 (protocol 1) and stable 0.1.1 (protocol 2). The public
-//! descriptor selects the protocol before any one-time pairing exchange.
+//! The public descriptor must advertise orchestration protocol 2 before any
+//! one-time pairing exchange. Older servers must be upgraded first.
 //!
 //! The flow:
 //!
@@ -32,14 +31,12 @@ use crate::agents::ports::agent::AgentError;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum T3Protocol {
     #[default]
-    V1,
     V2,
 }
 
 impl T3Protocol {
     pub fn version(self) -> u64 {
         match self {
-            Self::V1 => 1,
             Self::V2 => 2,
         }
     }
@@ -104,23 +101,21 @@ fn decode_protocol_version<'de, D: serde::Deserializer<'de>>(
 
 impl EnvironmentDescriptor {
     pub fn protocol_version(&self) -> u64 {
-        self.orchestration_protocol_version
-            .unwrap_or(super::ORCHESTRATION_PROTOCOL_VERSION)
+        self.orchestration_protocol_version.unwrap_or(1)
     }
 
     /// Only known protocols are supported, including rejection of zero.
     pub fn unsupported_reason(&self) -> Option<String> {
         let version = self.protocol_version();
-        (!matches!(version, 1 | 2)).then(|| {
+        (version != super::ORCHESTRATION_PROTOCOL_VERSION).then(|| {
             format!(
-                "T3 server speaks orchestration protocol {version}; this gateway supports 1 and 2"
+                "T3 server speaks orchestration protocol {version}; this gateway requires protocol 2; upgrade T3 Code"
             )
         })
     }
 
     pub fn protocol(&self) -> Result<T3Protocol, AgentError> {
         match self.protocol_version() {
-            1 => Ok(T3Protocol::V1),
             2 => Ok(T3Protocol::V2),
             _ => Err(AgentError::Unsupported(self.unsupported_reason().unwrap())),
         }
@@ -182,7 +177,7 @@ impl T3Endpoint {
             url,
             ws_url,
             credential,
-            protocol: T3Protocol::V1,
+            protocol: T3Protocol::V2,
             environment_id: None,
         }
     }
@@ -223,11 +218,11 @@ impl T3Endpoint {
     }
 
     pub fn ws_url_with_ticket(&self, ticket: &str) -> String {
-        let mut url = format!("{}?wsTicket={}", self.ws_url, url_encode(ticket));
-        if self.protocol == T3Protocol::V2 {
-            url.push_str("&orchestrationProtocol=2");
-        }
-        url
+        format!(
+            "{}?wsTicket={}&orchestrationProtocol=2",
+            self.ws_url,
+            url_encode(ticket)
+        )
     }
 
     /// Fetch the environment descriptor. This is the health probe: a server
@@ -458,7 +453,7 @@ mod tests {
         assert_eq!(ep.credential_kind(), "bearer");
         assert_eq!(
             ep.ws_url_with_ticket("abc.def/+="),
-            "wss://t3.example.ts.net/ws?wsTicket=abc.def%2F%2B%3D"
+            "wss://t3.example.ts.net/ws?wsTicket=abc.def%2F%2B%3D&orchestrationProtocol=2"
         );
     }
 
@@ -486,7 +481,7 @@ mod tests {
         );
         assert!(!d.capability("agentActivityPublishing"));
         assert!(!d.capability("no-such-flag"));
-        assert_eq!(d.unsupported_reason(), None);
+        assert!(d.unsupported_reason().is_some());
     }
 
     fn descriptor_with_protocol(version: u64) -> EnvironmentDescriptor {
@@ -498,11 +493,11 @@ mod tests {
 
     #[test]
     fn only_known_protocols_are_supported() {
-        assert_eq!(descriptor_with_protocol(1).unsupported_reason(), None);
+        assert!(descriptor_with_protocol(1).unsupported_reason().is_some());
         assert_eq!(descriptor_with_protocol(2).unsupported_reason(), None);
         assert_eq!(
             descriptor_with_protocol(3).unsupported_reason().as_deref(),
-            Some("T3 server speaks orchestration protocol 3; this gateway supports 1 and 2")
+            Some("T3 server speaks orchestration protocol 3; this gateway requires protocol 2; upgrade T3 Code")
         );
         assert!(descriptor_with_protocol(0).unsupported_reason().is_some());
         for invalid in [

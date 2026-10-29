@@ -580,14 +580,17 @@ async fn codex_earlier_cancelled_rpc_keeps_staged_residual_retryable() {
 #[tokio::test]
 async fn codex_earlier_legacy_reasoning_residual_keeps_summary_and_content_ordinals() {
     let mut fixture = Fixture::new(|r| {
-        assert_eq!(r["method"], "thread/read");
-        let mut thread = golden()["thread"].clone();
-        thread["historyMode"] = json!("legacy");
-        thread["turns"] = json!([{"id":"turn","items":[{"id":"reason","type":"reasoning",
+        if r["method"] == "thread/read" {
+            assert_eq!(r["params"]["includeTurns"], false);
+            let mut thread = golden()["thread"].clone();
+            thread["historyMode"] = json!("legacy");
+            return json!({"thread":thread});
+        }
+        assert_eq!(r["method"], "thread/turns/list");
+        json!({"data":[{"id":"turn","itemsView":"full","items":[{"id":"reason","type":"reasoning",
             "summary":(0..50).map(|n|n.to_string()).collect::<Vec<_>>(),
             "content":(50..101).map(|n|n.to_string()).collect::<Vec<_>>()
-        }]}]);
-        json!({"thread":thread})
+        }]}],"nextCursor":null})
     })
     .await;
     fixture.ready().await;
@@ -823,10 +826,11 @@ async fn codex_both_history_storage_modes_use_stable_live_item_ids() {
         let item_clone = item.clone();
         let mut fixture = Fixture::new(move |r|match r["method"].as_str().unwrap() {
             "thread/read" => {
-                let mut thread = thread.clone();
-                if r["params"]["includeTurns"] == true {thread["turns"] = json!([{"id":turn,"items":[item_clone.clone()]}]);}
+                let thread = thread.clone();
+                assert_eq!(r["params"]["includeTurns"], false);
                 json!({"thread":thread})
             }
+            "thread/turns/list" => json!({"data":[{"id":turn,"itemsView":"full","items":[item_clone.clone()]}],"nextCursor":null}),
             "thread/items/list" => json!({"data":[{"turnId":turn,"item":item_clone}],"nextCursor":null,"backwardsCursor":null}),
             _ => panic!("unexpected history RPC"),
         }).await;

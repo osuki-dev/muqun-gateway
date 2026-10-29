@@ -705,19 +705,19 @@ mod tests {
                 true,
             ),
         ));
-        for payload in [
-            json!({"toolCallId": "t3-call", "data": {
-                "toolName": "mcp__muqun__exec.run", "command": "pwd",
-                "rawOutput": {"content": "output"}
-            }}),
-            json!({"toolCallId": "t3-call", "toolName": "muqun.tasks.read"}),
-        ] {
-            parts.push(AgentPart::Tool(
-                adapters::t3::mapper::map_tool(&json!({
-                    "id": "activity", "kind": "tool.completed", "payload": payload
-                }))
-                .unwrap(),
-            ));
+        for name in ["mcp__muqun__exec.run", "muqun.tasks.read"] {
+            let rows = adapters::t3::v2::mapper::timeline(
+                "thread",
+                &json!({
+                "visibleTurnItems": [{"sourceThreadId":"thread","sourceItemId":"t3-call", "position":1,
+                        "item":{"id":"t3-call","type":"dynamic_tool","toolName":name,
+                            "input":{"command":"pwd"},"output":"output","status":"completed"}}]
+                }),
+                1,
+            );
+            assert_eq!(rows.len(), 1);
+            assert!(matches!(&rows[0].part, AgentPart::Tool(_)));
+            parts.push(rows[0].part.clone());
         }
         for value in [
             json!({"type": "mcpToolCall", "id": "codex-call", "server": "muqun",

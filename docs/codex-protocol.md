@@ -221,7 +221,15 @@ the retained history remains untouched; it is not converted to native ownership.
 Metadata caching and initial transcript hydration are tracked separately. The
 first selected snapshot reads a bounded canonical history page even if a viewed
 marker or resume event has already cached metadata. Successful empty history is
-cached too; repeated or concurrent snapshots do not reload it. Initial hydration
+cached too; repeated or concurrent snapshots do not reload it. Legacy storage is read
+one complete turn at a time using `thread/turns/list` with `itemsView: full`,
+`sortDirection: desc`, and the provider's opaque cursor. Opening a thread does
+not hydrate all of its older turns. Residual mapped items and the next-turn cursor
+are committed atomically with the accepted page; cancelled preparations preserve
+the previous cursor. Empty turns are skipped only while their cursor says more
+turns exist. Legacy has no item-level pagination inside a single turn: wire and
+retained-page budgets still apply to that turn, and incomplete provider turn
+bodies are never accepted as complete history. Initial hydration
 merges history without replacing newer live rows, and failed reads remain retryable.
 `thread/resume` carries only its exact ID and `excludeTurns: true`; it does not
 apply model, instructions or permission overrides. A one-turn metadata page
@@ -522,10 +530,17 @@ After an accepted shared-daemon rejoin, opening its timeline also recovers unans
 questions from the exact currently active turn. Paginated storage uses
 `thread/items/list` filtered by `turnId`; legacy storage uses a single
 `thread/turns/list` page with `itemsView: full`, requiring the returned active turn
-identity to match. Recovery is bounded to 1,600 items, 128 pages, 1 MiB of retained
-question/reply items, and the shared 20-second deadline, history wire-work budget
-and role-specific correlated history-reply ceiling described above.
-It publishes no partial result. Committed answer envelopes are applied before
+identity to match. Recovery runs separately from opening the timeline, with one
+scheduled scan per thread/turn ownership and at most four scans per adapter.
+Further selected sessions wait in FIFO order; stale queued requests are discarded
+when their loaded thread, active turn, or ownership changes. Queue size is bounded
+by the loaded-session capacity, with at most four stale in-flight requests.
+Each scan uses its
+own identity-verified, history-only connection, so it cannot occupy the foreground
+history reader or issue prompts, callbacks, or mutations. There is no item-count
+or page-count cutoff. A 60-second deadline and 32 MiB wire-work budget bound each
+attempt, including reader connection and initialization; failure or exhaustion leaves the timeline available and publishes no
+partial question result. A later selected refresh can attempt recovery again. Committed answer envelopes are applied before
 question forms; bounded answer identities also prevent a concurrent TUI answer from
 being resurrected by recovery. Turn changes, completion, disconnect, or an unload/rejoin
 of the same thread fence the result. Explicit interrupt and prompt control do not wait

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use serde_json::{json, Value};
@@ -52,11 +52,14 @@ pub struct CodexDriver {
     terminal_runtime: Option<Arc<crate::agents::terminal_runtime::TerminalRuntime>>,
     native_sessions: Option<Arc<super::native_sessions::NativeSessions>>,
     /// Only explicitly created, forked or submitted-to threads are resumed.
-    loaded: Mutex<HashSet<String>>,
+    loaded: Arc<Mutex<HashSet<String>>>,
+    question_recoveries: Arc<Mutex<QuestionRecoveries>>,
     /// Serializes explicit mutations, not the stream or read-only RPC calls.
     mutations: Arc<Mutex<()>>,
     order: std::sync::Mutex<ItemOrder>,
     order_epochs: std::sync::Mutex<HashMap<String, u64>>,
+    /// Text seen only as live deltas, scoped to the runtime subscription.
+    provisional_text: std::sync::Mutex<HashMap<(String, String, String), Option<u64>>>,
     next_models: Arc<std::sync::Mutex<HashMap<String, PendingModel>>>,
     metadata_versions: Arc<Mutex<HashMap<String, u64>>>,
     next_metadata_version: std::sync::atomic::AtomicU64,
@@ -118,6 +121,25 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct QuestionRecoveryKey {
+    thread: String,
+    turn: String,
+    ownership: u64,
+}
+
+struct QuestionRecovery {
+    key: QuestionRecoveryKey,
+    history_mode: Option<String>,
+}
+
+#[derive(Default)]
+struct QuestionRecoveries {
+    scheduled: HashSet<QuestionRecoveryKey>,
+    pending: VecDeque<QuestionRecovery>,
+    workers: usize,
+}
+
 struct PendingModel {
     model: ModelRef,
     accepted_revision: Option<u64>,
@@ -127,6 +149,7 @@ struct PendingModel {
 struct HistoryPage {
     revision: u64,
     started: bool,
+    legacy_turns: bool,
     cursor: Option<String>,
     /// Raw page while preparing, oldest first. Shared pages are projected once
     /// before publication; private stdio keeps its existing one-item expansion.
@@ -181,10 +204,12 @@ impl CodexDriver {
             account_limits: Default::default(),
             terminal_runtime: None,
             native_sessions: None,
-            loaded: Mutex::new(HashSet::new()),
+            loaded: Arc::new(Mutex::new(HashSet::new())),
+            question_recoveries: Arc::new(Mutex::new(QuestionRecoveries::default())),
             mutations: Arc::new(Mutex::new(())),
             order: std::sync::Mutex::new(HashMap::new()),
             order_epochs: std::sync::Mutex::new(HashMap::new()),
+            provisional_text: Default::default(),
             next_models: Arc::new(std::sync::Mutex::new(HashMap::new())),
             metadata_versions: Arc::new(Mutex::new(HashMap::new())),
             next_metadata_version: std::sync::atomic::AtomicU64::new(1),
@@ -216,6 +241,30 @@ impl CodexDriver {
         if let Some(signals) = &self.inbox_signals {
             let _ = signals.send(signal);
         }
+    }
+
+    /// Caller holds `mutations`; all queue receipts use one publication path.
+    fn enqueue_prompt(
+        &self,
+        thread: &str,
+        text: &str,
+        files: Vec<Value>,
+        input: Vec<Value>,
+        delivery: Delivery,
+    ) -> Result<(), AgentError> {
+        self.queue().push(
+            thread,
+            Queued {
+                id: format!("inbox_{}", uuid::Uuid::new_v4().simple()),
+                created_ms: now_ms(),
+                delivery,
+                text: text.to_owned(),
+                files,
+                input,
+            },
+        )?;
+        self.signal(InboxSignal::Changed(thread.into()));
+        Ok(())
     }
 
     fn queue(&self) -> std::sync::MutexGuard<'_, Inbox> {
@@ -288,6 +337,30 @@ impl CodexDriver {
         let _ = self.settle(thread, &item.id, result);
     }
 
+    /// Compaction postpones steering; it must not turn it into next-turn work.
+    pub(crate) fn deliver_deferred_steering(self: &Arc<Self>, thread: &str, turn: &str) {
+        let driver = self.clone();
+        let thread = thread.to_owned();
+        let turn = turn.to_owned();
+        tokio::spawn(async move {
+            let _guard = driver.mutations.lock().await;
+            while !driver.client.is_compacting(&thread)
+                && driver.client.active_turn(&thread).as_deref() == Some(turn.as_str())
+            {
+                let Some(item) = driver.queue().next(&thread).cloned() else {
+                    break;
+                };
+                if item.delivery != Delivery::Steer {
+                    break;
+                }
+                let result = driver.steer_locked(&thread, &turn, item.input).await;
+                if driver.settle(&thread, &item.id, result).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+
     /// "Send now": steer it into the running turn, or start a turn with it.
     async fn send_queued_now(&self, thread: &str, id: &str) -> Result<(), AgentError> {
         self.prepare_shared_interaction(thread).await?;
@@ -297,6 +370,12 @@ impl CodexDriver {
             .get(thread, id)
             .map(|item| item.input.clone())
             .ok_or_else(|| inbox_item_not_found(id))?;
+        if self.client.is_compacting(thread) {
+            // Preserve the requested mode while compaction blocks delivery.
+            self.queue().set_delivery(thread, id, Delivery::Steer);
+            self.signal(InboxSignal::Changed(thread.into()));
+            return Ok(());
+        }
         let result = match self.client.active_turn(thread) {
             Some(turn) => self.steer_locked(thread, &turn, input).await,
             None => self.start_turn_locked(thread, input).await,
@@ -867,6 +946,34 @@ impl CodexDriver {
         Ok(rows)
     }
 
+    pub(crate) fn observe_text_delta(&self, thread: &str, turn: &str, item: &str) {
+        let mut pending = self
+            .provisional_text
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        // Match the existing order retention budget. Missing bookkeeping may
+        // preserve an obsolete bubble, but must never reject valid output.
+        if pending.len() < 8192 {
+            pending
+                .entry((thread.into(), turn.into(), item.into()))
+                .or_insert_with(|| self.client.subscription_revision(thread));
+        }
+    }
+
+    pub(crate) fn complete_text_item(&self, thread: &str, turn: &str, item: &str) {
+        self.provisional_text
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&(thread.into(), turn.into(), item.into()));
+    }
+
+    pub(crate) fn finish_provisional_turn(&self, thread: &str, turn: &str) {
+        self.provisional_text
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|(t, u, _), _| t != thread || u != turn);
+    }
+
     /// Complete turn arrays can repair provisional live order. Their rows and
     /// the projection commit are accepted together by the mirror.
     pub(crate) fn prepare_completed_turn<'a>(
@@ -875,6 +982,7 @@ impl CodexDriver {
         turn: &str,
         items: &[Value],
         full: bool,
+        canonical_completed: bool,
     ) -> Result<PreparedTimeline<'a>, AgentError> {
         let (mut order, epoch) = self.order_candidate(thread);
         let ids = items
@@ -908,12 +1016,12 @@ impl CodexDriver {
             }
         }
         let mut rows = Vec::new();
-        for (item, id) in items.iter().zip(ids) {
-            let position = order[&(thread.to_owned(), turn.to_owned(), id)];
+        for (item, id) in items.iter().zip(&ids) {
+            let position = order[&(thread.to_owned(), turn.to_owned(), id.clone())];
             rows.extend(self.project_item(thread, turn, item, 0, position)?);
         }
         let fresh_ids = rows.iter().map(|item| item.id.clone()).collect();
-        let replace_groups = rows
+        let replace_groups: HashSet<_> = rows
             .iter()
             .filter(|item| {
                 matches!(&item.part, AgentPart::Tool(call)
@@ -921,11 +1029,39 @@ impl CodexDriver {
             })
             .map(|item| item.message_id.clone())
             .collect();
+        let turn = turn.to_owned();
+        let ownership = self.client.subscription_revision(thread);
         Ok(PreparedTimeline {
             items: rows,
             commit: Some(Box::new(move || {
+                let mut pending = self
+                    .provisional_text
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                let mut replace_groups = replace_groups;
+                // Only an explicitly complete successful turn can prove that
+                // an unfinished producer was discarded (for example by steer).
+                // Recheck ownership at mirror acceptance, not just preparation.
+                let prune = full
+                    && canonical_completed
+                    && self.client.subscription_revision(thread) == ownership
+                    && self.client.is_current_turn_completion(thread, &turn);
+                if prune {
+                    for (key @ (t, u, id), observed) in pending.iter() {
+                        if t == thread && u == &turn && *observed == ownership && !ids.contains(id)
+                        {
+                            if let Some(position) = order.get(key) {
+                                replace_groups
+                                    .insert(mapper::order_group(thread, &turn, *position));
+                            }
+                        }
+                    }
+                }
                 let mut accepted =
                     self.accept_order_candidate(thread, (order, epoch), fresh_ids, None)?;
+                if prune {
+                    pending.retain(|(t, u, _), _| t != thread || u != &turn);
+                }
                 accepted.replace_groups = replace_groups;
                 Ok(accepted)
             })),
@@ -1034,6 +1170,10 @@ impl CodexDriver {
     }
 
     pub(crate) async fn forget_thread(&self, id: &str) {
+        self.provisional_text
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|(thread, _, _), _| thread != id);
         self.clear_async_questions(id).await;
         self.loaded.lock().await.remove(id);
         self.next_models
@@ -1078,12 +1218,11 @@ impl CodexDriver {
         let _guard = self.mutations.lock().await;
         if self.client.is_subscribed(id) {
             drop(_guard);
-            return if recover_questions {
-                self.recover_async_questions(id, metadata["historyMode"].as_str())
-                    .await
-            } else {
-                Ok(())
-            };
+            if recover_questions {
+                self.schedule_question_recovery(id, metadata["historyMode"].as_str())
+                    .await;
+            }
+            return Ok(());
         }
         // Recheck after waiting for another mutation, including provenance.
         // A remembered origin is permission to request resume, not ownership.
@@ -1124,53 +1263,151 @@ impl CodexDriver {
         // reply can proceed, and turn/subscription fences discard a stale read.
         drop(_guard);
         if recover_questions {
-            self.recover_async_questions(id, metadata["historyMode"].as_str())
-                .await
-        } else {
-            Ok(())
+            self.schedule_question_recovery(id, metadata["historyMode"].as_str())
+                .await;
         }
+        Ok(())
+    }
+
+    /// Optional question recovery must never delay or reject opening a timeline.
+    /// One read per thread, with bounded concurrency and the same ownership fence
+    /// across scheduling, pagination, and event-pump publication.
+    async fn schedule_question_recovery(&self, id: &str, history_mode: Option<&str>) {
+        let Some(turn) = self.client.active_turn(id) else {
+            return;
+        };
+        let Some(ownership) = self.client.subscription_revision(id) else {
+            return;
+        };
+        let loaded = self.loaded.lock().await;
+        if !self.client.is_shared() || !loaded.contains(id) {
+            return;
+        }
+        let mut queue = self.question_recoveries.lock().await;
+        // At most one valid pending request per loaded thread; stale requests
+        // cannot accumulate as sessions close or change turns. Loaded threads
+        // are already bounded by MAX_SESSIONS, plus at most four running reads.
+        let mut stale = Vec::new();
+        queue.pending.retain(|request| {
+            let key = &request.key;
+            let valid = loaded.contains(&key.thread)
+                && self.client.subscription_revision(&key.thread) == Some(key.ownership)
+                && self.client.active_turn(&key.thread).as_deref() == Some(key.turn.as_str());
+            if !valid {
+                stale.push(key.clone());
+            }
+            valid
+        });
+        for key in stale {
+            queue.scheduled.remove(&key);
+        }
+        let key = QuestionRecoveryKey {
+            thread: id.into(),
+            turn,
+            ownership,
+        };
+        if queue.scheduled.contains(&key) {
+            return;
+        }
+        // Keep a single queued generation even if notifications advanced this
+        // thread while stale ownership checks above were being evaluated.
+        let mut superseded = Vec::new();
+        queue.pending.retain(|request| {
+            if request.key.thread == id {
+                superseded.push(request.key.clone());
+                false
+            } else {
+                true
+            }
+        });
+        for key in superseded {
+            queue.scheduled.remove(&key);
+        }
+        queue.scheduled.insert(key.clone());
+        queue.pending.push_back(QuestionRecovery {
+            key,
+            history_mode: history_mode.map(str::to_owned),
+        });
+        if queue.workers >= 4 {
+            return;
+        }
+        queue.workers += 1;
+        drop(queue);
+        drop(loaded);
+        let client = self.client.clone();
+        let loaded = self.loaded.clone();
+        let queue = self.question_recoveries.clone();
+        tokio::spawn(async move {
+            loop {
+                let request = {
+                    let mut state = queue.lock().await;
+                    let Some(request) = state.pending.pop_front() else {
+                        state.workers -= 1;
+                        return;
+                    };
+                    request
+                };
+                let key = &request.key;
+                // Include connection establishment and initialization in the
+                // attempt deadline, not just the subsequent page calls.
+                tokio::select! {
+                    _ = client.cancel_token().cancelled_owned() => {},
+                    result = tokio::time::timeout(std::time::Duration::from_secs(60), Self::recover_async_questions(
+                        &client, &loaded, &key.thread, &key.turn, key.ownership, request.history_mode.as_deref()
+                    )) => {
+                        if !matches!(result, Ok(Ok(()))) {
+                            tracing::debug!("Codex optional question recovery incomplete; timeline remains available");
+                        }
+                    }
+                }
+                let mut state = queue.lock().await;
+                state.scheduled.remove(key);
+                if client.cancel_token().is_cancelled() {
+                    state.pending.clear();
+                    state.scheduled.clear();
+                    state.workers -= 1;
+                    return;
+                }
+            }
+        });
     }
 
     /// Never infer callbacks from persisted/unowned history. This is a bounded
     /// canonical read of one currently owned shared turn, including its committed
     /// answers. Publish only after reaching verified end, in event-pump order.
     async fn recover_async_questions(
-        &self,
+        client: &CodexClient,
+        loaded: &Mutex<HashSet<String>>,
         id: &str,
+        turn: &str,
+        ownership: u64,
         history_mode: Option<&str>,
     ) -> Result<(), AgentError> {
-        let Some(turn) = self.client.active_turn(id) else {
-            return Ok(());
-        };
-        if !self.client.is_shared()
-            || !self.client.is_subscribed(id)
-            || !self.loaded.lock().await.contains(id)
+        if client.subscription_revision(id) != Some(ownership)
+            || client.active_turn(id).as_deref() != Some(turn)
+            || !loaded.lock().await.contains(id)
         {
             return Ok(());
         }
-        let Some(ownership) = self.client.subscription_revision(id) else {
-            return Ok(());
-        };
-        let mut budget = Budget::new();
+        let mut budget = Budget::question_recovery();
+        let reader = client.question_history_reader().await?;
         let mut cursor = None;
         let mut seen = HashSet::new();
         let mut items = vec![];
-        let mut retained_bytes = 0usize;
-        let mut read_rows = 0usize;
-        for _ in 0..super::budget::MAX_PAGES {
-            if self.client.subscription_revision(id) != Some(ownership)
-                || self.client.active_turn(id).as_deref() != Some(&turn)
+        loop {
+            if client.subscription_revision(id) != Some(ownership)
+                || client.active_turn(id).as_deref() != Some(turn)
             {
                 return Ok(());
             }
             let (page, max_rows) = match history_mode {
-                Some("paginated") => (budget.call(&self.client, "thread/items/list", json!({
+                Some("paginated") => (budget.call(&reader, "thread/items/list", json!({
                     "threadId":id,"turnId":turn,"limit":100,"sortDirection":"asc","cursor":cursor
                 })).await?, 100),
                 Some("legacy") => {
                     // Legacy storage rejects thread/items/list. The official
                     // one-turn page merges its active in-memory canonical items.
-                    let page = budget.call(&self.client, "thread/turns/list", json!({
+                    let page = budget.call(&reader, "thread/turns/list", json!({
                         "threadId":id,"limit":1,"sortDirection":"desc","itemsView":"full"
                     })).await?;
                     let turns = page["data"].as_array().filter(|rows| rows.len() <= 1)
@@ -1181,9 +1418,9 @@ impl CodexDriver {
                     if current["itemsView"] != "full" {
                         return Err(AgentError::Protocol("incomplete Codex current-turn items".into()));
                     }
-                    let items = current["items"].as_array().filter(|items| items.len() <= 1600)
+                    let items = current["items"].as_array()
                         .ok_or_else(|| AgentError::Protocol("invalid Codex current-turn items".into()))?;
-                    (json!({"data":items.iter().map(|item| json!({"turnId":turn,"item":item})).collect::<Vec<_>>(),"nextCursor":null}), 1600)
+                    (json!({"data":items.iter().map(|item| json!({"turnId":turn,"item":item})).collect::<Vec<_>>(),"nextCursor":null}), items.len())
                 },
                 _ => return unsupported("Codex question recovery storage mode"),
             };
@@ -1193,12 +1430,6 @@ impl CodexDriver {
                 .ok_or_else(|| {
                     AgentError::Protocol("invalid Codex question recovery page".into())
                 })?;
-            read_rows += rows.len();
-            if read_rows > 1600 {
-                return Err(AgentError::RequestFailed(
-                    "Codex question recovery budget exhausted".into(),
-                ));
-            }
             for row in rows {
                 if row["turnId"] != turn || row["item"]["id"].as_str().is_none() {
                     return Err(AgentError::Protocol(
@@ -1209,34 +1440,20 @@ impl CodexDriver {
                 if item["type"] == "userMessage"
                     || (item["type"] == "agentMessage" && item["questions"].is_array())
                 {
-                    retained_bytes += serde_json::to_vec(item)
-                        .map_err(|_| {
-                            AgentError::Protocol("invalid Codex question recovery item".into())
-                        })?
-                        .len();
-                    if retained_bytes > 1024 * 1024 {
-                        return Err(AgentError::RequestFailed(
-                            "Codex question recovery budget exhausted".into(),
-                        ));
-                    }
                     items.push(item.clone());
                 }
             }
             cursor = next_cursor(&page, &mut seen)?;
             if cursor.is_none() {
-                if self.client.subscription_revision(id) == Some(ownership)
-                    && self.client.active_turn(id).as_deref() == Some(&turn)
-                    && self.loaded.lock().await.contains(id)
+                if client.subscription_revision(id) == Some(ownership)
+                    && client.active_turn(id).as_deref() == Some(turn)
+                    && loaded.lock().await.contains(id)
                 {
-                    self.client
-                        .recovered_questions(ownership, id, &turn, items)?;
+                    client.recovered_questions(ownership, id, turn, items)?;
                 }
                 return Ok(());
             }
         }
-        Err(AgentError::RequestFailed(
-            "Codex question recovery budget exhausted".into(),
-        ))
     }
 
     async fn selected_response(&self, response: Value) -> Result<AgentSessionInfo, AgentError> {
@@ -1802,6 +2019,51 @@ impl CodexDriver {
         })
     }
 
+    /// Legacy storage has turn-level cursors, not item cursors. Keep only
+    /// the requested turn and its mapped residual, never hydrate the thread.
+    async fn read_legacy_turn_page(
+        &self,
+        id: &str,
+        state: &mut HistoryPage,
+        budget: &mut Budget,
+        order: &mut ItemOrder,
+    ) -> Result<(), AgentError> {
+        let response = budget.call(&self.client, "thread/turns/list", json!({
+            "threadId":id,"limit":1,"sortDirection":"desc","itemsView":"full","cursor":state.cursor
+        })).await?;
+        let turns = response["data"]
+            .as_array()
+            .filter(|rows| rows.len() <= 1)
+            .ok_or_else(|| AgentError::Protocol("invalid Codex legacy turn page".into()))?;
+        let next = next_cursor(&response, &mut state.seen)?;
+        if turns.is_empty() && next.is_some() {
+            return Err(AgentError::Protocol(
+                "empty continuing Codex turn page".into(),
+            ));
+        }
+        for turn in turns {
+            let turn_id = mapper::string(turn, "id")?;
+            if turn["itemsView"] != "full" {
+                return Err(AgentError::Protocol("incomplete Codex legacy turn".into()));
+            }
+            let rows = turn["items"]
+                .as_array()
+                .ok_or_else(|| AgentError::Protocol("invalid Codex legacy turn items".into()))?;
+            let ids = rows
+                .iter()
+                .map(|row| mapper::string(row, "id"))
+                .collect::<Result<Vec<_>, _>>()?;
+            Self::rebase_prepared_order(id, &turn_id, &ids, order)?;
+            for row in rows {
+                state.pending.push(json!({"turnId":turn_id,"item":row,
+                    "startedAtMs":turn["startedAt"].as_u64().unwrap_or(0).saturating_mul(1000)}));
+            }
+        }
+        state.cursor = next;
+        state.started = true;
+        Ok(())
+    }
+
     async fn read_history_batch(
         &self,
         id: &str,
@@ -1830,68 +2092,76 @@ impl CodexDriver {
                 {
                     break;
                 }
-                let page_limit = (limit - items.len()).min(100);
-                let mut page = budget.call(&self.client, "thread/items/list", json!({
+                if state.legacy_turns {
+                    self.read_legacy_turn_page(id, state, budget, order).await?;
+                    // Empty turns are not EOF; their canonical cursor decides.
+                    if state.pending.is_empty() {
+                        continue;
+                    }
+                } else {
+                    let page_limit = (limit - items.len()).min(100);
+                    let mut page = budget.call(&self.client, "thread/items/list", json!({
                     "threadId":id,"limit":page_limit,"sortDirection":"desc","cursor":state.cursor
                 })).await?;
-                let data = page["data"]
-                    .as_array()
-                    .ok_or_else(|| AgentError::Protocol("invalid Codex item page".into()))?;
-                if data.len() > page_limit {
-                    return Err(AgentError::Protocol("oversized Codex item page".into()));
-                }
-                budget.rows(data.len())?;
-                let next = next_cursor(&page, &mut state.seen)?;
-                if state.seen.len() > 8192 {
-                    return Err(AgentError::RequestFailed(
-                        "Codex history cursor capacity exhausted".into(),
-                    ));
-                }
-                if data.is_empty() && next.is_some() {
-                    return Err(AgentError::Protocol(
-                        "empty continuing Codex item page".into(),
-                    ));
-                }
-                let mut ids_by_turn: HashMap<String, Vec<String>> = HashMap::new();
-                for row in data.iter().rev() {
-                    let turn = mapper::string(row, "turnId")?;
-                    mapper::string(&row["item"], "type")?;
-                    if row["item"]["type"] == "reasoning"
-                        && ["summary", "content"].iter().any(|key| {
-                            row["item"][*key]
-                                .as_array()
-                                .is_some_and(|parts| parts.len() > super::MAX_REASONING_PARTS)
-                        })
-                    {
-                        return Err(AgentError::Protocol(
-                            "Codex reasoning part limit exceeded".into(),
+                    let data = page["data"]
+                        .as_array()
+                        .ok_or_else(|| AgentError::Protocol("invalid Codex item page".into()))?;
+                    if data.len() > page_limit {
+                        return Err(AgentError::Protocol("oversized Codex item page".into()));
+                    }
+                    budget.rows(data.len())?;
+                    let next = next_cursor(&page, &mut state.seen)?;
+                    if state.seen.len() > 8192 {
+                        return Err(AgentError::RequestFailed(
+                            "Codex history cursor capacity exhausted".into(),
                         ));
                     }
-                    ids_by_turn
-                        .entry(turn)
-                        .or_default()
-                        .push(mapper::string(&row["item"], "id")?);
-                }
-                for (turn, ids) in ids_by_turn {
-                    let changes = self
-                        .prepare_history_order(id, &turn, &ids, state.started, order, budget)
-                        .await?;
-                    for row in state.remaining.iter_mut().chain(items.iter_mut()) {
-                        if let Some(next) = changes.get(&row.message_id) {
-                            row.message_id.clone_from(next);
+                    if data.is_empty() && next.is_some() {
+                        return Err(AgentError::Protocol(
+                            "empty continuing Codex item page".into(),
+                        ));
+                    }
+                    let mut ids_by_turn: HashMap<String, Vec<String>> = HashMap::new();
+                    for row in data.iter().rev() {
+                        let turn = mapper::string(row, "turnId")?;
+                        mapper::string(&row["item"], "type")?;
+                        if row["item"]["type"] == "reasoning"
+                            && ["summary", "content"].iter().any(|key| {
+                                row["item"][*key]
+                                    .as_array()
+                                    .is_some_and(|parts| parts.len() > super::MAX_REASONING_PARTS)
+                            })
+                        {
+                            return Err(AgentError::Protocol(
+                                "Codex reasoning part limit exceeded".into(),
+                            ));
+                        }
+                        ids_by_turn
+                            .entry(turn)
+                            .or_default()
+                            .push(mapper::string(&row["item"], "id")?);
+                    }
+                    for (turn, ids) in ids_by_turn {
+                        let changes = self
+                            .prepare_history_order(id, &turn, &ids, state.started, order, budget)
+                            .await?;
+                        for row in state.remaining.iter_mut().chain(items.iter_mut()) {
+                            if let Some(next) = changes.get(&row.message_id) {
+                                row.message_id.clone_from(next);
+                            }
                         }
                     }
-                }
-                state.pending = page["data"]
-                    .as_array_mut()
-                    .expect("validated item page")
-                    .drain(..)
-                    .rev()
-                    .collect();
-                state.cursor = next;
-                state.started = true;
-                if state.pending.is_empty() {
-                    break;
+                    state.pending = page["data"]
+                        .as_array_mut()
+                        .expect("validated item page")
+                        .drain(..)
+                        .rev()
+                        .collect();
+                    state.cursor = next;
+                    state.started = true;
+                    if state.pending.is_empty() {
+                        break;
+                    }
                 }
             }
             // Project the accepted page once and release all raw image bodies.
@@ -2290,7 +2560,9 @@ impl AgentPort for CodexDriver {
             // Validate uploads before any rejoin/resume or prompt mutation.
             let prepared = super::input::prepare(text, attachments).await?;
             let input = prepared.input;
-            if delivery == Some(Delivery::Queue) {
+            // Compaction cannot consume steering yet. Publish the accepted
+            // prompt through the ordinary inbox instead of hiding it upstream.
+            if delivery == Some(Delivery::Queue) || self.client.is_compacting(id) {
                 self.prepare_shared_interaction(id).await?;
                 let _guard = self.mutations.lock().await;
                 self.require_native_interaction(id).await?;
@@ -2305,19 +2577,13 @@ impl AgentPort for CodexDriver {
                 if !self.loaded.lock().await.contains(id) {
                     return unsupported("Codex queued delivery requires an owned live thread");
                 }
-                self.queue().push(
+                return self.enqueue_prompt(
                     id,
-                    Queued {
-                        id: format!("inbox_{}", uuid::Uuid::new_v4().simple()),
-                        created_ms: now_ms(),
-                        delivery: Delivery::Queue,
-                        text: text.to_owned(),
-                        files: prepared.files,
-                        input,
-                    },
-                )?;
-                self.signal(InboxSignal::Changed(id.into()));
-                return Ok(());
+                    text,
+                    prepared.files,
+                    input,
+                    delivery.unwrap_or(Delivery::Steer),
+                );
             }
             if delivery == Some(Delivery::Steer) {
                 self.prepare_shared_interaction(id).await?;
@@ -2325,6 +2591,10 @@ impl AgentPort for CodexDriver {
                 self.require_native_interaction(id).await?;
                 if !self.loaded.lock().await.contains(id) {
                     return unsupported("Codex steering requires an owned live thread");
+                }
+                // Compaction may have begun while preparing the interaction.
+                if self.client.is_compacting(id) {
+                    return self.enqueue_prompt(id, text, prepared.files, input, Delivery::Steer);
                 }
                 let turn = self.client.active_turn(id).ok_or_else(|| {
                     AgentError::InvalidRequest(
@@ -2855,53 +3125,14 @@ impl AgentPort for CodexDriver {
             let _history_read = self.history.lock().await;
             let mut page = HistoryPage::default();
             let (mut order, epoch) = self.order_candidate(id);
-            let items = match thread["historyMode"].as_str() {
-                Some("paginated") => {
-                    self.read_history_batch(id, limit, &mut page, &mut budget, &mut order)
-                        .await?
-                }
-                Some("legacy") => {
-                    let response = budget
-                        .call(
-                            &self.client,
-                            "thread/read",
-                            json!({"threadId":id,"includeTurns":true}),
-                        )
-                        .await?;
-                    if response["thread"]["id"] != id {
-                        return Err(AgentError::Protocol(
-                            "Codex history identity mismatch".into(),
-                        ));
-                    }
-                    let turns = response["thread"]["turns"].as_array().ok_or_else(|| {
-                        AgentError::Protocol("invalid Codex legacy history".into())
-                    })?;
-                    for turn in turns {
-                        let turn_id = mapper::string(turn, "id")?;
-                        if turn.get("itemsView").is_some_and(|view| view != "full") {
-                            return Err(AgentError::Protocol(
-                                "incomplete Codex legacy turn".into(),
-                            ));
-                        }
-                        if let Some(rows) = turn["items"].as_array() {
-                            budget.rows(rows.len())?;
-                            let ids = rows
-                                .iter()
-                                .map(|row| mapper::string(row, "id"))
-                                .collect::<Result<Vec<_>, _>>()?;
-                            Self::rebase_prepared_order(id, &turn_id, &ids, &mut order)?;
-                            for row in rows {
-                                page.pending.push(json!({"turnId":turn_id,"item":row,
-                                    "startedAtMs":turn["startedAt"].as_u64().unwrap_or(0).saturating_mul(1000)}));
-                            }
-                        }
-                    }
-                    page.started = true;
-                    self.read_history_batch(id, limit, &mut page, &mut budget, &mut order)
-                        .await?
-                }
+            page.legacy_turns = match thread["historyMode"].as_str() {
+                Some("legacy") => true,
+                Some("paginated") => false,
                 _ => return unsupported("Codex thread history storage mode"),
             };
+            let items = self
+                .read_history_batch(id, limit, &mut page, &mut budget, &mut order)
+                .await?;
             // Finish every async preparation before exposing the candidate.
             // A usage-lock wait, timeout or cancellation cannot reset history.
             if let Some(prepared) = &prepared {
@@ -3080,6 +3311,270 @@ mod history_tests {
     use crate::agents::use_cases::SessionService;
     use std::future::Future;
     use std::task::Poll;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shared_question_recovery_failure_does_not_reject_selection_or_publish_partial_forms() {
+        use crate::agents::adapters::codex::client::websocket::tests::Fixture as SharedFixture;
+        for scenario in ["wrong_turn", "cycle", "wire_budget"] {
+            let page = std::sync::atomic::AtomicUsize::new(0);
+            let mut fixture = SharedFixture::new(move |request| match request["method"].as_str().unwrap() {
+                "thread/read" | "thread/resume" => json!({"thread":{"id":"live","historyMode":"paginated","status":{"type":"active","activeFlags":[]}}}),
+                "thread/turns/list" => json!({"data":[{"id":"turn","status":"inProgress"}]}),
+                "thread/items/list" if request["params"]["turnId"].is_null() => json!({"data":[],"nextCursor":null}),
+                "thread/items/list" => match scenario {
+                    "wrong_turn" => json!({"data":[{"turnId":"old-turn","item":{"id":"q","type":"agentMessage","questions":[{"title":"Old?"}]}}],"nextCursor":null}),
+                    "cycle" => json!({"data":[],"nextCursor":"same"}),
+                    _ => json!({"data":[{"turnId":"turn","item":{"id":"q","type":"agentMessage","questions":[{"title":"Unverified?"}],"text":"x".repeat(1024*1024)}}],"nextCursor":page.fetch_add(1,std::sync::atomic::Ordering::SeqCst).to_string()}),
+                },
+                other => panic!("unexpected RPC {other}"),
+            }).await;
+            let driver = CodexDriver::new(fixture.client.clone());
+            driver.prepare_selected_session("live").await.unwrap();
+            driver.get_timeline("live", 10).await.unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while !driver.question_recoveries.lock().await.scheduled.is_empty() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            driver.get_session("live").await.unwrap();
+            assert!(driver.get_pending_forms("live").await.unwrap().is_empty());
+            while let Ok(event) = fixture.events.try_recv() {
+                assert!(
+                    !matches!(event, super::super::CodexEvent::RecoveredQuestions { .. }),
+                    "{scenario}"
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shared_question_recovery_is_nonblocking_deduplicated_and_fenced_in_flight() {
+        use super::super::CodexEvent;
+        use crate::agents::adapters::codex::client::websocket::tests::Fixture as SharedFixture;
+        for scenario in ["pending", "completed", "new_turn", "unloaded", "cancelled"] {
+            let gate = Arc::new(tokio::sync::Notify::new());
+            let mut fixture = SharedFixture::with_deferred(|request| match request["method"].as_str().unwrap() {
+                "thread/read" | "thread/resume" => json!({"thread":{"id":"live","historyMode":"paginated","status":{"type":"active","activeFlags":[]}}}),
+                "thread/turns/list" => json!({"data":[{"id":"turn","status":"inProgress"}]}),
+                "thread/items/list" => json!({"data":[{"turnId":"turn","item":{"id":"q","type":"agentMessage","questions":[{"title":"Pending?"}]}}],"nextCursor":null}),
+                other => panic!("unexpected RPC {other}"),
+            }, Some(("thread/items/list", gate.clone()))).await;
+            let driver = CodexDriver::new(fixture.client.clone());
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                driver.prepare_selected_session("live"),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while !fixture
+                    .requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|r| r["method"] == "thread/items/list")
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            // The recovery is held on a separate reader; foreground metadata
+            // still works and repeated selections cannot fan out more readers.
+            driver.get_session("live").await.unwrap();
+            driver
+                .schedule_question_recovery("live", Some("paginated"))
+                .await;
+            assert_eq!(driver.question_recoveries.lock().await.scheduled.len(), 1);
+            assert_eq!(
+                fixture
+                    .requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|r| r["method"] == "thread/items/list")
+                    .count(),
+                1
+            );
+            if scenario == "cancelled" {
+                fixture.client.stop();
+            } else if scenario != "pending" {
+                let (method, params) = match scenario {
+                    "completed" => (
+                        "turn/completed",
+                        json!({"threadId":"live","turn":{"id":"turn","status":"completed"}}),
+                    ),
+                    "new_turn" => (
+                        "turn/started",
+                        json!({"threadId":"live","turn":{"id":"next","status":"inProgress"}}),
+                    ),
+                    _ => ("thread/closed", json!({"threadId":"live"})),
+                };
+                fixture
+                    .send
+                    .send(json!({"method":method,"params":params}))
+                    .await
+                    .unwrap();
+                loop {
+                    let event = tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        fixture.events.recv(),
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap();
+                    if matches!(event, CodexEvent::Notification {method: current, ..} if current == method)
+                    {
+                        break;
+                    }
+                }
+            }
+            gate.notify_one();
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while !driver.question_recoveries.lock().await.scheduled.is_empty() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let mut recovered = 0;
+            while let Ok(event) = fixture.events.try_recv() {
+                if matches!(event, CodexEvent::RecoveredQuestions { .. }) {
+                    recovered += 1;
+                }
+            }
+            assert_eq!(recovered, usize::from(scenario == "pending"), "{scenario}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn question_recovery_queues_fifth_session_without_reselection() {
+        use super::super::CodexEvent;
+        use crate::agents::adapters::codex::client::websocket::tests::Fixture as SharedFixture;
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let mut fixture = SharedFixture::with_deferred(|request| match request["method"].as_str().unwrap() {
+            "thread/read" | "thread/resume" => json!({"thread":{"id":request["params"]["threadId"],"historyMode":"paginated","status":{"type":"active","activeFlags":[]}}}),
+            "thread/turns/list" => json!({"data":[{"id":"turn","status":"inProgress"}]}),
+            "thread/items/list" => json!({"data":[{"turnId":request["params"]["turnId"],"item":{"id":"q","type":"agentMessage","questions":[{"title":"Pending?"}]}}],"nextCursor":null}),
+            other => panic!("unexpected RPC {other}"),
+        }, Some(("thread/items/list", gate.clone()))).await;
+        let driver = CodexDriver::new(fixture.client.clone());
+        for n in 0..5 {
+            driver
+                .prepare_selected_session(&format!("thread-{n}"))
+                .await
+                .unwrap();
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while fixture
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|r| r["method"] == "thread/items/list")
+                .count()
+                < 4
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        {
+            let state = driver.question_recoveries.lock().await;
+            assert_eq!(state.workers, 4);
+            assert_eq!(state.pending.len(), 1);
+            assert_eq!(state.scheduled.len(), 5);
+        }
+        fixture.send.send(json!({"method":"turn/started","params":{"threadId":"thread-4","turn":{"id":"next-turn","status":"inProgress"}}})).await.unwrap();
+        loop {
+            let event =
+                tokio::time::timeout(std::time::Duration::from_secs(2), fixture.events.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            if matches!(event, CodexEvent::Notification {method, ..} if method == "turn/started") {
+                break;
+            }
+        }
+        driver
+            .schedule_question_recovery("thread-4", Some("paginated"))
+            .await;
+        assert_eq!(driver.question_recoveries.lock().await.pending.len(), 1);
+        gate.notify_waiters();
+        // A permit is retained even if the fifth worker has not reached its
+        // fixture gate yet. No new selection/refresh is needed to trigger it.
+        gate.notify_one();
+        let mut recovered = HashMap::new();
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while recovered.len() < 5 {
+                if let Some(CodexEvent::RecoveredQuestions { thread, turn, .. }) =
+                    fixture.events.recv().await
+                {
+                    recovered.insert(thread, turn);
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            recovered.get("thread-4").map(String::as_str),
+            Some("next-turn")
+        );
+        assert!(fixture.client.is_ready());
+    }
+
+    #[tokio::test]
+    async fn legacy_turn_pages_open_large_threads_and_preserve_cursor_until_acceptance() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let invalid = Arc::new(AtomicBool::new(false));
+        let invalid_response = invalid.clone();
+        let mut fixture = Fixture::new(move |request| match request["method"].as_str().unwrap() {
+            "thread/read" => {
+                assert_eq!(request["params"]["includeTurns"], false, "never hydrate all 30,000 historical items");
+                let mut thread = golden()["thread"].clone();
+                thread["historyMode"] = json!("legacy");
+                json!({"thread":thread})
+            }
+            "thread/turns/list" => {
+                assert_eq!(request["params"]["limit"], 1);
+                assert_eq!(request["params"]["sortDirection"], "desc");
+                assert_eq!(request["params"]["itemsView"], "full");
+                let index = request["params"]["cursor"].as_str().map(|v| v.parse::<usize>().unwrap()).unwrap_or(300);
+                assert!(index >= 298, "only the requested turns may be hydrated");
+                let rows: Vec<_> = if index == 300 { vec![] } else {
+                    (0..100).map(|n| json!({"id":format!("item-{index}-{n}"),"type":"agentMessage","text":format!("{index}-{n}")})).collect()
+                };
+                json!({"data":[{"id":format!("turn-{index:04}"),"itemsView":if invalid_response.load(Ordering::Acquire) {"notLoaded"} else {"full"},"items":rows}],"nextCursor":(index-1).to_string()})
+            }
+            other => panic!("unexpected RPC {other}"),
+        }).await;
+        fixture.ready().await;
+        let driver = CodexDriver::new(fixture.client.clone());
+        let id = golden()["thread"]["id"].as_str().unwrap().to_owned();
+        let tail = driver.get_timeline(&id, 80).await.unwrap();
+        assert_eq!(tail.len(), 80);
+        assert!(matches!(&tail[0].part, AgentPart::Text{text} if text == "299-20"));
+        // Prepared/cancelled refreshes and malformed provider pages must leave
+        // the accepted earlier cursor and residual untouched.
+        drop(driver.prepare_timeline(&id, 80).await.unwrap());
+        invalid.store(true, Ordering::Release);
+        assert!(driver.get_timeline(&id, 80).await.is_err());
+        invalid.store(false, Ordering::Release);
+        let older = driver.load_earlier_timeline(&id, 80).await.unwrap();
+        assert_eq!(older.len(), 80);
+        assert!(matches!(&older[0].part, AgentPart::Text{text} if text == "298-40"));
+        assert!(matches!(&older[79].part, AgentPart::Text{text} if text == "299-19"));
+        assert!(older.last().unwrap().sort_key() < tail[0].sort_key());
+        let ids: HashSet<_> = older.iter().chain(tail.iter()).map(|row| &row.id).collect();
+        assert_eq!(ids.len(), 160);
+    }
 
     // A notification after the fixture's RPC response proves the client reader
     // delivered that reply. The test can then poll precisely to the blocked
@@ -3618,7 +4113,7 @@ mod history_tests {
         spawn["status"] = json!("completed");
         spawn["receiverThreadIds"] = json!(["child-a", "child-b"]);
         let prepared = driver
-            .prepare_completed_turn("thread", "turn", &[spawn], true)
+            .prepare_completed_turn("thread", "turn", &[spawn], true, false)
             .unwrap();
         assert_eq!(prepared.items.len(), 2);
         let children: Vec<_> = prepared.items.iter().map(|row| row.id.clone()).collect();
@@ -3698,10 +4193,11 @@ mod history_tests {
                 "turn",
                 &[values[2].clone(), values[0].clone(), values[1].clone()],
                 true,
+                false,
             )
             .unwrap();
         let prepared = driver
-            .prepare_completed_turn("thread", "turn", &values, true)
+            .prepare_completed_turn("thread", "turn", &values, true, false)
             .unwrap();
         mirror.accept_live_history(&asid, prepared).await.unwrap();
         let accepted = mirror.get_snapshot(&asid).await.unwrap();
@@ -3744,6 +4240,7 @@ mod history_tests {
                 "thread",
                 "turn",
                 &[values[2].clone(), values[0].clone()],
+                false,
                 false,
             )
             .unwrap();

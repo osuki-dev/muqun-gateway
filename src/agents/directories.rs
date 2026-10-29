@@ -62,6 +62,108 @@ const SKIPPED: &[&str] = &[
     "__pycache__",
 ];
 pub(crate) const MAX_RESULTS: usize = 30;
+
+/// Keyword search starts at home, including linked workspaces, with cycle detection.
+/// Explicit path completion remains available for intentionally excluded folders.
+pub(crate) async fn search(query: &str, home: Option<&Path>) -> Completion {
+    let query = query.trim().to_lowercase();
+    let Some(home) = home.filter(|_| !query.is_empty() && query.len() <= 256) else {
+        return Completion::default();
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(250);
+    let mut pending = std::collections::VecDeque::from([(home.to_path_buf(), 0usize)]);
+    let mut result = Completion::default();
+    let mut visited = std::collections::HashSet::new();
+    let mut read = 0usize;
+    while let Some((dir, depth)) = pending.pop_front() {
+        let canonical = match tokio::time::timeout_at(deadline, tokio::fs::canonicalize(&dir)).await
+        {
+            Ok(Ok(path)) => path,
+            Ok(Err(_)) => continue,
+            Err(_) => {
+                result.truncated = true;
+                break;
+            }
+        };
+        if !visited.insert(canonical) {
+            continue;
+        }
+        let mut entries = match tokio::time::timeout_at(deadline, tokio::fs::read_dir(&dir)).await {
+            Ok(Ok(entries)) => entries,
+            Ok(Err(_)) => continue,
+            Err(_) => {
+                result.truncated = true;
+                break;
+            }
+        };
+        loop {
+            if read >= 10_000 {
+                result.truncated = true;
+                return result;
+            }
+            let entry = match tokio::time::timeout_at(deadline, entries.next_entry()).await {
+                Ok(Ok(Some(entry))) => entry,
+                Ok(_) => break,
+                Err(_) => {
+                    result.truncated = true;
+                    return result;
+                }
+            };
+            read += 1;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.')
+                || SKIPPED.contains(&name.as_str())
+                || matches!(
+                    name.as_str(),
+                    "Library" | "AppData" | "Applications" | "vendor" | "venv"
+                )
+            {
+                continue;
+            }
+            let kind = match tokio::time::timeout_at(deadline, entry.file_type()).await {
+                Ok(Ok(kind)) => kind,
+                Ok(Err(_)) => continue,
+                Err(_) => {
+                    result.truncated = true;
+                    return result;
+                }
+            };
+            let is_dir = if kind.is_symlink() {
+                match tokio::time::timeout_at(deadline, tokio::fs::metadata(entry.path())).await {
+                    Ok(Ok(metadata)) => metadata.is_dir(),
+                    Ok(Err(_)) => false,
+                    Err(_) => {
+                        result.truncated = true;
+                        return result;
+                    }
+                }
+            } else {
+                kind.is_dir()
+            };
+            if !is_dir {
+                continue;
+            }
+            let path = entry.path();
+            if name.to_lowercase().contains(&query) {
+                result.directories.push(DirectoryEntry {
+                    name,
+                    path: path.to_string_lossy().into_owned(),
+                });
+                if result.directories.len() >= MAX_RESULTS {
+                    result.truncated = true;
+                    return result;
+                }
+            }
+            if depth < 8 {
+                pending.push_back((path, depth + 1));
+            } else {
+                result.truncated = true;
+            }
+        }
+    }
+    result.directories.sort_by(|a, b| a.path.cmp(&b.path));
+    result
+}
 const MAX_ENTRIES_READ: usize = 2000;
 const READ_BUDGET: Duration = Duration::from_millis(50);
 
@@ -183,6 +285,65 @@ mod tests {
 
     fn names(c: &Completion) -> Vec<&str> {
         c.directories.iter().map(|d| d.name.as_str()).collect()
+    }
+
+    #[tokio::test]
+    async fn keyword_search_finds_nested_folders_and_excludes_generated_and_private_trees() {
+        let home = scratch("keyword");
+        for path in [
+            "Work/MyProject",
+            "Documents/project-notes",
+            ".private/project-secret",
+            "Library/project-cache",
+            "Work/node_modules/project-dependency",
+        ] {
+            std::fs::create_dir_all(home.join(path)).unwrap();
+        }
+        let result = search("PROJECT", Some(&home)).await;
+        assert_eq!(result.directories.len(), 2);
+        assert!(result
+            .directories
+            .iter()
+            .all(|entry| entry.path.starts_with(home.to_str().unwrap())));
+        assert!(names(&result).contains(&"MyProject"));
+        assert!(names(&result).contains(&"project-notes"));
+        assert!(search("", Some(&home)).await.directories.is_empty());
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn keyword_search_includes_linked_workspaces_without_following_cycles() {
+        let home = scratch("keyword-home");
+        let outside = scratch("keyword-outside");
+        std::fs::create_dir_all(outside.join("project-secret")).unwrap();
+        std::os::unix::fs::symlink(&outside, home.join("linked")).unwrap();
+        std::os::unix::fs::symlink(&home, home.join("loop")).unwrap();
+        let result = search("project", Some(&home)).await;
+        assert_eq!(result.directories.len(), 1);
+        assert_eq!(
+            result.directories[0].path,
+            home.join("linked/project-secret").to_string_lossy()
+        );
+        assert!(!result.truncated);
+        assert_eq!(
+            search("linked", Some(&home)).await.directories[0].name,
+            "linked"
+        );
+        std::fs::remove_dir_all(home).unwrap();
+        std::fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[tokio::test]
+    async fn keyword_search_reports_result_limit() {
+        let home = scratch("keyword-limit");
+        for i in 0..MAX_RESULTS + 1 {
+            std::fs::create_dir(home.join(format!("project-{i}"))).unwrap();
+        }
+        let result = search("project", Some(&home)).await;
+        assert_eq!(result.directories.len(), MAX_RESULTS);
+        assert!(result.truncated);
+        std::fs::remove_dir_all(home).unwrap();
     }
 
     #[test]

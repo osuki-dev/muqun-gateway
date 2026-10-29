@@ -599,8 +599,11 @@ mod tests {
         let scope = scope("huge", "p", 2);
         feed(&repository, &scope, &["x".repeat(MAX_PAGE_BYTES)]);
         assert_eq!(
-            read_page(&repository, scope, None).await,
-            Err(HistoryError::TooLarge)
+            read_page(&repository, scope, None).await.unwrap()["rows"][0]
+                .as_str()
+                .unwrap()
+                .len(),
+            MAX_PAGE_BYTES
         );
     }
 }
