@@ -478,6 +478,9 @@ impl Context {
         if !self.track(thread).await {
             return;
         }
+        // Restore only Gateway-authored, native-correlated presentation records.
+        // No record or old native echoes without clientId preserve the full text.
+        let _ = self.driver.restore_prompt_presentations(thread).await;
         let asid = AgentSessionId(thread.into());
         let acceptance = self.mirror.timeline_commit_gate(&asid).await;
         let _acceptance = acceptance.lock().await;
@@ -971,34 +974,62 @@ mod tests {
         /// How the fixture answers `turn/steer`: "ok", "reject" or "mismatch".
         steer: Arc<std::sync::Mutex<&'static str>>,
         thread: String,
+        _presentation_directory:
+            Option<crate::agents::adapters::codex::daemon::tests::TestDirectory>,
     }
 
     impl Queue {
         async fn new() -> Self {
+            Self::new_with_store(false).await
+        }
+
+        async fn new_with_store(presented: bool) -> Self {
+            let directory =
+                presented.then(crate::agents::adapters::codex::daemon::tests::TestDirectory::new);
             let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
             let steer = Arc::new(std::sync::Mutex::new("ok"));
             let (seen, steering) = (sent.clone(), steer.clone());
-            let mut fixture = Fixture::new_reply(move |request| {
-                let method = request["method"].as_str().unwrap();
-                if matches!(method, "turn/start" | "turn/steer") {
-                    seen.lock().unwrap().push(request.clone());
-                }
-                Ok(match method {
-                    "thread/start" | "thread/read" => json!({"thread":golden()["thread"]}),
-                    "turn/start" => json!({"turn":{"id":"accepted","status":"inProgress"}}),
-                    "turn/steer" => match *steering.lock().unwrap() {
-                        "reject" => return Err(json!({"code":-32600,"message":"no active turn"})),
-                        "mismatch" => json!({"turnId":"another-turn"}),
-                        _ => json!({"turnId":request["params"]["expectedTurnId"]}),
-                    },
-                    other => panic!("unexpected RPC {other}"),
-                })
-            })
+            let mut fixture = Fixture::new_reply_in_cwd(
+                move |request| {
+                    let method = request["method"].as_str().unwrap();
+                    if matches!(method, "turn/start" | "turn/steer") {
+                        seen.lock().unwrap().push(request.clone());
+                    }
+                    Ok(match method {
+                        "thread/start" | "thread/read" => json!({"thread":golden()["thread"]}),
+                        "turn/start" => json!({"turn":{"id":"accepted","status":"inProgress"}}),
+                        "turn/steer" => match *steering.lock().unwrap() {
+                            "reject" => {
+                                return Err(json!({"code":-32600,"message":"no active turn"}))
+                            }
+                            "mismatch" => json!({"turnId":"another-turn"}),
+                            _ => json!({"turnId":request["params"]["expectedTurnId"]}),
+                        },
+                        other => panic!("unexpected RPC {other}"),
+                    })
+                },
+                None,
+                directory.as_ref().map(|directory| directory.0.clone()),
+            )
             .await;
             fixture.ready().await;
             let (signal_tx, signals) = mpsc::unbounded_channel();
             let mut driver = CodexDriver::new(fixture.client.clone());
             driver.observe_inbox(signal_tx);
+            if let Some(directory) = &directory {
+                let db = crate::platform::store::sqlite::SqliteStore::open(
+                    &directory.0.join("store.sqlite"),
+                    None,
+                    &[
+                        crate::agents::adapters::codex::native_sessions::MIGRATION,
+                        crate::agents::adapters::codex::native_sessions::PRESENTATION_MIGRATION,
+                    ],
+                )
+                .unwrap();
+                driver.restore_native_sessions(Some(
+                    crate::agents::adapters::codex::native_sessions::NativeSessions::new(db),
+                ));
+            }
             let driver = Arc::new(driver);
             let session = driver.create_session(None, None, None).await.unwrap();
             let mirror = Arc::new(MemoryMirror::for_agent("codex"));
@@ -1021,6 +1052,7 @@ mod tests {
                 sent,
                 steer,
                 thread: session.asid.0,
+                _presentation_directory: directory,
             }
         }
 
@@ -1114,6 +1146,58 @@ mod tests {
             .iter()
             .map(|item| item["payload"]["text"].as_str().unwrap())
             .collect()
+    }
+
+    #[tokio::test]
+    async fn computer_context_presentation_survives_queue_and_steer_without_changing_native_input()
+    {
+        let mut q = Queue::new_with_store(true).await;
+        q.send("start", None).await.unwrap();
+        q.turn_started("t1").await;
+        let queued = "queued user text\n\ncontext with machine-uuid";
+        q.driver
+            .send_prompt_with_display(&q.thread, queued, "queued user text", &[], Some("queue"))
+            .await
+            .unwrap();
+        let (inbox, _) = q.publish().await;
+        assert_eq!(texts(&inbox), ["queued user text"]);
+        let steered = "steered user text\n\ncontext with machine-uuid";
+        q.driver
+            .send_prompt_with_display(&q.thread, steered, "steered user text", &[], Some("steer"))
+            .await
+            .unwrap();
+        let steer = q.sent.lock().unwrap()[1]["params"].clone();
+        assert_eq!(steer["input"][0]["text"], steered);
+        assert!(steer["clientUserMessageId"].as_str().is_some());
+        let thread = q.thread.clone();
+        q.notify("item/started", json!({"threadId":thread,"turnId":"t1","item":{"id":"steered-user","type":"userMessage","clientId":steer["clientUserMessageId"],"content":steer["input"]}})).await;
+        let snapshot = q
+            .mirror
+            .get_snapshot(&AgentSessionId(thread.clone()))
+            .await
+            .unwrap();
+        assert!(snapshot
+            .timeline
+            .iter()
+            .any(|row| matches!(&row.part, AgentPart::Text {text} if text == "steered user text")));
+        q.turn_completed("t1", "completed").await;
+        q.wait_delivered(3).await;
+        let queued_native = q.sent.lock().unwrap()[2]["params"].clone();
+        assert_eq!(queued_native["input"][0]["text"], queued);
+        assert_ne!(
+            queued_native["clientUserMessageId"],
+            steer["clientUserMessageId"]
+        );
+        q.notify("item/started", json!({"threadId":thread,"turnId":"accepted","item":{"id":"queued-user","type":"userMessage","clientId":queued_native["clientUserMessageId"],"content":queued_native["input"]}})).await;
+        let snapshot = q
+            .mirror
+            .get_snapshot(&AgentSessionId(thread))
+            .await
+            .unwrap();
+        assert!(snapshot
+            .timeline
+            .iter()
+            .any(|row| matches!(&row.part, AgentPart::Text {text} if text == "queued user text")));
     }
 
     #[tokio::test]

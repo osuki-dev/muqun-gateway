@@ -12,6 +12,7 @@ mod launch;
 pub mod mapper;
 mod mcp;
 pub(crate) mod native_sessions;
+mod presentation;
 pub(crate) mod process_tree;
 pub(crate) mod rollout;
 pub(crate) mod rollout_projection;

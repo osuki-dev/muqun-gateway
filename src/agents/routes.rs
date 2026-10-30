@@ -1295,14 +1295,15 @@ async fn do_send_agent_prompt(
         .map_err(super::computer_context::ComputerContextError::before_dispatch)?;
         format!("{}\n\n{}", body.text, context)
     } else {
-        body.text
+        body.text.clone()
     };
     let attachments = body.attachments.as_deref().unwrap_or(&[]);
     manager
         .prompts()
-        .send_prompt(
+        .send_prompt_with_display(
             &AgentSessionId(asid.to_string()),
             &text,
+            &body.text,
             attachments,
             body.delivery.as_deref(),
         )
