@@ -684,6 +684,9 @@ mod tests {
     async fn spawn_uses_explicit_argv_cwd_and_provider_without_fx_policy() {
         let cwd = std::env::temp_dir().join(format!("muqun-acp-argv-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&cwd).unwrap();
+        // macOS temp_dir may use /var while sh reports /private/var in PWD.
+        // Keep the fixture's literal cwd/argv assertion on one physical path.
+        let cwd = std::fs::canonicalize(&cwd).unwrap();
         let script = r#"
             test "$PWD" = "$1" || exit 1
             IFS= read -r first
