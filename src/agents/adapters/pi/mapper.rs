@@ -402,7 +402,7 @@ pub enum LiveChange {
     Status(AgentSessionStatus),
     Upsert(Vec<TimelineItem>),
     Remove(Vec<String>),
-    Permission(PermissionRequest),
+    Permission(Box<PermissionRequest>),
     PermissionResolved(String),
     Title(String),
     Compaction {
@@ -832,7 +832,7 @@ impl LiveFolder {
         if method == "confirm" && text(record, "title") == Some(PERMISSION_TITLE) {
             if let Some(request) = self.permission(id, text(record, "message")) {
                 self.pending_permissions.insert(id.to_string());
-                return vec![LiveChange::Permission(request)];
+                return vec![LiveChange::Permission(Box::new(request))];
             }
         }
         // A dialog nobody will see, or our own with an unreadable payload:

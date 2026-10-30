@@ -69,7 +69,10 @@ impl SessionStore {
     /// matched exactly, because the directory name is lossy (`/a-b` and `/a/b`
     /// collide).
     pub async fn list(&self, cwd: Option<&str>) -> Result<Vec<SessionFile>, AgentError> {
-        let mut dirs = Vec::new();
+        // The root itself too: with `--session-dir`,
+        // `PI_CODING_AGENT_SESSION_DIR` or the `sessionDir` setting Pi writes
+        // files flat into the directory instead of per-cwd buckets.
+        let mut dirs = vec![self.root.clone()];
         match cwd {
             Some(cwd) => dirs.push(self.root.join(Self::dir_for_cwd(cwd))),
             None => {

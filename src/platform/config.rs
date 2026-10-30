@@ -131,6 +131,9 @@ pub(crate) struct Config {
     /// The T3 Code agent adapter: off unless `enabled` or `url` is set.
     #[serde(default, skip_serializing_if = "is_default_t3")]
     pub(crate) t3: agents::T3Config,
+    /// The Pi agent adapter: on, attached once a `pi` binary is found.
+    #[serde(default, skip_serializing_if = "is_default_pi")]
+    pub(crate) pi: agents::PiConfig,
     /// Private Codex app-server support is on unless explicitly disabled.
     /// Authentication and permission configuration remain owned by Codex.
     #[serde(default, skip_serializing_if = "is_default_codex")]
@@ -316,6 +319,10 @@ pub(crate) fn is_default_deepseek(config: &agents::DeepseekConfig) -> bool {
 
 pub(crate) fn is_default_t3(config: &agents::T3Config) -> bool {
     *config == agents::T3Config::default()
+}
+
+pub(crate) fn is_default_pi(config: &agents::PiConfig) -> bool {
+    *config == agents::PiConfig::default()
 }
 
 pub(crate) fn is_default_codex(config: &agents::runtime::CodexConfig) -> bool {

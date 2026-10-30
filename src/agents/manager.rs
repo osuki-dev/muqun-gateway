@@ -640,6 +640,61 @@ impl AgentManager {
         )
     }
 
+    /// Build a manager for local Pi children. There is no stream to lose:
+    /// the driver's channel lives as long as the driver, and each child's
+    /// records reach it until that child exits.
+    pub fn connect_pi(
+        driver: Arc<crate::agents::adapters::pi::PiDriver>,
+        version: Option<String>,
+        events_tx: broadcast::Sender<AgentDomainEvent>,
+    ) -> Self {
+        let mirror = Arc::new(MemoryMirror::for_agent(driver.kind()));
+        let mut records = driver.subscribe();
+        let ctx = Arc::new(pi::PiEventContext {
+            driver: driver.clone(),
+            mirror: mirror.clone(),
+            tx: events_tx.clone(),
+        });
+        // The driver owns the sending side and outlives every child, so the
+        // pump ends on the driver's shutdown rather than on a closed channel.
+        let stopped = driver.stopped();
+        tokio::spawn(async move {
+            loop {
+                let received = tokio::select! {
+                    _ = stopped.cancelled() => break,
+                    received = records.recv() => received,
+                };
+                match received {
+                    Ok((asid, record)) => pi::handle_pi_record(&asid, &record, &ctx).await,
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::warn!(skipped, "pi event backlog overflowed, resyncing");
+                        ctx.emit(AgentDomainEvent::Resync {
+                            asid: AgentSessionId(String::new()),
+                            reason: "event_backlog_overflow".to_string(),
+                        });
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+            tracing::debug!("pi event pump wound down");
+        });
+        driver.start_reaper();
+        tracing::info!(
+            version = version.as_deref().unwrap_or("unknown"),
+            "agent manager initialized with the Pi agent"
+        );
+        let shutdown = driver.clone();
+        Self::assemble(
+            driver,
+            mirror,
+            events_tx,
+            crate::agents::adapters::pi::ENDPOINT.to_string(),
+            version,
+            Arc::new(|| true),
+            Arc::new(move || shutdown.shutdown()),
+        )
+    }
+
     /// A manager over a caller-supplied agent with no event stream, for
     /// route and service tests.
     #[cfg(test)]
@@ -1780,6 +1835,7 @@ impl AgentManager {
 
 mod codex;
 mod deepseek;
+mod pi;
 mod t3;
 
 #[cfg(test)]

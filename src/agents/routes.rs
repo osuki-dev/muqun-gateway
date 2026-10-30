@@ -5779,15 +5779,17 @@ mod tests {
     async fn vcs_files_and_file_answer_from_git_for_any_agent() {
         // Keep fixture construction out of this multi-route test's large future.
         let (state, root, _repo) = Box::pin(vcs_state("agent-vcs-files")).await;
+        // Each call boxed too: `AppState` is held by value and grows with
+        // every agent's config block.
         let files = |asid: &str, mode: Option<&str>| {
-            get_agent_vcs_files(
+            Box::pin(get_agent_vcs_files(
                 State(state.clone()),
                 Path(asid.to_string()),
                 Query(AgentVcsDiffQuery {
                     mode: mode.map(str::to_string),
                 }),
                 device_headers(),
-            )
+            ))
         };
 
         let Json(answer) = files("ses_git", None).await.expect("lists");

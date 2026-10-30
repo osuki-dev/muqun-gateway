@@ -21,9 +21,10 @@ The retired `herdr.gateway` identifier remains only for migration compatibility.
   - `ports/`: `AgentPort` (`ports/agent.rs`) and `SessionMirrorPort`.
   - `adapters/`: OpenCode, DeepSeek, Codex (`adapters/codex/`, private app-server
     stdio or verified shared-daemon Unix WebSocket; wire reference in `docs/codex-protocol.md`), T3 Code (`adapters/t3/`,
-    Effect RPC over a WebSocket; wire reference in `docs/t3-protocol.md`), and the in-memory
+    Effect RPC over a WebSocket; wire reference in `docs/t3-protocol.md`), Pi (`adapters/pi/`,
+    one `pi --mode rpc` child per session in use; wire reference in `docs/pi-protocol.md`), and the in-memory
     mirror adapter. Each adapter's event stream is folded into domain events
-    by a module under `manager/` (`deepseek.rs`, `t3.rs`, `codex.rs`).
+    by a module under `manager/` (`deepseek.rs`, `t3.rs`, `codex.rs`, `pi.rs`).
   - `manager.rs`, `runtime.rs`, `use_cases/`: agent supervision and the
     session/prompt/interaction services. `runtime/t3.rs` holds T3's config
     block, its pairing-token-to-bearer credential (persisted by

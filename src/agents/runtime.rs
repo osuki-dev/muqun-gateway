@@ -28,7 +28,10 @@ pub use codex::CodexConfig;
 pub(crate) mod deepseek;
 pub(crate) mod fx;
 pub use fx::FxConfig;
+mod pi;
 mod t3;
+pub use pi::PiConfig;
+use pi::PiState;
 use t3::{catalog_entry, T3State};
 pub use t3::{T3Config, DEFAULT_T3_URL};
 
@@ -60,7 +63,7 @@ const VERSION_OUTPUT_LIMIT: u64 = 4096;
 
 /// Preference among attached providers. Explicit provider/session selections
 /// retain their route; discovery additionally puts usable providers first.
-pub const AGENT_PREFERENCE: [&str; 5] = ["codex", "opencode", "deepseek", "t3", "fx"];
+pub const AGENT_PREFERENCE: [&str; 6] = ["codex", "opencode", "deepseek", "t3", "fx", "pi"];
 /// Most session-to-agent routes remembered; the oldest go first.
 const MAX_SESSION_ROUTES: usize = 4096;
 /// How long an agent discovery result is reused.
@@ -282,6 +285,7 @@ pub struct AgentRuntime {
     config: OpencodeConfig,
     deepseek_config: DeepseekConfig,
     t3: T3State,
+    pi: PiState,
     codex: codex::CodexState,
     fx: fx::FxState,
     /// The harness this gateway started, if any. Not a kill handle.
@@ -401,10 +405,35 @@ impl AgentRuntime {
         fx_config: FxConfig,
         state_dir: Option<std::path::PathBuf>,
     ) -> Arc<Self> {
+        // Pi is on by default in `config.json`, but a caller that names no
+        // Pi block (tests, offline tools) must not depend on the host's PATH.
+        Self::with_pi_configs(
+            config,
+            deepseek_config,
+            t3_config,
+            codex_config,
+            fx_config,
+            PiConfig::disabled(),
+            state_dir,
+        )
+    }
+
+    /// Every agent's configuration, Pi included; what the gateway and the
+    /// CLI build from `config.json`.
+    pub fn with_pi_configs(
+        config: OpencodeConfig,
+        deepseek_config: DeepseekConfig,
+        t3_config: T3Config,
+        codex_config: CodexConfig,
+        fx_config: FxConfig,
+        pi_config: PiConfig,
+        state_dir: Option<std::path::PathBuf>,
+    ) -> Arc<Self> {
         Self::with_states(
             config,
             deepseek_config,
-            T3State::new(t3_config, state_dir),
+            T3State::new(t3_config, state_dir.clone()),
+            PiState::new(pi_config, state_dir),
             codex::CodexState::new(codex_config),
             fx::FxState::new(fx_config),
         )
@@ -419,6 +448,7 @@ impl AgentRuntime {
             config,
             deepseek_config,
             t3,
+            PiState::new(PiConfig::disabled(), None),
             codex::CodexState::new(CodexConfig::default()),
             fx::FxState::new(FxConfig::default()),
         )
@@ -428,6 +458,7 @@ impl AgentRuntime {
         config: OpencodeConfig,
         deepseek_config: DeepseekConfig,
         t3: T3State,
+        pi: PiState,
         codex: codex::CodexState,
         fx: fx::FxState,
     ) -> Arc<Self> {
@@ -442,6 +473,7 @@ impl AgentRuntime {
             config,
             deepseek_config,
             t3,
+            pi,
             codex,
             fx,
             deepseek_spawn: Mutex::new(deepseek::SpawnSlot::default()),
@@ -891,6 +923,7 @@ impl AgentRuntime {
                         opencode_features(false, false),
                     ),
                     "t3" => (self.t3.wanted(), "T3 Code", self.t3.features()),
+                    "pi" => (self.pi.enabled(), "Pi", self.pi.features()),
                     "codex" => (self.codex.config.enabled, "Codex", codex::features()),
                     "fx" => (self.fx.config.enabled, "FX", fx::features()),
                     _ => (
@@ -1214,6 +1247,7 @@ impl AgentRuntime {
         };
         agents.push(opencode_info);
         agents.push(self.t3_discovery().await);
+        agents.push(self.pi_discovery().await);
         agents.push(self.codex.discovery(self).await);
         agents.push(self.fx.discovery(self).await);
         crate::discovery::order_agents(&mut agents);
@@ -1320,8 +1354,9 @@ impl AgentRuntime {
         let t3_ok = self.supervise_t3().await;
         let codex_ok = self.codex.supervise(self).await;
         let fx_ok = self.fx.supervise(self).await;
+        let pi_ok = self.supervise_pi().await;
 
-        if deepseek_ok || opencode_ok || t3_ok || codex_ok || fx_ok {
+        if deepseek_ok || opencode_ok || t3_ok || codex_ok || fx_ok || pi_ok {
             *start_backoff = Duration::from_secs(2);
             let primary = pick_primary(&*self.managers.read().await).cloned();
             if let Some(mgr) = primary {
@@ -3323,6 +3358,10 @@ mod tests {
         assert_eq!(pick_primary(&map), Some(&2), "DeepSeek outranks T3");
         map.remove("deepseek");
         assert_eq!(pick_primary(&map), Some(&4));
+        map.insert("pi".to_string(), 6);
+        assert_eq!(pick_primary(&map), Some(&4), "T3 outranks Pi");
+        map.remove("t3");
+        assert_eq!(pick_primary(&map), Some(&6));
     }
 
     #[test]
@@ -3695,7 +3734,7 @@ mod tests {
                 .iter()
                 .map(|a| a.id.as_str())
                 .collect::<Vec<_>>(),
-            ["codex", "opencode", "deepseek", "t3", "fx"]
+            ["codex", "opencode", "deepseek", "t3", "fx", "pi"]
         );
         assert_eq!(runtime.manager().await.unwrap().agent().kind(), "codex");
         assert_eq!(
@@ -3720,7 +3759,7 @@ mod tests {
         let runtime = AgentRuntime::disabled();
         let found = runtime.discover_agents().await;
         let ids: Vec<&str> = found.agents.iter().map(|a| a.id.as_str()).collect();
-        assert_eq!(ids, ["opencode", "deepseek", "t3", "fx", "codex"]);
+        assert_eq!(ids, ["opencode", "deepseek", "t3", "fx", "pi", "codex"]);
     }
 
     #[tokio::test]

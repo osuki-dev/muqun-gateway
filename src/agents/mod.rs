@@ -19,4 +19,4 @@ pub mod use_cases;
 pub mod ws_routes;
 
 pub use domain::*;
-pub use runtime::{AgentRuntime, DeepseekConfig, OpencodeConfig, T3Config};
+pub use runtime::{AgentRuntime, DeepseekConfig, OpencodeConfig, PiConfig, T3Config};
