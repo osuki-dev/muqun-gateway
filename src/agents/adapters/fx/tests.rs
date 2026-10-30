@@ -136,7 +136,7 @@ pub(crate) mod integration {
     use crate::agents::ports::mirror::SessionMirrorPort;
 
     pub(crate) struct Fixture {
-        directory: PathBuf,
+        pub(crate) directory: PathBuf,
         pub(crate) driver: Arc<FxDriver>,
         mirror: Arc<MemoryMirror>,
         _permit: tokio::sync::OwnedSemaphorePermit,
@@ -191,7 +191,16 @@ for line in sys.stdin:
         with open('init-capabilities.json','w') as f:json.dump(caps,f)
         notices=isinstance(caps.get('session',{}).get('notices'),dict)
         reply(message['id'],{'protocolVersion':1,'agentCapabilities':{'loadSession':True,'promptCapabilities':{'image':True,'embeddedContext':True},'sessionCapabilities':{'list':{},'fork':{},'delete':{}} if '--acp' in sys.argv else {'list':{}}}})
-    elif method=='session/list': reply(message['id'],{'sessions':[{'sessionId':sid,'cwd':os.getcwd(),'title':'Mock','updatedAt':'2026-10-30T03:00:00Z'} for sid in read()]})
+    elif method=='session/list':
+        if os.path.exists('fail-list'):
+            send({'jsonrpc':'2.0','id':message['id'],'error':{'code':-32603,'message':'metadata unavailable'}});continue
+        if params.get('cursor') and os.path.exists('fail-list-page'):
+            send({'jsonrpc':'2.0','id':message['id'],'error':{'code':-32603,'message':'next page unavailable'}});continue
+        rows=[{'sessionId':sid,'cwd':os.getcwd(),'title':'Mock','updatedAt':'2026-10-30T03:00:00Z'} for sid in read()]
+        if os.path.exists('list-delay'):
+            with open('list-started','w') as f:f.write('ready')
+            time.sleep(0.15)
+        reply(message['id'],dict(sessions=rows,**({'nextCursor':'page-2'} if os.path.exists('fail-list-page') else {})))
     elif method=='session/new':
         active='session-'+str(os.getpid())
         data=read();data[active]=[]
