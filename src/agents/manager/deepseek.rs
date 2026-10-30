@@ -690,6 +690,7 @@ async fn handle_session_event(asid: &AgentSessionId, event: &Value, ctx: &Deepse
                 reason,
                 delta: None,
                 seq,
+                error: None,
             });
         }
         // Audit-only pairs and bookkeeping the app has no row for.

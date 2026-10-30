@@ -163,18 +163,17 @@ async fn apply_change(asid: &AgentSessionId, change: LiveChange, ctx: &PiEventCo
                 });
             }
         }
-        LiveChange::Compaction { status, summary } => {
-            let seq = ctx
-                .mirror
-                .record_compaction(asid, status, None, summary.clone())
-                .await;
-            ctx.emit(AgentDomainEvent::CompactionChanged {
-                asid: asid.clone(),
-                status,
-                reason: None,
-                delta: summary,
-                seq,
-            });
+        LiveChange::Compaction {
+            status,
+            summary,
+            reason,
+            error,
+        } => {
+            ctx.emit(
+                ctx.mirror
+                    .record_compaction_with_error(asid, status, reason, summary, error)
+                    .await,
+            );
         }
         LiveChange::Usage { tokens, cost, .. } => {
             if ctx.driver.has_native_usage(&asid.0) {

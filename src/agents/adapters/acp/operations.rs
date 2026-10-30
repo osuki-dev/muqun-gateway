@@ -58,7 +58,7 @@ pub(crate) async fn prompt_parts(
         .map_err(|_| AgentError::NotAvailable("ACP attachment preparation failed".into()))?
 }
 
-fn upload_parts(
+pub(crate) fn upload_parts(
     text: &str,
     attachments: &[String],
     uploads: &Path,

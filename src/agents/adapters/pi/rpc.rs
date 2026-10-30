@@ -5,8 +5,9 @@
 //! breaks on U+2028/U+2029 would cut JSON strings apart -- and an optional CR
 //! before the LF is dropped. Commands carry a string `id` that the matching
 //! `response` repeats; everything else on stdout is a session or extension-UI
-//! event and is fanned out to subscribers untouched. Stderr is diagnostics
-//! only and is never parsed.
+//! event is fanned out to subscribers. Uploaded image bytes are removed from
+//! user-message telemetry after Pi has accepted them; native session files
+//! and model input retain the pixels. Stderr is never parsed.
 //!
 //! The host only holds children; the driver decides when to start one.
 
@@ -27,7 +28,7 @@ use crate::agents::ports::agent::AgentError;
 /// A record this long is not a protocol message we can use: holding it would
 /// let one runaway tool output pin unbounded memory, and resynchronising
 /// mid-stream is guesswork, so the child is treated as broken.
-pub(super) const MAX_LINE_BYTES: usize = 1024 * 1024;
+pub(super) const MAX_LINE_BYTES: usize = 8 * 1024 * 1024;
 /// A blocked pipe must not hold shutdown or an approval response forever.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Pi answers every command once it is handled (a `prompt` is answered on
@@ -576,7 +577,7 @@ async fn read_stdout<R: AsyncBufRead + Unpin>(
             continue;
         }
         touch(&last_used);
-        let record = match serde_json::from_slice::<Value>(&line) {
+        let mut record = match serde_json::from_slice::<Value>(&line) {
             Ok(record @ Value::Object(_)) => record,
             Ok(_) => {
                 tracing::warn!(
@@ -592,7 +593,12 @@ async fn read_stdout<R: AsyncBufRead + Unpin>(
             }
         };
         if record.get("type").and_then(Value::as_str) != Some("response") {
-            let Some(record) = PiRecord::bounded(record, line.len()) else {
+            let queued_bytes = if omit_user_image_echo(&mut record) {
+                serde_json::to_vec(&record).map_or(usize::MAX, |bytes| bytes.len())
+            } else {
+                line.len()
+            };
+            let Some(record) = PiRecord::bounded(record, queued_bytes) else {
                 alive.store(false, Ordering::SeqCst);
                 shared.fail_all(AgentError::Protocol("pi event byte budget exceeded".into()));
                 kill.notify_one();
@@ -623,6 +629,26 @@ async fn read_stdout<R: AsyncBufRead + Unpin>(
     // failure must also see it dead, so they respawn rather than retry it.
     alive.store(false, Ordering::SeqCst);
     shared.fail_all(AgentError::NotAvailable("pi exited".into()));
+}
+
+pub(super) fn omit_user_image_echo(record: &mut Value) -> bool {
+    let message_path = match record.get("type").and_then(Value::as_str) {
+        Some("message_start" | "message_end") => "/message",
+        Some("entry_appended") => "/entry/message",
+        _ => return false,
+    };
+    let Some(message) = record.pointer_mut(message_path) else {
+        return false;
+    };
+    if message.get("role").and_then(Value::as_str) != Some("user") {
+        return false;
+    }
+    let Some(blocks) = message.get_mut("content").and_then(Value::as_array_mut) else {
+        return false;
+    };
+    let before = blocks.len();
+    blocks.retain(|block| block.get("type").and_then(Value::as_str) != Some("image"));
+    blocks.len() != before
 }
 
 async fn log_stderr<R: AsyncBufRead + Unpin>(mut reader: R, pid: Option<u32>) {
@@ -997,5 +1023,22 @@ for raw in sys.stdin.buffer:
         drop(forwarded);
         assert_eq!(budget.available_permits(), 8);
         assert!(PiRecord::bounded(Value::Null, MAX_LINE_BYTES + 1).is_none());
+    }
+
+    #[test]
+    fn uploaded_pixels_are_not_repeated_in_user_event_queues() {
+        let mut record = json!({"type":"message_end","message":{"role":"user","timestamp":1,"content":[{"type":"text","text":"uploaded image path"},{"type":"image","mimeType":"image/webp","data":"a".repeat(2 * 1024 * 1024)}]}});
+        assert!(omit_user_image_echo(&mut record));
+        assert_eq!(
+            record["message"]["content"],
+            json!([{"type":"text","text":"uploaded image path"}])
+        );
+        assert!(serde_json::to_vec(&record).unwrap().len() < 1024);
+        let mut entry = json!({"type":"entry_appended","entry":{"id":"native","message":{"role":"user","content":[{"type":"image","data":"pixels"}]}}});
+        assert!(omit_user_image_echo(&mut entry));
+        assert_eq!(entry["entry"]["id"], "native");
+        let mut other = json!({"type":"message_end","message":{"role":"assistant","content":[{"type":"image","data":"preserve provider output"}]}});
+        assert!(!omit_user_image_echo(&mut other));
+        assert!(other.pointer("/message/content/0/data").is_some());
     }
 }

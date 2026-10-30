@@ -1350,6 +1350,7 @@ impl AgentManager {
                     reason,
                     delta,
                     seq,
+                    error: None,
                 });
                 // The finished boundary is a real message; read it back so the
                 // timeline carries the summary rather than only the event.

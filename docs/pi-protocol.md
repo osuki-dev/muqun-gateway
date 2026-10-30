@@ -44,7 +44,7 @@ on the host; discovery alone does not verify model authentication.
   until then the session is answered from the driver's live state.
 - Child environment: `MUQUN_MCP_URL` and `MUQUN_MCP_TOKEN` (a runtime token
   minted per attach, agent id `pi`) when MCP is on, and `MUQUN_PI_APPROVALS`.
-- Framing: LF-terminated JSON objects, optional CR dropped, 1 MiB per record
+- Framing: LF-terminated JSON objects, optional CR dropped, 8 MiB per record
   (a longer one kills the child). Commands carry a string `id`; the matching
   `response` resolves it (60 s timeout). Writes have a 5 s deadline. An
   interrupted write or timed-out request closes the transport, reports an
@@ -60,7 +60,7 @@ on the host; discovery alone does not verify model authentication.
   descendants before reaping the leader, so its process-group identity
   cannot be reused during cleanup. Shutdown includes the stdin-lock wait in
   its deadline.
-- All children and both event queues share a 16 MiB raw-record byte budget;
+- All children and both event queues share a 16 MiB queued-record byte budget;
   each queue also holds at most 32 records. Exceeding a byte budget or losing
   a child event stops that child. Losing manager events stops every Pi child
   and explicitly resolves pending approvals before requesting a resync.
@@ -68,7 +68,7 @@ on the host; discovery alone does not verify model authentication.
   of conservatively accounted retained payload per folder. A folder overflow
   fails that session. Accounting traverses retained payloads without
   serializing the entire folder on every text delta.
-- History reads retain at most 16 MiB per file/tail and 1 MiB per entry;
+- History reads retain at most 16 MiB per file/tail and 8 MiB per entry;
   headers are bounded at 64 KiB. Discovery scans at most 4,096 session files
   and 1,024 directories. Reads reject non-regular files and final symlinks;
   Unix opens are nonblocking so a FIFO cannot hold session discovery open.
@@ -146,6 +146,33 @@ queues. Folding and tail-offset updates reject an older generation, including
 records already queued before a replacement. Records for a deleted session
 are dropped.
 
+## Uploads and compaction failures
+
+Uploads remain inside the Gateway upload directory and are read through the
+shared bounded regular-file reader; final symlinks and outside paths are
+refused. Image MIME types come from bytes, supporting PNG, JPEG, GIF and WebP.
+Images use Pi's native `images: [{type: "image", mimeType, data}]` field for
+idle prompts, steer and follow-up delivery. UTF-8 files are embedded in the
+message. Attachment paths remain in the transcript for App thumbnail links;
+Pi receives the pixels directly without a tool call.
+
+At most 16 uploads are prepared together. Each image allows 5 MiB of base64
+(3.75 MiB of source bytes); the complete serialized prompt, including text,
+paths, JSON escaping and all images, must fit 7 MiB. Preparation failure
+rejects the whole submission before starting a child or sending a prompt.
+Native user-image echoes are omitted from Gateway event queues, including
+synthetic persisted-entry echoes; the original native session file and model
+input retain them. Text and entry identity are preserved.
+
+Compaction follows Pi's own retained-tail threshold. A short session can
+correctly fail with nothing to compact even when its context includes many
+system/tool tokens. Failed `agent.compaction.changed` events carry optional
+`error: {name, message}`; `reason` remains `manual`/`auto` and `delta` contains
+only a real summary. Known short-session, already-compacted and cancellation
+failures use fixed safe messages; unknown upstream text is not exposed.
+The same stamped error event is retained for replay. The App can display
+`error.message`; older consumers may ignore this optional field.
+
 ## Extension contract
 
 `muqun-extension.js` (embedded, rewritten at every attach):
@@ -183,7 +210,7 @@ the gateway sends is also folded, which resolves the pending approval.
 | `list_sessions` | session files (one bucket with a directory filter), newest first (`order=asc` reverses); title = latest `session_info.name`, else first user text (80 chars), else `New session`; model from the last `model_change`/`thinking_level_change`; status `Busy` while the live child runs, else `Idle`; `search` matches the title; a parent filter other than top-level matches nothing |
 | `get_session` | the same, one file; a fresh session without a file from live state |
 | `create_session(dir, model, _)` | new child in `dir`; `set_model` (+ `set_thinking_level` for a variant); `get_state` |
-| `send_prompt` | attachments as host paths in the text (`ByPath`); idle → `prompt`; running → `steer` for delivery `steer`, else `prompt` with `streamingBehavior:"followUp"`; failures are returned without replay |
+| `send_prompt` | validated uploads as native `images` blocks plus embedded UTF-8 text; idle → `prompt`; running → `steer` for delivery `steer`, else `prompt` with `streamingBehavior:"followUp"`; failures are returned without replay |
 | `interrupt` | `abort`; no child means no run. Pi may continue existing native queued messages after abort; the Gateway preserves those messages rather than clearing another client's queue |
 | `switch_model` | `set_model {provider, modelId}`; `variant` → `set_thinking_level {level}`; read `get_state` afterward and retain the actual normalized model/level, including before the first session-file write |
 | `reply_permission` | `extension_ui_response {id, confirmed}`; accepts only one reply while that generation's request is pending; persistent permission and reason text are refused |
@@ -215,7 +242,7 @@ available, partial-message counters cannot overwrite them. `context_usage`
 comes only from Pi's `contextUsage`; a post-compaction unknown stays unknown.
 
 Features: streaming, reasoning effort, model selection, compaction,
-attachments by path, session rename/delete/fork, slash commands and older
+native image and UTF-8 text uploads, session rename/delete/fork, slash commands and older
 timeline pages; tool approvals when `approvals` asks. No modes, separate
 skills catalog, revert, inbox, worktrees or session-list pagination. Native
 `fork(entryId)`, `get_tree` and arbitrary branch navigation exist in Pi but

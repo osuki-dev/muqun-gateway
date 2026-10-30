@@ -24,6 +24,7 @@
 pub mod driver;
 mod fork;
 pub mod mapper;
+mod prompt;
 pub mod rpc;
 pub mod sessions;
 

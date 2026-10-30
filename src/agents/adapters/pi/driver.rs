@@ -37,8 +37,8 @@ use crate::agents::domain::{
     TimelineItem, TokensUsage,
 };
 use crate::agents::ports::agent::{
-    append_attachment_paths, AgentError, AgentFuture, AgentPort, AttachmentMode, FileDiffItem,
-    HistoryCommit, PreparedTimeline,
+    AgentError, AgentFuture, AgentPort, AttachmentMode, FileDiffItem, HistoryCommit,
+    PreparedTimeline,
 };
 
 /// Discovery asks for the catalog on every refresh; a probe child costs a
@@ -84,6 +84,7 @@ struct LiveSession {
     cost: Option<f64>,
     context_usage: Option<SessionContextUsage>,
     native_usage: bool,
+    compacting: bool,
     failed: bool,
     /// Bytes of the file already seen, so the tail read is cheap.
     offset: u64,
@@ -108,6 +109,7 @@ impl LiveSession {
             cost: None,
             context_usage: None,
             native_usage: false,
+            compacting: false,
             failed: false,
             offset: 0,
             created_ms: now_ms(),
@@ -116,10 +118,11 @@ impl LiveSession {
     }
 
     fn running(&self) -> bool {
-        matches!(
-            self.status,
-            AgentSessionStatus::Busy | AgentSessionStatus::Retry
-        )
+        self.compacting
+            || matches!(
+                self.status,
+                AgentSessionStatus::Busy | AgentSessionStatus::Retry
+            )
     }
 }
 
@@ -854,7 +857,14 @@ fn apply(session: &mut LiveSession, change: &LiveChange) {
                 session.cost = *cost;
             }
         }
-        LiveChange::Compaction { .. } | LiveChange::UiCancel(_) => {}
+        LiveChange::Compaction { status, .. } => {
+            session.compacting = matches!(
+                status,
+                crate::agents::domain::CompactionStatus::Started
+                    | crate::agents::domain::CompactionStatus::Running
+            )
+        }
+        LiveChange::UiCancel(_) => {}
     }
 }
 
@@ -973,7 +983,8 @@ async fn forward(
                         }
                     };
                     for entry in entries {
-                        let record = json!({"type": "entry_appended", "entry": entry});
+                        let mut record = json!({"type": "entry_appended", "entry": entry});
+                        super::rpc::omit_user_image_echo(&mut record);
                         let bytes = serde_json::to_vec(&record).map_or(usize::MAX, |b| b.len());
                         let Some(record) = PiRecord::bounded(record, bytes) else {
                             child.terminate("pi event byte budget exceeded");
@@ -1228,7 +1239,7 @@ impl AgentPort for PiDriver {
     }
 
     fn attachment_mode(&self) -> AttachmentMode {
-        AttachmentMode::ByPath
+        AttachmentMode::NativeUploads
     }
 
     fn send_prompt<'a>(
@@ -1239,19 +1250,22 @@ impl AgentPort for PiDriver {
         delivery: Option<&'a str>,
     ) -> AgentFuture<'a, ()> {
         Box::pin(async move {
-            // Pi's tools read files off this host; paths travel in the text.
-            let message = append_attachment_paths(text, attachments);
+            let prepared = super::prompt::prepare(text, attachments).await?;
+            // Validate the longest delivery envelope before starting a child.
+            let mut command = prepared.command("prompt", Some("followUp"))?;
             let child = self.child_for(session_id).await?;
             let running = self.live.with(session_id, |s| s.running()) == Some(true);
             // An idle session always gets `prompt`: a `follow_up` sent to an
             // idle Pi waits for a run nobody starts.
-            let command = match (running, delivery) {
-                (true, Some("steer")) => json!({"type": "steer", "message": message}),
-                (true, _) => {
-                    json!({"type": "prompt", "message": message, "streamingBehavior": "followUp"})
-                }
-                (false, _) => json!({"type": "prompt", "message": message}),
-            };
+            if !running || delivery == Some("steer") {
+                command
+                    .as_object_mut()
+                    .expect("Pi prompt is an object")
+                    .remove("streamingBehavior");
+            }
+            if running && delivery == Some("steer") {
+                command["type"] = json!("steer");
+            }
             self.ensure_open()?;
             // A rejected, timed-out or disconnected submission is never
             // automatically replayed: its delivery may be ambiguous.
@@ -1625,15 +1639,14 @@ impl AgentPort for PiDriver {
             // `compact` answers only when the summary is written, which can
             // outlast the request timeout; progress arrives as
             // `compaction_start`/`compaction_end` either way.
-            let live = self.live.clone();
-            let asid = AgentSessionId(session_id.to_string());
             tokio::spawn(async move {
                 match child.request(json!({"type": "compact"})).await {
                     Ok(_) => {}
-                    // Refused before it started: say so the way Pi would.
+                    // Pi emits its own terminal compaction event before a
+                    // failed response. Do not overwrite that precise failure
+                    // with a fabricated generic aborted event.
                     Err(AgentError::RequestFailed(reason)) => {
                         tracing::info!(%reason, "pi refused to compact");
-                        live.publish(&asid, json!({"type": "compaction_end", "aborted": true}));
                     }
                     Err(error) => tracing::debug!(%error, "pi compact reply lost"),
                 }
@@ -1792,6 +1805,26 @@ for raw in sys.stdin.buffer:
         assert_eq!(prompts.len(), 1);
         assert!(prompts[0].get("streamingBehavior").is_none());
         driver.host.shutdown_all().await;
+    }
+
+    #[tokio::test]
+    async fn invalid_native_uploads_fail_before_starting_or_sending_to_a_child() {
+        let Some((driver, dir)) = fake_driver(Duration::from_secs(900)) else {
+            return;
+        };
+        assert_eq!(driver.attachment_mode(), AttachmentMode::NativeUploads);
+        let error = driver
+            .send_prompt(
+                "not-yet-started",
+                "do not send a partial prompt",
+                &["not-an-upload.png".into()],
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AgentError::InvalidRequest(_)));
+        assert!(!driver.host.any_alive());
+        assert!(!dir.join("commands.jsonl").exists());
     }
 
     #[tokio::test]

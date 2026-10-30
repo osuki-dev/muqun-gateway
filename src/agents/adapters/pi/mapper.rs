@@ -15,10 +15,10 @@ use serde_json::Value;
 
 use crate::agents::adapters::t3::client::ms_from_iso;
 use crate::agents::domain::{
-    AgentCatalog, AgentPart, AgentSessionId, AgentSessionStatus, CatalogDefaults, CommandInfo,
-    CompactionStatus, ModelInfo, ModelRef, ModelVariantInfo, PermissionDecision, PermissionOption,
-    PermissionRequest, SessionContextUsage, TimelineItem, TimelineRole, TokensUsage, ToolCall,
-    ToolCallStatus, ToolTime,
+    AgentCatalog, AgentErrorInfo, AgentPart, AgentSessionId, AgentSessionStatus, CatalogDefaults,
+    CommandInfo, CompactionStatus, ModelInfo, ModelRef, ModelVariantInfo, PermissionDecision,
+    PermissionOption, PermissionRequest, SessionContextUsage, TimelineItem, TimelineRole,
+    TokensUsage, ToolCall, ToolCallStatus, ToolTime,
 };
 
 /// The bundled Pi extension: approval gate plus the Muqun MCP server. Written
@@ -229,6 +229,36 @@ pub(super) fn apply_stats(info: &mut crate::agents::domain::AgentSessionInfo, st
 
 fn text<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
     value.get(key).and_then(Value::as_str)
+}
+
+fn compaction_reason(record: &Value) -> Option<String> {
+    match text(record, "reason") {
+        Some("manual") => Some("manual".into()),
+        Some("threshold" | "overflow") => Some("auto".into()),
+        _ => None,
+    }
+}
+
+fn compaction_error(message: Option<&str>, aborted: bool) -> AgentErrorInfo {
+    let (name, message) = match message.map(str::trim) {
+        Some("Nothing to compact (session too small)") => (
+            "compaction_too_small",
+            "Nothing to compact: this session is too short.",
+        ),
+        Some("Already compacted") => (
+            "compaction_already_current",
+            "This session is already compacted.",
+        ),
+        Some("Compaction cancelled") => ("compaction_cancelled", "Compaction was cancelled."),
+        _ if aborted => ("compaction_cancelled", "Compaction was cancelled."),
+        _ => ("compaction_failed", "Compaction failed."),
+    };
+    AgentErrorInfo {
+        name: name.into(),
+        message: message.into(),
+        status: None,
+        retry_after_ms: None,
+    }
 }
 
 /// The timeline orders rows by `message_id`, and Pi entry ids are random hex,
@@ -620,6 +650,8 @@ pub enum LiveChange {
     Compaction {
         status: CompactionStatus,
         summary: Option<String>,
+        reason: Option<String>,
+        error: Option<AgentErrorInfo>,
     },
     Usage {
         tokens: TokensUsage,
@@ -659,6 +691,8 @@ pub struct LiveFolder {
     completed_usage: UsageTotals,
     current_usage: Option<Value>,
     usage_timestamp: Option<u64>,
+    compacting: bool,
+    compaction_reason: Option<String>,
 }
 
 impl LiveFolder {
@@ -674,6 +708,8 @@ impl LiveFolder {
             completed_usage: UsageTotals::default(),
             current_usage: None,
             usage_timestamp: None,
+            compacting: false,
+            compaction_reason: None,
         }
     }
 
@@ -721,6 +757,20 @@ impl LiveFolder {
                     .drain()
                     .map(LiveChange::PermissionResolved)
                     .collect();
+                if self.compacting {
+                    self.compacting = false;
+                    changes.push(LiveChange::Compaction {
+                        status: CompactionStatus::Failed,
+                        summary: None,
+                        reason: self.compaction_reason.clone(),
+                        error: Some(AgentErrorInfo {
+                            name: "compaction_interrupted".into(),
+                            message: "The agent disconnected during compaction.".into(),
+                            status: None,
+                            retry_after_ms: None,
+                        }),
+                    });
+                }
                 changes.push(LiveChange::Status(if aborted {
                     AgentSessionStatus::Interrupted
                 } else {
@@ -748,11 +798,18 @@ impl LiveFolder {
                 .get("entry")
                 .map(|e| self.on_entry(e))
                 .unwrap_or_default(),
-            "compaction_start" => vec![LiveChange::Compaction {
-                status: CompactionStatus::Started,
-                summary: None,
-            }],
+            "compaction_start" => {
+                self.compacting = true;
+                self.compaction_reason = compaction_reason(record);
+                vec![LiveChange::Compaction {
+                    status: CompactionStatus::Started,
+                    summary: None,
+                    reason: self.compaction_reason.clone(),
+                    error: None,
+                }]
+            }
             "compaction_end" => {
+                self.compacting = false;
                 let summary = record
                     .pointer("/result/summary")
                     .and_then(Value::as_str)
@@ -763,7 +820,15 @@ impl LiveFolder {
                 } else {
                     CompactionStatus::Failed
                 };
-                vec![LiveChange::Compaction { status, summary }]
+                let reason = compaction_reason(record).or_else(|| self.compaction_reason.clone());
+                let error = (status == CompactionStatus::Failed)
+                    .then(|| compaction_error(text(record, "errorMessage"), aborted));
+                vec![LiveChange::Compaction {
+                    status,
+                    summary,
+                    reason,
+                    error,
+                }]
             }
             "session_info_changed" => text(record, "name")
                 .map(|name| vec![LiveChange::Title(name.to_string())])
@@ -1441,6 +1506,36 @@ mod tests {
             let mut folder = LiveFolder::new("s1".into());
             assert_eq!(folder.fold(&json!({"type":"extension_ui_request","id":"bad","method":"confirm","title":PERMISSION_TITLE,"message":payload.to_string()})), vec![LiveChange::UiCancel("bad".into())]);
         }
+    }
+
+    #[test]
+    fn compaction_errors_are_separate_from_trigger_and_summary_and_whitelisted() {
+        let mut folder = LiveFolder::new("s1".into());
+        folder.fold(&json!({"type":"compaction_start","reason":"manual"}));
+        let changes = folder.fold(&json!({"type":"compaction_end","reason":"manual","aborted":false,"errorMessage":"Nothing to compact (session too small)"}));
+        let [LiveChange::Compaction {
+            status,
+            summary,
+            reason,
+            error,
+        }] = changes.as_slice()
+        else {
+            panic!("compaction expected");
+        };
+        assert_eq!(*status, CompactionStatus::Failed);
+        assert!(summary.is_none());
+        assert_eq!(reason.as_deref(), Some("manual"));
+        assert_eq!(error.as_ref().unwrap().name, "compaction_too_small");
+        assert_eq!(
+            error.as_ref().unwrap().message,
+            "Nothing to compact: this session is too short."
+        );
+        let unknown = compaction_error(Some("provider rejected private credential=secret"), false);
+        assert_eq!(unknown.message, "Compaction failed.");
+        let done = folder.fold(&json!({"type":"compaction_end","reason":"manual","result":{"summary":"a real summary"},"aborted":false}));
+        assert!(
+            matches!(&done[0], LiveChange::Compaction { status:CompactionStatus::Completed, error:None, summary:Some(summary), .. } if summary == "a real summary")
+        );
     }
 
     #[test]
