@@ -78,6 +78,8 @@ pub(crate) enum SetupAgent {
     Codex,
     /// Explain FX ACP setup without starting a session or changing credentials.
     Fx,
+    /// Explain Qoder CLI ACP setup without starting a session or changing credentials.
+    Qoder,
 }
 
 pub(crate) async fn run_agent_command(
@@ -131,6 +133,10 @@ pub(crate) async fn run_agent_command(
                 )?;
             }
             SetupAgent::Opencode => setup_opencode().await?,
+            SetupAgent::Qoder => {
+                println!("Qoder CLI support is enabled by default when qodercli is installed on PATH. Configure and sign in to Qoder CLI on this host yourself. Gateway opens a private `qodercli --acp` child per session; discovery alone does not verify model authentication.");
+                println!("Set qoder.enabled=false to disable it; qoder.binary may name an absolute CLI executable. A separately opened Qoder terminal or IDE is not a shared live ACP session. This command does not start Qoder, install packages, log in or restart Gateway.");
+            }
             SetupAgent::Fx => {
                 println!("FX support is enabled by default when fx is installed on PATH. Sign in and configure FX on this host yourself. Gateway opens a private `fx acp` child per session and checks ACP capabilities on session creation; discovery alone does not prove model authentication.");
                 println!("Set fx.enabled=false to disable it; fx.binary may name an absolute executable. External FX TUI processes are not shared live sessions. This command does not start FX, install packages, log in or restart Gateway.");
@@ -148,12 +154,13 @@ pub(crate) async fn run_agent_command(
 async fn list(json: bool) -> anyhow::Result<bool> {
     let config = load_config(None)?;
     let runtime = if config.agent_runtime.enabled {
-        AgentRuntime::with_fx_configs(
+        AgentRuntime::with_qoder_configs(
             config.opencode.clone(),
             config.deepseek.clone(),
             config.t3.clone(),
             config.codex.clone(),
             config.fx.clone(),
+            config.qoder.clone(),
             Some(state_dir()?),
         )
     } else {
@@ -276,6 +283,10 @@ pub(crate) fn next_step(id: &str, status: &AgentAvailability) -> Option<&'static
         (Unconfigured | Disabled, "t3") => "muqun-gateway agent setup t3",
         (Unconfigured | Disabled, "deepseek") => "muqun-gateway agent setup deepseek",
         (Disabled, "opencode") => "set `opencode.enabled` to true in config.json",
+        (Disabled, "qoder") => "set `qoder.enabled` to true in config.json",
+        (NotInstalled, "qoder") => "install Qoder CLI yourself, set qoder.binary, or disable qoder.enabled",
+        (Unconfigured, "qoder") => "check qoder.binary and configure Qoder CLI authentication on this host yourself",
+        (Offline | Unsupported, "qoder") => "check Qoder CLI ACP support; failed prompts are never automatically retried",
         (Disabled, "fx") => "set `fx.enabled` to true in config.json",
         (NotInstalled, "fx") => "install FX yourself, set fx.binary, or disable fx.enabled",
         (Unconfigured, "fx") => "check fx.binary and configure FX authentication on this host yourself",

@@ -122,7 +122,7 @@ pub struct AcpClient {
     outgoing: mpsc::Sender<WritePacket>,
 }
 
-/// A request admitted only after its complete frame was flushed to FX stdin.
+/// A request admitted only after its complete frame was flushed to agent stdin.
 /// Dropping it removes correlation state; it never resubmits the operation.
 pub struct AcpRequest {
     state: Arc<State>,
@@ -623,6 +623,41 @@ mod tests {
     use super::*;
 
     #[cfg(unix)]
+    #[tokio::test]
+    async fn spawn_uses_explicit_argv_cwd_and_provider_without_fx_policy() {
+        let cwd = std::env::temp_dir().join(format!("muqun-acp-argv-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&cwd).unwrap();
+        let script = r#"
+            test "$PWD" = "$1" || exit 1
+            IFS= read -r first
+            printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"cwdVerified":true}}'
+            IFS= read -r second
+            printf '%s\n' '{"jsonrpc":"2.0","id":2,"error":{"code":-32603,"message":"Session is busy"}}'
+            IFS= read -r hold
+        "#;
+        let directory = cwd.to_str().unwrap();
+        let client = AcpClient::spawn(
+            "sh",
+            &["-c", script, "fixture", directory],
+            directory,
+            "Qoder",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            client.request("probe", json!({})).await.unwrap()["cwdVerified"],
+            true
+        );
+        assert_eq!(
+            client.request("error", json!({})).await.unwrap_err(),
+            "Qoder ACP request rejected (code -32603)"
+        );
+        client.shutdown().await;
+        assert!(client.state.exited.is_cancelled());
+        std::fs::remove_dir(cwd).unwrap();
+    }
+
+    #[cfg(unix)]
     fn fake(script: &str) -> Arc<AcpClient> {
         let mut command = Command::new("sh");
         command.arg("-c").arg(script);
@@ -873,5 +908,52 @@ mod tests {
             .is_err());
         assert!(client.state.cancel.is_cancelled());
         client.shutdown().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires explicit ACP_TEST_BINARY and ACP_TEST_ARGS_JSON; read-only native ACP handshake"]
+    async fn real_agent_initialize_and_list_without_prompt() {
+        let binary = std::env::var("ACP_TEST_BINARY").expect("explicit ACP_TEST_BINARY required");
+        let args: Vec<String> = serde_json::from_str(
+            &std::env::var("ACP_TEST_ARGS_JSON").expect("explicit ACP_TEST_ARGS_JSON required"),
+        )
+        .unwrap();
+        let args: Vec<_> = args.iter().map(String::as_str).collect();
+        let cwd =
+            std::env::temp_dir().join(format!("muqun-acp-read-only-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&cwd).unwrap();
+        let client = AcpClient::spawn(&binary, &args, cwd.to_str().unwrap(), "ACP test")
+            .await
+            .unwrap();
+        let mut events = client.subscribe();
+        async fn read_only_request(
+            client: &AcpClient,
+            events: &mut broadcast::Receiver<AcpEvent>,
+            method: &str,
+            params: Value,
+        ) -> Value {
+            let reply = client.request_with_timeout(method, params, Duration::from_secs(30));
+            tokio::pin!(reply);
+            loop {
+                tokio::select! {
+                    result = &mut reply => return result.unwrap(),
+                    event = events.recv() => match event.unwrap() {
+                        AcpEvent::Notification { .. } => {},
+                        AcpEvent::Request { .. } => panic!("Unexpected interaction; no approval sent"),
+                        AcpEvent::Disconnected { reason } => panic!("ACP disconnected during read-only probe: {reason}"),
+                    }
+                }
+            }
+        }
+        let init = read_only_request(&client, &mut events, "initialize", json!({
+            "protocolVersion":1,"clientCapabilities":{},"clientInfo":{"name":"muqun-gateway-read-only-test","version":"test"}
+        })).await;
+        assert_eq!(init["protocolVersion"], 1);
+        let list =
+            read_only_request(&client, &mut events, "session/list", json!({"cwd":cwd})).await;
+        assert!(list["sessions"].is_array());
+        client.shutdown().await;
+        assert!(client.state.exited.is_cancelled());
+        std::fs::remove_dir(cwd).unwrap();
     }
 }

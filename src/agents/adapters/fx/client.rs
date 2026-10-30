@@ -1,17 +1,21 @@
 //! FX launch arguments and its exact, safe native error guidance.
+#[cfg(test)]
 use std::ops::Deref;
+#[cfg(test)]
 use std::sync::Arc;
 
 use serde_json::Value;
 
+#[cfg(test)]
 use crate::agents::adapters::acp::AcpClient;
-pub use crate::agents::adapters::acp::AcpEvent as FxEvent;
 
 /// Keep FX's existing constructor while sharing all RPC and process ownership.
+#[cfg(test)]
 pub struct FxClient {
     inner: Arc<AcpClient>,
 }
 
+#[cfg(test)]
 impl FxClient {
     pub async fn spawn(binary: &str, cwd: &str) -> Result<Arc<Self>, String> {
         let inner =
@@ -21,6 +25,7 @@ impl FxClient {
     }
 }
 
+#[cfg(test)]
 impl Deref for FxClient {
     type Target = AcpClient;
     fn deref(&self) -> &Self::Target {
@@ -28,7 +33,7 @@ impl Deref for FxClient {
     }
 }
 
-fn safe_error_message(error: &Value) -> Option<&'static str> {
+pub(crate) fn safe_error_message(error: &Value) -> Option<&'static str> {
     // Exact FX 0.0.16 constants only. Never expose arbitrary native diagnostics.
     match error.get("message").and_then(Value::as_str) {
         Some("Session is busy") => Some("Session is busy"),

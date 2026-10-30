@@ -121,7 +121,7 @@ fn oversized_history_is_explicitly_unavailable() {
 }
 
 #[cfg(unix)]
-pub(super) mod integration {
+pub(crate) mod integration {
     use super::*;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -134,14 +134,14 @@ pub(super) mod integration {
     use crate::agents::ports::agent::{AgentError, AgentPort};
     use crate::agents::ports::mirror::SessionMirrorPort;
 
-    pub(in crate::agents::adapters::fx) struct Fixture {
+    pub(crate) struct Fixture {
         directory: PathBuf,
-        pub(in crate::agents::adapters::fx) driver: Arc<FxDriver>,
+        pub(crate) driver: Arc<FxDriver>,
         mirror: Arc<MemoryMirror>,
         _permit: tokio::sync::OwnedSemaphorePermit,
     }
     impl Fixture {
-        pub(in crate::agents::adapters::fx) async fn new() -> Self {
+        pub(crate) async fn new() -> Self {
             static FIXTURES: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> =
                 std::sync::OnceLock::new();
             let permit = FIXTURES
@@ -166,7 +166,10 @@ def send(value):
     print(json.dumps(value), flush=True)
 def reply(id, result): send({'jsonrpc':'2.0','id':id,'result':result})
 def update(sid, value): send({'jsonrpc':'2.0','method':'session/update','params':{'sessionId':sid,'update':value}})
-def text(sid, mid, content, user=False): update(sid,{'sessionUpdate':'user_message_chunk' if user else 'agent_message_chunk','messageId':mid,'content':{'type':'text','text':content}})
+def text(sid, mid, content, user=False):
+    value={'sessionUpdate':'user_message_chunk' if user else 'agent_message_chunk','content':{'type':'text','text':content}}
+    if '--acp' not in sys.argv:value['messageId']=mid
+    update(sid,value)
 config={'configOptions':[{'id':'provider','currentValue':'mock-provider','options':[{'value':'mock-provider','name':'Mock provider'},{'value':'other-provider','name':'Other provider'}]},{'id':'model','currentValue':'mock-model','options':[{'value':'mock-model','name':'Mock model'},{'value':'other-model','name':'Other model'}]},{'id':'effort','currentValue':'low','options':[{'value':'low','name':'Low'},{'value':'high','name':'High'}]}]}
 active=None
 pending=None
@@ -205,6 +208,7 @@ for line in sys.stdin:
     elif method=='session/prompt':
         turn+=1
         content=params['prompt'][0]['text']
+        if '--acp' in sys.argv:text(active,'echo-'+str(turn),content,True)
         if content=='disconnect':sys.exit(0)
         data=read(); data[active].append(['user-'+str(turn),content,True])
         with open(store,'w') as f:json.dump(data,f)
@@ -242,7 +246,19 @@ for line in sys.stdin:
                 _permit: permit,
             }
         }
-        pub(in crate::agents::adapters::fx) fn methods(&self) -> Vec<String> {
+        pub(crate) fn qoder_driver(&self) -> Arc<crate::agents::adapters::qoder::QoderDriver> {
+            let (tx, _) = broadcast::channel(256);
+            crate::agents::adapters::qoder::QoderDriver::new(
+                self.directory
+                    .join("mock-fx")
+                    .to_string_lossy()
+                    .into_owned(),
+                self.directory.to_string_lossy().into_owned(),
+                Arc::new(MemoryMirror::for_agent("qoder")),
+                tx,
+            )
+        }
+        pub(crate) fn methods(&self) -> Vec<String> {
             std::fs::read_to_string(self.directory.join("methods.log"))
                 .unwrap_or_default()
                 .lines()

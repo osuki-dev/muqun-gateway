@@ -200,37 +200,7 @@ fn features_for_models(models: &[crate::discovery::AgentModelInfo]) -> AgentFeat
 }
 
 pub(super) fn features() -> AgentFeatures {
-    AgentFeatures {
-        streaming: true,
-        reasoning_effort: false,
-        model_selection: false,
-        tool_approvals: true,
-        worktrees: false,
-        revert: false,
-        staged_revert: false,
-        inbox: false,
-        modes: false,
-        skills: false,
-        slash_commands: false,
-        compaction: false,
-        background_shells: false,
-        attachments: false,
-        attachments_by_path: false,
-        extra: [
-            "inboxEdit",
-            "modeSwitching",
-            "sessionRename",
-            "sessionDelete",
-            "sessionFork",
-            "sessionPagination",
-            "timelineEarlier",
-            "accountLimits",
-            "computerTools",
-        ]
-        .into_iter()
-        .map(|key| (key.into(), serde_json::json!(false)))
-        .collect(),
-    }
+    super::acp_features()
 }
 
 #[cfg(test)]

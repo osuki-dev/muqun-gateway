@@ -17,7 +17,7 @@ Two planes are implemented in this binary:
   adapters implement it.
 - **Agents plane** — agent sessions, models, prompts, tasks,
   permissions, approvals and event history, behind the `AgentPort`
-  port; the OpenCode, DeepSeek, T3 Code, Codex and FX adapters implement it.
+  port; the OpenCode, DeepSeek, T3 Code, Codex, FX and Qoder CLI adapters implement it.
 
 `/api/discovery` also reports an **SSH plane**, but that one is the app's own
 transport, not a gateway subsystem: the phone can open an SSH connection to a
@@ -346,6 +346,7 @@ muqun-gateway agent                  # each agent's status and the next step (--
 muqun-gateway agent setup t3         # store a T3 Code credential and enable T3
 muqun-gateway agent setup deepseek   # enable DeepSeek; Gateway starts or joins the harness
 muqun-gateway agent setup fx         # explain local FX ACP configuration (no process starts)
+muqun-gateway agent setup qoder      # explain local Qoder CLI ACP configuration (no process starts)
 ```
 
 `agent` probes the agents from your shell the way the running gateway does,
@@ -462,6 +463,25 @@ retains the timeline observed during this Gateway run. Model/effort controls
 appear only after native session catalogs supply their actual options; mode
 switching remains disabled. Unsupported controls are explicitly false in
 discovery. See [FX protocol](docs/fx-protocol.md).
+
+### The Qoder CLI service agent
+
+Qoder CLI is discovered by default through `qodercli` on PATH. Its Gateway
+provider id is `qoder`. Set `qoder.binary` to an absolute CLI executable for a
+differently named installation, or `qoder.enabled: false` to disable the adapter.
+Gateway deliberately does not guess that an executable named `qoder` is the CLI:
+it can also be an IDE launcher. The `agent_runtime.enabled` master switch applies.
+
+Configure Qoder CLI authentication on this host yourself. Gateway reuses the
+CLI's own credentials and starts one private `--acp` child per selected session.
+Discovery only probes `--version`; it does not log in, start ACP or send a model
+request. Permission requests require the owner's explicit answer. A lost prompt
+is never automatically resubmitted.
+
+A separate Qoder terminal or IDE is not a shared live ACP connection. Session
+metadata reads do not load or take ownership of its conversation. Unsupported
+App controls, including model/effort and permission-mode switching, remain
+explicitly false. See [Qoder protocol](docs/qoder-protocol.md).
 
 ### The OpenCode agent
 

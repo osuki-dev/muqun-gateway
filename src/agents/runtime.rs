@@ -28,6 +28,8 @@ pub use codex::CodexConfig;
 pub(crate) mod deepseek;
 pub(crate) mod fx;
 pub use fx::FxConfig;
+pub(crate) mod qoder;
+pub use qoder::QoderConfig;
 mod t3;
 use t3::{catalog_entry, T3State};
 pub use t3::{T3Config, DEFAULT_T3_URL};
@@ -60,7 +62,7 @@ const VERSION_OUTPUT_LIMIT: u64 = 4096;
 
 /// Preference among attached providers. Explicit provider/session selections
 /// retain their route; discovery additionally puts usable providers first.
-pub const AGENT_PREFERENCE: [&str; 5] = ["codex", "opencode", "deepseek", "t3", "fx"];
+pub const AGENT_PREFERENCE: [&str; 6] = ["codex", "opencode", "deepseek", "t3", "fx", "qoder"];
 /// Most session-to-agent routes remembered; the oldest go first.
 const MAX_SESSION_ROUTES: usize = 4096;
 /// How long an agent discovery result is reused.
@@ -284,6 +286,7 @@ pub struct AgentRuntime {
     t3: T3State,
     codex: codex::CodexState,
     fx: fx::FxState,
+    qoder: qoder::QoderState,
     /// The harness this gateway started, if any. Not a kill handle.
     deepseek_spawn: Mutex<deepseek::SpawnSlot>,
     /// Origin of the attached DeepSeek manager, including when it is not primary.
@@ -401,12 +404,33 @@ impl AgentRuntime {
         fx_config: FxConfig,
         state_dir: Option<std::path::PathBuf>,
     ) -> Arc<Self> {
+        Self::with_qoder_configs(
+            config,
+            deepseek_config,
+            t3_config,
+            codex_config,
+            fx_config,
+            QoderConfig::default(),
+            state_dir,
+        )
+    }
+
+    pub fn with_qoder_configs(
+        config: OpencodeConfig,
+        deepseek_config: DeepseekConfig,
+        t3_config: T3Config,
+        codex_config: CodexConfig,
+        fx_config: FxConfig,
+        qoder_config: QoderConfig,
+        state_dir: Option<std::path::PathBuf>,
+    ) -> Arc<Self> {
         Self::with_states(
             config,
             deepseek_config,
             T3State::new(t3_config, state_dir),
             codex::CodexState::new(codex_config),
             fx::FxState::new(fx_config),
+            qoder::QoderState::new(qoder_config),
         )
     }
 
@@ -421,6 +445,7 @@ impl AgentRuntime {
             t3,
             codex::CodexState::new(CodexConfig::default()),
             fx::FxState::new(FxConfig::default()),
+            qoder::QoderState::new(QoderConfig::default()),
         )
     }
 
@@ -430,6 +455,7 @@ impl AgentRuntime {
         t3: T3State,
         codex: codex::CodexState,
         fx: fx::FxState,
+        qoder: qoder::QoderState,
     ) -> Arc<Self> {
         let (events_tx, _) = broadcast::channel(1024);
         Arc::new(Self {
@@ -444,6 +470,7 @@ impl AgentRuntime {
             t3,
             codex,
             fx,
+            qoder,
             deepseek_spawn: Mutex::new(deepseek::SpawnSlot::default()),
             deepseek_origin: RwLock::new(AgentOrigin::None),
             origin: RwLock::new(AgentOrigin::None),
@@ -560,7 +587,7 @@ impl AgentRuntime {
     /// A runtime that will never attach an agent, for tests and for a build
     /// of `AppState` that has no business starting anything.
     pub fn disabled() -> Arc<Self> {
-        Self::with_fx_configs(
+        Self::with_qoder_configs(
             OpencodeConfig {
                 enabled: false,
                 autostart: false,
@@ -573,6 +600,10 @@ impl AgentRuntime {
                 binary: None,
             },
             FxConfig {
+                enabled: false,
+                binary: None,
+            },
+            QoderConfig {
                 enabled: false,
                 binary: None,
             },
@@ -727,10 +758,9 @@ impl AgentRuntime {
             } else {
                 local_installation_status(&self.config)
             },
-            origin: if manager
-                .as_ref()
-                .is_some_and(|manager| manager.agent().kind() == "fx" && manager.stream_connected())
-            {
+            origin: if manager.as_ref().is_some_and(|manager| {
+                matches!(manager.agent().kind(), "fx" | "qoder") && manager.stream_connected()
+            }) {
                 AgentOrigin::Spawned
             } else {
                 *self.origin.read().await
@@ -746,7 +776,10 @@ impl AgentRuntime {
                 .is_some_and(|m| m.agent().kind() == "codex")
             {
                 self.codex.config.enabled
-            } else if manager.as_ref().is_some_and(|m| m.agent().kind() == "fx") {
+            } else if manager
+                .as_ref()
+                .is_some_and(|m| matches!(m.agent().kind(), "fx" | "qoder"))
+            {
                 false
             } else {
                 self.config.autostart
@@ -769,7 +802,7 @@ impl AgentRuntime {
         Some(AgentStatus {
             available: kind != "codex" || manager.stream_connected(),
             installation: AgentInstallation::Installed,
-            origin: if kind == "fx" {
+            origin: if matches!(kind.as_str(), "fx" | "qoder") {
                 if manager.stream_connected() {
                     AgentOrigin::Spawned
                 } else {
@@ -893,6 +926,7 @@ impl AgentRuntime {
                     "t3" => (self.t3.wanted(), "T3 Code", self.t3.features()),
                     "codex" => (self.codex.config.enabled, "Codex", codex::features()),
                     "fx" => (self.fx.config.enabled, "FX", fx::features()),
+                    "qoder" => (self.qoder.config.enabled, "Qoder CLI", qoder::features()),
                     _ => (
                         self.deepseek_config.enabled || self.deepseek_config.endpoint.is_some(),
                         "DeepSeek",
@@ -921,7 +955,9 @@ impl AgentRuntime {
                     kind: id.to_string(),
                     status: match (enabled, manager) {
                         (false, _) => AgentAvailability::Disabled,
-                        (true, Some(_)) if *id == "fx" => AgentAvailability::Reachable,
+                        (true, Some(_)) if matches!(*id, "fx" | "qoder") => {
+                            AgentAvailability::Reachable
+                        }
                         (true, Some(_)) => AgentAvailability::Connected,
                         (true, None) => AgentAvailability::Offline,
                     },
@@ -1216,6 +1252,7 @@ impl AgentRuntime {
         agents.push(self.t3_discovery().await);
         agents.push(self.codex.discovery(self).await);
         agents.push(self.fx.discovery(self).await);
+        agents.push(self.qoder.discovery(self).await);
         crate::discovery::order_agents(&mut agents);
 
         let supported = agents.iter().any(|h| {
@@ -1291,7 +1328,7 @@ impl AgentRuntime {
             .read()
             .await
             .as_ref()
-            .map(|m| m.agent().kind() != "fx" && !m.stream_connected())
+            .map(|m| !matches!(m.agent().kind(), "fx" | "qoder") && !m.stream_connected())
             .unwrap_or(false)
     }
 
@@ -1320,8 +1357,9 @@ impl AgentRuntime {
         let t3_ok = self.supervise_t3().await;
         let codex_ok = self.codex.supervise(self).await;
         let fx_ok = self.fx.supervise(self).await;
+        let qoder_ok = self.qoder.supervise(self).await;
 
-        if deepseek_ok || opencode_ok || t3_ok || codex_ok || fx_ok {
+        if deepseek_ok || opencode_ok || t3_ok || codex_ok || fx_ok || qoder_ok {
             *start_backoff = Duration::from_secs(2);
             let primary = pick_primary(&*self.managers.read().await).cloned();
             if let Some(mgr) = primary {
@@ -2012,6 +2050,40 @@ async fn wait_for_service() -> anyhow::Result<(OpencodeEndpoint, Option<String>)
     }
 }
 
+fn acp_features() -> crate::discovery::AgentFeatures {
+    crate::discovery::AgentFeatures {
+        streaming: true,
+        reasoning_effort: false,
+        model_selection: false,
+        tool_approvals: true,
+        worktrees: false,
+        revert: false,
+        staged_revert: false,
+        inbox: false,
+        modes: false,
+        skills: false,
+        slash_commands: false,
+        compaction: false,
+        background_shells: false,
+        attachments: false,
+        attachments_by_path: false,
+        extra: [
+            "inboxEdit",
+            "modeSwitching",
+            "sessionRename",
+            "sessionDelete",
+            "sessionFork",
+            "sessionPagination",
+            "timelineEarlier",
+            "accountLimits",
+            "computerTools",
+        ]
+        .into_iter()
+        .map(|key| (key.into(), serde_json::json!(false)))
+        .collect(),
+    }
+}
+
 fn deepseek_features(
     supports_reasoning: bool,
     has_models: bool,
@@ -2187,6 +2259,60 @@ mod tests {
         runtime.shutdown_fx().await;
         assert!(!manager.stream_connected());
         assert!(!runtime.fx.supervise(&runtime).await);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn qoder_discovery_and_supervision_only_probe_version_and_shutdown_is_final() {
+        // This executable accepts --version only; attempting ACP initialization
+        // during discovery or supervision would fail instead of installing it.
+        let binary = VersionScript::new("printf 1.1.81");
+        let runtime = AgentRuntime::with_qoder_configs(
+            OpencodeConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            DeepseekConfig::default(),
+            T3Config::default(),
+            CodexConfig {
+                enabled: false,
+                binary: None,
+            },
+            FxConfig {
+                enabled: false,
+                binary: None,
+            },
+            QoderConfig {
+                enabled: true,
+                binary: Some(binary.0.to_string_lossy().into_owned()),
+            },
+            None,
+        );
+        let found = runtime.qoder.discovery(&runtime).await;
+        assert_eq!(found.status, crate::discovery::AgentAvailability::Reachable);
+        assert_eq!(found.version.as_deref(), Some("1.1.81"));
+        assert!(runtime.manager_for_agent("qoder").await.is_none());
+        assert!(runtime.qoder.supervise(&runtime).await);
+        let manager = runtime.manager_for_agent("qoder").await.unwrap();
+        assert_eq!(manager.agent().kind(), "qoder");
+        let snapshot = runtime.health_snapshot().await;
+        assert!(snapshot.supported);
+        assert_eq!(snapshot.agents[0].id, "qoder");
+        assert_eq!(
+            snapshot.agents[0].status,
+            crate::discovery::AgentAvailability::Reachable
+        );
+        let status = runtime.status_for("qoder").await.unwrap();
+        assert!(!status.autostart);
+        assert_eq!(status.origin, AgentOrigin::None);
+        assert!(
+            !manager.stream_connected(),
+            "no ACP stream exists before opening a session"
+        );
+        assert!(manager.agent().probe().await.unwrap());
+        runtime.shutdown_qoder().await;
+        assert!(!manager.stream_connected());
+        assert!(!runtime.qoder.supervise(&runtime).await);
     }
 
     #[tokio::test]
@@ -3368,6 +3494,7 @@ mod tests {
         assert!(runtime.is_known_agent("deepseek"));
         assert!(runtime.is_known_agent("t3"));
         assert!(runtime.is_known_agent("fx"));
+        assert!(runtime.is_known_agent("qoder"));
         assert!(!runtime.is_known_agent("claude"));
     }
 
@@ -3644,7 +3771,7 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_discovery_orders_all_appended_connected_providers_and_preserves_routes() {
-        let runtime = AgentRuntime::with_fx_configs(
+        let runtime = AgentRuntime::with_qoder_configs(
             OpencodeConfig {
                 enabled: true,
                 autostart: false,
@@ -3654,6 +3781,10 @@ mod tests {
             T3Config::default(),
             CodexConfig::default(),
             FxConfig {
+                enabled: false,
+                binary: None,
+            },
+            QoderConfig {
                 enabled: false,
                 binary: None,
             },
@@ -3695,7 +3826,7 @@ mod tests {
                 .iter()
                 .map(|a| a.id.as_str())
                 .collect::<Vec<_>>(),
-            ["codex", "opencode", "deepseek", "t3", "fx"]
+            ["codex", "opencode", "deepseek", "t3", "fx", "qoder"]
         );
         assert_eq!(runtime.manager().await.unwrap().agent().kind(), "codex");
         assert_eq!(
@@ -3720,7 +3851,7 @@ mod tests {
         let runtime = AgentRuntime::disabled();
         let found = runtime.discover_agents().await;
         let ids: Vec<&str> = found.agents.iter().map(|a| a.id.as_str()).collect();
-        assert_eq!(ids, ["opencode", "deepseek", "t3", "fx", "codex"]);
+        assert_eq!(ids, ["opencode", "deepseek", "t3", "fx", "qoder", "codex"]);
     }
 
     #[tokio::test]

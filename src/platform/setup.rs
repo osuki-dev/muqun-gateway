@@ -142,6 +142,7 @@ pub(crate) fn setup(
             t3: agents::T3Config::default(),
             codex: agents::runtime::CodexConfig::default(),
             fx: agents::runtime::FxConfig::default(),
+            qoder: agents::runtime::QoderConfig::default(),
             agent_runtime: crate::platform::config::AgentRuntimeConfig::default(),
             store: crate::platform::config::StoreConfig::default(),
             mcp: crate::platform::config::McpConfig::default(),

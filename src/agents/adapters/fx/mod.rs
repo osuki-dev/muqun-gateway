@@ -1,8 +1,9 @@
 pub mod client;
 pub mod driver;
+#[cfg(test)]
 pub(crate) mod mapper;
 
 pub use driver::FxDriver;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

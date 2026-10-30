@@ -112,12 +112,13 @@ pub(crate) async fn run(config_path: Option<String>) -> anyhow::Result<()> {
     backend_startup::spawn(&config);
 
     let agent_runtime = if config.agent_runtime.enabled {
-        agents::AgentRuntime::with_fx_configs(
+        agents::AgentRuntime::with_qoder_configs(
             config.opencode.clone(),
             config.deepseek.clone(),
             config.t3.clone(),
             config.codex.clone(),
             config.fx.clone(),
+            config.qoder.clone(),
             Some(state_dir()?),
         )
     } else {
@@ -321,7 +322,7 @@ async fn serve_until_shutdown(
         _ = shutdown => Ok(()),
         result = axum::serve(listener,app.into_make_service_with_connect_info::<SocketAddr>()).into_future() => result,
     };
-    runtime.shutdown_fx().await;
+    tokio::join!(runtime.shutdown_fx(), runtime.shutdown_qoder());
     let cleanup = runtime.shutdown_codex().await;
     match (result, cleanup) {
         (result, Ok(())) => result.context("Gateway HTTP listener stopped"),

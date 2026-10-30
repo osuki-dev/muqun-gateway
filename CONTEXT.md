@@ -21,9 +21,14 @@ The retired `herdr.gateway` identifier remains only for migration compatibility.
   - `ports/`: `AgentPort` (`ports/agent.rs`) and `SessionMirrorPort`.
   - `adapters/`: OpenCode, DeepSeek, Codex (`adapters/codex/`, private app-server
     stdio or verified shared-daemon Unix WebSocket; wire reference in `docs/codex-protocol.md`), T3 Code (`adapters/t3/`,
-    Effect RPC over a WebSocket; wire reference in `docs/t3-protocol.md`), and the in-memory
-    mirror adapter. Each adapter's event stream is folded into domain events
-    by a module under `manager/` (`deepseek.rs`, `t3.rs`, `codex.rs`).
+    Effect RPC over a WebSocket; wire reference in `docs/t3-protocol.md`), FX and
+    Qoder CLI (`adapters/fx/`, `adapters/qoder/`), and the in-memory mirror.
+    FX/Qoder share the bounded private stdio client and session projection in
+    `adapters/acp/`; provider profiles retain their native launch, message-id
+    and capability differences. Their drivers own session children and domain
+    events; other service event streams are folded under `manager/`
+    (`deepseek.rs`, `t3.rs`, `codex.rs`). See `docs/fx-protocol.md` and
+    `docs/qoder-protocol.md` for their separate upstream contracts.
   - `manager.rs`, `runtime.rs`, `use_cases/`: agent supervision and the
     session/prompt/interaction services. `runtime/t3.rs` holds T3's config
     block, its pairing-token-to-bearer credential (persisted by
@@ -36,8 +41,11 @@ The retired `herdr.gateway` identifier remains only for migration compatibility.
     to the verified Codex home in the shared SQLite store. Selected unloaded
     sessions can request official same-ID resume after restart; this evidence
     grants neither runtime ownership nor permission to replay a prompt.
-    service agents default on for Codex and OpenCode, with the master
-    `agent_runtime.enabled` switch independent of terminal-agent dispatch.
+    Service agents default on for Codex and OpenCode. `runtime/fx.rs` and
+    `runtime/qoder.rs` default to discovering installed CLIs without starting
+    ACP; explicit session operations create private children. Both retain
+    independent configuration and shutdown ownership. The master
+    `agent_runtime.enabled` switch is independent of terminal-agent dispatch.
   - `routes.rs`: the OpenCode-style agent-session API (global and legacy paths).
     The session-to-agent routes `manager_for_session` records (which adapter
     to ask for a session) are kept in the shared store's
