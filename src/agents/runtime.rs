@@ -510,6 +510,7 @@ impl AgentRuntime {
                 qoder: QoderConfig {
                     enabled: false,
                     binary: None,
+                    ..Default::default()
                 },
                 pi: pi_config,
             },
@@ -688,10 +689,12 @@ impl AgentRuntime {
                 fx: FxConfig {
                     enabled: false,
                     binary: None,
+                    ..Default::default()
                 },
                 qoder: QoderConfig {
                     enabled: false,
                     binary: None,
+                    ..Default::default()
                 },
                 pi: PiConfig::disabled(),
             },
@@ -2383,6 +2386,7 @@ mod tests {
             FxConfig {
                 enabled: true,
                 binary: Some(binary.0.to_string_lossy().into_owned()),
+                ..Default::default()
             },
             None,
         );
@@ -2433,10 +2437,12 @@ mod tests {
             FxConfig {
                 enabled: false,
                 binary: None,
+                ..Default::default()
             },
             QoderConfig {
                 enabled: true,
                 binary: Some(binary.0.to_string_lossy().into_owned()),
+                ..Default::default()
             },
             None,
         );
@@ -3498,6 +3504,7 @@ mod tests {
             FxConfig {
                 enabled: false,
                 binary: None,
+                ..Default::default()
             },
             None,
         );
@@ -4016,10 +4023,12 @@ mod tests {
             FxConfig {
                 enabled: false,
                 binary: None,
+                ..Default::default()
             },
             QoderConfig {
                 enabled: false,
                 binary: None,
+                ..Default::default()
             },
             None,
         );

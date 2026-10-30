@@ -524,6 +524,7 @@ for line in sys.stdin:
             tx,
         );
         let service = SessionService::with_memory_mirror(driver.clone(), mirror);
+        service.prepare_session(&info.asid).await.unwrap();
         let opening = service
             .history_window(&info.asid, None, false)
             .await
@@ -870,6 +871,9 @@ for line in sys.stdin:
             second.get_session("foreign-id").await,
             Err(AgentError::SessionNotFound(_))
         ));
+        assert!(second.get_timeline(id, 100).await.is_err());
+        assert!(!fixture.methods().contains(&"session/load".into()));
+        second.prepare_selected_session(id).await.unwrap();
         assert_eq!(second.get_timeline(id, 100).await.unwrap().len(), 2);
         assert_eq!(
             fixture
@@ -911,7 +915,21 @@ for line in sys.stdin:
             .await
             .unwrap();
         fixture.status(id, AgentSessionStatus::Unknown).await;
-        let before_failed_load = fixture.mirror.get_snapshot(&session.asid).await.unwrap();
+        // Wait for the old generation's final runtime observation, then prove
+        // a rejected explicit load cannot change that settled snapshot.
+        let before_failed_load = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let snapshot = fixture.mirror.get_snapshot(&session.asid).await.unwrap();
+                if snapshot.info.runtime.as_ref().is_some_and(|runtime| {
+                    runtime.interaction == crate::agents::domain::RuntimeInteraction::Unavailable
+                }) {
+                    break snapshot;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
         std::fs::write(fixture.directory.join("busy-load"), b"busy").unwrap();
         let error = fixture
             .driver

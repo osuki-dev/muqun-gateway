@@ -476,6 +476,22 @@ impl Projection {
         group
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    pub fn latest_text(&self, role: TimelineRole) -> Option<&str> {
+        self.rows
+            .values()
+            .filter(|row| row.role == role)
+            .filter_map(|row| match &row.part {
+                AgentPart::Text { text } => Some((row.ordinal, text.as_str())),
+                _ => None,
+            })
+            .max_by_key(|(ordinal, _)| *ordinal)
+            .map(|(_, text)| text)
+    }
+
     pub fn can_submit(&self, text: &str) -> Result<(), AgentError> {
         if self
             .observed_bytes

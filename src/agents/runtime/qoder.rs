@@ -17,6 +17,13 @@ pub struct QoderConfig {
     /// An absolute executable path, otherwise normal PATH lookup.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binary: Option<String>,
+    /// Release verified idle native children; background reads never extend it.
+    #[serde(default = "default_idle_timeout_secs")]
+    pub idle_timeout_secs: u64,
+}
+
+fn default_idle_timeout_secs() -> u64 {
+    crate::agents::adapters::acp::session::DEFAULT_IDLE_TIMEOUT_SECS
 }
 
 impl Default for QoderConfig {
@@ -24,6 +31,7 @@ impl Default for QoderConfig {
         Self {
             enabled: true,
             binary: None,
+            idle_timeout_secs: default_idle_timeout_secs(),
         }
     }
 }
@@ -110,6 +118,9 @@ impl QoderState {
             Some(version),
             runtime.events_tx.clone(),
         );
+        driver.set_idle_timeout(std::time::Duration::from_secs(
+            self.config.idle_timeout_secs.max(1),
+        ));
         let _ = self.driver.set(driver);
         runtime.install("qoder", manager, AgentOrigin::None).await;
         true

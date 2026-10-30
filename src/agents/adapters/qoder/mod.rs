@@ -5,3 +5,5 @@ pub use driver::QoderDriver;
 mod tests;
 
 mod native_sessions;
+
+mod recovery;

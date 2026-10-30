@@ -58,10 +58,12 @@ pub(crate) fn test_config(token: &str) -> Config {
         fx: agents::runtime::FxConfig {
             enabled: false,
             binary: None,
+            ..Default::default()
         },
         qoder: agents::runtime::QoderConfig {
             enabled: false,
             binary: None,
+            ..Default::default()
         },
         agent_runtime: crate::platform::config::AgentRuntimeConfig { enabled: false },
         store: crate::platform::config::StoreConfig::default(),

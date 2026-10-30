@@ -448,6 +448,7 @@ mod tests {
                 crate::agents::runtime::FxConfig {
                     enabled: false,
                     binary: None,
+                    ..Default::default()
                 },
                 got,
                 None,

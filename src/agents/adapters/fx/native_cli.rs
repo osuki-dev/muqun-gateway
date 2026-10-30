@@ -23,6 +23,68 @@ pub(crate) async fn read_json(
         .map_err(|_| AgentError::Protocol("FX metadata was not JSON".into()))
 }
 
+pub(crate) async fn recovery_snapshot(
+    binary: &str,
+    directory: &str,
+    id: &str,
+    stop: &CancellationToken,
+) -> Result<crate::agents::adapters::acp::recovery::NativeSnapshot, AgentError> {
+    let bytes = crate::agents::adapters::acp::session::read_metadata_output_bounded(
+        binary,
+        &["session", "--id", id, "--json"],
+        directory,
+        stop,
+        64 * 1024 * 1024,
+        std::time::Duration::from_secs(3),
+    )
+    .await?;
+    let value: Value = serde_json::from_slice(&bytes)
+        .map_err(|_| AgentError::Protocol("FX recovery metadata was not JSON".into()))?;
+    drop(bytes);
+    recovery_snapshot_value(id, value)
+}
+
+fn recovery_snapshot_value(
+    id: &str,
+    mut value: Value,
+) -> Result<crate::agents::adapters::acp::recovery::NativeSnapshot, AgentError> {
+    use crate::agents::adapters::acp::recovery::NativeSnapshot;
+    if value["kind"].as_str() != Some("session_detail") || value["id"].as_str() != Some(id) {
+        return Err(AgentError::Protocol(
+            "FX recovery metadata changed session identity".into(),
+        ));
+    }
+    let count = value["history_len"].as_u64();
+    let entries = match value["history"].take() {
+        Value::Array(entries) => entries,
+        _ => {
+            return Err(AgentError::Protocol(
+                "FX recovery history is missing".into(),
+            ))
+        }
+    };
+    if count != Some(entries.len() as u64) || entries.len() > 100_000 {
+        return Err(AgentError::Protocol(
+            "FX recovery history is incomplete or exceeds its budget".into(),
+        ));
+    }
+    let last = entries
+        .last()
+        .filter(|turn| turn["kind"].as_str() == Some("assistant"));
+    let last_user = last
+        .and_then(|turn| turn["user"]["text"].as_str())
+        .map(str::to_owned);
+    let last_assistant = last
+        .and_then(|turn| turn["assistant"].as_str())
+        .map(str::to_owned);
+    Ok(NativeSnapshot {
+        session_id: id.into(),
+        entries,
+        last_user,
+        last_assistant,
+    })
+}
+
 fn native_provider<'a>(source: &str, status: &'a Value) -> Option<&'a str> {
     let provider = match source {
         "Codex subscription" => Some("codex"),
@@ -193,6 +255,59 @@ pub(crate) fn account_limits(value: &Value) -> AccountLimits {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[tokio::test]
+    #[ignore = "requires explicit FX_RECOVERY_QA_ID belonging to an authorized completed QA session; read-only"]
+    async fn real_fx_recovery_snapshot_read_only() {
+        let id = std::env::var("FX_RECOVERY_QA_ID").expect("explicit own QA identity required");
+        let binary = std::env::var("FX_RECOVERY_QA_BINARY").unwrap_or_else(|_| "fx".into());
+        let cwd = std::env::current_dir().unwrap();
+        let snapshot = recovery_snapshot(
+            &binary,
+            cwd.to_str().unwrap(),
+            &id,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(snapshot.session_id, id);
+        assert!(snapshot
+            .last_user
+            .as_ref()
+            .is_some_and(|text| !text.is_empty()));
+        assert!(snapshot
+            .last_assistant
+            .as_ref()
+            .is_some_and(|text| !text.is_empty()));
+        println!(
+            "verified native saved history: turns={}, checkpoint={}",
+            snapshot.entries.len(),
+            snapshot.checkpoint().digest
+        );
+    }
+
+    #[test]
+    fn recovery_requires_exact_identity_complete_history_and_final_normal_turn() {
+        let good = json_for_recovery(
+            "same",
+            serde_json::json!([{"kind":"assistant","user":{"text":"question","images":[]},"assistant":"answer","execution":{"tool_steps":[]}}]),
+        );
+        let snapshot = recovery_snapshot_value("same", good.clone()).unwrap();
+        assert_eq!(snapshot.last_assistant.as_deref(), Some("answer"));
+        assert!(recovery_snapshot_value("other", good.clone()).is_err());
+        let mut truncated = good;
+        truncated["history_len"] = serde_json::json!(2);
+        assert!(recovery_snapshot_value("same", truncated).is_err());
+        let cancelled = recovery_snapshot_value(
+            "same",
+            json_for_recovery("same", serde_json::json!([{"kind":"interrupted"}])),
+        )
+        .unwrap();
+        assert!(cancelled.last_assistant.is_none());
+    }
+    fn json_for_recovery(id: &str, history: Value) -> Value {
+        serde_json::json!({"kind":"session_detail","id":id,"history_len":history.as_array().unwrap().len(),"history":history})
+    }
+
     #[test]
     fn cold_catalog_uses_verified_provider_identity_without_guessing_effort() {
         let models =

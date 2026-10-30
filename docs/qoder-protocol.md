@@ -30,6 +30,40 @@ or a model response has been verified. Each explicitly opened session owns a
 private `qodercli --acp` child. Shutdown stops and reaps Gateway-owned children;
 external terminal and IDE processes are untouched.
 
+Verified idle conversations release their private process after
+`qoder.idle_timeout_secs` (default 300 seconds, checked every 30 seconds). The
+driver checks the exact session's bounded native JSONL journal without loading
+it: the last matching `active-leaf` selects the branch, `parentUuid` orders its
+records, and native human-input metadata distinguishes prompts from tool-result
+user records. A normal nonempty `end_turn` must extend the checkpoint captured
+before that prompt by one human turn, with unchanged earlier context and exact
+user/final-assistant text hashes. Context attachments, reasoning and tool
+records remain part of the canonical checkpoint. A clean final native
+`end_turn` is required; cancellation/error records do not qualify.
+
+Busy/in-flight work and pending approvals prevent retirement. Gateway closes
+stdin in FIFO order, drains stdout/stderr, waits for a successful exit, then
+checks the same native checkpoint again. The live child and projection are
+released; only bounded identity/workspace metadata and the ordinary bounded
+mirror cache remain. A verified metadata-only empty session may also retire.
+Recovery descriptors are capped at 512 per provider and 16 KiB serialized info
+each (8 MiB payload plus bounded indexes). Oversized metadata prevents retirement
+before EOF; an unexpected exit keeps only bounded recovery identity and resolves
+the full display title through the existing bounded mirror/native metadata.
+Inspection admission remains owned by the blocking scan/read/parse job even if
+its caller is cancelled, so another inspection cannot exceed its memory budget.
+Background snapshot/history/catalog reads do not wake a dormant conversation.
+Explicit foreground preparation or a new user send restores the same native
+ID once and replaces the prepared history atomically, without replaying an old
+prompt. Unexpected or uncertain exits stay Unknown and require explicit
+foreground preparation before another prompt.
+
+Native compacted/repaired/sidechain formats or unknown record kinds currently
+fail recovery inspection rather than being mistaken for a simple active
+branch. Missing, ambiguous, changing or oversized journals leave the live
+process intact. A `session/close` acknowledgement alone is never a persistence
+guarantee.
+
 A separately opened Qoder terminal or IDE is not a shared live ACP connection.
 Gateway can read saved session metadata without loading that conversation. An
 explicit selection may request native load and history replay. This does not

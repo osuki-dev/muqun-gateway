@@ -8,8 +8,10 @@ use tokio::io::AsyncReadExt;
 use tokio::sync::{broadcast, mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 
+use super::client::AcpRetirement;
 use super::mapper::{self, Permission, Projection};
 use super::operations::{self, PromptCapabilities};
+use super::recovery::{self, Checkpoint, NativeSnapshot, TurnEvidence};
 use super::{AcpClient, AcpEvent};
 use crate::agents::adapters::memory_mirror::MemoryMirror;
 use crate::agents::domain::*;
@@ -27,6 +29,15 @@ pub trait AcpProvider: Send + Sync + 'static {
     const REQUIRE_MESSAGE_ID: bool;
     const MODEL_SELECTION: bool;
     const SESSION_NOTICES: bool = false;
+    const IDLE_RETIREMENT: bool = false;
+    fn recovery_snapshot<'a>(
+        _binary: &'a str,
+        _directory: &'a str,
+        _id: &'a str,
+        _stop: &'a CancellationToken,
+    ) -> AgentFuture<'a, NativeSnapshot> {
+        unsupported("read-only native recovery evidence")
+    }
     const PROVIDER_CONFIG: bool = true;
     const EFFORT_CONFIG: &'static str = "effort";
     fn session_metadata<'a>(
@@ -55,6 +66,11 @@ pub trait AcpProvider: Send + Sync + 'static {
 }
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
+pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 300;
+const RETIREMENT_TIMEOUT: Duration = Duration::from_secs(15);
+// At most 8 MiB of serialized dormant info, plus bounded map/index overhead.
+const MAX_DORMANT_SESSIONS: usize = 512;
+const MAX_DORMANT_INFO_BYTES: usize = 16 * 1024;
 const MAX_CONNECTIONS: usize = 16;
 const MAX_LIST_PAGES: usize = 64;
 const SESSION_METADATA_TTL: Duration = Duration::from_secs(30);
@@ -81,6 +97,116 @@ struct SessionState {
     usage: mapper::SessionUsage,
     projection: Projection,
     permissions: HashMap<String, Permission>,
+    last_activity: tokio::time::Instant,
+    recovery: Option<RecoveryEvidence>,
+    prompt_checkpoint: Option<Checkpoint>,
+    prompt_user_digest: Option<String>,
+    turn_had_output: bool,
+}
+
+#[derive(Clone)]
+enum RecoveryEvidence {
+    Loaded(Checkpoint),
+    Turn {
+        before: Checkpoint,
+        expected: TurnEvidence,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DormantKind {
+    Parked,
+    Unexpected,
+}
+
+#[derive(Clone)]
+struct DormantSession {
+    info: AgentSessionInfo,
+    owned_mutations: bool,
+    kind: DormantKind,
+    complete_metadata: bool,
+}
+
+fn dormant_metadata_fits(info: &AgentSessionInfo) -> bool {
+    struct Counter(usize);
+    impl std::io::Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if bytes.len() > MAX_DORMANT_INFO_BYTES.saturating_sub(self.0) {
+                return Err(std::io::Error::other("dormant metadata byte budget"));
+            }
+            self.0 += bytes.len();
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    serde_json::to_writer(Counter(0), info).is_ok()
+}
+
+fn parked_runtime() -> SessionRuntime {
+    SessionRuntime {
+        transcript: Some(TranscriptSource::Snapshot),
+        source: RuntimeSource::Native,
+        interaction: RuntimeInteraction::Native,
+        status: Some(TerminalRuntimeStatus::Idle),
+        terminal: None,
+        reason: Some(RuntimeReason::NotLoaded),
+    }
+}
+
+fn parked_metadata_fits(info: &AgentSessionInfo) -> bool {
+    if !dormant_metadata_fits(info) {
+        return false;
+    }
+    let mut parked = info.clone();
+    parked.runtime = Some(parked_runtime());
+    dormant_metadata_fits(&parked)
+}
+
+impl DormantSession {
+    fn new(info: &AgentSessionInfo, owned_mutations: bool, kind: DormantKind) -> Self {
+        let complete_metadata = dormant_metadata_fits(info);
+        let info = if complete_metadata {
+            info.clone()
+        } else {
+            // Display reads retain the full title in the bounded mirror. Do
+            // not duplicate an oversized native JSON tree in another store.
+            let mut compact = mapper::session(
+                &info.asid.0,
+                info.directory.as_deref().unwrap_or_default(),
+                &Value::Null,
+            );
+            compact.status = AgentSessionStatus::Unknown;
+            compact.runtime = Some(SessionRuntime {
+                transcript: Some(TranscriptSource::Snapshot),
+                source: RuntimeSource::Native,
+                interaction: RuntimeInteraction::Unavailable,
+                status: Some(TerminalRuntimeStatus::Unknown),
+                terminal: None,
+                reason: Some(RuntimeReason::NotLoaded),
+            });
+            if !dormant_metadata_fits(&compact) {
+                compact.directory = None;
+            }
+            compact
+        };
+        Self {
+            info,
+            owned_mutations,
+            kind,
+            complete_metadata,
+        }
+    }
+
+    fn overlay(&self, info: &mut AgentSessionInfo) {
+        if self.complete_metadata {
+            *info = self.info.clone();
+        } else {
+            info.status = self.info.status;
+            info.runtime = self.info.runtime.clone();
+        }
+    }
 }
 
 struct Session {
@@ -93,6 +219,18 @@ struct Session {
     commands_observed: Arc<AtomicBool>,
     prompt_capabilities: PromptCapabilities,
     finished: CancellationToken,
+    retirement: Mutex<()>,
+}
+
+type LiveSessions = Arc<StdMutex<HashMap<String, Arc<Session>>>>;
+type DormantSessions = Arc<StdMutex<HashMap<String, DormantSession>>>;
+
+struct ListenerContext {
+    sessions: LiveSessions,
+    dormant: DormantSessions,
+    idle_timeout_secs: Arc<AtomicU64>,
+    binary: String,
+    inspection: Arc<Mutex<()>>,
 }
 
 struct Admission<'a> {
@@ -119,7 +257,10 @@ pub struct AcpDriver<P: AcpProvider> {
     default_directory: String,
     mirror: Arc<MemoryMirror>,
     tx: broadcast::Sender<AgentDomainEvent>,
-    sessions: StdMutex<HashMap<String, Arc<Session>>>,
+    sessions: LiveSessions,
+    dormant: DormantSessions,
+    idle_timeout_secs: Arc<AtomicU64>,
+    inspection: Arc<Mutex<()>>,
     connections: StdMutex<Vec<Weak<AcpClient>>>,
     connection_admission: Mutex<()>,
     starting: tokio::sync::RwLock<()>,
@@ -149,6 +290,25 @@ pub(crate) async fn read_metadata_output(
     directory: &str,
     stop: &CancellationToken,
 ) -> Result<Vec<u8>, AgentError> {
+    read_metadata_output_bounded(
+        binary,
+        arguments,
+        directory,
+        stop,
+        1024 * 1024,
+        Duration::from_secs(15),
+    )
+    .await
+}
+
+pub(crate) async fn read_metadata_output_bounded(
+    binary: &str,
+    arguments: &[&str],
+    directory: &str,
+    stop: &CancellationToken,
+    limit: usize,
+    timeout: Duration,
+) -> Result<Vec<u8>, AgentError> {
     use std::process::Stdio;
     let mut child = tokio::process::Command::new(binary)
         .args(arguments)
@@ -163,13 +323,13 @@ pub(crate) async fn read_metadata_output(
         .stdout
         .take()
         .ok_or_else(|| AgentError::Protocol("Agent metadata stdout missing".into()))?
-        .take(1024 * 1024 + 1);
+        .take(limit as u64 + 1);
     let mut bytes = Vec::new();
     let result = tokio::select! {
         _ = stop.cancelled() => Err(AgentError::NotAvailable("Agent metadata command cancelled".into())),
-        result = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        result = tokio::time::timeout(timeout, async {
             stdout.read_to_end(&mut bytes).await.map_err(|_| AgentError::Protocol("Could not read Agent metadata".into()))?;
-            if bytes.len() > 1024 * 1024 { return Err(AgentError::Protocol("Agent metadata exceeds its byte budget".into())); }
+            if bytes.len() > limit { return Err(AgentError::Protocol("Agent metadata exceeds its byte budget".into())); }
             let status = child.wait().await.map_err(|_| AgentError::NotAvailable("Agent metadata process failed".into()))?;
             if !status.success() { return Err(AgentError::NotAvailable("Agent metadata is unavailable; inspect FX authentication in the terminal".into())); }
             Ok(bytes)
@@ -195,7 +355,10 @@ impl<P: AcpProvider> AcpDriver<P> {
             default_directory,
             mirror,
             tx,
-            sessions: StdMutex::new(HashMap::new()),
+            sessions: Arc::new(StdMutex::new(HashMap::new())),
+            dormant: Arc::new(StdMutex::new(HashMap::new())),
+            idle_timeout_secs: Arc::new(AtomicU64::new(DEFAULT_IDLE_TIMEOUT_SECS)),
+            inspection: Arc::new(Mutex::new(())),
             connections: StdMutex::new(Vec::new()),
             connection_admission: Mutex::new(()),
             starting: tokio::sync::RwLock::new(()),
@@ -210,6 +373,11 @@ impl<P: AcpProvider> AcpDriver<P> {
             commands_observed: Arc::new(AtomicBool::new(false)),
             stop: CancellationToken::new(),
         })
+    }
+
+    pub fn set_idle_timeout(&self, timeout: Duration) {
+        self.idle_timeout_secs
+            .store(timeout.as_secs().max(1), Ordering::Release);
     }
 
     /// Discovery verifies the binary. ACP is initialized only on an explicit read or mutation.
@@ -369,6 +537,7 @@ impl<P: AcpProvider> AcpDriver<P> {
         value: &str,
     ) -> Result<(), AgentError> {
         let mut state = session.state.lock().await;
+        state.last_activity = tokio::time::Instant::now();
         let option = mapper::config_option(&state.config, config_id)
             .ok_or_else(|| AgentError::Unsupported(format!("ACP {config_id} selection")))?;
         if option["currentValue"].as_str() == Some(value) {
@@ -488,7 +657,7 @@ impl<P: AcpProvider> AcpDriver<P> {
         let admission = self.connection_admission.lock().await;
         {
             let mut connections = self.connections.lock().unwrap();
-            connections.retain(|client| client.strong_count() > 0);
+            connections.retain(|client| client.upgrade().is_some_and(|client| client.is_running()));
             if connections.len() >= MAX_CONNECTIONS + 2 {
                 return Err(AgentError::NotAvailable(
                     "ACP connection capacity exhausted".into(),
@@ -506,7 +675,7 @@ impl<P: AcpProvider> AcpDriver<P> {
         .map_err(AgentError::NotAvailable)?;
         {
             let mut connections = self.connections.lock().unwrap();
-            connections.retain(|client| client.strong_count() > 0);
+            connections.retain(|client| client.upgrade().is_some_and(|client| client.is_running()));
             connections.push(Arc::downgrade(&client));
         }
         drop(admission);
@@ -652,6 +821,8 @@ impl<P: AcpProvider> AcpDriver<P> {
         for info in &mut sessions {
             if let Some(known) = self.retained(&info.asid.0) {
                 *info = known.state.lock().await.info.clone();
+            } else if let Some(known) = self.dormant.lock().unwrap().get(&info.asid.0) {
+                known.overlay(info);
             }
         }
         Some(sessions)
@@ -791,6 +962,7 @@ impl<P: AcpProvider> AcpDriver<P> {
             }
             // A native listing proves neither runtime ownership nor idle state.
             info.status = AgentSessionStatus::Unknown;
+            let dormant = self.dormant.lock().unwrap().get(id).cloned();
             if let Some(known) = self.retained(id) {
                 let mut state = known.state.lock().await;
                 let mut changed = false;
@@ -812,6 +984,8 @@ impl<P: AcpProvider> AcpDriver<P> {
                         },
                     );
                 }
+            } else if let Some(known) = dormant {
+                known.overlay(&mut info);
             } else if info.directory.is_none() {
                 info.directory = self
                     .mirror
@@ -869,7 +1043,7 @@ impl<P: AcpProvider> AcpDriver<P> {
     }
 
     async fn readonly_empty_snapshot(&self, id: &str) -> Result<bool, AgentError> {
-        if self.retained(id).is_some() {
+        if self.retained(id).is_some() || self.dormant.lock().unwrap().contains_key(id) {
             return Ok(false);
         }
         let info = self.native_session_info(id).await?;
@@ -911,30 +1085,124 @@ impl<P: AcpProvider> AcpDriver<P> {
     }
 
     async fn ensure_loaded(&self, id: &str) -> Result<Arc<Session>, AgentError> {
-        if let Some(session) = self.retained(id) {
-            if session.connected.load(Ordering::Acquire) {
-                return Ok(session);
-            }
-            return Err(AgentError::NotAvailable(
-                "ACP connection ended; refresh the session explicitly before sending again".into(),
-            ));
-        }
+        self.activate(id, false, false).await
+    }
+
+    async fn activate(
+        &self,
+        id: &str,
+        explicit_prepare: bool,
+        reserve_prompt: bool,
+    ) -> Result<Arc<Session>, AgentError> {
+        // One explicit activation restores a same-ID generation. Prompt calls
+        // never replay a previous request and cannot recover an unexpected loss.
         let _mutation = self.mutations.lock().await;
         if let Some(session) = self.retained(id) {
+            let retirement = session.retirement.lock().await;
             if session.connected.load(Ordering::Acquire) {
+                if reserve_prompt
+                    && session
+                        .busy
+                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                        .is_err()
+                {
+                    return Err(AgentError::NotAvailable(
+                        "ACP session is already processing a turn".into(),
+                    ));
+                }
+                if explicit_prepare {
+                    session.state.lock().await.last_activity = tokio::time::Instant::now();
+                }
+                drop(retirement);
                 return Ok(session);
             }
-            return Err(AgentError::NotAvailable(
-                "ACP connection ended; refresh the session explicitly before sending again".into(),
-            ));
+            drop(retirement);
+            tokio::time::timeout(RETIREMENT_TIMEOUT, session.finished.cancelled())
+                .await
+                .map_err(|_| {
+                    AgentError::NotAvailable("Previous ACP generation has not stopped".into())
+                })?;
         }
-        let info = self.native_session_info(id).await?;
-        let directory = info
-            .directory
-            .clone()
+        let dormant = self.dormant.lock().unwrap().get(id).cloned();
+        if dormant
+            .as_ref()
+            .is_some_and(|entry| entry.kind == DormantKind::Unexpected)
+            && !explicit_prepare
+        {
+            return Err(AgentError::NotAvailable("ACP connection ended unexpectedly; explicitly open the conversation before sending a new prompt; delivery was not retried".into()));
+        }
+        let info = match &dormant {
+            Some(entry) => self.dormant_info(id, entry).await?,
+            None => self.native_session_info(id).await?,
+        };
+        let directory = info.directory.clone()
             .filter(|cwd| std::path::Path::new(cwd).is_absolute())
             .ok_or_else(|| AgentError::NotAvailable("The native session has no verified working directory; open it in Qoder or FX once before loading it here".into()))?;
-        self.open(&directory, Some(info)).await
+        let session = self.open(&directory, Some(info)).await?;
+        if let Some(entry) = dormant {
+            session.state.lock().await.owned_mutations = entry.owned_mutations;
+            if let Some(model) = &entry.info.model {
+                if session.state.lock().await.info.model.as_ref() != Some(model) {
+                    // Model/effort choices are session-scoped. Restore the
+                    // previous offered selection without changing host defaults.
+                    self.select_model(&session, model).await?;
+                }
+            }
+            self.dormant.lock().unwrap().remove(id);
+        }
+        if reserve_prompt
+            && session
+                .busy
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            return Err(AgentError::NotAvailable(
+                "ACP session is already processing a turn".into(),
+            ));
+        }
+        Ok(session)
+    }
+
+    async fn observed_snapshot(
+        &self,
+        id: &str,
+    ) -> Result<Option<AgentSessionSnapshot>, AgentError> {
+        if self.retained(id).is_some() {
+            return Ok(None);
+        }
+        if self.dormant.lock().unwrap().contains_key(id) {
+            return self
+                .mirror
+                .get_snapshot(&AgentSessionId::from(id))
+                .await
+                .map(Some)
+                .ok_or_else(|| {
+                    AgentError::NotAvailable(
+                        "Cached history expired; explicitly open the conversation to restore it"
+                            .into(),
+                    )
+                });
+        }
+        Err(AgentError::NotAvailable(
+            "Conversation history is not loaded; explicitly open it before reading native history"
+                .into(),
+        ))
+    }
+
+    async fn dormant_info(
+        &self,
+        id: &str,
+        entry: &DormantSession,
+    ) -> Result<AgentSessionInfo, AgentError> {
+        if entry.complete_metadata {
+            return Ok(entry.info.clone());
+        }
+        let mut info = match self.mirror.session_info(&AgentSessionId::from(id)).await {
+            Some(info) => info,
+            None => self.native_session_info(id).await?,
+        };
+        entry.overlay(&mut info);
+        Ok(info)
     }
 
     async fn open(
@@ -942,10 +1210,23 @@ impl<P: AcpProvider> AcpDriver<P> {
         directory: &str,
         existing: Option<AgentSessionInfo>,
     ) -> Result<Arc<Session>, AgentError> {
-        if self.sessions.lock().unwrap().len() >= MAX_CONNECTIONS {
-            return Err(AgentError::NotAvailable(
-                "ACP active-session capacity exhausted".into(),
-            ));
+        {
+            let sessions = self.sessions.lock().unwrap();
+            let dormant = self.dormant.lock().unwrap();
+            if dormant.len() + sessions.len() >= MAX_DORMANT_SESSIONS
+                && existing
+                    .as_ref()
+                    .is_none_or(|info| !dormant.contains_key(&info.asid.0))
+            {
+                return Err(AgentError::NotAvailable(
+                    "ACP recovery metadata capacity exhausted".into(),
+                ));
+            }
+            if sessions.len() >= MAX_CONNECTIONS {
+                return Err(AgentError::NotAvailable(
+                    "ACP active-session capacity exhausted".into(),
+                ));
+            }
         }
         let new_session = existing.is_none();
         let id = existing.as_ref().map(|info| info.asid.0.clone());
@@ -1041,8 +1322,16 @@ impl<P: AcpProvider> AcpDriver<P> {
             }
         }
         let id = id.or_else(|| value["sessionId"].as_str().map(str::to_owned)).ok_or_else(|| protocol("ACP session creation returned no sessionId; do not retry creation automatically"))?;
+        if id.is_empty() || id.len() > 256 || id.chars().any(char::is_control) {
+            client.shutdown().await;
+            return Err(protocol(
+                "ACP returned an invalid native session identity; do not retry creation",
+            ));
+        }
         let mut info = existing.unwrap_or_else(|| mapper::session(&id, directory, &value));
         info.status = AgentSessionStatus::Idle;
+        info.runtime = None;
+        info.error = None;
         info.model = mapper::selected_model_for(&value, P::KIND);
         if info.updated_ms == 0 {
             info.updated_ms = mapper::now_ms();
@@ -1060,6 +1349,11 @@ impl<P: AcpProvider> AcpDriver<P> {
             usage: mapper::SessionUsage::new(new_session),
             projection: Projection::new(P::REQUIRE_MESSAGE_ID),
             permissions: HashMap::new(),
+            last_activity: tokio::time::Instant::now(),
+            recovery: None,
+            prompt_checkpoint: None,
+            prompt_user_digest: None,
+            turn_had_output: false,
         };
         for params in replay {
             if params["sessionId"].as_str() != Some(id.as_str()) {
@@ -1076,6 +1370,18 @@ impl<P: AcpProvider> AcpDriver<P> {
             return Err(AgentError::NotAvailable(
                 "ACP runtime stopped while loading a session".into(),
             ));
+        }
+        if P::IDLE_RETIREMENT {
+            let _inspection = self.inspection.lock().await;
+            if let Ok(snapshot) =
+                P::recovery_snapshot(&self.binary, directory, &id, &self.stop).await
+            {
+                if snapshot.session_id == id
+                    && Self::snapshot_matches_projection(&snapshot, &state.projection)
+                {
+                    state.recovery = Some(RecoveryEvidence::Loaded(snapshot.checkpoint()));
+                }
+            }
         }
         // Native replay ids need not survive a load. Only a fully validated
         // replacement may replace the old snapshot; no replay row is broadcast.
@@ -1109,6 +1415,7 @@ impl<P: AcpProvider> AcpDriver<P> {
         if !state.catalog.commands.is_empty() {
             self.commands_observed.store(true, Ordering::Release);
         }
+        state.last_activity = tokio::time::Instant::now();
         let session = Arc::new(Session {
             client,
             state: Mutex::new(state),
@@ -1128,6 +1435,7 @@ impl<P: AcpProvider> AcpDriver<P> {
             native_capabilities: capabilities,
             commands_observed: self.commands_observed.clone(),
             finished: CancellationToken::new(),
+            retirement: Mutex::new(()),
         });
         self.sessions
             .lock()
@@ -1143,6 +1451,13 @@ impl<P: AcpProvider> AcpDriver<P> {
         );
         Self::listen(
             session.clone(),
+            ListenerContext {
+                sessions: self.sessions.clone(),
+                dormant: self.dormant.clone(),
+                idle_timeout_secs: self.idle_timeout_secs.clone(),
+                binary: self.binary.clone(),
+                inspection: self.inspection.clone(),
+            },
             events,
             completed,
             self.mirror.clone(),
@@ -1268,6 +1583,14 @@ impl<P: AcpProvider> AcpDriver<P> {
                 },
             );
             return;
+        }
+        if session.busy.load(Ordering::Acquire)
+            && params["update"]["sessionUpdate"].as_str() == Some("agent_message_chunk")
+            && params["update"]["content"]["text"]
+                .as_str()
+                .is_some_and(|text| !text.trim().is_empty())
+        {
+            state.turn_had_output = true;
         }
         let old_info = state.info.clone();
         let old_commands = state.catalog.commands.clone();
@@ -1500,8 +1823,142 @@ impl<P: AcpProvider> AcpDriver<P> {
         }
     }
 
+    fn snapshot_matches_projection(snapshot: &NativeSnapshot, projection: &Projection) -> bool {
+        if projection.is_empty() {
+            return snapshot.entries.is_empty();
+        }
+        snapshot.last_user.as_deref() == projection.latest_text(TimelineRole::User)
+            && snapshot.last_assistant.as_deref().is_some_and(|text| {
+                !text.is_empty() && Some(text) == projection.latest_text(TimelineRole::Assistant)
+            })
+    }
+
+    async fn retire_idle(
+        session: &Session,
+        context: &ListenerContext,
+        events: &mut broadcast::Receiver<AcpEvent>,
+        mirror: &MemoryMirror,
+        tx: &broadcast::Sender<AgentDomainEvent>,
+        stop: &CancellationToken,
+    ) -> Option<DormantKind> {
+        let Ok(_retirement) = session.retirement.try_lock() else {
+            return None;
+        };
+        if !P::IDLE_RETIREMENT
+            || !session.connected.load(Ordering::Acquire)
+            || session
+                .busy
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            return None;
+        }
+        let _admission = Admission {
+            busy: &session.busy,
+            handed_off: false,
+        };
+        let (id, directory, evidence) = {
+            let state = session.state.lock().await;
+            if state.info.status != AgentSessionStatus::Idle
+                || !state.permissions.is_empty()
+                || !parked_metadata_fits(&state.info)
+                || state.last_activity.elapsed()
+                    < Duration::from_secs(context.idle_timeout_secs.load(Ordering::Acquire))
+            {
+                return None;
+            }
+            let evidence = state.recovery.clone()?;
+            (
+                state.info.asid.0.clone(),
+                state.info.directory.clone()?,
+                evidence,
+            )
+        };
+        // At most one potentially large native history inspection per provider.
+        let Ok(_inspection) = context.inspection.try_lock() else {
+            return None;
+        };
+        let snapshot = P::recovery_snapshot(&context.binary, &directory, &id, stop)
+            .await
+            .ok()?;
+        let verified = match evidence {
+            RecoveryEvidence::Loaded(expected) => {
+                snapshot.session_id == id && snapshot.checkpoint() == expected
+            }
+            RecoveryEvidence::Turn { before, expected } => {
+                snapshot.proves_turn(&id, &before, &expected)
+            }
+        };
+        if !verified {
+            return None;
+        }
+        let confirmed = snapshot.checkpoint();
+        drop(snapshot);
+        let retirement = session.client.retire(RETIREMENT_TIMEOUT);
+        tokio::pin!(retirement);
+        let mut result = loop {
+            tokio::select! {
+                biased;
+                event = events.recv() => match event {
+                    Ok(event) => if !Self::event(session, mirror, tx, event).await {
+                        break Err("ACP stream ended during retirement".to_owned());
+                    },
+                    Err(_) => break Err("ACP retirement stream was interrupted".to_owned()),
+                },
+                result = &mut retirement => break result,
+            }
+        };
+        if result == Ok(AcpRetirement::NotIdle) {
+            return None;
+        }
+        while let Ok(event) = events.try_recv() {
+            if !Self::event(session, mirror, tx, event).await {
+                result = Err("ACP retirement stream was interrupted".into());
+                break;
+            }
+        }
+        if result.is_ok() {
+            result = match P::recovery_snapshot(&context.binary, &directory, &id, stop).await {
+                Ok(after) if after.session_id == id && after.checkpoint() == confirmed => {
+                    let state = session.state.lock().await;
+                    if Self::snapshot_matches_projection(&after, &state.projection)
+                        && parked_metadata_fits(&state.info)
+                    {
+                        Ok(AcpRetirement::Retired)
+                    } else {
+                        Err("Live history changed during native retirement".into())
+                    }
+                }
+                _ => Err("Native recovery changed during retirement".into()),
+            };
+        }
+        session.connected.store(false, Ordering::Release);
+        if result.is_err() {
+            Self::status(session, mirror, tx, AgentSessionStatus::Unknown, Some(AgentErrorInfo {
+                name: "AcpRetirementUnconfirmed".into(), message: "Native session recovery was not confirmed; explicitly open the conversation before sending; no prompt was retried".into(),
+                status: None, retry_after_ms: None,
+            })).await;
+            return Some(DormantKind::Unexpected);
+        }
+        let mut state = session.state.lock().await;
+        state.info.runtime = Some(parked_runtime());
+        let info = state.info.clone();
+        let seq = mirror.update_session(info.clone()).await;
+        Self::emit(
+            mirror,
+            tx,
+            AgentDomainEvent::SessionUpdated {
+                asid: info.asid.clone(),
+                info: Box::new(info),
+                seq,
+            },
+        );
+        Some(DormantKind::Parked)
+    }
+
     fn listen(
         session: Arc<Session>,
+        context: ListenerContext,
         mut events: broadcast::Receiver<AcpEvent>,
         mut completed: mpsc::UnboundedReceiver<Result<Value, String>>,
         mirror: Arc<MemoryMirror>,
@@ -1509,6 +1966,9 @@ impl<P: AcpProvider> AcpDriver<P> {
         stop: CancellationToken,
     ) {
         tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(30));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut dormant_kind = DormantKind::Unexpected;
             loop {
                 tokio::select! {
                     biased;
@@ -1522,6 +1982,7 @@ impl<P: AcpProvider> AcpDriver<P> {
                         while let Ok(event) = events.try_recv() { if !Self::event(&session, &mirror, &tx, event).await { break; } }
                         if !session.connected.load(Ordering::Acquire) { break; }
                         Self::finish_usage(&session, &mirror, &tx, result.as_ref().ok()).await;
+                        let normal_end = result.as_ref().is_ok_and(|value| value["stopReason"].as_str() == Some("end_turn"));
                         let (status, error) = match result {
                             Ok(value) => match value["stopReason"].as_str() {
                                 Some("cancelled") => (AgentSessionStatus::Interrupted, None),
@@ -1532,13 +1993,64 @@ impl<P: AcpProvider> AcpDriver<P> {
                         };
                         Self::clear_permissions(&session, &mirror, &tx).await;
                         Self::status(&session, &mirror, &tx, status, error).await;
+                        {
+                            let mut state = session.state.lock().await;
+                            state.last_activity = tokio::time::Instant::now();
+                            state.recovery = if normal_end && state.turn_had_output {
+                                match (state.prompt_checkpoint.take(), state.prompt_user_digest.take(), state.projection.latest_text(TimelineRole::Assistant)) {
+                                    (Some(before), Some(user_digest), Some(assistant)) if !assistant.is_empty() => Some(RecoveryEvidence::Turn { before, expected: TurnEvidence { user_digest, assistant_digest: recovery::text_digest(assistant) } }),
+                                    _ => None,
+                                }
+                            } else { None };
+                        }
                         session.busy.store(false, Ordering::Release);
+                    }
+                    _ = tick.tick(), if P::IDLE_RETIREMENT => {
+                        if let Some(kind) = Self::retire_idle(&session, &context, &mut events, &mirror, &tx, &stop).await {
+                            dormant_kind = kind; break;
+                        }
                     }
                 }
             }
             session.connected.store(false, Ordering::Release);
             Self::clear_permissions(&session, &mirror, &tx).await;
             session.client.shutdown().await;
+            let mut state = session.state.lock().await;
+            let id = state.info.asid.0.clone();
+            if dormant_kind == DormantKind::Unexpected {
+                state.info.runtime = Some(SessionRuntime {
+                    transcript: Some(TranscriptSource::Snapshot),
+                    source: RuntimeSource::Native,
+                    interaction: RuntimeInteraction::Unavailable,
+                    status: Some(TerminalRuntimeStatus::Unknown),
+                    terminal: None,
+                    reason: Some(RuntimeReason::NotLoaded),
+                });
+                let info = state.info.clone();
+                let seq = mirror.update_session(info.clone()).await;
+                Self::emit(
+                    &mirror,
+                    &tx,
+                    AgentDomainEvent::SessionUpdated {
+                        asid: info.asid.clone(),
+                        info: Box::new(info),
+                        seq,
+                    },
+                );
+            }
+            let compact = DormantSession::new(&state.info, state.owned_mutations, dormant_kind);
+            drop(state);
+            let mut sessions = context.sessions.lock().unwrap();
+            if sessions
+                .get(&id)
+                .is_some_and(|current| Arc::ptr_eq(current, &session))
+            {
+                let mut dormant = context.dormant.lock().unwrap();
+                if dormant.len() < MAX_DORMANT_SESSIONS || dormant.contains_key(&id) {
+                    dormant.insert(id.clone(), compact);
+                    sessions.remove(&id);
+                }
+            }
             session.finished.cancel();
         });
     }
@@ -1573,7 +2085,11 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
             if self.readonly_empty_snapshot(id).await? {
                 return Ok(Vec::new());
             }
-            self.ensure_loaded(id).await?;
+            if self.retained(id).is_none() {
+                self.observed_snapshot(id).await?;
+                return Ok(Vec::new());
+            }
+
             Ok(Vec::new())
         })
     }
@@ -1697,6 +2213,10 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
             if let Some(session) = self.retained(id) {
                 return Ok(session.state.lock().await.info.clone());
             }
+            let dormant = self.dormant.lock().unwrap().get(id).cloned();
+            if let Some(entry) = dormant {
+                return self.dormant_info(id, &entry).await;
+            }
             self.native_session_info(id).await
         })
     }
@@ -1705,25 +2225,21 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
             if self.readonly_empty_snapshot(id).await? {
                 return Ok(());
             }
-            // Only an explicit selection/refresh may replace a dead connection.
-            // Wait for the old reducer to stop before a same-id load publishes.
-            {
-                let _mutation = self.mutations.lock().await;
-                if let Some(session) = self.retained(id) {
-                    if !session.connected.load(Ordering::Acquire) {
-                        session.client.shutdown().await;
-                        tokio::time::timeout(Duration::from_secs(5), session.finished.cancelled())
-                            .await
-                            .map_err(|_| {
-                                AgentError::NotAvailable(
-                                    "ACP previous connection has not stopped yet".into(),
-                                )
-                            })?;
-                        self.sessions.lock().unwrap().remove(id);
-                    }
-                }
+            self.activate(id, true, false).await.map(|_| ())
+        })
+    }
+    fn prepare_observed_session<'a>(&'a self, id: &'a str) -> AgentFuture<'a, ()> {
+        Box::pin(async move {
+            if self.retained(id).is_some() || self.dormant.lock().unwrap().contains_key(id) {
+                return Ok(());
             }
-            self.ensure_loaded(id).await.map(|_| ())
+            if self.readonly_empty_snapshot(id).await? {
+                return Ok(());
+            }
+            // A saved/native identity is metadata, not foreground activation.
+            Err(AgentError::NotAvailable(
+                "Explicitly open this conversation to load its native history".into(),
+            ))
         })
     }
     fn send_prompt<'a>(
@@ -1739,27 +2255,41 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
                     "ACP prompt steering or queueing".into(),
                 ));
             }
-            let session = self.ensure_loaded(id).await?;
-            let prepared =
-                operations::prompt_parts(text, attachments, session.prompt_capabilities).await?;
-            if session
-                .busy
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
-            {
-                return Err(AgentError::NotAvailable(
-                    "ACP session is already processing a turn".into(),
-                ));
-            }
+            let session = self.activate(id, false, true).await?;
             let mut admission = Admission {
                 busy: &session.busy,
                 handed_off: false,
+            };
+            let prepared =
+                operations::prompt_parts(text, attachments, session.prompt_capabilities).await?;
+            let checkpoint = if P::IDLE_RETIREMENT && attachments.is_empty() {
+                let state = session.state.lock().await;
+                let initial_empty = state.owned_mutations && state.projection.is_empty();
+                let directory = state.info.directory.clone().unwrap_or_default();
+                drop(state);
+                if initial_empty {
+                    Some(NativeSnapshot::empty(id).checkpoint())
+                } else {
+                    let _inspection = self.inspection.lock().await;
+                    P::recovery_snapshot(&self.binary, &directory, id, &self.stop)
+                        .await
+                        .ok()
+                        .filter(|snapshot| snapshot.session_id == id)
+                        .map(|snapshot| snapshot.checkpoint())
+                }
+            } else {
+                None
             };
             // Admission and the local user row share the state lock: a fast
             // native response cannot appear ahead of its submitted user text.
             // Busy is published only after a request was actually flushed.
             let mut state = session.state.lock().await;
             state.projection.can_submit(&prepared.transcript)?;
+            state.recovery = None;
+            state.prompt_checkpoint = checkpoint;
+            state.prompt_user_digest = Some(recovery::text_digest(&prepared.transcript));
+            state.turn_had_output = false;
+            state.last_activity = tokio::time::Instant::now();
             let request = session
                 .client
                 .start_request(
@@ -1898,7 +2428,12 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
             if self.readonly_empty_snapshot(id).await? {
                 return Ok(Vec::new());
             }
-            let session = self.ensure_loaded(id).await?;
+            if let Some(snapshot) = self.observed_snapshot(id).await? {
+                return Ok(snapshot.permissions);
+            }
+            let session = self.retained(id).ok_or_else(|| {
+                AgentError::NotAvailable("ACP generation changed during observation".into())
+            })?;
             let pending = session
                 .state
                 .lock()
@@ -1929,7 +2464,15 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
                 if self.readonly_empty_snapshot(id).await? {
                     return Ok(AgentCatalog::default());
                 }
-                let session = self.ensure_loaded(id).await?;
+                if self.retained(id).is_none() {
+                    self.observed_snapshot(id).await?;
+                    return self.available_catalog(directory).await;
+                }
+                let session = self.retained(id).ok_or_else(|| {
+                    AgentError::NotAvailable(
+                        "ACP generation changed during catalog observation".into(),
+                    )
+                })?;
                 let mut catalog = session.state.lock().await.catalog.clone();
                 if !P::MODEL_SELECTION {
                     catalog.models.clear();
@@ -1954,7 +2497,12 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
             if self.readonly_empty_snapshot(id).await? {
                 return Ok(Vec::new());
             }
-            let session = self.ensure_loaded(id).await?;
+            if let Some(snapshot) = self.observed_snapshot(id).await? {
+                return Ok(snapshot.timeline);
+            }
+            let session = self.retained(id).ok_or_else(|| {
+                AgentError::NotAvailable("ACP generation changed during observation".into())
+            })?;
             let timeline = session
                 .state
                 .lock()
@@ -2043,6 +2591,13 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
     }
     fn delete_session<'a>(&'a self, id: &'a str) -> AgentFuture<'a, ()> {
         Box::pin(async move {
+            let parked_owned =
+                self.dormant.lock().unwrap().get(id).is_some_and(|entry| {
+                    entry.kind == DormantKind::Parked && entry.owned_mutations
+                });
+            if parked_owned {
+                self.ensure_loaded(id).await?;
+            }
             let _mutation = self.mutations.lock().await;
             let session = self.retained(id).ok_or_else(|| {
                 AgentError::Unsupported(
@@ -2090,6 +2645,7 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
                     AgentError::NotAvailable("deleted session connection has not stopped".into())
                 })?;
             self.sessions.lock().unwrap().remove(id);
+            self.dormant.lock().unwrap().remove(id);
             if let Some(metadata) = self.session_metadata.lock().await.as_mut() {
                 metadata.sessions.remove(id);
             }
@@ -2758,3 +3314,7 @@ mod admission_tests {
         assert!(!fixture.methods().contains(&"session/prompt".into()));
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "idle_tests.rs"]
+mod idle_tests;

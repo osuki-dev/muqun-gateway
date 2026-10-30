@@ -13,6 +13,18 @@ impl AcpProvider for QoderProvider {
     }
     const REQUIRE_MESSAGE_ID: bool = false;
     const MODEL_SELECTION: bool = true;
+    const IDLE_RETIREMENT: bool = true;
+    fn recovery_snapshot<'a>(
+        _binary: &'a str,
+        _directory: &'a str,
+        id: &'a str,
+        stop: &'a tokio_util::sync::CancellationToken,
+    ) -> crate::agents::ports::agent::AgentFuture<
+        'a,
+        crate::agents::adapters::acp::recovery::NativeSnapshot,
+    > {
+        Box::pin(super::recovery::inspect(id, stop))
+    }
     const PROVIDER_CONFIG: bool = false;
     const EFFORT_CONFIG: &'static str = "reasoning_effort";
     fn global_catalog<'a>(

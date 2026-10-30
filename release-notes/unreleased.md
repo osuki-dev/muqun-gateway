@@ -2,6 +2,20 @@
 
 ## Changes and fixes
 
+- **Verified idle FX and Qoder conversations release their private processes.**
+  Both default to a five-minute idle timeout, configurable with the provider's
+  `idle_timeout_secs`. Running work, in-flight requests and approvals remain
+  protected. Native latest-turn recovery is checked before and after graceful
+  shutdown; failed or uncertain checks never claim a saved idle state. A
+  foreground App open explicitly restores the original native conversation;
+  background history reads do not wake it, and no earlier prompt is replayed.
+  Live projections are released while bounded history caching remains. FX
+  0.0.16 cannot persist/recreate an unsaved empty native ID, so those blank
+  children remain protected. Unverified Qoder journal formats also remain live.
+  The foreground-open behavior requires an App that supports
+  `agent_session_resume_v1`; updating does not change CLI authentication or
+  permission modes.
+
 - **Repeated FX and Qoder session lists reuse recent metadata.** Complete lists
   share one native startup per directory and remain cached for up to 30 seconds.
   Gateway-created sessions, forks, deletions and model changes invalidate these

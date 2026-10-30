@@ -4,3 +4,5 @@ pub mod session;
 pub use client::{AcpClient, AcpEvent};
 
 pub(crate) mod operations;
+
+pub(crate) mod recovery;

@@ -28,6 +28,35 @@ before a prompt. One ordinary prompt may be in flight per session. Cancellation
 uses ACP's native cancellation notification; it is not evidence that a failed or
 lost prompt never ran. Ambiguous delivery is never retried automatically.
 
+Verified idle conversations release their private process after
+`fx.idle_timeout_secs` (default 300 seconds, checked every 30 seconds). Gateway
+records a native-history checkpoint before a prompt, then requires a normal
+nonempty `end_turn`, one new saved turn, an unchanged prior-history prefix and
+exact submitted-user/final-assistant hashes. The bounded read-only
+`fx session --id <id> --json` inspection includes the complete native execution
+records in its checkpoint. Busy turns, pending requests and approvals prevent
+retirement. Gateway closes stdin in FIFO order, drains both output pipes, waits
+for a successful exit and verifies the same native checkpoint afterward.
+
+Retirement drops the live projection and child, retaining only small bounded
+identity/workspace metadata and the ordinary bounded mirror cache.
+Recovery descriptors are capped at 512 per provider and 16 KiB of serialized
+info each (8 MiB payload plus bounded indexes). Oversized metadata is refused
+before retirement; unexpected exits retain only a bounded recovery identity,
+while full display metadata stays in the ordinary bounded mirror/native store.
+Background snapshot, catalog and history reads do not reopen the child. Explicit foreground
+preparation or a new user send restores one same-ID generation. Native history
+replaces the prepared snapshot atomically; no earlier prompt is replayed.
+An uncertain close or unexpected disconnect remains Unknown and requires
+explicit foreground preparation before another prompt.
+
+FX 0.0.16 does not save a newly created empty session before its first real
+prompt, and provides no ordinary ACP exact-ID creation/save operation. Such
+unsaved empty children remain protected: Gateway does not forge journals,
+invent a prompt or substitute a new native identity. Cancelled, refused,
+yielded or unverified turns are also ineligible. Missing or oversized recovery
+evidence leaves the existing process intact.
+
 An external FX TUI has its own connection and session lock. Gateway does not
 adopt it or claim that it shares a live ACP session. Session listing reads
 native saved metadata without claiming a live runtime.
