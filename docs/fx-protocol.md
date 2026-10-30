@@ -13,7 +13,10 @@ absolute executable in `fx.binary`. `fx.enabled: false` disables FX, and
 host configuration and authentication. Gateway does not install packages, log in,
 change permission policy, or update a global FX configuration file.
 
-Discovery executes only a time- and output-bounded `--version` probe. A
+Discovery uses a time- and output-bounded `--version` probe. An attached lazy
+adapter can additionally read the native model catalog through bounded
+`fx models --json` and `fx status --json`; successful results are cached for 60
+seconds and failures for five. These reads start no ACP session or model prompt. A
 `reachable` result means an executable answered, not that a model request has
 succeeded. The first session open is the ACP negotiation boundary. A missing or
 invalid executable does not block other adapters.
@@ -31,7 +34,8 @@ native saved metadata without claiming a live runtime.
 An explicit session open may use native `session/load` to resume a saved
 conversation and replay its history; an active external TUI may hold an
 exclusive lock, which Gateway must respect. Timeline data is retained in the
-Gateway mirror for this run, with no separate historical paging. Rename, delete
+Gateway mirror for this run. Earlier timeline reads page that complete bounded
+cache; there is no separate native before-cursor source. Rename, delete
 and fork are not advertised. A saved FX conversation alone does not establish
 that Gateway owns a live runtime or may replay a prompt.
 
@@ -79,10 +83,17 @@ apply explicitly selected native provider/model/effort choices before its first
 prompt. Unobserved choices are not fabricated from version numbers or global
 configuration. These operations never write an FX mode/profile.
 
-Modes, skills, slash commands, attachments, worktrees, revert, compaction,
-background shells and inbox editing remain disabled. Optional
-`sessionRename`, `sessionDelete`, `sessionFork`, `sessionPagination`,
-`timelineEarlier`, `accountLimits` and `computerTools` are explicitly false.
+Native uploads are enabled only after initialization advertises image or embedded
+context support, with upload-path and byte-budget checks. Slash commands require
+an actually observed native command catalog. Native fork/delete are exposed only
+when advertised and still enforce Gateway ownership, idle-state and native
+operation guards. Modes, skills, worktrees, revert, compaction, background shells
+and inbox editing remain disabled. Optional
+`sessionRename`, `sessionPagination` and `computerTools` are explicitly false.
+FX does not currently advertise native fork/delete, so those controls remain off. `timelineEarlier` reads the complete
+validated replay cache. `accountLimits` exposes the implemented read-only FX CLI
+usage inspection; unsupported providers return an unavailable result rather
+than fabricated quota values.
 A mode being mentioned by native ACP does not enable mode switching: FX's mode
 setter changes host configuration, so it is outside this session adapter.
 

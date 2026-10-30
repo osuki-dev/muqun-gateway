@@ -48,11 +48,42 @@ impl PiEventContext {
             seq,
         });
     }
+
+    pub(crate) async fn abort_backlog(&self) {
+        for (asid, changes) in self.driver.abort_backlog().await {
+            for change in changes {
+                apply_change(&asid, change, self).await;
+            }
+        }
+        self.emit(AgentDomainEvent::Resync {
+            asid: AgentSessionId(String::new()),
+            reason: "event_backlog_overflow".into(),
+        });
+    }
 }
 
-pub(crate) async fn handle_pi_record(asid: &AgentSessionId, record: &Value, ctx: &PiEventContext) {
-    for change in ctx.driver.fold(asid, record).await {
+pub(crate) async fn handle_pi_record(
+    asid: &AgentSessionId,
+    generation: u64,
+    record: &Value,
+    ctx: &PiEventContext,
+) {
+    let changes = ctx.driver.fold(asid, generation, record).await;
+    let settled =
+        record.get("type").and_then(Value::as_str) == Some("agent_settled") && !changes.is_empty();
+    for change in changes {
         apply_change(asid, change, ctx).await;
+    }
+    if settled {
+        if let Ok(mut info) = ctx.driver.get_session(&asid.0).await {
+            let seq = ctx.mirror.update_session(info.clone()).await;
+            ctx.mirror.overlay_read_markers(&mut info).await;
+            ctx.emit(AgentDomainEvent::SessionUpdated {
+                asid: asid.clone(),
+                info: Box::new(info),
+                seq,
+            });
+        }
     }
 }
 
@@ -134,6 +165,9 @@ async fn apply_change(asid: &AgentSessionId, change: LiveChange, ctx: &PiEventCo
             });
         }
         LiveChange::Usage { tokens, cost, .. } => {
+            if ctx.driver.has_native_usage(&asid.0) {
+                return;
+            }
             if let Some((seq, info)) = ctx.mirror.update_usage(asid, cost, Some(tokens)).await {
                 ctx.emit(AgentDomainEvent::SessionUpdated {
                     asid: asid.clone(),

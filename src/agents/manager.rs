@@ -144,7 +144,7 @@ impl Drop for AgentManager {
     fn drop(&mut self) {
         // Private protocol pumps own transports strongly, so releasing their
         // external manager must cancel them. Adopted services stay untouched.
-        if matches!(self.agent.kind(), "codex" | "fx" | "qoder") {
+        if matches!(self.agent.kind(), "codex" | "fx" | "qoder" | "pi") {
             (self.shutdown_handle)();
         }
     }
@@ -693,13 +693,15 @@ impl AgentManager {
                     received = records.recv() => received,
                 };
                 match received {
-                    Ok((asid, record)) => pi::handle_pi_record(&asid, &record, &ctx).await,
+                    Ok((asid, generation, record)) => {
+                        pi::handle_pi_record(&asid, generation, &record, &ctx).await
+                    }
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                        tracing::warn!(skipped, "pi event backlog overflowed, resyncing");
-                        ctx.emit(AgentDomainEvent::Resync {
-                            asid: AgentSessionId(String::new()),
-                            reason: "event_backlog_overflow".to_string(),
-                        });
+                        tracing::warn!(
+                            skipped,
+                            "pi event backlog overflowed, stopping affected sessions"
+                        );
+                        ctx.abort_backlog().await;
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
@@ -712,13 +714,14 @@ impl AgentManager {
             "agent manager initialized with the Pi agent"
         );
         let shutdown = driver.clone();
+        let readiness = driver.clone();
         Self::assemble(
             driver,
             mirror,
             events_tx,
             crate::agents::adapters::pi::ENDPOINT.to_string(),
             version,
-            Arc::new(|| true),
+            Arc::new(move || readiness.is_connected()),
             Arc::new(move || shutdown.shutdown()),
         )
     }

@@ -17,7 +17,7 @@ Two planes are implemented in this binary:
   adapters implement it.
 - **Agents plane** — agent sessions, models, prompts, tasks,
   permissions, approvals and event history, behind the `AgentPort`
-  port; the OpenCode, DeepSeek, T3 Code, Codex, FX and Qoder CLI adapters implement it.
+  port; the OpenCode, DeepSeek, T3 Code, Codex, FX, Qoder CLI and Pi adapters implement it.
 
 `/api/discovery` also reports an **SSH plane**, but that one is the app's own
 transport, not a gateway subsystem: the phone can open an SSH connection to a
@@ -50,7 +50,7 @@ the far side. The gateway implements no SSH client or server itself.
 │   └─────────────┬──────────────┘  └───────────────┬────────────────┘     │
 │                 │                                 │                      │
 │        Herdr adapter · tmux adapter   OpenCode · DeepSeek · T3 · Codex   │
-│                                       adapters                           │
+│                                    FX · Qoder CLI · Pi adapters          │
 │                                                                          │
 │  routes: platform (health, discovery, openapi) · connectivity (pairing,  │
 │    push registration) · terminal · agents                                │
@@ -62,7 +62,7 @@ the far side. The gateway implements no SSH client or server itself.
         │
         ▼
  Herdr unix socket · tmux argv · OpenCode / DeepSeek HTTP · T3 WebSocket
- Codex private app-server stdio
+ Codex private app-server stdio · FX/Qoder ACP · Pi RPC
 ```
 
 A request travels: the phone authenticates with its device token (and, when
@@ -449,7 +449,8 @@ configure FX authentication on this host yourself. Set `fx.binary` to an absolut
 executable path when needed, or `fx.enabled: false` to disable it. The master
 `agent_runtime.enabled` switch also applies. No package is installed or upgraded.
 
-Discovery performs a bounded `fx --version` probe and reports `reachable`; it
+Discovery performs a bounded `fx --version` probe, reads a cached native model
+catalog when the adapter is attached, and reports `reachable`; it
 does not establish model authentication or promise ACP support from a version
 number. Opening a session checks the actual ACP initialization response and
 starts a private `fx acp` child for that session. Gateway never auto-accepts
@@ -460,7 +461,7 @@ not adopt it, steal its lock or promise its terminal history. Native saved
 sessions can be listed and explicitly resumed with ACP load; a live external
 TUI may hold an exclusive lock, which Gateway respects. The Gateway mirror
 retains the timeline observed during this Gateway run. Model/effort controls
-appear only after native session catalogs supply their actual options; mode
+use actual native catalog options; mode
 switching remains disabled. Unsupported controls are explicitly false in
 discovery. See [FX protocol](docs/fx-protocol.md).
 
@@ -480,8 +481,9 @@ is never automatically resubmitted.
 
 A separate Qoder terminal or IDE is not a shared live ACP connection. Session
 metadata reads do not load or take ownership of its conversation. Unsupported
-App controls, including model/effort and permission-mode switching, remain
-explicitly false. See [Qoder protocol](docs/qoder-protocol.md).
+App controls remain explicitly gated: native model choices and observed effort
+options can be selected temporarily within a session; permission-mode switching
+remains unavailable. See [Qoder protocol](docs/qoder-protocol.md).
 
 ### The OpenCode agent
 

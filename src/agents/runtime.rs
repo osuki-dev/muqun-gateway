@@ -2159,19 +2159,42 @@ fn acp_features() -> crate::discovery::AgentFeatures {
         attachments: false,
         attachments_by_path: false,
         extra: [
-            "inboxEdit",
-            "modeSwitching",
-            "sessionRename",
-            "sessionDelete",
-            "sessionFork",
-            "sessionPagination",
-            "timelineEarlier",
-            "accountLimits",
-            "computerTools",
+            ("inboxEdit", false),
+            ("modeSwitching", false),
+            ("sessionRename", false),
+            ("sessionDelete", false),
+            ("sessionFork", false),
+            ("sessionPagination", false),
+            ("timelineEarlier", true),
+            ("accountLimits", false),
+            ("computerTools", false),
         ]
         .into_iter()
-        .map(|key| (key.into(), serde_json::json!(false)))
+        .map(|(key, supported)| (key.into(), serde_json::json!(supported)))
         .collect(),
+    }
+}
+
+fn apply_acp_capabilities(
+    features: &mut crate::discovery::AgentFeatures,
+    capabilities: &serde_json::Value,
+    commands_listed: bool,
+) {
+    features.attachments = capabilities
+        .pointer("/promptCapabilities/image")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+        || capabilities
+            .pointer("/promptCapabilities/embeddedContext")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+    features.attachments_by_path = false;
+    features.slash_commands = commands_listed;
+    for (feature, operation) in [("sessionFork", "fork"), ("sessionDelete", "delete")] {
+        features.extra.insert(
+            feature.into(),
+            serde_json::json!(capabilities["sessionCapabilities"][operation].is_object()),
+        );
     }
 }
 

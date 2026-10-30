@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 
 use crate::agents::adapters::t3::client::ms_from_iso;
 use crate::agents::domain::{
@@ -22,6 +22,10 @@ use crate::agents::ports::AgentError;
 /// Longest title taken from the first user message, in characters.
 const TITLE_CHARS: usize = 80;
 const UNTITLED: &str = "New session";
+pub(super) const MAX_SESSION_BYTES: usize = 16 * 1024 * 1024;
+const MAX_HEADER_BYTES: usize = 64 * 1024;
+const MAX_SESSION_FILES: usize = 4096;
+const MAX_SESSION_DIRS: usize = 1024;
 
 #[derive(Debug, Clone)]
 pub struct SessionStore {
@@ -82,11 +86,17 @@ impl SessionStore {
                 while let Some(e) = rd.next_entry().await.map_err(io_err)? {
                     if e.file_type().await.is_ok_and(|t| t.is_dir()) {
                         dirs.push(e.path());
+                        if dirs.len() > MAX_SESSION_DIRS {
+                            return Err(AgentError::Protocol(
+                                "pi session directory limit exceeded".into(),
+                            ));
+                        }
                     }
                 }
             }
         }
         let mut out = Vec::new();
+        let mut scanned = 0;
         for dir in dirs {
             let Some(mut rd) = read_dir_or_none(&dir).await? else {
                 continue;
@@ -95,6 +105,12 @@ impl SessionStore {
                 let path = e.path();
                 if path.extension().and_then(|x| x.to_str()) != Some("jsonl") {
                     continue;
+                }
+                scanned += 1;
+                if scanned > MAX_SESSION_FILES {
+                    return Err(AgentError::Protocol(
+                        "pi session file limit exceeded".into(),
+                    ));
                 }
                 // A file that vanished or is half-written is skipped, not fatal:
                 // Pi may be creating or removing it while we scan.
@@ -127,10 +143,22 @@ impl SessionStore {
         let f = tokio::fs::File::open(&file.path)
             .await
             .map_err(|e| not_found_or_io(e, &file.id))?;
-        let mut lines = BufReader::new(f).lines();
+        let mut bytes = Vec::new();
+        f.take((MAX_SESSION_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .await
+            .map_err(io_err)?;
+        if bytes.len() > MAX_SESSION_BYTES {
+            return Err(AgentError::Protocol("pi session exceeds byte limit".into()));
+        }
         let mut out = Vec::new();
-        while let Some(line) = lines.next_line().await.map_err(io_err)? {
-            if let Ok(v) = serde_json::from_str::<Value>(&line) {
+        for line in bytes.split(|b| *b == b'\n') {
+            if line.len() > super::rpc::MAX_LINE_BYTES {
+                return Err(AgentError::Protocol(
+                    "pi session entry exceeds record limit".into(),
+                ));
+            }
+            if let Ok(v) = serde_json::from_slice::<Value>(line) {
                 out.push(v);
             }
         }
@@ -186,9 +214,19 @@ async fn open_file(path: &Path) -> Option<SessionFile> {
         .map_or(0, |d| d.as_millis() as u64);
 
     let f = tokio::fs::File::open(path).await.ok()?;
-    let first = BufReader::new(f).lines().next_line().await.ok()??;
-    let header: Value = serde_json::from_str(&first).ok()?;
+    let mut first = Vec::new();
+    BufReader::new(f.take((MAX_HEADER_BYTES + 1) as u64))
+        .read_until(b'\n', &mut first)
+        .await
+        .ok()?;
+    if first.len() > MAX_HEADER_BYTES {
+        return None;
+    }
+    let header: Value = serde_json::from_slice(&first).ok()?;
     if header.get("type").and_then(Value::as_str) != Some("session") {
+        return None;
+    }
+    if header.get("id").and_then(Value::as_str) != Some(id) {
         return None;
     }
     let cwd = header.get("cwd").and_then(Value::as_str)?.to_string();
@@ -235,6 +273,9 @@ pub fn active_branch(entries: &[Value]) -> Vec<Value> {
         .filter_map(|e| Some((e.get("id")?.as_str()?, *e)))
         .collect();
     let mut seen = HashSet::new();
+    if let Some(id) = last.get("id").and_then(Value::as_str) {
+        seen.insert(id);
+    }
     let mut chain = vec![last];
     let mut cur = last;
     while let Some(pid) = cur.get("parentId").and_then(Value::as_str) {
@@ -307,6 +348,7 @@ pub fn session_info(
     status: AgentSessionStatus,
 ) -> AgentSessionInfo {
     let branch = active_branch(entries);
+    let usage = super::mapper::usage_from_entries(&branch);
     AgentSessionInfo {
         asid: AgentSessionId(file.id.clone()),
         agent_id: String::new(),
@@ -321,8 +363,8 @@ pub fn session_info(
         agent_name: None,
         agent_role: None,
         directory: Some(file.cwd.clone()),
-        cost: None,
-        tokens: None,
+        cost: usage.cost,
+        tokens: (usage.total_tokens > 0).then_some(usage.tokens),
         limit: None,
         parent_id: None,
         project_id: None,
@@ -507,5 +549,33 @@ mod tests {
             (p[0].id.as_str(), p[0].name.as_str()),
             ("/workspace/demo", "demo")
         );
+    }
+
+    #[tokio::test]
+    async fn oversized_history_and_mismatched_identity_are_refused() {
+        let root = std::env::temp_dir().join(format!("muqun-pi-bounds-{}", uuid::Uuid::new_v4()));
+        let path = write(
+            &root,
+            "2026-10-14T06-51-18-225Z_large.jsonl",
+            &[header("large", "/workspace/demo")],
+        );
+        let store = SessionStore::new(root.clone());
+        let file = store.find("large").await.unwrap();
+        let output = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        output.set_len((MAX_SESSION_BYTES + 1) as u64).unwrap();
+        assert!(matches!(
+            store.read_entries(&file).await,
+            Err(AgentError::Protocol(_))
+        ));
+        write(
+            &root,
+            "2026-10-14T06-51-18-225Z_forged.jsonl",
+            &[header("different", "/workspace/demo")],
+        );
+        assert!(matches!(
+            store.find("forged").await,
+            Err(AgentError::SessionNotFound(_))
+        ));
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

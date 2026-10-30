@@ -125,6 +125,9 @@ pub(super) struct PiState {
     state_dir: Option<PathBuf>,
     /// Supervision retries every pass; the missing state dir is said once.
     no_state_dir_logged: std::sync::atomic::AtomicBool,
+    stopped: std::sync::atomic::AtomicBool,
+    start: tokio::sync::Mutex<()>,
+    driver: std::sync::Mutex<Option<Arc<PiDriver>>>,
 }
 
 impl PiState {
@@ -133,11 +136,14 @@ impl PiState {
             config,
             state_dir,
             no_state_dir_logged: std::sync::atomic::AtomicBool::new(false),
+            stopped: std::sync::atomic::AtomicBool::new(false),
+            start: tokio::sync::Mutex::new(()),
+            driver: std::sync::Mutex::new(None),
         }
     }
 
     pub(super) fn enabled(&self) -> bool {
-        self.config.enabled
+        self.config.enabled && !self.stopped.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     pub(super) fn features(&self) -> crate::discovery::AgentFeatures {
@@ -195,7 +201,7 @@ pub(super) fn pi_features(approvals: bool) -> crate::discovery::AgentFeatures {
         inbox: false,
         modes: false,
         skills: false,
-        slash_commands: false,
+        slash_commands: true,
         compaction: true,
         background_shells: false,
         // Attachments arrive as host paths in the prompt text.
@@ -203,7 +209,7 @@ pub(super) fn pi_features(approvals: bool) -> crate::discovery::AgentFeatures {
         attachments_by_path: true,
         extra: std::collections::BTreeMap::from([
             ("sessionPagination".into(), serde_json::json!(false)),
-            ("timelineEarlier".into(), serde_json::json!(false)),
+            ("timelineEarlier".into(), serde_json::json!(true)),
             ("sessionRename".into(), serde_json::json!(true)),
             ("sessionDelete".into(), serde_json::json!(true)),
             ("sessionFork".into(), serde_json::json!(false)),
@@ -212,8 +218,20 @@ pub(super) fn pi_features(approvals: bool) -> crate::discovery::AgentFeatures {
 }
 
 impl AgentRuntime {
+    pub(crate) async fn shutdown_pi(&self) {
+        self.pi
+            .stopped
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let _start = self.pi.start.lock().await;
+        let driver = self.pi.driver.lock().ok().and_then(|mut d| d.take());
+        if let Some(driver) = driver {
+            driver.shutdown_and_wait().await;
+        }
+    }
+
     /// One supervision pass for Pi. Returns whether it is attached and well.
     pub(super) async fn supervise_pi(&self) -> bool {
+        let _start = self.pi.start.lock().await;
         if !self.pi.enabled() {
             return false;
         }
@@ -273,7 +291,7 @@ impl AgentRuntime {
                     .collect()
             })
             .unwrap_or_default();
-        let driver = PiDriver::new(
+        let driver = Arc::new(PiDriver::new(
             PiCommandLine {
                 binary: binary.clone(),
                 extension,
@@ -282,12 +300,19 @@ impl AgentRuntime {
             self.pi.config.asks_approval(),
             Duration::from_secs(self.pi.config.idle_timeout_secs.max(1)),
             env,
-        );
-        let manager = AgentManager::connect_pi(
-            Arc::new(driver),
-            Some(version.clone()),
-            self.events_tx.clone(),
-        );
+        ));
+        if !self.pi.enabled() {
+            driver.shutdown_and_wait().await;
+            if let (Some(wiring), Some((env, previous))) = (self.mcp.get(), &minted) {
+                settle_agent_tokens(wiring.tokens.as_ref(), env, previous, false).await;
+            }
+            return false;
+        }
+        if let Ok(mut current) = self.pi.driver.lock() {
+            *current = Some(driver.clone());
+        }
+        let manager =
+            AgentManager::connect_pi(driver, Some(version.clone()), self.events_tx.clone());
         self.install(pi::KIND, manager, AgentOrigin::Spawned).await;
         if let (Some(wiring), Some((env, previous))) = (self.mcp.get(), &minted) {
             settle_agent_tokens(wiring.tokens.as_ref(), env, previous, true).await;
@@ -435,6 +460,12 @@ mod tests {
                 info.endpoint.as_deref(),
                 (status != Disabled).then_some(pi::ENDPOINT)
             );
+            runtime.shutdown_pi().await;
+            assert!(
+                !runtime.supervise_pi().await,
+                "stopped Pi must not reattach"
+            );
+            assert_eq!(runtime.pi_discovery().await.status, Disabled);
         }
         let default = PiConfig::default();
         assert!(default.enabled && default.asks_approval());

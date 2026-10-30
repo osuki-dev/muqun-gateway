@@ -22,7 +22,9 @@ CLI authentication on this host. Configure and sign in to Qoder CLI yourself.
 An authentication failure is reported; Gateway never starts an authentication
 flow or automatically retries the original operation after login.
 
-Discovery runs only a time- and output-bounded `--version` probe. Its `reachable`
+Discovery uses a time- and output-bounded `--version` probe and may read the
+native `--list-models` catalog after attachment. No ACP session is created for
+that catalog read. Its `reachable`
 status means an installed executable answered, not that model authentication
 or a model response has been verified. Each explicitly opened session owns a
 private `qodercli --acp` child. Shutdown stops and reaps Gateway-owned children;
@@ -65,11 +67,18 @@ timeout and disconnect are not approval. Gateway does not pass bypass flags or
 change Qoder's permission mode.
 
 Qoder advertises several native abilities beyond this first Gateway contract.
-That advertisement alone does not enable App controls. Model and reasoning-effort
-selection, modes, skills, slash commands, attachments, compaction, background
-shells, worktrees, revert, inbox editing, rename, delete, fork, historical paging,
-account limits and computer tools are explicitly disabled. Permission-mode and
-configuration setters remain unavailable while their persistence and security
+That advertisement alone does not enable App controls. Model choices come from
+the actual native catalog; effort choices require observed native config options.
+Session config selection uses Qoder's temporary setting contract and rejects
+unoffered values. It does not change the global CLI profile.
+
+Native uploads require observed image or embedded-context capabilities and strict
+upload fences. Slash commands require an actual native catalog; native fork and
+delete require advertised operations plus ownership/idle guards. Modes, skills,
+compaction, background shells, worktrees, revert, inbox editing, rename, native
+history paging, account limits and computer tools remain disabled. Earlier
+timeline reads may page the complete bounded replay already held by Gateway;
+unverified or oversized native history is an explicit error. Permission-mode switching remains unavailable while its persistence and security
 scope are unverified. Native image/MCP/session-management capability declarations
 are not promises that Gateway implements those surfaces.
 

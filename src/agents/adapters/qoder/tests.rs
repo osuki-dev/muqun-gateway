@@ -50,7 +50,11 @@ async fn idless_echo_stream_followup_cancel_and_history_reuse_shared_lifecycle()
         .get_catalog_for_session(Some(id), None)
         .await
         .unwrap();
-    assert!(catalog.models.is_empty());
+    assert_eq!(catalog.models.len(), 2);
+    assert!(catalog
+        .models
+        .iter()
+        .all(|model| model.provider_id == "qoder"));
     assert!(catalog.modes.is_empty());
     driver.shutdown().await;
     let resumed = fixture.qoder_driver();
@@ -111,5 +115,85 @@ async fn permission_requires_explicit_offered_choice_and_publishes_completed_too
     assert!(rows
         .iter()
         .any(|row| matches!(&row.part, AgentPart::Text{text} if text == "Permission answered")));
+    driver.shutdown().await;
+}
+
+#[tokio::test]
+async fn late_commands_native_model_effort_and_owned_fork_delete_follow_native_contracts() {
+    use crate::agents::domain::ModelRef;
+    let fixture = Fixture::new().await;
+    let driver = fixture.qoder_driver();
+    let source = driver.create_session(None, None, None).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !driver.slash_commands_listed() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let catalog = driver
+        .get_catalog_for_session(Some(&source.asid.0), None)
+        .await
+        .unwrap();
+    assert_eq!(catalog.commands[0].name, "goal");
+    assert_eq!(
+        catalog
+            .models
+            .iter()
+            .find(|model| model.id == "mock-model")
+            .unwrap()
+            .variants
+            .as_ref()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert!(driver.fork_session(&source.asid.0, None).await.is_err());
+    driver
+        .switch_model(
+            &source.asid.0,
+            &ModelRef {
+                provider_id: "qoder".into(),
+                model_id: "Other model".into(),
+                variant: Some("high".into()),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        driver
+            .get_session(&source.asid.0)
+            .await
+            .unwrap()
+            .model
+            .unwrap()
+            .model_id,
+        "other-model"
+    );
+    driver
+        .run_command(&source.asid.0, "goal", "test", None)
+        .await
+        .unwrap();
+    status(&driver, &source.asid.0, AgentSessionStatus::Idle).await;
+    assert!(matches!(
+        driver
+            .run_command(&source.asid.0, "not-offered", "", None)
+            .await,
+        Err(AgentError::Unsupported(_)) | Err(AgentError::InvalidRequest(_))
+    ));
+    let fork = driver.fork_session(&source.asid.0, None).await.unwrap();
+    assert_ne!(fork.asid, source.asid);
+    driver.delete_session(&fork.asid.0).await.unwrap();
+    assert!(driver.get_session(&fork.asid.0).await.is_err());
+    driver
+        .send_prompt(&source.asid.0, "hold", &[], None)
+        .await
+        .unwrap();
+    assert!(matches!(
+        driver.delete_session(&source.asid.0).await,
+        Err(AgentError::NotAvailable(_))
+    ));
+    driver.interrupt(&source.asid.0).await.unwrap();
+    status(&driver, &source.asid.0, AgentSessionStatus::Interrupted).await;
     driver.shutdown().await;
 }

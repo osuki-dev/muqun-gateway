@@ -60,26 +60,27 @@ pub(crate) fn config_option<'a>(value: &'a Value, id: &str) -> Option<&'a Value>
 }
 
 pub(crate) fn selected_model(value: &Value) -> Option<ModelRef> {
-    Some(ModelRef {
-        provider_id: config_option(value, "provider")?["currentValue"]
-            .as_str()?
-            .into(),
-        model_id: config_option(value, "model")?["currentValue"]
-            .as_str()?
-            .into(),
-        variant: config_option(value, "effort")
-            .and_then(|option| option["currentValue"].as_str())
-            .map(str::to_owned),
-    })
+    selected_model_for(value, "fx")
 }
 
-/// ACP allows providerless model catalogs; keep native model ids opaque.
-pub(crate) fn selected_model_for(value: &Value, provider: &str) -> Option<ModelRef> {
+pub(crate) fn effort_key(provider: &str) -> &'static str {
     if provider == "fx" {
-        return selected_model(value);
+        "effort"
+    } else {
+        "reasoning_effort"
     }
+}
+
+/// ACP model ids are opaque. FX names its configured native provider; other
+/// agents expose a providerless catalog within their own Gateway namespace.
+pub(crate) fn selected_model_for(value: &Value, provider: &str) -> Option<ModelRef> {
+    let provider_id = if provider == "fx" {
+        config_option(value, "provider")?["currentValue"].as_str()?
+    } else {
+        provider
+    };
     Some(ModelRef {
-        provider_id: provider.into(),
+        provider_id: provider_id.into(),
         model_id: config_option(value, "model")
             .and_then(|option| option["currentValue"].as_str())
             .or_else(|| {
@@ -88,93 +89,243 @@ pub(crate) fn selected_model_for(value: &Value, provider: &str) -> Option<ModelR
                     .and_then(Value::as_str)
             })?
             .into(),
-        variant: config_option(value, "reasoning_effort")
+        variant: config_option(value, effort_key(provider))
             .and_then(|option| option["currentValue"].as_str())
             .map(str::to_owned),
     })
 }
 
+fn select_options(option: &Value) -> Vec<&Value> {
+    let mut values = Vec::new();
+    for entry in option["options"].as_array().into_iter().flatten() {
+        if let Some(group) = entry["options"].as_array() {
+            values.extend(group);
+        } else {
+            values.push(entry);
+        }
+    }
+    values
+}
+
+/// A cold CLI catalog may name a model while ACP exposes its opaque value.
+/// Resolve only an exact native id or one unique native display name.
+pub(crate) fn resolve_model_value(value: &Value, wanted: &str) -> Result<String, AgentError> {
+    let options = config_option(value, "model")
+        .map(select_options)
+        .unwrap_or_default();
+    if options
+        .iter()
+        .any(|option| option["value"].as_str() == Some(wanted))
+    {
+        return Ok(wanted.into());
+    }
+    let choices: std::collections::HashSet<_> = options
+        .iter()
+        .filter(|option| option["name"].as_str() == Some(wanted))
+        .filter_map(|option| option["value"].as_str())
+        .filter(|id| !id.is_empty())
+        .collect();
+    if choices.len() == 1 {
+        return Ok(choices.into_iter().next().unwrap().into());
+    }
+    Err(AgentError::InvalidRequest(
+        "model choice is not an unambiguous native option".into(),
+    ))
+}
+
+pub(crate) fn offers_config_value(value: &Value, id: &str, wanted: &str) -> bool {
+    config_option(value, id).is_some_and(|option| {
+        select_options(option)
+            .iter()
+            .any(|option| option["value"].as_str() == Some(wanted))
+    })
+}
+
 pub(crate) fn catalog_for(value: &Value, provider: &str) -> AgentCatalog {
-    if provider == "fx" {
-        catalog(value)
-    } else {
-        AgentCatalog::default()
+    let selected = selected_model_for(value, provider);
+    let provider_id = selected
+        .as_ref()
+        .map(|model| model.provider_id.as_str())
+        .unwrap_or(provider);
+    let mut models = std::collections::BTreeMap::new();
+    if let Some(available) = value
+        .pointer("/models/availableModels")
+        .and_then(Value::as_array)
+    {
+        for native in available {
+            let Some(id) = native["modelId"].as_str() else {
+                continue;
+            };
+            models.insert(
+                id.to_owned(),
+                ModelInfo {
+                    id: id.into(),
+                    name: native["name"].as_str().unwrap_or(id).into(),
+                    provider_id: provider_id.into(),
+                    family: None,
+                    limit: None,
+                    variants: None,
+                    cost: None,
+                    enabled: true,
+                    status: None,
+                },
+            );
+        }
+    }
+    if let Some(option) = config_option(value, "model") {
+        for native in select_options(option) {
+            let Some(id) = native["value"].as_str() else {
+                continue;
+            };
+            models.insert(
+                id.to_owned(),
+                ModelInfo {
+                    id: id.into(),
+                    name: native["name"].as_str().unwrap_or(id).into(),
+                    provider_id: provider_id.into(),
+                    family: None,
+                    limit: None,
+                    variants: None,
+                    cost: None,
+                    enabled: true,
+                    status: None,
+                },
+            );
+        }
+    }
+    if let Some(current) = &selected {
+        if let Some(model) = models.get_mut(&current.model_id) {
+            model.variants = config_option(value, effort_key(provider)).map(|option| {
+                select_options(option)
+                    .into_iter()
+                    .filter_map(|native| {
+                        let id = native["value"].as_str()?;
+                        Some(ModelVariantInfo {
+                            id: id.into(),
+                            reasoning_effort: Some(id.into()),
+                        })
+                    })
+                    .collect()
+            });
+        }
+    }
+    // Neither ACP provider's permission-mode controls are session-local model
+    // choices. Their modes must not leak into App new-session defaults.
+    AgentCatalog {
+        models: models.into_values().collect(),
+        defaults: CatalogDefaults {
+            model: selected,
+            mode: None,
+        },
+        ..Default::default()
     }
 }
 
 pub(crate) fn catalog(value: &Value) -> AgentCatalog {
-    let mut catalog = AgentCatalog::default();
-    let selected = selected_model(value);
-    if let Some(models) =
-        config_option(value, "model").and_then(|option| option["options"].as_array())
-    {
-        catalog.models = models
-            .iter()
-            .filter_map(|model| {
-                let id = model["value"].as_str()?;
-                Some(ModelInfo {
-                    id: id.into(),
-                    name: model["name"].as_str().unwrap_or(id).into(),
-                    provider_id: selected
-                        .as_ref()
-                        .map(|model| model.provider_id.clone())
-                        .unwrap_or_else(|| "fx".into()),
-                    family: None,
-                    limit: None,
-                    variants: if selected
-                        .as_ref()
-                        .is_some_and(|selected| selected.model_id == id)
-                    {
-                        config_option(value, "effort")
-                            .and_then(|option| option["options"].as_array())
-                            .map(|options| {
-                                options
-                                    .iter()
-                                    .filter_map(|option| {
-                                        let value = option["value"].as_str()?;
-                                        Some(ModelVariantInfo {
-                                            id: value.into(),
-                                            reasoning_effort: Some(value.into()),
-                                        })
-                                    })
-                                    .collect()
-                            })
-                    } else {
-                        None
-                    },
-                    cost: None,
-                    enabled: true,
-                    status: None,
-                })
-            })
-            .collect();
+    catalog_for(value, "fx")
+}
+
+/// A prompt response reports that turn's token usage, not context occupancy or
+/// the provider account's billing period. Preserve native cache/reasoning names.
+pub(crate) fn turn_usage(
+    value: &Value,
+    provider: &str,
+    _native_provider: &str,
+) -> Option<TokensUsage> {
+    let usage = value.get("usage")?;
+    let optional = |names: &[&str]| -> Option<Option<u64>> {
+        match names.iter().find_map(|name| usage.get(*name)) {
+            Some(value) if !value.is_null() => value.as_u64().map(Some),
+            _ => Some(None),
+        }
+    };
+    let (read, write, reasoning): (&[&str], &[&str], &[&str]) = if provider == "fx" {
+        (
+            &["cacheReadTokens"],
+            &["cacheWriteTokens"],
+            &["reasoningTokens"],
+        )
+    } else {
+        (
+            &["cachedReadTokens"],
+            &["cachedWriteTokens"],
+            &["thoughtTokens"],
+        )
+    };
+    let mut tokens = TokensUsage {
+        input: usage["inputTokens"].as_u64()?,
+        output: usage["outputTokens"].as_u64()?,
+        cache_read: optional(read)?,
+        cache_write: optional(write)?,
+        reasoning: optional(reasoning)?,
+    };
+    // FX Codex, AI Gateway and Grok responses include cache/reasoning within
+    // their parent counters; custom chat-completions provides no breakdown.
+    // The Gateway contract uses disjoint parts, so preserve the actual total.
+    if provider == "fx" {
+        tokens.input = tokens
+            .input
+            .checked_sub(tokens.cache_read.unwrap_or(0))?
+            .checked_sub(tokens.cache_write.unwrap_or(0))?;
+        tokens.output = tokens.output.checked_sub(tokens.reasoning.unwrap_or(0))?;
     }
-    if let Some(modes) = value
-        .pointer("/modes/availableModes")
-        .and_then(Value::as_array)
-    {
-        catalog.modes = modes
-            .iter()
-            .filter_map(|mode| {
-                let id = mode["id"].as_str()?;
-                Some(ModeInfo {
-                    id: id.into(),
-                    name: mode["name"].as_str().unwrap_or(id).into(),
-                    model: None,
-                    description: mode["description"].as_str().map(str::to_owned),
-                    mode: None,
-                    color: None,
-                    hidden: false,
-                })
-            })
-            .collect();
+    Some(tokens)
+}
+
+/// Totals are complete only for a new session whose every admitted turn had a
+/// valid authoritative reply. Native load supplies no historical token totals.
+pub(crate) struct SessionUsage {
+    total: Option<TokensUsage>,
+    observed: bool,
+}
+impl SessionUsage {
+    pub fn new(new_session: bool) -> Self {
+        Self {
+            total: new_session.then(TokensUsage::default),
+            observed: false,
+        }
     }
-    catalog.defaults.model = selected;
-    catalog.defaults.mode = value
-        .pointer("/modes/currentModeId")
-        .and_then(Value::as_str)
-        .map(str::to_owned);
-    catalog
+    pub fn finish(&mut self, usage: Option<TokensUsage>) -> Option<TokensUsage> {
+        let merge_optional =
+            |a: Option<u64>, b: Option<u64>, parent: &mut u64| -> Option<Option<u64>> {
+                match (a, b) {
+                    (Some(a), Some(b)) => a.checked_add(b).map(Some),
+                    (Some(known), None) | (None, Some(known)) => {
+                        *parent = parent.checked_add(known)?;
+                        Some(None)
+                    }
+                    (None, None) => Some(None),
+                }
+            };
+        self.total = self.total.take().zip(usage).and_then(|(total, next)| {
+            let mut input = total.input.checked_add(next.input)?;
+            let mut output = total.output.checked_add(next.output)?;
+            let cache_read = if self.observed {
+                merge_optional(total.cache_read, next.cache_read, &mut input)?
+            } else {
+                next.cache_read
+            };
+            let cache_write = if self.observed {
+                merge_optional(total.cache_write, next.cache_write, &mut input)?
+            } else {
+                next.cache_write
+            };
+            let reasoning = if self.observed {
+                merge_optional(total.reasoning, next.reasoning, &mut output)?
+            } else {
+                next.reasoning
+            };
+            Some(TokensUsage {
+                input,
+                output,
+                cache_read,
+                cache_write,
+                reasoning,
+            })
+        });
+        self.observed = true;
+        self.total.clone()
+    }
 }
 
 pub(crate) struct Permission {
@@ -686,7 +837,116 @@ mod tests {
     }
 
     #[test]
-    fn providerless_model_metadata_does_not_enable_unverified_selection() {
+    fn cold_model_names_resolve_only_to_one_native_option() {
+        let options = json!({"configOptions":[{"id":"model","options":[{"value":"qfmodel","name":"Qwen3.8-Flash"},{"value":"dfmodel","name":"DeepSeek-Flash"}]}]});
+        assert_eq!(
+            resolve_model_value(&options, "Qwen3.8-Flash").unwrap(),
+            "qfmodel"
+        );
+        assert_eq!(resolve_model_value(&options, "dfmodel").unwrap(), "dfmodel");
+        assert!(resolve_model_value(&options, "invented").is_err());
+        assert!(resolve_model_value(&json!({"configOptions":[{"id":"model","options":[{"value":"one","name":"Same"},{"value":"two","name":"Same"}]}]}),"Same").is_err());
+    }
+
+    #[test]
+    fn incomplete_optional_breakdown_keeps_the_exact_known_total() {
+        let mut session = SessionUsage::new(true);
+        let complete=turn_usage(&json!({"usage":{"inputTokens":17,"outputTokens":7,"cacheReadTokens":5,"cacheWriteTokens":2,"reasoningTokens":3}}),"fx","codex").unwrap();
+        session.finish(Some(complete)).unwrap();
+        let next = turn_usage(
+            &json!({"usage":{"inputTokens":17,"outputTokens":7}}),
+            "fx",
+            "codex",
+        )
+        .unwrap();
+        let total = session.finish(Some(next)).unwrap();
+        assert_eq!(total.input + total.output, 48);
+        assert!(
+            total.cache_read.is_none() && total.cache_write.is_none() && total.reasoning.is_none()
+        );
+    }
+
+    #[test]
+    fn native_model_catalog_and_grouped_effort_keep_opaque_choices() {
+        let value = json!({"models":{"currentModelId":"m-one","availableModels":[{"modelId":"m-one","name":"Native one"},{"modelId":"m-two","name":"Native two"}]},"configOptions":[{"id":"reasoning_effort","currentValue":"high","options":[{"group":"Thinking","options":[{"value":"low","name":"Low"},{"value":"high","name":"High"}]}]}]});
+        let catalog = catalog_for(&value, "qoder");
+        assert_eq!(catalog.models.len(), 2);
+        assert_eq!(
+            catalog.defaults.model.as_ref().unwrap().provider_id,
+            "qoder"
+        );
+        assert_eq!(
+            catalog.defaults.model.as_ref().unwrap().variant.as_deref(),
+            Some("high")
+        );
+        assert_eq!(catalog.models[0].variants.as_ref().unwrap().len(), 2);
+        assert!(catalog.models[1].variants.is_none());
+        assert!(offers_config_value(&value, "reasoning_effort", "high"));
+        assert!(!offers_config_value(&value, "reasoning_effort", "invented"));
+    }
+
+    #[test]
+    fn prompt_usage_preserves_disjoint_totals_and_unknown_optional_counters() {
+        let value = json!({"usage":{"inputTokens":17,"outputTokens":7,"cacheReadTokens":5,"cacheWriteTokens":2,"reasoningTokens":3}});
+        let usage = turn_usage(&value, "fx", "codex").unwrap();
+        assert_eq!(
+            (
+                usage.input,
+                usage.output,
+                usage.cache_read,
+                usage.cache_write,
+                usage.reasoning
+            ),
+            (10, 4, Some(5), Some(2), Some(3))
+        );
+        let qoder = turn_usage(
+            &json!({"usage":{"inputTokens":9,"outputTokens":4,"totalTokens":13}}),
+            "qoder",
+            "qoder",
+        )
+        .unwrap();
+        assert_eq!((qoder.input, qoder.output), (9, 4));
+        assert!(qoder.reasoning.is_none());
+        assert!(turn_usage(
+            &json!({"usage":{"inputTokens":3,"outputTokens":4,"cacheReadTokens":5}}),
+            "fx",
+            "codex"
+        )
+        .is_none());
+        assert!(turn_usage(&json!({"usage":{"inputTokens":3}}), "fx", "codex").is_none());
+    }
+
+    #[test]
+    fn session_totals_require_complete_history_and_every_authoritative_turn() {
+        let turn = TokensUsage {
+            input: 10,
+            output: 4,
+            ..Default::default()
+        };
+        let mut fresh = SessionUsage::new(true);
+        assert_eq!(fresh.finish(Some(turn.clone())).unwrap().input, 10);
+        assert_eq!(fresh.finish(Some(turn.clone())).unwrap().input, 20);
+        assert!(fresh.finish(None).is_none());
+        assert!(fresh.finish(Some(turn.clone())).is_none());
+        let mut restored = SessionUsage::new(false);
+        assert!(restored.finish(Some(turn)).is_none());
+        let mut overflow = SessionUsage::new(true);
+        overflow
+            .finish(Some(TokensUsage {
+                input: u64::MAX,
+                ..Default::default()
+            }))
+            .unwrap();
+        assert!(overflow
+            .finish(Some(TokensUsage {
+                input: 1,
+                ..Default::default()
+            }))
+            .is_none());
+    }
+
+    #[test]
+    fn providerless_model_metadata_keeps_native_selection_and_effort_namespace() {
         let value = json!({"configOptions":[{"id":"model","currentValue":"native-model"},{"id":"reasoning_effort","currentValue":"xhigh"}]});
         let model = selected_model_for(&value, "qoder").unwrap();
         assert_eq!(model.provider_id, "qoder");
@@ -695,7 +955,7 @@ mod tests {
         let catalog = catalog_for(&value, "qoder");
         assert!(catalog.models.is_empty());
         assert!(catalog.modes.is_empty());
-        assert!(catalog.defaults.model.is_none());
+        assert_eq!(catalog.defaults.model, Some(model));
         assert!(catalog.defaults.mode.is_none());
     }
 }

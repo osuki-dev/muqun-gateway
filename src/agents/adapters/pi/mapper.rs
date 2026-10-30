@@ -15,9 +15,10 @@ use serde_json::Value;
 
 use crate::agents::adapters::t3::client::ms_from_iso;
 use crate::agents::domain::{
-    AgentCatalog, AgentPart, AgentSessionId, AgentSessionStatus, CatalogDefaults, CompactionStatus,
-    ModelInfo, ModelRef, ModelVariantInfo, PermissionDecision, PermissionOption, PermissionRequest,
-    TimelineItem, TimelineRole, TokensUsage, ToolCall, ToolCallStatus, ToolTime,
+    AgentCatalog, AgentPart, AgentSessionId, AgentSessionStatus, CatalogDefaults, CommandInfo,
+    CompactionStatus, ModelInfo, ModelRef, ModelVariantInfo, PermissionDecision, PermissionOption,
+    PermissionRequest, SessionContextUsage, TimelineItem, TimelineRole, TokensUsage, ToolCall,
+    ToolCallStatus, ToolTime,
 };
 
 /// The bundled Pi extension: approval gate plus the Muqun MCP server. Written
@@ -42,6 +43,85 @@ pub fn is_provisional(row_id: &str) -> bool {
 /// events. A run streams one assistant message per turn; this covers far more
 /// turns than sit between a message and its tool results.
 const MAX_LIVE_MESSAGES: usize = 64;
+
+#[derive(Debug, Clone, Default)]
+pub struct UsageTotals {
+    pub tokens: TokensUsage,
+    pub cost: Option<f64>,
+    pub total_tokens: u64,
+}
+
+impl UsageTotals {
+    fn add(&mut self, usage: &Value) {
+        let count = |key| usage.get(key).and_then(Value::as_u64).unwrap_or(0);
+        self.tokens.input = self.tokens.input.saturating_add(count("input"));
+        self.tokens.output = self.tokens.output.saturating_add(count("output"));
+        for (target, key) in [
+            (&mut self.tokens.reasoning, "reasoning"),
+            (&mut self.tokens.cache_read, "cacheRead"),
+            (&mut self.tokens.cache_write, "cacheWrite"),
+        ] {
+            if let Some(n) = usage.get(key).and_then(Value::as_u64) {
+                *target = Some(target.unwrap_or(0).saturating_add(n));
+            }
+        }
+        self.total_tokens = self.total_tokens.saturating_add(count("totalTokens"));
+        if let Some(cost) = usage
+            .pointer("/cost/total")
+            .and_then(Value::as_f64)
+            .filter(|v| v.is_finite() && *v >= 0.0)
+        {
+            self.cost = Some(self.cost.unwrap_or(0.0) + cost);
+        }
+    }
+}
+
+pub fn usage_from_entries(entries: &[Value]) -> UsageTotals {
+    let mut totals = UsageTotals::default();
+    for entry in entries {
+        if entry.pointer("/message/role").and_then(Value::as_str) == Some("assistant") {
+            if let Some(usage) = entry.pointer("/message/usage") {
+                totals.add(usage);
+            }
+        }
+    }
+    totals
+}
+
+/// Session statistics include tool usage and compaction work that message
+/// usage alone cannot reconstruct. Context occupancy is Pi's own estimate.
+pub(super) fn apply_stats(info: &mut crate::agents::domain::AgentSessionInfo, stats: &Value) {
+    if let Some(tokens) = stats.get("tokens") {
+        if let (Some(input), Some(output)) = (
+            tokens.get("input").and_then(Value::as_u64),
+            tokens.get("output").and_then(Value::as_u64),
+        ) {
+            info.tokens = Some(TokensUsage {
+                input,
+                output,
+                reasoning: None,
+                cache_read: tokens.get("cacheRead").and_then(Value::as_u64),
+                cache_write: tokens.get("cacheWrite").and_then(Value::as_u64),
+            });
+        }
+    }
+    info.cost = stats
+        .get("cost")
+        .and_then(Value::as_f64)
+        .filter(|n| n.is_finite() && *n >= 0.0)
+        .or(info.cost);
+    info.context_usage = stats.get("contextUsage").and_then(|context| {
+        Some(SessionContextUsage {
+            tokens: None,
+            total_tokens: context.get("tokens")?.as_u64()?,
+            limit: context
+                .get("contextWindow")
+                .and_then(Value::as_u64)
+                .filter(|n| *n > 0)
+                .map(|n| serde_json::json!({"context":n})),
+        })
+    });
+}
 
 fn text<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
     value.get(key).and_then(Value::as_str)
@@ -402,6 +482,27 @@ pub fn catalog(models: &Value, levels: &Value, current: Option<&Value>) -> Agent
     }
 }
 
+pub(super) fn commands(value: &Value) -> Vec<CommandInfo> {
+    value
+        .get("commands")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|command| {
+            let name = text(command, "name")?;
+            if name.is_empty() || name.chars().any(char::is_whitespace) || name.starts_with('/') {
+                return None;
+            }
+            Some(CommandInfo {
+                name: name.to_string(),
+                description: text(command, "description").map(str::to_string),
+                mode: None,
+                template: None,
+            })
+        })
+        .collect()
+}
+
 /// One change a live record makes to a session.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LiveChange {
@@ -449,7 +550,9 @@ pub struct LiveFolder {
     current: Option<String>,
     outcomes: HashMap<String, ToolOutcome>,
     pending_permissions: HashSet<String>,
-    last_total_tokens: u64,
+    completed_usage: UsageTotals,
+    current_usage: Option<Value>,
+    usage_timestamp: Option<u64>,
 }
 
 impl LiveFolder {
@@ -462,7 +565,9 @@ impl LiveFolder {
             current: None,
             outcomes: HashMap::new(),
             pending_permissions: HashSet::new(),
-            last_total_tokens: 0,
+            completed_usage: UsageTotals::default(),
+            current_usage: None,
+            usage_timestamp: None,
         }
     }
 
@@ -471,6 +576,30 @@ impl LiveFolder {
     pub fn with_history_len(mut self, n: usize) -> Self {
         self.seq = n as u64;
         self
+    }
+
+    pub fn with_history_usage(mut self, entries: &[Value]) -> Self {
+        self.completed_usage = usage_from_entries(entries);
+        self
+    }
+
+    pub(super) fn retained_bytes(&self) -> usize {
+        let mut bytes = 0usize;
+        for message in &self.messages {
+            bytes = bytes
+                .saturating_add(serde_json::to_vec(&message.items).map_or(usize::MAX, |v| v.len()));
+        }
+        for (id, outcome) in &self.outcomes {
+            bytes = bytes.saturating_add(id.len());
+            for value in [outcome.input.as_ref(), outcome.result.as_ref()]
+                .into_iter()
+                .flatten()
+            {
+                bytes =
+                    bytes.saturating_add(serde_json::to_vec(value).map_or(usize::MAX, |v| v.len()));
+            }
+        }
+        bytes
     }
 
     pub fn fold(&mut self, record: &Value) -> Vec<LiveChange> {
@@ -554,6 +683,13 @@ impl LiveFolder {
         let key = format!("{PROVISIONAL_PREFIX}{}", self.minted);
         if self.messages.len() >= MAX_LIVE_MESSAGES {
             self.messages.remove(0);
+            self.outcomes.retain(|id, _| {
+                self.messages.iter().any(|m| {
+                    m.items
+                        .iter()
+                        .any(|row| matches!(&row.part, AgentPart::Tool(call) if &call.id == id))
+                })
+            });
         }
         self.messages.push(LiveMessage {
             key: key.clone(),
@@ -612,7 +748,14 @@ impl LiveFolder {
         {
             changes.push(LiveChange::Upsert(vec![row]));
         }
-        changes.extend(self.usage(record.get("usage")));
+        let timestamp = self
+            .current
+            .as_ref()
+            .and_then(|key| self.messages.iter().find(|m| &m.key == key))
+            .map(|m| m.timestamp);
+        if let Some(timestamp) = timestamp {
+            changes.extend(self.usage(timestamp, record.get("usage")));
+        }
         changes
     }
 
@@ -698,7 +841,7 @@ impl LiveFolder {
                     .unwrap_or(0);
                 let rows = message_items(&key, ts, message, &self.outcomes);
                 let mut changes = self.replace_rows(&key, &key, rows);
-                changes.extend(self.usage(message.get("usage")));
+                changes.extend(self.usage(ts, message.get("usage")));
                 changes
             }
             Some("user") => {
@@ -811,27 +954,34 @@ impl LiveFolder {
         changes
     }
 
-    fn usage(&mut self, usage: Option<&Value>) -> Vec<LiveChange> {
+    fn usage(&mut self, timestamp: u64, usage: Option<&Value>) -> Vec<LiveChange> {
         let Some(usage) = usage else {
             return vec![];
         };
-        let count = |key: &str| usage.get(key).and_then(Value::as_u64);
-        let total_tokens = count("totalTokens").unwrap_or(0);
+        let total_tokens = usage
+            .get("totalTokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
         // Providers that do not stream usage report zeros until completion.
-        if total_tokens == 0 || total_tokens == self.last_total_tokens {
+        if total_tokens == 0
+            || (self.usage_timestamp == Some(timestamp)
+                && self.current_usage.as_ref() == Some(usage))
+        {
             return vec![];
         }
-        self.last_total_tokens = total_tokens;
+        if self.usage_timestamp != Some(timestamp) {
+            if let Some(previous) = self.current_usage.take() {
+                self.completed_usage.add(&previous);
+            }
+            self.usage_timestamp = Some(timestamp);
+        }
+        self.current_usage = Some(usage.clone());
+        let mut totals = self.completed_usage.clone();
+        totals.add(usage);
         vec![LiveChange::Usage {
-            tokens: TokensUsage {
-                input: count("input").unwrap_or(0),
-                output: count("output").unwrap_or(0),
-                reasoning: count("reasoning"),
-                cache_read: count("cacheRead"),
-                cache_write: count("cacheWrite"),
-            },
-            cost: usage.pointer("/cost/total").and_then(Value::as_f64),
-            total_tokens,
+            tokens: totals.tokens,
+            cost: totals.cost,
+            total_tokens: totals.total_tokens,
         }]
     }
 
@@ -1121,5 +1271,62 @@ mod tests {
                 [LiveChange::Status(AgentSessionStatus::Idle)]
             );
         }
+    }
+
+    #[test]
+    fn usage_is_cumulative_and_equal_sized_responses_are_not_deduplicated() {
+        let usage = json!({"input":10,"output":5,"cacheRead":2,"cacheWrite":1,"totalTokens":18,"cost":{"total":0.01}});
+        let history =
+            vec![json!({"type":"message", "message":{"role":"assistant", "usage":usage}})];
+        let mut folder = LiveFolder::new("s1".into()).with_history_usage(&history);
+        for (timestamp, total) in [(1, 36), (2, 54)] {
+            let message =
+                json!({"role":"assistant", "timestamp":timestamp, "content":[], "usage":usage});
+            let changes = folder.fold(&json!({"type":"message_end", "message":message}));
+            let Some(LiveChange::Usage {
+                tokens,
+                cost,
+                total_tokens,
+            }) = changes.last()
+            else {
+                panic!("{changes:?}");
+            };
+            assert_eq!(*total_tokens, total);
+            assert_eq!(tokens.input, total / 18 * 10);
+            assert_eq!(*cost, Some(total as f64 / 18.0 * 0.01));
+            assert!(
+                folder.usage(timestamp, Some(&usage)).is_empty(),
+                "same response is counted once"
+            );
+        }
+    }
+
+    #[test]
+    fn native_statistics_preserve_totals_and_unknown_context_after_compaction() {
+        let file = super::super::sessions::SessionFile {
+            id: "s1".into(),
+            path: std::path::PathBuf::new(),
+            cwd: "/workspace/demo".into(),
+            created_ms: 0,
+            modified_ms: 0,
+        };
+        let mut info = super::super::sessions::session_info(&file, &[], AgentSessionStatus::Idle);
+        apply_stats(
+            &mut info,
+            &json!({"tokens":{"input":100,"output":20,"cacheRead":30,"cacheWrite":10,"total":160}, "cost":0.25,"contextUsage":{"tokens":80,"contextWindow":200000,"percent":0.04}}),
+        );
+        assert_eq!(info.tokens.as_ref().unwrap().input, 100);
+        assert_eq!(info.cost, Some(0.25));
+        assert_eq!(info.context_usage.as_ref().unwrap().total_tokens, 80);
+        assert_eq!(
+            info.context_usage.as_ref().unwrap().limit,
+            Some(json!({"context":200000}))
+        );
+        apply_stats(
+            &mut info,
+            &json!({"contextUsage":{"tokens":null,"contextWindow":200000,"percent":null}}),
+        );
+        assert!(info.context_usage.is_none());
+        assert_eq!(info.cost, Some(0.25));
     }
 }

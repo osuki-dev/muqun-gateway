@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use super::{AgentOrigin, AgentRuntime};
-use crate::agents::ports::agent::AgentError;
+use crate::agents::ports::agent::{AgentError, AgentPort};
 use crate::discovery::{AgentAvailability, AgentDiscoveryInfo, AgentFeatures};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -138,14 +138,27 @@ impl FxState {
             info.status = AgentAvailability::Reachable;
             info.version = manager.version();
             if let Some(driver) = self.driver.get() {
-                info.models = driver
-                    .observed_catalog()
-                    .await
-                    .models
-                    .iter()
-                    .map(crate::discovery::model_info_to_agent_model)
-                    .collect();
-                info.features = features_for_models(&info.models);
+                match driver.available_catalog(None).await {
+                    Ok(catalog) => {
+                        info.models = catalog
+                            .models
+                            .iter()
+                            .map(crate::discovery::model_info_to_agent_model)
+                            .collect();
+                        info.features = features_for_models(&info.models);
+                    }
+                    Err(_) => {
+                        info.reason = Some(
+                            "FX model catalog is unavailable; check FX configuration on this host"
+                                .into(),
+                        );
+                    }
+                }
+                super::apply_acp_capabilities(
+                    &mut info.features,
+                    &driver.observed_capabilities(),
+                    driver.slash_commands_listed(),
+                );
             }
             return info;
         }
@@ -200,7 +213,11 @@ fn features_for_models(models: &[crate::discovery::AgentModelInfo]) -> AgentFeat
 }
 
 pub(super) fn features() -> AgentFeatures {
-    super::acp_features()
+    let mut found = super::acp_features();
+    found
+        .extra
+        .insert("accountLimits".into(), serde_json::json!(true));
+    found
 }
 
 #[cfg(test)]
@@ -268,11 +285,11 @@ mod tests {
             "sessionDelete",
             "sessionFork",
             "sessionPagination",
-            "timelineEarlier",
-            "accountLimits",
             "computerTools",
         ] {
             assert_eq!(value[key], false, "{key}");
         }
+        assert_eq!(value["timelineEarlier"], true);
+        assert_eq!(value["accountLimits"], true);
     }
 }

@@ -325,7 +325,11 @@ async fn serve_until_shutdown(
         _ = shutdown => Ok(()),
         result = axum::serve(listener,app.into_make_service_with_connect_info::<SocketAddr>()).into_future() => result,
     };
-    tokio::join!(runtime.shutdown_fx(), runtime.shutdown_qoder());
+    tokio::join!(
+        runtime.shutdown_fx(),
+        runtime.shutdown_qoder(),
+        runtime.shutdown_pi()
+    );
     let cleanup = runtime.shutdown_codex().await;
     match (result, cleanup) {
         (result, Ok(())) => result.context("Gateway HTTP listener stopped"),

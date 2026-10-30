@@ -311,14 +311,36 @@ impl AcpClient {
 
         let lifecycle = state.clone();
         tokio::spawn(async move {
+            #[cfg(unix)]
+            if let Some(group) = process_group {
+                let still_owned = tokio::select! {
+                    biased;
+                    _ = lifecycle.cancel.cancelled() => true,
+                    result = wait_for_unreaped_exit(group) => {
+                        lifecycle.stop("process_exited");
+                        // Only ECHILD means ownership was lost. Other inspection
+                        // failures still close the owned child instead of waiting
+                        // indefinitely for a process whose exit cannot be observed.
+                        match result {
+                            Ok(()) => true,
+                            Err(error) => error.raw_os_error() != Some(libc::ECHILD),
+                        }
+                    },
+                };
+                if still_owned {
+                    // SAFETY: process_group(0) created this group and the owned
+                    // child has not been reaped, so its id cannot be reused.
+                    unsafe {
+                        libc::killpg(group, libc::SIGKILL);
+                    }
+                }
+                let _ = child.wait().await;
+                lifecycle.exited.cancel();
+                return;
+            }
             tokio::select! {
                 biased;
                 _ = lifecycle.cancel.cancelled() => {
-                    #[cfg(unix)]
-                    if let Some(group) = process_group {
-                        // SAFETY: this child created its own process group.
-                        unsafe { libc::killpg(group, libc::SIGKILL); }
-                    }
                     let _ = child.start_kill();
                     let _ = child.wait().await;
                 }
@@ -433,6 +455,41 @@ impl AcpClient {
     pub async fn shutdown(&self) {
         self.state.stop("local_shutdown");
         let _ = tokio::time::timeout(WRITE_TIMEOUT, self.state.exited.cancelled()).await;
+    }
+}
+
+/// Observe exit without reaping: the zombie leader reserves the owned group
+/// id until its descendants have been killed. Waiting first would open a race
+/// in which an unrelated new process group could reuse that id.
+#[cfg(unix)]
+async fn wait_for_unreaped_exit(pid: i32) -> std::io::Result<()> {
+    loop {
+        let exited = {
+            // SAFETY: siginfo_t accepts all-zero initialization; waitid writes it
+            // before inspection and WNOWAIT leaves the owned child unreaped.
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            let result = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    pid as libc::id_t,
+                    &mut info,
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            };
+            if result != 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error);
+            }
+            // SAFETY: waitid initialized the child-status fields above.
+            (unsafe { info.si_pid() }) != 0
+        };
+        if exited {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
@@ -676,6 +733,49 @@ mod tests {
         assert!(state.cancel.is_cancelled());
         assert!(locked(&state.pending).is_empty());
         assert!(locked(&state.server_requests).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn natural_exit_kills_descendants_before_reaping_the_group_leader() {
+        let directory =
+            std::env::temp_dir().join(format!("muqun-acp-exit-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let marker = directory.join("descendant-survived");
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            r#"
+                IFS= read -r first
+                (sleep 0.5; printf survived > "$1"; sleep 30) &
+                printf '{"jsonrpc":"2.0","id":1,"result":{"ready":true,"descendantPid":%s}}\n' "$!"
+                IFS= read -r release
+                exit 0
+            "#,
+            "fixture",
+        ]);
+        command.arg(&marker);
+        let client = AcpClient::spawn_command(command, "FX", no_safe_error_message).unwrap();
+        let ready = client.request("ready", json!({})).await.unwrap();
+        assert_eq!(ready["ready"], true);
+        let descendant = ready["descendantPid"].as_i64().unwrap() as i32;
+        client.notify("exit", json!({})).await.unwrap();
+        tokio::time::timeout(WRITE_TIMEOUT, client.state.exited.cancelled())
+            .await
+            .unwrap();
+        // The descendant inherits stdout, so EOF cannot cause the cleanup.
+        // It would write this marker after its leader exits if left alive.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let survived = marker.exists();
+        if survived {
+            // SAFETY: a surviving fixture is still in its explicit 30s sleep.
+            // Keep a failed regression from leaving its test process behind.
+            unsafe {
+                libc::kill(descendant, libc::SIGKILL);
+            }
+        }
+        std::fs::remove_dir_all(directory).unwrap();
+        assert!(!survived, "ACP descendant survived its process leader");
     }
 
     #[cfg(unix)]

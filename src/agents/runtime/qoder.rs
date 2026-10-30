@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use super::{AgentOrigin, AgentRuntime};
-use crate::agents::ports::agent::AgentError;
+use crate::agents::ports::agent::{AgentError, AgentPort};
 use crate::discovery::{AgentAvailability, AgentDiscoveryInfo, AgentFeatures};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -137,6 +137,26 @@ impl QoderState {
             // process or authenticated model response is implied by discovery.
             info.status = AgentAvailability::Reachable;
             info.version = manager.version();
+            if let Some(driver) = self.driver.get() {
+                match driver.available_catalog(None).await {
+                    Ok(catalog) => {
+                        info.models = catalog
+                            .models
+                            .iter()
+                            .map(crate::discovery::model_info_to_agent_model)
+                            .collect();
+                        info.features = features_for_models(&info.models);
+                    }
+                    Err(_) => {
+                        info.reason = Some("Qoder model catalog is unavailable; check CLI configuration on this host".into());
+                    }
+                }
+                super::apply_acp_capabilities(
+                    &mut info.features,
+                    &driver.observed_capabilities(),
+                    driver.slash_commands_listed(),
+                );
+            }
             return info;
         }
         match self.config.resolve_binary() {
@@ -178,6 +198,15 @@ impl AgentRuntime {
             driver.shutdown().await;
         }
     }
+}
+
+fn features_for_models(models: &[crate::discovery::AgentModelInfo]) -> AgentFeatures {
+    let mut found = features();
+    found.model_selection = !models.is_empty();
+    found.reasoning_effort = models
+        .iter()
+        .any(|model| !model.reasoning_effort_tiers.is_empty());
+    found
 }
 
 pub(super) fn features() -> AgentFeatures {
@@ -226,11 +255,11 @@ mod tests {
             "sessionDelete",
             "sessionFork",
             "sessionPagination",
-            "timelineEarlier",
             "accountLimits",
             "computerTools",
         ] {
             assert_eq!(value[key], false, "{key}");
         }
+        assert_eq!(value["timelineEarlier"], true);
     }
 }

@@ -156,7 +156,7 @@ pub(crate) mod integration {
             std::fs::create_dir_all(&directory).unwrap();
             let binary = directory.join("mock-fx");
             std::fs::write(&binary, r##"#!/usr/bin/env python3
-import json, os, sys
+import json, os, sys, time
 store = 'sessions.json'
 def read():
     try:
@@ -171,6 +171,10 @@ def text(sid, mid, content, user=False):
     if '--acp' not in sys.argv:value['messageId']=mid
     update(sid,value)
 config={'configOptions':[{'id':'provider','currentValue':'mock-provider','options':[{'value':'mock-provider','name':'Mock provider'},{'value':'other-provider','name':'Other provider'}]},{'id':'model','currentValue':'mock-model','options':[{'value':'mock-model','name':'Mock model'},{'value':'other-model','name':'Other model'}]},{'id':'effort','currentValue':'low','options':[{'value':'low','name':'Low'},{'value':'high','name':'High'}]}]}
+if '--acp' in sys.argv:
+    config['configOptions']=[option for option in config['configOptions'] if option['id']!='provider']
+    for option in config['configOptions']:
+        if option['id']=='effort':option['id']='reasoning_effort'
 active=None
 pending=None
 turn=0
@@ -181,13 +185,16 @@ for line in sys.stdin:
     with open('methods.log','a') as f: f.write((method or 'response')+'\n')
     if method=='initialize':
         if os.path.exists('hang-init'):continue
-        reply(message['id'],{'protocolVersion':1,'agentCapabilities':{'loadSession':True,'sessionCapabilities':{'list':{}}}})
+        reply(message['id'],{'protocolVersion':1,'agentCapabilities':{'loadSession':True,'promptCapabilities':{'image':True,'embeddedContext':True},'sessionCapabilities':{'list':{},'fork':{},'delete':{}} if '--acp' in sys.argv else {'list':{}}}})
     elif method=='session/list': reply(message['id'],{'sessions':[{'sessionId':sid,'cwd':os.getcwd(),'title':'Mock','updatedAt':'2026-10-30T03:00:00Z'} for sid in read()]})
     elif method=='session/new':
         active='session-'+str(os.getpid())
         data=read();data[active]=[]
         with open(store,'w') as f:json.dump(data,f)
         reply(message['id'],dict(config,sessionId=active))
+        if '--acp' in sys.argv:
+            time.sleep(0.03)
+            update(active,{'sessionUpdate':'available_commands_update','availableCommands':[{'name':'goal','description':'Set goal'}]})
     elif method=='session/load':
         if os.path.exists('busy-load'):
             send({'jsonrpc':'2.0','id':message['id'],'error':{'code':-32603,'message':'Session is busy'}});continue
@@ -195,6 +202,16 @@ for line in sys.stdin:
         if active not in read():send({'jsonrpc':'2.0','id':message['id'],'error':{'code':-32602,'message':'not found'}});continue
         for index,entry in enumerate(read()[active]):text(active,'replay-'+str(os.getpid())+'-'+str(index),entry[1],entry[2])
         reply(message['id'],config)
+    elif method=='session/fork':
+        data=read();source=params['sessionId']
+        if not data.get(source):send({'jsonrpc':'2.0','id':message['id'],'error':{'code':500,'message':'No conversation to branch'}});continue
+        cloned='fork-'+str(os.getpid());data[cloned]=data[source]
+        with open(store,'w') as f:json.dump(data,f)
+        reply(message['id'],dict(config,sessionId=cloned))
+    elif method=='session/delete':
+        data=read();data.pop(params['sessionId'],None)
+        with open(store,'w') as f:json.dump(data,f)
+        reply(message['id'],{})
     elif method=='session/set_config_option':
         for option in config['configOptions']:
             if option['id']==params['configId']:option['currentValue']=params['value']
@@ -221,7 +238,7 @@ for line in sys.stdin:
             text(active,'assistant-'+str(turn),'A');text(active,'assistant-'+str(turn),'B')
             data=read();data[active].append(['assistant-'+str(turn),'AB',False])
             with open(store,'w') as f:json.dump(data,f)
-            reply(message['id'],{'stopReason':'end_turn'})
+            reply(message['id'],{'stopReason':'end_turn','usage':{'inputTokens':17,'outputTokens':7,'cacheReadTokens':5,'cacheWriteTokens':2,'reasoningTokens':3}})
     elif method=='session/cancel':
         if pending is not None:reply(pending,{'stopReason':'cancelled'});pending=None
     elif method is None and message.get('id')=='permission-opaque':
@@ -361,6 +378,94 @@ for line in sys.stdin:
                 .count(),
             3
         );
+    }
+
+    #[tokio::test]
+    async fn usage_replies_publish_verified_totals_and_full_history_pages_from_cache() {
+        use crate::agents::use_cases::SessionService;
+        let fixture = Fixture::new().await;
+        let info = fixture
+            .driver
+            .create_session(None, None, None)
+            .await
+            .unwrap();
+        for text in ["first", "second"] {
+            fixture
+                .driver
+                .send_prompt(&info.asid.0, text, &[], None)
+                .await
+                .unwrap();
+            fixture.status(&info.asid.0, AgentSessionStatus::Idle).await;
+        }
+        let tokens = fixture
+            .driver
+            .get_session(&info.asid.0)
+            .await
+            .unwrap()
+            .tokens
+            .unwrap();
+        assert_eq!(
+            (
+                tokens.input,
+                tokens.output,
+                tokens.cache_read,
+                tokens.reasoning
+            ),
+            (20, 8, Some(10), Some(6))
+        );
+        fixture.driver.shutdown().await;
+        let history: Vec<_> = (0..150)
+            .flat_map(|index| {
+                [
+                    json!([format!("u{index}"), format!("question {index}"), true]),
+                    json!([format!("a{index}"), format!("answer {index}"), false]),
+                ]
+            })
+            .collect();
+        std::fs::write(
+            fixture.directory.join("sessions.json"),
+            serde_json::to_vec(&json!({info.asid.0.clone():history})).unwrap(),
+        )
+        .unwrap();
+        let mirror = Arc::new(MemoryMirror::for_agent("fx"));
+        let (tx, _) = broadcast::channel(256);
+        let driver = FxDriver::new(
+            fixture
+                .directory
+                .join("mock-fx")
+                .to_string_lossy()
+                .into_owned(),
+            fixture.directory.to_string_lossy().into_owned(),
+            mirror.clone(),
+            tx,
+        );
+        let service = SessionService::with_memory_mirror(driver.clone(), mirror);
+        let opening = service
+            .history_window(&info.asid, None, false)
+            .await
+            .unwrap();
+        assert_eq!(opening.snapshot.timeline.len(), 100);
+        assert!(opening.snapshot.info.tokens.is_none());
+        let mut ids: std::collections::HashSet<_> = opening
+            .snapshot
+            .timeline
+            .iter()
+            .map(|row| row.id.clone())
+            .collect();
+        let mut cursor = opening.history_cursor.unwrap();
+        loop {
+            let page = service.history_page(&info.asid, &cursor).await.unwrap();
+            for row in page.items {
+                assert!(ids.insert(row.id));
+            }
+            if page.exhausted {
+                break;
+            }
+            cursor = page.history_cursor.unwrap();
+        }
+        assert_eq!(ids.len(), 300);
+        assert!(driver.load_earlier_timeline("not-owned", 80).await.is_err());
+        driver.shutdown().await;
     }
 
     #[tokio::test]

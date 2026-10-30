@@ -16,19 +16,32 @@ export default function (pi) {
   const ask = (process.env.MUQUN_PI_APPROVALS ?? "ask") !== "never";
   const url = process.env.MUQUN_MCP_URL;
   const token = process.env.MUQUN_MCP_TOKEN;
+  let bridgeReady = true;
   if (url && token) {
-    pi.registerMcpServer("muqun", { url, headers: { Authorization: `Bearer ${token}` } });
+    try {
+      pi.registerMcpServer("muqun", { url, headers: { Authorization: `Bearer ${token}` } });
+    } catch {
+      // Keep the approval handler installed even when registration fails.
+      bridgeReady = false;
+    }
   }
 
   pi.on("tool_call", async (event, ctx) => {
-    if (!ask || !ctx.hasUI) return undefined;
+    if (!ask) return undefined;
     if (!["bash", "edit", "write"].includes(event.toolName)) return undefined;
-    const ok = await ctx.ui.confirm(
-      "muqun.permission",
-      JSON.stringify({ tool: event.toolName, toolCallId: event.toolCallId, input: event.input }),
-      { signal: ctx.signal },
-    );
-    if (!ok) return { block: true, reason: "Denied from Muqun" };
-    return undefined;
+    // RPC has UI through extension_ui_request/response. Missing UI or a
+    // broken bridge must never grant permission to a mutating tool.
+    if (!bridgeReady || !ctx.hasUI) return { block: true, reason: "Muqun approval bridge unavailable" };
+    try {
+      const ok = await ctx.ui.confirm(
+        "muqun.permission",
+        JSON.stringify({ tool: event.toolName, toolCallId: event.toolCallId, input: event.input }),
+        { signal: ctx.signal },
+      );
+      if (ok === true && !ctx.signal?.aborted) return undefined;
+    } catch {
+      return { block: true, reason: "Muqun approval bridge unavailable" };
+    }
+    return { block: true, reason: "Denied from Muqun" };
   });
 }

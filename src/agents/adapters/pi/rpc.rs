@@ -14,22 +14,22 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, Command};
-use tokio::sync::{broadcast, oneshot, watch, Notify};
+use tokio::sync::{broadcast, oneshot, watch, Notify, OwnedSemaphorePermit, Semaphore};
 
 use crate::agents::ports::agent::AgentError;
 
 /// A record this long is not a protocol message we can use: holding it would
 /// let one runaway tool output pin unbounded memory, and resynchronising
 /// mid-stream is guesswork, so the child is treated as broken.
-const MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
-/// Stderr lines are only logged; a longer one is dropped in pieces, not buffered.
-const MAX_STDERR_LINE_BYTES: usize = 64 * 1024;
+pub(super) const MAX_LINE_BYTES: usize = 1024 * 1024;
+/// A blocked pipe must not hold shutdown or an approval response forever.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Pi answers every command once it is handled (a `prompt` is answered on
 /// acceptance, not completion), so a minute without one means it is stuck.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
@@ -41,7 +41,51 @@ const CLOSE_GRACE: Duration = Duration::from_secs(5);
 const DRAIN_GRACE: Duration = Duration::from_secs(2);
 /// Text deltas arrive in bursts; a slow subscriber lags rather than blocking
 /// the reader (which would stall Pi through stdout backpressure).
-const EVENT_CAPACITY: usize = 4096;
+const EVENT_CAPACITY: usize = 32;
+/// One budget shared across every child's reader and the driver's queue.
+/// Arc clones retain the reservation until both queues release a record.
+const EVENT_BYTES: usize = 16 * 1024 * 1024;
+static EVENT_BUDGET: OnceLock<Arc<Semaphore>> = OnceLock::new();
+
+#[derive(Debug)]
+pub struct PiRecord {
+    value: Value,
+    _budget: Option<OwnedSemaphorePermit>,
+}
+
+impl std::ops::Deref for PiRecord {
+    type Target = Value;
+
+    fn deref(&self) -> &Self::Target {
+        &self.value
+    }
+}
+
+impl PiRecord {
+    pub(super) fn bounded(value: Value, bytes: usize) -> Option<Arc<Self>> {
+        if bytes > MAX_LINE_BYTES {
+            return None;
+        }
+        let budget = EVENT_BUDGET.get_or_init(|| Arc::new(Semaphore::new(EVENT_BYTES)));
+        let permit = budget
+            .clone()
+            .try_acquire_many_owned(bytes.max(1).try_into().ok()?)
+            .ok()?;
+        Some(Arc::new(Self {
+            value,
+            _budget: Some(permit),
+        }))
+    }
+
+    /// Small, Gateway-authored cleanup notifications must remain deliverable
+    /// when upstream records have consumed the budget.
+    pub(super) fn cleanup(value: Value) -> Arc<Self> {
+        Arc::new(Self {
+            value,
+            _budget: None,
+        })
+    }
+}
 
 /// Where the `pi` binary and the bundled muqun extension live.
 #[derive(Debug, Clone)]
@@ -149,28 +193,54 @@ pub struct PiChild {
     stdin: tokio::sync::Mutex<Option<ChildStdin>>,
     shared: Arc<Shared>,
     next_id: AtomicU64,
-    events: broadcast::Sender<Value>,
+    events: broadcast::Sender<Arc<PiRecord>>,
     alive: Arc<AtomicBool>,
     last_used: Arc<Mutex<Instant>>,
     kill: Arc<Notify>,
     exited: watch::Receiver<bool>,
 }
 
+/// Cancelling a partial JSONL write makes this transport unusable. Killing
+/// it prevents a later command being appended to a truncated earlier frame.
+struct WriteGuard<'a> {
+    child: &'a PiChild,
+    complete: bool,
+}
+
+impl Drop for WriteGuard<'_> {
+    fn drop(&mut self) {
+        if !self.complete {
+            self.child
+                .terminate("pi write interrupted; outcome unknown; not retried");
+        }
+    }
+}
+
+impl Drop for PiChild {
+    fn drop(&mut self) {
+        self.terminate("pi transport closed");
+    }
+}
+
 impl PiChild {
     pub async fn spawn(cmd: &PiCommandLine, launch: &PiLaunch) -> Result<Self, AgentError> {
-        let mut child = Command::new(&cmd.binary)
+        let mut command = Command::new(&cmd.binary);
+        command
             .args(launch.args(cmd))
             .current_dir(&launch.cwd)
+            .env_remove("MUQUN_MCP_URL")
+            .env_remove("MUQUN_MCP_TOKEN")
             .envs(launch.env.iter().map(|(k, v)| (k, v)))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             // A gateway that dies or drops the host must not leave Pi behind.
-            .kill_on_drop(true)
+            .kill_on_drop(true);
+        #[cfg(unix)]
+        command.process_group(0);
+        let mut child = command
             .spawn()
-            .map_err(|e| {
-                AgentError::NotAvailable(format!("cannot start {}: {e}", cmd.binary.display()))
-            })?;
+            .map_err(|_| AgentError::NotAvailable("cannot start pi".into()))?;
         let pid = child.id();
         let (stdin, stdout, stderr) =
             match (child.stdin.take(), child.stdout.take(), child.stderr.take()) {
@@ -200,13 +270,7 @@ impl PiChild {
             let alive = alive.clone();
             let kill = kill.clone();
             tokio::spawn(async move {
-                let status = tokio::select! {
-                    status = child.wait() => status,
-                    _ = kill.notified() => {
-                        let _ = child.start_kill();
-                        child.wait().await
-                    }
-                };
+                let status = wait_owned_child(&mut child, &kill).await;
                 alive.store(false, Ordering::SeqCst);
                 tracing::debug!(?pid, ?status, "pi exited");
                 let _ = tokio::time::timeout(DRAIN_GRACE, reader).await;
@@ -264,8 +328,11 @@ impl PiChild {
         match tokio::time::timeout(REQUEST_TIMEOUT, exchange).await {
             Ok(reply) => reply,
             Err(_) => {
-                tracing::warn!(pid = ?self.pid, command = ?command.get("type"), "pi request timed out");
-                Err(AgentError::Network("pi request timed out".into()))
+                tracing::warn!(pid = ?self.pid, "pi request timed out");
+                self.terminate("pi request timed out; outcome unknown; not retried");
+                Err(AgentError::Network(
+                    "pi request timed out; outcome unknown; not retried".into(),
+                ))
             }
         }
     }
@@ -277,7 +344,7 @@ impl PiChild {
 
     /// Every non-response stdout record. Subscribe before sending a `prompt`,
     /// or a fast run can settle before the subscriber exists.
-    pub fn events(&self) -> broadcast::Receiver<Value> {
+    pub fn events(&self) -> broadcast::Receiver<Arc<PiRecord>> {
         self.events.subscribe()
     }
 
@@ -300,34 +367,128 @@ impl PiChild {
 
     /// Close stdin so Pi shuts down in order, wait up to 5 s, then kill.
     pub async fn close(&self) {
-        self.stdin.lock().await.take();
         let mut exited = self.exited.clone();
-        if tokio::time::timeout(CLOSE_GRACE, exited.wait_for(|done| *done))
-            .await
-            .is_err()
+        if tokio::time::timeout(CLOSE_GRACE, async {
+            self.stdin.lock().await.take();
+            let _ = exited.wait_for(|done| *done).await;
+        })
+        .await
+        .is_err()
         {
             tracing::debug!(pid = ?self.pid, "pi ignored stdin close; killing");
-            self.kill.notify_one();
-            let _ = exited.wait_for(|done| *done).await;
+            self.terminate("pi transport closed");
+            let _ = tokio::time::timeout(DRAIN_GRACE, exited.wait_for(|done| *done)).await;
         }
+    }
+
+    pub(super) fn terminate(&self, reason: &'static str) {
+        self.alive.store(false, Ordering::SeqCst);
+        self.shared
+            .fail_all(AgentError::NotAvailable(reason.into()));
+        self.kill.notify_one();
     }
 
     async fn write(&self, record: &Value) -> Result<(), AgentError> {
         let mut line = serde_json::to_vec(record)
-            .map_err(|e| AgentError::InvalidRequest(format!("pi record: {e}")))?;
+            .map_err(|_| AgentError::InvalidRequest("invalid pi record".into()))?;
         line.push(b'\n');
+        if line.len() > MAX_LINE_BYTES {
+            return Err(AgentError::InvalidRequest(
+                "pi command exceeds record limit".into(),
+            ));
+        }
         self.touch();
-        let mut stdin = self.stdin.lock().await;
-        let Some(pipe) = stdin.as_mut() else {
-            return Err(AgentError::NotAvailable("pi stdin closed".into()));
-        };
         let written = async {
-            pipe.write_all(&line).await?;
-            pipe.flush().await
+            let mut stdin = self.stdin.lock().await;
+            if !self.is_alive() {
+                return Err(AgentError::NotAvailable("pi transport closed".into()));
+            }
+            let Some(pipe) = stdin.as_mut() else {
+                return Err(AgentError::NotAvailable("pi stdin closed".into()));
+            };
+            let mut guard = WriteGuard {
+                child: self,
+                complete: false,
+            };
+            pipe.write_all(&line).await.map_err(|_| {
+                AgentError::NotAvailable(
+                    "pi stdin write failed; outcome unknown; not retried".into(),
+                )
+            })?;
+            pipe.flush().await.map_err(|_| {
+                AgentError::NotAvailable(
+                    "pi stdin write failed; outcome unknown; not retried".into(),
+                )
+            })?;
+            guard.complete = true;
+            Ok(())
         };
-        written
-            .await
-            .map_err(|e| AgentError::NotAvailable(format!("pi stdin: {e}")))
+        match tokio::time::timeout(WRITE_TIMEOUT, written).await {
+            Ok(result) => result,
+            Err(_) => {
+                self.terminate("pi stdin write timed out; outcome unknown; not retried");
+                Err(AgentError::NotAvailable(
+                    "pi stdin write timed out; outcome unknown; not retried".into(),
+                ))
+            }
+        }
+    }
+}
+
+/// Observe exit without reaping before group cleanup, so the owned leader's
+/// PID cannot be reused between inspection and killpg.
+async fn wait_owned_child(
+    child: &mut tokio::process::Child,
+    kill: &Notify,
+) -> std::io::Result<std::process::ExitStatus> {
+    #[cfg(unix)]
+    if let Some(group) = child.id().and_then(|pid| i32::try_from(pid).ok()) {
+        let owned = tokio::select! {
+            _ = kill.notified() => true,
+            result = wait_unreaped(group) => result.is_ok() || result.err().is_some_and(|e| e.raw_os_error() != Some(libc::ECHILD)),
+        };
+        if owned {
+            // SAFETY: process_group(0) created this group; its owned leader
+            // has not been reaped and its PID cannot have been reused.
+            unsafe {
+                libc::killpg(group, libc::SIGKILL);
+            }
+        }
+        return child.wait().await;
+    }
+    tokio::select! {
+        result = child.wait() => result,
+        _ = kill.notified() => { let _ = child.start_kill(); child.wait().await }
+    }
+}
+
+#[cfg(unix)]
+async fn wait_unreaped(pid: i32) -> std::io::Result<()> {
+    loop {
+        let exited = {
+            // SAFETY: waitid initializes the status; WNOWAIT preserves ownership.
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            let result = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    pid as libc::id_t,
+                    &mut info,
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            };
+            if result != 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error);
+            }
+            (unsafe { info.si_pid() }) != 0
+        };
+        if exited {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
@@ -380,7 +541,7 @@ async fn read_stdout<R: AsyncBufRead + Unpin>(
     mut reader: R,
     pid: Option<u32>,
     shared: Arc<Shared>,
-    events: broadcast::Sender<Value>,
+    events: broadcast::Sender<Arc<PiRecord>>,
     last_used: Arc<Mutex<Instant>>,
     alive: Arc<AtomicBool>,
     kill: Arc<Notify>,
@@ -431,28 +592,31 @@ async fn read_stdout<R: AsyncBufRead + Unpin>(
             }
         };
         if record.get("type").and_then(Value::as_str) != Some("response") {
+            let Some(record) = PiRecord::bounded(record, line.len()) else {
+                alive.store(false, Ordering::SeqCst);
+                shared.fail_all(AgentError::Protocol("pi event byte budget exceeded".into()));
+                kill.notify_one();
+                return;
+            };
             let _ = events.send(record);
             continue;
         }
-        let command = record.get("command").and_then(Value::as_str).unwrap_or("");
         let Some(id) = record.get("id").and_then(Value::as_str) else {
             // A parse failure on our own output, or a command sent without
             // an id: nothing can be waiting on it.
-            tracing::warn!(?pid, command, error = ?record.get("error"), "pi response without id");
+            tracing::warn!(?pid, "pi response without id");
             continue;
         };
         let reply = if record.get("success").and_then(Value::as_bool) == Some(true) {
             Ok(record.get("data").cloned().unwrap_or(Value::Null))
         } else {
+            // Upstream errors may contain prompts, tool input or secrets.
             Err(AgentError::RequestFailed(
-                record
-                    .get("error")
-                    .and_then(Value::as_str)
-                    .map_or_else(|| format!("pi {command} failed"), str::to_owned),
+                "pi command rejected before acceptance".into(),
             ))
         };
         if !shared.resolve(id, reply) {
-            tracing::warn!(?pid, id, command, "pi response for unknown id");
+            tracing::warn!(?pid, "pi response for unknown id");
         }
     }
     // Without stdout the child can answer nothing: callers that see the
@@ -462,22 +626,12 @@ async fn read_stdout<R: AsyncBufRead + Unpin>(
 }
 
 async fn log_stderr<R: AsyncBufRead + Unpin>(mut reader: R, pid: Option<u32>) {
-    let mut line = Vec::new();
+    // Drain diagnostics without retaining or logging private upstream text.
+    let mut buffer = [0_u8; 4096];
     loop {
-        match read_line(&mut reader, &mut line, MAX_STDERR_LINE_BYTES).await {
-            Ok(Line::Record) => {
-                tracing::debug!(?pid, line = %String::from_utf8_lossy(&line).trim_end(), "pi stderr");
-            }
-            Ok(Line::TooLong) => {
-                // Skip the chunk that overflowed; the rest arrives as more lines.
-                line.clear();
-                if let Ok(buf) = reader.fill_buf().await {
-                    let n = buf.len().min(MAX_STDERR_LINE_BYTES);
-                    reader.consume(n);
-                }
-                tracing::debug!(?pid, "pi stderr line too long; dropped");
-            }
-            Ok(Line::Eof) | Err(_) => return,
+        match reader.read(&mut buffer).await {
+            Ok(0) | Err(_) => return,
+            Ok(bytes) => tracing::trace!(?pid, bytes, "pi diagnostics discarded"),
         }
     }
 }
@@ -517,6 +671,13 @@ impl PiHost {
         self.children
             .lock()
             .is_ok_and(|children| children.values().any(|child| child.is_alive()))
+    }
+
+    pub(super) fn alive_count(&self) -> usize {
+        self.children
+            .lock()
+            .map(|children| children.values().filter(|c| c.is_alive()).count())
+            .unwrap_or(usize::MAX)
     }
 
     pub fn remove(&self, asid: &str) -> Option<Arc<PiChild>> {
@@ -577,7 +738,7 @@ mod tests {
     /// oversized record on `flood`, and rejects anything else. Startup noise
     /// (empty line, non-object, id-less response) must be skipped.
     const FAKE_PI: &str = r#"#!/usr/bin/env python3
-import json, os, sys
+import json, os, sys, time, subprocess
 def out(rec, end="\n"):
     sys.stdout.write(json.dumps(rec) + end); sys.stdout.flush()
 sys.stdout.write("\n[1, 2]\n"); out({"type": "response", "command": "parse", "success": False, "error": "x"})
@@ -595,8 +756,14 @@ for raw in sys.stdin.buffer:
         sys.exit(3)
     elif t == "flood":
         sys.stdout.write("x" * (17 * 1024 * 1024)); sys.stdout.flush()
+    elif t == "stall":
+        out({"type": "stall_ready"})
+        time.sleep(120)
+    elif t == "spawn_exit":
+        subprocess.Popen([sys.executable, "-c", "import time,pathlib; time.sleep(1); pathlib.Path('descendant-survived').touch()"])
+        sys.exit(0)
     else:
-        out({"id": rid, "type": "response", "command": t, "success": False, "error": "Unknown command: " + t})
+        out({"id": rid, "type": "response", "command": t, "success": False, "error": "private-token-and-prompt: " + t})
 "#;
 
     fn fake_pi() -> Option<(PiCommandLine, PiLaunch)> {
@@ -656,7 +823,9 @@ for raw in sys.stdin.buffer:
         assert_eq!(event["type"], "agent_settled");
 
         match child.request(json!({"type": "bogus"})).await {
-            Err(AgentError::RequestFailed(msg)) => assert_eq!(msg, "Unknown command: bogus"),
+            Err(AgentError::RequestFailed(msg)) => {
+                assert_eq!(msg, "pi command rejected before acceptance")
+            }
             other => panic!("unexpected {other:?}"),
         }
 
@@ -690,5 +859,66 @@ for raw in sys.stdin.buffer:
         assert_eq!(reaped, ["s-dead", "s-idle"]);
         assert!(!idle.is_alive());
         assert!(host.get("s-idle").is_none());
+    }
+
+    #[tokio::test]
+    async fn cancelled_partial_write_closes_transport_and_shutdown_is_bounded() {
+        let Some((cmd, launch)) = fake_pi() else {
+            return;
+        };
+        let child = PiChild::spawn(&cmd, &launch).await.unwrap();
+        let mut events = child.events();
+        child.send(json!({"type":"stall"})).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let record =
+            json!({"type":"extension_ui_response", "padding":"x".repeat(MAX_LINE_BYTES / 2)});
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), child.send(record))
+                .await
+                .is_err()
+        );
+        assert!(!child.is_alive());
+        assert!(child.send(json!({"type":"get_state"})).await.is_err());
+        tokio::time::timeout(Duration::from_secs(8), child.close())
+            .await
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn child_exit_removes_tool_descendants_before_they_can_write() {
+        let Some((cmd, launch)) = fake_pi() else {
+            return;
+        };
+        let child = PiChild::spawn(&cmd, &launch).await.unwrap();
+        child.send(json!({"type":"spawn_exit"})).await.unwrap();
+        let mut exited = child.exited.clone();
+        tokio::time::timeout(Duration::from_secs(4), exited.wait_for(|v| *v))
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert!(!launch.cwd.join("descendant-survived").exists());
+    }
+
+    #[test]
+    fn event_reservations_are_shared_and_released_after_the_last_queue_copy() {
+        // A dedicated budget keeps this invariant deterministic while other
+        // protocol tests exercise the process-wide budget concurrently.
+        let budget = Arc::new(Semaphore::new(8));
+        let permit = budget.clone().try_acquire_many_owned(8).unwrap();
+        let record = Arc::new(PiRecord {
+            value: json!({"type":"example"}),
+            _budget: Some(permit),
+        });
+        let forwarded = record.clone();
+        drop(record);
+        assert!(budget.clone().try_acquire_owned().is_err());
+        drop(forwarded);
+        assert_eq!(budget.available_permits(), 8);
+        assert!(PiRecord::bounded(Value::Null, MAX_LINE_BYTES + 1).is_none());
     }
 }

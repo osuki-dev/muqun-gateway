@@ -4,10 +4,12 @@ use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::Duration;
 
 use serde_json::{json, Value};
+use tokio::io::AsyncReadExt;
 use tokio::sync::{broadcast, mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 
 use super::mapper::{self, Permission, Projection};
+use super::operations::{self, PromptCapabilities};
 use super::{AcpClient, AcpEvent};
 use crate::agents::adapters::memory_mirror::MemoryMirror;
 use crate::agents::domain::*;
@@ -24,6 +26,22 @@ pub trait AcpProvider: Send + Sync + 'static {
     const ARGS: &'static [&'static str];
     const REQUIRE_MESSAGE_ID: bool;
     const MODEL_SELECTION: bool;
+    const PROVIDER_CONFIG: bool = true;
+    const EFFORT_CONFIG: &'static str = "effort";
+    fn global_catalog<'a>(
+        _binary: &'a str,
+        _directory: &'a str,
+        _stop: &'a CancellationToken,
+    ) -> AgentFuture<'a, AgentCatalog> {
+        unsupported("global ACP model catalog")
+    }
+    fn account_limits<'a>(
+        _binary: &'a str,
+        _directory: &'a str,
+        _stop: &'a CancellationToken,
+    ) -> AgentFuture<'a, crate::agents::domain::account_limits::AccountLimits> {
+        unsupported("ACP account limits")
+    }
     fn safe_error_message(_: &Value) -> Option<&'static str> {
         None
     }
@@ -37,6 +55,8 @@ struct SessionState {
     info: AgentSessionInfo,
     catalog: AgentCatalog,
     config: Value,
+    owned_mutations: bool,
+    usage: mapper::SessionUsage,
     projection: Projection,
     permissions: HashMap<String, Permission>,
 }
@@ -47,6 +67,9 @@ struct Session {
     busy: AtomicBool,
     connected: AtomicBool,
     completions: mpsc::UnboundedSender<Result<Value, String>>,
+    native_capabilities: Value,
+    commands_observed: Arc<AtomicBool>,
+    prompt_capabilities: PromptCapabilities,
     finished: CancellationToken,
 }
 
@@ -62,6 +85,12 @@ impl Drop for Admission<'_> {
     }
 }
 
+type CatalogCacheEntry = (
+    String,
+    tokio::time::Instant,
+    Result<AgentCatalog, AgentError>,
+);
+
 pub struct AcpDriver<P: AcpProvider> {
     provider: PhantomData<P>,
     binary: String,
@@ -73,6 +102,9 @@ pub struct AcpDriver<P: AcpProvider> {
     connection_admission: Mutex<()>,
     starting: tokio::sync::RwLock<()>,
     mutations: Mutex<()>,
+    global_catalog: Mutex<Option<CatalogCacheEntry>>,
+    native_capabilities: StdMutex<Value>,
+    commands_observed: Arc<AtomicBool>,
     stop: CancellationToken,
 }
 
@@ -82,6 +114,45 @@ fn unsupported<'a, T: Send + 'a>(feature: &'static str) -> AgentFuture<'a, T> {
 
 fn protocol(message: &str) -> AgentError {
     AgentError::Protocol(message.into())
+}
+
+pub(crate) async fn read_metadata_output(
+    binary: &str,
+    arguments: &[&str],
+    directory: &str,
+    stop: &CancellationToken,
+) -> Result<Vec<u8>, AgentError> {
+    use std::process::Stdio;
+    let mut child = tokio::process::Command::new(binary)
+        .args(arguments)
+        .current_dir(directory)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|_| AgentError::NotAvailable("Could not run Agent metadata command".into()))?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| AgentError::Protocol("Agent metadata stdout missing".into()))?
+        .take(1024 * 1024 + 1);
+    let mut bytes = Vec::new();
+    let result = tokio::select! {
+        _ = stop.cancelled() => Err(AgentError::NotAvailable("Agent metadata command cancelled".into())),
+        result = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            stdout.read_to_end(&mut bytes).await.map_err(|_| AgentError::Protocol("Could not read Agent metadata".into()))?;
+            if bytes.len() > 1024 * 1024 { return Err(AgentError::Protocol("Agent metadata exceeds its byte budget".into())); }
+            let status = child.wait().await.map_err(|_| AgentError::NotAvailable("Agent metadata process failed".into()))?;
+            if !status.success() { return Err(AgentError::NotAvailable("Agent metadata is unavailable; inspect FX authentication in the terminal".into())); }
+            Ok(bytes)
+        }) => result.unwrap_or_else(|_| Err(AgentError::NotAvailable("Agent metadata command timed out".into()))),
+    };
+    if result.is_err() {
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+    }
+    result
 }
 
 impl<P: AcpProvider> AcpDriver<P> {
@@ -102,6 +173,9 @@ impl<P: AcpProvider> AcpDriver<P> {
             connection_admission: Mutex::new(()),
             starting: tokio::sync::RwLock::new(()),
             mutations: Mutex::new(()),
+            global_catalog: Mutex::new(None),
+            native_capabilities: StdMutex::new(Value::Null),
+            commands_observed: Arc::new(AtomicBool::new(false)),
             stop: CancellationToken::new(),
         })
     }
@@ -156,11 +230,18 @@ impl<P: AcpProvider> AcpDriver<P> {
             .collect();
         sessions.sort_by(|a, b| a.0.cmp(&b.0));
         let mut models: BTreeMap<(String, String), ModelInfo> = BTreeMap::new();
+        let mut commands = BTreeMap::new();
         for (_, session) in sessions {
             if !session.connected.load(Ordering::Acquire) {
                 continue;
             }
-            for model in &session.state.lock().await.catalog.models {
+            let state = session.state.lock().await;
+            for command in &state.catalog.commands {
+                commands
+                    .entry(command.name.clone())
+                    .or_insert_with(|| command.clone());
+            }
+            for model in &state.catalog.models {
                 let current = models
                     .entry((model.provider_id.clone(), model.id.clone()))
                     .or_insert_with(|| model.clone());
@@ -183,8 +264,48 @@ impl<P: AcpProvider> AcpDriver<P> {
         }
         AgentCatalog {
             models: models.into_values().collect(),
+            commands: commands.into_values().collect(),
             ..Default::default()
         }
+    }
+
+    pub fn observed_capabilities(&self) -> Value {
+        self.native_capabilities.lock().unwrap().clone()
+    }
+
+    /// A verified read-only provider catalog may bootstrap choices before a
+    /// session exists. Native session catalogs remain the authoritative source.
+    pub async fn available_catalog(
+        &self,
+        directory: Option<&str>,
+    ) -> Result<AgentCatalog, AgentError> {
+        let mut observed = self.observed_catalog().await;
+        if !P::MODEL_SELECTION {
+            observed.models.clear();
+            observed.defaults.model = None;
+            return Ok(observed);
+        }
+        if !observed.models.is_empty() {
+            return Ok(observed);
+        }
+        let directory = directory.unwrap_or(&self.default_directory);
+        let mut cached = self.global_catalog.lock().await;
+        if let Some((scope, at, result)) = &*cached {
+            let ttl = if result.is_ok() { 60 } else { 5 };
+            if scope == directory && at.elapsed() < Duration::from_secs(ttl) {
+                return result.clone();
+            }
+        }
+        let result = match P::global_catalog(&self.binary, directory, &self.stop).await {
+            Err(AgentError::Unsupported(_)) => Ok(observed),
+            result => result,
+        };
+        *cached = Some((
+            directory.into(),
+            tokio::time::Instant::now(),
+            result.clone(),
+        ));
+        result
     }
 
     async fn select_config(
@@ -199,11 +320,7 @@ impl<P: AcpProvider> AcpDriver<P> {
         if option["currentValue"].as_str() == Some(value) {
             return Ok(());
         }
-        if !option["options"].as_array().is_some_and(|options| {
-            options
-                .iter()
-                .any(|option| option["value"].as_str() == Some(value))
-        }) {
+        if !mapper::offers_config_value(&state.config, config_id, value) {
             return Err(AgentError::InvalidRequest(format!(
                 "ACP {config_id} choice is not offered by this session"
             )));
@@ -283,12 +400,22 @@ impl<P: AcpProvider> AcpDriver<P> {
             busy: &session.busy,
             handed_off: false,
         };
-        self.select_config(session, "provider", &model.provider_id)
-            .await?;
-        self.select_config(session, "model", &model.model_id)
-            .await?;
+        if P::PROVIDER_CONFIG {
+            self.select_config(session, "provider", &model.provider_id)
+                .await?;
+        } else if model.provider_id != P::KIND {
+            return Err(AgentError::InvalidRequest(
+                "model belongs to another ACP provider".into(),
+            ));
+        }
+        let native_model = {
+            let state = session.state.lock().await;
+            mapper::resolve_model_value(&state.config, &model.model_id)?
+        };
+        self.select_config(session, "model", &native_model).await?;
         if let Some(effort) = &model.variant {
-            self.select_config(session, "effort", effort).await?;
+            self.select_config(session, P::EFFORT_CONFIG, effort)
+                .await?;
         }
         Ok(())
     }
@@ -340,7 +467,9 @@ impl<P: AcpProvider> AcpDriver<P> {
         };
         match result {
             Ok(value) if value["protocolVersion"].as_u64() == Some(1) => {
-                Ok((client, events, value["agentCapabilities"].clone()))
+                let capabilities = value["agentCapabilities"].clone();
+                *self.native_capabilities.lock().unwrap() = capabilities.clone();
+                Ok((client, events, capabilities))
             }
             result => {
                 client.shutdown().await;
@@ -488,6 +617,7 @@ impl<P: AcpProvider> AcpDriver<P> {
                 "ACP active-session capacity exhausted".into(),
             ));
         }
+        let new_session = existing.is_none();
         let id = existing.as_ref().map(|info| info.asid.0.clone());
         let revision = match &id {
             Some(id) => {
@@ -596,6 +726,8 @@ impl<P: AcpProvider> AcpDriver<P> {
             info,
             catalog: mapper::catalog_for(&value, P::KIND),
             config: value.clone(),
+            owned_mutations: new_session,
+            usage: mapper::SessionUsage::new(new_session),
             projection: Projection::new(P::REQUIRE_MESSAGE_ID),
             permissions: HashMap::new(),
         };
@@ -644,12 +776,27 @@ impl<P: AcpProvider> AcpDriver<P> {
                 "ACP session changed while loading; refresh again".into(),
             ));
         }
+        if !state.catalog.commands.is_empty() {
+            self.commands_observed.store(true, Ordering::Release);
+        }
         let session = Arc::new(Session {
             client,
             state: Mutex::new(state),
             busy: AtomicBool::new(false),
             connected: AtomicBool::new(true),
             completions,
+            prompt_capabilities: PromptCapabilities {
+                images: capabilities
+                    .pointer("/promptCapabilities/image")
+                    .and_then(Value::as_bool)
+                    == Some(true),
+                embedded_context: capabilities
+                    .pointer("/promptCapabilities/embeddedContext")
+                    .and_then(Value::as_bool)
+                    == Some(true),
+            },
+            native_capabilities: capabilities,
+            commands_observed: self.commands_observed.clone(),
             finished: CancellationToken::new(),
         });
         self.sessions
@@ -733,17 +880,23 @@ impl<P: AcpProvider> AcpDriver<P> {
                 }
                 Ok(None)
             }
+            Some("available_commands_update") => {
+                state.catalog.commands = operations::commands(update)?;
+                Ok(None)
+            }
             Some("current_mode_update") => {
                 state.info.mode = update["currentModeId"].as_str().map(str::to_owned);
                 Ok(None)
             }
             Some("config_option_update") => {
-                let mut catalog = mapper::catalog_for(update, P::KIND);
+                state.config["configOptions"] = update["configOptions"].clone();
+                let mut catalog = mapper::catalog_for(&state.config, P::KIND);
+                catalog.commands = state.catalog.commands.clone();
                 catalog.modes = state.catalog.modes.clone();
                 catalog.defaults.mode = state.catalog.defaults.mode.clone();
                 state.catalog = catalog;
                 state.config["configOptions"] = update["configOptions"].clone();
-                state.info.model = mapper::selected_model_for(update, P::KIND);
+                state.info.model = mapper::selected_model_for(&state.config, P::KIND);
                 Ok(None)
             }
             _ => state.projection.update(update),
@@ -787,10 +940,24 @@ impl<P: AcpProvider> AcpDriver<P> {
             return;
         }
         let old_info = state.info.clone();
+        let old_commands = state.catalog.commands.clone();
         match Self::reduce(&mut state, &params["update"]) {
             Ok(Some(row)) => {
                 let event = mirror.record_timeline_upsert(&asid, vec![row]).await;
                 Self::emit(mirror, tx, event);
+            }
+            Ok(None) if old_commands != state.catalog.commands => {
+                if !state.catalog.commands.is_empty() {
+                    session.commands_observed.store(true, Ordering::Release);
+                }
+                Self::emit(
+                    mirror,
+                    tx,
+                    AgentDomainEvent::Resync {
+                        asid,
+                        reason: "agent_catalog_changed".into(),
+                    },
+                );
             }
             Ok(None) if old_info != state.info => {
                 let info = state.info.clone();
@@ -970,6 +1137,38 @@ impl<P: AcpProvider> AcpDriver<P> {
         }
     }
 
+    async fn finish_usage(
+        session: &Session,
+        mirror: &MemoryMirror,
+        tx: &broadcast::Sender<AgentDomainEvent>,
+        response: Option<&Value>,
+    ) {
+        let mut state = session.state.lock().await;
+        let native_provider = state
+            .info
+            .model
+            .as_ref()
+            .map(|model| model.provider_id.as_str())
+            .unwrap_or(P::KIND);
+        let turn =
+            response.and_then(|response| mapper::turn_usage(response, P::KIND, native_provider));
+        let total = state.usage.finish(turn);
+        if state.info.tokens != total {
+            state.info.tokens = total;
+            let info = state.info.clone();
+            let seq = mirror.update_session(info.clone()).await;
+            Self::emit(
+                mirror,
+                tx,
+                AgentDomainEvent::SessionUpdated {
+                    asid: info.asid.clone(),
+                    info: Box::new(info),
+                    seq,
+                },
+            );
+        }
+    }
+
     fn listen(
         session: Arc<Session>,
         mut events: broadcast::Receiver<AcpEvent>,
@@ -991,6 +1190,7 @@ impl<P: AcpProvider> AcpDriver<P> {
                         // The RPC reader queued all updates before resolving this reply.
                         while let Ok(event) = events.try_recv() { if !Self::event(&session, &mirror, &tx, event).await { break; } }
                         if !session.connected.load(Ordering::Acquire) { break; }
+                        Self::finish_usage(&session, &mirror, &tx, result.as_ref().ok()).await;
                         let (status, error) = match result {
                             Ok(value) => match value["stopReason"].as_str() {
                                 Some("cancelled") => (AgentSessionStatus::Interrupted, None),
@@ -1023,11 +1223,56 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
     fn kind(&self) -> &'static str {
         P::KIND
     }
+    fn supports_earlier_timeline(&self) -> bool {
+        true
+    }
+    fn load_earlier_timeline<'a>(
+        &'a self,
+        id: &'a str,
+        limit: usize,
+    ) -> AgentFuture<'a, Vec<TimelineItem>> {
+        Box::pin(async move {
+            if limit == 0 {
+                return Err(AgentError::InvalidRequest(
+                    "history page limit must be positive".into(),
+                ));
+            }
+            // Each accepted ACP load already validates the complete native replay.
+            // Older retained rows page through MemoryMirror before this hook runs.
+            self.ensure_loaded(id).await?;
+            Ok(Vec::new())
+        })
+    }
     fn probe(&self) -> AgentFuture<'_, bool> {
         Box::pin(async { Ok(self.is_connected()) })
     }
+    fn account_limits(
+        &self,
+    ) -> AgentFuture<'_, crate::agents::domain::account_limits::AccountLimits> {
+        P::account_limits(&self.binary, &self.default_directory, &self.stop)
+    }
     fn attachment_mode(&self) -> AttachmentMode {
-        AttachmentMode::ByPath
+        AttachmentMode::NativeUploads
+    }
+    fn slash_commands_listed(&self) -> bool {
+        self.commands_observed.load(Ordering::Acquire)
+    }
+    fn run_command<'a>(
+        &'a self,
+        id: &'a str,
+        name: &'a str,
+        arguments: &'a str,
+        delivery: Option<&'a str>,
+    ) -> AgentFuture<'a, ()> {
+        Box::pin(async move {
+            let session = self.ensure_loaded(id).await?;
+            let prompt = operations::command_prompt(
+                &session.state.lock().await.catalog.commands,
+                name,
+                arguments,
+            )?;
+            self.send_prompt(id, &prompt, &[], delivery).await
+        })
     }
     fn list_projects(&self) -> AgentFuture<'_, Vec<AgentProject>> {
         Box::pin(async move {
@@ -1158,12 +1403,9 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
                     "ACP prompt steering or queueing".into(),
                 ));
             }
-            if !attachments.is_empty() {
-                return Err(AgentError::InvalidRequest(
-                    "ACP attachments must pass through the Gateway upload use case".into(),
-                ));
-            }
             let session = self.ensure_loaded(id).await?;
+            let prepared =
+                operations::prompt_parts(text, attachments, session.prompt_capabilities).await?;
             if session
                 .busy
                 .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -1181,12 +1423,12 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
             // native response cannot appear ahead of its submitted user text.
             // Busy is published only after a request was actually flushed.
             let mut state = session.state.lock().await;
-            state.projection.can_submit(text)?;
+            state.projection.can_submit(&prepared.transcript)?;
             let request = session
                 .client
                 .start_request(
                     "session/prompt",
-                    json!({ "sessionId": id, "prompt": [{ "type": "text", "text": text }] }),
+                    json!({ "sessionId": id, "prompt": prepared.content }),
                 )
                 .await;
             match request {
@@ -1210,7 +1452,7 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
                             },
                         );
                     }
-                    let row = state.projection.submitted(text);
+                    let row = state.projection.submitted(&prepared.transcript);
                     let event = self
                         .mirror
                         .record_timeline_upsert(&state.info.asid, vec![row])
@@ -1335,8 +1577,8 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
             Ok(Vec::new())
         })
     }
-    fn get_catalog<'a>(&'a self, _directory: Option<&'a str>) -> AgentFuture<'a, AgentCatalog> {
-        Box::pin(async { Ok(self.observed_catalog().await) })
+    fn get_catalog<'a>(&'a self, directory: Option<&'a str>) -> AgentFuture<'a, AgentCatalog> {
+        Box::pin(async move { self.available_catalog(directory).await })
     }
     fn get_catalog_for_session<'a>(
         &'a self,
@@ -1347,6 +1589,10 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
             if let Some(id) = id {
                 let session = self.ensure_loaded(id).await?;
                 let mut catalog = session.state.lock().await.catalog.clone();
+                if !P::MODEL_SELECTION {
+                    catalog.models.clear();
+                    catalog.defaults.model = None;
+                }
                 // ACP mode changes persist permission defaults outside the current
                 // session, so the existing App must not offer them as local choices.
                 catalog.modes.clear();
@@ -1377,6 +1623,147 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
                 })
                 .collect();
             Ok(timeline)
+        })
+    }
+    fn fork_session<'a>(
+        &'a self,
+        id: &'a str,
+        message_id: Option<&'a str>,
+    ) -> AgentFuture<'a, AgentSessionInfo> {
+        Box::pin(async move {
+            let _mutation = self.mutations.lock().await;
+            let source = self.retained(id).ok_or_else(|| {
+                AgentError::Unsupported("open a Gateway-owned session before forking".into())
+            })?;
+            if !source.connected.load(Ordering::Acquire)
+                || !operations::supports_operation(&source.native_capabilities, "fork")
+            {
+                return Err(AgentError::Unsupported("native session fork".into()));
+            }
+            if source
+                .busy
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                return Err(AgentError::NotAvailable("session is busy".into()));
+            }
+            let _admission = Admission {
+                busy: &source.busy,
+                handed_off: false,
+            };
+            let info = source.state.lock().await.info.clone();
+            if message_id.is_some() {
+                return Err(AgentError::Unsupported(
+                    "ACP fork at a message boundary".into(),
+                ));
+            }
+            if source.state.lock().await.projection.rows.is_empty() {
+                return Err(AgentError::InvalidRequest(
+                    "No conversation to branch".into(),
+                ));
+            }
+            let directory = info
+                .directory
+                .as_deref()
+                .ok_or_else(|| protocol("source session has no directory"))?;
+            let params = operations::fork_params(id, directory, message_id)?;
+            let (client, _events, capabilities) = self.initialized(directory).await?;
+            if !operations::supports_operation(&capabilities, "fork") {
+                client.shutdown().await;
+                return Err(AgentError::Unsupported("native session fork".into()));
+            }
+            let response = client
+                .request_with_timeout("session/fork", params, RPC_TIMEOUT)
+                .await;
+            client.shutdown().await;
+            let response = response.map_err(AgentError::RequestFailed)?;
+            let new_id = operations::forked_session_id(id, &response)?;
+            if self.retained(&new_id).is_some()
+                || self
+                    .mirror
+                    .session_info(&AgentSessionId::from(new_id.as_str()))
+                    .await
+                    .is_some()
+            {
+                return Err(protocol(
+                    "fork returned an existing session identity; do not retry automatically",
+                ));
+            }
+            let cloned=self.open(directory,Some(mapper::session(&new_id,directory,&response))).await.map_err(|error|AgentError::RequestFailed(format!("session {new_id} was forked but could not be loaded: {error}; do not retry fork")))?;
+            let mut state = cloned.state.lock().await;
+            state.owned_mutations = true;
+            Ok(state.info.clone())
+        })
+    }
+    fn delete_session<'a>(&'a self, id: &'a str) -> AgentFuture<'a, ()> {
+        Box::pin(async move {
+            let _mutation = self.mutations.lock().await;
+            let session = self.retained(id).ok_or_else(|| {
+                AgentError::Unsupported(
+                    "deletion requires a session created by this Gateway".into(),
+                )
+            })?;
+            if !session.connected.load(Ordering::Acquire)
+                || !session.state.lock().await.owned_mutations
+                || !operations::supports_operation(&session.native_capabilities, "delete")
+            {
+                return Err(AgentError::Unsupported(
+                    "deletion requires an idle Gateway-created native session".into(),
+                ));
+            }
+            if session
+                .busy
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                return Err(AgentError::NotAvailable("session is busy".into()));
+            }
+            let _admission = Admission {
+                busy: &session.busy,
+                handed_off: false,
+            };
+            let directory = session
+                .state
+                .lock()
+                .await
+                .info
+                .directory
+                .clone()
+                .ok_or_else(|| protocol("session has no directory"))?;
+            let params = operations::delete_params(id)?;
+            let (client, _events, capabilities) = self.initialized(&directory).await?;
+            if !operations::supports_operation(&capabilities, "delete") {
+                client.shutdown().await;
+                return Err(AgentError::Unsupported("native session delete".into()));
+            }
+            session.connected.store(false, Ordering::Release);
+            session.client.shutdown().await;
+            tokio::time::timeout(Duration::from_secs(5), session.finished.cancelled())
+                .await
+                .map_err(|_| {
+                    AgentError::NotAvailable(
+                        "session connection has not stopped; deletion was not submitted".into(),
+                    )
+                })?;
+            let result = client
+                .request_with_timeout("session/delete", params, RPC_TIMEOUT)
+                .await;
+            client.shutdown().await;
+            let value = result.map_err(AgentError::RequestFailed)?;
+            if !value.is_object() {
+                return Err(protocol(
+                    "native deletion outcome is unknown; do not retry automatically",
+                ));
+            }
+            session.connected.store(false, Ordering::Release);
+            session.client.shutdown().await;
+            tokio::time::timeout(Duration::from_secs(5), session.finished.cancelled())
+                .await
+                .map_err(|_| {
+                    AgentError::NotAvailable("deleted session connection has not stopped".into())
+                })?;
+            self.sessions.lock().unwrap().remove(id);
+            Ok(())
         })
     }
     fn revert_session<'a>(&'a self, _id: &'a str, _message: &'a str) -> AgentFuture<'a, ()> {

@@ -39,14 +39,32 @@ once attached. It ranks last in `AGENT_PREFERENCE`.
   until then the session is answered from the driver's live state.
 - Child environment: `MUQUN_MCP_URL` and `MUQUN_MCP_TOKEN` (a runtime token
   minted per attach, agent id `pi`) when MCP is on, and `MUQUN_PI_APPROVALS`.
-- Framing: LF-terminated JSON objects, optional CR dropped, 16 MiB per record
+- Framing: LF-terminated JSON objects, optional CR dropped, 1 MiB per record
   (a longer one kills the child). Commands carry a string `id`; the matching
-  `response` resolves it (60 s timeout). Stderr is logged, never parsed.
+  `response` resolves it (60 s timeout). Writes have a 5 s deadline. An
+  interrupted write or timed-out request closes the transport, reports an
+  unknown outcome and is never automatically replayed. Native diagnostics
+  are drained without retaining their contents; upstream errors returned to
+  the App use fixed messages.
 - Idle: children are touched on every record and command; the reaper (every
   30 s) never closes a child whose session is running (a long silent tool call)
   or whose session file does not exist yet (a new session before its first
   message: the child is all there is of it). Idle children get stdin closed,
   then a kill after 5 s. Manager shutdown closes every child.
+- Children use an owned process group on Unix. Cleanup kills remaining tool
+  descendants before reaping the leader, so its process-group identity
+  cannot be reused during cleanup. Shutdown includes the stdin-lock wait in
+  its deadline.
+- All children and both event queues share a 16 MiB raw-record byte budget;
+  each queue also holds at most 32 records. Exceeding a byte budget or losing
+  a child event stops that child. Losing manager events stops every Pi child
+  and explicitly resolves pending approvals before requesting a resync.
+  Limits also include 8 live children, 64 cached session folders, and 4 MiB
+  of serialized live state per folder. A folder overflow fails that session.
+- History reads retain at most 16 MiB per file/tail and 1 MiB per entry;
+  headers are bounded at 64 KiB. Discovery scans at most 4,096 session files
+  and 1,024 directories. Limits return an error instead of claiming that
+  truncated history is complete.
 - The extension is written to `<state_dir>/pi/` (owner-only directory, atomic
   rename, a symlink at the file is removed, a symlinked directory refused).
   Without a state directory Pi is not attached (discovery `offline`, reason
@@ -80,8 +98,10 @@ A child that exits during a run produces a synthetic
 write respawns a dead child before its forwarder noticed, the driver publishes
 a synthetic `muqun_discard` naming the old child's open approvals and
 provisional rows, so the mirror drops them. `agent_settled` resolves any
-approval still open. Records for a session with no live state (one just
-deleted) are dropped.
+approval still open. Records carry the child's generation through both
+queues. Folding and tail-offset updates reject an older generation, including
+records already queued before a replacement. Records for a deleted session
+are dropped.
 
 ## Extension contract
 
@@ -90,12 +110,16 @@ deleted) are dropped.
 - With `MUQUN_MCP_URL` and `MUQUN_MCP_TOKEN` set, registers the MCP server
   `muqun` with a bearer header.
 - Unless `MUQUN_PI_APPROVALS=never`, on `tool_call` for `bash`, `edit`, `write`
-  (top-level calls) asks
+  (including nested calls) asks
   `ctx.ui.confirm("muqun.permission", JSON.stringify({tool, toolCallId, input}))`
   with no timeout and `{signal: ctx.signal}`, and blocks the call when the
   answer is false. Stop (`abort`) fires that signal: Pi resolves the dialog
   `false` without sending anything, the call is blocked and the run settles
   with `aborted:true`, which drops the card.
+- RPC mode reports `ctx.hasUI=true`; its dialogs use the RPC subprotocol.
+  Missing UI, a failed bridge, an exception, cancellation or any answer
+  other than the boolean `true` blocks the tool. MCP registration failure
+  cannot remove the installed gate. No approval expires into an allow.
 
 On the wire this is
 `{"type":"extension_ui_request","id":…,"method":"confirm","title":"muqun.permission","message":"<json>"}`,
@@ -113,27 +137,37 @@ the gateway sends is also folded, which resolves the pending approval.
 | `list_sessions` | session files (one bucket with a directory filter), newest first (`order=asc` reverses); title = latest `session_info.name`, else first user text (80 chars), else `New session`; model from the last `model_change`/`thinking_level_change`; status `Busy` while the live child runs, else `Idle`; `search` matches the title; a parent filter other than top-level matches nothing |
 | `get_session` | the same, one file; a fresh session without a file from live state |
 | `create_session(dir, model, _)` | new child in `dir`; `set_model` (+ `set_thinking_level` for a variant); `get_state` |
-| `send_prompt` | attachments as host paths in the text (`ByPath`); idle → `prompt`; running → `steer` for delivery `steer`, else `prompt` with `streamingBehavior:"followUp"`; a "streaming" refusal of an idle-looking session is re-sent once with `followUp` (the refusal precedes acceptance) |
-| `interrupt` | `abort`; no child means no run |
-| `switch_model` | `set_model {provider, modelId}`; `variant` → `set_thinking_level {level}` |
-| `reply_permission` | `extension_ui_response {id, confirmed}`; `AllowAlways` acts as `Allow`; a reason text is refused |
+| `send_prompt` | attachments as host paths in the text (`ByPath`); idle → `prompt`; running → `steer` for delivery `steer`, else `prompt` with `streamingBehavior:"followUp"`; failures are returned without replay |
+| `interrupt` | `abort`; no child means no run. Pi may continue existing native queued messages after abort; the Gateway preserves those messages rather than clearing another client's queue |
+| `switch_model` | `set_model {provider, modelId}`; `variant` → `set_thinking_level {level}`; read `get_state` afterward and retain the actual normalized model/level, including before the first session-file write |
+| `reply_permission` | `extension_ui_response {id, confirmed}`; accepts only one reply while that generation's request is pending; persistent permission and reason text are refused |
 | `get_pending_permissions` | the driver's live pending map |
 | `get_timeline(limit)` | active branch of the file (follow `parentId` from the last entry) mapped, merged with live rows not yet in the file, last `limit` |
+| `prepare_timeline` / `prepare_earlier_timeline` | file-backed row-id cursor; snapshot and older-page boundaries move only when the mirror accepts the candidate. Snapshot refresh preserves an older accepted boundary. A lost anchor or concurrent stale commit reports `HistoryCursorLost`; empty means the actual active-branch start |
 | `rename_session` | `set_session_name` (child started if needed) |
 | `delete_session` | close the child, remove the file (only under the session root) |
 | `compact_session` | `compact` sent in the background (it answers only when done); progress via `compaction_start`/`compaction_end`; returns `{"started":true}` |
-| `get_catalog` | probe child, see above; thinking levels become variants of reasoning models |
+| `get_catalog` | model probe child, see above; thinking levels become variants of reasoning models. Commands come from a live child in the requested directory, or an isolated extension-free probe there. The probe lists only the templates/skills it actually observes; extension commands become available with a live session |
+| `run_command` / `execute_command` | validate against that session's current `get_commands`, then submit `/name arguments` through `prompt`, including when busy. Built-in TUI-only commands are not offered |
+| `fork_session` | currently unsupported: native resume/clone can mutate the source file during initialization, so a safe isolated snapshot is required before enabling this App action |
 | `get_pending_forms` | empty |
-| `switch_mode`, `revert_session`, `fork_session`, `find_files`, `get_vcs_diff`, `reply_form` | `Unsupported` |
+| `switch_mode`, `revert_session`, `find_files`, `get_vcs_diff`, `reply_form` | `Unsupported` |
 
 Live record → change: `agent_start` Busy; `agent_settled` Idle or
 Interrupted; `auto_retry_start` Retry; `message_update` text/thinking deltas
 and `toolcall_end` rows; `tool_execution_start/end` tool state; `message_end`
 the authoritative rows of the message; `compaction_start/end` compaction
 status; `session_info_changed` title; usage from `message_update.usage` and
-`message_end.message.usage`.
+`message_end.message.usage`. Message usage accumulates per response without
+double-counting streaming snapshots, seeded from persisted history. Live
+session reads and settlement refresh `get_session_stats`, whose authoritative
+totals also include tool and compaction usage. After those native totals are
+available, partial-message counters cannot overwrite them. `context_usage`
+comes only from Pi's `contextUsage`; a post-compaction unknown stays unknown.
 
 Features: streaming, reasoning effort, model selection, compaction,
-attachments by path, session rename and delete; tool approvals when
-`approvals` asks. No modes, skills, slash commands, revert, fork, inbox,
-worktrees or pagination.
+attachments by path, session rename/delete, slash commands and older
+timeline pages; tool approvals when `approvals` asks. No modes, separate
+skills catalog, revert, fork, inbox, worktrees or session-list pagination. Native
+`fork(entryId)`, `get_tree` and arbitrary branch navigation exist in Pi but
+are not exposed by this adapter's current App contract.
