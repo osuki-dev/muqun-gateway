@@ -215,6 +215,9 @@ struct Activity {
     compacting: bool,
     queued: bool,
     has_conversation: bool,
+    /// Pi exposes no active-job query. Once this owned generation executes
+    /// tools or extensions, a settled model cannot prove their jobs ended.
+    execution_observed: bool,
 }
 
 /// An explicit session operation pins its child through all of its RPCs.
@@ -304,6 +307,7 @@ impl PiChild {
             compacting: false,
             queued: false,
             has_conversation: false,
+            execution_observed: false,
         }));
         let kill = Arc::new(Notify::new());
         let (exited_tx, exited) = watch::channel(false);
@@ -469,6 +473,7 @@ impl PiChild {
                 || activity.running
                 || activity.compacting
                 || activity.queued
+                || activity.execution_observed
                 || activity.last_used.elapsed() < timeout
             {
                 return false;
@@ -509,6 +514,18 @@ impl PiChild {
             return Err(AgentError::InvalidRequest(
                 "pi command exceeds record limit".into(),
             ));
+        }
+        let kind = record.get("type").and_then(Value::as_str);
+        let executable = kind == Some("bash")
+            || (matches!(kind, Some("prompt" | "steer" | "follow_up"))
+                && record
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .is_some_and(|message| message.trim_start().starts_with('/')));
+        if executable {
+            if let Ok(mut activity) = self.activity.lock() {
+                activity.execution_observed = true;
+            }
         }
         if !record
             .get("type")
@@ -706,6 +723,20 @@ async fn read_stdout<R: AsyncBufRead + Unpin>(
         if record.get("type").and_then(Value::as_str) != Some("response") {
             if let Ok(mut activity) = activity.lock() {
                 activity.last_used = Instant::now();
+                let kind = record
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if matches!(
+                    kind,
+                    "tool_execution_start"
+                        | "tool_execution_update"
+                        | "tool_execution_end"
+                        | "entry_appended"
+                ) || kind.starts_with("extension_ui_")
+                {
+                    activity.execution_observed = true;
+                }
                 if matches!(
                     record.get("type").and_then(Value::as_str),
                     Some("message_start" | "message_end")
@@ -1021,6 +1052,12 @@ for raw in sys.stdin.buffer:
     elif t == "event":
         out(cmd["event"])
         out({"id": rid, "type": "response", "command": t, "success": True})
+    elif t == "background_tool":
+        job = subprocess.Popen([sys.executable, "-c", "import time,pathlib; gate=pathlib.Path('release-background'); exec('while not gate.exists(): time.sleep(0.02)'); pathlib.Path('background-sentinel').write_text('completed')"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        out({"type":"tool_execution_start", "toolCallId":"owned-background", "toolName":"test-tool", "args":{}})
+        out({"type":"tool_execution_end", "toolCallId":"owned-background", "toolName":"test-tool", "result":{}, "isError":False})
+        out({"type":"agent_settled"})
+        out({"id": rid, "type": "response", "command": t, "success": True, "data":{"pid":job.pid}})
     else:
         out({"id": rid, "type": "response", "command": t, "success": False, "error": "private-token-and-prompt: " + t})
 "#;
@@ -1168,6 +1205,71 @@ for raw in sys.stdin.buffer:
         }
         assert!(child.retire_if_idle(Duration::ZERO, None));
         child.close().await;
+    }
+
+    #[tokio::test]
+    async fn settled_live_tool_generation_keeps_its_background_job_through_idle_reaping() {
+        let Some((cmd, launch)) = fake_pi() else {
+            return;
+        };
+        let child = Arc::new(PiChild::spawn(&cmd, &launch).await.unwrap());
+        let host = PiHost::new();
+        host.insert("owned".into(), child.clone());
+        child
+            .request(json!({"type":"background_tool"}))
+            .await
+            .unwrap();
+        // Later turns, compaction and cancellation cannot establish that
+        // the completed tool's separate background job has also ended.
+        for event in [
+            json!({"type":"agent_start"}),
+            json!({"type":"compaction_start"}),
+            json!({"type":"compaction_end"}),
+            json!({"type":"agent_settled", "aborted":true}),
+        ] {
+            child
+                .request(json!({"type":"event", "event":event}))
+                .await
+                .unwrap();
+        }
+        assert!(host
+            .reap_idle(Duration::ZERO, &Default::default(), None)
+            .await
+            .is_empty());
+        assert!(child.is_alive());
+        assert!(!launch.cwd.join("background-sentinel").exists());
+        std::fs::write(launch.cwd.join("release-background"), "release").unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !launch.cwd.join("background-sentinel").exists() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("owned background job survives idle retirement attempt");
+        assert_eq!(
+            std::fs::read_to_string(launch.cwd.join("background-sentinel")).unwrap(),
+            "completed"
+        );
+        host.shutdown_all().await;
+    }
+
+    #[tokio::test]
+    async fn extension_commands_and_native_execution_records_latch_the_owned_generation() {
+        let Some((cmd, launch)) = fake_pi() else {
+            return;
+        };
+        for command in [
+            json!({"type":"prompt", "message":"/extension-background"}),
+            json!({"type":"bash", "command":"unused fixture command"}),
+            json!({"type":"event", "event":{"type":"extension_ui_request", "method":"notify"}}),
+            json!({"type":"event", "event":{"type":"entry_appended", "entry":{"type":"custom"}}}),
+            json!({"type":"event", "event":{"type":"tool_execution_end"}}),
+        ] {
+            let child = PiChild::spawn(&cmd, &launch).await.unwrap();
+            let _reply = child.request(command.clone()).await;
+            assert!(!child.retire_if_idle(Duration::ZERO, None), "{command}");
+            child.close().await;
+        }
     }
 
     #[tokio::test]

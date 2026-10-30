@@ -17,7 +17,7 @@ the default):
 | `binary` | `pi` on `PATH` | A value with a path separator is a file path. |
 | `session_dir` | `PI_CODING_AGENT_SESSION_DIR`, else `~/.pi/agent/sessions` | Pi's session-file root. Must match where Pi writes. Discovery/history read existing files; explicit clone/delete operations create or remove files. |
 | `approvals` | `ask` | `ask`: `bash`/`edit`/`write` wait for an App approval. `never`: no gate. Any other value asks. |
-| `idle_timeout_secs` | `300` | A child with no active work or explicit user activity for this long is closed. Explicit configured values are preserved; the previous default was 900 seconds. |
+| `idle_timeout_secs` | `3600` | A child with no active work or explicit user activity for this long is closed. Explicit configured values are preserved; the previous default was 900 seconds. The default is now one hour. |
 
 Discovery: id/kind `pi`, name `Pi`, endpoint `stdio://pi`, version from
 `pi --version`. `disabled` when `enabled` is false, `not_installed` when no
@@ -56,7 +56,20 @@ on the host; discovery alone does not verify model authentication.
   metadata/history polls neither keep an idle child alive nor recreate it.
   The reaper runs every 30 s and preserves active operations, running or
   retrying turns, compaction, native queued messages, pending approvals and
-  provisional rows that have not reached the session file. Conversations
+  provisional rows that have not reached the session file. Pi exposes no
+  supported active-job query: model settlement does not prove tool, extension
+  or MCP background work has ended. A live execution record, extension UI or
+  custom entry, native RPC bash command, or slash-command submission latches
+  the owned child generation against automatic idle retirement. Later turns,
+  cancellation and compaction do not clear this protection. Historical file
+  replay alone does not set it. Such generations remain until explicit
+  shutdown or native process exit; idle memory reclamation is limited to
+  generations without this unproven background work. Ordinary built-in
+  service startup alone does not set this latch. Arbitrary third-party hooks
+  may start silent background work without a protocol execution record; Pi
+  exposes no supported inventory that can certify those jobs, so this policy
+  does not guarantee their absence and does not disable user extensions.
+  Conversations
   require the same validated, discoverable session file used for resume.
   A Gateway-created blank session may also retire: Pi intentionally writes
   no setup-only file, so its bounded ID/cwd/model/title descriptor remains
