@@ -555,6 +555,30 @@ impl<P: AcpProvider> AcpDriver<P> {
         &self,
         directory: Option<&str>,
     ) -> Result<Vec<AgentSessionInfo>, AgentError> {
+        self.native_sessions_with_timeout(directory, RPC_TIMEOUT)
+            .await
+    }
+
+    async fn native_sessions_with_timeout(
+        &self,
+        directory: Option<&str>,
+        timeout: Duration,
+    ) -> Result<Vec<AgentSessionInfo>, AgentError> {
+        // Queueing, startup and every page share one budget. Failed refreshes
+        // must not give each queued caller another full native RPC timeout.
+        tokio::select! {
+            biased;
+            _ = self.stop.cancelled() => Err(AgentError::NotAvailable("ACP runtime stopped".into())),
+            result = tokio::time::timeout(timeout, self.refresh_session_list(directory)) => {
+                result.unwrap_or_else(|_| Err(AgentError::NotAvailable("ACP session listing timed out".into())))
+            }
+        }
+    }
+
+    async fn refresh_session_list(
+        &self,
+        directory: Option<&str>,
+    ) -> Result<Vec<AgentSessionInfo>, AgentError> {
         if self.stop.is_cancelled() {
             return Err(AgentError::NotAvailable("ACP runtime stopped".into()));
         }
@@ -2276,6 +2300,99 @@ mod admission_tests {
         assert_eq!(driver.session_lists.lock().await.len(), 2);
         driver.shutdown().await;
         assert!(driver.native_sessions(None).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn concurrent_failed_lists_share_a_total_timeout_including_gate_wait() {
+        let fixture = Fixture::new().await;
+        let driver = fixture.qoder_driver();
+        std::fs::write(fixture.directory.join("list-delay"), "1").unwrap();
+        std::fs::write(fixture.directory.join("fail-list"), "1").unwrap();
+        let budget = Duration::from_millis(350);
+        let (a, b, c, d) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(
+                driver.native_sessions_with_timeout(None, budget),
+                driver.native_sessions_with_timeout(None, budget),
+                driver.native_sessions_with_timeout(None, budget),
+                driver.native_sessions_with_timeout(None, budget)
+            )
+        })
+        .await
+        .unwrap();
+        let results = [a, b, c, d];
+        assert!(results.iter().all(Result::is_err));
+        assert!(results.iter().any(|result| matches!(result,
+            Err(AgentError::NotAvailable(message)) if message == "ACP session listing timed out"
+        )));
+        assert!(driver.session_lists.lock().await.is_empty());
+        assert!(driver
+            .connections
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|c| c.strong_count() == 0));
+        // A failed caller cannot make every waiter start another slow refresh.
+        assert!(
+            fixture
+                .methods()
+                .iter()
+                .filter(|m| *m == "session/list")
+                .count()
+                < 4
+        );
+        std::fs::remove_file(fixture.directory.join("list-delay")).unwrap();
+        std::fs::remove_file(fixture.directory.join("fail-list")).unwrap();
+        assert!(driver.native_sessions(None).await.unwrap().is_empty());
+        driver.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn stopping_cancels_both_list_refresh_and_same_scope_waiters() {
+        let fixture = Fixture::new().await;
+        let driver = fixture.qoder_driver();
+        std::fs::write(fixture.directory.join("list-delay"), "1").unwrap();
+        std::fs::write(fixture.directory.join("fail-list"), "1").unwrap();
+        let listing_driver = driver.clone();
+        let listing = tokio::spawn(async move {
+            tokio::join!(
+                listing_driver.native_sessions(None),
+                listing_driver.native_sessions(None),
+                listing_driver.native_sessions(None)
+            )
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !fixture.directory.join("list-started").exists() {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .unwrap();
+        driver.stop.cancel();
+        let (a, b, c) = tokio::time::timeout(Duration::from_secs(1), listing)
+            .await
+            .unwrap()
+            .unwrap();
+        for result in [a, b, c] {
+            assert!(
+                matches!(result, Err(AgentError::NotAvailable(message)) if message == "ACP runtime stopped")
+            );
+        }
+        assert_eq!(
+            fixture
+                .methods()
+                .iter()
+                .filter(|m| *m == "session/list")
+                .count(),
+            1
+        );
+        assert!(driver.session_lists.lock().await.is_empty());
+        assert!(driver
+            .connections
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|c| c.strong_count() == 0));
+        driver.shutdown().await;
     }
 
     #[tokio::test]

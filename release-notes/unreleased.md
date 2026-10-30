@@ -6,7 +6,9 @@
   share one native startup per directory and remain cached for up to 30 seconds.
   Gateway-created sessions, forks, deletions and model changes invalidate these
   snapshots; live session state stays current. First reads and expired snapshots
-  still start the installed CLI. No background metadata process is retained.
+  still start the installed CLI. Queueing, startup and pagination share a
+  30-second timeout; failures remain explicit. No background metadata process is
+  retained.
 
 - **Large Herdr workspaces no longer open a socket for every pane at once.**
   Pane enrichment has bounded concurrency, and all one-shot Herdr RPCs share
