@@ -17,7 +17,7 @@ the default):
 | `binary` | `pi` on `PATH` | A value with a path separator is a file path. |
 | `session_dir` | `PI_CODING_AGENT_SESSION_DIR`, else `~/.pi/agent/sessions` | Pi's session-file root. Must match where Pi writes. Discovery/history read existing files; explicit clone/delete operations create or remove files. |
 | `approvals` | `ask` | `ask`: `bash`/`edit`/`write` wait for an App approval. `never`: no gate. Any other value asks. |
-| `idle_timeout_secs` | `900` | A child with no run and no command for this long is closed. |
+| `idle_timeout_secs` | `300` | A child with no active work or explicit user activity for this long is closed. Explicit configured values are preserved; the previous default was 900 seconds. |
 
 Discovery: id/kind `pi`, name `Pi`, endpoint `stdio://pi`, version from
 `pi --version`. `disabled` when `enabled` is false, `not_installed` when no
@@ -35,8 +35,8 @@ on the host; discovery alone does not verify model authentication.
   `<root>/--<cwd>--/<timestamp>_<id>.jsonl`, or flat in the root when Pi's
   session directory was overridden. Listings, titles, models and history are
   read from the files without a child.
-- A child is started lazily for the first write to a session (prompt, model
-  switch, rename, compact) or by `create_session`:
+- A child is started lazily for an explicit foreground selection, the first
+  write to a session (prompt, model switch, rename, compact), or by `create_session`:
   `pi --mode rpc --session <file> -e <state_dir>/pi/muqun-extension.js`, with
   `current_dir` = the header `cwd`. A new session is
   `pi --mode rpc -e <ext>` in the requested directory, then `get_state` for
@@ -51,11 +51,27 @@ on the host; discovery alone does not verify model authentication.
   unknown outcome and is never automatically replayed. Native diagnostics
   are drained without retaining their contents; upstream errors returned to
   the App use fixed messages.
-- Idle: children are touched on every record and command; the reaper (every
-  30 s) never closes a child whose session is running (a long silent tool call)
-  or whose session file does not exist yet (a new session before its first
-  message: the child is all there is of it). Idle children get stdin closed,
-  then a kill after 5 s. Manager shutdown closes every child.
+- Idle: explicit user operations and native session events renew the idle
+  deadline. Read-only RPC commands and their replies do not; background
+  metadata/history polls neither keep an idle child alive nor recreate it.
+  The reaper runs every 30 s and preserves active operations, running or
+  retrying turns, compaction, native queued messages, pending approvals and
+  provisional rows that have not reached the session file. Conversations
+  require the same validated, discoverable session file used for resume.
+  A Gateway-created blank session may also retire: Pi intentionally writes
+  no setup-only file, so its bounded ID/cwd/model/title descriptor remains
+  in the driver and foreground selection recreates that exact ID through
+  native `--session-id`, without a prompt or fabricated session file. These
+  unsent blank descriptors last for the current Gateway runtime; they do
+  not claim native durability across a Gateway restart. Missing files for
+  sessions that have started a conversation still keep their child alive.
+  Retirement and operation
+  admission share one lock, and startup is serialized with close, preventing
+  a command from reaching a retiring child. Idle children get stdin closed,
+  then a kill after 5 s; conversation folders are released after exit and
+  blank folders retain only setup metadata. Foreground
+  selection resumes that file and verifies Pi returned the original session
+  ID, without submitting a prompt. Manager shutdown closes every child.
 - Children use an owned process group on Unix. Cleanup kills remaining tool
   descendants before reaping the leader, so its process-group identity
   cannot be reused during cleanup. Shutdown includes the stdin-lock wait in

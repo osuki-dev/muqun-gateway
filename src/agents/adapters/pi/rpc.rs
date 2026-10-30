@@ -100,6 +100,9 @@ pub struct PiCommandLine {
 pub struct PiLaunch {
     /// Resume this session file; `None` lets Pi create a new session in `cwd`.
     pub session_file: Option<PathBuf>,
+    /// Official exact-ID creation for a Gateway-owned, never-used session
+    /// whose setup-only state Pi intentionally has not written yet.
+    pub session_id: Option<String>,
     pub cwd: PathBuf,
     pub env: Vec<(String, String)>,
     /// A throwaway probe (model catalog): `--no-extensions` and no muqun
@@ -114,6 +117,9 @@ impl PiLaunch {
         if let Some(file) = &self.session_file {
             args.push("--session".into());
             args.push(file.into());
+        } else if let Some(id) = &self.session_id {
+            args.push("--session-id".into());
+            args.push(id.into());
         } else if self.no_extensions {
             args.push("--no-session".into());
         }
@@ -196,9 +202,47 @@ pub struct PiChild {
     next_id: AtomicU64,
     events: broadcast::Sender<Arc<PiRecord>>,
     alive: Arc<AtomicBool>,
-    last_used: Arc<Mutex<Instant>>,
+    activity: Arc<Mutex<Activity>>,
     kill: Arc<Notify>,
     exited: watch::Receiver<bool>,
+}
+
+struct Activity {
+    last_used: Instant,
+    operations: usize,
+    retiring: bool,
+    running: bool,
+    compacting: bool,
+    queued: bool,
+    has_conversation: bool,
+}
+
+/// An explicit session operation pins its child through all of its RPCs.
+/// Acquiring and retiring use the same lock, so neither can overtake the other.
+pub(super) struct PiLease {
+    child: Arc<PiChild>,
+}
+
+impl std::ops::Deref for PiLease {
+    type Target = PiChild;
+
+    fn deref(&self) -> &Self::Target {
+        &self.child
+    }
+}
+
+impl Drop for PiLease {
+    fn drop(&mut self) {
+        self.child.finish_operation();
+    }
+}
+
+struct Operation<'a>(&'a PiChild);
+
+impl Drop for Operation<'_> {
+    fn drop(&mut self) {
+        self.0.finish_operation();
+    }
 }
 
 /// Cancelling a partial JSONL write makes this transport unusable. Killing
@@ -252,7 +296,15 @@ impl PiChild {
         let shared = Arc::new(Shared::default());
         let (events, _) = broadcast::channel(EVENT_CAPACITY);
         let alive = Arc::new(AtomicBool::new(true));
-        let last_used = Arc::new(Mutex::new(Instant::now()));
+        let activity = Arc::new(Mutex::new(Activity {
+            last_used: Instant::now(),
+            operations: 0,
+            retiring: false,
+            running: false,
+            compacting: false,
+            queued: false,
+            has_conversation: false,
+        }));
         let kill = Arc::new(Notify::new());
         let (exited_tx, exited) = watch::channel(false);
 
@@ -261,7 +313,7 @@ impl PiChild {
             pid,
             shared.clone(),
             events.clone(),
-            last_used.clone(),
+            activity.clone(),
             alive.clone(),
             kill.clone(),
         ));
@@ -287,7 +339,7 @@ impl PiChild {
             next_id: AtomicU64::new(1),
             events,
             alive,
-            last_used,
+            activity,
             kill,
             exited,
         })
@@ -296,6 +348,8 @@ impl PiChild {
     /// Send a command, await its `response` (matched by `id`), 60 s timeout.
     /// `Ok(data)` (`Null` when the response has none) or `RequestFailed(error)`.
     pub async fn request(&self, mut command: Value) -> Result<Value, AgentError> {
+        self.begin_operation(false)?;
+        let _operation = Operation(self);
         let id = self.next_id.fetch_add(1, Ordering::Relaxed).to_string();
         let Some(object) = command.as_object_mut() else {
             return Err(AgentError::InvalidRequest(
@@ -340,6 +394,8 @@ impl PiChild {
 
     /// Fire a record with no response (`extension_ui_response`).
     pub async fn send(&self, record: Value) -> Result<(), AgentError> {
+        self.begin_operation(true)?;
+        let _operation = Operation(self);
         self.write(&record).await
     }
 
@@ -353,17 +409,73 @@ impl PiChild {
         self.alive.load(Ordering::SeqCst)
     }
 
-    /// Commands and stdout records touch on their own; the driver touches
-    /// for activity the child cannot see.
+    #[cfg(test)]
+    pub(super) fn pid(&self) -> Option<u32> {
+        self.pid
+    }
+
+    /// Explicit user activity; observational commands and responses do not
+    /// extend the idle deadline.
     pub fn touch(&self) {
-        touch(&self.last_used);
+        if let Ok(mut activity) = self.activity.lock() {
+            activity.last_used = Instant::now();
+        }
     }
 
     pub fn idle_for(&self) -> Duration {
-        self.last_used
+        self.activity
             .lock()
-            .map(|at| at.elapsed())
+            .map(|activity| activity.last_used.elapsed())
             .unwrap_or_default()
+    }
+
+    pub(super) fn has_conversation(&self) -> bool {
+        self.activity.lock().map_or(true, |a| a.has_conversation)
+    }
+
+    fn begin_operation(&self, foreground: bool) -> Result<(), AgentError> {
+        let mut activity = self
+            .activity
+            .lock()
+            .map_err(|_| AgentError::NotAvailable("pi activity poisoned".into()))?;
+        if activity.retiring || !self.is_alive() {
+            return Err(AgentError::NotAvailable("pi session is retiring".into()));
+        }
+        activity.operations += 1;
+        if foreground {
+            activity.last_used = Instant::now();
+        }
+        Ok(())
+    }
+
+    fn finish_operation(&self) {
+        if let Ok(mut activity) = self.activity.lock() {
+            activity.operations = activity.operations.saturating_sub(1);
+        }
+    }
+
+    pub(super) fn lease(self: &Arc<Self>) -> Option<PiLease> {
+        self.begin_operation(true).ok()?;
+        Some(PiLease {
+            child: self.clone(),
+        })
+    }
+
+    fn retire_if_idle(&self, timeout: Duration, observed: Option<Instant>) -> bool {
+        self.activity.lock().is_ok_and(|mut activity| {
+            if activity.retiring
+                || observed.is_some_and(|at| at != activity.last_used)
+                || activity.operations > 0
+                || activity.running
+                || activity.compacting
+                || activity.queued
+                || activity.last_used.elapsed() < timeout
+            {
+                return false;
+            }
+            activity.retiring = true;
+            true
+        })
     }
 
     /// Close stdin so Pi shuts down in order, wait up to 5 s, then kill.
@@ -398,7 +510,13 @@ impl PiChild {
                 "pi command exceeds record limit".into(),
             ));
         }
-        self.touch();
+        if !record
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| kind.starts_with("get_"))
+        {
+            self.touch();
+        }
         let written = async {
             let mut stdin = self.stdin.lock().await;
             if !self.is_alive() {
@@ -493,12 +611,6 @@ async fn wait_unreaped(pid: i32) -> std::io::Result<()> {
     }
 }
 
-fn touch(last_used: &Mutex<Instant>) {
-    if let Ok(mut at) = last_used.lock() {
-        *at = Instant::now();
-    }
-}
-
 pub(super) enum Line {
     Record,
     TooLong,
@@ -543,7 +655,7 @@ async fn read_stdout<R: AsyncBufRead + Unpin>(
     pid: Option<u32>,
     shared: Arc<Shared>,
     events: broadcast::Sender<Arc<PiRecord>>,
-    last_used: Arc<Mutex<Instant>>,
+    activity: Arc<Mutex<Activity>>,
     alive: Arc<AtomicBool>,
     kill: Arc<Notify>,
 ) {
@@ -576,7 +688,6 @@ async fn read_stdout<R: AsyncBufRead + Unpin>(
         if line.is_empty() {
             continue;
         }
-        touch(&last_used);
         let mut record = match serde_json::from_slice::<Value>(&line) {
             Ok(record @ Value::Object(_)) => record,
             Ok(_) => {
@@ -593,6 +704,33 @@ async fn read_stdout<R: AsyncBufRead + Unpin>(
             }
         };
         if record.get("type").and_then(Value::as_str) != Some("response") {
+            if let Ok(mut activity) = activity.lock() {
+                activity.last_used = Instant::now();
+                if matches!(
+                    record.get("type").and_then(Value::as_str),
+                    Some("message_start" | "message_end")
+                ) && matches!(
+                    record.pointer("/message/role").and_then(Value::as_str),
+                    Some("user" | "assistant")
+                ) {
+                    activity.has_conversation = true;
+                }
+                match record.get("type").and_then(Value::as_str) {
+                    Some("agent_start" | "auto_retry_start") => activity.running = true,
+                    Some("agent_settled") => activity.running = false,
+                    Some("compaction_start") => activity.compacting = true,
+                    Some("compaction_end") => activity.compacting = false,
+                    Some("queue_update") => {
+                        activity.queued = ["steering", "followUp"].iter().any(|key| {
+                            record
+                                .get(key)
+                                .and_then(Value::as_array)
+                                .is_some_and(|q| !q.is_empty())
+                        });
+                    }
+                    _ => {}
+                }
+            }
             let queued_bytes = if omit_user_image_echo(&mut record) {
                 serde_json::to_vec(&record).map_or(usize::MAX, |bytes| bytes.len())
             } else {
@@ -726,6 +864,12 @@ impl PiHost {
         }
     }
 
+    pub(super) fn lease(&self, asid: &str) -> Option<PiLease> {
+        // Hold the host lock until the activity pin is acquired. A reaper
+        // cannot remove this child between lookup and the operation.
+        self.children.lock().ok()?.get(asid)?.lease()
+    }
+
     /// Hold `child` for `asid`, returning the one it replaces (the caller
     /// closes it).
     pub fn insert(&self, asid: String, child: Arc<PiChild>) -> Option<Arc<PiChild>> {
@@ -756,19 +900,44 @@ impl PiHost {
         self.children.lock().ok()?.remove(asid)
     }
 
+    pub(super) fn activity_stamps(&self) -> HashMap<String, Instant> {
+        self.children
+            .lock()
+            .map(|children| {
+                children
+                    .iter()
+                    .filter_map(|(id, child)| {
+                        child
+                            .activity
+                            .lock()
+                            .ok()
+                            .map(|a| (id.clone(), a.last_used))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Close children idle for at least `timeout`, except those in `keep`,
     /// and drop dead ones. Returns the asids that were let go.
     pub async fn reap_idle(
         &self,
         timeout: Duration,
         keep: &std::collections::HashSet<String>,
+        observed: Option<&HashMap<String, Instant>>,
     ) -> Vec<String> {
         let reaped: Vec<(String, Arc<PiChild>)> = match self.children.lock() {
             Ok(mut children) => {
                 let ids: Vec<String> = children
                     .iter()
                     .filter(|(asid, child)| {
-                        !child.is_alive() || (child.idle_for() >= timeout && !keep.contains(*asid))
+                        !child.is_alive()
+                            || (!keep.contains(*asid)
+                                && observed.is_none_or(|stamps| stamps.contains_key(*asid))
+                                && child.retire_if_idle(
+                                    timeout,
+                                    observed.and_then(|stamps| stamps.get(*asid).copied()),
+                                ))
                     })
                     .map(|(asid, _)| asid.clone())
                     .collect();
@@ -785,7 +954,7 @@ impl PiHost {
         if let Ok(mut probes) = self.probes.lock() {
             let ids = probes
                 .iter()
-                .filter(|(_, child)| !child.is_alive() || child.idle_for() >= timeout)
+                .filter(|(_, child)| !child.is_alive() || child.retire_if_idle(timeout, None))
                 .map(|(id, _)| *id)
                 .collect::<Vec<_>>();
             closing.extend(ids.into_iter().filter_map(|id| probes.remove(&id)));
@@ -849,6 +1018,9 @@ for raw in sys.stdin.buffer:
     elif t == "spawn_exit":
         subprocess.Popen([sys.executable, "-c", "import time,pathlib; time.sleep(1); pathlib.Path('descendant-survived').touch()"])
         sys.exit(0)
+    elif t == "event":
+        out(cmd["event"])
+        out({"id": rid, "type": "response", "command": t, "success": True})
     else:
         out({"id": rid, "type": "response", "command": t, "success": False, "error": "private-token-and-prompt: " + t})
 "#;
@@ -874,6 +1046,7 @@ for raw in sys.stdin.buffer:
         };
         let launch = PiLaunch {
             session_file: None,
+            session_id: None,
             cwd: dir,
             env: vec![("MUQUN_PI_APPROVALS".into(), "ask".into())],
             no_extensions: false,
@@ -927,6 +1100,77 @@ for raw in sys.stdin.buffer:
     }
 
     #[tokio::test]
+    async fn observation_does_not_renew_idle_and_operation_pins_retirement() {
+        let Some((cmd, launch)) = fake_pi() else {
+            return;
+        };
+        let child = Arc::new(PiChild::spawn(&cmd, &launch).await.unwrap());
+        let host = PiHost::new();
+        host.insert("s-1".into(), child.clone());
+        let old = Instant::now() - Duration::from_secs(600);
+        child.activity.lock().unwrap().last_used = old;
+        child.request(json!({"type":"get_state"})).await.unwrap();
+        assert_eq!(child.activity.lock().unwrap().last_used, old);
+        let observed = host.activity_stamps();
+        child.touch();
+        assert!(
+            host.reap_idle(Duration::ZERO, &Default::default(), Some(&observed))
+                .await
+                .is_empty(),
+            "activity during durable-file validation invalidates retirement"
+        );
+        let lease = host.lease("s-1").unwrap();
+        child.activity.lock().unwrap().last_used = old;
+        assert!(host
+            .reap_idle(Duration::ZERO, &Default::default(), None)
+            .await
+            .is_empty());
+        drop(lease);
+        assert_eq!(
+            host.reap_idle(Duration::ZERO, &Default::default(), None)
+                .await,
+            ["s-1"]
+        );
+        assert!(!child.is_alive());
+        assert!(child.lease().is_none());
+    }
+
+    #[tokio::test]
+    async fn running_compacting_and_queued_native_work_protect_idle_children() {
+        let Some((cmd, launch)) = fake_pi() else {
+            return;
+        };
+        let child = Arc::new(PiChild::spawn(&cmd, &launch).await.unwrap());
+        child.request(json!({"type":"get_state"})).await.unwrap();
+        for (start, end) in [
+            (
+                json!({"type":"agent_start"}),
+                json!({"type":"agent_settled"}),
+            ),
+            (
+                json!({"type":"compaction_start"}),
+                json!({"type":"compaction_end"}),
+            ),
+            (
+                json!({"type":"queue_update","steering":[],"followUp":["keep queued"]}),
+                json!({"type":"queue_update","steering":[],"followUp":[]}),
+            ),
+        ] {
+            child
+                .request(json!({"type":"event", "event":start}))
+                .await
+                .unwrap();
+            assert!(!child.retire_if_idle(Duration::ZERO, None), "{start}");
+            child
+                .request(json!({"type":"event", "event":end}))
+                .await
+                .unwrap();
+        }
+        assert!(child.retire_if_idle(Duration::ZERO, None));
+        child.close().await;
+    }
+
+    #[tokio::test]
     async fn oversized_record_kills_child_and_host_reaps() {
         let Some((cmd, launch)) = fake_pi() else {
             return;
@@ -941,7 +1185,9 @@ for raw in sys.stdin.buffer:
         let idle = Arc::new(PiChild::spawn(&cmd, &launch).await.unwrap());
         host.insert("s-idle".into(), idle.clone());
 
-        let mut reaped = host.reap_idle(Duration::ZERO, &Default::default()).await;
+        let mut reaped = host
+            .reap_idle(Duration::ZERO, &Default::default(), None)
+            .await;
         reaped.sort();
         assert_eq!(reaped, ["s-dead", "s-idle"]);
         assert!(!idle.is_alive());

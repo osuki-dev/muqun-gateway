@@ -58,6 +58,7 @@ pub(super) async fn clone_session(
             cmd,
             &PiLaunch {
                 session_file: Some(snapshot),
+                session_id: None,
                 cwd: PathBuf::from(&source.cwd),
                 env: vec![(
                     "PI_CODING_AGENT_SESSION_DIR".into(),
