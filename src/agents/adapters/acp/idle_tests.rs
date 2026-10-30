@@ -190,6 +190,40 @@ while True:
 }
 
 #[tokio::test]
+async fn direct_slash_delivery_pins_before_write_and_later_plain_turn_cannot_clear_it() {
+    // Native extension commands can be absent from, or newer than, the last
+    // advertised catalog. Both routes still deliver the same prompt bytes.
+    for command in [
+        "/extension-command arguments",
+        " \t /late-command arguments",
+    ] {
+        let fixture = Fixture::new().await;
+        let driver = driver(&fixture);
+        let info = driver.create_session(None, None, None).await.unwrap();
+        driver
+            .send_prompt(&info.asid.0, command, &[], None)
+            .await
+            .unwrap();
+        assert!(driver
+            .retained(&info.asid.0)
+            .unwrap()
+            .client
+            .has_unverified_live_work());
+        idle(&driver, &info.asid.0).await.unwrap();
+        driver
+            .send_prompt(&info.asid.0, "a later plain turn", &[], None)
+            .await
+            .unwrap();
+        idle(&driver, &info.asid.0).await.unwrap();
+        expire(&driver, &info.asid.0).await;
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert!(driver.retained(&info.asid.0).unwrap().client.is_running());
+        assert!(!driver.dormant.lock().unwrap().contains_key(&info.asid.0));
+        driver.shutdown().await;
+    }
+}
+
+#[tokio::test]
 async fn parked_observation_drops_live_projection_and_concurrent_foreground_prepares_load_once() {
     let fixture = Fixture::new().await;
     let driver = driver(&fixture);

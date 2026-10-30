@@ -1871,7 +1871,9 @@ impl<P: AcpProvider> AcpDriver<P> {
         state.prompt_user_digest = Some(recovery::text_digest(&prepared.transcript));
         state.turn_had_output = false;
         state.last_activity = tokio::time::Instant::now();
-        if native_command {
+        // Direct prompt delivery can carry the same native slash command as
+        // run_command; catalogs may be stale or omit extension commands.
+        if native_command || text.trim_start().starts_with('/') {
             session.client.protect_unverified_live_work();
         }
         let request = session
