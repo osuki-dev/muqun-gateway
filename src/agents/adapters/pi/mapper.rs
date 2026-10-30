@@ -88,6 +88,110 @@ pub fn usage_from_entries(entries: &[Value]) -> UsageTotals {
     totals
 }
 
+// Conservative retained-payload accounting. String lengths are O(1), so a
+// text delta does not reserialize every earlier message just to check a cap.
+pub(super) fn value_bytes(value: &Value) -> usize {
+    let size = std::mem::size_of::<Value>();
+    match value {
+        Value::String(s) => size.saturating_add(s.capacity()),
+        Value::Array(values) => values.iter().fold(
+            size.saturating_add(values.capacity() * std::mem::size_of::<Value>()),
+            |n, v| n.saturating_add(value_bytes(v)),
+        ),
+        Value::Object(values) => values.iter().fold(size, |n, (k, v)| {
+            n.saturating_add(128)
+                .saturating_add(k.capacity())
+                .saturating_add(value_bytes(v))
+        }),
+        _ => size,
+    }
+}
+
+pub(super) fn item_bytes(item: &TimelineItem) -> usize {
+    let payload = match &item.part {
+        AgentPart::Text { text } | AgentPart::Reasoning { text, .. } => text.capacity(),
+        AgentPart::Tool(call) => {
+            let mut n = call
+                .id
+                .capacity()
+                .saturating_add(call.name.capacity())
+                .saturating_add(value_bytes(&call.input));
+            for value in [
+                call.output.as_ref(),
+                call.content.as_ref(),
+                call.metadata.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                n = n.saturating_add(value_bytes(value));
+            }
+            for s in [
+                call.title.as_ref(),
+                call.child_session_id.as_ref(),
+                call.input_partial.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                n = n.saturating_add(s.capacity());
+            }
+            n
+        }
+        AgentPart::Compaction {
+            summary,
+            reason,
+            recent,
+            keep_message_id,
+            ..
+        } => [summary, reason, recent, keep_message_id]
+            .into_iter()
+            .flatten()
+            .map(String::capacity)
+            .sum(),
+        AgentPart::ModelSwitched { model, previous } => std::iter::once(model)
+            .chain(previous.iter())
+            .map(|m| {
+                m.provider_id.capacity()
+                    + m.model_id.capacity()
+                    + m.variant.as_ref().map_or(0, String::capacity)
+            })
+            .sum(),
+        _ => 0,
+    };
+    std::mem::size_of::<TimelineItem>()
+        .saturating_add(item.id.capacity())
+        .saturating_add(item.message_id.capacity())
+        .saturating_add(payload)
+}
+
+pub(super) fn permission_bytes(request: &PermissionRequest) -> usize {
+    let mut n = std::mem::size_of::<PermissionRequest>()
+        + request.id.capacity()
+        + request.prompt.capacity()
+        + request.action.capacity();
+    for s in request
+        .resources
+        .iter()
+        .chain(request.save.iter())
+        .chain(request.tool.iter())
+        .chain(request.source_message_id.iter())
+        .chain(request.source_tool_call_id.iter())
+        .chain(request.message.iter())
+    {
+        n = n.saturating_add(s.capacity());
+    }
+    for option in &request.options {
+        n = n
+            .saturating_add(std::mem::size_of::<PermissionOption>())
+            .saturating_add(option.label.capacity());
+    }
+    if let Some(metadata) = &request.metadata {
+        n = n.saturating_add(value_bytes(metadata));
+    }
+    n
+}
+
 /// Session statistics include tool usage and compaction work that message
 /// usage alone cannot reconstruct. Context occupancy is Pi's own estimate.
 pub(super) fn apply_stats(info: &mut crate::agents::domain::AgentSessionInfo, stats: &Value) {
@@ -506,6 +610,7 @@ pub(super) fn commands(value: &Value) -> Vec<CommandInfo> {
 /// One change a live record makes to a session.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LiveChange {
+    Model(ModelRef),
     Status(AgentSessionStatus),
     Upsert(Vec<TimelineItem>),
     Remove(Vec<String>),
@@ -534,6 +639,7 @@ struct LiveMessage {
     role: String,
     timestamp: u64,
     items: Vec<TimelineItem>,
+    seen_live: bool,
 }
 
 /// Folds one session's RPC records into [`LiveChange`]s.
@@ -586,8 +692,9 @@ impl LiveFolder {
     pub(super) fn retained_bytes(&self) -> usize {
         let mut bytes = 0usize;
         for message in &self.messages {
-            bytes = bytes
-                .saturating_add(serde_json::to_vec(&message.items).map_or(usize::MAX, |v| v.len()));
+            for item in &message.items {
+                bytes = bytes.saturating_add(item_bytes(item));
+            }
         }
         for (id, outcome) in &self.outcomes {
             bytes = bytes.saturating_add(id.len());
@@ -595,8 +702,7 @@ impl LiveFolder {
                 .into_iter()
                 .flatten()
             {
-                bytes =
-                    bytes.saturating_add(serde_json::to_vec(value).map_or(usize::MAX, |v| v.len()));
+                bytes = bytes.saturating_add(value_bytes(value));
             }
         }
         bytes
@@ -662,6 +768,11 @@ impl LiveFolder {
             "session_info_changed" => text(record, "name")
                 .map(|name| vec![LiveChange::Title(name.to_string())])
                 .unwrap_or_default(),
+            "muqun_model" => record
+                .get("model")
+                .and_then(|model| serde_json::from_value(model.clone()).ok())
+                .map(|model| vec![LiveChange::Model(model)])
+                .unwrap_or_default(),
             "extension_ui_request" => self.on_ui_request(record),
             // The gateway's own reply, folded so the pending set stays honest.
             "extension_ui_response" => text(record, "id")
@@ -679,6 +790,21 @@ impl LiveFolder {
 
     /// Track a new live message under a fresh provisional key.
     fn open(&mut self, message: &Value) -> String {
+        let timestamp = message
+            .get("timestamp")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let role = text(message, "role").unwrap_or_default();
+        if timestamp != 0 {
+            if let Some(known) = self
+                .messages
+                .iter_mut()
+                .find(|m| !m.seen_live && m.timestamp == timestamp && m.role == role)
+            {
+                known.seen_live = true;
+                return known.key.clone();
+            }
+        }
         self.minted += 1;
         let key = format!("{PROVISIONAL_PREFIX}{}", self.minted);
         if self.messages.len() >= MAX_LIVE_MESSAGES {
@@ -699,6 +825,7 @@ impl LiveFolder {
                 .and_then(Value::as_u64)
                 .unwrap_or(0),
             items: Vec::new(),
+            seen_live: true,
         });
         key
     }
@@ -770,6 +897,9 @@ impl LiveFolder {
         };
         let key = self.current.clone()?;
         let message = self.messages.iter_mut().find(|m| m.key == key)?;
+        if !is_provisional(&message.key) {
+            return None;
+        }
         let id = format!("{key}:{index}");
         let at = match message.items.iter().position(|r| r.id == id) {
             Some(at) => at,
@@ -920,18 +1050,37 @@ impl LiveFolder {
         };
         let role = text(message, "role").unwrap_or_default();
         let ts = message.get("timestamp").and_then(Value::as_u64);
-        let Some(key) = self
+        let key = self
             .messages
             .iter()
             .find(|m| {
                 m.key.starts_with(PROVISIONAL_PREFIX) && m.role == role && Some(m.timestamp) == ts
             })
             .map(|m| m.key.clone())
-        else {
-            return vec![];
+            .or_else(|| {
+                self.messages
+                    .iter()
+                    .find(|m| m.key == entry_id)
+                    .map(|m| m.key.clone())
+            });
+        let key = match key {
+            Some(key) => key,
+            None => {
+                if self.messages.len() >= MAX_LIVE_MESSAGES {
+                    self.messages.remove(0);
+                }
+                self.messages.push(LiveMessage {
+                    key: entry_id.to_string(),
+                    role: role.to_string(),
+                    timestamp: ts.unwrap_or(0),
+                    items: Vec::new(),
+                    seen_live: false,
+                });
+                entry_id.to_string()
+            }
         };
         if self.current.as_deref() == Some(key.as_str()) {
-            self.current = None;
+            self.current = Some(entry_id.to_string());
         }
         let ms = text(entry, "timestamp")
             .and_then(ms_from_iso)
@@ -1009,6 +1158,14 @@ impl LiveFolder {
         let payload: Value = serde_json::from_str(message?).ok()?;
         let tool = text(&payload, "tool")?;
         let input = payload.get("input").cloned().unwrap_or(Value::Null);
+        let field = match tool {
+            "bash" => "command",
+            "edit" | "write" => "path",
+            _ => return None,
+        };
+        if text(&input, field).is_none_or(|value| value.trim().is_empty()) {
+            return None;
+        }
         let call_id = text(&payload, "toolCallId");
         let (prompt, resources) = permission_prompt(tool, &input);
         let source_message_id = call_id.and_then(|call_id| {
@@ -1274,6 +1431,19 @@ mod tests {
     }
 
     #[test]
+    fn malformed_mutating_permissions_are_cancelled_instead_of_becoming_unscoped_cards() {
+        for payload in [
+            json!({"tool":"unknown","input":{}}),
+            json!({"tool":"bash","input":{"command":""}}),
+            json!({"tool":"edit","input":{"path":[]}}),
+            json!({"tool":"write"}),
+        ] {
+            let mut folder = LiveFolder::new("s1".into());
+            assert_eq!(folder.fold(&json!({"type":"extension_ui_request","id":"bad","method":"confirm","title":PERMISSION_TITLE,"message":payload.to_string()})), vec![LiveChange::UiCancel("bad".into())]);
+        }
+    }
+
+    #[test]
     fn usage_is_cumulative_and_equal_sized_responses_are_not_deduplicated() {
         let usage = json!({"input":10,"output":5,"cacheRead":2,"cacheWrite":1,"totalTokens":18,"cost":{"total":0.01}});
         let history =
@@ -1328,5 +1498,26 @@ mod tests {
         );
         assert!(info.context_usage.is_none());
         assert_eq!(info.cost, Some(0.25));
+    }
+
+    #[test]
+    fn persisted_user_entries_before_live_echo_keep_identity_and_repeated_text() {
+        let mut folder = LiveFolder::new("s1".into());
+        let message = json!({"role":"user", "timestamp":100, "content":[{"type":"text", "text":"repeat exactly"}]});
+        for id in ["native-1", "native-2"] {
+            folder.fold(&json!({"type":"entry_appended", "entry":{"type":"message","id":id,"message":message}}));
+        }
+        for id in ["native-1", "native-2"] {
+            let changes = folder.fold(&json!({"type":"message_end", "message":message}));
+            assert!(changes
+                .iter()
+                .any(|c| matches!(c, LiveChange::Upsert(rows) if rows.iter().any(|r| r.id == id))));
+        }
+        assert_eq!(
+            folder.messages.len(),
+            2,
+            "same text and timestamp must preserve two distinct native entries"
+        );
+        assert!(folder.messages.iter().all(|m| !is_provisional(&m.key)));
     }
 }

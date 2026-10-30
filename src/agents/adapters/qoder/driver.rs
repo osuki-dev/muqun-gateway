@@ -5,6 +5,12 @@ impl AcpProvider for QoderProvider {
     const KIND: &'static str = "qoder";
     const LABEL: &'static str = "Qoder";
     const ARGS: &'static [&'static str] = &["--acp"];
+    fn session_metadata<'a>(
+        rows: Vec<serde_json::Value>,
+        stop: &'a tokio_util::sync::CancellationToken,
+    ) -> crate::agents::ports::agent::AgentFuture<'a, Vec<serde_json::Value>> {
+        Box::pin(super::native_sessions::recover(rows, stop))
+    }
     const REQUIRE_MESSAGE_ID: bool = false;
     const MODEL_SELECTION: bool = true;
     const PROVIDER_CONFIG: bool = false;

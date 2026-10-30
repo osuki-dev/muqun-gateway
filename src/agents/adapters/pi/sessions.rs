@@ -8,8 +8,10 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::UNIX_EPOCH;
 
+use serde::Deserialize;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 
@@ -26,10 +28,21 @@ pub(super) const MAX_SESSION_BYTES: usize = 16 * 1024 * 1024;
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_SESSION_FILES: usize = 4096;
 const MAX_SESSION_DIRS: usize = 1024;
+const MAX_SUMMARY_SCAN_BYTES: usize = 128 * 1024 * 1024;
+const MAX_SUMMARY_RECORD_BYTES: usize = 8 * 1024 * 1024;
+const MAX_SUMMARY_ENTRIES: usize = 32_768;
 
 #[derive(Debug, Clone)]
 pub struct SessionStore {
     root: PathBuf,
+    summaries: Arc<Mutex<HashMap<PathBuf, CachedSummary>>>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedSummary {
+    modified: Option<std::time::SystemTime>,
+    bytes: u64,
+    info: AgentSessionInfo,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,7 +56,14 @@ pub struct SessionFile {
 
 impl SessionStore {
     pub fn new(root: PathBuf) -> Self {
-        Self { root }
+        Self {
+            root,
+            summaries: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    pub(super) fn root(&self) -> &Path {
+        &self.root
     }
 
     /// `$HOME/.pi/agent/sessions`, where Pi writes unless told otherwise.
@@ -140,7 +160,7 @@ impl SessionStore {
     /// Every JSONL line as a `Value`, header first. Lines that do not parse
     /// are dropped: Pi may be mid-append on the last one.
     pub async fn read_entries(&self, file: &SessionFile) -> Result<Vec<Value>, AgentError> {
-        let f = tokio::fs::File::open(&file.path)
+        let f = open_regular(&file.path)
             .await
             .map_err(|e| not_found_or_io(e, &file.id))?;
         let mut bytes = Vec::new();
@@ -165,6 +185,104 @@ impl SessionStore {
         Ok(out)
     }
 
+    /// Listings need identifiers, titles and model changes, not image data
+    /// or tool output. Project each bounded record while scanning so a large
+    /// saved history cannot make the whole provider's session list fail.
+    pub async fn read_summary(
+        &self,
+        file: &SessionFile,
+        status: AgentSessionStatus,
+    ) -> Result<AgentSessionInfo, AgentError> {
+        let input = open_regular(&file.path)
+            .await
+            .map_err(|e| not_found_or_io(e, &file.id))?;
+        let metadata = input.metadata().await.map_err(io_err)?;
+        let file_bytes = metadata.len();
+        let modified = metadata.modified().ok();
+        if let Some(mut info) = self.summaries.lock().ok().and_then(|cache| {
+            cache
+                .get(&file.path)
+                .filter(|entry| entry.modified == modified && entry.bytes == file_bytes)
+                .map(|entry| entry.info.clone())
+        }) {
+            info.status = status;
+            return Ok(info);
+        }
+        let mut reader = BufReader::new(input.take((MAX_SUMMARY_SCAN_BYTES + 1) as u64));
+        let mut line = Vec::new();
+        let mut entries = Vec::new();
+        let mut retained = 0usize;
+        let mut incomplete = file_bytes > MAX_SUMMARY_SCAN_BYTES as u64;
+        loop {
+            match super::rpc::read_line(&mut reader, &mut line, MAX_SUMMARY_RECORD_BYTES)
+                .await
+                .map_err(io_err)?
+            {
+                super::rpc::Line::Eof => break,
+                super::rpc::Line::TooLong => {
+                    incomplete = true;
+                    // Consume the rest without retaining it; otherwise a
+                    // suffix could be mistaken for another JSONL entry.
+                    loop {
+                        let available = reader.fill_buf().await.map_err(io_err)?;
+                        if available.is_empty() {
+                            break;
+                        }
+                        let end = available.iter().position(|b| *b == b'\n');
+                        let used = end.map_or(available.len(), |n| n + 1);
+                        reader.consume(used);
+                        if end.is_some() {
+                            break;
+                        }
+                    }
+                    continue;
+                }
+                super::rpc::Line::Record => {}
+            }
+            if let Ok(entry) = serde_json::from_slice::<SummaryEntry>(&line) {
+                let projected = entry.project();
+                retained = retained.saturating_add(super::mapper::value_bytes(&projected));
+                if retained > MAX_SESSION_BYTES {
+                    incomplete = true;
+                    break;
+                }
+                entries.push(projected);
+            } else if !line.is_empty() {
+                incomplete = true;
+            }
+            if entries.len() >= MAX_SUMMARY_ENTRIES {
+                incomplete = true;
+                break;
+            }
+        }
+        let mut info = session_info(file, &entries, status);
+        if incomplete {
+            info.model = None;
+            info.tokens = None;
+            info.cost = None;
+            info.error = Some(crate::agents::domain::AgentErrorInfo { name:"PiMetadataLimit".into(), message:"Pi session metadata could not be scanned completely; saved history remains unchanged".into(), status:None, retry_after_ms:None });
+            if info.title == UNTITLED {
+                info.title = "Pi session".into();
+            }
+        }
+        if let Ok(mut cache) = self.summaries.lock() {
+            if cache.len() >= 64 && !cache.contains_key(&file.path) {
+                if let Some(path) = cache.keys().next().cloned() {
+                    cache.remove(&path);
+                }
+            }
+            cache.insert(
+                file.path.clone(),
+                CachedSummary {
+                    modified,
+                    bytes: file_bytes,
+                    info: info.clone(),
+                },
+            );
+        }
+        Ok(info)
+    }
+
     /// Remove the session file. Refuses anything not under the store root, so a
     /// forged `SessionFile` cannot turn this into an arbitrary file delete.
     pub async fn delete(&self, file: &SessionFile) -> Result<(), AgentError> {
@@ -178,6 +296,115 @@ impl SessionStore {
             ));
         }
         tokio::fs::remove_file(&path).await.map_err(io_err)
+    }
+}
+
+#[derive(Deserialize)]
+struct SummaryEntry {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(flatten)]
+    fields: SummaryFields,
+    #[serde(default)]
+    message: Option<SummaryMessage>,
+}
+
+#[derive(Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SummaryFields {
+    id: Option<String>,
+    parent_id: Option<String>,
+    timestamp: Option<String>,
+    provider: Option<String>,
+    model_id: Option<String>,
+    thinking_level: Option<String>,
+    name: Option<String>,
+    parent_session: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct SummaryMessage {
+    role: String,
+    #[serde(default, deserialize_with = "summary_content")]
+    content: String,
+    #[serde(default)]
+    usage: Option<SummaryUsage>,
+}
+
+#[derive(Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SummaryUsage {
+    input: Option<u64>,
+    output: Option<u64>,
+    reasoning: Option<u64>,
+    cache_read: Option<u64>,
+    cache_write: Option<u64>,
+    total_tokens: Option<u64>,
+    cost: Option<SummaryCost>,
+}
+
+#[derive(Deserialize, serde::Serialize)]
+struct SummaryCost {
+    total: Option<f64>,
+}
+
+#[derive(Deserialize)]
+struct SummaryBlock {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default, deserialize_with = "short_text")]
+    text: String,
+}
+
+fn short_text<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    struct Text;
+    impl serde::de::Visitor<'_> for Text {
+        type Value = String;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("text")
+        }
+        fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<String, E> {
+            Ok(value.chars().take(TITLE_CHARS).collect())
+        }
+    }
+    deserializer.deserialize_str(Text)
+}
+
+fn summary_content<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    struct Content;
+    impl<'de> serde::de::Visitor<'de> for Content {
+        type Value = String;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("message text or content blocks")
+        }
+        fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<String, E> {
+            Ok(value.chars().take(TITLE_CHARS).collect())
+        }
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<String, A::Error> {
+            let mut text = String::new();
+            while let Some(block) = seq.next_element::<SummaryBlock>()? {
+                if block.kind == "text" && text.chars().count() < TITLE_CHARS {
+                    if !text.is_empty() {
+                        text.push('\n');
+                    }
+                    let room = TITLE_CHARS.saturating_sub(text.chars().count());
+                    text.extend(block.text.chars().take(room));
+                }
+            }
+            Ok(text)
+        }
+    }
+    deserializer.deserialize_any(Content)
+}
+
+impl SummaryEntry {
+    fn project(self) -> Value {
+        let mut entry = serde_json::to_value(self.fields).unwrap_or(Value::Null);
+        entry["type"] = self.kind.into();
+        if let Some(message) = self.message {
+            entry["message"] = serde_json::json!({"role":message.role,"content":if message.role == "user" { message.content } else { String::new() },"usage":message.usage});
+        }
+        entry
     }
 }
 
@@ -213,7 +440,7 @@ async fn open_file(path: &Path) -> Option<SessionFile> {
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
         .map_or(0, |d| d.as_millis() as u64);
 
-    let f = tokio::fs::File::open(path).await.ok()?;
+    let f = open_regular(path).await.ok()?;
     let mut first = Vec::new();
     BufReader::new(f.take((MAX_HEADER_BYTES + 1) as u64))
         .read_until(b'\n', &mut first)
@@ -240,6 +467,32 @@ async fn open_file(path: &Path) -> Option<SessionFile> {
         created_ms,
         modified_ms,
     })
+}
+
+/// Open the final path without following symlinks or blocking on a FIFO.
+/// Descriptor metadata closes the path-check/open race.
+pub(super) async fn open_regular(path: &Path) -> std::io::Result<tokio::fs::File> {
+    let path = path.to_owned();
+    let file = tokio::task::spawn_blocking(move || {
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+        }
+        let file = options.open(path)?;
+        if !file.metadata()?.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Pi session is not a regular file",
+            ));
+        }
+        Ok(file)
+    })
+    .await
+    .map_err(|_| std::io::Error::other("Pi session opener failed"))??;
+    Ok(tokio::fs::File::from_std(file))
 }
 
 /// `2026-10-14T06-51-18-225Z` -> epoch ms. Pi swaps the `:` and `.` of an ISO
@@ -371,7 +624,22 @@ pub fn session_info(
         outcome: None,
         error: None,
         revert: None,
-        fork: None,
+        fork: entries
+            .first()
+            .and_then(|header| header.get("parentSession"))
+            .and_then(Value::as_str)
+            .and_then(|path| Path::new(path).file_stem())
+            .and_then(|stem| stem.to_str())
+            .and_then(|stem| stem.split_once('_'))
+            .and_then(|(_, id)| {
+                uuid::Uuid::parse_str(id)
+                    .ok()
+                    .map(|_| crate::agents::domain::SessionForkInfo {
+                        session_id: id.to_string(),
+                        boundary_type: None,
+                        message_id: None,
+                    })
+            }),
         time_idle: None,
         time_viewed: None,
         deleted: false,
@@ -577,5 +845,130 @@ mod tests {
             Err(AgentError::SessionNotFound(_))
         ));
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fifo_and_symlink_sessions_are_refused_without_waiting_for_a_writer() {
+        use std::os::unix::ffi::OsStrExt;
+        let root = std::env::temp_dir().join(format!("muqun-pi-regular-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let fifo = root.join("2026-10-14T06-51-18-225Z_fifo.jsonl");
+        let name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: name is a valid NUL-terminated path in this owned fixture.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), open_regular(&fifo))
+                .await
+                .unwrap()
+                .is_err()
+        );
+        let outside = root.join("outside");
+        std::fs::write(&outside, format!("{}\n", header("link", "/workspace/demo"))).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("2026-10-14T06-51-18-225Z_link.jsonl"))
+            .unwrap();
+        let store = SessionStore::new(root.clone());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), store.list(None))
+                .await
+                .unwrap()
+                .unwrap()
+                .is_empty()
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn large_saved_payloads_do_not_block_metadata_or_hide_history_errors() {
+        let root = std::env::temp_dir().join(format!("muqun-pi-summary-{}", uuid::Uuid::new_v4()));
+        let mut entries = vec![
+            header("large", "/workspace/demo"),
+            user("entry", None, "A real saved title"),
+            json!({"type":"message","id":"usage","parentId":"entry","message":{"role":"assistant","content":[],"usage":{"input":10,"output":5,"totalTokens":15,"cost":{"total":0.01}}}}),
+        ];
+        for n in 0..6 {
+            entries.push(json!({"type":"message", "id":format!("image-{n}"), "parentId":if n == 0 { "usage".to_string() } else { format!("image-{}",n-1) }, "timestamp":"2026-10-14T06:51:19.000Z", "message":{"role":"user", "content":[{"type":"image", "data":"x".repeat(3 * 1024 * 1024), "mimeType":"image/png"}]}}));
+        }
+        entries.push(json!({"type":"model_change", "id":"model", "parentId":"image-5", "provider":"example", "modelId":"chosen"}));
+        entries.push(json!({"type":"thinking_level_change", "id":"effort", "parentId":"model", "thinkingLevel":"low"}));
+        let path = write(&root, "2026-10-14T06-51-18-225Z_large.jsonl", &entries);
+        let store = SessionStore::new(root.clone());
+        let file = store.find("large").await.unwrap();
+        assert!(std::fs::metadata(path).unwrap().len() > MAX_SESSION_BYTES as u64);
+        let info = store
+            .read_summary(&file, AgentSessionStatus::Idle)
+            .await
+            .unwrap();
+        assert_eq!(info.title, "A real saved title");
+        assert_eq!(info.model.unwrap().variant.as_deref(), Some("low"));
+        assert!(info.error.is_none());
+        assert_eq!(info.tokens.as_ref().unwrap().input, 10);
+        assert_eq!(info.cost, Some(0.01));
+        assert!(matches!(
+            store.read_entries(&file).await,
+            Err(AgentError::Protocol(_))
+        ));
+        let mut append = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&file.path)
+            .unwrap();
+        use std::io::Write;
+        writeln!(
+            append,
+            "{}",
+            json!({"type":"session_info", "id":"name", "parentId":"effort", "name":"Updated title"})
+        )
+        .unwrap();
+        let updated = store.find("large").await.unwrap();
+        assert_eq!(
+            store
+                .read_summary(&updated, AgentSessionStatus::Idle)
+                .await
+                .unwrap()
+                .title,
+            "Updated title"
+        );
+        writeln!(append, "{}", json!({"type":"message","id":"too-large","parentId":"name","message":{"role":"user","content":[{"type":"image","data":"x".repeat(MAX_SUMMARY_RECORD_BYTES + 1)}]}})).unwrap();
+        let incomplete = store
+            .read_summary(
+                &store.find("large").await.unwrap(),
+                AgentSessionStatus::Idle,
+            )
+            .await
+            .unwrap();
+        assert!(incomplete.error.is_some());
+        assert!(incomplete.model.is_none());
+        assert!(
+            incomplete.tokens.is_none(),
+            "partial token totals must remain unknown"
+        );
+        assert!(
+            incomplete.cost.is_none(),
+            "partial costs must remain unknown"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "read-only inspection of the installed Pi session metadata; no model calls"]
+    async fn real_pi_session_summaries_are_readable_without_history_payloads() {
+        let root = std::env::var_os("PI_CODING_AGENT_SESSION_DIR")
+            .map(PathBuf::from)
+            .or_else(SessionStore::default_root)
+            .unwrap();
+        let store = SessionStore::new(root);
+        let files = store.list(None).await.unwrap();
+        for file in &files {
+            let info = store
+                .read_summary(file, AgentSessionStatus::Idle)
+                .await
+                .unwrap();
+            assert_eq!(info.asid.0, file.id);
+            assert!(!info.title.is_empty());
+        }
+        eprintln!(
+            "Pi native metadata summaries read successfully: {} sessions",
+            files.len()
+        );
     }
 }

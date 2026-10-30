@@ -498,7 +498,7 @@ fn touch(last_used: &Mutex<Instant>) {
     }
 }
 
-enum Line {
+pub(super) enum Line {
     Record,
     TooLong,
     Eof,
@@ -507,7 +507,7 @@ enum Line {
 /// Read up to the next LF into `line` (LF excluded). Stops with `TooLong`
 /// as soon as the line passes `max`, without buffering the rest; an
 /// unterminated tail at EOF still counts as a record.
-async fn read_line<R: AsyncBufRead + Unpin>(
+pub(super) async fn read_line<R: AsyncBufRead + Unpin>(
     reader: &mut R,
     line: &mut Vec<u8>,
     max: usize,
@@ -640,11 +640,50 @@ async fn log_stderr<R: AsyncBufRead + Unpin>(mut reader: R, pid: Option<u32>) {
 #[derive(Default)]
 pub struct PiHost {
     children: Mutex<HashMap<String, Arc<PiChild>>>,
+    probes: Mutex<HashMap<u64, Arc<PiChild>>>,
+    probe_ids: AtomicU64,
+}
+
+pub(super) struct PiProbe {
+    host: Arc<PiHost>,
+    child: Arc<PiChild>,
+    id: u64,
+    finished: bool,
+}
+
+impl PiProbe {
+    pub(super) fn finish(&mut self) {
+        if let Ok(mut probes) = self.host.probes.lock() {
+            probes.remove(&self.id);
+        }
+        self.finished = true;
+    }
+}
+
+impl Drop for PiProbe {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.child.terminate("pi probe cancelled; not retried");
+        }
+    }
 }
 
 impl PiHost {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub(super) fn hold_probe(self: &Arc<Self>, child: Arc<PiChild>) -> PiProbe {
+        let id = self.probe_ids.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut probes) = self.probes.lock() {
+            probes.insert(id, child.clone());
+        }
+        PiProbe {
+            host: self.clone(),
+            child,
+            id,
+            finished: false,
+        }
     }
 
     /// The live child for `asid`. A child that exited on its own is dropped
@@ -674,10 +713,17 @@ impl PiHost {
     }
 
     pub(super) fn alive_count(&self) -> usize {
-        self.children
+        let children = self
+            .children
             .lock()
             .map(|children| children.values().filter(|c| c.is_alive()).count())
-            .unwrap_or(usize::MAX)
+            .unwrap_or(usize::MAX);
+        children.saturating_add(
+            self.probes
+                .lock()
+                .map(|probes| probes.values().filter(|c| c.is_alive()).count())
+                .unwrap_or(usize::MAX),
+        )
     }
 
     pub fn remove(&self, asid: &str) -> Option<Arc<PiChild>> {
@@ -706,15 +752,30 @@ impl PiHost {
             }
             Err(_) => return Vec::new(),
         };
-        close_all(reaped.iter().map(|(_, child)| child.clone()).collect()).await;
+        let mut closing = reaped
+            .iter()
+            .map(|(_, child)| child.clone())
+            .collect::<Vec<_>>();
+        if let Ok(mut probes) = self.probes.lock() {
+            let ids = probes
+                .iter()
+                .filter(|(_, child)| !child.is_alive() || child.idle_for() >= timeout)
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>();
+            closing.extend(ids.into_iter().filter_map(|id| probes.remove(&id)));
+        }
+        close_all(closing).await;
         reaped.into_iter().map(|(asid, _)| asid).collect()
     }
 
     pub async fn shutdown_all(&self) {
-        let children: Vec<Arc<PiChild>> = match self.children.lock() {
+        let mut children: Vec<Arc<PiChild>> = match self.children.lock() {
             Ok(mut children) => children.drain().map(|(_, child)| child).collect(),
             Err(_) => return,
         };
+        if let Ok(mut probes) = self.probes.lock() {
+            children.extend(probes.drain().map(|(_, child)| child));
+        }
         close_all(children).await;
     }
 }
@@ -885,6 +946,22 @@ for raw in sys.stdin.buffer:
         tokio::time::timeout(Duration::from_secs(8), child.close())
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_private_probes_remain_owned_until_shutdown_reaps_them() {
+        let Some((cmd, launch)) = fake_pi() else {
+            return;
+        };
+        let host = Arc::new(PiHost::new());
+        let child = Arc::new(PiChild::spawn(&cmd, &launch).await.unwrap());
+        let probe = host.hold_probe(child.clone());
+        assert_eq!(host.alive_count(), 1);
+        drop(probe);
+        assert!(!child.is_alive());
+        host.shutdown_all().await;
+        assert!(*child.exited.borrow());
+        assert!(host.probes.lock().unwrap().is_empty());
     }
 
     #[cfg(unix)]

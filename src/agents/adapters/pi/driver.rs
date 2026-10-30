@@ -44,6 +44,7 @@ use crate::agents::ports::agent::{
 /// Discovery asks for the catalog on every refresh; a probe child costs a
 /// Node start-up, so the answer is reused this long.
 const CATALOG_TTL: Duration = Duration::from_secs(60);
+const COMMANDS_TTL: Duration = Duration::from_secs(30);
 /// `pi --version` is a process too; health checks run every 15 s.
 const PROBE_TTL: Duration = Duration::from_secs(60);
 /// How often the reaper looks for idle children.
@@ -127,6 +128,7 @@ struct Live {
     events: broadcast::Sender<(AgentSessionId, u64, Arc<PiRecord>)>,
     sessions: Mutex<HashMap<String, LiveSession>>,
     generations: std::sync::atomic::AtomicU64,
+    store: SessionStore,
 }
 
 impl Live {
@@ -154,12 +156,21 @@ impl Live {
     /// Message entries appended to the session file since the last read.
     /// Only whole lines are consumed: Pi may be mid-append on the last one.
     async fn read_tail(&self, asid: &str, generation: u64) -> Result<Vec<Value>, AgentError> {
+        if self.with(asid, |s| s.generation == generation && s.file.is_none()) == Some(true) {
+            if let Ok(file) = self.store.find(asid).await {
+                self.with(asid, |s| {
+                    if s.generation == generation && s.file.is_none() {
+                        s.file = Some(file.path);
+                    }
+                });
+            }
+        }
         let Some(Some((Some(path), offset))) = self.with(asid, |s| {
             (s.generation == generation).then(|| (s.file.clone(), s.offset))
         }) else {
             return Ok(Vec::new());
         };
-        let Ok(mut file) = tokio::fs::File::open(&path).await else {
+        let Ok(mut file) = sessions::open_regular(&path).await else {
             return Ok(Vec::new());
         };
         if file.seek(std::io::SeekFrom::Start(offset)).await.is_err() {
@@ -221,6 +232,7 @@ pub struct PiDriver {
     spawn_lock: Arc<tokio::sync::Mutex<()>>,
     catalog: tokio::sync::Mutex<Option<(Instant, AgentCatalog)>>,
     commands_listed: std::sync::atomic::AtomicBool,
+    command_cache: Mutex<HashMap<PathBuf, (Instant, Vec<crate::agents::domain::CommandInfo>)>>,
     probed: Mutex<Option<(Instant, bool)>>,
     failed: std::sync::atomic::AtomicBool,
     history: Mutex<HashMap<String, HistoryCursor>>,
@@ -250,7 +262,7 @@ impl PiDriver {
         let (events, _) = broadcast::channel(EVENT_CAPACITY);
         Self {
             cmd,
-            store,
+            store: store.clone(),
             host: Arc::new(PiHost::new()),
             env,
             idle_timeout,
@@ -258,10 +270,12 @@ impl PiDriver {
                 events,
                 sessions: Mutex::new(HashMap::new()),
                 generations: std::sync::atomic::AtomicU64::new(0),
+                store,
             }),
             spawn_lock: Arc::new(tokio::sync::Mutex::new(())),
             catalog: tokio::sync::Mutex::new(None),
             commands_listed: std::sync::atomic::AtomicBool::new(false),
+            command_cache: Mutex::new(HashMap::new()),
             probed: Mutex::new(None),
             failed: std::sync::atomic::AtomicBool::new(false),
             history: Mutex::new(HashMap::new()),
@@ -404,9 +418,19 @@ impl PiDriver {
             let bytes = session
                 .folder
                 .retained_bytes()
-                .saturating_add(serde_json::to_vec(&session.rows).map_or(usize::MAX, |v| v.len()))
                 .saturating_add(
-                    serde_json::to_vec(&session.pending).map_or(usize::MAX, |v| v.len()),
+                    session
+                        .rows
+                        .iter()
+                        .map(mapper::item_bytes)
+                        .fold(0usize, usize::saturating_add),
+                )
+                .saturating_add(
+                    session
+                        .pending
+                        .iter()
+                        .map(mapper::permission_bytes)
+                        .fold(0usize, usize::saturating_add),
                 );
             if bytes > MAX_LIVE_BYTES {
                 let mut cleanup = session
@@ -642,8 +666,10 @@ impl PiDriver {
     }
 
     async fn info_for(&self, file: &SessionFile) -> Result<AgentSessionInfo, AgentError> {
-        let entries = self.store.read_entries(file).await?;
-        let mut info = sessions::session_info(file, &entries, self.status_of(&file.id));
+        let mut info = self
+            .store
+            .read_summary(file, self.status_of(&file.id))
+            .await?;
         if self.host.get(&file.id).is_some() {
             self.live.with(&file.id, |s| {
                 if s.model.is_some() {
@@ -695,6 +721,8 @@ impl PiDriver {
     /// Models and thinking levels from a throwaway child that loads no
     /// extensions and writes no session.
     async fn read_catalog(&self) -> Result<AgentCatalog, AgentError> {
+        let _one = self.spawn_lock.lock().await;
+        self.ensure_open()?;
         let cwd = dirs::home_dir().unwrap_or_else(std::env::temp_dir);
         let launch = PiLaunch {
             session_file: None,
@@ -702,8 +730,9 @@ impl PiDriver {
             env: Vec::new(),
             no_extensions: true,
         };
-        let child = PiChild::spawn(&self.cmd, &launch).await?;
-        let read = async {
+        let child = Arc::new(PiChild::spawn(&self.cmd, &launch).await?);
+        let mut owned = self.host.hold_probe(child.clone());
+        let operation = async {
             let models = child
                 .request(json!({"type": "get_available_models"}))
                 .await?;
@@ -712,9 +741,14 @@ impl PiDriver {
                 .await?;
             let state = child.request(json!({"type": "get_state"})).await?;
             Ok::<_, AgentError>(mapper::catalog(&models, &levels, state.get("model")))
-        }
-        .await;
+        };
+        let read = tokio::select! {
+            biased;
+            _ = self.stop.cancelled() => Err(AgentError::NotAvailable("pi runtime stopped".into())),
+            read = operation => read,
+        };
         child.close().await;
+        owned.finish();
         read
     }
 
@@ -744,28 +778,56 @@ impl PiDriver {
                 cwd.to_string_lossy().into_owned(),
             ));
         }
-        let child = PiChild::spawn(
-            &self.cmd,
-            &PiLaunch {
-                session_file: None,
-                cwd,
-                env: Vec::new(),
-                no_extensions: true,
-            },
-        )
-        .await?;
-        let result = child.request(json!({"type":"get_commands"})).await;
+        if let Some(commands) = self.command_cache.lock().ok().and_then(|cache| {
+            cache
+                .get(&cwd)
+                .filter(|(at, _)| at.elapsed() < COMMANDS_TTL)
+                .map(|(_, commands)| commands.clone())
+        }) {
+            return Ok(commands);
+        }
+        let _one = self.spawn_lock.lock().await;
+        self.ensure_open()?;
+        let child = Arc::new(
+            PiChild::spawn(
+                &self.cmd,
+                &PiLaunch {
+                    session_file: None,
+                    cwd: cwd.clone(),
+                    env: Vec::new(),
+                    no_extensions: true,
+                },
+            )
+            .await?,
+        );
+        let mut owned = self.host.hold_probe(child.clone());
+        let result = tokio::select! {
+            biased;
+            _ = self.stop.cancelled() => Err(AgentError::NotAvailable("pi runtime stopped".into())),
+            result = child.request(json!({"type":"get_commands"})) => result,
+        };
         child.close().await;
+        owned.finish();
         let result = result?;
         self.commands_listed
             .store(true, std::sync::atomic::Ordering::Relaxed);
-        Ok(mapper::commands(&result))
+        let commands = mapper::commands(&result);
+        if let Ok(mut cache) = self.command_cache.lock() {
+            if cache.len() >= MAX_TRACKED_SESSIONS && !cache.contains_key(&cwd) {
+                if let Some(directory) = cache.keys().next().cloned() {
+                    cache.remove(&directory);
+                }
+            }
+            cache.insert(cwd, (Instant::now(), commands.clone()));
+        }
+        Ok(commands)
     }
 }
 
 /// Keep the driver's view of a session in step with one fold result.
 fn apply(session: &mut LiveSession, change: &LiveChange) {
     match change {
+        LiveChange::Model(model) => session.model = Some(model.clone()),
         LiveChange::Status(status) => session.status = *status,
         LiveChange::Upsert(items) => {
             for item in items {
@@ -1223,8 +1285,14 @@ impl AgentPort for PiDriver {
             // the actual state even then, without retrying either mutation.
             match child.request(json!({"type":"get_state"})).await {
                 Ok(state) => {
-                    self.live
-                        .with(session_id, |s| s.model = model_from_state(&state));
+                    let effective = model_from_state(&state);
+                    self.live.with(session_id, |s| s.model = effective.clone());
+                    if let Some(model) = effective {
+                        self.live.publish(
+                            &AgentSessionId(session_id.to_string()),
+                            json!({"type":"muqun_model","model":model}),
+                        );
+                    }
                 }
                 Err(error) if applied.is_ok() => return Err(error),
                 Err(_) => {}
@@ -1362,6 +1430,23 @@ impl AgentPort for PiDriver {
             // Extension commands are accepted only through prompt, including
             // while busy; the separate steer RPC rejects extension commands.
             child.request(command).await.map(|_| ())
+        })
+    }
+
+    fn fork_session<'a>(
+        &'a self,
+        session_id: &'a str,
+        message_id: Option<&'a str>,
+    ) -> AgentFuture<'a, AgentSessionInfo> {
+        Box::pin(async move {
+            if message_id.is_some() {
+                return Err(AgentError::Unsupported("fork at a message boundary".into()));
+            }
+            let _one = self.spawn_lock.lock().await;
+            self.ensure_open()?;
+            self.reserve_slot(None)?;
+            super::fork::clone_session(&self.cmd, &self.store, &self.host, &self.stop, session_id)
+                .await
         })
     }
 
@@ -1572,6 +1657,10 @@ sid = str(uuid.uuid4())
 model = {"provider": "example", "id": "default"}
 level = "medium"
 session_file = os.path.join(os.getcwd(), "session.jsonl")
+if "--session" in sys.argv:
+    loaded = sys.argv[sys.argv.index("--session") + 1]
+    with open(loaded, "a") as f:
+        f.write(json.dumps({"type":"model_change","id":"initialized","parentId":"entry","provider":"example","modelId":"default"}) + "\n")
 for raw in sys.stdin.buffer:
     cmd = json.loads(raw)
     if cmd.get("type") == "set_model":
@@ -1585,7 +1674,7 @@ for raw in sys.stdin.buffer:
         sid = str(uuid.uuid4())
         entries[0]["id"] = sid
         entries[0]["parentSession"] = source
-        session_file = os.path.join(os.path.dirname(source), "2026-10-14T06-51-18-225Z_" + sid + ".jsonl")
+        session_file = os.path.join(os.environ.get("PI_CODING_AGENT_SESSION_DIR", os.path.dirname(source)), "2026-10-14T06-51-18-225Z_" + sid + ".jsonl")
         with open(session_file, "w") as f:
             f.writelines(json.dumps(entry) + "\n" for entry in entries)
     data = {"sessionId": sid, "sessionFile": session_file, "model": model, "thinkingLevel": level}
@@ -1624,7 +1713,7 @@ for raw in sys.stdin.buffer:
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
         let cmd = PiCommandLine {
             binary,
-            extension: PathBuf::from("/workspace/demo/muqun-extension.js"),
+            extension: dir.join("muqun-extension.js"),
         };
         let store = SessionStore::new(dir.join("sessions"));
         Some((
@@ -1760,7 +1849,14 @@ for raw in sys.stdin.buffer:
             variant: Some("low".into()),
             ..requested
         };
+        let mut updates = driver.subscribe();
         driver.switch_model(&info.asid.0, &switched).await.unwrap();
+        let (_, _, published) = tokio::time::timeout(Duration::from_secs(2), updates.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(published["type"], "muqun_model");
+        assert_eq!(published["model"]["variant"], "low");
         assert_eq!(
             driver.get_session(&info.asid.0).await.unwrap().model,
             Some(switched)
@@ -1815,6 +1911,44 @@ for raw in sys.stdin.buffer:
         assert_eq!(submitted[0]["type"], "prompt");
         assert_eq!(submitted[0]["streamingBehavior"], "steer");
         assert!(!commands.iter().any(|c| c["message"] == "/settings"));
+        driver.host.shutdown_all().await;
+    }
+
+    #[tokio::test]
+    async fn whole_session_fork_uses_a_separate_child_and_preserves_the_source() {
+        let Some((driver, dir)) = fake_driver(Duration::from_secs(900)) else {
+            return;
+        };
+        let source = uuid::Uuid::new_v4().to_string();
+        let path = dir
+            .join("sessions")
+            .join(format!("2026-10-14T06-51-18-225Z_{source}.jsonl"));
+        let body = format!(
+            "{}\n{}\n",
+            json!({"type":"session", "id":source, "cwd":dir.to_str().unwrap(), "timestamp":"2026-10-14T06:51:18.225Z"}),
+            json!({"type":"message", "id":"entry", "parentId":null, "timestamp":"2026-10-14T06:51:18.225Z", "message":{"role":"user", "content":"kept", "timestamp":1}})
+        );
+        std::fs::write(&path, &body).unwrap();
+        let source_child = driver.child_for(&source).await.unwrap();
+        source_child
+            .request(json!({"type":"get_state"}))
+            .await
+            .unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+        let cloned = driver.fork_session(&source, None).await.unwrap();
+        assert_ne!(cloned.asid.0, source);
+        assert_eq!(cloned.fork.unwrap().session_id, source);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        assert!(Arc::ptr_eq(
+            &source_child,
+            &driver.host.get(&source).unwrap()
+        ));
+        assert!(source_child.is_alive());
+        assert!(
+            driver.host.get(&cloned.asid.0).is_none(),
+            "clone probe must not become an ungated runtime"
+        );
+        assert!(driver.fork_session(&source, Some("entry")).await.is_err());
         driver.host.shutdown_all().await;
     }
 
@@ -1902,6 +2036,66 @@ for raw in sys.stdin.buffer:
                 .await
                 .is_err());
         }
+    }
+
+    #[tokio::test]
+    async fn new_session_discovers_its_file_after_the_first_message_and_rekeys_the_echo() {
+        let Some((driver, dir)) = fake_driver(Duration::from_secs(900)) else {
+            return;
+        };
+        let info = driver
+            .create_session(dir.to_str(), None, None)
+            .await
+            .unwrap();
+        let generation = driver
+            .live
+            .with(&info.asid.0, |s| {
+                s.file = None;
+                s.generation
+            })
+            .unwrap();
+        let message = json!({"role":"user", "content":"one delivery", "timestamp":100});
+        driver
+            .fold(
+                &info.asid,
+                generation,
+                &json!({"type":"message_end", "message":message}),
+            )
+            .await;
+        let path = dir
+            .join("sessions")
+            .join(format!("2026-10-14T06-51-18-225Z_{}.jsonl", info.asid.0));
+        let rows = [
+            json!({"type":"session","id":info.asid.0,"cwd":dir.to_str().unwrap(),"timestamp":"2026-10-14T06:51:18.225Z"}),
+            json!({"type":"message","id":"native-entry","parentId":null,"timestamp":"2026-10-14T06:51:19.000Z","message":message}),
+        ];
+        std::fs::write(
+            &path,
+            rows.iter().map(|r| format!("{r}\n")).collect::<String>(),
+        )
+        .unwrap();
+        for entry in driver
+            .live
+            .read_tail(&info.asid.0, generation)
+            .await
+            .unwrap()
+        {
+            driver
+                .fold(
+                    &info.asid,
+                    generation,
+                    &json!({"type":"entry_appended", "entry":entry}),
+                )
+                .await;
+        }
+        assert_eq!(
+            driver.live.with(&info.asid.0, |s| s.file.clone()).flatten(),
+            Some(path)
+        );
+        let rows = driver.live.with(&info.asid.0, |s| s.rows.clone()).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "native-entry");
+        driver.shutdown_and_wait().await;
     }
 
     #[tokio::test]

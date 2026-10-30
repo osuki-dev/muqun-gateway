@@ -22,6 +22,7 @@
 //! default) and a `pi` binary is found.
 
 pub mod driver;
+mod fork;
 pub mod mapper;
 pub mod rpc;
 pub mod sessions;

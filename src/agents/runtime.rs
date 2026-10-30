@@ -297,7 +297,7 @@ pub struct AgentRuntime {
     /// The last agent discovery and when it was taken.
     discovery_cache: RwLock<Option<(tokio::time::Instant, crate::discovery::AgentPlaneDiscovery)>>,
     /// One refresh at a time; the rest wait and read its result.
-    discovery_refresh: Mutex<()>,
+    discovery_refresh: Arc<Mutex<()>>,
     /// The event channel belongs to the runtime, not to a manager, so a
     /// subscriber keeps its stream across a reconnect.
     events_tx: broadcast::Sender<AgentDomainEvent>,
@@ -547,7 +547,7 @@ impl AgentRuntime {
             managers: RwLock::new(BTreeMap::new()),
             session_routes: RwLock::new(SessionRoutes::default()),
             discovery_cache: RwLock::new(None),
-            discovery_refresh: Mutex::new(()),
+            discovery_refresh: Arc::new(Mutex::new(())),
             events_tx,
             config,
             deepseek_config,
@@ -912,6 +912,44 @@ impl AgentRuntime {
             kind: Some(kind.clone()),
             agent_id: Some(kind),
         })
+    }
+
+    /// HTTP discovery never waits for a provider or a cold native catalog.
+    /// One bounded background refresh publishes real results for later reads.
+    pub async fn discovery_snapshot(self: &Arc<Self>) -> crate::discovery::AgentPlaneDiscovery {
+        let cached = self.discovery_cache.read().await.clone();
+        if cached
+            .as_ref()
+            .is_none_or(|(at, _)| at.elapsed() >= DISCOVERY_TTL)
+        {
+            if let Ok(guard) = self.discovery_refresh.clone().try_lock_owned() {
+                let runtime = self.clone();
+                tokio::spawn(async move {
+                    let _one = guard;
+                    if runtime
+                        .discovery_cache
+                        .read()
+                        .await
+                        .as_ref()
+                        .is_some_and(|(at, _)| at.elapsed() < DISCOVERY_TTL)
+                    {
+                        return;
+                    }
+                    match tokio::time::timeout(DISCOVERY_TIMEOUT, runtime.probe_agents()).await {
+                        Ok(found) => {
+                            *runtime.discovery_cache.write().await =
+                                Some((tokio::time::Instant::now(), found));
+                        }
+                        Err(_) => tracing::warn!("background agent discovery timed out"),
+                    }
+                });
+            }
+        }
+        let found = match cached {
+            Some((_, found)) => found,
+            None => self.attached_snapshot().await,
+        };
+        self.fence_codex_discovery(found).await
     }
 
     /// Status and capabilities of all configured or reachable AI agents.
@@ -3364,6 +3402,80 @@ mod tests {
         // A subscriber works with no agent attached, which is what lets a
         // stream outlive a reconnect.
         let _rx = runtime.subscribe_events();
+    }
+
+    #[tokio::test]
+    async fn discovery_returns_cold_and_stale_snapshots_while_one_refresh_finishes() {
+        let runtime = AgentRuntime::with_all_configs(
+            OpencodeConfig {
+                enabled: true,
+                autostart: false,
+                binary: None,
+            },
+            DeepseekConfig::default(),
+            T3Config::default(),
+            CodexConfig {
+                enabled: false,
+                binary: None,
+            },
+            None,
+        );
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let mut agent = crate::FakeAgent::new("opencode");
+        agent.catalog_gate = Some(gate.clone());
+        agent.catalog.models.push(
+            serde_json::from_value(serde_json::json!({
+                "id":"observed-model", "name":"Observed model", "provider_id":"fixture"
+            }))
+            .unwrap(),
+        );
+        runtime
+            .install(
+                "opencode",
+                AgentManager::for_test(Arc::new(agent)),
+                AgentOrigin::Adopted,
+            )
+            .await;
+
+        for cold in [true, false] {
+            if !cold {
+                runtime.discovery_cache.write().await.as_mut().unwrap().0 =
+                    tokio::time::Instant::now() - DISCOVERY_TTL;
+            }
+            for _ in 0..3 {
+                let snapshot =
+                    tokio::time::timeout(Duration::from_millis(250), runtime.discovery_snapshot())
+                        .await
+                        .expect("HTTP discovery does not await a catalog");
+                let provider = snapshot
+                    .agents
+                    .iter()
+                    .find(|agent| agent.id == "opencode")
+                    .unwrap();
+                assert_eq!(provider.models.is_empty(), cold);
+            }
+            assert!(
+                runtime.discovery_refresh.try_lock().is_err(),
+                "one refresh owns the gate"
+            );
+            gate.notify_one();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                let _one = runtime.discovery_refresh.lock().await;
+            })
+            .await
+            .expect("a single provider release completes the shared refresh");
+            let snapshot = runtime.discovery_snapshot().await;
+            assert_eq!(
+                snapshot
+                    .agents
+                    .iter()
+                    .find(|agent| agent.id == "opencode")
+                    .unwrap()
+                    .models[0]
+                    .id,
+                "observed-model"
+            );
+        }
     }
 
     #[tokio::test]

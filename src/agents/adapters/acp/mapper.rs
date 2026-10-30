@@ -371,13 +371,45 @@ pub(crate) fn permission(rpc_id: Value, params: &Value) -> Result<Permission, Ag
     let id = format!("acp:{}", uuid::Uuid::new_v4());
     let name = tool["name"]
         .as_str()
+        .or_else(|| {
+            tool.pointer("/_meta/qoder/toolName")
+                .and_then(Value::as_str)
+        })
         .or_else(|| tool["kind"].as_str())
         .unwrap_or("tool");
+    // The App's shell safety scanner needs the actual command, never a title
+    // or lossy argv rendering. Unknown execute inputs must not reach older
+    // Apps as empty-resource requests that YOLO would automatically allow.
+    let shell = tool["kind"].as_str() == Some("execute")
+        || matches!(name, "shell" | "bash" | "Bash" | "run_shell_command");
+    let resources = if shell {
+        let input = tool["rawInput"].as_object().ok_or_else(|| {
+            AgentError::Protocol("ACP execute permission has no complete command input".into())
+        })?;
+        if input
+            .get("action")
+            .is_some_and(|action| action.as_str() != Some("run"))
+        {
+            return Err(AgentError::Protocol(
+                "ACP execute permission has an unsupported shell action".into(),
+            ));
+        }
+        let command = input
+            .get("command")
+            .and_then(Value::as_str)
+            .filter(|command| !command.trim().is_empty())
+            .ok_or_else(|| {
+                AgentError::Protocol("ACP execute permission has no complete command input".into())
+            })?;
+        vec![command.to_string()]
+    } else {
+        Vec::new()
+    };
     let request = PermissionRequest {
         id,
         asid: session.into(),
-        action: name.into(),
-        resources: Vec::new(),
+        action: if shell { "shell" } else { name }.into(),
+        resources,
         save: Vec::new(),
         prompt: tool["title"].as_str().unwrap_or(name).into(),
         tool: Some(name.into()),
@@ -406,6 +438,8 @@ pub(crate) struct Projection {
     current: Option<String>,
     thought: Option<String>,
     tool_groups: HashMap<String, String>,
+    permission_contexts: HashMap<String, Value>,
+    permission_turn_active: bool,
 }
 
 impl Default for Projection {
@@ -427,6 +461,8 @@ impl Projection {
             current: None,
             thought: None,
             tool_groups: HashMap::new(),
+            permission_contexts: HashMap::new(),
+            permission_turn_active: false,
         }
     }
 
@@ -472,9 +508,37 @@ impl Projection {
     }
 
     pub fn begin_turn(&mut self) {
+        self.permission_contexts.clear();
+        self.permission_turn_active = true;
         self.current = None;
         self.thought = None;
         self.anonymous = None;
+    }
+
+    /// Recover omitted input only from this submitted turn's unfinished call,
+    /// never native history or a previous turn that reused an opaque tool id.
+    pub fn permission(&self, rpc_id: Value, params: &Value) -> Result<Permission, AgentError> {
+        let mut complete = params.clone();
+        if let Some(context) = params["toolCall"]["toolCallId"]
+            .as_str()
+            .and_then(|id| self.permission_contexts.get(id))
+        {
+            if let Some(tool) = complete.get_mut("toolCall").and_then(Value::as_object_mut) {
+                for field in ["name", "kind", "rawInput", "_meta"] {
+                    if !tool.contains_key(field) {
+                        if let Some(value) = context.get(field) {
+                            tool.insert(field.into(), value.clone());
+                        }
+                    }
+                }
+            }
+        }
+        permission(rpc_id, &complete)
+    }
+
+    pub fn end_turn(&mut self) {
+        self.permission_contexts.clear();
+        self.permission_turn_active = false;
     }
 
     fn assistant_group(&mut self) -> String {
@@ -698,6 +762,24 @@ impl Projection {
                         call.set_state(status);
                     }
                 }
+                if self.permission_turn_active {
+                    if matches!(
+                        call.state,
+                        ToolCallStatus::Pending | ToolCallStatus::Running
+                    ) {
+                        let context = self
+                            .permission_contexts
+                            .entry(native.into())
+                            .or_insert_with(|| Value::Object(Default::default()));
+                        for field in ["name", "kind", "rawInput", "_meta"] {
+                            if let Some(value) = update.get(field) {
+                                context[field] = value.clone();
+                            }
+                        }
+                    } else {
+                        self.permission_contexts.remove(native);
+                    }
+                }
                 let group = if let Some(group) = self.tool_groups.get(native) {
                     group.clone()
                 } else {
@@ -834,6 +916,90 @@ mod tests {
             .is_err());
         }
         assert!(permission(json!(1), &json!({"sessionId":"s","toolCall":{"toolCallId":"t"},"options":[{"optionId":"allow-opaque","kind":"allow_once"},{"optionId":"deny-opaque","kind":"reject_once"}]})).is_ok());
+    }
+
+    fn shell_permission(input: Option<Value>) -> Value {
+        let mut params = json!({"sessionId":"s","toolCall":{"toolCallId":"tool","kind":"execute"},"options":[{"optionId":"once","kind":"allow_once"},{"optionId":"no","kind":"reject_once"}]});
+        if let Some(input) = input {
+            params["toolCall"]["rawInput"] = input;
+        }
+        params
+    }
+
+    #[test]
+    fn native_execute_permissions_preserve_the_complete_shell_command() {
+        let command = "sudo rm -rf /\nprintf 'full input must remain visible'";
+        for input in [
+            json!({"action":"run","command":command}),
+            json!({"command":command}),
+        ] {
+            let mut params = shell_permission(Some(input));
+            params["toolCall"]["_meta"] = json!({"qoder":{"toolName":"Bash"}});
+            let parsed = permission(json!(1), &params).unwrap();
+            assert_eq!(parsed.request.action, "shell");
+            assert_eq!(parsed.request.resources, [command]);
+        }
+    }
+
+    #[test]
+    fn unknown_execute_inputs_cannot_become_auto_approvable_requests() {
+        for input in [
+            None,
+            Some(Value::Null),
+            Some(json!({})),
+            Some(json!({"command":" "})),
+            Some(json!({"command":["rm","-rf","/"]})),
+            Some(json!({"code":"rm -rf /"})),
+            Some(json!({"action":"write","command":"printf misleading"})),
+        ] {
+            assert!(permission(json!(1), &shell_permission(input)).is_err());
+        }
+        let ordinary = json!({"sessionId":"s","toolCall":{"toolCallId":"question","kind":"other","title":"Choose an option"},"options":[{"optionId":"yes","kind":"allow_once"}]});
+        assert!(permission(json!(2), &ordinary).is_ok());
+    }
+
+    #[test]
+    fn permission_patch_recovers_only_this_turns_unfinished_tool_input() {
+        let mut projection = Projection::new(false);
+        let update = json!({"sessionUpdate":"tool_call","toolCallId":"tool","name":"shell","kind":"execute","status":"pending","rawInput":{"action":"run","command":"rm -rf /"}});
+        // History is not a live submitted turn.
+        projection.update(&update).unwrap();
+        assert!(projection
+            .permission(json!(1), &shell_permission(None))
+            .is_err());
+        projection.submitted("start");
+        projection.update(&update).unwrap();
+        assert_eq!(
+            projection
+                .permission(json!(1), &shell_permission(None))
+                .unwrap()
+                .request
+                .resources,
+            ["rm -rf /"]
+        );
+        // Explicitly malformed input never falls back to earlier input.
+        assert!(projection
+            .permission(json!(1), &shell_permission(Some(Value::Null)))
+            .is_err());
+        let mut other = shell_permission(None);
+        other["toolCall"]["toolCallId"] = json!("different");
+        assert!(projection.permission(json!(1), &other).is_err());
+        projection.update(&json!({"sessionUpdate":"tool_call_update","toolCallId":"tool","status":"completed"})).unwrap();
+        assert!(projection
+            .permission(json!(1), &shell_permission(None))
+            .is_err());
+
+        let mut projection = Projection::new(false);
+        projection.submitted("one");
+        projection.update(&update).unwrap();
+        projection.end_turn();
+        assert!(projection
+            .permission(json!(1), &shell_permission(None))
+            .is_err());
+        projection.submitted("two");
+        assert!(projection
+            .permission(json!(1), &shell_permission(None))
+            .is_err());
     }
 
     #[test]

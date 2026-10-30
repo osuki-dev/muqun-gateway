@@ -13,9 +13,9 @@ the default):
 
 | Key | Default | Meaning |
 |---|---|---|
-| `enabled` | `true` | Attach when a `pi` binary is found. Nothing runs until a session is used. |
+| `enabled` | `true` | Attach when a `pi` binary is found. Session children start on use; discovery and catalogs may run short probes. |
 | `binary` | `pi` on `PATH` | A value with a path separator is a file path. |
-| `session_dir` | `PI_CODING_AGENT_SESSION_DIR`, else `~/.pi/agent/sessions` | Read-only root of Pi's session files. Must match where Pi writes. |
+| `session_dir` | `PI_CODING_AGENT_SESSION_DIR`, else `~/.pi/agent/sessions` | Pi's session-file root. Must match where Pi writes. Discovery/history read existing files; explicit clone/delete operations create or remove files. |
 | `approvals` | `ask` | `ask`: `bash`/`edit`/`write` wait for an App approval. `never`: no gate. Any other value asks. |
 | `idle_timeout_secs` | `900` | A child with no run and no command for this long is closed. |
 
@@ -23,6 +23,11 @@ Discovery: id/kind `pi`, name `Pi`, endpoint `stdio://pi`, version from
 `pi --version`. `disabled` when `enabled` is false, `not_installed` when no
 binary is found, `reachable` before the first supervision pass, `connected`
 once attached. It ranks last in `AGENT_PREFERENCE`.
+
+`muqun-gateway agent setup pi` prints host setup and configuration guidance.
+It does not start Pi, change configuration, install packages, start a login
+flow or restart Gateway. Providers and authentication are configured in Pi
+on the host; discovery alone does not verify model authentication.
 
 ## Process model
 
@@ -60,11 +65,14 @@ once attached. It ranks last in `AGENT_PREFERENCE`.
   a child event stops that child. Losing manager events stops every Pi child
   and explicitly resolves pending approvals before requesting a resync.
   Limits also include 8 live children, 64 cached session folders, and 4 MiB
-  of serialized live state per folder. A folder overflow fails that session.
+  of conservatively accounted retained payload per folder. A folder overflow
+  fails that session. Accounting traverses retained payloads without
+  serializing the entire folder on every text delta.
 - History reads retain at most 16 MiB per file/tail and 1 MiB per entry;
   headers are bounded at 64 KiB. Discovery scans at most 4,096 session files
-  and 1,024 directories. Limits return an error instead of claiming that
-  truncated history is complete.
+  and 1,024 directories. Reads reject non-regular files and final symlinks;
+  Unix opens are nonblocking so a FIFO cannot hold session discovery open.
+  A history read above its budget returns an explicit error.
 - The extension is written to `<state_dir>/pi/` (owner-only directory, atomic
   rename, a symlink at the file is removed, a symlinked directory refused).
   Without a state directory Pi is not attached (discovery `offline`, reason
@@ -74,6 +82,29 @@ once attached. It ranks last in `AGENT_PREFERENCE`.
   `pi --mode rpc --no-session --no-extensions` child
   (`get_available_models`, `get_available_thinking_levels`, `get_state`),
   cached 60 s.
+- Temporary catalog and clone probes have separate lifecycle ownership from
+  session children. Cancellation terminates a probe, and its handle stays
+  registered until shutdown or reaping can await its exit. Gateway shutdown
+  waits for admissions and owned children; stopped supervision cannot attach
+  another Pi runtime.
+
+## Session inventory and metadata
+
+Session summaries use a separate streaming projection. It retains entry
+identity and parent links, titles, model/effort changes and usage counters,
+while discarding image data and conversation bodies from the summary. A
+valid large image entry therefore does not prevent the whole session list
+from loading. Opening that session's history still uses the history budgets
+above and may return a size error.
+
+Each summary scan allows 128 MiB of source data, 8 MiB per record, 32,768
+projected entries and 16 MiB of accounted retained metadata. An incomplete
+scan keeps the session visible with a metadata error and leaves model,
+tokens and cost unknown; it does not present partial totals as complete.
+At most 64 summaries are cached by file path, precise modification time and
+length. An appended model change, rename or message invalidates that file's
+cached summary. Live status and authoritative native statistics are applied
+after the cached file summary.
 
 ## Live events and re-keying
 
@@ -92,6 +123,18 @@ message timestamp, removes the provisional rows and upserts them under the
 entry id, so a later file read produces the same rows. Row `message_id` is
 `<message timestamp ms, 20 digits>:<entry id>` so the mirror's ordering
 follows creation time.
+
+A newly created session may have no `sessionFile` before its first message.
+Tail reads discover the matching native file after it is written and bind
+it only to the same child generation. If a persisted entry is observed
+before its live echo, its entry identity is retained and reused when that
+echo arrives. Identical text in distinct native entries remains distinct.
+
+Live timeline events are emitted from the mirror's stamped upsert result.
+Their item revisions match the event sequence and snapshot revisions, so a
+follow-up can acknowledge the App's optimistic row after earlier events.
+Model changes likewise publish the actual normalized `get_state` selection
+to the mirror rather than leaving the toolbar and session snapshot divergent.
 
 A child that exits during a run produces a synthetic
 `agent_settled{aborted:true}`, and its open approvals are resolved. When a
@@ -120,6 +163,9 @@ are dropped.
   Missing UI, a failed bridge, an exception, cancellation or any answer
   other than the boolean `true` blocks the tool. MCP registration failure
   cannot remove the installed gate. No approval expires into an allow.
+- A permission payload must identify `bash.command`, `edit.path` or
+  `write.path` as a nonempty string. Unknown tools and malformed or empty
+  resources are cancelled instead of becoming unscoped permission cards.
 
 On the wire this is
 `{"type":"extension_ui_request","id":…,"method":"confirm","title":"muqun.permission","message":"<json>"}`,
@@ -132,7 +178,7 @@ the gateway sends is also folded, which resolves the pending approval.
 
 | AgentPort | Pi |
 |---|---|
-| `probe` | healthy while any child is alive; otherwise `pi --version` succeeds (cached 60 s) |
+| `probe` | healthy while a session child is alive; otherwise `pi --version` succeeds (cached 60 s) |
 | `list_projects` | distinct header `cwd`; `name` = last segment; `missing` when the directory is gone |
 | `list_sessions` | session files (one bucket with a directory filter), newest first (`order=asc` reverses); title = latest `session_info.name`, else first user text (80 chars), else `New session`; model from the last `model_change`/`thinking_level_change`; status `Busy` while the live child runs, else `Idle`; `search` matches the title; a parent filter other than top-level matches nothing |
 | `get_session` | the same, one file; a fresh session without a file from live state |
@@ -147,11 +193,14 @@ the gateway sends is also folded, which resolves the pending approval.
 | `rename_session` | `set_session_name` (child started if needed) |
 | `delete_session` | close the child, remove the file (only under the session root) |
 | `compact_session` | `compact` sent in the background (it answers only when done); progress via `compaction_start`/`compaction_end`; returns `{"started":true}` |
-| `get_catalog` | model probe child, see above; thinking levels become variants of reasoning models. Commands come from a live child in the requested directory, or an isolated extension-free probe there. The probe lists only the templates/skills it actually observes; extension commands become available with a live session |
+| `get_catalog` | model probe child, see above; thinking levels become variants of reasoning models. Commands come from a live child in the requested directory, or an isolated extension-free probe there. Cold command results are cached per directory for 30 s, at most 64 directories; a matching live child is always queried directly. The cold probe lists only the templates/skills it observes; extension commands become available with a live session |
 | `run_command` / `execute_command` | validate against that session's current `get_commands`, then submit `/name arguments` through `prompt`, including when busy. Built-in TUI-only commands are not offered |
-| `fork_session` | currently unsupported: native resume/clone can mutate the source file during initialization, so a safe isolated snapshot is required before enabling this App action |
+| `fork_session` | whole-session native `clone` runs against an owner-only private source snapshot, with output kept private until the probe exits. The new header points to the original source, and a complete new file is published atomically into the source bucket without replacing an existing file. The source file and source child are preserved. Forking at a message boundary remains unsupported |
 | `get_pending_forms` | empty |
 | `switch_mode`, `revert_session`, `find_files`, `get_vcs_diff`, `reply_form` | `Unsupported` |
+
+The isolated clone probe uses `--no-extensions`; user
+`session_before_fork` handlers do not participate in this copy operation.
 
 Live record → change: `agent_start` Busy; `agent_settled` Idle or
 Interrupted; `auto_retry_start` Retry; `message_update` text/thinking deltas
@@ -166,8 +215,8 @@ available, partial-message counters cannot overwrite them. `context_usage`
 comes only from Pi's `contextUsage`; a post-compaction unknown stays unknown.
 
 Features: streaming, reasoning effort, model selection, compaction,
-attachments by path, session rename/delete, slash commands and older
+attachments by path, session rename/delete/fork, slash commands and older
 timeline pages; tool approvals when `approvals` asks. No modes, separate
-skills catalog, revert, fork, inbox, worktrees or session-list pagination. Native
+skills catalog, revert, inbox, worktrees or session-list pagination. Native
 `fork(entryId)`, `get_tree` and arbitrary branch navigation exist in Pi but
 are not exposed by this adapter's current App contract.

@@ -197,3 +197,40 @@ async fn late_commands_native_model_effort_and_owned_fork_delete_follow_native_c
     status(&driver, &source.asid.0, AgentSessionStatus::Interrupted).await;
     driver.shutdown().await;
 }
+
+#[tokio::test]
+async fn owned_delete_uses_bound_native_context_and_removes_the_saved_session() {
+    let fixture = Fixture::new().await;
+    let driver = fixture.qoder_driver();
+    let source = driver.create_session(None, None, None).await.unwrap();
+    driver
+        .send_prompt(&source.asid.0, "first", &[], None)
+        .await
+        .unwrap();
+    status(&driver, &source.asid.0, AgentSessionStatus::Idle).await;
+    let initialized_before = fixture
+        .methods()
+        .iter()
+        .filter(|method| *method == "initialize")
+        .count();
+    driver.delete_session(&source.asid.0).await.unwrap();
+    let initialized_after = fixture
+        .methods()
+        .iter()
+        .filter(|method| *method == "initialize")
+        .count();
+    assert_eq!(
+        initialized_after, initialized_before,
+        "native delete must reuse the session's loaded cwd context"
+    );
+    assert!(driver.get_session(&source.asid.0).await.is_err());
+    let observer = fixture.qoder_driver();
+    assert!(observer
+        .list_sessions(&Default::default())
+        .await
+        .unwrap()
+        .iter()
+        .all(|info| info.asid != source.asid));
+    observer.shutdown().await;
+    driver.shutdown().await;
+}

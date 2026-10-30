@@ -65,7 +65,7 @@ fn identical_stream_chunks_are_stable_and_missing_ids_are_refused() {
 
 #[test]
 fn permission_uses_offered_opaque_ids_and_session_only_label() {
-    let permission = mapper::permission(json!(42), &json!({"sessionId":"s","toolCall":{"toolCallId":"t","name":"shell","title":"Run command"},"options":[
+    let permission = mapper::permission(json!(42), &json!({"sessionId":"s","toolCall":{"toolCallId":"t","name":"shell","title":"Run command","rawInput":{"action":"run","command":"pwd"}},"options":[
         {"optionId":"opaque-1","name":"Allow once","kind":"allow_once"},
         {"optionId":"opaque-2","name":"Allow for this session","kind":"allow_always"},
         {"optionId":"opaque-3","name":"Reject forever","kind":"reject_always"}
@@ -209,6 +209,8 @@ for line in sys.stdin:
         with open(store,'w') as f:json.dump(data,f)
         reply(message['id'],dict(config,sessionId=cloned))
     elif method=='session/delete':
+        if active!=params['sessionId']:
+            send({'jsonrpc':'2.0','id':message['id'],'error':{'code':-32602,'message':'Deletion requires a bound native session'}});continue
         data=read();data.pop(params['sessionId'],None)
         with open(store,'w') as f:json.dump(data,f)
         reply(message['id'],{})

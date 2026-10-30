@@ -80,6 +80,8 @@ pub(crate) enum SetupAgent {
     Fx,
     /// Explain Qoder CLI ACP setup without starting a session or changing credentials.
     Qoder,
+    /// Explain Pi RPC setup without starting a session or changing credentials.
+    Pi,
 }
 
 pub(crate) async fn run_agent_command(
@@ -133,6 +135,10 @@ pub(crate) async fn run_agent_command(
                 )?;
             }
             SetupAgent::Opencode => setup_opencode().await?,
+            SetupAgent::Pi => {
+                println!("Pi support is enabled by default when pi is installed on PATH. Configure providers and sign in to Pi on this host yourself. Gateway opens a private `pi --mode rpc` child only when a session is used; discovery does not verify model authentication.");
+                println!("Set pi.enabled=false to disable it; pi.binary may name an absolute executable. Native session files are discovered from pi.session_dir or Pi's default session directory. Mutating built-in tools ask for App approval by default. This command does not start Pi, install packages, log in or restart Gateway.");
+            }
             SetupAgent::Qoder => {
                 println!("Qoder CLI support is enabled by default when qodercli is installed on PATH. Configure and sign in to Qoder CLI on this host yourself. Gateway opens a private `qodercli --acp` child per session; discovery alone does not verify model authentication.");
                 println!("Set qoder.enabled=false to disable it; qoder.binary may name an absolute CLI executable. A separately opened Qoder terminal or IDE is not a shared live ACP session. This command does not start Qoder, install packages, log in or restart Gateway.");
