@@ -733,7 +733,11 @@ async fn read_stdout<R: AsyncBufRead + Unpin>(
                         | "tool_execution_update"
                         | "tool_execution_end"
                         | "entry_appended"
+                        | "extension_error"
                 ) || kind.starts_with("extension_ui_")
+                    || (matches!(kind, "message_start" | "message_end")
+                        && record.pointer("/message/role").and_then(Value::as_str)
+                            == Some("custom"))
                 {
                     activity.execution_observed = true;
                 }
@@ -1278,6 +1282,9 @@ for raw in sys.stdin.buffer:
             json!({"type":"event", "event":{"type":"extension_ui_request", "method":"notify"}}),
             json!({"type":"event", "event":{"type":"entry_appended", "entry":{"type":"custom"}}}),
             json!({"type":"event", "event":{"type":"tool_execution_end"}}),
+            json!({"type":"event", "event":{"type":"extension_error", "extensionPath":"/fixture/extension.ts", "event":"input", "error":"handler failed"}}),
+            json!({"type":"event", "event":{"type":"message_start", "message":{"role":"custom", "customType":"fixture", "content":"extension output"}}}),
+            json!({"type":"event", "event":{"type":"message_end", "message":{"role":"custom", "customType":"fixture", "content":"extension output"}}}),
         ] {
             let child = PiChild::spawn(&cmd, &launch).await.unwrap();
             let _reply = child.request(command.clone()).await;
