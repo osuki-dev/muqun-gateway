@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::Duration;
 
@@ -58,6 +58,15 @@ const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_CONNECTIONS: usize = 16;
 const MAX_LIST_PAGES: usize = 64;
 const SESSION_METADATA_TTL: Duration = Duration::from_secs(30);
+const SESSION_LIST_TTL: Duration = SESSION_METADATA_TTL;
+const MAX_LIST_SCOPES: usize = 4;
+const MAX_CACHED_LIST_ROWS: usize = 4096;
+
+struct CachedSessionList {
+    directory: Option<String>,
+    listed_at: tokio::time::Instant,
+    sessions: Vec<AgentSessionInfo>,
+}
 
 struct SessionMetadata {
     listed_at: tokio::time::Instant,
@@ -118,6 +127,9 @@ pub struct AcpDriver<P: AcpProvider> {
     global_catalog: Mutex<Option<CatalogCacheEntry>>,
     session_metadata: Mutex<Option<SessionMetadata>>,
     metadata_refresh: Mutex<()>,
+    session_lists: Mutex<Vec<CachedSessionList>>,
+    list_refreshes: StdMutex<HashMap<Option<String>, Weak<Mutex<()>>>>,
+    metadata_revision: AtomicU64,
     native_capabilities: StdMutex<Value>,
     commands_observed: Arc<AtomicBool>,
     stop: CancellationToken,
@@ -191,6 +203,9 @@ impl<P: AcpProvider> AcpDriver<P> {
             global_catalog: Mutex::new(None),
             session_metadata: Mutex::new(None),
             metadata_refresh: Mutex::new(()),
+            session_lists: Mutex::new(Vec::new()),
+            list_refreshes: StdMutex::new(HashMap::new()),
+            metadata_revision: AtomicU64::new(0),
             native_capabilities: StdMutex::new(Value::Null),
             commands_observed: Arc::new(AtomicBool::new(false)),
             stop: CancellationToken::new(),
@@ -378,8 +393,9 @@ impl<P: AcpProvider> AcpDriver<P> {
                 }),
                 RPC_TIMEOUT,
             )
-            .await
-            .map_err(AgentError::RequestFailed)?;
+            .await;
+        self.invalidate_session_lists().await;
+        let response = response.map_err(AgentError::RequestFailed)?;
         if !response["configOptions"].is_array() {
             return Err(protocol(
                 "ACP config selection returned no configOptions; refresh before retrying",
@@ -539,6 +555,95 @@ impl<P: AcpProvider> AcpDriver<P> {
         &self,
         directory: Option<&str>,
     ) -> Result<Vec<AgentSessionInfo>, AgentError> {
+        if self.stop.is_cancelled() {
+            return Err(AgentError::NotAvailable("ACP runtime stopped".into()));
+        }
+        if let Some(sessions) = self.cached_session_list(directory).await {
+            return Ok(sessions);
+        }
+        // Equal scopes share one native startup; unrelated directories do not
+        // wait behind each other. Weak gates disappear after their last caller.
+        let scope = directory.map(str::to_owned);
+        let gate = {
+            let mut gates = self.list_refreshes.lock().unwrap();
+            gates.retain(|_, gate| gate.strong_count() > 0);
+            if let Some(gate) = gates.get(&scope).and_then(Weak::upgrade) {
+                gate
+            } else {
+                if gates.len() >= MAX_CONNECTIONS + 2 {
+                    return Err(AgentError::NotAvailable(
+                        "ACP metadata request capacity exhausted".into(),
+                    ));
+                }
+                let gate = Arc::new(Mutex::new(()));
+                gates.insert(scope, Arc::downgrade(&gate));
+                gate
+            }
+        };
+        let _refresh = tokio::select! {
+            _ = self.stop.cancelled() => return Err(AgentError::NotAvailable("ACP runtime stopped".into())),
+            guard = gate.lock() => guard,
+        };
+        if let Some(sessions) = self.cached_session_list(directory).await {
+            return Ok(sessions);
+        }
+        let revision = self.metadata_revision.load(Ordering::Acquire);
+        let sessions = self.read_native_sessions(directory).await?;
+        let mut lists = self.session_lists.lock().await;
+        if self.metadata_revision.load(Ordering::Acquire) == revision {
+            lists.retain(|list| {
+                list.listed_at.elapsed() < SESSION_LIST_TTL
+                    && list.directory.as_deref() != directory
+            });
+            while !lists.is_empty()
+                && (lists.len() >= MAX_LIST_SCOPES
+                    || lists.iter().map(|list| list.sessions.len()).sum::<usize>() + sessions.len()
+                        > MAX_CACHED_LIST_ROWS)
+            {
+                lists.remove(0);
+            }
+            if sessions.len() <= MAX_CACHED_LIST_ROWS {
+                lists.push(CachedSessionList {
+                    directory: directory.map(str::to_owned),
+                    listed_at: tokio::time::Instant::now(),
+                    sessions: sessions.clone(),
+                });
+            }
+        }
+        Ok(sessions)
+    }
+
+    async fn cached_session_list(&self, directory: Option<&str>) -> Option<Vec<AgentSessionInfo>> {
+        let mut sessions = {
+            let mut lists = self.session_lists.lock().await;
+            lists.retain(|list| list.listed_at.elapsed() < SESSION_LIST_TTL);
+            lists
+                .iter()
+                .find(|list| list.directory.as_deref() == directory)?
+                .sessions
+                .clone()
+        };
+        // A metadata snapshot never freezes a Gateway-owned session's live
+        // status, model, title, permissions or latest activity.
+        for info in &mut sessions {
+            if let Some(known) = self.retained(&info.asid.0) {
+                *info = known.state.lock().await.info.clone();
+            }
+        }
+        Some(sessions)
+    }
+
+    async fn invalidate_session_lists(&self) {
+        self.metadata_revision.fetch_add(1, Ordering::AcqRel);
+        self.session_lists.lock().await.clear();
+        *self.session_metadata.lock().await = None;
+    }
+
+    async fn read_native_sessions(
+        &self,
+        directory: Option<&str>,
+    ) -> Result<Vec<AgentSessionInfo>, AgentError> {
+        let revision = self.metadata_revision.load(Ordering::Acquire);
         let (client, _events, capabilities) = self.initialized(&self.default_directory).await?;
         if !capabilities
             .pointer("/sessionCapabilities/list")
@@ -618,13 +723,16 @@ impl<P: AcpProvider> AcpDriver<P> {
         .await;
         client.shutdown().await;
         if let Ok(sessions) = &result {
-            *self.session_metadata.lock().await = Some(SessionMetadata {
-                listed_at: tokio::time::Instant::now(),
-                sessions: sessions
-                    .iter()
-                    .map(|info| (info.asid.0.clone(), info.clone()))
-                    .collect(),
-            });
+            let mut metadata = self.session_metadata.lock().await;
+            if self.metadata_revision.load(Ordering::Acquire) == revision {
+                *metadata = Some(SessionMetadata {
+                    listed_at: tokio::time::Instant::now(),
+                    sessions: sessions
+                        .iter()
+                        .map(|info| (info.asid.0.clone(), info.clone()))
+                        .collect(),
+                });
+            }
         }
         result
     }
@@ -716,7 +824,9 @@ impl<P: AcpProvider> AcpDriver<P> {
         if let Some(info) = self.cached_session_info(id).await {
             return Ok(info);
         }
-        self.native_sessions(None)
+        // An inventory snapshot's absence must not become a cached claim that
+        // an exact native identity was deleted or never existed.
+        self.read_native_sessions(None)
             .await?
             .into_iter()
             .find(|info| info.asid.0 == id)
@@ -1544,7 +1654,10 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
                 return Err(AgentError::WorkspaceMissing(directory.into()));
             }
             let _mutation = self.mutations.lock().await;
-            let session = self.open(directory, None).await?;
+            self.invalidate_session_lists().await;
+            let opened = self.open(directory, None).await;
+            self.invalidate_session_lists().await;
+            let session = opened?;
             if let Some(model) = model {
                 if let Err(error) = self.select_model(&session, model).await {
                     let id = session.state.lock().await.info.asid.0.clone();
@@ -1883,6 +1996,7 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
             let response = client
                 .request_with_timeout("session/fork", params, RPC_TIMEOUT)
                 .await;
+            self.invalidate_session_lists().await;
             client.shutdown().await;
             let response = response.map_err(AgentError::RequestFailed)?;
             let new_id = operations::forked_session_id(id, &response)?;
@@ -1937,6 +2051,7 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
                 .client
                 .request_with_timeout("session/delete", params, RPC_TIMEOUT)
                 .await;
+            self.invalidate_session_lists().await;
             let value = result.map_err(AgentError::RequestFailed)?;
             if !value.is_object() {
                 return Err(protocol(
@@ -2122,6 +2237,7 @@ mod admission_tests {
             .as_mut()
             .unwrap()
             .listed_at = tokio::time::Instant::now() - SESSION_METADATA_TTL;
+        resumed.session_lists.lock().await.clear();
         resumed.native_session_info(&info.asid.0).await.unwrap();
         assert_eq!(
             fixture
@@ -2132,6 +2248,253 @@ mod admission_tests {
             2
         );
         resumed.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn complete_lists_share_native_startup_only_within_the_exact_scope() {
+        let fixture = Fixture::new().await;
+        let driver = fixture.qoder_driver();
+        let (a, b, c) = tokio::join!(
+            driver.native_sessions(None),
+            driver.native_sessions(None),
+            driver.native_sessions(None)
+        );
+        assert!(a.unwrap().is_empty() && b.unwrap().is_empty() && c.unwrap().is_empty());
+        assert_eq!(fixture.methods(), ["initialize", "session/list"]);
+        let directory = fixture.directory.to_str().unwrap();
+        driver.native_sessions(Some(directory)).await.unwrap();
+        driver.native_sessions(None).await.unwrap();
+        driver.native_sessions(Some(directory)).await.unwrap();
+        assert_eq!(
+            fixture
+                .methods()
+                .iter()
+                .filter(|m| *m == "session/list")
+                .count(),
+            2
+        );
+        assert_eq!(driver.session_lists.lock().await.len(), 2);
+        driver.shutdown().await;
+        assert!(driver.native_sessions(None).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn list_expiry_observes_external_sessions_and_failures_are_not_cached() {
+        let fixture = Fixture::new().await;
+        let driver = fixture.qoder_driver();
+        assert!(driver.native_sessions(None).await.unwrap().is_empty());
+        std::fs::write(
+            fixture.directory.join("sessions.json"),
+            r#"{"external":[]}"#,
+        )
+        .unwrap();
+        assert!(driver.native_sessions(None).await.unwrap().is_empty());
+        driver.session_lists.lock().await[0].listed_at =
+            tokio::time::Instant::now() - SESSION_LIST_TTL;
+        std::fs::write(fixture.directory.join("fail-list"), "1").unwrap();
+        assert!(driver.native_sessions(None).await.is_err());
+        assert!(driver.native_sessions(None).await.is_err());
+        assert!(driver.session_lists.lock().await.is_empty());
+        std::fs::remove_file(fixture.directory.join("fail-list")).unwrap();
+        let listed = driver.native_sessions(None).await.unwrap();
+        assert_eq!(listed[0].asid.0, "external");
+        assert_eq!(
+            fixture
+                .methods()
+                .iter()
+                .filter(|m| *m == "session/list")
+                .count(),
+            4
+        );
+        driver.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn partial_lists_do_not_become_successful_snapshots_or_negative_identity_lookups() {
+        let fixture = Fixture::new().await;
+        let driver = fixture.qoder_driver();
+        driver.native_sessions(None).await.unwrap();
+        std::fs::write(
+            fixture.directory.join("sessions.json"),
+            r#"{"external":[]}"#,
+        )
+        .unwrap();
+        // A young list may omit an external identity, but an exact lookup
+        // still asks native metadata rather than declaring the identity gone.
+        assert_eq!(
+            driver.get_session("external").await.unwrap().asid.0,
+            "external"
+        );
+        driver.invalidate_session_lists().await;
+        std::fs::write(fixture.directory.join("fail-list-page"), "1").unwrap();
+        assert!(driver.native_sessions(None).await.is_err());
+        assert!(driver.native_sessions(None).await.is_err());
+        assert!(driver.session_lists.lock().await.is_empty());
+        assert!(driver.session_metadata.lock().await.is_none());
+        std::fs::remove_file(fixture.directory.join("fail-list-page")).unwrap();
+        assert_eq!(driver.native_sessions(None).await.unwrap().len(), 1);
+        driver.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn list_query_limits_and_order_never_truncate_the_cached_native_snapshot() {
+        let fixture = Fixture::new().await;
+        let driver = fixture.qoder_driver();
+        std::fs::write(
+            fixture.directory.join("sessions.json"),
+            r#"{"first":[],"second":[]}"#,
+        )
+        .unwrap();
+        let limited = driver
+            .list_sessions(&SessionQuery {
+                limit: Some(1),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(limited.len(), 1);
+        let all = driver
+            .list_sessions(&SessionQuery {
+                order: Some("asc".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].asid.0, "second");
+        assert_eq!(
+            fixture
+                .methods()
+                .iter()
+                .filter(|m| *m == "session/list")
+                .count(),
+            1
+        );
+        driver.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn owned_changes_invalidate_lists_and_cached_rows_keep_live_state() {
+        let fixture = Fixture::new().await;
+        let driver = fixture.qoder_driver();
+        driver.native_sessions(None).await.unwrap();
+        let info = driver.create_session(None, None, None).await.unwrap();
+        let listed = driver.native_sessions(None).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        let session = driver.retained(&info.asid.0).unwrap();
+        session.state.lock().await.info.title = "Latest local title".into();
+        assert_eq!(
+            driver.native_sessions(None).await.unwrap()[0].title,
+            "Latest local title"
+        );
+        assert_eq!(
+            fixture
+                .methods()
+                .iter()
+                .filter(|m| *m == "session/list")
+                .count(),
+            2
+        );
+        driver
+            .switch_model(
+                &info.asid.0,
+                &ModelRef {
+                    provider_id: "qoder".into(),
+                    model_id: "other-model".into(),
+                    variant: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(driver.session_lists.lock().await.is_empty());
+        driver.native_sessions(None).await.unwrap();
+        // This executable is the protocol fixture, never a real model process.
+        driver
+            .send_prompt(&info.asid.0, "fixture turn", &[], None)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while session.busy.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let forked = driver.fork_session(&info.asid.0, None).await.unwrap();
+        assert!(driver.session_lists.lock().await.is_empty());
+        assert_eq!(driver.native_sessions(None).await.unwrap().len(), 2);
+        driver.delete_session(&forked.asid.0).await.unwrap();
+        assert!(driver.session_lists.lock().await.is_empty());
+        let listed = driver.native_sessions(None).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].asid, info.asid);
+        driver.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_list_started_before_creation_cannot_repopulate_the_new_revision() {
+        let fixture = Fixture::new().await;
+        let driver = fixture.qoder_driver();
+        std::fs::write(fixture.directory.join("list-delay"), "1").unwrap();
+        let listing_driver = driver.clone();
+        let listing = tokio::spawn(async move { listing_driver.native_sessions(None).await });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !fixture.directory.join("list-started").exists() {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let created = driver.create_session(None, None, None).await.unwrap();
+        assert!(listing.await.unwrap().unwrap().is_empty());
+        assert!(driver.session_lists.lock().await.is_empty());
+        let listed = driver.native_sessions(None).await.unwrap();
+        assert_eq!(listed[0].asid, created.asid);
+        driver.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn list_cache_bounds_scopes_and_total_rows_without_retaining_children() {
+        let fixture = Fixture::new().await;
+        let driver = fixture.qoder_driver();
+        let created = driver.create_session(None, None, None).await.unwrap();
+        driver.session_lists.lock().await.push(CachedSessionList {
+            directory: Some("/older".into()),
+            listed_at: tokio::time::Instant::now(),
+            sessions: (0..MAX_CACHED_LIST_ROWS)
+                .map(|n| {
+                    let mut info = created.clone();
+                    info.asid = format!("cached-{n}").into();
+                    info
+                })
+                .collect(),
+        });
+        driver.native_sessions(None).await.unwrap();
+        assert_eq!(driver.session_lists.lock().await.len(), 1);
+        for index in 0..MAX_LIST_SCOPES + 2 {
+            driver
+                .native_sessions(Some(&format!("/scope-{index}")))
+                .await
+                .unwrap();
+        }
+        let lists = driver.session_lists.lock().await;
+        assert_eq!(lists.len(), MAX_LIST_SCOPES);
+        assert!(
+            lists.iter().map(|list| list.sessions.len()).sum::<usize>() <= MAX_CACHED_LIST_ROWS
+        );
+        drop(lists);
+        assert_eq!(
+            driver
+                .connections
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|client| client.strong_count() > 0)
+                .count(),
+            1,
+            "only the explicitly created session retains a native child"
+        );
+        driver.shutdown().await;
     }
 
     #[tokio::test]

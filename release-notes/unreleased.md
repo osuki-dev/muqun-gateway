@@ -2,6 +2,12 @@
 
 ## Changes and fixes
 
+- **Repeated FX and Qoder session lists reuse recent metadata.** Complete lists
+  share one native startup per directory and remain cached for up to 30 seconds.
+  Gateway-created sessions, forks, deletions and model changes invalidate these
+  snapshots; live session state stays current. First reads and expired snapshots
+  still start the installed CLI. No background metadata process is retained.
+
 - **FX and Qoder CLI conversations use their native ACP interfaces.** The
   Gateway discovers installed CLIs and supports private session creation,
   saved-session loading, streamed replies, tool activity and explicit approval
