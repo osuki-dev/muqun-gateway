@@ -427,7 +427,10 @@ impl AgentPlaneDiscovery {
 /// Build complete capability discovery response. An unauthenticated caller
 /// gets each agent's id, kind, status and features, without endpoints or versions.
 pub async fn build_discovery(state: &AppState, _sealed: bool, authenticated: bool) -> Value {
-    let mut planes = build_discovery_planes(state).await;
+    let terminal = build_terminal_plane_discovery(state).await;
+    let mut agents = state.agent_runtime.discovery_snapshot().await;
+    agents.order_for_picker();
+    let mut planes = discovery_planes(terminal, agents);
     if !authenticated {
         planes.agents.redact_endpoints();
     }
@@ -543,7 +546,7 @@ mod tests {
                     .iter()
                     .map(|a| a.id.as_str())
                     .collect::<Vec<_>>(),
-                ["codex", "opencode", "deepseek", "t3"]
+                ["codex", "opencode", "deepseek", "t3", "fx", "qoder", "pi"]
             );
             for agent in &plane.agents {
                 assert_eq!(serde_json::to_value(agent).unwrap(), metadata[&agent.id]);
@@ -585,7 +588,7 @@ mod tests {
                     .iter()
                     .map(|a| a.id.as_str())
                     .collect::<Vec<_>>(),
-                ["opencode", "deepseek", "t3", "codex"]
+                ["opencode", "deepseek", "t3", "fx", "qoder", "pi", "codex"]
             );
         }
     }
@@ -617,7 +620,7 @@ mod tests {
                 .iter()
                 .map(|a| a.id.as_str())
                 .collect::<Vec<_>>(),
-            ["opencode", "deepseek", "t3"]
+            ["opencode", "deepseek", "t3", "fx", "qoder", "pi"]
         );
     }
 

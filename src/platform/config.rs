@@ -131,10 +131,19 @@ pub(crate) struct Config {
     /// The T3 Code agent adapter: off unless `enabled` or `url` is set.
     #[serde(default, skip_serializing_if = "is_default_t3")]
     pub(crate) t3: agents::T3Config,
+    /// The Pi agent adapter: on, attached once a `pi` binary is found.
+    #[serde(default, skip_serializing_if = "is_default_pi")]
+    pub(crate) pi: agents::PiConfig,
     /// Private Codex app-server support is on unless explicitly disabled.
     /// Authentication and permission configuration remain owned by Codex.
     #[serde(default, skip_serializing_if = "is_default_codex")]
     pub(crate) codex: agents::runtime::CodexConfig,
+    /// Installed FX is discovered by default; ACP starts only when a session is opened.
+    #[serde(default, skip_serializing_if = "is_default_fx")]
+    pub(crate) fx: agents::runtime::FxConfig,
+    /// Local Qoder CLI ACP support; private children start only on explicit session operations.
+    #[serde(default, skip_serializing_if = "is_default_qoder")]
+    pub(crate) qoder: agents::runtime::QoderConfig,
     /// Master switch for service agents; terminal agents remain independent.
     #[serde(default, skip_serializing_if = "AgentRuntimeConfig::is_default")]
     pub(crate) agent_runtime: AgentRuntimeConfig,
@@ -315,8 +324,20 @@ pub(crate) fn is_default_t3(config: &agents::T3Config) -> bool {
     *config == agents::T3Config::default()
 }
 
+pub(crate) fn is_default_pi(config: &agents::PiConfig) -> bool {
+    *config == agents::PiConfig::default()
+}
+
 pub(crate) fn is_default_codex(config: &agents::runtime::CodexConfig) -> bool {
     *config == agents::runtime::CodexConfig::default()
+}
+
+pub(crate) fn is_default_fx(config: &agents::runtime::FxConfig) -> bool {
+    *config == agents::runtime::FxConfig::default()
+}
+
+pub(crate) fn is_default_qoder(config: &agents::runtime::QoderConfig) -> bool {
+    *config == agents::runtime::QoderConfig::default()
 }
 
 pub(crate) fn is_required_transport(mode: &TransportEncryptionMode) -> bool {
@@ -606,25 +627,36 @@ mod tests {
     use crate::*;
 
     #[test]
-    fn codex_and_master_runtime_default_on_roundtrip_explicit_off_and_reject_secrets() {
+    fn service_agents_and_master_runtime_default_on_roundtrip_explicit_off_and_reject_secrets() {
         let base = json!({"server_id":"synthetic-server","label":"fixture","listen":"127.0.0.1:23847","public_url":"","token_hash":"synthetic-hash","sessions":[]});
         let default: Config = serde_json::from_value(base.clone()).unwrap();
-        assert!(default.codex.enabled && default.agent_runtime.enabled);
+        assert!(
+            default.codex.enabled
+                && default.fx.enabled
+                && default.qoder.enabled
+                && default.agent_runtime.enabled
+        );
         assert_eq!(serde_json::to_value(default).unwrap(), base);
-        for key in ["codex", "agent_runtime"] {
+        for key in ["codex", "fx", "qoder", "agent_runtime"] {
             let mut off = base.clone();
             off[key] = json!({"enabled":false});
             let config: Config = serde_json::from_value(off.clone()).unwrap();
-            assert!(!if key == "codex" {
-                config.codex.enabled
-            } else {
-                config.agent_runtime.enabled
+            assert!(!match key {
+                "codex" => config.codex.enabled,
+                "fx" => config.fx.enabled,
+                "qoder" => config.qoder.enabled,
+                _ => config.agent_runtime.enabled,
             });
             assert_eq!(serde_json::to_value(config).unwrap(), off);
             let mut empty = base.clone();
             empty[key] = json!({});
             let config: Config = serde_json::from_value(empty).unwrap();
-            assert!(config.codex.enabled && config.agent_runtime.enabled);
+            assert!(
+                config.codex.enabled
+                    && config.fx.enabled
+                    && config.qoder.enabled
+                    && config.agent_runtime.enabled
+            );
             let mut unknown = base.clone();
             unknown[key] = json!({"api_key":"synthetic-not-a-credential"});
             assert!(serde_json::from_value::<Config>(unknown).is_err());

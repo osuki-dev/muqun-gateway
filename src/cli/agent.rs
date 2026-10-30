@@ -76,6 +76,12 @@ pub(crate) enum SetupAgent {
     Opencode,
     /// Explain Codex setup without starting an agent or a login flow.
     Codex,
+    /// Explain FX ACP setup without starting a session or changing credentials.
+    Fx,
+    /// Explain Qoder CLI ACP setup without starting a session or changing credentials.
+    Qoder,
+    /// Explain Pi RPC setup without starting a session or changing credentials.
+    Pi,
 }
 
 pub(crate) async fn run_agent_command(
@@ -129,6 +135,18 @@ pub(crate) async fn run_agent_command(
                 )?;
             }
             SetupAgent::Opencode => setup_opencode().await?,
+            SetupAgent::Pi => {
+                println!("Pi support is enabled by default when pi is installed on PATH. Configure providers and sign in to Pi on this host yourself. Gateway opens a private `pi --mode rpc` child only when a session is used; discovery does not verify model authentication.");
+                println!("Set pi.enabled=false to disable it; pi.binary may name an absolute executable. Native session files are discovered from pi.session_dir or Pi's default session directory. Mutating built-in tools ask for App approval by default. This command does not start Pi, install packages, log in or restart Gateway.");
+            }
+            SetupAgent::Qoder => {
+                println!("Qoder CLI support is enabled by default when qodercli is installed on PATH. Configure and sign in to Qoder CLI on this host yourself. Gateway opens a private `qodercli --acp` child per session; discovery alone does not verify model authentication.");
+                println!("Set qoder.enabled=false to disable it; qoder.binary may name an absolute CLI executable. A separately opened Qoder terminal or IDE is not a shared live ACP session. This command does not start Qoder, install packages, log in or restart Gateway.");
+            }
+            SetupAgent::Fx => {
+                println!("FX support is enabled by default when fx is installed on PATH. Sign in and configure FX on this host yourself. Gateway opens a private `fx acp` child per session and checks ACP capabilities on session creation; discovery alone does not prove model authentication.");
+                println!("Set fx.enabled=false to disable it; fx.binary may name an absolute executable. External FX TUI processes are not shared live sessions. This command does not start FX, install packages, log in or restart Gateway.");
+            }
             SetupAgent::Codex => {
                 println!("Codex support is enabled by default. Install Codex 0.163.0 or newer and sign in on this host yourself. A running Gateway starts or joins the one shared Codex daemon; a Codex you open later uses that same socket and the same threads. It does not change permission policy or credential files.");
                 println!("Set codex.enabled=false to disable it; codex.binary may name an absolute executable. This command does not start Codex, install packages, log in or restart the Gateway.");
@@ -142,11 +160,16 @@ pub(crate) async fn run_agent_command(
 async fn list(json: bool) -> anyhow::Result<bool> {
     let config = load_config(None)?;
     let runtime = if config.agent_runtime.enabled {
-        AgentRuntime::with_all_configs(
+        AgentRuntime::with_local_configs(
             config.opencode.clone(),
             config.deepseek.clone(),
             config.t3.clone(),
-            config.codex.clone(),
+            crate::agents::runtime::LocalAgentConfigs {
+                codex: config.codex.clone(),
+                fx: config.fx.clone(),
+                qoder: config.qoder.clone(),
+                pi: config.pi.clone(),
+            },
             Some(state_dir()?),
         )
     } else {
@@ -269,6 +292,14 @@ pub(crate) fn next_step(id: &str, status: &AgentAvailability) -> Option<&'static
         (Unconfigured | Disabled, "t3") => "muqun-gateway agent setup t3",
         (Unconfigured | Disabled, "deepseek") => "muqun-gateway agent setup deepseek",
         (Disabled, "opencode") => "set `opencode.enabled` to true in config.json",
+        (Disabled, "qoder") => "set `qoder.enabled` to true in config.json",
+        (NotInstalled, "qoder") => "install Qoder CLI yourself, set qoder.binary, or disable qoder.enabled",
+        (Unconfigured, "qoder") => "check qoder.binary and configure Qoder CLI authentication on this host yourself",
+        (Offline | Unsupported, "qoder") => "check Qoder CLI ACP support; failed prompts are never automatically retried",
+        (Disabled, "fx") => "set `fx.enabled` to true in config.json",
+        (NotInstalled, "fx") => "install FX yourself, set fx.binary, or disable fx.enabled",
+        (Unconfigured, "fx") => "check fx.binary and configure FX authentication on this host yourself",
+        (Offline | Unsupported, "fx") => "check FX ACP support and host configuration; prompts are never automatically retried",
         (Disabled, "codex") => "set `codex.enabled` to true in config.json",
         (Unconfigured, "codex") => {
             "configure Codex authentication on this host; Gateway will not log in for you"
@@ -292,6 +323,9 @@ pub(crate) fn next_step(id: &str, status: &AgentAvailability) -> Option<&'static
             "install OpenCode 2 (https://opencode.ai), or set `opencode.enabled` to false"
         }
         (NotInstalled, "t3") => "install T3 Code (https://t3.codes)",
+        (Disabled, "pi") => "set `pi.enabled` to true in config.json",
+        (NotInstalled, "pi") => "install Pi (https://pi.dev), or set `pi.binary`",
+        (Offline, "pi") => "check that `pi --version` runs on this host",
         (Unsupported, "t3") => {
             "update muqun-gateway: this T3 server speaks a newer orchestration protocol"
         }

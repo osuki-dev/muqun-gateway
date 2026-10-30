@@ -17,7 +17,7 @@ Two planes are implemented in this binary:
   adapters implement it.
 - **Agents plane** — agent sessions, models, prompts, tasks,
   permissions, approvals and event history, behind the `AgentPort`
-  port; the OpenCode, DeepSeek, T3 Code and Codex adapters implement it.
+  port; the OpenCode, DeepSeek, T3 Code, Codex, FX, Qoder CLI and Pi adapters implement it.
 
 `/api/discovery` also reports an **SSH plane**, but that one is the app's own
 transport, not a gateway subsystem: the phone can open an SSH connection to a
@@ -50,7 +50,7 @@ the far side. The gateway implements no SSH client or server itself.
 │   └─────────────┬──────────────┘  └───────────────┬────────────────┘     │
 │                 │                                 │                      │
 │        Herdr adapter · tmux adapter   OpenCode · DeepSeek · T3 · Codex   │
-│                                       adapters                           │
+│                                    FX · Qoder CLI · Pi adapters          │
 │                                                                          │
 │  routes: platform (health, discovery, openapi) · connectivity (pairing,  │
 │    push registration) · terminal · agents                                │
@@ -62,7 +62,7 @@ the far side. The gateway implements no SSH client or server itself.
         │
         ▼
  Herdr unix socket · tmux argv · OpenCode / DeepSeek HTTP · T3 WebSocket
- Codex private app-server stdio
+ Codex private app-server stdio · FX/Qoder ACP · Pi RPC
 ```
 
 A request travels: the phone authenticates with its device token (and, when
@@ -345,6 +345,8 @@ that points to another installation.
 muqun-gateway agent                  # each agent's status and the next step (--json for the raw list)
 muqun-gateway agent setup t3         # store a T3 Code credential and enable T3
 muqun-gateway agent setup deepseek   # enable DeepSeek; Gateway starts or joins the harness
+muqun-gateway agent setup fx         # explain local FX ACP configuration (no process starts)
+muqun-gateway agent setup qoder      # explain local Qoder CLI ACP configuration (no process starts)
 ```
 
 `agent` probes the agents from your shell the way the running gateway does,
@@ -439,6 +441,49 @@ an ephemeral next-turn choice, not a durable pre-turn upstream change. See the
 [Agent API](docs/agent-api.md) and [Codex protocol reference](docs/codex-protocol.md)
 for capabilities and limits. Real Codex and paired App/macOS acceptance remain
 deferred; protocol fixtures are not live certification.
+
+### The FX service agent
+
+FX is discovered by default when `fx` is on the Gateway's PATH. Install and
+configure FX authentication on this host yourself. Set `fx.binary` to an absolute
+executable path when needed, or `fx.enabled: false` to disable it. The master
+`agent_runtime.enabled` switch also applies. No package is installed or upgraded.
+
+Discovery performs a bounded `fx --version` probe, reads a cached native model
+catalog when the adapter is attached, and reports `reachable`; it
+does not establish model authentication or promise ACP support from a version
+number. Opening a session checks the actual ACP initialization response and
+starts a private `fx acp` child for that session. Gateway never auto-accepts
+permission requests and never automatically retries an ambiguous prompt.
+
+An FX TUI opened separately is not a shared live ACP session. The adapter does
+not adopt it, steal its lock or promise its terminal history. Native saved
+sessions can be listed and explicitly resumed with ACP load; a live external
+TUI may hold an exclusive lock, which Gateway respects. The Gateway mirror
+retains the timeline observed during this Gateway run. Model/effort controls
+use actual native catalog options; mode
+switching remains disabled. Unsupported controls are explicitly false in
+discovery. See [FX protocol](docs/fx-protocol.md).
+
+### The Qoder CLI service agent
+
+Qoder CLI is discovered by default through `qodercli` on PATH. Its Gateway
+provider id is `qoder`. Set `qoder.binary` to an absolute CLI executable for a
+differently named installation, or `qoder.enabled: false` to disable the adapter.
+Gateway deliberately does not guess that an executable named `qoder` is the CLI:
+it can also be an IDE launcher. The `agent_runtime.enabled` master switch applies.
+
+Configure Qoder CLI authentication on this host yourself. Gateway reuses the
+CLI's own credentials and starts one private `--acp` child per selected session.
+Discovery only probes `--version`; it does not log in, start ACP or send a model
+request. Permission requests require the owner's explicit answer. A lost prompt
+is never automatically resubmitted.
+
+A separate Qoder terminal or IDE is not a shared live ACP connection. Session
+metadata reads do not load or take ownership of its conversation. Unsupported
+App controls remain explicitly gated: native model choices and observed effort
+options can be selected temporarily within a session; permission-mode switching
+remains unavailable. See [Qoder protocol](docs/qoder-protocol.md).
 
 ### The OpenCode agent
 

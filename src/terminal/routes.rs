@@ -1358,6 +1358,8 @@ fn agent_form_push_data(
 fn agent_display_name(agent_id: &str) -> Option<&'static str> {
     match agent_id {
         "opencode" => Some("OpenCode"),
+        "qoder" => Some("Qoder CLI"),
+        "fx" => Some("FX"),
         "deepseek" => Some("DeepSeek"),
         "t3" => Some("T3 Code"),
         _ => None,

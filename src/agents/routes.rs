@@ -5777,17 +5777,19 @@ mod tests {
 
     #[tokio::test]
     async fn vcs_files_and_file_answer_from_git_for_any_agent() {
-        // Keep fixture construction out of this multi-route test's large future.
+        // Keep the fixture and route futures off the default test worker stack.
         let (state, root, _repo) = Box::pin(vcs_state("agent-vcs-files")).await;
+        // Each call boxed too: `AppState` is held by value and grows with
+        // every agent's config block.
         let files = |asid: &str, mode: Option<&str>| {
-            get_agent_vcs_files(
+            Box::pin(get_agent_vcs_files(
                 State(state.clone()),
                 Path(asid.to_string()),
                 Query(AgentVcsDiffQuery {
                     mode: mode.map(str::to_string),
                 }),
                 device_headers(),
-            )
+            ))
         };
 
         let Json(answer) = files("ses_git", None).await.expect("lists");
@@ -5829,24 +5831,34 @@ mod tests {
         assert!(plain["data"].get("repo").is_none());
 
         // The agent's own diff carries the same branch line.
-        let Json(diff) = do_get_agent_vcs_diff(&state, "ses_git", None, &device_headers())
-            .await
-            .expect("diff");
+        let Json(diff) = Box::pin(do_get_agent_vcs_diff(
+            &state,
+            "ses_git",
+            None,
+            &device_headers(),
+        ))
+        .await
+        .expect("diff");
         assert_eq!(diff["data"]["vcs"], "git");
         assert_eq!(diff["data"]["repo"]["branch"], "main");
         assert_eq!(diff["data"]["repo"]["detached"], false);
-        let Json(diff) = do_get_agent_vcs_diff(&state, "ses_plain", None, &device_headers())
-            .await
-            .expect("diff");
+        let Json(diff) = Box::pin(do_get_agent_vcs_diff(
+            &state,
+            "ses_plain",
+            None,
+            &device_headers(),
+        ))
+        .await
+        .expect("diff");
         assert!(diff["data"].get("repo").is_none());
 
         let file = |query: VcsFileQuery| {
-            get_agent_vcs_file(
+            Box::pin(get_agent_vcs_file(
                 State(state.clone()),
                 Path("ses_git".to_string()),
                 Query(query),
                 device_headers(),
-            )
+            ))
         };
         let Json(one) = file(file_query(None, "src/a.ts")).await.expect("patch");
         assert_eq!(one["data"]["path"], "src/a.ts");

@@ -2,6 +2,24 @@
 
 ## Changes and fixes
 
+- **FX and Qoder CLI conversations use their native ACP interfaces.** The
+  Gateway discovers installed CLIs and supports private session creation,
+  saved-session loading, streamed replies, tool activity and explicit approval
+  choices through the existing App contract. Shared transport and session
+  handling retain each provider's native differences. Existing CLI login is
+  reused; Gateway does not install agents, change permission modes or replay
+  ambiguous prompts. Restart the Gateway after updating; no App update or
+  re-pairing is required. See the provider protocol documents for capability
+  and history limits.
+
+- **Pi joins the native agent conversations.** A locally installed Pi (pi.dev, 1.4.0
+  verified) appears in the App as `Pi` with its sessions, models and thinking
+  levels. The gateway drives it through `pi --mode rpc`, one child per session
+  in use, closed after 15 idle minutes. `bash`, `edit` and `write` wait for an
+  approval in the App unless `pi.approvals` is `never`; Pi sessions reach the
+  Muqun MCP tools. Set `pi.enabled` to false to turn it off. Restart the
+  Gateway after updating; no App update is required.
+
 - **Codex starts again after a host reboot.** A retained official socket link
   whose temporary target disappeared now triggers Codex's idempotent shared
   daemon start command instead of a repeated protection error. Existing path,

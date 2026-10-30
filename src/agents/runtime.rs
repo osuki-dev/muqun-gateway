@@ -26,7 +26,14 @@ use super::manager::AgentManager;
 pub(crate) mod codex;
 pub use codex::CodexConfig;
 pub(crate) mod deepseek;
+pub(crate) mod fx;
+pub use fx::FxConfig;
+mod pi;
+pub(crate) mod qoder;
+pub use qoder::QoderConfig;
 mod t3;
+pub use pi::PiConfig;
+use pi::PiState;
 use t3::{catalog_entry, T3State};
 pub use t3::{T3Config, DEFAULT_T3_URL};
 
@@ -58,7 +65,8 @@ const VERSION_OUTPUT_LIMIT: u64 = 4096;
 
 /// Preference among attached providers. Explicit provider/session selections
 /// retain their route; discovery additionally puts usable providers first.
-pub const AGENT_PREFERENCE: [&str; 4] = ["codex", "opencode", "deepseek", "t3"];
+pub const AGENT_PREFERENCE: [&str; 7] =
+    ["codex", "opencode", "deepseek", "t3", "fx", "qoder", "pi"];
 /// Most session-to-agent routes remembered; the oldest go first.
 const MAX_SESSION_ROUTES: usize = 4096;
 /// How long an agent discovery result is reused.
@@ -264,6 +272,22 @@ pub struct AgentStatus {
     pub agent_id: Option<String>,
 }
 
+/// Configurations for the local service adapters, named to keep construction clear.
+#[derive(Default)]
+pub struct LocalAgentConfigs {
+    pub codex: CodexConfig,
+    pub fx: FxConfig,
+    pub qoder: QoderConfig,
+    pub pi: PiConfig,
+}
+
+struct LocalAgentStates {
+    codex: codex::CodexState,
+    fx: fx::FxState,
+    qoder: qoder::QoderState,
+    pi: PiState,
+}
+
 pub struct AgentRuntime {
     manager: RwLock<Option<Arc<AgentManager>>>,
     managers: RwLock<BTreeMap<String, Arc<AgentManager>>>,
@@ -273,14 +297,17 @@ pub struct AgentRuntime {
     /// The last agent discovery and when it was taken.
     discovery_cache: RwLock<Option<(tokio::time::Instant, crate::discovery::AgentPlaneDiscovery)>>,
     /// One refresh at a time; the rest wait and read its result.
-    discovery_refresh: Mutex<()>,
+    discovery_refresh: Arc<Mutex<()>>,
     /// The event channel belongs to the runtime, not to a manager, so a
     /// subscriber keeps its stream across a reconnect.
     events_tx: broadcast::Sender<AgentDomainEvent>,
     config: OpencodeConfig,
     deepseek_config: DeepseekConfig,
     t3: T3State,
+    pi: PiState,
     codex: codex::CodexState,
+    fx: fx::FxState,
+    qoder: qoder::QoderState,
     /// The harness this gateway started, if any. Not a kill handle.
     deepseek_spawn: Mutex<deepseek::SpawnSlot>,
     /// Origin of the attached DeepSeek manager, including when it is not primary.
@@ -364,15 +391,19 @@ impl AgentRuntime {
         t3_config: T3Config,
         state_dir: Option<std::path::PathBuf>,
     ) -> Arc<Self> {
-        Self::with_all_configs(
+        Self::with_local_configs(
             config,
             deepseek_config,
             t3_config,
-            CodexConfig::default(),
+            LocalAgentConfigs {
+                pi: PiConfig::disabled(),
+                ..Default::default()
+            },
             state_dir,
         )
     }
 
+    /// Compatibility construction for callers that supplied only Codex explicitly.
     pub fn with_all_configs(
         config: OpencodeConfig,
         deepseek_config: DeepseekConfig,
@@ -380,11 +411,109 @@ impl AgentRuntime {
         codex_config: CodexConfig,
         state_dir: Option<std::path::PathBuf>,
     ) -> Arc<Self> {
+        Self::with_local_configs(
+            config,
+            deepseek_config,
+            t3_config,
+            LocalAgentConfigs {
+                codex: codex_config,
+                pi: PiConfig::disabled(),
+                ..Default::default()
+            },
+            state_dir,
+        )
+    }
+
+    /// The composition root supplies every local adapter's configuration by name.
+    pub fn with_local_configs(
+        config: OpencodeConfig,
+        deepseek_config: DeepseekConfig,
+        t3_config: T3Config,
+        local: LocalAgentConfigs,
+        state_dir: Option<std::path::PathBuf>,
+    ) -> Arc<Self> {
         Self::with_states(
             config,
             deepseek_config,
-            T3State::new(t3_config, state_dir),
-            codex::CodexState::new(codex_config),
+            T3State::new(t3_config, state_dir.clone()),
+            LocalAgentStates {
+                codex: codex::CodexState::new(local.codex),
+                fx: fx::FxState::new(local.fx),
+                qoder: qoder::QoderState::new(local.qoder),
+                pi: PiState::new(local.pi, state_dir),
+            },
+        )
+    }
+
+    pub fn with_fx_configs(
+        config: OpencodeConfig,
+        deepseek_config: DeepseekConfig,
+        t3_config: T3Config,
+        codex_config: CodexConfig,
+        fx_config: FxConfig,
+        state_dir: Option<std::path::PathBuf>,
+    ) -> Arc<Self> {
+        Self::with_local_configs(
+            config,
+            deepseek_config,
+            t3_config,
+            LocalAgentConfigs {
+                codex: codex_config,
+                fx: fx_config,
+                qoder: QoderConfig::default(),
+                pi: PiConfig::disabled(),
+            },
+            state_dir,
+        )
+    }
+
+    pub fn with_qoder_configs(
+        config: OpencodeConfig,
+        deepseek_config: DeepseekConfig,
+        t3_config: T3Config,
+        codex_config: CodexConfig,
+        fx_config: FxConfig,
+        qoder_config: QoderConfig,
+        state_dir: Option<std::path::PathBuf>,
+    ) -> Arc<Self> {
+        Self::with_local_configs(
+            config,
+            deepseek_config,
+            t3_config,
+            LocalAgentConfigs {
+                codex: codex_config,
+                fx: fx_config,
+                qoder: qoder_config,
+                pi: PiConfig::disabled(),
+            },
+            state_dir,
+        )
+    }
+
+    /// Compatibility construction for callers that explicitly supply Pi.
+    pub fn with_pi_configs(
+        config: OpencodeConfig,
+        deepseek_config: DeepseekConfig,
+        t3_config: T3Config,
+        codex_config: CodexConfig,
+        fx_config: FxConfig,
+        pi_config: PiConfig,
+        state_dir: Option<std::path::PathBuf>,
+    ) -> Arc<Self> {
+        Self::with_local_configs(
+            config,
+            deepseek_config,
+            t3_config,
+            LocalAgentConfigs {
+                codex: codex_config,
+                fx: fx_config,
+                qoder: QoderConfig {
+                    enabled: false,
+                    binary: None,
+                },
+                pi: pi_config,
+            },
+            state_dir,
         )
     }
 
@@ -397,7 +526,12 @@ impl AgentRuntime {
             config,
             deepseek_config,
             t3,
-            codex::CodexState::new(CodexConfig::default()),
+            LocalAgentStates {
+                codex: codex::CodexState::new(CodexConfig::default()),
+                fx: fx::FxState::new(FxConfig::default()),
+                qoder: qoder::QoderState::new(QoderConfig::default()),
+                pi: PiState::new(PiConfig::disabled(), None),
+            },
         )
     }
 
@@ -405,7 +539,7 @@ impl AgentRuntime {
         config: OpencodeConfig,
         deepseek_config: DeepseekConfig,
         t3: T3State,
-        codex: codex::CodexState,
+        local: LocalAgentStates,
     ) -> Arc<Self> {
         let (events_tx, _) = broadcast::channel(1024);
         Arc::new(Self {
@@ -413,12 +547,15 @@ impl AgentRuntime {
             managers: RwLock::new(BTreeMap::new()),
             session_routes: RwLock::new(SessionRoutes::default()),
             discovery_cache: RwLock::new(None),
-            discovery_refresh: Mutex::new(()),
+            discovery_refresh: Arc::new(Mutex::new(())),
             events_tx,
             config,
             deepseek_config,
             t3,
-            codex,
+            pi: local.pi,
+            codex: local.codex,
+            fx: local.fx,
+            qoder: local.qoder,
             deepseek_spawn: Mutex::new(deepseek::SpawnSlot::default()),
             deepseek_origin: RwLock::new(AgentOrigin::None),
             origin: RwLock::new(AgentOrigin::None),
@@ -535,7 +672,7 @@ impl AgentRuntime {
     /// A runtime that will never attach an agent, for tests and for a build
     /// of `AppState` that has no business starting anything.
     pub fn disabled() -> Arc<Self> {
-        Self::with_all_configs(
+        Self::with_local_configs(
             OpencodeConfig {
                 enabled: false,
                 autostart: false,
@@ -543,9 +680,20 @@ impl AgentRuntime {
             },
             DeepseekConfig::default(),
             T3Config::default(),
-            CodexConfig {
-                enabled: false,
-                binary: None,
+            LocalAgentConfigs {
+                codex: CodexConfig {
+                    enabled: false,
+                    binary: None,
+                },
+                fx: FxConfig {
+                    enabled: false,
+                    binary: None,
+                },
+                qoder: QoderConfig {
+                    enabled: false,
+                    binary: None,
+                },
+                pi: PiConfig::disabled(),
             },
             None,
         )
@@ -698,7 +846,13 @@ impl AgentRuntime {
             } else {
                 local_installation_status(&self.config)
             },
-            origin: *self.origin.read().await,
+            origin: if manager.as_ref().is_some_and(|manager| {
+                matches!(manager.agent().kind(), "fx" | "qoder") && manager.stream_connected()
+            }) {
+                AgentOrigin::Spawned
+            } else {
+                *self.origin.read().await
+            },
             url: manager.as_ref().map(|m| m.endpoint_url().to_string()),
             version: manager.as_ref().and_then(|m| m.version()),
             stream_connected: manager
@@ -710,6 +864,11 @@ impl AgentRuntime {
                 .is_some_and(|m| m.agent().kind() == "codex")
             {
                 self.codex.config.enabled
+            } else if manager
+                .as_ref()
+                .is_some_and(|m| matches!(m.agent().kind(), "fx" | "qoder"))
+            {
+                false
             } else {
                 self.config.autostart
             },
@@ -731,7 +890,13 @@ impl AgentRuntime {
         Some(AgentStatus {
             available: kind != "codex" || manager.stream_connected(),
             installation: AgentInstallation::Installed,
-            origin: if kind == "deepseek" {
+            origin: if matches!(kind.as_str(), "fx" | "qoder") {
+                if manager.stream_connected() {
+                    AgentOrigin::Spawned
+                } else {
+                    AgentOrigin::None
+                }
+            } else if kind == "deepseek" {
                 *self.deepseek_origin.read().await
             } else if kind == "codex"
                 && manager.endpoint_url() == "stdio://private-codex-app-server"
@@ -747,6 +912,44 @@ impl AgentRuntime {
             kind: Some(kind.clone()),
             agent_id: Some(kind),
         })
+    }
+
+    /// HTTP discovery never waits for a provider or a cold native catalog.
+    /// One bounded background refresh publishes real results for later reads.
+    pub async fn discovery_snapshot(self: &Arc<Self>) -> crate::discovery::AgentPlaneDiscovery {
+        let cached = self.discovery_cache.read().await.clone();
+        if cached
+            .as_ref()
+            .is_none_or(|(at, _)| at.elapsed() >= DISCOVERY_TTL)
+        {
+            if let Ok(guard) = self.discovery_refresh.clone().try_lock_owned() {
+                let runtime = self.clone();
+                tokio::spawn(async move {
+                    let _one = guard;
+                    if runtime
+                        .discovery_cache
+                        .read()
+                        .await
+                        .as_ref()
+                        .is_some_and(|(at, _)| at.elapsed() < DISCOVERY_TTL)
+                    {
+                        return;
+                    }
+                    match tokio::time::timeout(DISCOVERY_TIMEOUT, runtime.probe_agents()).await {
+                        Ok(found) => {
+                            *runtime.discovery_cache.write().await =
+                                Some((tokio::time::Instant::now(), found));
+                        }
+                        Err(_) => tracing::warn!("background agent discovery timed out"),
+                    }
+                });
+            }
+        }
+        let found = match cached {
+            Some((_, found)) => found,
+            None => self.attached_snapshot().await,
+        };
+        self.fence_codex_discovery(found).await
     }
 
     /// Status and capabilities of all configured or reachable AI agents.
@@ -847,7 +1050,10 @@ impl AgentRuntime {
                         opencode_features(false, false),
                     ),
                     "t3" => (self.t3.wanted(), "T3 Code", self.t3.features()),
+                    "pi" => (self.pi.enabled(), "Pi", self.pi.features()),
                     "codex" => (self.codex.config.enabled, "Codex", codex::features()),
+                    "fx" => (self.fx.config.enabled, "FX", fx::features()),
+                    "qoder" => (self.qoder.config.enabled, "Qoder CLI", qoder::features()),
                     _ => (
                         self.deepseek_config.enabled || self.deepseek_config.endpoint.is_some(),
                         "DeepSeek",
@@ -876,6 +1082,9 @@ impl AgentRuntime {
                     kind: id.to_string(),
                     status: match (enabled, manager) {
                         (false, _) => AgentAvailability::Disabled,
+                        (true, Some(_)) if matches!(*id, "fx" | "qoder") => {
+                            AgentAvailability::Reachable
+                        }
                         (true, Some(_)) => AgentAvailability::Connected,
                         (true, None) => AgentAvailability::Offline,
                     },
@@ -890,9 +1099,12 @@ impl AgentRuntime {
             })
             .collect::<Vec<_>>();
         crate::discovery::order_agents(&mut agents);
-        let supported = agents
-            .iter()
-            .any(|h| h.status == AgentAvailability::Connected);
+        let supported = agents.iter().any(|agent| {
+            matches!(
+                agent.status,
+                AgentAvailability::Connected | AgentAvailability::Reachable
+            )
+        });
         AgentPlaneDiscovery {
             supported,
             agents,
@@ -1165,7 +1377,10 @@ impl AgentRuntime {
         };
         agents.push(opencode_info);
         agents.push(self.t3_discovery().await);
+        agents.push(self.pi_discovery().await);
         agents.push(self.codex.discovery(self).await);
+        agents.push(self.fx.discovery(self).await);
+        agents.push(self.qoder.discovery(self).await);
         crate::discovery::order_agents(&mut agents);
 
         let supported = agents.iter().any(|h| {
@@ -1241,7 +1456,7 @@ impl AgentRuntime {
             .read()
             .await
             .as_ref()
-            .map(|m| !m.stream_connected())
+            .map(|m| !matches!(m.agent().kind(), "fx" | "qoder") && !m.stream_connected())
             .unwrap_or(false)
     }
 
@@ -1269,8 +1484,11 @@ impl AgentRuntime {
         // 3. Supervise T3 Code
         let t3_ok = self.supervise_t3().await;
         let codex_ok = self.codex.supervise(self).await;
+        let fx_ok = self.fx.supervise(self).await;
+        let qoder_ok = self.qoder.supervise(self).await;
+        let pi_ok = self.supervise_pi().await;
 
-        if deepseek_ok || opencode_ok || t3_ok || codex_ok {
+        if deepseek_ok || opencode_ok || t3_ok || codex_ok || fx_ok || qoder_ok || pi_ok {
             *start_backoff = Duration::from_secs(2);
             let primary = pick_primary(&*self.managers.read().await).cloned();
             if let Some(mgr) = primary {
@@ -1961,6 +2179,63 @@ async fn wait_for_service() -> anyhow::Result<(OpencodeEndpoint, Option<String>)
     }
 }
 
+fn acp_features() -> crate::discovery::AgentFeatures {
+    crate::discovery::AgentFeatures {
+        streaming: true,
+        reasoning_effort: false,
+        model_selection: false,
+        tool_approvals: true,
+        worktrees: false,
+        revert: false,
+        staged_revert: false,
+        inbox: false,
+        modes: false,
+        skills: false,
+        slash_commands: false,
+        compaction: false,
+        background_shells: false,
+        attachments: false,
+        attachments_by_path: false,
+        extra: [
+            ("inboxEdit", false),
+            ("modeSwitching", false),
+            ("sessionRename", false),
+            ("sessionDelete", false),
+            ("sessionFork", false),
+            ("sessionPagination", false),
+            ("timelineEarlier", true),
+            ("accountLimits", false),
+            ("computerTools", false),
+        ]
+        .into_iter()
+        .map(|(key, supported)| (key.into(), serde_json::json!(supported)))
+        .collect(),
+    }
+}
+
+fn apply_acp_capabilities(
+    features: &mut crate::discovery::AgentFeatures,
+    capabilities: &serde_json::Value,
+    commands_listed: bool,
+) {
+    features.attachments = capabilities
+        .pointer("/promptCapabilities/image")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+        || capabilities
+            .pointer("/promptCapabilities/embeddedContext")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+    features.attachments_by_path = false;
+    features.slash_commands = commands_listed;
+    for (feature, operation) in [("sessionFork", "fork"), ("sessionDelete", "delete")] {
+        features.extra.insert(
+            feature.into(),
+            serde_json::json!(capabilities["sessionCapabilities"][operation].is_object()),
+        );
+    }
+}
+
 fn deepseek_features(
     supports_reasoning: bool,
     has_models: bool,
@@ -2088,6 +2363,110 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fx_discovery_and_supervision_only_probe_version_and_shutdown_is_final() {
+        // This executable accepts --version only; attempting ACP initialization
+        // during discovery or supervision would fail instead of installing it.
+        let binary = VersionScript::new("printf 0.0.16");
+        let runtime = AgentRuntime::with_fx_configs(
+            OpencodeConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            DeepseekConfig::default(),
+            T3Config::default(),
+            CodexConfig {
+                enabled: false,
+                binary: None,
+            },
+            FxConfig {
+                enabled: true,
+                binary: Some(binary.0.to_string_lossy().into_owned()),
+            },
+            None,
+        );
+        let found = runtime.fx.discovery(&runtime).await;
+        assert_eq!(found.status, crate::discovery::AgentAvailability::Reachable);
+        assert_eq!(found.version.as_deref(), Some("0.0.16"));
+        assert!(runtime.manager_for_agent("fx").await.is_none());
+        assert!(runtime.fx.supervise(&runtime).await);
+        let manager = runtime.manager_for_agent("fx").await.unwrap();
+        assert_eq!(manager.agent().kind(), "fx");
+        let snapshot = runtime.health_snapshot().await;
+        assert!(snapshot.supported);
+        assert_eq!(snapshot.agents[0].id, "fx");
+        assert_eq!(
+            snapshot.agents[0].status,
+            crate::discovery::AgentAvailability::Reachable
+        );
+        let status = runtime.status_for("fx").await.unwrap();
+        assert!(!status.autostart);
+        assert_eq!(status.origin, AgentOrigin::None);
+        assert!(
+            !manager.stream_connected(),
+            "no ACP stream exists before opening a session"
+        );
+        assert!(manager.agent().probe().await.unwrap());
+        runtime.shutdown_fx().await;
+        assert!(!manager.stream_connected());
+        assert!(!runtime.fx.supervise(&runtime).await);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn qoder_discovery_and_supervision_only_probe_version_and_shutdown_is_final() {
+        // This executable accepts --version only; attempting ACP initialization
+        // during discovery or supervision would fail instead of installing it.
+        let binary = VersionScript::new("printf 1.1.81");
+        let runtime = AgentRuntime::with_qoder_configs(
+            OpencodeConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            DeepseekConfig::default(),
+            T3Config::default(),
+            CodexConfig {
+                enabled: false,
+                binary: None,
+            },
+            FxConfig {
+                enabled: false,
+                binary: None,
+            },
+            QoderConfig {
+                enabled: true,
+                binary: Some(binary.0.to_string_lossy().into_owned()),
+            },
+            None,
+        );
+        let found = runtime.qoder.discovery(&runtime).await;
+        assert_eq!(found.status, crate::discovery::AgentAvailability::Reachable);
+        assert_eq!(found.version.as_deref(), Some("1.1.81"));
+        assert!(runtime.manager_for_agent("qoder").await.is_none());
+        assert!(runtime.qoder.supervise(&runtime).await);
+        let manager = runtime.manager_for_agent("qoder").await.unwrap();
+        assert_eq!(manager.agent().kind(), "qoder");
+        let snapshot = runtime.health_snapshot().await;
+        assert!(snapshot.supported);
+        assert_eq!(snapshot.agents[0].id, "qoder");
+        assert_eq!(
+            snapshot.agents[0].status,
+            crate::discovery::AgentAvailability::Reachable
+        );
+        let status = runtime.status_for("qoder").await.unwrap();
+        assert!(!status.autostart);
+        assert_eq!(status.origin, AgentOrigin::None);
+        assert!(
+            !manager.stream_connected(),
+            "no ACP stream exists before opening a session"
+        );
+        assert!(manager.agent().probe().await.unwrap());
+        runtime.shutdown_qoder().await;
+        assert!(!manager.stream_connected());
+        assert!(!runtime.qoder.supervise(&runtime).await);
+    }
+
     #[tokio::test]
     async fn opencode_reuses_only_the_same_verified_instance_and_reports_actual_info() {
         let service = MockOpencode::new().await;
@@ -2159,7 +2538,7 @@ mod tests {
     async fn invalid_explicit_opencode_never_attaches_or_starts_a_fallback() {
         use axum::http::StatusCode;
         let service = MockOpencode::new().await;
-        let binary = VersionScript::new("printf '2.0.27\\n'");
+        let binary = VersionScript::new("printf 0.0.16");
         let runtime = AgentRuntime::new(OpencodeConfig {
             autostart: true,
             binary: Some(binary.0.to_str().unwrap().into()),
@@ -3026,10 +3405,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn health_does_not_wait_on_cold_or_expired_provider_catalogs() {
-        use crate::discovery::AgentAvailability;
-        let mut state = crate::test_state("admin", vec![crate::test_device("phone", "device")]);
-        state.config.sessions.clear();
+    async fn discovery_returns_cold_and_stale_snapshots_while_one_refresh_finishes() {
         let runtime = AgentRuntime::with_all_configs(
             OpencodeConfig {
                 enabled: true,
@@ -3039,6 +3415,87 @@ mod tests {
             DeepseekConfig::default(),
             T3Config::default(),
             CodexConfig {
+                enabled: false,
+                binary: None,
+            },
+            None,
+        );
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let mut agent = crate::FakeAgent::new("opencode");
+        agent.catalog_gate = Some(gate.clone());
+        agent.catalog.models.push(
+            serde_json::from_value(serde_json::json!({
+                "id":"observed-model", "name":"Observed model", "provider_id":"fixture"
+            }))
+            .unwrap(),
+        );
+        runtime
+            .install(
+                "opencode",
+                AgentManager::for_test(Arc::new(agent)),
+                AgentOrigin::Adopted,
+            )
+            .await;
+
+        for cold in [true, false] {
+            if !cold {
+                runtime.discovery_cache.write().await.as_mut().unwrap().0 =
+                    tokio::time::Instant::now() - DISCOVERY_TTL;
+            }
+            for _ in 0..3 {
+                let snapshot =
+                    tokio::time::timeout(Duration::from_millis(250), runtime.discovery_snapshot())
+                        .await
+                        .expect("HTTP discovery does not await a catalog");
+                let provider = snapshot
+                    .agents
+                    .iter()
+                    .find(|agent| agent.id == "opencode")
+                    .unwrap();
+                assert_eq!(provider.models.is_empty(), cold);
+            }
+            assert!(
+                runtime.discovery_refresh.try_lock().is_err(),
+                "one refresh owns the gate"
+            );
+            gate.notify_one();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                let _one = runtime.discovery_refresh.lock().await;
+            })
+            .await
+            .expect("a single provider release completes the shared refresh");
+            let snapshot = runtime.discovery_snapshot().await;
+            assert_eq!(
+                snapshot
+                    .agents
+                    .iter()
+                    .find(|agent| agent.id == "opencode")
+                    .unwrap()
+                    .models[0]
+                    .id,
+                "observed-model"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn health_does_not_wait_on_cold_or_expired_provider_catalogs() {
+        use crate::discovery::AgentAvailability;
+        let mut state = crate::test_state("admin", vec![crate::test_device("phone", "device")]);
+        state.config.sessions.clear();
+        let runtime = AgentRuntime::with_fx_configs(
+            OpencodeConfig {
+                enabled: true,
+                autostart: false,
+                binary: None,
+            },
+            DeepseekConfig::default(),
+            T3Config::default(),
+            CodexConfig {
+                enabled: false,
+                binary: None,
+            },
+            FxConfig {
                 enabled: false,
                 binary: None,
             },
@@ -3117,7 +3574,7 @@ mod tests {
         use crate::agents::adapters::codex::tests::Fixture;
         let mut fixture = Fixture::new(|_| serde_json::json!({})).await;
         fixture.client.initialize().await.unwrap();
-        let runtime = AgentRuntime::with_all_configs(
+        let runtime = AgentRuntime::with_local_configs(
             OpencodeConfig {
                 enabled: false,
                 autostart: false,
@@ -3125,7 +3582,10 @@ mod tests {
             },
             DeepseekConfig::default(),
             T3Config::default(),
-            CodexConfig::default(),
+            LocalAgentConfigs {
+                pi: PiConfig::disabled(),
+                ..Default::default()
+            },
             None,
         );
         runtime
@@ -3218,6 +3678,10 @@ mod tests {
         assert_eq!(pick_primary(&map), Some(&2), "DeepSeek outranks T3");
         map.remove("deepseek");
         assert_eq!(pick_primary(&map), Some(&4));
+        map.insert("pi".to_string(), 6);
+        assert_eq!(pick_primary(&map), Some(&4), "T3 outranks Pi");
+        map.remove("t3");
+        assert_eq!(pick_primary(&map), Some(&6));
     }
 
     #[test]
@@ -3262,6 +3726,8 @@ mod tests {
         assert!(runtime.is_known_agent("opencode"));
         assert!(runtime.is_known_agent("deepseek"));
         assert!(runtime.is_known_agent("t3"));
+        assert!(runtime.is_known_agent("fx"));
+        assert!(runtime.is_known_agent("qoder"));
         assert!(!runtime.is_known_agent("claude"));
     }
 
@@ -3538,7 +4004,7 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_discovery_orders_all_appended_connected_providers_and_preserves_routes() {
-        let runtime = AgentRuntime::with_all_configs(
+        let runtime = AgentRuntime::with_qoder_configs(
             OpencodeConfig {
                 enabled: true,
                 autostart: false,
@@ -3547,6 +4013,14 @@ mod tests {
             DeepseekConfig::default(),
             T3Config::default(),
             CodexConfig::default(),
+            FxConfig {
+                enabled: false,
+                binary: None,
+            },
+            QoderConfig {
+                enabled: false,
+                binary: None,
+            },
             None,
         );
         runtime
@@ -3585,7 +4059,7 @@ mod tests {
                 .iter()
                 .map(|a| a.id.as_str())
                 .collect::<Vec<_>>(),
-            ["codex", "opencode", "deepseek", "t3"]
+            ["codex", "opencode", "deepseek", "t3", "fx", "qoder", "pi"]
         );
         assert_eq!(runtime.manager().await.unwrap().agent().kind(), "codex");
         assert_eq!(
@@ -3610,7 +4084,10 @@ mod tests {
         let runtime = AgentRuntime::disabled();
         let found = runtime.discover_agents().await;
         let ids: Vec<&str> = found.agents.iter().map(|a| a.id.as_str()).collect();
-        assert_eq!(ids, ["opencode", "deepseek", "t3", "codex"]);
+        assert_eq!(
+            ids,
+            ["opencode", "deepseek", "t3", "fx", "qoder", "pi", "codex"]
+        );
     }
 
     #[tokio::test]

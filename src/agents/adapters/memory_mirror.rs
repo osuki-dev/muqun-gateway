@@ -1175,6 +1175,19 @@ impl MemoryMirror {
         reason: Option<String>,
         delta: Option<String>,
     ) -> u64 {
+        self.record_compaction_with_error(asid, status, reason, delta, None)
+            .await
+            .seq()
+    }
+
+    pub(crate) async fn record_compaction_with_error(
+        &self,
+        asid: &AgentSessionId,
+        status: crate::agents::domain::CompactionStatus,
+        reason: Option<String>,
+        delta: Option<String>,
+        error: Option<crate::agents::domain::AgentErrorInfo>,
+    ) -> AgentDomainEvent {
         let mut sessions = self.sessions.write().await;
         let state = Self::entry(
             &self.agent_id,
@@ -1194,9 +1207,10 @@ impl MemoryMirror {
             reason,
             delta,
             seq,
+            error,
         };
-        state.push_event(event);
-        seq
+        state.push_event(event.clone());
+        event
     }
 
     /// Direct helper to append streaming text/reasoning chunk to existing timeline item
@@ -1702,7 +1716,6 @@ impl MemoryMirror {
         }
     }
 
-    #[cfg(test)]
     pub(crate) async fn refresh_prepared_snapshot(
         &self,
         snapshot: AgentSessionSnapshot,
@@ -1783,6 +1796,9 @@ impl MemoryMirror {
             snapshot.info.time_idle = previous.info.time_idle;
         }
         let state = Self::entry(&self.agent_id, &mut sessions, &asid, snapshot.info.status);
+        if !self.agent_id.is_empty() {
+            snapshot.info.agent_id = self.agent_id.to_string();
+        }
         state.info = snapshot.info;
         state.placeholder = false;
         state.history_initialized = true;
@@ -2116,6 +2132,39 @@ impl SessionMirrorPort for MemoryMirror {
 mod tests {
     use super::*;
     use crate::agents::domain::{AgentPart, AgentSessionInfo, AgentSessionStatus, TimelineRole};
+
+    #[tokio::test]
+    async fn compaction_failure_live_and_replay_keep_the_same_optional_error() {
+        let mirror = MemoryMirror::for_agent("pi");
+        let asid = AgentSessionId("compact-failure".into());
+        let event = mirror
+            .record_compaction_with_error(
+                &asid,
+                crate::agents::domain::CompactionStatus::Failed,
+                Some("manual".into()),
+                None,
+                Some(crate::agents::domain::AgentErrorInfo {
+                    name: "compaction_too_small".into(),
+                    message: "Nothing to compact: this session is too short.".into(),
+                    status: None,
+                    retry_after_ms: None,
+                }),
+            )
+            .await;
+        let replay = mirror.get_events_after(&asid, 0).await.unwrap();
+        assert_eq!(replay, vec![event.clone()]);
+        let mut wire = serde_json::to_value(event).unwrap();
+        assert_eq!(wire["reason"], "manual");
+        assert!(wire.get("delta").is_none());
+        assert_eq!(wire["error"]["name"], "compaction_too_small");
+        wire.as_object_mut().unwrap().remove("error");
+        let legacy: AgentDomainEvent = serde_json::from_value(wire).unwrap();
+        assert!(matches!(
+            legacy,
+            AgentDomainEvent::CompactionChanged { error: None, .. }
+        ));
+        assert!(serde_json::to_value(legacy).unwrap().get("error").is_none());
+    }
 
     #[tokio::test]
     async fn earlier_history_acceptance_preserves_newer_live_rows_and_commits_atomically() {

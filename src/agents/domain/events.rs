@@ -85,6 +85,9 @@ pub enum AgentDomainEvent {
         /// The streamed summary text, on `session.compaction.delta`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         delta: Option<String>,
+        /// A bounded, sanitized failure, distinct from trigger reason/summary.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<super::AgentErrorInfo>,
         seq: u64,
     },
     /// `session.revert.staged|committed|cleared`: a rollback boundary the user

@@ -142,9 +142,9 @@ pub struct AgentManager {
 
 impl Drop for AgentManager {
     fn drop(&mut self) {
-        // Codex's pump strongly owns its transport; releasing the external
-        // manager must cancel it. Other adapters retain their existing policy.
-        if self.agent.kind() == "codex" {
+        // Private protocol pumps own transports strongly, so releasing their
+        // external manager must cancel them. Adopted services stay untouched.
+        if matches!(self.agent.kind(), "codex" | "fx" | "qoder" | "pi") {
             (self.shutdown_handle)();
         }
     }
@@ -462,6 +462,62 @@ impl AgentManager {
         }
     }
 
+    /// Assemble the lazy ACP adapter; each FX session owns its own child.
+    pub fn connect_fx(
+        binary: String,
+        directory: String,
+        version: Option<String>,
+        events_tx: broadcast::Sender<AgentDomainEvent>,
+    ) -> (Self, Arc<crate::agents::adapters::fx::FxDriver>) {
+        let mirror = Arc::new(MemoryMirror::for_agent("fx"));
+        let driver = crate::agents::adapters::fx::FxDriver::new(
+            binary,
+            directory,
+            mirror.clone(),
+            events_tx.clone(),
+        );
+        let connected = driver.clone();
+        let shutdown = driver.clone();
+        let manager = Self::assemble(
+            driver.clone(),
+            mirror,
+            events_tx,
+            "stdio://fx-acp".into(),
+            version,
+            Arc::new(move || connected.has_live_stream()),
+            Arc::new(move || shutdown.stop()),
+        );
+        (manager, driver)
+    }
+
+    /// Assemble the lazy ACP adapter; each Qoder session owns its own child.
+    pub fn connect_qoder(
+        binary: String,
+        directory: String,
+        version: Option<String>,
+        events_tx: broadcast::Sender<AgentDomainEvent>,
+    ) -> (Self, Arc<crate::agents::adapters::qoder::QoderDriver>) {
+        let mirror = Arc::new(MemoryMirror::for_agent("qoder"));
+        let driver = crate::agents::adapters::qoder::QoderDriver::new(
+            binary,
+            directory,
+            mirror.clone(),
+            events_tx.clone(),
+        );
+        let connected = driver.clone();
+        let shutdown = driver.clone();
+        let manager = Self::assemble(
+            driver.clone(),
+            mirror,
+            events_tx,
+            "stdio://qoder-acp".into(),
+            version,
+            Arc::new(move || connected.has_live_stream()),
+            Arc::new(move || shutdown.stop()),
+        );
+        (manager, driver)
+    }
+
     /// Build a manager for a DeepSeek endpoint.
     pub fn connect_deepseek(
         endpoint: crate::agents::adapters::deepseek::DeepseekEndpoint,
@@ -609,6 +665,64 @@ impl AgentManager {
                 cancel.cancel();
                 client.shutdown();
             }),
+        )
+    }
+
+    /// Build a manager for local Pi children. There is no stream to lose:
+    /// the driver's channel lives as long as the driver, and each child's
+    /// records reach it until that child exits.
+    pub fn connect_pi(
+        driver: Arc<crate::agents::adapters::pi::PiDriver>,
+        version: Option<String>,
+        events_tx: broadcast::Sender<AgentDomainEvent>,
+    ) -> Self {
+        let mirror = Arc::new(MemoryMirror::for_agent(driver.kind()));
+        let mut records = driver.subscribe();
+        let ctx = Arc::new(pi::PiEventContext {
+            driver: driver.clone(),
+            mirror: mirror.clone(),
+            tx: events_tx.clone(),
+        });
+        // The driver owns the sending side and outlives every child, so the
+        // pump ends on the driver's shutdown rather than on a closed channel.
+        let stopped = driver.stopped();
+        tokio::spawn(async move {
+            loop {
+                let received = tokio::select! {
+                    _ = stopped.cancelled() => break,
+                    received = records.recv() => received,
+                };
+                match received {
+                    Ok((asid, generation, record)) => {
+                        pi::handle_pi_record(&asid, generation, &record, &ctx).await
+                    }
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::warn!(
+                            skipped,
+                            "pi event backlog overflowed, stopping affected sessions"
+                        );
+                        ctx.abort_backlog().await;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+            tracing::debug!("pi event pump wound down");
+        });
+        driver.start_reaper();
+        tracing::info!(
+            version = version.as_deref().unwrap_or("unknown"),
+            "agent manager initialized with the Pi agent"
+        );
+        let shutdown = driver.clone();
+        let readiness = driver.clone();
+        Self::assemble(
+            driver,
+            mirror,
+            events_tx,
+            crate::agents::adapters::pi::ENDPOINT.to_string(),
+            version,
+            Arc::new(move || readiness.is_connected()),
+            Arc::new(move || shutdown.shutdown()),
         )
     }
 
@@ -1236,6 +1350,7 @@ impl AgentManager {
                     reason,
                     delta,
                     seq,
+                    error: None,
                 });
                 // The finished boundary is a real message; read it back so the
                 // timeline carries the summary rather than only the event.
@@ -1752,6 +1867,7 @@ impl AgentManager {
 
 mod codex;
 mod deepseek;
+mod pi;
 mod t3;
 
 #[cfg(test)]

@@ -1,0 +1,2280 @@
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex as StdMutex, Weak};
+use std::time::Duration;
+
+use serde_json::{json, Value};
+use tokio::io::AsyncReadExt;
+use tokio::sync::{broadcast, mpsc, Mutex};
+use tokio_util::sync::CancellationToken;
+
+use super::mapper::{self, Permission, Projection};
+use super::operations::{self, PromptCapabilities};
+use super::{AcpClient, AcpEvent};
+use crate::agents::adapters::memory_mirror::MemoryMirror;
+use crate::agents::domain::*;
+use crate::agents::ports::agent::{
+    AgentError, AgentFuture, AgentPort, AttachmentMode, FileDiffItem,
+};
+use crate::agents::ports::mirror::{AgentSessionSnapshot, SessionMirrorPort};
+use std::marker::PhantomData;
+
+/// Native launch and verified differences; protocol lifecycle is shared.
+pub trait AcpProvider: Send + Sync + 'static {
+    const KIND: &'static str;
+    const LABEL: &'static str;
+    const ARGS: &'static [&'static str];
+    const REQUIRE_MESSAGE_ID: bool;
+    const MODEL_SELECTION: bool;
+    const SESSION_NOTICES: bool = false;
+    const PROVIDER_CONFIG: bool = true;
+    const EFFORT_CONFIG: &'static str = "effort";
+    fn session_metadata<'a>(
+        rows: Vec<Value>,
+        _stop: &'a CancellationToken,
+    ) -> AgentFuture<'a, Vec<Value>> {
+        Box::pin(async move { Ok(rows) })
+    }
+    fn global_catalog<'a>(
+        _binary: &'a str,
+        _directory: &'a str,
+        _stop: &'a CancellationToken,
+    ) -> AgentFuture<'a, AgentCatalog> {
+        unsupported("global ACP model catalog")
+    }
+    fn account_limits<'a>(
+        _binary: &'a str,
+        _directory: &'a str,
+        _stop: &'a CancellationToken,
+    ) -> AgentFuture<'a, crate::agents::domain::account_limits::AccountLimits> {
+        unsupported("ACP account limits")
+    }
+    fn safe_error_message(_: &Value) -> Option<&'static str> {
+        None
+    }
+}
+
+const RPC_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_CONNECTIONS: usize = 16;
+const MAX_LIST_PAGES: usize = 64;
+const SESSION_METADATA_TTL: Duration = Duration::from_secs(30);
+
+struct SessionMetadata {
+    listed_at: tokio::time::Instant,
+    sessions: HashMap<String, AgentSessionInfo>,
+}
+
+struct SessionState {
+    info: AgentSessionInfo,
+    catalog: AgentCatalog,
+    config: Value,
+    owned_mutations: bool,
+    usage: mapper::SessionUsage,
+    projection: Projection,
+    permissions: HashMap<String, Permission>,
+}
+
+struct Session {
+    client: Arc<AcpClient>,
+    state: Mutex<SessionState>,
+    busy: AtomicBool,
+    connected: AtomicBool,
+    completions: mpsc::UnboundedSender<Result<Value, String>>,
+    native_capabilities: Value,
+    commands_observed: Arc<AtomicBool>,
+    prompt_capabilities: PromptCapabilities,
+    finished: CancellationToken,
+}
+
+struct Admission<'a> {
+    busy: &'a AtomicBool,
+    handed_off: bool,
+}
+impl Drop for Admission<'_> {
+    fn drop(&mut self) {
+        if !self.handed_off {
+            self.busy.store(false, Ordering::Release);
+        }
+    }
+}
+
+type CatalogCacheEntry = (
+    String,
+    tokio::time::Instant,
+    Result<AgentCatalog, AgentError>,
+);
+
+pub struct AcpDriver<P: AcpProvider> {
+    provider: PhantomData<P>,
+    binary: String,
+    default_directory: String,
+    mirror: Arc<MemoryMirror>,
+    tx: broadcast::Sender<AgentDomainEvent>,
+    sessions: StdMutex<HashMap<String, Arc<Session>>>,
+    connections: StdMutex<Vec<Weak<AcpClient>>>,
+    connection_admission: Mutex<()>,
+    starting: tokio::sync::RwLock<()>,
+    mutations: Mutex<()>,
+    global_catalog: Mutex<Option<CatalogCacheEntry>>,
+    session_metadata: Mutex<Option<SessionMetadata>>,
+    metadata_refresh: Mutex<()>,
+    native_capabilities: StdMutex<Value>,
+    commands_observed: Arc<AtomicBool>,
+    stop: CancellationToken,
+}
+
+fn unsupported<'a, T: Send + 'a>(feature: &'static str) -> AgentFuture<'a, T> {
+    Box::pin(async move { Err(AgentError::Unsupported(feature.into())) })
+}
+
+fn protocol(message: &str) -> AgentError {
+    AgentError::Protocol(message.into())
+}
+
+pub(crate) async fn read_metadata_output(
+    binary: &str,
+    arguments: &[&str],
+    directory: &str,
+    stop: &CancellationToken,
+) -> Result<Vec<u8>, AgentError> {
+    use std::process::Stdio;
+    let mut child = tokio::process::Command::new(binary)
+        .args(arguments)
+        .current_dir(directory)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|_| AgentError::NotAvailable("Could not run Agent metadata command".into()))?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| AgentError::Protocol("Agent metadata stdout missing".into()))?
+        .take(1024 * 1024 + 1);
+    let mut bytes = Vec::new();
+    let result = tokio::select! {
+        _ = stop.cancelled() => Err(AgentError::NotAvailable("Agent metadata command cancelled".into())),
+        result = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            stdout.read_to_end(&mut bytes).await.map_err(|_| AgentError::Protocol("Could not read Agent metadata".into()))?;
+            if bytes.len() > 1024 * 1024 { return Err(AgentError::Protocol("Agent metadata exceeds its byte budget".into())); }
+            let status = child.wait().await.map_err(|_| AgentError::NotAvailable("Agent metadata process failed".into()))?;
+            if !status.success() { return Err(AgentError::NotAvailable("Agent metadata is unavailable; inspect FX authentication in the terminal".into())); }
+            Ok(bytes)
+        }) => result.unwrap_or_else(|_| Err(AgentError::NotAvailable("Agent metadata command timed out".into()))),
+    };
+    if result.is_err() {
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+    }
+    result
+}
+
+impl<P: AcpProvider> AcpDriver<P> {
+    pub fn new(
+        binary: String,
+        default_directory: String,
+        mirror: Arc<MemoryMirror>,
+        tx: broadcast::Sender<AgentDomainEvent>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            provider: PhantomData,
+            binary,
+            default_directory,
+            mirror,
+            tx,
+            sessions: StdMutex::new(HashMap::new()),
+            connections: StdMutex::new(Vec::new()),
+            connection_admission: Mutex::new(()),
+            starting: tokio::sync::RwLock::new(()),
+            mutations: Mutex::new(()),
+            global_catalog: Mutex::new(None),
+            session_metadata: Mutex::new(None),
+            metadata_refresh: Mutex::new(()),
+            native_capabilities: StdMutex::new(Value::Null),
+            commands_observed: Arc::new(AtomicBool::new(false)),
+            stop: CancellationToken::new(),
+        })
+    }
+
+    /// Discovery verifies the binary. ACP is initialized only on an explicit read or mutation.
+    pub fn is_connected(&self) -> bool {
+        !self.stop.is_cancelled()
+    }
+
+    pub fn stop(&self) {
+        self.stop.cancel();
+    }
+
+    pub fn has_live_stream(&self) -> bool {
+        self.sessions
+            .lock()
+            .unwrap()
+            .values()
+            .any(|session| session.connected.load(Ordering::Acquire))
+    }
+
+    pub async fn shutdown(&self) {
+        self.stop();
+        // Initialization registers every private child before releasing this
+        // gate, including short-lived listing clients and unfinished creates.
+        let _starting = self.starting.write().await;
+        let clients: Vec<_> = self
+            .connections
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(Weak::upgrade)
+            .collect();
+        futures::future::join_all(clients.iter().map(|client| client.shutdown())).await;
+        let sessions: Vec<_> = self.sessions.lock().unwrap().values().cloned().collect();
+        futures::future::join_all(sessions.iter().map(|session| async move {
+            session.client.shutdown().await;
+            let _ =
+                tokio::time::timeout(Duration::from_secs(5), session.finished.cancelled()).await;
+        }))
+        .await;
+    }
+
+    /// Only catalogs actually received from native sessions contribute choices.
+    pub async fn observed_catalog(&self) -> AgentCatalog {
+        let mut sessions: Vec<_> = self
+            .sessions
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(id, session)| (id.clone(), session.clone()))
+            .collect();
+        sessions.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut models: BTreeMap<(String, String), ModelInfo> = BTreeMap::new();
+        let mut commands = BTreeMap::new();
+        for (_, session) in sessions {
+            if !session.connected.load(Ordering::Acquire) {
+                continue;
+            }
+            let state = session.state.lock().await;
+            for command in &state.catalog.commands {
+                commands
+                    .entry(command.name.clone())
+                    .or_insert_with(|| command.clone());
+            }
+            for model in &state.catalog.models {
+                let current = models
+                    .entry((model.provider_id.clone(), model.id.clone()))
+                    .or_insert_with(|| model.clone());
+                if let Some(variants) = &model.variants {
+                    let mut known: BTreeMap<_, _> = current
+                        .variants
+                        .take()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|variant| (variant.id.clone(), variant))
+                        .collect();
+                    for variant in variants {
+                        known
+                            .entry(variant.id.clone())
+                            .or_insert_with(|| variant.clone());
+                    }
+                    current.variants = Some(known.into_values().collect());
+                }
+            }
+        }
+        AgentCatalog {
+            models: models.into_values().collect(),
+            commands: commands.into_values().collect(),
+            ..Default::default()
+        }
+    }
+
+    pub fn observed_capabilities(&self) -> Value {
+        self.native_capabilities.lock().unwrap().clone()
+    }
+
+    /// A verified read-only provider catalog may bootstrap choices before a
+    /// session exists. Native session catalogs remain the authoritative source.
+    pub async fn available_catalog(
+        &self,
+        directory: Option<&str>,
+    ) -> Result<AgentCatalog, AgentError> {
+        let mut observed = self.observed_catalog().await;
+        if !P::MODEL_SELECTION {
+            observed.models.clear();
+            observed.defaults.model = None;
+            return Ok(observed);
+        }
+        if !observed.models.is_empty() {
+            return Ok(observed);
+        }
+        let directory = directory.unwrap_or(&self.default_directory);
+        let mut cached = self.global_catalog.lock().await;
+        if let Some((scope, at, result)) = &*cached {
+            let ttl = if result.is_ok() { 60 } else { 5 };
+            if scope == directory && at.elapsed() < Duration::from_secs(ttl) {
+                return Self::merge_global_catalog(result.clone(), observed);
+            }
+        }
+        let result = match P::global_catalog(&self.binary, directory, &self.stop).await {
+            Err(AgentError::Unsupported(_)) => Ok(AgentCatalog::default()),
+            result => result,
+        };
+        *cached = Some((
+            directory.into(),
+            tokio::time::Instant::now(),
+            result.clone(),
+        ));
+        Self::merge_global_catalog(result, observed)
+    }
+
+    fn merge_global_catalog(
+        result: Result<AgentCatalog, AgentError>,
+        observed: AgentCatalog,
+    ) -> Result<AgentCatalog, AgentError> {
+        match result {
+            Ok(mut catalog) => {
+                let mut commands: BTreeMap<_, _> = catalog
+                    .commands
+                    .into_iter()
+                    .map(|command| (command.name.clone(), command))
+                    .collect();
+                for command in observed.commands {
+                    commands.insert(command.name.clone(), command);
+                }
+                catalog.commands = commands.into_values().collect();
+                Ok(catalog)
+            }
+            Err(_) if !observed.commands.is_empty() => Ok(observed),
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn select_config(
+        &self,
+        session: &Session,
+        config_id: &str,
+        value: &str,
+    ) -> Result<(), AgentError> {
+        let mut state = session.state.lock().await;
+        let option = mapper::config_option(&state.config, config_id)
+            .ok_or_else(|| AgentError::Unsupported(format!("ACP {config_id} selection")))?;
+        if option["currentValue"].as_str() == Some(value) {
+            return Ok(());
+        }
+        if !mapper::offers_config_value(&state.config, config_id, value) {
+            return Err(AgentError::InvalidRequest(format!(
+                "ACP {config_id} choice is not offered by this session"
+            )));
+        }
+        let previous_provider = state
+            .info
+            .model
+            .as_ref()
+            .map(|model| model.provider_id.clone());
+        let response = session
+            .client
+            .request_with_timeout(
+                "session/set_config_option",
+                json!({
+                    "sessionId": state.info.asid.0, "configId": config_id, "value": value
+                }),
+                RPC_TIMEOUT,
+            )
+            .await
+            .map_err(AgentError::RequestFailed)?;
+        if !response["configOptions"].is_array() {
+            return Err(protocol(
+                "ACP config selection returned no configOptions; refresh before retrying",
+            ));
+        }
+        let update = json!({"sessionUpdate":"config_option_update","configOptions":response["configOptions"]});
+        Self::reduce(&mut state, &update)?;
+        let info = state.info.clone();
+        let seq = self.mirror.update_session(info.clone()).await;
+        Self::emit(
+            &self.mirror,
+            &self.tx,
+            AgentDomainEvent::SessionUpdated {
+                asid: info.asid.clone(),
+                info: Box::new(info),
+                seq,
+            },
+        );
+        if config_id != "provider"
+            && state
+                .info
+                .model
+                .as_ref()
+                .map(|model| model.provider_id.clone())
+                != previous_provider
+        {
+            return Err(protocol("ACP changed the provider during model or effort selection; native state was retained, refresh before retrying"));
+        }
+        if mapper::config_option(&state.config, config_id)
+            .and_then(|option| option["currentValue"].as_str())
+            != Some(value)
+        {
+            return Err(protocol(
+                "ACP did not confirm the requested config value; refresh before retrying",
+            ));
+        }
+        Ok(())
+    }
+
+    async fn select_model(&self, session: &Session, model: &ModelRef) -> Result<(), AgentError> {
+        if !P::MODEL_SELECTION {
+            return Err(AgentError::Unsupported("ACP model selection".into()));
+        }
+        if !session.connected.load(Ordering::Acquire) {
+            return Err(AgentError::NotAvailable("ACP connection ended".into()));
+        }
+        if session
+            .busy
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(AgentError::NotAvailable(
+                "ACP session is busy; model changes require an idle session".into(),
+            ));
+        }
+        let _admission = Admission {
+            busy: &session.busy,
+            handed_off: false,
+        };
+        if P::PROVIDER_CONFIG {
+            self.select_config(session, "provider", &model.provider_id)
+                .await?;
+        } else if model.provider_id != P::KIND {
+            return Err(AgentError::InvalidRequest(
+                "model belongs to another ACP provider".into(),
+            ));
+        }
+        let native_model = {
+            let state = session.state.lock().await;
+            mapper::resolve_model_value(&state.config, &model.model_id)?
+        };
+        self.select_config(session, "model", &native_model).await?;
+        if let Some(effort) = &model.variant {
+            self.select_config(session, P::EFFORT_CONFIG, effort)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn initialized(
+        &self,
+        directory: &str,
+    ) -> Result<(Arc<AcpClient>, broadcast::Receiver<AcpEvent>, Value), AgentError> {
+        let _starting = self.starting.read().await;
+        if self.stop.is_cancelled() {
+            return Err(AgentError::NotAvailable("ACP runtime stopped".into()));
+        }
+        // Reserve two short-lived listing connections beyond the session cap.
+        // Serialize spawn admission only; prompts and initialization stay concurrent.
+        let admission = self.connection_admission.lock().await;
+        {
+            let mut connections = self.connections.lock().unwrap();
+            connections.retain(|client| client.strong_count() > 0);
+            if connections.len() >= MAX_CONNECTIONS + 2 {
+                return Err(AgentError::NotAvailable(
+                    "ACP connection capacity exhausted".into(),
+                ));
+            }
+        }
+        let client = AcpClient::spawn_with_error_mapper(
+            &self.binary,
+            P::ARGS,
+            directory,
+            P::LABEL,
+            P::safe_error_message,
+        )
+        .await
+        .map_err(AgentError::NotAvailable)?;
+        {
+            let mut connections = self.connections.lock().unwrap();
+            connections.retain(|client| client.strong_count() > 0);
+            connections.push(Arc::downgrade(&client));
+        }
+        drop(admission);
+        let events = client.subscribe();
+        let mut client_capabilities = json!({
+            "fs": { "readTextFile": false, "writeTextFile": false },
+            "terminal": false
+        });
+        if P::SESSION_NOTICES {
+            client_capabilities["session"] = json!({ "notices": {} });
+        }
+        let initialize = client.request_with_timeout(
+            "initialize",
+            json!({
+                "protocolVersion": 1,
+                "clientInfo": { "name": "muqun-gateway", "version": env!("CARGO_PKG_VERSION") },
+                "clientCapabilities": client_capabilities
+            }),
+            RPC_TIMEOUT,
+        );
+        let result = tokio::select! {
+            _ = self.stop.cancelled() => Err("ACP runtime stopped".into()),
+            result = initialize => result,
+        };
+        match result {
+            Ok(value) if value["protocolVersion"].as_u64() == Some(1) => {
+                let capabilities = value["agentCapabilities"].clone();
+                *self.native_capabilities.lock().unwrap() = capabilities.clone();
+                Ok((client, events, capabilities))
+            }
+            result => {
+                client.shutdown().await;
+                Err(match result {
+                    Ok(_) => protocol("ACP did not negotiate ACP protocol 1"),
+                    Err(error) => AgentError::Protocol(error),
+                })
+            }
+        }
+    }
+
+    fn retained(&self, id: &str) -> Option<Arc<Session>> {
+        self.sessions.lock().unwrap().get(id).cloned()
+    }
+
+    async fn native_sessions(
+        &self,
+        directory: Option<&str>,
+    ) -> Result<Vec<AgentSessionInfo>, AgentError> {
+        let (client, _events, capabilities) = self.initialized(&self.default_directory).await?;
+        if !capabilities
+            .pointer("/sessionCapabilities/list")
+            .is_some_and(Value::is_object)
+        {
+            client.shutdown().await;
+            let sessions: Vec<_> = self.sessions.lock().unwrap().values().cloned().collect();
+            let mut retained = Vec::new();
+            for session in sessions {
+                let info = session.state.lock().await.info.clone();
+                if directory.is_none_or(|cwd| info.directory.as_deref() == Some(cwd)) {
+                    retained.push(info);
+                }
+            }
+            return Ok(retained);
+        }
+        let result = async {
+            let mut cursor = None;
+            let mut seen = HashSet::new();
+            let mut sessions = Vec::new();
+            let mut listed = HashSet::new();
+            let mut observed_bytes: usize = 0;
+            for _ in 0..MAX_LIST_PAGES {
+                let mut params = json!({});
+                if let Some(directory) = directory {
+                    params["cwd"] = json!(directory);
+                }
+                if let Some(cursor) = &cursor {
+                    params["cursor"] = json!(cursor);
+                }
+                let value = client
+                    .request_with_timeout("session/list", params, RPC_TIMEOUT)
+                    .await
+                    .map_err(AgentError::RequestFailed)?;
+                observed_bytes = observed_bytes.saturating_add(
+                    serde_json::to_vec(&value)
+                        .map(|bytes| bytes.len())
+                        .unwrap_or(usize::MAX),
+                );
+                if observed_bytes > 8 * 1024 * 1024 {
+                    return Err(AgentError::NotAvailable(
+                        "ACP session listing exceeded its byte budget".into(),
+                    ));
+                }
+                let rows = value["sessions"]
+                    .as_array()
+                    .ok_or_else(|| protocol("ACP list missing sessions"))?;
+                for row in rows {
+                    let id = row["sessionId"]
+                        .as_str()
+                        .ok_or_else(|| protocol("ACP listed session missing sessionId"))?;
+                    row["cwd"]
+                        .as_str()
+                        .ok_or_else(|| protocol("ACP listed session missing cwd"))?;
+                    if !listed.insert(id.to_owned()) {
+                        continue;
+                    }
+                    if sessions.len() >= 4096 {
+                        return Err(AgentError::NotAvailable(
+                            "ACP session listing exceeded its session budget".into(),
+                        ));
+                    }
+                    sessions.push(row.clone());
+                }
+                let Some(next) = value["nextCursor"].as_str() else {
+                    return self.project_listed_sessions(sessions).await;
+                };
+                if next.is_empty() || !seen.insert(next.to_owned()) {
+                    return Err(protocol("ACP session cursor did not advance"));
+                }
+                cursor = Some(next.to_owned());
+            }
+            Err(AgentError::NotAvailable(
+                "ACP session listing exceeded its page budget".into(),
+            ))
+        }
+        .await;
+        client.shutdown().await;
+        if let Ok(sessions) = &result {
+            *self.session_metadata.lock().await = Some(SessionMetadata {
+                listed_at: tokio::time::Instant::now(),
+                sessions: sessions
+                    .iter()
+                    .map(|info| (info.asid.0.clone(), info.clone()))
+                    .collect(),
+            });
+        }
+        result
+    }
+
+    async fn project_listed_sessions(
+        &self,
+        rows: Vec<Value>,
+    ) -> Result<Vec<AgentSessionInfo>, AgentError> {
+        let mut expected: HashSet<_> = rows
+            .iter()
+            .filter_map(|row| row["sessionId"].as_str().map(str::to_owned))
+            .collect();
+        let rows = P::session_metadata(rows, &self.stop).await?;
+        for row in &rows {
+            let id = row["sessionId"]
+                .as_str()
+                .ok_or_else(|| protocol("ACP session metadata missing identity"))?;
+            if !expected.remove(id) {
+                return Err(protocol("ACP session metadata changed listed identities"));
+            }
+        }
+        if !expected.is_empty() {
+            return Err(protocol("ACP session metadata dropped listed identities"));
+        }
+        let mut sessions = Vec::with_capacity(rows.len());
+        for row in rows {
+            let id = row["sessionId"].as_str().unwrap();
+            let cwd = row["cwd"].as_str().unwrap_or_default();
+            let mut info = mapper::session(id, cwd, &row);
+            if !std::path::Path::new(cwd).is_absolute() {
+                info.directory = None;
+            }
+            // A native listing proves neither runtime ownership nor idle state.
+            info.status = AgentSessionStatus::Unknown;
+            if let Some(known) = self.retained(id) {
+                let mut state = known.state.lock().await;
+                let mut changed = false;
+                if !known.busy.load(Ordering::Acquire) && row["title"].is_string() {
+                    changed = state.info.title != info.title;
+                    state.info.title = info.title;
+                    state.info.updated_ms = state.info.updated_ms.max(info.updated_ms);
+                }
+                info = state.info.clone();
+                if changed {
+                    let seq = self.mirror.update_session(info.clone()).await;
+                    Self::emit(
+                        &self.mirror,
+                        &self.tx,
+                        AgentDomainEvent::SessionUpdated {
+                            asid: info.asid.clone(),
+                            info: Box::new(info.clone()),
+                            seq,
+                        },
+                    );
+                }
+            } else if info.directory.is_none() {
+                info.directory = self
+                    .mirror
+                    .session_info(&info.asid)
+                    .await
+                    .and_then(|known| known.directory)
+                    .filter(|cwd| std::path::Path::new(cwd).is_absolute());
+            }
+            if P::KIND == "qoder"
+                && info.directory.is_none()
+                && row["_muqunEmptySession"].as_bool() == Some(true)
+            {
+                info.runtime = Some(Self::empty_runtime());
+            }
+            sessions.push(info);
+        }
+        Ok(sessions)
+    }
+
+    async fn cached_session_info(&self, id: &str) -> Option<AgentSessionInfo> {
+        self.session_metadata
+            .lock()
+            .await
+            .as_ref()
+            .filter(|metadata| metadata.listed_at.elapsed() < SESSION_METADATA_TTL)
+            .and_then(|metadata| metadata.sessions.get(id).cloned())
+    }
+
+    async fn native_session_info(&self, id: &str) -> Result<AgentSessionInfo, AgentError> {
+        if let Some(info) = self.cached_session_info(id).await {
+            return Ok(info);
+        }
+        let _refresh = self.metadata_refresh.lock().await;
+        if let Some(info) = self.cached_session_info(id).await {
+            return Ok(info);
+        }
+        self.native_sessions(None)
+            .await?
+            .into_iter()
+            .find(|info| info.asid.0 == id)
+            .ok_or_else(|| AgentError::SessionNotFound(id.into()))
+    }
+
+    fn empty_runtime() -> SessionRuntime {
+        SessionRuntime {
+            transcript: Some(TranscriptSource::Persisted),
+            source: RuntimeSource::Native,
+            interaction: RuntimeInteraction::Unavailable,
+            status: Some(TerminalRuntimeStatus::Unknown),
+            terminal: None,
+            reason: Some(RuntimeReason::NotLoaded),
+        }
+    }
+
+    async fn readonly_empty_snapshot(&self, id: &str) -> Result<bool, AgentError> {
+        if self.retained(id).is_some() {
+            return Ok(false);
+        }
+        let info = self.native_session_info(id).await?;
+        if info.directory.is_some() || info.runtime.as_ref() != Some(&Self::empty_runtime()) {
+            return Ok(false);
+        }
+        if let Some(snapshot) = self.mirror.get_snapshot(&info.asid).await {
+            if !snapshot.timeline.is_empty()
+                || !snapshot.permissions.is_empty()
+                || !snapshot.forms.is_empty()
+                || !snapshot.inbox.is_empty()
+            {
+                return Err(AgentError::NotAvailable(
+                    "Native empty-session metadata conflicts with the retained conversation".into(),
+                ));
+            }
+            return Ok(true);
+        }
+        let revision = self.mirror.snapshot_read_revision(&info.asid).await;
+        let snapshot = AgentSessionSnapshot {
+            info,
+            timeline: Vec::new(),
+            permissions: Vec::new(),
+            forms: Vec::new(),
+            inbox: Vec::new(),
+            seq: 0,
+        };
+        if self
+            .mirror
+            .refresh_prepared_snapshot(snapshot, revision.0, revision.1, None)
+            .await?
+            .is_none()
+        {
+            return Err(AgentError::NotAvailable(
+                "Empty-session snapshot changed; refresh again".into(),
+            ));
+        }
+        Ok(true)
+    }
+
+    async fn ensure_loaded(&self, id: &str) -> Result<Arc<Session>, AgentError> {
+        if let Some(session) = self.retained(id) {
+            if session.connected.load(Ordering::Acquire) {
+                return Ok(session);
+            }
+            return Err(AgentError::NotAvailable(
+                "ACP connection ended; refresh the session explicitly before sending again".into(),
+            ));
+        }
+        let _mutation = self.mutations.lock().await;
+        if let Some(session) = self.retained(id) {
+            if session.connected.load(Ordering::Acquire) {
+                return Ok(session);
+            }
+            return Err(AgentError::NotAvailable(
+                "ACP connection ended; refresh the session explicitly before sending again".into(),
+            ));
+        }
+        let info = self.native_session_info(id).await?;
+        let directory = info
+            .directory
+            .clone()
+            .filter(|cwd| std::path::Path::new(cwd).is_absolute())
+            .ok_or_else(|| AgentError::NotAvailable("The native session has no verified working directory; open it in Qoder or FX once before loading it here".into()))?;
+        self.open(&directory, Some(info)).await
+    }
+
+    async fn open(
+        &self,
+        directory: &str,
+        existing: Option<AgentSessionInfo>,
+    ) -> Result<Arc<Session>, AgentError> {
+        if self.sessions.lock().unwrap().len() >= MAX_CONNECTIONS {
+            return Err(AgentError::NotAvailable(
+                "ACP active-session capacity exhausted".into(),
+            ));
+        }
+        let new_session = existing.is_none();
+        let id = existing.as_ref().map(|info| info.asid.0.clone());
+        let revision = match &id {
+            Some(id) => {
+                self.mirror
+                    .snapshot_read_revision(&AgentSessionId::from(id.as_str()))
+                    .await
+            }
+            None => (None, None),
+        };
+        let (client, mut events, capabilities) = self.initialized(directory).await?;
+        if id.is_some() && capabilities["loadSession"].as_bool() != Some(true) {
+            client.shutdown().await;
+            return Err(AgentError::Unsupported(
+                "ACP native session history loading".into(),
+            ));
+        }
+        let method = if id.is_some() {
+            "session/load"
+        } else {
+            "session/new"
+        };
+        let mut params = json!({ "cwd": directory, "mcpServers": [] });
+        if let Some(id) = &id {
+            params["sessionId"] = json!(id);
+        }
+        let request = client
+            .start_request(method, params)
+            .await
+            .map_err(AgentError::RequestFailed)?;
+        let response = request.wait_with_timeout(RPC_TIMEOUT);
+        tokio::pin!(response);
+        let mut replay = Vec::new();
+        let mut replay_bytes: usize = 0;
+        // Drain as the full load replays, instead of leaving the bounded transport
+        // subscription full while waiting for the response.
+        let value = loop {
+            tokio::select! {
+                biased;
+                event = events.recv() => match event {
+                    Ok(AcpEvent::Notification { method, params }) if method == "session/update" => {
+                        replay_bytes = replay_bytes.saturating_add(serde_json::to_vec(&params).map(|bytes| bytes.len()).unwrap_or(usize::MAX));
+                        if replay_bytes > 32 * 1024 * 1024 || replay.len() >= 100_000 {
+                            client.shutdown().await;
+                            return Err(AgentError::NotAvailable("ACP whole-history replay exceeds the Gateway budget; open this session in the agent's terminal".into()));
+                        }
+                        replay.push(params);
+                    },
+                    Ok(AcpEvent::Disconnected { reason }) => { client.shutdown().await; return Err(AgentError::Network(reason)); },
+                    Ok(AcpEvent::Request { .. }) => {
+                        client.shutdown().await;
+                        return Err(AgentError::NotAvailable("ACP requested user interaction before the session was loaded; open it in the agent's terminal".into()));
+                    },
+                    Ok(_) => {},
+                    Err(_) => { client.shutdown().await; return Err(protocol("ACP history stream was interrupted")); },
+                },
+                value = &mut response => break value,
+            }
+        };
+        let value = match value {
+            Ok(value) => value,
+            Err(error) => {
+                client.shutdown().await;
+                return Err(AgentError::RequestFailed(error));
+            }
+        };
+        while let Ok(event) = events.try_recv() {
+            match event {
+                AcpEvent::Notification { method, params } if method == "session/update" => {
+                    replay_bytes = replay_bytes.saturating_add(
+                        serde_json::to_vec(&params)
+                            .map(|bytes| bytes.len())
+                            .unwrap_or(usize::MAX),
+                    );
+                    if replay_bytes > 32 * 1024 * 1024 || replay.len() >= 100_000 {
+                        client.shutdown().await;
+                        return Err(AgentError::NotAvailable(
+                            "ACP whole-history replay exceeds the Gateway budget".into(),
+                        ));
+                    }
+                    replay.push(params);
+                }
+                AcpEvent::Disconnected { reason } => {
+                    client.shutdown().await;
+                    return Err(AgentError::Network(reason));
+                }
+                AcpEvent::Request { .. } => {
+                    client.shutdown().await;
+                    return Err(AgentError::NotAvailable("ACP requested interaction before session load completed; use the agent's terminal".into()));
+                }
+                _ => {}
+            }
+        }
+        let id = id.or_else(|| value["sessionId"].as_str().map(str::to_owned)).ok_or_else(|| protocol("ACP session creation returned no sessionId; do not retry creation automatically"))?;
+        let mut info = existing.unwrap_or_else(|| mapper::session(&id, directory, &value));
+        info.status = AgentSessionStatus::Idle;
+        info.model = mapper::selected_model_for(&value, P::KIND);
+        if info.updated_ms == 0 {
+            info.updated_ms = mapper::now_ms();
+        }
+        info.mode = value
+            .pointer("/modes/currentModeId")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let (completions, completed) = mpsc::unbounded_channel();
+        let mut state = SessionState {
+            info,
+            catalog: mapper::catalog_for(&value, P::KIND),
+            config: value.clone(),
+            owned_mutations: new_session,
+            usage: mapper::SessionUsage::new(new_session),
+            projection: Projection::new(P::REQUIRE_MESSAGE_ID),
+            permissions: HashMap::new(),
+        };
+        for params in replay {
+            if params["sessionId"].as_str() != Some(id.as_str()) {
+                client.shutdown().await;
+                return Err(protocol("ACP history replay changed session identity"));
+            }
+            if let Err(error) = Self::reduce(&mut state, &params["update"]) {
+                client.shutdown().await;
+                return Err(error);
+            }
+        }
+        if self.stop.is_cancelled() {
+            client.shutdown().await;
+            return Err(AgentError::NotAvailable(
+                "ACP runtime stopped while loading a session".into(),
+            ));
+        }
+        // Native replay ids need not survive a load. Only a fully validated
+        // replacement may replace the old snapshot; no replay row is broadcast.
+        let snapshot = AgentSessionSnapshot {
+            info: state.info.clone(),
+            timeline: state
+                .projection
+                .timeline()
+                .into_iter()
+                .map(|mut row| {
+                    row.seq = 0;
+                    row
+                })
+                .collect(),
+            permissions: Vec::new(),
+            forms: Vec::new(),
+            inbox: Vec::new(),
+            seq: 0,
+        };
+        if self
+            .mirror
+            .refresh_prepared_snapshot(snapshot, revision.0, revision.1, None)
+            .await?
+            .is_none()
+        {
+            client.shutdown().await;
+            return Err(AgentError::NotAvailable(
+                "ACP session changed while loading; refresh again".into(),
+            ));
+        }
+        if !state.catalog.commands.is_empty() {
+            self.commands_observed.store(true, Ordering::Release);
+        }
+        let session = Arc::new(Session {
+            client,
+            state: Mutex::new(state),
+            busy: AtomicBool::new(false),
+            connected: AtomicBool::new(true),
+            completions,
+            prompt_capabilities: PromptCapabilities {
+                images: capabilities
+                    .pointer("/promptCapabilities/image")
+                    .and_then(Value::as_bool)
+                    == Some(true),
+                embedded_context: capabilities
+                    .pointer("/promptCapabilities/embeddedContext")
+                    .and_then(Value::as_bool)
+                    == Some(true),
+            },
+            native_capabilities: capabilities,
+            commands_observed: self.commands_observed.clone(),
+            finished: CancellationToken::new(),
+        });
+        self.sessions
+            .lock()
+            .unwrap()
+            .insert(id.clone(), session.clone());
+        Self::emit(
+            &self.mirror,
+            &self.tx,
+            AgentDomainEvent::Resync {
+                asid: id.as_str().into(),
+                reason: "acp_session_loaded".into(),
+            },
+        );
+        Self::listen(
+            session.clone(),
+            events,
+            completed,
+            self.mirror.clone(),
+            self.tx.clone(),
+            self.stop.child_token(),
+        );
+        Ok(session)
+    }
+
+    fn emit(
+        mirror: &MemoryMirror,
+        tx: &broadcast::Sender<AgentDomainEvent>,
+        mut event: AgentDomainEvent,
+    ) {
+        mirror.stamp_event(&mut event);
+        let _ = tx.send(event);
+    }
+
+    async fn status(
+        session: &Session,
+        mirror: &MemoryMirror,
+        tx: &broadcast::Sender<AgentDomainEvent>,
+        status: AgentSessionStatus,
+        error: Option<AgentErrorInfo>,
+    ) {
+        let asid = {
+            let mut state = session.state.lock().await;
+            state.info.status = status;
+            state.info.error = error.clone();
+            state.info.updated_ms = mapper::now_ms();
+            state.info.asid.clone()
+        };
+        if let Some(seq) = mirror.update_status(&asid, status, error.clone()).await {
+            Self::emit(
+                mirror,
+                tx,
+                AgentDomainEvent::StatusChanged {
+                    asid,
+                    status,
+                    error,
+                    seq,
+                },
+            );
+        }
+    }
+
+    fn reduce(
+        state: &mut SessionState,
+        update: &Value,
+    ) -> Result<Option<TimelineItem>, AgentError> {
+        match update["sessionUpdate"].as_str() {
+            Some("session_info_update") => {
+                if let Some(title) = update["title"].as_str() {
+                    state.info.title = title.into();
+                }
+                Ok(None)
+            }
+            Some("usage_update") => {
+                if let Some(used) = update["used"].as_u64() {
+                    state.info.context_usage = Some(SessionContextUsage {
+                        tokens: None,
+                        total_tokens: used,
+                        limit: update["size"].as_u64().map(|size| json!({"context":size})),
+                    });
+                }
+                Ok(None)
+            }
+            Some("available_commands_update") => {
+                state.catalog.commands = operations::commands(update)?;
+                Ok(None)
+            }
+            Some("current_mode_update") => {
+                state.info.mode = update["currentModeId"].as_str().map(str::to_owned);
+                Ok(None)
+            }
+            Some("config_option_update") => {
+                state.config["configOptions"] = update["configOptions"].clone();
+                let mut catalog = mapper::catalog_for(&state.config, P::KIND);
+                catalog.commands = state.catalog.commands.clone();
+                catalog.modes = state.catalog.modes.clone();
+                catalog.defaults.mode = state.catalog.defaults.mode.clone();
+                state.catalog = catalog;
+                state.config["configOptions"] = update["configOptions"].clone();
+                state.info.model = mapper::selected_model_for(&state.config, P::KIND);
+                Ok(None)
+            }
+            _ => state.projection.update(update),
+        }
+    }
+
+    async fn notification(
+        session: &Session,
+        mirror: &MemoryMirror,
+        tx: &broadcast::Sender<AgentDomainEvent>,
+        params: &Value,
+    ) {
+        let mut state = session.state.lock().await;
+        let asid = state.info.asid.clone();
+        if params["sessionId"].as_str() != Some(asid.0.as_str()) {
+            session.connected.store(false, Ordering::Release);
+            state.info.status = AgentSessionStatus::Unknown;
+            if let Some(seq) = mirror
+                .update_status(&asid, AgentSessionStatus::Unknown, None)
+                .await
+            {
+                Self::emit(
+                    mirror,
+                    tx,
+                    AgentDomainEvent::StatusChanged {
+                        asid: asid.clone(),
+                        status: AgentSessionStatus::Unknown,
+                        error: None,
+                        seq,
+                    },
+                );
+            }
+            Self::emit(
+                mirror,
+                tx,
+                AgentDomainEvent::Resync {
+                    asid,
+                    reason: "ACP event changed session identity".into(),
+                },
+            );
+            return;
+        }
+        let old_info = state.info.clone();
+        let old_commands = state.catalog.commands.clone();
+        match Self::reduce(&mut state, &params["update"]) {
+            Ok(Some(row)) => {
+                let event = mirror.record_timeline_upsert(&asid, vec![row]).await;
+                Self::emit(mirror, tx, event);
+            }
+            Ok(None) if old_commands != state.catalog.commands => {
+                if !state.catalog.commands.is_empty() {
+                    session.commands_observed.store(true, Ordering::Release);
+                }
+                Self::emit(
+                    mirror,
+                    tx,
+                    AgentDomainEvent::Resync {
+                        asid,
+                        reason: "agent_catalog_changed".into(),
+                    },
+                );
+            }
+            Ok(None) if old_info != state.info => {
+                let info = state.info.clone();
+                let seq = mirror.update_session(info.clone()).await;
+                Self::emit(
+                    mirror,
+                    tx,
+                    AgentDomainEvent::SessionUpdated {
+                        asid,
+                        info: Box::new(info),
+                        seq,
+                    },
+                );
+            }
+            Ok(None) => {}
+            Err(error) => {
+                session.connected.store(false, Ordering::Release);
+                state.info.status = AgentSessionStatus::Unknown;
+                let error_info = Some(AgentErrorInfo {
+                    name: "AcpHistoryUnavailable".into(),
+                    message: error.to_string(),
+                    status: None,
+                    retry_after_ms: None,
+                });
+                state.info.error = error_info.clone();
+                if let Some(seq) = mirror
+                    .update_status(&asid, AgentSessionStatus::Unknown, error_info.clone())
+                    .await
+                {
+                    Self::emit(
+                        mirror,
+                        tx,
+                        AgentDomainEvent::StatusChanged {
+                            asid: asid.clone(),
+                            status: AgentSessionStatus::Unknown,
+                            error: error_info,
+                            seq,
+                        },
+                    );
+                }
+                Self::emit(
+                    mirror,
+                    tx,
+                    AgentDomainEvent::Resync {
+                        asid,
+                        reason: error.to_string(),
+                    },
+                );
+            }
+        }
+    }
+
+    async fn event(
+        session: &Session,
+        mirror: &MemoryMirror,
+        tx: &broadcast::Sender<AgentDomainEvent>,
+        event: AcpEvent,
+    ) -> bool {
+        match event {
+            AcpEvent::Notification { method, params } if method == "session/update" => {
+                Self::notification(session, mirror, tx, &params).await
+            }
+            AcpEvent::Request { id, method, params } if method == "session/request_permission" => {
+                let mut state = session.state.lock().await;
+                if params["sessionId"].as_str() != Some(state.info.asid.0.as_str()) {
+                    let _ = session
+                        .client
+                        .respond_error(id, -32602, "Session identity mismatch")
+                        .await;
+                    return true;
+                }
+                match state.projection.permission(id.clone(), &params) {
+                    Ok(mut permission) => {
+                        let mut tool = params["toolCall"].clone();
+                        tool["sessionUpdate"] = json!("tool_call");
+                        match state.projection.update(&tool) {
+                            Ok(Some(row)) => {
+                                permission.request.source_message_id = Some(row.message_id.clone());
+                                let event = mirror
+                                    .record_timeline_upsert(&state.info.asid, vec![row])
+                                    .await;
+                                Self::emit(mirror, tx, event);
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                session.connected.store(false, Ordering::Release);
+                                state.info.status = AgentSessionStatus::Unknown;
+                                let asid = state.info.asid.clone();
+                                if let Some(seq) = mirror
+                                    .update_status(&asid, AgentSessionStatus::Unknown, None)
+                                    .await
+                                {
+                                    Self::emit(
+                                        mirror,
+                                        tx,
+                                        AgentDomainEvent::StatusChanged {
+                                            asid: asid.clone(),
+                                            status: AgentSessionStatus::Unknown,
+                                            error: None,
+                                            seq,
+                                        },
+                                    );
+                                }
+                                Self::emit(
+                                    mirror,
+                                    tx,
+                                    AgentDomainEvent::Resync {
+                                        asid,
+                                        reason: error.to_string(),
+                                    },
+                                );
+                                return false;
+                            }
+                        }
+                        let request = permission.request.clone();
+                        state.permissions.insert(request.id.clone(), permission);
+                        let seq = mirror.add_permission(request.clone()).await;
+                        Self::emit(
+                            mirror,
+                            tx,
+                            AgentDomainEvent::PermissionPending {
+                                asid: request.asid.clone(),
+                                request,
+                                seq,
+                            },
+                        );
+                    }
+                    Err(_) => {
+                        let _ = session
+                            .client
+                            .respond_error(id, -32602, "Invalid permission request")
+                            .await;
+                    }
+                }
+            }
+            AcpEvent::Disconnected { reason } => {
+                session.connected.store(false, Ordering::Release);
+                Self::status(
+                    session,
+                    mirror,
+                    tx,
+                    AgentSessionStatus::Unknown,
+                    Some(AgentErrorInfo {
+                        name: "AcpDisconnected".into(),
+                        message: format!("{reason}; prompt delivery will not be retried"),
+                        status: None,
+                        retry_after_ms: None,
+                    }),
+                )
+                .await;
+                Self::clear_permissions(session, mirror, tx).await;
+                return false;
+            }
+            _ => {}
+        }
+        session.connected.load(Ordering::Acquire)
+    }
+
+    async fn clear_permissions(
+        session: &Session,
+        mirror: &MemoryMirror,
+        tx: &broadcast::Sender<AgentDomainEvent>,
+    ) {
+        let mut state = session.state.lock().await;
+        state.projection.end_turn();
+        let asid = state.info.asid.clone();
+        for (request_id, _) in state.permissions.drain() {
+            let seq = mirror.resolve_permission(&asid, &request_id).await;
+            Self::emit(
+                mirror,
+                tx,
+                AgentDomainEvent::PermissionResolved {
+                    asid: asid.clone(),
+                    request_id,
+                    seq,
+                },
+            );
+        }
+    }
+
+    async fn finish_usage(
+        session: &Session,
+        mirror: &MemoryMirror,
+        tx: &broadcast::Sender<AgentDomainEvent>,
+        response: Option<&Value>,
+    ) {
+        let mut state = session.state.lock().await;
+        let native_provider = state
+            .info
+            .model
+            .as_ref()
+            .map(|model| model.provider_id.as_str())
+            .unwrap_or(P::KIND);
+        let turn =
+            response.and_then(|response| mapper::turn_usage(response, P::KIND, native_provider));
+        let total = state.usage.finish(turn);
+        if state.info.tokens != total {
+            state.info.tokens = total;
+            let info = state.info.clone();
+            let seq = mirror.update_session(info.clone()).await;
+            Self::emit(
+                mirror,
+                tx,
+                AgentDomainEvent::SessionUpdated {
+                    asid: info.asid.clone(),
+                    info: Box::new(info),
+                    seq,
+                },
+            );
+        }
+    }
+
+    fn listen(
+        session: Arc<Session>,
+        mut events: broadcast::Receiver<AcpEvent>,
+        mut completed: mpsc::UnboundedReceiver<Result<Value, String>>,
+        mirror: Arc<MemoryMirror>,
+        tx: broadcast::Sender<AgentDomainEvent>,
+        stop: CancellationToken,
+    ) {
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = stop.cancelled() => break,
+                    event = events.recv() => match event {
+                        Ok(event) => if !Self::event(&session, &mirror, &tx, event).await { break; },
+                        Err(_) => { Self::status(&session, &mirror, &tx, AgentSessionStatus::Unknown, None).await; break; }
+                    },
+                    Some(result) = completed.recv() => {
+                        // The RPC reader queued all updates before resolving this reply.
+                        while let Ok(event) = events.try_recv() { if !Self::event(&session, &mirror, &tx, event).await { break; } }
+                        if !session.connected.load(Ordering::Acquire) { break; }
+                        Self::finish_usage(&session, &mirror, &tx, result.as_ref().ok()).await;
+                        let (status, error) = match result {
+                            Ok(value) => match value["stopReason"].as_str() {
+                                Some("cancelled") => (AgentSessionStatus::Interrupted, None),
+                                Some("end_turn" | "max_tokens" | "max_turn_requests" | "refusal") => (AgentSessionStatus::Idle, None),
+                                _ => (AgentSessionStatus::Unknown, Some(AgentErrorInfo { name: "AcpUnknownStop".into(), message: "ACP returned no recognized stop reason".into(), status: None, retry_after_ms: None })),
+                            },
+                            Err(error) => (AgentSessionStatus::Failed, Some(AgentErrorInfo { name: "AcpPromptFailed".into(), message: format!("{error}; delivery was not retried"), status: None, retry_after_ms: None })),
+                        };
+                        Self::clear_permissions(&session, &mirror, &tx).await;
+                        Self::status(&session, &mirror, &tx, status, error).await;
+                        session.busy.store(false, Ordering::Release);
+                    }
+                }
+            }
+            session.connected.store(false, Ordering::Release);
+            Self::clear_permissions(&session, &mirror, &tx).await;
+            session.client.shutdown().await;
+            session.finished.cancel();
+        });
+    }
+}
+
+impl<P: AcpProvider> Drop for AcpDriver<P> {
+    fn drop(&mut self) {
+        self.stop.cancel();
+    }
+}
+
+impl<P: AcpProvider> AgentPort for AcpDriver<P> {
+    fn kind(&self) -> &'static str {
+        P::KIND
+    }
+    fn supports_earlier_timeline(&self) -> bool {
+        true
+    }
+    fn load_earlier_timeline<'a>(
+        &'a self,
+        id: &'a str,
+        limit: usize,
+    ) -> AgentFuture<'a, Vec<TimelineItem>> {
+        Box::pin(async move {
+            if limit == 0 {
+                return Err(AgentError::InvalidRequest(
+                    "history page limit must be positive".into(),
+                ));
+            }
+            // Each accepted ACP load already validates the complete native replay.
+            // Older retained rows page through MemoryMirror before this hook runs.
+            if self.readonly_empty_snapshot(id).await? {
+                return Ok(Vec::new());
+            }
+            self.ensure_loaded(id).await?;
+            Ok(Vec::new())
+        })
+    }
+    fn probe(&self) -> AgentFuture<'_, bool> {
+        Box::pin(async { Ok(self.is_connected()) })
+    }
+    fn account_limits(
+        &self,
+    ) -> AgentFuture<'_, crate::agents::domain::account_limits::AccountLimits> {
+        P::account_limits(&self.binary, &self.default_directory, &self.stop)
+    }
+    fn attachment_mode(&self) -> AttachmentMode {
+        AttachmentMode::NativeUploads
+    }
+    fn slash_commands_listed(&self) -> bool {
+        self.commands_observed.load(Ordering::Acquire)
+    }
+    fn run_command<'a>(
+        &'a self,
+        id: &'a str,
+        name: &'a str,
+        arguments: &'a str,
+        delivery: Option<&'a str>,
+    ) -> AgentFuture<'a, ()> {
+        Box::pin(async move {
+            let session = self.ensure_loaded(id).await?;
+            let prompt = operations::command_prompt(
+                &session.state.lock().await.catalog.commands,
+                name,
+                arguments,
+            )?;
+            self.send_prompt(id, &prompt, &[], delivery).await
+        })
+    }
+    fn list_projects(&self) -> AgentFuture<'_, Vec<AgentProject>> {
+        Box::pin(async move {
+            let mut directories = HashSet::new();
+            Ok(self
+                .native_sessions(None)
+                .await?
+                .into_iter()
+                .filter_map(|info| info.directory)
+                .filter(|directory| directories.insert(directory.clone()))
+                .map(|directory| AgentProject {
+                    id: directory.clone(),
+                    canonical: directory.clone(),
+                    name: std::path::Path::new(&directory)
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| directory.clone()),
+                    vcs: None,
+                    sandboxes: Vec::new(),
+                    missing: !std::path::Path::new(&directory).is_dir(),
+                })
+                .collect())
+        })
+    }
+    fn list_sessions<'a>(
+        &'a self,
+        query: &'a SessionQuery,
+    ) -> AgentFuture<'a, Vec<AgentSessionInfo>> {
+        Box::pin(async move {
+            if query.cursor.is_some() {
+                return Err(AgentError::Unsupported("session pagination".into()));
+            }
+            let mut sessions = self.native_sessions(query.directory.as_deref()).await?;
+            sessions.retain(|info| {
+                query.keeps_parent(info.parent_id.as_deref())
+                    && query.search.as_ref().is_none_or(|search| {
+                        info.title.to_lowercase().contains(&search.to_lowercase())
+                    })
+            });
+            sessions.sort_by(|a, b| {
+                b.updated_ms
+                    .cmp(&a.updated_ms)
+                    .then_with(|| a.asid.0.cmp(&b.asid.0))
+            });
+            if query.order.as_deref() == Some("asc") {
+                sessions.reverse();
+            }
+            if let Some(limit) = query.limit {
+                sessions.truncate(limit);
+            }
+            Ok(sessions)
+        })
+    }
+    fn create_session<'a>(
+        &'a self,
+        directory: Option<&'a str>,
+        model: Option<&'a ModelRef>,
+        mode: Option<&'a str>,
+    ) -> AgentFuture<'a, AgentSessionInfo> {
+        Box::pin(async move {
+            if model.is_some() && !P::MODEL_SELECTION {
+                return Err(AgentError::Unsupported("ACP model selection".into()));
+            }
+            if mode.is_some() {
+                return Err(AgentError::Unsupported("ACP mode selection".into()));
+            }
+            let directory = directory.unwrap_or(&self.default_directory);
+            if !std::path::Path::new(directory).is_dir() {
+                return Err(AgentError::WorkspaceMissing(directory.into()));
+            }
+            let _mutation = self.mutations.lock().await;
+            let session = self.open(directory, None).await?;
+            if let Some(model) = model {
+                if let Err(error) = self.select_model(&session, model).await {
+                    let id = session.state.lock().await.info.asid.0.clone();
+                    return Err(AgentError::RequestFailed(format!("ACP session {id} was created, but model selection failed: {error}; do not retry creation")));
+                }
+            }
+            let info = session.state.lock().await.info.clone();
+            Ok(info)
+        })
+    }
+    fn get_session<'a>(&'a self, id: &'a str) -> AgentFuture<'a, AgentSessionInfo> {
+        Box::pin(async move {
+            if let Some(session) = self.retained(id) {
+                return Ok(session.state.lock().await.info.clone());
+            }
+            self.native_session_info(id).await
+        })
+    }
+    fn prepare_selected_session<'a>(&'a self, id: &'a str) -> AgentFuture<'a, ()> {
+        Box::pin(async move {
+            if self.readonly_empty_snapshot(id).await? {
+                return Ok(());
+            }
+            // Only an explicit selection/refresh may replace a dead connection.
+            // Wait for the old reducer to stop before a same-id load publishes.
+            {
+                let _mutation = self.mutations.lock().await;
+                if let Some(session) = self.retained(id) {
+                    if !session.connected.load(Ordering::Acquire) {
+                        session.client.shutdown().await;
+                        tokio::time::timeout(Duration::from_secs(5), session.finished.cancelled())
+                            .await
+                            .map_err(|_| {
+                                AgentError::NotAvailable(
+                                    "ACP previous connection has not stopped yet".into(),
+                                )
+                            })?;
+                        self.sessions.lock().unwrap().remove(id);
+                    }
+                }
+            }
+            self.ensure_loaded(id).await.map(|_| ())
+        })
+    }
+    fn send_prompt<'a>(
+        &'a self,
+        id: &'a str,
+        text: &'a str,
+        attachments: &'a [String],
+        delivery: Option<&'a str>,
+    ) -> AgentFuture<'a, ()> {
+        Box::pin(async move {
+            if delivery.is_some_and(|delivery| delivery != "auto") {
+                return Err(AgentError::Unsupported(
+                    "ACP prompt steering or queueing".into(),
+                ));
+            }
+            let session = self.ensure_loaded(id).await?;
+            let prepared =
+                operations::prompt_parts(text, attachments, session.prompt_capabilities).await?;
+            if session
+                .busy
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                return Err(AgentError::NotAvailable(
+                    "ACP session is already processing a turn".into(),
+                ));
+            }
+            let mut admission = Admission {
+                busy: &session.busy,
+                handed_off: false,
+            };
+            // Admission and the local user row share the state lock: a fast
+            // native response cannot appear ahead of its submitted user text.
+            // Busy is published only after a request was actually flushed.
+            let mut state = session.state.lock().await;
+            state.projection.can_submit(&prepared.transcript)?;
+            let request = session
+                .client
+                .start_request(
+                    "session/prompt",
+                    json!({ "sessionId": id, "prompt": prepared.content }),
+                )
+                .await;
+            match request {
+                Ok(request) => {
+                    state.info.status = AgentSessionStatus::Busy;
+                    state.info.error = None;
+                    state.info.updated_ms = mapper::now_ms();
+                    if let Some(seq) = self
+                        .mirror
+                        .update_status(&state.info.asid, AgentSessionStatus::Busy, None)
+                        .await
+                    {
+                        Self::emit(
+                            &self.mirror,
+                            &self.tx,
+                            AgentDomainEvent::StatusChanged {
+                                asid: state.info.asid.clone(),
+                                status: AgentSessionStatus::Busy,
+                                error: None,
+                                seq,
+                            },
+                        );
+                    }
+                    let row = state.projection.submitted(&prepared.transcript);
+                    let event = self
+                        .mirror
+                        .record_timeline_upsert(&state.info.asid, vec![row])
+                        .await;
+                    Self::emit(&self.mirror, &self.tx, event);
+                    drop(state);
+                    let sender = session.completions.clone();
+                    tokio::spawn(async move {
+                        let _ = sender.send(request.wait().await);
+                    });
+                    admission.handed_off = true;
+                    Ok(())
+                }
+                Err(error) => {
+                    drop(state);
+                    // A partial stdio write can be ambiguous. Preserve the uncertainty;
+                    // no automatic retry, queue fallback or second delivery is allowed.
+                    session.connected.store(false, Ordering::Release);
+                    Self::status(
+                        &session,
+                        &self.mirror,
+                        &self.tx,
+                        AgentSessionStatus::Unknown,
+                        None,
+                    )
+                    .await;
+                    Err(AgentError::Network(format!(
+                        "{error}; prompt delivery may have occurred; do not retry automatically"
+                    )))
+                }
+            }
+        })
+    }
+    fn interrupt<'a>(&'a self, id: &'a str) -> AgentFuture<'a, ()> {
+        Box::pin(async move {
+            let session = self
+                .retained(id)
+                .ok_or_else(|| AgentError::SessionNotFound(id.into()))?;
+            if !session.connected.load(Ordering::Acquire) {
+                return Err(AgentError::NotAvailable("ACP connection ended".into()));
+            }
+            session
+                .client
+                .notify("session/cancel", json!({"sessionId":id}))
+                .await
+                .map_err(AgentError::Network)
+        })
+    }
+    fn reply_permission<'a>(
+        &'a self,
+        id: &'a str,
+        request_id: &'a str,
+        decision: PermissionDecision,
+        message: Option<&'a str>,
+    ) -> AgentFuture<'a, ()> {
+        Box::pin(async move {
+            if message.is_some_and(|message| !message.is_empty()) {
+                return Err(AgentError::Unsupported(
+                    "ACP permission rejection reasons".into(),
+                ));
+            }
+            let session = self
+                .retained(id)
+                .ok_or_else(|| AgentError::SessionNotFound(id.into()))?;
+            let mut state = session.state.lock().await;
+            let permission = state.permissions.get(request_id).ok_or_else(|| {
+                AgentError::InvalidRequest("ACP permission is no longer pending".into())
+            })?;
+            let option = permission
+                .options
+                .iter()
+                .filter(|(candidate, _)| *candidate == decision)
+                .collect::<Vec<_>>();
+            if option.len() != 1 {
+                return Err(AgentError::Unsupported(
+                    "requested ACP permission option is unavailable or ambiguous".into(),
+                ));
+            }
+            session
+                .client
+                .respond(
+                    permission.rpc_id.clone(),
+                    json!({"outcome":{"outcome":"selected","optionId":option[0].1}}),
+                )
+                .await
+                .map_err(AgentError::Network)?;
+            state.permissions.remove(request_id);
+            let asid = AgentSessionId::from(id);
+            let seq = self.mirror.resolve_permission(&asid, request_id).await;
+            Self::emit(
+                &self.mirror,
+                &self.tx,
+                AgentDomainEvent::PermissionResolved {
+                    asid,
+                    request_id: request_id.into(),
+                    seq,
+                },
+            );
+            Ok(())
+        })
+    }
+    fn get_pending_permissions<'a>(
+        &'a self,
+        id: &'a str,
+    ) -> AgentFuture<'a, Vec<PermissionRequest>> {
+        Box::pin(async move {
+            if self.readonly_empty_snapshot(id).await? {
+                return Ok(Vec::new());
+            }
+            let session = self.ensure_loaded(id).await?;
+            let pending = session
+                .state
+                .lock()
+                .await
+                .permissions
+                .values()
+                .map(|permission| permission.request.clone())
+                .collect();
+            Ok(pending)
+        })
+    }
+    fn get_pending_forms<'a>(&'a self, id: &'a str) -> AgentFuture<'a, Vec<FormRequest>> {
+        Box::pin(async move {
+            self.get_session(id).await?;
+            Ok(Vec::new())
+        })
+    }
+    fn get_catalog<'a>(&'a self, directory: Option<&'a str>) -> AgentFuture<'a, AgentCatalog> {
+        Box::pin(async move { self.available_catalog(directory).await })
+    }
+    fn get_catalog_for_session<'a>(
+        &'a self,
+        id: Option<&'a str>,
+        directory: Option<&'a str>,
+    ) -> AgentFuture<'a, AgentCatalog> {
+        Box::pin(async move {
+            if let Some(id) = id {
+                if self.readonly_empty_snapshot(id).await? {
+                    return Ok(AgentCatalog::default());
+                }
+                let session = self.ensure_loaded(id).await?;
+                let mut catalog = session.state.lock().await.catalog.clone();
+                if !P::MODEL_SELECTION {
+                    catalog.models.clear();
+                    catalog.defaults.model = None;
+                }
+                // ACP mode changes persist permission defaults outside the current
+                // session, so the existing App must not offer them as local choices.
+                catalog.modes.clear();
+                catalog.defaults.mode = None;
+                Ok(catalog)
+            } else {
+                self.get_catalog(directory).await
+            }
+        })
+    }
+    fn get_timeline<'a>(
+        &'a self,
+        id: &'a str,
+        _limit: usize,
+    ) -> AgentFuture<'a, Vec<TimelineItem>> {
+        Box::pin(async move {
+            if self.readonly_empty_snapshot(id).await? {
+                return Ok(Vec::new());
+            }
+            let session = self.ensure_loaded(id).await?;
+            let timeline = session
+                .state
+                .lock()
+                .await
+                .projection
+                .timeline()
+                .into_iter()
+                .map(|mut row| {
+                    row.seq = 0;
+                    row
+                })
+                .collect();
+            Ok(timeline)
+        })
+    }
+    fn fork_session<'a>(
+        &'a self,
+        id: &'a str,
+        message_id: Option<&'a str>,
+    ) -> AgentFuture<'a, AgentSessionInfo> {
+        Box::pin(async move {
+            let _mutation = self.mutations.lock().await;
+            let source = self.retained(id).ok_or_else(|| {
+                AgentError::Unsupported("open a Gateway-owned session before forking".into())
+            })?;
+            if !source.connected.load(Ordering::Acquire)
+                || !operations::supports_operation(&source.native_capabilities, "fork")
+            {
+                return Err(AgentError::Unsupported("native session fork".into()));
+            }
+            if source
+                .busy
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                return Err(AgentError::NotAvailable("session is busy".into()));
+            }
+            let _admission = Admission {
+                busy: &source.busy,
+                handed_off: false,
+            };
+            let info = source.state.lock().await.info.clone();
+            if message_id.is_some() {
+                return Err(AgentError::Unsupported(
+                    "ACP fork at a message boundary".into(),
+                ));
+            }
+            if source.state.lock().await.projection.rows.is_empty() {
+                return Err(AgentError::InvalidRequest(
+                    "No conversation to branch".into(),
+                ));
+            }
+            let directory = info
+                .directory
+                .as_deref()
+                .ok_or_else(|| protocol("source session has no directory"))?;
+            let params = operations::fork_params(id, directory, message_id)?;
+            let (client, _events, capabilities) = self.initialized(directory).await?;
+            if !operations::supports_operation(&capabilities, "fork") {
+                client.shutdown().await;
+                return Err(AgentError::Unsupported("native session fork".into()));
+            }
+            let response = client
+                .request_with_timeout("session/fork", params, RPC_TIMEOUT)
+                .await;
+            client.shutdown().await;
+            let response = response.map_err(AgentError::RequestFailed)?;
+            let new_id = operations::forked_session_id(id, &response)?;
+            if self.retained(&new_id).is_some()
+                || self
+                    .mirror
+                    .session_info(&AgentSessionId::from(new_id.as_str()))
+                    .await
+                    .is_some()
+            {
+                return Err(protocol(
+                    "fork returned an existing session identity; do not retry automatically",
+                ));
+            }
+            let cloned=self.open(directory,Some(mapper::session(&new_id,directory,&response))).await.map_err(|error|AgentError::RequestFailed(format!("session {new_id} was forked but could not be loaded: {error}; do not retry fork")))?;
+            let mut state = cloned.state.lock().await;
+            state.owned_mutations = true;
+            Ok(state.info.clone())
+        })
+    }
+    fn delete_session<'a>(&'a self, id: &'a str) -> AgentFuture<'a, ()> {
+        Box::pin(async move {
+            let _mutation = self.mutations.lock().await;
+            let session = self.retained(id).ok_or_else(|| {
+                AgentError::Unsupported(
+                    "deletion requires a session created by this Gateway".into(),
+                )
+            })?;
+            if !session.connected.load(Ordering::Acquire)
+                || !session.state.lock().await.owned_mutations
+                || !operations::supports_operation(&session.native_capabilities, "delete")
+            {
+                return Err(AgentError::Unsupported(
+                    "deletion requires an idle Gateway-created native session".into(),
+                ));
+            }
+            if session
+                .busy
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                return Err(AgentError::NotAvailable("session is busy".into()));
+            }
+            let _admission = Admission {
+                busy: &session.busy,
+                handed_off: false,
+            };
+            let params = operations::delete_params(id)?;
+            // Qoder resolves deletion through this connection's bound workspace.
+            // An unbound temporary client may acknowledge without deleting it.
+            let result = session
+                .client
+                .request_with_timeout("session/delete", params, RPC_TIMEOUT)
+                .await;
+            let value = result.map_err(AgentError::RequestFailed)?;
+            if !value.is_object() {
+                return Err(protocol(
+                    "native deletion outcome is unknown; do not retry automatically",
+                ));
+            }
+            session.connected.store(false, Ordering::Release);
+            session.client.shutdown().await;
+            tokio::time::timeout(Duration::from_secs(5), session.finished.cancelled())
+                .await
+                .map_err(|_| {
+                    AgentError::NotAvailable("deleted session connection has not stopped".into())
+                })?;
+            self.sessions.lock().unwrap().remove(id);
+            if let Some(metadata) = self.session_metadata.lock().await.as_mut() {
+                metadata.sessions.remove(id);
+            }
+            Ok(())
+        })
+    }
+    fn revert_session<'a>(&'a self, _id: &'a str, _message: &'a str) -> AgentFuture<'a, ()> {
+        unsupported("revert")
+    }
+    fn switch_model<'a>(&'a self, id: &'a str, model: &'a ModelRef) -> AgentFuture<'a, ()> {
+        Box::pin(async move {
+            let session = self.ensure_loaded(id).await?;
+            self.select_model(&session, model).await
+        })
+    }
+    fn switch_mode<'a>(&'a self, _id: &'a str, _mode: &'a str) -> AgentFuture<'a, ()> {
+        unsupported("mode selection")
+    }
+    fn find_files<'a>(
+        &'a self,
+        _query: &'a str,
+        _limit: usize,
+        _directory: Option<&'a str>,
+    ) -> AgentFuture<'a, Vec<Value>> {
+        unsupported("file search")
+    }
+    fn reply_form<'a>(
+        &'a self,
+        _id: &'a str,
+        _form: &'a str,
+        _answers: Value,
+    ) -> AgentFuture<'a, ()> {
+        unsupported("interactive forms")
+    }
+    fn get_vcs_diff<'a>(
+        &'a self,
+        _id: &'a str,
+        _mode: &'a str,
+    ) -> AgentFuture<'a, Vec<FileDiffItem>> {
+        unsupported("VCS diff")
+    }
+}
+
+#[cfg(all(test, unix))]
+mod admission_tests {
+    use super::*;
+    use crate::agents::adapters::fx::tests::integration::Fixture;
+
+    #[tokio::test]
+    async fn verified_empty_history_is_readonly_without_starting_a_child() {
+        let fixture = Fixture::new().await;
+        let driver = fixture.qoder_driver();
+        let mut empty =
+            mapper::session("verified-empty", "", &json!({"title":"Empty conversation"}));
+        empty.directory = None;
+        empty.status = AgentSessionStatus::Unknown;
+        empty.runtime = Some(AcpDriver::<
+            crate::agents::adapters::qoder::driver::QoderProvider,
+        >::empty_runtime());
+        let mut nonempty = empty.clone();
+        nonempty.asid = "unknown-nonempty".into();
+        nonempty.backend_session_id = "unknown-nonempty".into();
+        nonempty.runtime = None;
+        *driver.session_metadata.lock().await = Some(SessionMetadata {
+            listed_at: tokio::time::Instant::now(),
+            sessions: [empty.clone(), nonempty]
+                .into_iter()
+                .map(|info| (info.asid.0.clone(), info))
+                .collect(),
+        });
+        let before = fixture.methods();
+        driver
+            .prepare_selected_session("verified-empty")
+            .await
+            .unwrap();
+        assert_eq!(driver.get_session("verified-empty").await.unwrap(), empty);
+        assert!(driver
+            .get_timeline("verified-empty", 100)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(driver
+            .get_pending_permissions("verified-empty")
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(driver
+            .get_pending_forms("verified-empty")
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(driver
+            .load_earlier_timeline("verified-empty", 80)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            driver
+                .get_catalog_for_session(Some("verified-empty"), None)
+                .await
+                .unwrap(),
+            AgentCatalog::default()
+        );
+        let snapshot = driver.mirror.get_snapshot(&empty.asid).await.unwrap();
+        assert_eq!(snapshot.info.asid, empty.asid);
+        assert!(snapshot.info.directory.is_none());
+        assert!(
+            snapshot.timeline.is_empty()
+                && snapshot.permissions.is_empty()
+                && snapshot.forms.is_empty()
+        );
+        assert!(matches!(
+            driver
+                .send_prompt("verified-empty", "do not send", &[], None)
+                .await,
+            Err(AgentError::NotAvailable(_))
+        ));
+        assert!(matches!(
+            driver.get_timeline("unknown-nonempty", 100).await,
+            Err(AgentError::NotAvailable(_))
+        ));
+        assert!(driver
+            .mirror
+            .get_snapshot(&AgentSessionId::from("unknown-nonempty"))
+            .await
+            .is_none());
+        assert_eq!(fixture.methods(), before);
+        driver.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn listed_metadata_avoids_a_second_list_before_history_load() {
+        let fixture = Fixture::new().await;
+        let original = fixture.qoder_driver();
+        let info = original.create_session(None, None, None).await.unwrap();
+        original.shutdown().await;
+        let resumed = fixture.qoder_driver();
+        let before = fixture.methods();
+        resumed.native_sessions(None).await.unwrap();
+        assert_eq!(
+            resumed.get_session(&info.asid.0).await.unwrap().asid,
+            info.asid
+        );
+        resumed
+            .prepare_selected_session(&info.asid.0)
+            .await
+            .unwrap();
+        let methods = fixture.methods();
+        let recent = &methods[before.len()..];
+        assert_eq!(
+            recent
+                .iter()
+                .filter(|method| *method == "session/list")
+                .count(),
+            1
+        );
+        assert_eq!(
+            recent
+                .iter()
+                .filter(|method| *method == "session/load")
+                .count(),
+            1
+        );
+        assert!(!recent.iter().any(|method| method == "session/prompt"));
+        resumed
+            .session_metadata
+            .lock()
+            .await
+            .as_mut()
+            .unwrap()
+            .listed_at = tokio::time::Instant::now() - SESSION_METADATA_TTL;
+        resumed.native_session_info(&info.asid.0).await.unwrap();
+        assert_eq!(
+            fixture
+                .methods()
+                .iter()
+                .filter(|method| *method == "session/list")
+                .count(),
+            2
+        );
+        resumed.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn unknown_directory_is_not_replaced_with_home_and_native_titles_refresh() {
+        let fixture = Fixture::new().await;
+        let driver = &fixture.driver;
+        let info = driver.create_session(None, None, None).await.unwrap();
+        let rows = driver
+            .project_listed_sessions(vec![
+                json!({
+                    "sessionId":info.asid.0, "cwd":"", "title":"Native renamed title"
+                }),
+                json!({"sessionId":"unknown-directory", "cwd":"", "title":"Unknown"}),
+            ])
+            .await
+            .unwrap();
+        assert_eq!(rows[0].directory, info.directory);
+        assert_eq!(rows[0].title, "Native renamed title");
+        assert!(rows[1].directory.is_none());
+        assert_eq!(
+            driver
+                .mirror
+                .get_snapshot(&info.asid)
+                .await
+                .unwrap()
+                .info
+                .title,
+            "Native renamed title"
+        );
+        *driver.session_metadata.lock().await = Some(SessionMetadata {
+            listed_at: tokio::time::Instant::now(),
+            sessions: rows
+                .into_iter()
+                .map(|info| (info.asid.0.clone(), info))
+                .collect(),
+        });
+        let before = fixture.methods();
+        assert!(matches!(
+            driver.ensure_loaded("unknown-directory").await,
+            Err(AgentError::NotAvailable(_))
+        ));
+        assert_eq!(fixture.methods(), before);
+        driver.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn global_catalog_cache_and_failure_preserve_current_commands() {
+        let fixture = Fixture::new().await;
+        let driver = &fixture.driver;
+        let info = driver.create_session(None, None, None).await.unwrap();
+        let session = driver.retained(&info.asid.0).unwrap();
+        let command = |name: &str| CommandInfo {
+            name: name.into(),
+            description: None,
+            mode: None,
+            template: None,
+        };
+        let mut state = session.state.lock().await;
+        let global = state.catalog.clone();
+        assert!(!global.models.is_empty());
+        assert!(global.commands.is_empty());
+        state.catalog.models.clear();
+        state.catalog.commands = vec![command("rename")];
+        drop(state);
+        *driver.global_catalog.lock().await = Some((
+            driver.default_directory.clone(),
+            tokio::time::Instant::now(),
+            Ok(global.clone()),
+        ));
+
+        let catalog = driver.available_catalog(None).await.unwrap();
+        assert_eq!(catalog.models, global.models);
+        assert_eq!(catalog.commands, vec![command("rename")]);
+        session.state.lock().await.catalog.commands = vec![command("goal")];
+        let catalog = driver.available_catalog(None).await.unwrap();
+        assert_eq!(catalog.commands, vec![command("goal")]);
+        assert!(driver
+            .global_catalog
+            .lock()
+            .await
+            .as_ref()
+            .unwrap()
+            .2
+            .as_ref()
+            .unwrap()
+            .commands
+            .is_empty());
+
+        // This ACP-only fixture returns no CLI metadata. A fresh global lookup
+        // fails, and its cached failure must not erase known session commands.
+        *driver.global_catalog.lock().await = None;
+        for _ in 0..2 {
+            let catalog = driver.available_catalog(None).await.unwrap();
+            assert!(catalog.models.is_empty());
+            assert_eq!(catalog.commands, vec![command("goal")]);
+            assert!(driver
+                .global_catalog
+                .lock()
+                .await
+                .as_ref()
+                .unwrap()
+                .2
+                .is_err());
+        }
+        driver.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_before_dispatch_keeps_idle_and_sends_no_prompt() {
+        let fixture = Fixture::new().await;
+        let info = fixture
+            .driver
+            .create_session(None, None, None)
+            .await
+            .unwrap();
+        let session = fixture.driver.retained(&info.asid.0).unwrap();
+        let projection = session.state.lock().await;
+        let driver = fixture.driver.clone();
+        let id = info.asid.0.clone();
+        let pending =
+            tokio::spawn(
+                async move { driver.send_prompt(&id, "never dispatched", &[], None).await },
+            );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !session.busy.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        pending.abort();
+        assert!(pending.await.unwrap_err().is_cancelled());
+        assert!(!session.busy.load(Ordering::Acquire));
+        assert_eq!(projection.info.status, AgentSessionStatus::Idle);
+        drop(projection);
+        let snapshot = fixture
+            .driver
+            .mirror
+            .get_snapshot(&info.asid)
+            .await
+            .unwrap();
+        assert_eq!(snapshot.info.status, AgentSessionStatus::Idle);
+        assert!(snapshot.timeline.is_empty());
+        assert!(!fixture.methods().contains(&"session/prompt".into()));
+    }
+}

@@ -50,7 +50,16 @@ pub(crate) fn test_config(token: &str) -> Config {
         opencode: agents::OpencodeConfig::default(),
         deepseek: agents::DeepseekConfig::default(),
         t3: agents::T3Config::default(),
+        pi: agents::PiConfig::default(),
         codex: agents::runtime::CodexConfig {
+            enabled: false,
+            binary: None,
+        },
+        fx: agents::runtime::FxConfig {
+            enabled: false,
+            binary: None,
+        },
+        qoder: agents::runtime::QoderConfig {
             enabled: false,
             binary: None,
         },

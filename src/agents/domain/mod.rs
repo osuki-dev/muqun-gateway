@@ -403,6 +403,7 @@ mod contract_tests {
                 reason: Some("manual".into()),
                 delta: None,
                 seq: 2,
+                error: None,
             },
             AgentDomainEvent::InboxChanged {
                 asid: asid.clone(),
