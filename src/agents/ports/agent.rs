@@ -228,6 +228,19 @@ pub trait AgentPort: Send + Sync {
         delivery: Option<&'a str>,
     ) -> AgentFuture<'a, ()>;
 
+    /// Gateway-authored presentation metadata, separate from model input.
+    /// Providers without native message correlation preserve their existing echo.
+    fn send_prompt_with_display<'a>(
+        &'a self,
+        session_id: &'a str,
+        text: &'a str,
+        _display_text: &'a str,
+        attachments: &'a [String],
+        delivery: Option<&'a str>,
+    ) -> AgentFuture<'a, ()> {
+        self.send_prompt(session_id, text, attachments, delivery)
+    }
+
     /// Whether the agent's service takes an MCP server at runtime
     /// ([`AgentPort::add_mcp_server`]).
     fn adds_mcp_servers(&self) -> bool {

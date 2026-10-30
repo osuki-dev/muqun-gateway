@@ -56,7 +56,7 @@ pub(crate) struct Queued {
     /// `[{uri, name, mime?}]`, as OpenCode lists a prompt's files.
     pub files: Vec<Value>,
     /// The prepared Codex `UserInput` list, validated when it was queued.
-    pub input: Vec<Value>,
+    pub input: super::presentation::PromptInput,
 }
 
 impl Queued {
@@ -159,7 +159,7 @@ mod tests {
             delivery,
             text: id.into(),
             files: Vec::new(),
-            input: vec![json!({"type":"text","text":id,"text_elements":[]})],
+            input: vec![json!({"type":"text","text":id,"text_elements":[]})].into(),
         }
     }
 

@@ -1471,7 +1471,7 @@ impl TaskService {
             };
             manager
                 .prompts()
-                .send_prompt(&asid, &goal, &request.attachments, None)
+                .send_prompt_with_display(&asid, &goal, &request.goal, &request.attachments, None)
                 .await?;
             let task = self
                 .store()
