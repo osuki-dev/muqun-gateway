@@ -8,6 +8,7 @@ impl AcpProvider for FxProvider {
     const ARGS: &'static [&'static str] = &["acp"];
     const REQUIRE_MESSAGE_ID: bool = true;
     const MODEL_SELECTION: bool = true;
+    const SESSION_NOTICES: bool = true;
     fn global_catalog<'a>(
         binary: &'a str,
         directory: &'a str,

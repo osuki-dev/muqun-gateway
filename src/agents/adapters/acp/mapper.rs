@@ -592,6 +592,45 @@ impl Projection {
         self.observed_bytes += bytes;
         let kind = update["sessionUpdate"].as_str().unwrap_or_default();
         match kind {
+            "notice" => {
+                let severity = match update["severity"].as_str() {
+                    Some("info") => "Agent notice",
+                    Some("warning") => "Agent warning",
+                    Some("error") => "Agent error",
+                    _ => "Agent notice (unknown severity)",
+                };
+                let title = update["title"]
+                    .as_str()
+                    .unwrap_or("The agent sent a notice without a readable title.");
+                // Native notice text is untrusted display data. Bound this row
+                // independently, retain visible severity, and make truncation explicit.
+                const MAX_NOTICE_BYTES: usize = 64 * 1024;
+                let mut text = String::with_capacity(title.len().min(MAX_NOTICE_BYTES));
+                for ch in title
+                    .chars()
+                    .filter(|ch| !ch.is_control() || matches!(ch, '\n' | '\t'))
+                {
+                    if text.len() + ch.len_utf8() > MAX_NOTICE_BYTES {
+                        text.push_str("\n[Notice truncated by Gateway; open the agent's terminal for the complete diagnostic.]");
+                        break;
+                    }
+                    text.push(ch);
+                }
+                if text.is_empty() {
+                    text.push_str("The agent sent an empty notice.");
+                }
+                let id = format!("acp-notice:{}", self.next_row + 1);
+                let group = self.group(&id);
+                Ok(Some(self.row(
+                    id,
+                    group,
+                    TimelineRole::System,
+                    AgentPart::System {
+                        text: format!("{severity}: {text}"),
+                        description: Some("ACP session notice".into()),
+                    },
+                )))
+            }
             "agent_message_chunk" | "user_message_chunk" | "agent_thought_chunk" => {
                 // A role boundary also ends an anonymous segment when the new
                 // chunk has a native id or carries unsupported non-text content.
@@ -809,6 +848,54 @@ impl Projection {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn notices_remain_separate_from_literal_assistant_chunks() {
+        let mut projection = Projection::default();
+        let literal =
+            "[context] skill catalog shortened 97 descriptions\n\u{1b}literal assistant text";
+        projection.update(&json!({"sessionUpdate":"agent_message_chunk","messageId":"answer","content":{"type":"text","text":literal}})).unwrap();
+        for severity in ["info", "warning", "error", "future-severity"] {
+            let row=projection.update(&json!({"sessionUpdate":"notice","severity":severity,"title":"Diagnostic\u{0}\u{7}\r\nnext line"})).unwrap().unwrap();
+            assert_eq!(row.role, TimelineRole::System);
+            assert!(
+                matches!(&row.part,AgentPart::System{text,..} if text.ends_with("Diagnostic\nnext line") && !text.contains('\0') && !text.contains('\u{7}'))
+            );
+            if severity == "future-severity" {
+                assert!(
+                    matches!(&row.part,AgentPart::System{text,..} if text.contains("unknown severity"))
+                );
+            }
+        }
+        let row=projection.update(&json!({"sessionUpdate":"agent_message_chunk","messageId":"answer","content":{"type":"text","text":"\nEnd"}})).unwrap().unwrap();
+        assert_eq!(row.role, TimelineRole::Assistant);
+        assert!(matches!(&row.part,AgentPart::Text{text} if text == &format!("{literal}\nEnd")));
+        assert_eq!(projection.timeline().len(), 5);
+    }
+
+    #[test]
+    fn oversized_and_malformed_notices_keep_visible_severity_and_limits() {
+        let mut projection = Projection::default();
+        let row = projection
+            .update(
+                &json!({"sessionUpdate":"notice","severity":"error","title":"界".repeat(30_000)}),
+            )
+            .unwrap()
+            .unwrap();
+        let AgentPart::System { text, .. } = row.part else {
+            panic!("notice must remain a system row")
+        };
+        assert!(text.starts_with("Agent error:"));
+        assert!(text.contains("Notice truncated by Gateway"));
+        assert!(text.len() < 66_000);
+        let row = projection
+            .update(&json!({"sessionUpdate":"notice","severity":"error"}))
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(&row.part,AgentPart::System{text,..} if text.starts_with("Agent error:") && text.contains("without a readable title"))
+        );
+    }
 
     #[test]
     fn idless_stream_merges_chunks_but_splits_at_tools_and_turns() {

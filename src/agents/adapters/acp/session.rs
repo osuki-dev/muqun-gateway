@@ -26,6 +26,7 @@ pub trait AcpProvider: Send + Sync + 'static {
     const ARGS: &'static [&'static str];
     const REQUIRE_MESSAGE_ID: bool;
     const MODEL_SELECTION: bool;
+    const SESSION_NOTICES: bool = false;
     const PROVIDER_CONFIG: bool = true;
     const EFFORT_CONFIG: &'static str = "effort";
     fn session_metadata<'a>(
@@ -494,11 +495,22 @@ impl<P: AcpProvider> AcpDriver<P> {
         }
         drop(admission);
         let events = client.subscribe();
-        let initialize = client.request_with_timeout("initialize", json!({
-            "protocolVersion": 1,
-            "clientInfo": { "name": "muqun-gateway", "version": env!("CARGO_PKG_VERSION") },
-            "clientCapabilities": { "fs": { "readTextFile": false, "writeTextFile": false }, "terminal": false }
-        }), RPC_TIMEOUT);
+        let mut client_capabilities = json!({
+            "fs": { "readTextFile": false, "writeTextFile": false },
+            "terminal": false
+        });
+        if P::SESSION_NOTICES {
+            client_capabilities["session"] = json!({ "notices": {} });
+        }
+        let initialize = client.request_with_timeout(
+            "initialize",
+            json!({
+                "protocolVersion": 1,
+                "clientInfo": { "name": "muqun-gateway", "version": env!("CARGO_PKG_VERSION") },
+                "clientCapabilities": client_capabilities
+            }),
+            RPC_TIMEOUT,
+        );
         let result = tokio::select! {
             _ = self.stop.cancelled() => Err("ACP runtime stopped".into()),
             result = initialize => result,

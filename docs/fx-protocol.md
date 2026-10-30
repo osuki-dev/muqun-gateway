@@ -71,6 +71,12 @@ interaction and event routes. No App bundle changes are required: provider
 selection is dynamic, and discovery states each control explicitly.
 
 Streaming text, reasoning and tool updates enter the existing timeline mirror.
+Gateway advertises ACP session notices and projects exact `notice` updates into
+the existing collapsible system-notice rows. FX's skill-discovery and context
+diagnostics therefore remain separate from assistant answers. Notice severity
+is visible; oversized diagnostic text has an explicit truncation marker. Ordinary
+assistant chunks are preserved without text-based diagnostic filtering, including
+fallback text from clients or native versions that do not use notice metadata.
 Permissions retain their native request identity and offered choices. The owner
 must answer a request explicitly; missing or unsupported choices are refused.
 No allow-all policy is installed and a timeout/disconnection is not approval.

@@ -123,6 +123,7 @@ fn oversized_history_is_explicitly_unavailable() {
 #[cfg(unix)]
 pub(crate) mod integration {
     use super::*;
+    use serde_json::Value;
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::time::Duration;
@@ -178,6 +179,7 @@ if '--acp' in sys.argv:
 active=None
 pending=None
 turn=0
+notices=False
 for line in sys.stdin:
     message=json.loads(line)
     method=message.get('method')
@@ -185,6 +187,9 @@ for line in sys.stdin:
     with open('methods.log','a') as f: f.write((method or 'response')+'\n')
     if method=='initialize':
         if os.path.exists('hang-init'):continue
+        caps=params.get('clientCapabilities',{})
+        with open('init-capabilities.json','w') as f:json.dump(caps,f)
+        notices=isinstance(caps.get('session',{}).get('notices'),dict)
         reply(message['id'],{'protocolVersion':1,'agentCapabilities':{'loadSession':True,'promptCapabilities':{'image':True,'embeddedContext':True},'sessionCapabilities':{'list':{},'fork':{},'delete':{}} if '--acp' in sys.argv else {'list':{}}}})
     elif method=='session/list': reply(message['id'],{'sessions':[{'sessionId':sid,'cwd':os.getcwd(),'title':'Mock','updatedAt':'2026-10-30T03:00:00Z'} for sid in read()]})
     elif method=='session/new':
@@ -228,6 +233,10 @@ for line in sys.stdin:
         turn+=1
         content=params['prompt'][0]['text']
         if '--acp' in sys.argv:text(active,'echo-'+str(turn),content,True)
+        if content=='native notice':
+            diagnostic='[context] synthetic skill catalog diagnostic'
+            if notices:update(active,{'sessionUpdate':'notice','severity':'warning','title':diagnostic})
+            else:text(active,'notice-'+str(turn),diagnostic)
         if content=='disconnect':sys.exit(0)
         data=read(); data[active].append(['user-'+str(turn),content,True])
         with open(store,'w') as f:json.dump(data,f)
@@ -302,6 +311,70 @@ for line in sys.stdin:
             self.driver.stop();
             let _ = std::fs::remove_dir_all(&self.directory);
         }
+    }
+
+    #[tokio::test]
+    async fn native_notices_are_negotiated_without_reclassifying_fallback_text() {
+        let fixture = Fixture::new().await;
+        let info = fixture
+            .driver
+            .create_session(None, None, None)
+            .await
+            .unwrap();
+        let capabilities: Value = serde_json::from_slice(
+            &std::fs::read(fixture.directory.join("init-capabilities.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(capabilities
+            .pointer("/session/notices")
+            .is_some_and(Value::is_object));
+        assert_eq!(capabilities["terminal"], false);
+        assert_eq!(capabilities["fs"]["readTextFile"], false);
+        fixture
+            .driver
+            .send_prompt(&info.asid.0, "native notice", &[], None)
+            .await
+            .unwrap();
+        fixture.status(&info.asid.0, AgentSessionStatus::Idle).await;
+        let rows = fixture
+            .driver
+            .get_timeline(&info.asid.0, 100)
+            .await
+            .unwrap();
+        assert!(rows.iter().any(|row| row.role == TimelineRole::System
+            && matches!(&row.part,AgentPart::System{text,..} if text.contains("synthetic skill catalog diagnostic"))));
+        assert!(rows.iter().any(|row| row.role == TimelineRole::Assistant
+            && matches!(&row.part,AgentPart::Text{text} if text == "AB")));
+
+        // Older/native providers may still emit diagnostics as ordinary text.
+        // Without exact notice metadata the Gateway must retain it unchanged.
+        let legacy = fixture.qoder_driver();
+        let info = legacy.create_session(None, None, None).await.unwrap();
+        let capabilities: Value = serde_json::from_slice(
+            &std::fs::read(fixture.directory.join("init-capabilities.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(capabilities.pointer("/session/notices").is_none());
+        legacy
+            .send_prompt(&info.asid.0, "native notice", &[], None)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while legacy.get_session(&info.asid.0).await.unwrap().status != AgentSessionStatus::Idle
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let rows = legacy.get_timeline(&info.asid.0, 100).await.unwrap();
+        assert!(!rows.iter().any(|row| row.role == TimelineRole::System));
+        assert!(rows
+            .iter()
+            .any(|row| matches!(&row.part,AgentPart::Text{text}
+            if text == "[context] synthetic skill catalog diagnosticAB")));
+        legacy.shutdown().await;
+        fixture.driver.shutdown().await;
     }
 
     #[tokio::test]
