@@ -178,12 +178,19 @@ while True:
         assert!(driver.retained(&info.asid.0).unwrap().client.is_running());
         assert!(!driver.dormant.lock().unwrap().contains_key(&info.asid.0));
         let before = std::fs::read_to_string(fixture.directory.join("heartbeat")).unwrap();
-        tokio::time::sleep(Duration::from_millis(80)).await;
-        let after = std::fs::read_to_string(fixture.directory.join("heartbeat")).unwrap();
-        assert_ne!(
-            before, after,
-            "the detached background process must keep working"
-        );
+        // OS scheduling is independent of Tokio's clock. A fixed short sleep
+        // can expire before the detached process runs on a loaded CI machine.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let after = std::fs::read_to_string(fixture.directory.join("heartbeat")).unwrap();
+                if !after.is_empty() && before != after {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the detached background process must keep working");
     }
     drop(sentinel);
     driver.shutdown().await;

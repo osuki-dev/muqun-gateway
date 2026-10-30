@@ -380,8 +380,21 @@ impl AcpClient {
                     // SAFETY: process_group(0) created this group and the owned
                     // child has not been reaped, so its id cannot be reused.
                     let result = unsafe { libc::killpg(group, libc::SIGKILL) };
+                    let error = (result != 0).then(std::io::Error::last_os_error);
                     descendants_cleaned = result == 0
-                        || std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+                        || error.as_ref().and_then(std::io::Error::raw_os_error)
+                            == Some(libc::ESRCH);
+                    #[cfg(target_os = "macos")]
+                    if !descendants_cleaned
+                        && exit_observed
+                        && error.as_ref().and_then(std::io::Error::raw_os_error)
+                            == Some(libc::EPERM)
+                    {
+                        // Darwin returns EPERM for an empty/zombie-only group.
+                        // Permission denial alone is not cleanup evidence: query
+                        // the still-anchored group before accepting that case.
+                        descendants_cleaned = exited_group_has_no_other_members(group);
+                    }
                 }
                 *locked(&lifecycle.exit_success) = child
                     .wait()
@@ -630,6 +643,35 @@ async fn wait_for_unreaped_exit(pid: i32) -> std::io::Result<()> {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+}
+
+// A full buffer may have been truncated. Only an empty result or the exact
+// already-exited, unreaped leader can establish absence of live group members.
+#[cfg(any(target_os = "macos", test))]
+fn only_exited_leader_listed(group: i32, members: &[i32; 2], count: i32, error: i32) -> bool {
+    error == 0
+        && count >= 0
+        && count < members.len() as i32
+        && members[..count as usize].iter().all(|pid| *pid == group)
+}
+
+#[cfg(target_os = "macos")]
+fn exited_group_has_no_other_members(group: i32) -> bool {
+    let mut members = [0_i32; 2];
+    // libproc maps an enumeration error to zero while preserving errno. Clear
+    // the previous killpg error first; a failed query must never look empty.
+    // SAFETY: __error returns this thread's errno; the buffer has its exact
+    // advertised capacity and contains only PIDs from this owned group.
+    let (count, error) = unsafe {
+        *libc::__error() = 0;
+        let count = libc::proc_listpgrppids(
+            group,
+            members.as_mut_ptr().cast(),
+            std::mem::size_of_val(&members) as i32,
+        );
+        (count, *libc::__error())
+    };
+    only_exited_leader_listed(group, &members, count, error)
 }
 
 impl Drop for AcpClient {
@@ -942,6 +984,54 @@ mod tests {
         assert_eq!(*locked(&client.state.exit_success), Some(true));
         assert!(!client.state.cancel.is_cancelled());
         assert!(client.request("after_retirement", json!({})).await.is_err());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn exited_group_membership_refuses_errors_truncation_and_any_other_process() {
+        assert!(only_exited_leader_listed(42, &[0, 0], 0, 0));
+        assert!(only_exited_leader_listed(42, &[42, 0], 1, 0));
+        for (members, count, error) in [
+            ([0, 0], 0, libc::EPERM),
+            ([0, 0], 0, libc::ESRCH),
+            ([0, 0], -1, 0),
+            ([42, 42], 2, 0),
+            ([42, 77], 2, 0),
+            ([77, 0], 1, 0),
+        ] {
+            assert!(!only_exited_leader_listed(42, &members, count, error));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn graceful_retirement_cleans_a_live_group_member_before_reaping_the_leader() {
+        let directory =
+            std::env::temp_dir().join(format!("muqun-acp-group-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let marker = directory.join("descendant-survived");
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            r#"
+            while IFS= read -r request; do :; done
+            (sleep 0.5; printf survived > "$1"; sleep 30) &
+            exit 0
+        "#,
+            "fixture",
+        ]);
+        command.arg(&marker);
+        let client = AcpClient::spawn_command(command, "FX", no_safe_error_message).unwrap();
+        assert_eq!(
+            client.retire(Duration::from_secs(5)).await.unwrap(),
+            AcpRetirement::Retired
+        );
+        assert_eq!(*locked(&client.state.exit_success), Some(true));
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert!(
+            !marker.exists(),
+            "a live descendant must still be killed before the leader is reaped"
+        );
         std::fs::remove_dir_all(directory).unwrap();
     }
 

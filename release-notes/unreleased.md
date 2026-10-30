@@ -46,11 +46,14 @@
 - **Pi joins the native agent conversations.** A locally installed Pi (pi.dev, 1.4.0
   verified) appears in the App as `Pi` with its sessions, models and thinking
   levels. The gateway drives it through `pi --mode rpc`, one child per session
-  in use, closed after one idle hour by default. Explicit existing
-  `pi.idle_timeout_secs` values remain unchanged. `bash`, `edit` and `write` wait for an
-  approval in the App unless `pi.approvals` is `never`; Pi sessions reach the
-  Muqun MCP tools. Set `pi.enabled` to false to turn it off. Restart the
-  Gateway after updating; no App update is required.
+  in use. Eligible idle generations close after one hour by default; running
+  work, approvals and observed tool or extension execution remain protected.
+  Explicit existing `pi.idle_timeout_secs` values remain unchanged. `bash`,
+  `edit` and `write` wait for an approval in the App unless `pi.approvals` is
+  `never`; Pi sessions reach the Muqun MCP tools. Set `pi.enabled` to false to
+  turn it off. Restart the Gateway after updating. Ordinary sending remains
+  compatible with older Apps; reopening a conversation on foreground selection
+  requires an App supporting `agent_session_resume_v1`.
 
 - **Codex starts again after a host reboot.** A retained official socket link
   whose temporary target disappeared now triggers Codex's idempotent shared

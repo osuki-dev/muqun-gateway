@@ -17,7 +17,7 @@ the default):
 | `binary` | `pi` on `PATH` | A value with a path separator is a file path. |
 | `session_dir` | `PI_CODING_AGENT_SESSION_DIR`, else `~/.pi/agent/sessions` | Pi's session-file root. Must match where Pi writes. Discovery/history read existing files; explicit clone/delete operations create or remove files. |
 | `approvals` | `ask` | `ask`: `bash`/`edit`/`write` wait for an App approval. `never`: no gate. Any other value asks. |
-| `idle_timeout_secs` | `3600` | A child with no active work or explicit user activity for this long is closed. Explicit configured values are preserved; the previous default was 900 seconds. The default is now one hour. |
+| `idle_timeout_secs` | `3600` | An eligible child with no active work or explicit user activity for this long is closed. Explicit configured values are preserved; the previous default was 900 seconds. The default is now one hour. |
 
 Discovery: id/kind `pi`, name `Pi`, endpoint `stdio://pi`, version from
 `pi --version`. `disabled` when `enabled` is false, `not_installed` when no
@@ -42,6 +42,10 @@ on the host; discovery alone does not verify model authentication.
   `pi --mode rpc -e <ext>` in the requested directory, then `get_state` for
   `sessionId`/`sessionFile`. Pi writes the file only with the first message, so
   until then the session is answered from the driver's live state.
+- Explicit foreground selection wakes the same native session only through the
+  capability-gated `agent_session_resume_v1` preparation contract. Older Apps
+  can still wake an eligible dormant conversation by sending a new message;
+  background history and inventory reads do not carry foreground intent.
 - Child environment: `MUQUN_MCP_URL` and `MUQUN_MCP_TOKEN` (a runtime token
   minted per attach, agent id `pi`) when MCP is on, and `MUQUN_PI_APPROVALS`.
 - Framing: LF-terminated JSON objects, optional CR dropped, 8 MiB per record
