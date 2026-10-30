@@ -783,6 +783,18 @@ async fn read_stdout<R: AsyncBufRead + Unpin>(
             continue;
         };
         let reply = if record.get("success").and_then(Value::as_bool) == Some(true) {
+            // An input handler can consume plain text and continue work
+            // asynchronously without emitting a tool or extension UI event.
+            // Pin before releasing the command's operation lease.
+            if matches!(
+                record.get("command").and_then(Value::as_str),
+                Some("prompt" | "steer" | "follow_up")
+            ) && record.pointer("/data/disposition").and_then(Value::as_str) == Some("handled")
+            {
+                if let Ok(mut activity) = activity.lock() {
+                    activity.execution_observed = true;
+                }
+            }
             Ok(record.get("data").cloned().unwrap_or(Value::Null))
         } else {
             // Upstream errors may contain prompts, tool input or secrets.
@@ -1036,6 +1048,8 @@ for raw in sys.stdin.buffer:
         out({"id": rid, "type": "response", "command": t, "success": True,
              "data": {"sessionId": "s-1", "argv": sys.argv[1:], "cwd": os.getcwd(),
                       "approvals": os.environ.get("MUQUN_PI_APPROVALS")}}, "\r\n")
+    elif t in ("prompt", "steer", "follow_up") and cmd.get("message") == "handled input":
+        out({"id": rid, "type": "response", "command": t, "success": True, "data": {"disposition": "handled"}})
     elif t == "prompt":
         out({"id": rid, "type": "response", "command": t, "success": True, "data": {"disposition": "started"}})
         out({"type": "agent_settled"})
@@ -1268,6 +1282,38 @@ for raw in sys.stdin.buffer:
             let child = PiChild::spawn(&cmd, &launch).await.unwrap();
             let _reply = child.request(command.clone()).await;
             assert!(!child.retire_if_idle(Duration::ZERO, None), "{command}");
+            child.close().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn handled_input_pins_before_reply_and_later_normal_turns_cannot_clear_it() {
+        let Some((cmd, launch)) = fake_pi() else {
+            return;
+        };
+        for kind in ["prompt", "steer", "follow_up"] {
+            let child = PiChild::spawn(&cmd, &launch).await.unwrap();
+            let reply = child
+                .request(json!({"type":kind, "message":"handled input"}))
+                .await
+                .unwrap();
+            assert_eq!(reply["disposition"], "handled");
+            assert!(
+                !child.retire_if_idle(Duration::ZERO, None),
+                "handled {kind}"
+            );
+            child
+                .request(json!({"type":"prompt", "message":"ordinary later turn"}))
+                .await
+                .unwrap();
+            child
+                .request(json!({"type":"event", "event":{"type":"agent_settled"}}))
+                .await
+                .unwrap();
+            assert!(
+                !child.retire_if_idle(Duration::ZERO, None),
+                "later turn cleared handled {kind}"
+            );
             child.close().await;
         }
     }

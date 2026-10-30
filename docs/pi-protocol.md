@@ -59,7 +59,8 @@ on the host; discovery alone does not verify model authentication.
   provisional rows that have not reached the session file. Pi exposes no
   supported active-job query: model settlement does not prove tool, extension
   or MCP background work has ended. A live execution record, extension UI or
-  custom entry, native RPC bash command, or slash-command submission latches
+  custom entry, native RPC bash command, slash-command submission, or successful
+  prompt/steer/follow-up reply with `disposition: "handled"` latches
   the owned child generation against automatic idle retirement. Later turns,
   cancellation and compaction do not clear this protection. Historical file
   replay alone does not set it. Such generations remain until explicit
