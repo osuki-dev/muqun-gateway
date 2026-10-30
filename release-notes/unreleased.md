@@ -8,6 +8,13 @@
   snapshots; live session state stays current. First reads and expired snapshots
   still start the installed CLI. No background metadata process is retained.
 
+- **Large Herdr workspaces no longer open a socket for every pane at once.**
+  Pane enrichment has bounded concurrency, and all one-shot Herdr RPCs share
+  a connection budget across concurrent Gateway requests. Pane ordering,
+  optional-metadata fallback and request deadlines are preserved. This avoids
+  descriptor exhaustion during pane discovery without changing host limits.
+  Restart the Gateway after updating; no App update or re-pairing is required.
+
 - **FX and Qoder CLI conversations use their native ACP interfaces.** The
   Gateway discovers installed CLIs and supports private session creation,
   saved-session loading, streamed replies, tool activity and explicit approval

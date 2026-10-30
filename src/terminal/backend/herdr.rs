@@ -93,6 +93,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+#[cfg(unix)]
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use anyhow::Context as _;
@@ -127,9 +129,20 @@ use super::{
 /// coming, and a bound that tried to be tight would start failing real calls
 /// on a loaded machine -- which is worse than the leak.
 ///
-/// Bounds `request_transport` only. See `activity_stream`, which must not have
-/// one and says why.
+/// Includes waiting for RPC admission. Pane enrichment shares this deadline
+/// across its batches. See `activity_stream`, whose subscription must not have
+/// an idle timeout and says why.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+// Backend instances are created independently for concurrent callers. Share
+// the socket budget across all of them, leaving room for HTTP, subscriptions,
+// agent transports and files even under a low inherited descriptor limit.
+#[cfg(unix)]
+const MAX_RPC_CONNECTIONS: usize = 32;
+#[cfg(unix)]
+static RPC_SLOTS: LazyLock<Arc<tokio::sync::Semaphore>> =
+    LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(MAX_RPC_CONNECTIONS)));
+const PANE_INFO_CONCURRENCY: usize = 16;
 
 fn startup_refusal(code: &str, message: &str) -> BackendError {
     BackendError::Refused {
@@ -183,6 +196,8 @@ pub struct HerdrBackend {
     /// Overridable so a test can prove the timeout fires without waiting out
     /// the real one.
     request_timeout: Duration,
+    #[cfg(unix)]
+    rpc_slots: Arc<tokio::sync::Semaphore>,
     /// Whether this herdr answers `pane.process_info`. Assumed until the
     /// first refusal, then remembered: a herdr below the method's protocol
     /// is asked once per pane listing, not once per pane per listing, and
@@ -207,6 +222,8 @@ impl HerdrBackend {
         Self {
             socket_path: socket_path.into(),
             request_timeout,
+            #[cfg(unix)]
+            rpc_slots: Arc::clone(&RPC_SLOTS),
             process_info: AtomicBool::new(true),
             terminals: Mutex::new(HashMap::new()),
             terminal_devices: std::sync::OnceLock::new(),
@@ -259,8 +276,8 @@ impl HerdrBackend {
         }
     }
 
-    /// One request written and one response read back, with no bound of its
-    /// own -- `request_transport` is the only caller and it supplies one.
+    /// One request written and one response read back. Callers supply the
+    /// deadline, including time spent waiting for the shared socket budget.
     #[cfg(unix)]
     async fn exchange(&self, method: &str, params: Value) -> anyhow::Result<Value> {
         Ok(self.exchange_with_peer(method, params).await?.0)
@@ -272,6 +289,7 @@ impl HerdrBackend {
         method: &str,
         params: Value,
     ) -> anyhow::Result<(Value, Option<u32>)> {
+        let _slot = self.rpc_slots.acquire().await?;
         let mut stream = UnixStream::connect(&self.socket_path)
             .await
             .with_context(|| format!("failed to connect {}", self.socket_path.display()))?;
@@ -435,18 +453,25 @@ impl TerminalBackend for HerdrBackend {
 
     fn list_panes(&self) -> BackendFuture<'_, Vec<Pane>> {
         Box::pin(async move {
+            use futures::StreamExt as _;
+
             let panes = self.list_panes_for_liveness().await?;
             if !panes.is_empty() {
                 self.terminal_devices.get_or_init(tty::device_paths);
             }
-            // One `pane.process_info` per pane, all in flight at once: the
-            // approval watcher lists every 1.5s, and N round trips of 0.1ms
-            // each are cheap in parallel and still cheap in series, but there
-            // is no reason to pay the series.
-            Ok(
-                futures::future::join_all(panes.into_iter().map(|pane| self.complete_pane(pane)))
-                    .await,
+            // Bound enrichment within each listing as well as across backend
+            // instances. One shared deadline keeps a mute Herdr from costing
+            // a fresh timeout for every batch; unfinished panes retain their
+            // topology fields. buffered preserves Herdr's pane order.
+            let deadline = tokio::time::Instant::now() + self.request_timeout;
+            Ok(futures::stream::iter(
+                panes
+                    .into_iter()
+                    .map(|pane| self.complete_pane_before(pane, deadline)),
             )
+            .buffered(PANE_INFO_CONCURRENCY)
+            .collect()
+            .await)
         })
     }
 
@@ -934,12 +959,17 @@ impl HerdrBackend {
     /// the pane as it was parsed, which is the pane every client got before
     /// this existed. herdr's own `foreground_command`, should it ever send
     /// one, is kept over the derived one.
-    async fn complete_pane(&self, mut pane: Pane) -> Pane {
-        if !self.process_info.load(Ordering::Relaxed) {
+    async fn complete_pane(&self, pane: Pane) -> Pane {
+        self.complete_pane_before(pane, tokio::time::Instant::now() + self.request_timeout)
+            .await
+    }
+
+    async fn complete_pane_before(&self, mut pane: Pane, deadline: tokio::time::Instant) -> Pane {
+        if !self.process_info.load(Ordering::Relaxed) || tokio::time::Instant::now() >= deadline {
             return pane;
         }
-        let info = tokio::time::timeout(
-            self.request_timeout,
+        let info = tokio::time::timeout_at(
+            deadline,
             self.exchange_with_peer("pane.process_info", json!({ "pane_id": pane.id.as_str() })),
         )
         .await;
@@ -2804,6 +2834,214 @@ mod tests {
         assert!(workspace["params"].get("env").is_none());
     }
 
+    #[derive(Default)]
+    struct RpcLoad {
+        active: std::sync::atomic::AtomicUsize,
+        peak: std::sync::atomic::AtomicUsize,
+        process_info: std::sync::atomic::AtomicUsize,
+    }
+
+    struct ActiveRpc(Arc<RpcLoad>);
+
+    impl Drop for ActiveRpc {
+        fn drop(&mut self) {
+            self.0.active.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    struct LoadedHerdr {
+        socket_path: PathBuf,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl LoadedHerdr {
+        fn start(pane_count: usize, mute_process_info: bool, load: Arc<RpcLoad>) -> Self {
+            let socket_path = crate::short_test_socket("gw-herdr-load");
+            let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+            let task = tokio::spawn(async move {
+                let mut handlers = tokio::task::JoinSet::new();
+                while let Ok((stream, _)) = listener.accept().await {
+                    while handlers.try_join_next().is_some() {}
+                    let load = Arc::clone(&load);
+                    handlers.spawn(async move {
+                        let mut reader = BufReader::new(stream);
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                            return;
+                        }
+                        let request: Value = serde_json::from_str(&line).unwrap();
+                        let active = load.active.fetch_add(1, Ordering::SeqCst) + 1;
+                        load.peak.fetch_max(active, Ordering::SeqCst);
+                        let _active = ActiveRpc(Arc::clone(&load));
+                        let method = request["method"].as_str().unwrap();
+                        if method == "pane.process_info" {
+                            load.process_info.fetch_add(1, Ordering::SeqCst);
+                            if mute_process_info {
+                                // Hold the connection until the client times
+                                // out or is cancelled, without sending EOF.
+                                line.clear();
+                                let _ = reader.read_line(&mut line).await;
+                                return;
+                            }
+                        }
+                        let index = request["params"]["pane_id"]
+                            .as_str()
+                            .unwrap_or("0")
+                            .parse::<usize>()
+                            .unwrap();
+                        // Replies deliberately finish out of pane order.
+                        tokio::time::sleep(Duration::from_millis(5 + (index % 4) as u64 * 5)).await;
+                        let response = match method {
+                            "pane.list" => json!({ "result": { "panes": (0..pane_count)
+                                .map(|index| json!({ "pane_id": index.to_string(),
+                                    "workspace_id": "w", "tab_id": "t", "width": 120 }))
+                                .collect::<Vec<_>>() } }),
+                            "pane.process_info" if index != 3 => json!({ "result": {
+                                "process_info": { "foreground_processes": [{
+                                    "name": format!("program-{index}")
+                                }] }
+                            } }),
+                            "pane.process_info" | "pane.read" => json!({ "error": {
+                                "code": "fixture_refused", "message": "fixture refusal"
+                            } }),
+                            _ => json!({ "result": { "ok": true } }),
+                        };
+                        let mut stream = reader.into_inner();
+                        let _ = stream.write_all(format!("{response}\n").as_bytes()).await;
+                    });
+                }
+            });
+            Self { socket_path, task }
+        }
+    }
+
+    impl Drop for LoadedHerdr {
+        fn drop(&mut self) {
+            self.task.abort();
+            let _ = std::fs::remove_file(&self.socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn overlapping_pane_lists_and_direct_rpcs_share_a_process_wide_socket_budget() {
+        let load = Arc::new(RpcLoad::default());
+        let servers: Vec<_> = (0..3)
+            .map(|_| LoadedHerdr::start(80, false, Arc::clone(&load)))
+            .collect();
+        // Independently constructed backends, as with separate HTTP requests.
+        let backends: Vec<_> = servers
+            .iter()
+            .map(|server| HerdrBackend::new(&server.socket_path))
+            .collect();
+        let listings =
+            futures::future::join_all(backends.iter().map(|backend| backend.list_panes()));
+        let reads = futures::future::join_all(
+            (0..16).map(|_| backends[0].request("pane.read", json!({ "pane_id": "0" }))),
+        );
+        let (listings, reads) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(listings, reads)
+        })
+        .await
+        .expect("bounded RPCs must still make progress");
+        for panes in listings {
+            let panes = panes.unwrap();
+            assert_eq!(panes.len(), 80);
+            for (index, pane) in panes.iter().enumerate() {
+                assert_eq!(pane.id.as_str(), index.to_string());
+                assert_eq!(pane.width, Some(120));
+                assert_eq!(
+                    pane.foreground_command,
+                    (index != 3).then(|| format!("program-{index}")),
+                    "one refused enrichment must preserve that pane without losing others"
+                );
+            }
+        }
+        assert!(reads.into_iter().all(|read| matches!(read,
+            Err(BackendError::Refused { code: Some(code), message })
+                if code == "fixture_refused" && message == "fixture refusal"
+        )));
+        let peak = load.peak.load(Ordering::SeqCst);
+        assert!(peak > PANE_INFO_CONCURRENCY, "fixture must overlap callers");
+        assert!(
+            peak <= MAX_RPC_CONNECTIONS,
+            "opened {peak} simultaneous RPCs"
+        );
+        assert_eq!(load.process_info.load(Ordering::SeqCst), 240);
+    }
+
+    #[tokio::test]
+    async fn a_large_mute_pane_listing_has_one_enrichment_deadline() {
+        let load = Arc::new(RpcLoad::default());
+        let server = LoadedHerdr::start(512, true, Arc::clone(&load));
+        let mut backend =
+            HerdrBackend::with_request_timeout(&server.socket_path, Duration::from_millis(100));
+        // A private pool keeps this stalled fixture from delaying other tests.
+        backend.rpc_slots = Arc::new(tokio::sync::Semaphore::new(MAX_RPC_CONNECTIONS));
+        let panes = tokio::time::timeout(Duration::from_secs(1), backend.list_panes())
+            .await
+            .expect("queued enrichment must not start a new deadline per batch")
+            .unwrap();
+        assert_eq!(panes.len(), 512);
+        for (index, pane) in panes.iter().enumerate() {
+            assert_eq!(pane.id.as_str(), index.to_string());
+            assert_eq!(pane.width, Some(120));
+            assert_eq!(pane.foreground_command, None);
+        }
+        assert_eq!(
+            load.process_info.load(Ordering::SeqCst),
+            PANE_INFO_CONCURRENCY
+        );
+        assert_eq!(backend.rpc_slots.available_permits(), MAX_RPC_CONNECTIONS);
+    }
+
+    #[tokio::test]
+    async fn rpc_budget_waits_share_the_deadline_and_cancellation_releases_the_socket_slot() {
+        let load = Arc::new(RpcLoad::default());
+        let server = LoadedHerdr::start(0, true, Arc::clone(&load));
+        let mut backend =
+            HerdrBackend::with_request_timeout(&server.socket_path, Duration::from_millis(100));
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        backend.rpc_slots = Arc::clone(&slots);
+        let held = slots.acquire().await.unwrap();
+        let waiting =
+            tokio::time::timeout(Duration::from_secs(1), backend.request("ping", json!({})))
+                .await
+                .expect("waiting for admission must obey the request deadline");
+        assert!(matches!(waiting, Err(BackendError::Unavailable)));
+        assert_eq!(
+            load.peak.load(Ordering::SeqCst),
+            0,
+            "no socket before admission"
+        );
+        drop(held);
+
+        let backend = Arc::new(backend);
+        let caller = Arc::clone(&backend);
+        let pending = tokio::spawn(async move {
+            caller
+                .request("pane.process_info", json!({ "pane_id": "0" }))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while load.process_info.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("fixture never received the admitted request");
+        pending.abort();
+        assert!(pending.await.unwrap_err().is_cancelled());
+        assert_eq!(slots.available_permits(), 1);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while load.active.load(Ordering::SeqCst) != 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("cancellation must close the admitted socket");
+        assert!(backend.request("ping", json!({})).await.is_ok());
+    }
+
     /// A herdr that accepts the connection and then never answers used to
     /// hold this task and its file descriptor forever, and every request that
     /// landed on it did the same.
@@ -2874,8 +3112,14 @@ mod tests {
             }
         });
 
-        let backend = HerdrBackend::with_request_timeout(&socket_path, Duration::from_millis(250));
+        let mut backend =
+            HerdrBackend::with_request_timeout(&socket_path, Duration::from_millis(250));
+        backend.rpc_slots = Arc::new(tokio::sync::Semaphore::new(1));
         let mut stream = backend.activity_stream().await.unwrap();
+        assert!(
+            backend.request("ping", json!({})).await.is_ok(),
+            "a persistent subscription must leave the one-shot RPC budget available"
+        );
 
         // Nothing happens for three times the request timeout. The stream must
         // still be waiting, not have ended or errored.
