@@ -29,7 +29,7 @@ uses ACP's native cancellation notification; it is not evidence that a failed or
 lost prompt never ran. Ambiguous delivery is never retried automatically.
 
 Verified idle conversations release their private process after
-`fx.idle_timeout_secs` (default 300 seconds, checked every 30 seconds). Gateway
+`fx.idle_timeout_secs` (default 3600 seconds, checked every 30 seconds). Gateway
 records a native-history checkpoint before a prompt, then requires a normal
 nonempty `end_turn`, one new saved turn, an unchanged prior-history prefix and
 exact submitted-user/final-assistant hashes. The bounded read-only
@@ -37,6 +37,17 @@ exact submitted-user/final-assistant hashes. The bounded read-only
 records in its checkpoint. Busy turns, pending requests and approvals prevent
 retirement. Gateway closes stdin in FIFO order, drains both output pipes, waits
 for a successful exit and verifies the same native checkpoint afterward.
+
+Observed live tool execution, native command delivery, permission requests or
+unknown extension/subagent control activity protects that entire process
+generation from automatic retirement, even after later ordinary turns finish.
+Native EOF can stop background jobs; a completed reply does not prove those
+jobs ended, and these CLIs expose no supported read-only job inventory.
+Historical replay alone does not pin a new generation. Custom hooks that launch
+silent work without observable execution/control records are outside this guard;
+Gateway does not disable user extensions or claim universal job-absence proof.
+Explicit configured timeouts remain unchanged, and history polling does not
+renew the idle timer.
 
 Retirement drops the live projection and child, retaining only small bounded
 identity/workspace metadata and the ordinary bounded mirror cache.

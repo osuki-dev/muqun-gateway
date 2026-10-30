@@ -41,7 +41,10 @@ pub enum AcpRetirement {
     NotIdle,
 }
 
-type Reply = oneshot::Sender<Result<Value, String>>;
+struct Reply {
+    sender: oneshot::Sender<Result<Value, String>>,
+    arm_work_guard: bool,
+}
 
 struct State {
     provider: &'static str,
@@ -54,6 +57,8 @@ struct State {
     cancel: CancellationToken,
     exited: CancellationToken,
     retiring: AtomicBool,
+    work_guard_armed: AtomicBool,
+    live_execution_seen: AtomicBool,
     exit_success: Mutex<Option<bool>>,
     stdout_drained: CancellationToken,
     stderr_drained: CancellationToken,
@@ -88,7 +93,7 @@ impl State {
         }
         self.cancel.cancel();
         for (_, reply) in pending.drain() {
-            let _ = reply.send(Err(self.disconnected()));
+            let _ = reply.sender.send(Err(self.disconnected()));
         }
         locked(&self.server_requests).clear();
         let _ = self.events.send(AcpEvent::Disconnected {
@@ -248,6 +253,8 @@ impl AcpClient {
             cancel: CancellationToken::new(),
             exited: CancellationToken::new(),
             retiring: AtomicBool::new(false),
+            work_guard_armed: AtomicBool::new(false),
+            live_execution_seen: AtomicBool::new(false),
             exit_success: Mutex::new(None),
             stdout_drained: CancellationToken::new(),
             stderr_drained: CancellationToken::new(),
@@ -411,6 +418,25 @@ impl AcpClient {
         !self.state.exited.is_cancelled()
     }
 
+    /// Initial native load replay is history, not work owned by this child.
+    /// Once armed, execution evidence is never cleared for this generation.
+    #[cfg(test)]
+    pub fn arm_live_work_guard(&self) {
+        let _admission = locked(&self.state.pending);
+        self.state.work_guard_armed.store(true, Ordering::Release);
+    }
+
+    pub fn has_unverified_live_work(&self) -> bool {
+        self.state.live_execution_seen.load(Ordering::Acquire)
+    }
+
+    pub fn protect_unverified_live_work(&self) {
+        let _admission = locked(&self.state.pending);
+        self.state
+            .live_execution_seen
+            .store(true, Ordering::Release);
+    }
+
     pub fn subscribe(&self) -> broadcast::Receiver<AcpEvent> {
         self.state.events.subscribe()
     }
@@ -429,7 +455,18 @@ impl AcpClient {
                     self.state.provider
                 ));
             }
-            pending.insert(id, reply);
+            // A new session has no replay. For a load, arm at the matching
+            // successful response, before the reader can dispatch live events.
+            if method == "session/new" {
+                self.state.work_guard_armed.store(true, Ordering::Release);
+            }
+            pending.insert(
+                id,
+                Reply {
+                    sender: reply,
+                    arm_work_guard: method == "session/load",
+                },
+            );
         }
         let request = AcpRequest {
             state: self.state.clone(),
@@ -522,6 +559,7 @@ impl AcpClient {
                 return Err(self.state.disconnected());
             }
             if self.state.retiring.load(Ordering::Acquire)
+                || self.state.live_execution_seen.load(Ordering::Acquire)
                 || !pending.is_empty()
                 || !locked(&self.state.server_requests).is_empty()
             {
@@ -694,6 +732,33 @@ async fn dispatch(
     }
     if let Some(method) = value.get("method").and_then(Value::as_str) {
         let params = value.get("params").cloned().unwrap_or(Value::Null);
+        let passive_update = method == "session/update"
+            && matches!(
+                params["update"]["sessionUpdate"].as_str(),
+                Some(
+                    "user_message_chunk"
+                        | "agent_message_chunk"
+                        | "agent_thought_chunk"
+                        | "plan"
+                        | "notice"
+                        | "usage_update"
+                        | "available_commands_update"
+                        | "current_mode_update"
+                        | "config_option_update"
+                        | "session_info_update"
+                )
+            );
+        // Unknown live extension/subagent/control messages cannot establish
+        // job absence. Ordinary text, diagnostics and metadata do not pin.
+        let execution = value.get("id").is_some() || !passive_update;
+        if execution {
+            // Record before event backpressure or prompt-result delivery can
+            // make the reducer look idle. Share the final EOF admission lock.
+            let _admission = locked(&state.pending);
+            if state.work_guard_armed.load(Ordering::Acquire) {
+                state.live_execution_seen.store(true, Ordering::Release);
+            }
+        }
         if let Some(id) = value.get("id") {
             if state.retiring.load(Ordering::Acquire) {
                 state.stop("server_request_during_retirement");
@@ -752,7 +817,10 @@ async fn dispatch(
             }
         };
         if let Some(reply) = locked(&state.pending).remove(&id) {
-            let _ = reply.send(result);
+            if reply.arm_work_guard && result.is_ok() {
+                state.work_guard_armed.store(true, Ordering::Release);
+            }
+            let _ = reply.sender.send(result);
         }
         Ok(())
     } else {
@@ -901,6 +969,77 @@ mod tests {
             client.retire(Duration::from_secs(3)).await.unwrap(),
             AcpRetirement::Retired
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn live_execution_is_latched_before_reply_and_never_cleared_by_later_text() {
+        let client = fake(
+            r#"
+            IFS= read -r first
+            printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"owned","update":{"sessionUpdate":"tool_call","status":"completed"}}}'
+            printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}'
+            IFS= read -r second
+            printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"owned","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"done"}}}}'
+            printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{}}'
+            while IFS= read -r hold; do :; done
+        "#,
+        );
+        let _events = client.subscribe();
+        client.arm_live_work_guard();
+        client.request("first", json!({})).await.unwrap();
+        assert!(client.has_unverified_live_work());
+        client.request("second", json!({})).await.unwrap();
+        assert_eq!(
+            client.retire(Duration::from_secs(1)).await.unwrap(),
+            AcpRetirement::NotIdle
+        );
+        assert!(client.is_running());
+        client.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn initial_replayed_tools_do_not_pin_a_new_native_generation() {
+        let client = fake(
+            r#"
+            IFS= read -r load
+            printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"owned","update":{"sessionUpdate":"tool_call","status":"completed"}}}'
+            printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}'
+            while IFS= read -r hold; do :; done
+        "#,
+        );
+        let _events = client.subscribe();
+        client.request("session/load", json!({})).await.unwrap();
+        client.arm_live_work_guard();
+        assert!(!client.has_unverified_live_work());
+        assert_eq!(
+            client.retire(Duration::from_secs(1)).await.unwrap(),
+            AcpRetirement::Retired
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn load_reply_arms_before_the_same_read_batch_can_deliver_live_tools() {
+        let client = fake(
+            r#"
+            IFS= read -r load
+            printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"tool_call","status":"completed"}}}' '{"jsonrpc":"2.0","id":1,"result":{}}' '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"tool_call_update","status":"completed"}}}'
+            IFS= read -r barrier
+            printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{}}'
+            while IFS= read -r hold; do :; done
+        "#,
+        );
+        let _events = client.subscribe();
+        client.request("session/load", json!({})).await.unwrap();
+        client.request("barrier", json!({})).await.unwrap();
+        assert!(client.has_unverified_live_work());
+        assert_eq!(
+            client.retire(Duration::from_secs(1)).await.unwrap(),
+            AcpRetirement::NotIdle
+        );
+        client.shutdown().await;
     }
 
     #[cfg(unix)]

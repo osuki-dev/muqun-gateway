@@ -3,9 +3,11 @@
 ## Changes and fixes
 
 - **Verified idle FX and Qoder conversations release their private processes.**
-  Both default to a five-minute idle timeout, configurable with the provider's
+  Both default to a one-hour idle timeout, configurable with the provider's
   `idle_timeout_secs`. Running work, in-flight requests and approvals remain
-  protected. Native latest-turn recovery is checked before and after graceful
+  protected. Observed tool or native-command activity protects that process
+  generation, including background work after a completed reply. Silent custom
+  hooks without observable activity cannot be inventoried. Native latest-turn recovery is checked before and after graceful
   shutdown; failed or uncertain checks never claim a saved idle state. A
   foreground App open explicitly restores the original native conversation;
   background history reads do not wake it, and no earlier prompt is replayed.
@@ -44,7 +46,7 @@
 - **Pi joins the native agent conversations.** A locally installed Pi (pi.dev, 1.4.0
   verified) appears in the App as `Pi` with its sessions, models and thinking
   levels. The gateway drives it through `pi --mode rpc`, one child per session
-  in use, closed after five idle minutes by default. Explicit existing
+  in use, closed after one idle hour by default. Explicit existing
   `pi.idle_timeout_secs` values remain unchanged. `bash`, `edit` and `write` wait for an
   approval in the App unless `pi.approvals` is `never`; Pi sessions reach the
   Muqun MCP tools. Set `pi.enabled` to false to turn it off. Restart the

@@ -66,7 +66,7 @@ pub trait AcpProvider: Send + Sync + 'static {
 }
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
-pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 300;
+pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 3600;
 const RETIREMENT_TIMEOUT: Duration = Duration::from_secs(15);
 // At most 8 MiB of serialized dormant info, plus bounded map/index overhead.
 const MAX_DORMANT_SESSIONS: usize = 512;
@@ -1823,6 +1823,119 @@ impl<P: AcpProvider> AcpDriver<P> {
         }
     }
 
+    async fn submit_prompt(
+        &self,
+        id: &str,
+        text: &str,
+        attachments: &[String],
+        delivery: Option<&str>,
+        native_command: bool,
+    ) -> Result<(), AgentError> {
+        if delivery.is_some_and(|delivery| delivery != "auto") {
+            return Err(AgentError::Unsupported(
+                "ACP prompt steering or queueing".into(),
+            ));
+        }
+        let session = self.activate(id, false, true).await?;
+        let mut admission = Admission {
+            busy: &session.busy,
+            handed_off: false,
+        };
+        let prepared =
+            operations::prompt_parts(text, attachments, session.prompt_capabilities).await?;
+        let checkpoint = if P::IDLE_RETIREMENT && attachments.is_empty() {
+            let state = session.state.lock().await;
+            let initial_empty = state.owned_mutations && state.projection.is_empty();
+            let directory = state.info.directory.clone().unwrap_or_default();
+            drop(state);
+            if initial_empty {
+                Some(NativeSnapshot::empty(id).checkpoint())
+            } else {
+                let _inspection = self.inspection.lock().await;
+                P::recovery_snapshot(&self.binary, &directory, id, &self.stop)
+                    .await
+                    .ok()
+                    .filter(|snapshot| snapshot.session_id == id)
+                    .map(|snapshot| snapshot.checkpoint())
+            }
+        } else {
+            None
+        };
+        // Admission and the local user row share the state lock: a fast
+        // native response cannot appear ahead of its submitted user text.
+        // Busy is published only after a request was actually flushed.
+        let mut state = session.state.lock().await;
+        state.projection.can_submit(&prepared.transcript)?;
+        state.recovery = None;
+        state.prompt_checkpoint = checkpoint;
+        state.prompt_user_digest = Some(recovery::text_digest(&prepared.transcript));
+        state.turn_had_output = false;
+        state.last_activity = tokio::time::Instant::now();
+        if native_command {
+            session.client.protect_unverified_live_work();
+        }
+        let request = session
+            .client
+            .start_request(
+                "session/prompt",
+                json!({ "sessionId": id, "prompt": prepared.content }),
+            )
+            .await;
+        match request {
+            Ok(request) => {
+                state.info.status = AgentSessionStatus::Busy;
+                state.info.error = None;
+                state.info.updated_ms = mapper::now_ms();
+                if let Some(seq) = self
+                    .mirror
+                    .update_status(&state.info.asid, AgentSessionStatus::Busy, None)
+                    .await
+                {
+                    Self::emit(
+                        &self.mirror,
+                        &self.tx,
+                        AgentDomainEvent::StatusChanged {
+                            asid: state.info.asid.clone(),
+                            status: AgentSessionStatus::Busy,
+                            error: None,
+                            seq,
+                        },
+                    );
+                }
+                let row = state.projection.submitted(&prepared.transcript);
+                let event = self
+                    .mirror
+                    .record_timeline_upsert(&state.info.asid, vec![row])
+                    .await;
+                Self::emit(&self.mirror, &self.tx, event);
+                drop(state);
+                let sender = session.completions.clone();
+                tokio::spawn(async move {
+                    let _ = sender.send(request.wait().await);
+                });
+                admission.handed_off = true;
+                Ok(())
+            }
+            Err(error) => {
+                drop(state);
+                // A partial stdio write can be ambiguous. Preserve the uncertainty;
+                // no automatic retry, queue fallback or second delivery is allowed.
+                session.connected.store(false, Ordering::Release);
+                Self::status(
+                    &session,
+                    &self.mirror,
+                    &self.tx,
+                    AgentSessionStatus::Unknown,
+                    None,
+                )
+                .await;
+                Err(AgentError::Network(format!(
+                    "{error}; prompt delivery may have occurred; do not retry automatically"
+                )))
+            }
+        }
+    }
+
     fn snapshot_matches_projection(snapshot: &NativeSnapshot, projection: &Projection) -> bool {
         if projection.is_empty() {
             return snapshot.entries.is_empty();
@@ -1846,6 +1959,7 @@ impl<P: AcpProvider> AcpDriver<P> {
         };
         if !P::IDLE_RETIREMENT
             || !session.connected.load(Ordering::Acquire)
+            || session.client.has_unverified_live_work()
             || session
                 .busy
                 .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -2121,7 +2235,7 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
                 name,
                 arguments,
             )?;
-            self.send_prompt(id, &prompt, &[], delivery).await
+            self.submit_prompt(id, &prompt, &[], delivery, true).await
         })
     }
     fn list_projects(&self) -> AgentFuture<'_, Vec<AgentProject>> {
@@ -2249,108 +2363,7 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
         attachments: &'a [String],
         delivery: Option<&'a str>,
     ) -> AgentFuture<'a, ()> {
-        Box::pin(async move {
-            if delivery.is_some_and(|delivery| delivery != "auto") {
-                return Err(AgentError::Unsupported(
-                    "ACP prompt steering or queueing".into(),
-                ));
-            }
-            let session = self.activate(id, false, true).await?;
-            let mut admission = Admission {
-                busy: &session.busy,
-                handed_off: false,
-            };
-            let prepared =
-                operations::prompt_parts(text, attachments, session.prompt_capabilities).await?;
-            let checkpoint = if P::IDLE_RETIREMENT && attachments.is_empty() {
-                let state = session.state.lock().await;
-                let initial_empty = state.owned_mutations && state.projection.is_empty();
-                let directory = state.info.directory.clone().unwrap_or_default();
-                drop(state);
-                if initial_empty {
-                    Some(NativeSnapshot::empty(id).checkpoint())
-                } else {
-                    let _inspection = self.inspection.lock().await;
-                    P::recovery_snapshot(&self.binary, &directory, id, &self.stop)
-                        .await
-                        .ok()
-                        .filter(|snapshot| snapshot.session_id == id)
-                        .map(|snapshot| snapshot.checkpoint())
-                }
-            } else {
-                None
-            };
-            // Admission and the local user row share the state lock: a fast
-            // native response cannot appear ahead of its submitted user text.
-            // Busy is published only after a request was actually flushed.
-            let mut state = session.state.lock().await;
-            state.projection.can_submit(&prepared.transcript)?;
-            state.recovery = None;
-            state.prompt_checkpoint = checkpoint;
-            state.prompt_user_digest = Some(recovery::text_digest(&prepared.transcript));
-            state.turn_had_output = false;
-            state.last_activity = tokio::time::Instant::now();
-            let request = session
-                .client
-                .start_request(
-                    "session/prompt",
-                    json!({ "sessionId": id, "prompt": prepared.content }),
-                )
-                .await;
-            match request {
-                Ok(request) => {
-                    state.info.status = AgentSessionStatus::Busy;
-                    state.info.error = None;
-                    state.info.updated_ms = mapper::now_ms();
-                    if let Some(seq) = self
-                        .mirror
-                        .update_status(&state.info.asid, AgentSessionStatus::Busy, None)
-                        .await
-                    {
-                        Self::emit(
-                            &self.mirror,
-                            &self.tx,
-                            AgentDomainEvent::StatusChanged {
-                                asid: state.info.asid.clone(),
-                                status: AgentSessionStatus::Busy,
-                                error: None,
-                                seq,
-                            },
-                        );
-                    }
-                    let row = state.projection.submitted(&prepared.transcript);
-                    let event = self
-                        .mirror
-                        .record_timeline_upsert(&state.info.asid, vec![row])
-                        .await;
-                    Self::emit(&self.mirror, &self.tx, event);
-                    drop(state);
-                    let sender = session.completions.clone();
-                    tokio::spawn(async move {
-                        let _ = sender.send(request.wait().await);
-                    });
-                    admission.handed_off = true;
-                    Ok(())
-                }
-                Err(error) => {
-                    drop(state);
-                    // A partial stdio write can be ambiguous. Preserve the uncertainty;
-                    // no automatic retry, queue fallback or second delivery is allowed.
-                    session.connected.store(false, Ordering::Release);
-                    Self::status(
-                        &session,
-                        &self.mirror,
-                        &self.tx,
-                        AgentSessionStatus::Unknown,
-                        None,
-                    )
-                    .await;
-                    Err(AgentError::Network(format!(
-                        "{error}; prompt delivery may have occurred; do not retry automatically"
-                    )))
-                }
-            }
-        })
+        Box::pin(self.submit_prompt(id, text, attachments, delivery, false))
     }
     fn interrupt<'a>(&'a self, id: &'a str) -> AgentFuture<'a, ()> {
         Box::pin(async move {

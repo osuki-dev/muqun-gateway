@@ -113,6 +113,82 @@ async fn dormant<P: AcpProvider>(driver: &AcpDriver<P>, id: &str) {
     .unwrap();
 }
 
+// A detached OS process models the native guard's EOF cleanup hazard. The
+// completed tool record is intentionally absent from the fixture's journal:
+// later history/ordinary turns must never clear live execution ownership.
+#[cfg(unix)]
+#[tokio::test]
+async fn observed_execution_keeps_detached_background_work_alive_across_idle_sweeps() {
+    let fixture = Fixture::new().await;
+    let binary = fixture.directory.join("mock-fx");
+    let script = std::fs::read_to_string(&binary).unwrap()
+        .replace("import json, os, sys, time", "import json, os, sys, time, subprocess, signal\nbackground=None")
+        .replace("        turn+=1", r#"        turn+=1
+        if turn==1:
+            background=subprocess.Popen([sys.executable,'background-sentinel.py'],start_new_session=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+            with open('background-pid','w') as f:f.write(str(background.pid))
+            update(active,{'sessionUpdate':'tool_call','toolCallId':'background','title':'Start background work','status':'completed'})"#);
+    std::fs::write(&binary, format!("{script}\nif background is not None:\n    with open('eof-guard-ran','w') as f:f.write('cleanup')\n    os.killpg(background.pid,signal.SIGKILL)\n    background.wait()\n")).unwrap();
+    std::fs::write(
+        fixture.directory.join("background-sentinel.py"),
+        r#"
+import time
+while True:
+    with open('heartbeat','w') as f:f.write(str(time.time_ns()))
+    time.sleep(0.02)
+"#,
+    )
+    .unwrap();
+    let driver = driver(&fixture);
+    let info = driver.create_session(None, None, None).await.unwrap();
+    driver
+        .send_prompt(&info.asid.0, "start", &[], None)
+        .await
+        .unwrap();
+    idle(&driver, &info.asid.0).await.unwrap();
+    let pid: i32 = std::fs::read_to_string(fixture.directory.join("background-pid"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    // The still-live fixture owns the unreaped detached group leader, keeping
+    // its identity reserved until this guard cleans up our own sentinel.
+    struct Sentinel(i32);
+    impl Drop for Sentinel {
+        fn drop(&mut self) {
+            unsafe {
+                libc::kill(-self.0, libc::SIGKILL);
+            }
+        }
+    }
+    let sentinel = Sentinel(pid);
+    for prompt in [None, Some("a later ordinary turn")] {
+        if let Some(prompt) = prompt {
+            driver
+                .send_prompt(&info.asid.0, prompt, &[], None)
+                .await
+                .unwrap();
+            idle(&driver, &info.asid.0).await.unwrap();
+        }
+        expire(&driver, &info.asid.0).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !fixture.directory.join("eof-guard-ran").exists(),
+            "idle EOF would kill the background job"
+        );
+        assert!(driver.retained(&info.asid.0).unwrap().client.is_running());
+        assert!(!driver.dormant.lock().unwrap().contains_key(&info.asid.0));
+        let before = std::fs::read_to_string(fixture.directory.join("heartbeat")).unwrap();
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let after = std::fs::read_to_string(fixture.directory.join("heartbeat")).unwrap();
+        assert_ne!(
+            before, after,
+            "the detached background process must keep working"
+        );
+    }
+    drop(sentinel);
+    driver.shutdown().await;
+}
+
 #[tokio::test]
 async fn parked_observation_drops_live_projection_and_concurrent_foreground_prepares_load_once() {
     let fixture = Fixture::new().await;

@@ -31,7 +31,7 @@ private `qodercli --acp` child. Shutdown stops and reaps Gateway-owned children;
 external terminal and IDE processes are untouched.
 
 Verified idle conversations release their private process after
-`qoder.idle_timeout_secs` (default 300 seconds, checked every 30 seconds). The
+`qoder.idle_timeout_secs` (default 3600 seconds, checked every 30 seconds). The
 driver checks the exact session's bounded native JSONL journal without loading
 it: the last matching `active-leaf` selects the branch, `parentUuid` orders its
 records, and native human-input metadata distinguishes prompts from tool-result
@@ -40,6 +40,17 @@ before that prompt by one human turn, with unchanged earlier context and exact
 user/final-assistant text hashes. Context attachments, reasoning and tool
 records remain part of the canonical checkpoint. A clean final native
 `end_turn` is required; cancellation/error records do not qualify.
+
+Observed live tool execution, native command delivery, permission requests or
+unknown extension/subagent control activity protects that entire process
+generation from automatic retirement, even after later ordinary turns finish.
+Native EOF can stop background jobs; a completed reply does not prove those
+jobs ended, and these CLIs expose no supported read-only job inventory.
+Historical replay alone does not pin a new generation. Custom hooks that launch
+silent work without observable execution/control records are outside this guard;
+Gateway does not disable user extensions or claim universal job-absence proof.
+Explicit configured timeouts remain unchanged, and history polling does not
+renew the idle timer.
 
 Busy/in-flight work and pending approvals prevent retirement. Gateway closes
 stdin in FIFO order, drains stdout/stderr, waits for a successful exit, then
