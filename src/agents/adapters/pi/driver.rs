@@ -9,10 +9,11 @@
 //! live state the driver answers from (status, pending approvals, rows not
 //! yet in the file) and the mirror are fed by the same fold.
 //!
-//! Pi 1.4.0 sends no entry id for a live message, so after each `turn_end`
-//! and `agent_settled` the forwarder reads the new tail of the session file
-//! and feeds every new message entry back as a synthetic `entry_appended`;
-//! the live folder re-keys its provisional `live-<n>` rows to the real ids.
+//! Pi 1.4.0 sends no entry id for a live message, so whenever a message may
+//! have reached the file (see [`rereads_tail`]) the forwarder reads the new
+//! tail of the session file and feeds every new message entry back as a
+//! synthetic `entry_appended`; the live folder re-keys its provisional
+//! `live-<n>` rows to the real ids.
 //!
 //! Everything Pi does not offer keeps the trait default and answers
 //! `Unsupported`; nothing here returns `Ok(())` for work it did not do.
@@ -55,6 +56,11 @@ const EVENT_CAPACITY: usize = 4096;
 /// file are dropped at the next read; this only bounds a session whose file
 /// cannot be read.
 const MAX_LIVE_ROWS: usize = 512;
+/// A synthetic record the driver publishes when a child replaces a dead one:
+/// it names the dead child's open approvals and provisional rows so the
+/// mirror drops them. The new child's folder never saw them, so this cannot
+/// go through it. Pi has no record of this type.
+const DISCARD: &str = "muqun_discard";
 
 /// What the driver knows about a session while (or since) a child ran it.
 struct LiveSession {
@@ -211,9 +217,7 @@ impl PiDriver {
         self.stop.clone()
     }
 
-    /// Start closing idle children. A child whose session is running is
-    /// touched first: a long silent tool call prints nothing, and the host
-    /// cannot tell that from idleness.
+    /// Start closing idle children, one [`reap_once`] pass per tick.
     pub fn start_reaper(&self) {
         let (host, live, stop, timeout) = (
             self.host.clone(),
@@ -228,24 +232,7 @@ impl PiDriver {
                     _ = stop.cancelled() => break,
                     _ = tick.tick() => {}
                 }
-                let running: Vec<String> = live
-                    .sessions
-                    .lock()
-                    .map(|s| {
-                        s.iter()
-                            .filter(|(_, s)| s.running())
-                            .map(|(k, _)| k.clone())
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                for asid in running {
-                    if let Some(child) = host.get(&asid) {
-                        child.touch();
-                    }
-                }
-                for asid in host.reap_idle(timeout).await {
-                    tracing::debug!(%asid, "closed an idle pi child");
-                }
+                reap_once(&host, &live, timeout).await;
             }
         });
     }
@@ -268,15 +255,24 @@ impl PiDriver {
     /// Fold one record of `asid` into live state and return what changed.
     /// Dialogs that are not ours are answered `cancelled` here, so Pi never
     /// waits on a prompt nobody sees.
+    ///
+    /// A record for a session with no live state is dropped: `adopt` creates
+    /// the state before it forwards anything, so such a record is one still
+    /// in flight after `delete_session`, and folding it would bring the
+    /// deleted session back as a ghost.
     pub async fn fold(&self, asid: &AgentSessionId, record: &Value) -> Vec<LiveChange> {
         let changes = {
             let Ok(mut sessions) = self.live.sessions.lock() else {
                 return Vec::new();
             };
-            let session = sessions
-                .entry(asid.0.clone())
-                .or_insert_with(|| LiveSession::new(asid, None, String::new(), 0));
-            let changes = session.folder.fold(record);
+            let Some(session) = sessions.get_mut(&asid.0) else {
+                return Vec::new();
+            };
+            let changes = if record.get("type").and_then(Value::as_str) == Some(DISCARD) {
+                discarded(record)
+            } else {
+                session.folder.fold(record)
+            };
             for change in &changes {
                 apply(session, change);
             }
@@ -314,9 +310,30 @@ impl PiDriver {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             + 1;
         session.generation = generation;
-        if let Ok(mut sessions) = self.live.sessions.lock() {
-            // A previous child's pending dialogs died with it.
-            sessions.insert(asid.0.clone(), session);
+        let replaced = self
+            .live
+            .sessions
+            .lock()
+            .ok()
+            .and_then(|mut sessions| sessions.insert(asid.0.clone(), session));
+        // A previous child's dialogs and unfinished rows died with it. Its
+        // forwarder stays silent (the generation moved on), so they are
+        // dropped here; published before the new forwarder starts, the
+        // discard folds ahead of anything the new child says.
+        if let Some(old) = replaced {
+            let permissions: Vec<&str> = old.pending.iter().map(|p| p.id.as_str()).collect();
+            let rows: Vec<&str> = old
+                .rows
+                .iter()
+                .map(|r| r.id.as_str())
+                .filter(|id| mapper::is_provisional(id))
+                .collect();
+            if !permissions.is_empty() || !rows.is_empty() {
+                self.live.publish(
+                    asid,
+                    json!({"type": DISCARD, "permissions": permissions, "rows": rows}),
+                );
+            }
         }
         if let Some(old) = self.host.insert(asid.0.clone(), child.clone()) {
             tokio::spawn(async move { old.close().await });
@@ -462,9 +479,91 @@ fn apply(session: &mut LiveSession, change: &LiveChange) {
     }
 }
 
-/// Forward one child's records until it exits. After a turn or a run ends,
-/// the file's new message entries follow as `entry_appended` so live rows
-/// are re-keyed. A child that dies leaves no run and no dialog behind.
+/// The changes a [`DISCARD`] record stands for.
+fn discarded(record: &Value) -> Vec<LiveChange> {
+    let ids = |key: &str| -> Vec<String> {
+        record
+            .get(key)
+            .and_then(Value::as_array)
+            .map(|ids| {
+                ids.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let mut changes: Vec<LiveChange> = ids("permissions")
+        .into_iter()
+        .map(LiveChange::PermissionResolved)
+        .collect();
+    let rows = ids("rows");
+    if !rows.is_empty() {
+        changes.push(LiveChange::Remove(rows));
+    }
+    changes
+}
+
+/// One reaper pass: close children idle past `timeout`.
+///
+/// Two kinds are kept however long they sit:
+/// - a running session: a long silent tool call prints nothing, and the host
+///   cannot tell that from idleness;
+/// - a session whose file does not exist yet: Pi writes it with the first
+///   message, so until then the child is the only thing that knows the
+///   session, and closing it would make the session unreachable (the next
+///   prompt finds no file to resume).
+async fn reap_once(host: &PiHost, live: &Live, timeout: Duration) {
+    let sessions: Vec<(String, bool, Option<PathBuf>)> = live
+        .sessions
+        .lock()
+        .map(|s| {
+            s.iter()
+                .map(|(asid, s)| (asid.clone(), s.running(), s.file.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut keep = std::collections::HashSet::new();
+    for (asid, running, file) in sessions {
+        let unwritten = match &file {
+            None => true,
+            Some(path) => !tokio::fs::try_exists(path).await.unwrap_or(true),
+        };
+        if running || unwritten {
+            keep.insert(asid);
+        }
+    }
+    for asid in host.reap_idle(timeout, &keep).await {
+        tracing::debug!(%asid, "closed an idle pi child");
+    }
+}
+
+/// Records after which a message entry may have reached the session file.
+///
+/// Pi prints `message_end` and then appends the entry, so the read on
+/// `message_end` usually sees it but can lose that race. The records that
+/// follow before any wait (`tool_execution_start`, an approval request)
+/// catch it before the user looks; `turn_end` and `agent_settled` catch
+/// whatever is left. Without the early reads a tool run or an approval wait
+/// shows each assistant message twice: once from the file and once as its
+/// not yet re-keyed live row.
+fn rereads_tail(record: &Value) -> bool {
+    matches!(
+        record.get("type").and_then(Value::as_str),
+        Some(
+            "message_end"
+                | "tool_execution_start"
+                | "extension_ui_request"
+                | "turn_end"
+                | "agent_settled"
+        )
+    )
+}
+
+/// Forward one child's records until it exits. Whenever a message may have
+/// been persisted, the file's new message entries follow as `entry_appended`
+/// so live rows are re-keyed. A child that dies leaves no run and no dialog
+/// behind.
 async fn forward(
     live: Arc<Live>,
     asid: AgentSessionId,
@@ -481,12 +580,9 @@ async fn forward(
         };
         match received {
             Ok(record) => {
-                let ends = matches!(
-                    record.get("type").and_then(Value::as_str),
-                    Some("turn_end" | "agent_settled")
-                );
+                let reread = rereads_tail(&record);
                 live.publish(&asid, record);
-                if ends {
+                if reread {
                     for entry in live.read_tail(&asid.0).await {
                         live.publish(&asid, json!({"type": "entry_appended", "entry": entry}));
                     }
@@ -532,8 +628,16 @@ impl AgentPort for PiDriver {
         super::KIND
     }
 
+    /// Healthy while any child is alive: a failed probe makes the runtime
+    /// shut the manager down, which kills every child, and a `pi --version`
+    /// that fails once (a loaded host, an upgrade swapping the install) says
+    /// nothing about the children already running. Only with none alive
+    /// does the binary's answer decide.
     fn probe(&self) -> AgentFuture<'_, bool> {
         Box::pin(async move {
+            if self.host.any_alive() {
+                return Ok(true);
+            }
             if let Some((at, ok)) = self.probed.lock().ok().and_then(|p| *p) {
                 if at.elapsed() < PROBE_TTL {
                     return Ok(ok);
@@ -941,5 +1045,98 @@ impl AgentPort for PiDriver {
             });
             Ok(json!({"started": true}))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A Pi stand-in: `--version` fails, `get_state` answers a fresh session
+    /// whose file would be `<cwd>/session.jsonl`, anything else succeeds.
+    const FAKE_PI: &str = r#"#!/usr/bin/env python3
+import json, os, sys, uuid
+if "--version" in sys.argv:
+    sys.exit(1)
+sid = str(uuid.uuid4())
+for raw in sys.stdin.buffer:
+    cmd = json.loads(raw)
+    data = {"sessionId": sid, "sessionFile": os.path.join(os.getcwd(), "session.jsonl")}
+    sys.stdout.write(json.dumps({"id": cmd.get("id"), "type": "response",
+                                 "command": cmd.get("type"), "success": True, "data": data}) + "\n")
+    sys.stdout.flush()
+"#;
+
+    /// A driver over the stand-in and a scratch directory, or `None` when
+    /// the host has no python3.
+    fn fake_driver(idle_timeout: Duration) -> Option<(PiDriver, PathBuf)> {
+        let python = std::process::Command::new("python3")
+            .arg("--version")
+            .output();
+        if !python.is_ok_and(|out| out.status.success()) {
+            eprintln!("python3 missing; skipping");
+            return None;
+        }
+        let dir = std::env::temp_dir().join(format!("muqun-pi-driver-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("sessions")).unwrap();
+        let binary = dir.join("pi");
+        std::fs::write(&binary, FAKE_PI).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let cmd = PiCommandLine {
+            binary,
+            extension: PathBuf::from("/workspace/demo/muqun-extension.js"),
+        };
+        let store = SessionStore::new(dir.join("sessions"));
+        Some((
+            PiDriver::new(cmd, store, true, idle_timeout, Vec::new()),
+            dir,
+        ))
+    }
+
+    /// The reaper closes an idle child only once its session has a file:
+    /// before the first message the child is all there is of the session.
+    #[tokio::test]
+    async fn reaper_keeps_a_child_until_its_session_is_written() {
+        let Some((driver, dir)) = fake_driver(Duration::ZERO) else {
+            return;
+        };
+        for (written, kept) in [(false, true), (true, false)] {
+            let project = dir.join(format!("project-{written}"));
+            std::fs::create_dir_all(&project).unwrap();
+            let info = driver
+                .create_session(project.to_str(), None, None)
+                .await
+                .unwrap();
+            if written {
+                std::fs::write(project.join("session.jsonl"), "{}\n").unwrap();
+            }
+            reap_once(&driver.host, &driver.live, Duration::ZERO).await;
+            assert_eq!(
+                driver.host.get(&info.asid.0).is_some(),
+                kept,
+                "written={written}"
+            );
+        }
+        driver.host.shutdown_all().await;
+    }
+
+    /// A failing `pi --version` does not count against the agent while a
+    /// child is running; with none, it does.
+    #[tokio::test]
+    async fn probe_trusts_a_live_child_over_the_binary() {
+        let Some((driver, dir)) = fake_driver(Duration::from_secs(900)) else {
+            return;
+        };
+        let info = driver
+            .create_session(dir.to_str(), None, None)
+            .await
+            .unwrap();
+        for (alive, healthy) in [(true, true), (false, false)] {
+            if !alive {
+                driver.delete_session(&info.asid.0).await.unwrap();
+            }
+            assert_eq!(driver.probe().await.unwrap(), healthy, "alive={alive}");
+        }
     }
 }

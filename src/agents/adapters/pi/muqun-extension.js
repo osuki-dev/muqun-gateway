@@ -5,7 +5,10 @@
 // `confirm` with a fixed title the gateway recognises; the message carries the
 // call as JSON so the gateway can render a real permission card instead of
 // parsing prose. No timeout is passed: Pi must wait for the user, never
-// auto-resolve. `MUQUN_PI_APPROVALS=never` turns the gate off.
+// auto-resolve. The turn's abort signal is passed so Stop dismisses the
+// dialog (Pi resolves it `false`, so the call is blocked); Pi tells the
+// client nothing when that happens, so the gateway drops the card itself when
+// the run settles. `MUQUN_PI_APPROVALS=never` turns the gate off.
 //
 // `tool_call` event fields (Pi 1.4.0): `toolName`, `toolCallId`, `input`, and
 // `parentToolCallId` on calls a tool makes itself.
@@ -23,6 +26,7 @@ export default function (pi) {
     const ok = await ctx.ui.confirm(
       "muqun.permission",
       JSON.stringify({ tool: event.toolName, toolCallId: event.toolCallId, input: event.input }),
+      { signal: ctx.signal },
     );
     if (!ok) return { block: true, reason: "Denied from Muqun" };
     return undefined;

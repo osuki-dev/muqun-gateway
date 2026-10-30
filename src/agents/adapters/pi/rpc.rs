@@ -513,18 +513,30 @@ impl PiHost {
         self.children.lock().ok()?.insert(asid, child)
     }
 
+    pub fn any_alive(&self) -> bool {
+        self.children
+            .lock()
+            .is_ok_and(|children| children.values().any(|child| child.is_alive()))
+    }
+
     pub fn remove(&self, asid: &str) -> Option<Arc<PiChild>> {
         self.children.lock().ok()?.remove(asid)
     }
 
-    /// Close children idle for at least `timeout` and drop dead ones.
-    /// Returns the asids that were let go.
-    pub async fn reap_idle(&self, timeout: Duration) -> Vec<String> {
+    /// Close children idle for at least `timeout`, except those in `keep`,
+    /// and drop dead ones. Returns the asids that were let go.
+    pub async fn reap_idle(
+        &self,
+        timeout: Duration,
+        keep: &std::collections::HashSet<String>,
+    ) -> Vec<String> {
         let reaped: Vec<(String, Arc<PiChild>)> = match self.children.lock() {
             Ok(mut children) => {
                 let ids: Vec<String> = children
                     .iter()
-                    .filter(|(_, child)| !child.is_alive() || child.idle_for() >= timeout)
+                    .filter(|(asid, child)| {
+                        !child.is_alive() || (child.idle_for() >= timeout && !keep.contains(*asid))
+                    })
                     .map(|(asid, _)| asid.clone())
                     .collect();
                 ids.into_iter()
@@ -673,7 +685,7 @@ for raw in sys.stdin.buffer:
         let idle = Arc::new(PiChild::spawn(&cmd, &launch).await.unwrap());
         host.insert("s-idle".into(), idle.clone());
 
-        let mut reaped = host.reap_idle(Duration::ZERO).await;
+        let mut reaped = host.reap_idle(Duration::ZERO, &Default::default()).await;
         reaped.sort();
         assert_eq!(reaped, ["s-dead", "s-idle"]);
         assert!(!idle.is_alive());

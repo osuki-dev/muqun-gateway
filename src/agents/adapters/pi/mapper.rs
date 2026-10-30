@@ -32,6 +32,12 @@ pub const PERMISSION_TITLE: &str = "muqun.permission";
 /// Prefix of the ids minted for a live message before Pi has persisted it.
 const PROVISIONAL_PREFIX: &str = "live-";
 
+/// Whether `row_id` is a provisional live row (`live-<n>` or `live-<n>:<i>`)
+/// rather than one keyed by a persisted entry.
+pub fn is_provisional(row_id: &str) -> bool {
+    row_id.starts_with(PROVISIONAL_PREFIX)
+}
+
 /// How many live messages the folder remembers for re-keying and late tool
 /// events. A run streams one assistant message per turn; this covers far more
 /// turns than sit between a message and its tool results.
@@ -472,11 +478,20 @@ impl LiveFolder {
             "agent_start" => vec![LiveChange::Status(AgentSessionStatus::Busy)],
             "agent_settled" => {
                 let aborted = record.get("aborted").and_then(Value::as_bool) == Some(true);
-                vec![LiveChange::Status(if aborted {
+                // A dialog still open when the run ends is dead: an abort
+                // dismisses it inside Pi without telling the client, and
+                // answering it afterwards would reach an id Pi forgot.
+                let mut changes: Vec<LiveChange> = self
+                    .pending_permissions
+                    .drain()
+                    .map(LiveChange::PermissionResolved)
+                    .collect();
+                changes.push(LiveChange::Status(if aborted {
                     AgentSessionStatus::Interrupted
                 } else {
                     AgentSessionStatus::Idle
-                })]
+                }));
+                changes
             }
             "auto_retry_start" => vec![LiveChange::Status(AgentSessionStatus::Retry)],
             "message_start" => {
@@ -1055,15 +1070,24 @@ mod tests {
                 json!({"command": "rm -rf build"}),
                 "bash: rm -rf build",
                 "rm -rf build",
+                json!({"type": "extension_ui_response", "id": "ui-1", "confirmed": true}),
+                vec![LiveChange::PermissionResolved("ui-1".into())],
             ),
             (
                 "edit",
                 json!({"path": "src/main.rs"}),
                 "edit src/main.rs",
                 "src/main.rs",
+                // Stop while the card is open: Pi dismisses the dialog
+                // without a word, so the settle must drop the card.
+                json!({"type": "agent_settled", "aborted": true}),
+                vec![
+                    LiveChange::PermissionResolved("ui-1".into()),
+                    LiveChange::Status(AgentSessionStatus::Interrupted),
+                ],
             ),
         ];
-        for (tool, input, prompt, resource) in cases {
+        for (tool, input, prompt, resource, close, closed) in cases {
             let mut folder = LiveFolder::new("s1".into());
             let payload = json!({"tool": tool, "toolCallId": "call-7", "input": input});
             let request = json!({"type": "extension_ui_request", "id": "ui-1",
@@ -1090,9 +1114,12 @@ mod tests {
                     (1, PermissionDecision::Deny)
                 ]
             );
-            let resolved = folder.fold(&json!({"type": "extension_ui_response", "id": "ui-1",
-                                               "confirmed": true}));
-            assert_eq!(resolved, [LiveChange::PermissionResolved("ui-1".into())]);
+            assert_eq!(folder.fold(&close), closed, "{tool}");
+            // Resolved once: a later settle has nothing left to drop.
+            assert_eq!(
+                folder.fold(&json!({"type": "agent_settled"})),
+                [LiveChange::Status(AgentSessionStatus::Idle)]
+            );
         }
     }
 }

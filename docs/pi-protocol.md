@@ -43,9 +43,15 @@ once attached. It ranks last in `AGENT_PREFERENCE`.
   (a longer one kills the child). Commands carry a string `id`; the matching
   `response` resolves it (60 s timeout). Stderr is logged, never parsed.
 - Idle: children are touched on every record and command; the reaper (every
-  30 s) also touches any child whose session is running, so a long silent tool
-  call is never reaped. Idle children get stdin closed, then a kill after 5 s.
-  Manager shutdown closes every child.
+  30 s) never closes a child whose session is running (a long silent tool call)
+  or whose session file does not exist yet (a new session before its first
+  message: the child is all there is of it). Idle children get stdin closed,
+  then a kill after 5 s. Manager shutdown closes every child.
+- The extension is written to `<state_dir>/pi/` (owner-only directory, atomic
+  rename, a symlink at the file is removed, a symlinked directory refused).
+  Without a state directory Pi is not attached (discovery `offline`, reason
+  "no state directory for the Pi extension"): Pi executes that file, so it
+  never goes to a shared temp path.
 - The model catalog comes from a throwaway
   `pi --mode rpc --no-session --no-extensions` child
   (`get_available_models`, `get_available_thinking_levels`, `get_state`),
@@ -59,8 +65,10 @@ driver's per-session `LiveFolder` and applies the result to the mirror.
 
 Pi 1.4.0 sends no entry id for a live message (`entry_appended` is emitted only
 for extension entries). Live rows are keyed `live-<n>[:<contentIndex>]`; after
-every `turn_end` and `agent_settled` the driver reads the session file from
-the last byte it saw and feeds each new `message` entry back as a synthetic
+every `message_end`, `tool_execution_start`, `extension_ui_request`,
+`turn_end` and `agent_settled` the driver reads the session file from the
+last byte it saw (Pi prints `message_end` before it appends the entry, so the
+later records catch a lost race before a tool run or an approval wait) and feeds each new `message` entry back as a synthetic
 `{"type":"entry_appended","entry":…}`. The folder matches it on role and
 message timestamp, removes the provisional rows and upserts them under the
 entry id, so a later file read produces the same rows. Row `message_id` is
@@ -68,7 +76,12 @@ entry id, so a later file read produces the same rows. Row `message_id` is
 follows creation time.
 
 A child that exits during a run produces a synthetic
-`agent_settled{aborted:true}`, and its open approvals are resolved.
+`agent_settled{aborted:true}`, and its open approvals are resolved. When a
+write respawns a dead child before its forwarder noticed, the driver publishes
+a synthetic `muqun_discard` naming the old child's open approvals and
+provisional rows, so the mirror drops them. `agent_settled` resolves any
+approval still open. Records for a session with no live state (one just
+deleted) are dropped.
 
 ## Extension contract
 
@@ -79,7 +92,10 @@ A child that exits during a run produces a synthetic
 - Unless `MUQUN_PI_APPROVALS=never`, on `tool_call` for `bash`, `edit`, `write`
   (top-level calls) asks
   `ctx.ui.confirm("muqun.permission", JSON.stringify({tool, toolCallId, input}))`
-  with no timeout and blocks the call when the answer is false.
+  with no timeout and `{signal: ctx.signal}`, and blocks the call when the
+  answer is false. Stop (`abort`) fires that signal: Pi resolves the dialog
+  `false` without sending anything, the call is blocked and the run settles
+  with `aborted:true`, which drops the card.
 
 On the wire this is
 `{"type":"extension_ui_request","id":…,"method":"confirm","title":"muqun.permission","message":"<json>"}`,
@@ -92,7 +108,7 @@ the gateway sends is also folded, which resolves the pending approval.
 
 | AgentPort | Pi |
 |---|---|
-| `probe` | `pi --version` succeeds (cached 60 s) |
+| `probe` | healthy while any child is alive; otherwise `pi --version` succeeds (cached 60 s) |
 | `list_projects` | distinct header `cwd`; `name` = last segment; `missing` when the directory is gone |
 | `list_sessions` | session files (one bucket with a directory filter), newest first (`order=asc` reverses); title = latest `session_info.name`, else first user text (80 chars), else `New session`; model from the last `model_change`/`thinking_level_change`; status `Busy` while the live child runs, else `Idle`; `search` matches the title; a parent filter other than top-level matches nothing |
 | `get_session` | the same, one file; a fresh session without a file from live state |

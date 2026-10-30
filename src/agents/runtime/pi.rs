@@ -119,13 +119,21 @@ impl PiConfig {
 /// What the runtime keeps for Pi between supervision passes.
 pub(super) struct PiState {
     config: PiConfig,
-    /// Where the bundled extension is written; a temp dir when `None`.
+    /// Where the bundled extension is written. Without one Pi is not
+    /// attached: Pi runs that file with the user's rights, so it must sit in
+    /// a directory only the user can write, never a shared temp path.
     state_dir: Option<PathBuf>,
+    /// Supervision retries every pass; the missing state dir is said once.
+    no_state_dir_logged: std::sync::atomic::AtomicBool,
 }
 
 impl PiState {
     pub(super) fn new(config: PiConfig, state_dir: Option<PathBuf>) -> Self {
-        Self { config, state_dir }
+        Self {
+            config,
+            state_dir,
+            no_state_dir_logged: std::sync::atomic::AtomicBool::new(false),
+        }
     }
 
     pub(super) fn enabled(&self) -> bool {
@@ -138,16 +146,40 @@ impl PiState {
 
     /// Write the bundled extension where `pi -e` can load it. Rewritten on
     /// every attach so an upgraded gateway never runs a stale copy.
-    async fn write_extension(&self) -> std::io::Result<PathBuf> {
-        let dir = match &self.state_dir {
-            Some(dir) => dir.join("pi"),
-            None => std::env::temp_dir().join("muqun-pi"),
-        };
-        tokio::fs::create_dir_all(&dir).await?;
-        let path = dir.join("muqun-extension.js");
-        tokio::fs::write(&path, mapper::EXTENSION_SOURCE).await?;
-        Ok(path)
+    ///
+    /// The directory is locked down and the file replaced by an atomic
+    /// rename. A symlink at either path is never followed: one planted at the
+    /// file is removed first, and a symlinked directory is refused, because
+    /// whatever ends up at that path is executed by Pi.
+    async fn write_extension(&self) -> anyhow::Result<PathBuf> {
+        let state_dir = self
+            .state_dir
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!(NO_STATE_DIR))?;
+        tokio::task::spawn_blocking(move || write_extension_into(&state_dir.join("pi")))
+            .await
+            .map_err(|error| anyhow::anyhow!("extension writer panicked: {error}"))?
     }
+}
+
+/// Why Pi is not attached when the gateway runs without a state directory.
+const NO_STATE_DIR: &str = "no state directory for the Pi extension";
+
+fn write_extension_into(dir: &Path) -> anyhow::Result<PathBuf> {
+    use crate::platform::store::{ensure_secret_dir, write_secret_file};
+    if std::fs::symlink_metadata(dir).is_ok_and(|m| m.file_type().is_symlink()) {
+        anyhow::bail!(
+            "{} is a symlink; refusing to write the Pi extension",
+            dir.display()
+        );
+    }
+    ensure_secret_dir(dir)?;
+    let path = dir.join("muqun-extension.js");
+    if std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
+        std::fs::remove_file(&path)?;
+    }
+    write_secret_file(&path, mapper::EXTENSION_SOURCE.as_bytes())?;
+    Ok(path)
 }
 
 /// The feature flags the App reads for the `pi` agent.
@@ -188,6 +220,16 @@ impl AgentRuntime {
         if self.keep_if_healthy(pi::KIND).await {
             return true;
         }
+        if self.pi.state_dir.is_none() {
+            if !self
+                .pi
+                .no_state_dir_logged
+                .swap(true, std::sync::atomic::Ordering::Relaxed)
+            {
+                tracing::warn!("Pi is not attached: {NO_STATE_DIR}");
+            }
+            return false;
+        }
         let Some(binary) = self.pi.config.binary() else {
             return false;
         };
@@ -202,7 +244,7 @@ impl AgentRuntime {
         let extension = match self.pi.write_extension().await {
             Ok(path) => path,
             Err(error) => {
-                tracing::warn!(%error, "could not write the Muqun extension for Pi");
+                tracing::warn!("could not write the Muqun extension for Pi: {error:#}");
                 return false;
             }
         };
@@ -284,6 +326,11 @@ impl AgentRuntime {
         // supervision pass, so it is `reachable`.
         match self.pi.config.binary() {
             None => info.status = AgentAvailability::NotInstalled,
+            // Never attached: see `PiState::state_dir`.
+            Some(_) if self.pi.state_dir.is_none() => {
+                info.status = AgentAvailability::Offline;
+                info.reason = Some(NO_STATE_DIR.to_string());
+            }
             Some(binary) => match binary_version(&binary).await {
                 Some(version) => {
                     info.status = AgentAvailability::Reachable;
