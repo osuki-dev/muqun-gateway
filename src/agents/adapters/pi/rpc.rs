@@ -208,6 +208,7 @@ pub struct PiChild {
 }
 
 struct Activity {
+    pid: Option<u32>,
     last_used: Instant,
     operations: usize,
     retiring: bool,
@@ -218,6 +219,86 @@ struct Activity {
     /// Pi exposes no active-job query. Once this owned generation executes
     /// tools or extensions, a settled model cannot prove their jobs ended.
     execution_observed: bool,
+    first_execution: Option<ExecutionReason>,
+    last_refusal: Option<RetirementRefusal>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExecutionReason {
+    NativeTool,
+    NativeBash,
+    SlashCommand,
+    ExtensionUi(UiMethod),
+    EntryAppended,
+    ExtensionError,
+    CustomMessage,
+    HandledInput,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UiMethod {
+    Notify,
+    SetStatus,
+    SetWidget,
+    SetTitle,
+    SetEditorText,
+    Confirm,
+    Select,
+    Input,
+    Editor,
+    Other,
+}
+
+impl UiMethod {
+    fn from_record(record: &Value) -> Self {
+        match record.get("method").and_then(Value::as_str) {
+            Some("notify") => Self::Notify,
+            Some("setStatus") => Self::SetStatus,
+            Some("setWidget") => Self::SetWidget,
+            Some("setTitle") => Self::SetTitle,
+            Some("set_editor_text") => Self::SetEditorText,
+            Some("confirm") => Self::Confirm,
+            Some("select") => Self::Select,
+            Some("input") => Self::Input,
+            Some("editor") => Self::Editor,
+            _ => Self::Other,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RetirementRefusal {
+    Retiring,
+    ActivityChanged,
+    InFlight,
+    Running,
+    Compacting,
+    Queued,
+    Execution,
+    RecentActivity,
+    PendingPermission,
+    UnpersistedRows,
+    SessionFileUnavailable,
+}
+
+impl Activity {
+    fn observe_execution(&mut self, reason: ExecutionReason) {
+        self.execution_observed = true;
+        if self.first_execution.is_none() {
+            self.first_execution = Some(reason);
+            tracing::debug!(
+                pid = ?self.pid, ?reason,
+                "Pi idle retirement protected by observed execution"
+            );
+        }
+    }
+
+    fn refuse(&mut self, reason: RetirementRefusal) {
+        if self.last_refusal != Some(reason) {
+            tracing::debug!(pid = ?self.pid, ?reason, first_execution = ?self.first_execution, "Pi idle retirement refused");
+            self.last_refusal = Some(reason);
+        }
+    }
 }
 
 /// An explicit session operation pins its child through all of its RPCs.
@@ -300,6 +381,7 @@ impl PiChild {
         let (events, _) = broadcast::channel(EVENT_CAPACITY);
         let alive = Arc::new(AtomicBool::new(true));
         let activity = Arc::new(Mutex::new(Activity {
+            pid,
             last_used: Instant::now(),
             operations: 0,
             retiring: false,
@@ -308,6 +390,8 @@ impl PiChild {
             queued: false,
             has_conversation: false,
             execution_observed: false,
+            first_execution: None,
+            last_refusal: None,
         }));
         let kill = Arc::new(Notify::new());
         let (exited_tx, exited) = watch::channel(false);
@@ -437,6 +521,22 @@ impl PiChild {
         self.activity.lock().map_or(true, |a| a.has_conversation)
     }
 
+    pub(super) fn note_refusal(&self, reason: RetirementRefusal) {
+        if let Ok(mut activity) = self.activity.lock() {
+            activity.refuse(reason);
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn diagnostics(&self) -> Value {
+        self.activity.lock().map(|a| serde_json::json!({
+            "idle_secs":a.last_used.elapsed().as_secs_f64(), "operations":a.operations,
+            "running":a.running, "compacting":a.compacting, "queued":a.queued,
+            "execution_observed":a.execution_observed, "first_execution":format!("{:?}",a.first_execution),
+            "refusal":format!("{:?}",a.last_refusal)
+        })).unwrap_or(Value::Null)
+    }
+
     fn begin_operation(&self, foreground: bool) -> Result<(), AgentError> {
         let mut activity = self
             .activity
@@ -467,17 +567,30 @@ impl PiChild {
 
     fn retire_if_idle(&self, timeout: Duration, observed: Option<Instant>) -> bool {
         self.activity.lock().is_ok_and(|mut activity| {
-            if activity.retiring
-                || observed.is_some_and(|at| at != activity.last_used)
-                || activity.operations > 0
-                || activity.running
-                || activity.compacting
-                || activity.queued
-                || activity.execution_observed
-                || activity.last_used.elapsed() < timeout
-            {
+            let reason = if activity.retiring {
+                Some(RetirementRefusal::Retiring)
+            } else if observed.is_some_and(|at| at != activity.last_used) {
+                Some(RetirementRefusal::ActivityChanged)
+            } else if activity.operations > 0 {
+                Some(RetirementRefusal::InFlight)
+            } else if activity.running {
+                Some(RetirementRefusal::Running)
+            } else if activity.compacting {
+                Some(RetirementRefusal::Compacting)
+            } else if activity.queued {
+                Some(RetirementRefusal::Queued)
+            } else if activity.execution_observed {
+                Some(RetirementRefusal::Execution)
+            } else if activity.last_used.elapsed() < timeout {
+                Some(RetirementRefusal::RecentActivity)
+            } else {
+                None
+            };
+            if let Some(reason) = reason {
+                activity.refuse(reason);
                 return false;
             }
+            activity.last_refusal = None;
             activity.retiring = true;
             true
         })
@@ -524,7 +637,11 @@ impl PiChild {
                     .is_some_and(|message| message.trim_start().starts_with('/')));
         if executable {
             if let Ok(mut activity) = self.activity.lock() {
-                activity.execution_observed = true;
+                activity.observe_execution(if kind == Some("bash") {
+                    ExecutionReason::NativeBash
+                } else {
+                    ExecutionReason::SlashCommand
+                });
             }
         }
         if !record
@@ -739,7 +856,16 @@ async fn read_stdout<R: AsyncBufRead + Unpin>(
                         && record.pointer("/message/role").and_then(Value::as_str)
                             == Some("custom"))
                 {
-                    activity.execution_observed = true;
+                    let reason = match kind {
+                        "entry_appended" => ExecutionReason::EntryAppended,
+                        "extension_error" => ExecutionReason::ExtensionError,
+                        "message_start" | "message_end" => ExecutionReason::CustomMessage,
+                        "tool_execution_start" | "tool_execution_update" | "tool_execution_end" => {
+                            ExecutionReason::NativeTool
+                        }
+                        _ => ExecutionReason::ExtensionUi(UiMethod::from_record(&record)),
+                    };
+                    activity.observe_execution(reason);
                 }
                 if matches!(
                     record.get("type").and_then(Value::as_str),
@@ -796,7 +922,7 @@ async fn read_stdout<R: AsyncBufRead + Unpin>(
             ) && record.pointer("/data/disposition").and_then(Value::as_str) == Some("handled")
             {
                 if let Ok(mut activity) = activity.lock() {
-                    activity.execution_observed = true;
+                    activity.observe_execution(ExecutionReason::HandledInput);
                 }
             }
             Ok(record.get("data").cloned().unwrap_or(Value::Null))
@@ -1174,6 +1300,10 @@ for raw in sys.stdin.buffer:
                 .is_empty(),
             "activity during durable-file validation invalidates retirement"
         );
+        assert_eq!(
+            child.activity.lock().unwrap().last_refusal,
+            Some(RetirementRefusal::ActivityChanged)
+        );
         let lease = host.lease("s-1").unwrap();
         child.activity.lock().unwrap().last_used = old;
         assert!(host
@@ -1305,6 +1435,10 @@ for raw in sys.stdin.buffer:
                 .await
                 .unwrap();
             assert_eq!(reply["disposition"], "handled");
+            assert_eq!(
+                child.activity.lock().unwrap().first_execution,
+                Some(ExecutionReason::HandledInput)
+            );
             assert!(
                 !child.retire_if_idle(Duration::ZERO, None),
                 "handled {kind}"
@@ -1320,6 +1454,14 @@ for raw in sys.stdin.buffer:
             assert!(
                 !child.retire_if_idle(Duration::ZERO, None),
                 "later turn cleared handled {kind}"
+            );
+            assert_eq!(
+                child.activity.lock().unwrap().first_execution,
+                Some(ExecutionReason::HandledInput)
+            );
+            assert_eq!(
+                child.activity.lock().unwrap().last_refusal,
+                Some(RetirementRefusal::Execution)
             );
             child.close().await;
         }
