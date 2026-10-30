@@ -22,12 +22,13 @@ The retired `herdr.gateway` identifier remains only for migration compatibility.
   - `adapters/`: OpenCode, DeepSeek, Codex (`adapters/codex/`, private app-server
     stdio or verified shared-daemon Unix WebSocket; wire reference in `docs/codex-protocol.md`), T3 Code (`adapters/t3/`,
     Effect RPC over a WebSocket; wire reference in `docs/t3-protocol.md`), FX and
-    Qoder CLI (`adapters/fx/`, `adapters/qoder/`), and the in-memory mirror.
+    Qoder CLI (`adapters/fx/`, `adapters/qoder/`), Pi (`adapters/pi/`,
+    private `pi --mode rpc` children; see `docs/pi-protocol.md`), and the in-memory mirror.
     FX/Qoder share the bounded private stdio client and session projection in
     `adapters/acp/`; provider profiles retain their native launch, message-id
     and capability differences. Their drivers own session children and domain
     events; other service event streams are folded under `manager/`
-    (`deepseek.rs`, `t3.rs`, `codex.rs`). See `docs/fx-protocol.md` and
+    (`deepseek.rs`, `t3.rs`, `codex.rs`, `pi.rs`). See `docs/fx-protocol.md` and
     `docs/qoder-protocol.md` for their separate upstream contracts.
   - `manager.rs`, `runtime.rs`, `use_cases/`: agent supervision and the
     session/prompt/interaction services. `runtime/t3.rs` holds T3's config

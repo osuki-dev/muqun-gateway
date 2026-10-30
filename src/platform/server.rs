@@ -112,13 +112,16 @@ pub(crate) async fn run(config_path: Option<String>) -> anyhow::Result<()> {
     backend_startup::spawn(&config);
 
     let agent_runtime = if config.agent_runtime.enabled {
-        agents::AgentRuntime::with_qoder_configs(
+        agents::AgentRuntime::with_local_configs(
             config.opencode.clone(),
             config.deepseek.clone(),
             config.t3.clone(),
-            config.codex.clone(),
-            config.fx.clone(),
-            config.qoder.clone(),
+            crate::agents::runtime::LocalAgentConfigs {
+                codex: config.codex.clone(),
+                fx: config.fx.clone(),
+                qoder: config.qoder.clone(),
+                pi: config.pi.clone(),
+            },
             Some(state_dir()?),
         )
     } else {

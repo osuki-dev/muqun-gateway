@@ -5779,6 +5779,8 @@ mod tests {
     async fn vcs_files_and_file_answer_from_git_for_any_agent() {
         // Keep the fixture and route futures off the default test worker stack.
         let (state, root, _repo) = Box::pin(vcs_state("agent-vcs-files")).await;
+        // Each call boxed too: `AppState` is held by value and grows with
+        // every agent's config block.
         let files = |asid: &str, mode: Option<&str>| {
             Box::pin(get_agent_vcs_files(
                 State(state.clone()),

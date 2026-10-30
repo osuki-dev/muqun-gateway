@@ -140,6 +140,7 @@ pub(crate) fn setup(
             opencode: agents::OpencodeConfig::default(),
             deepseek: agents::DeepseekConfig::default(),
             t3: agents::T3Config::default(),
+            pi: agents::PiConfig::default(),
             codex: agents::runtime::CodexConfig::default(),
             fx: agents::runtime::FxConfig::default(),
             qoder: agents::runtime::QoderConfig::default(),

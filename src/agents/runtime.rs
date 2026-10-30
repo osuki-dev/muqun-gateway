@@ -28,9 +28,12 @@ pub use codex::CodexConfig;
 pub(crate) mod deepseek;
 pub(crate) mod fx;
 pub use fx::FxConfig;
+mod pi;
 pub(crate) mod qoder;
 pub use qoder::QoderConfig;
 mod t3;
+pub use pi::PiConfig;
+use pi::PiState;
 use t3::{catalog_entry, T3State};
 pub use t3::{T3Config, DEFAULT_T3_URL};
 
@@ -62,7 +65,8 @@ const VERSION_OUTPUT_LIMIT: u64 = 4096;
 
 /// Preference among attached providers. Explicit provider/session selections
 /// retain their route; discovery additionally puts usable providers first.
-pub const AGENT_PREFERENCE: [&str; 6] = ["codex", "opencode", "deepseek", "t3", "fx", "qoder"];
+pub const AGENT_PREFERENCE: [&str; 7] =
+    ["codex", "opencode", "deepseek", "t3", "fx", "qoder", "pi"];
 /// Most session-to-agent routes remembered; the oldest go first.
 const MAX_SESSION_ROUTES: usize = 4096;
 /// How long an agent discovery result is reused.
@@ -268,6 +272,22 @@ pub struct AgentStatus {
     pub agent_id: Option<String>,
 }
 
+/// Configurations for the local service adapters, named to keep construction clear.
+#[derive(Default)]
+pub struct LocalAgentConfigs {
+    pub codex: CodexConfig,
+    pub fx: FxConfig,
+    pub qoder: QoderConfig,
+    pub pi: PiConfig,
+}
+
+struct LocalAgentStates {
+    codex: codex::CodexState,
+    fx: fx::FxState,
+    qoder: qoder::QoderState,
+    pi: PiState,
+}
+
 pub struct AgentRuntime {
     manager: RwLock<Option<Arc<AgentManager>>>,
     managers: RwLock<BTreeMap<String, Arc<AgentManager>>>,
@@ -284,6 +304,7 @@ pub struct AgentRuntime {
     config: OpencodeConfig,
     deepseek_config: DeepseekConfig,
     t3: T3State,
+    pi: PiState,
     codex: codex::CodexState,
     fx: fx::FxState,
     qoder: qoder::QoderState,
@@ -370,15 +391,19 @@ impl AgentRuntime {
         t3_config: T3Config,
         state_dir: Option<std::path::PathBuf>,
     ) -> Arc<Self> {
-        Self::with_all_configs(
+        Self::with_local_configs(
             config,
             deepseek_config,
             t3_config,
-            CodexConfig::default(),
+            LocalAgentConfigs {
+                pi: PiConfig::disabled(),
+                ..Default::default()
+            },
             state_dir,
         )
     }
 
+    /// Compatibility construction for callers that supplied only Codex explicitly.
     pub fn with_all_configs(
         config: OpencodeConfig,
         deepseek_config: DeepseekConfig,
@@ -386,13 +411,37 @@ impl AgentRuntime {
         codex_config: CodexConfig,
         state_dir: Option<std::path::PathBuf>,
     ) -> Arc<Self> {
-        Self::with_fx_configs(
+        Self::with_local_configs(
             config,
             deepseek_config,
             t3_config,
-            codex_config,
-            FxConfig::default(),
+            LocalAgentConfigs {
+                codex: codex_config,
+                pi: PiConfig::disabled(),
+                ..Default::default()
+            },
             state_dir,
+        )
+    }
+
+    /// The composition root supplies every local adapter's configuration by name.
+    pub fn with_local_configs(
+        config: OpencodeConfig,
+        deepseek_config: DeepseekConfig,
+        t3_config: T3Config,
+        local: LocalAgentConfigs,
+        state_dir: Option<std::path::PathBuf>,
+    ) -> Arc<Self> {
+        Self::with_states(
+            config,
+            deepseek_config,
+            T3State::new(t3_config, state_dir.clone()),
+            LocalAgentStates {
+                codex: codex::CodexState::new(local.codex),
+                fx: fx::FxState::new(local.fx),
+                qoder: qoder::QoderState::new(local.qoder),
+                pi: PiState::new(local.pi, state_dir),
+            },
         )
     }
 
@@ -404,13 +453,16 @@ impl AgentRuntime {
         fx_config: FxConfig,
         state_dir: Option<std::path::PathBuf>,
     ) -> Arc<Self> {
-        Self::with_qoder_configs(
+        Self::with_local_configs(
             config,
             deepseek_config,
             t3_config,
-            codex_config,
-            fx_config,
-            QoderConfig::default(),
+            LocalAgentConfigs {
+                codex: codex_config,
+                fx: fx_config,
+                qoder: QoderConfig::default(),
+                pi: PiConfig::disabled(),
+            },
             state_dir,
         )
     }
@@ -424,13 +476,44 @@ impl AgentRuntime {
         qoder_config: QoderConfig,
         state_dir: Option<std::path::PathBuf>,
     ) -> Arc<Self> {
-        Self::with_states(
+        Self::with_local_configs(
             config,
             deepseek_config,
-            T3State::new(t3_config, state_dir),
-            codex::CodexState::new(codex_config),
-            fx::FxState::new(fx_config),
-            qoder::QoderState::new(qoder_config),
+            t3_config,
+            LocalAgentConfigs {
+                codex: codex_config,
+                fx: fx_config,
+                qoder: qoder_config,
+                pi: PiConfig::disabled(),
+            },
+            state_dir,
+        )
+    }
+
+    /// Compatibility construction for callers that explicitly supply Pi.
+    pub fn with_pi_configs(
+        config: OpencodeConfig,
+        deepseek_config: DeepseekConfig,
+        t3_config: T3Config,
+        codex_config: CodexConfig,
+        fx_config: FxConfig,
+        pi_config: PiConfig,
+        state_dir: Option<std::path::PathBuf>,
+    ) -> Arc<Self> {
+        Self::with_local_configs(
+            config,
+            deepseek_config,
+            t3_config,
+            LocalAgentConfigs {
+                codex: codex_config,
+                fx: fx_config,
+                qoder: QoderConfig {
+                    enabled: false,
+                    binary: None,
+                },
+                pi: pi_config,
+            },
+            state_dir,
         )
     }
 
@@ -443,9 +526,12 @@ impl AgentRuntime {
             config,
             deepseek_config,
             t3,
-            codex::CodexState::new(CodexConfig::default()),
-            fx::FxState::new(FxConfig::default()),
-            qoder::QoderState::new(QoderConfig::default()),
+            LocalAgentStates {
+                codex: codex::CodexState::new(CodexConfig::default()),
+                fx: fx::FxState::new(FxConfig::default()),
+                qoder: qoder::QoderState::new(QoderConfig::default()),
+                pi: PiState::new(PiConfig::disabled(), None),
+            },
         )
     }
 
@@ -453,9 +539,7 @@ impl AgentRuntime {
         config: OpencodeConfig,
         deepseek_config: DeepseekConfig,
         t3: T3State,
-        codex: codex::CodexState,
-        fx: fx::FxState,
-        qoder: qoder::QoderState,
+        local: LocalAgentStates,
     ) -> Arc<Self> {
         let (events_tx, _) = broadcast::channel(1024);
         Arc::new(Self {
@@ -468,9 +552,10 @@ impl AgentRuntime {
             config,
             deepseek_config,
             t3,
-            codex,
-            fx,
-            qoder,
+            pi: local.pi,
+            codex: local.codex,
+            fx: local.fx,
+            qoder: local.qoder,
             deepseek_spawn: Mutex::new(deepseek::SpawnSlot::default()),
             deepseek_origin: RwLock::new(AgentOrigin::None),
             origin: RwLock::new(AgentOrigin::None),
@@ -587,7 +672,7 @@ impl AgentRuntime {
     /// A runtime that will never attach an agent, for tests and for a build
     /// of `AppState` that has no business starting anything.
     pub fn disabled() -> Arc<Self> {
-        Self::with_qoder_configs(
+        Self::with_local_configs(
             OpencodeConfig {
                 enabled: false,
                 autostart: false,
@@ -595,17 +680,20 @@ impl AgentRuntime {
             },
             DeepseekConfig::default(),
             T3Config::default(),
-            CodexConfig {
-                enabled: false,
-                binary: None,
-            },
-            FxConfig {
-                enabled: false,
-                binary: None,
-            },
-            QoderConfig {
-                enabled: false,
-                binary: None,
+            LocalAgentConfigs {
+                codex: CodexConfig {
+                    enabled: false,
+                    binary: None,
+                },
+                fx: FxConfig {
+                    enabled: false,
+                    binary: None,
+                },
+                qoder: QoderConfig {
+                    enabled: false,
+                    binary: None,
+                },
+                pi: PiConfig::disabled(),
             },
             None,
         )
@@ -924,6 +1012,7 @@ impl AgentRuntime {
                         opencode_features(false, false),
                     ),
                     "t3" => (self.t3.wanted(), "T3 Code", self.t3.features()),
+                    "pi" => (self.pi.enabled(), "Pi", self.pi.features()),
                     "codex" => (self.codex.config.enabled, "Codex", codex::features()),
                     "fx" => (self.fx.config.enabled, "FX", fx::features()),
                     "qoder" => (self.qoder.config.enabled, "Qoder CLI", qoder::features()),
@@ -1250,6 +1339,7 @@ impl AgentRuntime {
         };
         agents.push(opencode_info);
         agents.push(self.t3_discovery().await);
+        agents.push(self.pi_discovery().await);
         agents.push(self.codex.discovery(self).await);
         agents.push(self.fx.discovery(self).await);
         agents.push(self.qoder.discovery(self).await);
@@ -1358,8 +1448,9 @@ impl AgentRuntime {
         let codex_ok = self.codex.supervise(self).await;
         let fx_ok = self.fx.supervise(self).await;
         let qoder_ok = self.qoder.supervise(self).await;
+        let pi_ok = self.supervise_pi().await;
 
-        if deepseek_ok || opencode_ok || t3_ok || codex_ok || fx_ok || qoder_ok {
+        if deepseek_ok || opencode_ok || t3_ok || codex_ok || fx_ok || qoder_ok || pi_ok {
             *start_backoff = Duration::from_secs(2);
             let primary = pick_primary(&*self.managers.read().await).cloned();
             if let Some(mgr) = primary {
@@ -3348,7 +3439,7 @@ mod tests {
         use crate::agents::adapters::codex::tests::Fixture;
         let mut fixture = Fixture::new(|_| serde_json::json!({})).await;
         fixture.client.initialize().await.unwrap();
-        let runtime = AgentRuntime::with_all_configs(
+        let runtime = AgentRuntime::with_local_configs(
             OpencodeConfig {
                 enabled: false,
                 autostart: false,
@@ -3356,7 +3447,10 @@ mod tests {
             },
             DeepseekConfig::default(),
             T3Config::default(),
-            CodexConfig::default(),
+            LocalAgentConfigs {
+                pi: PiConfig::disabled(),
+                ..Default::default()
+            },
             None,
         );
         runtime
@@ -3449,6 +3543,10 @@ mod tests {
         assert_eq!(pick_primary(&map), Some(&2), "DeepSeek outranks T3");
         map.remove("deepseek");
         assert_eq!(pick_primary(&map), Some(&4));
+        map.insert("pi".to_string(), 6);
+        assert_eq!(pick_primary(&map), Some(&4), "T3 outranks Pi");
+        map.remove("t3");
+        assert_eq!(pick_primary(&map), Some(&6));
     }
 
     #[test]
@@ -3826,7 +3924,7 @@ mod tests {
                 .iter()
                 .map(|a| a.id.as_str())
                 .collect::<Vec<_>>(),
-            ["codex", "opencode", "deepseek", "t3", "fx", "qoder"]
+            ["codex", "opencode", "deepseek", "t3", "fx", "qoder", "pi"]
         );
         assert_eq!(runtime.manager().await.unwrap().agent().kind(), "codex");
         assert_eq!(
@@ -3851,7 +3949,10 @@ mod tests {
         let runtime = AgentRuntime::disabled();
         let found = runtime.discover_agents().await;
         let ids: Vec<&str> = found.agents.iter().map(|a| a.id.as_str()).collect();
-        assert_eq!(ids, ["opencode", "deepseek", "t3", "fx", "qoder", "codex"]);
+        assert_eq!(
+            ids,
+            ["opencode", "deepseek", "t3", "fx", "qoder", "pi", "codex"]
+        );
     }
 
     #[tokio::test]

@@ -2,6 +2,14 @@
 
 ## Changes and fixes
 
+- **Pi joins as a fifth agent.** A locally installed Pi (pi.dev, 1.4.0
+  verified) appears in the App as `Pi` with its sessions, models and thinking
+  levels. The gateway drives it through `pi --mode rpc`, one child per session
+  in use, closed after 15 idle minutes. `bash`, `edit` and `write` wait for an
+  approval in the App unless `pi.approvals` is `never`; Pi sessions reach the
+  Muqun MCP tools. Set `pi.enabled` to false to turn it off. Restart the
+  Gateway after updating; no App update is required.
+
 - **Codex starts again after a host reboot.** A retained official socket link
   whose temporary target disappeared now triggers Codex's idempotent shared
   daemon start command instead of a repeated protection error. Existing path,

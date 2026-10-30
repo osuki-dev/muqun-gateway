@@ -154,13 +154,16 @@ pub(crate) async fn run_agent_command(
 async fn list(json: bool) -> anyhow::Result<bool> {
     let config = load_config(None)?;
     let runtime = if config.agent_runtime.enabled {
-        AgentRuntime::with_qoder_configs(
+        AgentRuntime::with_local_configs(
             config.opencode.clone(),
             config.deepseek.clone(),
             config.t3.clone(),
-            config.codex.clone(),
-            config.fx.clone(),
-            config.qoder.clone(),
+            crate::agents::runtime::LocalAgentConfigs {
+                codex: config.codex.clone(),
+                fx: config.fx.clone(),
+                qoder: config.qoder.clone(),
+                pi: config.pi.clone(),
+            },
             Some(state_dir()?),
         )
     } else {
@@ -314,6 +317,9 @@ pub(crate) fn next_step(id: &str, status: &AgentAvailability) -> Option<&'static
             "install OpenCode 2 (https://opencode.ai), or set `opencode.enabled` to false"
         }
         (NotInstalled, "t3") => "install T3 Code (https://t3.codes)",
+        (Disabled, "pi") => "set `pi.enabled` to true in config.json",
+        (NotInstalled, "pi") => "install Pi (https://pi.dev), or set `pi.binary`",
+        (Offline, "pi") => "check that `pi --version` runs on this host",
         (Unsupported, "t3") => {
             "update muqun-gateway: this T3 server speaks a newer orchestration protocol"
         }

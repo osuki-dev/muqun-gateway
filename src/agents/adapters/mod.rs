@@ -4,5 +4,6 @@ pub mod deepseek;
 pub mod fx;
 pub mod memory_mirror;
 pub mod opencode;
+pub mod pi;
 pub mod qoder;
 pub mod t3;
