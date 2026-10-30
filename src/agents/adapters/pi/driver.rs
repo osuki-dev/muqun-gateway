@@ -2195,6 +2195,27 @@ for raw in sys.stdin.buffer:
                 .unwrap();
             assert!(assistant.to_string().contains(&marker));
             eprintln!("Pi production-profile same_id_resume=true marker_recalled=true");
+            let resumed = driver.host.get(&asid).unwrap();
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            eprintln!(
+                "Pi production-profile resumed_before_reap flags={} rows={:?}",
+                resumed.diagnostics(),
+                driver.live.with(&asid, |s| (
+                    s.running(),
+                    s.pending.len(),
+                    s.rows
+                        .iter()
+                        .filter(|r| mapper::is_provisional(&r.id))
+                        .count(),
+                    s.file.is_some()
+                ))
+            );
+            reap_once(&driver.host, &driver.live, Duration::from_secs(2)).await;
+            eprintln!(
+                "Pi production-profile resumed_after_reap retired={} flags={}",
+                driver.host.get(&asid).is_none(),
+                resumed.diagnostics()
+            );
         }
         driver.shutdown_and_wait().await;
     }
