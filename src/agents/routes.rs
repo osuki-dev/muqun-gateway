@@ -389,6 +389,14 @@ pub fn mount(router: Router<AppState>) -> Router<AppState> {
             "/api/agents/{agent_id}/sessions/{asid}",
             delete(delete_agent_session_scoped),
         )
+        .route(
+            "/api/agent-sessions/{asid}/prepare",
+            post(prepare_agent_session_global),
+        )
+        .route(
+            "/api/agents/{agent_id}/sessions/{asid}/prepare",
+            post(prepare_agent_session_scoped),
+        )
         .route("/api/agent-sessions/{asid}/fork", post(fork_agent_session))
         .route(
             "/api/agents/{agent_id}/sessions/{asid}/fork",
@@ -2646,6 +2654,56 @@ async fn do_list_agent_session_descendants(
     Ok(json_etag_response(headers, content_envelope(data)))
 }
 
+async fn prepare_agent_session_global(
+    State(state): State<AppState>,
+    Path(asid): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    do_prepare_agent_session(&state, &asid, None, &headers).await
+}
+
+async fn prepare_agent_session_scoped(
+    State(state): State<AppState>,
+    Path((agent_id, asid)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    do_prepare_agent_session(&state, &asid, Some(&agent_id), &headers).await
+}
+
+async fn do_prepare_agent_session(
+    state: &AppState,
+    asid: &str,
+    agent_id: Option<&str>,
+    headers: &HeaderMap,
+) -> ApiResult<Json<Value>> {
+    require_device(state, headers)?;
+    if asid.is_empty()
+        || asid.len() > 4096
+        || matches!(asid, "." | "..")
+        || asid.chars().any(char::is_control)
+    {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_session",
+            "Invalid session identifier",
+        ));
+    }
+    let manager = match agent_id {
+        Some(agent_id) => agent_manager_or_err(state, agent_id).await?,
+        None => session_manager_or_err(state, asid).await?,
+    };
+    manager
+        .sessions()
+        .prepare_session(&AgentSessionId(asid.to_owned()))
+        .await
+        .map_err(agent_error)?;
+    state
+        .agent_runtime
+        .record_session_route(asid, manager.agent().kind())
+        .await;
+    Ok(Json(content_envelope(json!({"prepared":true}))))
+}
+
 async fn delete_agent_session_global(
     State(state): State<AppState>,
     Path(asid): Path<String>,
@@ -4004,6 +4062,16 @@ mod tests {
                     .await
                     .unwrap_err();
             assert_eq!(limits_refusal.0, status);
+            for selected in [None, Some("fx")] {
+                let refusal = do_prepare_agent_session(&state, "fixture", selected, &headers)
+                    .await
+                    .unwrap_err();
+                assert_eq!(refusal.0, status);
+                assert_eq!(
+                    crate::test_support::error_body(&refusal)["error"]["code"],
+                    code
+                );
+            }
             let refusal = do_read_agent_session(&state, "fixture", true, &headers)
                 .await
                 .unwrap_err();
@@ -4013,6 +4081,40 @@ mod tests {
                 code
             );
         }
+    }
+
+    #[tokio::test]
+    async fn foreground_prepare_is_separate_from_snapshot_and_automatic_refresh() {
+        let mut agent = FakeAgent::new("opencode").with_sessions(&[("conversation", 1)]);
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        agent.preparation_log = Some(log.clone());
+        let prompts = agent.prompts.clone();
+        let state = state_with(vec![agent]).await;
+        do_read_agent_session(&state, "conversation", false, &device_headers())
+            .await
+            .unwrap();
+        do_read_agent_session(&state, "conversation", true, &device_headers())
+            .await
+            .unwrap();
+        assert!(log.lock().unwrap().iter().all(|(selected, _)| !selected));
+        let observed = log.lock().unwrap().len();
+        assert!(observed >= 2);
+        let Json(response) =
+            do_prepare_agent_session(&state, "conversation", Some("opencode"), &device_headers())
+                .await
+                .unwrap();
+        assert_eq!(response["data"]["prepared"], true);
+        assert_eq!(
+            &log.lock().unwrap()[observed..],
+            &[(true, "conversation".to_owned())]
+        );
+        assert!(prompts.lock().unwrap().is_empty());
+        assert!(
+            do_prepare_agent_session(&state, "missing", Some("opencode"), &device_headers())
+                .await
+                .is_err()
+        );
+        assert_eq!(log.lock().unwrap().len(), observed + 1);
     }
 
     #[tokio::test]

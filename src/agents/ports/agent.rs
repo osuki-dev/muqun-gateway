@@ -205,6 +205,13 @@ pub trait AgentPort: Send + Sync {
         Box::pin(async { Ok(()) })
     }
 
+    /// Prepare a read-only snapshot or automatic resync. Adapters with dormant
+    /// children override this hook so observing history cannot wake a process.
+    /// The default preserves existing adapters' selection behavior.
+    fn prepare_observed_session<'a>(&'a self, id: &'a str) -> AgentFuture<'a, ()> {
+        self.prepare_selected_session(id)
+    }
+
     /// Optional fresh runtime observation, without reading/replacing transcript history.
     fn session_runtime<'a>(
         &'a self,

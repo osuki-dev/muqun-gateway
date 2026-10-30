@@ -1096,6 +1096,7 @@ pub(crate) struct FakeAgent {
     /// Shared, so a test can answer them after the agent moved.
     pub permissions: Arc<Mutex<Vec<agents::domain::PermissionRequest>>>,
     pub calls: Arc<Mutex<Vec<String>>>,
+    pub preparation_log: Option<Arc<Mutex<Vec<(bool, String)>>>>,
     /// The model each `create_session` was asked for.
     pub created_with: Arc<Mutex<Vec<Option<agents::domain::ModelRef>>>>,
     /// The text of every prompt sent.
@@ -1133,6 +1134,7 @@ impl FakeAgent {
             session_timelines: HashMap::new(),
             permissions: Arc::default(),
             calls: Arc::default(),
+            preparation_log: None,
             created_with: Arc::default(),
             prompts: Arc::default(),
             attached: Arc::default(),
@@ -1357,6 +1359,28 @@ impl agents::ports::agent::AgentPort for FakeAgent {
                 .find(|s| s.asid.0 == session_id)
                 .cloned()
                 .ok_or_else(|| agents::ports::agent::AgentError::SessionNotFound(session_id.into()))
+        })
+    }
+    fn prepare_selected_session<'a>(
+        &'a self,
+        id: &'a str,
+    ) -> agents::ports::agent::AgentFuture<'a, ()> {
+        Box::pin(async move {
+            if let Some(log) = &self.preparation_log {
+                log.lock().unwrap().push((true, id.into()));
+            }
+            Ok(())
+        })
+    }
+    fn prepare_observed_session<'a>(
+        &'a self,
+        id: &'a str,
+    ) -> agents::ports::agent::AgentFuture<'a, ()> {
+        Box::pin(async move {
+            if let Some(log) = &self.preparation_log {
+                log.lock().unwrap().push((false, id.into()));
+            }
+            Ok(())
         })
     }
     fn delete_session<'a>(
