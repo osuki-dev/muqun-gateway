@@ -49,6 +49,10 @@ pub enum CodexEvent {
     Attached {
         thread: Value,
     },
+    /// Local queue fence: acknowledgement follows all earlier mirror events.
+    PreparationBarrier {
+        completed: Arc<tokio::sync::Notify>,
+    },
     /// Bounded current-turn reconstruction after an accepted shared subscription.
     RecoveredQuestions {
         ownership: u64,
@@ -106,6 +110,7 @@ struct State {
     lifecycle_completed_turns: Mutex<HashMap<String, String>>,
     next_id: AtomicU64,
     ready: AtomicBool,
+    event_barriers: AtomicBool,
     disconnect_reason: std::sync::OnceLock<&'static str>,
     history_capacity: std::sync::OnceLock<HistoryCapacity>,
     cancel: CancellationToken,
@@ -395,6 +400,7 @@ impl CodexClient {
             lifecycle_completed_turns: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
             ready: AtomicBool::new(false),
+            event_barriers: AtomicBool::new(false),
             disconnect_reason: std::sync::OnceLock::new(),
             history_capacity: std::sync::OnceLock::new(),
             cancel: CancellationToken::new(),
@@ -550,6 +556,37 @@ impl CodexClient {
             turn: turn.into(),
             items,
         })
+    }
+
+    pub(crate) fn enable_event_barriers(&self) {
+        self.state.event_barriers.store(true, Ordering::Release);
+    }
+
+    /// A shared resume enqueues Attached before waking its RPC caller. Drain
+    /// that local publication before a caller captures a mirror CAS revision.
+    /// Standalone drivers without a manager have no mirror pump to wait for.
+    pub(crate) async fn flush_preparation_events(&self) -> Result<(), AgentError> {
+        if !self.is_shared() || !self.state.event_barriers.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let completed = Arc::new(tokio::sync::Notify::new());
+        // Local read admission must not disconnect an active native turn if
+        // the bounded stream queue is already full. No native event is lost.
+        self.state
+            .events
+            .try_send(CodexEvent::PreparationBarrier {
+                completed: completed.clone(),
+            })
+            .map_err(|_| {
+                AgentError::NotAvailable("Codex mirror preparation queue unavailable".into())
+            })?;
+        tokio::select! {
+            biased;
+            _ = self.state.cancel.cancelled() => Err(disconnected()),
+            result = tokio::time::timeout(Duration::from_secs(5), completed.notified()) => {
+                result.map_err(|_| AgentError::NotAvailable("Codex mirror preparation timed out; no prompt was submitted".into()))
+            }
+        }
     }
 
     pub fn cancel_token(&self) -> CancellationToken {

@@ -2825,7 +2825,7 @@ impl AgentPort for CodexDriver {
                 let thread = self.read_thread(id).await?;
                 self.rejoin_loaded(id, &thread, true).await?;
             }
-            Ok(())
+            self.client.flush_preparation_events().await
         })
     }
 

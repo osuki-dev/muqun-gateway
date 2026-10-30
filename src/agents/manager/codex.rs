@@ -342,6 +342,7 @@ impl Context {
 
     async fn event(&self, event: CodexEvent) {
         match event {
+            CodexEvent::PreparationBarrier { completed } => completed.notify_one(),
             CodexEvent::Attached { thread } => {
                 if let Ok(info) = self.driver.project_session(&thread).await {
                     self.update_info(info).await;
@@ -866,6 +867,7 @@ impl AgentManager {
             Arc<crate::agents::adapters::codex::native_sessions::NativeSessions>,
         >,
     ) -> Self {
+        client.enable_event_barriers();
         let endpoint = client.endpoint();
         let observed = observer.is_some();
         let mut driver = CodexDriver::new(client.clone());

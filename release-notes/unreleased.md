@@ -537,3 +537,8 @@ list request that could delay or prevent interruption.
   the first canonical user message proves its Gateway presentation metadata.
   Explicit names and uncorrelated historical text remain unchanged; optional
   verification reads never resume a session or resend its prompt.
+
+- Wait for queued Codex attachment metadata to reach the session mirror before
+  capturing a refresh revision, preventing the first native refresh from
+  conflicting with its own recovery event. Concurrent live updates still fence
+  stale refreshes; local queue pressure or cancellation never resends a prompt.
