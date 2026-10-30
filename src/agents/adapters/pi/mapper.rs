@@ -240,7 +240,15 @@ fn compaction_reason(record: &Value) -> Option<String> {
 }
 
 fn compaction_error(message: Option<&str>, aborted: bool) -> AgentErrorInfo {
-    let (name, message) = match message.map(str::trim) {
+    // Pi 1.4 emits a fixed prefix in compaction_end.errorMessage; the
+    // failed command response contains the bare message. Only classify the
+    // exact known suffixes and never forward the remainder as user text.
+    let message = message.map(str::trim).map(|message| {
+        message
+            .strip_prefix("Compaction failed: ")
+            .unwrap_or(message)
+    });
+    let (name, message) = match message {
         Some("Nothing to compact (session too small)") => (
             "compaction_too_small",
             "Nothing to compact: this session is too short.",
@@ -1512,7 +1520,7 @@ mod tests {
     fn compaction_errors_are_separate_from_trigger_and_summary_and_whitelisted() {
         let mut folder = LiveFolder::new("s1".into());
         folder.fold(&json!({"type":"compaction_start","reason":"manual"}));
-        let changes = folder.fold(&json!({"type":"compaction_end","reason":"manual","aborted":false,"errorMessage":"Nothing to compact (session too small)"}));
+        let changes = folder.fold(&json!({"type":"compaction_end","reason":"manual","aborted":false,"errorMessage":"Compaction failed: Nothing to compact (session too small)"}));
         let [LiveChange::Compaction {
             status,
             summary,
@@ -1530,7 +1538,10 @@ mod tests {
             error.as_ref().unwrap().message,
             "Nothing to compact: this session is too short."
         );
-        let unknown = compaction_error(Some("provider rejected private credential=secret"), false);
+        let unknown = compaction_error(
+            Some("Compaction failed: provider rejected private credential=secret"),
+            false,
+        );
         assert_eq!(unknown.message, "Compaction failed.");
         let done = folder.fold(&json!({"type":"compaction_end","reason":"manual","result":{"summary":"a real summary"},"aborted":false}));
         assert!(
