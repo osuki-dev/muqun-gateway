@@ -44,7 +44,8 @@
 - **Pi joins the native agent conversations.** A locally installed Pi (pi.dev, 1.4.0
   verified) appears in the App as `Pi` with its sessions, models and thinking
   levels. The gateway drives it through `pi --mode rpc`, one child per session
-  in use, closed after 15 idle minutes. `bash`, `edit` and `write` wait for an
+  in use, closed after five idle minutes by default. Explicit existing
+  `pi.idle_timeout_secs` values remain unchanged. `bash`, `edit` and `write` wait for an
   approval in the App unless `pi.approvals` is `never`; Pi sessions reach the
   Muqun MCP tools. Set `pi.enabled` to false to turn it off. Restart the
   Gateway after updating; no App update is required.
