@@ -2,6 +2,37 @@
 
 ## Changes and fixes
 
+- **Verified idle FX and Qoder conversations release their private processes.**
+  Both default to a one-hour idle timeout, configurable with the provider's
+  `idle_timeout_secs`. Running work, in-flight requests and approvals remain
+  protected. Observed tool or native-command activity protects that process
+  generation, including background work after a completed reply. Silent custom
+  hooks without observable activity cannot be inventoried. Native latest-turn recovery is checked before and after graceful
+  shutdown; failed or uncertain checks never claim a saved idle state. A
+  foreground App open explicitly restores the original native conversation;
+  background history reads do not wake it, and no earlier prompt is replayed.
+  Live projections are released while bounded history caching remains. FX
+  0.0.16 cannot persist/recreate an unsaved empty native ID, so those blank
+  children remain protected. Unverified Qoder journal formats also remain live.
+  The foreground-open behavior requires an App that supports
+  `agent_session_resume_v1`; updating does not change CLI authentication or
+  permission modes.
+
+- **Repeated FX and Qoder session lists reuse recent metadata.** Complete lists
+  share one native startup per directory and remain cached for up to 30 seconds.
+  Gateway-created sessions, forks, deletions and model changes invalidate these
+  snapshots; live session state stays current. First reads and expired snapshots
+  still start the installed CLI. Queueing, startup and pagination share a
+  30-second timeout; failures remain explicit. No background metadata process is
+  retained.
+
+- **Large Herdr workspaces no longer open a socket for every pane at once.**
+  Pane enrichment has bounded concurrency, and all one-shot Herdr RPCs share
+  a connection budget across concurrent Gateway requests. Pane ordering,
+  optional-metadata fallback and request deadlines are preserved. This avoids
+  descriptor exhaustion during pane discovery without changing host limits.
+  Restart the Gateway after updating; no App update or re-pairing is required.
+
 - **FX and Qoder CLI conversations use their native ACP interfaces.** The
   Gateway discovers installed CLIs and supports private session creation,
   saved-session loading, streamed replies, tool activity and explicit approval
@@ -15,10 +46,14 @@
 - **Pi joins the native agent conversations.** A locally installed Pi (pi.dev, 1.4.0
   verified) appears in the App as `Pi` with its sessions, models and thinking
   levels. The gateway drives it through `pi --mode rpc`, one child per session
-  in use, closed after 15 idle minutes. `bash`, `edit` and `write` wait for an
-  approval in the App unless `pi.approvals` is `never`; Pi sessions reach the
-  Muqun MCP tools. Set `pi.enabled` to false to turn it off. Restart the
-  Gateway after updating; no App update is required.
+  in use. Eligible idle generations close after one hour by default; running
+  work, approvals and observed tool or extension execution remain protected.
+  Explicit existing `pi.idle_timeout_secs` values remain unchanged. `bash`,
+  `edit` and `write` wait for an approval in the App unless `pi.approvals` is
+  `never`; Pi sessions reach the Muqun MCP tools. Set `pi.enabled` to false to
+  turn it off. Restart the Gateway after updating. Ordinary sending remains
+  compatible with older Apps; reopening a conversation on foreground selection
+  requires an App supporting `agent_session_resume_v1`.
 
 - **Codex starts again after a host reboot.** A retained official socket link
   whose temporary target disappeared now triggers Codex's idempotent shared
@@ -497,3 +532,13 @@ been removed before public release; old servers receive an upgrade message befor
 a pairing credential is exchanged. App-facing session APIs stay unchanged. Stop
 now reads only the current thread control snapshot, avoiding an unrelated project
 list request that could delay or prevent interruption.
+
+- Keep computer-reference context out of automatic Codex preview titles when
+  the first canonical user message proves its Gateway presentation metadata.
+  Explicit names and uncorrelated historical text remain unchanged; optional
+  verification reads never resume a session or resend its prompt.
+
+- Wait for queued Codex attachment metadata to reach the session mirror before
+  capturing a refresh revision, preventing the first native refresh from
+  conflicting with its own recovery event. Concurrent live updates still fence
+  stale refreshes; local queue pressure or cancellation never resends a prompt.

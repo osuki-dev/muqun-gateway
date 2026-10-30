@@ -12,6 +12,7 @@ mod launch;
 pub mod mapper;
 mod mcp;
 pub(crate) mod native_sessions;
+mod presentation;
 pub(crate) mod process_tree;
 pub(crate) mod rollout;
 pub(crate) mod rollout_projection;
@@ -48,3 +49,6 @@ pub(crate) const MAX_REASONING_PARTS: usize = 512;
 
 #[cfg(test)]
 pub(crate) mod tests;
+
+#[cfg(test)]
+pub(crate) use driver::presentation_tests::title_fixture;

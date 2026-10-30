@@ -103,6 +103,7 @@ impl CodexClient {
             lifecycle_completed_turns: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
             ready: AtomicBool::new(false),
+            event_barriers: AtomicBool::new(false),
             disconnect_reason: std::sync::OnceLock::new(),
             history_capacity: std::sync::OnceLock::new(),
             cancel: parent.map_or_else(CancellationToken::new, |parent| parent.child_token()),
@@ -254,6 +255,71 @@ pub(crate) mod tests {
         // Isolated framing diagnostics, not an actual daemon/auth handshake.
         client.state.ready.store(true, Ordering::Release);
         (client, events, server)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shared_preparation_barriers_preserve_fifo_and_bound_abandoned_consumers() {
+        let (client, mut events, _server) = diagnostic_peer().await;
+        client.enable_event_barriers();
+        client
+            .state
+            .emit(CodexEvent::Attached {
+                thread: json!({"id":"attached"}),
+            })
+            .unwrap();
+        let flush = client.flush_preparation_events();
+        tokio::pin!(flush);
+        assert!(futures::poll!(&mut flush).is_pending());
+        assert!(matches!(
+            events.recv().await,
+            Some(CodexEvent::Attached { .. })
+        ));
+        let Some(CodexEvent::PreparationBarrier { completed }) = events.recv().await else {
+            panic!("missing FIFO barrier")
+        };
+        assert!(futures::poll!(&mut flush).is_pending());
+        completed.notify_one();
+        flush.await.unwrap();
+        let start = tokio::time::Instant::now();
+        let error = client.flush_preparation_events().await.unwrap_err();
+        assert!(error.to_string().contains("preparation timed out"));
+        assert_eq!(start.elapsed(), Duration::from_secs(5));
+        assert!(
+            client.is_ready(),
+            "an abandoned local read barrier is not an ambiguous native mutation"
+        );
+        client.stop();
+        assert!(client.flush_preparation_events().await.is_err());
+
+        let (client, events, _server) = diagnostic_peer().await;
+        client.enable_event_barriers();
+        let flush = client.flush_preparation_events();
+        tokio::pin!(flush);
+        assert!(futures::poll!(&mut flush).is_pending());
+        drop(events);
+        client.stop();
+        assert!(flush.await.is_err());
+
+        let (client, events, _server) = diagnostic_peer().await;
+        client.enable_event_barriers();
+        drop(events);
+        assert!(client.flush_preparation_events().await.is_err());
+
+        let (client, _events, _server) = diagnostic_peer().await;
+        client.enable_event_barriers();
+        for _ in 0..QUEUE_SIZE {
+            client
+                .state
+                .emit(CodexEvent::Attached {
+                    thread: json!({"id":"queued"}),
+                })
+                .unwrap();
+        }
+        assert!(client.flush_preparation_events().await.is_err());
+        assert!(
+            client.is_ready(),
+            "local read admission must not interrupt an active native turn"
+        );
     }
 
     #[tokio::test]
@@ -1994,16 +2060,39 @@ pub(crate) mod tests {
             registry.record(&fixture._home.0, ID).await.unwrap();
             let herdr = crate::test_support::FakeHerdr::start(vec![], None);
             herdr.set_agents(json!([{"pane_id":"w1:p1","terminal_id":"fixture-terminal","agent":"codex","agent_status":"idle","shell_pid":42,"agent_session":{"kind":"id","agent":"codex","value":ID}}]));
+            // Hold Attached until a later preparation barrier is observed.
+            // This forces the problematic scheduler order without sleeps:
+            // resume already returned, but no mirror publication happened yet.
+            let mut source = std::mem::replace(&mut fixture.events, events::channel(1).1);
+            let (forward, consumer) = events::channel(64);
+            let barrier_seen = Arc::new(tokio::sync::Notify::new());
+            let release = Arc::new(tokio::sync::Notify::new());
+            let (seen, permit) = (barrier_seen.clone(), release.clone());
+            let relay = tokio::spawn(async move {
+                let mut attached = None;
+                while let Some(event) = source.recv().await {
+                    match event {
+                        event @ CodexEvent::Attached { .. } => attached = Some(event),
+                        event @ CodexEvent::PreparationBarrier { .. } if attached.is_some() => {
+                            seen.notify_one();
+                            permit.notified().await;
+                            forward.try_send(attached.take().unwrap()).unwrap();
+                            forward.try_send(event).unwrap();
+                        }
+                        event => forward.try_send(event).unwrap(),
+                    }
+                }
+            });
             let (tx, _events) = tokio::sync::broadcast::channel(64);
-            let manager = AgentManager::connect_codex_recoverable(
+            let manager = Arc::new(AgentManager::connect_codex_recoverable(
                 fixture.client.clone(),
-                std::mem::replace(&mut fixture.events, events::channel(1).1),
+                consumer,
                 tx,
                 Some(crate::agents::terminal_runtime::TerminalRuntime::new(&[
                     herdr.session(),
                 ])),
                 Some(registry),
-            );
+            ));
             if mode != "cold" {
                 manager.view_session(ID, 1).await.unwrap();
             }
@@ -2020,11 +2109,34 @@ pub(crate) mod tests {
             );
             assert!(!fixture.client.is_subscribed(ID));
             let asid = AgentSessionId(ID.into());
-            let first = if mode == "refresh" {
-                manager.sessions().refresh_snapshot(&asid).await.unwrap()
-            } else {
-                manager.sessions().get_snapshot(&asid).await.unwrap()
-            };
+            let preparing = manager.clone();
+            let selected = asid.clone();
+            let opening = tokio::spawn(async move {
+                if mode == "refresh" {
+                    preparing.sessions().refresh_snapshot(&selected).await
+                } else {
+                    preparing.sessions().get_snapshot(&selected).await
+                }
+            });
+            tokio::time::timeout(Duration::from_secs(2), barrier_seen.notified())
+                .await
+                .unwrap();
+            assert!(
+                !opening.is_finished(),
+                "preparation cannot overtake its Attached mirror publication"
+            );
+            assert!(
+                !locked(&fixture.requests)
+                    .iter()
+                    .any(|request| request["method"] == "thread/items/list"),
+                "the revision/canonical read must start after the queued attach is applied"
+            );
+            release.notify_one();
+            let first = tokio::time::timeout(Duration::from_secs(2), opening)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
             assert_eq!(
                 first.info.runtime.as_ref().unwrap().source,
                 RuntimeSource::Native
@@ -2061,6 +2173,7 @@ pub(crate) mod tests {
                 .iter()
                 .any(|r| r["method"] == "turn/start"));
             manager.shutdown();
+            relay.abort();
         }
     }
 

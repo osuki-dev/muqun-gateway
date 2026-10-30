@@ -21,9 +21,8 @@ base64 = "0.23.1"
 clap = { version = "4.6.2", features = ["derive"] }
 crossterm = "0.29.0"
 dirs = "7.0.0"
-# Just `join_all`, to probe configured backends concurrently in
-# `GET /api/sessions` -- tokio has no bundled fan-out-and-collect primitive
-# for a dynamic list of futures that doesn't require spawning tasks.
+# Concurrent backend discovery and bounded, ordered pane enrichment without
+# spawning one task per RPC.
 futures = { version = "0.3.32", default-features = false, features = ["std"] }
 hkdf = "0.13.0"
 hmac = "0.13.0"

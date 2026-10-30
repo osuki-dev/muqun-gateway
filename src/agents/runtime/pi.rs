@@ -17,7 +17,7 @@ use super::{AgentOrigin, AgentRuntime};
 use crate::agents::adapters::pi::{self, mapper, PiCommandLine, PiDriver, SessionStore};
 use crate::agents::manager::AgentManager;
 
-const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 900;
+const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 3600;
 
 fn default_true() -> bool {
     true
@@ -448,6 +448,7 @@ mod tests {
                 crate::agents::runtime::FxConfig {
                     enabled: false,
                     binary: None,
+                    ..Default::default()
                 },
                 got,
                 None,
@@ -469,10 +470,10 @@ mod tests {
         }
         let default = PiConfig::default();
         assert!(default.enabled && default.asks_approval());
-        assert_eq!(default.idle_timeout_secs, 900);
+        assert_eq!(default.idle_timeout_secs, 3600);
         assert_eq!(
             serde_json::to_string(&PiConfig::default()).unwrap(),
-            r#"{"enabled":true,"approvals":"ask","idle_timeout_secs":900}"#
+            r#"{"enabled":true,"approvals":"ask","idle_timeout_secs":3600}"#
         );
     }
 
@@ -488,6 +489,7 @@ mod tests {
         };
         let launch = PiLaunch {
             session_file: None,
+            session_id: None,
             cwd: std::env::temp_dir(),
             env: Vec::new(),
             no_extensions: true,

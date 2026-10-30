@@ -1,6 +1,6 @@
 //! Bounded ACP stdio transport. Provider adapters own protocol and credential policy.
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -35,16 +35,33 @@ pub enum AcpEvent {
     },
 }
 
-type Reply = oneshot::Sender<Result<Value, String>>;
+#[derive(Debug, PartialEq, Eq)]
+pub enum AcpRetirement {
+    Retired,
+    NotIdle,
+}
+
+struct Reply {
+    sender: oneshot::Sender<Result<Value, String>>,
+    arm_work_guard: bool,
+}
 
 struct State {
     provider: &'static str,
+    #[cfg(test)]
+    process_id: Option<u32>,
     safe_error_message: SafeErrorMessage,
     pending: Mutex<HashMap<u64, Reply>>,
     server_requests: Mutex<HashMap<String, usize>>,
     next_id: AtomicU64,
     cancel: CancellationToken,
     exited: CancellationToken,
+    retiring: AtomicBool,
+    work_guard_armed: AtomicBool,
+    live_execution_seen: AtomicBool,
+    exit_success: Mutex<Option<bool>>,
+    stdout_drained: CancellationToken,
+    stderr_drained: CancellationToken,
     events: broadcast::Sender<AcpEvent>,
 }
 
@@ -76,7 +93,7 @@ impl State {
         }
         self.cancel.cancel();
         for (_, reply) in pending.drain() {
-            let _ = reply.send(Err(self.disconnected()));
+            let _ = reply.sender.send(Err(self.disconnected()));
         }
         locked(&self.server_requests).clear();
         let _ = self.events.send(AcpEvent::Disconnected {
@@ -110,6 +127,11 @@ impl State {
     }
 }
 
+enum WriteCommand {
+    Packet(WritePacket),
+    Close,
+}
+
 struct WritePacket {
     bytes: Vec<u8>,
     written: oneshot::Sender<Result<(), String>>,
@@ -119,7 +141,7 @@ struct WritePacket {
 /// cancels and reaps even a child which never produces another stdout byte.
 pub struct AcpClient {
     state: Arc<State>,
-    outgoing: mpsc::Sender<WritePacket>,
+    outgoing: mpsc::Sender<WriteCommand>,
 }
 
 /// A request admitted only after its complete frame was flushed to agent stdin.
@@ -222,15 +244,23 @@ impl AcpClient {
         let (events, _) = broadcast::channel(EVENT_CAPACITY);
         let state = Arc::new(State {
             provider,
+            #[cfg(test)]
+            process_id: child.id(),
             safe_error_message,
             pending: Mutex::new(HashMap::new()),
             server_requests: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
             cancel: CancellationToken::new(),
             exited: CancellationToken::new(),
+            retiring: AtomicBool::new(false),
+            work_guard_armed: AtomicBool::new(false),
+            live_execution_seen: AtomicBool::new(false),
+            exit_success: Mutex::new(None),
+            stdout_drained: CancellationToken::new(),
+            stderr_drained: CancellationToken::new(),
             events,
         });
-        let (outgoing, mut packets) = mpsc::channel::<WritePacket>(WRITE_CAPACITY);
+        let (outgoing, mut packets) = mpsc::channel::<WriteCommand>(WRITE_CAPACITY);
         let client = Arc::new(Self {
             state: state.clone(),
             outgoing: outgoing.clone(),
@@ -243,6 +273,12 @@ impl AcpClient {
                     biased;
                     _ = writer.cancel.cancelled() => break,
                     packet = packets.recv() => match packet { Some(packet) => packet, None => break },
+                };
+                let packet = match packet {
+                    WriteCommand::Packet(packet) => packet,
+                    // FIFO ordering lets previously admitted writes finish before
+                    // EOF. Keep both readers alive while the agent flushes.
+                    WriteCommand::Close => break,
                 };
                 let result = tokio::select! {
                     biased;
@@ -281,7 +317,9 @@ impl AcpClient {
                         }
                     }
                     Ok(None) => {
-                        reader.stop("stdout_closed");
+                        if !reader.retiring.load(Ordering::Acquire) {
+                            reader.stop("stdout_closed");
+                        }
                         break;
                     }
                     Err(_) => {
@@ -290,6 +328,7 @@ impl AcpClient {
                     }
                 }
             }
+            reader.stdout_drained.cancel();
         });
 
         let diagnostics = state.clone();
@@ -302,39 +341,66 @@ impl AcpClient {
                     biased;
                     _ = diagnostics.cancel.cancelled() => break,
                     result = stderr.read(&mut buffer) => match result {
-                        Ok(0) | Err(_) => break,
+                        Ok(0) => break,
+                        Err(_) => {
+                            if diagnostics.retiring.load(Ordering::Acquire) {
+                                diagnostics.stop("stderr_read_failed_during_retirement");
+                            }
+                            break;
+                        }
                         Ok(_) => {},
                     }
                 }
             }
+            diagnostics.stderr_drained.cancel();
         });
 
         let lifecycle = state.clone();
         tokio::spawn(async move {
             #[cfg(unix)]
             if let Some(group) = process_group {
-                let still_owned = tokio::select! {
+                let (still_owned, exit_observed) = tokio::select! {
                     biased;
-                    _ = lifecycle.cancel.cancelled() => true,
+                    _ = lifecycle.cancel.cancelled() => (true, false),
                     result = wait_for_unreaped_exit(group) => {
-                        lifecycle.stop("process_exited");
+                        if !lifecycle.retiring.load(Ordering::Acquire) {
+                            lifecycle.stop("process_exited");
+                        }
                         // Only ECHILD means ownership was lost. Other inspection
                         // failures still close the owned child instead of waiting
                         // indefinitely for a process whose exit cannot be observed.
                         match result {
-                            Ok(()) => true,
-                            Err(error) => error.raw_os_error() != Some(libc::ECHILD),
+                            Ok(()) => (true, true),
+                            Err(error) => (error.raw_os_error() != Some(libc::ECHILD), false),
                         }
                     },
                 };
+                let mut descendants_cleaned = false;
                 if still_owned {
                     // SAFETY: process_group(0) created this group and the owned
                     // child has not been reaped, so its id cannot be reused.
-                    unsafe {
-                        libc::killpg(group, libc::SIGKILL);
+                    let result = unsafe { libc::killpg(group, libc::SIGKILL) };
+                    let error = (result != 0).then(std::io::Error::last_os_error);
+                    descendants_cleaned = result == 0
+                        || error.as_ref().and_then(std::io::Error::raw_os_error)
+                            == Some(libc::ESRCH);
+                    #[cfg(target_os = "macos")]
+                    if !descendants_cleaned
+                        && exit_observed
+                        && error.as_ref().and_then(std::io::Error::raw_os_error)
+                            == Some(libc::EPERM)
+                    {
+                        // Darwin returns EPERM for an empty/zombie-only group.
+                        // Permission denial alone is not cleanup evidence: query
+                        // the still-anchored group before accepting that case.
+                        descendants_cleaned = exited_group_has_no_other_members(group);
                     }
                 }
-                let _ = child.wait().await;
+                *locked(&lifecycle.exit_success) = child
+                    .wait()
+                    .await
+                    .ok()
+                    .map(|status| status.success() && exit_observed && descendants_cleaned);
                 lifecycle.exited.cancel();
                 return;
             }
@@ -344,11 +410,44 @@ impl AcpClient {
                     let _ = child.start_kill();
                     let _ = child.wait().await;
                 }
-                _ = child.wait() => lifecycle.stop("process_exited"),
+                status = child.wait() => {
+                    *locked(&lifecycle.exit_success) = status.ok().map(|status| status.success());
+                    if !lifecycle.retiring.load(Ordering::Acquire) {
+                        lifecycle.stop("process_exited");
+                    }
+                },
             }
             lifecycle.exited.cancel();
         });
         Ok(client)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn process_id(&self) -> Option<u32> {
+        self.state.process_id
+    }
+
+    pub fn is_running(&self) -> bool {
+        !self.state.exited.is_cancelled()
+    }
+
+    /// Initial native load replay is history, not work owned by this child.
+    /// Once armed, execution evidence is never cleared for this generation.
+    #[cfg(test)]
+    pub fn arm_live_work_guard(&self) {
+        let _admission = locked(&self.state.pending);
+        self.state.work_guard_armed.store(true, Ordering::Release);
+    }
+
+    pub fn has_unverified_live_work(&self) -> bool {
+        self.state.live_execution_seen.load(Ordering::Acquire)
+    }
+
+    pub fn protect_unverified_live_work(&self) {
+        let _admission = locked(&self.state.pending);
+        self.state
+            .live_execution_seen
+            .store(true, Ordering::Release);
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<AcpEvent> {
@@ -360,7 +459,7 @@ impl AcpClient {
         let (reply, receiver) = oneshot::channel();
         {
             let mut pending = locked(&self.state.pending);
-            if self.state.cancel.is_cancelled() {
+            if self.state.cancel.is_cancelled() || self.state.retiring.load(Ordering::Acquire) {
                 return Err(self.state.disconnected());
             }
             if pending.len() >= MAX_PENDING {
@@ -369,7 +468,18 @@ impl AcpClient {
                     self.state.provider
                 ));
             }
-            pending.insert(id, reply);
+            // A new session has no replay. For a load, arm at the matching
+            // successful response, before the reader can dispatch live events.
+            if method == "session/new" {
+                self.state.work_guard_armed.store(true, Ordering::Release);
+            }
+            pending.insert(
+                id,
+                Reply {
+                    sender: reply,
+                    arm_work_guard: method == "session/load",
+                },
+            );
         }
         let request = AcpRequest {
             state: self.state.clone(),
@@ -452,6 +562,48 @@ impl AcpClient {
         response
     }
 
+    /// Stop admission, close stdin in FIFO order, and wait for a normal exit
+    /// with both output pipes drained. This proves process shutdown, never
+    /// session durability; the provider must establish recovery separately.
+    pub async fn retire(&self, timeout: Duration) -> Result<AcpRetirement, String> {
+        {
+            let pending = locked(&self.state.pending);
+            if self.state.cancel.is_cancelled() {
+                return Err(self.state.disconnected());
+            }
+            if self.state.retiring.load(Ordering::Acquire)
+                || self.state.live_execution_seen.load(Ordering::Acquire)
+                || !pending.is_empty()
+                || !locked(&self.state.server_requests).is_empty()
+            {
+                return Ok(AcpRetirement::NotIdle);
+            }
+            self.state.retiring.store(true, Ordering::Release);
+            if self.outgoing.try_send(WriteCommand::Close).is_err() {
+                self.state.retiring.store(false, Ordering::Release);
+                return Ok(AcpRetirement::NotIdle);
+            }
+        }
+        let drained = tokio::time::timeout(timeout, async {
+            self.state.exited.cancelled().await;
+            self.state.stdout_drained.cancelled().await;
+            self.state.stderr_drained.cancelled().await;
+        })
+        .await;
+        if drained.is_ok()
+            && !self.state.cancel.is_cancelled()
+            && *locked(&self.state.exit_success) == Some(true)
+        {
+            return Ok(AcpRetirement::Retired);
+        }
+        self.state.stop("retirement_unconfirmed");
+        let _ = tokio::time::timeout(WRITE_TIMEOUT, self.state.exited.cancelled()).await;
+        Err(format!(
+            "{} ACP retirement was not confirmed; session recovery is unknown",
+            self.state.provider
+        ))
+    }
+
     pub async fn shutdown(&self) {
         self.state.stop("local_shutdown");
         let _ = tokio::time::timeout(WRITE_TIMEOUT, self.state.exited.cancelled()).await;
@@ -493,6 +645,35 @@ async fn wait_for_unreaped_exit(pid: i32) -> std::io::Result<()> {
     }
 }
 
+// A full buffer may have been truncated. Only an empty result or the exact
+// already-exited, unreaped leader can establish absence of live group members.
+#[cfg(any(target_os = "macos", test))]
+fn only_exited_leader_listed(group: i32, members: &[i32; 2], count: i32, error: i32) -> bool {
+    error == 0
+        && count >= 0
+        && count < members.len() as i32
+        && members[..count as usize].iter().all(|pid| *pid == group)
+}
+
+#[cfg(target_os = "macos")]
+fn exited_group_has_no_other_members(group: i32) -> bool {
+    let mut members = [0_i32; 2];
+    // libproc maps an enumeration error to zero while preserving errno. Clear
+    // the previous killpg error first; a failed query must never look empty.
+    // SAFETY: __error returns this thread's errno; the buffer has its exact
+    // advertised capacity and contains only PIDs from this owned group.
+    let (count, error) = unsafe {
+        *libc::__error() = 0;
+        let count = libc::proc_listpgrppids(
+            group,
+            members.as_mut_ptr().cast(),
+            std::mem::size_of_val(&members) as i32,
+        );
+        (count, *libc::__error())
+    };
+    only_exited_leader_listed(group, &members, count, error)
+}
+
 impl Drop for AcpClient {
     fn drop(&mut self) {
         self.state.stop("client_dropped");
@@ -501,7 +682,7 @@ impl Drop for AcpClient {
 
 async fn send_packet(
     state: &State,
-    outgoing: &mpsc::Sender<WritePacket>,
+    outgoing: &mpsc::Sender<WriteCommand>,
     value: Value,
 ) -> Result<(), String> {
     if state.cancel.is_cancelled() {
@@ -517,17 +698,24 @@ async fn send_packet(
     let mut bytes = bounded.0;
     bytes.push(b'\n');
     let (written, receiver) = oneshot::channel();
-    outgoing
-        .try_send(WritePacket { bytes, written })
-        .map_err(|error| match error {
-            mpsc::error::TrySendError::Full(_) => {
-                format!(
-                    "{} ACP write queue is full; request was not queued",
-                    state.provider
-                )
-            }
-            mpsc::error::TrySendError::Closed(_) => state.disconnected(),
-        })?;
+    // Share admission with retirement; Close cannot overtake an admitted write.
+    {
+        let _admission = locked(&state.pending);
+        if state.cancel.is_cancelled() || state.retiring.load(Ordering::Acquire) {
+            return Err(state.disconnected());
+        }
+        outgoing
+            .try_send(WriteCommand::Packet(WritePacket { bytes, written }))
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => {
+                    format!(
+                        "{} ACP write queue is full; request was not queued",
+                        state.provider
+                    )
+                }
+                mpsc::error::TrySendError::Closed(_) => state.disconnected(),
+            })?;
+    }
     // The deadline includes queueing. On timeout a queued/partial write has an
     // ambiguous outcome, so close the connection and never attempt another write.
     match tokio::time::timeout(WRITE_TIMEOUT, receiver).await {
@@ -565,7 +753,7 @@ fn request_key(id: &Value) -> Option<String> {
 
 async fn dispatch(
     state: &State,
-    outgoing: &mpsc::Sender<WritePacket>,
+    outgoing: &mpsc::Sender<WriteCommand>,
     frame: &[u8],
 ) -> Result<(), String> {
     let value: Value = serde_json::from_slice(frame).map_err(|_| {
@@ -586,7 +774,38 @@ async fn dispatch(
     }
     if let Some(method) = value.get("method").and_then(Value::as_str) {
         let params = value.get("params").cloned().unwrap_or(Value::Null);
+        let passive_update = method == "session/update"
+            && matches!(
+                params["update"]["sessionUpdate"].as_str(),
+                Some(
+                    "user_message_chunk"
+                        | "agent_message_chunk"
+                        | "agent_thought_chunk"
+                        | "plan"
+                        | "notice"
+                        | "usage_update"
+                        | "available_commands_update"
+                        | "current_mode_update"
+                        | "config_option_update"
+                        | "session_info_update"
+                )
+            );
+        // Unknown live extension/subagent/control messages cannot establish
+        // job absence. Ordinary text, diagnostics and metadata do not pin.
+        let execution = value.get("id").is_some() || !passive_update;
+        if execution {
+            // Record before event backpressure or prompt-result delivery can
+            // make the reducer look idle. Share the final EOF admission lock.
+            let _admission = locked(&state.pending);
+            if state.work_guard_armed.load(Ordering::Acquire) {
+                state.live_execution_seen.store(true, Ordering::Release);
+            }
+        }
         if let Some(id) = value.get("id") {
+            if state.retiring.load(Ordering::Acquire) {
+                state.stop("server_request_during_retirement");
+                return Err(state.disconnected());
+            }
             let Some(key) = request_key(id) else {
                 state.stop("invalid_server_request_id");
                 return Err(state.disconnected());
@@ -595,12 +814,19 @@ async fn dispatch(
                 return send_packet(state, outgoing, json!({"jsonrpc":"2.0","id":id,"error":{"code":-32601,"message":"Method not supported by Muqun Gateway"}})).await;
             }
             {
+                let admission = locked(&state.pending);
+                if state.retiring.load(Ordering::Acquire) || state.cancel.is_cancelled() {
+                    drop(admission);
+                    state.stop("server_request_during_retirement");
+                    return Err(state.disconnected());
+                }
                 let mut requests = locked(&state.server_requests);
                 if requests.contains_key(&key)
                     || requests.len() >= MAX_PENDING
                     || requests.values().sum::<usize>() + frame.len() > MAX_SERVER_REQUEST_BYTES
                 {
                     drop(requests);
+                    drop(admission);
                     state.stop("server_request_limit_or_duplicate");
                     return Err(state.disconnected());
                 }
@@ -633,7 +859,10 @@ async fn dispatch(
             }
         };
         if let Some(reply) = locked(&state.pending).remove(&id) {
-            let _ = reply.send(result);
+            if reply.arm_work_guard && result.is_ok() {
+                state.work_guard_armed.store(true, Ordering::Release);
+            }
+            let _ = reply.sender.send(result);
         }
         Ok(())
     } else {
@@ -722,6 +951,197 @@ mod tests {
         let mut command = Command::new("sh");
         command.arg("-c").arg(script);
         AcpClient::spawn_command(command, "FX", no_safe_error_message).unwrap()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn retirement_waits_for_eof_flush_and_does_not_kill_on_early_stdout_eof() {
+        let directory =
+            std::env::temp_dir().join(format!("muqun-acp-retire-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let marker = directory.join("flushed");
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            r#"
+            while IFS= read -r request; do :; done
+            exec 1>&-
+            sleep 0.2
+            printf saved > "$1"
+            printf final-diagnostic >&2
+            exit 0
+        "#,
+            "fixture",
+        ]);
+        command.arg(&marker);
+        let client = AcpClient::spawn_command(command, "FX", no_safe_error_message).unwrap();
+        client.notify("before_eof", json!({})).await.unwrap();
+        assert_eq!(
+            client.retire(Duration::from_secs(3)).await.unwrap(),
+            AcpRetirement::Retired
+        );
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "saved");
+        assert_eq!(*locked(&client.state.exit_success), Some(true));
+        assert!(!client.state.cancel.is_cancelled());
+        assert!(client.request("after_retirement", json!({})).await.is_err());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn exited_group_membership_refuses_errors_truncation_and_any_other_process() {
+        assert!(only_exited_leader_listed(42, &[0, 0], 0, 0));
+        assert!(only_exited_leader_listed(42, &[42, 0], 1, 0));
+        for (members, count, error) in [
+            ([0, 0], 0, libc::EPERM),
+            ([0, 0], 0, libc::ESRCH),
+            ([0, 0], -1, 0),
+            ([42, 42], 2, 0),
+            ([42, 77], 2, 0),
+            ([77, 0], 1, 0),
+        ] {
+            assert!(!only_exited_leader_listed(42, &members, count, error));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn graceful_retirement_cleans_a_live_group_member_before_reaping_the_leader() {
+        let directory =
+            std::env::temp_dir().join(format!("muqun-acp-group-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let marker = directory.join("descendant-survived");
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            r#"
+            while IFS= read -r request; do :; done
+            (sleep 0.5; printf survived > "$1"; sleep 30) &
+            exit 0
+        "#,
+            "fixture",
+        ]);
+        command.arg(&marker);
+        let client = AcpClient::spawn_command(command, "FX", no_safe_error_message).unwrap();
+        assert_eq!(
+            client.retire(Duration::from_secs(5)).await.unwrap(),
+            AcpRetirement::Retired
+        );
+        assert_eq!(*locked(&client.state.exit_success), Some(true));
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert!(
+            !marker.exists(),
+            "a live descendant must still be killed before the leader is reaped"
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn retirement_refuses_pending_requests_and_permissions_without_closing_stdin() {
+        let client = fake("while IFS= read -r request; do :; done");
+        let pending = client.start_request("hold", json!({})).await.unwrap();
+        assert_eq!(
+            client.retire(Duration::from_millis(20)).await.unwrap(),
+            AcpRetirement::NotIdle
+        );
+        assert!(!client.state.retiring.load(Ordering::Acquire));
+        drop(pending);
+        client.shutdown().await;
+        let client = fake("while IFS= read -r request; do :; done");
+        locked(&client.state.server_requests).insert("approval".into(), 1);
+        assert_eq!(
+            client.retire(Duration::from_millis(20)).await.unwrap(),
+            AcpRetirement::NotIdle
+        );
+        assert!(!client.state.retiring.load(Ordering::Acquire));
+        locked(&client.state.server_requests).clear();
+        assert_eq!(
+            client.retire(Duration::from_secs(3)).await.unwrap(),
+            AcpRetirement::Retired
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn live_execution_is_latched_before_reply_and_never_cleared_by_later_text() {
+        let client = fake(
+            r#"
+            IFS= read -r first
+            printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"owned","update":{"sessionUpdate":"tool_call","status":"completed"}}}'
+            printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}'
+            IFS= read -r second
+            printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"owned","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"done"}}}}'
+            printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{}}'
+            while IFS= read -r hold; do :; done
+        "#,
+        );
+        let _events = client.subscribe();
+        client.arm_live_work_guard();
+        client.request("first", json!({})).await.unwrap();
+        assert!(client.has_unverified_live_work());
+        client.request("second", json!({})).await.unwrap();
+        assert_eq!(
+            client.retire(Duration::from_secs(1)).await.unwrap(),
+            AcpRetirement::NotIdle
+        );
+        assert!(client.is_running());
+        client.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn initial_replayed_tools_do_not_pin_a_new_native_generation() {
+        let client = fake(
+            r#"
+            IFS= read -r load
+            printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"owned","update":{"sessionUpdate":"tool_call","status":"completed"}}}'
+            printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}'
+            while IFS= read -r hold; do :; done
+        "#,
+        );
+        let _events = client.subscribe();
+        client.request("session/load", json!({})).await.unwrap();
+        client.arm_live_work_guard();
+        assert!(!client.has_unverified_live_work());
+        assert_eq!(
+            client.retire(Duration::from_secs(1)).await.unwrap(),
+            AcpRetirement::Retired
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn load_reply_arms_before_the_same_read_batch_can_deliver_live_tools() {
+        let client = fake(
+            r#"
+            IFS= read -r load
+            printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"tool_call","status":"completed"}}}' '{"jsonrpc":"2.0","id":1,"result":{}}' '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"tool_call_update","status":"completed"}}}'
+            IFS= read -r barrier
+            printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{}}'
+            while IFS= read -r hold; do :; done
+        "#,
+        );
+        let _events = client.subscribe();
+        client.request("session/load", json!({})).await.unwrap();
+        client.request("barrier", json!({})).await.unwrap();
+        assert!(client.has_unverified_live_work());
+        assert_eq!(
+            client.retire(Duration::from_secs(1)).await.unwrap(),
+            AcpRetirement::NotIdle
+        );
+        client.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn retirement_timeout_and_nonzero_exit_do_not_confirm_recovery() {
+        let client = fake("while IFS= read -r request; do :; done; sleep 30");
+        assert!(client.retire(Duration::from_millis(30)).await.is_err());
+        assert!(client.state.cancel.is_cancelled());
+        assert!(client.state.exited.is_cancelled());
+        let client = fake("while IFS= read -r request; do :; done; exit 7");
+        assert!(client.retire(Duration::from_secs(3)).await.is_err());
+        assert_eq!(*locked(&client.state.exit_success), Some(false));
     }
 
     #[cfg(unix)]

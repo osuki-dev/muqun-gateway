@@ -51,6 +51,10 @@ pub struct CodexDriver {
     account_limits: super::account_limits::Cache,
     terminal_runtime: Option<Arc<crate::agents::terminal_runtime::TerminalRuntime>>,
     native_sessions: Option<Arc<super::native_sessions::NativeSessions>>,
+    presentations: std::sync::Mutex<super::presentation::Cache>,
+    /// Isolated optional reads never consume the foreground history slot. No
+    /// first-item proof is cached: external native rollback can change it.
+    title_reader: Mutex<Option<Arc<CodexClient>>>,
     /// Only explicitly created, forked or submitted-to threads are resumed.
     loaded: Arc<Mutex<HashSet<String>>>,
     question_recoveries: Arc<Mutex<QuestionRecoveries>>,
@@ -204,6 +208,8 @@ impl CodexDriver {
             account_limits: Default::default(),
             terminal_runtime: None,
             native_sessions: None,
+            presentations: std::sync::Mutex::new(super::presentation::Cache::default()),
+            title_reader: Mutex::new(None),
             loaded: Arc::new(Mutex::new(HashSet::new())),
             question_recoveries: Arc::new(Mutex::new(QuestionRecoveries::default())),
             mutations: Arc::new(Mutex::new(())),
@@ -249,7 +255,7 @@ impl CodexDriver {
         thread: &str,
         text: &str,
         files: Vec<Value>,
-        input: Vec<Value>,
+        input: super::presentation::PromptInput,
         delivery: Delivery,
     ) -> Result<(), AgentError> {
         self.queue().push(
@@ -388,7 +394,7 @@ impl CodexDriver {
         &self,
         thread: &str,
         turn: &str,
-        input: Vec<Value>,
+        input: super::presentation::PromptInput,
     ) -> Result<(), SendFailure> {
         self.require_native_interaction(thread)
             .await
@@ -627,14 +633,18 @@ impl CodexDriver {
     pub(crate) async fn clear_async_questions(&self, thread: &str) {
         self.async_questions.lock().await.clear(thread);
     }
-    async fn steer(&self, thread: &str, turn: &str, input: Vec<Value>) -> Result<(), AgentError> {
-        let result = self
-            .client
-            .call(
-                "turn/steer",
-                json!({"threadId":thread,"expectedTurnId":turn,"input":input}),
-            )
-            .await?;
+    async fn steer(
+        &self,
+        thread: &str,
+        turn: &str,
+        input: super::presentation::PromptInput,
+    ) -> Result<(), AgentError> {
+        let client_id = self.record_prompt_presentation(thread, &input).await?;
+        let mut params = json!({"threadId":thread,"expectedTurnId":turn,"input":input.native});
+        if let Some(client_id) = client_id {
+            params["clientUserMessageId"] = json!(client_id);
+        }
+        let result = self.client.call("turn/steer", params).await?;
         if result["turnId"] != turn {
             self.client.stop();
             return Err(AgentError::Protocol(
@@ -1068,6 +1078,172 @@ impl CodexDriver {
         })
     }
 
+    async fn record_prompt_presentation(
+        &self,
+        thread: &str,
+        input: &super::presentation::PromptInput,
+    ) -> Result<Option<String>, AgentError> {
+        let Some(value) = &input.presentation else {
+            return Ok(None);
+        };
+        let client_id = uuid::Uuid::new_v4().to_string();
+        let store = self.native_sessions.as_ref().ok_or_else(|| {
+            AgentError::NotAvailable(
+                "Codex presentation storage is unavailable; nothing was sent".into(),
+            )
+        })?;
+        let home = self.client.codex_home().ok_or_else(|| {
+            AgentError::NotAvailable(
+                "Codex presentation scope is unavailable; nothing was sent".into(),
+            )
+        })?;
+        store
+            .record_presentation(home, thread, &client_id, value.clone())
+            .await
+            .map_err(|_| {
+                AgentError::NotAvailable(
+                    "Codex presentation storage is unavailable or full; nothing was sent".into(),
+                )
+            })?;
+        self.presentations
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(thread, &client_id, value.clone());
+        Ok(Some(client_id))
+    }
+
+    pub(crate) async fn restore_prompt_presentations(
+        &self,
+        thread: &str,
+    ) -> Result<(), AgentError> {
+        if self
+            .presentations
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .loaded(thread)
+        {
+            return Ok(());
+        }
+        if let (Some(store), Some(home)) = (&self.native_sessions, self.client.codex_home()) {
+            let Ok(records) = store.presentations(home, thread).await else {
+                tracing::debug!("Codex presentation metadata unavailable; preserving native text");
+                return Ok(());
+            };
+            let mut cache = self.presentations.lock().unwrap_or_else(|p| p.into_inner());
+            for (client, value) in records {
+                cache.insert(thread, &client, value);
+            }
+            cache.mark_loaded(thread);
+        }
+        Ok(())
+    }
+
+    /// Explicit names always win. Automatic previews need a fresh canonical
+    /// first-user/client-ID proof, not merely matching text in any later turn.
+    pub(crate) async fn project_session(
+        &self,
+        thread: &Value,
+    ) -> Result<AgentSessionInfo, AgentError> {
+        self.project_session_until(thread, Self::title_deadline())
+            .await
+    }
+
+    fn title_deadline() -> tokio::time::Instant {
+        tokio::time::Instant::now() + std::time::Duration::from_secs(2)
+    }
+
+    async fn project_session_until(
+        &self,
+        thread: &Value,
+        deadline: tokio::time::Instant,
+    ) -> Result<AgentSessionInfo, AgentError> {
+        let mut info = mapper::session(thread)?;
+        if thread["name"].as_str().is_some() || tokio::time::Instant::now() >= deadline {
+            return Ok(info);
+        }
+        // A single deadline includes storage, reader admission, initialization
+        // and canonical read, and is shared by all rows/pages of an inventory.
+        let proof = async {
+            self.restore_prompt_presentations(&info.asid.0).await.ok()?;
+            let preview = thread["preview"].as_str()?;
+            if !self
+                .presentations
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .has_preview_candidate(&info.asid.0, preview)
+            {
+                return None;
+            }
+            let mut held = self.title_reader.lock().await;
+            // Retain the connection only after a completed proof attempt. A
+            // cancelled/expired read drops its isolated client and pending RPC.
+            let reader = match held.take().filter(|reader| reader.is_ready()) {
+                Some(reader) => reader,
+                None => self.client.question_history_reader().await.ok()?,
+            };
+            let mode = if let Some(mode) = thread["historyMode"].as_str() {
+                mode.to_owned()
+            } else {
+                let metadata = self
+                    .client
+                    .call(
+                        "thread/read",
+                        json!({
+                            "threadId":info.asid.0,"includeTurns":false
+                        }),
+                    )
+                    .await
+                    .ok()?;
+                if metadata["thread"]["id"] != info.asid.0
+                    || metadata["thread"]["name"].as_str().is_some()
+                    || metadata["thread"]["preview"] != preview
+                {
+                    return None;
+                }
+                metadata["thread"]["historyMode"].as_str()?.to_owned()
+            };
+            let mut budget = Budget::new();
+            let page = match mode.as_str() {
+                "paginated" => budget.call(&reader, "thread/items/list", json!({
+                    "threadId":info.asid.0,"limit":1,"sortDirection":"asc","cursor":null
+                })).await.ok()?,
+                "legacy" => budget.call(&reader, "thread/turns/list", json!({
+                    "threadId":info.asid.0,"limit":1,"sortDirection":"asc","itemsView":"full","cursor":null
+                })).await.ok()?,
+                _ => return None,
+            };
+            let rows = page["data"].as_array().filter(|rows| rows.len() == 1)?;
+            let first = if mode == "paginated" {
+                rows[0]["turnId"].as_str().filter(|id| !id.is_empty())?;
+                &rows[0]["item"]
+            } else {
+                rows[0]["id"].as_str().filter(|id| !id.is_empty())?;
+                if rows[0]["itemsView"] != "full" {
+                    return None;
+                }
+                rows[0]["items"].as_array()?.first()?
+            };
+            first["id"].as_str().filter(|id| !id.is_empty())?;
+            let display = self
+                .presentations
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .project_first_preview(&info.asid.0, preview, first);
+            *held = Some(reader);
+            display
+        };
+        let cancel = self.client.cancel_token();
+        let display = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => None,
+            result = tokio::time::timeout_at(deadline, proof) => result.ok().flatten(),
+        };
+        if let Some(display) = display {
+            info.title = display;
+        }
+        Ok(info)
+    }
+
     pub(crate) fn ordered_items(
         &self,
         thread: &str,
@@ -1122,6 +1298,28 @@ impl CodexDriver {
                 "Codex collaboration target limit exceeded; resync required".into(),
             ));
         }
+        let presented;
+        let item = if let Some(display) = self
+            .presentations
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .project(thread, item)
+        {
+            presented = {
+                let mut value = item.clone();
+                value["content"] = serde_json::json!([{ "type":"text", "text":display }]);
+                // Preserve every native non-text attachment alongside the display text.
+                if let Some(content) = item["content"].as_array() {
+                    for part in content.iter().filter(|part| part["type"] != "text") {
+                        value["content"].as_array_mut().unwrap().push(part.clone());
+                    }
+                }
+                value
+            };
+            &presented
+        } else {
+            item
+        };
         let mut rows = mapper::item(thread, turn, item, at_ms);
         for row in &mut rows {
             row.message_id = mapper::order_group(thread, turn, position);
@@ -1464,7 +1662,7 @@ impl CodexDriver {
                 thread[key] = value.clone();
             }
         }
-        let mut session = mapper::session(&thread)?;
+        let mut session = self.project_session(&thread).await?;
         self.apply_usage(&mut session).await;
         self.remember(&session.asid.0).await?;
         let revision = self.metadata_revision(&session.asid.0).await?;
@@ -1634,7 +1832,11 @@ impl CodexDriver {
     }
 
     /// Start a turn whose input is already a Codex `UserInput` list.
-    async fn submit_turn(&self, id: &str, input: Vec<Value>) -> Result<(), AgentError> {
+    async fn submit_turn(
+        &self,
+        id: &str,
+        input: super::presentation::PromptInput,
+    ) -> Result<(), AgentError> {
         self.prepare_shared_interaction(id).await?;
         let _guard = self.mutations.lock().await;
         self.start_turn_locked(id, input)
@@ -1644,11 +1846,22 @@ impl CodexDriver {
 
     /// Caller holds `mutations`. Everything before `turn/start` is written
     /// fails as `NotSent`.
-    async fn start_turn_locked(&self, id: &str, input: Vec<Value>) -> Result<(), SendFailure> {
+    async fn start_turn_locked(
+        &self,
+        id: &str,
+        input: super::presentation::PromptInput,
+    ) -> Result<(), SendFailure> {
         self.prepare_turn_locked(id)
             .await
             .map_err(SendFailure::NotSent)?;
-        let mut params = json!({"threadId":id,"input":input});
+        let client_id = self
+            .record_prompt_presentation(id, &input)
+            .await
+            .map_err(SendFailure::NotSent)?;
+        let mut params = json!({"threadId":id,"input":input.native});
+        if let Some(client_id) = client_id {
+            params["clientUserMessageId"] = json!(client_id);
+        }
         let model = self
             .next_models
             .lock()
@@ -2072,6 +2285,7 @@ impl CodexDriver {
         budget: &mut Budget,
         order: &mut ItemOrder,
     ) -> Result<Vec<TimelineItem>, AgentError> {
+        self.restore_prompt_presentations(id).await?;
         let mut items = Vec::new();
         while items.len() < limit {
             if !state.remaining.is_empty() {
@@ -2250,6 +2464,7 @@ impl CodexDriver {
             seen.insert(cursor.clone());
         }
         let mut page_query = query.clone();
+        let title_deadline = Self::title_deadline();
         let mut out = vec![];
         loop {
             page_query.limit = Some(
@@ -2258,7 +2473,9 @@ impl CodexDriver {
                     .map(|n| n.saturating_sub(out.len()).min(100))
                     .unwrap_or(100),
             );
-            let page = self.session_page(&page_query, &mut budget).await?;
+            let page = self
+                .session_page(&page_query, &mut budget, title_deadline)
+                .await?;
             out.extend(page.data);
             if query.limit.is_some_and(|n| out.len() >= n) {
                 return Ok(out);
@@ -2277,6 +2494,7 @@ impl CodexDriver {
         &self,
         query: &SessionQuery,
         budget: &mut Budget,
+        title_deadline: tokio::time::Instant,
     ) -> Result<SessionPage, AgentError> {
         let order = query.order.as_deref().unwrap_or("desc");
         let limit = query.limit.unwrap_or(50);
@@ -2301,7 +2519,7 @@ impl CodexDriver {
         budget.rows(rows.len())?;
         let mut data = vec![];
         for row in rows {
-            let mut info = mapper::session(row)?;
+            let mut info = self.project_session_until(row, title_deadline).await?;
             self.apply_usage(&mut info).await;
             if query.keeps_parent(info.parent_id.as_deref()) {
                 data.push(info);
@@ -2330,6 +2548,83 @@ impl CodexDriver {
                     "Codex request expired, already answered or belongs to another thread".into(),
                 )
             })
+    }
+}
+
+impl CodexDriver {
+    fn presented_prompt<'a>(
+        &'a self,
+        id: &'a str,
+        text: &'a str,
+        attachments: &'a [String],
+        delivery: Option<&'a str>,
+        display: Option<&'a str>,
+    ) -> AgentFuture<'a, ()> {
+        Box::pin(async move {
+            let delivery = match delivery {
+                None => None,
+                Some(mode) => Some(Delivery::parse(mode).ok_or_else(|| {
+                    AgentError::InvalidRequest("delivery must be steer or queue".into())
+                })?),
+            };
+            validate_id(id)?;
+            if text.is_empty() && attachments.is_empty() {
+                return Err(AgentError::InvalidRequest("empty Codex prompt".into()));
+            }
+            // Validate uploads before any rejoin/resume or prompt mutation.
+            let prepared = super::input::prepare(text, attachments).await?;
+            let input = super::presentation::PromptInput::presented(prepared.input, text, display)?;
+            // Compaction cannot consume steering yet. Publish the accepted
+            // prompt through the ordinary inbox instead of hiding it upstream.
+            if delivery == Some(Delivery::Queue) || self.client.is_compacting(id) {
+                self.prepare_shared_interaction(id).await?;
+                let _guard = self.mutations.lock().await;
+                self.require_native_interaction(id).await?;
+                if self.client.active_turn(id).is_none() {
+                    // Idle: nothing to wait for, so it starts now, as an idle
+                    // OpenCode session delivers a queued prompt at once.
+                    return self
+                        .start_turn_locked(id, input)
+                        .await
+                        .map_err(SendFailure::into_error);
+                }
+                if !self.loaded.lock().await.contains(id) {
+                    return unsupported("Codex queued delivery requires an owned live thread");
+                }
+                return self.enqueue_prompt(
+                    id,
+                    display.unwrap_or(text),
+                    prepared.files,
+                    input,
+                    delivery.unwrap_or(Delivery::Steer),
+                );
+            }
+            if delivery == Some(Delivery::Steer) {
+                self.prepare_shared_interaction(id).await?;
+                let _guard = self.mutations.lock().await;
+                self.require_native_interaction(id).await?;
+                if !self.loaded.lock().await.contains(id) {
+                    return unsupported("Codex steering requires an owned live thread");
+                }
+                // Compaction may have begun while preparing the interaction.
+                if self.client.is_compacting(id) {
+                    return self.enqueue_prompt(
+                        id,
+                        display.unwrap_or(text),
+                        prepared.files,
+                        input,
+                        Delivery::Steer,
+                    );
+                }
+                let turn = self.client.active_turn(id).ok_or_else(|| {
+                    AgentError::InvalidRequest(
+                        "Codex active turn ended before steering; message was not resent".into(),
+                    )
+                })?;
+                return self.steer(id, &turn, input).await;
+            }
+            self.submit_turn(id, input).await
+        })
     }
 }
 
@@ -2477,7 +2772,10 @@ impl AgentPort for CodexDriver {
     }
 
     fn list_sessions_page<'a>(&'a self, query: &'a SessionQuery) -> AgentFuture<'a, SessionPage> {
-        Box::pin(async { self.session_page(query, &mut Budget::new()).await })
+        Box::pin(async {
+            self.session_page(query, &mut Budget::new(), Self::title_deadline())
+                .await
+        })
     }
 
     fn create_session<'a>(
@@ -2527,13 +2825,13 @@ impl AgentPort for CodexDriver {
                 let thread = self.read_thread(id).await?;
                 self.rejoin_loaded(id, &thread, true).await?;
             }
-            Ok(())
+            self.client.flush_preparation_events().await
         })
     }
 
     fn get_session<'a>(&'a self, id: &'a str) -> AgentFuture<'a, AgentSessionInfo> {
         Box::pin(async move {
-            let mut info = mapper::session(&self.read_thread(id).await?)?;
+            let mut info = self.project_session(&self.read_thread(id).await?).await?;
             self.apply_usage(&mut info).await;
             Ok(info)
         })
@@ -2546,65 +2844,18 @@ impl AgentPort for CodexDriver {
         attachments: &'a [String],
         delivery: Option<&'a str>,
     ) -> AgentFuture<'a, ()> {
-        Box::pin(async move {
-            let delivery = match delivery {
-                None => None,
-                Some(mode) => Some(Delivery::parse(mode).ok_or_else(|| {
-                    AgentError::InvalidRequest("delivery must be steer or queue".into())
-                })?),
-            };
-            validate_id(id)?;
-            if text.is_empty() && attachments.is_empty() {
-                return Err(AgentError::InvalidRequest("empty Codex prompt".into()));
-            }
-            // Validate uploads before any rejoin/resume or prompt mutation.
-            let prepared = super::input::prepare(text, attachments).await?;
-            let input = prepared.input;
-            // Compaction cannot consume steering yet. Publish the accepted
-            // prompt through the ordinary inbox instead of hiding it upstream.
-            if delivery == Some(Delivery::Queue) || self.client.is_compacting(id) {
-                self.prepare_shared_interaction(id).await?;
-                let _guard = self.mutations.lock().await;
-                self.require_native_interaction(id).await?;
-                if self.client.active_turn(id).is_none() {
-                    // Idle: nothing to wait for, so it starts now, as an idle
-                    // OpenCode session delivers a queued prompt at once.
-                    return self
-                        .start_turn_locked(id, input)
-                        .await
-                        .map_err(SendFailure::into_error);
-                }
-                if !self.loaded.lock().await.contains(id) {
-                    return unsupported("Codex queued delivery requires an owned live thread");
-                }
-                return self.enqueue_prompt(
-                    id,
-                    text,
-                    prepared.files,
-                    input,
-                    delivery.unwrap_or(Delivery::Steer),
-                );
-            }
-            if delivery == Some(Delivery::Steer) {
-                self.prepare_shared_interaction(id).await?;
-                let _guard = self.mutations.lock().await;
-                self.require_native_interaction(id).await?;
-                if !self.loaded.lock().await.contains(id) {
-                    return unsupported("Codex steering requires an owned live thread");
-                }
-                // Compaction may have begun while preparing the interaction.
-                if self.client.is_compacting(id) {
-                    return self.enqueue_prompt(id, text, prepared.files, input, Delivery::Steer);
-                }
-                let turn = self.client.active_turn(id).ok_or_else(|| {
-                    AgentError::InvalidRequest(
-                        "Codex active turn ended before steering; message was not resent".into(),
-                    )
-                })?;
-                return self.steer(id, &turn, input).await;
-            }
-            self.submit_turn(id, input).await
-        })
+        self.presented_prompt(id, text, attachments, delivery, None)
+    }
+
+    fn send_prompt_with_display<'a>(
+        &'a self,
+        id: &'a str,
+        text: &'a str,
+        display_text: &'a str,
+        attachments: &'a [String],
+        delivery: Option<&'a str>,
+    ) -> AgentFuture<'a, ()> {
+        self.presented_prompt(id, text, attachments, delivery, Some(display_text))
     }
 
     fn interrupt<'a>(&'a self, id: &'a str) -> AgentFuture<'a, ()> {
@@ -2829,7 +3080,7 @@ impl AgentPort for CodexDriver {
                     questions.claim(thread, &turn, id, &answers)?
                 };
                 if let Err(error) = self
-                    .steer(thread, &turn, super::input::text_input(&text))
+                    .steer(thread, &turn, super::input::text_input(&text).into())
                     .await
                 {
                     // An explicit RPC rejection did not accept this input.
@@ -2955,7 +3206,7 @@ impl AgentPort for CodexDriver {
             let path = self.skill_path(session_id, name).await?;
             self.submit_turn(
                 session_id,
-                vec![json!({"type":"skill","name":name,"path":path})],
+                vec![json!({"type":"skill","name":name,"path":path})].into(),
             )
             .await
         })
@@ -4661,5 +4912,418 @@ mod model_page_tests {
         .await
         .unwrap();
         assert!(fixture.requests.try_recv().is_err());
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod presentation_tests {
+    use super::*;
+    use crate::agents::adapters::codex::{daemon::tests::TestDirectory, tests::Fixture};
+    use crate::platform::store::sqlite::SqliteStore;
+
+    fn shown(rows: &[TimelineItem]) -> &str {
+        match &rows[0].part {
+            AgentPart::Text { text } => text,
+            _ => panic!("expected user text"),
+        }
+    }
+
+    pub(crate) async fn title_fixture(
+        mode: &'static str,
+    ) -> (
+        TestDirectory,
+        Fixture,
+        Fixture,
+        Arc<CodexDriver>,
+        Arc<std::sync::Mutex<Value>>,
+    ) {
+        let directory = TestDirectory::new();
+        let mut thread = super::super::tests::golden()["thread"].clone();
+        thread["name"] = Value::Null;
+        thread["preview"] = json!("Original plus machine-uuid");
+        thread["historyMode"] = json!(mode);
+        let metadata = thread.clone();
+        let mut primary = Fixture::new_in_home(
+            move |request| match request["method"].as_str().unwrap() {
+                "thread/read" => json!({"thread":metadata}),
+                "thread/list" => {
+                    json!({"data":[metadata.clone(),metadata.clone()],"nextCursor":null})
+                }
+                other => panic!("optional title proof must not mutate: {other}"),
+            },
+            &directory.0,
+        )
+        .await;
+        primary.ready().await;
+        let first = Arc::new(std::sync::Mutex::new(json!({
+            "id":"first-user","type":"userMessage","clientId":"00000000-0000-4000-8000-000000000111",
+            "content":[{"type":"text","text":"Original plus machine-uuid"}]
+        })));
+        let observed = first.clone();
+        let mut history = Fixture::new(move |request| {
+            assert_eq!(request["params"]["limit"],1);
+            assert_eq!(request["params"]["sortDirection"],"asc");
+            assert!(request["params"].get("turnId").is_none());
+            let item = observed.lock().unwrap().clone();
+            match request["method"].as_str().unwrap() {
+                "thread/items/list" => json!({"data":[{"turnId":"first-turn","item":item}],"nextCursor":"more"}),
+                "thread/turns/list" => json!({"data":[{"id":"first-turn","itemsView":"full","items":[item]}],"nextCursor":"more"}),
+                other => panic!("unexpected title reader RPC {other}"),
+            }
+        }).await;
+        history.ready().await;
+        let db = SqliteStore::open(
+            &directory.0.join("store.sqlite"),
+            None,
+            &[
+                super::super::native_sessions::MIGRATION,
+                super::super::native_sessions::PRESENTATION_MIGRATION,
+            ],
+        )
+        .unwrap();
+        let store = super::super::native_sessions::NativeSessions::new(db);
+        store
+            .record_presentation(
+                &directory.0,
+                thread["id"].as_str().unwrap(),
+                "00000000-0000-4000-8000-000000000111",
+                super::super::presentation::Presentation {
+                    wire: "Original plus machine-uuid".into(),
+                    display: "Original".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let mut driver = CodexDriver::new(primary.client.clone());
+        driver.restore_native_sessions(Some(store));
+        *driver.title_reader.lock().await = Some(history.client.clone());
+        (directory, primary, history, Arc::new(driver), first)
+    }
+
+    #[tokio::test]
+    async fn title_projection_requires_fresh_canonical_first_user_not_any_matching_later_prompt() {
+        for mode in ["paginated", "legacy"] {
+            let (_directory, _primary, mut history, driver, first) = title_fixture(mode).await;
+            let mut thread = super::super::tests::golden()["thread"].clone();
+            thread["name"] = Value::Null;
+            thread["preview"] = json!("Original plus machine-uuid");
+            thread["historyMode"] = json!(mode);
+            assert_eq!(
+                driver.project_session(&thread).await.unwrap().title,
+                "Original"
+            );
+            // A later retained Gateway prompt has exactly the same text as an
+            // earlier external literal. Only the canonical first client's ID counts.
+            first.lock().unwrap()["clientId"] = json!("external-first");
+            assert_eq!(
+                driver.project_session(&thread).await.unwrap().title,
+                "Original plus machine-uuid"
+            );
+            first.lock().unwrap()["clientId"] = json!("00000000-0000-4000-8000-000000000111");
+            first.lock().unwrap()["content"][0]["text"] = json!("changed by native rollback");
+            assert_eq!(
+                driver.project_session(&thread).await.unwrap().title,
+                "Original plus machine-uuid"
+            );
+            first.lock().unwrap()["content"][0]["text"] = json!("Original plus machine-uuid");
+            assert_eq!(
+                driver.project_session(&thread).await.unwrap().title,
+                "Original"
+            );
+            while history.requests.try_recv().is_ok() {}
+            // An explicit user rename is preserved even when it equals the wire.
+            thread["name"] = thread["preview"].clone();
+            assert_eq!(
+                driver.project_session(&thread).await.unwrap().title,
+                "Original plus machine-uuid"
+            );
+            assert!(history.requests.try_recv().is_err());
+            assert!(driver.loaded.lock().await.is_empty());
+            assert!(driver.order.lock().unwrap().is_empty());
+            assert!(driver.history_state.lock().unwrap().pages.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn persisted_title_projection_reaches_session_reads_and_inventory_without_mutations() {
+        let (_directory, mut primary, mut history, driver, _) = title_fixture("paginated").await;
+        let id = super::super::tests::golden()["thread"]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(driver.get_session(&id).await.unwrap().title, "Original");
+        let rows = driver
+            .list_sessions(&SessionQuery::default())
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| row.title == "Original"));
+        let methods = std::iter::from_fn(|| primary.requests.try_recv().ok())
+            .map(|r| r["method"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(methods, ["thread/read", "thread/list"]);
+        assert_eq!(
+            std::iter::from_fn(|| history.requests.try_recv().ok()).count(),
+            3
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn title_proof_deadline_is_shared_by_the_whole_list_and_failure_preserves_previews() {
+        let (_directory, _primary, _history, driver, _) = title_fixture("paginated").await;
+        let held = driver.title_reader.lock().await;
+        let start = tokio::time::Instant::now();
+        let rows = driver
+            .list_sessions(&SessionQuery::default())
+            .await
+            .unwrap();
+        assert_eq!(start.elapsed(), std::time::Duration::from_secs(2));
+        assert!(rows
+            .iter()
+            .all(|row| row.title == "Original plus machine-uuid"));
+        drop(held);
+        driver.client.stop();
+        let thread =
+            json!({"id":"unknown","preview":"literal Muqun computer references","name":null});
+        assert_eq!(
+            driver.project_session(&thread).await.unwrap().title,
+            "literal Muqun computer references"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "explicit own-session read-only native title metadata probe"]
+    async fn own_native_title_metadata_probe() {
+        let home = std::path::PathBuf::from(
+            std::env::var_os("MUQUN_CODEX_TITLE_PROBE_HOME").expect("explicit home"),
+        );
+        let id = std::env::var("MUQUN_CODEX_TITLE_PROBE_THREAD").expect("explicit own QA session");
+        let (client, _events) = super::super::daemon::connect_at(&home)
+            .await
+            .unwrap()
+            .expect("existing daemon");
+        let response = client
+            .call("thread/read", json!({"threadId":id,"includeTurns":false}))
+            .await
+            .unwrap();
+        let thread = &response["thread"];
+        assert_eq!(thread["id"], id);
+        println!(
+            "name_is_null={} name_len={} preview_len={} paginated={}",
+            thread["name"].is_null(),
+            thread["name"].as_str().map(str::len).unwrap_or(0),
+            thread["preview"].as_str().map(str::len).unwrap_or(0),
+            thread["historyMode"] == "paginated"
+        );
+        let reader = client.question_history_reader().await.unwrap();
+        let page = reader
+            .call(
+                "thread/items/list",
+                json!({
+                    "threadId":id,"limit":1,"sortDirection":"asc","cursor":null
+                }),
+            )
+            .await
+            .unwrap();
+        let first = &page["data"][0]["item"];
+        assert_eq!(first["type"], "userMessage");
+        assert!(first["clientId"].as_str().is_some());
+        assert_eq!(
+            super::super::presentation::text(first["content"].as_array().unwrap()),
+            thread["preview"].as_str().unwrap()
+        );
+        println!("canonical_first_user_has_client_id=true canonical_text_equals_preview=true");
+        reader.stop();
+        client.stop();
+    }
+
+    #[tokio::test]
+    async fn presentation_without_durable_storage_is_rejected_before_model_dispatch() {
+        let mut fixture =
+            Fixture::new(|request| panic!("must not dispatch {}", request["method"])).await;
+        fixture.ready().await;
+        let driver = CodexDriver::new(fixture.client.clone());
+        let thread = "00000000-0000-4000-8000-000000000001";
+        driver.loaded.lock().await.insert(thread.into());
+        let error = driver
+            .send_prompt_with_display(thread, "user plus machine UUID", "user", &[], None)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AgentError::NotAvailable(_)));
+        assert!(fixture.requests.try_recv().is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn presentation_is_durable_and_visible_before_the_native_acknowledgement() {
+        let directory = TestDirectory::new();
+        let captured = Arc::new(std::sync::Mutex::new(None::<Value>));
+        let seen = captured.clone();
+        let (release, wait) = std::sync::mpsc::channel();
+        let wait = std::sync::Mutex::new(wait);
+        let mut fixture = Fixture::new_in_home(
+            move |request| {
+                if request["method"] == "turn/start" {
+                    *seen.lock().unwrap() = Some(request["params"].clone());
+                    wait.lock()
+                        .unwrap()
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .unwrap();
+                    return json!({"turn":{"id":"turn","status":"inProgress"}});
+                }
+                if request["method"] == "thread/read" {
+                    let mut value = super::super::tests::golden()["thread"].clone();
+                    value["id"] = json!("00000000-0000-4000-8000-000000000001");
+                    return json!({"thread":value});
+                }
+                panic!("unexpected RPC {}", request["method"]);
+            },
+            &directory.0,
+        )
+        .await;
+        fixture.ready().await;
+        let db = SqliteStore::open(
+            &directory.0.join("store.sqlite"),
+            None,
+            &[
+                super::super::native_sessions::MIGRATION,
+                super::super::native_sessions::PRESENTATION_MIGRATION,
+            ],
+        )
+        .unwrap();
+        let store = super::super::native_sessions::NativeSessions::new(db);
+        let mut driver = CodexDriver::new(fixture.client.clone());
+        driver.restore_native_sessions(Some(store.clone()));
+        let driver = Arc::new(driver);
+        let thread = "00000000-0000-4000-8000-000000000001";
+        driver.loaded.lock().await.insert(thread.into());
+        let sending = driver.clone();
+        let send = tokio::spawn(async move {
+            sending
+                .send_prompt_with_display(thread, "user plus machine-uuid", "user", &[], None)
+                .await
+        });
+        let request = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Some(value) = captured.lock().unwrap().clone() {
+                    break value;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!send.is_finished());
+        assert_eq!(
+            store
+                .presentations(&directory.0, thread)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        let echo = json!({"id":"native-before-ack","type":"userMessage","clientId":request["clientUserMessageId"],"content":request["input"]});
+        assert_eq!(
+            shown(&driver.ordered_items(thread, "turn", &echo, 1).unwrap()),
+            "user"
+        );
+        release.send(()).unwrap();
+        send.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn native_client_identity_preserves_model_context_and_restores_live_and_reopened_history_display(
+    ) {
+        let dir = TestDirectory::new();
+        let thread = "00000000-0000-4000-8000-000000000001";
+        let sent = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let captured = sent.clone();
+        let mut fixture = Fixture::new_in_home(
+            move |request| {
+                if request["method"] == "turn/start" {
+                    captured.lock().unwrap().push(request["params"].clone());
+                    return json!({"turn":{"id":"turn","status":"inProgress"}});
+                }
+                if request["method"] == "thread/read" {
+                    let mut value = super::super::tests::golden()["thread"].clone();
+                    value["id"] = json!(thread);
+                    return json!({"thread":value});
+                }
+                panic!("unexpected RPC {}", request["method"]);
+            },
+            &dir.0,
+        )
+        .await;
+        fixture.ready().await;
+        let db = SqliteStore::open(
+            &dir.0.join("store.sqlite"),
+            None,
+            &[
+                super::super::native_sessions::MIGRATION,
+                super::super::native_sessions::PRESENTATION_MIGRATION,
+            ],
+        )
+        .unwrap();
+        let store = super::super::native_sessions::NativeSessions::new(db);
+        let mut driver = CodexDriver::new(fixture.client.clone());
+        driver.restore_native_sessions(Some(store.clone()));
+        driver.loaded.lock().await.insert(thread.into());
+        let original = "Inspect @mini, then explain this literal: Muqun computer references (names are display data)";
+        let wire = format!("{original}\n\nMuqun computer references (names are display data): [{{\"machineId\":\"machine-uuid\",\"name\":\"mini\"}}]. Use the muqun tools.");
+        driver
+            .send_prompt_with_display(thread, &wire, original, &[], None)
+            .await
+            .unwrap();
+        let request = sent.lock().unwrap()[0].clone();
+        assert_eq!(request["input"][0]["text"], wire);
+        let client = request["clientUserMessageId"].as_str().unwrap();
+        uuid::Uuid::parse_str(client).unwrap();
+        let native = json!({"type":"userMessage","id":"native-user","clientId":client,"content":request["input"]});
+        assert_eq!(
+            shown(&driver.ordered_items(thread, "turn", &native, 10).unwrap()),
+            original
+        );
+        let mut no_client = native.clone();
+        no_client["clientId"] = Value::Null;
+        assert_eq!(
+            shown(
+                &driver
+                    .ordered_items(thread, "turn", &no_client, 10)
+                    .unwrap()
+            ),
+            wire
+        );
+        let mut changed = native.clone();
+        changed["content"][0]["text"] = json!(format!("{wire} changed"));
+        assert_eq!(
+            shown(&driver.ordered_items(thread, "turn", &changed, 10).unwrap()),
+            format!("{wire} changed")
+        );
+        drop(driver);
+        let mut reopened = CodexDriver::new(fixture.client.clone());
+        reopened.restore_native_sessions(Some(store));
+        reopened.restore_prompt_presentations(thread).await.unwrap();
+        // Canonical history and live events share this production projection.
+        assert_eq!(
+            shown(&reopened.ordered_items(thread, "turn", &native, 10).unwrap()),
+            original
+        );
+        assert_eq!(
+            shown(
+                &reopened
+                    .ordered_items("other-thread", "turn", &native, 10)
+                    .unwrap()
+            ),
+            wire
+        );
+        // A user-authored copy with no Gateway-issued correlation stays literal.
+        assert_eq!(
+            shown(
+                &reopened
+                    .ordered_items(thread, "turn", &no_client, 10)
+                    .unwrap()
+            ),
+            wire
+        );
     }
 }

@@ -8,6 +8,20 @@ impl AcpProvider for FxProvider {
     const ARGS: &'static [&'static str] = &["acp"];
     const REQUIRE_MESSAGE_ID: bool = true;
     const MODEL_SELECTION: bool = true;
+    const IDLE_RETIREMENT: bool = true;
+    fn recovery_snapshot<'a>(
+        binary: &'a str,
+        directory: &'a str,
+        id: &'a str,
+        stop: &'a tokio_util::sync::CancellationToken,
+    ) -> crate::agents::ports::agent::AgentFuture<
+        'a,
+        crate::agents::adapters::acp::recovery::NativeSnapshot,
+    > {
+        Box::pin(super::native_cli::recovery_snapshot(
+            binary, directory, id, stop,
+        ))
+    }
     const SESSION_NOTICES: bool = true;
     fn global_catalog<'a>(
         binary: &'a str,

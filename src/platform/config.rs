@@ -639,7 +639,13 @@ mod tests {
         assert_eq!(serde_json::to_value(default).unwrap(), base);
         for key in ["codex", "fx", "qoder", "agent_runtime"] {
             let mut off = base.clone();
-            off[key] = json!({"enabled":false});
+            off[key] = if matches!(key, "fx" | "qoder") {
+                // Saving an explicit off setting must also retain its configured
+                // retirement timeout, rather than replacing it with the default.
+                json!({"enabled":false,"idle_timeout_secs":731})
+            } else {
+                json!({"enabled":false})
+            };
             let config: Config = serde_json::from_value(off.clone()).unwrap();
             assert!(!match key {
                 "codex" => config.codex.enabled,

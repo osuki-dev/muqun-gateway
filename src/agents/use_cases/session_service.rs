@@ -133,14 +133,33 @@ impl SessionService {
         Ok(info)
     }
 
+    /// An explicit foreground selection may restore a dormant native runtime.
+    /// Ordinary reads and automatic history refreshes never carry this intent.
+    pub async fn prepare_session(&self, asid: &AgentSessionId) -> Result<(), AgentError> {
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            let info = self.agent.get_session(&asid.0).await?;
+            if info.asid != *asid {
+                return Err(AgentError::Protocol(
+                    "Session identity changed before preparation".into(),
+                ));
+            }
+            self.agent.prepare_selected_session(&asid.0).await
+        })
+        .await
+        .map_err(|_| {
+            AgentError::NotAvailable(
+                "Session preparation timed out; no prompt was submitted".into(),
+            )
+        })?
+    }
+
     pub async fn get_snapshot(
         &self,
         asid: &AgentSessionId,
     ) -> Result<AgentSessionSnapshot, AgentError> {
-        // Mark-viewed and metadata events may already have seeded the mirror.
-        // Ownership recovery belongs to selection, not a transcript cache miss.
-        // A rejected preparation leaves the retained snapshot untouched.
-        self.agent.prepare_selected_session(&asid.0).await?;
+        // Observing a retained snapshot is independent of foreground runtime
+        // activation. A rejected observation leaves retained history untouched.
+        self.agent.prepare_observed_session(&asid.0).await?;
         let history_gate = if let Some(memory) = &self.memory {
             Some(memory.history_gate(asid).await)
         } else {
@@ -264,7 +283,7 @@ impl SessionService {
     }
 
     async fn refresh_history_inner(&self, asid: &AgentSessionId) -> Result<(), AgentError> {
-        self.agent.prepare_selected_session(&asid.0).await?;
+        self.agent.prepare_observed_session(&asid.0).await?;
         let memory = self
             .memory
             .as_ref()
@@ -309,7 +328,7 @@ impl SessionService {
         } else if !memory.history_initialized(asid).await {
             self.get_snapshot(asid).await?;
         } else {
-            self.agent.prepare_selected_session(&asid.0).await?;
+            self.agent.prepare_observed_session(&asid.0).await?;
         }
         let mut window = memory.history_window(asid, cursor).await?;
         self.observe_runtime(&mut window.snapshot.info).await;

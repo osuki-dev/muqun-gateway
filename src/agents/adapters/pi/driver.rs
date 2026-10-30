@@ -29,7 +29,7 @@ use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
 use super::mapper::{self, LiveChange, LiveFolder};
-use super::rpc::{PiChild, PiCommandLine, PiHost, PiLaunch, PiRecord};
+use super::rpc::{PiChild, PiCommandLine, PiHost, PiLaunch, PiLease, PiRecord};
 use super::sessions::{self, SessionFile, SessionStore};
 use crate::agents::domain::{
     AgentCatalog, AgentProject, AgentSessionId, AgentSessionInfo, AgentSessionStatus, FormRequest,
@@ -92,6 +92,9 @@ struct LiveSession {
     /// Which child this state belongs to, so the forwarder of a child that
     /// died cannot settle the run of the one that replaced it.
     generation: u64,
+    /// Gateway-created blank identity, resumable through Pi's --session-id.
+    /// Cleared permanently once a real user/assistant message is observed.
+    provisional: bool,
 }
 
 impl LiveSession {
@@ -114,6 +117,7 @@ impl LiveSession {
             offset: 0,
             created_ms: now_ms(),
             generation: 0,
+            provisional: false,
         }
     }
 
@@ -346,11 +350,12 @@ impl PiDriver {
 
     /// Start closing idle children, one [`reap_once`] pass per tick.
     pub fn start_reaper(&self) {
-        let (host, live, stop, timeout) = (
+        let (host, live, stop, timeout, admission) = (
             self.host.clone(),
             self.live.clone(),
             self.stop.clone(),
             self.idle_timeout,
+            self.spawn_lock.clone(),
         );
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(REAP_TICK);
@@ -359,6 +364,7 @@ impl PiDriver {
                     _ = stop.cancelled() => break,
                     _ = tick.tick() => {}
                 }
+                let _one = admission.lock().await;
                 reap_once(&host, &live, timeout).await;
             }
         });
@@ -409,6 +415,15 @@ impl PiDriver {
             }
             if session.failed {
                 return Vec::new();
+            }
+            if matches!(
+                record.get("type").and_then(Value::as_str),
+                Some("message_start" | "message_end")
+            ) && matches!(
+                record.pointer("/message/role").and_then(Value::as_str),
+                Some("user" | "assistant")
+            ) {
+                session.provisional = false;
             }
             let changes = if record.get("type").and_then(Value::as_str) == Some(DISCARD) {
                 discarded(record)
@@ -475,6 +490,7 @@ impl PiDriver {
     fn launch(&self, session_file: Option<PathBuf>, cwd: &Path) -> PiLaunch {
         PiLaunch {
             session_file,
+            session_id: None,
             cwd: cwd.to_path_buf(),
             env: self.env.clone(),
             no_extensions: false,
@@ -528,19 +544,26 @@ impl PiDriver {
     }
 
     /// The child running `session_id`, started from its file if none is.
-    async fn child_for(&self, session_id: &str) -> Result<Arc<PiChild>, AgentError> {
+    async fn child_for(&self, session_id: &str) -> Result<PiLease, AgentError> {
         self.ensure_open()?;
-        if let Some(child) = self.host.get(session_id) {
-            child.touch();
+        if let Some(child) = self.host.lease(session_id) {
             return Ok(child);
         }
         let _one = self.spawn_lock.lock().await;
         self.ensure_open()?;
-        if let Some(child) = self.host.get(session_id) {
+        if let Some(child) = self.host.lease(session_id) {
             return Ok(child);
         }
         self.reserve_slot(Some(session_id))?;
-        let file = self.store.find(session_id).await?;
+        let file = match self.store.find(session_id).await {
+            Ok(file) => file,
+            Err(AgentError::SessionNotFound(_))
+                if self.live.with(session_id, |s| s.provisional) == Some(true) =>
+            {
+                return self.resume_blank(session_id).await;
+            }
+            Err(error) => return Err(error),
+        };
         let cwd = PathBuf::from(&file.cwd);
         if !cwd.is_dir() {
             return Err(AgentError::WorkspaceMissing(file.cwd.clone()));
@@ -557,6 +580,20 @@ impl PiDriver {
             child.close().await;
             return Err(error);
         }
+        let resumed = child.request(json!({"type":"get_state"})).await;
+        match resumed {
+            Ok(state) if state.get("sessionId").and_then(Value::as_str) == Some(session_id) => {}
+            Ok(_) => {
+                child.close().await;
+                return Err(AgentError::Protocol(
+                    "pi resumed a different session".into(),
+                ));
+            }
+            Err(error) => {
+                child.close().await;
+                return Err(error);
+            }
+        }
         let asid = AgentSessionId(file.id.clone());
         let mut session = LiveSession::new(&asid, Some(file.path.clone()), file.cwd, history_len);
         session.folder = session
@@ -566,7 +603,71 @@ impl PiDriver {
         session.created_ms = file.created_ms;
         self.adopt(&asid, child.clone(), session);
         tracing::debug!(session = %asid.0, "started a pi child");
-        Ok(child)
+        child
+            .lease()
+            .ok_or_else(|| AgentError::NotAvailable("pi session exited during startup".into()))
+    }
+
+    /// Pi deliberately writes no setup-only file. Preserve only the bounded
+    /// metadata we already own and ask its native CLI to recreate that ID.
+    async fn resume_blank(&self, id: &str) -> Result<PiLease, AgentError> {
+        let (cwd, model, title, created_ms) = self
+            .live
+            .with(id, |s| {
+                (
+                    s.cwd.clone(),
+                    s.model.clone(),
+                    s.title.clone(),
+                    s.created_ms,
+                )
+            })
+            .ok_or_else(|| AgentError::SessionNotFound(id.into()))?;
+        if !Path::new(&cwd).is_dir() {
+            return Err(AgentError::WorkspaceMissing(cwd));
+        }
+        let mut launch = self.launch(None, Path::new(&cwd));
+        launch.session_id = Some(id.into());
+        let child = Arc::new(PiChild::spawn(&self.cmd, &launch).await?);
+        let restored = async {
+            let state = child.request(json!({"type":"get_state"})).await?;
+            if state.get("sessionId").and_then(Value::as_str) != Some(id) {
+                return Err(AgentError::Protocol(
+                    "pi recreated a different session".into(),
+                ));
+            }
+            if let Some(model) = &model {
+                self.apply_model(&child, model).await?;
+            }
+            if let Some(title) = &title {
+                child
+                    .request(json!({"type":"set_session_name", "name":title}))
+                    .await?;
+            }
+            self.ensure_open()?;
+            Ok(state)
+        }
+        .await;
+        let state = match restored {
+            Ok(state) => state,
+            Err(error) => {
+                child.close().await;
+                return Err(error);
+            }
+        };
+        let asid = AgentSessionId(id.into());
+        let file = state
+            .get("sessionFile")
+            .and_then(Value::as_str)
+            .map(PathBuf::from);
+        let mut session = LiveSession::new(&asid, file, cwd, 0);
+        session.model = model;
+        session.title = title;
+        session.created_ms = created_ms;
+        session.provisional = true;
+        self.adopt(&asid, child.clone(), session);
+        child
+            .lease()
+            .ok_or_else(|| AgentError::NotAvailable("pi session exited during startup".into()))
     }
 
     /// Eviction drops only cached state whose child is gone. Session files
@@ -588,7 +689,7 @@ impl PiDriver {
         if sessions.len() >= MAX_TRACKED_SESSIONS {
             let evict = sessions
                 .iter()
-                .filter(|(id, _)| self.host.get(id).is_none())
+                .filter(|(id, s)| !s.provisional && self.host.get(id).is_none())
                 .min_by_key(|(_, s)| s.generation)
                 .map(|(id, _)| id.clone());
             if let Some(id) = evict {
@@ -729,6 +830,7 @@ impl PiDriver {
         let cwd = dirs::home_dir().unwrap_or_else(std::env::temp_dir);
         let launch = PiLaunch {
             session_file: None,
+            session_id: None,
             cwd,
             env: Vec::new(),
             no_extensions: true,
@@ -796,6 +898,7 @@ impl PiDriver {
                 &self.cmd,
                 &PiLaunch {
                     session_file: None,
+                    session_id: None,
                     cwd: cwd.clone(),
                     env: Vec::new(),
                     no_extensions: true,
@@ -895,34 +998,86 @@ fn discarded(record: &Value) -> Vec<LiveChange> {
 
 /// One reaper pass: close children idle past `timeout`.
 ///
-/// Two kinds are kept however long they sit:
-/// - a running session: a long silent tool call prints nothing, and the host
-///   cannot tell that from idleness;
-/// - a session whose file does not exist yet: Pi writes it with the first
-///   message, so until then the child is the only thing that knows the
-///   session, and closing it would make the session unreachable (the next
-///   prompt finds no file to resume).
+/// Preserve active work, approvals and unpersisted rows. A discoverable
+/// native file is also required: before Pi writes its first message the
+/// child is the only owner of the session identity. The host atomically
+/// excludes operations and native work from retirement admission.
 async fn reap_once(host: &PiHost, live: &Live, timeout: Duration) {
-    let sessions: Vec<(String, bool, Option<PathBuf>)> = live
-        .sessions
-        .lock()
-        .map(|s| {
-            s.iter()
-                .map(|(asid, s)| (asid.clone(), s.running(), s.file.clone()))
-                .collect()
-        })
-        .unwrap_or_default();
+    // Native activity during file validation invalidates this pass. Recheck
+    // its stamp atomically with retirement rather than using a stale snapshot.
+    let observed = host.activity_stamps();
+    struct Candidate {
+        asid: String,
+        protected: bool,
+        file: Option<PathBuf>,
+        generation: u64,
+        provisional: bool,
+    }
+    let Ok(candidates) = live.sessions.lock().map(|sessions| {
+        sessions
+            .iter()
+            .map(|(asid, s)| Candidate {
+                asid: asid.clone(),
+                protected: s.running()
+                    || !s.pending.is_empty()
+                    || s.rows.iter().any(|r| mapper::is_provisional(&r.id)),
+                file: s.file.clone(),
+                generation: s.generation,
+                provisional: s.provisional,
+            })
+            .collect::<Vec<_>>()
+    }) else {
+        return;
+    };
     let mut keep = std::collections::HashSet::new();
-    for (asid, running, file) in sessions {
-        let unwritten = match &file {
+    let mut blanks = std::collections::HashSet::new();
+    for candidate in &candidates {
+        let child = host.get(&candidate.asid);
+        if child
+            .as_ref()
+            .is_some_and(|child| child.idle_for() < timeout)
+        {
+            keep.insert(candidate.asid.clone());
+            continue;
+        }
+        // Resume uses native discovery. An absent file is allowed only for
+        // our own genuinely blank identity, recreated via --session-id.
+        let unwritten = match &candidate.file {
             None => true,
-            Some(path) => !tokio::fs::try_exists(path).await.unwrap_or(true),
+            Some(path) => live
+                .store
+                .find(&candidate.asid)
+                .await
+                .map_or(true, |f| f.path != *path),
         };
-        if running || unwritten {
-            keep.insert(asid);
+        let blank = candidate.provisional
+            && child.as_ref().is_some_and(|c| !c.has_conversation())
+            && candidate.file.as_ref().is_none_or(|p| !p.exists());
+        if candidate.protected || (unwritten && !blank) {
+            keep.insert(candidate.asid.clone());
+        } else if unwritten && blank {
+            blanks.insert(candidate.asid.clone());
         }
     }
-    for asid in host.reap_idle(timeout, &keep).await {
+    for asid in host.reap_idle(timeout, &keep, Some(&observed)).await {
+        if let Ok(mut current) = live.sessions.lock() {
+            let generation = candidates
+                .iter()
+                .find(|c| c.asid == asid)
+                .map(|c| c.generation);
+            if current.get(&asid).map(|s| s.generation) == generation {
+                if blanks.contains(&asid) {
+                    // Keep only the bounded blank descriptor, never an
+                    // unpersisted conversation or a retained process.
+                    if let Some(session) = current.get_mut(&asid) {
+                        session.folder = LiveFolder::new(AgentSessionId(asid.clone()));
+                        session.rows.clear();
+                    }
+                } else {
+                    current.remove(&asid);
+                }
+            }
+        }
         tracing::debug!(%asid, "closed an idle pi child");
     }
 }
@@ -1130,7 +1285,7 @@ impl AgentPort for PiDriver {
                         .filter(|(id, s)| {
                             s.file.as_deref().is_none_or(|f| !f.exists())
                                 && directory.is_none_or(|d| d == s.cwd)
-                                && self.host.get(id).is_some()
+                                && (s.provisional || self.host.get(id).is_some())
                         })
                         .map(|(id, _)| id.clone())
                         .collect()
@@ -1213,6 +1368,7 @@ impl AgentPort for PiDriver {
                 return Err(error);
             }
             let mut session = LiveSession::new(&asid, file, dir.to_string(), 0);
+            session.provisional = true;
             session.model = effective_model;
             self.adopt(&asid, child, session);
             let info = self
@@ -1240,6 +1396,24 @@ impl AgentPort for PiDriver {
 
     fn attachment_mode(&self) -> AttachmentMode {
         AttachmentMode::NativeUploads
+    }
+
+    fn prepare_selected_session<'a>(&'a self, id: &'a str) -> AgentFuture<'a, ()> {
+        Box::pin(async move {
+            let child = self.child_for(id).await?;
+            let state = child.request(json!({"type":"get_state"})).await?;
+            if state.get("sessionId").and_then(Value::as_str) != Some(id) {
+                return Err(AgentError::Protocol(
+                    "pi resumed a different session".into(),
+                ));
+            }
+            Ok(())
+        })
+    }
+
+    fn prepare_observed_session<'a>(&'a self, _id: &'a str) -> AgentFuture<'a, ()> {
+        // Snapshots and polls read native files without waking a process.
+        Box::pin(async { Ok(()) })
     }
 
     fn send_prompt<'a>(
@@ -1666,12 +1840,15 @@ mod tests {
 import json, os, sys, uuid
 if "--version" in sys.argv:
     sys.exit(1)
-sid = str(uuid.uuid4())
+sid = sys.argv[sys.argv.index("--session-id") + 1] if "--session-id" in sys.argv else str(uuid.uuid4())
 model = {"provider": "example", "id": "default"}
 level = "medium"
-session_file = os.path.join(os.getcwd(), "session.jsonl")
+session_file = os.path.join(os.environ.get("PI_CODING_AGENT_SESSION_DIR", os.getcwd()), "2026-10-14T06-51-18-225Z_" + sid + ".jsonl")
 if "--session" in sys.argv:
     loaded = sys.argv[sys.argv.index("--session") + 1]
+    session_file = loaded
+    with open(loaded) as f:
+        sid = json.loads(f.readline())["id"]
     with open(loaded, "a") as f:
         f.write(json.dumps({"type":"model_change","id":"initialized","parentId":"entry","provider":"example","modelId":"default"}) + "\n")
 for raw in sys.stdin.buffer:
@@ -1735,31 +1912,212 @@ for raw in sys.stdin.buffer:
         ))
     }
 
-    /// The reaper closes an idle child only once its session has a file:
-    /// before the first message the child is all there is of the session.
+    /// Only known blank identities may retire before native persistence.
+    /// Once conversation starts, an absent file must retain the process.
     #[tokio::test]
-    async fn reaper_keeps_a_child_until_its_session_is_written() {
+    async fn reaper_retires_blank_and_written_but_keeps_unpersisted_conversation() {
         let Some((driver, dir)) = fake_driver(Duration::ZERO) else {
             return;
         };
-        for (written, kept) in [(false, true), (true, false)] {
-            let project = dir.join(format!("project-{written}"));
+        for (state, kept) in [
+            ("blank", false),
+            ("unpersisted", true),
+            ("written", false),
+            ("approval", true),
+            ("row", true),
+            ("running", true),
+        ] {
+            let project = dir.join(format!("project-{state}"));
             std::fs::create_dir_all(&project).unwrap();
             let info = driver
                 .create_session(project.to_str(), None, None)
                 .await
                 .unwrap();
-            if written {
-                std::fs::write(project.join("session.jsonl"), "{}\n").unwrap();
+            if state != "blank" {
+                driver.live.with(&info.asid.0, |s| s.provisional = false);
+            }
+            if !matches!(state, "blank" | "unpersisted") {
+                let path = dir
+                    .join("sessions")
+                    .join(format!("2026-10-14T06-51-18-225Z_{}.jsonl", info.asid.0));
+                std::fs::write(
+                    &path,
+                    format!(
+                        "{}\n",
+                        json!({"type":"session", "id":info.asid.0, "cwd":project})
+                    ),
+                )
+                .unwrap();
+                driver.live.with(&info.asid.0, |s| s.file = Some(path));
+            }
+            let record = match state {
+                "approval" => Some(
+                    json!({"type":"extension_ui_request", "id":"keep", "method":"confirm", "title":"muqun.permission", "message": json!({"tool":"bash", "input":{"command":"true"}}).to_string()}),
+                ),
+                "row" => Some(
+                    json!({"type":"message_end", "message":{"role":"assistant", "content":[{"type":"text", "text":"not saved yet"}], "stopReason":"stop"}}),
+                ),
+                "running" => Some(json!({"type":"agent_start"})),
+                _ => None,
+            };
+            if let Some(record) = record {
+                let generation = driver.live.with(&info.asid.0, |s| s.generation).unwrap();
+                driver.fold(&info.asid, generation, &record).await;
             }
             reap_once(&driver.host, &driver.live, Duration::ZERO).await;
             assert_eq!(
                 driver.host.get(&info.asid.0).is_some(),
                 kept,
-                "written={written}"
+                "state={state}"
             );
+            if state == "blank" {
+                assert!(driver
+                    .get_timeline(&info.asid.0, 10)
+                    .await
+                    .unwrap()
+                    .is_empty());
+                driver.prepare_selected_session(&info.asid.0).await.unwrap();
+                assert!(driver.host.get(&info.asid.0).is_some());
+            }
         }
         driver.host.shutdown_all().await;
+    }
+
+    /// Opt-in live model contract. Its entire workspace and session root
+    /// are test-owned; tools are disabled and no approval is answered.
+    #[tokio::test]
+    #[ignore]
+    async fn real_pi_idle_exit_and_same_id_context_resume() {
+        use std::os::unix::fs::PermissionsExt;
+        let root =
+            std::env::temp_dir().join(format!("muqun-pi-idle-live-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("sessions")).unwrap();
+        let extension = root.join("muqun-extension.js");
+        std::fs::write(&extension, mapper::EXTENSION_SOURCE).unwrap();
+        let binary = root.join("pi-no-tools");
+        std::fs::write(&binary, "#!/bin/sh\nexec pi --no-tools \"$@\"\n").unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let driver = PiDriver::new(
+            PiCommandLine { binary, extension },
+            SessionStore::new(root.join("sessions")),
+            true,
+            Duration::from_secs(2),
+            vec![(
+                "PI_CODING_AGENT_SESSION_DIR".into(),
+                root.join("sessions").to_string_lossy().into_owned(),
+            )],
+        );
+        let mut events = driver.subscribe();
+        let info = driver
+            .create_session(root.to_str(), None, None)
+            .await
+            .unwrap();
+        let asid = info.asid.0;
+        let blank = driver.host.get(&asid).unwrap();
+        let blank_pid = blank.pid().unwrap();
+        reap_once(&driver.host, &driver.live, Duration::ZERO).await;
+        assert!(
+            !blank.is_alive(),
+            "blank process kept alive without a native file"
+        );
+        assert!(driver.get_timeline(&asid, 100).await.unwrap().is_empty());
+        assert!(driver
+            .list_sessions(&SessionQuery::default())
+            .await
+            .unwrap()
+            .iter()
+            .any(|s| s.asid.0 == asid));
+        assert!(driver.host.get(&asid).is_none());
+        driver.prepare_selected_session(&asid).await.unwrap();
+        assert_eq!(driver.get_session(&asid).await.unwrap().model, info.model);
+        let first = driver.host.get(&asid).unwrap();
+        assert_ne!(first.pid().unwrap(), blank_pid);
+        let first_pid = first.pid().unwrap();
+        let first_rss = std::fs::read_to_string(format!("/proc/{first_pid}/status"))
+            .ok()
+            .and_then(|status| {
+                status
+                    .lines()
+                    .find(|line| line.starts_with("VmRSS:"))
+                    .map(str::to_owned)
+            });
+        let marker = format!("PI-IDLE-{}", uuid::Uuid::new_v4());
+        driver.send_prompt(&asid, &format!("Remember this exact marker for this conversation: {marker}. Reply with only SAVED. Do not use any tools."), &[], None).await.unwrap();
+        real_turn_settled(&driver, &mut events).await;
+        let before = driver.get_timeline(&asid, 100).await.unwrap();
+        assert!(!before.is_empty());
+        // Repeated observational polling crosses the configured QA timeout.
+        for _ in 0..12 {
+            driver.get_session(&asid).await.unwrap();
+            driver.get_timeline(&asid, 100).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        reap_once(&driver.host, &driver.live, Duration::from_secs(2)).await;
+        assert!(driver.host.get(&asid).is_none(), "idle Pi was not retired");
+        assert!(!first.is_alive());
+        assert_eq!(
+            unsafe { libc::kill(first_pid as i32, 0) },
+            -1,
+            "original PID still exists"
+        );
+        assert!(
+            driver.live.with(&asid, |_| ()).is_none(),
+            "retired live projection retained"
+        );
+        driver.get_session(&asid).await.unwrap();
+        driver.get_timeline(&asid, 100).await.unwrap();
+        assert!(
+            !driver.host.any_alive(),
+            "background observation respawned Pi"
+        );
+        driver.prepare_selected_session(&asid).await.unwrap();
+        let second = driver.host.get(&asid).unwrap();
+        let second_pid = second.pid().unwrap();
+        assert_ne!(first_pid, second_pid);
+        assert_eq!(driver.get_timeline(&asid, 100).await.unwrap(), before);
+        driver.send_prompt(&asid, "What exact marker did I ask you to remember? Reply only with the marker. Do not use any tools.", &[], None).await.unwrap();
+        real_turn_settled(&driver, &mut events).await;
+        let file = driver.store.find(&asid).await.unwrap();
+        let entries = driver.store.read_entries(&file).await.unwrap();
+        let last_assistant = entries
+            .iter()
+            .rev()
+            .find(|e| e.pointer("/message/role").and_then(Value::as_str) == Some("assistant"))
+            .unwrap();
+        assert!(
+            last_assistant.to_string().contains(&marker),
+            "resumed context lost marker"
+        );
+        eprintln!("Pi idle QA: asid={asid} blank_pid={blank_pid} blank_retired_and_recreated=true first_pid={first_pid} first_rss={first_rss:?} absent_after_idle=true second_pid={second_pid} history_before={} marker_recalled=true root={}", before.len(), root.display());
+        driver.shutdown_and_wait().await;
+    }
+
+    async fn real_turn_settled(
+        driver: &PiDriver,
+        events: &mut broadcast::Receiver<(AgentSessionId, u64, Arc<PiRecord>)>,
+    ) {
+        tokio::time::timeout(Duration::from_secs(180), async {
+            let mut settled = false;
+            loop {
+                match tokio::time::timeout(Duration::from_millis(250), events.recv()).await {
+                    Ok(Ok((id, generation, record))) => {
+                        assert_ne!(
+                            record.get("type").and_then(Value::as_str),
+                            Some("extension_ui_request"),
+                            "live Pi requested approval; no answer sent"
+                        );
+                        settled |=
+                            record.get("type").and_then(Value::as_str) == Some("agent_settled");
+                        driver.fold(&id, generation, &record).await;
+                    }
+                    Err(_) if settled => break,
+                    Err(_) => {}
+                    other => panic!("Pi event stream failed: {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("live Pi turn settles");
     }
 
     /// A failing `pi --version` does not count against the agent while a
@@ -1972,9 +2330,9 @@ for raw in sys.stdin.buffer:
         assert_ne!(cloned.asid.0, source);
         assert_eq!(cloned.fork.unwrap().session_id, source);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
-        assert!(Arc::ptr_eq(
-            &source_child,
-            &driver.host.get(&source).unwrap()
+        assert!(std::ptr::eq(
+            &*source_child,
+            &*driver.host.get(&source).unwrap()
         ));
         assert!(source_child.is_alive());
         assert!(

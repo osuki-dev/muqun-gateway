@@ -599,6 +599,23 @@ All four are optional; `agent_id` picks the agent (see [Agents](#agents)) and
 configured default** — the gateway no longer substitutes one. `directory` must
 be absolute or `~`-rooted and must exist; the session records it canonical. Returns `AgentSessionInfo`.
 
+### `POST /api/agents/{agent_id}/sessions/{asid}/prepare`
+
+Capability **`agent_session_resume_v1`** adds an explicit foreground selection
+operation. A paired App calls it once when the user actually opens or selects a
+conversation. The global alias is `POST /api/agent-sessions/{asid}/prepare`;
+prefer the scoped path to carry the selected provider identity. No body is
+required. The ordinary content envelope contains `data: {"prepared": true}`.
+Read the normal snapshot, history window and catalog afterward.
+
+Preparation may restore one dormant same-ID native runtime. It submits no model
+prompt, answers no approval and never replays an ambiguous prompt. Concurrent
+same-ID prepares are serialized by the provider. A failed prepare preserves the
+retained snapshot and is an explicit error. Automatic snapshot/history resync,
+including `refresh=true`, uses the observation hook and must not activate dormant
+ACP or Pi children. Background watchers must never call this endpoint. Gate the
+new call on the capability; older Gateways keep their existing behavior.
+
 ### `GET /api/agent-sessions/{asid}`
 
 Returns `AgentSessionSnapshot`:

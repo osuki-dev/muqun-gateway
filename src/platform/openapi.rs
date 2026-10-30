@@ -816,6 +816,22 @@ pub fn openapi_spec() -> Value {
     }});
     spec["paths"]["/api/agent-sessions/{asid}/audio-asset"] = audio_asset_endpoint();
     spec["paths"]["/api/agent-sessions/page"] = session_page_endpoint();
+    for path in [
+        "/api/agent-sessions/{asid}/prepare",
+        "/api/agents/{agent_id}/sessions/{asid}/prepare",
+    ] {
+        let mut parameters = vec![path_param("asid")];
+        if path.contains("{agent_id}") {
+            parameters.push(path_param("agent_id"));
+        }
+        spec["paths"][path] = json!({"post": {
+            "summary": "Prepare one explicitly selected foreground conversation",
+            "description": "Requires a paired App and agent_session_resume_v1. May restore one dormant same-ID native runtime; sends no model prompt and answers no approval. Call only for actual foreground user selection/open, never a background watcher or automatic resync. Prefer the explicit agent-scoped path. Concurrent same-ID preparation is serialized by the owning adapter. Normal snapshot/window/refresh reads use the observed hook and do not activate dormant ACP/Pi children. Success is the content envelope with data.prepared=true; fetch the ordinary snapshot/catalog afterward. No request body is required.",
+            "parameters": parameters,
+            "responses": ok_response()
+        }});
+    }
+
     spec["paths"]["/api/agent-sessions/{asid}/timeline/earlier"] = json!({"post": {
         "summary": "Read the next older timeline batch for the session owner",
         "description": "Requires a paired App device and both agent_timeline_earlier_v1 and owning-provider features.timelineEarlier true. No body or client cursor. Load the selected snapshot first; merge rows by stable ID and (message_id, ordinal), preserving the viewport. At most 80 mapped rows. exhausted is true only on an empty adapter batch; filtering may produce an empty visible items array with exhausted false. State is provider/session scoped; serialize client pulls and do not automatically retry an ambiguously completed POST. Failed/cancelled provider reads preserve the cursor; successful explicit snapshot refresh resets the newest-tail boundary. See docs/agent-api.md.",

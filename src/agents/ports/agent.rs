@@ -205,6 +205,13 @@ pub trait AgentPort: Send + Sync {
         Box::pin(async { Ok(()) })
     }
 
+    /// Prepare a read-only snapshot or automatic resync. Adapters with dormant
+    /// children override this hook so observing history cannot wake a process.
+    /// The default preserves existing adapters' selection behavior.
+    fn prepare_observed_session<'a>(&'a self, id: &'a str) -> AgentFuture<'a, ()> {
+        self.prepare_selected_session(id)
+    }
+
     /// Optional fresh runtime observation, without reading/replacing transcript history.
     fn session_runtime<'a>(
         &'a self,
@@ -227,6 +234,19 @@ pub trait AgentPort: Send + Sync {
         attachments: &'a [String],
         delivery: Option<&'a str>,
     ) -> AgentFuture<'a, ()>;
+
+    /// Gateway-authored presentation metadata, separate from model input.
+    /// Providers without native message correlation preserve their existing echo.
+    fn send_prompt_with_display<'a>(
+        &'a self,
+        session_id: &'a str,
+        text: &'a str,
+        _display_text: &'a str,
+        attachments: &'a [String],
+        delivery: Option<&'a str>,
+    ) -> AgentFuture<'a, ()> {
+        self.send_prompt(session_id, text, attachments, delivery)
+    }
 
     /// Whether the agent's service takes an MCP server at runtime
     /// ([`AgentPort::add_mcp_server`]).

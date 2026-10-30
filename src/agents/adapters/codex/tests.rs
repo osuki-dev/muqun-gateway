@@ -123,7 +123,7 @@ impl Fixture {
         Self::new_reply_in_cwd(move |r| Ok(handler(r)), None, Some(home.to_owned())).await
     }
 
-    async fn new_reply_in_cwd(
+    pub(crate) async fn new_reply_in_cwd(
         handler: impl Fn(&Value) -> Result<Value, Value> + Send + Sync + 'static,
         cwd: Option<String>,
         home: Option<std::path::PathBuf>,

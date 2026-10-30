@@ -4,7 +4,8 @@
 //! its RPC mode (`pi --mode rpc`), strict JSONL over a child's stdin/stdout,
 //! one child per live session. Pi owns its session files
 //! (`~/.pi/agent/sessions/**.jsonl`); listings, titles and history are read
-//! from them without a child, and a child is started only for a write. The
+//! from them without a child; explicit foreground selection or a write starts
+//! a child. The
 //! wire contract is written up in `docs/pi-protocol.md`.
 //!
 //! Layout:
