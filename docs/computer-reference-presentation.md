@@ -69,3 +69,22 @@ computer reference in an isolated Codex session, verify original text in the liv
 transcript and after history reload, and verify that the model can still address
 the referenced machine by its immutable ID. Do not automatically approve agent
 trust or tool requests during this check.
+
+## Automatic Codex titles
+
+On verified shared Codex daemons, a complete automatic preview can also repeat
+model-facing context. Gateway projects that preview only after a fresh ascending
+canonical history read proves that the first native user item has the retained
+client ID and exact complete text. A matching later submission is insufficient.
+Explicit native names, truncated previews, older messages without client IDs,
+unknown history formats and unverified/private transports retain their native
+titles. User-authored copies of the context instructions are not parsed.
+
+These optional reads use a separate verified read-only connection, without
+resuming a thread, changing history cursors, renaming it or sending a prompt.
+All title proofs in one inventory share a two-second allowance, including
+storage, admission and connection initialization. A failed or incomplete proof
+preserves the native preview and does not fail the inventory. The connection may
+be reused; first-item evidence is read afresh because native rollback can change
+canonical history. The same title projection feeds session reads and live
+metadata mirrors. No native title or stored transcript is rewritten.

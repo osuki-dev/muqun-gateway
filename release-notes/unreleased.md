@@ -526,3 +526,8 @@ been removed before public release; old servers receive an upgrade message befor
 a pairing credential is exchanged. App-facing session APIs stay unchanged. Stop
 now reads only the current thread control snapshot, avoiding an unrelated project
 list request that could delay or prevent interruption.
+
+- Keep computer-reference context out of automatic Codex preview titles when
+  the first canonical user message proves its Gateway presentation metadata.
+  Explicit names and uncorrelated historical text remain unchanged; optional
+  verification reads never resume a session or resend its prompt.

@@ -100,6 +100,26 @@ impl Cache {
         self.bytes += bytes;
         self.records.insert(key, value);
     }
+    /// A candidate only narrows optional canonical reads. Text equality alone
+    /// never authorizes changing a native title.
+    pub(super) fn has_preview_candidate(&self, thread: &str, preview: &str) -> bool {
+        self.records
+            .iter()
+            .any(|((scope, _), value)| scope == thread && value.wire == preview)
+    }
+
+    pub(super) fn project_first_preview(
+        &self,
+        thread: &str,
+        preview: &str,
+        first: &Value,
+    ) -> Option<String> {
+        let content = first["content"].as_array()?;
+        (text(content) == preview)
+            .then(|| self.project(thread, first))
+            .flatten()
+    }
+
     pub(super) fn project(&self, thread: &str, item: &Value) -> Option<String> {
         if item["type"] != "userMessage" {
             return None;

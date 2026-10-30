@@ -52,6 +52,9 @@ pub struct CodexDriver {
     terminal_runtime: Option<Arc<crate::agents::terminal_runtime::TerminalRuntime>>,
     native_sessions: Option<Arc<super::native_sessions::NativeSessions>>,
     presentations: std::sync::Mutex<super::presentation::Cache>,
+    /// Isolated optional reads never consume the foreground history slot. No
+    /// first-item proof is cached: external native rollback can change it.
+    title_reader: Mutex<Option<Arc<CodexClient>>>,
     /// Only explicitly created, forked or submitted-to threads are resumed.
     loaded: Arc<Mutex<HashSet<String>>>,
     question_recoveries: Arc<Mutex<QuestionRecoveries>>,
@@ -206,6 +209,7 @@ impl CodexDriver {
             terminal_runtime: None,
             native_sessions: None,
             presentations: std::sync::Mutex::new(super::presentation::Cache::default()),
+            title_reader: Mutex::new(None),
             loaded: Arc::new(Mutex::new(HashSet::new())),
             question_recoveries: Arc::new(Mutex::new(QuestionRecoveries::default())),
             mutations: Arc::new(Mutex::new(())),
@@ -1134,6 +1138,112 @@ impl CodexDriver {
         Ok(())
     }
 
+    /// Explicit names always win. Automatic previews need a fresh canonical
+    /// first-user/client-ID proof, not merely matching text in any later turn.
+    pub(crate) async fn project_session(
+        &self,
+        thread: &Value,
+    ) -> Result<AgentSessionInfo, AgentError> {
+        self.project_session_until(thread, Self::title_deadline())
+            .await
+    }
+
+    fn title_deadline() -> tokio::time::Instant {
+        tokio::time::Instant::now() + std::time::Duration::from_secs(2)
+    }
+
+    async fn project_session_until(
+        &self,
+        thread: &Value,
+        deadline: tokio::time::Instant,
+    ) -> Result<AgentSessionInfo, AgentError> {
+        let mut info = mapper::session(thread)?;
+        if thread["name"].as_str().is_some() || tokio::time::Instant::now() >= deadline {
+            return Ok(info);
+        }
+        // A single deadline includes storage, reader admission, initialization
+        // and canonical read, and is shared by all rows/pages of an inventory.
+        let proof = async {
+            self.restore_prompt_presentations(&info.asid.0).await.ok()?;
+            let preview = thread["preview"].as_str()?;
+            if !self
+                .presentations
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .has_preview_candidate(&info.asid.0, preview)
+            {
+                return None;
+            }
+            let mut held = self.title_reader.lock().await;
+            // Retain the connection only after a completed proof attempt. A
+            // cancelled/expired read drops its isolated client and pending RPC.
+            let reader = match held.take().filter(|reader| reader.is_ready()) {
+                Some(reader) => reader,
+                None => self.client.question_history_reader().await.ok()?,
+            };
+            let mode = if let Some(mode) = thread["historyMode"].as_str() {
+                mode.to_owned()
+            } else {
+                let metadata = self
+                    .client
+                    .call(
+                        "thread/read",
+                        json!({
+                            "threadId":info.asid.0,"includeTurns":false
+                        }),
+                    )
+                    .await
+                    .ok()?;
+                if metadata["thread"]["id"] != info.asid.0
+                    || metadata["thread"]["name"].as_str().is_some()
+                    || metadata["thread"]["preview"] != preview
+                {
+                    return None;
+                }
+                metadata["thread"]["historyMode"].as_str()?.to_owned()
+            };
+            let mut budget = Budget::new();
+            let page = match mode.as_str() {
+                "paginated" => budget.call(&reader, "thread/items/list", json!({
+                    "threadId":info.asid.0,"limit":1,"sortDirection":"asc","cursor":null
+                })).await.ok()?,
+                "legacy" => budget.call(&reader, "thread/turns/list", json!({
+                    "threadId":info.asid.0,"limit":1,"sortDirection":"asc","itemsView":"full","cursor":null
+                })).await.ok()?,
+                _ => return None,
+            };
+            let rows = page["data"].as_array().filter(|rows| rows.len() == 1)?;
+            let first = if mode == "paginated" {
+                rows[0]["turnId"].as_str().filter(|id| !id.is_empty())?;
+                &rows[0]["item"]
+            } else {
+                rows[0]["id"].as_str().filter(|id| !id.is_empty())?;
+                if rows[0]["itemsView"] != "full" {
+                    return None;
+                }
+                rows[0]["items"].as_array()?.first()?
+            };
+            first["id"].as_str().filter(|id| !id.is_empty())?;
+            let display = self
+                .presentations
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .project_first_preview(&info.asid.0, preview, first);
+            *held = Some(reader);
+            display
+        };
+        let cancel = self.client.cancel_token();
+        let display = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => None,
+            result = tokio::time::timeout_at(deadline, proof) => result.ok().flatten(),
+        };
+        if let Some(display) = display {
+            info.title = display;
+        }
+        Ok(info)
+    }
+
     pub(crate) fn ordered_items(
         &self,
         thread: &str,
@@ -1552,7 +1662,7 @@ impl CodexDriver {
                 thread[key] = value.clone();
             }
         }
-        let mut session = mapper::session(&thread)?;
+        let mut session = self.project_session(&thread).await?;
         self.apply_usage(&mut session).await;
         self.remember(&session.asid.0).await?;
         let revision = self.metadata_revision(&session.asid.0).await?;
@@ -2354,6 +2464,7 @@ impl CodexDriver {
             seen.insert(cursor.clone());
         }
         let mut page_query = query.clone();
+        let title_deadline = Self::title_deadline();
         let mut out = vec![];
         loop {
             page_query.limit = Some(
@@ -2362,7 +2473,9 @@ impl CodexDriver {
                     .map(|n| n.saturating_sub(out.len()).min(100))
                     .unwrap_or(100),
             );
-            let page = self.session_page(&page_query, &mut budget).await?;
+            let page = self
+                .session_page(&page_query, &mut budget, title_deadline)
+                .await?;
             out.extend(page.data);
             if query.limit.is_some_and(|n| out.len() >= n) {
                 return Ok(out);
@@ -2381,6 +2494,7 @@ impl CodexDriver {
         &self,
         query: &SessionQuery,
         budget: &mut Budget,
+        title_deadline: tokio::time::Instant,
     ) -> Result<SessionPage, AgentError> {
         let order = query.order.as_deref().unwrap_or("desc");
         let limit = query.limit.unwrap_or(50);
@@ -2405,7 +2519,7 @@ impl CodexDriver {
         budget.rows(rows.len())?;
         let mut data = vec![];
         for row in rows {
-            let mut info = mapper::session(row)?;
+            let mut info = self.project_session_until(row, title_deadline).await?;
             self.apply_usage(&mut info).await;
             if query.keeps_parent(info.parent_id.as_deref()) {
                 data.push(info);
@@ -2658,7 +2772,10 @@ impl AgentPort for CodexDriver {
     }
 
     fn list_sessions_page<'a>(&'a self, query: &'a SessionQuery) -> AgentFuture<'a, SessionPage> {
-        Box::pin(async { self.session_page(query, &mut Budget::new()).await })
+        Box::pin(async {
+            self.session_page(query, &mut Budget::new(), Self::title_deadline())
+                .await
+        })
     }
 
     fn create_session<'a>(
@@ -2714,7 +2831,7 @@ impl AgentPort for CodexDriver {
 
     fn get_session<'a>(&'a self, id: &'a str) -> AgentFuture<'a, AgentSessionInfo> {
         Box::pin(async move {
-            let mut info = mapper::session(&self.read_thread(id).await?)?;
+            let mut info = self.project_session(&self.read_thread(id).await?).await?;
             self.apply_usage(&mut info).await;
             Ok(info)
         })
@@ -4799,7 +4916,7 @@ mod model_page_tests {
 }
 
 #[cfg(test)]
-mod presentation_tests {
+pub(crate) mod presentation_tests {
     use super::*;
     use crate::agents::adapters::codex::{daemon::tests::TestDirectory, tests::Fixture};
     use crate::platform::store::sqlite::SqliteStore;
@@ -4809,6 +4926,216 @@ mod presentation_tests {
             AgentPart::Text { text } => text,
             _ => panic!("expected user text"),
         }
+    }
+
+    pub(crate) async fn title_fixture(
+        mode: &'static str,
+    ) -> (
+        TestDirectory,
+        Fixture,
+        Fixture,
+        Arc<CodexDriver>,
+        Arc<std::sync::Mutex<Value>>,
+    ) {
+        let directory = TestDirectory::new();
+        let mut thread = super::super::tests::golden()["thread"].clone();
+        thread["name"] = Value::Null;
+        thread["preview"] = json!("Original plus machine-uuid");
+        thread["historyMode"] = json!(mode);
+        let metadata = thread.clone();
+        let mut primary = Fixture::new_in_home(
+            move |request| match request["method"].as_str().unwrap() {
+                "thread/read" => json!({"thread":metadata}),
+                "thread/list" => {
+                    json!({"data":[metadata.clone(),metadata.clone()],"nextCursor":null})
+                }
+                other => panic!("optional title proof must not mutate: {other}"),
+            },
+            &directory.0,
+        )
+        .await;
+        primary.ready().await;
+        let first = Arc::new(std::sync::Mutex::new(json!({
+            "id":"first-user","type":"userMessage","clientId":"00000000-0000-4000-8000-000000000111",
+            "content":[{"type":"text","text":"Original plus machine-uuid"}]
+        })));
+        let observed = first.clone();
+        let mut history = Fixture::new(move |request| {
+            assert_eq!(request["params"]["limit"],1);
+            assert_eq!(request["params"]["sortDirection"],"asc");
+            assert!(request["params"].get("turnId").is_none());
+            let item = observed.lock().unwrap().clone();
+            match request["method"].as_str().unwrap() {
+                "thread/items/list" => json!({"data":[{"turnId":"first-turn","item":item}],"nextCursor":"more"}),
+                "thread/turns/list" => json!({"data":[{"id":"first-turn","itemsView":"full","items":[item]}],"nextCursor":"more"}),
+                other => panic!("unexpected title reader RPC {other}"),
+            }
+        }).await;
+        history.ready().await;
+        let db = SqliteStore::open(
+            &directory.0.join("store.sqlite"),
+            None,
+            &[
+                super::super::native_sessions::MIGRATION,
+                super::super::native_sessions::PRESENTATION_MIGRATION,
+            ],
+        )
+        .unwrap();
+        let store = super::super::native_sessions::NativeSessions::new(db);
+        store
+            .record_presentation(
+                &directory.0,
+                thread["id"].as_str().unwrap(),
+                "00000000-0000-4000-8000-000000000111",
+                super::super::presentation::Presentation {
+                    wire: "Original plus machine-uuid".into(),
+                    display: "Original".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let mut driver = CodexDriver::new(primary.client.clone());
+        driver.restore_native_sessions(Some(store));
+        *driver.title_reader.lock().await = Some(history.client.clone());
+        (directory, primary, history, Arc::new(driver), first)
+    }
+
+    #[tokio::test]
+    async fn title_projection_requires_fresh_canonical_first_user_not_any_matching_later_prompt() {
+        for mode in ["paginated", "legacy"] {
+            let (_directory, _primary, mut history, driver, first) = title_fixture(mode).await;
+            let mut thread = super::super::tests::golden()["thread"].clone();
+            thread["name"] = Value::Null;
+            thread["preview"] = json!("Original plus machine-uuid");
+            thread["historyMode"] = json!(mode);
+            assert_eq!(
+                driver.project_session(&thread).await.unwrap().title,
+                "Original"
+            );
+            // A later retained Gateway prompt has exactly the same text as an
+            // earlier external literal. Only the canonical first client's ID counts.
+            first.lock().unwrap()["clientId"] = json!("external-first");
+            assert_eq!(
+                driver.project_session(&thread).await.unwrap().title,
+                "Original plus machine-uuid"
+            );
+            first.lock().unwrap()["clientId"] = json!("00000000-0000-4000-8000-000000000111");
+            first.lock().unwrap()["content"][0]["text"] = json!("changed by native rollback");
+            assert_eq!(
+                driver.project_session(&thread).await.unwrap().title,
+                "Original plus machine-uuid"
+            );
+            first.lock().unwrap()["content"][0]["text"] = json!("Original plus machine-uuid");
+            assert_eq!(
+                driver.project_session(&thread).await.unwrap().title,
+                "Original"
+            );
+            while history.requests.try_recv().is_ok() {}
+            // An explicit user rename is preserved even when it equals the wire.
+            thread["name"] = thread["preview"].clone();
+            assert_eq!(
+                driver.project_session(&thread).await.unwrap().title,
+                "Original plus machine-uuid"
+            );
+            assert!(history.requests.try_recv().is_err());
+            assert!(driver.loaded.lock().await.is_empty());
+            assert!(driver.order.lock().unwrap().is_empty());
+            assert!(driver.history_state.lock().unwrap().pages.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn persisted_title_projection_reaches_session_reads_and_inventory_without_mutations() {
+        let (_directory, mut primary, mut history, driver, _) = title_fixture("paginated").await;
+        let id = super::super::tests::golden()["thread"]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(driver.get_session(&id).await.unwrap().title, "Original");
+        let rows = driver
+            .list_sessions(&SessionQuery::default())
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| row.title == "Original"));
+        let methods = std::iter::from_fn(|| primary.requests.try_recv().ok())
+            .map(|r| r["method"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(methods, ["thread/read", "thread/list"]);
+        assert_eq!(
+            std::iter::from_fn(|| history.requests.try_recv().ok()).count(),
+            3
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn title_proof_deadline_is_shared_by_the_whole_list_and_failure_preserves_previews() {
+        let (_directory, _primary, _history, driver, _) = title_fixture("paginated").await;
+        let held = driver.title_reader.lock().await;
+        let start = tokio::time::Instant::now();
+        let rows = driver
+            .list_sessions(&SessionQuery::default())
+            .await
+            .unwrap();
+        assert_eq!(start.elapsed(), std::time::Duration::from_secs(2));
+        assert!(rows
+            .iter()
+            .all(|row| row.title == "Original plus machine-uuid"));
+        drop(held);
+        driver.client.stop();
+        let thread =
+            json!({"id":"unknown","preview":"literal Muqun computer references","name":null});
+        assert_eq!(
+            driver.project_session(&thread).await.unwrap().title,
+            "literal Muqun computer references"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "explicit own-session read-only native title metadata probe"]
+    async fn own_native_title_metadata_probe() {
+        let home = std::path::PathBuf::from(
+            std::env::var_os("MUQUN_CODEX_TITLE_PROBE_HOME").expect("explicit home"),
+        );
+        let id = std::env::var("MUQUN_CODEX_TITLE_PROBE_THREAD").expect("explicit own QA session");
+        let (client, _events) = super::super::daemon::connect_at(&home)
+            .await
+            .unwrap()
+            .expect("existing daemon");
+        let response = client
+            .call("thread/read", json!({"threadId":id,"includeTurns":false}))
+            .await
+            .unwrap();
+        let thread = &response["thread"];
+        assert_eq!(thread["id"], id);
+        println!(
+            "name_is_null={} name_len={} preview_len={} paginated={}",
+            thread["name"].is_null(),
+            thread["name"].as_str().map(str::len).unwrap_or(0),
+            thread["preview"].as_str().map(str::len).unwrap_or(0),
+            thread["historyMode"] == "paginated"
+        );
+        let reader = client.question_history_reader().await.unwrap();
+        let page = reader
+            .call(
+                "thread/items/list",
+                json!({
+                    "threadId":id,"limit":1,"sortDirection":"asc","cursor":null
+                }),
+            )
+            .await
+            .unwrap();
+        let first = &page["data"][0]["item"];
+        assert_eq!(first["type"], "userMessage");
+        assert!(first["clientId"].as_str().is_some());
+        assert_eq!(
+            super::super::presentation::text(first["content"].as_array().unwrap()),
+            thread["preview"].as_str().unwrap()
+        );
+        println!("canonical_first_user_has_client_id=true canonical_text_equals_preview=true");
+        reader.stop();
+        client.stop();
     }
 
     #[tokio::test]

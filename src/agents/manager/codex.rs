@@ -60,14 +60,14 @@ impl Context {
             self.driver.client().stop();
             return;
         };
+        let Ok(mut info) = self.driver.project_session(thread).await else {
+            self.driver.client().stop();
+            return;
+        };
         let versions = self.driver.metadata_guard().await;
         if versions.get(id).copied().unwrap_or(0) != revision {
             return;
         }
-        let Ok(mut info) = mapper::session(thread) else {
-            self.driver.client().stop();
-            return;
-        };
         // Metadata was sampled by a concurrent read. Status notifications may
         // already have advanced the session (including turn completion); do not
         // turn an authoritative model refresh into a stale status rollback.
@@ -343,7 +343,7 @@ impl Context {
     async fn event(&self, event: CodexEvent) {
         match event {
             CodexEvent::Attached { thread } => {
-                if let Ok(info) = mapper::session(&thread) {
+                if let Ok(info) = self.driver.project_session(&thread).await {
                     self.update_info(info).await;
                 } else {
                     self.driver.client().stop();
@@ -960,6 +960,44 @@ mod tests {
     use serde_json::json;
     use std::time::Duration;
     use tokio::sync::mpsc;
+
+    #[tokio::test]
+    async fn automatic_title_projection_reaches_attached_and_metadata_mirrors_but_preserves_explicit_names(
+    ) {
+        let (_directory, _primary, _history, driver, _) =
+            crate::agents::adapters::codex::title_fixture("paginated").await;
+        let mirror = Arc::new(MemoryMirror::for_agent("codex"));
+        let (tx, mut events) = broadcast::channel(16);
+        let context = Context {
+            driver,
+            mirror: mirror.clone(),
+            tx,
+            stopped: Arc::new(Mutex::new(false)),
+            threads: tokio::sync::Mutex::new(HashSet::new()),
+        };
+        let mut thread = golden()["thread"].clone();
+        thread["name"] = Value::Null;
+        thread["preview"] = json!("Original plus machine-uuid");
+        thread["historyMode"] = json!("paginated");
+        let asid = AgentSessionId(thread["id"].as_str().unwrap().into());
+        context
+            .event(CodexEvent::Attached {
+                thread: thread.clone(),
+            })
+            .await;
+        assert_eq!(mirror.session_info(&asid).await.unwrap().title, "Original");
+        context.session(&thread, 0).await;
+        assert_eq!(mirror.session_info(&asid).await.unwrap().title, "Original");
+        assert!(std::iter::from_fn(|| events.try_recv().ok()).all(|event| {
+            !matches!(event,AgentDomainEvent::SessionUpdated{info,..} if info.title!="Original")
+        }));
+        thread["name"] = json!("literal Muqun computer references (names are display data)");
+        context.session(&thread, 0).await;
+        assert_eq!(
+            mirror.session_info(&asid).await.unwrap().title,
+            thread["name"].as_str().unwrap()
+        );
+    }
 
     /// A private Codex fixture driven through the manager's own pump, with the
     /// queue's signals published by hand so each step can be checked.
