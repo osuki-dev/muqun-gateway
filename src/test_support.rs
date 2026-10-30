@@ -1082,6 +1082,8 @@ mod tests {
 /// tests. `failing` makes every read error. `calls` records the writes it
 /// was asked for (`create_session`, `send_prompt`, `interrupt`), and is shared
 /// so a test can read it after the agent moved into a manager.
+type PreparationLog = Arc<Mutex<Vec<(bool, String)>>>;
+
 pub(crate) struct FakeAgent {
     pub kind: &'static str,
     pub sessions: Vec<agents::domain::AgentSessionInfo>,
@@ -1096,7 +1098,7 @@ pub(crate) struct FakeAgent {
     /// Shared, so a test can answer them after the agent moved.
     pub permissions: Arc<Mutex<Vec<agents::domain::PermissionRequest>>>,
     pub calls: Arc<Mutex<Vec<String>>>,
-    pub preparation_log: Option<Arc<Mutex<Vec<(bool, String)>>>>,
+    pub preparation_log: Option<PreparationLog>,
     /// The model each `create_session` was asked for.
     pub created_with: Arc<Mutex<Vec<Option<agents::domain::ModelRef>>>>,
     /// The text of every prompt sent.
