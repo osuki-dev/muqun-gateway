@@ -3229,6 +3229,7 @@ pub(crate) async fn session_failure(
 fn agent_name(kind: &str) -> &str {
     match kind {
         "opencode" => "OpenCode",
+        "fx" => "FX",
         "deepseek" => "DeepSeek",
         "t3" => "T3 Code",
         "claude" => "Claude Code",

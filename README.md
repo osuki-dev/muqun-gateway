@@ -17,7 +17,7 @@ Two planes are implemented in this binary:
   adapters implement it.
 - **Agents plane** — agent sessions, models, prompts, tasks,
   permissions, approvals and event history, behind the `AgentPort`
-  port; the OpenCode, DeepSeek, T3 Code and Codex adapters implement it.
+  port; the OpenCode, DeepSeek, T3 Code, Codex and FX adapters implement it.
 
 `/api/discovery` also reports an **SSH plane**, but that one is the app's own
 transport, not a gateway subsystem: the phone can open an SSH connection to a
@@ -345,6 +345,7 @@ that points to another installation.
 muqun-gateway agent                  # each agent's status and the next step (--json for the raw list)
 muqun-gateway agent setup t3         # store a T3 Code credential and enable T3
 muqun-gateway agent setup deepseek   # enable DeepSeek; Gateway starts or joins the harness
+muqun-gateway agent setup fx         # explain local FX ACP configuration (no process starts)
 ```
 
 `agent` probes the agents from your shell the way the running gateway does,
@@ -439,6 +440,28 @@ an ephemeral next-turn choice, not a durable pre-turn upstream change. See the
 [Agent API](docs/agent-api.md) and [Codex protocol reference](docs/codex-protocol.md)
 for capabilities and limits. Real Codex and paired App/macOS acceptance remain
 deferred; protocol fixtures are not live certification.
+
+### The FX service agent
+
+FX is discovered by default when `fx` is on the Gateway's PATH. Install and
+configure FX authentication on this host yourself. Set `fx.binary` to an absolute
+executable path when needed, or `fx.enabled: false` to disable it. The master
+`agent_runtime.enabled` switch also applies. No package is installed or upgraded.
+
+Discovery performs a bounded `fx --version` probe and reports `reachable`; it
+does not establish model authentication or promise ACP support from a version
+number. Opening a session checks the actual ACP initialization response and
+starts a private `fx acp` child for that session. Gateway never auto-accepts
+permission requests and never automatically retries an ambiguous prompt.
+
+An FX TUI opened separately is not a shared live ACP session. The adapter does
+not adopt it, steal its lock or promise its terminal history. Native saved
+sessions can be listed and explicitly resumed with ACP load; a live external
+TUI may hold an exclusive lock, which Gateway respects. The Gateway mirror
+retains the timeline observed during this Gateway run. Model/effort controls
+appear only after native session catalogs supply their actual options; mode
+switching remains disabled. Unsupported controls are explicitly false in
+discovery. See [FX protocol](docs/fx-protocol.md).
 
 ### The OpenCode agent
 

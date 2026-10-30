@@ -76,6 +76,8 @@ pub(crate) enum SetupAgent {
     Opencode,
     /// Explain Codex setup without starting an agent or a login flow.
     Codex,
+    /// Explain FX ACP setup without starting a session or changing credentials.
+    Fx,
 }
 
 pub(crate) async fn run_agent_command(
@@ -129,6 +131,10 @@ pub(crate) async fn run_agent_command(
                 )?;
             }
             SetupAgent::Opencode => setup_opencode().await?,
+            SetupAgent::Fx => {
+                println!("FX support is enabled by default when fx is installed on PATH. Sign in and configure FX on this host yourself. Gateway opens a private `fx acp` child per session and checks ACP capabilities on session creation; discovery alone does not prove model authentication.");
+                println!("Set fx.enabled=false to disable it; fx.binary may name an absolute executable. External FX TUI processes are not shared live sessions. This command does not start FX, install packages, log in or restart Gateway.");
+            }
             SetupAgent::Codex => {
                 println!("Codex support is enabled by default. Install Codex 0.163.0 or newer and sign in on this host yourself. A running Gateway starts or joins the one shared Codex daemon; a Codex you open later uses that same socket and the same threads. It does not change permission policy or credential files.");
                 println!("Set codex.enabled=false to disable it; codex.binary may name an absolute executable. This command does not start Codex, install packages, log in or restart the Gateway.");
@@ -142,11 +148,12 @@ pub(crate) async fn run_agent_command(
 async fn list(json: bool) -> anyhow::Result<bool> {
     let config = load_config(None)?;
     let runtime = if config.agent_runtime.enabled {
-        AgentRuntime::with_all_configs(
+        AgentRuntime::with_fx_configs(
             config.opencode.clone(),
             config.deepseek.clone(),
             config.t3.clone(),
             config.codex.clone(),
+            config.fx.clone(),
             Some(state_dir()?),
         )
     } else {
@@ -269,6 +276,10 @@ pub(crate) fn next_step(id: &str, status: &AgentAvailability) -> Option<&'static
         (Unconfigured | Disabled, "t3") => "muqun-gateway agent setup t3",
         (Unconfigured | Disabled, "deepseek") => "muqun-gateway agent setup deepseek",
         (Disabled, "opencode") => "set `opencode.enabled` to true in config.json",
+        (Disabled, "fx") => "set `fx.enabled` to true in config.json",
+        (NotInstalled, "fx") => "install FX yourself, set fx.binary, or disable fx.enabled",
+        (Unconfigured, "fx") => "check fx.binary and configure FX authentication on this host yourself",
+        (Offline | Unsupported, "fx") => "check FX ACP support and host configuration; prompts are never automatically retried",
         (Disabled, "codex") => "set `codex.enabled` to true in config.json",
         (Unconfigured, "codex") => {
             "configure Codex authentication on this host; Gateway will not log in for you"

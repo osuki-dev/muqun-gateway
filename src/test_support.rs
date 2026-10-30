@@ -54,6 +54,10 @@ pub(crate) fn test_config(token: &str) -> Config {
             enabled: false,
             binary: None,
         },
+        fx: agents::runtime::FxConfig {
+            enabled: false,
+            binary: None,
+        },
         agent_runtime: crate::platform::config::AgentRuntimeConfig { enabled: false },
         store: crate::platform::config::StoreConfig::default(),
         mcp: crate::platform::config::McpConfig::default(),

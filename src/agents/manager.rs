@@ -142,9 +142,9 @@ pub struct AgentManager {
 
 impl Drop for AgentManager {
     fn drop(&mut self) {
-        // Codex's pump strongly owns its transport; releasing the external
-        // manager must cancel it. Other adapters retain their existing policy.
-        if self.agent.kind() == "codex" {
+        // Private protocol pumps own transports strongly, so releasing their
+        // external manager must cancel them. Adopted services stay untouched.
+        if matches!(self.agent.kind(), "codex" | "fx") {
             (self.shutdown_handle)();
         }
     }
@@ -460,6 +460,34 @@ impl AgentManager {
             stream_connected,
             shutdown_handle,
         }
+    }
+
+    /// Assemble the lazy ACP adapter; each FX session owns its own child.
+    pub fn connect_fx(
+        binary: String,
+        directory: String,
+        version: Option<String>,
+        events_tx: broadcast::Sender<AgentDomainEvent>,
+    ) -> (Self, Arc<crate::agents::adapters::fx::FxDriver>) {
+        let mirror = Arc::new(MemoryMirror::for_agent("fx"));
+        let driver = crate::agents::adapters::fx::FxDriver::new(
+            binary,
+            directory,
+            mirror.clone(),
+            events_tx.clone(),
+        );
+        let connected = driver.clone();
+        let shutdown = driver.clone();
+        let manager = Self::assemble(
+            driver.clone(),
+            mirror,
+            events_tx,
+            "stdio://fx-acp".into(),
+            version,
+            Arc::new(move || connected.has_live_stream()),
+            Arc::new(move || shutdown.stop()),
+        );
+        (manager, driver)
     }
 
     /// Build a manager for a DeepSeek endpoint.

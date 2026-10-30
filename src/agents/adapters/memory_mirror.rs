@@ -1702,7 +1702,6 @@ impl MemoryMirror {
         }
     }
 
-    #[cfg(test)]
     pub(crate) async fn refresh_prepared_snapshot(
         &self,
         snapshot: AgentSessionSnapshot,
@@ -1783,6 +1782,9 @@ impl MemoryMirror {
             snapshot.info.time_idle = previous.info.time_idle;
         }
         let state = Self::entry(&self.agent_id, &mut sessions, &asid, snapshot.info.status);
+        if !self.agent_id.is_empty() {
+            snapshot.info.agent_id = self.agent_id.to_string();
+        }
         state.info = snapshot.info;
         state.placeholder = false;
         state.history_initialized = true;

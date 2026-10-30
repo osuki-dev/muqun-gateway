@@ -921,7 +921,7 @@ pub(crate) mod tests {
             .await
             .is_some());
         assert!(crate::tasks::service::runs_in_pane(&state, "codex").await);
-        for service in ["opencode", "deepseek", "t3"] {
+        for service in ["opencode", "deepseek", "t3", "fx"] {
             assert!(!crate::tasks::service::runs_in_pane(&state, service).await);
         }
     }
@@ -1146,7 +1146,7 @@ pub(crate) mod tests {
         assert_eq!(features.extra["sessionPagination"], true);
         assert_eq!(
             super::super::AGENT_PREFERENCE,
-            ["codex", "opencode", "deepseek", "t3"]
+            ["codex", "opencode", "deepseek", "t3", "fx"]
         );
     }
 

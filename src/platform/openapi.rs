@@ -17,7 +17,7 @@ fn agents_plane_schema() -> Value {
                     "type": "object",
                     "required": ["id", "name", "kind", "status", "enabled", "features", "models", "modes"],
                     "properties": {
-                        "id": { "type": "string", "enum": ["opencode", "deepseek", "t3"] },
+                        "id": { "type": "string", "enum": ["codex", "opencode", "deepseek", "t3", "fx"] },
                         "name": { "type": "string" },
                         "kind": { "type": "string" },
                         "status": { "type": "string", "enum": ["connected", "reachable", "offline", "disabled", "not_installed", "unconfigured", "unsupported", "unknown"] },
