@@ -287,6 +287,7 @@ impl Activity {
         if self.first_execution.is_none() {
             self.first_execution = Some(reason);
             tracing::debug!(
+                target: "muqun_gateway::idle_retirement",
                 pid = ?self.pid, ?reason,
                 "Pi idle retirement protected by observed execution"
             );
@@ -295,7 +296,7 @@ impl Activity {
 
     fn refuse(&mut self, reason: RetirementRefusal) {
         if self.last_refusal != Some(reason) {
-            tracing::debug!(pid = ?self.pid, ?reason, first_execution = ?self.first_execution, "Pi idle retirement refused");
+            tracing::debug!(target: "muqun_gateway::idle_retirement", pid = ?self.pid, ?reason, first_execution = ?self.first_execution, "Pi idle retirement refused");
             self.last_refusal = Some(reason);
         }
     }
