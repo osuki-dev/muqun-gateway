@@ -2362,6 +2362,7 @@ mod tests {
         assert!(stale.is_empty(), "pane 2 is cached as a shell, not stale");
     }
 
+    #[cfg(unix)]
     /// A `ps` that ran and failed is not a `ps` that answered "no agents".
     ///
     /// Only a spawn failure used to take the fallback, so a `ps` that exits

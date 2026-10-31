@@ -2,6 +2,16 @@
 //! Never adopts a PID file, process name, terminal session or shared daemon.
 use std::collections::{HashMap, HashSet};
 
+#[cfg(unix)]
+use libc::{SIGCONT, SIGKILL, SIGSTOP};
+// Never delivered off Unix: `Owned::signal` refuses every signal there.
+#[cfg(not(unix))]
+const SIGSTOP: i32 = 19;
+#[cfg(not(unix))]
+const SIGCONT: i32 = 18;
+#[cfg(not(unix))]
+const SIGKILL: i32 = 9;
+
 #[derive(Clone, PartialEq, Eq)]
 struct Identity {
     pid: u32,
@@ -253,7 +263,7 @@ impl ProcessTree {
     #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn kill_root_for_test(&self) {
         if let Some(root) = self.owned.get(&self.root) {
-            let _ = root.signal(libc::SIGKILL);
+            let _ = root.signal(SIGKILL);
         }
     }
     pub fn can_force(&self) -> bool {
@@ -302,7 +312,7 @@ impl ProcessTree {
             return false;
         }
         if let Some(root) = self.owned.get(&self.root) {
-            if !root.signal(libc::SIGSTOP) {
+            if !root.signal(SIGSTOP) {
                 self.reliable = false;
                 return false;
             }
@@ -313,21 +323,21 @@ impl ProcessTree {
         for _ in 0..8 {
             self.observe();
             for (pid, node) in &self.owned {
-                if *pid != self.root && !node.signal(libc::SIGSTOP) {
+                if *pid != self.root && !node.signal(SIGSTOP) {
                     self.reliable = false;
                 }
             }
         }
         if !self.reliable {
             for node in self.owned.values() {
-                let _ = node.signal(libc::SIGCONT);
+                let _ = node.signal(SIGCONT);
             }
             return false;
         }
         let mut killed = true;
         for (pid, node) in &self.owned {
             if *pid != self.root {
-                killed &= node.signal(libc::SIGKILL);
+                killed &= node.signal(SIGKILL);
             }
         }
         if !killed {
@@ -337,11 +347,11 @@ impl ProcessTree {
         // acquisition/signal into a parent-only kill or permanent tool stop.
         if !killed {
             for node in self.owned.values() {
-                let _ = node.signal(libc::SIGCONT);
+                let _ = node.signal(SIGCONT);
             }
         }
         if let Some(root) = self.owned.get(&self.root) {
-            killed &= root.signal(libc::SIGCONT);
+            killed &= root.signal(SIGCONT);
         }
         killed
     }
@@ -349,7 +359,7 @@ impl ProcessTree {
         let mut killed = true;
         for (pid, node) in &self.owned {
             if *pid != self.root {
-                killed &= node.signal(libc::SIGKILL);
+                killed &= node.signal(SIGKILL);
             }
         }
         killed

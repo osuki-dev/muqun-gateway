@@ -722,6 +722,8 @@ impl CodexClient {
                 .history_call(method, params, deadline, wire_allowance)
                 .await;
         }
+        #[cfg(not(unix))]
+        let _ = (deadline, wire_allowance);
         self.call_inner_sized(method, params).await
     }
 

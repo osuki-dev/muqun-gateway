@@ -947,6 +947,7 @@ mod tests {
             workspace.0.display(),
             outside.0.file_name().unwrap().to_str().unwrap()
         );
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut values = vec![
             json!({"savedPath":path}),
             json!({"savedPath":"relative.png"}),

@@ -914,6 +914,7 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn worktree_repository_identity_survives_a_symlinked_tmpdir() {
         let root = temp_dir("symlinked-tmpdir").canonicalize().unwrap();
