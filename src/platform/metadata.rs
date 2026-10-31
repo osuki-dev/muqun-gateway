@@ -45,6 +45,10 @@ pub(crate) const API_CAPABILITIES: &[&str] = &[
     // A remembered ACP sign-in failure: discovery `signInFailedAtMs` and
     // `POST /api/agents/{kind}/signin-check`.
     "agent_signin_state",
+    // `GET /api/agent-catalog?agent_id=&directory=` fills `defaults` (model,
+    // mode, effort) from the choice last made in that folder, then on this
+    // computer; ACP agents list their last session's models before one opens.
+    "agent_session_defaults",
     "agent_account_limits_v1",
     "agent_events",
     "multi_agent",

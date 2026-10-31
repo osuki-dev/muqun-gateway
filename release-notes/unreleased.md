@@ -2,6 +2,17 @@
 
 ## Changes and fixes
 
+- **New sessions remember each folder's model, mode and effort on every
+  device.** The Gateway now records the model (with its effort) and mode the
+  App picks when it creates a session or switches one, per agent and folder
+  and for the computer as a whole, and fills `defaults` (now also `effort`) of
+  `GET /api/agent-catalog?agent_id=&directory=` with this folder's last choice,
+  then the computer's, then the agent's own (capability
+  `agent_session_defaults`). Phone and tablet now start from the same choice.
+  Only ids are stored. ACP agents (Claude Code, Qoder CLI, FX, ...) also list
+  the models and efforts their last session showed before a new one opens, so
+  they can be chosen up front; the list is dropped when the agent updates.
+
 - **An ACP agent that is not signed in stays marked until it is.** FX, Qoder
   CLI and the other ACP agents only learn about sign-in when a session is
   opened, so after a refusal discovery kept reporting them ready and the App

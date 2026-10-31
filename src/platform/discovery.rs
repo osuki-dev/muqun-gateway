@@ -462,6 +462,29 @@ fn mark_signin_failure(agent: &mut Value, failed_at_ms: Option<u64>) {
     agent["signInFailedAtMs"] = json!(at);
 }
 
+/// An agent whose models are only known inside a live session (ACP agents)
+/// lists the ones its last session showed, from the same agent version, so
+/// the App can offer model and effort before the first prompt.
+async fn fill_cached_models(state: &AppState, id: &str, agent: &mut Value) {
+    let Some(manager) = state.agent_runtime.manager_for_agent(id).await else {
+        return;
+    };
+    let Some(version) = manager.version() else {
+        return;
+    };
+    let Some(models) =
+        crate::agents::session_defaults::cached_models(&state.db, id, &version).await
+    else {
+        return;
+    };
+    let models: Vec<AgentModelInfo> = models.iter().map(model_info_to_agent_model).collect();
+    agent["features"]["modelSelection"] = json!(!models.is_empty());
+    agent["features"]["reasoningEffort"] = json!(models
+        .iter()
+        .any(|model| !model.reasoning_effort_tiers.is_empty()));
+    agent["models"] = json!(models);
+}
+
 /// Build complete capability discovery response. An unauthenticated caller
 /// gets each agent's id, kind, status and features, without endpoints or versions.
 pub async fn build_discovery(state: &AppState, _sealed: bool, authenticated: bool) -> Value {
@@ -511,6 +534,9 @@ pub async fn build_discovery(state: &AppState, _sealed: bool, authenticated: boo
             ));
             if let Some(manager) = state.agent_runtime.manager_for_agent(&id).await {
                 mark_signin_failure(agent, manager.agent().signin_failure());
+            }
+            if agent["models"].as_array().is_some_and(Vec::is_empty) {
+                fill_cached_models(state, &id, agent).await;
             }
         }
     }
