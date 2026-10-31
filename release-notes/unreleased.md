@@ -2,6 +2,14 @@
 
 ## Changes and fixes
 
+- **Antigravity, Claude Code and Cursor offer model and thinking choices on
+  Home right after a Gateway restart.** These agents start on first use, and
+  discovery only filled in the models their last session showed once the
+  agent had started, so after a restart it reported no model selection and
+  Home greyed out the model pill (Antigravity's thinking levels could only be
+  picked inside a session). Discovery now uses the version it reads from the
+  binary to find that list.
+
 - **Claude Code, Cursor and Antigravity sessions can finish a Home task.**
   A task delegated to one of these native ACP sessions was answered
   `task_not_found` when the agent called `tasks.complete`, so it ended
