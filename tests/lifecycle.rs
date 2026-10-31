@@ -1039,6 +1039,13 @@ fn manager_pty_navigates_scrolls_resizes_and_keeps_start_failures_in_the_ui() {
     )
     .unwrap();
     let mut manager = ManagerPty::open(&install);
+    // Nothing is paired yet, so the manager opens on the pairing QR; Esc
+    // leaves it on the (empty) device list and 1 returns to the Overview.
+    let output = manager.until("1 Scan the QR in Muqun");
+    assert!(output.contains("Pair a device"), "{output:?}");
+    manager.send(b"\x1b");
+    manager.until("No devices paired yet.");
+    manager.send(b"1");
     let output = manager.until("s start · t stop · r restart");
     assert!(output.contains("Runtime"));
     assert!(output.contains("Connectivity"));
@@ -1192,6 +1199,12 @@ fn manager_compact_pairing_keeps_the_full_address_reachable_without_resizing() {
     )
     .unwrap();
     let mut manager = ManagerPty::open(&install);
+    // Opens on the pairing QR (nothing paired); start this test from the
+    // Overview as before so the resize lands on a known frame.
+    manager.until("1 Scan the QR in Muqun");
+    manager.send(b"\x1b");
+    manager.until("No devices paired yet.");
+    manager.send(b"1");
     manager.until("s start · t stop · r restart");
     let size = libc::winsize {
         ws_row: 8,
