@@ -201,6 +201,9 @@ machine, so never recreate or reset the volume.
     unavailable. The API answers, and requires a token (401 without one).
   - `agent list` shows OpenCode reachable, and Codex, Qoder and Pi not
     installed (none were installed in the VM).
+  - Herdr 0.9.5 (`herdr-windows-x86_64.zip`, unzipped into a scratch
+    directory) runs and prints its CLI. I did not start a Herdr server; the
+    gateway has no named-pipe transport to reach one yet.
   - Not tried yet: a paired App and a real agent turn.
 - Building the gateway inside the VM needs the MSVC C++ build tools and Perl
   (for the vendored OpenSSL under SQLCipher). From the VM, `winget` hung
