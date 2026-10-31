@@ -593,6 +593,26 @@ impl<P: AcpProvider> AcpDriver<P> {
             .terminal_bridge()
             .ok_or_else(|| AgentError::NotAvailable("No terminal bridge".into()))?;
         bridge.send(&route, text).await?;
+        // Acknowledge the reader's send as native prompts are; the next
+        // transcript refresh replaces this row with the terminal's own.
+        let native = format!("terminal-submission:{}", uuid::Uuid::new_v4());
+        let row = TimelineItem {
+            id: native.clone(),
+            message_id: native,
+            role: TimelineRole::User,
+            part: AgentPart::Text { text: text.into() },
+            seq: 0,
+            updated_ms: mapper::now_ms(),
+            ordinal: 0,
+            attachments: None,
+            image_assets: None,
+            generation: None,
+        };
+        let event = self
+            .mirror
+            .record_timeline_upsert(&AgentSessionId::from(id), vec![row])
+            .await;
+        Self::emit(&self.mirror, &self.tx, event);
         self.follow_terminal(id.to_owned());
         Ok(())
     }
