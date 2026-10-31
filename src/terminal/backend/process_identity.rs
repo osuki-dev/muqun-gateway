@@ -171,6 +171,32 @@ fn walk(server: u32, root: u32) -> Option<Verified> {
     None
 }
 
+/// The live parent of `pid` (same user, not a zombie), where the platform says.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn parent_of(pid: u32) -> Option<u32> {
+    process(pid).map(|(parent, _)| parent)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn parent_of(_pid: u32) -> Option<u32> {
+    None
+}
+
+/// Whether `ancestor` is `pid` or one of its live ancestors.
+pub(crate) fn descends_from(pid: u32, ancestor: u32) -> bool {
+    let mut current = pid;
+    for _ in 0..64 {
+        if current == ancestor {
+            return true;
+        }
+        match parent_of(current) {
+            Some(parent) if current > 1 => current = parent,
+            _ => return false,
+        }
+    }
+    false
+}
+
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn verified_incarnation(_server: u32, _root: u32) -> Option<String> {
     // A PID or command-line timestamp is not a substitute for kernel evidence.

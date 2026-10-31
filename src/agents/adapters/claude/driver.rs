@@ -30,6 +30,16 @@ impl AcpProvider for ClaudeProvider {
     ) -> AgentFuture<'a, crate::agents::adapters::acp::recovery::NativeSnapshot> {
         Box::pin(super::recovery::inspect(directory, id, stop))
     }
+    fn live_timeline<'a>(
+        directory: &'a str,
+        id: &'a str,
+        stop: &'a tokio_util::sync::CancellationToken,
+    ) -> AgentFuture<'a, Vec<crate::agents::domain::TimelineItem>> {
+        Box::pin(super::recovery::live_timeline(directory, id, stop))
+    }
+    fn transcript_modified(directory: &str, id: &str) -> Option<std::time::SystemTime> {
+        super::recovery::transcript_modified(directory, id)
+    }
     fn offline_sessions<'a>(
         directory: Option<&'a str>,
         stop: &'a tokio_util::sync::CancellationToken,

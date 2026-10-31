@@ -66,6 +66,19 @@ pub trait AcpProvider: Send + Sync + 'static {
     fn safe_error_message(_: &Value) -> Option<&'static str> {
         None
     }
+    /// History of a session another process (a terminal) is writing, read
+    /// from the native store without loading it. See [`TerminalBridge`].
+    fn live_timeline<'a>(
+        _directory: &'a str,
+        _id: &'a str,
+        _stop: &'a CancellationToken,
+    ) -> AgentFuture<'a, Vec<TimelineItem>> {
+        unsupported("reading a session held by a terminal")
+    }
+    /// When that store last changed for `id`, to notice terminal progress.
+    fn transcript_modified(_directory: &str, _id: &str) -> Option<std::time::SystemTime> {
+        None
+    }
     /// Rows for `session/list` read from the native store without starting
     /// the agent, or `None` to ask the agent itself.
     fn offline_sessions<'a>(
@@ -75,6 +88,33 @@ pub trait AcpProvider: Send + Sync + 'static {
         None
     }
 }
+
+/// A session that another process on this computer (a terminal) has open.
+/// The driver never starts a second agent process for it: history is read
+/// from the native store and input goes into that terminal.
+#[derive(Clone, Debug)]
+pub struct TerminalLive {
+    pub runtime: SessionRuntime,
+    /// Where typed input goes; `None` when no terminal pane holds the process.
+    pub route: Option<TerminalRoute>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TerminalRoute {
+    /// The Gateway terminal session (tmux/Herdr) and pane.
+    pub session: String,
+    pub pane: String,
+}
+
+/// Correlates sessions with terminal processes and reaches their panes.
+pub trait TerminalBridge: Send + Sync {
+    fn live<'a>(&'a self, ids: &'a [String]) -> AgentFuture<'a, HashMap<String, TerminalLive>>;
+    fn send<'a>(&'a self, route: &'a TerminalRoute, text: &'a str) -> AgentFuture<'a, ()>;
+    fn interrupt<'a>(&'a self, route: &'a TerminalRoute) -> AgentFuture<'a, ()>;
+}
+
+/// How long a terminal-held transcript is followed after input from here.
+const TERMINAL_FOLLOW: Duration = Duration::from_secs(600);
 
 /// How the driver starts its ACP child when it is not `binary` with
 /// [`AcpProvider::ARGS`]: a runner's arguments and the child's environment.
@@ -294,6 +334,8 @@ pub struct AcpDriver<P: AcpProvider> {
     commands_observed: Arc<AtomicBool>,
     launch: StdMutex<Option<AcpLaunch>>,
     mcp_servers: StdMutex<Value>,
+    terminal: StdMutex<Option<Arc<dyn TerminalBridge>>>,
+    me: Weak<Self>,
     stop: CancellationToken,
 }
 
@@ -370,7 +412,7 @@ impl<P: AcpProvider> AcpDriver<P> {
         mirror: Arc<MemoryMirror>,
         tx: broadcast::Sender<AgentDomainEvent>,
     ) -> Arc<Self> {
-        Arc::new(Self {
+        Arc::new_cyclic(|me| Self {
             provider: PhantomData,
             binary,
             default_directory,
@@ -394,6 +436,8 @@ impl<P: AcpProvider> AcpDriver<P> {
             commands_observed: Arc::new(AtomicBool::new(false)),
             launch: StdMutex::new(None),
             mcp_servers: StdMutex::new(json!([])),
+            terminal: StdMutex::new(None),
+            me: me.clone(),
             stop: CancellationToken::new(),
         })
     }
@@ -413,6 +457,140 @@ impl<P: AcpProvider> AcpDriver<P> {
 
     fn mcp_servers(&self) -> Value {
         self.mcp_servers.lock().unwrap().clone()
+    }
+
+    pub fn set_terminal_bridge(&self, bridge: Arc<dyn TerminalBridge>) {
+        *self.terminal.lock().unwrap() = Some(bridge);
+    }
+
+    fn terminal_bridge(&self) -> Option<Arc<dyn TerminalBridge>> {
+        self.terminal.lock().unwrap().clone()
+    }
+
+    /// The terminal holding `id`, if any. A native child this driver holds
+    /// for the same session is handed over: released now when idle, else
+    /// after its turn (the next observation). Until then both may write --
+    /// the window is one turn and is logged.
+    async fn terminal_live(&self, id: &str) -> Option<TerminalLive> {
+        let bridge = self.terminal_bridge()?;
+        let live = bridge.live(&[id.to_owned()]).await.ok()?.remove(id)?;
+        if let Some(session) = self.retained(id) {
+            if session.busy.load(Ordering::Acquire) {
+                tracing::warn!(
+                    session = id,
+                    "Claude Code session resumed in a terminal while a Gateway turn runs; \
+                     handing over after this turn"
+                );
+                return None;
+            }
+            tracing::info!(
+                session = id,
+                "session resumed in a terminal; releasing the Gateway's process"
+            );
+            self.sessions.lock().unwrap().remove(id);
+            session.connected.store(false, Ordering::Release);
+            session.client.shutdown().await;
+        }
+        Some(live)
+    }
+
+    /// Put a terminal-held session's transcript into the mirror and tell
+    /// readers to refetch.
+    async fn refresh_terminal_snapshot(
+        &self,
+        id: &str,
+        live: &TerminalLive,
+    ) -> Result<(), AgentError> {
+        let mut info = self.native_session_info(id).await?;
+        let directory = info.directory.clone().ok_or_else(|| {
+            AgentError::NotAvailable("The session has no verified working directory".into())
+        })?;
+        let timeline = P::live_timeline(&directory, id, &self.stop).await?;
+        info.runtime = Some(live.runtime.clone());
+        let asid = info.asid.clone();
+        let revision = self.mirror.snapshot_read_revision(&asid).await;
+        let snapshot = AgentSessionSnapshot {
+            info,
+            timeline,
+            permissions: Vec::new(),
+            forms: Vec::new(),
+            inbox: Vec::new(),
+            seq: 0,
+        };
+        self.mirror
+            .refresh_prepared_snapshot(snapshot, revision.0, revision.1, None)
+            .await?;
+        Ok(())
+    }
+
+    /// Input for a terminal-held session goes into that terminal: the user
+    /// there sees it typed. Without a known pane it cannot be delivered.
+    async fn send_to_terminal(
+        &self,
+        id: &str,
+        live: TerminalLive,
+        text: &str,
+        attachments: &[String],
+    ) -> Result<(), AgentError> {
+        let Some(route) = live.route else {
+            return Err(AgentError::TerminalInteraction(Box::new(live.runtime)));
+        };
+        if !attachments.is_empty() {
+            return Err(AgentError::Unsupported(
+                "attachments for a conversation open in a terminal".into(),
+            ));
+        }
+        let bridge = self
+            .terminal_bridge()
+            .ok_or_else(|| AgentError::NotAvailable("No terminal bridge".into()))?;
+        bridge.send(&route, text).await?;
+        self.follow_terminal(id.to_owned());
+        Ok(())
+    }
+
+    /// Follow a terminal-held transcript after input from here, so readers
+    /// see the turn the terminal runs.
+    fn follow_terminal(&self, id: String) {
+        let driver = self.me.clone();
+        tokio::spawn(async move {
+            let started = tokio::time::Instant::now();
+            let mut seen = None;
+            while started.elapsed() < TERMINAL_FOLLOW {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let Some(driver) = driver.upgrade() else {
+                    return;
+                };
+                if driver.stop.is_cancelled() {
+                    return;
+                }
+                let Some(directory) = driver
+                    .native_session_info(&id)
+                    .await
+                    .ok()
+                    .and_then(|info| info.directory)
+                else {
+                    return;
+                };
+                let modified = P::transcript_modified(&directory, &id);
+                if modified == seen {
+                    continue;
+                }
+                seen = modified;
+                let Some(live) = driver.terminal_live(&id).await else {
+                    return;
+                };
+                if driver.refresh_terminal_snapshot(&id, &live).await.is_ok() {
+                    Self::emit(
+                        &driver.mirror,
+                        &driver.tx,
+                        AgentDomainEvent::Resync {
+                            asid: id.as_str().into(),
+                            reason: "terminal transcript advanced".into(),
+                        },
+                    );
+                }
+            }
+        });
     }
 
     pub fn set_idle_timeout(&self, timeout: Duration) {
@@ -887,7 +1065,17 @@ impl<P: AcpProvider> AcpDriver<P> {
     ) -> Result<Vec<AgentSessionInfo>, AgentError> {
         let revision = self.metadata_revision.load(Ordering::Acquire);
         if let Some(rows) = P::offline_sessions(directory, &self.stop) {
-            let sessions = self.project_listed_sessions(rows.await?).await?;
+            let mut sessions = self.project_listed_sessions(rows.await?).await?;
+            if let Some(bridge) = self.terminal_bridge() {
+                let ids: Vec<_> = sessions.iter().map(|info| info.asid.0.clone()).collect();
+                let mut live = bridge.live(&ids).await.unwrap_or_default();
+                for info in &mut sessions {
+                    if let Some(live) = live.remove(&info.asid.0) {
+                        live.runtime.clone().apply(info);
+                        info.runtime = Some(live.runtime);
+                    }
+                }
+            }
             self.remember_session_metadata(revision, &sessions).await;
             return Ok(sessions);
         }
@@ -1294,6 +1482,11 @@ impl<P: AcpProvider> AcpDriver<P> {
             }
             None => Default::default(),
         };
+        if let Some(id) = &id {
+            if let Some(live) = self.terminal_live(id).await {
+                return Err(AgentError::TerminalInteraction(Box::new(live.runtime)));
+            }
+        }
         let (client, mut events, capabilities) = self.initialized(directory).await?;
         if id.is_some() && capabilities["loadSession"].as_bool() != Some(true) {
             client.shutdown().await;
@@ -2257,7 +2450,10 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
                 return Ok(Vec::new());
             }
             if self.retained(id).is_none() {
-                self.observed_snapshot(id).await?;
+                // A terminal-held transcript is mirrored whole; nothing older.
+                if self.terminal_live(id).await.is_none() {
+                    self.observed_snapshot(id).await?;
+                }
                 return Ok(Vec::new());
             }
 
@@ -2391,8 +2587,16 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
             self.native_session_info(id).await
         })
     }
+    fn session_runtime<'a>(&'a self, id: &'a str) -> AgentFuture<'a, Option<SessionRuntime>> {
+        Box::pin(async move { Ok(self.terminal_live(id).await.map(|live| live.runtime)) })
+    }
     fn prepare_selected_session<'a>(&'a self, id: &'a str) -> AgentFuture<'a, ()> {
         Box::pin(async move {
+            if let Some(live) = self.terminal_live(id).await {
+                self.refresh_terminal_snapshot(id, &live).await?;
+                self.follow_terminal(id.to_owned());
+                return Ok(());
+            }
             if self.readonly_empty_snapshot(id).await? {
                 return Ok(());
             }
@@ -2403,6 +2607,9 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
         Box::pin(async move {
             if self.retained(id).is_some() || self.dormant.lock().unwrap().contains_key(id) {
                 return Ok(());
+            }
+            if let Some(live) = self.terminal_live(id).await {
+                return self.refresh_terminal_snapshot(id, &live).await;
             }
             if self.readonly_empty_snapshot(id).await? {
                 return Ok(());
@@ -2420,10 +2627,25 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
         attachments: &'a [String],
         delivery: Option<&'a str>,
     ) -> AgentFuture<'a, ()> {
-        Box::pin(self.submit_prompt(id, text, attachments, delivery, false))
+        Box::pin(async move {
+            if let Some(live) = self.terminal_live(id).await {
+                return self.send_to_terminal(id, live, text, attachments).await;
+            }
+            self.submit_prompt(id, text, attachments, delivery, false)
+                .await
+        })
     }
     fn interrupt<'a>(&'a self, id: &'a str) -> AgentFuture<'a, ()> {
         Box::pin(async move {
+            if let Some(TerminalLive {
+                route: Some(route), ..
+            }) = self.terminal_live(id).await
+            {
+                let bridge = self
+                    .terminal_bridge()
+                    .ok_or_else(|| AgentError::NotAvailable("No terminal bridge".into()))?;
+                return bridge.interrupt(&route).await;
+            }
             let session = self
                 .retained(id)
                 .ok_or_else(|| AgentError::SessionNotFound(id.into()))?;
@@ -2564,6 +2786,18 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
         _limit: usize,
     ) -> AgentFuture<'a, Vec<TimelineItem>> {
         Box::pin(async move {
+            if self.terminal_live(id).await.is_some() {
+                let directory = self
+                    .native_session_info(id)
+                    .await?
+                    .directory
+                    .ok_or_else(|| {
+                        AgentError::NotAvailable(
+                            "The session has no verified working directory".into(),
+                        )
+                    })?;
+                return P::live_timeline(&directory, id, &self.stop).await;
+            }
             if self.readonly_empty_snapshot(id).await? {
                 return Ok(Vec::new());
             }

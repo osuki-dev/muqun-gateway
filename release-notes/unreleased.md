@@ -12,7 +12,10 @@
   released when verified idle; session lists read Claude Code's transcripts
   without starting it. Model and effort follow the adapter's options, the muqun
   MCP server is passed per session, and a missing login is reported as "not
-  signed in". Goals delegated to `claude` still start in a pane unless the
+  signed in". A conversation open in a terminal stays one process: the App
+  shows it with the terminal's status and transcript, and what you send from
+  the phone is typed into that terminal. Goals delegated to `claude` still
+  start in a pane unless the
   session delivery is chosen. Restart the Gateway after updating; Apps that do
   not know the `claude` kind keep working without it.
 

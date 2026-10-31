@@ -216,6 +216,8 @@ pub(super) struct ClaudeState {
     stopped: std::sync::atomic::AtomicBool,
     start: tokio::sync::Mutex<()>,
     driver: std::sync::OnceLock<std::sync::Arc<crate::agents::adapters::claude::ClaudeDriver>>,
+    /// The terminal sessions (tmux/Herdr) whose panes may hold a Claude Code.
+    pub(super) terminals: std::sync::OnceLock<Vec<crate::SessionConfig>>,
 }
 
 impl ClaudeState {
@@ -226,6 +228,7 @@ impl ClaudeState {
             stopped: std::sync::atomic::AtomicBool::new(false),
             start: tokio::sync::Mutex::new(()),
             driver: std::sync::OnceLock::new(),
+            terminals: std::sync::OnceLock::new(),
         }
     }
 
@@ -264,6 +267,9 @@ impl ClaudeState {
             runtime.events_tx.clone(),
         );
         driver.set_launch(launch);
+        driver.set_terminal_bridge(std::sync::Arc::new(Terminals {
+            sessions: self.terminals.get().cloned().unwrap_or_default(),
+        }));
         driver.set_idle_timeout(std::time::Duration::from_secs(
             self.config.idle_timeout_secs.max(1),
         ));
@@ -391,6 +397,187 @@ async fn claude_version(claude: &std::path::Path) -> Option<String> {
             .unwrap_or(&version)
             .to_owned(),
     )
+}
+
+/// Claude Code running in a terminal, found through its own session registry
+/// (`<config>/sessions/<pid>.json`, see `native_sessions::live_sessions`),
+/// and the tmux/Herdr pane whose shell is that process's ancestor.
+struct Terminals {
+    sessions: Vec<crate::SessionConfig>,
+}
+
+/// A pane shell pid that is an ancestor of `pid`, when exactly one is.
+pub(crate) fn pane_for(
+    pid: u32,
+    panes: &[(String, String, u32)],
+    descends: impl Fn(u32, u32) -> bool,
+) -> Option<(String, String)> {
+    let mut found = panes
+        .iter()
+        .filter(|(_, _, shell)| descends(pid, *shell))
+        .map(|(session, pane, _)| (session.clone(), pane.clone()));
+    match (found.next(), found.next()) {
+        (Some(only), None) => Some(only),
+        _ => None,
+    }
+}
+
+/// The runtime a terminal-held session is shown with.
+pub(crate) fn terminal_runtime(
+    process: &crate::agents::adapters::claude::native_sessions::LiveProcess,
+    pane: Option<(String, String)>,
+) -> crate::agents::adapters::acp::session::TerminalLive {
+    use crate::agents::adapters::acp::session::{TerminalLive, TerminalRoute};
+    use crate::agents::domain::*;
+    let status = match process.busy {
+        Some(true) => TerminalRuntimeStatus::Working,
+        Some(false) => TerminalRuntimeStatus::Idle,
+        None => TerminalRuntimeStatus::Unknown,
+    };
+    match pane {
+        Some((session, pane)) => TerminalLive {
+            runtime: SessionRuntime {
+                transcript: Some(TranscriptSource::Persisted),
+                source: RuntimeSource::Terminal,
+                interaction: RuntimeInteraction::Terminal,
+                status: Some(status),
+                terminal: Some(RuntimeTerminal {
+                    session_id: session.clone(),
+                    pane_id: pane.clone(),
+                    instance_id: format!("claude:{}:{}", process.pid, process.start),
+                }),
+                reason: None,
+            },
+            route: Some(TerminalRoute { session, pane }),
+        },
+        // Running outside tmux/Herdr: shown, never typed into, never doubled.
+        None => TerminalLive {
+            runtime: SessionRuntime {
+                transcript: Some(TranscriptSource::Persisted),
+                source: RuntimeSource::Unobserved,
+                interaction: RuntimeInteraction::Unavailable,
+                status: Some(status),
+                terminal: None,
+                reason: Some(RuntimeReason::TerminalUnavailable),
+            },
+            route: None,
+        },
+    }
+}
+
+impl Terminals {
+    fn session(
+        &self,
+        id: &str,
+    ) -> Result<&crate::SessionConfig, crate::agents::ports::agent::AgentError> {
+        self.sessions.iter().find(|s| s.id == id).ok_or_else(|| {
+            crate::agents::ports::agent::AgentError::NotAvailable(
+                "The terminal holding this conversation is no longer configured".into(),
+            )
+        })
+    }
+}
+
+impl crate::agents::adapters::acp::session::TerminalBridge for Terminals {
+    fn live<'a>(
+        &'a self,
+        ids: &'a [String],
+    ) -> crate::agents::ports::agent::AgentFuture<
+        'a,
+        std::collections::HashMap<String, crate::agents::adapters::acp::session::TerminalLive>,
+    > {
+        Box::pin(async move {
+            let registry = tokio::task::spawn_blocking(
+                crate::agents::adapters::claude::native_sessions::live_sessions,
+            )
+            .await
+            .unwrap_or_default();
+            let wanted: Vec<_> = ids
+                .iter()
+                .filter_map(|id| {
+                    registry
+                        .get(id)
+                        .map(|process| (id.clone(), process.clone()))
+                })
+                .collect();
+            if wanted.is_empty() {
+                return Ok(Default::default());
+            }
+            let mut panes = Vec::new();
+            for session in &self.sessions {
+                let listed = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    crate::terminal_backend(session).list_panes(),
+                )
+                .await;
+                if let Ok(Ok(listed)) = listed {
+                    panes.extend(listed.into_iter().filter_map(|pane| {
+                        Some((
+                            session.id.clone(),
+                            pane.id.as_str().to_owned(),
+                            pane.shell_pid?,
+                        ))
+                    }));
+                }
+            }
+            let panes = std::sync::Arc::new(panes);
+            let mut live = std::collections::HashMap::new();
+            for (id, process) in wanted {
+                let panes = panes.clone();
+                let pid = process.pid;
+                let pane = tokio::task::spawn_blocking(move || {
+                    pane_for(pid, &panes, crate::terminal::backend::descends_from)
+                })
+                .await
+                .ok()
+                .flatten();
+                live.insert(id, terminal_runtime(&process, pane));
+            }
+            Ok(live)
+        })
+    }
+
+    fn send<'a>(
+        &'a self,
+        route: &'a crate::agents::adapters::acp::session::TerminalRoute,
+        text: &'a str,
+    ) -> crate::agents::ports::agent::AgentFuture<'a, ()> {
+        Box::pin(async move {
+            let session = self.session(&route.session)?;
+            crate::agents::session_routes::submit_agent_prompt(session, &route.pane, text)
+                .await
+                .map_err(|error| {
+                    tracing::warn!(?error, "typing into the Claude Code terminal failed");
+                    crate::agents::ports::agent::AgentError::NotAvailable(
+                        "Could not type into the terminal holding this conversation".into(),
+                    )
+                })?;
+            crate::agents::session_routes::schedule_submit_keypress(
+                session.clone(),
+                route.pane.clone(),
+            );
+            tracing::info!(pane = %route.pane, "Claude Code prompt typed into its terminal");
+            Ok(())
+        })
+    }
+
+    fn interrupt<'a>(
+        &'a self,
+        route: &'a crate::agents::adapters::acp::session::TerminalRoute,
+    ) -> crate::agents::ports::agent::AgentFuture<'a, ()> {
+        Box::pin(async move {
+            let session = self.session(&route.session)?;
+            crate::terminal_backend(session)
+                .send_keys(
+                    &crate::terminal::backend::PaneId::new(route.pane.clone()),
+                    &["Escape".to_owned()],
+                )
+                .await
+                .map_err(|error| {
+                    crate::agents::ports::agent::AgentError::NotAvailable(error.to_string())
+                })
+        })
+    }
 }
 
 fn features_for_models(models: &[crate::discovery::AgentModelInfo]) -> AgentFeatures {
@@ -523,6 +710,44 @@ mod tests {
         );
         assert_eq!(Missing::Claude.status(), AgentAvailability::NotInstalled);
         assert!(Missing::Claude.reason().contains("claude"));
+    }
+
+    #[test]
+    fn a_terminal_process_maps_to_exactly_one_pane_or_is_read_only() {
+        use crate::agents::adapters::claude::native_sessions::LiveProcess;
+        use crate::agents::domain::{RuntimeInteraction, RuntimeReason, TerminalRuntimeStatus};
+        // claude 300 runs under shell 30 (pane a); shell 40 holds nothing of it.
+        let tree = |pid: u32, ancestor: u32| pid == ancestor || (pid == 300 && ancestor == 30);
+        let pane = |session: &str, pane: &str, shell| (session.to_owned(), pane.to_owned(), shell);
+        for (panes, expected) in [
+            (
+                vec![pane("s", "a", 30), pane("s", "b", 40)],
+                Some(("s", "a")),
+            ),
+            (vec![pane("s", "b", 40)], None),
+            // Two panes claiming one process: never guess.
+            (vec![pane("s", "a", 30), pane("t", "a", 30)], None),
+        ] {
+            let found = pane_for(300, &panes, tree);
+            assert_eq!(found, expected.map(|(s, p)| (s.to_owned(), p.to_owned())));
+        }
+        let process = LiveProcess {
+            pid: 300,
+            start: "9".into(),
+            busy: Some(true),
+        };
+        let typed = terminal_runtime(&process, Some(("s".into(), "a".into())));
+        assert_eq!(typed.runtime.interaction, RuntimeInteraction::Terminal);
+        assert_eq!(typed.runtime.status, Some(TerminalRuntimeStatus::Working));
+        assert_eq!(typed.runtime.terminal.unwrap().instance_id, "claude:300:9");
+        assert_eq!(typed.route.unwrap().pane, "a");
+        let shown = terminal_runtime(&process, None);
+        assert_eq!(shown.runtime.interaction, RuntimeInteraction::Unavailable);
+        assert_eq!(
+            shown.runtime.reason,
+            Some(RuntimeReason::TerminalUnavailable)
+        );
+        assert!(shown.route.is_none());
     }
 
     #[test]

@@ -123,6 +123,75 @@ notifications, tool results and sidechains are not prompts. If the transcript
 is unsettled, too large, or does not prove the turn the Gateway saw, the child
 is simply kept.
 
+## A conversation that is open in a terminal
+
+The core case: a conversation started in a terminal is continued from the
+phone while that terminal keeps running, and both stay usable. Gateway never
+starts a second `claude` for it.
+
+**Correlation.** Every running Claude Code (terminal, IDE, another ACP
+client, the Gateway's own adapter child) records its current session in
+`<config>/sessions/<pid>.json` (`pid`, `sessionId`, `procStart`, `status`
+busy/idle). This is Claude Code's own registry, so no argv or cwd heuristic is
+needed: `claude --resume <id>`, `--continue` and a fresh `claude` all appear
+there. An entry counts when its process is alive, same user, not a zombie,
+with the recorded start time (Linux `/proc/<pid>/stat`; macOS `proc_pidinfo`
+for liveness only) and is not a descendant of the Gateway. The pane is the
+configured tmux/Herdr pane whose shell pid is an ancestor of that process;
+exactly one must match. Failure modes: a Claude Code too old to write the
+registry is not seen (the session then looks saved, and opening it would
+start a second process); on macOS a reused pid could look alive until Claude
+Code cleans its registry file.
+
+**Presentation.** Listings, `get_session` and snapshots carry the runtime the
+App already renders for Codex threads bound to a TUI: `source: "terminal"`,
+`interaction: "terminal"`, `status` from the registry, `terminal: {session_id,
+pane_id, instance_id: "claude:<pid>:<start>"}`. History is the transcript,
+read read-only (main chain: prompts, text, thinking, tool calls and results)
+through the same projection as `session/load` and mirrored whole, so earlier
+pages come from the mirror.
+
+**Input.** A prompt from the App is typed into that pane through the pane
+agent's prompt path (with its delayed Enter), so the terminal user sees it;
+Stop sends Escape there. After input the transcript is followed for ten
+minutes; each change refreshes the mirror and sends `agent.resync`.
+Attachments are refused for such a session. Without a pane (Claude Code
+outside tmux/Herdr) the session is shown read-only: `interaction:
+"unavailable"`, `reason: "terminal_unavailable"`, and prompts get
+`409 agent_terminal_interaction_required`.
+
+**Hand-over.** When the terminal process exits, the session is an ordinary
+saved session again and opens with `session/load`. When the Gateway holds a
+native child and a terminal resumes the same session, the next observation
+(list, read, prompt, Stop) releases the child if it is idle; a child in the
+middle of a turn keeps it and is released after it (logged). In that window,
+at most one turn, both processes can write the transcript; Claude Code itself
+does not lock it.
+
+## Parity with the other native agents
+
+| Capability | Claude (adapter 0.99.1) | Status |
+|---|---|---|
+| Models | `model` config option | implemented (`session/set_config_option`) |
+| Effort tiers | `effort` option, per model | implemented; tiers are listed only for the model selected in an observed session (shared ACP catalog rule) |
+| Permission mode | `mode` option, `session/set_mode` | adapter supports; not implemented (no ACP agent exposes modes yet; App mode catalog + switch, about half a day) |
+| Interrupt | `session/cancel` → `stopReason: "cancelled"` | implemented (Escape for a terminal-held session) |
+| Queue / steer while running | `_meta.steering.supported`, `promptQueueing` | adapter supports; not implemented (shared ACP driver refuses non-`auto` delivery; about a day with App inbox wiring) |
+| Fork / delete | `sessionCapabilities.fork`, `delete` | implemented (shared operations; discovery flags follow capabilities) |
+| Rename / title | generated title (`session_info_update`); `_session/rename` extension | title shown; rename not implemented (about half a day) |
+| Image / file attachments | `promptCapabilities.image`, `embeddedContext` | implemented (shared prompt parts) |
+| Approvals | `session/request_permission` | implemented (shared); asked only when Claude Code's own permission mode asks |
+| Questions / elicitation | form elicitation when the client advertises it | not implemented (not advertised; about a day) |
+| Delegated tasks | muqun MCP per session | MCP injected; the task sentence is not appended yet (`systemPrompt` capability exists; small follow-up) |
+| muqun MCP tools | `mcpCapabilities.http` | implemented (runtime-bound token) |
+| Worktrees | `additionalDirectories` only | not supported as worktrees |
+| Changes panel (`agent_vcs_files`) | tool calls carry inputs; no VCS listing method | not implemented for any ACP agent (`get_vcs_diff` unsupported) |
+| Compaction | `/compact` slash command | available as a slash command (`available_commands_update`) |
+| Token usage / context pill | `usage_update {used, size, cost}`, prompt `usage` | implemented (shared reducer) |
+| Account limits | no ACP method | not supported |
+| Idle retirement | transcript evidence | implemented |
+| Terminal-held sessions | Claude Code session registry | implemented (above) |
+
 ## Errors
 
 A prompt without a Claude Code login fails with JSON-RPC `-32000`
@@ -132,6 +201,10 @@ and sign in". Other native messages are not relayed. No prompt is ever
 retried automatically.
 
 ## Validation boundary
+
+Terminal-held sessions are verified with fakes (correlation table, hand-over
+driver test) and the transcript reader against real transcripts; typing into a
+real pane needs the deployed Gateway and App.
 
 Verified against the real adapter: initialize, new, set model/effort (haiku,
 low), prompt, cancel, load replay, list, the not-signed-in error, idle

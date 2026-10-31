@@ -27,6 +27,7 @@ pub use model::{
     WorktreePlacement, WorktreeRequest,
 };
 pub(crate) use process_identity::SUPPORTED as PROCESS_IDENTITY_SUPPORTED;
+pub(crate) use process_identity::{descends_from, parent_of as process_parent};
 pub use registry::BackendRegistry;
 pub use tmux::{TmuxBackend, TMUX_PROGRAM};
 pub use tmux_wire::TmuxWireIds;

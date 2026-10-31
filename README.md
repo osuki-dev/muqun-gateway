@@ -502,7 +502,10 @@ are optional; `claude.enabled: false` disables it.
 Startup only probes versions. The adapter starts on the first session open,
 create or prompt and is released when verified idle. Session lists come from
 Claude Code's transcripts (`~/.claude/projects`, or `CLAUDE_CONFIG_DIR`)
-without starting anything; opening one replays its history over ACP. Model and
+without starting anything; opening one replays its history over ACP. A
+conversation still open in a terminal is shown with the terminal's status and
+its transcript, and prompts from the App are typed into that terminal; no
+second Claude Code is started. Model and
 effort use the adapter's native options; the muqun MCP server is passed per
 session and `~/.claude` is never edited. A goal delegated to `claude` without
 an explicit delivery still starts in a pane. See
