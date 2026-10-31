@@ -1,6 +1,7 @@
 //! `muqun-gateway agent`: each agent's status and the one step that gets it
-//! working, without asking the running gateway anything. The probe is the
-//! one discovery runs, in this process, with nothing attached.
+//! working. The running gateway's discovery answer is the source; only when
+//! no gateway answers does this process probe the agents itself, with
+//! nothing attached and sign-in unchecked.
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -37,8 +38,11 @@ pub(crate) enum AgentCommand {
         /// Print the discovery agents array as JSON.
         #[arg(long)]
         json: bool,
+        /// List the agents that are not installed too.
+        #[arg(long)]
+        all: bool,
     },
-    /// Configure one agent in config.json and apply it.
+    /// Set up or explain one agent.
     Setup {
         #[command(subcommand)]
         agent: SetupAgent,
@@ -91,10 +95,14 @@ pub(crate) enum SetupAgent {
 pub(crate) async fn run_agent_command(
     command: Option<AgentCommand>,
     json: bool,
+    all: bool,
 ) -> anyhow::Result<()> {
-    match command.unwrap_or(AgentCommand::List { json }) {
-        AgentCommand::List { json: list_json } => {
-            if !list(json || list_json).await? {
+    match command.unwrap_or(AgentCommand::List { json, all }) {
+        AgentCommand::List {
+            json: list_json,
+            all: list_all,
+        } => {
+            if !list(json || list_json, all || list_all).await? {
                 std::process::exit(1);
             }
         }
@@ -168,9 +176,105 @@ pub(crate) async fn run_agent_command(
     Ok(())
 }
 
-/// Print every agent; `true` when each enabled one is usable.
-async fn list(json: bool) -> anyhow::Result<bool> {
-    let config = load_config(None)?;
+/// Where the rows came from: the running gateway knows sign-in and
+/// connection state; a shell probe only knows what is installed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Source {
+    Gateway,
+    Local { gateway_running: bool },
+}
+
+/// One agent as `agent` and `manage` show it: the part of a discovery entry
+/// a person reads. Parsed leniently so a newer or older gateway's answer
+/// still lists.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AgentRow {
+    pub(crate) id: String,
+    #[serde(default)]
+    pub(crate) name: String,
+    pub(crate) status: AgentAvailability,
+    #[serde(default = "enabled_default")]
+    pub(crate) enabled: bool,
+    #[serde(default)]
+    pub(crate) version: Option<String>,
+    #[serde(default)]
+    pub(crate) reason: Option<String>,
+}
+
+fn enabled_default() -> bool {
+    true
+}
+
+impl AgentRow {
+    pub(crate) fn display_name(&self) -> &str {
+        if self.name.is_empty() {
+            &self.id
+        } else {
+            &self.name
+        }
+    }
+
+    /// The word a person reads for this agent's state (see docs/agent-api.md).
+    pub(crate) fn state(&self) -> &'static str {
+        state_word(self.enabled, &self.status)
+    }
+}
+
+/// The six user-facing states, plus `unknown` for one nobody has checked.
+/// The wire status stays as it is; this is only how it reads.
+pub(crate) fn state_word(enabled: bool, status: &AgentAvailability) -> &'static str {
+    use AgentAvailability::*;
+    if !enabled {
+        return "off";
+    }
+    match status {
+        Connected | Reachable => "ready",
+        Unconfigured => "needs setup",
+        Offline => "not running",
+        NotInstalled => "not installed",
+        Unsupported => "needs update",
+        Disabled => "off",
+        Unknown => "unknown",
+    }
+}
+
+/// Parse a discovery `agents` array, skipping entries this build cannot read.
+pub(crate) fn rows_from_agents(agents: &serde_json::Value) -> Vec<AgentRow> {
+    agents
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|agent| serde_json::from_value(agent.clone()).ok())
+        .collect()
+}
+
+/// Ask the running gateway for its discovery answer; `None` when no gateway
+/// answers on this machine.
+async fn running_gateway_discovery(config: &Config) -> Option<serde_json::Value> {
+    let config = config.clone();
+    tokio::task::spawn_blocking(move || {
+        // Cold agent probes take a few seconds; `manage` waits as long.
+        match crate::cli::local_api::admin_request_with_timeouts(
+            &config,
+            "GET",
+            "/api/capabilities",
+            None,
+            std::time::Duration::from_millis(250),
+            std::time::Duration::from_secs(8),
+        ) {
+            Ok((200, value)) => Some(value),
+            _ => None,
+        }
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// Probe the agents from this shell, the way the gateway would, with
+/// nothing attached.
+async fn local_probe(config: &Config) -> anyhow::Result<Vec<AgentDiscoveryInfo>> {
     let runtime = if config.agent_runtime.enabled {
         AgentRuntime::with_local_configs(
             config.opencode.clone(),
@@ -192,38 +296,134 @@ async fn list(json: bool) -> anyhow::Result<bool> {
     // The uncached probe: `discover_agents` gives up after a few seconds
     // and would report everything offline while a catalog is still loading.
     let mut agents = runtime.probe_agents().await.agents;
-    // Discovery counts any held T3 bearer as usable; check it, read-only, so
-    // an expired or revoked one says what to do about it.
     let t3 = config
         .t3
         .clone()
         .with_env_fallback(|key| std::env::var(key).ok());
     for agent in agents.iter_mut() {
-        if agent.id == "t3"
-            && agent.status == AgentAvailability::Reachable
-            && t3_bearer_rejected(&t3, &state_dir()?).await
-        {
-            agent.status = AgentAvailability::Unconfigured;
+        match agent.id.as_str() {
+            // Discovery counts any held T3 bearer as usable; check it,
+            // read-only, so an expired or revoked one says what to do.
+            "t3" if agent.status == AgentAvailability::Reachable
+                && t3_bearer_rejected(&t3, &state_dir()?).await =>
+            {
+                agent.status = AgentAvailability::Unconfigured;
+            }
+            // Without a gateway nothing has asked Codex whether it is signed
+            // in: that is not knowing, not "needs setup".
+            "codex" if agent.status == AgentAvailability::Unconfigured => {
+                agent.status = AgentAvailability::Unknown;
+            }
+            _ => {}
         }
     }
+    Ok(agents)
+}
+
+/// Print every agent; `true` when each enabled one is usable.
+async fn list(json: bool, all: bool) -> anyhow::Result<bool> {
+    let config = load_config(None)?;
+    let (raw, source) = match running_gateway_discovery(&config).await {
+        Some(value) => (value["planes"]["agents"]["agents"].clone(), Source::Gateway),
+        None => (
+            serde_json::to_value(local_probe(&config).await?)?,
+            Source::Local {
+                gateway_running: gateway_pid(config.port()).is_some(),
+            },
+        ),
+    };
+    let rows = rows_from_agents(&raw);
     let text = if json {
-        serde_json::to_string_pretty(&agents)?
+        serde_json::to_string_pretty(&raw)?
     } else {
-        let mut rows: Vec<String> = agents.iter().map(|a| format_row(a, &config)).collect();
-        rows.push(format!(
-            "(probed from this shell: `connected` is only known to the running gateway; {})",
-            gateway_state(config.port())
-        ));
-        rows.join("\n")
+        render_list(&rows, source, all, config.agent_runtime.enabled)
     };
     // `agent --json | head` closes the pipe early; that is not an error.
     match writeln!(std::io::stdout(), "{text}") {
         Err(err) if err.kind() != std::io::ErrorKind::BrokenPipe => return Err(err.into()),
         _ => {}
     }
-    Ok(all_ready(
-        agents.iter().map(|agent| (agent.enabled, &agent.status)),
-    ))
+    Ok(all_ready(rows.iter().map(|row| (row.enabled, &row.status))))
+}
+
+/// The table: agents in use first, the not installed ones folded into one
+/// line unless `all`, and where the states came from.
+fn render_list(rows: &[AgentRow], source: Source, all: bool, runtime_enabled: bool) -> String {
+    let (shown, folded): (Vec<&AgentRow>, Vec<&AgentRow>) = rows
+        .iter()
+        .partition(|row| all || row.state() != "not installed");
+    let next = |row: &AgentRow| {
+        let step = if runtime_enabled {
+            next_step(&row.id, &row.status).unwrap_or_default()
+        } else {
+            "set `agent_runtime.enabled` to true in config.json"
+        };
+        match (row.id.as_str(), row.reason.as_deref()) {
+            // Several prerequisites; say which one is missing.
+            ("claude", Some(reason)) if !step.is_empty() => format!("{reason}; {step}"),
+            _ => step.to_string(),
+        }
+    };
+    let nexts: Vec<String> = shown.iter().map(|row| next(row)).collect();
+    let table: Vec<[&str; 4]> = std::iter::once(["AGENT", "STATE", "VERSION", "NEXT"])
+        .chain(shown.iter().zip(&nexts).map(|(row, next)| {
+            [
+                row.display_name(),
+                row.state(),
+                row.version.as_deref().unwrap_or("-"),
+                next.as_str(),
+            ]
+        }))
+        .collect();
+    let mut lines = format_table(&table);
+    if !folded.is_empty() {
+        let names: Vec<&str> = folded.iter().map(|row| row.display_name()).collect();
+        lines.push(format!(
+            "Not installed: {}  (--all for details)",
+            names.join(", ")
+        ));
+    }
+    lines.push(
+        match source {
+            Source::Gateway => "(from the running gateway)",
+            Source::Local {
+                gateway_running: false,
+            } => "(gateway not running: probed locally, sign-in not checked)",
+            Source::Local {
+                gateway_running: true,
+            } => "(the gateway did not answer: probed locally, sign-in not checked)",
+        }
+        .to_string(),
+    );
+    lines.join("\n")
+}
+
+/// Left-aligned columns as wide as their widest cell; the last column is
+/// not padded.
+pub(crate) fn format_table<const N: usize>(rows: &[[&str; N]]) -> Vec<String> {
+    let mut widths = [0usize; N];
+    for row in rows {
+        for (width, cell) in widths.iter_mut().zip(row) {
+            *width = (*width).max(cell.chars().count());
+        }
+    }
+    rows.iter()
+        .map(|row| {
+            let mut line = String::new();
+            for (index, cell) in row.iter().enumerate() {
+                if index + 1 == N {
+                    line.push_str(cell);
+                } else {
+                    line.push_str(cell);
+                    line.extend(std::iter::repeat_n(
+                        ' ',
+                        widths[index] - cell.chars().count() + 2,
+                    ));
+                }
+            }
+            line.trim_end().to_string()
+        })
+        .collect()
 }
 
 /// Whether the T3 server answers but refuses the bearer the gateway would
@@ -253,52 +453,13 @@ pub(crate) async fn t3_bearer_rejected(t3: &T3Config, state_dir: &Path) -> bool 
     }
 }
 
-/// Whether a gateway process is up, as `muqun-gateway status` tells it.
-fn gateway_state(port: u16) -> String {
-    let pid = read_pid()
+/// The running gateway's pid, as `muqun-gateway status` finds it.
+fn gateway_pid(port: u16) -> Option<u32> {
+    read_pid()
         .ok()
         .flatten()
         .filter(|pid| process_running(*pid))
-        .or_else(|| gateway_listener_pids(port).ok()?.first().copied());
-    match pid {
-        Some(pid) => format!("gateway running, pid {pid}"),
-        None => "gateway not running".to_string(),
-    }
-}
-
-fn format_row(agent: &AgentDiscoveryInfo, config: &Config) -> String {
-    let location = agent.endpoint.clone().or_else(|| {
-        (agent.id == "opencode")
-            .then(|| resolve_binary(config.opencode.binary.as_deref()).ok())
-            .flatten()
-            .map(|path| path.display().to_string())
-    });
-    let next = if config.agent_runtime.enabled {
-        next_step(&agent.id, &agent.status)
-    } else {
-        Some("set `agent_runtime.enabled` to true in config.json")
-    }
-    .map(|step| match (agent.id.as_str(), agent.reason.as_deref()) {
-        // Several prerequisites; say which one is missing.
-        ("claude", Some(reason)) => format!("  → {reason}; {step}"),
-        _ => format!("  → {step}"),
-    })
-    .unwrap_or_default();
-    format!(
-        "{:<9} {:<13} {:<9} {}{next}",
-        agent.id,
-        status_name(&agent.status),
-        agent.version.as_deref().unwrap_or("-"),
-        location.as_deref().unwrap_or("-"),
-    )
-}
-
-/// The wire name of a status, as discovery spells it.
-fn status_name(status: &AgentAvailability) -> String {
-    serde_json::to_value(status)
-        .ok()
-        .and_then(|value| value.as_str().map(str::to_owned))
-        .unwrap_or_default()
+        .or_else(|| gateway_listener_pids(port).ok()?.first().copied())
 }
 
 /// What to run so that agent `id` in `status` becomes usable; `None` when it
@@ -362,7 +523,8 @@ pub(crate) fn next_step(id: &str, status: &AgentAvailability) -> Option<&'static
     })
 }
 
-/// Whether every enabled agent is connected or reachable.
+/// Whether every enabled agent is connected or reachable. `unknown` (not
+/// checked from a shell) is not counted as a failure.
 pub(crate) fn all_ready<'a>(
     agents: impl IntoIterator<Item = (bool, &'a AgentAvailability)>,
 ) -> bool {
@@ -372,7 +534,9 @@ pub(crate) fn all_ready<'a>(
         .all(|(_, status)| {
             matches!(
                 status,
-                AgentAvailability::Connected | AgentAvailability::Reachable
+                AgentAvailability::Connected
+                    | AgentAvailability::Reachable
+                    | AgentAvailability::Unknown
             )
         })
 }
@@ -881,14 +1045,47 @@ mod tests {
         ]));
         assert!(!all_ready([(true, &Reachable), (true, &Unconfigured)]));
         assert!(!all_ready([(true, &Offline)]));
+        assert!(all_ready([(true, &Unknown)]), "unchecked is not a failure");
     }
 
     #[test]
-    fn status_names_match_the_wire() {
+    fn the_list_reads_the_gateways_states_and_folds_what_is_not_installed() {
+        let agents = serde_json::json!([
+            {"id": "t3", "name": "T3 Code", "status": "connected", "enabled": true, "version": "0.1.3"},
+            {"id": "codex", "name": "Codex", "status": "unknown", "enabled": true},
+            {"id": "antigravity", "name": "Antigravity", "status": "unconfigured", "enabled": true},
+            {"id": "deepseek", "name": "DeepSeek", "status": "disabled", "enabled": false},
+            {"id": "cursor", "name": "Cursor", "status": "not_installed", "enabled": true},
+            {"id": "claude", "name": "Claude Code", "status": "not_installed", "enabled": true, "reason": "Node.js 22 or newer not found"},
+            {"id": "future", "status": "a_state_from_a_newer_gateway", "enabled": true}
+        ]);
+        let rows = rows_from_agents(&agents);
+        assert_eq!(rows.len(), 6, "an unparseable entry is skipped, not fatal");
+        let text = render_list(&rows, Source::Gateway, false, true);
+        let lines: Vec<&str> = text.lines().collect();
         assert_eq!(
-            status_name(&AgentAvailability::NotInstalled),
-            "not_installed"
+            lines,
+            [
+                "AGENT        STATE        VERSION  NEXT",
+                "T3 Code      ready        0.1.3",
+                "Codex        unknown      -",
+                "Antigravity  needs setup  -        check antigravity.binary in config.json",
+                "DeepSeek     off          -        muqun-gateway agent setup deepseek",
+                "Not installed: Cursor, Claude Code  (--all for details)",
+                "(from the running gateway)",
+            ]
         );
+        let all = render_list(
+            &rows,
+            Source::Local {
+                gateway_running: false,
+            },
+            true,
+            true,
+        );
+        assert!(all.contains("Cursor       not installed"));
+        assert!(all.contains("Node.js 22 or newer not found; install Claude Code"));
+        assert!(all.ends_with("(gateway not running: probed locally, sign-in not checked)"));
     }
 
     #[test]
@@ -1450,21 +1647,27 @@ mod tests {
             parse(&["muqun-gateway", "agent", "--json"]),
             crate::Command::Agent {
                 command: None,
-                json: true
+                json: true,
+                all: false
             }
         ));
         assert!(matches!(
             parse(&["muqun-gateway", "agent", "list", "--json"]),
             crate::Command::Agent {
-                command: Some(AgentCommand::List { json: true }),
-                json: false
+                command: Some(AgentCommand::List {
+                    json: true,
+                    all: false
+                }),
+                json: false,
+                all: false
             }
         ));
         assert!(matches!(
             parse(&["muqun-gateway", "agent"]),
             crate::Command::Agent {
                 command: None,
-                json: false
+                json: false,
+                all: false
             }
         ));
         assert!(matches!(

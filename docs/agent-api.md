@@ -221,20 +221,35 @@ catalogs. Terminal liveness, compatibility and transport facts remain live.
   descriptor protocols or a Codex version outside its pinned baseline).
   `connected` and `reachable` can
   be selected: `reachable` means the gateway will attach on first use. The
-  rest cannot. `muqun-gateway agent` probes the same list from a shell on the
-  gateway host and prints the next step for each. It never attaches, so it
-  reports reachability only: never `connected`, and `reachable` where the
-  running gateway may say `connected`. Codex's shell probe checks the executable
-  only and reports readiness as unknown (`unconfigured`); the running Gateway
-  checks authentication through its private app-server. It also checks a held T3 bearer and
-  reports `unconfigured` when the server refuses it.
+  rest cannot. `muqun-gateway agent` reads this list from the running
+  gateway's `/api/capabilities` (over loopback with the admin token, which
+  sees versions and endpoints like the owner's App; a linked gateway does
+  not) and prints the next step for each. Only when no gateway answers does
+  it probe the same list from the shell; that probe never attaches or signs
+  in, so it shows `reachable` where the gateway may say `connected`, and
+  Codex, whose sign-in only the gateway checks, as `unknown` rather than
+  `unconfigured`. The local probe still checks a held T3 bearer and reports
+  `unconfigured` when the server refuses it.
+
+  People read six words, the same in the App, `agent` and `manage`; the wire
+  `status` is unchanged and `agent --json` still prints it:
+
+  | Word | wire `status` |
+  |---|---|
+  | ready | `connected`, `reachable` |
+  | needs setup | `unconfigured` |
+  | not running | `offline` |
+  | not installed | `not_installed` |
+  | needs update | `unsupported` |
+  | off | `disabled`, or `enabled: false` |
+  | unknown (not a state, nothing checked it) | `unknown` |
 
   | `status` | Next step `muqun-gateway agent` prints |
   |---|---|
   | `reachable` | none |
-  | `connected` | not shown by the CLI (only the running gateway knows) |
+  | `connected` | none |
   | `unconfigured` (t3: no bearer, or a refused one) | `muqun-gateway agent setup t3` |
-  | `unconfigured` (codex: readiness unchecked or authentication missing) | configure the existing Codex CLI login on the host; `muqun-gateway agent setup codex` explains setup without starting it |
+  | `unconfigured` (codex: authentication missing) | configure the existing Codex CLI login on the host; `muqun-gateway agent setup codex` explains setup without starting it |
   | `disabled` | `muqun-gateway agent setup t3` / `muqun-gateway agent setup deepseek`; for OpenCode or Codex, set the corresponding `enabled` key; check `agent_runtime.enabled` for the master switch |
   | `offline` | the agent's own start command: `opencode service start`, or "open T3 Code, or run `t3 service install`" |
   | `offline` (deepseek) | Gateway starts or joins DeepSeek Harness; run `muqun-gateway agent setup deepseek` for the manual command (`dsh`, otherwise `bunx`, otherwise `npx --yes`, still `web --no-open`, host and port from `deepseek.endpoint` or `http://127.0.0.1:3080`) |

@@ -179,7 +179,7 @@ impl QoderState {
                     AgentAvailability::Offline
                 };
                 info.reason = Some(
-                    "ACP capabilities and authentication are checked when opening an Qoder CLI session"
+                    "ACP capabilities and authentication are checked when opening a Qoder CLI session"
                         .into(),
                 );
             }

@@ -112,13 +112,16 @@ pub(crate) enum Command {
         #[arg(long)]
         all: bool,
     },
-    /// Agent status and the next step for each (OpenCode, DeepSeek, T3 Code).
+    /// Agent status and the next step for each.
     Agent {
         #[command(subcommand)]
         command: Option<AgentCommand>,
         /// Print the discovery agents array as JSON.
         #[arg(long)]
         json: bool,
+        /// List the agents that are not installed too.
+        #[arg(long)]
+        all: bool,
     },
     /// The gateway as an MCP server for agents on this machine.
     Mcp {
@@ -306,7 +309,9 @@ pub(crate) async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         }
         Command::Devices => list_devices()?,
         Command::Revoke { device_id, all } => revoke_device(device_id, all)?,
-        Command::Agent { command, json } => agent::run_agent_command(command, json).await?,
+        Command::Agent { command, json, all } => {
+            agent::run_agent_command(command, json, all).await?
+        }
         Command::Mcp { command } => mcp::run_mcp_command(command).await?,
         Command::Peers { command } => peers::run(command).await?,
     }

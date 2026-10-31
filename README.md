@@ -344,7 +344,7 @@ that points to another installation.
 ### Agents at a glance
 
 ```sh
-muqun-gateway agent                  # each agent's status and the next step (--json for the raw list)
+muqun-gateway agent                  # each agent's state and the next step (--json for the raw list, --all for not installed)
 muqun-gateway agent setup t3         # store a T3 Code credential and enable T3
 muqun-gateway agent setup deepseek   # enable DeepSeek; Gateway starts or joins the harness
 muqun-gateway agent setup fx         # explain local FX ACP configuration (no process starts)
@@ -353,14 +353,15 @@ muqun-gateway agent setup claude     # explain Claude Code native sessions (no p
 muqun-gateway agent setup antigravity # explain local Antigravity ACP configuration (no process starts)
 ```
 
-`agent` probes the agents from your shell the way the running gateway does,
-prints one line per agent (`id  status  version  endpoint  → next step`) and
-whether the gateway is running, and exits non-zero while an enabled agent is not
-usable. It reports reachability only: it never attaches, so it shows `reachable`
-where the gateway may be `connected`. For Codex, the shell probe only checks the
-executable; authentication/readiness remains unknown until Gateway supervision.
+`agent` asks the running gateway for its agent list and prints one row per
+agent (`AGENT  STATE  VERSION  NEXT`, state one of ready, needs setup, not
+running, not installed, needs update, off), with the agents that are not
+installed folded into one line (`--all` lists them), and exits non-zero while
+an enabled agent is not usable. When no gateway is running it probes the agents
+from your shell instead and says so: that probe never attaches or signs in, so
+Codex shows `unknown` until the gateway checks it.
 A T3 bearer the server refuses (expired or
-revoked) shows as `unconfigured`. `setup t3` checks that a T3 server answers
+revoked) shows as needs setup (`unconfigured`). `setup t3` checks that a T3 server answers
 (`--url`, else `t3.url`, else `http://127.0.0.1:3773`), mints a bearer with
 `t3 auth session issue` when `t3` is on `PATH` (`--base-dir` is passed through) or
 exchanges a `--token <code>` from `t3 pair` (`--token` wins over the local `t3`,

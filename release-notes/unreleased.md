@@ -2,6 +2,17 @@
 
 ## Changes and fixes
 
+- **`muqun-gateway agent` agrees with the App.** It now reads the running
+  Gateway's agent list instead of probing again from the shell, so a connected
+  T3 Code shows ready instead of `unconfigured`, and Codex no longer reads
+  `unconfigured` merely because a shell cannot check its sign-in (it shows
+  `unknown` when the Gateway is stopped and the probe is local). States read as
+  ready / needs setup / not running / not installed / needs update / off, columns
+  fit the longest agent name, agents that are not installed fold into one line
+  (`--all` lists them), and the "environment repaired" note only prints for
+  `run` and `status`. `agent --json` keeps the wire statuses. Versions show once
+  the running Gateway is this version too.
+
 - **Antigravity is a native agent.** When Google Antigravity's `agy` is on PATH
   and signed in (run `agy` once in a terminal), its conversations appear in the
   App: open, continue, interrupt, approve tool use, pick the thinking level, and
