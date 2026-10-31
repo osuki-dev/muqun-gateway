@@ -30,6 +30,9 @@ pub trait AcpProvider: Send + Sync + 'static {
     const MODEL_SELECTION: bool;
     const SESSION_NOTICES: bool = false;
     const IDLE_RETIREMENT: bool = false;
+    /// How long `initialize` may take; a runner that downloads the agent on
+    /// first use needs longer than a normal request.
+    const INITIALIZE_TIMEOUT: Duration = RPC_TIMEOUT;
     fn recovery_snapshot<'a>(
         _binary: &'a str,
         _directory: &'a str,
@@ -72,6 +75,22 @@ pub trait AcpProvider: Send + Sync + 'static {
     fn safe_error_message(_: &Value) -> Option<&'static str> {
         None
     }
+    /// Rows for `session/list` read from the native store without starting
+    /// the agent, or `None` to ask the agent itself.
+    fn offline_sessions<'a>(
+        _directory: Option<&'a str>,
+        _stop: &'a CancellationToken,
+    ) -> Option<AgentFuture<'a, Vec<Value>>> {
+        None
+    }
+}
+
+/// How the driver starts its ACP child when it is not `binary` with
+/// [`AcpProvider::ARGS`]: a runner's arguments and the child's environment.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AcpLaunch {
+    pub args: Vec<String>,
+    pub env: Vec<(String, String)>,
 }
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
@@ -295,6 +314,8 @@ pub struct AcpDriver<P: AcpProvider> {
     metadata_revision: AtomicU64,
     native_capabilities: StdMutex<Value>,
     commands_observed: Arc<AtomicBool>,
+    launch: StdMutex<Option<AcpLaunch>>,
+    mcp_servers: StdMutex<Value>,
     stop: CancellationToken,
 }
 
@@ -394,6 +415,8 @@ impl<P: AcpProvider> AcpDriver<P> {
             metadata_revision: AtomicU64::new(0),
             native_capabilities: StdMutex::new(Value::Null),
             commands_observed: Arc::new(AtomicBool::new(false)),
+            launch: StdMutex::new(None),
+            mcp_servers: StdMutex::new(json!([])),
             stop: CancellationToken::new(),
         })
     }
@@ -402,6 +425,23 @@ impl<P: AcpProvider> AcpDriver<P> {
     #[cfg(test)]
     pub(crate) fn set_session_store(&self, probe: fn() -> Option<u64>) {
         *self.session_store.lock().unwrap() = probe;
+    }
+
+    /// Replace `ARGS` and add child environment for every later spawn.
+    pub fn set_launch(&self, launch: AcpLaunch) {
+        *self.launch.lock().unwrap() = Some(launch);
+    }
+
+    /// ACP `mcpServers` entries given to every `session/new`, `session/load`
+    /// and `session/fork`. Never written to the agent's own configuration.
+    pub fn set_mcp_servers(&self, servers: Value) {
+        if servers.is_array() {
+            *self.mcp_servers.lock().unwrap() = servers;
+        }
+    }
+
+    fn mcp_servers(&self) -> Value {
+        self.mcp_servers.lock().unwrap().clone()
     }
 
     pub fn set_idle_timeout(&self, timeout: Duration) {
@@ -697,9 +737,16 @@ impl<P: AcpProvider> AcpDriver<P> {
                 ));
             }
         }
-        let client = AcpClient::spawn_with_error_mapper(
+        let launch = self.launch.lock().unwrap().clone().unwrap_or_default();
+        let args: Vec<&str> = if launch.args.is_empty() {
+            P::ARGS.to_vec()
+        } else {
+            launch.args.iter().map(String::as_str).collect()
+        };
+        let client = AcpClient::spawn_with_env(
             &self.binary,
-            P::ARGS,
+            &args,
+            &launch.env,
             directory,
             P::LABEL,
             P::safe_error_message,
@@ -727,7 +774,7 @@ impl<P: AcpProvider> AcpDriver<P> {
                 "clientInfo": { "name": "muqun-gateway", "version": env!("CARGO_PKG_VERSION") },
                 "clientCapabilities": client_capabilities
             }),
-            RPC_TIMEOUT,
+            P::INITIALIZE_TIMEOUT,
         );
         let result = tokio::select! {
             _ = self.stop.cancelled() => Err("ACP runtime stopped".into()),
@@ -877,6 +924,11 @@ impl<P: AcpProvider> AcpDriver<P> {
         directory: Option<&str>,
     ) -> Result<Vec<AgentSessionInfo>, AgentError> {
         let revision = self.metadata_revision.load(Ordering::Acquire);
+        if let Some(rows) = P::offline_sessions(directory, &self.stop) {
+            let sessions = self.project_listed_sessions(rows.await?).await?;
+            self.remember_session_metadata(revision, &sessions).await;
+            return Ok(sessions);
+        }
         let (client, _events, capabilities) = self.initialized(&self.default_directory).await?;
         if !capabilities
             .pointer("/sessionCapabilities/list")
@@ -956,18 +1008,22 @@ impl<P: AcpProvider> AcpDriver<P> {
         .await;
         client.shutdown().await;
         if let Ok(sessions) = &result {
-            let mut metadata = self.session_metadata.lock().await;
-            if self.metadata_revision.load(Ordering::Acquire) == revision {
-                *metadata = Some(SessionMetadata {
-                    listed_at: tokio::time::Instant::now(),
-                    sessions: sessions
-                        .iter()
-                        .map(|info| (info.asid.0.clone(), info.clone()))
-                        .collect(),
-                });
-            }
+            self.remember_session_metadata(revision, sessions).await;
         }
         result
+    }
+
+    async fn remember_session_metadata(&self, revision: u64, sessions: &[AgentSessionInfo]) {
+        let mut metadata = self.session_metadata.lock().await;
+        if self.metadata_revision.load(Ordering::Acquire) == revision {
+            *metadata = Some(SessionMetadata {
+                listed_at: tokio::time::Instant::now(),
+                sessions: sessions
+                    .iter()
+                    .map(|info| (info.asid.0.clone(), info.clone()))
+                    .collect(),
+            });
+        }
     }
 
     async fn project_listed_sessions(
@@ -1288,7 +1344,7 @@ impl<P: AcpProvider> AcpDriver<P> {
         } else {
             "session/new"
         };
-        let mut params = json!({ "cwd": directory, "mcpServers": [] });
+        let mut params = json!({ "cwd": directory, "mcpServers": self.mcp_servers() });
         if let Some(id) = &id {
             params["sessionId"] = json!(id);
         }
@@ -2611,7 +2667,8 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
                 .directory
                 .as_deref()
                 .ok_or_else(|| protocol("source session has no directory"))?;
-            let params = operations::fork_params(id, directory, message_id)?;
+            let mut params = operations::fork_params(id, directory, message_id)?;
+            params["mcpServers"] = self.mcp_servers();
             let (client, _events, capabilities) = self.initialized(directory).await?;
             if !operations::supports_operation(&capabilities, "fork") {
                 client.shutdown().await;

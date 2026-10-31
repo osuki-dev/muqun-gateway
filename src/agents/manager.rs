@@ -144,7 +144,10 @@ impl Drop for AgentManager {
     fn drop(&mut self) {
         // Private protocol pumps own transports strongly, so releasing their
         // external manager must cancel them. Adopted services stay untouched.
-        if matches!(self.agent.kind(), "codex" | "fx" | "qoder" | "pi") {
+        if matches!(
+            self.agent.kind(),
+            "codex" | "fx" | "qoder" | "pi" | "claude"
+        ) {
             (self.shutdown_handle)();
         }
     }
@@ -483,6 +486,34 @@ impl AgentManager {
             mirror,
             events_tx,
             "stdio://fx-acp".into(),
+            version,
+            Arc::new(move || connected.has_live_stream()),
+            Arc::new(move || shutdown.stop()),
+        );
+        (manager, driver)
+    }
+
+    /// Assemble the lazy ACP adapter; each Claude Code session owns its own child.
+    pub fn connect_claude(
+        binary: String,
+        directory: String,
+        version: Option<String>,
+        events_tx: broadcast::Sender<AgentDomainEvent>,
+    ) -> (Self, Arc<crate::agents::adapters::claude::ClaudeDriver>) {
+        let mirror = Arc::new(MemoryMirror::for_agent("claude"));
+        let driver = crate::agents::adapters::claude::ClaudeDriver::new(
+            binary,
+            directory,
+            mirror.clone(),
+            events_tx.clone(),
+        );
+        let connected = driver.clone();
+        let shutdown = driver.clone();
+        let manager = Self::assemble(
+            driver.clone(),
+            mirror,
+            events_tx,
+            "stdio://claude-acp".into(),
             version,
             Arc::new(move || connected.has_live_stream()),
             Arc::new(move || shutdown.stop()),

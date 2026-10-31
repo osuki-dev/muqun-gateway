@@ -546,7 +546,7 @@ mod tests {
                     .iter()
                     .map(|a| a.id.as_str())
                     .collect::<Vec<_>>(),
-                ["codex", "opencode", "deepseek", "t3", "fx", "qoder", "pi"]
+                ["codex", "opencode", "deepseek", "t3", "fx", "qoder", "pi", "claude"]
             );
             for agent in &plane.agents {
                 assert_eq!(serde_json::to_value(agent).unwrap(), metadata[&agent.id]);
@@ -588,7 +588,7 @@ mod tests {
                     .iter()
                     .map(|a| a.id.as_str())
                     .collect::<Vec<_>>(),
-                ["opencode", "deepseek", "t3", "fx", "qoder", "pi", "codex"]
+                ["opencode", "deepseek", "t3", "fx", "qoder", "pi", "claude", "codex"]
             );
         }
     }
@@ -620,7 +620,7 @@ mod tests {
                 .iter()
                 .map(|a| a.id.as_str())
                 .collect::<Vec<_>>(),
-            ["opencode", "deepseek", "t3", "fx", "qoder", "pi"]
+            ["opencode", "deepseek", "t3", "fx", "qoder", "pi", "claude"]
         );
     }
 

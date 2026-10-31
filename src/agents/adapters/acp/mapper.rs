@@ -64,7 +64,7 @@ pub(crate) fn selected_model(value: &Value) -> Option<ModelRef> {
 }
 
 pub(crate) fn effort_key(provider: &str) -> &'static str {
-    if provider == "fx" {
+    if matches!(provider, "fx" | "claude") {
         "effort"
     } else {
         "reasoning_effort"
