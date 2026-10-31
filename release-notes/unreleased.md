@@ -2,6 +2,16 @@
 
 ## Changes and fixes
 
+- **Qoder no longer launches a metadata process every minute.** While the App
+  was open, Home refreshes started a `qodercli --acp` child about once a minute
+  to list saved sessions and discovery ran `qodercli --list-models` about every
+  two minutes; each launch left a log session in Qoder's own data directory.
+  Session listings are now reused while Qoder's saved-session store is
+  unchanged (re-listed at least every 10 minutes), and a successful model list
+  is reused for 10 minutes. New or changed Qoder sessions still appear on the
+  next Home refresh, and a failed model list is retried after 5 seconds.
+  Restart the Gateway after updating.
+
 - **FX, Qoder and Pi conversations reopen right after a Gateway restart.** The
   Gateway starts answering before its agents finish attaching, and an App that
   was open reconnects within that moment. Its one foreground session

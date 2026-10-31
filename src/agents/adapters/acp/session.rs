@@ -53,6 +53,15 @@ pub trait AcpProvider: Send + Sync + 'static {
     ) -> AgentFuture<'a, AgentCatalog> {
         unsupported("global ACP model catalog")
     }
+    /// How long a successful global catalog is reused. Discovery asks on
+    /// every refresh, and each lookup launches a native process.
+    const CATALOG_TTL: Duration = Duration::from_secs(60);
+    /// Cheap token that changes whenever the native saved-session store does.
+    /// While it holds, a listing stays valid for `SESSION_STORE_MAX_AGE`, so
+    /// periodic Home refreshes do not launch a process to learn nothing new.
+    fn session_store_fingerprint() -> Option<u64> {
+        None
+    }
     fn account_limits<'a>(
         _binary: &'a str,
         _directory: &'a str,
@@ -75,13 +84,25 @@ const MAX_CONNECTIONS: usize = 16;
 const MAX_LIST_PAGES: usize = 64;
 const SESSION_METADATA_TTL: Duration = Duration::from_secs(30);
 const SESSION_LIST_TTL: Duration = SESSION_METADATA_TTL;
+const SESSION_STORE_MAX_AGE: Duration = Duration::from_secs(600);
 const MAX_LIST_SCOPES: usize = 4;
 const MAX_CACHED_LIST_ROWS: usize = 4096;
 
 struct CachedSessionList {
     directory: Option<String>,
     listed_at: tokio::time::Instant,
+    fingerprint: Option<u64>,
     sessions: Vec<AgentSessionInfo>,
+}
+
+impl CachedSessionList {
+    fn fresh(&self, fingerprint: Option<u64>) -> bool {
+        let age = self.listed_at.elapsed();
+        age < SESSION_LIST_TTL
+            || (fingerprint.is_some()
+                && self.fingerprint == fingerprint
+                && age < SESSION_STORE_MAX_AGE)
+    }
 }
 
 struct SessionMetadata {
@@ -269,6 +290,7 @@ pub struct AcpDriver<P: AcpProvider> {
     session_metadata: Mutex<Option<SessionMetadata>>,
     metadata_refresh: Mutex<()>,
     session_lists: Mutex<Vec<CachedSessionList>>,
+    session_store: StdMutex<fn() -> Option<u64>>,
     list_refreshes: StdMutex<HashMap<Option<String>, Weak<Mutex<()>>>>,
     metadata_revision: AtomicU64,
     native_capabilities: StdMutex<Value>,
@@ -367,12 +389,19 @@ impl<P: AcpProvider> AcpDriver<P> {
             session_metadata: Mutex::new(None),
             metadata_refresh: Mutex::new(()),
             session_lists: Mutex::new(Vec::new()),
+            session_store: StdMutex::new(P::session_store_fingerprint),
             list_refreshes: StdMutex::new(HashMap::new()),
             metadata_revision: AtomicU64::new(0),
             native_capabilities: StdMutex::new(Value::Null),
             commands_observed: Arc::new(AtomicBool::new(false)),
             stop: CancellationToken::new(),
         })
+    }
+
+    /// Tests point the store probe away from the real native store.
+    #[cfg(test)]
+    pub(crate) fn set_session_store(&self, probe: fn() -> Option<u64>) {
+        *self.session_store.lock().unwrap() = probe;
     }
 
     pub fn set_idle_timeout(&self, timeout: Duration) {
@@ -491,8 +520,12 @@ impl<P: AcpProvider> AcpDriver<P> {
         let directory = directory.unwrap_or(&self.default_directory);
         let mut cached = self.global_catalog.lock().await;
         if let Some((scope, at, result)) = &*cached {
-            let ttl = if result.is_ok() { 60 } else { 5 };
-            if scope == directory && at.elapsed() < Duration::from_secs(ttl) {
+            let ttl = if result.is_ok() {
+                P::CATALOG_TTL
+            } else {
+                Duration::from_secs(5)
+            };
+            if scope == directory && at.elapsed() < ttl {
                 return Self::merge_global_catalog(result.clone(), observed);
             }
         }
@@ -751,7 +784,10 @@ impl<P: AcpProvider> AcpDriver<P> {
         if self.stop.is_cancelled() {
             return Err(AgentError::NotAvailable("ACP runtime stopped".into()));
         }
-        if let Some(sessions) = self.cached_session_list(directory).await {
+        // Taken before listing: a store change during the read invalidates it.
+        let probe = *self.session_store.lock().unwrap();
+        let fingerprint = tokio::task::spawn_blocking(probe).await.ok().flatten();
+        if let Some(sessions) = self.cached_session_list(directory, fingerprint).await {
             return Ok(sessions);
         }
         // Equal scopes share one native startup; unrelated directories do not
@@ -777,17 +813,14 @@ impl<P: AcpProvider> AcpDriver<P> {
             _ = self.stop.cancelled() => return Err(AgentError::NotAvailable("ACP runtime stopped".into())),
             guard = gate.lock() => guard,
         };
-        if let Some(sessions) = self.cached_session_list(directory).await {
+        if let Some(sessions) = self.cached_session_list(directory, fingerprint).await {
             return Ok(sessions);
         }
         let revision = self.metadata_revision.load(Ordering::Acquire);
         let sessions = self.read_native_sessions(directory).await?;
         let mut lists = self.session_lists.lock().await;
         if self.metadata_revision.load(Ordering::Acquire) == revision {
-            lists.retain(|list| {
-                list.listed_at.elapsed() < SESSION_LIST_TTL
-                    && list.directory.as_deref() != directory
-            });
+            lists.retain(|list| list.fresh(fingerprint) && list.directory.as_deref() != directory);
             while !lists.is_empty()
                 && (lists.len() >= MAX_LIST_SCOPES
                     || lists.iter().map(|list| list.sessions.len()).sum::<usize>() + sessions.len()
@@ -799,6 +832,7 @@ impl<P: AcpProvider> AcpDriver<P> {
                 lists.push(CachedSessionList {
                     directory: directory.map(str::to_owned),
                     listed_at: tokio::time::Instant::now(),
+                    fingerprint,
                     sessions: sessions.clone(),
                 });
             }
@@ -806,10 +840,14 @@ impl<P: AcpProvider> AcpDriver<P> {
         Ok(sessions)
     }
 
-    async fn cached_session_list(&self, directory: Option<&str>) -> Option<Vec<AgentSessionInfo>> {
+    async fn cached_session_list(
+        &self,
+        directory: Option<&str>,
+        fingerprint: Option<u64>,
+    ) -> Option<Vec<AgentSessionInfo>> {
         let mut sessions = {
             let mut lists = self.session_lists.lock().await;
-            lists.retain(|list| list.listed_at.elapsed() < SESSION_LIST_TTL);
+            lists.retain(|list| list.fresh(fingerprint));
             lists
                 .iter()
                 .find(|list| list.directory.as_deref() == directory)?
@@ -2966,6 +3004,37 @@ mod admission_tests {
     }
 
     #[tokio::test]
+    async fn unchanged_native_store_keeps_listing_without_a_new_process() {
+        static STORE: AtomicU64 = AtomicU64::new(1);
+        let fixture = Fixture::new().await;
+        let driver = fixture.qoder_driver();
+        driver.set_session_store(|| Some(STORE.load(Ordering::SeqCst)));
+        let lists = || {
+            fixture
+                .methods()
+                .iter()
+                .filter(|m| *m == "session/list")
+                .count()
+        };
+        driver.native_sessions(None).await.unwrap();
+        // (list age, store changed, native list launched)
+        for (by, changed, relisted) in [
+            (SESSION_LIST_TTL, false, false),
+            (SESSION_LIST_TTL, true, true),
+            (SESSION_STORE_MAX_AGE, false, true),
+        ] {
+            let before = lists();
+            driver.session_lists.lock().await[0].listed_at = tokio::time::Instant::now() - by;
+            if changed {
+                STORE.fetch_add(1, Ordering::SeqCst);
+            }
+            driver.native_sessions(None).await.unwrap();
+            assert_eq!(lists() - before, usize::from(relisted), "{by:?} {changed}");
+        }
+        driver.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn list_expiry_observes_external_sessions_and_failures_are_not_cached() {
         let fixture = Fixture::new().await;
         let driver = fixture.qoder_driver();
@@ -3148,6 +3217,7 @@ mod admission_tests {
         driver.session_lists.lock().await.push(CachedSessionList {
             directory: Some("/older".into()),
             listed_at: tokio::time::Instant::now(),
+            fingerprint: None,
             sessions: (0..MAX_CACHED_LIST_ROWS)
                 .map(|n| {
                     let mut info = created.clone();

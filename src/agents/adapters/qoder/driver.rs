@@ -25,6 +25,12 @@ impl AcpProvider for QoderProvider {
     > {
         Box::pin(super::recovery::inspect(id, stop))
     }
+    // Every `qodercli` launch leaves a native log session behind, so the
+    // model list is reused longer; failures still retry within seconds.
+    const CATALOG_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+    fn session_store_fingerprint() -> Option<u64> {
+        super::native_sessions::store_fingerprint()
+    }
     const PROVIDER_CONFIG: bool = false;
     const EFFORT_CONFIG: &'static str = "reasoning_effort";
     fn global_catalog<'a>(
