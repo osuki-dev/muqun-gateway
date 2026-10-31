@@ -196,6 +196,8 @@ fn startup_ready(
 }
 
 pub struct HerdrBackend {
+    // Only the Unix socket transport reads this; elsewhere every call is refused.
+    #[cfg_attr(not(unix), allow(dead_code))]
     socket_path: PathBuf,
     /// Overridable so a test can prove the timeout fires without waiting out
     /// the real one.
@@ -1549,6 +1551,7 @@ fn worktree_error(error: BackendError) -> BackendError {
     }
 }
 
+#[cfg_attr(not(unix), allow(dead_code))]
 fn activity_subscriptions(panes: &[Pane]) -> Vec<Value> {
     let mut subscriptions = vec![
         json!({ "type": "workspace.created" }),

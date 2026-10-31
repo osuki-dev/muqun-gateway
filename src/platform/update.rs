@@ -1,5 +1,8 @@
 //! Explicit self-update, stable by default. HTTPS + SHA256 provide transport/integrity,
 //! not publisher signing. No alternate production origin or network retries.
+// Stop/replace/restart and self-update are Unix-only until Windows gets its
+// own supervisor (docs/windows.md, phase 2); off Unix their helpers are unused.
+#![cfg_attr(not(unix), allow(dead_code, unused_variables))]
 #[cfg(unix)]
 use std::fs::OpenOptions;
 use std::fs::{self, File};

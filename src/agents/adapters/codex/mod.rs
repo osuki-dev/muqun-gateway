@@ -50,5 +50,5 @@ pub(crate) const MAX_REASONING_PARTS: usize = 512;
 #[cfg(test)]
 pub(crate) mod tests;
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) use driver::presentation_tests::title_fixture;

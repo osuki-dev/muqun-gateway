@@ -2571,7 +2571,6 @@ mod tests {
         std::fs::remove_dir_all(repo.parent().unwrap()).ok();
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn a_file_patch_is_unified_paged_and_untracked_files_are_all_additions() {
         let repo = temp_repo("patch");
@@ -2650,6 +2649,7 @@ mod tests {
         std::fs::remove_dir_all(repo.parent().unwrap()).ok();
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_patch_refuses_paths_that_are_arguments_escapes_or_symlinks() {
         let repo = temp_repo("fence");
@@ -2815,7 +2815,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn capped_output_is_cut_on_a_whole_record() {
         let mut nul = b"a\0b c\0partial".to_vec();
@@ -2833,6 +2832,7 @@ mod tests {
         assert!(none.is_empty());
     }
 
+    #[cfg(unix)]
     #[test]
     fn untracked_lines_are_counted_within_the_budget_only() {
         let dir = temp_repo("count-budget");
@@ -3270,7 +3270,6 @@ mod tests {
         std::fs::remove_dir_all(repo.parent().unwrap()).ok();
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn discard_restores_tracked_files_and_deletes_untracked_ones() {
         let repo = changes_repo("vcs-discard");
@@ -3340,6 +3339,7 @@ mod tests {
         std::fs::remove_dir_all(repo.parent().unwrap()).ok();
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn discard_refuses_escapes_symlinks_out_home_and_unknown_paths() {
         let repo = changes_repo("vcs-discard-fence");

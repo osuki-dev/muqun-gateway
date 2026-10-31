@@ -265,10 +265,10 @@ impl Rollouts {
     }
 }
 
-#[cfg(test)]
+// The probe attaches the Unix-socket Codex daemon.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    #[cfg(unix)]
     #[tokio::test]
     #[ignore = "explicit read-only probe of an existing authorized thread"]
     async fn codex_persisted_read_only_probe() {
