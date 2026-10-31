@@ -64,10 +64,10 @@ pub(crate) fn selected_model(value: &Value) -> Option<ModelRef> {
 }
 
 pub(crate) fn effort_key(provider: &str) -> &'static str {
-    if matches!(provider, "fx" | "claude") {
-        "effort"
-    } else {
-        "reasoning_effort"
+    match provider {
+        "fx" | "claude" => "effort",
+        "antigravity" => "thought_level",
+        _ => "reasoning_effort",
     }
 }
 
@@ -167,9 +167,12 @@ pub(crate) fn catalog_for(value: &Value, provider: &str) -> AgentCatalog {
         .map(|model| model.provider_id.as_str())
         .unwrap_or(provider);
     let mut models = std::collections::BTreeMap::new();
+    // Antigravity 1.4 still lists 1.3's effort-suffixed ids here; its model
+    // and thinking options are the real choices.
     if let Some(available) = value
         .pointer("/models/availableModels")
         .and_then(Value::as_array)
+        .filter(|_| provider != "antigravity")
     {
         for native in available {
             let Some(id) = native["modelId"].as_str() else {

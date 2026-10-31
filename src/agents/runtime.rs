@@ -33,6 +33,8 @@ pub use fx::FxConfig;
 mod pi;
 pub(crate) mod qoder;
 pub use qoder::QoderConfig;
+pub(crate) mod antigravity;
+pub use antigravity::AntigravityConfig;
 mod t3;
 pub use pi::PiConfig;
 use pi::PiState;
@@ -69,8 +71,16 @@ const VERSION_OUTPUT_LIMIT: u64 = 4096;
 
 /// Preference among attached providers. Explicit provider/session selections
 /// retain their route; discovery additionally puts usable providers first.
-pub const AGENT_PREFERENCE: [&str; 8] = [
-    "codex", "opencode", "deepseek", "t3", "fx", "qoder", "pi", "claude",
+pub const AGENT_PREFERENCE: [&str; 9] = [
+    "codex",
+    "opencode",
+    "deepseek",
+    "t3",
+    "fx",
+    "qoder",
+    "pi",
+    "claude",
+    "antigravity",
 ];
 /// Most session-to-agent routes remembered; the oldest go first.
 const MAX_SESSION_ROUTES: usize = 4096;
@@ -285,6 +295,7 @@ pub struct LocalAgentConfigs {
     pub qoder: QoderConfig,
     pub pi: PiConfig,
     pub claude: ClaudeConfig,
+    pub antigravity: AntigravityConfig,
 }
 
 struct LocalAgentStates {
@@ -293,6 +304,7 @@ struct LocalAgentStates {
     qoder: qoder::QoderState,
     pi: PiState,
     claude: claude::ClaudeState,
+    antigravity: antigravity::AntigravityState,
 }
 
 pub struct AgentRuntime {
@@ -316,6 +328,7 @@ pub struct AgentRuntime {
     fx: fx::FxState,
     qoder: qoder::QoderState,
     claude: claude::ClaudeState,
+    antigravity: antigravity::AntigravityState,
     /// The harness this gateway started, if any. Not a kill handle.
     deepseek_spawn: Mutex<deepseek::SpawnSlot>,
     /// Origin of the attached DeepSeek manager, including when it is not primary.
@@ -408,6 +421,7 @@ impl AgentRuntime {
             LocalAgentConfigs {
                 pi: PiConfig::disabled(),
                 claude: ClaudeConfig::disabled(),
+                antigravity: AntigravityConfig::disabled(),
                 ..Default::default()
             },
             state_dir,
@@ -429,6 +443,7 @@ impl AgentRuntime {
             LocalAgentConfigs {
                 codex: codex_config,
                 pi: PiConfig::disabled(),
+                antigravity: AntigravityConfig::disabled(),
                 ..Default::default()
             },
             state_dir,
@@ -453,6 +468,7 @@ impl AgentRuntime {
                 qoder: qoder::QoderState::new(local.qoder),
                 pi: PiState::new(local.pi, state_dir),
                 claude: claude::ClaudeState::new(local.claude),
+                antigravity: antigravity::AntigravityState::new(local.antigravity),
             },
         )
     }
@@ -475,6 +491,7 @@ impl AgentRuntime {
                 qoder: QoderConfig::default(),
                 pi: PiConfig::disabled(),
                 claude: ClaudeConfig::disabled(),
+                antigravity: AntigravityConfig::disabled(),
             },
             state_dir,
         )
@@ -499,6 +516,7 @@ impl AgentRuntime {
                 qoder: qoder_config,
                 pi: PiConfig::disabled(),
                 claude: ClaudeConfig::disabled(),
+                antigravity: AntigravityConfig::disabled(),
             },
             state_dir,
         )
@@ -528,6 +546,7 @@ impl AgentRuntime {
                 },
                 pi: pi_config,
                 claude: ClaudeConfig::disabled(),
+                antigravity: AntigravityConfig::disabled(),
             },
             state_dir,
         )
@@ -548,6 +567,7 @@ impl AgentRuntime {
                 qoder: qoder::QoderState::new(QoderConfig::default()),
                 pi: PiState::new(PiConfig::disabled(), None),
                 claude: claude::ClaudeState::new(ClaudeConfig::disabled()),
+                antigravity: antigravity::AntigravityState::new(AntigravityConfig::disabled()),
             },
         )
     }
@@ -574,6 +594,7 @@ impl AgentRuntime {
             fx: local.fx,
             qoder: local.qoder,
             claude: local.claude,
+            antigravity: local.antigravity,
             deepseek_spawn: Mutex::new(deepseek::SpawnSlot::default()),
             deepseek_origin: RwLock::new(AgentOrigin::None),
             origin: RwLock::new(AgentOrigin::None),
@@ -717,6 +738,7 @@ impl AgentRuntime {
                 },
                 pi: PiConfig::disabled(),
                 claude: ClaudeConfig::disabled(),
+                antigravity: AntigravityConfig::disabled(),
             },
             None,
         )
@@ -910,8 +932,10 @@ impl AgentRuntime {
                 local_installation_status(&self.config)
             },
             origin: if manager.as_ref().is_some_and(|manager| {
-                matches!(manager.agent().kind(), "fx" | "qoder" | "claude")
-                    && manager.stream_connected()
+                matches!(
+                    manager.agent().kind(),
+                    "fx" | "qoder" | "claude" | "antigravity"
+                ) && manager.stream_connected()
             }) {
                 AgentOrigin::Spawned
             } else {
@@ -928,10 +952,9 @@ impl AgentRuntime {
                 .is_some_and(|m| m.agent().kind() == "codex")
             {
                 self.codex.config.enabled
-            } else if manager
-                .as_ref()
-                .is_some_and(|m| matches!(m.agent().kind(), "fx" | "qoder" | "claude"))
-            {
+            } else if manager.as_ref().is_some_and(|m| {
+                matches!(m.agent().kind(), "fx" | "qoder" | "claude" | "antigravity")
+            }) {
                 false
             } else {
                 self.config.autostart
@@ -954,7 +977,7 @@ impl AgentRuntime {
         Some(AgentStatus {
             available: kind != "codex" || manager.stream_connected(),
             installation: AgentInstallation::Installed,
-            origin: if matches!(kind.as_str(), "fx" | "qoder" | "claude") {
+            origin: if matches!(kind.as_str(), "fx" | "qoder" | "claude" | "antigravity") {
                 if manager.stream_connected() {
                     AgentOrigin::Spawned
                 } else {
@@ -1123,6 +1146,11 @@ impl AgentRuntime {
                         "Claude Code",
                         claude::features(),
                     ),
+                    "antigravity" => (
+                        self.antigravity.config.enabled,
+                        "Antigravity",
+                        antigravity::features(),
+                    ),
                     _ => (
                         self.deepseek_config.enabled || self.deepseek_config.endpoint.is_some(),
                         "DeepSeek",
@@ -1151,7 +1179,9 @@ impl AgentRuntime {
                     kind: id.to_string(),
                     status: match (enabled, manager) {
                         (false, _) => AgentAvailability::Disabled,
-                        (true, Some(_)) if matches!(*id, "fx" | "qoder" | "claude") => {
+                        (true, Some(_))
+                            if matches!(*id, "fx" | "qoder" | "claude" | "antigravity") =>
+                        {
                             AgentAvailability::Reachable
                         }
                         (true, Some(_)) => AgentAvailability::Connected,
@@ -1451,6 +1481,7 @@ impl AgentRuntime {
         agents.push(self.fx.discovery(self).await);
         agents.push(self.qoder.discovery(self).await);
         agents.push(self.claude.discovery(self).await);
+        agents.push(self.antigravity.discovery(self).await);
         crate::discovery::order_agents(&mut agents);
 
         let supported = agents.iter().any(|h| {
@@ -1528,7 +1559,8 @@ impl AgentRuntime {
             .await
             .as_ref()
             .map(|m| {
-                !matches!(m.agent().kind(), "fx" | "qoder" | "claude") && !m.stream_connected()
+                !matches!(m.agent().kind(), "fx" | "qoder" | "claude" | "antigravity")
+                    && !m.stream_connected()
             })
             .unwrap_or(false)
     }
@@ -1559,6 +1591,7 @@ impl AgentRuntime {
         let codex_ok = self.codex.supervise(self).await;
         let fx_ok = self.fx.supervise(self).await;
         let qoder_ok = self.qoder.supervise(self).await;
+        let antigravity_ok = self.antigravity.supervise(self).await;
         let pi_ok = self.supervise_pi().await;
         let claude_ok = self.claude.supervise(self).await;
 
@@ -1570,6 +1603,7 @@ impl AgentRuntime {
             || qoder_ok
             || pi_ok
             || claude_ok
+            || antigravity_ok
         {
             *start_backoff = Duration::from_secs(2);
             let primary = pick_primary(&*self.managers.read().await).cloned();
@@ -3670,6 +3704,7 @@ mod tests {
             T3Config::default(),
             LocalAgentConfigs {
                 pi: PiConfig::disabled(),
+                antigravity: AntigravityConfig::disabled(),
                 ..Default::default()
             },
             None,
@@ -4179,7 +4214,17 @@ mod tests {
                 .iter()
                 .map(|a| a.id.as_str())
                 .collect::<Vec<_>>(),
-            ["codex", "opencode", "deepseek", "t3", "fx", "qoder", "pi", "claude"]
+            [
+                "codex",
+                "opencode",
+                "deepseek",
+                "t3",
+                "fx",
+                "qoder",
+                "pi",
+                "claude",
+                "antigravity"
+            ]
         );
         assert_eq!(runtime.manager().await.unwrap().agent().kind(), "codex");
         assert_eq!(
@@ -4206,7 +4251,17 @@ mod tests {
         let ids: Vec<&str> = found.agents.iter().map(|a| a.id.as_str()).collect();
         assert_eq!(
             ids,
-            ["opencode", "deepseek", "t3", "fx", "qoder", "pi", "claude", "codex"]
+            [
+                "opencode",
+                "deepseek",
+                "t3",
+                "fx",
+                "qoder",
+                "pi",
+                "claude",
+                "antigravity",
+                "codex"
+            ]
         );
     }
 
