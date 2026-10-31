@@ -419,6 +419,80 @@ pub(super) async fn live_timeline(
     .map_err(|_| unavailable())?
 }
 
+/// How much of a transcript's end is read for its last model.
+const MODEL_TAIL: u64 = 1024 * 1024;
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Ran {
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    requested_model: Option<String>,
+    effort: Option<String>,
+    message: Option<RanMessage>,
+}
+
+#[derive(Deserialize)]
+struct RanMessage {
+    model: Option<String>,
+}
+
+/// The model and effort of the transcript's last assistant record, from
+/// its final megabyte; Claude Code records them on every response.
+fn last_model_in(bytes: &[u8], skip_first: bool) -> Option<(String, Option<String>)> {
+    let mut lines = bytes.split(|byte| *byte == b'\n');
+    if skip_first {
+        lines.next();
+    }
+    let mut found = None;
+    for line in lines {
+        if line.is_empty() || metadata_type(line).is_some() {
+            continue;
+        }
+        let Ok(ran) = serde_json::from_slice::<Ran>(line) else {
+            continue;
+        };
+        if ran.kind.as_deref() != Some("assistant") {
+            continue;
+        }
+        let model = ran
+            .requested_model
+            .or_else(|| ran.message.and_then(|message| message.model))
+            .filter(|model| !model.is_empty() && model.len() <= 128);
+        if let Some(model) = model {
+            found = Some((model, ran.effort.filter(|effort| effort.len() <= 32)));
+        }
+    }
+    found
+}
+
+pub(super) async fn transcript_model(
+    directory: &str,
+    id: &str,
+) -> Result<Option<(String, Option<String>)>, AgentError> {
+    if !valid_session_id(id) || !Path::new(directory).is_absolute() {
+        return Ok(None);
+    }
+    let Some(root) = projects_root() else {
+        return Ok(None);
+    };
+    let (directory, id) = (directory.to_owned(), id.to_owned());
+    Ok(tokio::task::spawn_blocking(move || {
+        use std::io::{Read, Seek, SeekFrom};
+        let path = find_exact(&root, &directory, &id).ok()?;
+        let mut file = std::fs::File::open(path).ok()?;
+        let len = file.metadata().ok()?.len();
+        let start = len.saturating_sub(MODEL_TAIL);
+        file.seek(SeekFrom::Start(start)).ok()?;
+        let mut bytes = Vec::new();
+        file.take(MODEL_TAIL).read_to_end(&mut bytes).ok()?;
+        last_model_in(&bytes, start > 0)
+    })
+    .await
+    .ok()
+    .flatten())
+}
+
 /// The transcript's modification time, to notice that a terminal wrote to it.
 pub(super) fn transcript_modified(directory: &str, id: &str) -> Option<std::time::SystemTime> {
     let root = projects_root()?;
@@ -476,6 +550,25 @@ mod tests {
         text.push_str(tail);
         std::fs::write(&path, text).unwrap();
         (dir, path)
+    }
+
+    #[test]
+    fn the_last_assistant_record_names_the_model_and_effort_to_restore() {
+        let lines = [
+            json!({"type":"assistant","requestedModel":"claude-opus-5-5","effort":"high"}),
+            json!({"type":"user","message":{"content":"next"}}),
+            json!({"type":"assistant","message":{"model":"claude-haiku-5-5"},"effort":"low"}),
+            json!({"type":"ai-title","aiTitle":"t"}),
+        ];
+        let text: String = lines.iter().map(|l| format!("{l}\n")).collect();
+        assert_eq!(
+            last_model_in(text.as_bytes(), false),
+            Some(("claude-haiku-5-5".into(), Some("low".into())))
+        );
+        // A tail that starts mid-record never yields its partial first line.
+        let cut = &text.as_bytes()[5..];
+        assert_eq!(last_model_in(cut, true).unwrap().0, "claude-haiku-5-5");
+        assert_eq!(last_model_in(b"{\"type\":\"user\"}\n", false), None);
     }
 
     #[test]

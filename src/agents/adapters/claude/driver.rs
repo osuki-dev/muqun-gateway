@@ -37,6 +37,12 @@ impl AcpProvider for ClaudeProvider {
     ) -> AgentFuture<'a, Vec<crate::agents::domain::TimelineItem>> {
         Box::pin(super::recovery::live_timeline(directory, id, stop))
     }
+    fn transcript_model<'a>(
+        directory: &'a str,
+        id: &'a str,
+    ) -> AgentFuture<'a, Option<(String, Option<String>)>> {
+        Box::pin(super::recovery::transcript_model(directory, id))
+    }
     fn transcript_modified(directory: &str, id: &str) -> Option<std::time::SystemTime> {
         super::recovery::transcript_modified(directory, id)
     }

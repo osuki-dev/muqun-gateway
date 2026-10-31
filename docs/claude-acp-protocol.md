@@ -78,6 +78,16 @@ set with `session/set_config_option`; `mode` (permission mode), `fast`,
 `ultracode` and `agent` are not exposed. No model is listed before a session
 has been opened in this Gateway run (no static catalog is guessed).
 
+On `session/load` the session's last model and effort are read from the
+transcript's final assistant record (`requestedModel` or `message.model`,
+`effort`) and set with `session/set_config_option` before any prompt: the exact
+offered value, else its family alias (`claude-haiku-5-5` → `haiku`, logged).
+A model that is not offered leaves the adapter's choice, which the session
+catalog shows. Without a read-only catalog, discovery keeps offering the models
+the last live session listed after its process is released; before any session
+has been opened in a Gateway run there are none (no process is started to read
+them).
+
 ## muqun MCP
 
 The muqun server is passed in every `session/new`, `session/load` and

@@ -95,7 +95,26 @@ pub(crate) fn selected_model_for(value: &Value, provider: &str) -> Option<ModelR
     })
 }
 
-fn select_options(option: &Value) -> Vec<&Value> {
+/// The offered model value for a recorded model id: itself when offered,
+/// else the alias of its family (`claude-haiku-5-5` → `haiku`).
+pub(crate) fn recorded_choice(recorded: &str, offered: &[String]) -> Option<String> {
+    if offered.iter().any(|value| value == recorded) {
+        return Some(recorded.to_owned());
+    }
+    offered
+        .iter()
+        .find(|alias| {
+            !alias.is_empty()
+                && alias.chars().all(|c| c.is_ascii_lowercase())
+                && alias.as_str() != "default"
+                && recorded
+                    .split(['-', '.', '_'])
+                    .any(|part| part == alias.as_str())
+        })
+        .cloned()
+}
+
+pub(crate) fn select_options(option: &Value) -> Vec<&Value> {
     let mut values = Vec::new();
     for entry in option["options"].as_array().into_iter().flatten() {
         if let Some(group) = entry["options"].as_array() {
@@ -864,6 +883,27 @@ impl Projection {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_recorded_model_maps_to_the_offered_value_or_its_family_alias() {
+        let offered: Vec<String> = ["default", "opus", "sonnet", "haiku", "claude-sonnet-5"]
+            .map(str::to_owned)
+            .to_vec();
+        for (recorded, expected) in [
+            ("claude-sonnet-5", Some("claude-sonnet-5")),
+            ("claude-haiku-5-5", Some("haiku")),
+            ("claude-opus-4-8", Some("opus")),
+            ("haiku", Some("haiku")),
+            ("claude-fable-5", None),
+            ("default", Some("default")),
+        ] {
+            assert_eq!(
+                recorded_choice(recorded, &offered).as_deref(),
+                expected,
+                "{recorded}"
+            );
+        }
+    }
 
     #[test]
     fn notices_remain_separate_from_literal_assistant_chunks() {
