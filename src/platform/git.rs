@@ -1059,12 +1059,22 @@ async fn count_untracked(toplevel: &Path, files: &mut [VcsFile]) {
 /// is not followed and a FIFO does not block.
 fn count_lines_within(path: &Path, budget: &mut u64) -> Option<(u64, bool)> {
     use std::io::Read as _;
+    #[cfg(unix)]
     use std::os::unix::fs::OpenOptionsExt as _;
+    #[cfg(windows)]
+    use std::os::windows::fs::OpenOptionsExt as _;
+
+    // Windows: FILE_FLAG_OPEN_REPARSE_POINT opens a symlink itself, which the
+    // `is_file` check below then refuses; there are no FIFOs to block on.
+    #[cfg(unix)]
+    let flags = libc::O_NOFOLLOW | libc::O_NONBLOCK;
+    #[cfg(windows)]
+    let flags = 0x0020_0000;
 
     let limit = MAX_COUNTED_UNTRACKED_BYTES.min(*budget);
     let file = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .custom_flags(flags)
         .open(path)
         .ok()?;
     if !file.metadata().ok()?.is_file() {
@@ -1426,6 +1436,21 @@ fn restore_unsupported(detail: &str) -> bool {
 /// deleting outside the checkout. `unlinkat` without `AT_REMOVEDIR` never
 /// removes a directory, and a symlink as the last component is removed
 /// itself, not its target.
+#[cfg(not(unix))]
+fn unlink_beneath(root: &Path, relative: &Path) -> std::io::Result<()> {
+    // No `openat` here: refuse a symlink (or junction) anywhere on the way
+    // down, then remove. This narrows the swap window rather than closing it.
+    let mut dir = root.to_path_buf();
+    for part in relative.parent().into_iter().flat_map(Path::iter) {
+        dir.push(part);
+        if std::fs::symlink_metadata(&dir)?.file_type().is_symlink() {
+            return Err(std::io::ErrorKind::InvalidInput.into());
+        }
+    }
+    std::fs::remove_file(root.join(relative))
+}
+
+#[cfg(unix)]
 fn unlink_beneath(root: &Path, relative: &Path) -> std::io::Result<()> {
     use std::ffi::CString;
     use std::os::fd::{AsRawFd as _, FromRawFd as _};
@@ -2546,6 +2571,7 @@ mod tests {
         std::fs::remove_dir_all(repo.parent().unwrap()).ok();
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_file_patch_is_unified_paged_and_untracked_files_are_all_additions() {
         let repo = temp_repo("patch");
@@ -2789,6 +2815,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn capped_output_is_cut_on_a_whole_record() {
         let mut nul = b"a\0b c\0partial".to_vec();
@@ -3243,6 +3270,7 @@ mod tests {
         std::fs::remove_dir_all(repo.parent().unwrap()).ok();
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn discard_restores_tracked_files_and_deletes_untracked_ones() {
         let repo = changes_repo("vcs-discard");
@@ -3367,6 +3395,7 @@ mod tests {
         std::fs::remove_dir_all(repo.parent().unwrap()).ok();
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn paired_http_reads_only_git_linked_worktrees_of_the_panes_repository() {
         use axum::{body::Body, http::Request};

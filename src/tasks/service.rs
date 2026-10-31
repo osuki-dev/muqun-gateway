@@ -5528,6 +5528,7 @@ mod tests {
         assert_eq!(title().await, "Fix the CI build");
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_folder_is_named_from_home() {
         // A home of its own, reached through a symlink as some are.

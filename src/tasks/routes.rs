@@ -1232,6 +1232,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_terminal_task_fixture_does_not_capture_an_unrelated_host_process() {
         use std::os::unix::fs::PermissionsExt;

@@ -1907,7 +1907,8 @@ for raw in sys.stdin.buffer:
         let python = std::process::Command::new("python3")
             .arg("--version")
             .output();
-        if !python.is_ok_and(|out| out.status.success()) {
+        // The stand-in is a `#!` script, which Windows cannot execute.
+        if cfg!(not(unix)) || !python.is_ok_and(|out| out.status.success()) {
             eprintln!("python3 missing; skipping");
             return None;
         }
@@ -1915,8 +1916,11 @@ for raw in sys.stdin.buffer:
         std::fs::create_dir_all(dir.join("sessions")).unwrap();
         let binary = dir.join("pi");
         std::fs::write(&binary, FAKE_PI).unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
         let cmd = PiCommandLine {
             binary,
             extension: dir.join("muqun-extension.js"),
@@ -1999,6 +2003,7 @@ for raw in sys.stdin.buffer:
         driver.host.shutdown_all().await;
     }
 
+    #[cfg(unix)]
     /// Opt-in live model contract. Its entire workspace and session root
     /// are test-owned; tools are disabled and no approval is answered.
     #[tokio::test]

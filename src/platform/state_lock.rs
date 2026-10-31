@@ -104,6 +104,19 @@ impl StateLock {
         Ok(Self { file })
     }
 
+    /// Transactions must fail closed on filesystems without working locks.
+    #[cfg(not(unix))]
+    pub(crate) fn acquire_strict(state_dir: &Path) -> anyhow::Result<Self> {
+        std::fs::create_dir_all(state_dir)?;
+        let file = open_lock_file(&state_dir.join(LOCK_FILE))?;
+        anyhow::ensure!(
+            file.try_lock().is_ok(),
+            "another lifecycle command is in progress, or this filesystem cannot lock safely"
+        );
+        record_holder(&file);
+        Ok(Self { file })
+    }
+
     /// Take exclusive ownership of `state_dir`, or fail naming the holder.
     pub fn acquire(state_dir: &Path) -> anyhow::Result<Self> {
         Self::acquire_with(state_dir, 1)

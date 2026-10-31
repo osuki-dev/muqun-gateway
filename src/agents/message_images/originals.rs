@@ -29,6 +29,7 @@ pub(super) fn digest(bytes: &[u8]) -> String {
 /// Create only gateway-owned directories; reject a symlink before changing
 /// permissions. Files below are written create-new, never replacing originals.
 pub(super) fn private_dir(path: &Path) -> std::io::Result<()> {
+    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut builder = std::fs::DirBuilder::new();
     #[cfg(unix)]
     {
@@ -188,6 +189,7 @@ pub(super) fn open_fenced(path: &Path, root: &Path) -> std::io::Result<std::fs::
     }
     let file = options.open(path)?;
     let opened = file.metadata()?;
+    #[cfg_attr(not(unix), allow(unused_variables))]
     let current = std::fs::metadata(&canonical)?;
     #[cfg(unix)]
     {
@@ -837,6 +839,7 @@ async fn original_response(
 }
 
 pub(super) fn metadata_etag(metadata: &std::fs::Metadata) -> String {
+    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut identity = format!("{}:{:?}", metadata.len(), metadata.modified().ok());
     #[cfg(unix)]
     {

@@ -280,24 +280,28 @@ async fn connect_verified_limited(
     Ok((client, events))
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 pub(crate) mod tests {
-    use super::*;
-    use sha2::{Digest, Sha256};
-    use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::fs::{symlink, PermissionsExt};
-    use std::os::unix::net::UnixListener;
+    use std::path::PathBuf;
 
     pub(crate) struct TestDirectory(pub PathBuf);
     impl TestDirectory {
         pub(crate) fn new() -> Self {
             // Leave room for the official 64-byte hash within macOS SUN_LEN.
-            let path = PathBuf::from("/tmp").join(format!(
+            #[cfg(unix)]
+            let root = PathBuf::from("/tmp");
+            #[cfg(not(unix))]
+            let root = std::env::temp_dir();
+            let path = root.join(format!(
                 "mqcd-{}",
                 &uuid::Uuid::new_v4().simple().to_string()[..12]
             ));
             std::fs::create_dir(&path).unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
             Self(std::fs::canonicalize(path).unwrap())
         }
     }
@@ -306,6 +310,16 @@ pub(crate) mod tests {
             let _ = std::fs::remove_dir_all(&self.0);
         }
     }
+}
+
+#[cfg(all(test, unix))]
+mod unix_tests {
+    use super::tests::TestDirectory;
+    use super::*;
+    use sha2::{Digest, Sha256};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    use std::os::unix::net::UnixListener;
 
     #[test]
     fn daemon_socket_requires_official_alias_and_private_protected_socket() {
