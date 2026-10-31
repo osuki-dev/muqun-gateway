@@ -17,8 +17,8 @@ Two planes are implemented in this binary:
   adapters implement it.
 - **Agents plane** — agent sessions, models, prompts, tasks,
   permissions, approvals and event history, behind the `AgentPort`
-  port; the OpenCode, DeepSeek, T3 Code, Codex, FX, Qoder CLI, Claude Code, Pi and
-  Antigravity adapters
+  port; the OpenCode, DeepSeek, T3 Code, Codex, FX, Qoder CLI, Claude Code, Pi,
+  Antigravity and Cursor adapters
   implement it.
 
 `/api/discovery` also reports an **SSH plane**, but that one is the app's own
@@ -351,6 +351,7 @@ muqun-gateway agent setup fx         # explain local FX ACP configuration (no pr
 muqun-gateway agent setup qoder      # explain local Qoder CLI ACP configuration (no process starts)
 muqun-gateway agent setup claude     # explain Claude Code native sessions (no process starts)
 muqun-gateway agent setup antigravity # explain local Antigravity ACP configuration (no process starts)
+muqun-gateway agent setup cursor     # explain local Cursor ACP configuration (no process starts)
 ```
 
 `agent` asks the running gateway for its agent list and prints one row per
@@ -525,6 +526,18 @@ Listing sessions reads Antigravity's own conversation index and starts nothing.
 When `agy` is not signed in, opening a session says so instead of waiting.
 Set `antigravity.binary` to an absolute executable or `antigravity.enabled:
 false` to disable it. See [Antigravity protocol](docs/antigravity-protocol.md).
+
+### The Cursor service agent
+
+The Cursor CLI is discovered by default through `agent` on PATH; its provider
+id is `cursor`. Sign in once with `agent login` in a terminal on this host.
+Gateway starts one private `agent acp` child per opened session, checks the
+login with `agent status` first (it never starts a browser sign-in), and passes
+its muqun tools to each session directly; it never edits Cursor's settings.
+Listing sessions reads Cursor's ACP session folder and starts nothing. Chats
+started in Cursor's terminal UI are a separate store that ACP cannot open, so
+they are not listed. Set `cursor.binary` to an absolute executable or
+`cursor.enabled: false` to disable it. See [Cursor protocol](docs/cursor-protocol.md).
 
 ### The OpenCode agent
 

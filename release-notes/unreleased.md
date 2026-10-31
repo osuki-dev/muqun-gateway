@@ -2,6 +2,21 @@
 
 ## Changes and fixes
 
+- **Cursor is a native agent.** When the Cursor CLI (`agent`) is on PATH and
+  signed in (`agent login`), Cursor conversations can be started and continued
+  in the App: pick a model, interrupt, approve tool use, run its slash commands,
+  and use muqun tools and delegated tasks from inside them. Gateway starts a
+  private `agent acp` only when a conversation is used, releases it after an
+  hour idle, and lists conversations from Cursor's own folder without starting
+  anything. If Cursor is not signed in, opening a conversation says so; the
+  Gateway never opens a sign-in page. Chats started in Cursor's terminal UI are
+  stored separately and are not shown. No setup is needed; `cursor.enabled:
+  false` turns it off. Restart the Gateway after updating.
+
+- **ACP agents that list a slash command twice work.** A command and a skill
+  with the same name made the whole session's history fail to load
+  ("ACP command names are ambiguous"); the name is now offered once.
+
 - **OpenCode gets its Muqun tools back once delegated sessions are gone, and
   says why while they are not.** A Gateway refuses OpenCode's shared Muqun
   token while an OpenCode session that ran work from another computer (or an

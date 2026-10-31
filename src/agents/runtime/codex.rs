@@ -1155,7 +1155,8 @@ pub(crate) mod tests {
                 "qoder",
                 "pi",
                 "claude",
-                "antigravity"
+                "antigravity",
+                "cursor"
             ]
         );
     }

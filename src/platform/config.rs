@@ -151,6 +151,9 @@ pub(crate) struct Config {
     /// Google Antigravity's own ACP server, `agy acp`; on when `agy` is found.
     #[serde(default, skip_serializing_if = "is_default_antigravity")]
     pub(crate) antigravity: agents::runtime::AntigravityConfig,
+    /// The Cursor CLI's own ACP server, `agent acp`; on when `agent` is found.
+    #[serde(default, skip_serializing_if = "is_default_cursor")]
+    pub(crate) cursor: agents::runtime::CursorConfig,
     /// Master switch for service agents; terminal agents remain independent.
     #[serde(default, skip_serializing_if = "AgentRuntimeConfig::is_default")]
     pub(crate) agent_runtime: AgentRuntimeConfig,
@@ -349,6 +352,10 @@ pub(crate) fn is_default_claude(config: &agents::runtime::ClaudeConfig) -> bool 
 
 pub(crate) fn is_default_antigravity(config: &agents::runtime::AntigravityConfig) -> bool {
     *config == agents::runtime::AntigravityConfig::default()
+}
+
+pub(crate) fn is_default_cursor(config: &agents::runtime::CursorConfig) -> bool {
+    *config == agents::runtime::CursorConfig::default()
 }
 
 pub(crate) fn is_default_qoder(config: &agents::runtime::QoderConfig) -> bool {

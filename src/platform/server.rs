@@ -121,6 +121,7 @@ pub(crate) async fn run(config_path: Option<String>) -> anyhow::Result<()> {
                 fx: config.fx.clone(),
                 qoder: config.qoder.clone(),
                 antigravity: config.antigravity.clone(),
+                cursor: config.cursor.clone(),
                 pi: config.pi.clone(),
                 claude: config.claude.clone(),
             },
@@ -332,6 +333,7 @@ async fn serve_until_shutdown(
         runtime.shutdown_qoder(),
         runtime.shutdown_claude(),
         runtime.shutdown_antigravity(),
+        runtime.shutdown_cursor(),
         runtime.shutdown_pi()
     );
     let cleanup = runtime.shutdown_codex().await;

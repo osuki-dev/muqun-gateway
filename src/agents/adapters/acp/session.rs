@@ -108,6 +108,15 @@ pub trait AcpProvider: Send + Sync + 'static {
     ) -> Option<AgentFuture<'a, Vec<Value>>> {
         None
     }
+    /// Asked before a child is started, for an agent whose `authenticate`
+    /// opens a browser sign-in when no login is stored: `Ok(false)` refuses
+    /// with `AUTHENTICATE.refusal` and nothing is spawned.
+    fn signed_in<'a>(
+        _binary: &'a str,
+        _stop: &'a CancellationToken,
+    ) -> Option<AgentFuture<'a, bool>> {
+        None
+    }
 }
 
 /// A session that another process on this computer (a terminal) has open.
@@ -1029,6 +1038,13 @@ impl<P: AcpProvider> AcpDriver<P> {
         let _starting = self.starting.read().await;
         if self.stop.is_cancelled() {
             return Err(AgentError::NotAvailable("ACP runtime stopped".into()));
+        }
+        if let (Some(auth), Some(check)) =
+            (&P::AUTHENTICATE, P::signed_in(&self.binary, &self.stop))
+        {
+            if !check.await? {
+                return Err(AgentError::NotAvailable(auth.refusal.into()));
+            }
         }
         // Reserve two short-lived listing connections beyond the session cap.
         // Serialize spawn admission only; prompts and initialization stay concurrent.
