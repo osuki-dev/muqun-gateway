@@ -67,6 +67,7 @@ pub(crate) fn test_config(token: &str) -> Config {
         },
         claude: agents::runtime::ClaudeConfig::disabled(),
         antigravity: agents::runtime::AntigravityConfig::disabled(),
+        cursor: agents::runtime::CursorConfig::disabled(),
         agent_runtime: crate::platform::config::AgentRuntimeConfig { enabled: false },
         store: crate::platform::config::StoreConfig::default(),
         mcp: crate::platform::config::McpConfig::default(),

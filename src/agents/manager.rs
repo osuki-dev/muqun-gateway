@@ -146,7 +146,7 @@ impl Drop for AgentManager {
         // external manager must cancel them. Adopted services stay untouched.
         if matches!(
             self.agent.kind(),
-            "codex" | "fx" | "qoder" | "pi" | "claude" | "antigravity"
+            "codex" | "fx" | "qoder" | "pi" | "claude" | "antigravity" | "cursor"
         ) {
             (self.shutdown_handle)();
         }
@@ -573,6 +573,34 @@ impl AgentManager {
             mirror,
             events_tx,
             "stdio://antigravity-acp".into(),
+            version,
+            Arc::new(move || connected.has_live_stream()),
+            Arc::new(move || shutdown.stop()),
+        );
+        (manager, driver)
+    }
+
+    /// Assemble the lazy ACP adapter; each Cursor session owns its own `agent acp`.
+    pub fn connect_cursor(
+        binary: String,
+        directory: String,
+        version: Option<String>,
+        events_tx: broadcast::Sender<AgentDomainEvent>,
+    ) -> (Self, Arc<crate::agents::adapters::cursor::CursorDriver>) {
+        let mirror = Arc::new(MemoryMirror::for_agent("cursor"));
+        let driver = crate::agents::adapters::cursor::CursorDriver::new(
+            binary,
+            directory,
+            mirror.clone(),
+            events_tx.clone(),
+        );
+        let connected = driver.clone();
+        let shutdown = driver.clone();
+        let manager = Self::assemble(
+            driver.clone(),
+            mirror,
+            events_tx,
+            "stdio://cursor-acp".into(),
             version,
             Arc::new(move || connected.has_live_stream()),
             Arc::new(move || shutdown.stop()),

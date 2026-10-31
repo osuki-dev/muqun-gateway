@@ -555,7 +555,8 @@ mod tests {
                     "qoder",
                     "pi",
                     "claude",
-                    "antigravity"
+                    "antigravity",
+                    "cursor"
                 ]
             );
             for agent in &plane.agents {
@@ -607,6 +608,7 @@ mod tests {
                     "pi",
                     "claude",
                     "antigravity",
+                    "cursor",
                     "codex"
                 ]
             );
@@ -648,7 +650,8 @@ mod tests {
                 "qoder",
                 "pi",
                 "claude",
-                "antigravity"
+                "antigravity",
+                "cursor"
             ]
         );
     }

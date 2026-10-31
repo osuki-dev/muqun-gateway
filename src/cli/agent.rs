@@ -90,6 +90,8 @@ pub(crate) enum SetupAgent {
     Claude,
     /// Explain Antigravity ACP setup without starting a session or changing credentials.
     Antigravity,
+    /// Explain Cursor ACP setup without starting a session or changing credentials.
+    Cursor,
 }
 
 pub(crate) async fn run_agent_command(
@@ -154,6 +156,10 @@ pub(crate) async fn run_agent_command(
             SetupAgent::Antigravity => {
                 println!("Antigravity support is enabled by default when agy is installed on PATH. Install Antigravity's CLI and sign in with your Google account by running `agy` once in a terminal on this host. Gateway opens a private `agy acp` child only when a session is opened, created or prompted, and reuses that login; listing sessions reads Antigravity's own index and starts nothing.");
                 println!("Set antigravity.enabled=false to disable it; antigravity.binary may name an absolute agy executable. Gateway never edits Antigravity's settings; its muqun tools are passed to each session directly. This command does not start agy, install packages, log in or restart Gateway.");
+            }
+            SetupAgent::Cursor => {
+                println!("Cursor support is enabled by default when Cursor's CLI (`agent`) is installed on PATH. Sign in once with `agent login` in a terminal on this host. Gateway opens a private `agent acp` child only when a session is opened, created or prompted, checks the login with `agent status` first and never starts a sign-in itself; listing sessions reads Cursor's own ACP session folder and starts nothing.");
+                println!("Set cursor.enabled=false to disable it; cursor.binary may name an absolute `agent` executable. Gateway never edits Cursor's settings; its muqun tools are passed to each session directly. Chats started in Cursor's terminal UI are a separate store that ACP cannot open, so they are not listed. This command does not start Cursor, install packages, log in or restart Gateway.");
             }
             SetupAgent::Qoder => {
                 println!("Qoder CLI support is enabled by default when qodercli is installed on PATH. Configure and sign in to Qoder CLI on this host yourself. Gateway opens a private `qodercli --acp` child per session; discovery alone does not verify model authentication.");
@@ -285,6 +291,7 @@ async fn local_probe(config: &Config) -> anyhow::Result<Vec<AgentDiscoveryInfo>>
                 fx: config.fx.clone(),
                 qoder: config.qoder.clone(),
                 antigravity: config.antigravity.clone(),
+                cursor: config.cursor.clone(),
                 pi: config.pi.clone(),
                 claude: config.claude.clone(),
             },
@@ -505,6 +512,10 @@ pub(crate) fn next_step(id: &str, status: &AgentAvailability) -> Option<&'static
         (NotInstalled, "antigravity") => "install Antigravity's agy and sign in by running `agy` once in a terminal",
         (Unconfigured, "antigravity") => "check antigravity.binary in config.json",
         (Offline | Unsupported, "antigravity") => "check that `agy --version` runs on this host",
+        (Disabled, "cursor") => "set `cursor.enabled` to true in config.json",
+        (NotInstalled, "cursor") => "install Cursor's CLI (`agent`) and run `agent login` once in a terminal",
+        (Unconfigured, "cursor") => "check cursor.binary in config.json",
+        (Offline | Unsupported, "cursor") => "check that `agent --version` runs on this host",
         (Disabled, "qoder") => "set `qoder.enabled` to true in config.json",
         (NotInstalled, "qoder") => "install Qoder CLI yourself, set qoder.binary, or disable qoder.enabled",
         (Unconfigured, "qoder") => "check qoder.binary and configure Qoder CLI authentication on this host yourself",

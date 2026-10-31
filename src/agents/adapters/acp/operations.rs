@@ -187,10 +187,10 @@ pub(crate) fn commands(update: &Value) -> Result<Vec<CommandInfo>, AgentError> {
             .as_str()
             .filter(|name| command_name(name))
             .ok_or_else(|| AgentError::Protocol("ACP command has an invalid name".into()))?;
+        // Cursor lists a global command and a user skill under one name;
+        // both run as the same `/name`, so the first description is kept.
         if !names.insert(name) {
-            return Err(AgentError::Protocol(
-                "ACP command names are ambiguous".into(),
-            ));
+            continue;
         }
         commands.push(CommandInfo {
             name: name.into(),
@@ -387,7 +387,7 @@ mod tests {
         assert!(upload_parts("", &[note.to_string_lossy().into_owned()], &root.0, caps()).is_err());
     }
     #[test]
-    fn discovered_commands_are_exact_and_ambiguity_is_refused() {
+    fn discovered_commands_are_exact_and_repeated_names_listed_once() {
         let offered=commands(&json!({"availableCommands":[{"name":"rename","description":"Rename","input":{"hint":"title"}},{"name":"plugin:task"}]})).unwrap();
         assert_eq!(
             command_prompt(&offered, "rename", "New title").unwrap(),
@@ -396,7 +396,10 @@ mod tests {
         assert_eq!(offered[0].template.as_deref(), Some("title"));
         assert!(command_prompt(&offered, "unknown", "").is_err());
         assert!(command_prompt(&offered, "rename\nrewind", "").is_err());
-        assert!(commands(&json!({"availableCommands":[{"name":"same"},{"name":"same"}]})).is_err());
+        let repeated = commands(&json!({"availableCommands":[{"name":"same","description":"global"},{"name":"same","description":"skill"}]})).unwrap();
+        assert_eq!(repeated.len(), 1);
+        assert_eq!(repeated[0].description.as_deref(), Some("global"));
+        assert_eq!(command_prompt(&repeated, "same", "").unwrap(), "/same");
         assert!(commands(&json!({"availableCommands":[{"name":"bad name"}]})).is_err());
         assert!(commands(&json!({"availableCommands":[]}))
             .unwrap()

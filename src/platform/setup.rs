@@ -146,6 +146,7 @@ pub(crate) fn setup(
             qoder: agents::runtime::QoderConfig::default(),
             claude: agents::runtime::ClaudeConfig::default(),
             antigravity: agents::runtime::AntigravityConfig::default(),
+            cursor: agents::runtime::CursorConfig::default(),
             agent_runtime: crate::platform::config::AgentRuntimeConfig::default(),
             store: crate::platform::config::StoreConfig::default(),
             mcp: crate::platform::config::McpConfig::default(),
