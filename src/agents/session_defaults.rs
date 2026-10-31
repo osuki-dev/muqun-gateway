@@ -236,8 +236,22 @@ pub(crate) async fn with_cached_models(
     }
     let (agent, at) = (agent_id.to_owned(), crate::tasks::domain::now_ms() as i64);
     let stored_version = version.clone();
+    let fresh = catalog.models.clone();
     let stored = db
         .call(move |db| {
+            // A session lists effort tiers only for its selected model; keep
+            // the tiers earlier sessions showed for the others.
+            let earlier: Option<String> = db
+                .query_row(
+                    "SELECT models FROM agent_catalog_cache WHERE agent_id = ?1 AND version = ?2",
+                    rusqlite::params![agent, stored_version],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let earlier: Vec<ModelInfo> = earlier
+                .and_then(|text| serde_json::from_str(&text).ok())
+                .unwrap_or_default();
+            let models = serde_json::to_string(&merge_variants(fresh, &earlier))?;
             db.execute(
                 "INSERT INTO agent_catalog_cache(agent_id, version, models, updated_ms)
                  VALUES(?1, ?2, ?3, ?4) ON CONFLICT(agent_id) DO UPDATE SET
@@ -255,6 +269,58 @@ pub(crate) async fn with_cached_models(
             written.push((agent_id.to_owned(), version, print));
         }
         Err(error) => tracing::debug!("agent catalog not cached: {error:#}"),
+    }
+}
+
+/// `fresh` with the effort tiers `earlier` knew for a model `fresh` lists
+/// without any.
+fn merge_variants(mut fresh: Vec<ModelInfo>, earlier: &[ModelInfo]) -> Vec<ModelInfo> {
+    for model in &mut fresh {
+        if model.variants.as_ref().is_none_or(Vec::is_empty) {
+            model.variants = earlier
+                .iter()
+                .find(|old| old.provider_id == model.provider_id && old.id == model.id)
+                .and_then(|old| old.variants.clone());
+        }
+    }
+    fresh
+}
+
+/// A model asked for while the agent lists none (an ACP agent before its
+/// first session, with nothing cached): passed on as asked, for the agent
+/// to accept or refuse. `<provider>/<model>` names the provider; a bare id
+/// is in the agent's own namespace.
+pub(crate) fn unlisted_model(agent_id: &str, id: &str, variant: Option<&str>) -> ModelRef {
+    let (provider_id, model_id) = id
+        .split_once('/')
+        .filter(|(provider, model)| !provider.is_empty() && !model.is_empty())
+        .unwrap_or((agent_id, id));
+    ModelRef {
+        provider_id: provider_id.into(),
+        model_id: model_id.into(),
+        variant: variant.map(str::to_owned),
+    }
+}
+
+/// After a session was created: remember what the App chose, and the model
+/// list the new session shows, so the next new session (also after a
+/// restart) can choose before its first prompt.
+pub(crate) async fn after_create(
+    db: &SqliteStore,
+    manager: &crate::agents::manager::AgentManager,
+    asid: &str,
+    directory: Option<&str>,
+    model: Option<&ModelRef>,
+    mode: Option<&str>,
+) {
+    let agent_id = manager.agent().kind();
+    record(db, agent_id, directory, model, mode).await;
+    if let Ok(mut catalog) = manager
+        .sessions()
+        .get_catalog_for_session(Some(asid), directory)
+        .await
+    {
+        with_cached_models(db, agent_id, manager.version(), &mut catalog).await;
     }
 }
 
@@ -394,6 +460,81 @@ mod tests {
             let mut empty = AgentCatalog::default();
             with_cached_models(&db, &agent, version.map(Into::into), &mut empty).await;
             assert_eq!(!empty.models.is_empty(), cached, "{version:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_cached_list_survives_a_restart_and_keeps_each_models_tiers() {
+        let path = crate::test_state_dir().join(format!("{}.sqlite3", uuid::Uuid::new_v4()));
+        let open = || {
+            SqliteStore::open(&path, None, crate::platform::store::sqlite::ALL_MIGRATIONS).unwrap()
+        };
+        let agent = format!("claude-{}", uuid::Uuid::new_v4());
+        let listed = |selected: &str| -> AgentCatalog {
+            let tiers = serde_json::json!([{"id": "low", "reasoning_effort": "low"}, {"id": "high", "reasoning_effort": "high"}]);
+            let model = |id: &str| {
+                let mut model = serde_json::json!({"id": id, "name": id, "provider_id": "claude"});
+                if id == selected {
+                    model["variants"] = tiers.clone();
+                }
+                model
+            };
+            serde_json::from_value(serde_json::json!({
+                "models": [model("opus"), model("haiku")], "modes": [], "mcp": []
+            }))
+            .unwrap()
+        };
+        {
+            let db = open();
+            // Two sessions, each showing tiers only for its selected model.
+            with_cached_models(&db, &agent, Some("2.1".into()), &mut listed("opus")).await;
+            with_cached_models(&db, &agent, Some("2.1".into()), &mut listed("haiku")).await;
+        }
+        // A new process: nothing in memory, the store file reopened.
+        let db = open();
+        let mut empty = AgentCatalog::default();
+        with_cached_models(&db, &agent, Some("2.1".into()), &mut empty).await;
+        let tiers = |id: &str| {
+            empty
+                .models
+                .iter()
+                .find(|model| model.id == id)
+                .and_then(|model| model.variants.as_ref())
+                .map(|variants| variants.len())
+        };
+        assert_eq!((tiers("opus"), tiers("haiku")), (Some(2), Some(2)));
+        let discovered: Vec<_> = empty
+            .models
+            .iter()
+            .map(crate::discovery::model_info_to_agent_model)
+            .collect();
+        assert!(discovered
+            .iter()
+            .all(|model| model.reasoning_effort_tiers == ["low", "high"]));
+    }
+
+    #[test]
+    fn a_model_the_agent_does_not_list_is_passed_on_as_asked() {
+        for (id, variant, provider, model) in [
+            ("haiku", Some("medium"), "claude", "haiku"),
+            (
+                "anthropic/claude-haiku-5-5",
+                None,
+                "anthropic",
+                "claude-haiku-5-5",
+            ),
+            ("/odd", None, "claude", "/odd"),
+        ] {
+            let got = unlisted_model("claude", id, variant);
+            assert_eq!(
+                (
+                    got.provider_id.as_str(),
+                    got.model_id.as_str(),
+                    got.variant.as_deref()
+                ),
+                (provider, model, variant),
+                "{id}"
+            );
         }
     }
 }

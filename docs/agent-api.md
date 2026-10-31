@@ -1810,7 +1810,19 @@ session showed, per agent and agent version, and serves it in this catalog and
 in discovery `agents[].models` (with `features.modelSelection` /
 `reasoningEffort` following it) while no session is open, so a model and effort
 can be chosen when the session is created. A different agent version drops the
-cached list; an agent that never had a session open still lists none.
+cached list; an agent that never had a session open still lists none. The list
+is kept in the shared store, so it is there right after a gateway restart,
+before any session opens; it is refreshed from every session the App creates.
+A session lists effort tiers (`variants`, discovery `reasoningEffortTiers`)
+only for its selected model, so the cache keeps the tiers earlier sessions
+showed for the other models. The key is the version the gateway probes for the
+agent (for Claude Code, the `claude` CLI version, not the npx adapter's).
+
+When an agent lists no models at all (nothing cached yet), `POST /api/tasks`
+no longer refuses a requested `model` with `unknown_model`: it passes the
+model (`<provider>/<model>`, or a bare id in the agent's own namespace) and
+`variant` to the agent, which accepts or refuses it on creation.
+`POST /api/agent-sessions` never checked the model against the catalog.
 
 Capability `agent_session_catalog_v1` identifies the `asid` contract. When supplied,
 only that session's owning provider is queried; a conflicting `agent_id` is

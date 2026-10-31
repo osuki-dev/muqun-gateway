@@ -1322,18 +1322,30 @@ impl TaskService {
         let variant = request.variant.as_deref();
         let model = match request.model.as_deref() {
             Some(id) => {
-                let catalog = manager
+                let mut catalog = manager
                     .sessions()
                     .get_catalog(request.cwd.as_deref())
                     .await?;
-                Some(
+                // An ACP agent lists models only inside a session: use the
+                // list its last session showed, and with none at all let the
+                // agent judge the model rather than refuse it here.
+                crate::agents::session_defaults::with_cached_models(
+                    &state.db,
+                    agent_id,
+                    manager.version(),
+                    &mut catalog,
+                )
+                .await;
+                Some(if catalog.models.is_empty() {
+                    crate::agents::session_defaults::unlisted_model(agent_id, id, variant)
+                } else {
                     resolve_model(&catalog.models, id, variant)
                         .ok_or_else(|| TaskError::UnknownModel(id.to_owned()))?
                         .map_err(|(wanted, offered)| TaskError::UnknownVariant {
                             wanted,
                             offered,
-                        })?,
-                )
+                        })?
+                })
             }
             None => None,
         };
@@ -1406,6 +1418,15 @@ impl TaskService {
             .agent_runtime
             .record_session_route(&asid.0, agent_id)
             .await;
+        crate::agents::session_defaults::after_create(
+            &state.db,
+            &manager,
+            &asid.0,
+            request.cwd.as_deref(),
+            model.as_ref(),
+            request.mode.as_deref(),
+        )
+        .await;
         let binding = TaskBinding::AgentSession {
             agent_id: agent_id.to_owned(),
             asid: asid.0.clone(),
@@ -4406,6 +4427,33 @@ mod tests {
         assert_eq!(slashed.provider_id, "openrouter");
         assert_eq!(resolve_model(&models, "gpt-9", None), None);
         assert_eq!(resolve_model(&models, "anthropic/gpt-9", None), None);
+    }
+
+    #[tokio::test]
+    async fn an_agent_that_lists_no_models_judges_the_requested_one_itself() {
+        let state = test_state("admin", Vec::new());
+        let agent = FakeAgent::new("claude").with_sessions(&[("claude_old", 1)]);
+        let created_with = agent.created_with.clone();
+        state.agent_runtime.attach_for_test(agent.manager()).await;
+        let mut asked = request(None);
+        asked.agent_id = Some("claude".into());
+        asked.delivery = Some(Delivery::Session);
+        asked.model = Some("haiku".into());
+        asked.variant = Some("medium".into());
+        state
+            .tasks
+            .delegate(&state, Requested::mcp(assistant("a")), asked)
+            .await
+            .unwrap();
+        let created = created_with.lock().unwrap().clone();
+        assert_eq!(
+            created,
+            [Some(ModelRef {
+                provider_id: "claude".into(),
+                model_id: "haiku".into(),
+                variant: Some("medium".into()),
+            })]
+        );
     }
 
     #[tokio::test]
