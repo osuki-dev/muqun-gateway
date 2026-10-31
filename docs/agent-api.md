@@ -261,6 +261,18 @@ catalogs. Terminal liveness, compatibility and transport facts remain live.
   status alone does not say why (for example, an unsupported T3 descriptor
   protocol or unchecked Codex readiness). Show it, don't
   parse it.
+- `signInFailedAtMs` (capability `agent_signin_state`) is present on an ACP
+  agent (FX, Qoder CLI, and every other agent the shared ACP adapter drives)
+  whose last `session/new` or `session/load` was refused with ACP's
+  `auth_required` (-32000). Discovery then reports it `unconfigured` with a
+  `reason` saying it was not signed in the last time a session was opened, so
+  the App guides the user instead of hitting the same refusal again. The
+  gateway does not start the agent to re-check. It is cleared by the next
+  open that succeeds (an existing session counts) or by
+  `POST /api/agents/{kind}/signin-check` (owner App or admin token; answers
+  `{"kind", "cleared"}`, 404 when the agent is not attached), which an App's
+  "check again" calls before retrying. The memory is per process: a gateway
+  restart forgets it.
 - `endpoint` and `version` are omitted when unknown or redacted. `models[]` and
   `modes[]` are that agent's own catalog summary; `reasoningEffortTiers` is
   omitted when empty; `modes[].description` when unset.

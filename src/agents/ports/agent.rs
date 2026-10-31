@@ -386,6 +386,16 @@ pub trait AgentPort: Send + Sync {
         false
     }
 
+    /// When opening a session last failed because the agent is not signed in
+    /// on this host (Unix ms). `None` until that happens, and again once a
+    /// later open succeeds or the owner asks to check again.
+    fn signin_failure(&self) -> Option<u64> {
+        None
+    }
+
+    /// Forget a remembered sign-in failure, so the next open asks the agent.
+    fn forget_signin_failure(&self) {}
+
     /// Fetch the VCS diff for a session's directory. `mode` is one of
     /// `working`, `branch` or `committed`; OpenCode requires it.
     fn get_vcs_diff<'a>(

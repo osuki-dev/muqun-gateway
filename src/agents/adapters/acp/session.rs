@@ -466,7 +466,16 @@ pub struct AcpDriver<P: AcpProvider> {
     /// Per-session instructions (key → text), appended to the system prompt
     /// whenever the session is started (`P::SYSTEM_PROMPT`).
     instructions: StdMutex<HashMap<String, BTreeMap<String, String>>>,
+    /// When `session/new` or `session/load` last answered ACP's
+    /// `auth_required`; cleared by the next one that succeeds.
+    signin_failure: StdMutex<Option<u64>>,
     stop: CancellationToken,
+}
+
+/// ACP's `auth_required` error, as the client words a rejection: the code,
+/// never the agent's own text.
+fn is_auth_required(error: &str) -> bool {
+    error.contains("ACP request rejected (code -32000)")
 }
 
 fn unsupported<'a, T: Send + 'a>(feature: &'static str) -> AgentFuture<'a, T> {
@@ -572,6 +581,7 @@ impl<P: AcpProvider> AcpDriver<P> {
             last_catalog: StdMutex::new(None),
             owned: StdMutex::new(OwnedSessions::default()),
             instructions: StdMutex::new(HashMap::new()),
+            signin_failure: StdMutex::new(None),
             stop: CancellationToken::new(),
         })
     }
@@ -1910,9 +1920,13 @@ impl<P: AcpProvider> AcpDriver<P> {
             Ok(value) => value,
             Err(error) => {
                 client.shutdown().await;
+                if is_auth_required(&error) {
+                    *self.signin_failure.lock().unwrap() = Some(crate::now_unix_ms() as u64);
+                }
                 return Err(AgentError::RequestFailed(error));
             }
         };
+        *self.signin_failure.lock().unwrap() = None;
         while let Ok(event) = events.try_recv() {
             match event {
                 AcpEvent::Notification { method, params } if method == "session/update" => {
@@ -3098,6 +3112,12 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
     }
     fn slash_commands_listed(&self) -> bool {
         self.commands_observed.load(Ordering::Acquire)
+    }
+    fn signin_failure(&self) -> Option<u64> {
+        *self.signin_failure.lock().unwrap()
+    }
+    fn forget_signin_failure(&self) {
+        *self.signin_failure.lock().unwrap() = None;
     }
     fn run_command<'a>(
         &'a self,

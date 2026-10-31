@@ -78,6 +78,27 @@ pub async fn api_set_agent_visibility(
     Ok(Json(json!({ "kind": kind, "visibility": body.visibility })))
 }
 
+/// `POST /api/agents/{kind}/signin-check`: forget that opening a session
+/// last failed because the agent was not signed in, so discovery reports it
+/// usable again and the next open asks the agent. Nothing is started here.
+pub async fn api_agent_signin_check(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(kind): Path<String>,
+) -> ApiResult<Json<Value>> {
+    crate::platform::http::require_pairing_manager(&state, &headers)?;
+    let Some(manager) = state.agent_runtime.manager_for_agent(&kind).await else {
+        return Err(api_error(
+            StatusCode::NOT_FOUND,
+            "agent_unavailable",
+            "no such agent is attached",
+        ));
+    };
+    let cleared = manager.agent().signin_failure().is_some();
+    manager.agent().forget_signin_failure();
+    Ok(Json(json!({ "kind": kind, "cleared": cleared })))
+}
+
 pub async fn docs() -> Html<&'static str> {
     Html(DOCS_HTML)
 }
@@ -170,6 +191,10 @@ pub fn mount(router: Router<AppState>) -> Router<AppState> {
         .route(
             "/api/agents/{agent_id}/visibility",
             axum::routing::put(api_set_agent_visibility),
+        )
+        .route(
+            "/api/agents/{agent_id}/signin-check",
+            axum::routing::post(api_agent_signin_check),
         )
 }
 

@@ -541,4 +541,58 @@ for line in sys.stdin:
         );
         driver.shutdown().await;
     }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_sign_in_refusal_is_remembered_until_an_open_succeeds() {
+        use crate::agents::adapters::acp::session::{AcpDriver, AcpProvider};
+        use crate::agents::adapters::memory_mirror::MemoryMirror;
+        use crate::agents::ports::agent::AgentPort;
+        use std::sync::Arc;
+
+        struct SignInProvider;
+        impl AcpProvider for SignInProvider {
+            const KIND: &'static str = "qoder";
+            const LABEL: &'static str = "Qoder sign-in fixture";
+            const REQUIRE_MESSAGE_ID: bool = false;
+            const MODEL_SELECTION: bool = false;
+            const ARGS: &'static [&'static str] = &[
+                "-u",
+                "-c",
+                r#"
+import json, os, sys
+def send(v): print(json.dumps(v),flush=True)
+for line in sys.stdin:
+    value=json.loads(line);method=value.get('method');rid=value.get('id')
+    if method=='initialize': send({'jsonrpc':'2.0','id':rid,'result':{'protocolVersion':1,'agentCapabilities':{}}})
+    elif method=='session/new' and not os.path.exists('signed-in'): send({'jsonrpc':'2.0','id':rid,'error':{'code':-32000,'message':'native login text'}})
+    elif method=='session/new' and os.path.exists('busy'): send({'jsonrpc':'2.0','id':rid,'error':{'code':-32603,'message':'busy'}})
+    elif method=='session/new': send({'jsonrpc':'2.0','id':rid,'result':{'sessionId':'signed-in-session'}})
+"#,
+            ];
+        }
+        let root = scratch();
+        let (tx, _events) = tokio::sync::broadcast::channel(16);
+        let driver = AcpDriver::<SignInProvider>::new(
+            "python3".into(),
+            root.0.to_string_lossy().into_owned(),
+            Arc::new(MemoryMirror::for_agent("qoder")),
+            tx,
+        );
+        assert_eq!(driver.signin_failure(), None);
+        assert!(driver.create_session(None, None, None).await.is_err());
+        assert!(
+            driver.signin_failure().is_some(),
+            "auth_required is remembered"
+        );
+        // Another kind of refusal is not a sign-in answer: the memory stays.
+        std::fs::write(root.0.join("signed-in"), b"").unwrap();
+        std::fs::write(root.0.join("busy"), b"").unwrap();
+        assert!(driver.create_session(None, None, None).await.is_err());
+        assert!(driver.signin_failure().is_some());
+        std::fs::remove_file(root.0.join("busy")).unwrap();
+        driver.create_session(None, None, None).await.unwrap();
+        assert_eq!(driver.signin_failure(), None, "a successful open clears it");
+        driver.shutdown().await;
+    }
 }
