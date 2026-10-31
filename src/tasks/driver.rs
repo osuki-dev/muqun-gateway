@@ -134,7 +134,7 @@ pub(crate) async fn drop_task_instruction(state: &AppState, binding: &TaskBindin
     let Some(manager) = state.agent_runtime.manager_for_agent(agent_id).await else {
         return;
     };
-    if !manager.agent().adds_mcp_servers() {
+    if !manager.agent().takes_session_instructions() {
         return;
     }
     if let Err(error) = manager

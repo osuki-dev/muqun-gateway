@@ -53,14 +53,18 @@ Listing sessions never starts it.
 
 | Method | Use | Observed shape (0.99.1) |
 |---|---|---|
-| `initialize` | protocolVersion 1, `fs`/`terminal` false, `session.notices` | `loadSession: true`; `sessionCapabilities` `list, resume, fork, delete, close, additionalDirectories, systemPrompt`; `promptCapabilities` image, embeddedContext; `mcpCapabilities` http, sse; `authMethods: []`; `agentInfo.version` |
+| `initialize` | protocolVersion 1, `fs`/`terminal` false, `session.notices`, `elicitation.form` | `loadSession: true`; `sessionCapabilities` `list, resume, fork, delete, close, additionalDirectories, systemPrompt`; `promptCapabilities` image, embeddedContext; `mcpCapabilities` http, sse; `authMethods: []`; `agentInfo.version`; top-level `_meta.steering.supported` |
 | `session/new` | `cwd`, `mcpServers` (muqun, below) | `sessionId` (UUID), `modes`, `configOptions` `mode, model, effort, fast, ultracode, agent`. No transcript is written until the first prompt. |
 | `session/load` | reopen with replay | replays `user_message_chunk`/`agent_message_chunk` (with `messageId`) and `available_commands_update`; same `configOptions`, keeping the session's model |
 | `session/set_config_option` | `model`, `effort` | answers the full `configOptions` |
+| `session/set_mode` | permission mode | answers `{}`; the change arrives as `config_option_update` (the `mode` option), not `current_mode_update` |
+| `session/resume` | re-apply the task instruction (`systemPrompt`) to a live, idle session | a changed `systemPrompt` makes the adapter rebuild the session; one never prompted comes back with the settings' default model, effort and mode, which Gateway selects again |
+| `_session/steering` | a prompt sent with `delivery: "steer"` while a turn runs, with `_meta.steering.idleBehavior: "promptRequired"` | `{"outcome":"injected"}`: the text joins the turn (no user echo; the reply has a new `messageId`) and the running `session/prompt` answers once it is answered. `{"outcome":"promptRequired"}` when no turn runs: Gateway sends an ordinary `session/prompt` |
 | `session/prompt` | text and image parts | `stopReason` `end_turn` / `cancelled`; `usage` with `inputTokens, outputTokens, cachedReadTokens, cachedWriteTokens` |
 | `session/cancel` | notification | the running prompt answers `stopReason: "cancelled"` |
 | `session/fork`, `session/delete` | when advertised | (shared ACP operations) |
 | `session/list` | not used | the adapter scans the same transcripts; Gateway does so without a process |
+| `elicitation/create` (agent → client) | AskUserQuestion, `mode: "form"` | below (Questions) |
 
 Notifications seen: `session/update` (`agent_message_chunk`,
 `user_message_chunk`, `usage_update` with `cost`, `session_info_update` with
@@ -75,7 +79,7 @@ Model choices come from the `model` config option (`default`, `opus`,
 `sonnet`, `haiku`, pinned ids), effort from `effort` (`default, low, medium,
 high, xhigh, max`). They map to the App catalog under provider `claude` and are
 set with `session/set_config_option`; `mode` (permission mode), `fast`,
-`ultracode` and `agent` are not exposed. No model is listed before a session
+`ultracode` and `agent` are not exposed (permission modes: below). No model is listed before a session
 has been opened in this Gateway run (no static catalog is guessed).
 
 On `session/load` the session's last model and effort are read from the
@@ -87,6 +91,81 @@ catalog shows. Without a read-only catalog, discovery keeps offering the models
 the last live session listed after its process is released; before any session
 has been opened in a Gateway run there are none (no process is started to read
 them).
+
+## Permission modes
+
+`modes.availableModes` (adapter 0.99.1: `default` "Manual", `acceptEdits`,
+`plan`, `auto`, `bypassPermissions` when allowed) are the session's catalog
+modes; the current one is the session's `mode`. Picking one calls
+`session/set_mode`, as does creating a session with a mode. The mode belongs
+to the session: the adapter calls Claude Code's `setPermissionMode` for that
+query only, and a load continues in the transcript's last mode (verified).
+A new session starts in the user's `permissions.defaultMode`. Observed:
+switching into and out of `plan` can change the session's model (Claude Code's
+plan-mode model); the App sees the new model in the session update.
+
+## Prompts while a turn runs
+
+`delivery: "steer"` steers (`_session/steering`, above). The adapter also
+accepts a second `session/prompt` during a turn and runs it after the turn
+(`agentCapabilities._meta.claudeCode.promptQueueing`, verified), but such a
+native queue cannot be listed, edited or cancelled item by item, so Gateway
+keeps no inbox for Claude Code: `delivery: "queue"` answers unsupported and
+discovery declares `inbox: false`, `promptSteering: true` (the App then offers
+steering only). A slash command is never steered.
+
+## Questions
+
+With `elicitation.form` advertised, AskUserQuestion reaches the client as
+`elicitation/create` (a JSON-RPC request; its id may be the number `0`):
+
+```json
+{"mode":"form","sessionId":"…","toolCallId":"toolu_…","message":"Which fruit do you pick?",
+ "requestedSchema":{"type":"object","properties":{
+   "question_0":{"type":"string","title":"Fruit","oneOf":[{"const":"Apple","title":"Apple","description":"…"},…]},
+   "question_0_custom":{"type":"string","title":"Other","description":"…"}}}}
+```
+
+It is shown as the App's question form (`agent.form.pending`, `forms` in the
+snapshot). Each property becomes a field: a string (with `oneOf`/`enum`
+choices), number, boolean, or an array of choices (multi-select). A single
+choice and its `<key>_custom` companion are one field that also takes typed
+text: an offered choice is sent as `<key>`, other text as `<key>_custom`. The
+answer is `{"action":"accept","content":{…}}`; Claude Code then reports
+`"Question"="Answer"` to the model. A schema with other shapes is answered
+`{"action":"cancel"}` instead of being half-shown. Pending questions expire
+when the turn ends. URL elicitation is not advertised.
+
+## Rename
+
+`_session/rename` is offered only to JetBrains AIR clients that declare its
+session index (`Method not found` otherwise, verified). Rename therefore
+sends Claude Code's own `/rename <title>` as a `session/prompt`: it runs no
+model turn (zero tokens), writes the transcript's `custom-title` record, and
+emits `session_info_update` with the title. Its output ("Session renamed to:
+…") and, on a later load, its replayed `/rename …` user message leave no rows.
+The session must be idle. The transcript keeps the command record; it is not
+a prompt for idle-retirement evidence.
+
+## Delegated tasks
+
+A task's session gets the task sentence (`mcp::inject::TASK_SENTENCE`) as an
+appended system prompt: `systemPrompt: {"mode":"append","content":[{type:
+"text",…}]}` on every `session/new`, `session/load` and, when it is set on a
+live idle session, `session/resume` (above). The instruction is held in memory
+under its key, re-sent at each later start while the task is open, and
+removed (followed by a resume without it) when the task ends.
+
+## Deleting
+
+`session/delete` is the SDK's transcript delete, Claude Code's own semantics
+(an id without a transcript succeeds). Only sessions this Gateway created or
+forked are deleted. Their ids are kept in `claude-owned-sessions.json` in the
+Gateway state directory (at most 4096, newest kept), so a session created
+before a Gateway restart is loaded and deleted by its adapter after it; a
+session started elsewhere answers unsupported, and one held by a terminal
+`409`. Discovery declares `sessionDelete` and `sessionFork` before any
+adapter has started.
 
 ## muqun MCP
 
@@ -188,15 +267,16 @@ does not lock it.
 |---|---|---|
 | Models | `model` config option | implemented (`session/set_config_option`) |
 | Effort tiers | `effort` option, per model | implemented; tiers are listed only for the model selected in an observed session (shared ACP catalog rule) |
-| Permission mode | `mode` option, `session/set_mode` | adapter supports; not implemented (no ACP agent exposes modes yet; App mode catalog + switch, about half a day) |
+| Permission mode | `modes`, `session/set_mode` | implemented (session catalog modes, `features.modes`, `modeSwitching`); verified live |
 | Interrupt | `session/cancel` → `stopReason: "cancelled"` | implemented (Escape for a terminal-held session) |
-| Queue / steer while running | `_meta.steering.supported`, `promptQueueing` | adapter supports; not implemented (shared ACP driver refuses non-`auto` delivery; about a day with App inbox wiring) |
-| Fork / delete | `sessionCapabilities.fork`, `delete` | implemented (shared operations; discovery flags follow capabilities) |
-| Rename / title | generated title (`session_info_update`); `_session/rename` extension | title shown; rename not implemented (about half a day) |
+| Steer while running | `_session/steering` | implemented (`promptSteering`); verified live |
+| Queue while running | native `promptQueueing` (verified) | not offered: the native queue has no list, edit or per-item cancel, and Gateway keeps no ACP inbox |
+| Fork / delete | `sessionCapabilities.fork`, `delete` | implemented for Gateway-created sessions, also after a Gateway restart; delete verified live |
+| Rename / title | generated title (`session_info_update`); `/rename` command (`_session/rename` is AIR-only) | implemented through `/rename`; verified live |
 | Image / file attachments | `promptCapabilities.image`, `embeddedContext` | implemented (shared prompt parts) |
 | Approvals | `session/request_permission` | implemented (shared); asked only when Claude Code's own permission mode asks |
-| Questions / elicitation | form elicitation when the client advertises it | not implemented (not advertised; about a day) |
-| Delegated tasks | muqun MCP per session | MCP injected; the task sentence is not appended yet (`systemPrompt` capability exists; small follow-up) |
+| Questions / elicitation | AskUserQuestion as form `elicitation/create` | implemented (App question form); verified live. URL elicitation not advertised |
+| Delegated tasks | muqun MCP per session, `systemPrompt` append | implemented (task sentence appended, kept across restarts of the child); verified live |
 | muqun MCP tools | `mcpCapabilities.http` | implemented (runtime-bound token) |
 | Worktrees | `additionalDirectories` only | not supported as worktrees |
 | Changes panel (`agent_vcs_files`) | tool calls carry inputs; no VCS listing method | not implemented for any ACP agent (`get_vcs_diff` unsupported) |
@@ -224,6 +304,10 @@ Verified against the real adapter: initialize, new, set model/effort (haiku,
 low), prompt, cancel, load replay, list, the not-signed-in error, idle
 retirement followed by transcript listing and a reload (`cargo test --
 --ignored real_turn_retires_lists_and_reloads` with `CLAUDE_ACP_TEST_ADAPTER`
-and `CLAUDE_ACP_TEST_WORKSPACE`). The muqun MCP entry's shape is accepted by the
+and `CLAUDE_ACP_TEST_WORKSPACE`); permission modes on create and switch, the
+task instruction with model and mode kept, an AskUserQuestion answered
+through the form, steering, rename and deleting a session after a driver
+restart (`real_modes_instruction_question_steer_rename_and_owned_delete`,
+same variables). The muqun MCP entry's shape is accepted by the
 adapter; a live muqun tool call from a native Claude session and the paired App
 flows still need a deployed Gateway.

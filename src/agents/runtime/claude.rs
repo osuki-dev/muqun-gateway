@@ -267,6 +267,12 @@ impl ClaudeState {
             runtime.events_tx.clone(),
         );
         driver.set_launch(launch);
+        match crate::platform::store::state_dir() {
+            Ok(dir) => driver.set_owned_store(dir.join("claude-owned-sessions.json")),
+            Err(error) => {
+                tracing::warn!(%error, "Claude Code session ownership lasts for this run")
+            }
+        }
         driver.set_terminal_bridge(std::sync::Arc::new(Terminals {
             sessions: self.terminals.get().cloned().unwrap_or_default(),
         }));
@@ -591,6 +597,18 @@ fn features_for_models(models: &[crate::discovery::AgentModelInfo]) -> AgentFeat
 
 pub(super) fn features() -> AgentFeatures {
     let mut found = super::acp_features();
+    // Verified with adapter 0.99.1 (`docs/claude-acp-protocol.md`); fork and
+    // delete follow the live `initialize` once a session has been opened.
+    found.modes = true;
+    for key in [
+        "modeSwitching",
+        "sessionRename",
+        "sessionDelete",
+        "sessionFork",
+        "promptSteering",
+    ] {
+        found.extra.insert(key.into(), serde_json::json!(true));
+    }
     // Prompts and Stop for a conversation open in a terminal pane are typed
     // into that pane (`TerminalBridge`); Apps that know this may send them.
     found

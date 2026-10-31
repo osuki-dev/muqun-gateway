@@ -243,6 +243,49 @@ pub(crate) fn catalog_for(value: &Value, provider: &str) -> AgentCatalog {
     }
 }
 
+/// The session's permission modes (`modes.availableModes`, else the `mode`
+/// config option) and the current one, for an agent whose modes belong to
+/// the session alone (Claude Code: `session/set_mode`).
+pub(crate) fn session_modes(value: &Value) -> (Vec<ModeInfo>, Option<String>) {
+    let mode = |id: &Value, name: &Value, description: &Value| {
+        let id = id.as_str().filter(|id| !id.is_empty() && id.len() <= 128)?;
+        Some(ModeInfo {
+            id: id.into(),
+            name: name.as_str().unwrap_or(id).into(),
+            model: None,
+            description: description.as_str().map(str::to_owned),
+            mode: None,
+            color: None,
+            hidden: false,
+        })
+    };
+    if let Some(available) = value
+        .pointer("/modes/availableModes")
+        .and_then(Value::as_array)
+    {
+        return (
+            available
+                .iter()
+                .filter_map(|m| mode(&m["id"], &m["name"], &m["description"]))
+                .collect(),
+            value
+                .pointer("/modes/currentModeId")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        );
+    }
+    match config_option(value, "mode") {
+        Some(option) => (
+            select_options(option)
+                .into_iter()
+                .filter_map(|m| mode(&m["value"], &m["name"], &m["description"]))
+                .collect(),
+            option["currentValue"].as_str().map(str::to_owned),
+        ),
+        None => (Vec::new(), None),
+    }
+}
+
 pub(crate) fn catalog(value: &Value) -> AgentCatalog {
     catalog_for(value, "fx")
 }
@@ -536,6 +579,23 @@ impl Projection {
         }
         self.observed_bytes += text.len() + 512;
         let native = format!("acp-submission:{}", uuid::Uuid::new_v4());
+        let group = self.group(&native);
+        self.row(
+            native,
+            group,
+            TimelineRole::User,
+            AgentPart::Text { text: text.into() },
+        )
+    }
+
+    /// A prompt steered into the running turn: a user row after the turn's
+    /// output so far. The turn, its permissions and its tools go on.
+    pub fn steered(&mut self, text: &str) -> TimelineItem {
+        self.current = None;
+        self.thought = None;
+        self.anonymous = None;
+        self.observed_bytes += text.len() + 512;
+        let native = format!("acp-steer:{}", uuid::Uuid::new_v4());
         let group = self.group(&native);
         self.row(
             native,
@@ -886,6 +946,29 @@ impl Projection {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn session_modes_come_from_modes_else_the_mode_option() {
+        // Shapes claude-agent-acp 0.99.1 sent: `session/new` carries both;
+        // a `config_option_update` only the option.
+        let modes = json!({"modes":{"currentModeId":"plan","availableModes":[
+            {"id":"default","name":"Manual","description":"Always ask"},{"id":"plan","name":"Plan"}]}});
+        let option = json!({"configOptions":[{"id":"mode","currentValue":"acceptEdits","options":[
+            {"value":"default","name":"Manual"},{"value":"acceptEdits","name":"Accept edits"}]}]});
+        for (value, ids, current) in [
+            (&modes, vec!["default", "plan"], Some("plan")),
+            (&option, vec!["default", "acceptEdits"], Some("acceptEdits")),
+            (&json!({}), vec![], None),
+        ] {
+            let (found, now) = session_modes(value);
+            assert_eq!(found.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ids);
+            assert_eq!(now.as_deref(), current);
+        }
+        assert_eq!(
+            session_modes(&modes).0[0].description.as_deref(),
+            Some("Always ask")
+        );
+    }
 
     #[test]
     fn a_recorded_model_maps_to_the_offered_value_or_its_family_alias() {

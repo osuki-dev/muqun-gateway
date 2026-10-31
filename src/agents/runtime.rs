@@ -2545,6 +2545,10 @@ fn apply_acp_capabilities(
             == Some(true);
     features.attachments_by_path = false;
     features.slash_commands = commands_listed;
+    // Before any process ran, the agent's own defaults stand.
+    if capabilities.is_null() {
+        return;
+    }
     for (feature, operation) in [("sessionFork", "fork"), ("sessionDelete", "delete")] {
         features.extra.insert(
             feature.into(),

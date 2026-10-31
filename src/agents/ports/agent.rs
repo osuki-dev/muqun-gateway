@@ -292,6 +292,13 @@ pub trait AgentPort: Send + Sync {
         })
     }
 
+    /// Whether a task's session of this agent takes the task sentence
+    /// through [`AgentPort::set_session_instruction`]; by default the agents
+    /// whose service takes MCP servers at runtime.
+    fn takes_session_instructions(&self) -> bool {
+        self.adds_mcp_servers()
+    }
+
     /// Attach (or replace) a durable instruction `text` under `key` to
     /// session `session_id`, outside its conversation. `Ok(false)` when the
     /// agent has no such thing.

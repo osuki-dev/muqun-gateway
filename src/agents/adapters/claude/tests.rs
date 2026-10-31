@@ -350,3 +350,208 @@ async fn real_turn_retires_lists_and_reloads() {
     );
     driver.shutdown().await;
 }
+
+/// Modes, the task instruction, a question, steering, rename and delete
+/// after a Gateway restart, each through this driver against the real
+/// adapter (same environment as `real_turn_retires_lists_and_reloads`).
+#[tokio::test]
+#[ignore = "runs real Claude Code turns (haiku, low effort)"]
+async fn real_modes_instruction_question_steer_rename_and_owned_delete() {
+    use crate::agents::domain::{AgentPart, AgentSessionStatus, TimelineRole};
+    use std::time::Duration;
+    let adapter = std::env::var("CLAUDE_ACP_TEST_ADAPTER").expect("adapter path");
+    let cwd = std::env::var("CLAUDE_ACP_TEST_WORKSPACE").expect("workspace");
+    let claude = crate::agents::tasks::find_on_path("claude").expect("claude");
+    let store = std::env::temp_dir().join(format!("muqun-claude-owned-{}", uuid::Uuid::new_v4()));
+    let start = || {
+        let driver: Arc<ClaudeDriver> = ClaudeDriver::new(
+            "node".into(),
+            cwd.clone(),
+            Arc::new(MemoryMirror::for_agent("claude")),
+            tokio::sync::broadcast::channel(4096).0,
+        );
+        driver.set_launch(AcpLaunch {
+            args: vec![adapter.clone()],
+            env: vec![
+                ("CLAUDE_AGENT_ACP_PROTOCOL".into(), "v1".into()),
+                (
+                    "CLAUDE_CODE_EXECUTABLE".into(),
+                    claude.to_string_lossy().into(),
+                ),
+            ],
+        });
+        driver.set_owned_store(store.clone());
+        driver
+    };
+    let driver = start();
+    let wait = |driver: Arc<ClaudeDriver>, id: String, busy: bool| async move {
+        tokio::time::timeout(Duration::from_secs(180), async {
+            loop {
+                let info = driver.get_session(&id).await.unwrap();
+                assert!(info.error.is_none(), "{:?}", info.error);
+                if (info.status == AgentSessionStatus::Idle) != busy {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .unwrap();
+    };
+    let texts = |rows: &[crate::agents::domain::TimelineItem], role: TimelineRole| -> Vec<String> {
+        rows.iter()
+            .filter(|row| row.role == role)
+            .filter_map(|row| match &row.part {
+                AgentPart::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+    let model = ModelRef {
+        provider_id: "claude".into(),
+        model_id: "haiku".into(),
+        variant: Some("low".into()),
+    };
+    let info = driver
+        .create_session(Some(&cwd), Some(&model), Some("acceptEdits"))
+        .await
+        .unwrap();
+    let id = info.asid.0.clone();
+    assert_eq!(info.mode.as_deref(), Some("acceptEdits"));
+    let catalog = driver
+        .get_catalog_for_session(Some(&id), Some(&cwd))
+        .await
+        .unwrap();
+    assert!(
+        catalog.modes.iter().any(|mode| mode.id == "plan"),
+        "{:?}",
+        catalog.modes
+    );
+    driver.switch_mode(&id, "plan").await.unwrap();
+    assert_eq!(
+        driver.get_session(&id).await.unwrap().mode.as_deref(),
+        Some("plan")
+    );
+    driver.switch_mode(&id, "default").await.unwrap();
+    // Claude Code may change the model around plan mode; choose it again.
+    driver.switch_model(&id, &model).await.unwrap();
+
+    // The task sentence: appended to the system prompt; the session keeps
+    // its model and mode across the restart that applies it.
+    assert!(driver
+        .set_session_instruction(
+            &id,
+            "muqun-task",
+            "Always end every reply with the word KIWI on its own line."
+        )
+        .await
+        .unwrap());
+    let now = driver.get_session(&id).await.unwrap();
+    assert_eq!(now.model.as_ref(), Some(&model));
+    assert_eq!(now.mode.as_deref(), Some("default"));
+    driver
+        .send_prompt(&id, "Say hello.", &[], None)
+        .await
+        .unwrap();
+    wait(driver.clone(), id.clone(), false).await;
+    let rows = driver.get_timeline(&id, 200).await.unwrap();
+    let said = texts(&rows, TimelineRole::Assistant);
+    assert!(said.last().unwrap().contains("KIWI"), "{said:?}");
+    driver
+        .remove_session_instruction(&id, "muqun-task")
+        .await
+        .unwrap();
+
+    // A question: AskUserQuestion becomes the App form, the answer returns.
+    driver
+        .send_prompt(&id, "Use the AskUserQuestion tool once to ask me to pick a fruit: Apple or Banana. Then reply with only the fruit I picked.", &[], None)
+        .await
+        .unwrap();
+    let form = tokio::time::timeout(Duration::from_secs(120), async {
+        loop {
+            if let Some(form) = driver.get_pending_forms(&id).await.unwrap().pop() {
+                break form;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let key = match &form.fields[0] {
+        crate::agents::domain::FormField::String { key, .. } => key.clone(),
+        other => panic!("{other:?}"),
+    };
+    driver
+        .reply_form(&id, &form.id, json!({ key: "Banana" }))
+        .await
+        .unwrap();
+    wait(driver.clone(), id.clone(), false).await;
+    let rows = driver.get_timeline(&id, 200).await.unwrap();
+    assert!(texts(&rows, TimelineRole::Assistant)
+        .last()
+        .unwrap()
+        .contains("Banana"));
+
+    // Steering: a prompt during a turn joins it; one turn ends.
+    driver
+        .send_prompt(
+            &id,
+            "Write the numbers from 1 to 200, one per line, nothing else.",
+            &[],
+            None,
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            let rows = driver.get_timeline(&id, 200).await.unwrap();
+            if texts(&rows, TimelineRole::Assistant)
+                .last()
+                .is_some_and(|t| t.contains("\n3"))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let steer = "Stop counting now and reply with exactly PONG.";
+    driver
+        .send_prompt(&id, steer, &[], Some("steer"))
+        .await
+        .unwrap();
+    wait(driver.clone(), id.clone(), false).await;
+    let rows = driver.get_timeline(&id, 300).await.unwrap();
+    assert!(texts(&rows, TimelineRole::User).iter().any(|t| t == steer));
+    assert!(texts(&rows, TimelineRole::Assistant)
+        .last()
+        .unwrap()
+        .contains("PONG"));
+    assert!(matches!(
+        driver.send_prompt(&id, "x", &[], Some("queue")).await,
+        Err(AgentError::Unsupported(_))
+    ));
+
+    // Rename: Claude Code's own command; no rows, the title moves.
+    let before = driver.get_timeline(&id, 300).await.unwrap().len();
+    driver.rename_session(&id, "Parity spike").await.unwrap();
+    assert_eq!(driver.get_session(&id).await.unwrap().title, "Parity spike");
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(driver.get_timeline(&id, 300).await.unwrap().len(), before);
+
+    // Delete after a restart: the new run still knows it created the session.
+    driver.shutdown().await;
+    let restarted = start();
+    restarted.delete_session(&id).await.unwrap();
+    let listed = restarted
+        .list_sessions(&SessionQuery {
+            directory: Some(cwd.clone()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(listed.iter().all(|row| row.asid.0 != id));
+    restarted.shutdown().await;
+    let _ = std::fs::remove_file(store);
+}

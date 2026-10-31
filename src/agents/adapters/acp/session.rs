@@ -33,6 +33,19 @@ pub trait AcpProvider: Send + Sync + 'static {
     /// How long `initialize` may take; a runner that downloads the agent on
     /// first use needs longer than a normal request.
     const INITIALIZE_TIMEOUT: Duration = RPC_TIMEOUT;
+    /// Permission modes belong to the session (`session/set_mode`) and are
+    /// offered as its modes. Off where a mode change persists elsewhere.
+    const SESSION_MODES: bool = false;
+    /// A prompt sent while a turn runs may be steered into it
+    /// (`_session/steering`, initialize `_meta.steering.supported`).
+    const STEERING: bool = false;
+    /// Advertise form elicitation; questions arrive as `elicitation/create`.
+    const FORM_ELICITATION: bool = false;
+    /// The session takes an appended system prompt (`systemPrompt` on
+    /// `session/new`, `session/load`, `session/resume`).
+    const SYSTEM_PROMPT: bool = false;
+    /// The native command that renames a session without a model turn.
+    const RENAME_COMMAND: Option<&'static str> = None;
     fn recovery_snapshot<'a>(
         _binary: &'a str,
         _directory: &'a str,
@@ -212,6 +225,9 @@ struct SessionState {
     prompt_checkpoint: Option<Checkpoint>,
     prompt_user_digest: Option<String>,
     turn_had_output: bool,
+    forms: HashMap<String, super::elicitation::Elicitation>,
+    /// A native command runs that leaves no rows (rename).
+    hidden_command: bool,
 }
 
 #[derive(Clone)]
@@ -355,6 +371,61 @@ impl Drop for Admission<'_> {
     }
 }
 
+/// The sessions this Gateway created (or forked), kept across restarts in a
+/// small file so they stay deletable after the Gateway is upgraded. Without
+/// a file (tests, other providers) ownership lasts for the process.
+#[derive(Default)]
+struct OwnedSessions {
+    path: Option<std::path::PathBuf>,
+    ids: Vec<String>,
+}
+
+const MAX_OWNED_SESSIONS: usize = 4096;
+
+impl OwnedSessions {
+    fn load(path: std::path::PathBuf) -> Self {
+        let ids = std::fs::read(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Vec<String>>(&bytes).ok())
+            .unwrap_or_default();
+        Self {
+            path: Some(path),
+            ids,
+        }
+    }
+    fn contains(&self, id: &str) -> bool {
+        self.ids.iter().any(|owned| owned == id)
+    }
+    fn mark(&mut self, id: &str) {
+        if self.contains(id) {
+            return;
+        }
+        self.ids.push(id.to_owned());
+        if self.ids.len() > MAX_OWNED_SESSIONS {
+            self.ids.remove(0);
+        }
+        self.save();
+    }
+    fn forget(&mut self, id: &str) {
+        let before = self.ids.len();
+        self.ids.retain(|owned| owned != id);
+        if self.ids.len() != before {
+            self.save();
+        }
+    }
+    fn save(&self) {
+        let Some(path) = &self.path else { return };
+        let temporary = path.with_extension("tmp");
+        let written = serde_json::to_vec(&self.ids)
+            .map_err(std::io::Error::other)
+            .and_then(|bytes| std::fs::write(&temporary, bytes))
+            .and_then(|()| std::fs::rename(&temporary, path));
+        if let Err(error) = written {
+            tracing::warn!(%error, "owned ACP sessions were not saved");
+        }
+    }
+}
+
 type CatalogCacheEntry = (
     String,
     tokio::time::Instant,
@@ -391,6 +462,10 @@ pub struct AcpDriver<P: AcpProvider> {
     /// The last model catalog a live session offered, kept after its
     /// process is released so choices stay available.
     last_catalog: StdMutex<Option<AgentCatalog>>,
+    owned: StdMutex<OwnedSessions>,
+    /// Per-session instructions (key → text), appended to the system prompt
+    /// whenever the session is started (`P::SYSTEM_PROMPT`).
+    instructions: StdMutex<HashMap<String, BTreeMap<String, String>>>,
     stop: CancellationToken,
 }
 
@@ -495,6 +570,8 @@ impl<P: AcpProvider> AcpDriver<P> {
             terminal: StdMutex::new(None),
             me: me.clone(),
             last_catalog: StdMutex::new(None),
+            owned: StdMutex::new(OwnedSessions::default()),
+            instructions: StdMutex::new(HashMap::new()),
             stop: CancellationToken::new(),
         })
     }
@@ -503,6 +580,30 @@ impl<P: AcpProvider> AcpDriver<P> {
     #[cfg(test)]
     pub(crate) fn set_session_store(&self, probe: fn() -> Option<u64>) {
         *self.session_store.lock().unwrap() = probe;
+    }
+
+    /// Keep the ids of Gateway-created sessions in `path` across restarts.
+    pub fn set_owned_store(&self, path: std::path::PathBuf) {
+        *self.owned.lock().unwrap() = OwnedSessions::load(path);
+    }
+
+    fn owns(&self, id: &str) -> bool {
+        self.owned.lock().unwrap().contains(id)
+    }
+
+    /// The `systemPrompt` a start of `id` carries, if it has instructions.
+    fn system_prompt(&self, id: Option<&str>) -> Option<Value> {
+        if !P::SYSTEM_PROMPT {
+            return None;
+        }
+        let instructions = self.instructions.lock().unwrap();
+        let text = instructions
+            .get(id?)?
+            .values()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        Some(json!({ "mode": "append", "content": [{ "type": "text", "text": text }] }))
     }
 
     /// Replace `ARGS` and add child environment for every later spawn.
@@ -991,6 +1092,48 @@ impl<P: AcpProvider> AcpDriver<P> {
         Ok(())
     }
 
+    /// `session/set_mode` to one of the session's own modes. The agent
+    /// answers with a `config_option_update`, which moves `info.mode`.
+    async fn select_mode(&self, session: &Session, mode: &str) -> Result<(), AgentError> {
+        let id = {
+            let state = session.state.lock().await;
+            if !state.catalog.modes.iter().any(|offered| offered.id == mode) {
+                return Err(AgentError::InvalidRequest(format!(
+                    "{} does not offer the mode {mode} in this session",
+                    P::LABEL
+                )));
+            }
+            state.info.asid.0.clone()
+        };
+        session
+            .client
+            .request_with_timeout(
+                "session/set_mode",
+                json!({ "sessionId": id, "modeId": mode }),
+                RPC_TIMEOUT,
+            )
+            .await
+            .map_err(AgentError::RequestFailed)?;
+        let mut state = session.state.lock().await;
+        if state.info.mode.as_deref() != Some(mode) {
+            state.info.mode = Some(mode.into());
+            state.catalog.defaults.mode = Some(mode.into());
+            let info = state.info.clone();
+            drop(state);
+            let seq = self.mirror.update_session(info.clone()).await;
+            Self::emit(
+                &self.mirror,
+                &self.tx,
+                AgentDomainEvent::SessionUpdated {
+                    asid: info.asid.clone(),
+                    info: Box::new(info),
+                    seq,
+                },
+            );
+        }
+        Ok(())
+    }
+
     async fn select_model(&self, session: &Session, model: &ModelRef) -> Result<(), AgentError> {
         if !P::MODEL_SELECTION {
             return Err(AgentError::Unsupported("ACP model selection".into()));
@@ -1087,6 +1230,9 @@ impl<P: AcpProvider> AcpDriver<P> {
         });
         if P::SESSION_NOTICES {
             client_capabilities["session"] = json!({ "notices": {} });
+        }
+        if P::FORM_ELICITATION {
+            client_capabilities["elicitation"] = json!({ "form": {} });
         }
         let initialize = client.request_with_timeout(
             "initialize",
@@ -1602,7 +1748,7 @@ impl<P: AcpProvider> AcpDriver<P> {
             }
         }
         if let Some(entry) = dormant {
-            session.state.lock().await.owned_mutations = entry.owned_mutations;
+            session.state.lock().await.owned_mutations = entry.owned_mutations || self.owns(id);
             if let Some(model) = &entry.info.model {
                 if session.state.lock().await.info.model.as_ref() != Some(model) {
                     // Model/effort choices are session-scoped. Restore the
@@ -1724,6 +1870,9 @@ impl<P: AcpProvider> AcpDriver<P> {
         if let Some(id) = &id {
             params["sessionId"] = json!(id);
         }
+        if let Some(prompt) = self.system_prompt(id.as_deref()) {
+            params["systemPrompt"] = prompt;
+        }
         let request = client
             .start_request(method, params)
             .await
@@ -1810,12 +1959,19 @@ impl<P: AcpProvider> AcpDriver<P> {
             .pointer("/modes/currentModeId")
             .and_then(Value::as_str)
             .map(str::to_owned);
+        let mut catalog = mapper::catalog_for(&value, P::KIND);
+        if P::SESSION_MODES {
+            (catalog.modes, catalog.defaults.mode) = mapper::session_modes(&value);
+        }
+        if new_session {
+            self.owned.lock().unwrap().mark(&id);
+        }
         let (completions, completed) = mpsc::unbounded_channel();
         let mut state = SessionState {
             info,
-            catalog: mapper::catalog_for(&value, P::KIND),
+            catalog,
             config: value.clone(),
-            owned_mutations: new_session,
+            owned_mutations: self.owns(&id),
             usage: mapper::SessionUsage::new(new_session),
             projection: Projection::new(P::REQUIRE_MESSAGE_ID),
             permissions: HashMap::new(),
@@ -1824,6 +1980,8 @@ impl<P: AcpProvider> AcpDriver<P> {
             prompt_checkpoint: None,
             prompt_user_digest: None,
             turn_had_output: false,
+            forms: HashMap::new(),
+            hidden_command: false,
         };
         for params in replay {
             if params["sessionId"].as_str() != Some(id.as_str()) {
@@ -2000,6 +2158,9 @@ impl<P: AcpProvider> AcpDriver<P> {
             }
             Some("current_mode_update") => {
                 state.info.mode = update["currentModeId"].as_str().map(str::to_owned);
+                if P::SESSION_MODES {
+                    state.catalog.defaults.mode = state.info.mode.clone();
+                }
                 Ok(None)
             }
             Some("config_option_update") => {
@@ -2011,6 +2172,27 @@ impl<P: AcpProvider> AcpDriver<P> {
                 state.catalog = catalog;
                 state.config["configOptions"] = update["configOptions"].clone();
                 state.info.model = mapper::selected_model_for(&state.config, P::KIND);
+                // `session/set_mode` answers with this update alone.
+                if P::SESSION_MODES {
+                    if let Some(current) = mapper::config_option(&state.config, "mode")
+                        .and_then(|option| option["currentValue"].as_str())
+                    {
+                        state.info.mode = Some(current.into());
+                        state.catalog.defaults.mode = Some(current.into());
+                    }
+                }
+                Ok(None)
+            }
+            Some("agent_message_chunk" | "agent_thought_chunk") if state.hidden_command => Ok(None),
+            // A rename leaves its command in the history; it is not a prompt.
+            Some("user_message_chunk")
+                if P::RENAME_COMMAND.is_some_and(|command| {
+                    update["content"]["text"]
+                        .as_str()
+                        .and_then(|text| text.strip_prefix(command))
+                        .is_some_and(|rest| rest.starts_with(' '))
+                }) =>
+            {
                 Ok(None)
             }
             _ => state.projection.update(update),
@@ -2215,6 +2397,36 @@ impl<P: AcpProvider> AcpDriver<P> {
                     }
                 }
             }
+            AcpEvent::Request { id, method, params }
+                if P::FORM_ELICITATION && method == "elicitation/create" =>
+            {
+                let mut state = session.state.lock().await;
+                let asid = state.info.asid.clone();
+                match super::elicitation::form(&id, &asid.0, &params) {
+                    Some(elicitation) => {
+                        let request = elicitation.form.clone();
+                        state.forms.insert(request.id.clone(), elicitation);
+                        let seq = mirror.add_form(request.clone()).await;
+                        Self::emit(
+                            mirror,
+                            tx,
+                            AgentDomainEvent::FormPending { asid, request, seq },
+                        );
+                    }
+                    None => {
+                        // Not a form the App can show whole: say no answer
+                        // was given instead of answering part of it.
+                        tracing::info!(session = %asid.0, "ACP elicitation cannot be shown; cancelled");
+                        let _ = session.client.respond(id, json!({"action":"cancel"})).await;
+                    }
+                }
+            }
+            AcpEvent::Request { id, .. } => {
+                let _ = session
+                    .client
+                    .respond_error(id, -32601, "Method not supported by Muqun Gateway")
+                    .await;
+            }
             AcpEvent::Disconnected { reason } => {
                 session.connected.store(false, Ordering::Release);
                 Self::status(
@@ -2254,6 +2466,21 @@ impl<P: AcpProvider> AcpDriver<P> {
                 AgentDomainEvent::PermissionResolved {
                     asid: asid.clone(),
                     request_id,
+                    seq,
+                },
+            );
+        }
+        for (form_id, _) in state.forms.drain() {
+            let seq = mirror
+                .resolve_form_with_reason(&asid, &form_id, Some(FormResolutionReason::Expired))
+                .await;
+            Self::emit(
+                mirror,
+                tx,
+                AgentDomainEvent::FormResolved {
+                    asid: asid.clone(),
+                    form_id,
+                    reason: Some(FormResolutionReason::Expired),
                     seq,
                 },
             );
@@ -2300,10 +2527,32 @@ impl<P: AcpProvider> AcpDriver<P> {
         delivery: Option<&str>,
         native_command: bool,
     ) -> Result<(), AgentError> {
-        if delivery.is_some_and(|delivery| delivery != "auto") {
-            return Err(AgentError::Unsupported(
-                "ACP prompt steering or queueing".into(),
-            ));
+        match delivery {
+            None | Some("auto") => {}
+            Some("steer") if P::STEERING && !native_command => {
+                let running = self.retained(id).filter(|session| {
+                    session.connected.load(Ordering::Acquire)
+                        && session.busy.load(Ordering::Acquire)
+                });
+                if let Some(session) = running {
+                    if self.steer(&session, id, text, attachments).await? {
+                        return Ok(());
+                    }
+                }
+                // No turn is running (any more): an ordinary prompt.
+            }
+            Some("steer") => {
+                return Err(AgentError::Unsupported("ACP prompt steering".into()));
+            }
+            // Gateway keeps no inbox for ACP sessions.
+            Some("queue") => {
+                return Err(AgentError::Unsupported("ACP prompt queueing".into()));
+            }
+            Some(_) => {
+                return Err(AgentError::InvalidRequest(
+                    "delivery must be steer or queue".into(),
+                ));
+            }
         }
         let session = self.activate(id, false, true).await?;
         let mut admission = Admission {
@@ -2336,6 +2585,7 @@ impl<P: AcpProvider> AcpDriver<P> {
         let mut state = session.state.lock().await;
         state.projection.can_submit(&prepared.transcript)?;
         state.recovery = None;
+        state.hidden_command = false;
         state.prompt_checkpoint = checkpoint;
         state.prompt_user_digest = Some(recovery::text_digest(&prepared.transcript));
         state.turn_had_output = false;
@@ -2405,6 +2655,160 @@ impl<P: AcpProvider> AcpDriver<P> {
                 )))
             }
         }
+    }
+
+    /// Steer `text` into the turn `session` is running. `Ok(false)` when
+    /// the agent answers that no turn runs: nothing was delivered.
+    async fn steer(
+        &self,
+        session: &Session,
+        id: &str,
+        text: &str,
+        attachments: &[String],
+    ) -> Result<bool, AgentError> {
+        let prepared =
+            operations::prompt_parts(text, attachments, session.prompt_capabilities).await?;
+        session
+            .state
+            .lock()
+            .await
+            .projection
+            .can_submit(&prepared.transcript)?;
+        let outcome = session
+            .client
+            .request_with_timeout(
+                "_session/steering",
+                json!({
+                    "sessionId": id,
+                    "prompt": prepared.content,
+                    "_meta": { "steering": { "idleBehavior": "promptRequired" } },
+                }),
+                RPC_TIMEOUT,
+            )
+            .await
+            .map_err(|error| {
+                AgentError::RequestFailed(format!(
+                    "{error}; the steered prompt may have been delivered; do not retry automatically"
+                ))
+            })?;
+        match outcome["outcome"].as_str() {
+            Some("injected") => {
+                let mut state = session.state.lock().await;
+                state.hidden_command = false;
+                state.last_activity = tokio::time::Instant::now();
+                let row = state.projection.steered(&prepared.transcript);
+                let event = self
+                    .mirror
+                    .record_timeline_upsert(&state.info.asid, vec![row])
+                    .await;
+                Self::emit(&self.mirror, &self.tx, event);
+                Ok(true)
+            }
+            Some("promptRequired") => Ok(false),
+            _ => Err(protocol(
+                "ACP steering answered an unknown outcome; do not retry automatically",
+            )),
+        }
+    }
+
+    /// Rename through the agent's own command, a prompt that runs no model
+    /// turn; its echo and output leave no rows.
+    async fn rename(&self, id: &str, command: &str, title: &str) -> Result<(), AgentError> {
+        let session = self.activate(id, false, true).await?;
+        let _admission = Admission {
+            busy: &session.busy,
+            handed_off: false,
+        };
+        session.state.lock().await.hidden_command = true;
+        let result = session
+            .client
+            .request_with_timeout(
+                "session/prompt",
+                json!({ "sessionId": id, "prompt": [{ "type": "text", "text": format!("{command} {title}") }] }),
+                RPC_TIMEOUT,
+            )
+            .await;
+        // Its output may still be on the way; the flag drops with the next
+        // prompt (`submit_prompt`, `steer`).
+        let mut state = session.state.lock().await;
+        result.map_err(|error| {
+            AgentError::RequestFailed(format!("{error}; the session may have been renamed"))
+        })?;
+        state.info.title = title.to_owned();
+        state.info.updated_ms = mapper::now_ms();
+        let info = state.info.clone();
+        drop(state);
+        self.invalidate_session_lists().await;
+        let seq = self.mirror.update_session(info.clone()).await;
+        Self::emit(
+            &self.mirror,
+            &self.tx,
+            AgentDomainEvent::SessionUpdated {
+                asid: info.asid.clone(),
+                info: Box::new(info),
+                seq,
+            },
+        );
+        Ok(())
+    }
+
+    /// Start the live, idle session `id` again with its current
+    /// instructions (`session/resume` with a changed `systemPrompt` makes the
+    /// agent rebuild it), then restore its model, effort and mode. A session
+    /// that is not live takes them at its next start.
+    async fn restart_with_instructions(&self, id: &str) -> Result<(), AgentError> {
+        let Some(session) = self.retained(id) else {
+            return Ok(());
+        };
+        if !session.connected.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let _mutation = self.mutations.lock().await;
+        if session
+            .busy
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(AgentError::NotAvailable(
+                "the session is busy; its instructions apply at its next start".into(),
+            ));
+        }
+        let admission = Admission {
+            busy: &session.busy,
+            handed_off: false,
+        };
+        let (directory, model, mode) = {
+            let state = session.state.lock().await;
+            (
+                state.info.directory.clone().unwrap_or_default(),
+                state.info.model.clone(),
+                state.info.mode.clone(),
+            )
+        };
+        let mut params =
+            json!({ "sessionId": id, "cwd": directory, "mcpServers": self.mcp_servers() });
+        if let Some(prompt) = self.system_prompt(Some(id)) {
+            params["systemPrompt"] = prompt;
+        }
+        let value = session
+            .client
+            .request_with_timeout("session/resume", params, RPC_TIMEOUT)
+            .await
+            .map_err(AgentError::RequestFailed)?;
+        if value["configOptions"].is_array() {
+            let update = json!({"sessionUpdate":"config_option_update","configOptions":value["configOptions"]});
+            Self::reduce(&mut *session.state.lock().await, &update)?;
+        }
+        drop(admission);
+        let now = session.state.lock().await.info.clone();
+        if let Some(model) = model.filter(|model| now.model.as_ref() != Some(model)) {
+            self.select_model(&session, &model).await?;
+        }
+        if let Some(mode) = mode.filter(|mode| P::SESSION_MODES && now.mode.as_ref() != Some(mode))
+        {
+            self.select_mode(&session, &mode).await?;
+        }
+        Ok(())
     }
 
     fn snapshot_matches_projection(snapshot: &NativeSnapshot, projection: &Projection) -> bool {
@@ -2774,7 +3178,7 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
             if model.is_some() && !P::MODEL_SELECTION {
                 return Err(AgentError::Unsupported("ACP model selection".into()));
             }
-            if mode.is_some() {
+            if mode.is_some() && !P::SESSION_MODES {
                 return Err(AgentError::Unsupported("ACP mode selection".into()));
             }
             let directory = directory.unwrap_or(&self.default_directory);
@@ -2790,6 +3194,12 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
                 if let Err(error) = self.select_model(&session, model).await {
                     let id = session.state.lock().await.info.asid.0.clone();
                     return Err(AgentError::RequestFailed(format!("ACP session {id} was created, but model selection failed: {error}; do not retry creation")));
+                }
+            }
+            if let Some(mode) = mode {
+                if let Err(error) = self.select_mode(&session, mode).await {
+                    let id = session.state.lock().await.info.asid.0.clone();
+                    return Err(AgentError::RequestFailed(format!("ACP session {id} was created, but mode selection failed: {error}; do not retry creation")));
                 }
             }
             let info = session.state.lock().await.info.clone();
@@ -2957,8 +3367,85 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
     }
     fn get_pending_forms<'a>(&'a self, id: &'a str) -> AgentFuture<'a, Vec<FormRequest>> {
         Box::pin(async move {
+            if let Some(session) = self.retained(id) {
+                let state = session.state.lock().await;
+                return Ok(state.forms.values().map(|e| e.form.clone()).collect());
+            }
             self.get_session(id).await?;
             Ok(Vec::new())
+        })
+    }
+    fn rename_session<'a>(&'a self, id: &'a str, title: &'a str) -> AgentFuture<'a, ()> {
+        Box::pin(async move {
+            let Some(command) = P::RENAME_COMMAND else {
+                return Err(AgentError::Unsupported("ACP session rename".into()));
+            };
+            let title = title.split_whitespace().collect::<Vec<_>>().join(" ");
+            if title.is_empty() || title.len() > 512 {
+                return Err(AgentError::InvalidRequest(
+                    "a title needs 1 to 512 bytes of text".into(),
+                ));
+            }
+            self.rename(id, command, &title).await
+        })
+    }
+    fn takes_session_instructions(&self) -> bool {
+        P::SYSTEM_PROMPT
+    }
+    fn set_session_instruction<'a>(
+        &'a self,
+        id: &'a str,
+        key: &'a str,
+        text: &'a str,
+    ) -> AgentFuture<'a, bool> {
+        Box::pin(async move {
+            if !P::SYSTEM_PROMPT {
+                return Ok(false);
+            }
+            let previous = self
+                .instructions
+                .lock()
+                .unwrap()
+                .entry(id.to_owned())
+                .or_default()
+                .insert(key.to_owned(), text.to_owned());
+            if previous.as_deref() != Some(text) {
+                if let Err(error) = self.restart_with_instructions(id).await {
+                    let mut instructions = self.instructions.lock().unwrap();
+                    let entry = instructions.entry(id.to_owned()).or_default();
+                    match previous {
+                        Some(previous) => entry.insert(key.to_owned(), previous),
+                        None => entry.remove(key),
+                    };
+                    if entry.is_empty() {
+                        instructions.remove(id);
+                    }
+                    return Err(error);
+                }
+            }
+            Ok(true)
+        })
+    }
+    fn remove_session_instruction<'a>(&'a self, id: &'a str, key: &'a str) -> AgentFuture<'a, ()> {
+        Box::pin(async move {
+            let removed = {
+                let mut instructions = self.instructions.lock().unwrap();
+                let removed = instructions
+                    .get_mut(id)
+                    .and_then(|entry| entry.remove(key))
+                    .is_some();
+                if instructions.get(id).is_some_and(BTreeMap::is_empty) {
+                    instructions.remove(id);
+                }
+                removed
+            };
+            // A busy or released session starts without it next time.
+            if removed {
+                if let Err(error) = self.restart_with_instructions(id).await {
+                    tracing::debug!(session = id, %error, "instruction removed for the next start");
+                }
+            }
+            Ok(())
         })
     }
     fn get_catalog<'a>(&'a self, directory: Option<&'a str>) -> AgentFuture<'a, AgentCatalog> {
@@ -2989,9 +3476,12 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
                     catalog.defaults.model = None;
                 }
                 // ACP mode changes persist permission defaults outside the current
-                // session, so the existing App must not offer them as local choices.
-                catalog.modes.clear();
-                catalog.defaults.mode = None;
+                // session, so the existing App must not offer them as local choices
+                // -- unless the agent keeps them per session.
+                if !P::SESSION_MODES {
+                    catalog.modes.clear();
+                    catalog.defaults.mode = None;
+                }
                 Ok(catalog)
             } else {
                 self.get_catalog(directory).await
@@ -3098,6 +3588,7 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
                 ));
             }
             let cloned=self.open(directory,Some(mapper::session(&new_id,directory,&response))).await.map_err(|error|AgentError::RequestFailed(format!("session {new_id} was forked but could not be loaded: {error}; do not retry fork")))?;
+            self.owned.lock().unwrap().mark(&new_id);
             let mut state = cloned.state.lock().await;
             state.owned_mutations = true;
             Ok(state.info.clone())
@@ -3108,11 +3599,9 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
             if let Some(live) = self.terminal_live(id).await {
                 return Err(AgentError::TerminalInteraction(Box::new(live.runtime)));
             }
-            let parked_owned =
-                self.dormant.lock().unwrap().get(id).is_some_and(|entry| {
-                    entry.kind == DormantKind::Parked && entry.owned_mutations
-                });
-            if parked_owned {
+            // Created here, possibly before the Gateway last restarted: load
+            // it so its own agent deletes it.
+            if self.retained(id).is_none() && self.owns(id) {
                 self.ensure_loaded(id).await?;
             }
             let _mutation = self.mutations.lock().await;
@@ -3163,6 +3652,8 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
                 })?;
             self.sessions.lock().unwrap().remove(id);
             self.dormant.lock().unwrap().remove(id);
+            self.owned.lock().unwrap().forget(id);
+            self.instructions.lock().unwrap().remove(id);
             if let Some(metadata) = self.session_metadata.lock().await.as_mut() {
                 metadata.sessions.remove(id);
             }
@@ -3178,8 +3669,14 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
             self.select_model(&session, model).await
         })
     }
-    fn switch_mode<'a>(&'a self, _id: &'a str, _mode: &'a str) -> AgentFuture<'a, ()> {
-        unsupported("mode selection")
+    fn switch_mode<'a>(&'a self, id: &'a str, mode: &'a str) -> AgentFuture<'a, ()> {
+        Box::pin(async move {
+            if !P::SESSION_MODES {
+                return Err(AgentError::Unsupported("mode selection".into()));
+            }
+            let session = self.ensure_loaded(id).await?;
+            self.select_mode(&session, mode).await
+        })
     }
     fn find_files<'a>(
         &'a self,
@@ -3189,13 +3686,40 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
     ) -> AgentFuture<'a, Vec<Value>> {
         unsupported("file search")
     }
-    fn reply_form<'a>(
-        &'a self,
-        _id: &'a str,
-        _form: &'a str,
-        _answers: Value,
-    ) -> AgentFuture<'a, ()> {
-        unsupported("interactive forms")
+    fn reply_form<'a>(&'a self, id: &'a str, form: &'a str, answers: Value) -> AgentFuture<'a, ()> {
+        Box::pin(async move {
+            let session = self
+                .retained(id)
+                .ok_or_else(|| AgentError::SessionNotFound(id.into()))?;
+            let mut state = session.state.lock().await;
+            let elicitation = state.forms.get(form).ok_or_else(|| {
+                AgentError::InvalidRequest("ACP question is no longer pending".into())
+            })?;
+            let result = super::elicitation::answer(elicitation, &answers)?;
+            session
+                .client
+                .respond(elicitation.rpc_id.clone(), result)
+                .await
+                .map_err(AgentError::Network)?;
+            state.forms.remove(form);
+            drop(state);
+            let asid = AgentSessionId::from(id);
+            let seq = self
+                .mirror
+                .resolve_form_with_reason(&asid, form, Some(FormResolutionReason::Answered))
+                .await;
+            Self::emit(
+                &self.mirror,
+                &self.tx,
+                AgentDomainEvent::FormResolved {
+                    asid,
+                    form_id: form.into(),
+                    reason: Some(FormResolutionReason::Answered),
+                    seq,
+                },
+            );
+            Ok(())
+        })
     }
     fn get_vcs_diff<'a>(
         &'a self,
