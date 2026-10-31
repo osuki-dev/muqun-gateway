@@ -344,7 +344,10 @@ case "$*" in
   printf '%s\n' 'Usage: muqun-gateway bootstrap-preview';;
 'bootstrap-preview') [ "$MOCK_FAULT" != bootstrap-failed ] || exit 1;;
 'service status') echo "service: $MOCK_SERVICE"; echo "gateway: $MOCK_GATEWAY";;
-'backend list') printf '%b' "$MOCK_BACKENDS";;
+'backend list')
+  # A fresh machine has no backends until this run's setup wrote them; an
+  # existing installation already lists its own.
+  if [ -e "$MOCK_SETUP_LOG" ] || [ "$MOCK_SERVICE" = installed ]; then printf '%b' "$MOCK_BACKENDS"; fi;;
 esac
 "#,
     );
@@ -750,11 +753,19 @@ fn installer_requires_explicit_consent_and_supports_each_backend_combination() {
         );
         assert_eq!(calls.contains("backend autostart tmux on"), tmux, "{calls}");
         assert!(!calls.contains("service install"));
+        // A fresh install on a terminal ends on the pairing QR.
+        assert!(calls.lines().any(|line| line == "manage"), "{calls}");
     }
     for answer in [None, Some(""), Some("n"), Some("invalid")] {
         let calls = install_case(true, true, answer, false);
         assert!(!calls.contains("backend autostart"));
         assert!(!calls.contains("service install"));
+        // Only a terminal gets the QR; a piped install prints the command.
+        assert_eq!(
+            calls.lines().any(|line| line == "manage"),
+            answer.is_some(),
+            "{calls}"
+        );
     }
 }
 
@@ -764,6 +775,8 @@ fn installer_refreshes_an_existing_service_without_stopping_it_by_pid() {
     assert!(calls.contains("service install"));
     assert!(!calls.lines().any(|line| line == "stop" || line == "start"));
     assert!(!calls.contains("backend autostart"));
+    // An update keeps its pairings; it never takes over the terminal.
+    assert!(!calls.lines().any(|line| line == "manage"), "{calls}");
 }
 
 fn security_case(case: DownloadCase) -> Result<String, String> {

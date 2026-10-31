@@ -2,6 +2,12 @@
 
 ## Changes and fixes
 
+- **A fresh install ends on the pairing QR.** The installer opens
+  `muqun-gateway manage` once a first install's Gateway is confirmed running in
+  a terminal, and `manage` opens on the pairing view whenever no device is
+  paired yet. Updates, piped installs and an unreadable device file keep the
+  previous behavior and only print the `manage` command.
+
 - **Opening saved FX and Qoder conversations tolerates concurrent read markers.**
   Foreground restoration preserves the latest viewed time while history reads
   and unchanged session metadata arrive. New messages, status changes and pending

@@ -658,3 +658,16 @@ echo "(* default)"
 echo
 echo "Open the pairing QR any time with:"
 echo "  $binary manage"
+
+# A fresh install has one thing left to do: pair the phone. Hand the terminal
+# straight to `manage`, which opens on the QR when nothing is paired yet, so
+# the reader is not left copying a command out of a summary. stdin is the
+# script itself on the `curl ... | sh` path, so `manage` reads /dev/tty. An
+# update keeps its pairings and gets the hint only; so does a run with no
+# terminal, or one whose gateway did not confirm it is up.
+if [ "$config_existed" = 0 ] && [ "$gateway_state" = running ] && [ -t 1 ] &&
+   (exec 3< /dev/tty) 2>/dev/null; then
+  echo
+  info "Opening the pairing QR now. Scan it with the Muqun app; press q to leave."
+  "$binary" manage < /dev/tty || warn "Could not open the pairing screen. Run: $binary manage"
+fi

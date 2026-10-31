@@ -73,14 +73,14 @@ pub(crate) fn manage() -> anyhow::Result<()> {
     let _terminal = TerminalModeGuard::enter()?;
     let mut message = auto_upgrade_local_public_url()?.unwrap_or_else(|| String::from(IDLE_STATUS));
     let mut pending_pairing = fetch_pending_pairing().ok().flatten();
-    let mut devices = match read_devices() {
-        Ok(devices) => devices,
+    let (mut devices, devices_readable) = match read_devices() {
+        Ok(devices) => (devices, true),
         Err(error) => {
             // An unreadable device file is not an empty one. Reporting it as
             // "no paired devices" is how an owner is talked into re-pairing,
             // and re-pairing is the write that makes the loss permanent.
             message = format!("could not read paired devices: {error}");
-            Vec::new()
+            (Vec::new(), false)
         }
     };
     // The pairing view is open while a phone is being paired: `p` opens it, a
@@ -93,6 +93,13 @@ pub(crate) fn manage() -> anyhow::Result<()> {
     let links = spawn_link_poller();
     let mut connectivity = Connectivity::default();
     let mut ui = ManageView::default();
+    // A Gateway with nothing paired yet has exactly one thing to do: pair the
+    // phone. The installer hands off here right after a fresh install, so
+    // open on the QR rather than on an Overview that only says "0 devices".
+    if devices_readable && devices.is_empty() {
+        ui.section = Section::Devices;
+        pairing.open = true;
+    }
     print_manage_screen(
         &message,
         pending_pairing.as_ref(),
