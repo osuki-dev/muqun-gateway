@@ -234,3 +234,32 @@ async fn owned_delete_uses_bound_native_context_and_removes_the_saved_session() 
     observer.shutdown().await;
     driver.shutdown().await;
 }
+
+#[tokio::test]
+async fn sessions_created_before_a_restart_stay_deletable_only_with_the_owned_store() {
+    for keep_store in [true, false] {
+        let fixture = Fixture::new().await;
+        let store = fixture.directory.join("owned.json");
+        let driver = fixture.qoder_driver();
+        driver.set_owned_store(store.clone());
+        let info = driver.create_session(None, None, None).await.unwrap();
+        driver
+            .send_prompt(&info.asid.0, "first", &[], None)
+            .await
+            .unwrap();
+        status(&driver, &info.asid.0, AgentSessionStatus::Idle).await;
+        driver.shutdown().await;
+        let restarted = fixture.qoder_driver();
+        if keep_store {
+            restarted.set_owned_store(store.clone());
+        }
+        let deleted = restarted.delete_session(&info.asid.0).await;
+        assert_eq!(deleted.is_ok(), keep_store, "{deleted:?}");
+        if !keep_store {
+            assert!(matches!(deleted, Err(AgentError::Unsupported(_))));
+        }
+        let listed = restarted.list_sessions(&Default::default()).await.unwrap();
+        assert_eq!(listed.iter().any(|row| row.asid == info.asid), !keep_store);
+        restarted.shutdown().await;
+    }
+}

@@ -2,6 +2,19 @@
 
 ## Changes and fixes
 
+- **Native Claude Code sessions do what the other native agents do.**
+  Permission modes (Manual, Accept edits, Plan, Auto, Bypass permissions) are
+  the session's own and can be picked from the App; a prompt sent while a turn
+  runs is steered into it; Claude Code's questions (AskUserQuestion) appear as
+  the App's question form; sessions can be renamed (through Claude Code's own
+  `/rename`, no model turn); and a task's session is told how to report its
+  end through an appended system prompt. Sessions this Gateway created stay
+  deletable after a Gateway restart (their ids are kept in
+  `claude-owned-sessions.json` in the state directory); deleting removes the
+  transcript the way Claude Code's SDK does. Queueing a prompt behind a running
+  Claude Code turn is not offered; sessions held by a terminal still answer
+  `409`.
+
 - **Cursor is a native agent.** When the Cursor CLI (`agent`) is on PATH and
   signed in (`agent login`), Cursor conversations can be started and continued
   in the App: pick a model, interrupt, approve tool use, run its slash commands,

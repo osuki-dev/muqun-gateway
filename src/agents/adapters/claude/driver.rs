@@ -22,6 +22,15 @@ impl AcpProvider for ClaudeProvider {
     const EFFORT_CONFIG: &'static str = "effort";
     // `npx` installs the adapter before it can answer; about a minute here.
     const INITIALIZE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+    // Permission modes are the session's own (`session/set_mode`; a load
+    // continues in the transcript's last mode).
+    const SESSION_MODES: bool = true;
+    const STEERING: bool = true;
+    // AskUserQuestion arrives as a form elicitation.
+    const FORM_ELICITATION: bool = true;
+    const SYSTEM_PROMPT: bool = true;
+    // `_session/rename` is offered to JetBrains AIR clients only.
+    const RENAME_COMMAND: Option<&'static str> = Some("/rename");
     fn recovery_snapshot<'a>(
         _binary: &'a str,
         directory: &'a str,

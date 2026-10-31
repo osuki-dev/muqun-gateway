@@ -1414,7 +1414,9 @@ impl TaskService {
         // conversation, where the agent takes one; removed when the task
         // ends (`driver::spawn_instruction_cleanup`).
         let mut unannounced = None;
-        if crate::mcp::inject::enabled(&state.config) && manager.agent().adds_mcp_servers() {
+        if crate::mcp::inject::enabled(&state.config)
+            && manager.agent().takes_session_instructions()
+        {
             // Served as a task's session from here, so the notice the
             // instruction may leave at once is stripped like the rest.
             self.mark_task_session(&asid.0);

@@ -824,7 +824,8 @@ async fn dispatch(
                 state.stop("invalid_server_request_id");
                 return Err(state.disconnected());
             };
-            if method != "session/request_permission" {
+            // Form questions reach only clients that advertised them.
+            if !matches!(method, "session/request_permission" | "elicitation/create") {
                 return send_packet(state, outgoing, json!({"jsonrpc":"2.0","id":id,"error":{"code":-32601,"message":"Method not supported by Muqun Gateway"}})).await;
             }
             {
