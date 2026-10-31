@@ -17,7 +17,8 @@ Two planes are implemented in this binary:
   adapters implement it.
 - **Agents plane** — agent sessions, models, prompts, tasks,
   permissions, approvals and event history, behind the `AgentPort`
-  port; the OpenCode, DeepSeek, T3 Code, Codex, FX, Qoder CLI and Pi adapters implement it.
+  port; the OpenCode, DeepSeek, T3 Code, Codex, FX, Qoder CLI, Claude Code and Pi adapters
+  implement it.
 
 `/api/discovery` also reports an **SSH plane**, but that one is the app's own
 transport, not a gateway subsystem: the phone can open an SSH connection to a
@@ -50,7 +51,7 @@ the far side. The gateway implements no SSH client or server itself.
 │   └─────────────┬──────────────┘  └───────────────┬────────────────┘     │
 │                 │                                 │                      │
 │        Herdr adapter · tmux adapter   OpenCode · DeepSeek · T3 · Codex   │
-│                                    FX · Qoder CLI · Pi adapters          │
+│                       FX · Qoder CLI · Claude Code · Pi adapters         │
 │                                                                          │
 │  routes: platform (health, discovery, openapi) · connectivity (pairing,  │
 │    push registration) · terminal · agents                                │
@@ -62,7 +63,7 @@ the far side. The gateway implements no SSH client or server itself.
         │
         ▼
  Herdr unix socket · tmux argv · OpenCode / DeepSeek HTTP · T3 WebSocket
- Codex private app-server stdio · FX/Qoder ACP · Pi RPC
+ Codex private app-server stdio · FX/Qoder/Claude Code ACP · Pi RPC
 ```
 
 A request travels: the phone authenticates with its device token (and, when
@@ -347,6 +348,7 @@ muqun-gateway agent setup t3         # store a T3 Code credential and enable T3
 muqun-gateway agent setup deepseek   # enable DeepSeek; Gateway starts or joins the harness
 muqun-gateway agent setup fx         # explain local FX ACP configuration (no process starts)
 muqun-gateway agent setup qoder      # explain local Qoder CLI ACP configuration (no process starts)
+muqun-gateway agent setup claude     # explain Claude Code native sessions (no process starts)
 ```
 
 `agent` probes the agents from your shell the way the running gateway does,
@@ -484,6 +486,30 @@ metadata reads do not load or take ownership of its conversation. Unsupported
 App controls remain explicitly gated: native model choices and observed effort
 options can be selected temporarily within a session; permission-mode switching
 remains unavailable. See [Qoder protocol](docs/qoder-protocol.md).
+
+### The Claude Code service agent
+
+Claude Code is also a native agent (provider id `claude`), next to its terminal
+panes. Claude Code does not speak ACP itself; Gateway starts its official ACP
+adapter, `claude-agent-acp` from PATH or else
+`npx -y @agentclientprotocol/claude-agent-acp`, which runs your own `claude`
+and reuses its login. It is on by default when `claude` and Node.js 22 or newer
+are on PATH; `muqun-gateway agent` names whichever is missing. Sign in to
+Claude Code yourself. `claude.binary` (an absolute adapter path),
+`claude.acp_package` (to pin the npx package) and `claude.idle_timeout_secs`
+are optional; `claude.enabled: false` disables it.
+
+Startup only probes versions. The adapter starts on the first session open,
+create or prompt and is released when verified idle. Session lists come from
+Claude Code's transcripts (`~/.claude/projects`, or `CLAUDE_CONFIG_DIR`)
+without starting anything; opening one replays its history over ACP. A
+conversation still open in a terminal is shown with the terminal's status and
+its transcript, and prompts from the App are typed into that terminal; no
+second Claude Code is started. Model and
+effort use the adapter's native options; the muqun MCP server is passed per
+session and `~/.claude` is never edited. A goal delegated to `claude` without
+an explicit delivery still starts in a pane. See
+[Claude Code ACP](docs/claude-acp-protocol.md).
 
 ### The OpenCode agent
 

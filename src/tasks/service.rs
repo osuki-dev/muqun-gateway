@@ -1694,7 +1694,9 @@ impl TaskService {
 /// unavailable. Explicit Codex task requests retain their existing terminal
 /// route, independent of the private Codex agent-session adapter's readiness.
 pub(crate) async fn runs_in_pane(state: &AppState, kind: &str) -> bool {
-    if kind == "codex" {
+    // Codex and Claude Code are both terminal and native agents: a goal
+    // without an explicit delivery keeps starting in a pane.
+    if matches!(kind, "codex" | "claude") {
         return pane_agent::is_terminal_agent(state, kind);
     }
     !AGENT_PREFERENCE.contains(&kind)

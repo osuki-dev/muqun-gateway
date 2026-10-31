@@ -201,6 +201,17 @@ impl AcpClient {
         provider: &'static str,
         safe_error_message: SafeErrorMessage,
     ) -> Result<Arc<Self>, String> {
+        Self::spawn_with_env(binary, args, &[], cwd, provider, safe_error_message).await
+    }
+
+    pub(crate) async fn spawn_with_env(
+        binary: &str,
+        args: &[&str],
+        env: &[(String, String)],
+        cwd: &str,
+        provider: &'static str,
+        safe_error_message: SafeErrorMessage,
+    ) -> Result<Arc<Self>, String> {
         if !std::path::Path::new(cwd).is_absolute() {
             return Err(format!(
                 "{provider} ACP requires an absolute working directory"
@@ -208,6 +219,7 @@ impl AcpClient {
         }
         let mut command = Command::new(binary);
         command.args(args).current_dir(cwd);
+        command.envs(env.iter().map(|(name, value)| (name, value)));
         Self::spawn_command(command, provider, safe_error_message)
     }
 
@@ -774,22 +786,24 @@ async fn dispatch(
     }
     if let Some(method) = value.get("method").and_then(Value::as_str) {
         let params = value.get("params").cloned().unwrap_or(Value::Null);
-        let passive_update = method == "session/update"
-            && matches!(
-                params["update"]["sessionUpdate"].as_str(),
-                Some(
-                    "user_message_chunk"
-                        | "agent_message_chunk"
-                        | "agent_thought_chunk"
-                        | "plan"
-                        | "notice"
-                        | "usage_update"
-                        | "available_commands_update"
-                        | "current_mode_update"
-                        | "config_option_update"
-                        | "session_info_update"
-                )
-            );
+        // Claude Code's adapter reports login changes this way; it is metadata.
+        let passive_update = method == "_auth/status_update"
+            || method == "session/update"
+                && matches!(
+                    params["update"]["sessionUpdate"].as_str(),
+                    Some(
+                        "user_message_chunk"
+                            | "agent_message_chunk"
+                            | "agent_thought_chunk"
+                            | "plan"
+                            | "notice"
+                            | "usage_update"
+                            | "available_commands_update"
+                            | "current_mode_update"
+                            | "config_option_update"
+                            | "session_info_update"
+                    )
+                );
         // Unknown live extension/subagent/control messages cannot establish
         // job absence. Ordinary text, diagnostics and metadata do not pin.
         let execution = value.get("id").is_some() || !passive_update;
