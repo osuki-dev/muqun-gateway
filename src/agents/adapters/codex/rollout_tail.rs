@@ -5,7 +5,9 @@
 //! module never scans directories, resolves a thread by mtime, or exposes paths.
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
-use std::path::{Component, Path, PathBuf};
+#[cfg(unix)]
+use std::path::Component;
+use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
@@ -360,6 +362,7 @@ mod tests {
         assert!(tail.poll().unwrap().records.is_empty());
     }
 
+    #[cfg(unix)]
     #[test]
     fn identity_path_symlinks_and_non_files_are_refused() {
         let fixture = Fixture::new();

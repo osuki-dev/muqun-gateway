@@ -337,13 +337,13 @@ pub async fn file_patch(
     let Some(relative) = validate_relative_path(path) else {
         return Ok(None);
     };
-    let relative_str = relative.to_string_lossy().into_owned();
+    let relative_str = slash_path(&relative);
     // A rename is only a rename when git can see both sides: with the new
     // path alone as the pathspec, the file is a brand-new one. The old path
     // is validated exactly as the new one and rides after the same `--`.
     let old_relative = match old_path {
         Some(old) => match validate_relative_path(old) {
-            Some(old) => Some(old.to_string_lossy().into_owned()),
+            Some(old) => Some(slash_path(&old)),
             None => return Ok(None),
         },
         None => None,
@@ -1059,12 +1059,22 @@ async fn count_untracked(toplevel: &Path, files: &mut [VcsFile]) {
 /// is not followed and a FIFO does not block.
 fn count_lines_within(path: &Path, budget: &mut u64) -> Option<(u64, bool)> {
     use std::io::Read as _;
+    #[cfg(unix)]
     use std::os::unix::fs::OpenOptionsExt as _;
+    #[cfg(windows)]
+    use std::os::windows::fs::OpenOptionsExt as _;
+
+    // Windows: FILE_FLAG_OPEN_REPARSE_POINT opens a symlink itself, which the
+    // `is_file` check below then refuses; there are no FIFOs to block on.
+    #[cfg(unix)]
+    let flags = libc::O_NOFOLLOW | libc::O_NONBLOCK;
+    #[cfg(windows)]
+    let flags = 0x0020_0000;
 
     let limit = MAX_COUNTED_UNTRACKED_BYTES.min(*budget);
     let file = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .custom_flags(flags)
         .open(path)
         .ok()?;
     if !file.metadata().ok()?.is_file() {
@@ -1167,7 +1177,7 @@ pub async fn changed_file_patch(
     let Some(relative) = validate_relative_path(path) else {
         return Ok(None);
     };
-    let relative_str = relative.to_string_lossy().into_owned();
+    let relative_str = slash_path(&relative);
     let listing = list_rows(toplevel, mode, Some(&relative_str)).await?;
     let Some(row) = listing.rows.into_iter().next() else {
         if tracked_exactly(toplevel, &relative_str).await? {
@@ -1231,7 +1241,7 @@ pub async fn changed_file_patch(
         .map_or("HEAD", |base| base.merge_base.as_str());
     let old = match &row.old_path {
         Some(old) => match validate_relative_path(old) {
-            Some(old) => Some(old.to_string_lossy().into_owned()),
+            Some(old) => Some(slash_path(&old)),
             None => return Ok(None),
         },
         None => None,
@@ -1355,7 +1365,7 @@ async fn discard_unless_home(
     home: Option<&Path>,
 ) -> Result<DiscardAction, DiscardError> {
     let relative = validate_relative_path(path).ok_or(DiscardError::UnknownPath)?;
-    let relative_str = relative.to_string_lossy().into_owned();
+    let relative_str = slash_path(&relative);
     let root = std::fs::canonicalize(toplevel).map_err(DiscardError::Io)?;
     if home
         .and_then(|home| std::fs::canonicalize(home).ok())
@@ -1390,7 +1400,7 @@ async fn discard_unless_home(
         if !stays_inside(&root, &old) {
             return Err(DiscardError::OutsideRepository);
         }
-        paths.push(old.to_string_lossy().into_owned());
+        paths.push(slash_path(&old));
     }
     let mut args = vec!["restore", "--staged", "--worktree", "--"];
     args.extend(paths.iter().map(String::as_str));
@@ -1426,6 +1436,21 @@ fn restore_unsupported(detail: &str) -> bool {
 /// deleting outside the checkout. `unlinkat` without `AT_REMOVEDIR` never
 /// removes a directory, and a symlink as the last component is removed
 /// itself, not its target.
+#[cfg(not(unix))]
+fn unlink_beneath(root: &Path, relative: &Path) -> std::io::Result<()> {
+    // No `openat` here: refuse a symlink (or junction) anywhere on the way
+    // down, then remove. This narrows the swap window rather than closing it.
+    let mut dir = root.to_path_buf();
+    for part in relative.parent().into_iter().flat_map(Path::iter) {
+        dir.push(part);
+        if std::fs::symlink_metadata(&dir)?.file_type().is_symlink() {
+            return Err(std::io::ErrorKind::InvalidInput.into());
+        }
+    }
+    std::fs::remove_file(root.join(relative))
+}
+
+#[cfg(unix)]
 fn unlink_beneath(root: &Path, relative: &Path) -> std::io::Result<()> {
     use std::ffi::CString;
     use std::os::fd::{AsRawFd as _, FromRawFd as _};
@@ -1947,6 +1972,15 @@ fn parse_numstat_z(bytes: &[u8]) -> HashMap<String, Counts> {
     counts
 }
 
+/// A relative path as the App and git spell it on every platform: components
+/// joined by `/`, never the host's `\`.
+pub fn slash_path(path: &Path) -> String {
+    path.components()
+        .map(|part| part.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 /// The one client-supplied value, checked before it goes anywhere near an
 /// argument list. Relative, made only of normal components, not starting
 /// with `-`, no NUL, and not empty.
@@ -1955,6 +1989,13 @@ pub fn validate_relative_path(path: &str) -> Option<PathBuf> {
         return None;
     }
     if Path::new(path).is_absolute() {
+        return None;
+    }
+    // Windows reads `\` as a separator too, so `..\secret` would be one
+    // "normal" component here and a parent directory there; and `C:x` is
+    // relative to another drive's working directory. Neither is ever a path
+    // the App sends, which always uses `/`.
+    if cfg!(windows) && (path.contains('\\') || path.contains(':')) {
         return None;
     }
     // Component by component on the string, not through `Path::components`,
@@ -2052,6 +2093,30 @@ fn page_lines(text: &str, from: usize, lines: usize) -> (usize, usize, usize, bo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relative_paths_are_spelled_with_slashes_everywhere() {
+        let path: PathBuf = ["src", "agent", "mod.rs"].iter().collect();
+        assert_eq!(slash_path(&path), "src/agent/mod.rs");
+        assert_eq!(
+            validate_relative_path("src/a.ts").map(|path| slash_path(&path)),
+            Some(String::from("src/a.ts"))
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_separators_and_drives_are_refused() {
+        for bad in [
+            r"..\secret.txt",
+            r"src\..\..\x",
+            "C:x",
+            r"C:\Windows\win.ini",
+            "a/b:c",
+        ] {
+            assert!(validate_relative_path(bad).is_none(), "{bad}");
+        }
+    }
 
     #[test]
     fn scrub_env_drops_every_inherited_git_variable_and_keeps_the_gateway_ones() {
@@ -2506,6 +2571,7 @@ mod tests {
         std::fs::remove_dir_all(repo.parent().unwrap()).ok();
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_file_patch_is_unified_paged_and_untracked_files_are_all_additions() {
         let repo = temp_repo("patch");
@@ -2749,6 +2815,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn capped_output_is_cut_on_a_whole_record() {
         let mut nul = b"a\0b c\0partial".to_vec();
@@ -3203,6 +3270,7 @@ mod tests {
         std::fs::remove_dir_all(repo.parent().unwrap()).ok();
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn discard_restores_tracked_files_and_deletes_untracked_ones() {
         let repo = changes_repo("vcs-discard");
@@ -3327,6 +3395,7 @@ mod tests {
         std::fs::remove_dir_all(repo.parent().unwrap()).ok();
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn paired_http_reads_only_git_linked_worktrees_of_the_panes_repository() {
         use axum::{body::Body, http::Request};

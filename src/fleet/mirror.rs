@@ -846,7 +846,7 @@ fn failed(why: &str) -> TaskChange {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use serde_json::Value;
 

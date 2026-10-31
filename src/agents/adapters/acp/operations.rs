@@ -335,6 +335,7 @@ mod tests {
         std::fs::create_dir(&uploads).unwrap();
         let outside = root.0.join("private.txt");
         std::fs::write(&outside, "private").unwrap();
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut denied = vec![
             "https://example.test/a.png".into(),
             "data:image/png;base64,AAA=".into(),

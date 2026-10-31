@@ -268,6 +268,7 @@ impl Rollouts {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     #[tokio::test]
     #[ignore = "explicit read-only probe of an existing authorized thread"]
     async fn codex_persisted_read_only_probe() {

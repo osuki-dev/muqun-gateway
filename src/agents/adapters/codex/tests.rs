@@ -1366,6 +1366,7 @@ async fn codex_stale_approval_handle_cannot_answer_a_reused_rpc_id_after_restart
     );
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn codex_terminal_runtime_blocks_controls_before_any_native_rpc() {
     use crate::agents::terminal_runtime::TerminalRuntime;

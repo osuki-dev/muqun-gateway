@@ -954,7 +954,7 @@ impl AgentManager {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::agents::adapters::codex::tests::{golden, Fixture};

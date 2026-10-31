@@ -1,4 +1,8 @@
 //! Shared test fixtures and fakes, compiled only for test builds.
+//!
+//! The fake Herdr servers listen on Unix sockets, so they and the test modules
+//! that use them are Unix-only; off Unix the helpers only they call are unused.
+#![cfg_attr(not(unix), allow(dead_code, unused_imports))]
 
 // The test prelude: names every test module sees through `use crate::*`.
 pub(crate) use crate::backend::{AgentStatus as BackendAgentStatus, BackendKind, TerminalBackend};
@@ -421,6 +425,7 @@ pub(crate) fn asset_test_dir(name: &str) -> PathBuf {
     std::fs::canonicalize(&dir).unwrap()
 }
 
+#[cfg(unix)]
 /// An owned private fixture directory whose canonical socket path fits sun_path.
 /// Only socket fixtures fall back to /tmp; asset fixtures keep their TMPDIR.
 pub(crate) struct TestSocket {
@@ -428,6 +433,7 @@ pub(crate) struct TestSocket {
     pub(crate) path: PathBuf,
 }
 
+#[cfg(unix)]
 impl TestSocket {
     pub(crate) fn new() -> Self {
         use std::os::unix::{ffi::OsStrExt, fs::DirBuilderExt};
@@ -449,6 +455,7 @@ impl TestSocket {
     }
 }
 
+#[cfg(unix)]
 impl Drop for TestSocket {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.dir);
@@ -571,6 +578,7 @@ pub(crate) fn remember_pane_root(state: &AppState, pane_id: &str, path: PathBuf)
     );
 }
 
+#[cfg(unix)]
 pub(crate) fn output_state(herdr: &FakeHerdr) -> AppState {
     let mut state = test_state("admin", vec![test_device("d1", "token")]);
     state.config.sessions[0].socket_path = herdr.session().socket_path;
@@ -639,6 +647,7 @@ pub(crate) fn approval_data_menu(
     approval_data(session_id, pane_id, agent, approval, "menu")
 }
 
+#[cfg(unix)]
 /// A Herdr socket that answers from a script.
 ///
 /// Every gateway request is its own short-lived connection, so this accepts
@@ -666,6 +675,7 @@ pub(crate) struct FakeHerdr {
     pane: Arc<Mutex<Option<Value>>>,
 }
 
+#[cfg(unix)]
 impl FakeHerdr {
     /// `advance_after` is the number of Enters it takes for the agent's
     /// state sequence to move; `None` makes `agent.list` come back empty,
@@ -862,6 +872,7 @@ pub(crate) fn repainting_screens() -> Vec<String> {
         .collect()
 }
 
+#[cfg(unix)]
 /// A Herdr socket that answers `pane.list` with a fixed set of panes (or
 /// none), for driving the real `HerdrBackend` -> `list_panes` path that
 /// `sessions()` probes end to end, without needing Herdr installed or a
@@ -871,6 +882,7 @@ pub(crate) struct FakePaneListHerdr {
     panes: Arc<Mutex<Value>>,
 }
 
+#[cfg(unix)]
 impl FakePaneListHerdr {
     pub(crate) fn start(panes: Value) -> Self {
         let socket_path = std::env::temp_dir().join(format!(
@@ -1001,13 +1013,14 @@ pub(crate) fn write_test_install(dir: &std::path::Path, server_id: &str, token: 
 /// zero, so "advanced past the baseline" cannot pass by accident.
 pub(crate) const FAKE_AGENT_SEQ: u64 = 100;
 
+#[cfg(unix)]
 impl Drop for FakeHerdr {
     fn drop(&mut self) {
         self.serving.abort();
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::os::unix::{ffi::OsStrExt, fs::PermissionsExt};

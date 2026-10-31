@@ -3564,7 +3564,7 @@ pub(crate) struct ZoomPaneBody {
     pub(crate) mode: Option<String>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     fn native_question_event(instance: &str, pending: Value, status: &str) -> Value {
         json!({ "data": {

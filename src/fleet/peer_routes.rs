@@ -345,7 +345,7 @@ async fn settings(
     ))
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
