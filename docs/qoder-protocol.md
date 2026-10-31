@@ -20,7 +20,11 @@ Gateway does not install or upgrade Qoder, change its global settings, log in,
 or copy credentials into Gateway configuration. The ACP child uses the existing
 CLI authentication on this host. Configure and sign in to Qoder CLI yourself.
 An authentication failure is reported; Gateway never starts an authentication
-flow or automatically retries the original operation after login.
+flow or automatically retries the original operation after login. Qoder answers
+an unauthenticated ACP request with ACP's `auth_required` code (-32000), which
+Gateway reports as `Qoder ACP request rejected (code -32000): authentication
+required; sign in to Qoder on this computer`. Other ACP error codes keep only
+`Qoder ACP request rejected (code N)`; Qoder's own error text is never relayed.
 
 Discovery uses a time- and output-bounded `--version` probe and may read the
 native `--list-models` catalog after attachment. No ACP session is created for

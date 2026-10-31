@@ -2,6 +2,13 @@
 
 ## Changes and fixes
 
+- **A Qoder or FX conversation that is not signed in says so.** An ACP agent's
+  `auth_required` refusal (code -32000) used to reach the App and task list as
+  only `ACP request rejected (code -32000)`. It now adds "authentication
+  required; sign in to <agent> on this computer". The agent's own error text is
+  still never relayed, and other codes are unchanged. Restart the Gateway after
+  updating.
+
 - **Qoder no longer launches a metadata process every minute.** While the App
   was open, Home refreshes started a `qodercli --acp` child about once a minute
   to list saved sessions and discovery ran `qodercli --list-models` about every
