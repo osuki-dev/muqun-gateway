@@ -1085,7 +1085,11 @@ Execution authorization never reads provider histories. Shared calls return
 task handles for `tasks.read` and `tasks.wait`, without guessed notifications.
 Incoming restricted work cannot inherit a shared runtime grant; unsupported
 delivery is refused before dispatch. Registration also rejects retained
-restricted sessions, preserving that restriction across task retention.
+restricted sessions, preserving that restriction across task retention: the
+session id is kept after its task is purged, and the restriction clears when
+the session is deleted through the App or the provider no longer has it when
+the Gateway attaches. An agent-wide record from an earlier Gateway names no
+session; `muqun-gateway mcp forget-delegated <agent>` removes it.
 Existing terminal task-bound
 helpers retain their narrower task authority. Disabling automatic injection
 rejects helper renewal; startup cleanup revokes native Codex runtime tokens.

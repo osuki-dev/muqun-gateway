@@ -36,7 +36,9 @@ impl AssistantTokenStore for SqliteTokenStore {
         Box::pin(self.db.call(move |c| {
             let tx = c.transaction()?;
             if let TokenBinding::Runtime { agent_id } = &binding {
-                anyhow::ensure!(crate::tasks::store_sqlite::runtime_registration_allowed(&tx, agent_id)?, "runtime_scope_conflict: retained delegated sessions require isolated credentials");
+                if let Some(block) = crate::tasks::store_sqlite::runtime_block(&tx, agent_id)? {
+                    return Err(anyhow::Error::new(block));
+                }
             }
             let token = crate::generate_token();
             let issued_ms = now_ms();

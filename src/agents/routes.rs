@@ -2782,6 +2782,21 @@ async fn do_delete_agent_session(
         .mirror()
         .remove_session(&AgentSessionId(asid.to_owned()))
         .await;
+    // A deleted session can no longer be resumed, so it stops withholding the
+    // agent's runtime credential (see `store_sqlite::RuntimeBlock`).
+    let (kind, gone) = (manager.agent().kind().to_owned(), asid.to_owned());
+    match state
+        .db
+        .call(move |c| crate::tasks::store_sqlite::clear_restricted_session(c, &kind, &gone))
+        .await
+    {
+        Ok(true) => tracing::info!(
+            agent_id = manager.agent().kind(),
+            "a deleted session no longer withholds the agent's Muqun tools"
+        ),
+        Ok(false) => {}
+        Err(error) => tracing::warn!(%error, "could not record a deleted restricted session"),
+    }
     if let Some(agent_id) = agent_id {
         state
             .agent_runtime

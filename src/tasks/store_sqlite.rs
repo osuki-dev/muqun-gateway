@@ -55,6 +55,9 @@ ALTER TABLE tasks ADD COLUMN reopened_ms INTEGER;
 ALTER TABLE tasks ADD COLUMN reopen_count INTEGER NOT NULL DEFAULT 0;
 ", "
 CREATE TABLE task_runtime_restrictions(agent_id TEXT PRIMARY KEY);
+", "
+CREATE TABLE task_restricted_sessions(agent_id TEXT NOT NULL, asid TEXT NOT NULL,
+  cleared_ms INTEGER, PRIMARY KEY(agent_id, asid));
 "],
 };
 
@@ -346,8 +349,8 @@ impl TaskStore for SqliteTaskStore {
             let tx = c.transaction()?;
             let before = before_ms as i64;
             // A finished ledger task is not proof that its provider session
-            // (or provider-native children) has been deleted. Keep authority
-            // restrictions when ordinary task retention forgets the evidence.
+            // (or provider-native children) has been deleted. Keep the
+            // restricted session ids when ordinary retention forgets the tasks.
             retain_runtime_restrictions(&tx)?;
             tx.execute(
                 &format!(
@@ -358,6 +361,15 @@ impl TaskStore for SqliteTaskStore {
             let purged = tx.execute(&format!("DELETE FROM tasks WHERE {ENDED}"), [before])?;
             tx.execute(
                 "DELETE FROM task_notices WHERE task_id NOT IN (SELECT id FROM tasks)",
+                [],
+            )?;
+            // A deleted session's tombstone is needed only while a ledger
+            // task still names it.
+            tx.execute(
+                "DELETE FROM task_restricted_sessions WHERE cleared_ms IS NOT NULL AND NOT EXISTS \
+                 (SELECT 1 FROM tasks WHERE json_extract(tasks.binding, '$.kind') = 'agent_session' \
+                 AND json_extract(tasks.binding, '$.agent_id') = task_restricted_sessions.agent_id \
+                 AND json_extract(tasks.binding, '$.asid') = task_restricted_sessions.asid)",
                 [],
             )?;
             tx.commit()?;
@@ -506,41 +518,150 @@ fn load(c: &Connection, id: &TaskId) -> anyhow::Result<Option<Task>> {
     .transpose()
 }
 
-/// Called in the same store transaction that issues an owner runtime token.
-/// Retained provider sessions can resume after their tasks finish, so all
-/// states participate. A bounded ancestry walk fails closed on missing/cyclic
-/// records. Task origin policy is shared with the execution service.
+/// Why an agent may not hold an owner-level runtime credential (PR #67).
+///
+/// Intent: a provider session that ran work from another computer (or from an
+/// assistant whose lineage cannot be resolved) can be resumed later. A shared
+/// runtime credential would hand that conversation owner authority, so it is
+/// refused while such a session may still exist. The evidence is the session,
+/// not the task: retention forgetting a finished task keeps the session id
+/// (`task_restricted_sessions`), and only the session's deletion -- seen
+/// through the gateway, or confirmed by the provider -- clears it. An agent
+/// row in `task_runtime_restrictions` was written by an earlier gateway that
+/// kept no session ids; it stays until the owner forgets it explicitly
+/// ([`forget_unrecorded_restriction`]), because no deletion can be matched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RuntimeBlock {
+    pub agent_id: String,
+    /// Restricted provider sessions that are not known to be deleted.
+    pub sessions: Vec<String>,
+    /// An earlier gateway recorded a restriction without session ids.
+    pub unrecorded: bool,
+}
+
+impl RuntimeBlock {
+    /// What the App and `muqun-gateway agent` show: no session ids, since
+    /// discovery also reaches linked computers.
+    pub(crate) fn summary(&self) -> String {
+        let mut parts = Vec::new();
+        if !self.sessions.is_empty() {
+            parts.push(format!(
+                "{} retained session(s) ran work from another computer or an unattributed assistant; delete them to restore the tools",
+                self.sessions.len()
+            ));
+        }
+        if self.unrecorded {
+            parts.push(format!(
+                "an earlier gateway recorded such a session without its id; once those sessions are gone, run `muqun-gateway mcp forget-delegated {}`",
+                self.agent_id
+            ));
+        }
+        parts.join("; ")
+    }
+}
+
+impl std::fmt::Display for RuntimeBlock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "runtime_scope_conflict: retained delegated sessions require isolated credentials: {}",
+            self.summary()
+        )?;
+        if !self.sessions.is_empty() {
+            write!(f, " (sessions: {})", self.sessions.join(", "))?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for RuntimeBlock {}
+
+#[cfg(test)]
 pub(crate) fn runtime_registration_allowed(c: &Connection, agent_id: &str) -> anyhow::Result<bool> {
-    if c.query_row(
+    Ok(runtime_block(c, agent_id)?.is_none())
+}
+
+/// What withholds an owner runtime credential from `agent_id`, if anything.
+/// Retained provider sessions can resume after their tasks finish, so all
+/// task states participate. A bounded ancestry walk fails closed on
+/// missing/cyclic records. Task origin policy is shared with the execution
+/// service.
+pub(crate) fn runtime_block(
+    c: &Connection,
+    agent_id: &str,
+) -> anyhow::Result<Option<RuntimeBlock>> {
+    let unrecorded = c.query_row(
         "SELECT EXISTS(SELECT 1 FROM task_runtime_restrictions WHERE agent_id = ?1)",
         [agent_id],
         |row| row.get::<_, bool>(0),
-    )? {
-        return Ok(false);
-    }
-    let mut query = c.prepare(&format!("SELECT {TASK_COLUMNS} FROM tasks WHERE json_extract(binding, '$.kind') = 'agent_session' AND json_extract(binding, '$.agent_id') = ?1"))?;
-    let rows = query.query_map([agent_id], read_row)?;
-    for row in rows {
-        let mut task = row??;
-        let mut visited = std::collections::HashSet::new();
-        for depth in 0..64 {
-            if depth == 63 || !visited.insert(task.id.clone()) {
-                return Ok(false);
-            }
-            match task.forwarding_ancestry() {
-                super::domain::ForwardingAncestry::Local => break,
-                super::domain::ForwardingAncestry::Remote
-                | super::domain::ForwardingAncestry::Unknown => return Ok(false),
-                super::domain::ForwardingAncestry::Parent(parent) => {
-                    let Some(parent) = load(c, parent)? else {
-                        return Ok(false);
-                    };
-                    task = parent;
-                }
+    )?;
+    let mut cleared = std::collections::HashSet::new();
+    let mut sessions = std::collections::BTreeSet::new();
+    {
+        let mut query = c.prepare(
+            "SELECT asid, cleared_ms IS NOT NULL FROM task_restricted_sessions WHERE agent_id = ?1",
+        )?;
+        for row in query.query_map([agent_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, bool>(1)?))
+        })? {
+            let (asid, gone) = row?;
+            if gone {
+                cleared.insert(asid);
+            } else {
+                sessions.insert(asid);
             }
         }
     }
-    Ok(true)
+    for asid in restricted_ledger_sessions(c, agent_id)? {
+        if !cleared.contains(&asid) {
+            sessions.insert(asid);
+        }
+    }
+    Ok((unrecorded || !sessions.is_empty()).then(|| RuntimeBlock {
+        agent_id: agent_id.to_owned(),
+        sessions: sessions.into_iter().collect(),
+        unrecorded,
+    }))
+}
+
+/// Provider sessions of `agent_id` whose ledger task does not resolve to a
+/// local owner root.
+fn restricted_ledger_sessions(c: &Connection, agent_id: &str) -> anyhow::Result<Vec<String>> {
+    let mut query = c.prepare(&format!("SELECT {TASK_COLUMNS} FROM tasks WHERE json_extract(binding, '$.kind') = 'agent_session' AND json_extract(binding, '$.agent_id') = ?1"))?;
+    let rows = query.query_map([agent_id], read_row)?;
+    let mut out = Vec::new();
+    for row in rows {
+        let task = row??;
+        let TaskBinding::AgentSession { asid, .. } = &task.binding else {
+            continue;
+        };
+        let asid = asid.clone();
+        if !local_root(c, task)? {
+            out.push(asid);
+        }
+    }
+    Ok(out)
+}
+
+fn local_root(c: &Connection, mut task: Task) -> anyhow::Result<bool> {
+    let mut visited = std::collections::HashSet::new();
+    for depth in 0..64 {
+        if depth == 63 || !visited.insert(task.id.clone()) {
+            return Ok(false);
+        }
+        match task.forwarding_ancestry() {
+            super::domain::ForwardingAncestry::Local => return Ok(true),
+            super::domain::ForwardingAncestry::Remote
+            | super::domain::ForwardingAncestry::Unknown => return Ok(false),
+            super::domain::ForwardingAncestry::Parent(parent) => {
+                let Some(parent) = load(c, parent)? else {
+                    return Ok(false);
+                };
+                task = parent;
+            }
+        }
+    }
+    Ok(false)
 }
 
 fn retain_runtime_restrictions(c: &Connection) -> anyhow::Result<()> {
@@ -552,14 +673,49 @@ fn retain_runtime_restrictions(c: &Connection) -> anyhow::Result<()> {
         agents
     };
     for agent in agents {
-        if !runtime_registration_allowed(c, &agent)? {
+        for asid in restricted_ledger_sessions(c, &agent)? {
             c.execute(
-                "INSERT OR IGNORE INTO task_runtime_restrictions(agent_id) VALUES(?1)",
-                [agent],
+                "INSERT OR IGNORE INTO task_restricted_sessions(agent_id, asid) VALUES(?1, ?2)",
+                [&agent, &asid],
             )?;
         }
     }
     Ok(())
+}
+
+/// The provider session `asid` of `agent_id` is gone: it no longer withholds
+/// the runtime credential. A tombstone is written only for a session that
+/// was restricted; it is kept while a ledger task still names the session.
+pub(crate) fn clear_restricted_session(
+    c: &Connection,
+    agent_id: &str,
+    asid: &str,
+) -> anyhow::Result<bool> {
+    let restricted = restricted_ledger_sessions(c, agent_id)?
+        .iter()
+        .any(|s| s == asid);
+    let changed = c.execute(
+        "INSERT INTO task_restricted_sessions(agent_id, asid, cleared_ms) \
+         SELECT ?1, ?2, ?3 WHERE ?4 OR EXISTS(SELECT 1 FROM task_restricted_sessions \
+           WHERE agent_id = ?1 AND asid = ?2 AND cleared_ms IS NULL) \
+         ON CONFLICT(agent_id, asid) DO UPDATE SET cleared_ms = excluded.cleared_ms \
+           WHERE task_restricted_sessions.cleared_ms IS NULL",
+        params![agent_id, asid, now_ms() as i64, restricted],
+    )?;
+    Ok(changed > 0)
+}
+
+/// The owner's explicit decision that an earlier gateway's restriction for
+/// `agent_id`, which named no session, no longer applies. Restricted sessions
+/// that are known by id still clear only when they are deleted.
+pub(crate) fn forget_unrecorded_restriction(
+    c: &Connection,
+    agent_id: &str,
+) -> anyhow::Result<bool> {
+    Ok(c.execute(
+        "DELETE FROM task_runtime_restrictions WHERE agent_id = ?1",
+        [agent_id],
+    )? > 0)
 }
 
 fn read_row(r: &Row<'_>) -> rusqlite::Result<anyhow::Result<Task>> {
@@ -799,14 +955,80 @@ mod tests {
         assert_eq!(store.purge_ended(now_ms() + 1).await.unwrap(), 2);
         // The provider session is not deleted by ledger retention. Neither
         // cancellation nor clearing old tasks may silently elevate its grant.
-        assert!(!db
-            .call(|c| runtime_registration_allowed(c, "codex"))
+        let block = db
+            .call(|c| runtime_block(c, "codex"))
             .await
-            .unwrap());
+            .unwrap()
+            .unwrap();
+        assert_eq!(block.sessions, ["retained-provider-child"]);
+        assert!(!block.unrecorded);
         assert!(db
             .call(|c| runtime_registration_allowed(c, "opencode"))
             .await
             .unwrap());
+        // Deleting that session is what clears it, and it stays clear.
+        let clear =
+            |asid: &'static str| db.call(move |c| clear_restricted_session(c, "codex", asid));
+        assert!(!clear("unrelated").await.unwrap());
+        assert!(clear("retained-provider-child").await.unwrap());
+        store.purge_ended(now_ms() + 1).await.unwrap();
+        assert!(db
+            .call(|c| runtime_registration_allowed(c, "codex"))
+            .await
+            .unwrap());
+    }
+
+    /// The mini's state: an OpenCode session delegated from a peer, and the
+    /// agent-wide row a 0.14 gateway wrote on every purge pass.
+    #[tokio::test]
+    async fn a_delegated_opencode_session_withholds_tools_until_deleted() {
+        let db = temp_store("runtime-opencode");
+        let store = SqliteTaskStore::new(db.clone());
+        let mut delegated = task("peer");
+        delegated.origin = TaskOrigin::Peer;
+        delegated.created_by.kind = PrincipalKind::Gateway;
+        delegated.binding = TaskBinding::AgentSession {
+            agent_id: "opencode".into(),
+            asid: "ses_delegated".into(),
+        };
+        let delegated = store.insert(&delegated).await.unwrap();
+        let blocked = || db.call(|c| runtime_block(c, "opencode"));
+        let sessions = |block: Option<RuntimeBlock>| block.map(|b| (b.sessions, b.unrecorded));
+        let held = Some((vec!["ses_delegated".to_owned()], false));
+        assert_eq!(sessions(blocked().await.unwrap()), held);
+        db.call(|c| {
+            c.execute(
+                "INSERT INTO task_runtime_restrictions(agent_id) VALUES('opencode')",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        for state in [TaskState::Dispatching, TaskState::Working, TaskState::Done] {
+            store
+                .transition(&delegated.id, change(state))
+                .await
+                .unwrap();
+        }
+        store.purge_ended(now_ms() + 1).await.unwrap();
+        let held = Some((vec!["ses_delegated".to_owned()], true));
+        assert_eq!(sessions(blocked().await.unwrap()), held);
+        // The App deletes the session; only the unnamed legacy row is left,
+        // and the token error says how to clear each part.
+        db.call(|c| clear_restricted_session(c, "opencode", "ses_delegated"))
+            .await
+            .unwrap();
+        let block = blocked().await.unwrap().unwrap();
+        assert_eq!((block.sessions.len(), block.unrecorded), (0, true));
+        assert!(block
+            .to_string()
+            .contains("muqun-gateway mcp forget-delegated opencode"));
+        assert!(db
+            .call(|c| forget_unrecorded_restriction(c, "opencode"))
+            .await
+            .unwrap());
+        assert_eq!(blocked().await.unwrap(), None);
     }
 
     #[tokio::test]

@@ -83,7 +83,8 @@ Local children of restricted tasks retain the restriction. A remote-origin task
 cannot regain remote authority by creating a local intermediate assignment.
 Existing restricted sessions must also be considered before registering a new
 owner-level runtime credential. Cancellation alone does not prove a provider
-session, or its children, has disappeared. Uncertain migration fails closed;
+session, or its children, has disappeared; its deletion does, and then the
+restriction clears. Uncertain migration fails closed;
 there is no automatic deletion of user conversations.
 
 These are credential and workflow boundaries, not an OS sandbox. A process
