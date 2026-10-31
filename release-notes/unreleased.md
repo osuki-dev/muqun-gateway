@@ -2,6 +2,14 @@
 
 ## Changes and fixes
 
+- **Home names the model an ACP agent actually starts with.** Before a
+  session is open, the model list kept from an earlier session has no current
+  model, so the App showed the first one listed: "Fable 5" for Claude Code,
+  whose new sessions run the adapter's default (Opus 5.5 here). The catalog
+  `defaults` now name the adapter's own default -- Claude Code's "Default
+  (recommended)", Cursor's "Auto" -- or the only model offered (Antigravity),
+  unless a choice is remembered for the folder or computer.
+
 - **Antigravity, Claude Code and Cursor offer model and thinking choices on
   Home right after a Gateway restart.** These agents start on first use, and
   discovery only filled in the models their last session showed once the
