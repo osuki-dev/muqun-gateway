@@ -300,7 +300,11 @@ async fn local_probe(config: &Config) -> anyhow::Result<Vec<AgentDiscoveryInfo>>
         .t3
         .clone()
         .with_env_fallback(|key| std::env::var(key).ok());
+    let opencode_block = opencode_tools_block(config).await;
     for agent in agents.iter_mut() {
+        if agent.id == "opencode" && agent.reason.is_none() {
+            agent.reason = opencode_block.clone();
+        }
         match agent.id.as_str() {
             // Discovery counts any held T3 bearer as usable; check it,
             // read-only, so an expired or revoked one says what to do.
@@ -375,7 +379,15 @@ fn render_list(rows: &[AgentRow], source: Source, all: bool, runtime_enabled: bo
             ]
         }))
         .collect();
-    let mut lines = format_table(&table);
+    let mut table = format_table(&table).into_iter();
+    let mut lines: Vec<String> = table.next().into_iter().collect();
+    for (row, line) in shown.iter().zip(table) {
+        lines.push(line);
+        // Claude's reason is already part of its next step.
+        if let Some(reason) = row.reason.as_deref().filter(|_| row.id != "claude") {
+            lines.push(format!("  {reason}"));
+        }
+    }
     if !folded.is_empty() {
         let names: Vec<&str> = folded.iter().map(|row| row.display_name()).collect();
         lines.push(format!(
@@ -451,6 +463,24 @@ pub(crate) async fn t3_bearer_rejected(t3: &T3Config, state_dir: &Path) -> bool 
         Ok(state) => state.get("authenticated").and_then(|v| v.as_bool()) != Some(true),
         Err(_) => false,
     }
+}
+
+/// Why OpenCode's shared Muqun tools are withheld, read from the gateway's
+/// store the way `muqun-gateway mcp revoke` opens it. `None` when MCP does
+/// not reach OpenCode anyway, nothing withholds them, or there is no store.
+async fn opencode_tools_block(config: &Config) -> Option<String> {
+    if !(config.mcp.enabled && config.mcp.inject_into_agents && config.opencode.enabled) {
+        return None;
+    }
+    if !crate::store_db_path(&state_dir().ok()?).exists() {
+        return None;
+    }
+    let db = super::mcp::open_store().ok()?;
+    let block = db
+        .call(|c| crate::tasks::store_sqlite::runtime_block(c, "opencode"))
+        .await
+        .ok()??;
+    Some(crate::agents::runtime::tools_unavailable(&block.summary()))
 }
 
 /// The running gateway's pid, as `muqun-gateway status` finds it.
@@ -1052,6 +1082,7 @@ mod tests {
     fn the_list_reads_the_gateways_states_and_folds_what_is_not_installed() {
         let agents = serde_json::json!([
             {"id": "t3", "name": "T3 Code", "status": "connected", "enabled": true, "version": "0.1.3"},
+            {"id": "opencode", "name": "OpenCode", "status": "connected", "enabled": true, "reason": "Muqun tools unavailable: a delegated session is retained"},
             {"id": "codex", "name": "Codex", "status": "unknown", "enabled": true},
             {"id": "antigravity", "name": "Antigravity", "status": "unconfigured", "enabled": true},
             {"id": "deepseek", "name": "DeepSeek", "status": "disabled", "enabled": false},
@@ -1060,7 +1091,7 @@ mod tests {
             {"id": "future", "status": "a_state_from_a_newer_gateway", "enabled": true}
         ]);
         let rows = rows_from_agents(&agents);
-        assert_eq!(rows.len(), 6, "an unparseable entry is skipped, not fatal");
+        assert_eq!(rows.len(), 7, "an unparseable entry is skipped, not fatal");
         let text = render_list(&rows, Source::Gateway, false, true);
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(
@@ -1068,6 +1099,8 @@ mod tests {
             [
                 "AGENT        STATE        VERSION  NEXT",
                 "T3 Code      ready        0.1.3",
+                "OpenCode     ready        -",
+                "  Muqun tools unavailable: a delegated session is retained",
                 "Codex        unknown      -",
                 "Antigravity  needs setup  -        check antigravity.binary in config.json",
                 "DeepSeek     off          -        muqun-gateway agent setup deepseek",

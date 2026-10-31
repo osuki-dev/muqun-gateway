@@ -2,6 +2,25 @@
 
 ## Changes and fixes
 
+- **OpenCode gets its Muqun tools back once delegated sessions are gone, and
+  says why while they are not.** A Gateway refuses OpenCode's shared Muqun
+  token while an OpenCode session that ran work from another computer (or an
+  unattributed assistant) may still be resumed. That record never cleared: the
+  task purge re-wrote an agent-wide restriction on every pass and nothing
+  removed it, so OpenCode silently lost its tools for good, and the journal
+  only said `could not mint OpenCode's MCP token: runtime_scope_conflict:
+  retained delegated sessions require isolated credentials`. The restriction is
+  now kept per session and clears when that session is deleted (in the App, or
+  in OpenCode, checked when the Gateway attaches). The journal names the
+  sessions and what clears them; `muqun-gateway agent` and discovery show
+  "Muqun tools unavailable" with the reason. An agent-wide record left by an
+  earlier Gateway names no session; `muqun-gateway mcp forget-delegated
+  opencode` removes it once those sessions are gone. Starting OpenCode without
+  a token now also unsets stale `MUQUN_MCP_URL`/`MUQUN_MCP_TOKEN` in its saved
+  service env (they could point at another, dead gateway), and adopting a
+  running service whose `MUQUN_MCP_URL` is not this Gateway's is reported, not
+  restarted.
+
 - **`muqun-gateway agent` agrees with the App.** It now reads the running
   Gateway's agent list instead of probing again from the shell, so a connected
   T3 Code shows ready instead of `unconfigured`, and Codex no longer reads

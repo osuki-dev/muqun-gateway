@@ -345,6 +345,10 @@ pub struct AgentRuntime {
     /// Where OpenCode's `MUQUN_MCP_*` environment comes from; set once the
     /// token store exists (the runtime is built before it).
     mcp: std::sync::OnceLock<McpWiring>,
+    /// Why the attached OpenCode service has no Muqun tools, when MCP is
+    /// wired but its token could not be issued or the adopted service points
+    /// elsewhere. Discovery shows it; `None` when nothing is known missing.
+    opencode_mcp_missing: RwLock<Option<String>>,
     terminal_runtime: std::sync::OnceLock<Arc<super::terminal_runtime::TerminalRuntime>>,
     native_codex_sessions:
         std::sync::OnceLock<Arc<super::adapters::codex::native_sessions::NativeSessions>>,
@@ -606,6 +610,7 @@ impl AgentRuntime {
             terminal_runtime: std::sync::OnceLock::new(),
             native_codex_sessions: std::sync::OnceLock::new(),
             route_store: std::sync::OnceLock::new(),
+            opencode_mcp_missing: RwLock::new(None),
         })
     }
 
@@ -701,12 +706,92 @@ impl AgentRuntime {
     /// as it always did.
     async fn opencode_mcp_env(&self) -> Option<(McpEnv, Vec<String>)> {
         let wiring = self.mcp.get()?;
-        match issue_agent_env(wiring.tokens.as_ref(), &wiring.url).await {
-            Ok(minted) => Some(minted),
+        let minted = issue_agent_env(wiring.tokens.as_ref(), &wiring.url).await;
+        *self.opencode_mcp_missing.write().await = match &minted {
+            Ok(_) => None,
             Err(err) => {
-                tracing::warn!("could not mint OpenCode's MCP token: {err}");
-                None
+                // Says what blocks the token and what clears it: the App
+                // shows nothing else, and the tools stay missing until then.
+                tracing::warn!(
+                    "OpenCode starts without Muqun tools: {err}. Once that is resolved, \
+                     `opencode service stop` lets the gateway start it again with them"
+                );
+                Some(
+                    match err.downcast_ref::<crate::tasks::store_sqlite::RuntimeBlock>() {
+                        Some(block) => block.summary(),
+                        None => "its MCP token could not be issued; see the gateway log".to_owned(),
+                    },
+                )
             }
+        };
+        minted.ok()
+    }
+
+    /// Check what an OpenCode service this gateway did not start carries for
+    /// `/mcp`. It is only reported, never fixed by restarting: the service is
+    /// the owner's and may be serving TUI clients and running turns, and its
+    /// saved env applies only to a fresh start anyway.
+    async fn check_adopted_mcp_env(&self) {
+        let Some(wiring) = self.mcp.get() else {
+            return;
+        };
+        let Ok(binary) = resolve_binary(self.config.binary.as_deref()) else {
+            return;
+        };
+        let saved = read_service_env(&tokio::process::Command::new(binary), "MUQUN_MCP_URL").await;
+        let Some((reason, log)) = adopted_mcp_mismatch(saved.as_deref(), &wiring.url) else {
+            *self.opencode_mcp_missing.write().await = None;
+            return;
+        };
+        tracing::warn!("{log}");
+        let mut missing = self.opencode_mcp_missing.write().await;
+        // A service this gateway started without a token keeps the reason
+        // that start recorded; it says more than "started without them".
+        if saved.is_some() || missing.is_none() {
+            *missing = Some(reason);
+        }
+    }
+
+    /// Clear restricted OpenCode sessions the provider no longer has, e.g.
+    /// deleted in OpenCode itself rather than through the App.
+    async fn reconcile_restricted_sessions(&self, manager: &AgentManager) {
+        use super::ports::agent::AgentError;
+        let Some(db) = self.route_store.get().cloned() else {
+            return;
+        };
+        let agent_id = manager.agent().kind().to_owned();
+        let id = agent_id.clone();
+        let Ok(Some(block)) = db
+            .call(move |c| crate::tasks::store_sqlite::runtime_block(c, &id))
+            .await
+        else {
+            return;
+        };
+        let mut cleared = 0usize;
+        for asid in block.sessions {
+            let gone = match manager.agent().get_session(&asid).await {
+                Err(AgentError::SessionNotFound(_)) => true,
+                Err(AgentError::RequestFailed(message)) => message.starts_with("HTTP 404"),
+                _ => false,
+            };
+            let id = agent_id.clone();
+            if gone
+                && db
+                    .call(move |c| {
+                        crate::tasks::store_sqlite::clear_restricted_session(c, &id, &asid)
+                    })
+                    .await
+                    .unwrap_or(false)
+            {
+                cleared += 1;
+            }
+        }
+        if cleared > 0 {
+            tracing::info!(
+                agent_id,
+                cleared,
+                "deleted sessions no longer withhold the agent's Muqun tools; if none remain, `opencode service stop` lets the gateway start it again with them"
+            );
         }
     }
 
@@ -1386,7 +1471,12 @@ impl AgentRuntime {
                 enabled: true,
                 endpoint: Some(m.endpoint_url().to_string()),
                 version: m.version(),
-                reason: None,
+                reason: self
+                    .opencode_mcp_missing
+                    .read()
+                    .await
+                    .as_deref()
+                    .map(tools_unavailable),
                 features: opencode_features(supports_reasoning, has_models),
                 models,
                 modes,
@@ -1675,6 +1765,7 @@ impl AgentRuntime {
         }
         if let Some((endpoint, id)) = verified {
             self.attach(endpoint, id, AgentOrigin::Adopted).await;
+            self.check_adopted_mcp_env().await;
             true
         } else {
             false
@@ -1700,6 +1791,7 @@ impl AgentRuntime {
             .and_then(running_binary_path)
             .map(|p| p.display().to_string());
         let manager = AgentManager::connect(endpoint, self.events_tx.clone());
+        self.reconcile_restricted_sessions(&manager).await;
         self.install("opencode", manager, origin).await;
         // Publish identity only after installing its manager. Cancellation
         // before this write causes a safe reattachment, never old-client reuse.
@@ -1952,13 +2044,92 @@ async fn save_service_env(like: &tokio::process::Command, mcp: &McpEnv) {
     }
 }
 
+/// The service env names that point OpenCode at a gateway's `/mcp`.
+const MCP_ENV_NAMES: [&str; 2] = ["MUQUN_MCP_TOKEN", "MUQUN_MCP_URL"];
+
+/// `opencode service get env NAME`: the saved value, `None` when unset or
+/// unreadable. OpenCode prints an empty line for an unset name.
+async fn read_service_env(like: &tokio::process::Command, name: &str) -> Option<String> {
+    let mut command = sibling_command(like);
+    command
+        .args(["service", "get", "env", name])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(STARTUP_WAIT, command.output())
+        .await
+        .ok()?
+        .ok()?;
+    let value = String::from_utf8(output.stdout).ok()?;
+    let value = value.trim();
+    (output.status.success() && !value.is_empty()).then(|| value.to_owned())
+}
+
+/// Starting without a token of its own, the gateway must not leave OpenCode
+/// the saved `MUQUN_MCP_*` of an earlier start or another gateway: a dead or
+/// foreign `/mcp` fails every tool call, where none at all is honest. Only
+/// names that are set are unset. Pi does the same for its child
+/// (`adapters::pi::rpc`).
+async fn clear_service_env(like: &tokio::process::Command) {
+    for name in MCP_ENV_NAMES {
+        if read_service_env(like, name).await.is_none() {
+            continue;
+        }
+        let mut command = sibling_command(like);
+        command
+            .args(["service", "unset", "env", name])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+        match tokio::time::timeout(STARTUP_WAIT, command.status()).await {
+            Ok(Ok(status)) if status.success() => {}
+            _ => tracing::warn!(
+                "`opencode service unset env {name}` failed; OpenCode keeps a stale value"
+            ),
+        }
+    }
+}
+
+/// What to say when an adopted OpenCode service's saved `MUQUN_MCP_URL` is
+/// not `ours`: the discovery reason (no address, since linked computers read
+/// it) and the log line. `None` when it is ours.
+fn adopted_mcp_mismatch(saved: Option<&str>, ours: &str) -> Option<(String, String)> {
+    const RESTART: &str =
+        "`opencode service stop` lets the gateway start it again with this gateway's";
+    match saved {
+        Some(url) if url.trim_end_matches('/') == ours.trim_end_matches('/') => None,
+        Some(url) => Some((
+            format!("the running OpenCode service points them at another gateway; {RESTART}"),
+            format!("the adopted OpenCode service's MUQUN_MCP_URL is {url}, not this gateway's {ours}; its Muqun tools reach that gateway or fail. {RESTART}"),
+        )),
+        None => Some((
+            format!("the running OpenCode service was started without them; {RESTART}"),
+            format!("the adopted OpenCode service has no MUQUN_MCP_URL, so it has no Muqun tools; {RESTART}"),
+        )),
+    }
+}
+
+/// The discovery reason for an attached agent without its Muqun tools.
+pub(crate) fn tools_unavailable(why: &str) -> String {
+    format!("Muqun tools unavailable: {why}")
+}
+
 async fn launch_service(
     mut command: tokio::process::Command,
     mcp: Option<&McpEnv>,
 ) -> anyhow::Result<()> {
-    if let Some(mcp) = mcp {
-        save_service_env(&command, mcp).await;
-        mcp.apply(&mut command);
+    match mcp {
+        Some(mcp) => {
+            save_service_env(&command, mcp).await;
+            mcp.apply(&mut command);
+        }
+        None => {
+            clear_service_env(&command).await;
+            for name in MCP_ENV_NAMES {
+                command.env_remove(name);
+            }
+        }
     }
     // `serve --service` bypasses saved service env; the CLI owns that setup.
     command
@@ -3136,6 +3307,107 @@ mod tests {
         launch_service(command, Some(&third))
             .await
             .expect("env reaches the child");
+    }
+
+    /// An `opencode` that keeps its saved service env as one file per name
+    /// and logs each `service` command.
+    #[cfg(unix)]
+    fn fake_service_cli(saved: &[(&str, &str)]) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir =
+            crate::test_state_dir().join(format!("opencode-service-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("env")).unwrap();
+        for (name, value) in saved {
+            std::fs::write(dir.join("env").join(name), value).unwrap();
+        }
+        let program = dir.join("opencode");
+        std::fs::write(
+            &program,
+            format!(
+                "#!/bin/sh\nd='{}'\nm=\"$2 $3\"\n[ \"$1\" = service ] || exit 0\necho \"$2 $4\" >> \"$d/log\"\ncase \"$m\" in\n  'get env') cat \"$d/env/$4\" 2>/dev/null; echo ;;\n  'set env') printf '%s' \"$5\" > \"$d/env/$4\" ;;\n  'unset env') rm -f \"$d/env/$4\" ;;\nesac\n",
+                dir.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // A concurrent fork may hold the write descriptor until its exec
+        // (ETXTBSY); wait that out once here.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::process::Command::new(&program)
+            .arg("ready")
+            .status()
+            .is_err()
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fake opencode never became executable"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        program
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_start_without_our_token_drops_stale_mcp_service_env() {
+        const STALE: &str = "http://127.0.0.1:18854/mcp";
+        let ours = McpEnv {
+            token_id: "id".into(),
+            token: "fresh".into(),
+            url: "http://127.0.0.1:23999/mcp".into(),
+        };
+        for (saved, mcp, expected_url, unsets) in [
+            // Minting failed: another gateway's values must not survive.
+            (
+                &[("MUQUN_MCP_URL", STALE), ("MUQUN_MCP_TOKEN", "old")][..],
+                None,
+                None,
+                2,
+            ),
+            (&[][..], None, None, 0),
+            (
+                &[("MUQUN_MCP_URL", STALE)][..],
+                Some(&ours),
+                Some(ours.url.as_str()),
+                0,
+            ),
+        ] {
+            let program = fake_service_cli(saved);
+            launch_service(tokio::process::Command::new(&program), mcp)
+                .await
+                .expect("service start");
+            let like = tokio::process::Command::new(&program);
+            assert_eq!(
+                read_service_env(&like, "MUQUN_MCP_URL").await.as_deref(),
+                expected_url
+            );
+            assert_eq!(
+                read_service_env(&like, "MUQUN_MCP_TOKEN").await.is_some(),
+                mcp.is_some()
+            );
+            let log = std::fs::read_to_string(program.with_file_name("log")).unwrap();
+            assert_eq!(log.matches("unset ").count(), unsets, "{log}");
+            assert!(log.lines().any(|line| line.starts_with("start")), "{log}");
+        }
+    }
+
+    #[test]
+    fn adoption_names_an_mcp_url_that_is_not_ours() {
+        const OURS: &str = "http://127.0.0.1:23847/mcp";
+        for (saved, mismatch) in [
+            (Some(OURS), false),
+            (Some("http://127.0.0.1:23847/mcp/"), false),
+            (Some("http://127.0.0.1:18854/mcp"), true),
+            (None, true),
+        ] {
+            let found = adopted_mcp_mismatch(saved, OURS);
+            assert_eq!(found.is_some(), mismatch, "{saved:?}");
+            if let Some((reason, log)) = found {
+                // Discovery reaches linked computers: no address in it.
+                assert!(!reason.contains("127.0.0.1"), "{reason}");
+                assert!(log.contains(saved.unwrap_or("no MUQUN_MCP_URL")), "{log}");
+            }
+        }
     }
 
     #[tokio::test]

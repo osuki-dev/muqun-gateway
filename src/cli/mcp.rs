@@ -49,6 +49,13 @@ pub(crate) enum McpCommand {
         #[arg(long)]
         id: Option<String>,
     },
+    /// Forget an earlier gateway's record that an agent here once ran work
+    /// from another computer without naming the session. Remove those
+    /// sessions first: this restores the agent's shared Muqun tools.
+    ForgetDelegated {
+        #[arg(value_parser = ["opencode", "codex"])]
+        agent: String,
+    },
     /// Point an MCP host (Claude Code, OpenCode, Codex, Pi) at this gateway.
     Enable {
         #[arg(value_enum)]
@@ -253,16 +260,41 @@ fn token_helper(
     Ok(())
 }
 
-async fn revoke(all: bool, id: Option<String>) -> anyhow::Result<()> {
+pub(crate) fn open_store(
+) -> anyhow::Result<std::sync::Arc<crate::platform::store::sqlite::SqliteStore>> {
     let config = crate::load_config(None)?;
     let state = crate::state_dir()?;
     let key = crate::platform::store::db_key::key_for(&config.store, &state)?;
-    let db = crate::platform::store::sqlite::SqliteStore::open(
+    crate::platform::store::sqlite::SqliteStore::open(
         &crate::store_db_path(&state),
         key,
         crate::platform::store::sqlite::ALL_MIGRATIONS,
-    )?;
-    let store = crate::mcp::tokens_sqlite::SqliteTokenStore::new(db);
+    )
+}
+
+async fn forget_delegated(agent: String) -> anyhow::Result<()> {
+    let id = agent.clone();
+    let (forgot, block) = open_store()?
+        .call(move |c| {
+            let forgot = crate::tasks::store_sqlite::forget_unrecorded_restriction(c, &id)?;
+            Ok((forgot, crate::tasks::store_sqlite::runtime_block(c, &id)?))
+        })
+        .await?;
+    if !forgot {
+        println!("No unnamed delegated-session record for {agent}.");
+    }
+    match block {
+        Some(block) => println!("{agent}'s Muqun tools stay withheld: {}", block.summary()),
+        None if agent == "opencode" => println!(
+            "Nothing withholds OpenCode's Muqun tools now. `opencode service stop` lets the gateway start it again with them."
+        ),
+        None => println!("Nothing withholds {agent}'s Muqun tools now."),
+    }
+    Ok(())
+}
+
+async fn revoke(all: bool, id: Option<String>) -> anyhow::Result<()> {
+    let store = crate::mcp::tokens_sqlite::SqliteTokenStore::new(open_store()?);
     let count = match (all, id) {
         (true, _) => store.revoke_all().await?,
         (false, Some(id)) => usize::from(store.revoke(&id).await?),
@@ -283,6 +315,7 @@ pub(crate) async fn run_mcp_command(command: McpCommand) -> anyhow::Result<()> {
             agent_id,
         } => token_helper(bearer, config_dir, url, state_dir, task_id, agent_id)?,
         McpCommand::Revoke { all, id } => revoke(all, id).await?,
+        McpCommand::ForgetDelegated { agent } => forget_delegated(agent).await?,
         McpCommand::Enable { host, project, url } => {
             let url = url.unwrap_or_else(default_url);
             let helper = hosts::helper_for_url(&url);
