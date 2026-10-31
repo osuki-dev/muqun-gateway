@@ -17,7 +17,8 @@ Two planes are implemented in this binary:
   adapters implement it.
 - **Agents plane** — agent sessions, models, prompts, tasks,
   permissions, approvals and event history, behind the `AgentPort`
-  port; the OpenCode, DeepSeek, T3 Code, Codex, FX, Qoder CLI and Pi adapters implement it.
+  port; the OpenCode, DeepSeek, T3 Code, Codex, FX, Qoder CLI, Pi and Antigravity adapters
+  implement it.
 
 `/api/discovery` also reports an **SSH plane**, but that one is the app's own
 transport, not a gateway subsystem: the phone can open an SSH connection to a
@@ -347,6 +348,7 @@ muqun-gateway agent setup t3         # store a T3 Code credential and enable T3
 muqun-gateway agent setup deepseek   # enable DeepSeek; Gateway starts or joins the harness
 muqun-gateway agent setup fx         # explain local FX ACP configuration (no process starts)
 muqun-gateway agent setup qoder      # explain local Qoder CLI ACP configuration (no process starts)
+muqun-gateway agent setup antigravity # explain local Antigravity ACP configuration (no process starts)
 ```
 
 `agent` probes the agents from your shell the way the running gateway does,
@@ -484,6 +486,18 @@ metadata reads do not load or take ownership of its conversation. Unsupported
 App controls remain explicitly gated: native model choices and observed effort
 options can be selected temporarily within a session; permission-mode switching
 remains unavailable. See [Qoder protocol](docs/qoder-protocol.md).
+
+### The Antigravity service agent
+
+Google Antigravity is discovered by default through `agy` on PATH; its provider
+id is `antigravity`. Install Antigravity's CLI and sign in with your Google
+account by running `agy` once in a terminal on this host. Gateway starts one
+private `agy acp` child per opened session, reuses that login, and passes its
+muqun tools to each session directly; it never edits Antigravity's settings.
+Listing sessions reads Antigravity's own conversation index and starts nothing.
+When `agy` is not signed in, opening a session says so instead of waiting.
+Set `antigravity.binary` to an absolute executable or `antigravity.enabled:
+false` to disable it. See [Antigravity protocol](docs/antigravity-protocol.md).
 
 ### The OpenCode agent
 

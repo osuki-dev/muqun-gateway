@@ -63,6 +63,26 @@ pub trait AcpProvider: Send + Sync + 'static {
     fn safe_error_message(_: &Value) -> Option<&'static str> {
         None
     }
+    /// An agent that refuses every session until the client sends ACP
+    /// `authenticate`, even with a login already stored on the computer.
+    const AUTHENTICATE: Option<Authenticate> = None;
+    /// Rows for `session/list` read from the native store without starting
+    /// the agent, or `None` to ask the agent itself.
+    fn offline_sessions<'a>(
+        _directory: Option<&'a str>,
+        _stop: &'a CancellationToken,
+    ) -> Option<AgentFuture<'a, Vec<Value>>> {
+        None
+    }
+}
+
+/// `authenticate` with a stored login. Without one the agent starts an
+/// interactive sign-in and never answers in time, so a refusal or timeout
+/// means "not signed in here": `refusal` says so in the user's terms.
+pub struct Authenticate {
+    pub method: &'static str,
+    pub timeout: Duration,
+    pub refusal: &'static str,
 }
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
@@ -273,6 +293,7 @@ pub struct AcpDriver<P: AcpProvider> {
     metadata_revision: AtomicU64,
     native_capabilities: StdMutex<Value>,
     commands_observed: Arc<AtomicBool>,
+    mcp_servers: StdMutex<Value>,
     stop: CancellationToken,
 }
 
@@ -371,8 +392,21 @@ impl<P: AcpProvider> AcpDriver<P> {
             metadata_revision: AtomicU64::new(0),
             native_capabilities: StdMutex::new(Value::Null),
             commands_observed: Arc::new(AtomicBool::new(false)),
+            mcp_servers: StdMutex::new(json!([])),
             stop: CancellationToken::new(),
         })
+    }
+
+    /// ACP `mcpServers` entries given to every `session/new`, `session/load`
+    /// and `session/fork`. Never written to the agent's own configuration.
+    pub fn set_mcp_servers(&self, servers: Value) {
+        if servers.is_array() {
+            *self.mcp_servers.lock().unwrap() = servers;
+        }
+    }
+
+    fn mcp_servers(&self) -> Value {
+        self.mcp_servers.lock().unwrap().clone()
     }
 
     pub fn set_idle_timeout(&self, timeout: Duration) {
@@ -704,6 +738,26 @@ impl<P: AcpProvider> AcpDriver<P> {
             Ok(value) if value["protocolVersion"].as_u64() == Some(1) => {
                 let capabilities = value["agentCapabilities"].clone();
                 *self.native_capabilities.lock().unwrap() = capabilities.clone();
+                if let Some(auth) = &P::AUTHENTICATE {
+                    let offered = value["authMethods"].as_array().is_some_and(|methods| {
+                        methods
+                            .iter()
+                            .any(|method| method["id"].as_str() == Some(auth.method))
+                    });
+                    let authenticated = offered
+                        && client
+                            .request_with_timeout(
+                                "authenticate",
+                                json!({ "methodId": auth.method }),
+                                auth.timeout,
+                            )
+                            .await
+                            .is_ok();
+                    if !authenticated {
+                        client.shutdown().await;
+                        return Err(AgentError::NotAvailable(auth.refusal.into()));
+                    }
+                }
                 Ok((client, events, capabilities))
             }
             result => {
@@ -839,6 +893,11 @@ impl<P: AcpProvider> AcpDriver<P> {
         directory: Option<&str>,
     ) -> Result<Vec<AgentSessionInfo>, AgentError> {
         let revision = self.metadata_revision.load(Ordering::Acquire);
+        if let Some(rows) = P::offline_sessions(directory, &self.stop) {
+            let sessions = self.project_listed_sessions(rows.await?).await?;
+            self.remember_session_metadata(revision, &sessions).await;
+            return Ok(sessions);
+        }
         let (client, _events, capabilities) = self.initialized(&self.default_directory).await?;
         if !capabilities
             .pointer("/sessionCapabilities/list")
@@ -918,18 +977,22 @@ impl<P: AcpProvider> AcpDriver<P> {
         .await;
         client.shutdown().await;
         if let Ok(sessions) = &result {
-            let mut metadata = self.session_metadata.lock().await;
-            if self.metadata_revision.load(Ordering::Acquire) == revision {
-                *metadata = Some(SessionMetadata {
-                    listed_at: tokio::time::Instant::now(),
-                    sessions: sessions
-                        .iter()
-                        .map(|info| (info.asid.0.clone(), info.clone()))
-                        .collect(),
-                });
-            }
+            self.remember_session_metadata(revision, sessions).await;
         }
         result
+    }
+
+    async fn remember_session_metadata(&self, revision: u64, sessions: &[AgentSessionInfo]) {
+        let mut metadata = self.session_metadata.lock().await;
+        if self.metadata_revision.load(Ordering::Acquire) == revision {
+            *metadata = Some(SessionMetadata {
+                listed_at: tokio::time::Instant::now(),
+                sessions: sessions
+                    .iter()
+                    .map(|info| (info.asid.0.clone(), info.clone()))
+                    .collect(),
+            });
+        }
     }
 
     async fn project_listed_sessions(
@@ -1250,7 +1313,7 @@ impl<P: AcpProvider> AcpDriver<P> {
         } else {
             "session/new"
         };
-        let mut params = json!({ "cwd": directory, "mcpServers": [] });
+        let mut params = json!({ "cwd": directory, "mcpServers": self.mcp_servers() });
         if let Some(id) = &id {
             params["sessionId"] = json!(id);
         }
@@ -2573,7 +2636,8 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
                 .directory
                 .as_deref()
                 .ok_or_else(|| protocol("source session has no directory"))?;
-            let params = operations::fork_params(id, directory, message_id)?;
+            let mut params = operations::fork_params(id, directory, message_id)?;
+            params["mcpServers"] = self.mcp_servers();
             let (client, _events, capabilities) = self.initialized(directory).await?;
             if !operations::supports_operation(&capabilities, "fork") {
                 client.shutdown().await;

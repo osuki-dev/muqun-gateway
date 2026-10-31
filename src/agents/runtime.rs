@@ -31,6 +31,8 @@ pub use fx::FxConfig;
 mod pi;
 pub(crate) mod qoder;
 pub use qoder::QoderConfig;
+pub(crate) mod antigravity;
+pub use antigravity::AntigravityConfig;
 mod t3;
 pub use pi::PiConfig;
 use pi::PiState;
@@ -65,8 +67,16 @@ const VERSION_OUTPUT_LIMIT: u64 = 4096;
 
 /// Preference among attached providers. Explicit provider/session selections
 /// retain their route; discovery additionally puts usable providers first.
-pub const AGENT_PREFERENCE: [&str; 7] =
-    ["codex", "opencode", "deepseek", "t3", "fx", "qoder", "pi"];
+pub const AGENT_PREFERENCE: [&str; 8] = [
+    "codex",
+    "opencode",
+    "deepseek",
+    "t3",
+    "fx",
+    "qoder",
+    "pi",
+    "antigravity",
+];
 /// Most session-to-agent routes remembered; the oldest go first.
 const MAX_SESSION_ROUTES: usize = 4096;
 /// How long an agent discovery result is reused.
@@ -279,6 +289,7 @@ pub struct LocalAgentConfigs {
     pub fx: FxConfig,
     pub qoder: QoderConfig,
     pub pi: PiConfig,
+    pub antigravity: AntigravityConfig,
 }
 
 struct LocalAgentStates {
@@ -286,6 +297,7 @@ struct LocalAgentStates {
     fx: fx::FxState,
     qoder: qoder::QoderState,
     pi: PiState,
+    antigravity: antigravity::AntigravityState,
 }
 
 pub struct AgentRuntime {
@@ -308,6 +320,7 @@ pub struct AgentRuntime {
     codex: codex::CodexState,
     fx: fx::FxState,
     qoder: qoder::QoderState,
+    antigravity: antigravity::AntigravityState,
     /// The harness this gateway started, if any. Not a kill handle.
     deepseek_spawn: Mutex<deepseek::SpawnSlot>,
     /// Origin of the attached DeepSeek manager, including when it is not primary.
@@ -397,6 +410,7 @@ impl AgentRuntime {
             t3_config,
             LocalAgentConfigs {
                 pi: PiConfig::disabled(),
+                antigravity: AntigravityConfig::disabled(),
                 ..Default::default()
             },
             state_dir,
@@ -418,6 +432,7 @@ impl AgentRuntime {
             LocalAgentConfigs {
                 codex: codex_config,
                 pi: PiConfig::disabled(),
+                antigravity: AntigravityConfig::disabled(),
                 ..Default::default()
             },
             state_dir,
@@ -441,6 +456,7 @@ impl AgentRuntime {
                 fx: fx::FxState::new(local.fx),
                 qoder: qoder::QoderState::new(local.qoder),
                 pi: PiState::new(local.pi, state_dir),
+                antigravity: antigravity::AntigravityState::new(local.antigravity),
             },
         )
     }
@@ -462,6 +478,7 @@ impl AgentRuntime {
                 fx: fx_config,
                 qoder: QoderConfig::default(),
                 pi: PiConfig::disabled(),
+                antigravity: AntigravityConfig::disabled(),
             },
             state_dir,
         )
@@ -485,6 +502,7 @@ impl AgentRuntime {
                 fx: fx_config,
                 qoder: qoder_config,
                 pi: PiConfig::disabled(),
+                antigravity: AntigravityConfig::disabled(),
             },
             state_dir,
         )
@@ -513,6 +531,7 @@ impl AgentRuntime {
                     ..Default::default()
                 },
                 pi: pi_config,
+                antigravity: AntigravityConfig::disabled(),
             },
             state_dir,
         )
@@ -532,6 +551,7 @@ impl AgentRuntime {
                 fx: fx::FxState::new(FxConfig::default()),
                 qoder: qoder::QoderState::new(QoderConfig::default()),
                 pi: PiState::new(PiConfig::disabled(), None),
+                antigravity: antigravity::AntigravityState::new(AntigravityConfig::disabled()),
             },
         )
     }
@@ -557,6 +577,7 @@ impl AgentRuntime {
             codex: local.codex,
             fx: local.fx,
             qoder: local.qoder,
+            antigravity: local.antigravity,
             deepseek_spawn: Mutex::new(deepseek::SpawnSlot::default()),
             deepseek_origin: RwLock::new(AgentOrigin::None),
             origin: RwLock::new(AgentOrigin::None),
@@ -697,6 +718,7 @@ impl AgentRuntime {
                     ..Default::default()
                 },
                 pi: PiConfig::disabled(),
+                antigravity: AntigravityConfig::disabled(),
             },
             None,
         )
@@ -850,7 +872,8 @@ impl AgentRuntime {
                 local_installation_status(&self.config)
             },
             origin: if manager.as_ref().is_some_and(|manager| {
-                matches!(manager.agent().kind(), "fx" | "qoder") && manager.stream_connected()
+                matches!(manager.agent().kind(), "fx" | "qoder" | "antigravity")
+                    && manager.stream_connected()
             }) {
                 AgentOrigin::Spawned
             } else {
@@ -869,7 +892,7 @@ impl AgentRuntime {
                 self.codex.config.enabled
             } else if manager
                 .as_ref()
-                .is_some_and(|m| matches!(m.agent().kind(), "fx" | "qoder"))
+                .is_some_and(|m| matches!(m.agent().kind(), "fx" | "qoder" | "antigravity"))
             {
                 false
             } else {
@@ -893,7 +916,7 @@ impl AgentRuntime {
         Some(AgentStatus {
             available: kind != "codex" || manager.stream_connected(),
             installation: AgentInstallation::Installed,
-            origin: if matches!(kind.as_str(), "fx" | "qoder") {
+            origin: if matches!(kind.as_str(), "fx" | "qoder" | "antigravity") {
                 if manager.stream_connected() {
                     AgentOrigin::Spawned
                 } else {
@@ -1057,6 +1080,11 @@ impl AgentRuntime {
                     "codex" => (self.codex.config.enabled, "Codex", codex::features()),
                     "fx" => (self.fx.config.enabled, "FX", fx::features()),
                     "qoder" => (self.qoder.config.enabled, "Qoder CLI", qoder::features()),
+                    "antigravity" => (
+                        self.antigravity.config.enabled,
+                        "Antigravity",
+                        antigravity::features(),
+                    ),
                     _ => (
                         self.deepseek_config.enabled || self.deepseek_config.endpoint.is_some(),
                         "DeepSeek",
@@ -1085,7 +1113,7 @@ impl AgentRuntime {
                     kind: id.to_string(),
                     status: match (enabled, manager) {
                         (false, _) => AgentAvailability::Disabled,
-                        (true, Some(_)) if matches!(*id, "fx" | "qoder") => {
+                        (true, Some(_)) if matches!(*id, "fx" | "qoder" | "antigravity") => {
                             AgentAvailability::Reachable
                         }
                         (true, Some(_)) => AgentAvailability::Connected,
@@ -1384,6 +1412,7 @@ impl AgentRuntime {
         agents.push(self.codex.discovery(self).await);
         agents.push(self.fx.discovery(self).await);
         agents.push(self.qoder.discovery(self).await);
+        agents.push(self.antigravity.discovery(self).await);
         crate::discovery::order_agents(&mut agents);
 
         let supported = agents.iter().any(|h| {
@@ -1459,7 +1488,9 @@ impl AgentRuntime {
             .read()
             .await
             .as_ref()
-            .map(|m| !matches!(m.agent().kind(), "fx" | "qoder") && !m.stream_connected())
+            .map(|m| {
+                !matches!(m.agent().kind(), "fx" | "qoder" | "antigravity") && !m.stream_connected()
+            })
             .unwrap_or(false)
     }
 
@@ -1489,9 +1520,18 @@ impl AgentRuntime {
         let codex_ok = self.codex.supervise(self).await;
         let fx_ok = self.fx.supervise(self).await;
         let qoder_ok = self.qoder.supervise(self).await;
+        let antigravity_ok = self.antigravity.supervise(self).await;
         let pi_ok = self.supervise_pi().await;
 
-        if deepseek_ok || opencode_ok || t3_ok || codex_ok || fx_ok || qoder_ok || pi_ok {
+        if deepseek_ok
+            || opencode_ok
+            || t3_ok
+            || codex_ok
+            || fx_ok
+            || qoder_ok
+            || pi_ok
+            || antigravity_ok
+        {
             *start_backoff = Duration::from_secs(2);
             let primary = pick_primary(&*self.managers.read().await).cloned();
             if let Some(mgr) = primary {
@@ -3591,6 +3631,7 @@ mod tests {
             T3Config::default(),
             LocalAgentConfigs {
                 pi: PiConfig::disabled(),
+                antigravity: AntigravityConfig::disabled(),
                 ..Default::default()
             },
             None,
@@ -4068,7 +4109,16 @@ mod tests {
                 .iter()
                 .map(|a| a.id.as_str())
                 .collect::<Vec<_>>(),
-            ["codex", "opencode", "deepseek", "t3", "fx", "qoder", "pi"]
+            [
+                "codex",
+                "opencode",
+                "deepseek",
+                "t3",
+                "fx",
+                "qoder",
+                "pi",
+                "antigravity"
+            ]
         );
         assert_eq!(runtime.manager().await.unwrap().agent().kind(), "codex");
         assert_eq!(
@@ -4095,7 +4145,16 @@ mod tests {
         let ids: Vec<&str> = found.agents.iter().map(|a| a.id.as_str()).collect();
         assert_eq!(
             ids,
-            ["opencode", "deepseek", "t3", "fx", "qoder", "pi", "codex"]
+            [
+                "opencode",
+                "deepseek",
+                "t3",
+                "fx",
+                "qoder",
+                "pi",
+                "antigravity",
+                "codex"
+            ]
         );
     }
 

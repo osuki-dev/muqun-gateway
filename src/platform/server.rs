@@ -120,6 +120,7 @@ pub(crate) async fn run(config_path: Option<String>) -> anyhow::Result<()> {
                 codex: config.codex.clone(),
                 fx: config.fx.clone(),
                 qoder: config.qoder.clone(),
+                antigravity: config.antigravity.clone(),
                 pi: config.pi.clone(),
             },
             Some(state_dir()?),
@@ -328,6 +329,7 @@ async fn serve_until_shutdown(
     tokio::join!(
         runtime.shutdown_fx(),
         runtime.shutdown_qoder(),
+        runtime.shutdown_antigravity(),
         runtime.shutdown_pi()
     );
     let cleanup = runtime.shutdown_codex().await;
