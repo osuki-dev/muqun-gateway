@@ -18,8 +18,9 @@
   picked inside a session). Discovery now uses the version it reads from the
   binary to find that list.
 
-- **Claude Code, Cursor and Antigravity sessions can finish a Home task.**
-  A task delegated to one of these native ACP sessions was answered
+- **Claude Code sessions can finish a Home task.** A task delegated to a
+  native ACP session (Claude Code, and likewise Cursor and Antigravity) was
+  answered
   `task_not_found` when the agent called `tasks.complete`, so it ended
   "idle, unconfirmed" instead of done. The Gateway matches the call to the
   session making it by its running tool call, but these adapters report a
