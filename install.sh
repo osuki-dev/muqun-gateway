@@ -223,10 +223,12 @@ staging="$(mktemp -d "$INSTALL_DIR/.muqun-gateway-install.XXXXXX")" || die "Cann
 
 download() (
   # curl versions before 8.4 only enforce --max-filesize for known lengths.
-  # The file-size limit also bounds chunked writes (shell units are at least
-  # 512 bytes; use 1024 conservatively on both macOS and Linux).
+  # The file-size limit also bounds chunked writes. Its unit is the shell's:
+  # 512-byte blocks in dash (Debian/Ubuntu /bin/sh), 1024 in bash. Size it for
+  # 512 so the backstop is never tighter than the cap; the exact cap is still
+  # --max-filesize plus the size check below.
   ulimit -c 0 || exit 1
-  ulimit -f "$((($3 + 1023) / 1024))" || exit 1
+  ulimit -f "$((($3 + 511) / 512))" || exit 1
   url="$1" output="$2" max_bytes="$3"
   set -- -fsSL
   if [ "$color" = 1 ] && [ -t 2 ]; then
