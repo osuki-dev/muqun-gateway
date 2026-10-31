@@ -285,7 +285,7 @@ for line in sys.stdin:
         }
         pub(crate) fn qoder_driver(&self) -> Arc<crate::agents::adapters::qoder::QoderDriver> {
             let (tx, _) = broadcast::channel(256);
-            crate::agents::adapters::qoder::QoderDriver::new(
+            let driver = crate::agents::adapters::qoder::QoderDriver::new(
                 self.directory
                     .join("mock-fx")
                     .to_string_lossy()
@@ -293,7 +293,10 @@ for line in sys.stdin:
                 self.directory.to_string_lossy().into_owned(),
                 Arc::new(MemoryMirror::for_agent("qoder")),
                 tx,
-            )
+            );
+            // Never fingerprint the real ~/.qoder store from tests.
+            driver.set_session_store(|| None);
+            driver
         }
         pub(crate) fn methods(&self) -> Vec<String> {
             std::fs::read_to_string(self.directory.join("methods.log"))
