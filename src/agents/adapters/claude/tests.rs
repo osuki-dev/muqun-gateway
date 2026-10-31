@@ -8,7 +8,7 @@ use super::ClaudeDriver;
 use crate::agents::adapters::acp::session::AcpLaunch;
 use crate::agents::adapters::memory_mirror::MemoryMirror;
 use crate::agents::domain::{ModelRef, SessionQuery};
-use crate::agents::ports::agent::AgentPort;
+use crate::agents::ports::agent::{AgentError, AgentPort};
 
 const FAKE: &str = r#"#!/usr/bin/env python3
 import json, os, sys
@@ -154,13 +154,55 @@ async fn listing_starts_nothing_and_sessions_get_launch_mcp_and_model() {
         .filter(|m| m[0] == "session/prompt")
         .count();
     assert_eq!(prompts, 1);
+
+    // Every read of a terminal-held session answers from its transcript;
+    // only what needs the conversation itself goes to the terminal (409),
+    // and without a pane so do prompts and Stop.
+    let id = info.asid.0.as_str();
+    for pane in [true, false] {
+        bridge.pane.store(pane, std::sync::atomic::Ordering::SeqCst);
+        driver.prepare_observed_session(id).await.unwrap();
+        driver.prepare_selected_session(id).await.unwrap();
+        driver.get_timeline(id, 100).await.unwrap();
+        driver.load_earlier_timeline(id, 50).await.unwrap();
+        assert!(driver.get_pending_permissions(id).await.unwrap().is_empty());
+        driver
+            .get_catalog_for_session(Some(id), Some(&cwd))
+            .await
+            .unwrap();
+        let terminal = |result: Result<(), AgentError>| {
+            matches!(result, Err(AgentError::TerminalInteraction(_)))
+        };
+        assert!(terminal(driver.switch_model(id, &model).await));
+        assert!(terminal(driver.delete_session(id).await));
+        assert!(terminal(driver.fork_session(id, None).await.map(|_| ())));
+        assert_eq!(terminal(driver.interrupt(id).await), !pane);
+        assert_eq!(
+            terminal(
+                driver
+                    .send_prompt(id, "Reply with exactly PONG", &[], None)
+                    .await
+            ),
+            !pane
+        );
+    }
+    assert!(!driver.has_live_stream());
     driver.shutdown().await;
     let _ = std::fs::remove_dir_all(&directory);
 }
 
-#[derive(Default)]
 struct FakeTerminal {
     sent: std::sync::Mutex<Vec<(String, String)>>,
+    pane: std::sync::atomic::AtomicBool,
+}
+
+impl Default for FakeTerminal {
+    fn default() -> Self {
+        Self {
+            sent: Default::default(),
+            pane: std::sync::atomic::AtomicBool::new(true),
+        }
+    }
 }
 
 impl crate::agents::adapters::acp::session::TerminalBridge for FakeTerminal {
@@ -180,10 +222,11 @@ impl crate::agents::adapters::acp::session::TerminalBridge for FakeTerminal {
             Ok(ids
                 .iter()
                 .map(|id| {
-                    let live = crate::agents::runtime::claude::terminal_runtime(
-                        &process,
-                        Some(("terminal".into(), "pane-1".into())),
-                    );
+                    let pane = self
+                        .pane
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                        .then(|| ("terminal".to_owned(), "pane-1".to_owned()));
+                    let live = crate::agents::runtime::claude::terminal_runtime(&process, pane);
                     (id.clone(), live)
                 })
                 .collect())
