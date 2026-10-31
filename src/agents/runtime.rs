@@ -23,6 +23,8 @@ use super::adapters::opencode::OpencodeEndpoint;
 use super::domain::AgentDomainEvent;
 use super::manager::AgentManager;
 
+pub(crate) mod claude;
+pub use claude::ClaudeConfig;
 pub(crate) mod codex;
 pub use codex::CodexConfig;
 pub(crate) mod deepseek;
@@ -65,8 +67,9 @@ const VERSION_OUTPUT_LIMIT: u64 = 4096;
 
 /// Preference among attached providers. Explicit provider/session selections
 /// retain their route; discovery additionally puts usable providers first.
-pub const AGENT_PREFERENCE: [&str; 7] =
-    ["codex", "opencode", "deepseek", "t3", "fx", "qoder", "pi"];
+pub const AGENT_PREFERENCE: [&str; 8] = [
+    "codex", "opencode", "deepseek", "t3", "fx", "qoder", "pi", "claude",
+];
 /// Most session-to-agent routes remembered; the oldest go first.
 const MAX_SESSION_ROUTES: usize = 4096;
 /// How long an agent discovery result is reused.
@@ -279,6 +282,7 @@ pub struct LocalAgentConfigs {
     pub fx: FxConfig,
     pub qoder: QoderConfig,
     pub pi: PiConfig,
+    pub claude: ClaudeConfig,
 }
 
 struct LocalAgentStates {
@@ -286,6 +290,7 @@ struct LocalAgentStates {
     fx: fx::FxState,
     qoder: qoder::QoderState,
     pi: PiState,
+    claude: claude::ClaudeState,
 }
 
 pub struct AgentRuntime {
@@ -308,6 +313,7 @@ pub struct AgentRuntime {
     codex: codex::CodexState,
     fx: fx::FxState,
     qoder: qoder::QoderState,
+    claude: claude::ClaudeState,
     /// The harness this gateway started, if any. Not a kill handle.
     deepseek_spawn: Mutex<deepseek::SpawnSlot>,
     /// Origin of the attached DeepSeek manager, including when it is not primary.
@@ -397,6 +403,7 @@ impl AgentRuntime {
             t3_config,
             LocalAgentConfigs {
                 pi: PiConfig::disabled(),
+                claude: ClaudeConfig::disabled(),
                 ..Default::default()
             },
             state_dir,
@@ -441,6 +448,7 @@ impl AgentRuntime {
                 fx: fx::FxState::new(local.fx),
                 qoder: qoder::QoderState::new(local.qoder),
                 pi: PiState::new(local.pi, state_dir),
+                claude: claude::ClaudeState::new(local.claude),
             },
         )
     }
@@ -462,6 +470,7 @@ impl AgentRuntime {
                 fx: fx_config,
                 qoder: QoderConfig::default(),
                 pi: PiConfig::disabled(),
+                claude: ClaudeConfig::disabled(),
             },
             state_dir,
         )
@@ -485,6 +494,7 @@ impl AgentRuntime {
                 fx: fx_config,
                 qoder: qoder_config,
                 pi: PiConfig::disabled(),
+                claude: ClaudeConfig::disabled(),
             },
             state_dir,
         )
@@ -513,6 +523,7 @@ impl AgentRuntime {
                     ..Default::default()
                 },
                 pi: pi_config,
+                claude: ClaudeConfig::disabled(),
             },
             state_dir,
         )
@@ -532,6 +543,7 @@ impl AgentRuntime {
                 fx: fx::FxState::new(FxConfig::default()),
                 qoder: qoder::QoderState::new(QoderConfig::default()),
                 pi: PiState::new(PiConfig::disabled(), None),
+                claude: claude::ClaudeState::new(ClaudeConfig::disabled()),
             },
         )
     }
@@ -557,6 +569,7 @@ impl AgentRuntime {
             codex: local.codex,
             fx: local.fx,
             qoder: local.qoder,
+            claude: local.claude,
             deepseek_spawn: Mutex::new(deepseek::SpawnSlot::default()),
             deepseek_origin: RwLock::new(AgentOrigin::None),
             origin: RwLock::new(AgentOrigin::None),
@@ -634,6 +647,7 @@ impl AgentRuntime {
         let _ = self
             .terminal_runtime
             .set(super::terminal_runtime::TerminalRuntime::new(sessions));
+        let _ = self.claude.terminals.set(sessions.to_vec());
     }
 
     pub(crate) fn restore_native_codex_sessions(
@@ -697,6 +711,7 @@ impl AgentRuntime {
                     ..Default::default()
                 },
                 pi: PiConfig::disabled(),
+                claude: ClaudeConfig::disabled(),
             },
             None,
         )
@@ -850,7 +865,8 @@ impl AgentRuntime {
                 local_installation_status(&self.config)
             },
             origin: if manager.as_ref().is_some_and(|manager| {
-                matches!(manager.agent().kind(), "fx" | "qoder") && manager.stream_connected()
+                matches!(manager.agent().kind(), "fx" | "qoder" | "claude")
+                    && manager.stream_connected()
             }) {
                 AgentOrigin::Spawned
             } else {
@@ -869,7 +885,7 @@ impl AgentRuntime {
                 self.codex.config.enabled
             } else if manager
                 .as_ref()
-                .is_some_and(|m| matches!(m.agent().kind(), "fx" | "qoder"))
+                .is_some_and(|m| matches!(m.agent().kind(), "fx" | "qoder" | "claude"))
             {
                 false
             } else {
@@ -893,7 +909,7 @@ impl AgentRuntime {
         Some(AgentStatus {
             available: kind != "codex" || manager.stream_connected(),
             installation: AgentInstallation::Installed,
-            origin: if matches!(kind.as_str(), "fx" | "qoder") {
+            origin: if matches!(kind.as_str(), "fx" | "qoder" | "claude") {
                 if manager.stream_connected() {
                     AgentOrigin::Spawned
                 } else {
@@ -1057,6 +1073,11 @@ impl AgentRuntime {
                     "codex" => (self.codex.config.enabled, "Codex", codex::features()),
                     "fx" => (self.fx.config.enabled, "FX", fx::features()),
                     "qoder" => (self.qoder.config.enabled, "Qoder CLI", qoder::features()),
+                    "claude" => (
+                        self.claude.config.enabled,
+                        "Claude Code",
+                        claude::features(),
+                    ),
                     _ => (
                         self.deepseek_config.enabled || self.deepseek_config.endpoint.is_some(),
                         "DeepSeek",
@@ -1085,7 +1106,7 @@ impl AgentRuntime {
                     kind: id.to_string(),
                     status: match (enabled, manager) {
                         (false, _) => AgentAvailability::Disabled,
-                        (true, Some(_)) if matches!(*id, "fx" | "qoder") => {
+                        (true, Some(_)) if matches!(*id, "fx" | "qoder" | "claude") => {
                             AgentAvailability::Reachable
                         }
                         (true, Some(_)) => AgentAvailability::Connected,
@@ -1384,6 +1405,7 @@ impl AgentRuntime {
         agents.push(self.codex.discovery(self).await);
         agents.push(self.fx.discovery(self).await);
         agents.push(self.qoder.discovery(self).await);
+        agents.push(self.claude.discovery(self).await);
         crate::discovery::order_agents(&mut agents);
 
         let supported = agents.iter().any(|h| {
@@ -1459,7 +1481,9 @@ impl AgentRuntime {
             .read()
             .await
             .as_ref()
-            .map(|m| !matches!(m.agent().kind(), "fx" | "qoder") && !m.stream_connected())
+            .map(|m| {
+                !matches!(m.agent().kind(), "fx" | "qoder" | "claude") && !m.stream_connected()
+            })
             .unwrap_or(false)
     }
 
@@ -1490,8 +1514,17 @@ impl AgentRuntime {
         let fx_ok = self.fx.supervise(self).await;
         let qoder_ok = self.qoder.supervise(self).await;
         let pi_ok = self.supervise_pi().await;
+        let claude_ok = self.claude.supervise(self).await;
 
-        if deepseek_ok || opencode_ok || t3_ok || codex_ok || fx_ok || qoder_ok || pi_ok {
+        if deepseek_ok
+            || opencode_ok
+            || t3_ok
+            || codex_ok
+            || fx_ok
+            || qoder_ok
+            || pi_ok
+            || claude_ok
+        {
             *start_backoff = Duration::from_secs(2);
             let primary = pick_primary(&*self.managers.read().await).cloned();
             if let Some(mgr) = primary {
@@ -3735,7 +3768,8 @@ mod tests {
         assert!(runtime.is_known_agent("t3"));
         assert!(runtime.is_known_agent("fx"));
         assert!(runtime.is_known_agent("qoder"));
-        assert!(!runtime.is_known_agent("claude"));
+        assert!(runtime.is_known_agent("claude"));
+        assert!(!runtime.is_known_agent("droid"));
     }
 
     #[tokio::test]
@@ -4068,7 +4102,7 @@ mod tests {
                 .iter()
                 .map(|a| a.id.as_str())
                 .collect::<Vec<_>>(),
-            ["codex", "opencode", "deepseek", "t3", "fx", "qoder", "pi"]
+            ["codex", "opencode", "deepseek", "t3", "fx", "qoder", "pi", "claude"]
         );
         assert_eq!(runtime.manager().await.unwrap().agent().kind(), "codex");
         assert_eq!(
@@ -4095,7 +4129,7 @@ mod tests {
         let ids: Vec<&str> = found.agents.iter().map(|a| a.id.as_str()).collect();
         assert_eq!(
             ids,
-            ["opencode", "deepseek", "t3", "fx", "qoder", "pi", "codex"]
+            ["opencode", "deepseek", "t3", "fx", "qoder", "pi", "claude", "codex"]
         );
     }
 

@@ -82,6 +82,8 @@ pub(crate) enum SetupAgent {
     Qoder,
     /// Explain Pi RPC setup without starting a session or changing credentials.
     Pi,
+    /// Explain Claude Code ACP setup without starting a session or changing credentials.
+    Claude,
 }
 
 pub(crate) async fn run_agent_command(
@@ -143,6 +145,10 @@ pub(crate) async fn run_agent_command(
                 println!("Qoder CLI support is enabled by default when qodercli is installed on PATH. Configure and sign in to Qoder CLI on this host yourself. Gateway opens a private `qodercli --acp` child per session; discovery alone does not verify model authentication.");
                 println!("Set qoder.enabled=false to disable it; qoder.binary may name an absolute CLI executable. A separately opened Qoder terminal or IDE is not a shared live ACP session. This command does not start Qoder, install packages, log in or restart Gateway.");
             }
+            SetupAgent::Claude => {
+                println!("Claude Code native sessions are enabled by default when claude and Node.js 22 or newer are on PATH. Sign in to Claude Code on this host yourself (run claude once). Gateway starts Claude Code's official ACP adapter, claude-agent-acp from PATH or else `npx -y @agentclientprotocol/claude-agent-acp`, only when a session is opened, created or prompted; it runs your own claude and reuses its login. Listing sessions reads Claude Code's transcripts and starts nothing.");
+                println!("Set claude.enabled=false to disable it; claude.binary may name an absolute claude-agent-acp, claude.acp_package may pin the package npx runs. Terminal Claude Code panes are unchanged. This command does not start Claude Code, install packages, log in, edit ~/.claude or restart Gateway.");
+            }
             SetupAgent::Fx => {
                 println!("FX support is enabled by default when fx is installed on PATH. Sign in and configure FX on this host yourself. Gateway opens a private `fx acp` child per session and checks ACP capabilities on session creation; discovery alone does not prove model authentication.");
                 println!("Set fx.enabled=false to disable it; fx.binary may name an absolute executable. External FX TUI processes are not shared live sessions. This command does not start FX, install packages, log in or restart Gateway.");
@@ -169,6 +175,7 @@ async fn list(json: bool) -> anyhow::Result<bool> {
                 fx: config.fx.clone(),
                 qoder: config.qoder.clone(),
                 pi: config.pi.clone(),
+                claude: config.claude.clone(),
             },
             Some(state_dir()?),
         )
@@ -264,7 +271,11 @@ fn format_row(agent: &AgentDiscoveryInfo, config: &Config) -> String {
     } else {
         Some("set `agent_runtime.enabled` to true in config.json")
     }
-    .map(|step| format!("  → {step}"))
+    .map(|step| match (agent.id.as_str(), agent.reason.as_deref()) {
+        // Several prerequisites; say which one is missing.
+        ("claude", Some(reason)) => format!("  → {reason}; {step}"),
+        _ => format!("  → {step}"),
+    })
     .unwrap_or_default();
     format!(
         "{:<9} {:<13} {:<9} {}{next}",
@@ -296,6 +307,13 @@ pub(crate) fn next_step(id: &str, status: &AgentAvailability) -> Option<&'static
         (NotInstalled, "qoder") => "install Qoder CLI yourself, set qoder.binary, or disable qoder.enabled",
         (Unconfigured, "qoder") => "check qoder.binary and configure Qoder CLI authentication on this host yourself",
         (Offline | Unsupported, "qoder") => "check Qoder CLI ACP support; failed prompts are never automatically retried",
+        (Disabled, "claude") => "set `claude.enabled` to true in config.json",
+        (NotInstalled, "claude") => {
+            "install Claude Code and Node.js 22+ (npx), or claude-agent-acp, yourself; the status reason names what is missing"
+        }
+        (Unsupported, "claude") => "install Node.js 22 or newer",
+        (Unconfigured, "claude") => "check claude.binary and claude.acp_package in config.json",
+        (Offline, "claude") => "check that `claude --version` runs on this host",
         (Disabled, "fx") => "set `fx.enabled` to true in config.json",
         (NotInstalled, "fx") => "install FX yourself, set fx.binary, or disable fx.enabled",
         (Unconfigured, "fx") => "check fx.binary and configure FX authentication on this host yourself",

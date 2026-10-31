@@ -30,6 +30,9 @@ pub trait AcpProvider: Send + Sync + 'static {
     const MODEL_SELECTION: bool;
     const SESSION_NOTICES: bool = false;
     const IDLE_RETIREMENT: bool = false;
+    /// How long `initialize` may take; a runner that downloads the agent on
+    /// first use needs longer than a normal request.
+    const INITIALIZE_TIMEOUT: Duration = RPC_TIMEOUT;
     fn recovery_snapshot<'a>(
         _binary: &'a str,
         _directory: &'a str,
@@ -63,6 +66,71 @@ pub trait AcpProvider: Send + Sync + 'static {
     fn safe_error_message(_: &Value) -> Option<&'static str> {
         None
     }
+    /// History of a session another process (a terminal) is writing, read
+    /// from the native store without loading it. See [`TerminalBridge`].
+    fn live_timeline<'a>(
+        _directory: &'a str,
+        _id: &'a str,
+        _stop: &'a CancellationToken,
+    ) -> AgentFuture<'a, Vec<TimelineItem>> {
+        unsupported("reading a session held by a terminal")
+    }
+    /// The model and effort the native store says the session last ran
+    /// with, applied when it is loaded so it does not fall back to the
+    /// agent's default. `None` when the store records none.
+    fn transcript_model<'a>(
+        _directory: &'a str,
+        _id: &'a str,
+    ) -> AgentFuture<'a, Option<(String, Option<String>)>> {
+        Box::pin(async { Ok(None) })
+    }
+    /// When that store last changed for `id`, to notice terminal progress.
+    fn transcript_modified(_directory: &str, _id: &str) -> Option<std::time::SystemTime> {
+        None
+    }
+    /// Rows for `session/list` read from the native store without starting
+    /// the agent, or `None` to ask the agent itself.
+    fn offline_sessions<'a>(
+        _directory: Option<&'a str>,
+        _stop: &'a CancellationToken,
+    ) -> Option<AgentFuture<'a, Vec<Value>>> {
+        None
+    }
+}
+
+/// A session that another process on this computer (a terminal) has open.
+/// The driver never starts a second agent process for it: history is read
+/// from the native store and input goes into that terminal.
+#[derive(Clone, Debug)]
+pub struct TerminalLive {
+    pub runtime: SessionRuntime,
+    /// Where typed input goes; `None` when no terminal pane holds the process.
+    pub route: Option<TerminalRoute>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TerminalRoute {
+    /// The Gateway terminal session (tmux/Herdr) and pane.
+    pub session: String,
+    pub pane: String,
+}
+
+/// Correlates sessions with terminal processes and reaches their panes.
+pub trait TerminalBridge: Send + Sync {
+    fn live<'a>(&'a self, ids: &'a [String]) -> AgentFuture<'a, HashMap<String, TerminalLive>>;
+    fn send<'a>(&'a self, route: &'a TerminalRoute, text: &'a str) -> AgentFuture<'a, ()>;
+    fn interrupt<'a>(&'a self, route: &'a TerminalRoute) -> AgentFuture<'a, ()>;
+}
+
+/// How long a terminal-held transcript is followed after input from here.
+const TERMINAL_FOLLOW: Duration = Duration::from_secs(600);
+
+/// How the driver starts its ACP child when it is not `binary` with
+/// [`AcpProvider::ARGS`]: a runner's arguments and the child's environment.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AcpLaunch {
+    pub args: Vec<String>,
+    pub env: Vec<(String, String)>,
 }
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
@@ -273,6 +341,13 @@ pub struct AcpDriver<P: AcpProvider> {
     metadata_revision: AtomicU64,
     native_capabilities: StdMutex<Value>,
     commands_observed: Arc<AtomicBool>,
+    launch: StdMutex<Option<AcpLaunch>>,
+    mcp_servers: StdMutex<Value>,
+    terminal: StdMutex<Option<Arc<dyn TerminalBridge>>>,
+    me: Weak<Self>,
+    /// The last model catalog a live session offered, kept after its
+    /// process is released so choices stay available.
+    last_catalog: StdMutex<Option<AgentCatalog>>,
     stop: CancellationToken,
 }
 
@@ -349,7 +424,7 @@ impl<P: AcpProvider> AcpDriver<P> {
         mirror: Arc<MemoryMirror>,
         tx: broadcast::Sender<AgentDomainEvent>,
     ) -> Arc<Self> {
-        Arc::new(Self {
+        Arc::new_cyclic(|me| Self {
             provider: PhantomData,
             binary,
             default_directory,
@@ -371,8 +446,204 @@ impl<P: AcpProvider> AcpDriver<P> {
             metadata_revision: AtomicU64::new(0),
             native_capabilities: StdMutex::new(Value::Null),
             commands_observed: Arc::new(AtomicBool::new(false)),
+            launch: StdMutex::new(None),
+            mcp_servers: StdMutex::new(json!([])),
+            terminal: StdMutex::new(None),
+            me: me.clone(),
+            last_catalog: StdMutex::new(None),
             stop: CancellationToken::new(),
         })
+    }
+
+    /// Replace `ARGS` and add child environment for every later spawn.
+    pub fn set_launch(&self, launch: AcpLaunch) {
+        *self.launch.lock().unwrap() = Some(launch);
+    }
+
+    /// ACP `mcpServers` entries given to every `session/new`, `session/load`
+    /// and `session/fork`. Never written to the agent's own configuration.
+    pub fn set_mcp_servers(&self, servers: Value) {
+        if servers.is_array() {
+            *self.mcp_servers.lock().unwrap() = servers;
+        }
+    }
+
+    fn mcp_servers(&self) -> Value {
+        self.mcp_servers.lock().unwrap().clone()
+    }
+
+    pub fn set_terminal_bridge(&self, bridge: Arc<dyn TerminalBridge>) {
+        *self.terminal.lock().unwrap() = Some(bridge);
+    }
+
+    fn terminal_bridge(&self) -> Option<Arc<dyn TerminalBridge>> {
+        self.terminal.lock().unwrap().clone()
+    }
+
+    /// The terminal holding `id`, if any. A native child this driver holds
+    /// for the same session is handed over: released now when idle, else
+    /// after its turn (the next observation). Until then both may write --
+    /// the window is one turn and is logged.
+    async fn terminal_live(&self, id: &str) -> Option<TerminalLive> {
+        let bridge = self.terminal_bridge()?;
+        let live = bridge.live(&[id.to_owned()]).await.ok()?.remove(id)?;
+        if let Some(session) = self.retained(id) {
+            if session.busy.load(Ordering::Acquire) {
+                tracing::warn!(
+                    session = id,
+                    "Claude Code session resumed in a terminal while a Gateway turn runs; \
+                     handing over after this turn"
+                );
+                return None;
+            }
+            tracing::info!(
+                session = id,
+                "session resumed in a terminal; releasing the Gateway's process"
+            );
+            self.sessions.lock().unwrap().remove(id);
+            session.connected.store(false, Ordering::Release);
+            session.client.shutdown().await;
+        }
+        Some(live)
+    }
+
+    /// Put a terminal-held session's transcript into the mirror and tell
+    /// readers to refetch.
+    /// A terminal-held session's history, read from its transcript. Never
+    /// pending approvals or forms: those belong to the terminal.
+    async fn terminal_snapshot(
+        &self,
+        id: &str,
+        live: &TerminalLive,
+    ) -> Result<AgentSessionSnapshot, AgentError> {
+        let mut info = match self.native_session_info(id).await {
+            Ok(info) => info,
+            Err(error) => self
+                .mirror
+                .session_info(&AgentSessionId::from(id))
+                .await
+                .ok_or(error)?,
+        };
+        let directory = info.directory.clone().ok_or_else(|| {
+            AgentError::NotAvailable("The session has no verified working directory".into())
+        })?;
+        let timeline = P::live_timeline(&directory, id, &self.stop).await?;
+        info.runtime = Some(live.runtime.clone());
+        live.runtime.clone().apply(&mut info);
+        Ok(AgentSessionSnapshot {
+            info,
+            timeline,
+            permissions: Vec::new(),
+            forms: Vec::new(),
+            inbox: Vec::new(),
+            seq: 0,
+        })
+    }
+
+    async fn refresh_terminal_snapshot(
+        &self,
+        id: &str,
+        live: &TerminalLive,
+    ) -> Result<(), AgentError> {
+        let snapshot = self.terminal_snapshot(id, live).await?;
+        let revision = self
+            .mirror
+            .snapshot_read_revision(&snapshot.info.asid)
+            .await;
+        self.mirror
+            .refresh_prepared_snapshot(snapshot, revision.0, revision.1, None)
+            .await?;
+        Ok(())
+    }
+
+    /// Input for a terminal-held session goes into that terminal: the user
+    /// there sees it typed. Without a known pane it cannot be delivered.
+    async fn send_to_terminal(
+        &self,
+        id: &str,
+        live: TerminalLive,
+        text: &str,
+        attachments: &[String],
+    ) -> Result<(), AgentError> {
+        let Some(route) = live.route else {
+            return Err(AgentError::TerminalInteraction(Box::new(live.runtime)));
+        };
+        if !attachments.is_empty() {
+            return Err(AgentError::Unsupported(
+                "attachments for a conversation open in a terminal".into(),
+            ));
+        }
+        let bridge = self
+            .terminal_bridge()
+            .ok_or_else(|| AgentError::NotAvailable("No terminal bridge".into()))?;
+        bridge.send(&route, text).await?;
+        // Acknowledge the reader's send as native prompts are; the next
+        // transcript refresh replaces this row with the terminal's own.
+        let native = format!("terminal-submission:{}", uuid::Uuid::new_v4());
+        let row = TimelineItem {
+            id: native.clone(),
+            message_id: native,
+            role: TimelineRole::User,
+            part: AgentPart::Text { text: text.into() },
+            seq: 0,
+            updated_ms: mapper::now_ms(),
+            ordinal: 0,
+            attachments: None,
+            image_assets: None,
+            generation: None,
+        };
+        let event = self
+            .mirror
+            .record_timeline_upsert(&AgentSessionId::from(id), vec![row])
+            .await;
+        Self::emit(&self.mirror, &self.tx, event);
+        self.follow_terminal(id.to_owned());
+        Ok(())
+    }
+
+    /// Follow a terminal-held transcript after input from here, so readers
+    /// see the turn the terminal runs.
+    fn follow_terminal(&self, id: String) {
+        let driver = self.me.clone();
+        tokio::spawn(async move {
+            let started = tokio::time::Instant::now();
+            let mut seen = None;
+            while started.elapsed() < TERMINAL_FOLLOW {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let Some(driver) = driver.upgrade() else {
+                    return;
+                };
+                if driver.stop.is_cancelled() {
+                    return;
+                }
+                let Some(directory) = driver
+                    .native_session_info(&id)
+                    .await
+                    .ok()
+                    .and_then(|info| info.directory)
+                else {
+                    return;
+                };
+                let modified = P::transcript_modified(&directory, &id);
+                if modified == seen {
+                    continue;
+                }
+                seen = modified;
+                let Some(live) = driver.terminal_live(&id).await else {
+                    return;
+                };
+                if driver.refresh_terminal_snapshot(&id, &live).await.is_ok() {
+                    Self::emit(
+                        &driver.mirror,
+                        &driver.tx,
+                        AgentDomainEvent::Resync {
+                            asid: id.as_str().into(),
+                            reason: "terminal transcript advanced".into(),
+                        },
+                    );
+                }
+            }
+        });
     }
 
     pub fn set_idle_timeout(&self, timeout: Duration) {
@@ -486,8 +757,10 @@ impl<P: AcpProvider> AcpDriver<P> {
             return Ok(observed);
         }
         if !observed.models.is_empty() {
+            *self.last_catalog.lock().unwrap() = Some(observed.clone());
             return Ok(observed);
         }
+
         let directory = directory.unwrap_or(&self.default_directory);
         let mut cached = self.global_catalog.lock().await;
         if let Some((scope, at, result)) = &*cached {
@@ -497,7 +770,18 @@ impl<P: AcpProvider> AcpDriver<P> {
             }
         }
         let result = match P::global_catalog(&self.binary, directory, &self.stop).await {
-            Err(AgentError::Unsupported(_)) => Ok(AgentCatalog::default()),
+            // Without a read-only catalog, what a live session last offered.
+            Err(AgentError::Unsupported(_)) => Ok(self
+                .last_catalog
+                .lock()
+                .unwrap()
+                .clone()
+                .map(|mut last| {
+                    last.commands.clear();
+                    last.defaults.model = None;
+                    last
+                })
+                .unwrap_or_default()),
             result => result,
         };
         *cached = Some((
@@ -527,6 +811,55 @@ impl<P: AcpProvider> AcpDriver<P> {
             }
             Err(_) if !observed.commands.is_empty() => Ok(observed),
             Err(error) => Err(error),
+        }
+    }
+
+    /// Select the model and effort a loaded session last ran with. The
+    /// recorded id is matched exactly, else by family alias; anything not
+    /// offered is left at the agent's choice, which the catalog then shows.
+    async fn restore_recorded_model(
+        &self,
+        session: &Session,
+        id: &str,
+        model: &str,
+        effort: Option<&str>,
+    ) {
+        let (model_choice, effort_choice) = {
+            let state = session.state.lock().await;
+            let values = |key: &str| -> Vec<String> {
+                mapper::config_option(&state.config, key)
+                    .map(|option| {
+                        mapper::select_options(option)
+                            .into_iter()
+                            .filter_map(|native| native["value"].as_str().map(str::to_owned))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+            (
+                mapper::recorded_choice(model, &values("model")),
+                effort.filter(|effort| values(P::EFFORT_CONFIG).iter().any(|v| v == effort)),
+            )
+        };
+        match &model_choice {
+            Some(choice) => {
+                if choice != model {
+                    tracing::info!(session = id, recorded = model, selected = %choice, "restored the nearest offered model");
+                }
+                if let Err(error) = self.select_config(session, "model", choice).await {
+                    tracing::warn!(session = id, %error, "could not restore the recorded model");
+                }
+            }
+            None => tracing::info!(
+                session = id,
+                recorded = model,
+                "recorded model is not offered; keeping the agent's default"
+            ),
+        }
+        if let Some(effort) = effort_choice {
+            if let Err(error) = self.select_config(session, P::EFFORT_CONFIG, effort).await {
+                tracing::warn!(session = id, %error, "could not restore the recorded effort");
+            }
         }
     }
 
@@ -664,9 +997,16 @@ impl<P: AcpProvider> AcpDriver<P> {
                 ));
             }
         }
-        let client = AcpClient::spawn_with_error_mapper(
+        let launch = self.launch.lock().unwrap().clone().unwrap_or_default();
+        let args: Vec<&str> = if launch.args.is_empty() {
+            P::ARGS.to_vec()
+        } else {
+            launch.args.iter().map(String::as_str).collect()
+        };
+        let client = AcpClient::spawn_with_env(
             &self.binary,
-            P::ARGS,
+            &args,
+            &launch.env,
             directory,
             P::LABEL,
             P::safe_error_message,
@@ -694,7 +1034,7 @@ impl<P: AcpProvider> AcpDriver<P> {
                 "clientInfo": { "name": "muqun-gateway", "version": env!("CARGO_PKG_VERSION") },
                 "clientCapabilities": client_capabilities
             }),
-            RPC_TIMEOUT,
+            P::INITIALIZE_TIMEOUT,
         );
         let result = tokio::select! {
             _ = self.stop.cancelled() => Err("ACP runtime stopped".into()),
@@ -839,6 +1179,21 @@ impl<P: AcpProvider> AcpDriver<P> {
         directory: Option<&str>,
     ) -> Result<Vec<AgentSessionInfo>, AgentError> {
         let revision = self.metadata_revision.load(Ordering::Acquire);
+        if let Some(rows) = P::offline_sessions(directory, &self.stop) {
+            let mut sessions = self.project_listed_sessions(rows.await?).await?;
+            if let Some(bridge) = self.terminal_bridge() {
+                let ids: Vec<_> = sessions.iter().map(|info| info.asid.0.clone()).collect();
+                let mut live = bridge.live(&ids).await.unwrap_or_default();
+                for info in &mut sessions {
+                    if let Some(live) = live.remove(&info.asid.0) {
+                        live.runtime.clone().apply(info);
+                        info.runtime = Some(live.runtime);
+                    }
+                }
+            }
+            self.remember_session_metadata(revision, &sessions).await;
+            return Ok(sessions);
+        }
         let (client, _events, capabilities) = self.initialized(&self.default_directory).await?;
         if !capabilities
             .pointer("/sessionCapabilities/list")
@@ -918,18 +1273,22 @@ impl<P: AcpProvider> AcpDriver<P> {
         .await;
         client.shutdown().await;
         if let Ok(sessions) = &result {
-            let mut metadata = self.session_metadata.lock().await;
-            if self.metadata_revision.load(Ordering::Acquire) == revision {
-                *metadata = Some(SessionMetadata {
-                    listed_at: tokio::time::Instant::now(),
-                    sessions: sessions
-                        .iter()
-                        .map(|info| (info.asid.0.clone(), info.clone()))
-                        .collect(),
-                });
-            }
+            self.remember_session_metadata(revision, sessions).await;
         }
         result
+    }
+
+    async fn remember_session_metadata(&self, revision: u64, sessions: &[AgentSessionInfo]) {
+        let mut metadata = self.session_metadata.lock().await;
+        if self.metadata_revision.load(Ordering::Acquire) == revision {
+            *metadata = Some(SessionMetadata {
+                listed_at: tokio::time::Instant::now(),
+                sessions: sessions
+                    .iter()
+                    .map(|info| (info.asid.0.clone(), info.clone()))
+                    .collect(),
+            });
+        }
     }
 
     async fn project_listed_sessions(
@@ -1046,6 +1405,10 @@ impl<P: AcpProvider> AcpDriver<P> {
         if self.retained(id).is_some() || self.dormant.lock().unwrap().contains_key(id) {
             return Ok(false);
         }
+        // A terminal-held session is read from its transcript instead.
+        if self.terminal_live(id).await.is_some() {
+            return Ok(false);
+        }
         let info = self.native_session_info(id).await?;
         if info.directory.is_some() || info.runtime.as_ref() != Some(&Self::empty_runtime()) {
             return Ok(false);
@@ -1094,6 +1457,10 @@ impl<P: AcpProvider> AcpDriver<P> {
         explicit_prepare: bool,
         reserve_prompt: bool,
     ) -> Result<Arc<Session>, AgentError> {
+        // A terminal holds it: never a second agent process.
+        if let Some(live) = self.terminal_live(id).await {
+            return Err(AgentError::TerminalInteraction(Box::new(live.runtime)));
+        }
         // One explicit activation restores a same-ID generation. Prompt calls
         // never replay a previous request and cannot recover an unexpected loss.
         let _mutation = self.mutations.lock().await;
@@ -1139,6 +1506,15 @@ impl<P: AcpProvider> AcpDriver<P> {
             .filter(|cwd| std::path::Path::new(cwd).is_absolute())
             .ok_or_else(|| AgentError::NotAvailable("The native session has no verified working directory; open it in Qoder or FX once before loading it here".into()))?;
         let session = self.open(&directory, Some(info)).await?;
+        if dormant
+            .as_ref()
+            .is_none_or(|entry| entry.info.model.is_none())
+        {
+            if let Ok(Some((model, effort))) = P::transcript_model(&directory, id).await {
+                self.restore_recorded_model(&session, id, &model, effort.as_deref())
+                    .await;
+            }
+        }
         if let Some(entry) = dormant {
             session.state.lock().await.owned_mutations = entry.owned_mutations;
             if let Some(model) = &entry.info.model {
@@ -1182,6 +1558,9 @@ impl<P: AcpProvider> AcpDriver<P> {
                             .into(),
                     )
                 });
+        }
+        if let Some(live) = self.terminal_live(id).await {
+            return self.terminal_snapshot(id, &live).await.map(Some);
         }
         Err(AgentError::NotAvailable(
             "Conversation history is not loaded; explicitly open it before reading native history"
@@ -1238,6 +1617,11 @@ impl<P: AcpProvider> AcpDriver<P> {
             }
             None => Default::default(),
         };
+        if let Some(id) = &id {
+            if let Some(live) = self.terminal_live(id).await {
+                return Err(AgentError::TerminalInteraction(Box::new(live.runtime)));
+            }
+        }
         let (client, mut events, capabilities) = self.initialized(directory).await?;
         if id.is_some() && capabilities["loadSession"].as_bool() != Some(true) {
             client.shutdown().await;
@@ -1250,7 +1634,7 @@ impl<P: AcpProvider> AcpDriver<P> {
         } else {
             "session/new"
         };
-        let mut params = json!({ "cwd": directory, "mcpServers": [] });
+        let mut params = json!({ "cwd": directory, "mcpServers": self.mcp_servers() });
         if let Some(id) = &id {
             params["sessionId"] = json!(id);
         }
@@ -2201,7 +2585,10 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
                 return Ok(Vec::new());
             }
             if self.retained(id).is_none() {
-                self.observed_snapshot(id).await?;
+                // A terminal-held transcript is mirrored whole; nothing older.
+                if self.terminal_live(id).await.is_none() {
+                    self.observed_snapshot(id).await?;
+                }
                 return Ok(Vec::new());
             }
 
@@ -2335,8 +2722,16 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
             self.native_session_info(id).await
         })
     }
+    fn session_runtime<'a>(&'a self, id: &'a str) -> AgentFuture<'a, Option<SessionRuntime>> {
+        Box::pin(async move { Ok(self.terminal_live(id).await.map(|live| live.runtime)) })
+    }
     fn prepare_selected_session<'a>(&'a self, id: &'a str) -> AgentFuture<'a, ()> {
         Box::pin(async move {
+            if let Some(live) = self.terminal_live(id).await {
+                self.refresh_terminal_snapshot(id, &live).await?;
+                self.follow_terminal(id.to_owned());
+                return Ok(());
+            }
             if self.readonly_empty_snapshot(id).await? {
                 return Ok(());
             }
@@ -2347,6 +2742,9 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
         Box::pin(async move {
             if self.retained(id).is_some() || self.dormant.lock().unwrap().contains_key(id) {
                 return Ok(());
+            }
+            if let Some(live) = self.terminal_live(id).await {
+                return self.refresh_terminal_snapshot(id, &live).await;
             }
             if self.readonly_empty_snapshot(id).await? {
                 return Ok(());
@@ -2364,10 +2762,22 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
         attachments: &'a [String],
         delivery: Option<&'a str>,
     ) -> AgentFuture<'a, ()> {
-        Box::pin(self.submit_prompt(id, text, attachments, delivery, false))
+        Box::pin(async move {
+            if let Some(live) = self.terminal_live(id).await {
+                return self.send_to_terminal(id, live, text, attachments).await;
+            }
+            self.submit_prompt(id, text, attachments, delivery, false)
+                .await
+        })
     }
     fn interrupt<'a>(&'a self, id: &'a str) -> AgentFuture<'a, ()> {
         Box::pin(async move {
+            if let Some(live) = self.terminal_live(id).await {
+                let (Some(route), Some(bridge)) = (live.route, self.terminal_bridge()) else {
+                    return Err(AgentError::TerminalInteraction(Box::new(live.runtime)));
+                };
+                return bridge.interrupt(&route).await;
+            }
             let session = self
                 .retained(id)
                 .ok_or_else(|| AgentError::SessionNotFound(id.into()))?;
@@ -2538,6 +2948,9 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
         message_id: Option<&'a str>,
     ) -> AgentFuture<'a, AgentSessionInfo> {
         Box::pin(async move {
+            if let Some(live) = self.terminal_live(id).await {
+                return Err(AgentError::TerminalInteraction(Box::new(live.runtime)));
+            }
             let _mutation = self.mutations.lock().await;
             let source = self.retained(id).ok_or_else(|| {
                 AgentError::Unsupported("open a Gateway-owned session before forking".into())
@@ -2573,7 +2986,8 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
                 .directory
                 .as_deref()
                 .ok_or_else(|| protocol("source session has no directory"))?;
-            let params = operations::fork_params(id, directory, message_id)?;
+            let mut params = operations::fork_params(id, directory, message_id)?;
+            params["mcpServers"] = self.mcp_servers();
             let (client, _events, capabilities) = self.initialized(directory).await?;
             if !operations::supports_operation(&capabilities, "fork") {
                 client.shutdown().await;
@@ -2605,6 +3019,9 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
     }
     fn delete_session<'a>(&'a self, id: &'a str) -> AgentFuture<'a, ()> {
         Box::pin(async move {
+            if let Some(live) = self.terminal_live(id).await {
+                return Err(AgentError::TerminalInteraction(Box::new(live.runtime)));
+            }
             let parked_owned =
                 self.dormant.lock().unwrap().get(id).is_some_and(|entry| {
                     entry.kind == DormantKind::Parked && entry.owned_mutations
