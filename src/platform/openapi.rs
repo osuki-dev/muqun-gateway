@@ -799,6 +799,12 @@ pub fn openapi_spec() -> Value {
         "requestBody": json_body(object_schema(&[("visibility", "string")], &["visibility"])),
         "responses": ok_response()
     }});
+    spec["paths"]["/api/agents/{kind}/signin-check"] = json!({ "post": {
+        "summary": "Forget that opening a session last failed because the agent was not signed in",
+        "description": "Owner App or admin token. Discovery then reports the agent usable again (no `signInFailedAtMs`) and the next session open asks the agent; nothing is started here. Answers `{\"kind\", \"cleared\"}`; 404 when the agent is not attached.",
+        "parameters": [path_param("kind")],
+        "responses": ok_response()
+    }});
     spec["paths"]["/api/history/storage"] = json!({ "get": {
         "summary": "Which captured-history storage this Gateway runs with (memory or sqlite, from config.json at startup), whether it captures at all, and, for sqlite with capture on, what it holds, from counters the write loop keeps. Requires the admin token or a device",
         "responses": json_ok("The storage", json!({

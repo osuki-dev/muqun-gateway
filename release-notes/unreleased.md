@@ -2,6 +2,16 @@
 
 ## Changes and fixes
 
+- **An ACP agent that is not signed in stays marked until it is.** FX, Qoder
+  CLI and the other ACP agents only learn about sign-in when a session is
+  opened, so after a refusal discovery kept reporting them ready and the App
+  hit the same "authentication required" on every new session. The Gateway now
+  remembers that refusal: discovery reports the agent as needs setup
+  (`unconfigured`, with `signInFailedAtMs`) until a later open succeeds or the
+  App asks to check again (`POST /api/agents/{kind}/signin-check`, capability
+  `agent_signin_state`). No process is started to re-check; a restart forgets
+  it.
+
 - **Hide an agent from the App's new-session list.** `agent_visibility` in
   config.json (`"hidden"`, otherwise automatic) keeps an installed agent out of
   the App's default new-session list on every device; it keeps working and its

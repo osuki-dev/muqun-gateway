@@ -445,6 +445,23 @@ pub(crate) fn agent_picker(visibility: &str, enabled: bool, status: &str) -> &'s
     }
 }
 
+/// An agent that was not signed in the last time a session was opened reads
+/// as needing setup, with `signInFailedAtMs`, until a later open succeeds or
+/// the owner asks to check again (`POST /api/agents/{kind}/signin-check`).
+/// Discovery does not start the agent to ask again.
+fn mark_signin_failure(agent: &mut Value, failed_at_ms: Option<u64>) {
+    let usable = matches!(agent["status"].as_str(), Some("connected" | "reachable"));
+    let Some(at) = failed_at_ms.filter(|_| usable) else {
+        return;
+    };
+    let name = agent["name"].as_str().unwrap_or("the agent").to_owned();
+    agent["status"] = json!("unconfigured");
+    agent["reason"] = json!(format!(
+        "Not signed in the last time a session was opened; sign in to {name} on this computer, then check again"
+    ));
+    agent["signInFailedAtMs"] = json!(at);
+}
+
 /// Build complete capability discovery response. An unauthenticated caller
 /// gets each agent's id, kind, status and features, without endpoints or versions.
 pub async fn build_discovery(state: &AppState, _sealed: bool, authenticated: bool) -> Value {
@@ -492,6 +509,9 @@ pub async fn build_discovery(state: &AppState, _sealed: bool, authenticated: boo
                 agent["enabled"].as_bool().unwrap_or(true),
                 agent["status"].as_str().unwrap_or_default(),
             ));
+            if let Some(manager) = state.agent_runtime.manager_for_agent(&id).await {
+                mark_signin_failure(agent, manager.agent().signin_failure());
+            }
         }
     }
     json!({
@@ -558,6 +578,28 @@ pub fn transports_discovery(mcp_helper: Option<&str>) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_remembered_sign_in_failure_reads_as_needs_setup_only_on_a_usable_agent() {
+        for (status, failure, want_status, marked) in [
+            ("reachable", Some(7), "unconfigured", true),
+            ("connected", Some(7), "unconfigured", true),
+            ("reachable", None, "reachable", false),
+            ("not_installed", Some(7), "not_installed", false),
+            ("disabled", Some(7), "disabled", false),
+        ] {
+            let mut agent = json!({"id": "qoder", "name": "Qoder CLI", "status": status});
+            mark_signin_failure(&mut agent, failure);
+            assert_eq!(agent["status"], want_status, "{status} {failure:?}");
+            assert_eq!(agent.get("signInFailedAtMs").is_some(), marked);
+            assert_eq!(
+                agent["reason"]
+                    .as_str()
+                    .is_some_and(|r| r.contains("sign in to Qoder CLI")),
+                marked
+            );
+        }
+    }
 
     #[tokio::test]
     async fn picker_prefers_ready_codex_then_opencode_without_changing_provider_metadata() {

@@ -42,6 +42,9 @@ pub(crate) const API_CAPABILITIES: &[&str] = &[
     // `visibility`/`picker` on discovery agents and
     // `PUT /api/agents/{kind}/visibility`.
     "agent_visibility",
+    // A remembered ACP sign-in failure: discovery `signInFailedAtMs` and
+    // `POST /api/agents/{kind}/signin-check`.
+    "agent_signin_state",
     "agent_account_limits_v1",
     "agent_events",
     "multi_agent",
