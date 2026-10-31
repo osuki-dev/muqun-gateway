@@ -10,15 +10,18 @@ Target: Windows 10 22H2 and Windows 11, x64. The floor comes from Rust
 (`*-pc-windows-msvc` is Tier 1 on Windows 10 or newer) and Tailscale. arm64
 can come later, on a best-effort basis.
 
-## Why this is mostly an agent-only project
+## Scope: an agent-only gateway
 
 Most agents the gateway drives no longer need a terminal backend. They run as
 native processes or local services: the Codex app-server, the OpenCode HTTP
-service, the T3 server, the DeepSeek harness, and ACP agents over stdio. tmux
-does not exist on Windows. Herdr has a Windows build, but the gateway's Herdr
-transport is Unix-socket only. So the first useful Windows gateway is
-**agent-only**: no terminal panes, and the agent features of the App
-otherwise unchanged.
+service, the T3 server, the DeepSeek harness, and ACP agents over stdio. The
+Windows gateway is therefore **agent-only**: the agent features of the App,
+and no terminal panes.
+
+**Out of scope on Windows: terminal backends.** tmux does not exist there.
+Herdr does ship a Windows build, but terminals on Windows will come from a
+separately planned desktop app, not from a Herdr transport in this gateway.
+Agents with no Windows build (fx) are left out of the plan.
 
 ## Upstream availability on Windows
 
@@ -34,9 +37,7 @@ Checked on 2026-10-31 against each project's release assets and docs.
 | Pi 1.4.0 | **Yes**: `pi-windows-{x64,arm64}.zip` | `--mode rpc` over stdio. **Its bash tool needs Git Bash.** | [Windows docs](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/windows.md) |
 | Claude Code through `claude-agent-acp` 0.99.1 | **Yes**: Claude Code is native (Windows 10 1809+, x64/arm64); the adapter is a Node script (Node ≥ 22) | ACP over stdio, spawned through `node` or npm's `.cmd` shim | [npm](https://www.npmjs.com/package/@agentclientprotocol/claude-agent-acp), [setup](https://code.claude.com/docs/en/setup) |
 | Antigravity `agy` 1.4.12 | Binary **yes** (`cli_windows_x64.exe`, arm64). Whether `agy acp` works there is **unverified**. | ACP over stdio | [install.ps1](https://antigravity.google/cli/install.ps1) |
-| fx (Vercel Labs) 0.0.16 | **No.** macOS and Linux only; Windows needs WSL. | n/a | [README](https://github.com/vercel-labs/fx) |
-| Herdr 0.9.5 | **Yes**, x64 only (`herdr-windows-x86_64.zip`). The docs page is still `/windows-beta/` but says "generally available". | IPC over a **named pipe** (`\\.\pipe\` followed by the socket path), not a Unix socket. Not supported there: `terminal attach`, live handoff, foreground process groups. Plugins are a preview. Elevated servers reject unelevated clients. | [docs](https://herdr.dev/docs/windows-beta/), [release](https://github.com/herdrdev/herdr/releases/tag/v0.9.5) |
-| tmux | **No** | n/a | |
+| Herdr 0.9.5 (out of scope) | Yes, x64 only (`herdr-windows-x86_64.zip`) | Named-pipe IPC. Not used: terminals on Windows are out of scope. | [docs](https://herdr.dev/docs/windows-beta/) |
 | Tailscale | **Yes** | `tailscale serve` of a port needs no elevation; serving a path or socket needs an elevated caller | [CLI docs](https://tailscale.com/kb/1080/cli) |
 
 ## Current state of this repository
@@ -88,8 +89,7 @@ Phase numbers refer to the plan below.
 | Process identity | `/proc/<pid>/stat`, `proc_pidinfo`, `lsof`/`ss` port-to-pid and boot-id checks prove a pid is the process it claims to be. Windows needs `OpenProcess` + `GetProcessTimes` (start time as the incarnation) or `GetExtendedTcpTable`. | `src/terminal/backend/process_identity.rs`, `src/platform/lifecycle.rs`, `src/platform/launchd.rs` `process_alive`, `src/terminal/supervision.rs` | M | 1–2 |
 | Codex shared daemon | Adoption is `cfg(unix)` (`/tmp/codex-daemon-<uid>`, peer uid checks). On Windows the gateway falls back to a private stdio app-server. Upstream supports AF_UNIX on Windows, so adoption is portable later; the socket path and DACL checks differ. | `src/agents/adapters/codex/daemon.rs`, `src/agents/runtime/codex.rs` | M | later |
 | OpenCode service | Works natively (verified below). **`opencode service start` launched from an SSH session dies when the session ends** (OpenSSH's job object), so the gateway has to start it from a process that outlives the login, or the user starts it from the desktop. | `src/agents/adapters/opencode/discovery.rs` | S | 1 |
-| tmux backend | Does not exist on Windows. Leave it compiled out at runtime, and say so through capabilities. | `src/terminal/backend/tmux.rs`, `src/terminal/factory.rs` | S | 1 |
-| Herdr backend | Herdr runs on Windows, but the gateway speaks to it over `UnixStream` and uses `peer_cred` for the peer pid. Windows needs a named-pipe transport (`tokio::net::windows::named_pipe`) and `GetNamedPipeServerProcessId`. Pane tty and size probes (`tty` module) also need a port. | `src/terminal/backend/herdr.rs`, `src/terminal/backend_startup.rs` | M–L | 1b (optional) |
+| Terminal backends (tmux, Herdr) | **Out of scope.** tmux does not exist on Windows; terminals there come from a separate desktop app. The gateway only has to report the absence honestly (see agent-only mode). | `src/terminal/` | n/a | n/a |
 | Agent-only mode | **Seen in the VM:** a fresh `setup` defaults to tmux and exits with "tmux backend selected, but no `tmux` was found", so there is no way to set up without a terminal backend. `setup --backend herdr` works around it: the gateway starts and serves agents, with the Herdr session marked unavailable. `setup` needs an agent-only choice (the default on Windows). `/health` and `/api/meta` with no terminal session must report zero sessions and say "agent-only" rather than `backend_unavailable`, and terminal-only capabilities must be trimmed. Needs a matching App change. | `src/platform/server.rs`, `src/platform/setup.rs` | M | 1 |
 | State / config dirs | Already portable: `dirs::config_dir()` and `dirs::data_dir()` resolve to `%APPDATA%` (Roaming). Consider `%LOCALAPPDATA%` for state (the SQLCipher store, uploads, image caches), which should not roam. The DB key file relies on 0600 permissions, so Windows needs a user-only DACL or DPAPI. | `src/platform/store.rs`, `src/platform/store/db_key.rs` | S–M | 1 |
 | Service install / supervision | `service install` writes a LaunchAgent or a systemd user unit and drives `launchctl`/`systemctl`. Windows: **Task Scheduler "at logon, run as the user, limited"** (`schtasks /SC ONLOGON /RL LIMITED`, or the COM API) is the closest match: no admin, and it runs in the user's session, so agents see the user's profile and credentials. A Windows Service would run as another account and needs admin. A tray app is nicer but is a separate product. | `src/platform/service.rs`, `src/platform/lifecycle.rs`, `src/cli/mod.rs` | M | 2 |
@@ -115,26 +115,33 @@ The Windows job compiles, lints and tests on every PR, and uploads an unsigned
 **What a user gets:** nothing yet. Contributors get a gateway that stays
 buildable on Windows.
 
-### Phase 1: agent-only gateway, manual start, M to L (about 1–2 weeks)
+### Phase 1: agent-only gateway, manual start, M (about 1–1.5 weeks)
 
-- PATHEXT-aware binary lookup and `.cmd`/`node` spawning for npm agents.
-- Job Objects for agent process trees (stop kills the whole turn).
-- Windows process identity (`OpenProcess` plus start time).
-- An agent-only mode that reports zero terminal sessions honestly, and the
-  matching App copy ("terminals need macOS or Linux").
-- State in `%LOCALAPPDATA%`, the DB key protected with a user-only DACL.
-- A drive-letter pass over workspace paths and fences.
-- A real-machine smoke test: pair the App, run one low-effort turn each on
-  OpenCode, Codex, Qoder and Claude Code (through `claude-agent-acp`).
-- Optional **1b**: a named-pipe Herdr transport, so Herdr panes work on
-  Windows (M to L; Herdr on Windows is x64 only, and `terminal attach` is
-  unsupported there).
+- PATHEXT-aware binary lookup (`.exe`, `.cmd`), and spawning npm `.cmd` shims
+  safely, or resolving them to `node <script>` (S).
+- Job Objects for agent process trees, so a stop kills the whole turn (M).
+- Windows process identity: `OpenProcess` plus process start time (S–M).
+- Agent-only `setup`, the default on Windows, plus `/health` and
+  `/api/meta` semantics with no terminal session: zero sessions, an
+  `agent_only` capability, and terminal capabilities trimmed (S–M).
+  **Depends on an App change:** the App has to read the capability and show
+  "terminals are not available on this computer" instead of trying to open a
+  terminal session.
+- State in `%LOCALAPPDATA%`, with the DB key and pairing files protected by
+  a user-only DACL (S–M).
+- Starting the OpenCode service so it outlives the shell or SSH session
+  that started it (S).
+- Smaller items: skip the login-shell probe; a drive-letter pass over
+  workspace paths and fences.
+- Smoke test on a real machine: pair the App, then run one low-effort turn
+  each on OpenCode, Codex, Qoder and Claude Code (through
+  `claude-agent-acp`).
 
-**What a user gets:** they download the `.exe` from a CI run, run
-`muqun-gateway setup` and `muqun-gateway serve` in a terminal, pair the App,
-and drive OpenCode, Codex, T3, Qoder, Pi (with Git Bash), Claude Code and
-DeepSeek from the phone. No terminals, no auto-start, no self-update. fx is
-not available on Windows.
+**What a user gets:** they download the `.exe` from a CI run, then run
+`muqun-gateway setup` and `muqun-gateway run` in a terminal. After pairing
+the App, they can drive OpenCode, Codex, T3, Qoder, Pi (with Git Bash),
+Claude Code and DeepSeek from the phone. Not yet: terminals (out of scope),
+auto-start and self-update.
 
 ### Phase 2: installer, updater, service, M (about 1 week)
 
@@ -202,8 +209,8 @@ machine, so never recreate or reset the volume.
   - `agent list` shows OpenCode reachable, and Codex, Qoder and Pi not
     installed (none were installed in the VM).
   - Herdr 0.9.5 (`herdr-windows-x86_64.zip`, unzipped into a scratch
-    directory) runs and prints its CLI. I did not start a Herdr server; the
-    gateway has no named-pipe transport to reach one yet.
+    directory) runs and prints its CLI. Not taken further: terminals on Windows are out
+    of scope.
   - Not tried yet: a paired App and a real agent turn.
 - Building the gateway inside the VM needs the MSVC C++ build tools and Perl
   (for the vendored OpenSSL under SQLCipher). From the VM, `winget` hung
