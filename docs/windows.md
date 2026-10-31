@@ -171,10 +171,47 @@ updates itself, and the same `manage` screen as on macOS and Linux.
 | #36's pieces ported onto `main` as they were | 47 errors | 113 errors |
 | Production code ported, Unix tests gated by line | 12 | 7 |
 | Unix-only helpers allowed off Unix | **0** (clippy clean); release build and artifact OK | 14 dead-code errors (test-only helpers of gated tests) |
-| Those helpers gated to Unix | see the latest `windows` check on the PR | |
+| Those helpers gated to Unix | 0 | 0; **tests run: 1576 passed, 61 failed, 36 ignored** |
+| The 61 marked `#[cfg_attr(windows, ignore = …)]` | 0 | 0; see the latest `windows` check |
 
 These counts come from `cargo clippy --all-targets -D warnings` on
 `windows-latest`. The release `.exe` has built since the second run.
+
+### The 61 tests that fail on Windows (Phase 1 work)
+
+They stay compiled and run on Unix. On Windows they are ignored with the
+reason "not yet ported to Windows". Run them with `cargo test -- --ignored`.
+They are grouped by cause, and most of them are real Windows bugs rather than
+test artifacts:
+
+- **File paths and `file://` URIs (about 30).** Image attachments, generated
+  image paths, `@`-mentions and the asset roots compare or build paths with
+  `/` and `file:///` plus a POSIX path. On Windows the path is `C:\…` and the
+  URI is `file:///C:/…`, so the fences refuse files that are inside the
+  workspace. Affected: `agents::message_images`, `codex::items`,
+  `codex::input`, `acp::operations`, `pi::prompt`, `agents::routes`,
+  `platform::assets`, `agents::directories`, `codex::rollout_tail`,
+  `qoder::native_sessions`.
+- **Verbatim `\\?\C:\…` paths leaking into agent config (4).**
+  `canonicalize` returns verbatim paths on Windows. The Claude Code and Codex
+  folder-trust entries written for a task folder get the `\\?\` prefix,
+  which those tools do not match. Strip it (as the `dunce` crate does) before
+  a path leaves the gateway. Affected: `agents::tasks`.
+- **POSIX shell assumptions (6).** `sh`, POSIX quoting for the MCP token-helper
+  command, the exit-marker wrapper, and shell-word round trips. Affected:
+  `agents::tasks`, `cli::mcp`, `terminal::exit_marker`,
+  `terminal::shell_word`, `platform::git`.
+- **PATH lookup (3).** Splitting `PATH` on `:` and relying on the exec bit
+  (`login_env::lookup`, `find_on_path`). This is the PATHEXT item above.
+- **Unix-only subsystems (8).** systemd identity, tmux probes and
+  backend-ordering in `setup`, and the state-lock refusal message: Windows
+  locks are mandatory, so the holder's pid cannot be read. These stay
+  Unix-only or get a Windows-specific expectation.
+- **`manage` TUI cell width (4).** The width locale is `cfg(unix)`; combining
+  marks and CJK widths differ without it.
+- **Other (6).** Git worktree inventory and the patch path filter, the
+  Codex MCP registration path, `mcp::hosts` absolute-path handling, the Codex
+  history wait. Each needs a look on a real machine.
 
 ## Local Windows VM (for maintainers)
 

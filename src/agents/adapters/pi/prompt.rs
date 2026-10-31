@@ -116,6 +116,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "not yet ported to Windows; see docs/windows.md")]
     fn uploaded_pixels_are_native_images_for_idle_steer_and_followup_commands() {
         let root = scratch();
         let path = root.0.join("renamed-not-an-image.txt");

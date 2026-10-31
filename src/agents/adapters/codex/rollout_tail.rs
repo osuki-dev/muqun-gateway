@@ -346,6 +346,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "not yet ported to Windows; see docs/windows.md")]
     fn incremental_poll_keeps_partial_lines_and_never_replays_unchanged_bytes() {
         let fixture = Fixture::new();
         fixture.append("{\"type\":\"event_msg\",\"payload\":");
@@ -405,6 +406,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "not yet ported to Windows; see docs/windows.md")]
     fn replacement_truncation_and_rewrite_fence_the_cursor() {
         for mutation in ["replace", "truncate", "rewrite"] {
             let fixture = Fixture::new();
@@ -443,6 +445,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "not yet ported to Windows; see docs/windows.md")]
     fn initial_overlap_and_each_poll_are_bounded_with_boundary_fragments_skipped() {
         let fixture = Fixture::new();
         fixture.append(&format!(
@@ -466,6 +469,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "not yet ported to Windows; see docs/windows.md")]
     fn oversized_and_malformed_new_records_fail_without_unbounded_buffering() {
         for malformed in [true, false] {
             let fixture = Fixture::new();

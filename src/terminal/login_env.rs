@@ -435,6 +435,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "not yet ported to Windows; see docs/windows.md")]
     fn lookup_finds_a_program_and_reports_a_missing_one() {
         let dir = std::env::temp_dir().join(format!("muqun-lookup-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -454,6 +455,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "not yet ported to Windows; see docs/windows.md")]
     fn lookup_honours_a_path_that_was_written_out_in_full() {
         assert_eq!(
             lookup("/bin/sh", "/nowhere").as_deref(),

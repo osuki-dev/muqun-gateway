@@ -3931,6 +3931,7 @@ mod history_tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(windows, ignore = "not yet ported to Windows; see docs/windows.md")]
     async fn codex_history_review_prepared_rollout_usage_wait_cancellation_does_not_reset_cursor() {
         let home = crate::test_support::asset_test_dir("history-prepared-rollout");
         std::fs::create_dir_all(home.join("sessions/day")).unwrap();

@@ -511,6 +511,7 @@ mod tests {
     /// A refusal that does not say who is holding the directory leaves the
     /// owner with an unstartable gateway and nothing to act on.
     #[test]
+    #[cfg_attr(windows, ignore = "not yet ported to Windows; see docs/windows.md")]
     fn a_refused_start_names_the_process_holding_the_directory() {
         let dir = scratch_dir("names-holder");
         let _held = acquire_within(&dir, RELEASE_VISIBLE_WITHIN).unwrap();

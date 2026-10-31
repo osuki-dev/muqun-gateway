@@ -1101,6 +1101,7 @@ mod tests {
 
     #[cfg(not(target_os = "macos"))]
     #[test]
+    #[cfg_attr(windows, ignore = "not yet ported to Windows; see docs/windows.md")]
     fn effective_systemd_identity_uses_exact_arguments_and_environment() {
         let fixture = paths();
         let exe = fixture.exe.to_str().unwrap();

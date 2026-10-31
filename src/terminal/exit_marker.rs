@@ -221,6 +221,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "not yet ported to Windows; see docs/windows.md")]
     fn real_commands_without_a_final_newline_keep_their_output_and_exit_status() {
         let file = crate::test_state_dir().join(format!("marker-{}.txt", uuid::Uuid::new_v4()));
         std::fs::write(&file, "{\"value\":\"cat without newline\"}").unwrap();

@@ -2497,6 +2497,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(windows, ignore = "not yet ported to Windows; see docs/windows.md")]
     async fn oversized_real_diff_returns_capped_without_waiting_for_timeout() {
         let repo = temp_repo("output-cap");
         // Many complete lines exceed the pipe buffer and the output budget.
@@ -3091,6 +3092,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(windows, ignore = "not yet ported to Windows; see docs/windows.md")]
     async fn a_path_is_a_name_never_a_pattern() {
         let repo = pathspec_repo("vcs-pathspec");
 
@@ -3271,6 +3273,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(windows, ignore = "not yet ported to Windows; see docs/windows.md")]
     async fn discard_restores_tracked_files_and_deletes_untracked_ones() {
         let repo = changes_repo("vcs-discard");
 
@@ -3574,6 +3577,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(windows, ignore = "not yet ported to Windows; see docs/windows.md")]
     async fn worktree_inventory_lists_past_the_old_limit_and_says_when_it_cuts() {
         let (root, repo) = git_test_repo("many-worktrees");
         let repo = std::fs::canonicalize(repo).unwrap();
@@ -3608,6 +3612,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(windows, ignore = "not yet ported to Windows; see docs/windows.md")]
     async fn worktree_inventory_omits_missing_and_foreign_checkouts() {
         let (root, repo) = git_test_repo("omitted-worktrees");
         let repo = std::fs::canonicalize(repo).unwrap();

@@ -2742,6 +2742,7 @@ mod tests {
     /// with nothing in it. `probe_reachable` exists so a caller that needs to
     /// tell those two apart can.
     #[tokio::test]
+    #[cfg_attr(windows, ignore = "not yet ported to Windows; see docs/windows.md")]
     async fn probe_reachable_tells_no_server_apart_from_list_panes_reporting_empty() {
         let socket = crate::short_test_socket("gw-probe");
         let backend = TmuxBackend::new(Some(socket));

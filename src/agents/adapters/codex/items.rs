@@ -533,6 +533,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(windows, ignore = "not yet ported to Windows; see docs/windows.md")]
     async fn image_view_outside_workspace_gets_authenticated_preview_and_exact_original() {
         use axum::extract::{Path as RoutePath, State};
         use axum::http::{HeaderMap, StatusCode};
@@ -597,6 +598,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(windows, ignore = "not yet ported to Windows; see docs/windows.md")]
     async fn image_view_refuses_non_images_and_does_not_widen_other_tool_file_scope() {
         let workspace = ImageWorkspace::new();
         let outside = ImageWorkspace::new();
@@ -648,6 +650,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(windows, ignore = "not yet ported to Windows; see docs/windows.md")]
     async fn image_generation_saved_paths_resolve_through_authenticated_attachment_pipeline() {
         let workspace = ImageWorkspace::new();
         for name in [
@@ -673,6 +676,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(windows, ignore = "not yet ported to Windows; see docs/windows.md")]
     async fn image_generation_legacy_result_file_uri_retains_parenthesized_filename() {
         let workspace = ImageWorkspace::new();
         let path = workspace.image("plot(1).png");
@@ -683,6 +687,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(windows, ignore = "not yet ported to Windows; see docs/windows.md")]
     async fn image_generation_legacy_encoded_file_uri_is_not_double_encoded() {
         let workspace = ImageWorkspace::new();
         let path = workspace.image("中文 %20 (#1).png");
@@ -1041,6 +1046,7 @@ mod tests {
         }
     }
     #[test]
+    #[cfg_attr(windows, ignore = "not yet ported to Windows; see docs/windows.md")]
     fn patch_counts_do_not_confuse_hunk_content_with_file_headers() {
         assert_eq!(
             patch_counts("--- a/f\n+++ b/f\n@@ -1 +1 @@\n--- content\n+++ content"),

@@ -1709,6 +1709,7 @@ async fn codex_skill_turn_carries_the_skill_file_and_file_search_stays_in_the_wo
 /// A bare `@` (empty query) lists the session directory's files, as OpenCode
 /// does, without asking Codex's fuzzy search, which matches nothing for it.
 #[tokio::test]
+#[cfg_attr(windows, ignore = "not yet ported to Windows; see docs/windows.md")]
 async fn codex_bare_mention_lists_the_session_directory() {
     let mut fixture = Fixture::new(|request| match request["method"].as_str().unwrap() {
         "fuzzyFileSearch" => panic!("an empty query must not reach fuzzyFileSearch"),

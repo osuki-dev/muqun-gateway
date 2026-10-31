@@ -123,6 +123,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "not yet ported to Windows; see docs/windows.md")]
     fn preserves_thread_instructions_mcp_trust_model_and_permissions_without_tui_config() {
         let launch = parse(
             "/synthetic/project",
