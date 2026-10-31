@@ -64,6 +64,42 @@ pub(super) async fn recover(
         .map_err(|_| AgentError::NotAvailable("Qoder session metadata reader failed".into()))?
 }
 
+/// Changes when Qoder adds, removes or appends to a saved session.
+pub(super) fn store_fingerprint() -> Option<u64> {
+    store_fingerprint_in(&dirs::home_dir()?.join(".qoder").join("projects"))
+}
+
+fn store_fingerprint_in(root: &Path) -> Option<u64> {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    let projects = match std::fs::read_dir(root) {
+        Ok(projects) => projects,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Some(0),
+        Err(_) => return None,
+    };
+    // Order-independent: directory iteration order is unspecified.
+    let mut fingerprint = 0_u64;
+    let mut entries = 0;
+    for project in projects {
+        let project = project.ok()?;
+        if !project.file_type().ok()?.is_dir() {
+            continue;
+        }
+        for entry in std::fs::read_dir(project.path()).ok()? {
+            entries += 1;
+            if entries > MAX_ENTRIES {
+                return None;
+            }
+            let entry = entry.ok()?;
+            let metadata = entry.metadata().ok()?;
+            let mut hasher = DefaultHasher::new();
+            (project.file_name(), entry.file_name()).hash(&mut hasher);
+            (metadata.len(), metadata.modified().ok()?).hash(&mut hasher);
+            fingerprint = fingerprint.wrapping_add(hasher.finish());
+        }
+    }
+    Some(fingerprint)
+}
+
 fn cancelled(stop: &CancellationToken) -> Result<(), AgentError> {
     if stop.is_cancelled() {
         Err(AgentError::NotAvailable("Qoder runtime stopped".into()))
@@ -353,6 +389,39 @@ mod tests {
             + "\n";
         std::fs::write(&path, content).unwrap();
         path
+    }
+    #[test]
+    fn store_fingerprint_moves_only_when_saved_sessions_change() {
+        let root = scratch();
+        assert_eq!(store_fingerprint_in(&root.0.join("absent")), Some(0));
+        let path = write(&root.0, "bucket", "one", &[json!({"sessionId":"one"})]);
+        let initial = store_fingerprint_in(&root.0).unwrap();
+        assert_eq!(store_fingerprint_in(&root.0), Some(initial));
+        let mut seen = vec![initial];
+        let changes: [&dyn Fn(); 3] = [
+            &|| {
+                let mut file = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&path)
+                    .unwrap();
+                std::io::Write::write_all(&mut file, b"{}\n").unwrap();
+            },
+            &|| {
+                drop(write(
+                    &root.0,
+                    "other",
+                    "two",
+                    &[json!({"sessionId":"two"})],
+                ))
+            },
+            &|| std::fs::remove_file(&path).unwrap(),
+        ];
+        for change in changes {
+            change();
+            let next = store_fingerprint_in(&root.0).unwrap();
+            assert!(!seen.contains(&next));
+            seen.push(next);
+        }
     }
     #[test]
     fn global_empty_cwd_recovers_exact_transcript_metadata_without_decoding_bucket() {
