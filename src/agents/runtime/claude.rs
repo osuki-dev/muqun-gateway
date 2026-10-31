@@ -590,7 +590,13 @@ fn features_for_models(models: &[crate::discovery::AgentModelInfo]) -> AgentFeat
 }
 
 pub(super) fn features() -> AgentFeatures {
-    super::acp_features()
+    let mut found = super::acp_features();
+    // Prompts and Stop for a conversation open in a terminal pane are typed
+    // into that pane (`TerminalBridge`); Apps that know this may send them.
+    found
+        .extra
+        .insert("terminalInput".into(), serde_json::json!(true));
+    found
 }
 
 #[cfg(test)]

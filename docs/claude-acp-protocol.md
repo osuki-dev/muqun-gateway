@@ -151,7 +151,7 @@ read read-only (main chain: prompts, text, thinking, tool calls and results)
 through the same projection as `session/load` and mirrored whole, so earlier
 pages come from the mirror.
 
-**Input.** A prompt from the App is typed into that pane through the pane
+**Input.** Discovery declares `features.terminalInput: true`. A prompt from the App is typed into that pane through the pane
 agent's prompt path (with its delayed Enter), so the terminal user sees it;
 Stop sends Escape there. After input the transcript is followed for ten
 minutes; each change refreshes the mirror and sends `agent.resync`.
