@@ -23,6 +23,7 @@ use serde_json::Value;
 use super::{lifecycle, service, update};
 use crate::authority::{hash_token, DeviceRecord, PendingPairing};
 use crate::backend::BackendKind;
+use crate::cli::AgentRow;
 use crate::{
     auto_public_url, backend_endpoint, config_changed_since_start, config_dir, configured_port,
     ensure_pairing_transport_key, load_config, make_backend_default, now_unix_ms, read_devices,
@@ -105,7 +106,7 @@ pub(crate) fn manage() -> anyhow::Result<()> {
         pending_pairing.as_ref(),
         &devices,
         &pairing,
-        connectivity,
+        &connectivity,
         &mut ui,
     )?;
 
@@ -140,7 +141,7 @@ pub(crate) fn manage() -> anyhow::Result<()> {
                     pairing.paired = None;
                     ui.scroll = 0;
                     if ui.section != Section::Devices {
-                        message = String::from("A phone is waiting for its code: open 3 Devices.");
+                        message = String::from("A phone is waiting for its code: open 4 Devices.");
                     }
                 }
                 pending_pairing = next_pending_pairing;
@@ -151,7 +152,7 @@ pub(crate) fn manage() -> anyhow::Result<()> {
                 pending_pairing.as_ref(),
                 &devices,
                 &pairing,
-                connectivity,
+                &connectivity,
                 &mut ui,
             )?;
             continue;
@@ -165,7 +166,7 @@ pub(crate) fn manage() -> anyhow::Result<()> {
                     pending_pairing.as_ref(),
                     &devices,
                     &pairing,
-                    connectivity,
+                    &connectivity,
                     &mut ui,
                 )?;
             }
@@ -178,6 +179,7 @@ pub(crate) fn manage() -> anyhow::Result<()> {
             break;
         }
         let item_count = match ui.section {
+            Section::Agents => listed_agents(&connectivity.rows, ui.all_agents).len(),
             Section::Terminals => load_config(None)?.sessions.len(),
             Section::Devices if !pairing.open => devices.len(),
             Section::Settings => Setting::ALL.len(),
@@ -202,7 +204,7 @@ pub(crate) fn manage() -> anyhow::Result<()> {
                 pending_pairing.as_ref(),
                 &devices,
                 &pairing,
-                connectivity,
+                &connectivity,
                 &mut ui,
             )?;
             continue;
@@ -219,7 +221,7 @@ pub(crate) fn manage() -> anyhow::Result<()> {
                 pending_pairing.as_ref(),
                 &devices,
                 &pairing,
-                connectivity,
+                &connectivity,
                 &mut ui,
             )?;
             continue;
@@ -265,7 +267,25 @@ pub(crate) fn manage() -> anyhow::Result<()> {
                     stop_background_inner(false)?;
                     message = String::from("Gateway stopped. Terminal tasks are still running.");
                 }
-                (Section::Overview | Section::Settings, "r") => {
+                (Section::Agents, "enter" | "e") => {
+                    let listed = listed_agents(&connectivity.rows, ui.all_agents);
+                    if let Some(row) = listed.get(ui.selected) {
+                        message = if input == "e" {
+                            toggle_agent_enabled(row)?
+                        } else {
+                            toggle_agent_visibility(row)?
+                        };
+                    }
+                }
+                (Section::Agents, "a") => {
+                    ui.all_agents = !ui.all_agents;
+                    message = String::from(if ui.all_agents {
+                        "Listing every agent, not installed ones too."
+                    } else {
+                        "Not installed agents folded."
+                    });
+                }
+                (Section::Overview | Section::Agents | Section::Settings, "r") => {
                     crate::restart_gateway(false)?;
                     ui.restart.clear();
                     message = String::from("gateway restarted");
@@ -389,7 +409,7 @@ pub(crate) fn manage() -> anyhow::Result<()> {
                                 pending_pairing.as_ref(),
                                 &devices,
                                 &pairing,
-                                connectivity,
+                                &connectivity,
                                 &mut ui,
                             )?;
                             let plan = update::in_thread(update::check)?;
@@ -403,7 +423,7 @@ pub(crate) fn manage() -> anyhow::Result<()> {
                         String::from("This manager stays open on its old image; reopen it to load the new UI."),
                     ], "update Gateway")? {
                         message = String::from("Downloading/verifying, then updating. Please wait; do not close this manager.");
-                        print_manage_screen(&message, pending_pairing.as_ref(), &devices, &pairing, connectivity, &mut ui)?;
+                        print_manage_screen(&message, pending_pairing.as_ref(), &devices, &pairing, &connectivity, &mut ui)?;
                         message = update::in_thread(move || update::apply(plan))?;
                     } else {
                         message = String::from("Gateway update cancelled; no binary downloaded or restart.");
@@ -446,7 +466,7 @@ pub(crate) fn manage() -> anyhow::Result<()> {
             pending_pairing.as_ref(),
             &devices,
             &pairing,
-            connectivity,
+            &connectivity,
             &mut ui,
         )?;
     }
@@ -663,7 +683,7 @@ pub(crate) fn unreachable_listen_warning(listen: &str, public_url: &str) -> Opti
         "warning: this gateway answers only on {listen}, but tells devices to reach it at \
          {public_url}. Nothing outside this machine can connect, and a phone will report the \
          pairing code as refused. Fix it with: muqun-gateway manage, then press [a] to detect \
-          the address again in [4] Settings."
+          the address again in [5] Settings."
     ))
 }
 
@@ -700,14 +720,16 @@ impl Drop for TerminalModeGuard {
 enum Section {
     #[default]
     Overview,
+    Agents,
     Terminals,
     Devices,
     Settings,
 }
 
 impl Section {
-    const ALL: [Self; 4] = [
+    const ALL: [Self; 5] = [
         Self::Overview,
+        Self::Agents,
         Self::Terminals,
         Self::Devices,
         Self::Settings,
@@ -816,18 +838,59 @@ impl Link {
 }
 
 /// What the running gateway reports about its backends and agents.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq)]
 struct Connectivity {
     herdr: Link,
     agents: Link,
+    /// Every agent, as discovery lists it, for the Agents view and the
+    /// header's counts.
+    rows: Vec<AgentRow>,
 }
+
+impl Connectivity {
+    /// "6 ready · 1 needs setup": the agents in use, by state, non-zero
+    /// counts only. Not installed and turned off agents are not counted.
+    /// `None` before the gateway has listed any.
+    fn agent_counts(&self) -> Option<String> {
+        let mut counts: Vec<(&str, usize)> = Vec::new();
+        for row in &self.rows {
+            let state = row.state();
+            if matches!(state, "not installed" | "off") {
+                continue;
+            }
+            match counts.iter_mut().find(|(word, _)| *word == state) {
+                Some((_, count)) => *count += 1,
+                None => counts.push((state, 1)),
+            }
+        }
+        if counts.is_empty() {
+            return None;
+        }
+        counts.sort_by_key(|(word, _)| AGENT_STATE_ORDER.iter().position(|w| w == word));
+        Some(
+            counts
+                .iter()
+                .map(|(word, count)| format!("{count} {word}"))
+                .collect::<Vec<_>>()
+                .join(" · "),
+        )
+    }
+}
+
+const AGENT_STATE_ORDER: [&str; 5] = [
+    "ready",
+    "needs setup",
+    "not running",
+    "needs update",
+    "unknown",
+];
 
 /// Everything the one-line header says.
 struct HeaderStatus<'a> {
     version: &'a str,
     listen: &'a str,
     running: bool,
-    links: Connectivity,
+    links: &'a Connectivity,
     devices: usize,
 }
 
@@ -843,7 +906,10 @@ fn header_line(status: &HeaderStatus<'_>, width: usize) -> String {
     let links = format!(
         "Herdr {} · Agents {}",
         status.links.herdr.label(),
-        status.links.agents.label()
+        status
+            .links
+            .agent_counts()
+            .unwrap_or_else(|| status.links.agents.label().to_owned())
     );
     let full = if status.running {
         format!(
@@ -904,6 +970,7 @@ fn connectivity_from_discovery(value: &Value) -> Connectivity {
         }
     };
     Connectivity {
+        rows: crate::cli::agent_rows(&planes["agents"]["agents"]),
         herdr: link(herdr.contains(&true), !herdr.is_empty()),
         agents: link(
             agents
@@ -994,6 +1061,7 @@ struct Footer {
 fn footer(section: Section, context: &FooterContext) -> Footer {
     let enter = match (section, context.pairing) {
         (Section::Devices, Some(_)) => "Enter back",
+        (Section::Agents, _) => "Enter show/hide in App",
         (Section::Terminals, _) if context.no_backends => "Enter add tmux",
         (Section::Terminals, _) => "Enter actions",
         (Section::Devices, None) if context.no_devices => "Enter pair",
@@ -1007,6 +1075,7 @@ fn footer(section: Section, context: &FooterContext) -> Footer {
     };
     let actions = match (section, context.pairing) {
         (Section::Overview, _) => Some("s start · t stop · r restart"),
+        (Section::Agents, _) => Some("e turn off/on · a all · r restart"),
         (Section::Terminals, _) => Some("h add Herdr · m add tmux"),
         (Section::Devices, Some(PairingStage::Done)) => Some("p pair another · Esc back"),
         (Section::Devices, Some(_)) => Some("Esc back"),
@@ -1059,6 +1128,7 @@ fn footer_lines(footer: &Footer, width: usize) -> Vec<ScreenLine> {
 fn enter_action(section: Section, empty_items: bool, pairing_open: bool) -> Option<&'static str> {
     match section {
         Section::Overview => None,
+        Section::Agents if empty_items => None,
         Section::Terminals if empty_items => Some("m"),
         // The pairing view (QR, code, or done) returns to the list on Enter.
         Section::Devices if pairing_open => Some("r"),
@@ -1478,8 +1548,60 @@ enum Ordered {
     Other(Value),
 }
 
+/// Hide agent `kind` from the App's new-session list (`"hidden"` in
+/// `agent_visibility`), or remove its entry so it is automatic again.
+pub(crate) fn set_agent_visibility(
+    file: &std::path::Path,
+    kind: &str,
+    hidden: bool,
+) -> anyhow::Result<()> {
+    set_config_key(
+        file,
+        &["agent_visibility", kind],
+        hidden.then(|| Value::from("hidden")),
+    )?;
+    Ok(())
+}
+
 fn write_config_key(path: &[&str], value: Option<Value>) -> anyhow::Result<crate::Config> {
     set_config_key(&config_dir()?.join(CONFIG_FILE), path, value)
+}
+
+/// The rows the Agents view lists: every agent, the not installed ones only
+/// with `all`.
+fn listed_agents(rows: &[AgentRow], all: bool) -> Vec<&AgentRow> {
+    rows.iter()
+        .filter(|row| all || row.state() != "not installed")
+        .collect()
+}
+
+/// Enter on an agent: hide it from the App's new-session list on every
+/// device, or set it back to automatic. Applies on the next discovery.
+fn toggle_agent_visibility(row: &AgentRow) -> anyhow::Result<String> {
+    let hidden =
+        crate::platform::discovery::agent_visibility(&load_config(None)?.agent_visibility, &row.id)
+            == "hidden";
+    set_agent_visibility(&config_dir()?.join(CONFIG_FILE), &row.id, !hidden)?;
+    Ok(format!(
+        "{}: {} the App's new-session list.",
+        row.display_name(),
+        if hidden { "back in" } else { "hidden from" }
+    ))
+}
+
+/// `e` on an agent: its adapter's `enabled` switch, which needs a restart.
+fn toggle_agent_enabled(row: &AgentRow) -> anyhow::Result<String> {
+    let path = config_dir()?.join(CONFIG_FILE);
+    // The written value if there is one (a change waiting for a restart),
+    // else what the running gateway reports.
+    let written: Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+    let enabled = written[&row.id]["enabled"].as_bool().unwrap_or(row.enabled);
+    set_config_key(&path, &[&row.id, "enabled"], Some(Value::Bool(!enabled)))?;
+    Ok(format!(
+        "{}: turned {}; press r to restart Gateway and apply.",
+        row.display_name(),
+        on_off(!enabled)
+    ))
 }
 
 /// Enter on "Skip the agent's own approval prompts": off by an empty
@@ -1821,6 +1943,8 @@ struct ManageView {
     /// Settings changed here that apply only after a restart; their rows say
     /// so until Gateway restarts.
     restart: Vec<Setting>,
+    /// The Agents view lists the not installed agents too.
+    all_agents: bool,
 }
 
 impl ManageView {
@@ -1830,9 +1954,11 @@ impl ManageView {
             .position(|section| *section == self.section)
             .unwrap();
         let section = match key {
-            KeyCode::Tab | KeyCode::Right => Some((index + 1) % 4),
-            KeyCode::BackTab | KeyCode::Left => Some((index + 3) % 4),
-            KeyCode::Char(ch @ '1'..='4') => Some(ch as usize - '1' as usize),
+            KeyCode::Tab | KeyCode::Right => Some((index + 1) % Section::ALL.len()),
+            KeyCode::BackTab | KeyCode::Left => {
+                Some((index + Section::ALL.len() - 1) % Section::ALL.len())
+            }
+            KeyCode::Char(ch @ '1'..='5') => Some(ch as usize - '1' as usize),
             _ => None,
         };
         if let Some(index) = section {
@@ -1891,7 +2017,7 @@ fn print_manage_screen(
     pending_pairing: Option<&PendingPairing>,
     devices: &[DeviceRecord],
     pairing: &PairingView,
-    connectivity: Connectivity,
+    connectivity: &Connectivity,
     ui: &mut ManageView,
 ) -> anyhow::Result<()> {
     let config = load_config(None)?;
@@ -1966,6 +2092,91 @@ fn print_manage_screen(
     };
     let lines = manage_lines(&data, ui, width, height);
     write_viewport(&lines, width, height)
+}
+
+/// The Agents view: one row per agent (state, whether the App lists it,
+/// version), the not installed ones folded into a line, and the selected
+/// agent's next step below.
+fn agent_lines(
+    rows: &[AgentRow],
+    config: &crate::Config,
+    ui: &ManageView,
+    running: bool,
+    width: usize,
+) -> Vec<ScreenLine> {
+    let quiet = |text: &str| {
+        word_wrap(text, width)
+            .into_iter()
+            .map(|line| ScreenLine::text(line, Tone::Quiet))
+            .collect::<Vec<_>>()
+    };
+    if rows.is_empty() {
+        return quiet(if running {
+            "Asking the running Gateway for its agents..."
+        } else {
+            "Gateway is stopped: start it on 1 Overview to see each agent's state."
+        });
+    }
+    let listed = listed_agents(rows, ui.all_agents);
+    let in_app = |row: &AgentRow| {
+        crate::platform::discovery::agent_visibility(&config.agent_visibility, &row.id)
+    };
+    let table: Vec<[&str; 4]> = std::iter::once(["AGENT", "STATE", "IN APP", "VERSION"])
+        .chain(listed.iter().map(|row| {
+            [
+                row.display_name(),
+                row.state(),
+                in_app(row),
+                row.version.as_deref().unwrap_or("-"),
+            ]
+        }))
+        .collect();
+    let mut lines = Vec::new();
+    for (index, text) in crate::cli::format_table(&table).into_iter().enumerate() {
+        let selected = index > 0 && index - 1 == ui.selected;
+        let marker = if selected { "▌ " } else { "  " };
+        let tone = match (index, selected) {
+            (0, _) => Tone::Title,
+            (_, true) => Tone::Selected,
+            _ => Tone::Normal,
+        };
+        lines.push(ScreenLine::text(format!("{marker}{text}"), tone));
+    }
+    let folded: Vec<&str> = rows
+        .iter()
+        .filter(|row| !ui.all_agents && row.state() == "not installed")
+        .map(AgentRow::display_name)
+        .collect();
+    if !folded.is_empty() {
+        lines.push(ScreenLine::text(
+            format!(
+                "  Not installed ({}): {}  · a: show all",
+                folded.len(),
+                folded.join(", ")
+            ),
+            Tone::Quiet,
+        ));
+    }
+    if let Some(row) = listed.get(ui.selected) {
+        lines.push(ScreenLine::plain(""));
+        let state = row.state();
+        let mut about = format!("{}: {state}", row.display_name());
+        if let Some(reason) = row.reason.as_deref().filter(|_| state != "ready") {
+            about.push_str(&format!(" ({reason})"));
+        }
+        lines.extend(word_wrap(&about, width).into_iter().map(ScreenLine::plain));
+        if let Some(step) = crate::cli::agent_next_step(&row.id, &row.status) {
+            lines.extend(
+                word_wrap(&format!("Next: {step}"), width)
+                    .into_iter()
+                    .map(|line| ScreenLine::text(line, Tone::Accent)),
+            );
+        }
+        lines.extend(quiet(
+            "Hidden agents keep working and their sessions stay listed; off stops the adapter.",
+        ));
+    }
+    lines
 }
 
 /// Whether tmux can be found by the gateway that will run it, and on which
@@ -2096,7 +2307,7 @@ struct ManageData<'a> {
     backend_states: &'a [String],
     qr: Option<&'a str>,
     changed: bool,
-    connectivity: Connectivity,
+    connectivity: &'a Connectivity,
     pairing: &'a PairingView,
 }
 
@@ -2163,6 +2374,9 @@ fn manage_lines(
     };
     let config = data.config;
     ui.selected = ui.selected.min(match ui.section {
+        Section::Agents => listed_agents(&data.connectivity.rows, ui.all_agents)
+            .len()
+            .saturating_sub(1),
         Section::Terminals => config.sessions.len().saturating_sub(1),
         Section::Devices => data.devices.len().saturating_sub(1),
         Section::Settings => Setting::ALL.len() - 1,
@@ -2311,7 +2525,7 @@ fn manage_lines(
             )));
             if data.pending.is_some() {
                 rows.push(ScreenLine::text(
-                    "Pairing request waiting: open 3 Devices for the code.",
+                    "Pairing request waiting: open 4 Devices for the code.",
                     Tone::Warning,
                 ));
             }
@@ -2335,7 +2549,7 @@ fn manage_lines(
                 .collect::<Vec<_>>();
             if rows.is_empty() {
                 rows.push(ScreenLine::plain(
-                    "No backends. Open 2 Terminals to add Herdr or tmux.",
+                    "No backends. Open 3 Terminals to add Herdr or tmux.",
                 ));
             }
             panel(&mut body, "Terminal servers", rows, content, framed);
@@ -2346,6 +2560,15 @@ fn manage_lines(
             body.push(ScreenLine::text(
                 "Stopping Gateway leaves terminal sessions and tasks running.",
                 Tone::Quiet,
+            ));
+        }
+        Section::Agents => {
+            body.extend(agent_lines(
+                &data.connectivity.rows,
+                config,
+                ui,
+                data.running,
+                content,
             ));
         }
         Section::Terminals => {
@@ -3294,25 +3517,26 @@ mod tests {
         let links = Connectivity {
             herdr: Link::Connected,
             agents: Link::Offline,
+            rows: Vec::new(),
         };
         let cases = [
             (
-                HeaderStatus { version: "1.2.3", listen: "0.0.0.0:23100", running: true, links, devices: 2 },
+                HeaderStatus { version: "1.2.3", listen: "0.0.0.0:23100", running: true, links: &links, devices: 2 },
                 96,
                 "Muqun Gateway v1.2.3 · Running 0.0.0.0:23100 · Herdr connected · Agents offline · 2 devices",
             ),
             (
-                HeaderStatus { version: "1.2.3", listen: "0.0.0.0:23100", running: true, links, devices: 1 },
+                HeaderStatus { version: "1.2.3", listen: "0.0.0.0:23100", running: true, links: &links, devices: 1 },
                 80,
                 "v1.2.3 · Running 0.0.0.0:23100 · Herdr connected · Agents offline · 1 device",
             ),
             (
-                HeaderStatus { version: "1.2.3", listen: "127.0.0.1:23100", running: false, links: Connectivity::default(), devices: 0 },
+                HeaderStatus { version: "1.2.3", listen: "127.0.0.1:23100", running: false, links: &Connectivity::default(), devices: 0 },
                 96,
                 "Muqun Gateway v1.2.3 · Stopped · listens on 127.0.0.1:23100 when started · 0 devices",
             ),
             (
-                HeaderStatus { version: "1.2.3", listen: "127.0.0.1:23100", running: false, links: Connectivity::default(), devices: 0 },
+                HeaderStatus { version: "1.2.3", listen: "127.0.0.1:23100", running: false, links: &Connectivity::default(), devices: 0 },
                 40,
                 "v1.2.3 · Stopped · 127.0.0.1:23100",
             ),
@@ -3330,6 +3554,21 @@ mod tests {
             }
         }));
         assert_eq!(discovered, links);
+        // Once agents are listed the header counts them by state; not
+        // installed and off agents are not counted.
+        let counted = super::connectivity_from_discovery(&serde_json::json!({
+            "planes": { "agents": { "agents": [
+                { "id": "t3", "status": "unconfigured", "enabled": true },
+                { "id": "codex", "status": "connected", "enabled": true },
+                { "id": "pi", "status": "reachable", "enabled": true },
+                { "id": "qoder", "status": "reachable", "enabled": false },
+                { "id": "cursor", "status": "not_installed", "enabled": true },
+            ]}}
+        }));
+        assert_eq!(
+            counted.agent_counts().as_deref(),
+            Some("2 ready · 1 needs setup")
+        );
     }
 
     #[test]
@@ -3504,7 +3743,7 @@ mod tests {
             backend_states: &[],
             qr: None,
             changed: false,
-            connectivity: super::Connectivity::default(),
+            connectivity: &super::Connectivity::default(),
             pairing: &super::PairingView::default(),
         };
         for width in [110_u16, 61] {
@@ -3632,7 +3871,7 @@ mod tests {
         let mut ui = ManageView::default();
         assert!(ui.navigate(KeyCode::BackTab, 0));
         assert_eq!(ui.section, Section::Settings);
-        ui.navigate(KeyCode::Char('2'), 0);
+        ui.navigate(KeyCode::Char('3'), 0);
         assert_eq!(ui.section, Section::Terminals);
         ui.navigate(KeyCode::End, 50);
         assert_eq!(ui.selected, 49);
@@ -3680,6 +3919,15 @@ mod tests {
     #[test]
     fn manager_styled_layout_is_cell_bounded_through_resize_and_keeps_selection_visible() {
         let config = layout_config();
+        let connectivity = super::Connectivity {
+            rows: crate::cli::agent_rows(&serde_json::json!([
+                { "id": "t3", "name": "T3 中文 e\u{301}\u{1b}[2J", "status": "unconfigured", "enabled": true,
+                  "reason": "the stored credential was refused \u{1b}[2J" },
+                { "id": "codex", "name": "Codex", "status": "connected", "enabled": true, "version": "0.164.0" },
+                { "id": "cursor", "name": "Cursor", "status": "not_installed", "enabled": true },
+            ])),
+            ..Default::default()
+        };
         let data = ManageData {
             history_caption: None,
             config: &config,
@@ -3692,7 +3940,7 @@ mod tests {
             backend_states: &[],
             qr: None,
             changed: false,
-            connectivity: super::Connectivity::default(),
+            connectivity: &connectivity,
             pairing: &super::PairingView::default(),
         };
         for section in Section::ALL {
@@ -3721,6 +3969,18 @@ mod tests {
                         );
                         assert!(line.width() <= 98);
                     }
+                    if section == Section::Agents && width == 100 && height == 30 {
+                        let text: Vec<String> = lines.iter().map(|line| line.render(200)).collect();
+                        let text = text.join("\n");
+                        for want in [
+                            "IN APP",
+                            "needs setup",
+                            "Not installed (1): Cursor",
+                            "Next: muqun-gateway agent setup t3",
+                        ] {
+                            assert!(text.contains(want), "{want}: {text}");
+                        }
+                    }
                     if section == Section::Terminals && width >= 40 && height >= 8 {
                         assert!(lines
                             .iter()
@@ -3739,6 +3999,7 @@ mod tests {
     fn manager_empty_states_and_default_marker_explain_next_actions() {
         let config = layout_config();
         let pairing = super::PairingView::default();
+        let connectivity = super::Connectivity::default();
         let data = |config| ManageData {
             history_caption: None,
             config,
@@ -3751,7 +4012,7 @@ mod tests {
             backend_states: &[],
             qr: None,
             changed: false,
-            connectivity: super::Connectivity::default(),
+            connectivity: &connectivity,
             pairing: &pairing,
         };
         let mut ui = ManageView {
@@ -3914,7 +4175,7 @@ mod tests {
             backend_states: &[],
             qr: Some(&qr),
             changed: false,
-            connectivity: super::Connectivity::default(),
+            connectivity: &super::Connectivity::default(),
             pairing: &super::PairingView {
                 open: true,
                 paired: None,

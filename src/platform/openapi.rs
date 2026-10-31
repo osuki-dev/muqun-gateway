@@ -792,6 +792,13 @@ pub fn openapi_spec() -> Value {
             "responses": ok_response()
         }
     });
+    spec["paths"]["/api/agents/{kind}/visibility"] = json!({ "put": {
+        "summary": "Hide a session agent from the App's new-session list on every device, or set it back to automatic",
+        "description": "Owner App or admin token only; a linked gateway gets 403. Body `{\"visibility\": \"auto\"|\"hidden\"}`. Written to `agent_visibility` in config.json and applied on the next discovery, without a restart. A hidden agent keeps running and its sessions stay listed; discovery reports it with `visibility: hidden` and `picker: more`.",
+        "parameters": [path_param("kind")],
+        "requestBody": json_body(object_schema(&[("visibility", "string")], &["visibility"])),
+        "responses": ok_response()
+    }});
     spec["paths"]["/api/history/storage"] = json!({ "get": {
         "summary": "Which captured-history storage this Gateway runs with (memory or sqlite, from config.json at startup), whether it captures at all, and, for sqlite with capture on, what it holds, from counters the write loop keeps. Requires the admin token or a device",
         "responses": json_ok("The storage", json!({

@@ -42,6 +42,17 @@ pub(crate) enum AgentCommand {
         #[arg(long)]
         all: bool,
     },
+    /// Keep an agent out of the App's new-session list (it keeps working and
+    /// its sessions stay listed).
+    Hide {
+        /// The agent's id, as `agent` lists it (codex, pi, ...).
+        agent: String,
+    },
+    /// Put a hidden agent back in the App's new-session list.
+    Show {
+        /// The agent's id, as `agent` lists it.
+        agent: String,
+    },
     /// Set up or explain one agent.
     Setup {
         #[command(subcommand)]
@@ -108,6 +119,8 @@ pub(crate) async fn run_agent_command(
                 std::process::exit(1);
             }
         }
+        AgentCommand::Hide { agent } => set_visibility(&agent, true)?,
+        AgentCommand::Show { agent } => set_visibility(&agent, false)?,
         AgentCommand::Setup { agent } => match agent {
             SetupAgent::T3 {
                 url,
@@ -193,7 +206,7 @@ enum Source {
 /// One agent as `agent` and `manage` show it: the part of a discovery entry
 /// a person reads. Parsed leniently so a newer or older gateway's answer
 /// still lists.
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct AgentRow {
     pub(crate) id: String,
@@ -204,8 +217,12 @@ pub(crate) struct AgentRow {
     pub(crate) enabled: bool,
     #[serde(default)]
     pub(crate) version: Option<String>,
+    /// Why it is not usable, when the state alone does not say.
     #[serde(default)]
     pub(crate) reason: Option<String>,
+    /// `hidden` or `auto`, as config.json's `agent_visibility` says.
+    #[serde(default)]
+    pub(crate) visibility: Option<String>,
 }
 
 fn enabled_default() -> bool {
@@ -224,6 +241,10 @@ impl AgentRow {
     /// The word a person reads for this agent's state (see docs/agent-api.md).
     pub(crate) fn state(&self) -> &'static str {
         state_word(self.enabled, &self.status)
+    }
+
+    pub(crate) fn hidden(&self) -> bool {
+        self.visibility.as_deref() == Some("hidden")
     }
 }
 
@@ -331,6 +352,18 @@ async fn local_probe(config: &Config) -> anyhow::Result<Vec<AgentDiscoveryInfo>>
     Ok(agents)
 }
 
+/// Write `agent_visibility` for `agent`. The running gateway reads it on its
+/// next discovery, so nothing restarts.
+fn set_visibility(agent: &str, hidden: bool) -> anyhow::Result<()> {
+    let config_path = config_dir()?.join(CONFIG_FILE);
+    crate::platform::manage::set_agent_visibility(&config_path, agent, hidden)?;
+    println!(
+        "{agent}: {} the App's new-session list on every device (applies on the next refresh).",
+        if hidden { "hidden from" } else { "back in" }
+    );
+    Ok(())
+}
+
 /// Print every agent; `true` when each enabled one is usable.
 async fn list(json: bool, all: bool) -> anyhow::Result<bool> {
     let config = load_config(None)?;
@@ -343,7 +376,13 @@ async fn list(json: bool, all: bool) -> anyhow::Result<bool> {
             },
         ),
     };
-    let rows = rows_from_agents(&raw);
+    let mut rows = rows_from_agents(&raw);
+    // An older gateway, or the local probe, does not say; the file does.
+    for row in &mut rows {
+        row.visibility.get_or_insert_with(|| {
+            crate::platform::discovery::agent_visibility(&config.agent_visibility, &row.id).into()
+        });
+    }
     let text = if json {
         serde_json::to_string_pretty(&raw)?
     } else {
@@ -363,6 +402,8 @@ fn render_list(rows: &[AgentRow], source: Source, all: bool, runtime_enabled: bo
     let (shown, folded): (Vec<&AgentRow>, Vec<&AgentRow>) = rows
         .iter()
         .partition(|row| all || row.state() != "not installed");
+    let (hidden, shown): (Vec<&AgentRow>, Vec<&AgentRow>) =
+        shown.into_iter().partition(|row| !all && row.hidden());
     let next = |row: &AgentRow| {
         let step = if runtime_enabled {
             next_step(&row.id, &row.status).unwrap_or_default()
@@ -394,6 +435,13 @@ fn render_list(rows: &[AgentRow], source: Source, all: bool, runtime_enabled: bo
         if let Some(reason) = row.reason.as_deref().filter(|_| row.id != "claude") {
             lines.push(format!("  {reason}"));
         }
+    }
+    if !hidden.is_empty() {
+        let names: Vec<&str> = hidden.iter().map(|row| row.display_name()).collect();
+        lines.push(format!(
+            "Hidden in the App: {}  (muqun-gateway agent show <agent>)",
+            names.join(", ")
+        ));
     }
     if !folded.is_empty() {
         let names: Vec<&str> = folded.iter().map(|row| row.display_name()).collect();
@@ -1099,10 +1147,11 @@ mod tests {
             {"id": "deepseek", "name": "DeepSeek", "status": "disabled", "enabled": false},
             {"id": "cursor", "name": "Cursor", "status": "not_installed", "enabled": true},
             {"id": "claude", "name": "Claude Code", "status": "not_installed", "enabled": true, "reason": "Node.js 22 or newer not found"},
+            {"id": "pi", "name": "Pi", "status": "reachable", "enabled": true, "visibility": "hidden"},
             {"id": "future", "status": "a_state_from_a_newer_gateway", "enabled": true}
         ]);
         let rows = rows_from_agents(&agents);
-        assert_eq!(rows.len(), 7, "an unparseable entry is skipped, not fatal");
+        assert_eq!(rows.len(), 8, "an unparseable entry is skipped, not fatal");
         let text = render_list(&rows, Source::Gateway, false, true);
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(
@@ -1115,6 +1164,7 @@ mod tests {
                 "Codex        unknown      -",
                 "Antigravity  needs setup  -        check antigravity.binary in config.json",
                 "DeepSeek     off          -        muqun-gateway agent setup deepseek",
+                "Hidden in the App: Pi  (muqun-gateway agent show <agent>)",
                 "Not installed: Cursor, Claude Code  (--all for details)",
                 "(from the running gateway)",
             ]

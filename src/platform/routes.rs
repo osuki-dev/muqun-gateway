@@ -1,7 +1,7 @@
 //! Platform Plane HTTP Routes: documentation, capabilities, health, discovery, and server metadata.
 
 use axum::{
-    extract::State,
+    extract::{Path, State},
     http::{HeaderMap, StatusCode},
     response::Html,
     routing::get,
@@ -19,6 +19,63 @@ use crate::{
 #[derive(Deserialize)]
 pub struct SetLabelBody {
     pub label: String,
+}
+
+#[derive(Deserialize)]
+pub struct SetVisibilityBody {
+    pub visibility: String,
+}
+
+/// `PUT /api/agents/{kind}/visibility`: hide a session agent from the App's
+/// new-session list on every device, or put it back to automatic. The
+/// owner's App or the admin token; a linked gateway is refused. Written to
+/// config.json, and read from there by the next discovery.
+pub async fn api_set_agent_visibility(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(kind): Path<String>,
+    Json(body): Json<SetVisibilityBody>,
+) -> ApiResult<Json<Value>> {
+    crate::platform::http::require_pairing_manager(&state, &headers)?;
+    let valid_kind = !kind.is_empty()
+        && kind.len() <= 64
+        && kind
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+    if !valid_kind {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_agent",
+            "agent kind must be 1-64 letters, digits, '_' or '-'",
+        ));
+    }
+    let hidden = match body.visibility.as_str() {
+        "hidden" => true,
+        "auto" => false,
+        _ => {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_visibility",
+                "visibility must be \"auto\" or \"hidden\"",
+            ))
+        }
+    };
+    crate::config_dir()
+        .and_then(|dir| {
+            crate::platform::manage::set_agent_visibility(
+                &dir.join(crate::CONFIG_FILE),
+                &kind,
+                hidden,
+            )
+        })
+        .map_err(|err| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "config_write_failed",
+                &err.to_string(),
+            )
+        })?;
+    Ok(Json(json!({ "kind": kind, "visibility": body.visibility })))
 }
 
 pub async fn docs() -> Html<&'static str> {
@@ -110,6 +167,10 @@ pub fn mount(router: Router<AppState>) -> Router<AppState> {
         .route("/api/capabilities", get(api_capabilities))
         .route("/api/discovery", get(api_discovery))
         .route("/api/meta", get(api_meta).patch(api_set_label))
+        .route(
+            "/api/agents/{agent_id}/visibility",
+            axum::routing::put(api_set_agent_visibility),
+        )
 }
 
 #[cfg(test)]
@@ -317,6 +378,7 @@ mod tests {
         assert!(API_CAPABILITIES.contains(&"capabilities_discovery"));
         assert!(API_CAPABILITIES.contains(&"agent_discovery"));
         assert!(API_CAPABILITIES.contains(&"multi_agent"));
+        assert!(API_CAPABILITIES.contains(&"agent_visibility"));
     }
 
     #[tokio::test]
@@ -388,6 +450,77 @@ mod tests {
             .as_array()
             .unwrap()
             .contains(&json!("multi_agent")));
+    }
+
+    #[tokio::test]
+    async fn only_the_owner_sets_agent_visibility_and_only_to_auto_or_hidden() {
+        use tower::ServiceExt;
+        let mut state = test_state(
+            "admin",
+            vec![
+                test_device("phone-1", "device-token"),
+                test_peer_device("peer-1", "peer-token"),
+            ],
+        );
+        state.config.transport_encryption = TransportEncryptionMode::Disabled;
+        let app = Router::new()
+            .route(
+                "/api/agents/{agent_id}/visibility",
+                axum::routing::put(api_set_agent_visibility),
+            )
+            .with_state(state);
+        for (token, kind, visibility, status) in [
+            ("peer-token", "pi", "hidden", StatusCode::FORBIDDEN),
+            ("device-token", "pi", "shown", StatusCode::BAD_REQUEST),
+            ("admin", "pi", "", StatusCode::BAD_REQUEST),
+            ("device-token", "p%20i", "hidden", StatusCode::BAD_REQUEST),
+        ] {
+            let request = Request::builder()
+                .uri(format!("/api/agents/{kind}/visibility"))
+                .method("PUT")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(json!({ "visibility": visibility }).to_string()))
+                .unwrap();
+            assert_eq!(
+                app.clone().oneshot(request).await.unwrap().status(),
+                status,
+                "{token} {kind} {visibility}"
+            );
+        }
+    }
+
+    #[test]
+    fn hidden_off_and_not_installed_agents_go_under_more() {
+        use crate::platform::discovery::{agent_picker, agent_visibility};
+        let map: std::collections::BTreeMap<String, String> = [
+            ("pi".into(), "hidden".into()),
+            ("fx".into(), "shown".into()),
+        ]
+        .into();
+        assert_eq!(agent_visibility(&map, "pi"), "hidden");
+        assert_eq!(
+            agent_visibility(&map, "fx"),
+            "auto",
+            "unknown values are auto"
+        );
+        assert_eq!(agent_visibility(&map, "codex"), "auto");
+        for (visibility, enabled, status, picker) in [
+            ("hidden", true, "connected", "more"),
+            ("auto", false, "reachable", "more"),
+            ("auto", true, "disabled", "more"),
+            ("auto", true, "not_installed", "more"),
+            ("auto", true, "reachable", "default"),
+            ("auto", true, "unconfigured", "default"),
+            ("auto", true, "offline", "default"),
+            ("auto", true, "unsupported", "default"),
+        ] {
+            assert_eq!(
+                agent_picker(visibility, enabled, status),
+                picker,
+                "{visibility} {enabled} {status}"
+            );
+        }
     }
 
     #[tokio::test]

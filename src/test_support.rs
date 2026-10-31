@@ -43,6 +43,7 @@ pub(crate) fn test_config(token: &str) -> Config {
             backend: BackendKind::Herdr,
         }],
         agent_commands: BTreeMap::new(),
+        agent_visibility: BTreeMap::new(),
         agent_launch_args: BTreeMap::new(),
         agent_env: Default::default(),
         agent_trust_folders: true,

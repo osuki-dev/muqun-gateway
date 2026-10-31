@@ -1,6 +1,6 @@
 //! Command-line interface: arguments, subcommands, and dispatch.
 
-mod agent;
+pub(crate) mod agent;
 pub(crate) mod local_api;
 mod mcp;
 mod peers;
@@ -10,6 +10,9 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand, ValueEnum};
 
 pub(crate) use agent::AgentCommand;
+pub(crate) use agent::{
+    format_table, next_step as agent_next_step, rows_from_agents as agent_rows, AgentRow,
+};
 pub(crate) use mcp::McpCommand;
 pub(crate) use peers::PeersCommand;
 
