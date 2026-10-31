@@ -2,6 +2,13 @@
 
 ## Changes and fixes
 
+- **Re-running `muqun-gateway agent setup t3` takes effect.** The command writes
+  the new bearer to a file while the running Gateway keeps its credential in the
+  encrypted store; when the two differed the Gateway refused both, so a refreshed
+  bearer or a new T3 URL never applied until the stored row was removed by hand.
+  A file saved after the stored credential now replaces it on the next read (and
+  is removed as before). A file that is not newer is still refused unchanged.
+
 - **Fresh preview installs work again on Debian and Ubuntu.** The installer's
   download size backstop assumed bash's 1024-byte `ulimit -f` unit; dash, their
   `/bin/sh`, counts 512-byte blocks, so the 1 MiB release-metadata cap was really
