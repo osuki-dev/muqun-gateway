@@ -104,13 +104,20 @@ impl T3Credentials {
         };
         let legacy: T3StoredCredential =
             serde_json::from_slice(&bytes).context("could not decode legacy T3 credential")?;
-        if let Some(stored) = &stored {
-            anyhow::ensure!(
-                stored == &legacy,
-                "legacy and encrypted T3 credentials differ; neither was changed"
-            );
-        } else {
-            self.import_if_empty(&legacy).await?;
+        match &stored {
+            Some(stored) if stored == &legacy => {}
+            // `muqun-gateway agent setup t3` writes this file; the running
+            // Gateway only ever reads the encrypted row. A file saved after
+            // the row is the operator's newer credential (a refreshed bearer
+            // or a new URL) and replaces it. Anything else -- the same
+            // timestamp, or an older file -- is refused unchanged.
+            Some(stored) if legacy.saved_at_ms > stored.saved_at_ms => {
+                self.write(&legacy).await?;
+            }
+            Some(_) => anyhow::bail!(
+                "legacy and encrypted T3 credentials differ and the file is not newer; neither was changed"
+            ),
+            None => self.import_if_empty(&legacy).await?,
         }
         // A separate read after the write has committed also handles a crash
         // between committing the import and removing its plaintext source.
@@ -211,6 +218,26 @@ mod tests {
             std::fs::read(directory.join(T3_CREDENTIAL_FILE)).unwrap(),
             before
         );
+    }
+
+    #[tokio::test]
+    async fn a_newer_setup_file_replaces_the_stored_credential() {
+        let (directory, _db, store) = fixture();
+        let original = credential();
+        store.save(&original).await.unwrap();
+        let mut refreshed = original.clone();
+        refreshed.url = "http://127.0.0.1:3775".into();
+        refreshed.token = "synthetic-refreshed".into();
+        refreshed.saved_at_ms = original.saved_at_ms + 1;
+        write_t3_credential_at(&directory, &refreshed).unwrap();
+        assert_eq!(store.load().await.unwrap(), Some(refreshed.clone()));
+        assert!(!directory.join(T3_CREDENTIAL_FILE).exists());
+        assert_eq!(store.read().await.unwrap(), Some(refreshed.clone()));
+        // An older file is a leftover, not an instruction.
+        write_t3_credential_at(&directory, &original).unwrap();
+        assert!(store.load().await.is_err());
+        assert_eq!(store.read().await.unwrap(), Some(refreshed));
+        assert!(directory.join(T3_CREDENTIAL_FILE).exists());
     }
 
     #[tokio::test]
