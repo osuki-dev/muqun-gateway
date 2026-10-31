@@ -12,6 +12,7 @@ pub mod message_images;
 pub mod ports;
 pub mod routes;
 pub mod runtime;
+pub(crate) mod session_defaults;
 pub mod session_routes;
 pub mod tasks;
 pub(crate) mod terminal_runtime;

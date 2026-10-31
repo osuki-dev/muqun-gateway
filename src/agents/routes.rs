@@ -871,6 +871,16 @@ async fn do_create_agent_session(
         .agent_runtime
         .record_session_route(&session.asid.0, manager.agent().kind())
         .await;
+    // Only what the App named; a session created without a choice changes
+    // nothing remembered.
+    super::session_defaults::record(
+        &state.db,
+        manager.agent().kind(),
+        validated_dir.as_deref(),
+        body.model.as_ref(),
+        body.mode.as_deref(),
+    )
+    .await;
 
     Ok(Json(content_envelope(json!(session))))
 }
@@ -1175,6 +1185,7 @@ async fn do_switch_mode(
         .switch_mode(asid, mode)
         .await
         .map_err(|e| api_error(StatusCode::BAD_GATEWAY, "agent_error", &e.to_string()))?;
+    remember_switch(state, &manager, asid, None, Some(mode)).await;
 
     Ok(Json(content_envelope(json!({ "ok": true }))))
 }
@@ -1372,6 +1383,31 @@ async fn do_interrupt_agent_session(
     Ok(Json(content_envelope(json!({ "interrupted": true }))))
 }
 
+/// Remember a model or mode switched in a session for its folder, so the
+/// next new session there starts with it.
+async fn remember_switch(
+    state: &AppState,
+    manager: &crate::agents::manager::AgentManager,
+    asid: &str,
+    model: Option<&ModelRef>,
+    mode: Option<&str>,
+) {
+    let directory = manager
+        .sessions()
+        .get_session(asid)
+        .await
+        .ok()
+        .and_then(|info| info.directory);
+    super::session_defaults::record(
+        &state.db,
+        manager.agent().kind(),
+        directory.as_deref(),
+        model,
+        mode,
+    )
+    .await;
+}
+
 async fn do_switch_agent_model(
     state: &AppState,
     asid: &str,
@@ -1390,6 +1426,7 @@ async fn do_switch_agent_model(
             super::ports::agent::AgentError::TerminalInteraction(_) => agent_error(e),
             _ => api_error(StatusCode::BAD_GATEWAY, "agent_error", &e.to_string()),
         })?;
+    remember_switch(state, &manager, asid, Some(&model), None).await;
 
     Ok(Json(content_envelope(json!({ "switched": true }))))
 }
@@ -1903,12 +1940,19 @@ pub async fn get_global_agent_catalog(
             .get_catalog_for_session(query.asid.as_deref(), query.directory.as_deref())
     }))
     .await;
-    for result in catalogs {
-        let cat = match result {
+    for (manager, result) in all_managers.iter().zip(catalogs) {
+        let mut cat = match result {
             Ok(cat) => cat,
             Err(error) if query.asid.is_some() => return Err(agent_error(error)),
             Err(_) => continue,
         };
+        super::session_defaults::with_cached_models(
+            &state.db,
+            manager.agent().kind(),
+            manager.version(),
+            &mut cat,
+        )
+        .await;
         if primary_defaults.is_none() {
             primary_defaults = Some(cat.defaults);
         }
@@ -1957,7 +2001,7 @@ pub async fn get_global_agent_catalog(
         merged_mcp.extend(cat.mcp);
     }
 
-    let catalog = crate::agents::domain::AgentCatalog {
+    let mut catalog = crate::agents::domain::AgentCatalog {
         models: merged_models,
         modes: merged_modes,
         mcp: merged_mcp,
@@ -1966,6 +2010,17 @@ pub async fn get_global_agent_catalog(
         commands: merged_commands,
         defaults: primary_defaults.unwrap_or_default(),
     };
+    // A new session's defaults for one agent: what was last chosen in this
+    // folder, else on this computer, else the agent's own.
+    if let (Some(agent_id), None) = (query.agent_id.as_deref(), query.asid.as_deref()) {
+        super::session_defaults::fill_defaults(
+            &state.db,
+            agent_id,
+            query.directory.as_deref(),
+            &mut catalog,
+        )
+        .await;
+    }
 
     if catalog_is_incomplete(&catalog) {
         tracing::warn!(

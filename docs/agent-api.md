@@ -1782,9 +1782,35 @@ Errors shared by the three routes:
   "providers":[ { "id", "name", "available", "activation?": "auto"|"enabled"|"disabled",
                   "models": [ { "id", "name", "enabled", "variants": [...], "limit?", "status?" } ] } ],
   "commands": [ { "name", "description?", "mode?", "template?" } ],
-  "defaults": { "model?": {"provider_id", "model_id", "variant?"}, "mode?": "build" }
+  "defaults": { "model?": {"provider_id", "model_id", "variant?"}, "mode?": "build", "effort?": "high" }
 }
 ```
+
+`defaults` is what a new session gets when the App does not choose. With
+capability `agent_session_defaults`, a request naming one `agent_id` and no
+`asid` fills it from the gateway's own memory, per field: the model (with its
+`variant`) and the mode last chosen for that agent in that `directory` (its
+real path), else the last chosen on this computer, else the agent's own
+default. A remembered model, effort or mode the catalog no longer offers is
+skipped. `effort` repeats `model.variant`, where the App keeps the reasoning
+effort; it is absent when the model has no variant. The gateway records a
+choice itself, there is no write route: the `model` and `mode` named in
+`POST /api/agent-sessions` (not when they are omitted), and a later
+`POST /api/agent-sessions/{asid}/model` or `/mode`, for that session's folder
+and for this computer. It keeps ids only (provider, model, variant, mode), the
+64 most recent folders per agent, in the shared store, so every device sees the
+same defaults. Sessions started on the computer itself are not recorded.
+Without the capability (an older gateway) `defaults` is only the agent's own
+and the App keeps its local memory.
+
+ACP agents (Claude Code, Qoder CLI, FX, and the others on the shared ACP
+adapter) only show models and efforts inside an open session. With the same
+capability, the gateway keeps the model list (with variants) the agent's last
+session showed, per agent and agent version, and serves it in this catalog and
+in discovery `agents[].models` (with `features.modelSelection` /
+`reasoningEffort` following it) while no session is open, so a model and effort
+can be chosen when the session is created. A different agent version drops the
+cached list; an agent that never had a session open still lists none.
 
 Capability `agent_session_catalog_v1` identifies the `asid` contract. When supplied,
 only that session's owning provider is queried; a conflicting `agent_id` is

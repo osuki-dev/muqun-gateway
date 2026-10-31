@@ -124,13 +124,38 @@ pub struct CommandInfo {
     pub template: Option<String>,
 }
 
-/// What OpenCode would choose for a session the app does not pick for.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+/// What a new session gets when the app does not pick: the choice last made
+/// in that folder (or on this computer) when the gateway remembers one, else
+/// the agent's own default.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
 pub struct CatalogDefaults {
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<super::session::ModelRef>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
+}
+
+/// On the wire `effort` repeats `model.variant` (where the App keeps the
+/// reasoning effort), so a client can read it without knowing that.
+impl Serialize for CatalogDefaults {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct Wire<'a> {
+            #[serde(skip_serializing_if = "Option::is_none")]
+            model: Option<&'a super::session::ModelRef>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            mode: Option<&'a str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            effort: Option<&'a str>,
+        }
+        Wire {
+            model: self.model.as_ref(),
+            mode: self.mode.as_deref(),
+            effort: self
+                .model
+                .as_ref()
+                .and_then(|model| model.variant.as_deref()),
+        }
+        .serialize(serializer)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
