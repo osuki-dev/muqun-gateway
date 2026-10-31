@@ -403,6 +403,7 @@ async fn in_pane_shell(state: &AppState, script: &str) -> Option<String> {
     #[cfg(unix)]
     shell.process_group(0);
     let child = shell.spawn().ok()?;
+    #[cfg_attr(not(unix), allow(unused_variables))]
     let group = child.id();
     match tokio::time::timeout(Duration::from_secs(10), child.wait_with_output()).await {
         Ok(out) => Some(String::from_utf8_lossy(&out.ok()?.stdout).into_owned()),

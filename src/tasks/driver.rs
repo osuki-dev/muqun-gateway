@@ -409,7 +409,7 @@ fn change(to: TaskState) -> TaskChange {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::tasks::domain::{now_ms, PrincipalKind, TaskId, TaskKind, TaskPrincipal};

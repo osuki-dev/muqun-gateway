@@ -178,6 +178,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "not yet ported to Windows; see docs/windows.md")]
     fn codex_upload_parts_use_content_type_and_keep_only_documents_in_text() {
         let mut files = Files::new();
         let root = crate::ensure_uploads_dir().unwrap();

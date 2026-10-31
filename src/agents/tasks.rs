@@ -856,6 +856,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "not yet ported to Windows; see docs/windows.md")]
     fn worktree_fallback_scrubs_inherited_repository_and_config_in_a_subprocess() {
         const ROOT_ENV: &str = "MUQUN_TEST_WORKTREE_ENV_ROOT";
         if let Some(root) = std::env::var_os(ROOT_ENV) {
@@ -914,6 +915,7 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn worktree_repository_identity_survives_a_symlinked_tmpdir() {
         let root = temp_dir("symlinked-tmpdir").canonicalize().unwrap();
@@ -1138,6 +1140,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "not yet ported to Windows; see docs/windows.md")]
     fn claude_trusts_the_task_folder_through_its_user_config() {
         let home = {
             let home = temp_dir("claude-trust");
@@ -1231,6 +1234,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "not yet ported to Windows; see docs/windows.md")]
     fn codex_trusts_the_task_directory_through_a_toml_value_not_a_dotted_key() {
         // Not a checkout: only the directory itself.
         let dir = temp_dir("trust-plain").join("my.project \"x\"");
@@ -1252,6 +1256,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "not yet ported to Windows; see docs/windows.md")]
     fn codex_also_trusts_the_checkout_and_a_linked_worktree_s_main_checkout_inside_home() {
         let base = temp_dir("trust-git");
         std::fs::create_dir_all(&base).unwrap();
@@ -1327,6 +1332,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "not yet ported to Windows; see docs/windows.md")]
     fn a_path_probe_only_ever_looks_on_path() {
         // A name with a separator is not a PATH lookup, and must not be
         // resolved against the gateway's own working directory.

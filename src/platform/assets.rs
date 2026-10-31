@@ -1680,6 +1680,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "not yet ported to Windows; see docs/windows.md")]
     fn every_pane_in_one_checkout_resolves_to_its_directory() {
         // Two panes in the same directory. The asset roots keep one entry for
         // it, under the first pane's id; the second pane must still be found.
@@ -2563,6 +2564,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "not yet ported to Windows; see docs/windows.md")]
     fn workspace_roots_come_from_pane_cwds_and_never_widen_to_the_whole_machine() {
         let home = dirs::home_dir().unwrap();
         let response = json!({
@@ -2665,6 +2667,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "not yet ported to Windows; see docs/windows.md")]
     fn worktree_events_name_a_root_to_scan_and_never_a_file() {
         // The payload Herdr actually sends on protocol 17: the worktree's
         // checkout path and its workspace, with no file information at all.

@@ -226,7 +226,7 @@ fn validate_launch_agent_program(contents: &str, exe: &Path) -> Result<()> {
 
 /// What launchd has loaded must be this binary too. `launchctl print` names
 /// the job's executable on its own top-level `program = ` line.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", all(test, unix)))]
 fn validate_loaded_program(print: &str, exe: &Path) -> Result<()> {
     let program = print
         .lines()
@@ -1101,6 +1101,7 @@ mod tests {
 
     #[cfg(not(target_os = "macos"))]
     #[test]
+    #[cfg_attr(windows, ignore = "not yet ported to Windows; see docs/windows.md")]
     fn effective_systemd_identity_uses_exact_arguments_and_environment() {
         let fixture = paths();
         let exe = fixture.exe.to_str().unwrap();

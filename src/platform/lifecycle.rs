@@ -1,5 +1,8 @@
 //! One lifecycle for CLI and manager; supervisors own supervised processes.
 //! Commands serialize independently of the gateway's lifetime state lock.
+// Stop/replace/restart and self-update are Unix-only until Windows gets its
+// own supervisor (docs/windows.md, phase 2); off Unix their helpers are unused.
+#![cfg_attr(not(unix), allow(dead_code, unused_variables))]
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;

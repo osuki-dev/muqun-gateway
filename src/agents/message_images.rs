@@ -974,6 +974,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(windows, ignore = "not yet ported to Windows; see docs/windows.md")]
     async fn file_source_selection_is_authenticated_and_preserves_local_file_policy() {
         use axum::{
             extract::{Path as RoutePath, Query, State},
@@ -1018,6 +1019,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(windows, ignore = "not yet ported to Windows; see docs/windows.md")]
     async fn queued_prompt_files_get_the_transcript_attachment_fields() {
         let state = crate::test_state("admin", vec![crate::test_device("phone", "token")]);
         let uploads = crate::ensure_uploads_dir().unwrap().canonicalize().unwrap();
@@ -1263,6 +1265,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "not yet ported to Windows; see docs/windows.md")]
     fn explicit_file_opens_account_artifacts_without_widening_passive_discovery() {
         let (scratch, session) = workspace();
         let home = scratch.path().join("home");
@@ -1389,6 +1392,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(windows, ignore = "not yet ported to Windows; see docs/windows.md")]
     async fn bare_file_image_passes_the_attachment_gate_without_changing_text() {
         let (_scratch, root) = workspace();
         let state = crate::test_state("admin", vec![]);
@@ -1469,6 +1473,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(windows, ignore = "not yet ported to Windows; see docs/windows.md")]
     async fn prose_uri_boundaries_preserve_parentheses_and_percent_escapes() {
         let (scratch, root) = workspace();
         std::fs::write(root.join("out/plot(1).png"), png(12, 34)).unwrap();
@@ -1508,6 +1513,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "not yet ported to Windows; see docs/windows.md")]
     fn relative_absolute_and_file_urls_resolve_inside_the_root() {
         let (_dir, root) = workspace();
         let flow = root.join("out/flow.png");
@@ -1532,6 +1538,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "not yet ported to Windows; see docs/windows.md")]
     fn spaces_and_cjk_resolve_raw_or_percent_encoded() {
         let (_dir, root) = workspace();
         let cjk = root.join("图 表/深色 流程.png");
@@ -1577,6 +1584,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "not yet ported to Windows; see docs/windows.md")]
     fn a_text_part_gets_a_map_of_what_it_can_serve() {
         let (_dir, root) = workspace();
         let flow = root.join("out/flow.png");
@@ -1615,6 +1623,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(windows, ignore = "not yet ported to Windows; see docs/windows.md")]
     async fn prose_file_outputs_are_fenced_authenticated_and_rechecked_on_download() {
         use crate::platform::assets::asset_download;
         use crate::{bearer_headers, test_device, test_state};

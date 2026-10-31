@@ -1073,6 +1073,7 @@ mod tests {
     /// so position 0 is the session the app opens. Adding a backend must
     /// therefore leave the existing order alone: it appends.
     #[test]
+    #[cfg_attr(windows, ignore = "not yet ported to Windows; see docs/windows.md")]
     fn adding_a_backend_appends_and_never_reorders_the_existing_ones() {
         let mut config = test_config("token");
         config.sessions.clear();
@@ -1086,6 +1087,7 @@ mod tests {
     /// and the next `backend add` used to sort tmux back in front of it --
     /// silently changing which backend the reader's phone opens.
     #[test]
+    #[cfg_attr(windows, ignore = "not yet ported to Windows; see docs/windows.md")]
     fn a_chosen_default_survives_adding_another_backend() {
         let mut config = test_config("token");
         config.sessions.clear();
@@ -1264,6 +1266,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "not yet ported to Windows; see docs/windows.md")]
     fn plugin_import_keeps_the_paired_identity_and_merges_tmux() {
         let root = std::env::temp_dir().join(format!("gateway-import-{}", uuid::Uuid::new_v4()));
         let source_config_dir = root.join("plugin-config");

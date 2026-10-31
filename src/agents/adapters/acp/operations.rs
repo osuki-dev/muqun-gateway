@@ -305,6 +305,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "not yet ported to Windows; see docs/windows.md")]
     fn uploaded_images_and_text_are_real_native_parts_and_retain_original_paths() {
         let root = scratch();
         let image = root.0.join("renamed.txt");
@@ -335,6 +336,7 @@ mod tests {
         std::fs::create_dir(&uploads).unwrap();
         let outside = root.0.join("private.txt");
         std::fs::write(&outside, "private").unwrap();
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut denied = vec![
             "https://example.test/a.png".into(),
             "data:image/png;base64,AAA=".into(),
@@ -403,6 +405,7 @@ mod tests {
             .is_empty());
     }
     #[test]
+    #[cfg_attr(windows, ignore = "not yet ported to Windows; see docs/windows.md")]
     fn whole_session_fork_never_silently_accepts_a_message_cutoff() {
         assert_eq!(
             fork_params("opaque", "/workspace", None).unwrap(),

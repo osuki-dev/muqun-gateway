@@ -285,6 +285,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "not yet ported to Windows; see docs/windows.md")]
     fn a_relative_config_dir_is_made_absolute() {
         let default = std::path::Path::new("/home/user/.config/muqun-gateway");
         let baked = non_default_dir("demo/cfg".into(), default).unwrap();

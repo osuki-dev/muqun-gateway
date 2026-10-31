@@ -421,6 +421,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(windows, ignore = "not yet ported to Windows; see docs/windows.md")]
     async fn filters_by_partial_case_insensitively_and_hides_dots() {
         let root = scratch("partial");
         for d in [

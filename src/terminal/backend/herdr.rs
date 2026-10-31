@@ -97,18 +97,22 @@ use std::sync::Mutex;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
+#[cfg(unix)]
 use anyhow::Context as _;
 use serde_json::{json, Value};
+#[cfg(unix)]
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 #[cfg(unix)]
 use tokio::net::UnixStream;
 
 use super::keys::{unknown_key, KeyBase, KeyChord, KeyboardVocabulary, NamedKey};
+#[cfg(unix)]
+use super::BackendActivity;
 use super::{
-    Agent, AgentStatus, BackendActivity, BackendActivityStream, BackendError, BackendFuture,
-    BackendKind, BackendMetadata, CreateTab, CreateWorkspace, OutputFormat, OutputSource, Pane,
-    PaneEnvVia, PaneId, PaneOutput, ReadPane, SendTextMode, SplitDirection, SplitPane, StartAgent,
+    Agent, AgentStatus, BackendActivityStream, BackendError, BackendFuture, BackendKind,
+    BackendMetadata, CreateTab, CreateWorkspace, OutputFormat, OutputSource, Pane, PaneEnvVia,
+    PaneId, PaneOutput, ReadPane, SendTextMode, SplitDirection, SplitPane, StartAgent,
     StartedAgent, Tab, TabId, TerminalBackend, Workspace, WorkspaceId, Worktree, WorktreePlacement,
     WorktreeRequest,
 };
@@ -192,6 +196,8 @@ fn startup_ready(
 }
 
 pub struct HerdrBackend {
+    // Only the Unix socket transport reads this; elsewhere every call is refused.
+    #[cfg_attr(not(unix), allow(dead_code))]
     socket_path: PathBuf,
     /// Overridable so a test can prove the timeout fires without waiting out
     /// the real one.
@@ -281,6 +287,15 @@ impl HerdrBackend {
     #[cfg(unix)]
     async fn exchange(&self, method: &str, params: Value) -> anyhow::Result<Value> {
         Ok(self.exchange_with_peer(method, params).await?.0)
+    }
+
+    #[cfg(not(unix))]
+    async fn exchange_with_peer(
+        &self,
+        _method: &str,
+        _params: Value,
+    ) -> anyhow::Result<(Value, Option<u32>)> {
+        anyhow::bail!("Herdr socket transport is unavailable on this platform")
     }
 
     #[cfg(unix)]
@@ -1536,6 +1551,7 @@ fn worktree_error(error: BackendError) -> BackendError {
     }
 }
 
+#[cfg_attr(not(unix), allow(dead_code))]
 fn activity_subscriptions(panes: &[Pane]) -> Vec<Value> {
     let mut subscriptions = vec![
         json!({ "type": "workspace.created" }),
@@ -1628,7 +1644,9 @@ fn required_string<'a>(
         .ok_or(BackendError::InvalidResponse(context))
 }
 
-#[cfg(test)]
+// Most tests drive the Unix socket transport, directly or through a fake Herdr
+// listening on one.
+#[cfg(all(test, unix))]
 mod tests {
     #[test]
     fn native_question_attention_is_optional_and_independent_of_work_status() {

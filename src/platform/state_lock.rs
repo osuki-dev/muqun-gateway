@@ -104,6 +104,19 @@ impl StateLock {
         Ok(Self { file })
     }
 
+    /// Transactions must fail closed on filesystems without working locks.
+    #[cfg(not(unix))]
+    pub(crate) fn acquire_strict(state_dir: &Path) -> anyhow::Result<Self> {
+        std::fs::create_dir_all(state_dir)?;
+        let file = open_lock_file(&state_dir.join(LOCK_FILE))?;
+        anyhow::ensure!(
+            file.try_lock().is_ok(),
+            "another lifecycle command is in progress, or this filesystem cannot lock safely"
+        );
+        record_holder(&file);
+        Ok(Self { file })
+    }
+
     /// Take exclusive ownership of `state_dir`, or fail naming the holder.
     pub fn acquire(state_dir: &Path) -> anyhow::Result<Self> {
         Self::acquire_with(state_dir, 1)
@@ -205,6 +218,7 @@ fn contended_message(state_dir: &Path, lock_path: &Path) -> String {
     };
     let how_to_find = match holder_pid(lock_path) {
         Some(pid) => format!("`ps -p {pid} -o pid,lstart,args`"),
+        None if cfg!(windows) => String::from("`tasklist /FI \"IMAGENAME eq muqun-gateway.exe\"`"),
         None => format!("`fuser {}`", lock_path.display()),
     };
     format!(
@@ -288,14 +302,42 @@ fn lock_exclusive(
     Ok(StateLock { file })
 }
 
+/// Windows has no `flock`; std's `try_lock` is `LockFileEx` over the whole
+/// file, which gives the same one-gateway-per-directory guarantee. That lock
+/// is mandatory rather than advisory, so another process cannot read the pid
+/// stamped into the file while it is held, and a refused start says so instead
+/// of naming the holder.
 #[cfg(not(unix))]
 fn lock_exclusive(
     file: std::fs::File,
-    _path: PathBuf,
-    _state_dir: &Path,
-    _attempts: u32,
+    path: PathBuf,
+    state_dir: &Path,
+    attempts: u32,
 ) -> anyhow::Result<StateLock> {
-    Ok(StateLock { file })
+    let mut attempt = 1;
+    loop {
+        match file.try_lock() {
+            Ok(()) => {
+                record_holder(&file);
+                return Ok(StateLock { file });
+            }
+            Err(std::fs::TryLockError::WouldBlock) if attempt < attempts => {
+                attempt += 1;
+                std::thread::sleep(ACQUIRE_RETRY);
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                anyhow::bail!(contended_message(state_dir, &path))
+            }
+            Err(std::fs::TryLockError::Error(error)) => {
+                tracing::warn!(
+                    "could not lock {} ({error}); this gateway cannot detect a second one \
+                     sharing its state directory",
+                    path.display()
+                );
+                return Ok(StateLock { file });
+            }
+        }
+    }
 }
 
 /// Stamp the holder's pid into the lock file so a refused start can name it.
@@ -469,6 +511,7 @@ mod tests {
     /// A refusal that does not say who is holding the directory leaves the
     /// owner with an unstartable gateway and nothing to act on.
     #[test]
+    #[cfg_attr(windows, ignore = "not yet ported to Windows; see docs/windows.md")]
     fn a_refused_start_names_the_process_holding_the_directory() {
         let dir = scratch_dir("names-holder");
         let _held = acquire_within(&dir, RELEASE_VISIBLE_WITHIN).unwrap();

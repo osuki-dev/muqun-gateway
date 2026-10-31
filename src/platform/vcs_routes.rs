@@ -164,7 +164,7 @@ pub(crate) async fn discard(
     ))
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use crate::*;
     use axum::http::StatusCode;

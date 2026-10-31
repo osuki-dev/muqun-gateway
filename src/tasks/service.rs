@@ -2393,12 +2393,12 @@ impl TaskService {
         self.store().insert(task).await.unwrap().id
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) async fn events_for_test(&self, id: &TaskId) -> Vec<TaskEvent> {
         self.store.events(id).await.unwrap()
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) async fn get_for_test(&self, id: &TaskId) -> Task {
         self.store.get(id).await.unwrap().unwrap()
     }
@@ -3666,7 +3666,7 @@ fn resolve_model(
         })
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::agents::domain::{AgentPart, AgentSessionId, TimelineRole};
@@ -5528,6 +5528,7 @@ mod tests {
         assert_eq!(title().await, "Fix the CI build");
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_folder_is_named_from_home() {
         // A home of its own, reached through a symlink as some are.

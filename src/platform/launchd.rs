@@ -15,6 +15,8 @@
 //!
 //! Compiled on Linux under `cfg(test)` so the transitions run against a fake
 //! `launchctl` in CI, not only on a Mac.
+// Off Unix only the tests that are themselves Unix-only reach this module.
+#![cfg_attr(all(test, not(unix)), allow(dead_code))]
 
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
@@ -294,6 +296,14 @@ pub(crate) fn parse_launchd_pid(print: &str) -> Option<u32> {
         .and_then(|pid| pid.trim().parse().ok())
 }
 
+/// Lifecycle commands (`stop`, `restart`, `service`) are not supported on
+/// Windows yet; nothing there signals a pid it has to prove alive first.
+#[cfg(not(unix))]
+pub(crate) fn process_alive(_pid: u32) -> bool {
+    false
+}
+
+#[cfg(unix)]
 pub(crate) fn process_alive(pid: u32) -> bool {
     let Ok(pid) = libc::pid_t::try_from(pid) else {
         return false;

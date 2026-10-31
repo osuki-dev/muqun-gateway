@@ -2013,7 +2013,7 @@ pub(crate) async fn enrich_blocked_notification(
 
 /// The two halves in one call, for tests that are about what a push says rather
 /// than about what the ring holds.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn notification_for_agent_status_event(
     event: &Value,
     statuses: &mut HashMap<String, String>,
@@ -3564,7 +3564,7 @@ pub(crate) struct ZoomPaneBody {
     pub(crate) mode: Option<String>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     fn native_question_event(instance: &str, pending: Value, status: &str) -> Value {
         json!({ "data": {

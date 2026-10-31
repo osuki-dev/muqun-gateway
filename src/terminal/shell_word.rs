@@ -57,6 +57,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "not yet ported to Windows; see docs/windows.md")]
     fn a_word_reads_back_unchanged_in_every_pane_shell() {
         let shells = ["bash", "zsh", "fish"];
         for value in [

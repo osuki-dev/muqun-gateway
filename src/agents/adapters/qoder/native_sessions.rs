@@ -424,6 +424,7 @@ mod tests {
         }
     }
     #[test]
+    #[cfg_attr(windows, ignore = "not yet ported to Windows; see docs/windows.md")]
     fn global_empty_cwd_recovers_exact_transcript_metadata_without_decoding_bucket() {
         let root = scratch();
         write(
@@ -449,6 +450,7 @@ mod tests {
         assert!(result[0].get("_muqunEmptySession").is_none());
     }
     #[test]
+    #[cfg_attr(windows, ignore = "not yet ported to Windows; see docs/windows.md")]
     fn genuinely_empty_metadata_never_guesses_a_workspace() {
         let root = scratch();
         write(

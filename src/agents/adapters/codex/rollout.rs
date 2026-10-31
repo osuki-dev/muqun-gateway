@@ -265,7 +265,8 @@ impl Rollouts {
     }
 }
 
-#[cfg(test)]
+// The probe attaches the Unix-socket Codex daemon.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     #[tokio::test]

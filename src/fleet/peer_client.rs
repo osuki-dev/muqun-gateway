@@ -1045,7 +1045,7 @@ fn refused(status: u16, body: &Value) -> PeerError {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::tasks::domain::{

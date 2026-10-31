@@ -1211,7 +1211,8 @@ for raw in sys.stdin.buffer:
         let python = std::process::Command::new("python3")
             .arg("--version")
             .output();
-        if !python.is_ok_and(|out| out.status.success()) {
+        // The stand-in is a `#!` script, which Windows cannot execute.
+        if cfg!(not(unix)) || !python.is_ok_and(|out| out.status.success()) {
             eprintln!("python3 missing; skipping");
             return None;
         }
@@ -1220,8 +1221,11 @@ for raw in sys.stdin.buffer:
         let dir = std::fs::canonicalize(&dir).unwrap();
         let binary = dir.join("pi");
         std::fs::write(&binary, FAKE_PI).unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
         let cmd = PiCommandLine {
             binary,
             extension: PathBuf::from("/workspace/demo/muqun-extension.js"),

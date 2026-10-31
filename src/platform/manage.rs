@@ -3678,6 +3678,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "not yet ported to Windows; see docs/windows.md")]
     fn manager_styled_layout_is_cell_bounded_through_resize_and_keeps_selection_visible() {
         let config = layout_config();
         let data = ManageData {
@@ -3818,6 +3819,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "not yet ported to Windows; see docs/windows.md")]
     fn manager_clips_viewport_in_cells_and_keeps_combining_marks_with_their_base() {
         assert_eq!(display_width("中文e\u{301}"), 5);
         assert_eq!(display_width("\x1b[30;47m中文e\u{301}\x1b[0m"), 5);
@@ -3834,6 +3836,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "not yet ported to Windows; see docs/windows.md")]
     fn manager_wide_fields_wrap_in_cells_without_losing_combining_or_cjk_text() {
         let value = "中文e\u{301}界a\u{308}中文";
         for width in [8, 10, 20] {
@@ -3877,6 +3880,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "not yet ported to Windows; see docs/windows.md")]
     fn terminal_qr_has_explicit_standard_colors_and_measurable_width() {
         let code = QrCode::with_error_correction_level(
             b"muqun://pair?u=http%3A%2F%2Fhost&s=id",

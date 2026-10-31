@@ -86,6 +86,12 @@ pub fn read_proc_info(_pid: u32) -> Option<ProcInfo> {
     None
 }
 
+#[cfg(not(unix))]
+pub fn send_signal(_pid: u32, _signal: Signal) -> bool {
+    false
+}
+
+#[cfg(unix)]
 pub fn send_signal(pid: u32, signal: Signal) -> bool {
     let sig = match signal {
         Signal::Term => libc::SIGTERM,

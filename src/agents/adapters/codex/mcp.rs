@@ -263,6 +263,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "not yet ported to Windows; see docs/windows.md")]
     fn registration_is_scoped_version_checked_and_contains_no_bearer() {
         let write = registration(&read(), &entry()).unwrap().unwrap();
         assert_eq!(write["keyPath"], "mcp_servers.muqun");
@@ -323,6 +324,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(windows, ignore = "not yet ported to Windows; see docs/windows.md")]
     async fn new_registration_reloads_without_restarting_or_sending_a_prompt() {
         let mut fixture = Fixture::new(|request| match request["method"].as_str().unwrap() {
             "config/read" => read(),

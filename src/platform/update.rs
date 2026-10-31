@@ -1,6 +1,11 @@
 //! Explicit self-update, stable by default. HTTPS + SHA256 provide transport/integrity,
 //! not publisher signing. No alternate production origin or network retries.
-use std::fs::{self, File, OpenOptions};
+// Stop/replace/restart and self-update are Unix-only until Windows gets its
+// own supervisor (docs/windows.md, phase 2); off Unix their helpers are unused.
+#![cfg_attr(not(unix), allow(dead_code, unused_variables))]
+#[cfg(unix)]
+use std::fs::OpenOptions;
+use std::fs::{self, File};
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -9,7 +14,9 @@ use anyhow::{Context as _, Result};
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 
-use super::lifecycle::{Action, Controller};
+use super::lifecycle::Action;
+#[cfg(unix)]
+use super::lifecycle::Controller;
 
 const REPO: &str = "osuki-dev/muqun-gateway";
 const TARGETS: [&str; 4] = [
@@ -589,6 +596,23 @@ async fn executable_version(path: &Path) -> Result<String> {
 #[cfg(unix)]
 pub(crate) async fn apply(plan: Plan) -> Result<String> {
     apply_install(plan, false).await
+}
+
+/// Windows cannot overwrite a running executable in place, and there is no
+/// supervisor to restart it yet; see docs/windows.md (phase 2).
+#[cfg(not(unix))]
+pub(crate) async fn apply(_plan: Plan) -> Result<String> {
+    anyhow::bail!("self-update is not supported on Windows yet; download the new release by hand")
+}
+
+#[cfg(not(unix))]
+async fn apply_install(_plan: Plan, _bootstrap: bool) -> Result<String> {
+    anyhow::bail!("self-update is not supported on Windows yet; download the new release by hand")
+}
+
+#[cfg(not(unix))]
+fn validate_destination(_exe: &Path, _home: &Path, _install_dir: &Path) -> Result<fs::Metadata> {
+    anyhow::bail!("the standalone installation layout is not supported on Windows yet")
 }
 
 /// No caller-supplied executable or source: bootstrap targets only the existing

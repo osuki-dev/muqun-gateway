@@ -6050,6 +6050,7 @@ mod tests {
     /// and the live stream alike -- and the asset URL in the map serves it,
     /// for exactly as long as the file is inside the session's directory.
     #[tokio::test]
+    #[cfg_attr(windows, ignore = "not yet ported to Windows; see docs/windows.md")]
     async fn text_parts_carry_servable_image_assets_and_keep_their_text() {
         let root = std::env::temp_dir().join(format!("muqun-msg-img-{}", std::process::id()));
         let work = root.join("work");

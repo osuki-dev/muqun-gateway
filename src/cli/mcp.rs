@@ -380,6 +380,7 @@ mod tests {
     /// `mcp enable claude --project`: the helper carries `--config-dir`
     /// exactly when the resolved config dir is not the default one.
     #[test]
+    #[cfg_attr(windows, ignore = "not yet ported to Windows; see docs/windows.md")]
     fn enable_bakes_a_non_default_config_dir_into_the_project_file() {
         let default = Path::new("/home/user/.config/muqun-gateway");
         let project = crate::test_state_dir().join(format!("proj-{}", uuid::Uuid::new_v4()));
