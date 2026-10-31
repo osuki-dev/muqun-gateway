@@ -424,6 +424,27 @@ impl AgentPlaneDiscovery {
     }
 }
 
+/// `"hidden"` when the owner hid agent `kind` from the App's new-session
+/// list (`agent_visibility` in config.json), otherwise `"auto"`.
+pub(crate) fn agent_visibility(visibility: &BTreeMap<String, String>, kind: &str) -> &'static str {
+    if visibility.get(kind).is_some_and(|value| value == "hidden") {
+        "hidden"
+    } else {
+        "auto"
+    }
+}
+
+/// Which list of the App's new-session picker an agent goes in: `"more"`
+/// when it is hidden, turned off or not installed, otherwise `"default"`
+/// (ready, needs setup, not running, needs update).
+pub(crate) fn agent_picker(visibility: &str, enabled: bool, status: &str) -> &'static str {
+    if visibility == "hidden" || !enabled || matches!(status, "disabled" | "not_installed") {
+        "more"
+    } else {
+        "default"
+    }
+}
+
 /// Build complete capability discovery response. An unauthenticated caller
 /// gets each agent's id, kind, status and features, without endpoints or versions.
 pub async fn build_discovery(state: &AppState, _sealed: bool, authenticated: bool) -> Value {
@@ -448,7 +469,13 @@ pub async fn build_discovery(state: &AppState, _sealed: bool, authenticated: boo
     .map(String::from)
     .collect();
 
-    // What `POST /api/tasks` can do for each agent, beside its features.
+    // What `POST /api/tasks` can do for each agent, beside its features,
+    // and where the App's new-session picker lists it. Visibility is read
+    // from config.json now, so `manage`, the CLI and the App's own change
+    // apply on the next discovery without a restart.
+    let visibility = crate::load_config(None)
+        .map(|config| config.agent_visibility)
+        .unwrap_or_else(|_| state.config.agent_visibility.clone());
     let mut planes = serde_json::to_value(&planes).unwrap_or(Value::Null);
     if let Some(agents) = planes
         .pointer_mut("/agents/agents")
@@ -458,6 +485,13 @@ pub async fn build_discovery(state: &AppState, _sealed: bool, authenticated: boo
             let id = agent["id"].as_str().unwrap_or_default().to_owned();
             agent["ledgerDelivery"] =
                 json!(crate::tasks::routes::ledger_delivery_names(state, &id).await);
+            let shown = agent_visibility(&visibility, agent["kind"].as_str().unwrap_or(&id));
+            agent["visibility"] = json!(shown);
+            agent["picker"] = json!(agent_picker(
+                shown,
+                agent["enabled"].as_bool().unwrap_or(true),
+                agent["status"].as_str().unwrap_or_default(),
+            ));
         }
     }
     json!({

@@ -133,6 +133,7 @@ pub(crate) fn setup(
             sessions: Vec::new(),
             autostart_backends: Vec::new(),
             agent_commands: BTreeMap::new(),
+            agent_visibility: BTreeMap::new(),
             agent_launch_args: BTreeMap::new(),
             agent_env: Default::default(),
             agent_trust_folders: true,

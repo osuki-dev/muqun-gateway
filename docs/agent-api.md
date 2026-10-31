@@ -268,6 +268,34 @@ catalogs. Terminal liveness, compatibility and transport facts remain live.
   perform for that `agent_id`: `"session"` (a session adapter of that kind
   is attached) and/or `"pane"` (a terminal launcher is known). See
   `docs/mcp.md`, capability `task_ledger_delivery`.
+- `visibility` and `picker` (per agent, capability `agent_visibility`) say
+  where the App's new-session picker lists the agent. `visibility` is
+  `"hidden"` when the owner hid it (config.json `agent_visibility`, keyed by
+  agent kind) and `"auto"` otherwise; treat any other value as `"auto"`.
+  `picker` is computed by the gateway, so the App keeps no per-agent rules:
+  `"more"` when the agent is hidden, `enabled: false`/`disabled`, or
+  `not_installed`; `"default"` for everything else (ready, needs setup, not
+  running, needs update). A hidden agent is still probed, attached and listed
+  here with its real `status` and `features`, and its existing sessions stay
+  readable and usable; only the new-session list changes. Visibility applies
+  only to session agents in this array; terminal-pane agents
+  (`GET /api/agents/catalog`) are unaffected.
+
+  `PUT /api/agents/{kind}/visibility` with `{"visibility": "auto"|"hidden"}`
+  changes it for every device. The owner's App or the admin token only (a
+  linked gateway gets 403); any other value is 400 `invalid_visibility`, a
+  kind outside 1-64 of `[A-Za-z0-9_-]` is 400 `invalid_agent`. It answers
+  `{"kind", "visibility"}`. `"hidden"` writes the kind into config.json's
+  `agent_visibility`; `"auto"` removes it. Discovery reads the file on every
+  request, so the change (and one made with `muqun-gateway agent hide|show`
+  or `manage`) applies on the next discovery without a restart.
+
+  Compatibility: an older App ignores both fields and lists every agent as
+  before (hiding is therefore never done by setting `enabled: false` or by
+  dropping the agent from this array, which would break its existing
+  sessions there). A newer App talking to an older gateway sees neither
+  field nor the capability: it should derive `picker` from the same rules
+  with every agent `auto`, and not offer hide/show.
 - `features` (per agent) says what the agent can do, so the App can hide
   controls rather than call and get `501 feature_unsupported`. The keys are
   camelCase (there is no snake_case spelling of them in this payload; the

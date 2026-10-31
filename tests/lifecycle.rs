@@ -1053,7 +1053,7 @@ fn manager_pty_navigates_scrolls_resizes_and_keeps_start_failures_in_the_ui() {
         output.contains("\x1b[7m"),
         "active tab is not reversed: {output:?}"
     );
-    manager.send(b"2\x1b[F");
+    manager.send(b"3\x1b[F");
     let output = manager.until_all(&["▌ qa-39", "终端 e\u{301} 39"]);
     assert!(
         output.contains("终端 e\u{301} 39"),
@@ -1073,7 +1073,7 @@ fn manager_pty_navigates_scrolls_resizes_and_keeps_start_failures_in_the_ui() {
     manager.until("Remove terminal backend?");
     manager.send(b"\x1b");
     manager.until("backend unchanged");
-    manager.send(b"3");
+    manager.send(b"4");
     manager.until("No devices paired yet.");
     manager.send(b"\r");
     manager.until("1 Scan the QR in Muqun");
@@ -1104,7 +1104,7 @@ fn manager_pty_navigates_scrolls_resizes_and_keeps_start_failures_in_the_ui() {
     manager.until("1 Scan the QR in Muqun");
     manager.send(b"\x1b");
     manager.until("No devices paired yet.");
-    manager.send(b"4\r");
+    manager.send(b"5\r");
     manager.until("Turn Gateway login autostart on?");
     // Default confirmation is cancel: no remembered shortcut and no registration.
     manager.send(b"\r");
@@ -1170,7 +1170,7 @@ fn manager_enter_targets_the_selected_device_and_esc_only_cancels_revocation() {
     let mut manager = ManagerPty::open(&install);
     manager.until("s start · t stop · r restart");
     // Enter shows the device; x there reviews its revocation.
-    manager.send(b"3\x1b[B\r");
+    manager.send(b"4\x1b[B\r");
     let output = manager.until("x revoke · Esc back");
     assert!(output.contains("First phone 中文 e\u{301}"));
     manager.send(b"x");
@@ -1220,7 +1220,7 @@ fn manager_compact_pairing_keeps_the_full_address_reachable_without_resizing() {
     // Wait for the resized Overview frame before starting pairing, so PTY
     // resize delivery cannot overlap the navigation input being asserted.
     manager.until("Tab next view · q quit");
-    manager.send(b"3\r");
+    manager.send(b"4\r");
     let output = manager.until(&address[..30]);
     assert!(output.contains("Resize for the full QR"));
     // Address has a nine-cell prefix, leaving thirty cells per wrapped segment.

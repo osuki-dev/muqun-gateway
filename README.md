@@ -153,12 +153,15 @@ link from recovering the credentials. Use the QR key, a verified protected
 tunnel, or HTTPS where available.
 
 Every view starts with a one-line header: Gateway version, whether it is
-running and where it listens, whether Herdr and the agent service answer,
-and how many devices are paired. While Gateway runs, the links refresh
+running and where it listens, whether Herdr answers, the agents in use counted
+by state (`Agents 6 ready · 1 needs setup`), and how many devices are paired.
+The Agents view lists each agent's state, whether the App lists it (`auto` or
+`hidden`) and its version, folds the not installed ones into one line, and
+shows the selected agent's next step below. While Gateway runs, the links refresh
 every few seconds; a stopped Gateway is not asked.
 
-The manager has four views: 1 Overview, 2 Terminals, 3 Devices, 4 Settings.
-`1`–`4`, Tab/Shift-Tab, or Left/Right switches views; Up/Down or `j`/`k`
+The manager has five views: 1 Overview, 2 Agents, 3 Terminals, 4 Devices,
+5 Settings. `1`–`5`, Tab/Shift-Tab, or Left/Right switches views; Up/Down or `j`/`k`
 selects a row, and **Enter is the only verb on a row**: it toggles a switch,
 opens a chooser for a choice, or edits a text. On Overview Enter does nothing;
 starting and stopping Gateway always take `s` and `t`. Esc always goes one
@@ -174,9 +177,10 @@ that are not a row:
 | view | rows (Enter) | own keys |
 | --- | --- | --- |
 | Overview (`1`) | — | `s` start, `t` stop, `r` restart the gateway |
-| Terminals (`2`) | a backend's actions: make default, start with Gateway on/off, remove | `h` / `m` add Herdr / tmux |
-| Devices (`3`) | the device's kind, pairing and last-seen times (last seen is saved every few minutes, so it can lag); `x` there revokes it | `p` pair a device; `x` revoke the selected one |
-| Settings (`4`) | change the selected setting (Detect address offers the address; Enter applies it) | `PgUp`/`PgDn` page; `r` restart the gateway |
+| Agents (`2`) | show/hide the agent in the App's new-session list (every device, no restart) | `e` turn the agent's adapter off/on (restart to apply); `a` list not installed agents too; `r` restart |
+| Terminals (`3`) | a backend's actions: make default, start with Gateway on/off, remove | `h` / `m` add Herdr / tmux |
+| Devices (`4`) | the device's kind, pairing and last-seen times (last seen is saved every few minutes, so it can lag); `x` there revokes it | `p` pair a device; `x` revoke the selected one |
+| Settings (`5`) | change the selected setting (Detect address offers the address; Enter applies it) | `PgUp`/`PgDn` page; `r` restart the gateway |
 
 Settings lists every setting as one row with its current value, a one-line
 explanation of the feature it switches, and, in grey, where it lives
@@ -345,6 +349,7 @@ that points to another installation.
 
 ```sh
 muqun-gateway agent                  # each agent's state and the next step (--json for the raw list, --all for not installed)
+muqun-gateway agent hide pi          # keep an agent out of the App's new-session list (show: back to auto)
 muqun-gateway agent setup t3         # store a T3 Code credential and enable T3
 muqun-gateway agent setup deepseek   # enable DeepSeek; Gateway starts or joins the harness
 muqun-gateway agent setup fx         # explain local FX ACP configuration (no process starts)
@@ -357,7 +362,8 @@ muqun-gateway agent setup cursor     # explain local Cursor ACP configuration (n
 `agent` asks the running gateway for its agent list and prints one row per
 agent (`AGENT  STATE  VERSION  NEXT`, state one of ready, needs setup, not
 running, not installed, needs update, off), with the agents that are not
-installed folded into one line (`--all` lists them), and exits non-zero while
+installed folded into one line (`--all` lists them) and the ones hidden from the
+App in another, and exits non-zero while
 an enabled agent is not usable. When no gateway is running it probes the agents
 from your shell instead and says so: that probe never attaches or signs in, so
 Codex shows `unknown` until the gateway checks it.

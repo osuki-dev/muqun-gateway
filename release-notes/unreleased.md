@@ -2,6 +2,18 @@
 
 ## Changes and fixes
 
+- **Hide an agent from the App's new-session list.** `agent_visibility` in
+  config.json (`"hidden"`, otherwise automatic) keeps an installed agent out of
+  the App's default new-session list on every device; it keeps working and its
+  sessions stay listed. Set it from the App (capability `agent_visibility`,
+  `PUT /api/agents/{kind}/visibility`), with `muqun-gateway agent hide|show
+  <agent>`, or in `manage`'s new **2 Agents** view, which lists every agent's
+  state, App visibility and version, toggles an agent's adapter with `e`, and
+  shows the next step. Discovery adds `visibility` and a gateway-computed
+  `picker` (`default`/`more`) per agent; older Apps ignore them. Changes apply
+  without a restart. `manage` views are renumbered: Terminals is now 3, Devices
+  4, Settings 5, and the header counts agents by state.
+
 - **Native Claude Code sessions do what the other native agents do.**
   Permission modes (Manual, Accept edits, Plan, Auto, Bypass permissions) are
   the session's own and can be picked from the App; a prompt sent while a turn

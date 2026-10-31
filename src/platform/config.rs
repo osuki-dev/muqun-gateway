@@ -81,6 +81,14 @@ pub(crate) struct Config {
     /// omitted when empty, so an existing `config.json` keeps working untouched.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) agent_commands: BTreeMap<String, String>,
+    /// Agent kind -> how the App lists that session agent: `"hidden"` keeps
+    /// it out of the new-session list (its sessions stay listed and usable);
+    /// absent, `"auto"` or anything else is automatic. Read from disk on
+    /// every discovery, so a change applies without a restart. A plain
+    /// string map, so an unknown value never stops the gateway from
+    /// starting. Omitted when empty.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) agent_visibility: BTreeMap<String, String>,
     /// Agent kind -> the arguments every agent the gateway launches for that
     /// kind starts with, in place of the built-in defaults (bypass-permission
     /// flags for `codex` and `claude`; see `agents::tasks::agent_launch_args`).
