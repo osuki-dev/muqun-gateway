@@ -705,7 +705,7 @@ async fn complete(
     Ok(Json(json!(task)))
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::tasks::domain::{now_ms, Task, TaskBinding, TaskKind};

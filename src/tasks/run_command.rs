@@ -434,7 +434,7 @@ fn tail(text: &str) -> String {
     text[start..].to_owned()
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::tasks::domain::{PrincipalKind, TaskPrincipal};

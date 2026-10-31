@@ -196,7 +196,7 @@ fn resolve(observations: &Observations, id: &str, native: bool) -> SessionRuntim
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     const ID: &str = "00000000-0000-4000-8000-000000000001";

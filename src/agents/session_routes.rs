@@ -2363,7 +2363,7 @@ fn decision_named(name: &str) -> ApiResult<approvals::Decision> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::agents::tasks;

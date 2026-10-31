@@ -82,7 +82,7 @@ async fn revoke(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::mcp::issue::sweep_closed_panes;

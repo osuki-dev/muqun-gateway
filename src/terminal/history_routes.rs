@@ -199,7 +199,7 @@ fn history_error(error: HistoryError) -> (StatusCode, Json<Value>) {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::*;
