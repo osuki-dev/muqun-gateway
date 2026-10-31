@@ -2,6 +2,13 @@
 
 ## Changes and fixes
 
+- **Codex provider mismatches are explained.** Codex 0.164 and newer refuse to
+  resume or prompt a thread whose saved model provider no longer matches the
+  current Codex configuration, and say so in structured error data. The Gateway
+  now relays that in plain words (which provider the thread uses, which one Codex
+  is set to, what to do) instead of "Codex rejected the request". Only provider
+  ids are relayed; upstream message text still never is.
+
 - **Re-running `muqun-gateway agent setup t3` takes effect.** The command writes
   the new bearer to a file while the running Gateway keeps its credential in the
   encrypted store; when the two differed the Gateway refused both, so a refreshed
