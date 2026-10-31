@@ -1233,10 +1233,10 @@ impl<P: AcpProvider> AcpDriver<P> {
         let revision = match &id {
             Some(id) => {
                 self.mirror
-                    .snapshot_read_revision(&AgentSessionId::from(id.as_str()))
+                    .native_reload_revision(&AgentSessionId::from(id.as_str()))
                     .await
             }
-            None => (None, None),
+            None => Default::default(),
         };
         let (client, mut events, capabilities) = self.initialized(directory).await?;
         if id.is_some() && capabilities["loadSession"].as_bool() != Some(true) {
@@ -1401,11 +1401,10 @@ impl<P: AcpProvider> AcpDriver<P> {
             inbox: Vec::new(),
             seq: 0,
         };
-        if self
+        if !self
             .mirror
-            .refresh_prepared_snapshot(snapshot, revision.0, revision.1, None)
+            .replace_native_snapshot(snapshot, revision)
             .await?
-            .is_none()
         {
             client.shutdown().await;
             return Err(AgentError::NotAvailable(

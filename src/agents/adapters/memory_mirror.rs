@@ -122,6 +122,19 @@ struct ReplayEvent {
     bytes: usize,
 }
 
+/// An opaque native-load fence: read markers may advance, but state changes
+/// and eviction/recreation still reject the complete replacement snapshot.
+#[derive(Default)]
+pub(crate) struct NativeReloadRevision {
+    sequence: Option<u64>,
+    incarnation: Option<Arc<tokio::sync::Mutex<()>>>,
+}
+
+enum RefreshSequence {
+    Strict(Option<u64>),
+    NativeReload(Option<u64>),
+}
+
 struct SessionState {
     info: AgentSessionInfo,
     timeline: timeline::Timeline,
@@ -134,6 +147,9 @@ struct SessionState {
     /// Last discarded sequence, even when the replay log is now empty.
     replay_floor: u64,
     current_seq: u64,
+    /// Every state mutation except read markers and identical metadata reads.
+    /// Native reloads can preserve those observations without losing new data.
+    snapshot_state_seq: u64,
     touched_ms: u64,
     /// True while `info` is the local stand-in rather than something OpenCode
     /// reported.
@@ -160,6 +176,7 @@ impl SessionState {
             event_log_bytes: 0,
             replay_floor: 0,
             current_seq: 0,
+            snapshot_state_seq: 0,
             touched_ms: now_ms(),
             placeholder: false,
             history_initialized: false,
@@ -178,6 +195,7 @@ impl SessionState {
         if order.is_empty() {
             return (Vec::new(), Vec::new());
         }
+        self.snapshot_state_seq += 1;
         let mut changed = Vec::new();
         if let Some(frontier) = &mut self.history_frontier {
             if let Some(next) = order.get(&frontier.message_id) {
@@ -205,6 +223,11 @@ impl SessionState {
     }
 
     fn next_seq(&mut self) -> u64 {
+        self.snapshot_state_seq += 1;
+        self.next_observation_seq()
+    }
+
+    fn next_observation_seq(&mut self) -> u64 {
         self.current_seq += 1;
         self.touched_ms = now_ms();
         self.current_seq
@@ -242,8 +265,22 @@ impl SessionState {
     }
 
     fn insert_item(&mut self, item: TimelineItem) {
+        // Older-page inserts deliberately have no public event sequence.
+        self.snapshot_state_seq += 1;
         self.timeline.insert(item);
         self.trim_timeline();
+    }
+
+    fn invalidate_history_reads(&mut self) {
+        self.history_removal_generation = self.history_removal_generation.wrapping_add(1);
+        self.snapshot_state_seq += 1;
+    }
+
+    fn initialize_history(&mut self) {
+        if !self.history_initialized {
+            self.snapshot_state_seq += 1;
+            self.history_initialized = true;
+        }
     }
 
     fn ordered_timeline(&self) -> Vec<TimelineItem> {
@@ -498,7 +535,7 @@ impl MemoryMirror {
             for id in &removed {
                 state.timeline.remove(id);
             }
-            state.history_removal_generation = state.history_removal_generation.wrapping_add(1);
+            state.invalidate_history_reads();
             let seq = state.next_seq();
             let mut ids: Vec<_> = removed.iter().cloned().collect();
             ids.sort();
@@ -638,7 +675,7 @@ impl MemoryMirror {
     /// session or a fork does not establish that fact.
     pub(crate) async fn mark_history_initialized(&self, asid: &AgentSessionId) {
         if let Some(state) = self.sessions.write().await.get_mut(asid) {
-            state.history_initialized = true;
+            state.initialize_history();
         }
     }
 
@@ -725,7 +762,7 @@ impl MemoryMirror {
             );
         }
         self.history_permissions(state, asid, permissions);
-        state.history_initialized = true;
+        state.initialize_history();
         Ok(true)
     }
 
@@ -785,6 +822,7 @@ impl MemoryMirror {
         };
         let (reordered, permissions) = state.apply_history_order(&changes.order);
         if let Some(oldest) = items.iter().min_by_key(|row| row.sort_key()) {
+            state.snapshot_state_seq += 1;
             state.history_frontier = Some(oldest.clone());
         }
         let mut accepted = Vec::with_capacity(items.len());
@@ -860,7 +898,7 @@ impl MemoryMirror {
         let mut sessions = self.sessions.write().await;
         let state = sessions.get_mut(asid)?;
         state.info.time_viewed = Some(viewed.max(state.info.time_viewed.unwrap_or(0)));
-        let seq = state.next_seq();
+        let seq = state.next_observation_seq();
         let info = state.info.clone();
         state.push_event(AgentDomainEvent::SessionUpdated {
             asid: asid.clone(),
@@ -1114,7 +1152,7 @@ impl MemoryMirror {
         let mut sessions = self.sessions.write().await;
         let state = sessions.get_mut(asid)?;
         // An unloaded row may still be in an in-flight canonical read.
-        state.history_removal_generation = state.history_removal_generation.wrapping_add(1);
+        state.invalidate_history_reads();
         let doomed: Vec<String> = state
             .timeline
             .values()
@@ -1149,7 +1187,7 @@ impl MemoryMirror {
         let mut sessions = self.sessions.write().await;
         let state = sessions.get_mut(asid)?;
         // An unloaded row may still be in an in-flight canonical read.
-        state.history_removal_generation = state.history_removal_generation.wrapping_add(1);
+        state.invalidate_history_reads();
         let removed: Vec<String> = ids
             .iter()
             .filter(|id| state.timeline.remove(id.as_str()).is_some())
@@ -1544,6 +1582,9 @@ impl MemoryMirror {
             asid,
             AgentSessionStatus::Idle,
         );
+        // Pending snapshots do not emit a wire event, but replacing or
+        // clearing one must still invalidate an in-flight native replacement.
+        state.snapshot_state_seq += 1;
         state.permissions = permissions.into_iter().map(|p| (p.id.clone(), p)).collect();
         state.forms = forms.into_iter().map(|f| (f.id.clone(), f)).collect();
     }
@@ -1716,6 +1757,38 @@ impl MemoryMirror {
         }
     }
 
+    pub(crate) async fn native_reload_revision(
+        &self,
+        asid: &AgentSessionId,
+    ) -> NativeReloadRevision {
+        let sessions = self.sessions.read().await;
+        match sessions.get(asid) {
+            Some(state) => NativeReloadRevision {
+                sequence: Some(state.snapshot_state_seq),
+                incarnation: Some(state.history_gate.clone()),
+            },
+            None => NativeReloadRevision::default(),
+        }
+    }
+
+    pub(crate) async fn replace_native_snapshot(
+        &self,
+        snapshot: AgentSessionSnapshot,
+        revision: NativeReloadRevision,
+    ) -> Result<bool, crate::agents::ports::agent::AgentError> {
+        self.commit_refresh(
+            snapshot,
+            (
+                RefreshSequence::NativeReload(revision.sequence),
+                revision.incarnation,
+            ),
+            None,
+            false,
+        )
+        .await
+        .map(|accepted| accepted.is_some())
+    }
+
     pub(crate) async fn refresh_prepared_snapshot(
         &self,
         snapshot: AgentSessionSnapshot,
@@ -1725,7 +1798,12 @@ impl MemoryMirror {
     ) -> Result<Option<AgentSessionSnapshot>, crate::agents::ports::agent::AgentError> {
         let asid = snapshot.info.asid.clone();
         match self
-            .commit_refresh(snapshot, (expected, incarnation), commit, false)
+            .commit_refresh(
+                snapshot,
+                (RefreshSequence::Strict(expected), incarnation),
+                commit,
+                false,
+            )
             .await?
         {
             Some(()) => Ok(self.get_snapshot(&asid).await),
@@ -1741,13 +1819,19 @@ impl MemoryMirror {
         revision: (Option<u64>, Option<Arc<tokio::sync::Mutex<()>>>),
         commit: Option<crate::agents::ports::agent::TimelineCommit<'_>>,
     ) -> Result<Option<()>, crate::agents::ports::agent::AgentError> {
-        self.commit_refresh(snapshot, revision, commit, true).await
+        self.commit_refresh(
+            snapshot,
+            (RefreshSequence::Strict(revision.0), revision.1),
+            commit,
+            true,
+        )
+        .await
     }
 
     async fn commit_refresh(
         &self,
         mut snapshot: AgentSessionSnapshot,
-        (expected, incarnation): (Option<u64>, Option<Arc<tokio::sync::Mutex<()>>>),
+        (expected, incarnation): (RefreshSequence, Option<Arc<tokio::sync::Mutex<()>>>),
         commit: Option<crate::agents::ports::agent::TimelineCommit<'_>>,
         preserve_history: bool,
     ) -> Result<Option<()>, crate::agents::ports::agent::AgentError> {
@@ -1760,7 +1844,15 @@ impl MemoryMirror {
         };
         let mut sessions = self.sessions.write().await;
         let asid = snapshot.info.asid.clone();
-        if sessions.get(&asid).map(|s| s.current_seq) != expected
+        let sequence_matches = match expected {
+            RefreshSequence::Strict(expected) => {
+                sessions.get(&asid).map(|s| s.current_seq) == expected
+            }
+            RefreshSequence::NativeReload(expected) => {
+                sessions.get(&asid).map(|s| s.snapshot_state_seq) == expected
+            }
+        };
+        if !sequence_matches
             || incarnation.as_ref().is_some_and(|gate| {
                 sessions
                     .get(&asid)
@@ -1801,7 +1893,7 @@ impl MemoryMirror {
         }
         state.info = snapshot.info;
         state.placeholder = false;
-        state.history_initialized = true;
+        state.initialize_history();
         state.history_frontier = None;
         if preserve_history {
             // The old path rebased retained rows after combining them with the
@@ -2029,9 +2121,14 @@ impl SessionMirrorPort for MemoryMirror {
             }
             merged.time_idle = merged.time_idle.max(state.info.time_idle);
             merged.time_viewed = merged.time_viewed.max(state.info.time_viewed);
+            let identical = !state.placeholder && state.info == merged;
             state.info = merged.clone();
             state.placeholder = false;
-            let seq = state.next_seq();
+            let seq = if identical {
+                state.next_observation_seq()
+            } else {
+                state.next_seq()
+            };
 
             let event = AgentDomainEvent::SessionUpdated {
                 asid,
@@ -2132,6 +2229,239 @@ impl SessionMirrorPort for MemoryMirror {
 mod tests {
     use super::*;
     use crate::agents::domain::{AgentPart, AgentSessionInfo, AgentSessionStatus, TimelineRole};
+
+    #[tokio::test]
+    async fn native_reload_preserves_read_markers_and_identical_info_without_changing_strict_cas() {
+        let mirror = MemoryMirror::for_agent("fx");
+        let asid = AgentSessionId("reload-observation".into());
+        mirror.update_session(info(&asid, "original")).await;
+        let before = mirror.get_snapshot(&asid).await.unwrap();
+        let strict = mirror.snapshot_read_revision(&asid).await;
+        let native = mirror.native_reload_revision(&asid).await;
+        mirror.mark_viewed(&asid, 100).await.unwrap();
+        mirror.mark_viewed(&asid, 90).await.unwrap();
+        let same = mirror.session_info(&asid).await.unwrap();
+        mirror.update_session(same).await;
+        assert!(mirror
+            .refresh_prepared_snapshot(before.clone(), strict.0, strict.1, None)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(mirror
+            .replace_native_snapshot(before, native)
+            .await
+            .unwrap());
+        assert_eq!(
+            mirror.session_info(&asid).await.unwrap().time_viewed,
+            Some(100)
+        );
+    }
+
+    #[tokio::test]
+    async fn native_reload_rejects_state_mutations_and_preserves_the_winning_data() {
+        for mutation in [
+            "status",
+            "error",
+            "title",
+            "directory",
+            "model",
+            "time_idle",
+            "timeline",
+            "remove",
+            "permission",
+            "form",
+            "inbox",
+            "silent_page",
+            "replace_pending",
+            "clear_pending",
+            "remove_unloaded",
+            "remove_unloaded_range",
+            "recreate",
+        ] {
+            let mirror = MemoryMirror::for_agent("fx");
+            let asid = AgentSessionId(format!("reload-{mutation}"));
+            let original_info = info(&asid, "original");
+            mirror.update_session(original_info.clone()).await;
+            mirror
+                .upsert_timeline_items(&asid, vec![text_item("row", "z", "original")])
+                .await;
+            mirror.mark_history_initialized(&asid).await;
+            if mutation == "clear_pending" {
+                mirror
+                    .replace_pending(
+                        &asid,
+                        vec![],
+                        vec![FormRequest {
+                            nonblocking: false,
+                            id: "old".into(),
+                            asid: asid.clone(),
+                            title: "old pending".into(),
+                            fields: vec![],
+                        }],
+                    )
+                    .await;
+            }
+            let before = mirror.get_snapshot(&asid).await.unwrap();
+            let revision = mirror.native_reload_revision(&asid).await;
+            match mutation {
+                "status" => {
+                    mirror
+                        .update_status(&asid, AgentSessionStatus::Busy, None)
+                        .await;
+                }
+                "error" => {
+                    mirror
+                        .update_status(
+                            &asid,
+                            AgentSessionStatus::Failed,
+                            Some(AgentErrorInfo {
+                                name: "new".into(),
+                                message: "new failure".into(),
+                                status: None,
+                                retry_after_ms: None,
+                            }),
+                        )
+                        .await;
+                }
+                "title" | "directory" | "model" | "time_idle" => {
+                    let mut changed = before.info.clone();
+                    match mutation {
+                        "title" => changed.title = "new title".into(),
+                        "directory" => changed.directory = Some("/new/workspace".into()),
+                        "model" => {
+                            changed.model = Some(crate::agents::domain::ModelRef {
+                                model_id: "new-model".into(),
+                                provider_id: "provider".into(),
+                                variant: None,
+                            })
+                        }
+                        _ => changed.time_idle = Some(200),
+                    }
+                    mirror.update_session(changed).await;
+                }
+                "timeline" => {
+                    mirror
+                        .upsert_timeline_items(&asid, vec![text_item("row", "z", "new live data")])
+                        .await;
+                }
+                "remove" => {
+                    mirror.remove_timeline_items(&asid, &["row".into()]).await;
+                }
+                "permission" => {
+                    mirror
+                        .add_permission(PermissionRequest {
+                            id: "pending".into(),
+                            asid: asid.clone(),
+                            action: "execute".into(),
+                            resources: vec![],
+                            save: vec![],
+                            prompt: "approval".into(),
+                            tool: None,
+                            source_message_id: None,
+                            source_tool_call_id: None,
+                            metadata: None,
+                            message: None,
+                            options: vec![],
+                        })
+                        .await;
+                }
+                "form" => {
+                    mirror
+                        .add_form(FormRequest {
+                            nonblocking: false,
+                            id: "pending".into(),
+                            asid: asid.clone(),
+                            title: "question".into(),
+                            fields: vec![],
+                        })
+                        .await;
+                }
+                "inbox" => {
+                    mirror
+                        .set_inbox(&asid, vec![serde_json::json!({"id":"queued"})])
+                        .await;
+                }
+                "silent_page" => {
+                    let gate = mirror.history_gate(&asid).await;
+                    let at = mirror.history_read_revision(&asid).await.unwrap();
+                    let sequence = mirror.get_snapshot(&asid).await.unwrap().seq;
+                    mirror
+                        .accept_earlier_window_history(
+                            &asid,
+                            &gate,
+                            at,
+                            vec![text_item("old", "a", "older context")],
+                            None,
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        mirror.get_snapshot(&asid).await.unwrap().seq,
+                        sequence,
+                        "older paging intentionally has no wire sequence"
+                    );
+                }
+                "replace_pending" => {
+                    mirror
+                        .replace_pending(
+                            &asid,
+                            vec![],
+                            vec![FormRequest {
+                                nonblocking: false,
+                                id: "new".into(),
+                                asid: asid.clone(),
+                                title: "new pending".into(),
+                                fields: vec![],
+                            }],
+                        )
+                        .await;
+                }
+                "clear_pending" => {
+                    mirror.replace_pending(&asid, vec![], vec![]).await;
+                }
+                "remove_unloaded" => {
+                    assert!(mirror
+                        .remove_timeline_items(&asid, &["not-retained".into()])
+                        .await
+                        .is_none());
+                }
+                "remove_unloaded_range" => {
+                    assert!(mirror
+                        .remove_timeline_from(&asid, "msg_not_retained")
+                        .await
+                        .is_none());
+                }
+                "recreate" => {
+                    let version = revision.sequence;
+                    mirror.remove_session(&asid).await;
+                    mirror.update_session(original_info).await;
+                    mirror
+                        .upsert_timeline_items(&asid, vec![text_item("row", "z", "original")])
+                        .await;
+                    mirror.mark_history_initialized(&asid).await;
+                    assert_eq!(
+                        mirror.native_reload_revision(&asid).await.sequence,
+                        version,
+                        "the incarnation fence must reject even matching version numbers"
+                    );
+                }
+                _ => unreachable!(),
+            }
+            let winner = mirror.get_snapshot(&asid).await.unwrap();
+            assert!(
+                !mirror
+                    .replace_native_snapshot(before, revision)
+                    .await
+                    .unwrap(),
+                "lost {mutation} race"
+            );
+            assert_eq!(
+                serde_json::to_value(mirror.get_snapshot(&asid).await.unwrap()).unwrap(),
+                serde_json::to_value(winner).unwrap(),
+                "overwrote {mutation} winner"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn compaction_failure_live_and_replay_keep_the_same_optional_error() {

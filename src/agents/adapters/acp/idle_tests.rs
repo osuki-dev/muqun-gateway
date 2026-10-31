@@ -231,6 +231,67 @@ async fn direct_slash_delivery_pins_before_write_and_later_plain_turn_cannot_cle
 }
 
 #[tokio::test]
+async fn parked_restore_keeps_a_read_marker_written_while_native_load_is_pending() {
+    let fixture = Fixture::new().await;
+    let binary = fixture.directory.join("mock-fx");
+    let script = std::fs::read_to_string(&binary).unwrap().replace(
+        "    elif method=='session/load':",
+        "    elif method=='session/load':\n        if os.path.exists('block-load'):\n            with open('load-entered','w') as f:f.write('ready')\n            while os.path.exists('block-load'):time.sleep(0.002)",
+    );
+    std::fs::write(&binary, script).unwrap();
+    let driver = driver(&fixture);
+    let info = driver.create_session(None, None, None).await.unwrap();
+    driver
+        .send_prompt(&info.asid.0, "saved turn", &[], None)
+        .await
+        .unwrap();
+    idle(&driver, &info.asid.0).await.unwrap();
+    expire(&driver, &info.asid.0).await;
+    dormant(&driver, &info.asid.0).await;
+    assert_eq!(
+        driver.dormant.lock().unwrap()[&info.asid.0].kind,
+        DormantKind::Parked
+    );
+    std::fs::write(fixture.directory.join("block-load"), "wait").unwrap();
+    let opening = driver.clone();
+    let id = info.asid.0.clone();
+    let prepare = tokio::spawn(async move { opening.prepare_selected_session(&id).await });
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !fixture.directory.join("load-entered").exists() {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .unwrap();
+    driver
+        .mirror
+        .mark_viewed(&info.asid, 123456789)
+        .await
+        .unwrap();
+    let same = driver.mirror.session_info(&info.asid).await.unwrap();
+    driver.mirror.update_session(same).await;
+    std::fs::remove_file(fixture.directory.join("block-load")).unwrap();
+    let result = prepare.await.unwrap();
+    assert!(
+        result.is_ok(),
+        "a foreground read marker must not reject native recovery: {result:?}"
+    );
+    let restored = driver.mirror.get_snapshot(&info.asid).await.unwrap();
+    assert_eq!(restored.info.time_viewed, Some(123456789));
+    assert_eq!(restored.timeline.len(), 2);
+    assert!(driver.retained(&info.asid.0).unwrap().client.is_running());
+    assert_eq!(
+        fixture
+            .methods()
+            .iter()
+            .filter(|method| *method == "session/load")
+            .count(),
+        1
+    );
+    driver.shutdown().await;
+}
+
+#[tokio::test]
 async fn parked_observation_drops_live_projection_and_concurrent_foreground_prepares_load_once() {
     let fixture = Fixture::new().await;
     let driver = driver(&fixture);

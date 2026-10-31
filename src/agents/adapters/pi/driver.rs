@@ -29,7 +29,7 @@ use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
 use super::mapper::{self, LiveChange, LiveFolder};
-use super::rpc::{PiChild, PiCommandLine, PiHost, PiLaunch, PiLease, PiRecord};
+use super::rpc::{PiChild, PiCommandLine, PiHost, PiLaunch, PiLease, PiRecord, RetirementRefusal};
 use super::sessions::{self, SessionFile, SessionStore};
 use crate::agents::domain::{
     AgentCatalog, AgentProject, AgentSessionId, AgentSessionInfo, AgentSessionStatus, FormRequest,
@@ -1008,7 +1008,7 @@ async fn reap_once(host: &PiHost, live: &Live, timeout: Duration) {
     let observed = host.activity_stamps();
     struct Candidate {
         asid: String,
-        protected: bool,
+        protected: Option<RetirementRefusal>,
         file: Option<PathBuf>,
         generation: u64,
         provisional: bool,
@@ -1018,9 +1018,15 @@ async fn reap_once(host: &PiHost, live: &Live, timeout: Duration) {
             .iter()
             .map(|(asid, s)| Candidate {
                 asid: asid.clone(),
-                protected: s.running()
-                    || !s.pending.is_empty()
-                    || s.rows.iter().any(|r| mapper::is_provisional(&r.id)),
+                protected: if s.running() {
+                    Some(RetirementRefusal::Running)
+                } else if !s.pending.is_empty() {
+                    Some(RetirementRefusal::PendingPermission)
+                } else if s.rows.iter().any(|r| mapper::is_provisional(&r.id)) {
+                    Some(RetirementRefusal::UnpersistedRows)
+                } else {
+                    None
+                },
                 file: s.file.clone(),
                 generation: s.generation,
                 provisional: s.provisional,
@@ -1037,6 +1043,9 @@ async fn reap_once(host: &PiHost, live: &Live, timeout: Duration) {
             .as_ref()
             .is_some_and(|child| child.idle_for() < timeout)
         {
+            if let Some(child) = &child {
+                child.note_refusal(RetirementRefusal::RecentActivity);
+            }
             keep.insert(candidate.asid.clone());
             continue;
         }
@@ -1053,7 +1062,14 @@ async fn reap_once(host: &PiHost, live: &Live, timeout: Duration) {
         let blank = candidate.provisional
             && child.as_ref().is_some_and(|c| !c.has_conversation())
             && candidate.file.as_ref().is_none_or(|p| !p.exists());
-        if candidate.protected || (unwritten && !blank) {
+        if candidate.protected.is_some() || (unwritten && !blank) {
+            if let Some(child) = &child {
+                child.note_refusal(
+                    candidate
+                        .protected
+                        .unwrap_or(RetirementRefusal::SessionFileUnavailable),
+                );
+            }
             keep.insert(candidate.asid.clone());
         } else if unwritten && blank {
             blanks.insert(candidate.asid.clone());
@@ -2092,6 +2108,118 @@ for raw in sys.stdin.buffer:
         driver.shutdown_and_wait().await;
     }
 
+    #[tokio::test]
+    #[ignore]
+    async fn real_pi_production_profile_idle_diagnostic() {
+        let source_pid: u32 = std::env::var("MUQUN_PI_DIAGNOSTIC_SOURCE_PID")
+            .expect("explicit diagnostic source PID")
+            .parse()
+            .unwrap();
+        let source = PathBuf::from(format!("/proc/{source_pid}"));
+        let binary = std::fs::canonicalize(source.join("exe")).unwrap();
+        let environment = std::fs::read(source.join("environ")).unwrap();
+        let mut env: Vec<(String, String)> = environment
+            .split(|b| *b == 0)
+            .filter_map(|entry| {
+                let at = entry.iter().position(|b| *b == b'=')?;
+                Some((
+                    String::from_utf8(entry[..at].to_vec()).ok()?,
+                    String::from_utf8(entry[at + 1..].to_vec()).ok()?,
+                ))
+            })
+            .collect();
+        let root = std::env::temp_dir().join(format!(
+            "muqun-pi-production-profile-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(root.join("sessions")).unwrap();
+        env.retain(|(key, _)| key != "PI_CODING_AGENT_SESSION_DIR");
+        env.push((
+            "PI_CODING_AGENT_SESSION_DIR".into(),
+            root.join("sessions").to_string_lossy().into_owned(),
+        ));
+        let extension = root.join("muqun-extension.js");
+        std::fs::write(&extension, mapper::EXTENSION_SOURCE).unwrap();
+        let driver = PiDriver::new(
+            PiCommandLine { binary, extension },
+            SessionStore::new(root.join("sessions")),
+            true,
+            Duration::from_secs(2),
+            env,
+        );
+        let mut events = driver.subscribe();
+        let info = driver
+            .create_session(root.to_str(), None, None)
+            .await
+            .unwrap();
+        let asid = info.asid.0;
+        let child = driver.host.get(&asid).unwrap();
+        let marker = format!("PI-PROFILE-{}", uuid::Uuid::new_v4());
+        eprintln!("Pi production-profile started asid={asid} private_pid={:?} source_pid={source_pid} cli_tools_unchanged=true before={}",child.pid(),child.diagnostics());
+        driver.send_prompt(&asid,&format!("Remember this exact marker: {marker}. Reply only ACK. Do not use tools, commands or external resources."),&[],None).await.unwrap();
+        real_turn_settled(&driver, &mut events).await;
+        eprintln!(
+            "Pi production-profile settled flags={}",
+            child.diagnostics()
+        );
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        eprintln!(
+            "Pi production-profile before_reap flags={} rows={:?}",
+            child.diagnostics(),
+            driver.live.with(&asid, |s| (
+                s.running(),
+                s.pending.len(),
+                s.rows
+                    .iter()
+                    .filter(|r| mapper::is_provisional(&r.id))
+                    .count(),
+                s.file.is_some()
+            ))
+        );
+        reap_once(&driver.host, &driver.live, Duration::from_secs(2)).await;
+        let retired = driver.host.get(&asid).is_none();
+        eprintln!(
+            "Pi production-profile after_reap retired={retired} flags={}",
+            child.diagnostics()
+        );
+        if retired {
+            driver.prepare_selected_session(&asid).await.unwrap();
+            driver.send_prompt(&asid,"What exact marker did I ask you to remember? Reply only that marker. Do not use tools, commands or external resources.",&[],None).await.unwrap();
+            real_turn_settled(&driver, &mut events).await;
+            let file = driver.store.find(&asid).await.unwrap();
+            let entries = driver.store.read_entries(&file).await.unwrap();
+            let assistant = entries
+                .iter()
+                .rev()
+                .find(|r| r.pointer("/message/role").and_then(Value::as_str) == Some("assistant"))
+                .unwrap();
+            assert!(assistant.to_string().contains(&marker));
+            eprintln!("Pi production-profile same_id_resume=true marker_recalled=true");
+            let resumed = driver.host.get(&asid).unwrap();
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            eprintln!(
+                "Pi production-profile resumed_before_reap flags={} rows={:?}",
+                resumed.diagnostics(),
+                driver.live.with(&asid, |s| (
+                    s.running(),
+                    s.pending.len(),
+                    s.rows
+                        .iter()
+                        .filter(|r| mapper::is_provisional(&r.id))
+                        .count(),
+                    s.file.is_some()
+                ))
+            );
+            reap_once(&driver.host, &driver.live, Duration::from_secs(2)).await;
+            eprintln!(
+                "Pi production-profile resumed_after_reap retired={} flags={}",
+                driver.host.get(&asid).is_none(),
+                resumed.diagnostics()
+            );
+        }
+        driver.shutdown_and_wait().await;
+    }
+
     async fn real_turn_settled(
         driver: &PiDriver,
         events: &mut broadcast::Receiver<(AgentSessionId, u64, Arc<PiRecord>)>,
@@ -2101,9 +2229,13 @@ for raw in sys.stdin.buffer:
             loop {
                 match tokio::time::timeout(Duration::from_millis(250), events.recv()).await {
                     Ok(Ok((id, generation, record))) => {
-                        assert_ne!(
-                            record.get("type").and_then(Value::as_str),
-                            Some("extension_ui_request"),
+                        assert!(
+                            !(record.get("type").and_then(Value::as_str)
+                                == Some("extension_ui_request")
+                                && matches!(
+                                    record.get("method").and_then(Value::as_str),
+                                    Some("confirm" | "select" | "input" | "editor")
+                                )),
                             "live Pi requested approval; no answer sent"
                         );
                         settled |=

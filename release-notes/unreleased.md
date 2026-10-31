@@ -2,6 +2,12 @@
 
 ## Changes and fixes
 
+- **Opening saved FX and Qoder conversations tolerates concurrent read markers.**
+  Foreground restoration preserves the latest viewed time while history reads
+  and unchanged session metadata arrive. New messages, status changes and pending
+  approvals still prevent an older native snapshot from replacing current data.
+  No prompt is retried or replayed. Restart the Gateway after updating.
+
 - **Verified idle FX and Qoder conversations release their private processes.**
   Both default to a one-hour idle timeout, configurable with the provider's
   `idle_timeout_secs`. Running work, in-flight requests and approvals remain
