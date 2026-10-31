@@ -144,6 +144,9 @@ pub(crate) struct Config {
     /// Local Qoder CLI ACP support; private children start only on explicit session operations.
     #[serde(default, skip_serializing_if = "is_default_qoder")]
     pub(crate) qoder: agents::runtime::QoderConfig,
+    /// Google Antigravity's own ACP server, `agy acp`; on when `agy` is found.
+    #[serde(default, skip_serializing_if = "is_default_antigravity")]
+    pub(crate) antigravity: agents::runtime::AntigravityConfig,
     /// Master switch for service agents; terminal agents remain independent.
     #[serde(default, skip_serializing_if = "AgentRuntimeConfig::is_default")]
     pub(crate) agent_runtime: AgentRuntimeConfig,
@@ -334,6 +337,10 @@ pub(crate) fn is_default_codex(config: &agents::runtime::CodexConfig) -> bool {
 
 pub(crate) fn is_default_fx(config: &agents::runtime::FxConfig) -> bool {
     *config == agents::runtime::FxConfig::default()
+}
+
+pub(crate) fn is_default_antigravity(config: &agents::runtime::AntigravityConfig) -> bool {
+    *config == agents::runtime::AntigravityConfig::default()
 }
 
 pub(crate) fn is_default_qoder(config: &agents::runtime::QoderConfig) -> bool {

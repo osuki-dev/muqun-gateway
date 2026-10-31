@@ -1,4 +1,5 @@
 pub mod acp;
+pub mod antigravity;
 pub mod codex;
 pub mod deepseek;
 pub mod fx;

@@ -65,6 +65,7 @@ pub(crate) fn test_config(token: &str) -> Config {
             binary: None,
             ..Default::default()
         },
+        antigravity: agents::runtime::AntigravityConfig::disabled(),
         agent_runtime: crate::platform::config::AgentRuntimeConfig { enabled: false },
         store: crate::platform::config::StoreConfig::default(),
         mcp: crate::platform::config::McpConfig::default(),

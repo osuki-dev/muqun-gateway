@@ -1146,7 +1146,16 @@ pub(crate) mod tests {
         assert_eq!(features.extra["sessionPagination"], true);
         assert_eq!(
             super::super::AGENT_PREFERENCE,
-            ["codex", "opencode", "deepseek", "t3", "fx", "qoder", "pi"]
+            [
+                "codex",
+                "opencode",
+                "deepseek",
+                "t3",
+                "fx",
+                "qoder",
+                "pi",
+                "antigravity"
+            ]
         );
     }
 
