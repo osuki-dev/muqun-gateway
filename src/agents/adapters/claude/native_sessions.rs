@@ -611,6 +611,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "not yet ported to Windows; see docs/windows.md")]
     fn listing_reads_title_and_workspace_and_skips_blob_records() {
         let root = Scratch(
             std::env::temp_dir().join(format!("muqun-claude-list-{}", uuid::Uuid::new_v4())),

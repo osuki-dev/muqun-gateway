@@ -172,12 +172,13 @@ updates itself, and the same `manage` screen as on macOS and Linux.
 | Production code ported, Unix tests gated by line | 12 | 7 |
 | Unix-only helpers allowed off Unix | **0** (clippy clean); release build and artifact OK | 14 dead-code errors (test-only helpers of gated tests) |
 | Those helpers gated to Unix | 0 | 0; **tests run: 1576 passed, 61 failed, 36 ignored** |
-| The 61 marked `#[cfg_attr(windows, ignore = …)]` | 0 | 0; see the latest `windows` check |
+| The 61 marked `#[cfg_attr(windows, ignore = …)]`, on main after #86–#89 | 0 | 0; 1586 passed, 1 failed (a new Claude session-listing test), 97 ignored |
+| That one marked too (62 in all) | 0 | 0; see the latest `windows` check |
 
 These counts come from `cargo clippy --all-targets -D warnings` on
 `windows-latest`. The release `.exe` has built since the second run.
 
-### The 61 tests that fail on Windows (Phase 1 work)
+### The 62 tests that fail on Windows (Phase 1 work)
 
 They stay compiled and run on Unix. On Windows they are ignored with the
 reason "not yet ported to Windows". Run them with `cargo test -- --ignored`.
@@ -190,7 +191,7 @@ test artifacts:
   URI is `file:///C:/…`, so the fences refuse files that are inside the
   workspace. Affected: `agents::message_images`, `codex::items`,
   `codex::input`, `acp::operations`, `pi::prompt`, `agents::routes`,
-  `platform::assets`, `agents::directories`, `codex::rollout_tail`,
+  `platform::assets`, `agents::directories`, `codex::rollout_tail`, `claude::native_sessions`,
   `qoder::native_sessions`.
 - **Verbatim `\\?\C:\…` paths leaking into agent config (4).**
   `canonicalize` returns verbatim paths on Windows. The Claude Code and Codex
