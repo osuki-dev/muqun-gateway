@@ -525,27 +525,47 @@ impl<P: AcpProvider> AcpDriver<P> {
 
     /// Put a terminal-held session's transcript into the mirror and tell
     /// readers to refetch.
-    async fn refresh_terminal_snapshot(
+    /// A terminal-held session's history, read from its transcript. Never
+    /// pending approvals or forms: those belong to the terminal.
+    async fn terminal_snapshot(
         &self,
         id: &str,
         live: &TerminalLive,
-    ) -> Result<(), AgentError> {
-        let mut info = self.native_session_info(id).await?;
+    ) -> Result<AgentSessionSnapshot, AgentError> {
+        let mut info = match self.native_session_info(id).await {
+            Ok(info) => info,
+            Err(error) => self
+                .mirror
+                .session_info(&AgentSessionId::from(id))
+                .await
+                .ok_or(error)?,
+        };
         let directory = info.directory.clone().ok_or_else(|| {
             AgentError::NotAvailable("The session has no verified working directory".into())
         })?;
         let timeline = P::live_timeline(&directory, id, &self.stop).await?;
         info.runtime = Some(live.runtime.clone());
-        let asid = info.asid.clone();
-        let revision = self.mirror.snapshot_read_revision(&asid).await;
-        let snapshot = AgentSessionSnapshot {
+        live.runtime.clone().apply(&mut info);
+        Ok(AgentSessionSnapshot {
             info,
             timeline,
             permissions: Vec::new(),
             forms: Vec::new(),
             inbox: Vec::new(),
             seq: 0,
-        };
+        })
+    }
+
+    async fn refresh_terminal_snapshot(
+        &self,
+        id: &str,
+        live: &TerminalLive,
+    ) -> Result<(), AgentError> {
+        let snapshot = self.terminal_snapshot(id, live).await?;
+        let revision = self
+            .mirror
+            .snapshot_read_revision(&snapshot.info.asid)
+            .await;
         self.mirror
             .refresh_prepared_snapshot(snapshot, revision.0, revision.1, None)
             .await?;
@@ -1328,6 +1348,10 @@ impl<P: AcpProvider> AcpDriver<P> {
         if self.retained(id).is_some() || self.dormant.lock().unwrap().contains_key(id) {
             return Ok(false);
         }
+        // A terminal-held session is read from its transcript instead.
+        if self.terminal_live(id).await.is_some() {
+            return Ok(false);
+        }
         let info = self.native_session_info(id).await?;
         if info.directory.is_some() || info.runtime.as_ref() != Some(&Self::empty_runtime()) {
             return Ok(false);
@@ -1376,6 +1400,10 @@ impl<P: AcpProvider> AcpDriver<P> {
         explicit_prepare: bool,
         reserve_prompt: bool,
     ) -> Result<Arc<Session>, AgentError> {
+        // A terminal holds it: never a second agent process.
+        if let Some(live) = self.terminal_live(id).await {
+            return Err(AgentError::TerminalInteraction(Box::new(live.runtime)));
+        }
         // One explicit activation restores a same-ID generation. Prompt calls
         // never replay a previous request and cannot recover an unexpected loss.
         let _mutation = self.mutations.lock().await;
@@ -1464,6 +1492,9 @@ impl<P: AcpProvider> AcpDriver<P> {
                             .into(),
                     )
                 });
+        }
+        if let Some(live) = self.terminal_live(id).await {
+            return self.terminal_snapshot(id, &live).await.map(Some);
         }
         Err(AgentError::NotAvailable(
             "Conversation history is not loaded; explicitly open it before reading native history"
@@ -2675,13 +2706,10 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
     }
     fn interrupt<'a>(&'a self, id: &'a str) -> AgentFuture<'a, ()> {
         Box::pin(async move {
-            if let Some(TerminalLive {
-                route: Some(route), ..
-            }) = self.terminal_live(id).await
-            {
-                let bridge = self
-                    .terminal_bridge()
-                    .ok_or_else(|| AgentError::NotAvailable("No terminal bridge".into()))?;
+            if let Some(live) = self.terminal_live(id).await {
+                let (Some(route), Some(bridge)) = (live.route, self.terminal_bridge()) else {
+                    return Err(AgentError::TerminalInteraction(Box::new(live.runtime)));
+                };
                 return bridge.interrupt(&route).await;
             }
             let session = self
@@ -2824,18 +2852,6 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
         _limit: usize,
     ) -> AgentFuture<'a, Vec<TimelineItem>> {
         Box::pin(async move {
-            if self.terminal_live(id).await.is_some() {
-                let directory = self
-                    .native_session_info(id)
-                    .await?
-                    .directory
-                    .ok_or_else(|| {
-                        AgentError::NotAvailable(
-                            "The session has no verified working directory".into(),
-                        )
-                    })?;
-                return P::live_timeline(&directory, id, &self.stop).await;
-            }
             if self.readonly_empty_snapshot(id).await? {
                 return Ok(Vec::new());
             }
@@ -2866,6 +2882,9 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
         message_id: Option<&'a str>,
     ) -> AgentFuture<'a, AgentSessionInfo> {
         Box::pin(async move {
+            if let Some(live) = self.terminal_live(id).await {
+                return Err(AgentError::TerminalInteraction(Box::new(live.runtime)));
+            }
             let _mutation = self.mutations.lock().await;
             let source = self.retained(id).ok_or_else(|| {
                 AgentError::Unsupported("open a Gateway-owned session before forking".into())
@@ -2934,6 +2953,9 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
     }
     fn delete_session<'a>(&'a self, id: &'a str) -> AgentFuture<'a, ()> {
         Box::pin(async move {
+            if let Some(live) = self.terminal_live(id).await {
+                return Err(AgentError::TerminalInteraction(Box::new(live.runtime)));
+            }
             let parked_owned =
                 self.dormant.lock().unwrap().get(id).is_some_and(|entry| {
                     entry.kind == DormantKind::Parked && entry.owned_mutations

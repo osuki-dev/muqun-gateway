@@ -404,7 +404,9 @@ pub(super) async fn live_timeline(
     let root = projects_root().ok_or_else(unavailable)?;
     let (directory, id, stop) = (directory.to_owned(), id.to_owned(), stop.clone());
     tokio::task::spawn_blocking(move || {
-        let path = find_exact(&root, &directory, &id)?;
+        let Ok(path) = find_exact(&root, &directory, &id) else {
+            return Ok(Vec::new());
+        };
         let chain = main_chain(&path, &id, &stop, false)?;
         let mut projection = crate::agents::adapters::acp::mapper::Projection::new(false);
         for update in replay_updates(&chain) {

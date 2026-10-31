@@ -155,7 +155,11 @@ pages come from the mirror.
 agent's prompt path (with its delayed Enter), so the terminal user sees it;
 Stop sends Escape there. After input the transcript is followed for ten
 minutes; each change refreshes the mirror and sends `agent.resync`.
-Attachments are refused for such a session. Without a pane (Claude Code
+Attachments are refused for such a session. Every read (snapshot, refresh,
+earlier pages, pending approvals, the session catalog, foreground and
+background preparation) answers from the transcript; model switches, fork,
+delete, and prompts or Stop without a pane answer
+`409 agent_terminal_interaction_required`. Without a pane (Claude Code
 outside tmux/Herdr) the session is shown read-only: `interaction:
 "unavailable"`, `reason: "terminal_unavailable"`, and prompts get
 `409 agent_terminal_interaction_required`.
