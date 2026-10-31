@@ -1379,11 +1379,8 @@ fn route_frame(state: &State, mut value: Value, frame_bytes: usize) -> Result<()
         }
         let reply = locked(&state.pending).remove(&id);
         if let Some(pending) = reply {
-            let result = if value.get("error").is_some() {
-                // Upstream diagnostics can contain prompts, paths and tokens.
-                Err(AgentError::RequestFailed(
-                    "Codex rejected the request".into(),
-                ))
+            let result = if let Some(error) = value.get("error") {
+                Err(AgentError::RequestFailed(rejection_message(error)))
             } else {
                 value
                     .get_mut("result")
@@ -1463,10 +1460,73 @@ fn route_frame(state: &State, mut value: Value, frame_bytes: usize) -> Result<()
     }
 }
 
+/// What the App is told when Codex answers a request with a JSON-RPC error.
+///
+/// Upstream `message` strings can carry prompts, paths and tokens, so they
+/// are never relayed. The one structured `error.data` Codex documents --
+/// `ModelProviderError` (0.164+), sent when a saved thread's model provider
+/// no longer matches the current configuration -- names only provider ids,
+/// which are configuration keys, not secrets. Those are relayed in our own
+/// words so the user learns what to change instead of "Codex rejected the
+/// request". Any other or malformed data keeps the generic text.
+fn rejection_message(error: &Value) -> String {
+    const GENERIC: &str = "Codex rejected the request";
+    let data = &error["data"];
+    let field = |name: &str| {
+        data[name]
+            .as_str()
+            .filter(|id| !id.is_empty() && id.len() <= 64)
+            .filter(|id| id.chars().all(|c| c.is_ascii_graphic() && c != '"'))
+    };
+    match data["type"].as_str() {
+        Some("modelProviderMismatch") => match (field("modelProvider"), field("currentModelProvider")) {
+            (Some(saved), Some(current)) => format!(
+                "Codex: this thread uses model provider \"{saved}\" but Codex is configured for \"{current}\"; switch Codex back to \"{saved}\" or start a new thread"
+            ),
+            _ => GENERIC.into(),
+        },
+        Some("modelProviderNotConfigured") => match field("modelProvider") {
+            Some(saved) => format!(
+                "Codex: this thread uses model provider \"{saved}\", which is no longer configured; restore it or start a new thread"
+            ),
+            None => GENERIC.into(),
+        },
+        Some("modelProviderPolicyConflict") => match (field("modelProvider"), field("requiredModelProvider")) {
+            (Some(saved), Some(required)) if saved != required => format!(
+                "Codex: this thread uses model provider \"{saved}\" but policy requires \"{required}\"; start a new thread with the required provider"
+            ),
+            (Some(_), Some(_)) => "Codex: this thread's model provider no longer meets policy; start a new thread with the current provider settings".into(),
+            _ => GENERIC.into(),
+        },
+        _ => GENERIC.into(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tokio::io::{AsyncBufReadExt, BufReader};
+
+    #[test]
+    fn provider_errors_are_explained_and_everything_else_stays_opaque() {
+        let cases = [
+            (json!({"code":-32000,"message":"secret prompt text"}), "Codex rejected the request"),
+            (json!({"code":-32000,"message":"x","data":{"type":"modelProviderMismatch","modelProvider":"openai","currentModelProvider":"azure"}}),
+             "Codex: this thread uses model provider \"openai\" but Codex is configured for \"azure\"; switch Codex back to \"openai\" or start a new thread"),
+            (json!({"code":-32000,"message":"x","data":{"type":"modelProviderNotConfigured","modelProvider":"ollama"}}),
+             "Codex: this thread uses model provider \"ollama\", which is no longer configured; restore it or start a new thread"),
+            (json!({"code":-32000,"message":"x","data":{"type":"modelProviderPolicyConflict","modelProvider":"openai","requiredModelProvider":"azure"}}),
+             "Codex: this thread uses model provider \"openai\" but policy requires \"azure\"; start a new thread with the required provider"),
+            (json!({"code":-32000,"message":"x","data":{"type":"modelProviderPolicyConflict","modelProvider":"openai","requiredModelProvider":"openai"}}),
+             "Codex: this thread's model provider no longer meets policy; start a new thread with the current provider settings"),
+            // Unknown types and ids that could smuggle text fall back.
+            (json!({"code":-32000,"message":"x","data":{"type":"somethingElse","modelProvider":"openai"}}), "Codex rejected the request"),
+            (json!({"code":-32000,"message":"x","data":{"type":"modelProviderNotConfigured","modelProvider":"has spaces and a /home/user path"}}), "Codex rejected the request"),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(rejection_message(&error), expected, "{error}");
+        }
+    }
 
     #[tokio::test]
     async fn unobserved_completion_fences_resurrection_without_authorizing_lifecycle_cleanup() {

@@ -96,7 +96,10 @@ threads, 8,192 item-order anchors, and 512 parts in each reasoning summary/raw
 array (with equally bounded delta indices). A request/write has a 20-second deadline.
 Stderr is continuously drained through a fixed 8 KiB buffer and discarded
 entirely, avoiding both pipe deadlocks and diagnostic credential leaks. Raw RPC
-error messages are not forwarded or logged. Writes succeed only after bounded
+error messages are not forwarded or logged; the one exception is the structured
+`ModelProviderError` data Codex 0.164+ attaches when a thread's saved model
+provider no longer matches the configuration (mismatch, not configured, policy
+conflict), whose provider ids are relayed in the Gateway's own wording. Writes succeed only after bounded
 `write_all` and flush completion, not queue enqueue. Callback replies keep the
 original native ID and emit resolution only after that acknowledgment; failed,
 cancelled or partial writes fence the connection without retry.
