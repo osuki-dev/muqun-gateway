@@ -337,13 +337,13 @@ pub async fn file_patch(
     let Some(relative) = validate_relative_path(path) else {
         return Ok(None);
     };
-    let relative_str = relative.to_string_lossy().into_owned();
+    let relative_str = slash_path(&relative);
     // A rename is only a rename when git can see both sides: with the new
     // path alone as the pathspec, the file is a brand-new one. The old path
     // is validated exactly as the new one and rides after the same `--`.
     let old_relative = match old_path {
         Some(old) => match validate_relative_path(old) {
-            Some(old) => Some(old.to_string_lossy().into_owned()),
+            Some(old) => Some(slash_path(&old)),
             None => return Ok(None),
         },
         None => None,
@@ -1167,7 +1167,7 @@ pub async fn changed_file_patch(
     let Some(relative) = validate_relative_path(path) else {
         return Ok(None);
     };
-    let relative_str = relative.to_string_lossy().into_owned();
+    let relative_str = slash_path(&relative);
     let listing = list_rows(toplevel, mode, Some(&relative_str)).await?;
     let Some(row) = listing.rows.into_iter().next() else {
         if tracked_exactly(toplevel, &relative_str).await? {
@@ -1231,7 +1231,7 @@ pub async fn changed_file_patch(
         .map_or("HEAD", |base| base.merge_base.as_str());
     let old = match &row.old_path {
         Some(old) => match validate_relative_path(old) {
-            Some(old) => Some(old.to_string_lossy().into_owned()),
+            Some(old) => Some(slash_path(&old)),
             None => return Ok(None),
         },
         None => None,
@@ -1355,7 +1355,7 @@ async fn discard_unless_home(
     home: Option<&Path>,
 ) -> Result<DiscardAction, DiscardError> {
     let relative = validate_relative_path(path).ok_or(DiscardError::UnknownPath)?;
-    let relative_str = relative.to_string_lossy().into_owned();
+    let relative_str = slash_path(&relative);
     let root = std::fs::canonicalize(toplevel).map_err(DiscardError::Io)?;
     if home
         .and_then(|home| std::fs::canonicalize(home).ok())
@@ -1390,7 +1390,7 @@ async fn discard_unless_home(
         if !stays_inside(&root, &old) {
             return Err(DiscardError::OutsideRepository);
         }
-        paths.push(old.to_string_lossy().into_owned());
+        paths.push(slash_path(&old));
     }
     let mut args = vec!["restore", "--staged", "--worktree", "--"];
     args.extend(paths.iter().map(String::as_str));
@@ -1947,6 +1947,15 @@ fn parse_numstat_z(bytes: &[u8]) -> HashMap<String, Counts> {
     counts
 }
 
+/// A relative path as the App and git spell it on every platform: components
+/// joined by `/`, never the host's `\`.
+pub fn slash_path(path: &Path) -> String {
+    path.components()
+        .map(|part| part.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 /// The one client-supplied value, checked before it goes anywhere near an
 /// argument list. Relative, made only of normal components, not starting
 /// with `-`, no NUL, and not empty.
@@ -1955,6 +1964,13 @@ pub fn validate_relative_path(path: &str) -> Option<PathBuf> {
         return None;
     }
     if Path::new(path).is_absolute() {
+        return None;
+    }
+    // Windows reads `\` as a separator too, so `..\secret` would be one
+    // "normal" component here and a parent directory there; and `C:x` is
+    // relative to another drive's working directory. Neither is ever a path
+    // the App sends, which always uses `/`.
+    if cfg!(windows) && (path.contains('\\') || path.contains(':')) {
         return None;
     }
     // Component by component on the string, not through `Path::components`,
@@ -2052,6 +2068,30 @@ fn page_lines(text: &str, from: usize, lines: usize) -> (usize, usize, usize, bo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relative_paths_are_spelled_with_slashes_everywhere() {
+        let path: PathBuf = ["src", "agent", "mod.rs"].iter().collect();
+        assert_eq!(slash_path(&path), "src/agent/mod.rs");
+        assert_eq!(
+            validate_relative_path("src/a.ts").map(|path| slash_path(&path)),
+            Some(String::from("src/a.ts"))
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_separators_and_drives_are_refused() {
+        for bad in [
+            r"..\secret.txt",
+            r"src\..\..\x",
+            "C:x",
+            r"C:\Windows\win.ini",
+            "a/b:c",
+        ] {
+            assert!(validate_relative_path(bad).is_none(), "{bad}");
+        }
+    }
 
     #[test]
     fn scrub_env_drops_every_inherited_git_variable_and_keeps_the_gateway_ones() {
