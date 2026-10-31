@@ -2,6 +2,13 @@
 
 ## Changes and fixes
 
+- **Fresh preview installs work again on Debian and Ubuntu.** The installer's
+  download size backstop assumed bash's 1024-byte `ulimit -f` unit; dash, their
+  `/bin/sh`, counts 512-byte blocks, so the 1 MiB release-metadata cap was really
+  512 KiB and failed at "Resolve preview release" once the release list grew past
+  it. The backstop is now sized for 512-byte units on every shell; the exact cap
+  is unchanged. Installer-only; no Gateway restart or App change.
+
 - **A fresh install ends on the pairing QR.** The installer opens
   `muqun-gateway manage` once a first install's Gateway is confirmed running in
   a terminal, and `manage` opens on the pairing view whenever no device is
