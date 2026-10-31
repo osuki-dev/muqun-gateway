@@ -84,6 +84,15 @@ pub trait AcpProvider: Send + Sync + 'static {
     ) -> AgentFuture<'a, Vec<TimelineItem>> {
         unsupported("reading a session held by a terminal")
     }
+    /// The model and effort the native store says the session last ran
+    /// with, applied when it is loaded so it does not fall back to the
+    /// agent's default. `None` when the store records none.
+    fn transcript_model<'a>(
+        _directory: &'a str,
+        _id: &'a str,
+    ) -> AgentFuture<'a, Option<(String, Option<String>)>> {
+        Box::pin(async { Ok(None) })
+    }
     /// When that store last changed for `id`, to notice terminal progress.
     fn transcript_modified(_directory: &str, _id: &str) -> Option<std::time::SystemTime> {
         None
@@ -358,6 +367,9 @@ pub struct AcpDriver<P: AcpProvider> {
     mcp_servers: StdMutex<Value>,
     terminal: StdMutex<Option<Arc<dyn TerminalBridge>>>,
     me: Weak<Self>,
+    /// The last model catalog a live session offered, kept after its
+    /// process is released so choices stay available.
+    last_catalog: StdMutex<Option<AgentCatalog>>,
     stop: CancellationToken,
 }
 
@@ -461,6 +473,7 @@ impl<P: AcpProvider> AcpDriver<P> {
             mcp_servers: StdMutex::new(json!([])),
             terminal: StdMutex::new(None),
             me: me.clone(),
+            last_catalog: StdMutex::new(None),
             stop: CancellationToken::new(),
         })
     }
@@ -773,8 +786,10 @@ impl<P: AcpProvider> AcpDriver<P> {
             return Ok(observed);
         }
         if !observed.models.is_empty() {
+            *self.last_catalog.lock().unwrap() = Some(observed.clone());
             return Ok(observed);
         }
+
         let directory = directory.unwrap_or(&self.default_directory);
         let mut cached = self.global_catalog.lock().await;
         if let Some((scope, at, result)) = &*cached {
@@ -788,7 +803,18 @@ impl<P: AcpProvider> AcpDriver<P> {
             }
         }
         let result = match P::global_catalog(&self.binary, directory, &self.stop).await {
-            Err(AgentError::Unsupported(_)) => Ok(AgentCatalog::default()),
+            // Without a read-only catalog, what a live session last offered.
+            Err(AgentError::Unsupported(_)) => Ok(self
+                .last_catalog
+                .lock()
+                .unwrap()
+                .clone()
+                .map(|mut last| {
+                    last.commands.clear();
+                    last.defaults.model = None;
+                    last
+                })
+                .unwrap_or_default()),
             result => result,
         };
         *cached = Some((
@@ -818,6 +844,55 @@ impl<P: AcpProvider> AcpDriver<P> {
             }
             Err(_) if !observed.commands.is_empty() => Ok(observed),
             Err(error) => Err(error),
+        }
+    }
+
+    /// Select the model and effort a loaded session last ran with. The
+    /// recorded id is matched exactly, else by family alias; anything not
+    /// offered is left at the agent's choice, which the catalog then shows.
+    async fn restore_recorded_model(
+        &self,
+        session: &Session,
+        id: &str,
+        model: &str,
+        effort: Option<&str>,
+    ) {
+        let (model_choice, effort_choice) = {
+            let state = session.state.lock().await;
+            let values = |key: &str| -> Vec<String> {
+                mapper::config_option(&state.config, key)
+                    .map(|option| {
+                        mapper::select_options(option)
+                            .into_iter()
+                            .filter_map(|native| native["value"].as_str().map(str::to_owned))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+            (
+                mapper::recorded_choice(model, &values("model")),
+                effort.filter(|effort| values(P::EFFORT_CONFIG).iter().any(|v| v == effort)),
+            )
+        };
+        match &model_choice {
+            Some(choice) => {
+                if choice != model {
+                    tracing::info!(session = id, recorded = model, selected = %choice, "restored the nearest offered model");
+                }
+                if let Err(error) = self.select_config(session, "model", choice).await {
+                    tracing::warn!(session = id, %error, "could not restore the recorded model");
+                }
+            }
+            None => tracing::info!(
+                session = id,
+                recorded = model,
+                "recorded model is not offered; keeping the agent's default"
+            ),
+        }
+        if let Some(effort) = effort_choice {
+            if let Err(error) = self.select_config(session, P::EFFORT_CONFIG, effort).await {
+                tracing::warn!(session = id, %error, "could not restore the recorded effort");
+            }
         }
     }
 
@@ -1469,6 +1544,15 @@ impl<P: AcpProvider> AcpDriver<P> {
             .filter(|cwd| std::path::Path::new(cwd).is_absolute())
             .ok_or_else(|| AgentError::NotAvailable("The native session has no verified working directory; open it in Qoder or FX once before loading it here".into()))?;
         let session = self.open(&directory, Some(info)).await?;
+        if dormant
+            .as_ref()
+            .is_none_or(|entry| entry.info.model.is_none())
+        {
+            if let Ok(Some((model, effort))) = P::transcript_model(&directory, id).await {
+                self.restore_recorded_model(&session, id, &model, effort.as_deref())
+                    .await;
+            }
+        }
         if let Some(entry) = dormant {
             session.state.lock().await.owned_mutations = entry.owned_mutations;
             if let Some(model) = &entry.info.model {
