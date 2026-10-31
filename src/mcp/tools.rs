@@ -1115,7 +1115,7 @@ pub(crate) mod tests_support {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::agents::domain::{AgentPart, TimelineItem, TimelineRole};

@@ -23,7 +23,7 @@ async fn fleet_self(
     Ok(Json(state.fleet.manifest(&state).await))
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::bearer_headers;

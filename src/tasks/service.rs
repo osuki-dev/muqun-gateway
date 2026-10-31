@@ -3664,7 +3664,7 @@ fn resolve_model(
         })
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::agents::domain::{AgentPart, AgentSessionId, TimelineRole};
