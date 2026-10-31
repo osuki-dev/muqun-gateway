@@ -48,9 +48,10 @@ pub async fn api_meta(State(state): State<AppState>, headers: HeaderMap) -> ApiR
 /// every capability and the agent configuration, which is fingerprinting
 /// for anyone on the network and the id the peer identity checks use.
 ///
-/// Only the owner's app sees the unredacted agent plane (local endpoints
-/// and versions); a linked gateway and the admin token get the document
-/// with those removed, as they did when `require_device` refused them.
+/// The owner's app and the admin token (this machine's own `agent` and
+/// `manage` commands, which can read every file anyway) see the unredacted
+/// agent plane (local endpoints and versions); a linked gateway gets the
+/// document with those removed.
 fn require_discovery_reader(
     state: &AppState,
     headers: &HeaderMap,
@@ -69,8 +70,9 @@ async fn discovery_for(state: &AppState, headers: &HeaderMap) -> ApiResult<Json<
     let sealed = app
         .map(|caller| device_seals_its_transport(state, &caller.device_id))
         .unwrap_or(false);
+    let unredacted = caller.is_none() || app.is_some();
     Ok(Json(
-        super::discovery::build_discovery(state, sealed, app.is_some()).await,
+        super::discovery::build_discovery(state, sealed, unredacted).await,
     ))
 }
 

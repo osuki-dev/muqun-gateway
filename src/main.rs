@@ -130,8 +130,14 @@ fn main() -> anyhow::Result<()> {
     // On stderr rather than stdout: for `run` this is the gateway log, which is
     // where it is wanted, and for a command a human is watching it says nothing
     // at all, because a shell has already given the process everything.
-    for note in login_env::adopt() {
-        eprintln!("environment repaired from the login shell -- {note}");
+    //
+    // Only `run` (the log) and `status` say so: on every other command the
+    // note is noise in front of the output a person asked for.
+    let notes = login_env::adopt();
+    if matches!(cli.command, Command::Run { .. } | Command::Status) {
+        for note in notes {
+            eprintln!("environment repaired from the login shell -- {note}");
+        }
     }
     init_tracing();
     tokio::runtime::Builder::new_multi_thread()
