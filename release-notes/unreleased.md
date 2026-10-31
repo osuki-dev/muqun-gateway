@@ -2,6 +2,14 @@
 
 ## Changes and fixes
 
+- **FX, Qoder and Pi conversations reopen right after a Gateway restart.** The
+  Gateway starts answering before its agents finish attaching, and an App that
+  was open reconnects within that moment. Its one foreground session
+  preparation was answered "Agent 'qoder' is not available", so the
+  conversation showed "Could not resume the session" with Retry and its history
+  stayed refused until Retry was tapped. Agent-scoped requests in that window
+  now wait (at most 10 s) for the first attach pass instead.
+
 - **Codex provider mismatches are explained.** Codex 0.164 and newer refuse to
   resume or prompt a thread whose saved model provider no longer matches the
   current Codex configuration, and say so in structured error data. The Gateway
