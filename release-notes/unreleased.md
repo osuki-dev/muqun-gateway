@@ -2,6 +2,16 @@
 
 ## Changes and fixes
 
+- **Qoder no longer launches a metadata process every minute.** While the App
+  was open, Home refreshes started a `qodercli --acp` child about once a minute
+  to list saved sessions and discovery ran `qodercli --list-models` about every
+  two minutes; each launch left a log session in Qoder's own data directory.
+  Session listings are now reused while Qoder's saved-session store is
+  unchanged (re-listed at least every 10 minutes), and a successful model list
+  is reused for 10 minutes. New or changed Qoder sessions still appear on the
+  next Home refresh, and a failed model list is retried after 5 seconds.
+  Restart the Gateway after updating.
+
 - **Codex provider mismatches are explained.** Codex 0.164 and newer refuse to
   resume or prompt a thread whose saved model provider no longer matches the
   current Codex configuration, and say so in structured error data. The Gateway

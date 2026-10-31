@@ -24,7 +24,11 @@ flow or automatically retries the original operation after login.
 
 Discovery uses a time- and output-bounded `--version` probe and may read the
 native `--list-models` catalog after attachment. No ACP session is created for
-that catalog read. Its `reachable`
+that catalog read. Every `qodercli` launch leaves a native log session, so a
+successful catalog is reused for 10 minutes (a failure for 5 seconds). The
+metadata `--acp` child behind session listings is launched again only when the
+saved-session store under `~/.qoder/projects` changes, or at least every 10
+minutes; an unchanged store keeps the previous listing. Discovery's `reachable`
 status means an installed executable answered, not that model authentication
 or a model response has been verified. Each explicitly opened session owns a
 private `qodercli --acp` child. Shutdown stops and reaps Gateway-owned children;
