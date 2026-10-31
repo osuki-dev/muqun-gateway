@@ -871,11 +871,24 @@ async fn dispatch(
     }
 }
 
+/// ACP's own `auth_required` code. Qoder CLI answers `session/new` with it when
+/// it is not signed in on this host.
+const ACP_AUTH_REQUIRED: i64 = -32000;
+
 fn rpc_error(state: &State, error: &Value) -> String {
     let code = error.get("code").and_then(Value::as_i64).unwrap_or(-32603);
-    let prefix = format!("{} ACP request rejected (code {code})", state.provider);
-    match (state.safe_error_message)(error) {
+    rpc_error_text(state.provider, code, (state.safe_error_message)(error))
+}
+
+/// `<Provider> ACP request rejected (code N)`, then the provider's allowlisted
+/// sentence or, for `auth_required`, the Gateway's own. Native text never.
+fn rpc_error_text(provider: &str, code: i64, safe: Option<&str>) -> String {
+    let prefix = format!("{provider} ACP request rejected (code {code})");
+    match safe {
         Some(message) => format!("{prefix}: {message}"),
+        None if code == ACP_AUTH_REQUIRED => {
+            format!("{prefix}: authentication required; sign in to {provider} on this computer")
+        }
         None => prefix,
     }
 }
@@ -944,6 +957,22 @@ mod tests {
         client.shutdown().await;
         assert!(client.state.exited.is_cancelled());
         std::fs::remove_dir(cwd).unwrap();
+    }
+
+    #[test]
+    fn rejection_text_names_auth_required_and_never_native_text() {
+        let auth = "Qoder ACP request rejected (code -32000): authentication required; sign in to Qoder on this computer";
+        for (code, safe, expected) in [
+            (-32000, None, auth),
+            (-32603, None, "Qoder ACP request rejected (code -32603)"),
+            (
+                -32000,
+                Some("Session is busy"),
+                "Qoder ACP request rejected (code -32000): Session is busy",
+            ),
+        ] {
+            assert_eq!(rpc_error_text("Qoder", code, safe), expected);
+        }
     }
 
     #[cfg(unix)]
@@ -1299,7 +1328,7 @@ mod tests {
         "#,
         );
         let error = client.request("initialize", json!({})).await.unwrap_err();
-        assert_eq!(error, "FX ACP request rejected (code -32000)");
+        assert!(error.starts_with("FX ACP request rejected (code -32000)"));
         assert!(!error.contains("secret"));
         client.shutdown().await;
     }

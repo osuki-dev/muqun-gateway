@@ -2,6 +2,13 @@
 
 ## Changes and fixes
 
+- **A Qoder or FX conversation that is not signed in says so.** An ACP agent's
+  `auth_required` refusal (code -32000) used to reach the App and task list as
+  only `ACP request rejected (code -32000)`. It now adds "authentication
+  required; sign in to <agent> on this computer". The agent's own error text is
+  still never relayed, and other codes are unchanged. Restart the Gateway after
+  updating.
+
 - **Codex provider mismatches are explained.** Codex 0.164 and newer refuse to
   resume or prompt a thread whose saved model provider no longer matches the
   current Codex configuration, and say so in structured error data. The Gateway
