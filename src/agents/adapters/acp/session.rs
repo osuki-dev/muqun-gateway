@@ -3538,6 +3538,27 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
             Ok(timeline)
         })
     }
+    /// ACP's `pending` covers a tool call the agent is already executing:
+    /// `claude-agent-acp` reports `in_progress` only with a progress beat,
+    /// so a quick MCP call stays `pending` until its result. An MCP request
+    /// arriving with that call's exact arguments is the call running.
+    fn mcp_call_timeline<'a>(
+        &'a self,
+        session_id: &'a str,
+        limit: usize,
+    ) -> AgentFuture<'a, Option<Vec<TimelineItem>>> {
+        Box::pin(async move {
+            let mut items = self.get_timeline(session_id, limit).await?;
+            for item in &mut items {
+                if let AgentPart::Tool(call) = &mut item.part {
+                    if call.state == ToolCallStatus::Pending {
+                        call.set_state(ToolCallStatus::Running);
+                    }
+                }
+            }
+            Ok(Some(items))
+        })
+    }
     fn fork_session<'a>(
         &'a self,
         id: &'a str,

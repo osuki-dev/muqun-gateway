@@ -1900,4 +1900,145 @@ mod tests {
             "the parent session is still told"
         );
     }
+
+    /// The ACP adapter fake for [`a_native_acp_session_completes_its_own_task`]:
+    /// its one prompt reports a muqun `tasks.complete` call the way
+    /// `claude-agent-acp` does (`pending`, no `in_progress`) and stays open.
+    const ACP_CALLER: &str = r#"#!/usr/bin/env python3
+import json, sys
+def send(value): print(json.dumps(value), flush=True)
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get('method')
+    if method == 'initialize':
+        send({'jsonrpc': '2.0', 'id': message['id'], 'result': {'protocolVersion': 1, 'agentCapabilities': {}, 'authMethods': []}})
+    elif method == 'session/new':
+        send({'jsonrpc': '2.0', 'id': message['id'], 'result': {'sessionId': '00000000-0000-4000-8000-0000000000cc'}})
+    elif method == 'session/prompt':
+        send({'jsonrpc': '2.0', 'method': 'session/update', 'params': {'sessionId': message['params']['sessionId'], 'update': {
+            'sessionUpdate': 'tool_call', 'toolCallId': 'toolu_1', 'name': 'mcp__muqun__tasks_complete', 'kind': 'other',
+            'title': 'tasks.complete', 'status': 'pending', 'rawInput': {'summary': 'Replied PONG.'}}}})
+    elif 'id' in message:
+        send({'jsonrpc': '2.0', 'id': message['id'], 'error': {'code': -32601, 'message': 'unsupported'}})
+"#;
+
+    /// A Home task bound to a native ACP session (Claude Code here; Cursor
+    /// and Antigravity share the driver and the agent-bound token): the
+    /// session's own `tasks.complete` call finds and ends that task, and a
+    /// call the session is not making does not.
+    #[tokio::test]
+    async fn a_native_acp_session_completes_its_own_task() {
+        use crate::agents::ports::agent::AgentPort;
+        use crate::tasks::domain::{
+            now_ms, PrincipalKind, Task, TaskBinding, TaskChange, TaskId, TaskKind, TaskOrigin,
+            TaskPrincipal, TaskState,
+        };
+        use std::os::unix::fs::PermissionsExt;
+        for (summary, completes) in [("Replied PONG.", true), ("Something else.", false)] {
+            let directory =
+                crate::test_state_dir().join(format!("acp-task-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&directory).unwrap();
+            let fake = directory.join("fake-claude-agent-acp");
+            std::fs::write(&fake, ACP_CALLER).unwrap();
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let cwd = directory.to_string_lossy().into_owned();
+            let state = test_state("admin", Vec::new());
+            let (tx, _) = tokio::sync::broadcast::channel(64);
+            let (manager, driver) = crate::agents::manager::AgentManager::connect_claude(
+                fake.to_string_lossy().into_owned(),
+                cwd.clone(),
+                None,
+                tx,
+            );
+            state
+                .agent_runtime
+                .attach_for_test(std::sync::Arc::new(manager))
+                .await;
+            let info = driver.create_session(Some(&cwd), None, None).await.unwrap();
+            let asid = info.asid.0.clone();
+            let now = now_ms();
+            let task = Task {
+                id: TaskId::new(),
+                kind: TaskKind::Delegation,
+                goal: "Reply with exactly PONG".into(),
+                cwd: Some(cwd.clone()),
+                binding: TaskBinding::AgentSession {
+                    agent_id: "claude".into(),
+                    asid: asid.clone(),
+                },
+                state: TaskState::Queued,
+                summary: None,
+                exit_code: None,
+                created_by: TaskPrincipal {
+                    kind: PrincipalKind::Device,
+                    id: "d1".into(),
+                },
+                created_ms: now,
+                updated_ms: now,
+                seq: 0,
+                parent: None,
+                origin: TaskOrigin::Device,
+                label: None,
+                requester_name: None,
+                session_title: None,
+                mentions: Vec::new(),
+                client_ref: None,
+                requester_server_id: None,
+                reopened_ms: None,
+                reopen_count: 0,
+            };
+            let id = state.tasks.insert_for_test(&task).await;
+            let working = TaskChange {
+                to: TaskState::Working,
+                source: "test".into(),
+                ..Default::default()
+            };
+            state.tasks.move_to(&id, working).await.unwrap();
+            driver
+                .send_prompt(&asid, "Reply with exactly PONG", &[], None)
+                .await
+                .unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while !driver
+                    .get_timeline(&asid, 20)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|item| matches!(&item.part, AgentPart::Tool(_)))
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("the adapter reported its tool call");
+
+            let token = AssistantSession {
+                token_id: "tok-claude".into(),
+                binding: TokenBinding::Agent {
+                    agent_id: "claude".into(),
+                },
+                label: "claude (native sessions)".into(),
+                expires_ms: None,
+            };
+            let args = CompleteArgs {
+                summary: summary.into(),
+                outcome: Outcome::Done,
+                task_id: None,
+            };
+            let (error, _, body) = answer(
+                MuqunMcp::new(state.clone(), token)
+                    .tasks_complete(Parameters(args))
+                    .await,
+            );
+            let now = state.tasks.task(&id).await.unwrap().unwrap().state;
+            if completes {
+                assert!(!error, "{body}");
+                assert_eq!(now, TaskState::Done, "{body}");
+            } else {
+                assert_eq!(body["error"], "task_not_found", "{body}");
+                assert_eq!(now, TaskState::Working);
+            }
+            driver.shutdown().await;
+        }
+    }
 }

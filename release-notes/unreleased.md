@@ -2,6 +2,16 @@
 
 ## Changes and fixes
 
+- **Claude Code, Cursor and Antigravity sessions can finish a Home task.**
+  A task delegated to one of these native ACP sessions was answered
+  `task_not_found` when the agent called `tasks.complete`, so it ended
+  "idle, unconfirmed" instead of done. The Gateway matches the call to the
+  session making it by its running tool call, but these adapters report a
+  quick MCP call as `pending` until its result, and the request can reach the
+  Gateway a few milliseconds before that report. Such a call now counts as
+  running, and a call that matches no session yet is looked for again for up
+  to half a second.
+
 - **Claude Code and Antigravity sessions start from Home right after a
   Gateway restart.** Until one of their sessions had run, they listed no
   models, so the model the App remembered was refused with `unknown_model` and
