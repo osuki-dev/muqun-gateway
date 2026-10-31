@@ -652,6 +652,7 @@ impl AgentRuntime {
         let _ = self
             .terminal_runtime
             .set(super::terminal_runtime::TerminalRuntime::new(sessions));
+        let _ = self.claude.terminals.set(sessions.to_vec());
     }
 
     pub(crate) fn restore_native_codex_sessions(

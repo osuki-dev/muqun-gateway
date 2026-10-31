@@ -23,13 +23,122 @@ const MAX_ROWS: usize = 4096;
 const MAX_TITLE_CHARS: usize = 200;
 const MAX_CACHED: usize = 8192;
 
+/// `$CLAUDE_CONFIG_DIR`, else `~/.claude`.
+fn config_dir() -> Option<PathBuf> {
+    match std::env::var_os("CLAUDE_CONFIG_DIR").filter(|dir| !dir.is_empty()) {
+        Some(dir) => Some(PathBuf::from(dir)),
+        None => Some(dirs::home_dir()?.join(".claude")),
+    }
+}
+
 /// `$CLAUDE_CONFIG_DIR/projects`, else `~/.claude/projects`.
 pub(crate) fn projects_root() -> Option<PathBuf> {
-    let config = match std::env::var_os("CLAUDE_CONFIG_DIR").filter(|dir| !dir.is_empty()) {
-        Some(dir) => PathBuf::from(dir),
-        None => dirs::home_dir()?.join(".claude"),
+    Some(config_dir()?.join("projects"))
+}
+
+const MAX_REGISTRY: usize = 512;
+const MAX_REGISTRY_BYTES: u64 = 64 * 1024;
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Registered {
+    pid: u32,
+    session_id: String,
+    proc_start: Option<String>,
+    status: Option<String>,
+}
+
+/// A Claude Code process outside this Gateway that has a session open.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LiveProcess {
+    pub pid: u32,
+    /// Its start time, as `procStart` records it; with the pid it names
+    /// this incarnation.
+    pub start: String,
+    /// Claude Code's own `busy` / `idle`, when it records one.
+    pub busy: Option<bool>,
+}
+
+/// The sessions another live process has open, from Claude Code's own
+/// registry: every running Claude Code (terminal, IDE or another ACP client)
+/// keeps `<config>/sessions/<pid>.json` naming its current session.
+/// `elsewhere(pid, proc_start)` says whether that pid is alive, is the same
+/// process (start time), and is not one of this Gateway's own children.
+fn live_in(
+    registry: &Path,
+    elsewhere: impl Fn(u32, Option<&str>) -> bool,
+) -> HashMap<String, LiveProcess> {
+    let Ok(entries) = std::fs::read_dir(registry) else {
+        return HashMap::new();
     };
-    Some(config.join("projects"))
+    entries
+        .take(MAX_REGISTRY)
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry.file_name().to_str().is_some_and(|name| {
+                name.strip_suffix(".json")
+                    .is_some_and(|pid| pid.bytes().all(|b| b.is_ascii_digit()))
+            }) && entry
+                .metadata()
+                .is_ok_and(|stat| stat.is_file() && stat.len() <= MAX_REGISTRY_BYTES)
+        })
+        .filter_map(|entry| std::fs::read(entry.path()).ok())
+        .filter_map(|bytes| serde_json::from_slice::<Registered>(&bytes).ok())
+        .filter(|entry| valid_session_id(&entry.session_id))
+        .filter(|entry| elsewhere(entry.pid, entry.proc_start.as_deref()))
+        .map(|entry| {
+            let process = LiveProcess {
+                pid: entry.pid,
+                start: entry.proc_start.unwrap_or_default(),
+                busy: match entry.status.as_deref() {
+                    Some("busy") => Some(true),
+                    Some("idle") => Some(false),
+                    _ => None,
+                },
+            };
+            (entry.session_id, process)
+        })
+        .collect()
+}
+
+/// `(ppid, start time)` from a Linux `/proc/<pid>/stat` line.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn parse_stat(stat: &str) -> Option<(u32, &str)> {
+    // The command name may contain spaces and parentheses; fields follow the last ')'.
+    let fields: Vec<&str> = stat
+        .get(stat.rfind(')')? + 1..)?
+        .split_whitespace()
+        .collect();
+    Some((fields.get(1)?.parse().ok()?, fields.get(19)?))
+}
+
+/// Alive, the same incarnation the registry recorded (where the start time
+/// can be read), and not this Gateway or one of its children.
+fn running_elsewhere(pid: u32, proc_start: Option<&str>) -> bool {
+    use crate::terminal::backend::{descends_from, process_parent};
+    if process_parent(pid).is_none() {
+        return false;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let start = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|stat| parse_stat(&stat).map(|(_, start)| start.to_owned()));
+        if proc_start.is_some_and(|expected| start.as_deref() != Some(expected)) {
+            return false;
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = proc_start;
+    !descends_from(pid, std::process::id())
+}
+
+/// Claude Code sessions open in another running process, by session id.
+pub(crate) fn live_sessions() -> HashMap<String, LiveProcess> {
+    match config_dir() {
+        Some(config) => live_in(&config.join("sessions"), running_elsewhere),
+        None => HashMap::new(),
+    }
 }
 
 fn encode(cwd: &str) -> String {
@@ -439,6 +548,47 @@ mod tests {
     impl Drop for Scratch {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn registry_marks_sessions_live_only_in_another_running_process() {
+        let dir = Scratch(
+            std::env::temp_dir().join(format!("muqun-claude-registry-{}", uuid::Uuid::new_v4())),
+        );
+        std::fs::create_dir_all(&dir.0).unwrap();
+        let ids = [
+            "00000000-0000-4000-8000-00000000000a",
+            "00000000-0000-4000-8000-00000000000b",
+            "00000000-0000-4000-8000-00000000000c",
+        ];
+        // (pid, session, file name)
+        for (pid, id, name) in [
+            (11, ids[0], "11.json"), // a terminal elsewhere: live
+            (12, ids[1], "12.json"), // exited, or one of ours: not live
+            (13, ids[2], "13.key"),  // not a registry entry
+            (14, "not-a-session", "14.json"),
+        ] {
+            let entry =
+                json!({"pid": pid, "sessionId": id, "procStart": "100", "kind": "interactive"});
+            std::fs::write(dir.0.join(name), entry.to_string()).unwrap();
+        }
+        let live = live_in(&dir.0, |pid, start| pid != 12 && start == Some("100"));
+        assert_eq!(live.keys().collect::<Vec<_>>(), [ids[0]]);
+        assert_eq!(live[ids[0]].pid, 11);
+        assert!(live_in(&dir.0.join("missing"), |_, _| true).is_empty());
+        for (stat, parsed) in [
+            (
+                "42 (claude) S 7 42 42 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 15811020 1",
+                Some((7, "15811020")),
+            ),
+            (
+                "42 (a) b) (c) S 9 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 77 1",
+                Some((9, "77")),
+            ),
+            ("42 (short) S", None),
+        ] {
+            assert_eq!(parse_stat(stat), parsed, "{stat}");
         }
     }
 

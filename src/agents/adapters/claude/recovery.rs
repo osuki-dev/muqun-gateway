@@ -182,11 +182,24 @@ fn node(record: &Record) -> Node {
     }
 }
 
-fn inspect_file(
+/// One main-chain record: its role for recovery and, when kept, its content.
+struct Chained {
+    uuid: String,
+    node: Node,
+    kind: Option<String>,
+    message_id: Option<String>,
+    content: Option<Value>,
+}
+
+/// The main chain, oldest first. `settled` demands a complete, unchanged
+/// file (recovery evidence); otherwise a transcript still being appended is
+/// read up to its last complete line (a live terminal's history).
+fn main_chain(
     path: &Path,
     id: &str,
     stop: &CancellationToken,
-) -> Result<NativeSnapshot, AgentError> {
+    settled: bool,
+) -> Result<Vec<Chained>, AgentError> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -202,10 +215,17 @@ fn inspect_file(
     let mut reader = std::io::BufReader::with_capacity(256 * 1024, &file);
     let mut buffer = Vec::new();
     let mut total = 0;
-    let mut nodes: HashMap<String, (Option<String>, Node)> = HashMap::new();
+    let mut nodes: HashMap<String, (Option<String>, Chained)> = HashMap::new();
     let mut leaf = None;
     let mut records = 0;
-    while let Some(line) = next_line(&mut reader, &mut buffer, &mut total)? {
+    loop {
+        let line = match next_line(&mut reader, &mut buffer, &mut total) {
+            Ok(Some(line)) => line,
+            Ok(None) => break,
+            // A live transcript ends mid-append; its complete lines stand.
+            Err(_) if !settled => break,
+            Err(error) => return Err(error),
+        };
         if stop.is_cancelled() {
             return Err(unavailable());
         }
@@ -237,21 +257,37 @@ fn inspect_file(
         if record.is_sidechain {
             continue;
         }
-        let entry = (record.parent_uuid.clone(), node(&record));
-        if nodes.insert(uuid.clone(), entry).is_some() {
+        let node = node(&record);
+        let chained = Chained {
+            uuid: uuid.clone(),
+            node,
+            kind: record.kind.clone(),
+            message_id: record.message.as_ref().and_then(|m| m.id.clone()),
+            content: if settled {
+                None
+            } else {
+                record.message.and_then(|m| m.content)
+            },
+        };
+        if nodes
+            .insert(uuid.clone(), (record.parent_uuid, chained))
+            .is_some()
+        {
             return Err(unavailable());
         }
         leaf = Some(uuid);
     }
-    let after = std::fs::symlink_metadata(path).map_err(|_| unavailable())?;
-    if after.len() != before.len()
-        || after.modified().ok() != before.modified().ok()
-        || total != before.len()
-    {
-        return Err(unavailable());
+    if settled {
+        let after = std::fs::symlink_metadata(path).map_err(|_| unavailable())?;
+        if after.len() != before.len()
+            || after.modified().ok() != before.modified().ok()
+            || total != before.len()
+        {
+            return Err(unavailable());
+        }
     }
     let Some(mut next) = leaf else {
-        return Ok(NativeSnapshot::empty(id));
+        return Ok(Vec::new());
     };
     let mut chain = Vec::new();
     let mut seen = HashSet::new();
@@ -259,17 +295,133 @@ fn inspect_file(
         if !seen.insert(next.clone()) {
             return Err(unavailable());
         }
-        let Some((parent, node)) = nodes.remove(&next) else {
+        let Some((parent, chained)) = nodes.remove(&next) else {
             return Err(unavailable());
         };
-        chain.push(node);
+        chain.push(chained);
         match parent {
             Some(parent) => next = parent,
             None => break,
         }
     }
     chain.reverse();
-    Ok(snapshot(id, chain))
+    Ok(chain)
+}
+
+fn inspect_file(
+    path: &Path,
+    id: &str,
+    stop: &CancellationToken,
+) -> Result<NativeSnapshot, AgentError> {
+    let chain = main_chain(path, id, stop, true)?;
+    Ok(snapshot(id, chain.into_iter().map(|c| c.node).collect()))
+}
+
+/// The ACP `session/update`s a `session/load` of this transcript would
+/// replay, for the shared projection: typed prompts, assistant text and
+/// thinking, tool calls with their results.
+fn replay_updates(chain: &[Chained]) -> Vec<Value> {
+    let mut updates = Vec::new();
+    for record in chain {
+        let parts = match &record.content {
+            Some(Value::String(text)) => vec![json!({"type": "text", "text": text})],
+            Some(Value::Array(parts)) => parts.clone(),
+            _ => continue,
+        };
+        match (record.kind.as_deref(), &record.node) {
+            (Some("user"), Node::Human(text)) => updates.push(json!({
+                "sessionUpdate": "user_message_chunk",
+                "messageId": record.uuid,
+                "content": {"type": "text", "text": text},
+            })),
+            (Some("user"), _) => {
+                for part in parts.iter().filter(|p| p["type"] == "tool_result") {
+                    let output = match &part["content"] {
+                        Value::String(text) => text.clone(),
+                        Value::Array(items) => items
+                            .iter()
+                            .filter_map(|item| item["text"].as_str())
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                        _ => String::new(),
+                    };
+                    updates.push(json!({
+                        "sessionUpdate": "tool_call_update",
+                        "toolCallId": part["tool_use_id"],
+                        "status": if part["is_error"] == true { "failed" } else { "completed" },
+                        "content": [{"type": "content", "content": {"type": "text", "text": output}}],
+                    }));
+                }
+            }
+            (Some("assistant"), _) => {
+                let message = record
+                    .message_id
+                    .clone()
+                    .unwrap_or_else(|| record.uuid.clone());
+                for part in &parts {
+                    match part["type"].as_str() {
+                        Some("text") => updates.push(json!({
+                            "sessionUpdate": "agent_message_chunk",
+                            "messageId": message,
+                            "content": {"type": "text", "text": part["text"]},
+                        })),
+                        Some("thinking")
+                            if part["thinking"].as_str().is_some_and(|t| !t.is_empty()) =>
+                        {
+                            updates.push(json!({
+                                "sessionUpdate": "agent_thought_chunk",
+                                "messageId": message,
+                                "content": {"type": "text", "text": part["thinking"]},
+                            }))
+                        }
+                        Some("tool_use") => updates.push(json!({
+                            "sessionUpdate": "tool_call",
+                            "toolCallId": part["id"],
+                            "title": part["name"],
+                            "name": part["name"],
+                            "status": "in_progress",
+                            "rawInput": part["input"],
+                        })),
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    updates
+}
+
+/// The timeline of a transcript another process is still writing, read-only.
+pub(super) async fn live_timeline(
+    directory: &str,
+    id: &str,
+    stop: &CancellationToken,
+) -> Result<Vec<crate::agents::domain::TimelineItem>, AgentError> {
+    if !valid_session_id(id) || !Path::new(directory).is_absolute() {
+        return Err(unavailable());
+    }
+    let root = projects_root().ok_or_else(unavailable)?;
+    let (directory, id, stop) = (directory.to_owned(), id.to_owned(), stop.clone());
+    tokio::task::spawn_blocking(move || {
+        let path = find_exact(&root, &directory, &id)?;
+        let chain = main_chain(&path, &id, &stop, false)?;
+        let mut projection = crate::agents::adapters::acp::mapper::Projection::new(false);
+        for update in replay_updates(&chain) {
+            // A record this reader cannot render is skipped, not fatal.
+            let _ = projection.update(&update);
+        }
+        Ok(projection.timeline())
+    })
+    .await
+    .map_err(|_| unavailable())?
+}
+
+/// The transcript's modification time, to notice that a terminal wrote to it.
+pub(super) fn transcript_modified(directory: &str, id: &str) -> Option<std::time::SystemTime> {
+    let root = projects_root()?;
+    let path = find_exact(&root, directory, id).ok()?;
+    std::fs::metadata(path).ok()?.modified().ok()
 }
 
 fn snapshot(id: &str, chain: Vec<Node>) -> NativeSnapshot {

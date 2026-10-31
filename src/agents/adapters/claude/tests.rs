@@ -129,8 +129,83 @@ async fn listing_starts_nothing_and_sessions_get_launch_mcp_and_model() {
         .filter(|m| m[0] == "session/prompt")
         .count();
     assert_eq!(prompts, 1);
+
+    // Hand-over: the same session is now resumed in a terminal pane. The
+    // Gateway's idle child is released and input goes into that pane; no
+    // second agent process receives the prompt.
+    let bridge = Arc::new(FakeTerminal::default());
+    driver.set_terminal_bridge(bridge.clone());
+    driver
+        .send_prompt(&info.asid.0, "Reply with exactly PONG", &[], None)
+        .await
+        .unwrap();
+    assert_eq!(
+        bridge.sent.lock().unwrap().as_slice(),
+        [("pane-1".to_owned(), "Reply with exactly PONG".to_owned())]
+    );
+    assert!(!driver.has_live_stream());
+    let runtime = driver.session_runtime(&info.asid.0).await.unwrap().unwrap();
+    assert_eq!(
+        runtime.interaction,
+        crate::agents::domain::RuntimeInteraction::Terminal
+    );
+    let prompts = lines(&directory.join("methods.log"))
+        .into_iter()
+        .filter(|m| m[0] == "session/prompt")
+        .count();
+    assert_eq!(prompts, 1);
     driver.shutdown().await;
     let _ = std::fs::remove_dir_all(&directory);
+}
+
+#[derive(Default)]
+struct FakeTerminal {
+    sent: std::sync::Mutex<Vec<(String, String)>>,
+}
+
+impl crate::agents::adapters::acp::session::TerminalBridge for FakeTerminal {
+    fn live<'a>(
+        &'a self,
+        ids: &'a [String],
+    ) -> crate::agents::ports::agent::AgentFuture<
+        'a,
+        std::collections::HashMap<String, crate::agents::adapters::acp::session::TerminalLive>,
+    > {
+        Box::pin(async move {
+            let process = super::native_sessions::LiveProcess {
+                pid: 4242,
+                start: "1".into(),
+                busy: Some(false),
+            };
+            Ok(ids
+                .iter()
+                .map(|id| {
+                    let live = crate::agents::runtime::claude::terminal_runtime(
+                        &process,
+                        Some(("terminal".into(), "pane-1".into())),
+                    );
+                    (id.clone(), live)
+                })
+                .collect())
+        })
+    }
+    fn send<'a>(
+        &'a self,
+        route: &'a crate::agents::adapters::acp::session::TerminalRoute,
+        text: &'a str,
+    ) -> crate::agents::ports::agent::AgentFuture<'a, ()> {
+        self.sent
+            .lock()
+            .unwrap()
+            .push((route.pane.clone(), text.to_owned()));
+        Box::pin(async { Ok(()) })
+    }
+    fn interrupt<'a>(
+        &'a self,
+        _route: &'a crate::agents::adapters::acp::session::TerminalRoute,
+    ) -> crate::agents::ports::agent::AgentFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 /// One real turn through the official adapter on the cheapest model, idle
