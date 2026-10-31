@@ -984,8 +984,13 @@ mod tests {
     /// A state whose OpenCode fake answers a new session `opencode_new`.
     async fn with_agent() -> AppState {
         let state = state();
-        let agent =
+        let mut agent =
             crate::test_support::FakeAgent::new("opencode").with_sessions(&[("opencode_new", 1)]);
+        // OpenCode always lists its models; one that is not listed is refused.
+        agent.catalog.models = serde_json::from_value(json!([
+            {"id": "union-alpha", "name": "Union Alpha", "provider_id": "opencode"}
+        ]))
+        .unwrap();
         state.agent_runtime.attach_for_test(agent.manager()).await;
         state
     }

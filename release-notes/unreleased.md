@@ -2,6 +2,15 @@
 
 ## Changes and fixes
 
+- **Claude Code and Antigravity sessions start from Home right after a
+  Gateway restart.** Until one of their sessions had run, they listed no
+  models, so the model the App remembered was refused with `unknown_model` and
+  a new session could not be created from Home. The model list their last
+  session showed is now kept across restarts (with the effort / thinking
+  tiers every earlier session showed, not only the selected model's), and
+  when an agent lists no models at all the requested model is passed to the
+  agent to judge instead of being refused.
+
 - **New sessions remember each folder's model, mode and effort on every
   device.** The Gateway now records the model (with its effort) and mode the
   App picks when it creates a session or switches one, per agent and folder

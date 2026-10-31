@@ -872,10 +872,11 @@ async fn do_create_agent_session(
         .record_session_route(&session.asid.0, manager.agent().kind())
         .await;
     // Only what the App named; a session created without a choice changes
-    // nothing remembered.
-    super::session_defaults::record(
+    // nothing remembered. The new session's model list is kept too.
+    super::session_defaults::after_create(
         &state.db,
-        manager.agent().kind(),
+        &manager,
+        &session.asid.0,
         validated_dir.as_deref(),
         body.model.as_ref(),
         body.mode.as_deref(),
