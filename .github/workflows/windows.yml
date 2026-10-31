@@ -1,0 +1,33 @@
+name: windows
+
+# Native Windows is not a release target yet (see docs/windows.md). This job
+# keeps the gateway compiling, linting and testing on Windows so the agent-only
+# work can land in small steps, and so a change that only builds on Unix is
+# caught before it reaches main rather than when a release is cut.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  check:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: rustup show active-toolchain
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --locked
+      # Not a release: a binary to try on a real Windows machine while the
+      # agent-only work lands. Download it from the run's Artifacts section.
+      - name: Build release binary
+        run: cargo build --release --locked
+      - uses: actions/upload-artifact@v4
+        with:
+          name: muqun-gateway-x86_64-pc-windows-msvc
+          path: target/release/muqun-gateway.exe
+          retention-days: 14

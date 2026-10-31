@@ -1123,7 +1123,7 @@ pub fn search_files(root: &Path, query: &str, limit: usize) -> Vec<FileHit> {
             let Ok(relative) = path.strip_prefix(root) else {
                 continue;
             };
-            let relative = relative.to_string_lossy().to_string();
+            let relative = crate::platform::git::slash_path(relative);
             let Some(score) = score(&relative, &name, &needle) else {
                 continue;
             };
