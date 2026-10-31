@@ -780,10 +780,17 @@ impl AgentRuntime {
         if !self.supervising.load(Ordering::SeqCst) || *self.first_pass.borrow() {
             return false;
         }
+        let started = tokio::time::Instant::now();
         let mut done = self.first_pass.subscribe();
-        tokio::time::timeout(FIRST_PASS_WAIT, done.wait_for(|done| *done))
+        let finished = tokio::time::timeout(FIRST_PASS_WAIT, done.wait_for(|done| *done))
             .await
-            .is_ok_and(|done| done.is_ok())
+            .is_ok_and(|done| done.is_ok());
+        tracing::info!(
+            waited_ms = started.elapsed().as_millis() as u64,
+            finished,
+            "agent request waited for the first attach pass"
+        );
+        finished
     }
 
     /// Whether `agent_id` is an id this gateway knows, attached or not.
