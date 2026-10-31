@@ -188,7 +188,7 @@ pub(crate) struct Requested {
 
 impl Requested {
     /// An authenticated local runtime owner's request with no parent.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn mcp(by: TaskPrincipal) -> Self {
         Self {
             forwarding: ForwardingContext::Runtime,

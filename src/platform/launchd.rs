@@ -15,6 +15,8 @@
 //!
 //! Compiled on Linux under `cfg(test)` so the transitions run against a fake
 //! `launchctl` in CI, not only on a Mac.
+// Off Unix only the tests that are themselves Unix-only reach this module.
+#![cfg_attr(all(test, not(unix)), allow(dead_code))]
 
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};

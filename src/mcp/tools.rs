@@ -1036,7 +1036,7 @@ pub(crate) async fn started_for_task(state: &AppState, session: &AssistantSessio
 }
 
 /// `tasks.delegate` as an agent in a pane would call it, for other modules' tests.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) mod tests_support {
     use super::*;
     use crate::mcp::tokens::TokenBinding;

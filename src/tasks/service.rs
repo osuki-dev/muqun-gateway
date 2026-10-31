@@ -2393,12 +2393,12 @@ impl TaskService {
         self.store().insert(task).await.unwrap().id
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) async fn events_for_test(&self, id: &TaskId) -> Vec<TaskEvent> {
         self.store.events(id).await.unwrap()
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) async fn get_for_test(&self, id: &TaskId) -> Task {
         self.store.get(id).await.unwrap().unwrap()
     }

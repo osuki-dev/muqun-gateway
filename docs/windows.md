@@ -41,7 +41,8 @@ Checked on 2026-10-31 against each project's release assets and docs.
 
 ## Current state of this repository
 
-- **Compiles on Windows: yes, as of this branch.** On `main`, the first
+- **Compiles on Windows: yes, as of this branch** (release build on
+  `windows-latest`; the binary runs on Windows 11). On `main`, the first
   `windows-latest` run failed: clippy found **47 errors in the gateway binary
   and 113 in the test target** (117 distinct messages). By category:
   `std::os::unix`, `std::os::fd` or Unix sockets used without a `cfg` (43);
@@ -160,8 +161,13 @@ updates itself, and the same `manage` screen as on macOS and Linux.
 
 | Run | Gateway binary | Test target |
 |---|---|---|
-| PR #36's pieces ported onto `main` as they were (b284ae0) | 47 errors | 113 errors |
-| This branch | _see the PR_ | _see the PR_ |
+| #36's pieces ported onto `main` as they were | 47 errors | 113 errors |
+| Production code ported, Unix tests gated by line | 12 | 7 |
+| Unix-only helpers allowed off Unix | **0** (clippy clean); release build and artifact OK | 14 dead-code errors (test-only helpers of gated tests) |
+| Those helpers gated to Unix | see the latest `windows` check on the PR | |
+
+These counts come from `cargo clippy --all-targets -D warnings` on
+`windows-latest`. The release `.exe` has built since the second run.
 
 ## Local Windows VM (for maintainers)
 
