@@ -2,6 +2,20 @@
 
 ## Changes and fixes
 
+- **Claude Code is a native agent.** Besides terminal panes, Claude Code now runs
+  as a native session agent with readable, replayable history, through its
+  official ACP adapter (`claude-agent-acp` on PATH, else
+  `npx -y @agentclientprotocol/claude-agent-acp`). It is on when `claude` and
+  Node.js 22+ are found and needs no configuration; `muqun-gateway agent` says
+  which prerequisite is missing. The adapter starts only when a session is
+  opened, created or prompted, runs your own `claude` with its login, and is
+  released when verified idle; session lists read Claude Code's transcripts
+  without starting it. Model and effort follow the adapter's options, the muqun
+  MCP server is passed per session, and a missing login is reported as "not
+  signed in". Goals delegated to `claude` still start in a pane unless the
+  session delivery is chosen. Restart the Gateway after updating; Apps that do
+  not know the `claude` kind keep working without it.
+
 - **Codex provider mismatches are explained.** Codex 0.164 and newer refuse to
   resume or prompt a thread whose saved model provider no longer matches the
   current Codex configuration, and say so in structured error data. The Gateway

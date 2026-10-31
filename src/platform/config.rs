@@ -144,6 +144,10 @@ pub(crate) struct Config {
     /// Local Qoder CLI ACP support; private children start only on explicit session operations.
     #[serde(default, skip_serializing_if = "is_default_qoder")]
     pub(crate) qoder: agents::runtime::QoderConfig,
+    /// Claude Code native sessions through its official ACP adapter; on when
+    /// `claude`, Node.js 22+ and the adapter or npx are found.
+    #[serde(default, skip_serializing_if = "is_default_claude")]
+    pub(crate) claude: agents::runtime::ClaudeConfig,
     /// Master switch for service agents; terminal agents remain independent.
     #[serde(default, skip_serializing_if = "AgentRuntimeConfig::is_default")]
     pub(crate) agent_runtime: AgentRuntimeConfig,
@@ -334,6 +338,10 @@ pub(crate) fn is_default_codex(config: &agents::runtime::CodexConfig) -> bool {
 
 pub(crate) fn is_default_fx(config: &agents::runtime::FxConfig) -> bool {
     *config == agents::runtime::FxConfig::default()
+}
+
+pub(crate) fn is_default_claude(config: &agents::runtime::ClaudeConfig) -> bool {
+    *config == agents::runtime::ClaudeConfig::default()
 }
 
 pub(crate) fn is_default_qoder(config: &agents::runtime::QoderConfig) -> bool {

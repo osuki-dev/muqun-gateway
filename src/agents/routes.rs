@@ -4196,7 +4196,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_session_rejects_an_unknown_agent() {
-        let (status, body) = create_refusal(json!({ "agent_id": "claude" })).await;
+        let (status, body) = create_refusal(json!({ "agent_id": "droid" })).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["error"]["code"], "invalid_agent");
     }
@@ -5755,7 +5755,7 @@ mod tests {
 
         let refusal = get_global_agent_catalog(
             State(state.clone()),
-            Query(query(Some("claude"))),
+            Query(query(Some("droid"))),
             device_headers(),
         )
         .await
@@ -5828,7 +5828,7 @@ mod tests {
         assert_eq!(other["data"]["kind"], "deepseek");
         assert_eq!(other["data"]["available"], true);
 
-        let refusal = status(Some("claude")).await.expect_err("unknown");
+        let refusal = status(Some("droid")).await.expect_err("unknown");
         assert_eq!(refusal.0, StatusCode::BAD_REQUEST);
         assert_eq!(
             crate::test_support::error_body(&refusal)["error"]["code"],

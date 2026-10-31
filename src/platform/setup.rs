@@ -144,6 +144,7 @@ pub(crate) fn setup(
             codex: agents::runtime::CodexConfig::default(),
             fx: agents::runtime::FxConfig::default(),
             qoder: agents::runtime::QoderConfig::default(),
+            claude: agents::runtime::ClaudeConfig::default(),
             agent_runtime: crate::platform::config::AgentRuntimeConfig::default(),
             store: crate::platform::config::StoreConfig::default(),
             mcp: crate::platform::config::McpConfig::default(),
