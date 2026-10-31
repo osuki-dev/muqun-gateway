@@ -97,6 +97,9 @@ pub trait AcpProvider: Send + Sync + 'static {
     fn transcript_modified(_directory: &str, _id: &str) -> Option<std::time::SystemTime> {
         None
     }
+    /// An agent that refuses every session until the client sends ACP
+    /// `authenticate`, even with a login already stored on the computer.
+    const AUTHENTICATE: Option<Authenticate> = None;
     /// Rows for `session/list` read from the native store without starting
     /// the agent, or `None` to ask the agent itself.
     fn offline_sessions<'a>(
@@ -140,6 +143,15 @@ const TERMINAL_FOLLOW: Duration = Duration::from_secs(600);
 pub struct AcpLaunch {
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
+}
+
+/// `authenticate` with a stored login. Without one the agent starts an
+/// interactive sign-in and never answers in time, so a refusal or timeout
+/// means "not signed in here": `refusal` says so in the user's terms.
+pub struct Authenticate {
+    pub method: &'static str,
+    pub timeout: Duration,
+    pub refusal: &'static str,
 }
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
@@ -1077,6 +1089,26 @@ impl<P: AcpProvider> AcpDriver<P> {
             Ok(value) if value["protocolVersion"].as_u64() == Some(1) => {
                 let capabilities = value["agentCapabilities"].clone();
                 *self.native_capabilities.lock().unwrap() = capabilities.clone();
+                if let Some(auth) = &P::AUTHENTICATE {
+                    let offered = value["authMethods"].as_array().is_some_and(|methods| {
+                        methods
+                            .iter()
+                            .any(|method| method["id"].as_str() == Some(auth.method))
+                    });
+                    let authenticated = offered
+                        && client
+                            .request_with_timeout(
+                                "authenticate",
+                                json!({ "methodId": auth.method }),
+                                auth.timeout,
+                            )
+                            .await
+                            .is_ok();
+                    if !authenticated {
+                        client.shutdown().await;
+                        return Err(AgentError::NotAvailable(auth.refusal.into()));
+                    }
+                }
                 Ok((client, events, capabilities))
             }
             result => {

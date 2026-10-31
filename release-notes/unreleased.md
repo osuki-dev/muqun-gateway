@@ -2,6 +2,16 @@
 
 ## Changes and fixes
 
+- **Antigravity is a native agent.** When Google Antigravity's `agy` is on PATH
+  and signed in (run `agy` once in a terminal), its conversations appear in the
+  App: open, continue, interrupt, approve tool use, pick the thinking level, and
+  use muqun tools and delegated tasks from inside them. Gateway starts a private
+  `agy acp` only when a conversation is used, releases it after an hour idle,
+  and lists conversations from Antigravity's own index without starting
+  anything. If `agy` is not signed in, opening a conversation says so. No setup
+  is needed; `antigravity.enabled: false` turns it off. Restart the Gateway after
+  updating.
+
 - **Claude Code is a native agent.** Besides terminal panes, Claude Code now runs
   as a native session agent with readable, replayable history, through its
   official ACP adapter (`claude-agent-acp` on PATH, else

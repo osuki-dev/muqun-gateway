@@ -84,6 +84,8 @@ pub(crate) enum SetupAgent {
     Pi,
     /// Explain Claude Code ACP setup without starting a session or changing credentials.
     Claude,
+    /// Explain Antigravity ACP setup without starting a session or changing credentials.
+    Antigravity,
 }
 
 pub(crate) async fn run_agent_command(
@@ -141,6 +143,10 @@ pub(crate) async fn run_agent_command(
                 println!("Pi support is enabled by default when pi is installed on PATH. Configure providers and sign in to Pi on this host yourself. Gateway opens a private `pi --mode rpc` child only when a session is used; discovery does not verify model authentication.");
                 println!("Set pi.enabled=false to disable it; pi.binary may name an absolute executable. Native session files are discovered from pi.session_dir or Pi's default session directory. Mutating built-in tools ask for App approval by default. This command does not start Pi, install packages, log in or restart Gateway.");
             }
+            SetupAgent::Antigravity => {
+                println!("Antigravity support is enabled by default when agy is installed on PATH. Install Antigravity's CLI and sign in with your Google account by running `agy` once in a terminal on this host. Gateway opens a private `agy acp` child only when a session is opened, created or prompted, and reuses that login; listing sessions reads Antigravity's own index and starts nothing.");
+                println!("Set antigravity.enabled=false to disable it; antigravity.binary may name an absolute agy executable. Gateway never edits Antigravity's settings; its muqun tools are passed to each session directly. This command does not start agy, install packages, log in or restart Gateway.");
+            }
             SetupAgent::Qoder => {
                 println!("Qoder CLI support is enabled by default when qodercli is installed on PATH. Configure and sign in to Qoder CLI on this host yourself. Gateway opens a private `qodercli --acp` child per session; discovery alone does not verify model authentication.");
                 println!("Set qoder.enabled=false to disable it; qoder.binary may name an absolute CLI executable. A separately opened Qoder terminal or IDE is not a shared live ACP session. This command does not start Qoder, install packages, log in or restart Gateway.");
@@ -174,6 +180,7 @@ async fn list(json: bool) -> anyhow::Result<bool> {
                 codex: config.codex.clone(),
                 fx: config.fx.clone(),
                 qoder: config.qoder.clone(),
+                antigravity: config.antigravity.clone(),
                 pi: config.pi.clone(),
                 claude: config.claude.clone(),
             },
@@ -303,6 +310,10 @@ pub(crate) fn next_step(id: &str, status: &AgentAvailability) -> Option<&'static
         (Unconfigured | Disabled, "t3") => "muqun-gateway agent setup t3",
         (Unconfigured | Disabled, "deepseek") => "muqun-gateway agent setup deepseek",
         (Disabled, "opencode") => "set `opencode.enabled` to true in config.json",
+        (Disabled, "antigravity") => "set `antigravity.enabled` to true in config.json",
+        (NotInstalled, "antigravity") => "install Antigravity's agy and sign in by running `agy` once in a terminal",
+        (Unconfigured, "antigravity") => "check antigravity.binary in config.json",
+        (Offline | Unsupported, "antigravity") => "check that `agy --version` runs on this host",
         (Disabled, "qoder") => "set `qoder.enabled` to true in config.json",
         (NotInstalled, "qoder") => "install Qoder CLI yourself, set qoder.binary, or disable qoder.enabled",
         (Unconfigured, "qoder") => "check qoder.binary and configure Qoder CLI authentication on this host yourself",
