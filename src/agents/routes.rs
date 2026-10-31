@@ -706,7 +706,7 @@ async fn agent_manager_or_err(
     }
     state
         .agent_runtime
-        .manager_for_agent(agent_id)
+        .request_manager_for_agent(agent_id)
         .await
         .ok_or_else(|| {
             api_error(
@@ -2439,7 +2439,7 @@ async fn session_manager_or_err(
     state: &AppState,
     asid: &str,
 ) -> ApiResult<std::sync::Arc<super::manager::AgentManager>> {
-    if let Some(manager) = state.agent_runtime.manager_for_session(asid).await {
+    if let Some(manager) = state.agent_runtime.request_manager_for_session(asid).await {
         return Ok(manager);
     }
     if state.agent_runtime.all_managers().await.is_empty() {

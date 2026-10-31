@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::{broadcast, Mutex, RwLock};
+use tokio::sync::{broadcast, watch, Mutex, RwLock};
 
 use super::adapters::opencode::OpencodeEndpoint;
 use super::domain::AgentDomainEvent;
@@ -41,6 +41,8 @@ pub use t3::{T3Config, DEFAULT_T3_URL};
 const HEALTHY_POLL: Duration = Duration::from_secs(15);
 /// How soon it retries after finding none.
 const UNHEALTHY_POLL: Duration = Duration::from_secs(3);
+/// How long a request at startup waits for agents to attach.
+const FIRST_PASS_WAIT: Duration = Duration::from_secs(10);
 /// How long service startup and registration may each take.
 const STARTUP_WAIT: Duration = Duration::from_secs(20);
 const STARTUP_POLL: Duration = Duration::from_millis(400);
@@ -319,6 +321,8 @@ pub struct AgentRuntime {
     /// Serialize startup commands; OpenCode owns the background service.
     start_lock: Mutex<()>,
     supervising: AtomicBool,
+    /// Set after the supervisor's first attach pass. The listener opens first.
+    first_pass: watch::Sender<bool>,
     /// Where OpenCode's `MUQUN_MCP_*` environment comes from; set once the
     /// token store exists (the runtime is built before it).
     mcp: std::sync::OnceLock<McpWiring>,
@@ -563,6 +567,7 @@ impl AgentRuntime {
             opencode_instance: RwLock::new(None),
             start_lock: Mutex::new(()),
             supervising: AtomicBool::new(false),
+            first_pass: watch::Sender::new(false),
             mcp: std::sync::OnceLock::new(),
             terminal_runtime: std::sync::OnceLock::new(),
             native_codex_sessions: std::sync::OnceLock::new(),
@@ -746,6 +751,46 @@ impl AgentRuntime {
             }
         }
         None
+    }
+
+    /// [`Self::manager_for_agent`] for a request. The listener opens before the
+    /// supervisor's first pass attaches FX, Qoder or Pi, and a phone reconnects
+    /// at once; answering `agent_unavailable` in that window made its one
+    /// foreground session preparation fail.
+    pub async fn request_manager_for_agent(&self, agent_id: &str) -> Option<Arc<AgentManager>> {
+        match self.manager_for_agent(agent_id).await {
+            Some(manager) => Some(manager),
+            None if self.await_first_pass().await => self.manager_for_agent(agent_id).await,
+            None => None,
+        }
+    }
+
+    /// [`Self::manager_for_session`] for a request; see [`Self::request_manager_for_agent`].
+    pub async fn request_manager_for_session(&self, asid: &str) -> Option<Arc<AgentManager>> {
+        match self.manager_for_session(asid).await {
+            Some(manager) => Some(manager),
+            None if self.await_first_pass().await => self.manager_for_session(asid).await,
+            None => None,
+        }
+    }
+
+    /// Wait, bounded, for a running supervisor's first pass. True when it
+    /// finished during this wait, so a lookup is worth repeating.
+    async fn await_first_pass(&self) -> bool {
+        if !self.supervising.load(Ordering::SeqCst) || *self.first_pass.borrow() {
+            return false;
+        }
+        let started = tokio::time::Instant::now();
+        let mut done = self.first_pass.subscribe();
+        let finished = tokio::time::timeout(FIRST_PASS_WAIT, done.wait_for(|done| *done))
+            .await
+            .is_ok_and(|done| done.is_ok());
+        tracing::info!(
+            waited_ms = started.elapsed().as_millis() as u64,
+            finished,
+            "agent request waited for the first attach pass"
+        );
+        finished
     }
 
     /// Whether `agent_id` is an id this gateway knows, attached or not.
@@ -1412,6 +1457,7 @@ impl AgentRuntime {
             let mut stream_loss_wait = STREAM_LOSS_FIRST_WAIT;
             loop {
                 let healthy = runtime.check_and_repair(&mut start_backoff).await;
+                runtime.first_pass.send_replace(true);
                 if healthy {
                     runtime.watch_while_healthy(&mut stream_loss_wait).await;
                 } else {
@@ -3639,6 +3685,37 @@ mod tests {
             codex.features.extra.get("sharedDaemonConnected"),
             Some(&serde_json::json!(false))
         );
+    }
+
+    #[tokio::test]
+    async fn requests_during_the_first_attach_pass_wait_for_the_agent() {
+        // (supervising, the pass attaches the agent, expected)
+        for (supervising, attaches, expected) in [
+            (true, true, true),
+            (true, false, false),
+            (false, true, false),
+        ] {
+            let runtime = AgentRuntime::disabled();
+            runtime.supervising.store(supervising, Ordering::SeqCst);
+            let pass = runtime.clone();
+            let started = tokio::time::Instant::now();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                if attaches {
+                    pass.attach_for_test(Arc::new(AgentManager::for_test(Arc::new(
+                        crate::test_support::FakeAgent::new("fx"),
+                    ))))
+                    .await;
+                }
+                pass.first_pass.send_replace(true);
+            });
+            assert_eq!(
+                runtime.request_manager_for_agent("fx").await.is_some(),
+                expected,
+                "supervising={supervising} attaches={attaches}"
+            );
+            assert!(started.elapsed() < FIRST_PASS_WAIT);
+        }
     }
 
     #[tokio::test]
