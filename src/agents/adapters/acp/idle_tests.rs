@@ -745,6 +745,10 @@ async fn unexpected_disconnect_never_replays_and_nonzero_retirement_is_unknown()
         .send_prompt(&info.asid.0, "after opening", &[], None)
         .await
         .unwrap();
+    // Shutdown kills the child. Let its turn finish first: a kill landing
+    // inside the fixture's truncate-then-write of sessions.json leaves it
+    // empty, and the next child dies reading it ("stdout_closed").
+    idle(&driver, &info.asid.0).await.unwrap();
     driver.shutdown().await;
     // A distinct fixture phase fails only after EOF; it has a valid saved turn.
     use std::io::Write;
