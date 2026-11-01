@@ -1330,7 +1330,8 @@ async fn do_send_agent_prompt(
         .await
         .map_err(|e| match e {
             super::ports::agent::AgentError::InvalidRequest(_)
-            | super::ports::agent::AgentError::TerminalInteraction(_) => agent_error(e),
+            | super::ports::agent::AgentError::TerminalInteraction(_)
+            | super::ports::agent::AgentError::OpenRequired(_) => agent_error(e),
             _ => api_error(StatusCode::BAD_GATEWAY, "agent_error", &e.to_string()),
         })?;
 
@@ -2550,6 +2551,9 @@ fn agent_error(err: super::ports::agent::AgentError) -> (StatusCode, Json<Value>
             "history_cursor_lost",
             &err.to_string(),
         ),
+        super::ports::agent::AgentError::OpenRequired(message) => {
+            api_error(StatusCode::CONFLICT, "session_open_required", message)
+        }
         _ => api_error(StatusCode::BAD_GATEWAY, "agent_error", &err.to_string()),
     }
 }

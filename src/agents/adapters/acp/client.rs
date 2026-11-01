@@ -85,6 +85,9 @@ impl State {
     }
 }
 
+/// The `Disconnected` reason of a process the Gateway itself stopped.
+pub(crate) const LOCAL_SHUTDOWN: &str = "local_shutdown";
+
 impl State {
     fn stop(&self, reason: &'static str) {
         // Cancellation and draining are serialized with request admission.
@@ -649,7 +652,7 @@ impl AcpClient {
     }
 
     pub async fn shutdown(&self) {
-        self.state.stop("local_shutdown");
+        self.state.stop(LOCAL_SHUTDOWN);
         let _ = tokio::time::timeout(WRITE_TIMEOUT, self.state.exited.cancelled()).await;
     }
 }

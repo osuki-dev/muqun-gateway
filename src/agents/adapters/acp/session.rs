@@ -1797,17 +1797,8 @@ impl<P: AcpProvider> AcpDriver<P> {
                         AgentError::NotAvailable("Previous ACP generation has not stopped".into())
                     })?;
             }
-            // One explicit activation restores a same-ID generation. Prompt calls
-            // never replay a previous request and cannot recover an unexpected loss.
-            if !explicit_prepare
-                && self
-                    .dormant
-                    .lock()
-                    .unwrap()
-                    .get(id)
-                    .is_some_and(|entry| entry.kind == DormantKind::Unexpected)
-            {
-                return Err(AgentError::NotAvailable("ACP connection ended unexpectedly; explicitly open the conversation before sending a new prompt; delivery was not retried".into()));
+            if reserve_prompt {
+                self.refuse_unopened_prompt(id)?;
             }
         }
         let session = self.load_once(id).await?;
@@ -1822,6 +1813,22 @@ impl<P: AcpProvider> AcpDriver<P> {
             ));
         }
         Ok(session)
+    }
+
+    /// A prompt never replays one an unexpectedly ended process may have
+    /// lost; the App's open (`/prepare`) restores it first. Reads, model or
+    /// mode switches and deletion load it without this.
+    fn refuse_unopened_prompt(&self, id: &str) -> Result<(), AgentError> {
+        if self
+            .dormant
+            .lock()
+            .unwrap()
+            .get(id)
+            .is_some_and(|entry| entry.kind == DormantKind::Unexpected)
+        {
+            return Err(AgentError::OpenRequired("The conversation's agent process ended unexpectedly; open the conversation again before sending; delivery was not retried".into()));
+        }
+        Ok(())
     }
 
     /// Load `id`, or wait for the load already under way. The load runs on
@@ -1921,26 +1928,24 @@ impl<P: AcpProvider> AcpDriver<P> {
         if self.retained(id).is_some() {
             return Ok(None);
         }
-        if self.dormant.lock().unwrap().contains_key(id) {
-            return self
-                .mirror
-                .get_snapshot(&AgentSessionId::from(id))
-                .await
-                .map(Some)
-                .ok_or_else(|| {
-                    AgentError::NotAvailable(
-                        "Cached history expired; explicitly open the conversation to restore it"
-                            .into(),
-                    )
-                });
+        if let Some(snapshot) = self.parked_snapshot(id).await {
+            return Ok(Some(snapshot));
         }
         if let Some(live) = self.terminal_live(id).await {
             return self.terminal_snapshot(id, &live).await.map(Some);
         }
-        Err(AgentError::NotAvailable(
-            "Conversation history is not loaded; explicitly open it before reading native history"
-                .into(),
-        ))
+        // Not held here (the Gateway restarted, or its parked copy expired):
+        // reading it loads it, as opening it does.
+        self.activate(id, true, false).await?;
+        Ok(None)
+    }
+
+    /// A parked session's retained history, read without waking it.
+    async fn parked_snapshot(&self, id: &str) -> Option<AgentSessionSnapshot> {
+        if !self.dormant.lock().unwrap().contains_key(id) {
+            return None;
+        }
+        self.mirror.get_snapshot(&AgentSessionId::from(id)).await
     }
 
     async fn dormant_info(
@@ -3310,11 +3315,22 @@ impl<P: AcpProvider> AcpDriver<P> {
             let mut tick = tokio::time::interval(Duration::from_secs(30));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let mut dormant_kind = DormantKind::Unexpected;
+            let mut ended = "idle ACP session released its process";
             loop {
                 tokio::select! {
                     biased;
-                    _ = stop.cancelled() => break,
+                    // The Gateway stopping, a deletion or a terminal taking over
+                    // ends the process on purpose: nothing was lost, and the
+                    // session loads again like a parked one.
+                    _ = stop.cancelled() => {
+                        (dormant_kind, ended) = (DormantKind::Parked, "ACP session process stopped by the Gateway");
+                        break;
+                    }
                     event = events.recv() => match event {
+                        Ok(AcpEvent::Disconnected { reason }) if reason == super::client::LOCAL_SHUTDOWN => {
+                            (dormant_kind, ended) = (DormantKind::Parked, "ACP session process stopped by the Gateway");
+                            break;
+                        }
                         Ok(event) => if !Self::event(&session, &mirror, &tx, event).await { break; },
                         Err(_) => { Self::status(&session, &mirror, &tx, AgentSessionStatus::Unknown, None).await; break; }
                     },
@@ -3358,15 +3374,19 @@ impl<P: AcpProvider> AcpDriver<P> {
             session.client.shutdown().await;
             let mut state = session.state.lock().await;
             let id = state.info.asid.0.clone();
-            if dormant_kind == DormantKind::Unexpected {
-                state.info.runtime = Some(SessionRuntime {
+            let runtime = match dormant_kind {
+                DormantKind::Parked => parked_runtime(),
+                DormantKind::Unexpected => SessionRuntime {
                     transcript: Some(TranscriptSource::Snapshot),
                     source: RuntimeSource::Native,
                     interaction: RuntimeInteraction::Unavailable,
                     status: Some(TerminalRuntimeStatus::Unknown),
                     terminal: None,
                     reason: Some(RuntimeReason::NotLoaded),
-                });
+                },
+            };
+            if state.info.runtime.as_ref() != Some(&runtime) {
+                state.info.runtime = Some(runtime);
                 let info = state.info.clone();
                 let seq = mirror.update_session(info.clone()).await;
                 Self::emit(
@@ -3380,9 +3400,7 @@ impl<P: AcpProvider> AcpDriver<P> {
                 );
             }
             match dormant_kind {
-                DormantKind::Parked => {
-                    tracing::info!(session = %id, "idle ACP session released its process")
-                }
+                DormantKind::Parked => tracing::info!(session = %id, "{ended}"),
                 DormantKind::Unexpected => tracing::warn!(
                     session = %id,
                     reason = state.info.error.as_ref().map(|error| error.message.as_str()).unwrap_or("-"),
@@ -3475,6 +3493,7 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
         delivery: Option<&'a str>,
     ) -> AgentFuture<'a, ()> {
         Box::pin(async move {
+            self.refuse_unopened_prompt(id)?;
             let session = self.ensure_loaded(id).await?;
             let prompt = operations::command_prompt(
                 &session.state.lock().await.catalog.commands,
@@ -3621,19 +3640,12 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
     }
     fn prepare_observed_session<'a>(&'a self, id: &'a str) -> AgentFuture<'a, ()> {
         Box::pin(async move {
-            if self.retained(id).is_some() || self.dormant.lock().unwrap().contains_key(id) {
+            if self.retained(id).is_some() || self.parked_snapshot(id).await.is_some() {
                 return Ok(());
             }
-            if let Some(live) = self.terminal_live(id).await {
-                return self.refresh_terminal_snapshot(id, &live).await;
-            }
-            if self.readonly_empty_snapshot(id).await? {
-                return Ok(());
-            }
-            // A saved/native identity is metadata, not foreground activation.
-            Err(AgentError::NotAvailable(
-                "Explicitly open this conversation to load its native history".into(),
-            ))
+            // Otherwise as an open: a listed session the Gateway does not hold
+            // (after a restart) is loaded rather than refused.
+            self.prepare_selected_session(id).await
         })
     }
     fn send_prompt<'a>(

@@ -71,6 +71,10 @@ pub enum AgentError {
     /// The inbox item is not queued: unknown, cancelled or already delivered.
     /// The App refetches the inbox.
     InboxItemNotFound(String),
+    /// The session's last process ended on its own mid-turn, so a prompt is
+    /// not sent until the App opens the conversation again (`/prepare`). A
+    /// `409` the App answers by opening it, not an agent fault.
+    OpenRequired(String),
 }
 
 impl fmt::Display for AgentError {
@@ -90,6 +94,7 @@ impl fmt::Display for AgentError {
                 "The earlier-history cursor for this session is gone; read the snapshot again",
             ),
             Self::InboxItemNotFound(msg) => write!(f, "Inbox item not found: {msg}"),
+            Self::OpenRequired(msg) => f.write_str(msg),
             Self::TerminalInteraction(_) => write!(
                 f,
                 "Native interaction is unavailable; use the current terminal binding when provided"

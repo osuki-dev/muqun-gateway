@@ -830,7 +830,7 @@ for line in sys.stdin:
     }
 
     #[tokio::test]
-    async fn native_history_load_is_explicit_metadata_listing_never_loads() {
+    async fn metadata_listing_never_loads_and_a_history_read_loads_once() {
         let fixture = Fixture::new().await;
         let session = fixture
             .driver
@@ -874,10 +874,9 @@ for line in sys.stdin:
             second.get_session("foreign-id").await,
             Err(AgentError::SessionNotFound(_))
         ));
-        assert!(second.get_timeline(id, 100).await.is_err());
-        assert!(!fixture.methods().contains(&"session/load".into()));
-        second.prepare_selected_session(id).await.unwrap();
+        // Reading its history loads it once; opening it then reuses that load.
         assert_eq!(second.get_timeline(id, 100).await.unwrap().len(), 2);
+        second.prepare_selected_session(id).await.unwrap();
         assert_eq!(
             fixture
                 .methods()
