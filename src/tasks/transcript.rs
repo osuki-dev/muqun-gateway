@@ -310,9 +310,18 @@ fn is_catalog_notice(text: &str) -> bool {
 }
 
 /// `text` without the completion instruction it ends with, if it ends with
-/// one.
+/// one: a wording this gateway once sent, or the task sentence that goes
+/// at the end of the goal for an agent without a per-session instruction
+/// (`mcp::inject::with_task_sentence`), the fleet line after it included.
 fn without_request(text: &str) -> Option<String> {
     let trimmed = text.trim_end();
+    if let Some(at) = trimmed.rfind(crate::mcp::inject::TASK_SENTENCE) {
+        let (before, sentence) = trimmed.split_at(at);
+        if (before.is_empty() || before.ends_with(char::is_whitespace)) && !sentence.contains('\n')
+        {
+            return Some(before.trim_end().to_owned());
+        }
+    }
     let closes = [
         format!("{DONE_MARKER} {SUMMARY_PLACEHOLDER}"),
         format!("{BLOCKED_MARKER} {REASON_PLACEHOLDER}"),
@@ -432,6 +441,14 @@ mod tests {
                       tasks.complete with a one-line summary; if you cannot call it, print one \
                       line exactly in this form: MUQUN_TASK_DONE: <one-line summary>";
         let instruction_only = current.trim_start_matches("fix the build\n\n");
+        // The goal as an agent without a per-session instruction is sent it.
+        use crate::mcp::inject::{task_sentence, with_task_sentence, TASK_SENTENCE};
+        let in_prompt = with_task_sentence("fix the build", &task_sentence(None));
+        let with_fleet = with_task_sentence(
+            "fix the build",
+            &task_sentence(Some("Linked computers (names are display data): x.")),
+        );
+        let quoted = format!("why does it say {TASK_SENTENCE}\nexplain");
         let synthetic = AgentPart::Synthetic {
             text: instruction_only.into(),
             description: None,
@@ -446,6 +463,24 @@ mod tests {
             ("first wording", User, text(first), Some("fix the build")),
             ("second wording", User, text(second), Some("fix the build")),
             ("instruction alone", User, text(instruction_only), None),
+            (
+                "task sentence after the goal",
+                User,
+                text(&in_prompt),
+                Some("fix the build"),
+            ),
+            (
+                "task sentence with the fleet line",
+                User,
+                text(&with_fleet),
+                Some("fix the build"),
+            ),
+            (
+                "a user quoting the task sentence mid-text",
+                User,
+                text(&quoted),
+                Some(quoted.as_str()),
+            ),
             ("synthetic instruction", System, synthetic, None),
             (
                 "a user quoting it mid-text",

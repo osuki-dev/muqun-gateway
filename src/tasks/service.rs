@@ -1435,7 +1435,13 @@ impl TaskService {
         // conversation, where the agent takes one; removed when the task
         // ends (`driver::spawn_instruction_cleanup`).
         let mut unannounced = None;
-        if crate::mcp::inject::enabled(&state.config)
+        // An agent without that channel reads it at the end of the goal.
+        let mut prompt_sentence = None;
+        if crate::mcp::inject::enabled(&state.config) && manager.agent().task_sentence_in_prompt() {
+            self.mark_task_session(&asid.0);
+            let fleet = fleet_line(state, &task).await;
+            prompt_sentence = Some(crate::mcp::inject::task_sentence(fleet.as_deref()));
+        } else if crate::mcp::inject::enabled(&state.config)
             && manager.agent().takes_session_instructions()
         {
             // Served as a task's session from here, so the notice the
@@ -1491,6 +1497,10 @@ impl TaskService {
                 format!("{}\n\n{}", request.goal, context)
             } else {
                 request.goal.clone()
+            };
+            let goal = match &prompt_sentence {
+                Some(sentence) => crate::mcp::inject::with_task_sentence(&goal, sentence),
+                None => goal,
             };
             manager
                 .prompts()

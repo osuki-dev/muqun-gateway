@@ -29,6 +29,9 @@ impl AcpProvider for CursorProvider {
     const MODEL_SELECTION: bool = true;
     const IDLE_RETIREMENT: bool = true;
     const PROVIDER_CONFIG: bool = false;
+    // No system prompt in its ACP server, and MCP server instructions do not
+    // reach the model.
+    const TASK_SENTENCE_IN_PROMPT: bool = true;
     // Sessions are refused until `authenticate`. With a stored login it
     // answers in seconds; without one it opens a browser, so `signed_in`
     // runs first and this timeout only bounds a slow backend.

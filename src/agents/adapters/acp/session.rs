@@ -44,6 +44,9 @@ pub trait AcpProvider: Send + Sync + 'static {
     /// The session takes an appended system prompt (`systemPrompt` on
     /// `session/new`, `session/load`, `session/resume`).
     const SYSTEM_PROMPT: bool = false;
+    /// Without a proven system prompt, the task sentence is appended to a
+    /// task's first prompt ([`AgentPort::task_sentence_in_prompt`]).
+    const TASK_SENTENCE_IN_PROMPT: bool = false;
     /// The native command that renames a session without a model turn.
     const RENAME_COMMAND: Option<&'static str> = None;
     /// Whether the agent's own record says that nothing of session `id`
@@ -3715,6 +3718,9 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
     }
     fn takes_session_instructions(&self) -> bool {
         P::SYSTEM_PROMPT
+    }
+    fn task_sentence_in_prompt(&self) -> bool {
+        P::TASK_SENTENCE_IN_PROMPT
     }
     fn set_session_instruction<'a>(
         &'a self,

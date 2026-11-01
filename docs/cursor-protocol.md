@@ -156,7 +156,7 @@ with the bearer header within a second of `session/new`.
 | Approvals | `session/request_permission` (allow-once / allow-always / reject-once) | Implemented (shared); asked only when Cursor's own approval mode asks, not verified live |
 | Questions / plan approval | `cursor/ask_question`, `cursor/create_plan` (blocking) | Not implemented: answered "method not supported", not verified live |
 | Todos / subagents / images | `cursor/update_todos`, `cursor/task`, `cursor/generate_image` notifications | Not shown |
-| Delegated tasks and muqun tools | ACP HTTP `mcpServers` | Implemented (verified against a probe MCP server) |
+| Delegated tasks and muqun tools | ACP HTTP `mcpServers` | Implemented (verified against a probe MCP server); no system prompt, so the task sentence ends the first prompt and is cut from the served transcript |
 | Worktrees | `agent -w` only in the terminal UI | Not supported |
 | File-change listing | No | Not supported |
 | Slash commands | `available_commands_update` (commands and skills) | Implemented; a name listed twice (a command and a skill) is offered once |

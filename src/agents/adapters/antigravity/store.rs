@@ -111,8 +111,14 @@ pub(super) fn list_at(
         if !valid_id(&id) || directory.is_some_and(|wanted| wanted != cwd) {
             continue;
         }
+        // A task's first prompt ends with the task sentence; a preview
+        // title stops before it.
         let title = if title.trim().is_empty() {
             preview
+                .split(crate::mcp::inject::TASK_SENTENCE)
+                .next()
+                .unwrap_or_default()
+                .to_owned()
         } else {
             title
         };

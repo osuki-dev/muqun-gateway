@@ -299,6 +299,14 @@ pub trait AgentPort: Send + Sync {
         self.adds_mcp_servers()
     }
 
+    /// Whether a task's session of this agent has no instruction channel its
+    /// model reads (no system prompt, MCP server instructions ignored), so
+    /// the task sentence goes at the end of the task's first prompt instead;
+    /// the served transcript cuts it (`tasks::transcript`).
+    fn task_sentence_in_prompt(&self) -> bool {
+        false
+    }
+
     /// Attach (or replace) a durable instruction `text` under `key` to
     /// session `session_id`, outside its conversation. `Ok(false)` when the
     /// agent has no such thing.

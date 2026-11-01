@@ -140,7 +140,7 @@ the child could kill it. Only sessions that ran no tool are released.
 | Image / file attachments | No `promptCapabilities` advertised | Not supported |
 | Approvals | `session/request_permission` (allow once / always / reject) | Implemented |
 | Questions | Permission requests with `interaction_` ids | Supported by agy, not implemented as questions (shared approval path; not verified live) |
-| Delegated tasks and muqun tools | ACP HTTP `mcpServers` | Implemented (verified against a probe MCP server) |
+| Delegated tasks and muqun tools | ACP HTTP `mcpServers` | Implemented (verified against a probe MCP server); the task sentence ends the first prompt and is cut from the served transcript, since `_meta.antigravity.systemPrompt.append` (advertised by agy 1.4.12) is unverified |
 | Subagents | Ordinary tool calls (`invoke_subagent`), no child ids | Shown as tool rows; child conversations not listed |
 | Worktrees | No | Not supported (same as the other ACP agents) |
 | File-change listing | No | Not supported |
