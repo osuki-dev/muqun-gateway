@@ -24,7 +24,7 @@ const MAX_TITLE_CHARS: usize = 200;
 const MAX_CACHED: usize = 8192;
 
 /// `$CLAUDE_CONFIG_DIR`, else `~/.claude`.
-fn config_dir() -> Option<PathBuf> {
+pub(crate) fn config_dir() -> Option<PathBuf> {
     match std::env::var_os("CLAUDE_CONFIG_DIR").filter(|dir| !dir.is_empty()) {
         Some(dir) => Some(PathBuf::from(dir)),
         None => Some(dirs::home_dir()?.join(".claude")),
@@ -137,18 +137,23 @@ fn running(pid: u32, proc_start: Option<&str>) -> bool {
     true
 }
 
-/// Whether Claude Code records session `id` as `idle` in its process under
-/// `root` (the Gateway's adapter child). It keeps a session `busy` while a
-/// turn runs and, observed with 2.1.314, while a background subagent the
-/// session started still runs after its turn ended.
-pub(crate) fn idle_under(id: &str, root: u32) -> bool {
-    config_dir().is_some_and(|config| {
-        live_in(&config.join("sessions"), |pid, start| {
-            running(pid, start) && crate::terminal::backend::descends_from(pid, root)
-        })
-        .get(id)
-        .is_some_and(|process| process.busy == Some(false))
-    })
+/// What Claude Code records for session `id` in its process under `root`
+/// (the Gateway's adapter child): `idle`, or `busy` while a turn runs and,
+/// observed with 2.1.314, while a background subagent the session started
+/// still runs after its turn ended. No entry or no status is `Unknown`.
+pub(crate) fn registry_work(id: &str, root: u32) -> crate::agents::adapters::acp::idle::Work {
+    use crate::agents::adapters::acp::idle::Work;
+    let Some(config) = config_dir() else {
+        return Work::Unknown;
+    };
+    let entries = live_in(&config.join("sessions"), |pid, start| {
+        running(pid, start) && crate::terminal::backend::descends_from(pid, root)
+    });
+    match entries.get(id).and_then(|process| process.busy) {
+        Some(false) => Work::Quiet,
+        Some(true) => Work::Active,
+        None => Work::Unknown,
+    }
 }
 
 /// Claude Code sessions open in another running process, by session id.

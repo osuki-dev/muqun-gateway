@@ -26,7 +26,7 @@ while default:
   "enabled": true,
   "binary": "/absolute/path/to/claude-agent-acp",
   "acp_package": "@agentclientprotocol/claude-agent-acp@0.99.1",
-  "idle_timeout_secs": 3600
+  "idle_timeout_secs": 300
 } }
 ```
 
@@ -46,7 +46,8 @@ Gateway never edits `~/.claude`, installs packages globally or logs in.
 
 Startup only probes `claude --version` and `node --version`. The ACP child
 starts on the first session open, create or prompt, serves that session,
-and is released after `idle_timeout_secs` of verified idleness (below).
+and is released after `idle_timeout_secs` (default 300) of verified idleness
+(below).
 Listing sessions never starts it.
 
 A session is loaded once at a time: repeated or concurrent opens (an App
@@ -228,15 +229,28 @@ is simply kept. A turn without such evidence (steered, interrupted) still
 counts when the transcript's last prompt and reply are the ones the session
 shows. A failed check is retried after another idle period, not every sweep.
 
-A child whose session ran tools may have started work that outlives the turn
-(a background command or subagent), which closing it would kill. It is
-released only when Claude Code's own registry entry for it
-(`<config>/sessions/<pid>.json` of the `claude` under the adapter) says
-`idle`; Claude Code keeps it `busy` while a turn runs and, observed with
-2.1.314, while a background subagent of the session still runs. A session that
-sent a command to the background (`rawInput.run_in_background`) keeps its
-child until it is closed otherwise. Retirement never runs during a turn or
-while an approval or question waits.
+A timer alone never releases a child: work a turn started may outlive it (a
+background command, a subagent, a script), and closing the child would kill
+it. After the idle window, every one of these must read quiet (checked every
+30 seconds):
+
+- no ACP turn in flight and no approval, question or form waiting;
+- Claude Code's own registry entry for the session
+  (`<config>/sessions/<pid>.json` of the `claude` under the adapter) says
+  `idle`; Claude Code keeps it `busy` while a turn runs and, observed with
+  2.1.314, while a background subagent of the session still runs;
+- the adapter's process tree holds no process that was not there before the
+  session's first prompt (the tree is read when the session opens and again
+  just before that prompt, so `claude` and the MCP servers it starts are
+  not work; a shell, script, background command or MCP server started later
+  is, and so is the same pid started again);
+- the transcript was not written during the whole window.
+
+Any signal showing work starts the window again; one that cannot be read (no
+registry entry, an unreadable process tree or transcript) keeps the child.
+A session that sent a command to the background (`rawInput.run_in_background`)
+keeps its child until it is closed otherwise. A retired session is loaded
+again (`session/load`) when it is next opened or prompted.
 
 ## A conversation that is open in a terminal
 

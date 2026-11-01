@@ -55,11 +55,21 @@ impl AcpProvider for ClaudeProvider {
     ) -> AgentFuture<'a, Option<(String, Option<String>)>> {
         Box::pin(super::recovery::transcript_model(directory, id))
     }
+    fn transcript_usage<'a>(
+        directory: &'a str,
+        id: &'a str,
+    ) -> AgentFuture<'a, Option<crate::agents::domain::TokensUsage>> {
+        Box::pin(super::recovery::transcript_usage(directory, id))
+    }
     fn static_modes() -> Vec<crate::agents::domain::ModeInfo> {
         permission_modes()
     }
-    fn work_settled(_directory: &str, id: &str, process: u32) -> bool {
-        super::native_sessions::idle_under(id, process)
+    fn registry_work(
+        _directory: &str,
+        id: &str,
+        process: u32,
+    ) -> Option<crate::agents::adapters::acp::idle::Work> {
+        Some(super::native_sessions::registry_work(id, process))
     }
     fn starts_background_work(update: &Value) -> bool {
         matches!(
@@ -67,6 +77,7 @@ impl AcpProvider for ClaudeProvider {
             Some("tool_call" | "tool_call_update")
         ) && update["rawInput"]["run_in_background"].as_bool() == Some(true)
     }
+    const STORE_ACTIVITY: bool = true;
     fn transcript_modified(directory: &str, id: &str) -> Option<std::time::SystemTime> {
         super::recovery::transcript_modified(directory, id)
     }
@@ -87,12 +98,16 @@ pub type ClaudeDriver = AcpDriver<ClaudeProvider>;
 
 /// The permission modes claude-agent-acp 0.99.1 offers every session
 /// (`modes.availableModes`, ids and names as it reports them). It offers
-/// `bypassPermissions` unless it runs as root outside a sandbox
-/// (`IS_SANDBOX`) or Claude Code's settings disable it; a live session's own
-/// list replaces this one.
+/// `bypassPermissions` only where Claude Code accepts it ([`bypass_allowed`]);
+/// a live session's own list replaces this one.
 pub(crate) fn permission_modes() -> Vec<crate::agents::domain::ModeInfo> {
     let root = unsafe { libc::geteuid() } == 0;
-    let bypass = !root || std::env::var_os("IS_SANDBOX").is_some_and(|value| !value.is_empty());
+    let settings: Vec<Value> = settings_files()
+        .iter()
+        .filter_map(|path| std::fs::read(path).ok())
+        .filter_map(|bytes| serde_json::from_slice(&bytes).ok())
+        .collect();
+    let bypass = bypass_allowed(root, std::env::var("IS_SANDBOX").ok().as_deref(), &settings);
     [
         ("default", "Manual", "Always ask before making changes"),
         (
@@ -122,6 +137,32 @@ pub(crate) fn permission_modes() -> Vec<crate::agents::domain::ModeInfo> {
     .collect()
 }
 
+/// Claude Code's user and managed settings, the tiers that apply to every
+/// session directory. A project's own settings can only disable bypass
+/// further; its live mode list says so.
+fn settings_files() -> Vec<std::path::PathBuf> {
+    let managed = if cfg!(target_os = "macos") {
+        "/Library/Application Support/ClaudeCode/managed-settings.json"
+    } else {
+        "/etc/claude-code/managed-settings.json"
+    };
+    super::native_sessions::config_dir()
+        .map(|dir| dir.join("settings.json"))
+        .into_iter()
+        .chain([managed.into()])
+        .collect()
+}
+
+/// Whether Claude Code accepts `bypassPermissions`: never when any settings
+/// tier sets `permissions.disableBypassPermissionsMode` to `"disable"`, and
+/// as root only inside a sandbox it is told of with `IS_SANDBOX=1`.
+fn bypass_allowed(root: bool, is_sandbox: Option<&str>, settings: &[Value]) -> bool {
+    let disabled = settings.iter().any(|settings| {
+        settings["permissions"]["disableBypassPermissionsMode"].as_str() == Some("disable")
+    });
+    !disabled && (!root || is_sandbox == Some("1"))
+}
+
 /// Exact adapter messages only; arbitrary native diagnostics are never shown.
 pub(crate) fn safe_error_message(error: &Value) -> Option<&'static str> {
     match (
@@ -134,5 +175,34 @@ pub(crate) fn safe_error_message(error: &Value) -> Option<&'static str> {
             "Claude Code is not signed in; run claude in a terminal on this computer and sign in",
         ),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    #[test]
+    fn bypass_is_offered_only_where_claude_code_accepts_it() {
+        let disabled = json!({"permissions": {"disableBypassPermissionsMode": "disable"}});
+        let other = json!({"permissions": {"defaultMode": "plan"}});
+        for (root, sandbox, settings, want) in [
+            (false, None, vec![], true),
+            (false, None, vec![other.clone()], true),
+            // Any tier that disables it wins (user or managed).
+            (false, None, vec![other.clone(), disabled.clone()], false),
+            (true, None, vec![], false),
+            (true, Some("1"), vec![], true),
+            // Claude Code refuses root bypass for any other value.
+            (true, Some("true"), vec![], false),
+            (true, Some(""), vec![], false),
+            (true, Some("1"), vec![disabled.clone()], false),
+        ] {
+            assert_eq!(
+                super::bypass_allowed(root, sandbox, &settings),
+                want,
+                "{root} {sandbox:?} {settings:?}"
+            );
+        }
     }
 }

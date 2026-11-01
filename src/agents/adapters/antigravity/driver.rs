@@ -22,6 +22,10 @@ impl AcpProvider for AntigravityProvider {
     const IDLE_RETIREMENT: bool = true;
     const PROVIDER_CONFIG: bool = false;
     const EFFORT_CONFIG: &'static str = "thought_level";
+    // agy 1.4.12 advertises `_meta.antigravity.systemPrompt.append`, but its
+    // wire shape is undocumented and unverified; until it is, the task
+    // sentence goes in the prompt.
+    const TASK_SENTENCE_IN_PROMPT: bool = true;
     // A stored Google login answers in milliseconds; without one `agy`
     // opens a browser sign-in and waits for it.
     const AUTHENTICATE: Option<Authenticate> = Some(Authenticate {
@@ -36,6 +40,10 @@ impl AcpProvider for AntigravityProvider {
         stop: &'a CancellationToken,
     ) -> AgentFuture<'a, NativeSnapshot> {
         Box::pin(super::store::recovery_snapshot(id, stop))
+    }
+    const STORE_ACTIVITY: bool = true;
+    fn transcript_modified(_directory: &str, id: &str) -> Option<std::time::SystemTime> {
+        super::store::store_modified(id)
     }
     fn offline_sessions<'a>(
         directory: Option<&'a str>,

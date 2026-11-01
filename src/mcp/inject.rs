@@ -43,6 +43,12 @@ pub(crate) fn task_sentence(fleet: Option<&str>) -> String {
     }
 }
 
+/// `goal` with the task sentence after it, for an agent that takes no
+/// per-session instruction; the served transcript cuts it again.
+pub(crate) fn with_task_sentence(goal: &str, sentence: &str) -> String {
+    format!("{goal}\n\n{sentence}")
+}
+
 /// How long a token handed to a session agent's service lives: a service
 /// that outlives it answers not connected, and the next delegation there
 /// registers a fresh one.

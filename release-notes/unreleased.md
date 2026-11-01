@@ -11,11 +11,36 @@
   longer killed after 10 minutes. (Claude Code, Antigravity, Cursor, FX,
   Qoder.)
 
-- **Idle Claude Code sessions release their processes.** A session that had
-  run any tool kept its adapter and `claude` until the Gateway stopped. After
-  an hour of idleness it is now released once Claude Code itself records the
-  session idle (no turn, background subagent or command), and reopens on the
-  next visit. Antigravity and Cursor still keep a session that ran tools.
+- **Idle ACP sessions release their processes after 5 minutes, only on
+  evidence.** A Claude Code session that had run any tool kept its adapter and
+  `claude` until the Gateway stopped. The default `idle_timeout_secs` is now
+  300 (was 3600) for Claude Code, Antigravity, Cursor, FX and Qoder (Pi keeps
+  its own hour), and the timer alone never decides: the session must have no
+  turn or question waiting, its process tree no process started after its
+  first prompt (a script or background command), its transcript or store no
+  write during the window, and -- for Claude Code -- its own registry entry
+  must say idle (a background subagent keeps it busy). Any sign of work starts
+  the window again; a signal that cannot be read keeps the process. A released
+  session reopens on the next visit. Antigravity and Cursor sessions that ran
+  tools are now released on the same evidence.
+
+- **Claude Code sessions report their token usage.** The context sheet showed
+  session tokens, input, output, thinking and cache counts as unavailable for
+  Claude Code. They are now summed from the session's transcript (each
+  message once) when it is opened, after each turn and for a session open in a
+  terminal. Claude Code records no per-turn cost, so cost stays unreported.
+
+- **Cursor and Antigravity tasks report when they finish.** Neither agent
+  takes a per-session instruction, so a delegated task never called
+  `tasks.complete`. The task's first prompt now ends with the task sentence;
+  the conversation shown in the App never contains it.
+
+- **Bypass permissions and Auto are never restored on their own.** Before a
+  session starts, Bypass permissions is offered only where Claude Code accepts
+  it (not when a user or managed settings file disables it, and as root only
+  with `IS_SANDBOX=1`). A remembered Bypass or Auto is no longer a new
+  session's default, and a new session asked for one gets it only if its own
+  mode list offers it; otherwise it keeps the adapter's default.
 
 - **Any Claude Code session listed on Home can be deleted**, not only those
   created from Muqun, using Claude Code's own delete; one open in a terminal

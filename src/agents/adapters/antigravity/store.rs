@@ -111,8 +111,14 @@ pub(super) fn list_at(
         if !valid_id(&id) || directory.is_some_and(|wanted| wanted != cwd) {
             continue;
         }
+        // A task's first prompt ends with the task sentence; a preview
+        // title stops before it.
         let title = if title.trim().is_empty() {
             preview
+                .split(crate::mcp::inject::TASK_SENTENCE)
+                .next()
+                .unwrap_or_default()
+                .to_owned()
         } else {
             title
         };
@@ -170,6 +176,15 @@ pub(super) async fn recovery_snapshot(
     let root = root().ok_or_else(unavailable)?;
     let id = id.to_owned();
     blocking(stop, move |stop| snapshot_at(&root, &id, &stop)).await
+}
+
+/// When conversation `id`'s steps were last written, for idle retirement.
+pub(super) fn store_modified(id: &str) -> Option<std::time::SystemTime> {
+    if !valid_id(id) {
+        return None;
+    }
+    let path = root()?.join("conversations").join(format!("{id}.db"));
+    crate::agents::adapters::acp::idle::sqlite_modified(&path)
 }
 
 pub(super) fn snapshot_at(

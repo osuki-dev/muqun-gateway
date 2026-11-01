@@ -29,6 +29,9 @@ impl AcpProvider for CursorProvider {
     const MODEL_SELECTION: bool = true;
     const IDLE_RETIREMENT: bool = true;
     const PROVIDER_CONFIG: bool = false;
+    // No system prompt in its ACP server, and MCP server instructions do not
+    // reach the model.
+    const TASK_SENTENCE_IN_PROMPT: bool = true;
     // Sessions are refused until `authenticate`. With a stored login it
     // answers in seconds; without one it opens a browser, so `signed_in`
     // runs first and this timeout only bounds a slow backend.
@@ -50,6 +53,10 @@ impl AcpProvider for CursorProvider {
         stop: &'a CancellationToken,
     ) -> AgentFuture<'a, NativeSnapshot> {
         Box::pin(super::store::recovery_snapshot(id, stop))
+    }
+    const STORE_ACTIVITY: bool = true;
+    fn transcript_modified(_directory: &str, id: &str) -> Option<std::time::SystemTime> {
+        super::store::store_modified(id)
     }
     fn offline_sessions<'a>(
         directory: Option<&'a str>,

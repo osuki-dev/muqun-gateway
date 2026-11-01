@@ -41,7 +41,7 @@ The provider id, kind and discovery id are `cursor`; the display name is
 Cursor.
 
 ```json
-{ "cursor": { "enabled": true, "binary": "/absolute/path/to/agent", "idle_timeout_secs": 3600 } }
+{ "cursor": { "enabled": true, "binary": "/absolute/path/to/agent", "idle_timeout_secs": 300 } }
 ```
 
 All three keys are optional and the block is omitted from a saved config while
@@ -53,7 +53,7 @@ Gateway does not install, update, log in or configure Cursor and never writes
 to its settings. Discovery runs a bounded `agent --version`; nothing else
 starts until a session is opened, created or prompted. Each such session owns a
 private `agent acp` child started in the session's folder; it is released after
-`idle_timeout_secs` of verified idleness (below), and shutdown stops and reaps
+`idle_timeout_secs` (default 300) of verified idleness (below), and shutdown stops and reaps
 Gateway-owned children.
 
 The CLI keeps its files in `CURSOR_CONFIG_DIR`, else `$XDG_CONFIG_HOME/cursor`,
@@ -115,9 +115,15 @@ message whose text carries `<user_query>\n…\n</user_query>` starts a turn;
 the last assistant message's text parts are the reply. Anything that does not
 match (summarized history, a changed format) keeps the child.
 
-A child whose session ran a tool is kept: Cursor has no record that says
-whether work a tool started (a background command) still runs, and closing
-the child could kill it. Only sessions that ran no tool are released.
+Cursor has no session registry, so a child, also one whose session ran tools, is
+released only when, after the idle window (checked every 30 seconds), there is
+no turn in flight and nothing waiting for an answer, the child's process tree
+holds no process that was not there before the session's first prompt (a
+background command or script keeps it), and the session's store (`store.db`) was not
+written during the whole window (SQLite's `-wal`/`-journal` included). A signal
+showing work starts the window again; one that cannot be read keeps the child.
+An in-process subagent that neither writes the store nor starts a process
+cannot be seen.
 
 ## Models and modes
 
@@ -156,7 +162,7 @@ with the bearer header within a second of `session/new`.
 | Approvals | `session/request_permission` (allow-once / allow-always / reject-once) | Implemented (shared); asked only when Cursor's own approval mode asks, not verified live |
 | Questions / plan approval | `cursor/ask_question`, `cursor/create_plan` (blocking) | Not implemented: answered "method not supported", not verified live |
 | Todos / subagents / images | `cursor/update_todos`, `cursor/task`, `cursor/generate_image` notifications | Not shown |
-| Delegated tasks and muqun tools | ACP HTTP `mcpServers` | Implemented (verified against a probe MCP server) |
+| Delegated tasks and muqun tools | ACP HTTP `mcpServers` | Implemented (verified against a probe MCP server); no system prompt, so the task sentence ends the first prompt and is cut from the served transcript |
 | Worktrees | `agent -w` only in the terminal UI | Not supported |
 | File-change listing | No | Not supported |
 | Slash commands | `available_commands_update` (commands and skills) | Implemented; a name listed twice (a command and a skill) is offered once |

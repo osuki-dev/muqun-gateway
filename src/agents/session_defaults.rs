@@ -144,10 +144,16 @@ async fn choices(db: &SqliteStore, agent_id: &str, folder: Option<String>) -> Ve
     .unwrap_or_default()
 }
 
+/// Modes that widen what the agent may do unasked (Claude Code's). A new
+/// session gets one only when it asks and its own live mode list offers it
+/// (ACP `create_session`), never as a remembered default: before a session
+/// exists, the list it will offer is unknown.
+pub(crate) const ELEVATING_MODES: [&str; 2] = ["bypassPermissions", "auto"];
+
 /// The catalog's defaults with the remembered choice in front: this folder's
 /// last, then this computer's last, then what the agent itself reported. A
 /// remembered model or mode the catalog no longer offers is skipped, and so
-/// is an effort the model no longer offers.
+/// is an effort the model no longer offers and an elevating mode.
 pub(crate) async fn fill_defaults(
     db: &SqliteStore,
     agent_id: &str,
@@ -184,6 +190,7 @@ fn pick_defaults(remembered: &[Choice], catalog: &AgentCatalog) -> CatalogDefaul
     let mode = remembered
         .iter()
         .filter_map(|(_, mode)| mode.as_ref())
+        .filter(|mode| !ELEVATING_MODES.contains(&mode.as_str()))
         .find(|mode| catalog.modes.iter().any(|offered| &offered.id == *mode))
         .cloned()
         .or_else(|| catalog.defaults.mode.clone());
@@ -472,6 +479,31 @@ mod tests {
         let mut cat = catalog();
         fill_defaults(&db, &agent, Some(&a), &mut cat).await;
         assert_eq!(cat.defaults.model, Some(model("deep", None)));
+    }
+
+    #[test]
+    fn a_remembered_elevating_mode_is_never_a_new_session_s_default() {
+        let mut offered = catalog();
+        offered.modes = serde_json::from_value(serde_json::json!([
+            {"id": "default", "name": "Manual"}, {"id": "plan", "name": "Plan"},
+            {"id": "auto", "name": "Auto"}, {"id": "bypassPermissions", "name": "Bypass"}
+        ]))
+        .unwrap();
+        offered.defaults.mode = Some("default".into());
+        for (remembered, want) in [
+            (vec!["bypassPermissions"], "default"),
+            (vec!["auto"], "default"),
+            // The folder's elevating choice is passed over for the computer's.
+            (vec!["bypassPermissions", "plan"], "plan"),
+            (vec!["plan"], "plan"),
+        ] {
+            let remembered: Vec<Choice> = remembered
+                .into_iter()
+                .map(|mode| (None, Some(mode.to_owned())))
+                .collect();
+            let picked = pick_defaults(&remembered, &offered);
+            assert_eq!(picked.mode.as_deref(), Some(want), "{remembered:?}");
+        }
     }
 
     #[tokio::test]

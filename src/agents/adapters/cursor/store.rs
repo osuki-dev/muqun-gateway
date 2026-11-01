@@ -138,6 +138,14 @@ fn read_meta(path: &Path) -> Option<(String, String)> {
     (!title.is_empty()).then(|| (cwd.to_owned(), title))
 }
 
+/// When session `id`'s store was last written, for idle retirement.
+pub(super) fn store_modified(id: &str) -> Option<std::time::SystemTime> {
+    if !valid_id(id) {
+        return None;
+    }
+    crate::agents::adapters::acp::idle::sqlite_modified(&root()?.join(id).join("store.db"))
+}
+
 fn modified_ms(path: &Path) -> Option<u64> {
     let modified = std::fs::metadata(path).ok()?.modified().ok()?;
     u64::try_from(modified.duration_since(UNIX_EPOCH).ok()?.as_millis()).ok()

@@ -197,7 +197,8 @@ while True:
 }
 
 /// The fixture with an agent-side record of settled work (Claude Code's
-/// session registry): `work-settled` in the workspace says nothing runs.
+/// session registry): `work-settled` in the workspace says nothing runs;
+/// its store is quiet.
 struct SettledFixture;
 impl AcpProvider for SettledFixture {
     const KIND: &'static str = "fx";
@@ -214,10 +215,21 @@ impl AcpProvider for SettledFixture {
     ) -> AgentFuture<'a, NativeSnapshot> {
         RecoverableFixture::recovery_snapshot(binary, directory, id, stop)
     }
-    fn work_settled(directory: &str, _id: &str, _process: u32) -> bool {
-        std::path::Path::new(directory)
+    fn registry_work(
+        directory: &str,
+        _id: &str,
+        _process: u32,
+    ) -> Option<super::super::idle::Work> {
+        use super::super::idle::Work;
+        let settled = std::path::Path::new(directory)
             .join("work-settled")
-            .exists()
+            .exists();
+        Some(if settled { Work::Quiet } else { Work::Active })
+    }
+    // A store last written long ago.
+    const STORE_ACTIVITY: bool = true;
+    fn transcript_modified(_directory: &str, _id: &str) -> Option<std::time::SystemTime> {
+        Some(std::time::SystemTime::UNIX_EPOCH)
     }
     fn starts_background_work(update: &Value) -> bool {
         update["rawInput"]["run_in_background"] == true

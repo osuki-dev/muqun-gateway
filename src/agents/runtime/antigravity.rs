@@ -270,7 +270,7 @@ mod tests {
         let config: AntigravityConfig = serde_json::from_str("{}").unwrap();
         assert_eq!(config, AntigravityConfig::default());
         assert!(config.enabled);
-        assert_eq!(config.idle_timeout_secs, 3600);
+        assert_eq!(config.idle_timeout_secs, 300);
         assert!(serde_json::from_str::<AntigravityConfig>(r#"{"token":"secret"}"#).is_err());
         let relative = AntigravityConfig {
             binary: Some("agy --unsafe".into()),

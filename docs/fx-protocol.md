@@ -29,7 +29,7 @@ uses ACP's native cancellation notification; it is not evidence that a failed or
 lost prompt never ran. Ambiguous delivery is never retried automatically.
 
 Verified idle conversations release their private process after
-`fx.idle_timeout_secs` (default 3600 seconds, checked every 30 seconds). Gateway
+`fx.idle_timeout_secs` (default 300 seconds, checked every 30 seconds). Gateway
 records a native-history checkpoint before a prompt, then requires a normal
 nonempty `end_turn`, one new saved turn, an unchanged prior-history prefix and
 exact submitted-user/final-assistant hashes. The bounded read-only
@@ -37,6 +37,9 @@ exact submitted-user/final-assistant hashes. The bounded read-only
 records in its checkpoint. Busy turns, pending requests and approvals prevent
 retirement. Gateway closes stdin in FIFO order, drains both output pipes, waits
 for a successful exit and verifies the same native checkpoint afterward.
+
+The child's process tree must also hold no process that was not there before
+the session's first prompt; one that does starts the idle window again.
 
 Observed live tool execution, native command delivery, permission requests or
 unknown extension/subagent control activity protects that entire process

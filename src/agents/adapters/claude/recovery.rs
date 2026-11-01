@@ -16,6 +16,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::native_sessions::{metadata_type, project_dirs, projects_root, valid_session_id};
 use crate::agents::adapters::acp::recovery::NativeSnapshot;
+use crate::agents::domain::TokensUsage;
 use crate::agents::ports::agent::AgentError;
 
 /// Larger transcripts are not inspected; their child is simply kept.
@@ -493,6 +494,157 @@ pub(super) async fn transcript_model(
     .flatten())
 }
 
+/// Per-message token counts, Claude Code's `message.usage`.
+#[derive(Deserialize)]
+struct Spent {
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    message: Option<SpentMessage>,
+}
+
+#[derive(Deserialize)]
+struct SpentMessage {
+    id: Option<String>,
+    usage: Option<MessageUsage>,
+}
+
+#[derive(Clone, Deserialize)]
+struct MessageUsage {
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_creation_input_tokens: Option<u64>,
+    cache_read_input_tokens: Option<u64>,
+    output_tokens_details: Option<OutputDetails>,
+}
+
+#[derive(Clone, Deserialize)]
+struct OutputDetails {
+    thinking_tokens: Option<u64>,
+}
+
+/// How far a transcript's usage has been read: complete lines up to
+/// `offset`, each message counted once by id (its last record wins; a
+/// streamed message is written once per content block).
+#[derive(Default)]
+struct UsageScan {
+    file: Option<(u64, u64)>,
+    offset: u64,
+    messages: HashMap<String, MessageUsage>,
+}
+
+impl UsageScan {
+    fn read(&mut self, reader: &mut impl BufRead) -> std::io::Result<()> {
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            let read = reader.read_until(b'\n', &mut line)?;
+            if read == 0 || line.last() != Some(&b'\n') {
+                // A record still being appended is read next time.
+                return Ok(());
+            }
+            self.offset += read as u64;
+            if metadata_type(&line).is_some() {
+                continue;
+            }
+            let Ok(spent) = serde_json::from_slice::<Spent>(&line) else {
+                continue;
+            };
+            if spent.kind.as_deref() != Some("assistant") {
+                continue;
+            }
+            if let Some(SpentMessage {
+                id: Some(id),
+                usage: Some(usage),
+            }) = spent.message
+            {
+                self.messages.insert(id, usage);
+            }
+        }
+    }
+
+    /// Disjoint counters, as the neutral shape has them: thinking is
+    /// reported inside `output_tokens` and is taken out of it.
+    fn total(&self) -> TokensUsage {
+        let mut total = TokensUsage::default();
+        let add = |slot: &mut Option<u64>, value: Option<u64>| {
+            if let Some(value) = value {
+                *slot = Some(slot.unwrap_or(0).saturating_add(value));
+            }
+        };
+        for usage in self.messages.values() {
+            let thinking = usage
+                .output_tokens_details
+                .as_ref()
+                .and_then(|details| details.thinking_tokens)
+                .filter(|thinking| *thinking <= usage.output_tokens);
+            total.input = total.input.saturating_add(usage.input_tokens);
+            total.output = total
+                .output
+                .saturating_add(usage.output_tokens - thinking.unwrap_or(0));
+            add(&mut total.reasoning, thinking);
+            add(&mut total.cache_read, usage.cache_read_input_tokens);
+            add(&mut total.cache_write, usage.cache_creation_input_tokens);
+        }
+        total
+    }
+}
+
+type UsageCache = std::sync::Mutex<HashMap<PathBuf, UsageScan>>;
+const MAX_USAGE_SCANS: usize = 64;
+
+/// The session's cumulative token usage from its transcript. A transcript
+/// only grows, so each call reads what was appended since the last one.
+/// Subagent transcripts are separate sessions and are not counted.
+pub(super) async fn transcript_usage(
+    directory: &str,
+    id: &str,
+) -> Result<Option<TokensUsage>, AgentError> {
+    static CACHE: std::sync::OnceLock<UsageCache> = std::sync::OnceLock::new();
+    if !valid_session_id(id) || !Path::new(directory).is_absolute() {
+        return Ok(None);
+    }
+    let Some(root) = projects_root() else {
+        return Ok(None);
+    };
+    let (directory, id) = (directory.to_owned(), id.to_owned());
+    Ok(tokio::task::spawn_blocking(move || {
+        use std::io::{Seek, SeekFrom};
+        let path = find_exact(&root, &directory, &id).ok()?;
+        let mut file = std::fs::File::open(&path).ok()?;
+        let stat = file.metadata().ok()?;
+        if stat.len() > MAX_BYTES {
+            return None;
+        }
+        let cache = CACHE.get_or_init(Default::default);
+        let mut scan = cache.lock().unwrap().remove(&path).unwrap_or_default();
+        #[cfg(unix)]
+        let identity = {
+            use std::os::unix::fs::MetadataExt as _;
+            Some((stat.dev(), stat.ino()))
+        };
+        #[cfg(not(unix))]
+        let identity = None;
+        if scan.file != identity || stat.len() < scan.offset {
+            scan = UsageScan {
+                file: identity,
+                ..UsageScan::default()
+            };
+        }
+        file.seek(SeekFrom::Start(scan.offset)).ok()?;
+        scan.read(&mut std::io::BufReader::new(file)).ok()?;
+        let total = scan.total();
+        let mut cache = cache.lock().unwrap();
+        if cache.len() >= MAX_USAGE_SCANS {
+            cache.clear();
+        }
+        cache.insert(path, scan);
+        Some(total)
+    })
+    .await
+    .ok()
+    .flatten())
+}
+
 /// The transcript's modification time, to notice that a terminal wrote to it.
 pub(super) fn transcript_modified(directory: &str, id: &str) -> Option<std::time::SystemTime> {
     let root = projects_root()?;
@@ -569,6 +721,47 @@ mod tests {
         let cut = &text.as_bytes()[5..];
         assert_eq!(last_model_in(cut, true).unwrap().0, "claude-haiku-5-5");
         assert_eq!(last_model_in(b"{\"type\":\"user\"}\n", false), None);
+    }
+
+    #[test]
+    fn usage_counts_each_message_once_and_resumes_after_a_partial_record() {
+        let assistant = |id: &str, output: u64, thinking: u64| {
+            json!({"type":"assistant","message":{"id":id,"usage":{
+                "input_tokens":2,"output_tokens":output,
+                "cache_creation_input_tokens":100,"cache_read_input_tokens":1000,
+                "output_tokens_details":{"thinking_tokens":thinking}}}})
+        };
+        // One message per content block: the same id and usage, repeated.
+        let first = [assistant("m1", 50, 20), assistant("m1", 50, 20)];
+        let mut text: String = first.iter().map(|l| format!("{l}\n")).collect();
+        text.push_str("{\"type\":\"api-request-blob\",\"usage\":{}}\n");
+        let partial = format!("{}", assistant("m2", 30, 0));
+        let (cut, rest) = partial.split_at(10);
+        text.push_str(cut);
+        let mut scan = UsageScan::default();
+        scan.read(&mut std::io::Cursor::new(text.as_bytes()))
+            .unwrap();
+        let total = scan.total();
+        assert_eq!(
+            (
+                total.input,
+                total.output,
+                total.reasoning,
+                total.cache_read,
+                total.cache_write
+            ),
+            (2, 30, Some(20), Some(1000), Some(100))
+        );
+        // The unfinished record is read whole once its line is complete.
+        assert_eq!(scan.offset as usize, text.len() - cut.len());
+        let tail = format!("{cut}{rest}\n");
+        scan.read(&mut std::io::Cursor::new(tail.as_bytes()))
+            .unwrap();
+        let total = scan.total();
+        assert_eq!(
+            (total.input, total.output, total.reasoning),
+            (4, 60, Some(20))
+        );
     }
 
     #[test]
