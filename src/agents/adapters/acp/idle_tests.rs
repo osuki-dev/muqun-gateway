@@ -291,6 +291,81 @@ async fn parked_restore_keeps_a_read_marker_written_while_native_load_is_pending
     driver.shutdown().await;
 }
 
+// The App's "tap to refresh" while it opens a parked session: its first
+// open gives up (request timeout, closed request) and a refresh commits the
+// parked copy while the native load runs. Neither may kill the process that
+// is loading; the retried open attaches to it, and once the session is live
+// opening or refreshing it again starts nothing.
+#[tokio::test]
+async fn abandoned_open_and_refresh_during_load_attach_to_one_native_process() {
+    use crate::agents::use_cases::SessionService;
+    let fixture = Fixture::new().await;
+    let binary = fixture.directory.join("mock-fx");
+    let script = std::fs::read_to_string(&binary).unwrap().replace(
+        "    elif method=='session/load':",
+        "    elif method=='session/load':\n        if os.path.exists('block-load'):\n            with open('load-entered','w') as f:f.write('ready')\n            while os.path.exists('block-load'):time.sleep(0.002)",
+    );
+    std::fs::write(&binary, script).unwrap();
+    let driver = driver(&fixture);
+    let service = SessionService::with_memory_mirror(driver.clone(), driver.mirror.clone());
+    let info = driver.create_session(None, None, None).await.unwrap();
+    driver
+        .send_prompt(&info.asid.0, "saved turn", &[], None)
+        .await
+        .unwrap();
+    idle(&driver, &info.asid.0).await.unwrap();
+    expire(&driver, &info.asid.0).await;
+    dormant(&driver, &info.asid.0).await;
+    let count = |name: &str| {
+        fixture
+            .methods()
+            .iter()
+            .filter(|method| *method == name)
+            .count()
+    };
+    assert_eq!(count("initialize"), 1);
+
+    std::fs::write(fixture.directory.join("block-load"), "wait").unwrap();
+    let opening = driver.clone();
+    let id = info.asid.0.clone();
+    let abandoned = tokio::spawn(async move { opening.prepare_selected_session(&id).await });
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !fixture.directory.join("load-entered").exists() {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .unwrap();
+    abandoned.abort();
+    assert!(abandoned.await.unwrap_err().is_cancelled());
+    service.refresh_snapshot(&info.asid).await.unwrap();
+    let opening = driver.clone();
+    let id = info.asid.0.clone();
+    let retried = tokio::spawn(async move { opening.prepare_selected_session(&id).await });
+    tokio::task::yield_now().await;
+    std::fs::remove_file(fixture.directory.join("block-load")).unwrap();
+    retried.await.unwrap().unwrap();
+
+    let session = driver.retained(&info.asid.0).unwrap();
+    assert!(session.connected.load(Ordering::Acquire));
+    assert!(session.client.is_running());
+    assert_eq!(
+        driver
+            .mirror
+            .get_snapshot(&info.asid)
+            .await
+            .unwrap()
+            .timeline
+            .len(),
+        2
+    );
+    driver.prepare_selected_session(&info.asid.0).await.unwrap();
+    service.refresh_snapshot(&info.asid).await.unwrap();
+    assert!(session.client.is_running());
+    assert_eq!((count("initialize"), count("session/load")), (2, 1));
+    driver.shutdown().await;
+}
+
 #[tokio::test]
 async fn parked_observation_drops_live_projection_and_concurrent_foreground_prepares_load_once() {
     let fixture = Fixture::new().await;

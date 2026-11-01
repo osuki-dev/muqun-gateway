@@ -49,6 +49,13 @@ starts on the first session open, create or prompt, serves that session,
 and is released after `idle_timeout_secs` of verified idleness (below).
 Listing sessions never starts it.
 
+A session is loaded once at a time: repeated or concurrent opens (an App
+retry, a refresh while it loads) wait for the same load, a caller that stops
+waiting does not stop it, and an open of a live session starts nothing. A
+refresh committed during the load does not discard the loaded process. A
+turn has no time limit; it ends with the agent's answer, Stop, or the process
+exiting. When a session's process ends unexpectedly the Gateway logs why.
+
 ## Methods used
 
 | Method | Use | Observed shape (0.99.1) |

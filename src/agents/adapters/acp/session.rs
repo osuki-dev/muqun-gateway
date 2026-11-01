@@ -349,6 +349,8 @@ struct Session {
 }
 
 type LiveSessions = Arc<StdMutex<HashMap<String, Arc<Session>>>>;
+type Activation =
+    futures::future::Shared<futures::future::BoxFuture<'static, Result<Arc<Session>, AgentError>>>;
 type DormantSessions = Arc<StdMutex<HashMap<String, DormantSession>>>;
 
 struct ListenerContext {
@@ -444,6 +446,9 @@ pub struct AcpDriver<P: AcpProvider> {
     inspection: Arc<Mutex<()>>,
     connections: StdMutex<Vec<Weak<AcpClient>>>,
     connection_admission: Mutex<()>,
+    /// Native loads in flight, one per session (`load_once`).
+    activations: StdMutex<HashMap<String, (u64, Activation)>>,
+    next_activation: AtomicU64,
     starting: tokio::sync::RwLock<()>,
     mutations: Mutex<()>,
     global_catalog: Mutex<Option<CatalogCacheEntry>>,
@@ -563,6 +568,8 @@ impl<P: AcpProvider> AcpDriver<P> {
             inspection: Arc::new(Mutex::new(())),
             connections: StdMutex::new(Vec::new()),
             connection_admission: Mutex::new(()),
+            activations: StdMutex::new(HashMap::new()),
+            next_activation: AtomicU64::new(0),
             starting: tokio::sync::RwLock::new(()),
             mutations: Mutex::new(()),
             global_catalog: Mutex::new(None),
@@ -1703,29 +1710,111 @@ impl<P: AcpProvider> AcpDriver<P> {
         if let Some(live) = self.terminal_live(id).await {
             return Err(AgentError::TerminalInteraction(Box::new(live.runtime)));
         }
-        // One explicit activation restores a same-ID generation. Prompt calls
-        // never replay a previous request and cannot recover an unexpected loss.
-        let _mutation = self.mutations.lock().await;
-        if let Some(session) = self.retained(id) {
-            let retirement = session.retirement.lock().await;
-            if session.connected.load(Ordering::Acquire) {
-                if reserve_prompt
-                    && session
-                        .busy
-                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                        .is_err()
-                {
-                    return Err(AgentError::NotAvailable(
-                        "ACP session is already processing a turn".into(),
-                    ));
-                }
-                if explicit_prepare {
-                    session.state.lock().await.last_activity = tokio::time::Instant::now();
+        {
+            let _mutation = self.mutations.lock().await;
+            if let Some(session) = self.retained(id) {
+                let retirement = session.retirement.lock().await;
+                if session.connected.load(Ordering::Acquire) {
+                    if reserve_prompt
+                        && session
+                            .busy
+                            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                            .is_err()
+                    {
+                        return Err(AgentError::NotAvailable(
+                            "ACP session is already processing a turn".into(),
+                        ));
+                    }
+                    if explicit_prepare {
+                        session.state.lock().await.last_activity = tokio::time::Instant::now();
+                    }
+                    drop(retirement);
+                    return Ok(session);
                 }
                 drop(retirement);
+                // Its end decides whether it may be loaded again (below).
+                tokio::time::timeout(RETIREMENT_TIMEOUT, session.finished.cancelled())
+                    .await
+                    .map_err(|_| {
+                        AgentError::NotAvailable("Previous ACP generation has not stopped".into())
+                    })?;
+            }
+            // One explicit activation restores a same-ID generation. Prompt calls
+            // never replay a previous request and cannot recover an unexpected loss.
+            if !explicit_prepare
+                && self
+                    .dormant
+                    .lock()
+                    .unwrap()
+                    .get(id)
+                    .is_some_and(|entry| entry.kind == DormantKind::Unexpected)
+            {
+                return Err(AgentError::NotAvailable("ACP connection ended unexpectedly; explicitly open the conversation before sending a new prompt; delivery was not retried".into()));
+            }
+        }
+        let session = self.load_once(id).await?;
+        if reserve_prompt
+            && session
+                .busy
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            return Err(AgentError::NotAvailable(
+                "ACP session is already processing a turn".into(),
+            ));
+        }
+        Ok(session)
+    }
+
+    /// Load `id`, or wait for the load already under way. The load runs on
+    /// its own: a caller that stops waiting (a request timeout, a closed
+    /// connection, an App retry) neither cancels it nor kills the process
+    /// it started, and the next caller attaches to the same process.
+    async fn load_once(&self, id: &str) -> Result<Arc<Session>, AgentError> {
+        use futures::FutureExt;
+        let flight = {
+            let mut flights = self.activations.lock().unwrap();
+            match flights.get(id) {
+                Some((_, flight)) => flight.clone(),
+                None => {
+                    let driver = self
+                        .me
+                        .upgrade()
+                        .ok_or_else(|| AgentError::NotAvailable("ACP runtime stopped".into()))?;
+                    let number = self.next_activation.fetch_add(1, Ordering::Relaxed);
+                    let owned = id.to_owned();
+                    let task = tokio::spawn(async move {
+                        let result = driver.load(&owned).await;
+                        let mut flights = driver.activations.lock().unwrap();
+                        if flights
+                            .get(&owned)
+                            .is_some_and(|(current, _)| *current == number)
+                        {
+                            flights.remove(&owned);
+                        }
+                        result
+                    });
+                    let flight = async move {
+                        task.await.unwrap_or_else(|_| {
+                            Err(AgentError::NotAvailable("ACP session load stopped".into()))
+                        })
+                    }
+                    .boxed()
+                    .shared();
+                    flights.insert(id.to_owned(), (number, flight.clone()));
+                    flight
+                }
+            }
+        };
+        flight.await
+    }
+
+    async fn load(&self, id: &str) -> Result<Arc<Session>, AgentError> {
+        let _mutation = self.mutations.lock().await;
+        if let Some(session) = self.retained(id) {
+            if session.connected.load(Ordering::Acquire) {
                 return Ok(session);
             }
-            drop(retirement);
             tokio::time::timeout(RETIREMENT_TIMEOUT, session.finished.cancelled())
                 .await
                 .map_err(|_| {
@@ -1733,13 +1822,6 @@ impl<P: AcpProvider> AcpDriver<P> {
                 })?;
         }
         let dormant = self.dormant.lock().unwrap().get(id).cloned();
-        if dormant
-            .as_ref()
-            .is_some_and(|entry| entry.kind == DormantKind::Unexpected)
-            && !explicit_prepare
-        {
-            return Err(AgentError::NotAvailable("ACP connection ended unexpectedly; explicitly open the conversation before sending a new prompt; delivery was not retried".into()));
-        }
         let info = match &dormant {
             Some(entry) => self.dormant_info(id, entry).await?,
             None => self.native_session_info(id).await?,
@@ -1767,16 +1849,6 @@ impl<P: AcpProvider> AcpDriver<P> {
                 }
             }
             self.dormant.lock().unwrap().remove(id);
-        }
-        if reserve_prompt
-            && session
-                .busy
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
-        {
-            return Err(AgentError::NotAvailable(
-                "ACP session is already processing a turn".into(),
-            ));
         }
         Ok(session)
     }
@@ -2043,15 +2115,29 @@ impl<P: AcpProvider> AcpDriver<P> {
             inbox: Vec::new(),
             seq: 0,
         };
-        if !self
+        // No other generation of this session runs while it loads, so what
+        // was written meanwhile (an App refresh or cold read of the parked
+        // copy) came from the Gateway's older copy: the replay is newer. Take
+        // the new revision and replace again instead of discarding a process
+        // that loaded correctly; give up only if writes never stop.
+        let mut revision = revision;
+        let mut attempts = 0;
+        while !self
             .mirror
-            .replace_native_snapshot(snapshot, revision)
+            .replace_native_snapshot(snapshot.clone(), revision)
             .await?
         {
-            client.shutdown().await;
-            return Err(AgentError::NotAvailable(
-                "ACP session changed while loading; refresh again".into(),
-            ));
+            attempts += 1;
+            if attempts == 3 {
+                client.shutdown().await;
+                return Err(AgentError::NotAvailable(
+                    "ACP session changed while loading; refresh again".into(),
+                ));
+            }
+            revision = self
+                .mirror
+                .native_reload_revision(&AgentSessionId::from(id.as_str()))
+                .await;
         }
         if !state.catalog.commands.is_empty() {
             self.commands_observed.store(true, Ordering::Release);
@@ -2646,7 +2732,7 @@ impl<P: AcpProvider> AcpDriver<P> {
                 drop(state);
                 let sender = session.completions.clone();
                 tokio::spawn(async move {
-                    let _ = sender.send(request.wait().await);
+                    let _ = sender.send(request.wait_for_turn().await);
                 });
                 admission.handed_off = true;
                 Ok(())
@@ -3040,6 +3126,16 @@ impl<P: AcpProvider> AcpDriver<P> {
                         seq,
                     },
                 );
+            }
+            match dormant_kind {
+                DormantKind::Parked => {
+                    tracing::info!(session = %id, "idle ACP session released its process")
+                }
+                DormantKind::Unexpected => tracing::warn!(
+                    session = %id,
+                    reason = state.info.error.as_ref().map(|error| error.message.as_str()).unwrap_or("-"),
+                    "ACP session process ended"
+                ),
             }
             let compact = DormantSession::new(&state.info, state.owned_mutations, dormant_kind);
             drop(state);

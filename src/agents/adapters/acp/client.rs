@@ -157,6 +157,16 @@ impl AcpRequest {
         self.wait_with_timeout(REQUEST_TIMEOUT).await
     }
 
+    /// A prompt's turn lasts as long as the agent works: it ends with the
+    /// agent's answer, a cancel or the process exiting, never with a timeout
+    /// that would kill the agent in the middle of a long turn.
+    pub async fn wait_for_turn(mut self) -> Result<Value, String> {
+        let reply = self.reply.take().expect("request waited once");
+        reply
+            .await
+            .unwrap_or_else(|_| Err(self.state.disconnected()))
+    }
+
     pub async fn wait_with_timeout(mut self, timeout: Duration) -> Result<Value, String> {
         let reply = self.reply.take().expect("request waited once");
         match tokio::time::timeout(timeout, reply).await {
