@@ -99,10 +99,12 @@ impl AcpProvider for ClaudeProvider {
     }
     fn offline_sessions<'a>(
         directory: Option<&'a str>,
+        owned: std::collections::HashSet<String>,
         stop: &'a tokio_util::sync::CancellationToken,
     ) -> Option<AgentFuture<'a, Vec<Value>>> {
         Some(Box::pin(super::native_sessions::list(
             directory.map(str::to_owned),
+            owned,
             stop.clone(),
         )))
     }

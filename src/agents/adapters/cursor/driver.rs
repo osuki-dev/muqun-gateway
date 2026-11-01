@@ -60,6 +60,7 @@ impl AcpProvider for CursorProvider {
     }
     fn offline_sessions<'a>(
         directory: Option<&'a str>,
+        _owned: std::collections::HashSet<String>,
         stop: &'a CancellationToken,
     ) -> Option<AgentFuture<'a, Vec<Value>>> {
         Some(Box::pin(super::store::list(directory, stop)))

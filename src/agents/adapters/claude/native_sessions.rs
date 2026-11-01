@@ -2,7 +2,7 @@
 //! the ACP adapter. Only the identity, workspace, modification time and title
 //! of each transcript are read, from a bounded head and tail like Claude
 //! Code's SDK does; request blobs and message bodies are never parsed.
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
@@ -233,6 +233,21 @@ struct Summary {
     cwd: Option<String>,
     title: Option<String>,
     sidechain: bool,
+    automated: bool,
+}
+
+/// Entrypoints of runs nobody typed into: `claude -p` (`sdk-cli`) and the
+/// Python Agent SDK (`sdk-py`, e.g. review bots). The TypeScript SDK
+/// (`sdk-ts`) is not one: claude-agent-acp, and so this Gateway, uses it.
+const AUTOMATED_ENTRYPOINTS: [&str; 2] = ["sdk-cli", "sdk-py"];
+
+/// A transcript started by an automated run and still last written by one;
+/// a session later resumed in the terminal or an ACP client is a
+/// conversation.
+fn automated(first: Option<&str>, last: Option<&str>) -> bool {
+    [first, last]
+        .iter()
+        .all(|entry| entry.is_some_and(|entry| AUTOMATED_ENTRYPOINTS.contains(&entry)))
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -265,19 +280,22 @@ fn cache() -> &'static SummaryCache {
 
 pub(super) async fn list(
     directory: Option<String>,
+    owned: HashSet<String>,
     stop: CancellationToken,
 ) -> Result<Vec<Value>, AgentError> {
     let Some(root) = projects_root() else {
         return Ok(Vec::new());
     };
-    tokio::task::spawn_blocking(move || list_in(&root, directory.as_deref(), &stop))
+    tokio::task::spawn_blocking(move || list_in(&root, directory.as_deref(), &owned, &stop))
         .await
         .map_err(|_| AgentError::NotAvailable("Claude Code session reader failed".into()))?
 }
 
+/// Automated runs are left out unless this Gateway created them (`owned`).
 fn list_in(
     root: &Path,
     directory: Option<&str>,
+    owned: &HashSet<String>,
     stop: &CancellationToken,
 ) -> Result<Vec<Value>, AgentError> {
     let cancelled = || {
@@ -334,6 +352,9 @@ fn list_in(
             let Some(summary) = summarize(&path, &stat) else {
                 continue;
             };
+            if summary.automated && !owned.contains(id) {
+                continue;
+            }
             let cwd = match (&summary.cwd, directory) {
                 // A lossy bucket can hold another workspace's transcripts.
                 (Some(cwd), Some(wanted)) if cwd != wanted => continue,
@@ -418,6 +439,10 @@ fn read_summary(path: &Path, len: u64) -> Option<Summary> {
         cwd: head.cwd,
         title: title.map(|title| clean_title(&title)),
         sidechain: head.sidechain,
+        automated: automated(
+            head.first_entrypoint.as_deref(),
+            tail.last_entrypoint.or(head.last_entrypoint).as_deref(),
+        ),
     })
 }
 
@@ -444,6 +469,8 @@ struct Fields {
     first_prompt: Option<String>,
     cwd: Option<String>,
     sidechain: bool,
+    first_entrypoint: Option<String>,
+    last_entrypoint: Option<String>,
     chat_seen: bool,
 }
 
@@ -459,6 +486,7 @@ struct Record {
     summary: Option<String>,
     uuid: Option<String>,
     cwd: Option<String>,
+    entrypoint: Option<String>,
     #[serde(default)]
     is_sidechain: bool,
     #[serde(default)]
@@ -514,6 +542,10 @@ impl Fields {
             if !fields.chat_seen {
                 fields.chat_seen = true;
                 fields.sidechain = record.is_sidechain;
+                fields.first_entrypoint = record.entrypoint.clone();
+            }
+            if record.entrypoint.is_some() {
+                fields.last_entrypoint = record.entrypoint;
             }
             if fields.cwd.is_none() {
                 fields.cwd = record
@@ -635,6 +667,124 @@ mod tests {
     }
 
     #[test]
+    fn automated_runs_are_hidden_unless_the_gateway_created_them() {
+        let root = Scratch(
+            std::env::temp_dir().join(format!("muqun-claude-auto-{}", uuid::Uuid::new_v4())),
+        );
+        let cwd = "/synthetic/workspace";
+        let bucket = root.0.join(encode(cwd));
+        std::fs::create_dir_all(&bucket).unwrap();
+        // Head shapes as Claude Code 2.1 writes them; `entrypoint` is on
+        // every chat record, metadata records carry none.
+        let chat = |kind: &str, entry: Option<&str>| {
+            let mut record = json!({"parentUuid":null,"isSidechain":false,"type":kind,
+                "uuid":uuid::Uuid::new_v4().to_string(),"userType":"external","cwd":cwd,
+                "version":"2.1.314","message":{"role":kind,"content":"Synthetic prompt"}});
+            if let Some(entry) = entry {
+                record["entrypoint"] = json!(entry);
+            }
+            record.to_string()
+        };
+        let queue = r#"{"type":"queue-operation","operation":"enqueue"}"#.to_owned();
+        let mode = r#"{"type":"permission-mode","permissionMode":"default"}"#.to_owned();
+        let title = r#"{"type":"ai-title","aiTitle":"Synthetic title"}"#.to_owned();
+        // Pushes the later records out of the head chunk.
+        let blob = format!(
+            "{{\"type\":\"api-request-blob\",\"m\":\"{}\"}}",
+            "x".repeat(100_000)
+        );
+        let one = |entry| vec![queue.clone(), chat("user", Some(entry)), title.clone()];
+        // (case, transcript lines, created by this Gateway, listed)
+        let cases: Vec<(&str, Vec<String>, bool, bool)> = vec![
+            (
+                "terminal",
+                vec![
+                    mode.clone(),
+                    chat("attachment", Some("cli")),
+                    chat("user", Some("cli")),
+                    title.clone(),
+                ],
+                false,
+                true,
+            ),
+            ("review bot (Python SDK)", one("sdk-py"), false, false),
+            (
+                "review bot resumed by the Gateway",
+                one("sdk-py"),
+                true,
+                true,
+            ),
+            ("claude -p", one("sdk-cli"), false, false),
+            (
+                "claude -p then the terminal",
+                vec![
+                    chat("user", Some("sdk-cli")),
+                    title.clone(),
+                    blob.clone(),
+                    chat("user", Some("cli")),
+                ],
+                false,
+                true,
+            ),
+            (
+                "claude -p, long",
+                vec![
+                    chat("user", Some("sdk-cli")),
+                    title.clone(),
+                    blob,
+                    chat("assistant", Some("sdk-cli")),
+                ],
+                false,
+                false,
+            ),
+            ("ACP client", one("sdk-ts"), false, true),
+            (
+                "terminal then the App",
+                vec![
+                    chat("user", Some("cli")),
+                    title.clone(),
+                    chat("user", Some("sdk-ts")),
+                ],
+                false,
+                true,
+            ),
+            ("desktop app", one("claude-desktop"), false, true),
+            (
+                "before entrypoints",
+                vec![chat("user", None), title.clone()],
+                false,
+                true,
+            ),
+        ];
+        let mut owned = HashSet::new();
+        let mut expected = Vec::new();
+        for (index, (case, lines, gateway, listed)) in cases.iter().enumerate() {
+            let id = format!("00000000-0000-4000-8000-{index:012}");
+            std::fs::write(bucket.join(format!("{id}.jsonl")), lines.join("\n") + "\n").unwrap();
+            if *gateway {
+                owned.insert(id.clone());
+            }
+            if *listed {
+                expected.push((id, *case));
+            }
+        }
+        let rows = list_in(&root.0, Some(cwd), &owned, &CancellationToken::new()).unwrap();
+        let mut listed: Vec<_> = rows
+            .iter()
+            .map(|row| row["sessionId"].as_str().unwrap())
+            .collect();
+        listed.sort_unstable();
+        assert_eq!(
+            listed,
+            expected
+                .iter()
+                .map(|(id, _)| id.as_str())
+                .collect::<Vec<_>>(),
+            "{expected:?}"
+        );
+    }
+
+    #[test]
     fn listing_reads_title_and_workspace_and_skips_blob_records() {
         let root = Scratch(
             std::env::temp_dir().join(format!("muqun-claude-list-{}", uuid::Uuid::new_v4())),
@@ -658,15 +808,20 @@ mod tests {
         // Not a session id: ignored.
         std::fs::write(bucket.join("notes.jsonl"), "{}\n").unwrap();
         let stop = CancellationToken::new();
-        let rows = list_in(&root.0, Some(cwd), &stop).unwrap();
+        let rows = list_in(&root.0, Some(cwd), &HashSet::new(), &stop).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["sessionId"], id);
         assert_eq!(rows[0]["cwd"], cwd);
         assert_eq!(rows[0]["title"], "Synthetic title");
         assert!(rows[0]["updatedAt"].as_str().unwrap().ends_with('Z'));
-        assert_eq!(list_in(&root.0, None, &stop).unwrap(), rows);
-        assert!(list_in(&root.0, Some("/synthetic/other"), &stop)
-            .unwrap()
-            .is_empty());
+        assert_eq!(
+            list_in(&root.0, None, &HashSet::new(), &stop).unwrap(),
+            rows
+        );
+        assert!(
+            list_in(&root.0, Some("/synthetic/other"), &HashSet::new(), &stop)
+                .unwrap()
+                .is_empty()
+        );
     }
 }
