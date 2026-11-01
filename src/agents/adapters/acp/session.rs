@@ -157,9 +157,11 @@ pub trait AcpProvider: Send + Sync + 'static {
     /// `authenticate`, even with a login already stored on the computer.
     const AUTHENTICATE: Option<Authenticate> = None;
     /// Rows for `session/list` read from the native store without starting
-    /// the agent, or `None` to ask the agent itself.
+    /// the agent, or `None` to ask the agent itself. `owned` names the
+    /// sessions this Gateway created, which are always listed.
     fn offline_sessions<'a>(
         _directory: Option<&'a str>,
+        _owned: HashSet<String>,
         _stop: &'a CancellationToken,
     ) -> Option<AgentFuture<'a, Vec<Value>>> {
         None
@@ -1497,7 +1499,8 @@ impl<P: AcpProvider> AcpDriver<P> {
         directory: Option<&str>,
     ) -> Result<Vec<AgentSessionInfo>, AgentError> {
         let revision = self.metadata_revision.load(Ordering::Acquire);
-        if let Some(rows) = P::offline_sessions(directory, &self.stop) {
+        let owned = self.owned.lock().unwrap().ids.iter().cloned().collect();
+        if let Some(rows) = P::offline_sessions(directory, owned, &self.stop) {
             let mut sessions = self.project_listed_sessions(rows.await?).await?;
             if let Some(bridge) = self.terminal_bridge() {
                 let ids: Vec<_> = sessions.iter().map(|info| info.asid.0.clone()).collect();
