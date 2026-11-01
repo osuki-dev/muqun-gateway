@@ -9,10 +9,12 @@ use tokio::sync::{broadcast, mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 
 use super::client::AcpRetirement;
+use super::idle::{IdleSignals, IdleVerdict};
 use super::mapper::{self, Permission, Projection};
 use super::operations::{self, PromptCapabilities};
 use super::recovery::{self, Checkpoint, NativeSnapshot, TurnEvidence};
 use super::{AcpClient, AcpEvent};
+use crate::agents::adapters::codex::process_tree::ProcessKey;
 use crate::agents::adapters::memory_mirror::MemoryMirror;
 use crate::agents::domain::*;
 use crate::agents::ports::agent::{
@@ -49,14 +51,16 @@ pub trait AcpProvider: Send + Sync + 'static {
     const TASK_SENTENCE_IN_PROMPT: bool = false;
     /// The native command that renames a session without a model turn.
     const RENAME_COMMAND: Option<&'static str> = None;
-    /// Whether the agent's own record says that nothing of session `id`
-    /// still runs in the child under `process` (no turn, background command
-    /// or subagent). Asked before idle retirement of a generation that ran
-    /// tools; without such a record (`false`) that child is kept, since
-    /// closing it could kill work that outlives its tool call.
-    fn work_settled(_directory: &str, _id: &str, _process: u32) -> bool {
-        false
+    /// What the agent's own session registry says of session `id` in the
+    /// child under `process` (a turn, background command or subagent still
+    /// running is `Active`), or `None` for an agent that keeps none. Asked
+    /// before every idle retirement ([`super::idle`]).
+    fn registry_work(_directory: &str, _id: &str, _process: u32) -> Option<super::idle::Work> {
+        None
     }
+    /// `transcript_modified` changes with every write of the session's
+    /// native store, so a quiet store is evidence for idle retirement.
+    const STORE_ACTIVITY: bool = false;
     /// A live update that starts work outliving its tool call (a command
     /// sent to the background). Its generation is never idle-retired.
     fn starts_background_work(_update: &Value) -> bool {
@@ -211,7 +215,7 @@ pub struct Authenticate {
 }
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
-pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 3600;
+pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 300;
 const RETIREMENT_TIMEOUT: Duration = Duration::from_secs(15);
 // At most 8 MiB of serialized dormant info, plus bounded map/index overhead.
 const MAX_DORMANT_SESSIONS: usize = 512;
@@ -264,6 +268,10 @@ struct SessionState {
     hidden_command: bool,
     /// This generation started work that outlives its tool call.
     background_work: bool,
+    /// The child's process tree before any work: read at the start and
+    /// again just before the first prompt (`None` when unreadable).
+    process_baseline: Option<HashSet<ProcessKey>>,
+    prompted: bool,
 }
 
 #[derive(Clone)]
@@ -2122,6 +2130,10 @@ impl<P: AcpProvider> AcpDriver<P> {
             forms: HashMap::new(),
             hidden_command: false,
             background_work: false,
+            process_baseline: client
+                .process_id()
+                .and_then(crate::agents::adapters::codex::process_tree::descendants),
+            prompted: false,
         };
         for params in replay {
             if params["sessionId"].as_str() != Some(id.as_str()) {
@@ -2770,6 +2782,15 @@ impl<P: AcpProvider> AcpDriver<P> {
         state.prompt_user_digest = Some(recovery::text_digest(&prepared.transcript));
         state.turn_had_output = false;
         state.last_activity = tokio::time::Instant::now();
+        if P::IDLE_RETIREMENT && !state.prompted {
+            // MCP servers may still be starting when the session opens.
+            state.prompted = true;
+            let now = session
+                .client
+                .process_id()
+                .and_then(crate::agents::adapters::codex::process_tree::descendants);
+            state.process_baseline = state.process_baseline.take().zip(now).map(|(a, b)| &a | &b);
+        }
         // Direct prompt delivery can carry the same native slash command as
         // run_command; catalogs may be stale or omit extension commands.
         if native_command || text.trim_start().starts_with('/') {
@@ -3118,15 +3139,15 @@ impl<P: AcpProvider> AcpDriver<P> {
             busy: &session.busy,
             handed_off: false,
         };
-        let (id, directory, evidence) = {
+        let window = Duration::from_secs(context.idle_timeout_secs.load(Ordering::Acquire));
+        let (id, directory, evidence, baseline) = {
             let state = session.state.lock().await;
             if state.info.status != AgentSessionStatus::Idle
                 || !state.permissions.is_empty()
                 || !state.forms.is_empty()
                 || state.background_work
                 || !parked_metadata_fits(&state.info)
-                || state.last_activity.elapsed()
-                    < Duration::from_secs(context.idle_timeout_secs.load(Ordering::Acquire))
+                || state.last_activity.elapsed() < window
             {
                 return None;
             }
@@ -3134,25 +3155,40 @@ impl<P: AcpProvider> AcpDriver<P> {
                 state.info.asid.0.clone(),
                 state.info.directory.clone()?,
                 state.recovery.clone(),
+                state.process_baseline.clone(),
             )
         };
-        // Tools ran in this generation: only the agent's own record can say
-        // that nothing they started still runs.
-        let live_work = if session.client.has_unverified_live_work() {
-            let mark = session.client.live_work_mark();
-            let process = session.client.process_id()?;
+        // Taken before the signals are read: work that arrives after is not
+        // covered by them.
+        let mark = session.client.live_work_mark();
+        let process = session.client.process_id()?;
+        let signals = {
             let (directory, id) = (directory.clone(), id.clone());
-            let settled =
-                tokio::task::spawn_blocking(move || P::work_settled(&directory, &id, process))
-                    .await
-                    .unwrap_or(false);
-            if !settled {
+            tokio::task::spawn_blocking(move || IdleSignals {
+                registry: P::registry_work(&directory, &id, process),
+                processes: super::idle::process_work(
+                    crate::agents::adapters::codex::process_tree::descendants(process).as_ref(),
+                    baseline.as_ref(),
+                ),
+                store: P::STORE_ACTIVITY.then(|| {
+                    super::idle::store_work(
+                        P::transcript_modified(&directory, &id),
+                        std::time::SystemTime::now(),
+                        window,
+                    )
+                }),
+            })
+            .await
+            .ok()?
+        };
+        match super::idle::idle_verdict(&signals) {
+            IdleVerdict::Retire => {}
+            IdleVerdict::Wait => return None,
+            IdleVerdict::Rearm => {
+                session.state.lock().await.last_activity = tokio::time::Instant::now();
                 return None;
             }
-            Some(mark)
-        } else {
-            None
-        };
+        }
         // At most one potentially large native history inspection per provider.
         let Ok(_inspection) = context.inspection.try_lock() else {
             return None;
@@ -3191,7 +3227,12 @@ impl<P: AcpProvider> AcpDriver<P> {
         };
         let confirmed = snapshot.checkpoint();
         drop(snapshot);
-        if live_work.is_some_and(|mark| !session.client.settle_live_work(mark)) {
+        // Tools ran in this generation: the signals above say nothing they
+        // started still runs, unless more work arrived since. Without the
+        // store signal they cannot say that.
+        if session.client.has_unverified_live_work()
+            && !(P::STORE_ACTIVITY && session.client.settle_live_work(mark))
+        {
             return None;
         }
         let retirement = session.client.retire(RETIREMENT_TIMEOUT);

@@ -13,7 +13,7 @@ Antigravity. The terminal launcher keeps its separate `agy` kind, so starting
 `agy` in a pane is unchanged.
 
 ```json
-{ "antigravity": { "enabled": true, "binary": "/absolute/path/to/agy", "idle_timeout_secs": 3600 } }
+{ "antigravity": { "enabled": true, "binary": "/absolute/path/to/agy", "idle_timeout_secs": 300 } }
 ```
 
 All three keys are optional and the block is omitted from a saved config while
@@ -113,7 +113,7 @@ user's own agy MCP configuration is untouched.
 ## Idle retirement
 
 Verified idle conversations release their child after
-`antigravity.idle_timeout_secs` (default 3600, checked every 30 seconds). The
+`antigravity.idle_timeout_secs` (default 300, checked every 30 seconds). The
 evidence is the conversation's own `~/.gemini/antigravity-cli/conversations/<id>.db`
 read-only: one entry per user-input step (kind 14) with its text (protobuf field
 19.2), the text of each model reply step (kind 15, field 20.1) and the kinds of
@@ -121,9 +121,15 @@ the steps between. A turn counts as stored when the checkpoint taken before the
 prompt is extended by exactly one entry whose user text and last reply text
 match what the live stream showed. Anything else keeps the child running.
 
-A child whose session ran a tool is kept: Antigravity has no record that says
-whether work a tool started (a background command) still runs, and closing
-the child could kill it. Only sessions that ran no tool are released.
+Antigravity has no session registry, so a child, also one whose session ran tools, is
+released only when, after the idle window (checked every 30 seconds), there is
+no turn in flight and nothing waiting for an answer, the child's process tree
+holds no process that was not there before the session's first prompt (a
+background command or script keeps it), and the session's store (`conversations/<id>.db`) was not
+written during the whole window (SQLite's `-wal`/`-journal` included). A signal
+showing work starts the window again; one that cannot be read keeps the child.
+An in-process subagent that neither writes the store nor starts a process
+cannot be seen.
 
 ## Feature parity
 

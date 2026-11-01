@@ -178,6 +178,15 @@ pub(super) async fn recovery_snapshot(
     blocking(stop, move |stop| snapshot_at(&root, &id, &stop)).await
 }
 
+/// When conversation `id`'s steps were last written, for idle retirement.
+pub(super) fn store_modified(id: &str) -> Option<std::time::SystemTime> {
+    if !valid_id(id) {
+        return None;
+    }
+    let path = root()?.join("conversations").join(format!("{id}.db"));
+    crate::agents::adapters::acp::idle::sqlite_modified(&path)
+}
+
 pub(super) fn snapshot_at(
     root: &Path,
     id: &str,

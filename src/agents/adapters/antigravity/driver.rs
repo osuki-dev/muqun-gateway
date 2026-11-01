@@ -41,6 +41,10 @@ impl AcpProvider for AntigravityProvider {
     ) -> AgentFuture<'a, NativeSnapshot> {
         Box::pin(super::store::recovery_snapshot(id, stop))
     }
+    const STORE_ACTIVITY: bool = true;
+    fn transcript_modified(_directory: &str, id: &str) -> Option<std::time::SystemTime> {
+        super::store::store_modified(id)
+    }
     fn offline_sessions<'a>(
         directory: Option<&'a str>,
         stop: &'a CancellationToken,

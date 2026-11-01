@@ -210,6 +210,31 @@ fn children(_pid: u32) -> Option<Vec<u32>> {
     None
 }
 
+/// One live process: its pid and kernel start time, which together name
+/// one incarnation.
+pub(crate) type ProcessKey = (u32, (u64, u64));
+
+/// Every live descendant of `root`, or `None` when the tree cannot be read
+/// whole (a process exited mid-walk, an unsupported platform). A child
+/// whose identity cannot be read (another user's, a zombie) gets a zero
+/// start time, which no earlier reading matches.
+pub(crate) fn descendants(root: u32) -> Option<HashSet<ProcessKey>> {
+    let mut found = HashSet::new();
+    let mut pending = vec![root];
+    while let Some(parent) = pending.pop() {
+        for pid in children(parent)? {
+            let start = identity(pid).map_or((0, 0), |found| found.start);
+            if found.insert((pid, start)) {
+                if found.len() > 1024 {
+                    return None;
+                }
+                pending.push(pid);
+            }
+        }
+    }
+    Some(found)
+}
+
 pub struct ProcessTree {
     root: u32,
     owned: HashMap<u32, Owned>,

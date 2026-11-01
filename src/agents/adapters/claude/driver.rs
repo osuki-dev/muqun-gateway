@@ -64,8 +64,12 @@ impl AcpProvider for ClaudeProvider {
     fn static_modes() -> Vec<crate::agents::domain::ModeInfo> {
         permission_modes()
     }
-    fn work_settled(_directory: &str, id: &str, process: u32) -> bool {
-        super::native_sessions::idle_under(id, process)
+    fn registry_work(
+        _directory: &str,
+        id: &str,
+        process: u32,
+    ) -> Option<crate::agents::adapters::acp::idle::Work> {
+        Some(super::native_sessions::registry_work(id, process))
     }
     fn starts_background_work(update: &Value) -> bool {
         matches!(
@@ -73,6 +77,7 @@ impl AcpProvider for ClaudeProvider {
             Some("tool_call" | "tool_call_update")
         ) && update["rawInput"]["run_in_background"].as_bool() == Some(true)
     }
+    const STORE_ACTIVITY: bool = true;
     fn transcript_modified(directory: &str, id: &str) -> Option<std::time::SystemTime> {
         super::recovery::transcript_modified(directory, id)
     }

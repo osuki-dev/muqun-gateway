@@ -265,7 +265,7 @@ mod tests {
         let config: CursorConfig = serde_json::from_str("{}").unwrap();
         assert_eq!(config, CursorConfig::default());
         assert!(config.enabled);
-        assert_eq!(config.idle_timeout_secs, 3600);
+        assert_eq!(config.idle_timeout_secs, 300);
         assert!(serde_json::from_str::<CursorConfig>(r#"{"token":"secret"}"#).is_err());
         let relative = CursorConfig {
             binary: Some("agent --unsafe".into()),

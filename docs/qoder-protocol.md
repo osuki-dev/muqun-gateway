@@ -39,7 +39,7 @@ private `qodercli --acp` child. Shutdown stops and reaps Gateway-owned children;
 external terminal and IDE processes are untouched.
 
 Verified idle conversations release their private process after
-`qoder.idle_timeout_secs` (default 3600 seconds, checked every 30 seconds). The
+`qoder.idle_timeout_secs` (default 300 seconds, checked every 30 seconds). The
 driver checks the exact session's bounded native JSONL journal without loading
 it: the last matching `active-leaf` selects the branch, `parentUuid` orders its
 records, and native human-input metadata distinguishes prompts from tool-result
@@ -48,6 +48,9 @@ before that prompt by one human turn, with unchanged earlier context and exact
 user/final-assistant text hashes. Context attachments, reasoning and tool
 records remain part of the canonical checkpoint. A clean final native
 `end_turn` is required; cancellation/error records do not qualify.
+
+The child's process tree must also hold no process that was not there before
+the session's first prompt; one that does starts the idle window again.
 
 Observed live tool execution, native command delivery, permission requests or
 unknown extension/subagent control activity protects that entire process
