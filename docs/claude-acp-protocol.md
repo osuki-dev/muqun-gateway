@@ -107,7 +107,12 @@ modes; the current one is the session's `mode`. Picking one calls
 `session/set_mode`, as does creating a session with a mode. The mode belongs
 to the session: the adapter calls Claude Code's `setPermissionMode` for that
 query only, and a load continues in the transcript's last mode (verified).
-A new session starts in the user's `permissions.defaultMode`. Observed:
+A new session starts in the user's `permissions.defaultMode`.
+These modes are fixed by the adapter, so the catalog and discovery list them
+before any adapter has run (`bypassPermissions` unless the Gateway runs as
+root outside a sandbox; a live session's own list replaces them, which also
+drops bypass when Claude Code's settings disable it). A session held by a
+terminal lists no modes: its mode belongs to that terminal. Observed:
 switching into and out of `plan` can change the session's model (Claude Code's
 plan-mode model); the App sees the new model in the session update.
 

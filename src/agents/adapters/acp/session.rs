@@ -63,6 +63,11 @@ pub trait AcpProvider: Send + Sync + 'static {
     /// Code: the SDK's transcript delete), so every listed session may be
     /// deleted, not only those this Gateway created.
     const DELETE_LISTED: bool = false;
+    /// The session modes the agent always offers (`SESSION_MODES`), listed
+    /// before any session has reported its own.
+    fn static_modes() -> Vec<ModeInfo> {
+        Vec::new()
+    }
     fn recovery_snapshot<'a>(
         _binary: &'a str,
         _directory: &'a str,
@@ -889,11 +894,15 @@ impl<P: AcpProvider> AcpDriver<P> {
         sessions.sort_by(|a, b| a.0.cmp(&b.0));
         let mut models: BTreeMap<(String, String), ModelInfo> = BTreeMap::new();
         let mut commands = BTreeMap::new();
+        let mut modes = Vec::new();
         for (_, session) in sessions {
             if !session.connected.load(Ordering::Acquire) {
                 continue;
             }
             let state = session.state.lock().await;
+            if P::SESSION_MODES && modes.is_empty() {
+                modes.clone_from(&state.catalog.modes);
+            }
             for command in &state.catalog.commands {
                 commands
                     .entry(command.name.clone())
@@ -920,9 +929,13 @@ impl<P: AcpProvider> AcpDriver<P> {
                 }
             }
         }
+        if modes.is_empty() {
+            modes = P::static_modes();
+        }
         AgentCatalog {
             models: models.into_values().collect(),
             commands: commands.into_values().collect(),
+            modes,
             ..Default::default()
         }
     }
@@ -998,6 +1011,9 @@ impl<P: AcpProvider> AcpDriver<P> {
                     commands.insert(command.name.clone(), command);
                 }
                 catalog.commands = commands.into_values().collect();
+                if catalog.modes.is_empty() {
+                    catalog.modes = observed.modes;
+                }
                 Ok(catalog)
             }
             Err(_) if !observed.commands.is_empty() => Ok(observed),
@@ -3732,6 +3748,14 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
                     return Ok(AgentCatalog::default());
                 }
                 if self.retained(id).is_none() {
+                    // A terminal's process holds it: its mode cannot be
+                    // switched from here, so none is offered.
+                    if self.terminal_live(id).await.is_some() {
+                        let mut catalog = self.available_catalog(directory).await?;
+                        catalog.modes.clear();
+                        catalog.defaults.mode = None;
+                        return Ok(catalog);
+                    }
                     self.observed_snapshot(id).await?;
                     return self.available_catalog(directory).await;
                 }
