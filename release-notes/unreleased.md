@@ -2,6 +2,33 @@
 
 ## Changes and fixes
 
+- **Home names the model an ACP agent actually starts with.** Before a
+  session is open, the model list kept from an earlier session has no current
+  model, so the App showed the first one listed: "Fable 5" for Claude Code,
+  whose new sessions run the adapter's default (Opus 5.5 here). The catalog
+  `defaults` now name the adapter's own default -- Claude Code's "Default
+  (recommended)", Cursor's "Auto" -- or the only model offered (Antigravity),
+  unless a choice is remembered for the folder or computer.
+
+- **Antigravity, Claude Code and Cursor offer model and thinking choices on
+  Home right after a Gateway restart.** These agents start on first use, and
+  discovery only filled in the models their last session showed once the
+  agent had started, so after a restart it reported no model selection and
+  Home greyed out the model pill (Antigravity's thinking levels could only be
+  picked inside a session). Discovery now uses the version it reads from the
+  binary to find that list.
+
+- **Claude Code sessions can finish a Home task.** A task delegated to a
+  native ACP session (Claude Code, and likewise Cursor and Antigravity) was
+  answered
+  `task_not_found` when the agent called `tasks.complete`, so it ended
+  "idle, unconfirmed" instead of done. The Gateway matches the call to the
+  session making it by its running tool call, but these adapters report a
+  quick MCP call as `pending` until its result, and the request can reach the
+  Gateway a few milliseconds before that report. Such a call now counts as
+  running, and a call that matches no session yet is looked for again for up
+  to half a second.
+
 - **Claude Code and Antigravity sessions start from Home right after a
   Gateway restart.** Until one of their sessions had run, they listed no
   models, so the model the App remembered was refused with `unknown_model` and

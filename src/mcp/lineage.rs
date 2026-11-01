@@ -37,6 +37,12 @@ use crate::AppState;
 const MAX_CANDIDATES: usize = 20;
 /// Timeline entries read per candidate: the calling turn is the last one.
 const PROBE_ITEMS: usize = 20;
+/// An agent's own report of a tool call and the MCP request it makes race:
+/// Claude Code sends the request within milliseconds of the adapter's
+/// `tool_call` notification. A call that matches no session yet is looked
+/// for again this many times, this far apart, before it is refused.
+const SETTLE_TRIES: usize = 5;
+const SETTLE_STEP: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// The MCP call that asks for a task: the tool (`exec.run`,
 /// `tasks.delegate`) and the arguments that tell this call from another of
@@ -327,15 +333,25 @@ pub(crate) async fn own_task(
     call: &Call<'_>,
     wanted: Option<&TaskId>,
 ) -> Option<TaskId> {
-    let fits = fitting(state, &session.binding, call).await;
-    let mut fits = fits
-        .into_iter()
-        .filter(|task| task.kind == TaskKind::Delegation)
-        .filter(|task| wanted.is_none_or(|id| task.id == *id));
-    match (fits.next(), fits.next()) {
-        (Some(task), None) => Some(task.id),
-        _ => None,
+    let observed = matches!(
+        session.binding,
+        TokenBinding::Agent { .. } | TokenBinding::Runtime { .. }
+    );
+    for attempt in 0..=SETTLE_TRIES {
+        let fits = fitting(state, &session.binding, call).await;
+        let mut fits = fits
+            .into_iter()
+            .filter(|task| task.kind == TaskKind::Delegation)
+            .filter(|task| wanted.is_none_or(|id| task.id == *id));
+        match (fits.next(), fits.next()) {
+            (Some(task), None) => return Some(task.id),
+            (None, _) if observed && attempt < SETTLE_TRIES => {
+                tokio::time::sleep(SETTLE_STEP).await;
+            }
+            _ => return None,
+        }
     }
+    None
 }
 
 /// The open tasks `binding` could be calling from (see the module docs).

@@ -464,12 +464,15 @@ fn mark_signin_failure(agent: &mut Value, failed_at_ms: Option<u64>) {
 
 /// An agent whose models are only known inside a live session (ACP agents)
 /// lists the ones its last session showed, from the same agent version, so
-/// the App can offer model and effort before the first prompt.
+/// the App can offer model and effort before the first prompt. Claude Code,
+/// Cursor and Antigravity start on first use, so after a restart there is no
+/// manager yet: the version discovery read from the binary stands for it.
 async fn fill_cached_models(state: &AppState, id: &str, agent: &mut Value) {
-    let Some(manager) = state.agent_runtime.manager_for_agent(id).await else {
-        return;
+    let version = match state.agent_runtime.manager_for_agent(id).await {
+        Some(manager) => manager.version(),
+        None => agent["version"].as_str().map(str::to_owned),
     };
-    let Some(version) = manager.version() else {
+    let Some(version) = version else {
         return;
     };
     let Some(models) =
@@ -623,6 +626,48 @@ mod tests {
                     .as_str()
                     .is_some_and(|r| r.contains("sign in to Qoder CLI")),
                 marked
+            );
+        }
+    }
+
+    /// After a restart an ACP agent that starts on first use has no manager;
+    /// discovery still lists its last session's models (with their thinking
+    /// tiers) for the version it read from the binary, and no other.
+    #[tokio::test]
+    async fn an_unstarted_acp_agent_lists_its_cached_models_for_its_binary_version() {
+        let state = crate::test_state("admin", Vec::new());
+        let mut catalog: crate::agents::domain::AgentCatalog = serde_json::from_value(json!({
+            "models": [{"id": "flash", "name": "Flash", "provider_id": "antigravity",
+                        "variants": [{"id": "low", "reasoning_effort": "low"},
+                                     {"id": "high", "reasoning_effort": "high"}]}],
+            "modes": [], "mcp": []
+        }))
+        .unwrap();
+        crate::agents::session_defaults::with_cached_models(
+            &state.db,
+            "antigravity",
+            Some("1.4.12".into()),
+            &mut catalog,
+        )
+        .await;
+        assert!(state
+            .agent_runtime
+            .manager_for_agent("antigravity")
+            .await
+            .is_none());
+        for (version, listed) in [
+            (json!("1.4.12"), true),
+            (json!("1.5.0"), false),
+            (Value::Null, false),
+        ] {
+            let mut agent = json!({"id": "antigravity", "version": version, "models": [],
+                                   "features": {"modelSelection": false, "reasoningEffort": false}});
+            fill_cached_models(&state, "antigravity", &mut agent).await;
+            assert_eq!(agent["features"]["modelSelection"], listed, "{version}");
+            assert_eq!(agent["features"]["reasoningEffort"], listed, "{version}");
+            assert_eq!(
+                agent["models"].as_array().unwrap().len(),
+                usize::from(listed)
             );
         }
     }

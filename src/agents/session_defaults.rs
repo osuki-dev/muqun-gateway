@@ -202,6 +202,30 @@ fn fingerprint(version: &str, models: &str) -> u64 {
     hasher.finish()
 }
 
+/// A catalog read before any session (cached or last seen) carries no
+/// current model. The adapter's own default then stands, by the name the
+/// adapter gives it -- Claude Code's `default` ("Default (recommended)"),
+/// Cursor's `default[]` ("Auto") -- or the one model offered (Antigravity),
+/// rather than whichever model the App lists first.
+pub(crate) fn fill_adapter_default(catalog: &mut AgentCatalog) {
+    if catalog.defaults.model.is_some() {
+        return;
+    }
+    let own = catalog
+        .models
+        .iter()
+        .find(|model| model.id == "default" || model.id.starts_with("default["));
+    let only = match catalog.models.as_slice() {
+        [model] => Some(model),
+        _ => None,
+    };
+    catalog.defaults.model = own.or(only).map(|model| ModelRef {
+        provider_id: model.provider_id.clone(),
+        model_id: model.id.clone(),
+        variant: None,
+    });
+}
+
 /// Keep the model list an agent shows while a session is open, and give a
 /// catalog that has none (no session yet) the last one seen from the same
 /// agent version. A different version drops the cached list: its models and
@@ -511,6 +535,49 @@ mod tests {
         assert!(discovered
             .iter()
             .all(|model| model.reasoning_effort_tiers == ["low", "high"]));
+    }
+
+    /// Before a session, the default is what the adapter runs unasked, not
+    /// the first model in the list (`claude-fable-5` sorts before `default`).
+    #[test]
+    fn a_catalog_without_a_current_model_defaults_to_the_adapter_s_own() {
+        let listed = |ids: &[&str]| -> AgentCatalog {
+            let models: Vec<_> = ids
+                .iter()
+                .map(|id| serde_json::json!({"id": id, "name": id, "provider_id": "a"}))
+                .collect();
+            serde_json::from_value(serde_json::json!({"models": models, "modes": [], "mcp": []}))
+                .unwrap()
+        };
+        let chosen = model("haiku", Some("low"));
+        for (ids, current, want) in [
+            (
+                &["claude-fable-5", "default", "haiku"][..],
+                None,
+                Some("default"),
+            ),
+            (
+                &["default[]", "gpt-5.5[reasoning=medium]"][..],
+                None,
+                Some("default[]"),
+            ),
+            (&["gemini-3.8-flash"][..], None, Some("gemini-3.8-flash")),
+            (&["fast", "deep"][..], None, None),
+            (
+                &["default", "haiku"][..],
+                Some(chosen.clone()),
+                Some("haiku"),
+            ),
+        ] {
+            let mut catalog = listed(ids);
+            catalog.defaults.model = current;
+            fill_adapter_default(&mut catalog);
+            assert_eq!(
+                catalog.defaults.model.as_ref().map(|m| m.model_id.as_str()),
+                want,
+                "{ids:?}"
+            );
+        }
     }
 
     #[test]

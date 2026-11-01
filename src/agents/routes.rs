@@ -1954,6 +1954,7 @@ pub async fn get_global_agent_catalog(
             &mut cat,
         )
         .await;
+        super::session_defaults::fill_adapter_default(&mut cat);
         if primary_defaults.is_none() {
             primary_defaults = Some(cat.defaults);
         }
