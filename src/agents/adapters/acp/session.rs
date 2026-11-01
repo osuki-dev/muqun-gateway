@@ -66,6 +66,11 @@ pub trait AcpProvider: Send + Sync + 'static {
     fn starts_background_work(_update: &Value) -> bool {
         false
     }
+    /// The `_meta` sent with `mcpServers` on `session/new`, `session/load`,
+    /// `session/resume` and `session/fork`, if any.
+    fn session_meta(_mcp_servers: &Value) -> Option<Value> {
+        None
+    }
     /// `session/delete` deletes any saved session, loaded or not (Claude
     /// Code: the SDK's transcript delete), so every listed session may be
     /// deleted, not only those this Gateway created.
@@ -680,8 +685,14 @@ impl<P: AcpProvider> AcpDriver<P> {
         }
     }
 
-    fn mcp_servers(&self) -> Value {
-        self.mcp_servers.lock().unwrap().clone()
+    /// Add `mcpServers` and the provider's [`AcpProvider::session_meta`] to
+    /// the params of a session start.
+    fn add_mcp_servers(&self, params: &mut Value) {
+        let servers = self.mcp_servers.lock().unwrap().clone();
+        if let Some(meta) = P::session_meta(&servers) {
+            params["_meta"] = meta;
+        }
+        params["mcpServers"] = servers;
     }
 
     pub fn set_terminal_bridge(&self, bridge: Arc<dyn TerminalBridge>) {
@@ -2014,7 +2025,8 @@ impl<P: AcpProvider> AcpDriver<P> {
         } else {
             "session/new"
         };
-        let mut params = json!({ "cwd": directory, "mcpServers": self.mcp_servers() });
+        let mut params = json!({ "cwd": directory });
+        self.add_mcp_servers(&mut params);
         if let Some(id) = &id {
             params["sessionId"] = json!(id);
         }
@@ -2991,8 +3003,8 @@ impl<P: AcpProvider> AcpDriver<P> {
                 state.info.mode.clone(),
             )
         };
-        let mut params =
-            json!({ "sessionId": id, "cwd": directory, "mcpServers": self.mcp_servers() });
+        let mut params = json!({ "sessionId": id, "cwd": directory });
+        self.add_mcp_servers(&mut params);
         if let Some(prompt) = self.system_prompt(Some(id)) {
             params["systemPrompt"] = prompt;
         }
@@ -3992,7 +4004,7 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
                 .as_deref()
                 .ok_or_else(|| protocol("source session has no directory"))?;
             let mut params = operations::fork_params(id, directory, message_id)?;
-            params["mcpServers"] = self.mcp_servers();
+            self.add_mcp_servers(&mut params);
             let (client, _events, capabilities) = self.initialized(directory).await?;
             if !operations::supports_operation(&capabilities, "fork") {
                 client.shutdown().await;

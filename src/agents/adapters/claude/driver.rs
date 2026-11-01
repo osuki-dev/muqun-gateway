@@ -71,6 +71,22 @@ impl AcpProvider for ClaudeProvider {
     ) -> Option<crate::agents::adapters::acp::idle::Work> {
         Some(super::native_sessions::registry_work(id, process))
     }
+    /// The muqun tools never ask for permission: they are allowed for the
+    /// session (`allowedTools`, a server-level rule), not in the user's
+    /// settings. The value is fixed, so it never changes the adapter's
+    /// session fingerprint between loads.
+    fn session_meta(mcp_servers: &Value) -> Option<Value> {
+        let muqun = crate::mcp::hosts::SERVER_NAME;
+        mcp_servers
+            .as_array()?
+            .iter()
+            .any(|server| server["name"] == muqun)
+            .then(|| {
+                serde_json::json!({ "claudeCode": { "options": {
+                    "allowedTools": [format!("mcp__{muqun}")]
+                } } })
+            })
+    }
     fn starts_background_work(update: &Value) -> bool {
         matches!(
             update["sessionUpdate"].as_str(),
