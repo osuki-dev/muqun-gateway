@@ -147,6 +147,14 @@ The muqun MCP server is passed as an ACP HTTP `mcpServers` entry with a
 `initialize` (client "Cursor"), `notifications/initialized` and `tools/list`
 with the bearer header within a second of `session/new`.
 
+Cursor reports every MCP call as `kind: "other"`, `title: "muqun: <tool>"`
+and `rawInput: {providerIdentifier, toolName, args}` (it sends no `name`).
+The Gateway tells which session makes a `tasks.complete`, `exec.run` or
+`tasks.delegate` call by finding that call running in a session's timeline,
+so it reads Cursor's tool as `<providerIdentifier>_<toolName>` and the
+arguments from `args`. The model reaches the tools through Cursor's
+`GetDynamicTools` / `CallDynamicTool`, which run as these MCP calls.
+
 ## Feature parity
 
 | Capability | Cursor ACP (CLI 2026.10.22) | Gateway |

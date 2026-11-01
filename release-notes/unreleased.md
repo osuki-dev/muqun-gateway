@@ -33,7 +33,10 @@
 - **Cursor and Antigravity tasks report when they finish.** Neither agent
   takes a per-session instruction, so a delegated task never called
   `tasks.complete`. The task's first prompt now ends with the task sentence;
-  the conversation shown in the App never contains it.
+  the conversation shown in the App never contains it. Cursor's call was
+  still refused as "not a Muqun task" (it reports every MCP call as `other`
+  with the tool and its arguments nested), so its tasks stayed "Idle,
+  unconfirmed"; the Gateway now reads that shape and the task reaches Done.
 
 - **Bypass permissions and Auto are never restored on their own.** Before a
   session starts, Bypass permissions is offered only where Claude Code accepts
