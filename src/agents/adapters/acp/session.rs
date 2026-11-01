@@ -128,6 +128,15 @@ pub trait AcpProvider: Send + Sync + 'static {
     ) -> AgentFuture<'a, Option<(String, Option<String>)>> {
         Box::pin(async { Ok(None) })
     }
+    /// The session's cumulative token usage as the native store records it,
+    /// for an agent whose prompt responses carry none. Replaces the
+    /// response-derived total wherever it is known.
+    fn transcript_usage<'a>(
+        _directory: &'a str,
+        _id: &'a str,
+    ) -> AgentFuture<'a, Option<TokensUsage>> {
+        Box::pin(async { Ok(None) })
+    }
     /// When that store last changed for `id`, to notice terminal progress.
     fn transcript_modified(_directory: &str, _id: &str) -> Option<std::time::SystemTime> {
         None
@@ -720,6 +729,9 @@ impl<P: AcpProvider> AcpDriver<P> {
             AgentError::NotAvailable("The session has no verified working directory".into())
         })?;
         let timeline = P::live_timeline(&directory, id, &self.stop).await?;
+        if let Ok(Some(tokens)) = P::transcript_usage(&directory, id).await {
+            info.tokens = Some(tokens);
+        }
         info.runtime = Some(live.runtime.clone());
         live.runtime.clone().apply(&mut info);
         Ok(AgentSessionSnapshot {
@@ -1885,6 +1897,9 @@ impl<P: AcpProvider> AcpDriver<P> {
             }
             self.dormant.lock().unwrap().remove(id);
         }
+        if let Some(tokens) = Self::transcript_tokens(&session).await {
+            Self::publish_tokens(&session, &self.mirror, &self.tx, Some(tokens)).await;
+        }
         Ok(session)
     }
 
@@ -2632,16 +2647,39 @@ impl<P: AcpProvider> AcpDriver<P> {
         tx: &broadcast::Sender<AgentDomainEvent>,
         response: Option<&Value>,
     ) {
+        let recorded = Self::transcript_tokens(session).await;
+        let total = {
+            let mut state = session.state.lock().await;
+            let native_provider = state
+                .info
+                .model
+                .as_ref()
+                .map(|model| model.provider_id.as_str())
+                .unwrap_or(P::KIND);
+            let turn = response
+                .and_then(|response| mapper::turn_usage(response, P::KIND, native_provider));
+            let total = state.usage.finish(turn);
+            recorded.or(total)
+        };
+        Self::publish_tokens(session, mirror, tx, total).await;
+    }
+
+    /// The native store's token total for this session, when it keeps one.
+    async fn transcript_tokens(session: &Session) -> Option<TokensUsage> {
+        let (directory, id) = {
+            let state = session.state.lock().await;
+            (state.info.directory.clone()?, state.info.asid.0.clone())
+        };
+        P::transcript_usage(&directory, &id).await.ok().flatten()
+    }
+
+    async fn publish_tokens(
+        session: &Session,
+        mirror: &MemoryMirror,
+        tx: &broadcast::Sender<AgentDomainEvent>,
+        total: Option<TokensUsage>,
+    ) {
         let mut state = session.state.lock().await;
-        let native_provider = state
-            .info
-            .model
-            .as_ref()
-            .map(|model| model.provider_id.as_str())
-            .unwrap_or(P::KIND);
-        let turn =
-            response.and_then(|response| mapper::turn_usage(response, P::KIND, native_provider));
-        let total = state.usage.finish(turn);
         if state.info.tokens != total {
             state.info.tokens = total;
             let info = state.info.clone();

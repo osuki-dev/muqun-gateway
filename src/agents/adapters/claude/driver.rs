@@ -55,6 +55,12 @@ impl AcpProvider for ClaudeProvider {
     ) -> AgentFuture<'a, Option<(String, Option<String>)>> {
         Box::pin(super::recovery::transcript_model(directory, id))
     }
+    fn transcript_usage<'a>(
+        directory: &'a str,
+        id: &'a str,
+    ) -> AgentFuture<'a, Option<crate::agents::domain::TokensUsage>> {
+        Box::pin(super::recovery::transcript_usage(directory, id))
+    }
     fn static_modes() -> Vec<crate::agents::domain::ModeInfo> {
         permission_modes()
     }
