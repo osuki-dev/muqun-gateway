@@ -24,7 +24,7 @@ const MAX_TITLE_CHARS: usize = 200;
 const MAX_CACHED: usize = 8192;
 
 /// `$CLAUDE_CONFIG_DIR`, else `~/.claude`.
-fn config_dir() -> Option<PathBuf> {
+pub(crate) fn config_dir() -> Option<PathBuf> {
     match std::env::var_os("CLAUDE_CONFIG_DIR").filter(|dir| !dir.is_empty()) {
         Some(dir) => Some(PathBuf::from(dir)),
         None => Some(dirs::home_dir()?.join(".claude")),

@@ -3523,6 +3523,23 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
                     return Err(AgentError::RequestFailed(format!("ACP session {id} was created, but model selection failed: {error}; do not retry creation")));
                 }
             }
+            // An elevating mode (a remembered one, sent back by the App) is
+            // applied only when this session's own list offers it; otherwise
+            // the session keeps the adapter's default.
+            let mode = match mode {
+                Some(mode) if crate::agents::session_defaults::ELEVATING_MODES.contains(&mode) => {
+                    let state = session.state.lock().await;
+                    let offered = state.catalog.modes.iter().any(|m| m.id == mode);
+                    if !offered {
+                        tracing::info!(
+                            mode,
+                            "the new session does not offer this mode; keeping its default"
+                        );
+                    }
+                    offered.then_some(mode)
+                }
+                other => other,
+            };
             if let Some(mode) = mode {
                 if let Err(error) = self.select_mode(&session, mode).await {
                     let id = session.state.lock().await.info.asid.0.clone();
