@@ -58,6 +58,11 @@ CREATE TABLE task_runtime_restrictions(agent_id TEXT PRIMARY KEY);
 ", "
 CREATE TABLE task_restricted_sessions(agent_id TEXT NOT NULL, asid TEXT NOT NULL,
   cleared_ms INTEGER, PRIMARY KEY(agent_id, asid));
+", "
+ALTER TABLE task_restricted_sessions ADD COLUMN title TEXT;
+ALTER TABLE task_restricted_sessions ADD COLUMN cwd TEXT;
+ALTER TABLE task_restricted_sessions ADD COLUMN since_ms INTEGER;
+ALTER TABLE task_restricted_sessions ADD COLUMN reason TEXT;
 "],
 };
 
@@ -535,11 +540,94 @@ pub(crate) struct RuntimeBlock {
     pub agent_id: String,
     /// Restricted provider sessions that are not known to be deleted.
     pub sessions: Vec<String>,
+    /// What is known about each of `sessions`, in the same order.
+    pub details: Vec<RestrictedSession>,
     /// An earlier gateway recorded a restriction without session ids.
     pub unrecorded: bool,
 }
 
+/// Why a provider session is restricted, as far as the gateway recorded it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RestrictedSession {
+    pub asid: String,
+    pub title: Option<String>,
+    pub cwd: Option<String>,
+    /// When the delegating task was created.
+    pub since_ms: Option<u64>,
+    pub reason: Option<Restriction>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Restriction {
+    Remote,
+    Unattributed,
+}
+
+impl Restriction {
+    fn code(self) -> &'static str {
+        match self {
+            Self::Remote => "remote",
+            Self::Unattributed => "unattributed",
+        }
+    }
+
+    fn from_code(code: &str) -> Option<Self> {
+        match code {
+            "remote" => Some(Self::Remote),
+            "unattributed" => Some(Self::Unattributed),
+            _ => None,
+        }
+    }
+
+    fn describe(self) -> &'static str {
+        match self {
+            Self::Remote => "ran work from another computer",
+            Self::Unattributed => "ran work from an unattributed assistant",
+        }
+    }
+}
+
 impl RuntimeBlock {
+    /// One line per retained session, id first, for the owner who has to
+    /// delete them: `<id>  <title>  <directory>  <since>  <why>`, `-` where
+    /// the gateway never recorded a field.
+    pub(crate) fn session_lines(&self) -> Vec<String> {
+        self.details
+            .iter()
+            .map(|d| {
+                let since = d.since_ms.map_or_else(
+                    || "-".to_owned(),
+                    |ms| {
+                        let iso = crate::agents::adapters::t3::client::iso_from_ms(ms);
+                        format!("{}Z", &iso[..16])
+                    },
+                );
+                let clean = |v: &Option<String>| match v.as_deref().map(str::trim) {
+                    Some(v) if !v.is_empty() => v.replace(['\n', '\t'], " "),
+                    _ => "-".to_owned(),
+                };
+                format!(
+                    "{}  {}  {}  {}  {}",
+                    d.asid,
+                    clean(&d.title),
+                    clean(&d.cwd),
+                    since,
+                    d.reason.map_or("-", Restriction::describe)
+                )
+            })
+            .collect()
+    }
+
+    /// How to delete the sessions listed by [`Self::session_lines`].
+    pub(crate) fn delete_hint(&self) -> String {
+        if self.agent_id == "opencode" {
+            "Delete them in the App, or run `opencode session delete <id>` for each id above."
+                .into()
+        } else {
+            "Delete them in the App, or with the agent's own CLI.".into()
+        }
+    }
+
     /// What the App and `muqun-gateway agent` show: no session ids, since
     /// discovery also reaches linked computers.
     pub(crate) fn summary(&self) -> String {
@@ -596,72 +684,112 @@ pub(crate) fn runtime_block(
         |row| row.get::<_, bool>(0),
     )?;
     let mut cleared = std::collections::HashSet::new();
-    let mut sessions = std::collections::BTreeSet::new();
+    let mut found = std::collections::BTreeMap::new();
     {
         let mut query = c.prepare(
-            "SELECT asid, cleared_ms IS NOT NULL FROM task_restricted_sessions WHERE agent_id = ?1",
+            "SELECT asid, cleared_ms IS NOT NULL, title, cwd, since_ms, reason \
+             FROM task_restricted_sessions WHERE agent_id = ?1",
         )?;
         for row in query.query_map([agent_id], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, bool>(1)?))
+            Ok((
+                RestrictedSession {
+                    asid: r.get(0)?,
+                    title: r.get(2)?,
+                    cwd: r.get(3)?,
+                    since_ms: r.get::<_, Option<i64>>(4)?.map(|v| v as u64),
+                    reason: r
+                        .get::<_, Option<String>>(5)?
+                        .as_deref()
+                        .and_then(Restriction::from_code),
+                },
+                r.get::<_, bool>(1)?,
+            ))
         })? {
-            let (asid, gone) = row?;
+            let (session, gone) = row?;
             if gone {
-                cleared.insert(asid);
+                cleared.insert(session.asid);
             } else {
-                sessions.insert(asid);
+                found.insert(session.asid.clone(), session);
             }
         }
     }
-    for asid in restricted_ledger_sessions(c, agent_id)? {
-        if !cleared.contains(&asid) {
-            sessions.insert(asid);
+    for session in restricted_ledger_sessions(c, agent_id)? {
+        if !cleared.contains(&session.asid) {
+            // The live task knows more than a row an older gateway wrote.
+            found.insert(session.asid.clone(), session);
         }
     }
-    Ok((unrecorded || !sessions.is_empty()).then(|| RuntimeBlock {
+    let details: Vec<RestrictedSession> = found.into_values().collect();
+    Ok((unrecorded || !details.is_empty()).then(|| RuntimeBlock {
         agent_id: agent_id.to_owned(),
-        sessions: sessions.into_iter().collect(),
+        sessions: details.iter().map(|d| d.asid.clone()).collect(),
+        details,
         unrecorded,
     }))
 }
 
 /// Provider sessions of `agent_id` whose ledger task does not resolve to a
-/// local owner root.
-fn restricted_ledger_sessions(c: &Connection, agent_id: &str) -> anyhow::Result<Vec<String>> {
+/// local owner root, with what the task says about them.
+fn restricted_ledger_sessions(
+    c: &Connection,
+    agent_id: &str,
+) -> anyhow::Result<Vec<RestrictedSession>> {
     let mut query = c.prepare(&format!("SELECT {TASK_COLUMNS} FROM tasks WHERE json_extract(binding, '$.kind') = 'agent_session' AND json_extract(binding, '$.agent_id') = ?1"))?;
     let rows = query.query_map([agent_id], read_row)?;
-    let mut out = Vec::new();
+    let mut out: Vec<RestrictedSession> = Vec::new();
     for row in rows {
         let task = row??;
         let TaskBinding::AgentSession { asid, .. } = &task.binding else {
             continue;
         };
-        let asid = asid.clone();
-        if !local_root(c, task)? {
-            out.push(asid);
+        let (asid, title, cwd, since_ms) = (
+            asid.clone(),
+            task.session_title.clone().or_else(|| task.label.clone()),
+            task.cwd.clone(),
+            task.created_ms,
+        );
+        let Some(reason) = restriction(c, task)? else {
+            continue;
+        };
+        let session = RestrictedSession {
+            asid,
+            title,
+            cwd,
+            since_ms: Some(since_ms),
+            reason: Some(reason),
+        };
+        // Several tasks can share a session; the earliest says since when.
+        match out.iter_mut().find(|s| s.asid == session.asid) {
+            Some(known) if known.since_ms <= session.since_ms => {}
+            Some(known) => *known = session,
+            None => out.push(session),
         }
     }
     Ok(out)
 }
 
-fn local_root(c: &Connection, mut task: Task) -> anyhow::Result<bool> {
+/// `None` when the task resolves to a local owner root.
+fn restriction(c: &Connection, mut task: Task) -> anyhow::Result<Option<Restriction>> {
     let mut visited = std::collections::HashSet::new();
     for depth in 0..64 {
         if depth == 63 || !visited.insert(task.id.clone()) {
-            return Ok(false);
+            return Ok(Some(Restriction::Unattributed));
         }
         match task.forwarding_ancestry() {
-            super::domain::ForwardingAncestry::Local => return Ok(true),
-            super::domain::ForwardingAncestry::Remote
-            | super::domain::ForwardingAncestry::Unknown => return Ok(false),
+            super::domain::ForwardingAncestry::Local => return Ok(None),
+            super::domain::ForwardingAncestry::Remote => return Ok(Some(Restriction::Remote)),
+            super::domain::ForwardingAncestry::Unknown => {
+                return Ok(Some(Restriction::Unattributed))
+            }
             super::domain::ForwardingAncestry::Parent(parent) => {
                 let Some(parent) = load(c, parent)? else {
-                    return Ok(false);
+                    return Ok(Some(Restriction::Unattributed));
                 };
                 task = parent;
             }
         }
     }
-    Ok(false)
+    Ok(Some(Restriction::Unattributed))
 }
 
 fn retain_runtime_restrictions(c: &Connection) -> anyhow::Result<()> {
@@ -673,10 +801,22 @@ fn retain_runtime_restrictions(c: &Connection) -> anyhow::Result<()> {
         agents
     };
     for agent in agents {
-        for asid in restricted_ledger_sessions(c, &agent)? {
+        for s in restricted_ledger_sessions(c, &agent)? {
             c.execute(
-                "INSERT OR IGNORE INTO task_restricted_sessions(agent_id, asid) VALUES(?1, ?2)",
-                [&agent, &asid],
+                "INSERT INTO task_restricted_sessions(agent_id, asid, title, cwd, since_ms, reason) \
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6) \
+                 ON CONFLICT(agent_id, asid) DO UPDATE SET \
+                   title = COALESCE(title, excluded.title), cwd = COALESCE(cwd, excluded.cwd), \
+                   since_ms = COALESCE(since_ms, excluded.since_ms), \
+                   reason = COALESCE(reason, excluded.reason)",
+                params![
+                    agent,
+                    s.asid,
+                    s.title,
+                    s.cwd,
+                    s.since_ms.map(|v| v as i64),
+                    s.reason.map(Restriction::code)
+                ],
             )?;
         }
     }
@@ -693,7 +833,7 @@ pub(crate) fn clear_restricted_session(
 ) -> anyhow::Result<bool> {
     let restricted = restricted_ledger_sessions(c, agent_id)?
         .iter()
-        .any(|s| s == asid);
+        .any(|s| s.asid == asid);
     let changed = c.execute(
         "INSERT INTO task_restricted_sessions(agent_id, asid, cleared_ms) \
          SELECT ?1, ?2, ?3 WHERE ?4 OR EXISTS(SELECT 1 FROM task_restricted_sessions \
@@ -943,6 +1083,9 @@ mod tests {
             asid: "retained-provider-child".into(),
         };
         child.state = TaskState::Cancelled;
+        child.session_title = Some("Fix the build".into());
+        child.cwd = Some("/work/app".into());
+        child.created_ms = 1_700_000_000_000;
         store.insert(&child).await.unwrap();
         assert!(!db
             .call(|c| runtime_registration_allowed(c, "codex"))
@@ -962,6 +1105,11 @@ mod tests {
             .unwrap();
         assert_eq!(block.sessions, ["retained-provider-child"]);
         assert!(!block.unrecorded);
+        // What the owner needs to find and delete it survives the purge.
+        assert_eq!(
+            block.session_lines(),
+            ["retained-provider-child  Fix the build  /work/app  2023-11-14T22:13Z  ran work from another computer"]
+        );
         assert!(db
             .call(|c| runtime_registration_allowed(c, "opencode"))
             .await

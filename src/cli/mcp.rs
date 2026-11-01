@@ -284,7 +284,17 @@ async fn forget_delegated(agent: String) -> anyhow::Result<()> {
         println!("No unnamed delegated-session record for {agent}.");
     }
     match block {
-        Some(block) => println!("{agent}'s Muqun tools stay withheld: {}", block.summary()),
+        Some(block) => {
+            println!("{agent}'s Muqun tools stay withheld: {}", block.summary());
+            let lines = block.session_lines();
+            if !lines.is_empty() {
+                println!("\nSESSION  TITLE  DIRECTORY  SINCE (UTC)  WHY");
+                for line in &lines {
+                    println!("{line}");
+                }
+                println!("\n{}", block.delete_hint());
+            }
+        }
         None if agent == "opencode" => println!(
             "Nothing withholds OpenCode's Muqun tools now. `opencode service stop` lets the gateway start it again with them."
         ),
