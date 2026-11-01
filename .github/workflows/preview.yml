@@ -39,10 +39,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-14
+          - os: macos-15
             target: aarch64-apple-darwin
             builder: cargo
-          - os: macos-14
+          - os: macos-15
             target: x86_64-apple-darwin
             builder: cargo
           - os: ubuntu-latest
