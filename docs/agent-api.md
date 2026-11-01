@@ -668,8 +668,15 @@ prompt, answers no approval and never replays an ambiguous prompt. Concurrent
 same-ID prepares are serialized by the provider. A failed prepare preserves the
 retained snapshot and is an explicit error. Automatic snapshot/history resync,
 including `refresh=true`, uses the observation hook and must not activate dormant
-ACP or Pi children. Background watchers must never call this endpoint. Gate the
-new call on the capability; older Gateways keep their existing behavior.
+ACP or Pi children whose history the Gateway still retains. An ACP conversation
+the Gateway does not hold (after a Gateway restart, or once its parked copy
+expired) is loaded by that read instead of refused. Background watchers must
+never call this endpoint. Gate the new call on the capability; older Gateways
+keep their existing behavior.
+
+A prompt to an ACP conversation whose process ended on its own mid-turn answers
+`409 session_open_required` until the App prepares it again; nothing was sent.
+A Gateway stop, idle release, deletion or terminal hand-over is not such an end.
 
 ### `GET /api/agent-sessions/{asid}`
 

@@ -583,6 +583,43 @@ async fn parked_observation_drops_live_projection_and_concurrent_foreground_prep
     driver.shutdown().await;
 }
 
+// The machine reboots with sessions loaded. Stopping the Gateway is not a
+// lost process, and after the restart nothing is held: the App's snapshot
+// read loads the listed session and its next prompt goes through, with no
+// separate open.
+#[tokio::test]
+async fn sessions_held_at_gateway_stop_read_and_prompt_after_restart() {
+    use crate::agents::use_cases::SessionService;
+    let fixture = Fixture::new().await;
+    let before = driver(&fixture);
+    let info = before.create_session(None, None, None).await.unwrap();
+    before
+        .send_prompt(&info.asid.0, "before the restart", &[], None)
+        .await
+        .unwrap();
+    idle(&before, &info.asid.0).await.unwrap();
+    before.shutdown().await;
+    dormant(&before, &info.asid.0).await;
+    assert_eq!(
+        before.dormant.lock().unwrap()[&info.asid.0].kind,
+        DormantKind::Parked
+    );
+
+    let after = driver(&fixture);
+    let service = SessionService::with_memory_mirror(after.clone(), after.mirror.clone());
+    let snapshot = service.get_snapshot(&info.asid).await.unwrap();
+    assert_eq!(snapshot.timeline.len(), 2);
+    after
+        .send_prompt(&info.asid.0, "after the restart", &[], None)
+        .await
+        .unwrap();
+    idle(&after, &info.asid.0).await.unwrap();
+    let methods = fixture.methods();
+    let count = |name: &str| methods.iter().filter(|method| *method == name).count();
+    assert_eq!((count("session/load"), count("session/prompt")), (1, 2));
+    after.shutdown().await;
+}
+
 #[tokio::test]
 async fn foreground_send_waits_for_retiring_generation_then_submits_one_new_prompt() {
     let fixture = Fixture::new().await;
@@ -695,11 +732,19 @@ async fn unexpected_disconnect_never_replays_and_nonzero_retirement_is_unknown()
         DormantKind::Unexpected
     );
     let methods = fixture.methods();
-    assert!(driver
-        .send_prompt(&info.asid.0, "do not replay", &[], None)
-        .await
-        .is_err());
+    assert!(matches!(
+        driver
+            .send_prompt(&info.asid.0, "do not replay", &[], None)
+            .await,
+        Err(AgentError::OpenRequired(_))
+    ));
     assert_eq!(fixture.methods(), methods);
+    // The App's open clears it; the next prompt is a new one.
+    driver.prepare_selected_session(&info.asid.0).await.unwrap();
+    driver
+        .send_prompt(&info.asid.0, "after opening", &[], None)
+        .await
+        .unwrap();
     driver.shutdown().await;
     // A distinct fixture phase fails only after EOF; it has a valid saved turn.
     use std::io::Write;
