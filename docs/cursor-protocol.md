@@ -115,6 +115,10 @@ message whose text carries `<user_query>\n…\n</user_query>` starts a turn;
 the last assistant message's text parts are the reply. Anything that does not
 match (summarized history, a changed format) keeps the child.
 
+A child whose session ran a tool is kept: Cursor has no record that says
+whether work a tool started (a background command) still runs, and closing
+the child could kill it. Only sessions that ran no tool are released.
+
 ## Models and modes
 
 `session/new` and `session/load` return `models` and a `model` config option

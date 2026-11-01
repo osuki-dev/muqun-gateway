@@ -112,11 +112,15 @@ fn parse_stat(stat: &str) -> Option<(u32, &str)> {
     Some((fields.get(1)?.parse().ok()?, fields.get(19)?))
 }
 
-/// Alive, the same incarnation the registry recorded (where the start time
-/// can be read), and not this Gateway or one of its children.
+/// Alive and not this Gateway or one of its children.
 fn running_elsewhere(pid: u32, proc_start: Option<&str>) -> bool {
-    use crate::terminal::backend::{descends_from, process_parent};
-    if process_parent(pid).is_none() {
+    running(pid, proc_start) && !crate::terminal::backend::descends_from(pid, std::process::id())
+}
+
+/// Alive and the same incarnation the registry recorded (where the start
+/// time can be read).
+fn running(pid: u32, proc_start: Option<&str>) -> bool {
+    if crate::terminal::backend::process_parent(pid).is_none() {
         return false;
     }
     #[cfg(target_os = "linux")]
@@ -130,7 +134,21 @@ fn running_elsewhere(pid: u32, proc_start: Option<&str>) -> bool {
     }
     #[cfg(not(target_os = "linux"))]
     let _ = proc_start;
-    !descends_from(pid, std::process::id())
+    true
+}
+
+/// Whether Claude Code records session `id` as `idle` in its process under
+/// `root` (the Gateway's adapter child). It keeps a session `busy` while a
+/// turn runs and, observed with 2.1.314, while a background subagent the
+/// session started still runs after its turn ended.
+pub(crate) fn idle_under(id: &str, root: u32) -> bool {
+    config_dir().is_some_and(|config| {
+        live_in(&config.join("sessions"), |pid, start| {
+            running(pid, start) && crate::terminal::backend::descends_from(pid, root)
+        })
+        .get(id)
+        .is_some_and(|process| process.busy == Some(false))
+    })
 }
 
 /// Claude Code sessions open in another running process, by session id.
@@ -569,13 +587,14 @@ mod tests {
             (13, ids[2], "13.key"),  // not a registry entry
             (14, "not-a-session", "14.json"),
         ] {
-            let entry =
-                json!({"pid": pid, "sessionId": id, "procStart": "100", "kind": "interactive"});
+            let entry = json!({"pid": pid, "sessionId": id, "procStart": "100",
+                               "kind": "interactive", "status": "idle"});
             std::fs::write(dir.0.join(name), entry.to_string()).unwrap();
         }
         let live = live_in(&dir.0, |pid, start| pid != 12 && start == Some("100"));
         assert_eq!(live.keys().collect::<Vec<_>>(), [ids[0]]);
         assert_eq!(live[ids[0]].pid, 11);
+        assert_eq!(live[ids[0]].busy, Some(false), "idle settles retirement");
         assert!(live_in(&dir.0.join("missing"), |_, _| true).is_empty());
         for (stat, parsed) in [
             (

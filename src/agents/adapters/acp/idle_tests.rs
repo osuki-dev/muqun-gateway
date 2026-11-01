@@ -196,6 +196,126 @@ while True:
     driver.shutdown().await;
 }
 
+/// The fixture with an agent-side record of settled work (Claude Code's
+/// session registry): `work-settled` in the workspace says nothing runs.
+struct SettledFixture;
+impl AcpProvider for SettledFixture {
+    const KIND: &'static str = "fx";
+    const LABEL: &'static str = "Settled fixture";
+    const ARGS: &'static [&'static str] = &["acp"];
+    const REQUIRE_MESSAGE_ID: bool = true;
+    const MODEL_SELECTION: bool = true;
+    const IDLE_RETIREMENT: bool = true;
+    fn recovery_snapshot<'a>(
+        binary: &'a str,
+        directory: &'a str,
+        id: &'a str,
+        stop: &'a CancellationToken,
+    ) -> AgentFuture<'a, NativeSnapshot> {
+        RecoverableFixture::recovery_snapshot(binary, directory, id, stop)
+    }
+    fn work_settled(directory: &str, _id: &str, _process: u32) -> bool {
+        std::path::Path::new(directory)
+            .join("work-settled")
+            .exists()
+    }
+    fn starts_background_work(update: &Value) -> bool {
+        update["rawInput"]["run_in_background"] == true
+    }
+}
+
+// A session that ran tools is released once the agent's own record says
+// nothing runs, never while that record says busy, a command it sent to the
+// background may still run, or an approval waits; it then reloads once.
+#[tokio::test]
+async fn tool_turns_retire_only_when_the_agent_records_settled_work() {
+    let fixture = Fixture::new().await;
+    let binary = fixture.directory.join("mock-fx");
+    let script = std::fs::read_to_string(&binary).unwrap().replace(
+        "        turn+=1",
+        "        turn+=1\n        if params['prompt'][0]['text'] in ('tool','background'):update(active,{'sessionUpdate':'tool_call','toolCallId':'tool-'+str(turn),'title':'Run mock tool','status':'completed','rawInput':{'command':'pwd','run_in_background':params['prompt'][0]['text']=='background'}})",
+    );
+    std::fs::write(&binary, script).unwrap();
+    let driver = AcpDriver::<SettledFixture>::new(
+        fixture.driver.binary.clone(),
+        fixture.driver.default_directory.clone(),
+        Arc::new(MemoryMirror::for_agent("fx")),
+        broadcast::channel(256).0,
+    );
+    driver.set_idle_timeout(Duration::from_secs(1));
+    let mut ids = Vec::new();
+    for prompt in ["tool", "background", "approval"] {
+        let info = driver.create_session(None, None, None).await.unwrap();
+        driver
+            .send_prompt(&info.asid.0, prompt, &[], None)
+            .await
+            .unwrap();
+        if prompt == "approval" {
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while driver
+                    .get_pending_permissions(&info.asid.0)
+                    .await
+                    .unwrap()
+                    .is_empty()
+                {
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+            })
+            .await
+            .unwrap();
+        } else {
+            idle(&driver, &info.asid.0).await.unwrap();
+        }
+        assert!(driver
+            .retained(&info.asid.0)
+            .unwrap()
+            .client
+            .has_unverified_live_work());
+        ids.push(info.asid.0);
+    }
+    let [tool, background, approval] = [&ids[0], &ids[1], &ids[2]];
+    let sweep = || async {
+        for id in &ids {
+            driver
+                .retained(id)
+                .unwrap()
+                .state
+                .lock()
+                .await
+                .last_activity = tokio::time::Instant::now() - Duration::from_secs(2);
+        }
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(31)).await;
+        tokio::time::resume();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    sweep().await;
+    assert!(ids.iter().all(|id| driver.retained(id).is_some()));
+
+    std::fs::write(fixture.directory.join("work-settled"), "idle").unwrap();
+    sweep().await;
+    dormant(&driver, tool).await;
+    assert_eq!(
+        driver.dormant.lock().unwrap()[tool].kind,
+        DormantKind::Parked
+    );
+    for kept in [background, approval] {
+        assert!(driver.retained(kept).unwrap().client.is_running());
+    }
+    driver.prepare_selected_session(tool).await.unwrap();
+    driver.prepare_selected_session(tool).await.unwrap();
+    assert!(driver.retained(tool).unwrap().client.is_running());
+    assert_eq!(
+        fixture
+            .methods()
+            .iter()
+            .filter(|method| *method == "session/load")
+            .count(),
+        1
+    );
+    driver.shutdown().await;
+}
+
 #[tokio::test]
 async fn direct_slash_delivery_pins_before_write_and_later_plain_turn_cannot_clear_it() {
     // Native extension commands can be absent from, or newer than, the last

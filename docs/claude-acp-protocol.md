@@ -217,7 +217,19 @@ holding that prompt and the text of the turn's final assistant message (one
 record per content block, joined by `message.id`). Interrupt markers, task
 notifications, tool results and sidechains are not prompts. If the transcript
 is unsettled, too large, or does not prove the turn the Gateway saw, the child
-is simply kept.
+is simply kept. A turn without such evidence (steered, interrupted) still
+counts when the transcript's last prompt and reply are the ones the session
+shows. A failed check is retried after another idle period, not every sweep.
+
+A child whose session ran tools may have started work that outlives the turn
+(a background command or subagent), which closing it would kill. It is
+released only when Claude Code's own registry entry for it
+(`<config>/sessions/<pid>.json` of the `claude` under the adapter) says
+`idle`; Claude Code keeps it `busy` while a turn runs and, observed with
+2.1.314, while a background subagent of the session still runs. A session that
+sent a command to the background (`rawInput.run_in_background`) keeps its
+child until it is closed otherwise. Retirement never runs during a turn or
+while an approval or question waits.
 
 ## A conversation that is open in a terminal
 

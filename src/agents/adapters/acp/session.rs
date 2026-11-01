@@ -46,6 +46,19 @@ pub trait AcpProvider: Send + Sync + 'static {
     const SYSTEM_PROMPT: bool = false;
     /// The native command that renames a session without a model turn.
     const RENAME_COMMAND: Option<&'static str> = None;
+    /// Whether the agent's own record says that nothing of session `id`
+    /// still runs in the child under `process` (no turn, background command
+    /// or subagent). Asked before idle retirement of a generation that ran
+    /// tools; without such a record (`false`) that child is kept, since
+    /// closing it could kill work that outlives its tool call.
+    fn work_settled(_directory: &str, _id: &str, _process: u32) -> bool {
+        false
+    }
+    /// A live update that starts work outliving its tool call (a command
+    /// sent to the background). Its generation is never idle-retired.
+    fn starts_background_work(_update: &Value) -> bool {
+        false
+    }
     fn recovery_snapshot<'a>(
         _binary: &'a str,
         _directory: &'a str,
@@ -228,6 +241,8 @@ struct SessionState {
     forms: HashMap<String, super::elicitation::Elicitation>,
     /// A native command runs that leaves no rows (rename).
     hidden_command: bool,
+    /// This generation started work that outlives its tool call.
+    background_work: bool,
 }
 
 #[derive(Clone)]
@@ -2068,6 +2083,7 @@ impl<P: AcpProvider> AcpDriver<P> {
             turn_had_output: false,
             forms: HashMap::new(),
             hidden_command: false,
+            background_work: false,
         };
         for params in replay {
             if params["sessionId"].as_str() != Some(id.as_str()) {
@@ -2334,6 +2350,9 @@ impl<P: AcpProvider> AcpDriver<P> {
                 },
             );
             return;
+        }
+        if P::starts_background_work(&params["update"]) {
+            state.background_work = true;
         }
         if session.busy.load(Ordering::Acquire)
             && params["update"]["sessionUpdate"].as_str() == Some("agent_message_chunk")
@@ -2934,7 +2953,6 @@ impl<P: AcpProvider> AcpDriver<P> {
         };
         if !P::IDLE_RETIREMENT
             || !session.connected.load(Ordering::Acquire)
-            || session.client.has_unverified_live_work()
             || session
                 .busy
                 .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -2950,18 +2968,36 @@ impl<P: AcpProvider> AcpDriver<P> {
             let state = session.state.lock().await;
             if state.info.status != AgentSessionStatus::Idle
                 || !state.permissions.is_empty()
+                || !state.forms.is_empty()
+                || state.background_work
                 || !parked_metadata_fits(&state.info)
                 || state.last_activity.elapsed()
                     < Duration::from_secs(context.idle_timeout_secs.load(Ordering::Acquire))
             {
                 return None;
             }
-            let evidence = state.recovery.clone()?;
             (
                 state.info.asid.0.clone(),
                 state.info.directory.clone()?,
-                evidence,
+                state.recovery.clone(),
             )
+        };
+        // Tools ran in this generation: only the agent's own record can say
+        // that nothing they started still runs.
+        let live_work = if session.client.has_unverified_live_work() {
+            let mark = session.client.live_work_mark();
+            let process = session.client.process_id()?;
+            let (directory, id) = (directory.clone(), id.clone());
+            let settled =
+                tokio::task::spawn_blocking(move || P::work_settled(&directory, &id, process))
+                    .await
+                    .unwrap_or(false);
+            if !settled {
+                return None;
+            }
+            Some(mark)
+        } else {
+            None
         };
         // At most one potentially large native history inspection per provider.
         let Ok(_inspection) = context.inspection.try_lock() else {
@@ -2969,20 +3005,41 @@ impl<P: AcpProvider> AcpDriver<P> {
         };
         let snapshot = P::recovery_snapshot(&context.binary, &directory, &id, stop)
             .await
-            .ok()?;
-        let verified = match evidence {
-            RecoveryEvidence::Loaded(expected) => {
-                snapshot.session_id == id && snapshot.checkpoint() == expected
+            .ok();
+        // The store holds the turn the Gateway saw, else at least the last
+        // exchange it shows (as a load proves it): a steered or interrupted
+        // turn leaves no turn evidence but may still be saved whole.
+        let verified = match &snapshot {
+            Some(snapshot) => {
+                let proven = match &evidence {
+                    Some(RecoveryEvidence::Loaded(expected)) => {
+                        snapshot.session_id == id && snapshot.checkpoint() == *expected
+                    }
+                    Some(RecoveryEvidence::Turn { before, expected }) => {
+                        snapshot.proves_turn(&id, before, expected)
+                    }
+                    None => false,
+                };
+                proven
+                    || (snapshot.session_id == id
+                        && Self::snapshot_matches_projection(
+                            snapshot,
+                            &session.state.lock().await.projection,
+                        ))
             }
-            RecoveryEvidence::Turn { before, expected } => {
-                snapshot.proves_turn(&id, &before, &expected)
-            }
+            None => false,
         };
-        if !verified {
+        let Some(snapshot) = snapshot.filter(|_| verified) else {
+            // Read a possibly large store again after another idle period,
+            // not every sweep.
+            session.state.lock().await.last_activity = tokio::time::Instant::now();
             return None;
-        }
+        };
         let confirmed = snapshot.checkpoint();
         drop(snapshot);
+        if live_work.is_some_and(|mark| !session.client.settle_live_work(mark)) {
+            return None;
+        }
         let retirement = session.client.retire(RETIREMENT_TIMEOUT);
         tokio::pin!(retirement);
         let mut result = loop {
