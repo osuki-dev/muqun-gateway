@@ -9,7 +9,7 @@ pub mod timeline;
 pub use events::{AgentDomainEvent, FormResolutionReason};
 pub use form::{FormField, FormOption, FormRequest, FormWhen};
 pub use model::{
-    AgentCatalog, CatalogDefaults, CommandInfo, McpServerInfo, ModeInfo, ModelInfo,
+    order_efforts, AgentCatalog, CatalogDefaults, CommandInfo, McpServerInfo, ModeInfo, ModelInfo,
     ModelVariantInfo, ProviderInfo, ProviderModelInfo, SkillInfo,
 };
 pub use permission::{PermissionDecision, PermissionOption, PermissionRequest};

@@ -374,7 +374,17 @@ pub(crate) async fn cached_models(
         .await
         .ok()
         .flatten();
-    serde_json::from_str(&text?).ok()
+    let mut models: Vec<ModelInfo> = serde_json::from_str(&text?).ok()?;
+    // Lists cached before efforts were ordered low to high.
+    for variants in models
+        .iter_mut()
+        .filter_map(|model| model.variants.as_mut())
+    {
+        crate::agents::domain::order_efforts(variants, |variant| {
+            variant.reasoning_effort.as_deref()
+        });
+    }
+    Some(models)
 }
 
 #[cfg(test)]
@@ -570,7 +580,7 @@ mod tests {
     }
 
     /// Before a session, the default is what the adapter runs unasked, not
-    /// the first model in the list (`claude-fable-5` sorts before `default`).
+    /// the first model in the list (`default` is not always listed first).
     #[test]
     fn a_catalog_without_a_current_model_defaults_to_the_adapter_s_own() {
         let listed = |ids: &[&str]| -> AgentCatalog {
