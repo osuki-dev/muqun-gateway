@@ -901,3 +901,83 @@ async fn native_round_trip<P: AcpProvider>(binary: String) {
         Err(error) => panic!("isolated native idle acceptance failed: {error}"),
     }
 }
+
+/// An agent whose `session/delete` finds any saved session (Claude Code).
+struct ListedDelete;
+impl AcpProvider for ListedDelete {
+    const KIND: &'static str = "fx";
+    const LABEL: &'static str = "Listed fixture";
+    const ARGS: &'static [&'static str] = &["--acp"];
+    const REQUIRE_MESSAGE_ID: bool = false;
+    const MODEL_SELECTION: bool = true;
+    const DELETE_LISTED: bool = true;
+}
+
+// A listed session started elsewhere is deleted through a short-lived child
+// without loading it; an agent that deletes only its own sessions says so.
+#[tokio::test]
+async fn listed_sessions_are_deleted_without_loading_where_the_agent_allows_it() {
+    let fixture = Fixture::new().await;
+    let binary = fixture.directory.join("mock-fx");
+    let script = std::fs::read_to_string(&binary).unwrap().replace(
+        "        if active!=params['sessionId']:",
+        "        if params['sessionId'] not in read():",
+    );
+    std::fs::write(&binary, script).unwrap();
+    let mut ids = Vec::new();
+    for prompt in ["first elsewhere", "second elsewhere"] {
+        let info = fixture
+            .driver
+            .create_session(None, None, None)
+            .await
+            .unwrap();
+        fixture
+            .driver
+            .send_prompt(&info.asid.0, prompt, &[], None)
+            .await
+            .unwrap();
+        idle(&fixture.driver, &info.asid.0).await.unwrap();
+        ids.push(info.asid.0);
+    }
+    fixture.driver.shutdown().await;
+
+    let own_only = driver(&fixture);
+    let refused = own_only.delete_session(&ids[1]).await;
+    assert!(
+        matches!(&refused, Err(AgentError::Unsupported(message)) if message.contains("started from Muqun")),
+        "{refused:?}"
+    );
+    own_only.shutdown().await;
+
+    let listed = AcpDriver::<ListedDelete>::new(
+        fixture.driver.binary.clone(),
+        fixture.driver.default_directory.clone(),
+        Arc::new(MemoryMirror::for_agent("fx")),
+        broadcast::channel(256).0,
+    );
+    let loads = fixture
+        .methods()
+        .iter()
+        .filter(|m| *m == "session/load")
+        .count();
+    listed.delete_session(&ids[0]).await.unwrap();
+    assert_eq!(
+        fixture
+            .methods()
+            .iter()
+            .filter(|m| *m == "session/load")
+            .count(),
+        loads,
+        "deleting must not resume the session"
+    );
+    let remaining: Vec<_> = listed
+        .list_sessions(&Default::default())
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|info| info.asid.0)
+        .collect();
+    assert_eq!(remaining, [ids[1].clone()]);
+    assert!(!listed.has_live_stream());
+    listed.shutdown().await;
+}

@@ -31,6 +31,9 @@ impl AcpProvider for ClaudeProvider {
     const SYSTEM_PROMPT: bool = true;
     // `_session/rename` is offered to JetBrains AIR clients only.
     const RENAME_COMMAND: Option<&'static str> = Some("/rename");
+    // `session/delete` is the SDK's transcript delete, which finds a saved
+    // session without loading it (adapter 0.99.1).
+    const DELETE_LISTED: bool = true;
     fn recovery_snapshot<'a>(
         _binary: &'a str,
         directory: &'a str,

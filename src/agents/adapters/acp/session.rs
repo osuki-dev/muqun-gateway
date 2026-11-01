@@ -59,6 +59,10 @@ pub trait AcpProvider: Send + Sync + 'static {
     fn starts_background_work(_update: &Value) -> bool {
         false
     }
+    /// `session/delete` deletes any saved session, loaded or not (Claude
+    /// Code: the SDK's transcript delete), so every listed session may be
+    /// deleted, not only those this Gateway created.
+    const DELETE_LISTED: bool = false;
     fn recovery_snapshot<'a>(
         _binary: &'a str,
         _directory: &'a str,
@@ -2930,6 +2934,99 @@ impl<P: AcpProvider> AcpDriver<P> {
         Ok(())
     }
 
+    /// Delete through the session's own process, then stop it.
+    async fn delete_live(&self, id: &str, session: &Session) -> Result<(), AgentError> {
+        if !session.connected.load(Ordering::Acquire) {
+            return Err(AgentError::NotAvailable(
+                "The conversation's process is ending; try deleting again".into(),
+            ));
+        }
+        if !session.state.lock().await.owned_mutations && !P::DELETE_LISTED {
+            return Err(AgentError::Unsupported(format!(
+                "{} deletes only conversations started from Muqun on this computer",
+                P::LABEL
+            )));
+        }
+        if !operations::supports_operation(&session.native_capabilities, "delete") {
+            return Err(AgentError::Unsupported(format!(
+                "This {} version does not offer deleting conversations",
+                P::LABEL
+            )));
+        }
+        if session
+            .busy
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(AgentError::NotAvailable(
+                "The conversation is working; stop it before deleting".into(),
+            ));
+        }
+        let _admission = Admission {
+            busy: &session.busy,
+            handed_off: false,
+        };
+        let params = operations::delete_params(id)?;
+        // Qoder resolves deletion through this connection's bound workspace.
+        // An unbound temporary client may acknowledge without deleting it.
+        let result = session
+            .client
+            .request_with_timeout("session/delete", params, RPC_TIMEOUT)
+            .await;
+        self.invalidate_session_lists().await;
+        let value = result.map_err(AgentError::RequestFailed)?;
+        if !value.is_object() {
+            return Err(protocol(
+                "native deletion outcome is unknown; do not retry automatically",
+            ));
+        }
+        session.connected.store(false, Ordering::Release);
+        session.client.shutdown().await;
+        tokio::time::timeout(Duration::from_secs(5), session.finished.cancelled())
+            .await
+            .map_err(|_| {
+                AgentError::NotAvailable("deleted session connection has not stopped".into())
+            })?;
+        Ok(())
+    }
+
+    /// Delete a listed session that is not loaded (`P::DELETE_LISTED`)
+    /// through a short-lived child; nothing is resumed.
+    async fn delete_saved(&self, id: &str) -> Result<(), AgentError> {
+        let dormant = self.dormant.lock().unwrap().get(id).cloned();
+        let info = match &dormant {
+            Some(entry) => self.dormant_info(id, entry).await?,
+            None => self.native_session_info(id).await?,
+        };
+        let directory = info
+            .directory
+            .filter(|cwd| std::path::Path::new(cwd).is_dir())
+            .unwrap_or_else(|| self.default_directory.clone());
+        let (client, _events, capabilities) = self.initialized(&directory).await?;
+        if !operations::supports_operation(&capabilities, "delete") {
+            client.shutdown().await;
+            return Err(AgentError::Unsupported(format!(
+                "This {} version does not offer deleting conversations",
+                P::LABEL
+            )));
+        }
+        let result = client
+            .request_with_timeout(
+                "session/delete",
+                operations::delete_params(id)?,
+                RPC_TIMEOUT,
+            )
+            .await;
+        self.invalidate_session_lists().await;
+        client.shutdown().await;
+        if !result.map_err(AgentError::RequestFailed)?.is_object() {
+            return Err(protocol(
+                "native deletion outcome is unknown; do not retry automatically",
+            ));
+        }
+        Ok(())
+    }
+
     fn snapshot_matches_projection(snapshot: &NativeSnapshot, projection: &Projection) -> bool {
         if projection.is_empty() {
             return snapshot.entries.is_empty();
@@ -3795,55 +3892,20 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
             }
             // Created here, possibly before the Gateway last restarted: load
             // it so its own agent deletes it.
-            if self.retained(id).is_none() && self.owns(id) {
+            if !P::DELETE_LISTED && self.retained(id).is_none() && self.owns(id) {
                 self.ensure_loaded(id).await?;
             }
             let _mutation = self.mutations.lock().await;
-            let session = self.retained(id).ok_or_else(|| {
-                AgentError::Unsupported(
-                    "deletion requires a session created by this Gateway".into(),
-                )
-            })?;
-            if !session.connected.load(Ordering::Acquire)
-                || !session.state.lock().await.owned_mutations
-                || !operations::supports_operation(&session.native_capabilities, "delete")
-            {
-                return Err(AgentError::Unsupported(
-                    "deletion requires an idle Gateway-created native session".into(),
-                ));
+            match self.retained(id) {
+                Some(session) => self.delete_live(id, &session).await?,
+                None if P::DELETE_LISTED => self.delete_saved(id).await?,
+                None => {
+                    return Err(AgentError::Unsupported(format!(
+                        "{} deletes only conversations started from Muqun on this computer",
+                        P::LABEL
+                    )))
+                }
             }
-            if session
-                .busy
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
-            {
-                return Err(AgentError::NotAvailable("session is busy".into()));
-            }
-            let _admission = Admission {
-                busy: &session.busy,
-                handed_off: false,
-            };
-            let params = operations::delete_params(id)?;
-            // Qoder resolves deletion through this connection's bound workspace.
-            // An unbound temporary client may acknowledge without deleting it.
-            let result = session
-                .client
-                .request_with_timeout("session/delete", params, RPC_TIMEOUT)
-                .await;
-            self.invalidate_session_lists().await;
-            let value = result.map_err(AgentError::RequestFailed)?;
-            if !value.is_object() {
-                return Err(protocol(
-                    "native deletion outcome is unknown; do not retry automatically",
-                ));
-            }
-            session.connected.store(false, Ordering::Release);
-            session.client.shutdown().await;
-            tokio::time::timeout(Duration::from_secs(5), session.finished.cancelled())
-                .await
-                .map_err(|_| {
-                    AgentError::NotAvailable("deleted session connection has not stopped".into())
-                })?;
             self.sessions.lock().unwrap().remove(id);
             self.dormant.lock().unwrap().remove(id);
             self.owned.lock().unwrap().forget(id);

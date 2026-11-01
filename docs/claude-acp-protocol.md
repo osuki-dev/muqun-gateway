@@ -166,13 +166,15 @@ removed (followed by a resume without it) when the task ends.
 ## Deleting
 
 `session/delete` is the SDK's transcript delete, Claude Code's own semantics
-(an id without a transcript succeeds). Only sessions this Gateway created or
-forked are deleted. Their ids are kept in `claude-owned-sessions.json` in the
-Gateway state directory (at most 4096, newest kept), so a session created
-before a Gateway restart is loaded and deleted by its adapter after it; a
-session started elsewhere answers unsupported, and one held by a terminal
-`409`. Discovery declares `sessionDelete` and `sessionFork` before any
-adapter has started.
+(an id without a transcript succeeds; it finds the transcript in any project
+directory without loading the session). Every listed session can therefore be
+deleted, as in Claude Code's own session list, whether or not this Gateway
+created it: a live one through its own child, which is then stopped (refused
+while a turn runs), a saved one through a short-lived adapter that resumes
+nothing. A session held by a terminal answers `409`. Ids of sessions this
+Gateway created or forked are still kept in `claude-owned-sessions.json`
+(at most 4096) for the other ownership rules. Discovery declares
+`sessionDelete` and `sessionFork` before any adapter has started.
 
 ## muqun MCP
 
@@ -290,7 +292,7 @@ does not lock it.
 | Interrupt | `session/cancel` → `stopReason: "cancelled"` | implemented (Escape for a terminal-held session) |
 | Steer while running | `_session/steering` | implemented (`promptSteering`); verified live |
 | Queue while running | native `promptQueueing` (verified) | not offered: the native queue has no list, edit or per-item cancel, and Gateway keeps no ACP inbox |
-| Fork / delete | `sessionCapabilities.fork`, `delete` | implemented for Gateway-created sessions, also after a Gateway restart; delete verified live |
+| Fork / delete | `sessionCapabilities.fork`, `delete` | fork for Gateway-created sessions; delete for every listed session not held by a terminal; delete verified live for a Gateway-created session |
 | Rename / title | generated title (`session_info_update`); `/rename` command (`_session/rename` is AIR-only) | implemented through `/rename`; verified live |
 | Image / file attachments | `promptCapabilities.image`, `embeddedContext` | implemented (shared prompt parts) |
 | Approvals | `session/request_permission` | implemented (shared); asked only when Claude Code's own permission mode asks |
