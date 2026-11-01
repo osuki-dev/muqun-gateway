@@ -182,6 +182,11 @@ pub(crate) const API_CAPABILITIES: &[&str] = &[
     // `idle_unconfirmed` or `waiting` task it opened). A session agent whose
     // turn ends without one is `idle_unconfirmed`, as a terminal agent is.
     "task_ledger_complete",
+    // `DELETE /api/tasks/{id}` (an app device): an ended task -- done,
+    // failed, cancelled or idle_unconfirmed -- goes with its history, and
+    // `task.deleted` (`{"task_id"}`) is published; a running one is
+    // `409 task_active`.
+    "task_ledger_delete",
     // `subscribe_tasks` on `/api/ws`: task views without session events.
     "task_ws_subscription",
     // The task view of P1's Home card: `tasks.complete` takes `outcome`

@@ -8,7 +8,8 @@ takes `delivery: "session" | "pane"`; each discovery agent entry says what
 it can do as `ledgerDelivery`), `task_ledger_complete` (a delegation is
 `done` only on an explicit signal: `tasks.complete`, the `MUQUN_TASK_DONE`
 marker, or the device's `POST /api/tasks/{id}/complete`; see
-[Finishing a delegation](#finishing-a-delegation)), `task_ws_subscription` (`subscribe_tasks`
+[Finishing a delegation](#finishing-a-delegation)), `task_ledger_delete`
+(`DELETE /api/tasks/{id}` and the `task.deleted` frame), `task_ws_subscription` (`subscribe_tasks`
 on `/api/ws`), `task_outcome` (`tasks.complete`'s `outcome` and the
 [blocked](#blocked) state, a `waiting` task's question as `summary`, the
 task view's `title`, `progress` in words) and `task_defaults` (`GET
@@ -363,6 +364,7 @@ unknown id is `404 task_not_found`; any other failure is `500 task_failed`.
 | `GET /api/tasks/{id}` | `{"task": TaskView, "events": [TaskEvent]}`; `events` is the task's state history, oldest first. |
 | `POST /api/tasks/{id}/cancel` | The `TaskView` after the cancel. Interrupts the agent or sends Ctrl-C to the command. Cancelling a finished task changes nothing. |
 | `POST /api/tasks/{id}/complete` | The `TaskView`, now `done`. The user confirms that a delegation opened on a device (`origin: device`; any paired device may confirm it, as any may cancel it) that is `idle_unconfirmed` or `waiting` is finished. Body `{"summary"?: string}`, optional (the body may be left out): the new `summary`, one line, cut to 240 characters; without it the task keeps the hint it had. Published as `task.updated`. A task already `done` is answered as it stands; any other state or origin is `409 task_not_confirmable`; a body that is not that JSON object is `400 invalid_request`. |
+| `DELETE /api/tasks/{id}` | `task_ledger_delete`. `{"deleted": true, "task_id": string}`. The user removes an ended task -- `done`, `failed`, `cancelled`, or `idle_unconfirmed` (an idle delegation the user decides is finished) -- with its history and notice, as retention would; a restricted provider session it ran stays restricted, and the agent session it was bound to is not touched. An app device only (or the admin token): another computer's token is `403 peer_forbidden`. A `queued`, `dispatching`, `working` or `waiting` task, or one with a sub-task in such a state, is `409 task_active`: cancel it first. Published as `task.deleted` (see [Live updates](#live-updates)), followed by its parent's `task.updated` when it had one. |
 
 `TaskView`: `task_id`, `state`, `kind` (`delegation` or `command`), `goal`
 (the delegated goal or the command line), `summary`, `exit_code`, `binding`,
@@ -1012,7 +1014,9 @@ and no pane or agent-session events. If it falls behind, it receives
 The initial `hello` and subscription acknowledgement still precede updates.
 
 `data` is the whole `TaskView`, so the latest frame for a task replaces what
-the client holds. A change to a task with a parent is followed by a frame for
+the client holds. A deleted task (`task_ledger_delete`) gets one last frame,
+`"event":"task.deleted"` with `"data":{"task_id":"…"}`, on both kinds of
+subscription: drop it. Clients that read only `task.updated` ignore it. A change to a task with a parent is followed by a frame for
 the parent, whose `children` moved (its `seq` is the parent's own, unchanged).
 That parent frame is built after the child's change and sent without
 ordering against the parent's own changes, so it can arrive after a newer

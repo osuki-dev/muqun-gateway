@@ -29,6 +29,11 @@ pub(crate) trait TaskStore: Send + Sync {
     /// Delete the tasks that ended before `before_ms` (none of whose
     /// children is still open), with their events. How many went.
     fn purge_ended<'a>(&'a self, before_ms: u64) -> TaskFuture<'a, usize>;
+    /// Delete task `id`, which has ended ([`TaskState::ended`]) and has no
+    /// open child, as `purge_ended` would: the task as it was, and the seq
+    /// of its removal. Refuses with `TaskStoreError::NotFound`, `Open` or
+    /// `ChildrenOpen`.
+    fn delete_ended<'a>(&'a self, id: &'a TaskId) -> TaskFuture<'a, (Task, u64)>;
     /// Where task `id`'s end is told, if anywhere.
     fn notice_of<'a>(&'a self, _id: &'a TaskId) -> TaskFuture<'a, Option<NoticeTarget>> {
         Box::pin(async { Ok(None) })
@@ -56,7 +61,14 @@ pub(crate) trait TaskStore: Send + Sync {
 #[derive(Debug)]
 pub(crate) enum TaskStoreError {
     NotFound,
-    IllegalTransition { from: TaskState, to: TaskState },
+    IllegalTransition {
+        from: TaskState,
+        to: TaskState,
+    },
+    /// Still running, in this state: only an ended task can be deleted.
+    Open(TaskState),
+    /// One of its children has not ended.
+    ChildrenOpen,
 }
 
 impl fmt::Display for TaskStoreError {
@@ -66,6 +78,8 @@ impl fmt::Display for TaskStoreError {
             Self::IllegalTransition { from, to } => {
                 write!(f, "cannot move a task from {from:?} to {to:?}")
             }
+            Self::Open(state) => write!(f, "the task is still {state:?}"),
+            Self::ChildrenOpen => write!(f, "a sub-task has not ended"),
         }
     }
 }

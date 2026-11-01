@@ -12,19 +12,30 @@ pub(crate) const TASK_EVENT_CAPACITY: usize = 256;
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum TaskDomainEvent {
     #[serde(rename = "task.updated")]
-    Updated { task: TaskView, seq: u64 },
+    Updated { task: Box<TaskView>, seq: u64 },
+    /// The device deleted an ended task: it is gone from the ledger.
+    #[serde(rename = "task.deleted")]
+    Deleted { task_id: String, seq: u64 },
 }
 
 impl TaskDomainEvent {
     pub(crate) fn seq(&self) -> u64 {
         match self {
-            Self::Updated { seq, .. } => *seq,
+            Self::Updated { seq, .. } | Self::Deleted { seq, .. } => *seq,
         }
     }
 
     pub(crate) fn event_name(&self) -> &'static str {
         match self {
             Self::Updated { .. } => "task.updated",
+            Self::Deleted { .. } => "task.deleted",
+        }
+    }
+
+    pub(crate) fn task_id(&self) -> &str {
+        match self {
+            Self::Updated { task, .. } => &task.task_id,
+            Self::Deleted { task_id, .. } => task_id,
         }
     }
 }

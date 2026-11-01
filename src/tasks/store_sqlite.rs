@@ -348,37 +348,40 @@ impl TaskStore for SqliteTaskStore {
 
     fn purge_ended<'a>(&'a self, before_ms: u64) -> TaskFuture<'a, usize> {
         Box::pin(self.db.call(move |c| {
-            const ENDED: &str = "state IN ('done', 'failed', 'cancelled') AND updated_ms < ?1 \
-                AND NOT EXISTS (SELECT 1 FROM tasks AS child WHERE child.parent_task_id = tasks.id \
-                AND child.state NOT IN ('done', 'failed', 'cancelled'))";
             let tx = c.transaction()?;
-            let before = before_ms as i64;
-            // A finished ledger task is not proof that its provider session
-            // (or provider-native children) has been deleted. Keep the
-            // restricted session ids when ordinary retention forgets the tasks.
-            retain_runtime_restrictions(&tx)?;
-            tx.execute(
-                &format!(
-                    "DELETE FROM task_events WHERE task_id IN (SELECT id FROM tasks WHERE {ENDED})"
-                ),
-                [before],
-            )?;
-            let purged = tx.execute(&format!("DELETE FROM tasks WHERE {ENDED}"), [before])?;
-            tx.execute(
-                "DELETE FROM task_notices WHERE task_id NOT IN (SELECT id FROM tasks)",
-                [],
-            )?;
-            // A deleted session's tombstone is needed only while a ledger
-            // task still names it.
-            tx.execute(
-                "DELETE FROM task_restricted_sessions WHERE cleared_ms IS NOT NULL AND NOT EXISTS \
-                 (SELECT 1 FROM tasks WHERE json_extract(tasks.binding, '$.kind') = 'agent_session' \
-                 AND json_extract(tasks.binding, '$.agent_id') = task_restricted_sessions.agent_id \
-                 AND json_extract(tasks.binding, '$.asid') = task_restricted_sessions.asid)",
-                [],
+            let purged = delete_tasks(
+                &tx,
+                "state IN ('done', 'failed', 'cancelled') AND updated_ms < ?1 AND NOT EXISTS \
+                 (SELECT 1 FROM tasks AS child WHERE child.parent_task_id = tasks.id \
+                 AND child.state NOT IN ('done', 'failed', 'cancelled'))",
+                [before_ms as i64],
             )?;
             tx.commit()?;
             Ok(purged)
+        }))
+    }
+
+    fn delete_ended<'a>(&'a self, id: &'a TaskId) -> TaskFuture<'a, (Task, u64)> {
+        let id = id.clone();
+        Box::pin(self.db.call(move |c| {
+            let tx = c.transaction()?;
+            let task = load(&tx, &id)?.ok_or(TaskStoreError::NotFound)?;
+            if !task.state.ended() {
+                return Err(TaskStoreError::Open(task.state).into());
+            }
+            let open_child = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM tasks WHERE parent_task_id = ?1 \
+                 AND state NOT IN ('done', 'failed', 'cancelled'))",
+                [&id.0],
+                |r| r.get::<_, bool>(0),
+            )?;
+            if open_child {
+                return Err(TaskStoreError::ChildrenOpen.into());
+            }
+            delete_tasks(&tx, "id = ?1", [&id.0])?;
+            let seq = next_seq(&tx)?;
+            tx.commit()?;
+            Ok((task, seq))
         }))
     }
 
@@ -790,6 +793,40 @@ fn restriction(c: &Connection, mut task: Task) -> anyhow::Result<Option<Restrict
         }
     }
     Ok(Some(Restriction::Unattributed))
+}
+
+/// Delete the tasks `which` (a condition on `tasks`, with `params`) selects,
+/// with every row kept for them: their events, notices and the tombstones of
+/// deleted sessions only they still named. Retention and the device's delete
+/// both go through here. How many tasks went.
+fn delete_tasks(
+    tx: &Transaction<'_>,
+    which: &str,
+    params: impl rusqlite::Params + Copy,
+) -> anyhow::Result<usize> {
+    // A finished ledger task is not proof that its provider session
+    // (or provider-native children) has been deleted. Keep the
+    // restricted session ids when the tasks are forgotten.
+    retain_runtime_restrictions(tx)?;
+    tx.execute(
+        &format!("DELETE FROM task_events WHERE task_id IN (SELECT id FROM tasks WHERE {which})"),
+        params,
+    )?;
+    let deleted = tx.execute(&format!("DELETE FROM tasks WHERE {which}"), params)?;
+    tx.execute(
+        "DELETE FROM task_notices WHERE task_id NOT IN (SELECT id FROM tasks)",
+        [],
+    )?;
+    // A deleted session's tombstone is needed only while a ledger
+    // task still names it.
+    tx.execute(
+        "DELETE FROM task_restricted_sessions WHERE cleared_ms IS NOT NULL AND NOT EXISTS \
+         (SELECT 1 FROM tasks WHERE json_extract(tasks.binding, '$.kind') = 'agent_session' \
+         AND json_extract(tasks.binding, '$.agent_id') = task_restricted_sessions.agent_id \
+         AND json_extract(tasks.binding, '$.asid') = task_restricted_sessions.asid)",
+        [],
+    )?;
+    Ok(deleted)
 }
 
 fn retain_runtime_restrictions(c: &Connection) -> anyhow::Result<()> {
@@ -1240,6 +1277,53 @@ mod tests {
         ] {
             assert_eq!(store.get(id).await.unwrap().is_some(), kept, "{id:?}");
             assert_eq!(!store.events(id).await.unwrap().is_empty(), kept, "{id:?}");
+        }
+    }
+
+    /// Retention and the device's delete forget a task alike: its events and
+    /// notice go, the restriction on the session it ran stays.
+    #[tokio::test]
+    async fn purge_and_delete_forget_a_task_alike() {
+        for delete in [false, true] {
+            let db = temp_store("tasks-forget");
+            let store = SqliteTaskStore::new(db.clone());
+            let mut t = task("peer");
+            t.origin = TaskOrigin::Peer;
+            t.created_by.kind = PrincipalKind::Gateway;
+            t.binding = TaskBinding::AgentSession {
+                agent_id: "codex".into(),
+                asid: "ses_kept".into(),
+            };
+            let t = store.insert(&t).await.unwrap();
+            for step in [TaskState::Dispatching, TaskState::Working, TaskState::Done] {
+                store.transition(&t.id, change(step)).await.unwrap();
+            }
+            let target = NoticeTarget::Session {
+                agent_id: "codex".into(),
+                asid: "parent".into(),
+            };
+            store.set_notice(&t.id, &target).await.unwrap();
+            if delete {
+                store.delete_ended(&t.id).await.unwrap();
+            } else {
+                assert_eq!(store.purge_ended(now_ms() + 1).await.unwrap(), 1);
+            }
+            let id = t.id.0.clone();
+            let left = db
+                .call(move |c| {
+                    Ok(c.query_row(
+                        "SELECT (SELECT COUNT(*) FROM tasks WHERE id = ?1) \
+                         + (SELECT COUNT(*) FROM task_events WHERE task_id = ?1) \
+                         + (SELECT COUNT(*) FROM task_notices WHERE task_id = ?1)",
+                        [&id],
+                        |r| r.get::<_, i64>(0),
+                    )?)
+                })
+                .await
+                .unwrap();
+            assert_eq!(left, 0, "delete={delete}");
+            let block = db.call(|c| runtime_block(c, "codex")).await.unwrap();
+            assert_eq!(block.unwrap().sessions, ["ses_kept"], "delete={delete}");
         }
     }
 
