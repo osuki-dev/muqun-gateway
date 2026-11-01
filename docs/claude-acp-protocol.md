@@ -62,7 +62,7 @@ exiting. When a session's process ends unexpectedly the Gateway logs why.
 | Method | Use | Observed shape (0.99.1) |
 |---|---|---|
 | `initialize` | protocolVersion 1, `fs`/`terminal` false, `session.notices`, `elicitation.form` | `loadSession: true`; `sessionCapabilities` `list, resume, fork, delete, close, additionalDirectories, systemPrompt`; `promptCapabilities` image, embeddedContext; `mcpCapabilities` http, sse; `authMethods: []`; `agentInfo.version`; top-level `_meta.steering.supported` |
-| `session/new` | `cwd`, `mcpServers` (muqun, below) | `sessionId` (UUID), `modes`, `configOptions` `mode, model, effort, fast, ultracode, agent`. No transcript is written until the first prompt. |
+| `session/new` | `cwd`, `mcpServers` and `_meta.claudeCode.options.allowedTools` (muqun, below) | `sessionId` (UUID), `modes`, `configOptions` `mode, model, effort, fast, ultracode, agent`. No transcript is written until the first prompt. |
 | `session/load` | reopen with replay | replays `user_message_chunk`/`agent_message_chunk` (with `messageId`) and `available_commands_update`; same `configOptions`, keeping the session's model |
 | `session/set_config_option` | `model`, `effort` | answers the full `configOptions` |
 | `session/set_mode` | permission mode | answers `{}`; the change arrives as `config_option_update` (the `mode` option), not `current_mode_update` |
@@ -184,8 +184,8 @@ Gateway created or forked are still kept in `claude-owned-sessions.json`
 
 ## muqun MCP
 
-The muqun server is passed in every `session/new`, `session/load` and
-`session/fork` as an ACP `mcpServers` HTTP entry:
+The muqun server is passed in every `session/new`, `session/load`,
+`session/resume` and `session/fork` as an ACP `mcpServers` HTTP entry:
 
 ```json
 { "type": "http", "name": "muqun", "url": "http://127.0.0.1:<port>/mcp",
@@ -197,6 +197,23 @@ OpenCode's), minted once per Gateway run when MCP injection is on; earlier
 ones are revoked. It travels only over the child's stdin, never argv or a file.
 A server that fails to start is reported by the adapter as a notice, not as
 transcript text.
+
+Its tools never ask for permission, in any mode: the same requests carry
+
+```json
+{ "_meta": { "claudeCode": { "options": { "allowedTools": ["mcp__muqun"] } } } }
+```
+
+The adapter spreads `_meta.claudeCode.options` into the Claude Agent SDK
+options for that session only (0.99.1, `createSession`; fork and resume pass
+`_meta` through the same path), and `mcp__muqun` is Claude Code's server-level
+allow rule for every `mcp__muqun__*` tool. Nothing is written to the user's
+`settings.json`; a user `deny` or `ask` rule for these tools still wins.
+`allowedTools` is part of the adapter's session fingerprint
+(`OPTION_REBUILDS_SESSION`): a load whose options differ from the live
+session's rebuilds it. Gateway always sends the same value, so it never
+causes a rebuild. Without the rule, a Manual (`default`) session asked
+"Mcp muqun tasks complete" before `tasks.complete`.
 
 ## Session listing without a process
 

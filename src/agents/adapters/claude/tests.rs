@@ -105,6 +105,11 @@ async fn listing_starts_nothing_and_sessions_get_launch_mcp_and_model() {
     let methods = lines(&directory.join("methods.log"));
     let new = methods.iter().find(|m| m[0] == "session/new").unwrap();
     assert_eq!(new[1]["mcpServers"], mcp);
+    // ...and its tools are allowed for the session, so they never prompt.
+    assert_eq!(
+        new[1]["_meta"],
+        json!({"claudeCode":{"options":{"allowedTools":["mcp__muqun"]}}})
+    );
     let configs: Vec<_> = methods
         .iter()
         .filter(|m| m[0] == "session/set_config_option")
