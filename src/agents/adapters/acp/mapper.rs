@@ -860,8 +860,13 @@ impl Projection {
                         truncated: false,
                         time: ToolTime::default(),
                     });
-                if let Some(name) = update["name"].as_str().or_else(|| update["kind"].as_str()) {
+                // An update without a name keeps the call's (Claude Code
+                // repeats only `kind`); `kind` names a call that has none.
+                if let Some(name) = update["name"].as_str() {
                     call.name = name.into();
+                } else if let Some(kind) = update["kind"].as_str().filter(|_| call.name.is_empty())
+                {
+                    call.name = kind.into();
                 }
                 if let Some(title) = update["title"].as_str() {
                     call.title = Some(title.into());
@@ -1069,6 +1074,25 @@ mod tests {
         assert!(matches!(&rows[3].part, AgentPart::Text{text} if text == "Three"));
         assert_ne!(rows[1].id, rows[3].id);
         assert_ne!(rows[3].message_id, rows[5].message_id);
+    }
+
+    #[test]
+    fn a_tool_update_without_a_name_keeps_the_call_name() {
+        let mut projection = Projection::new(false);
+        projection.submitted("question");
+        // claude-agent-acp 0.99.1: the call names the tool; the refinement
+        // and result repeat only `kind`.
+        for update in [
+            json!({"sessionUpdate":"tool_call","toolCallId":"toolu_1","name":"Bash","kind":"execute","status":"pending","title":"Terminal","rawInput":{},"content":[],"_meta":{"claudeCode":{"toolName":"Bash"}}}),
+            json!({"sessionUpdate":"tool_call_update","toolCallId":"toolu_1","kind":"execute","title":"`ls`","rawInput":{"command":"ls"},"content":[],"_meta":{"claudeCode":{"toolName":"Bash"}}}),
+            json!({"sessionUpdate":"tool_call_update","toolCallId":"toolu_1","status":"completed","rawOutput":"README.md","_meta":{"claudeCode":{"toolName":"Bash"}}}),
+        ] {
+            let row = projection.update(&update).unwrap().unwrap();
+            assert!(matches!(&row.part, AgentPart::Tool(tool) if tool.name == "Bash"));
+        }
+        // A call that never names its tool is still named by `kind`.
+        let row = projection.update(&json!({"sessionUpdate":"tool_call","toolCallId":"t2","kind":"read","status":"pending"})).unwrap().unwrap();
+        assert!(matches!(&row.part, AgentPart::Tool(tool) if tool.name == "read"));
     }
 
     #[test]
