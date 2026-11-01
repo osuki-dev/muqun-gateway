@@ -24,6 +24,24 @@
   session reopens on the next visit. Antigravity and Cursor sessions that ran
   tools are now released on the same evidence.
 
+- **Claude Code sessions report their token usage.** The context sheet showed
+  session tokens, input, output, thinking and cache counts as unavailable for
+  Claude Code. They are now summed from the session's transcript (each
+  message once) when it is opened, after each turn and for a session open in a
+  terminal. Claude Code records no per-turn cost, so cost stays unreported.
+
+- **Cursor and Antigravity tasks report when they finish.** Neither agent
+  takes a per-session instruction, so a delegated task never called
+  `tasks.complete`. The task's first prompt now ends with the task sentence;
+  the conversation shown in the App never contains it.
+
+- **Bypass permissions and Auto are never restored on their own.** Before a
+  session starts, Bypass permissions is offered only where Claude Code accepts
+  it (not when a user or managed settings file disables it, and as root only
+  with `IS_SANDBOX=1`). A remembered Bypass or Auto is no longer a new
+  session's default, and a new session asked for one gets it only if its own
+  mode list offers it; otherwise it keeps the adapter's default.
+
 - **Any Claude Code session listed on Home can be deleted**, not only those
   created from Muqun, using Claude Code's own delete; one open in a terminal
   still cannot. Refusals explain why.
