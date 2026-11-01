@@ -230,16 +230,25 @@ pub(crate) async fn caller_session(
 
 /// Whether `item` is `call` running right now.
 fn runs(item: &TimelineItem, call: &Call<'_>) -> bool {
-    match &item.part {
-        AgentPart::Tool(part) => {
-            part.state == ToolCallStatus::Running
-                && names_tool(&part.name, call.tool)
-                && call.args.iter().all(|(key, value)| {
-                    part.input.get(*key).and_then(|v| v.as_str()) == Some(*value)
-                })
-        }
-        _ => false,
-    }
+    let AgentPart::Tool(part) = &item.part else {
+        return false;
+    };
+    // Cursor's ACP reports every MCP call as kind `other` with
+    // `rawInput: {providerIdentifier, toolName, args}`.
+    let input = &part.input;
+    let (name, args) = match (
+        input["providerIdentifier"].as_str(),
+        input["toolName"].as_str(),
+    ) {
+        (Some(server), Some(tool)) => (format!("{server}_{tool}"), &input["args"]),
+        _ => (part.name.clone(), input),
+    };
+    part.state == ToolCallStatus::Running
+        && names_tool(&name, call.tool)
+        && call
+            .args
+            .iter()
+            .all(|(key, value)| args.get(*key).and_then(|v| v.as_str()) == Some(*value))
 }
 
 async fn parent_of(state: &AppState, binding: &TokenBinding, call: &Call<'_>) -> Option<TaskId> {
@@ -897,6 +906,16 @@ mod tests {
             ),
             ("ses_other", Vec::new()),
             ("ses_streamed", Vec::new()),
+            // Cursor 2026.10.22's ACP shape for any MCP call.
+            (
+                "ses_cursor",
+                calling(
+                    "other",
+                    "running",
+                    json!({ "providerIdentifier": "muqun", "toolName": "tasks.complete",
+                            "args": { "summary": "file made" } }),
+                ),
+            ),
         ])
         .await;
         let mine = working(&state, session_of("ses_mine")).await;
@@ -918,6 +937,15 @@ mod tests {
             own_task(&state, &agent, &with_id, Some(&other)).await,
             None,
             "another session's task, named by id"
+        );
+        let cursor = working(&state, session_of("ses_cursor")).await;
+        let from_cursor = Call {
+            tool: "tasks.complete",
+            args: vec![("summary", "file made")],
+        };
+        assert_eq!(
+            own_task(&state, &agent, &from_cursor, None).await,
+            Some(cursor)
         );
         // DeepSeek and T3: the running call is only in the streamed mirror.
         let streamed = working(&state, session_of("ses_streamed")).await;
