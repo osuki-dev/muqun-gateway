@@ -28,6 +28,20 @@ pub struct ModelInfo {
     pub status: Option<String>,
 }
 
+/// Order effort levels low to high: default, minimal, low, medium, high,
+/// xhigh, max. Adapters list them alphabetically; unknown levels keep their
+/// relative order after the known ones.
+pub fn order_efforts<T>(items: &mut [T], effort: impl Fn(&T) -> Option<&str>) {
+    const KNOWN: [&str; 7] = [
+        "default", "minimal", "low", "medium", "high", "xhigh", "max",
+    ];
+    items.sort_by_key(|item| {
+        effort(item)
+            .and_then(|level| KNOWN.iter().position(|known| *known == level))
+            .unwrap_or(KNOWN.len())
+    });
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModeInfo {
     pub id: String,
@@ -171,4 +185,29 @@ pub struct AgentCatalog {
     pub commands: Vec<CommandInfo>,
     #[serde(default)]
     pub defaults: CatalogDefaults,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::order_efforts;
+
+    #[test]
+    fn efforts_run_low_to_high_with_unknown_levels_last_in_original_order() {
+        for (given, want) in [
+            (
+                &["default", "high", "low", "max", "medium", "xhigh"][..],
+                &["default", "low", "medium", "high", "xhigh", "max"][..],
+            ),
+            (&["high", "low"], &["low", "high"]),
+            (
+                &["zeta", "max", "alpha", "minimal"],
+                &["minimal", "max", "zeta", "alpha"],
+            ),
+            (&[], &[]),
+        ] {
+            let mut levels = given.to_vec();
+            order_efforts(&mut levels, |level| Some(*level));
+            assert_eq!(levels, want, "{given:?}");
+        }
+    }
 }

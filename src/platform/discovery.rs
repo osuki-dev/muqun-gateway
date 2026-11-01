@@ -90,6 +90,8 @@ pub fn model_info_to_agent_model(model: &crate::agents::domain::ModelInfo) -> Ag
         }
     }
 
+    crate::agents::domain::order_efforts(&mut reasoning_effort_tiers, |tier| Some(tier.as_str()));
+
     AgentModelInfo {
         id: model.id.clone(),
         name: model.name.clone(),

@@ -166,7 +166,9 @@ pub(crate) fn catalog_for(value: &Value, provider: &str) -> AgentCatalog {
         .as_ref()
         .map(|model| model.provider_id.as_str())
         .unwrap_or(provider);
-    let mut models = std::collections::BTreeMap::new();
+    // The adapter's own order, one entry per id (a later listing of an id
+    // replaces the earlier entry in place).
+    let mut models: Vec<ModelInfo> = Vec::new();
     // Antigravity 1.4 still lists 1.3's effort-suffixed ids here; its model
     // and thinking options are the real choices.
     if let Some(available) = value
@@ -178,20 +180,21 @@ pub(crate) fn catalog_for(value: &Value, provider: &str) -> AgentCatalog {
             let Some(id) = native["modelId"].as_str() else {
                 continue;
             };
-            models.insert(
-                id.to_owned(),
-                ModelInfo {
-                    id: id.into(),
-                    name: native["name"].as_str().unwrap_or(id).into(),
-                    provider_id: provider_id.into(),
-                    family: None,
-                    limit: None,
-                    variants: None,
-                    cost: None,
-                    enabled: true,
-                    status: None,
-                },
-            );
+            let info = ModelInfo {
+                id: id.into(),
+                name: native["name"].as_str().unwrap_or(id).into(),
+                provider_id: provider_id.into(),
+                family: None,
+                limit: None,
+                variants: None,
+                cost: None,
+                enabled: true,
+                status: None,
+            };
+            match models.iter_mut().find(|known| known.id == id) {
+                Some(known) => *known = info,
+                None => models.push(info),
+            }
         }
     }
     if let Some(option) = config_option(value, "model") {
@@ -199,26 +202,27 @@ pub(crate) fn catalog_for(value: &Value, provider: &str) -> AgentCatalog {
             let Some(id) = native["value"].as_str() else {
                 continue;
             };
-            models.insert(
-                id.to_owned(),
-                ModelInfo {
-                    id: id.into(),
-                    name: native["name"].as_str().unwrap_or(id).into(),
-                    provider_id: provider_id.into(),
-                    family: None,
-                    limit: None,
-                    variants: None,
-                    cost: None,
-                    enabled: true,
-                    status: None,
-                },
-            );
+            let info = ModelInfo {
+                id: id.into(),
+                name: native["name"].as_str().unwrap_or(id).into(),
+                provider_id: provider_id.into(),
+                family: None,
+                limit: None,
+                variants: None,
+                cost: None,
+                enabled: true,
+                status: None,
+            };
+            match models.iter_mut().find(|known| known.id == id) {
+                Some(known) => *known = info,
+                None => models.push(info),
+            }
         }
     }
     if let Some(current) = &selected {
-        if let Some(model) = models.get_mut(&current.model_id) {
+        if let Some(model) = models.iter_mut().find(|model| model.id == current.model_id) {
             model.variants = config_option(value, effort_key(provider)).map(|option| {
-                select_options(option)
+                let mut variants: Vec<ModelVariantInfo> = select_options(option)
                     .into_iter()
                     .filter_map(|native| {
                         let id = native["value"].as_str()?;
@@ -227,14 +231,16 @@ pub(crate) fn catalog_for(value: &Value, provider: &str) -> AgentCatalog {
                             reasoning_effort: Some(id.into()),
                         })
                     })
-                    .collect()
+                    .collect();
+                order_efforts(&mut variants, |variant| variant.reasoning_effort.as_deref());
+                variants
             });
         }
     }
     // Neither ACP provider's permission-mode controls are session-local model
     // choices. Their modes must not leak into App new-session defaults.
     AgentCatalog {
-        models: models.into_values().collect(),
+        models,
         defaults: CatalogDefaults {
             model: selected,
             mode: None,
@@ -1277,6 +1283,20 @@ mod tests {
         assert_eq!(catalog.models[0].variants.as_ref().unwrap().len(), 2);
         assert!(catalog.models[1].variants.is_none());
         assert!(offers_config_value(&value, "reasoning_effort", "high"));
+
+        // The adapter's model order is kept (not sorted by id) and efforts run low to high.
+        let value = json!({"models":{"currentModelId":"default","availableModels":[{"modelId":"default","name":"Default"},{"modelId":"claude-a","name":"A"},{"modelId":"default","name":"Default"}]},"configOptions":[{"id":"effort","currentValue":"default","options":[{"value":"default","name":"Default"},{"value":"high","name":"High"},{"value":"low","name":"Low"},{"value":"xhigh","name":"X"},{"value":"max","name":"M"},{"value":"medium","name":"Med"}]}]});
+        let catalog = catalog_for(&value, "claude");
+        let ids: Vec<_> = catalog.models.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, ["default", "claude-a"]);
+        let tiers: Vec<_> = catalog.models[0]
+            .variants
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|v| v.id.as_str())
+            .collect();
+        assert_eq!(tiers, ["default", "low", "medium", "high", "xhigh", "max"]);
         assert!(!offers_config_value(&value, "reasoning_effort", "invented"));
     }
 
