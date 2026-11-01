@@ -46,6 +46,28 @@ pub trait AcpProvider: Send + Sync + 'static {
     const SYSTEM_PROMPT: bool = false;
     /// The native command that renames a session without a model turn.
     const RENAME_COMMAND: Option<&'static str> = None;
+    /// Whether the agent's own record says that nothing of session `id`
+    /// still runs in the child under `process` (no turn, background command
+    /// or subagent). Asked before idle retirement of a generation that ran
+    /// tools; without such a record (`false`) that child is kept, since
+    /// closing it could kill work that outlives its tool call.
+    fn work_settled(_directory: &str, _id: &str, _process: u32) -> bool {
+        false
+    }
+    /// A live update that starts work outliving its tool call (a command
+    /// sent to the background). Its generation is never idle-retired.
+    fn starts_background_work(_update: &Value) -> bool {
+        false
+    }
+    /// `session/delete` deletes any saved session, loaded or not (Claude
+    /// Code: the SDK's transcript delete), so every listed session may be
+    /// deleted, not only those this Gateway created.
+    const DELETE_LISTED: bool = false;
+    /// The session modes the agent always offers (`SESSION_MODES`), listed
+    /// before any session has reported its own.
+    fn static_modes() -> Vec<ModeInfo> {
+        Vec::new()
+    }
     fn recovery_snapshot<'a>(
         _binary: &'a str,
         _directory: &'a str,
@@ -228,6 +250,8 @@ struct SessionState {
     forms: HashMap<String, super::elicitation::Elicitation>,
     /// A native command runs that leaves no rows (rename).
     hidden_command: bool,
+    /// This generation started work that outlives its tool call.
+    background_work: bool,
 }
 
 #[derive(Clone)]
@@ -349,6 +373,8 @@ struct Session {
 }
 
 type LiveSessions = Arc<StdMutex<HashMap<String, Arc<Session>>>>;
+type Activation =
+    futures::future::Shared<futures::future::BoxFuture<'static, Result<Arc<Session>, AgentError>>>;
 type DormantSessions = Arc<StdMutex<HashMap<String, DormantSession>>>;
 
 struct ListenerContext {
@@ -444,6 +470,9 @@ pub struct AcpDriver<P: AcpProvider> {
     inspection: Arc<Mutex<()>>,
     connections: StdMutex<Vec<Weak<AcpClient>>>,
     connection_admission: Mutex<()>,
+    /// Native loads in flight, one per session (`load_once`).
+    activations: StdMutex<HashMap<String, (u64, Activation)>>,
+    next_activation: AtomicU64,
     starting: tokio::sync::RwLock<()>,
     mutations: Mutex<()>,
     global_catalog: Mutex<Option<CatalogCacheEntry>>,
@@ -563,6 +592,8 @@ impl<P: AcpProvider> AcpDriver<P> {
             inspection: Arc::new(Mutex::new(())),
             connections: StdMutex::new(Vec::new()),
             connection_admission: Mutex::new(()),
+            activations: StdMutex::new(HashMap::new()),
+            next_activation: AtomicU64::new(0),
             starting: tokio::sync::RwLock::new(()),
             mutations: Mutex::new(()),
             global_catalog: Mutex::new(None),
@@ -863,11 +894,15 @@ impl<P: AcpProvider> AcpDriver<P> {
         sessions.sort_by(|a, b| a.0.cmp(&b.0));
         let mut models: BTreeMap<(String, String), ModelInfo> = BTreeMap::new();
         let mut commands = BTreeMap::new();
+        let mut modes = Vec::new();
         for (_, session) in sessions {
             if !session.connected.load(Ordering::Acquire) {
                 continue;
             }
             let state = session.state.lock().await;
+            if P::SESSION_MODES && modes.is_empty() {
+                modes.clone_from(&state.catalog.modes);
+            }
             for command in &state.catalog.commands {
                 commands
                     .entry(command.name.clone())
@@ -894,9 +929,13 @@ impl<P: AcpProvider> AcpDriver<P> {
                 }
             }
         }
+        if modes.is_empty() {
+            modes = P::static_modes();
+        }
         AgentCatalog {
             models: models.into_values().collect(),
             commands: commands.into_values().collect(),
+            modes,
             ..Default::default()
         }
     }
@@ -972,6 +1011,9 @@ impl<P: AcpProvider> AcpDriver<P> {
                     commands.insert(command.name.clone(), command);
                 }
                 catalog.commands = commands.into_values().collect();
+                if catalog.modes.is_empty() {
+                    catalog.modes = observed.modes;
+                }
                 Ok(catalog)
             }
             Err(_) if !observed.commands.is_empty() => Ok(observed),
@@ -1703,29 +1745,111 @@ impl<P: AcpProvider> AcpDriver<P> {
         if let Some(live) = self.terminal_live(id).await {
             return Err(AgentError::TerminalInteraction(Box::new(live.runtime)));
         }
-        // One explicit activation restores a same-ID generation. Prompt calls
-        // never replay a previous request and cannot recover an unexpected loss.
-        let _mutation = self.mutations.lock().await;
-        if let Some(session) = self.retained(id) {
-            let retirement = session.retirement.lock().await;
-            if session.connected.load(Ordering::Acquire) {
-                if reserve_prompt
-                    && session
-                        .busy
-                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                        .is_err()
-                {
-                    return Err(AgentError::NotAvailable(
-                        "ACP session is already processing a turn".into(),
-                    ));
-                }
-                if explicit_prepare {
-                    session.state.lock().await.last_activity = tokio::time::Instant::now();
+        {
+            let _mutation = self.mutations.lock().await;
+            if let Some(session) = self.retained(id) {
+                let retirement = session.retirement.lock().await;
+                if session.connected.load(Ordering::Acquire) {
+                    if reserve_prompt
+                        && session
+                            .busy
+                            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                            .is_err()
+                    {
+                        return Err(AgentError::NotAvailable(
+                            "ACP session is already processing a turn".into(),
+                        ));
+                    }
+                    if explicit_prepare {
+                        session.state.lock().await.last_activity = tokio::time::Instant::now();
+                    }
+                    drop(retirement);
+                    return Ok(session);
                 }
                 drop(retirement);
+                // Its end decides whether it may be loaded again (below).
+                tokio::time::timeout(RETIREMENT_TIMEOUT, session.finished.cancelled())
+                    .await
+                    .map_err(|_| {
+                        AgentError::NotAvailable("Previous ACP generation has not stopped".into())
+                    })?;
+            }
+            // One explicit activation restores a same-ID generation. Prompt calls
+            // never replay a previous request and cannot recover an unexpected loss.
+            if !explicit_prepare
+                && self
+                    .dormant
+                    .lock()
+                    .unwrap()
+                    .get(id)
+                    .is_some_and(|entry| entry.kind == DormantKind::Unexpected)
+            {
+                return Err(AgentError::NotAvailable("ACP connection ended unexpectedly; explicitly open the conversation before sending a new prompt; delivery was not retried".into()));
+            }
+        }
+        let session = self.load_once(id).await?;
+        if reserve_prompt
+            && session
+                .busy
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            return Err(AgentError::NotAvailable(
+                "ACP session is already processing a turn".into(),
+            ));
+        }
+        Ok(session)
+    }
+
+    /// Load `id`, or wait for the load already under way. The load runs on
+    /// its own: a caller that stops waiting (a request timeout, a closed
+    /// connection, an App retry) neither cancels it nor kills the process
+    /// it started, and the next caller attaches to the same process.
+    async fn load_once(&self, id: &str) -> Result<Arc<Session>, AgentError> {
+        use futures::FutureExt;
+        let flight = {
+            let mut flights = self.activations.lock().unwrap();
+            match flights.get(id) {
+                Some((_, flight)) => flight.clone(),
+                None => {
+                    let driver = self
+                        .me
+                        .upgrade()
+                        .ok_or_else(|| AgentError::NotAvailable("ACP runtime stopped".into()))?;
+                    let number = self.next_activation.fetch_add(1, Ordering::Relaxed);
+                    let owned = id.to_owned();
+                    let task = tokio::spawn(async move {
+                        let result = driver.load(&owned).await;
+                        let mut flights = driver.activations.lock().unwrap();
+                        if flights
+                            .get(&owned)
+                            .is_some_and(|(current, _)| *current == number)
+                        {
+                            flights.remove(&owned);
+                        }
+                        result
+                    });
+                    let flight = async move {
+                        task.await.unwrap_or_else(|_| {
+                            Err(AgentError::NotAvailable("ACP session load stopped".into()))
+                        })
+                    }
+                    .boxed()
+                    .shared();
+                    flights.insert(id.to_owned(), (number, flight.clone()));
+                    flight
+                }
+            }
+        };
+        flight.await
+    }
+
+    async fn load(&self, id: &str) -> Result<Arc<Session>, AgentError> {
+        let _mutation = self.mutations.lock().await;
+        if let Some(session) = self.retained(id) {
+            if session.connected.load(Ordering::Acquire) {
                 return Ok(session);
             }
-            drop(retirement);
             tokio::time::timeout(RETIREMENT_TIMEOUT, session.finished.cancelled())
                 .await
                 .map_err(|_| {
@@ -1733,13 +1857,6 @@ impl<P: AcpProvider> AcpDriver<P> {
                 })?;
         }
         let dormant = self.dormant.lock().unwrap().get(id).cloned();
-        if dormant
-            .as_ref()
-            .is_some_and(|entry| entry.kind == DormantKind::Unexpected)
-            && !explicit_prepare
-        {
-            return Err(AgentError::NotAvailable("ACP connection ended unexpectedly; explicitly open the conversation before sending a new prompt; delivery was not retried".into()));
-        }
         let info = match &dormant {
             Some(entry) => self.dormant_info(id, entry).await?,
             None => self.native_session_info(id).await?,
@@ -1767,16 +1884,6 @@ impl<P: AcpProvider> AcpDriver<P> {
                 }
             }
             self.dormant.lock().unwrap().remove(id);
-        }
-        if reserve_prompt
-            && session
-                .busy
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
-        {
-            return Err(AgentError::NotAvailable(
-                "ACP session is already processing a turn".into(),
-            ));
         }
         Ok(session)
     }
@@ -1996,6 +2103,7 @@ impl<P: AcpProvider> AcpDriver<P> {
             turn_had_output: false,
             forms: HashMap::new(),
             hidden_command: false,
+            background_work: false,
         };
         for params in replay {
             if params["sessionId"].as_str() != Some(id.as_str()) {
@@ -2043,15 +2151,29 @@ impl<P: AcpProvider> AcpDriver<P> {
             inbox: Vec::new(),
             seq: 0,
         };
-        if !self
+        // No other generation of this session runs while it loads, so what
+        // was written meanwhile (an App refresh or cold read of the parked
+        // copy) came from the Gateway's older copy: the replay is newer. Take
+        // the new revision and replace again instead of discarding a process
+        // that loaded correctly; give up only if writes never stop.
+        let mut revision = revision;
+        let mut attempts = 0;
+        while !self
             .mirror
-            .replace_native_snapshot(snapshot, revision)
+            .replace_native_snapshot(snapshot.clone(), revision)
             .await?
         {
-            client.shutdown().await;
-            return Err(AgentError::NotAvailable(
-                "ACP session changed while loading; refresh again".into(),
-            ));
+            attempts += 1;
+            if attempts == 3 {
+                client.shutdown().await;
+                return Err(AgentError::NotAvailable(
+                    "ACP session changed while loading; refresh again".into(),
+                ));
+            }
+            revision = self
+                .mirror
+                .native_reload_revision(&AgentSessionId::from(id.as_str()))
+                .await;
         }
         if !state.catalog.commands.is_empty() {
             self.commands_observed.store(true, Ordering::Release);
@@ -2248,6 +2370,9 @@ impl<P: AcpProvider> AcpDriver<P> {
                 },
             );
             return;
+        }
+        if P::starts_background_work(&params["update"]) {
+            state.background_work = true;
         }
         if session.busy.load(Ordering::Acquire)
             && params["update"]["sessionUpdate"].as_str() == Some("agent_message_chunk")
@@ -2646,7 +2771,7 @@ impl<P: AcpProvider> AcpDriver<P> {
                 drop(state);
                 let sender = session.completions.clone();
                 tokio::spawn(async move {
-                    let _ = sender.send(request.wait().await);
+                    let _ = sender.send(request.wait_for_turn().await);
                 });
                 admission.handed_off = true;
                 Ok(())
@@ -2825,6 +2950,99 @@ impl<P: AcpProvider> AcpDriver<P> {
         Ok(())
     }
 
+    /// Delete through the session's own process, then stop it.
+    async fn delete_live(&self, id: &str, session: &Session) -> Result<(), AgentError> {
+        if !session.connected.load(Ordering::Acquire) {
+            return Err(AgentError::NotAvailable(
+                "The conversation's process is ending; try deleting again".into(),
+            ));
+        }
+        if !session.state.lock().await.owned_mutations && !P::DELETE_LISTED {
+            return Err(AgentError::Unsupported(format!(
+                "{} deletes only conversations started from Muqun on this computer",
+                P::LABEL
+            )));
+        }
+        if !operations::supports_operation(&session.native_capabilities, "delete") {
+            return Err(AgentError::Unsupported(format!(
+                "This {} version does not offer deleting conversations",
+                P::LABEL
+            )));
+        }
+        if session
+            .busy
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(AgentError::NotAvailable(
+                "The conversation is working; stop it before deleting".into(),
+            ));
+        }
+        let _admission = Admission {
+            busy: &session.busy,
+            handed_off: false,
+        };
+        let params = operations::delete_params(id)?;
+        // Qoder resolves deletion through this connection's bound workspace.
+        // An unbound temporary client may acknowledge without deleting it.
+        let result = session
+            .client
+            .request_with_timeout("session/delete", params, RPC_TIMEOUT)
+            .await;
+        self.invalidate_session_lists().await;
+        let value = result.map_err(AgentError::RequestFailed)?;
+        if !value.is_object() {
+            return Err(protocol(
+                "native deletion outcome is unknown; do not retry automatically",
+            ));
+        }
+        session.connected.store(false, Ordering::Release);
+        session.client.shutdown().await;
+        tokio::time::timeout(Duration::from_secs(5), session.finished.cancelled())
+            .await
+            .map_err(|_| {
+                AgentError::NotAvailable("deleted session connection has not stopped".into())
+            })?;
+        Ok(())
+    }
+
+    /// Delete a listed session that is not loaded (`P::DELETE_LISTED`)
+    /// through a short-lived child; nothing is resumed.
+    async fn delete_saved(&self, id: &str) -> Result<(), AgentError> {
+        let dormant = self.dormant.lock().unwrap().get(id).cloned();
+        let info = match &dormant {
+            Some(entry) => self.dormant_info(id, entry).await?,
+            None => self.native_session_info(id).await?,
+        };
+        let directory = info
+            .directory
+            .filter(|cwd| std::path::Path::new(cwd).is_dir())
+            .unwrap_or_else(|| self.default_directory.clone());
+        let (client, _events, capabilities) = self.initialized(&directory).await?;
+        if !operations::supports_operation(&capabilities, "delete") {
+            client.shutdown().await;
+            return Err(AgentError::Unsupported(format!(
+                "This {} version does not offer deleting conversations",
+                P::LABEL
+            )));
+        }
+        let result = client
+            .request_with_timeout(
+                "session/delete",
+                operations::delete_params(id)?,
+                RPC_TIMEOUT,
+            )
+            .await;
+        self.invalidate_session_lists().await;
+        client.shutdown().await;
+        if !result.map_err(AgentError::RequestFailed)?.is_object() {
+            return Err(protocol(
+                "native deletion outcome is unknown; do not retry automatically",
+            ));
+        }
+        Ok(())
+    }
+
     fn snapshot_matches_projection(snapshot: &NativeSnapshot, projection: &Projection) -> bool {
         if projection.is_empty() {
             return snapshot.entries.is_empty();
@@ -2848,7 +3066,6 @@ impl<P: AcpProvider> AcpDriver<P> {
         };
         if !P::IDLE_RETIREMENT
             || !session.connected.load(Ordering::Acquire)
-            || session.client.has_unverified_live_work()
             || session
                 .busy
                 .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -2864,18 +3081,36 @@ impl<P: AcpProvider> AcpDriver<P> {
             let state = session.state.lock().await;
             if state.info.status != AgentSessionStatus::Idle
                 || !state.permissions.is_empty()
+                || !state.forms.is_empty()
+                || state.background_work
                 || !parked_metadata_fits(&state.info)
                 || state.last_activity.elapsed()
                     < Duration::from_secs(context.idle_timeout_secs.load(Ordering::Acquire))
             {
                 return None;
             }
-            let evidence = state.recovery.clone()?;
             (
                 state.info.asid.0.clone(),
                 state.info.directory.clone()?,
-                evidence,
+                state.recovery.clone(),
             )
+        };
+        // Tools ran in this generation: only the agent's own record can say
+        // that nothing they started still runs.
+        let live_work = if session.client.has_unverified_live_work() {
+            let mark = session.client.live_work_mark();
+            let process = session.client.process_id()?;
+            let (directory, id) = (directory.clone(), id.clone());
+            let settled =
+                tokio::task::spawn_blocking(move || P::work_settled(&directory, &id, process))
+                    .await
+                    .unwrap_or(false);
+            if !settled {
+                return None;
+            }
+            Some(mark)
+        } else {
+            None
         };
         // At most one potentially large native history inspection per provider.
         let Ok(_inspection) = context.inspection.try_lock() else {
@@ -2883,20 +3118,41 @@ impl<P: AcpProvider> AcpDriver<P> {
         };
         let snapshot = P::recovery_snapshot(&context.binary, &directory, &id, stop)
             .await
-            .ok()?;
-        let verified = match evidence {
-            RecoveryEvidence::Loaded(expected) => {
-                snapshot.session_id == id && snapshot.checkpoint() == expected
+            .ok();
+        // The store holds the turn the Gateway saw, else at least the last
+        // exchange it shows (as a load proves it): a steered or interrupted
+        // turn leaves no turn evidence but may still be saved whole.
+        let verified = match &snapshot {
+            Some(snapshot) => {
+                let proven = match &evidence {
+                    Some(RecoveryEvidence::Loaded(expected)) => {
+                        snapshot.session_id == id && snapshot.checkpoint() == *expected
+                    }
+                    Some(RecoveryEvidence::Turn { before, expected }) => {
+                        snapshot.proves_turn(&id, before, expected)
+                    }
+                    None => false,
+                };
+                proven
+                    || (snapshot.session_id == id
+                        && Self::snapshot_matches_projection(
+                            snapshot,
+                            &session.state.lock().await.projection,
+                        ))
             }
-            RecoveryEvidence::Turn { before, expected } => {
-                snapshot.proves_turn(&id, &before, &expected)
-            }
+            None => false,
         };
-        if !verified {
+        let Some(snapshot) = snapshot.filter(|_| verified) else {
+            // Read a possibly large store again after another idle period,
+            // not every sweep.
+            session.state.lock().await.last_activity = tokio::time::Instant::now();
             return None;
-        }
+        };
         let confirmed = snapshot.checkpoint();
         drop(snapshot);
+        if live_work.is_some_and(|mark| !session.client.settle_live_work(mark)) {
+            return None;
+        }
         let retirement = session.client.retire(RETIREMENT_TIMEOUT);
         tokio::pin!(retirement);
         let mut result = loop {
@@ -3040,6 +3296,16 @@ impl<P: AcpProvider> AcpDriver<P> {
                         seq,
                     },
                 );
+            }
+            match dormant_kind {
+                DormantKind::Parked => {
+                    tracing::info!(session = %id, "idle ACP session released its process")
+                }
+                DormantKind::Unexpected => tracing::warn!(
+                    session = %id,
+                    reason = state.info.error.as_ref().map(|error| error.message.as_str()).unwrap_or("-"),
+                    "ACP session process ended"
+                ),
             }
             let compact = DormantSession::new(&state.info, state.owned_mutations, dormant_kind);
             drop(state);
@@ -3482,6 +3748,14 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
                     return Ok(AgentCatalog::default());
                 }
                 if self.retained(id).is_none() {
+                    // A terminal's process holds it: its mode cannot be
+                    // switched from here, so none is offered.
+                    if self.terminal_live(id).await.is_some() {
+                        let mut catalog = self.available_catalog(directory).await?;
+                        catalog.modes.clear();
+                        catalog.defaults.mode = None;
+                        return Ok(catalog);
+                    }
                     self.observed_snapshot(id).await?;
                     return self.available_catalog(directory).await;
                 }
@@ -3642,55 +3916,20 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
             }
             // Created here, possibly before the Gateway last restarted: load
             // it so its own agent deletes it.
-            if self.retained(id).is_none() && self.owns(id) {
+            if !P::DELETE_LISTED && self.retained(id).is_none() && self.owns(id) {
                 self.ensure_loaded(id).await?;
             }
             let _mutation = self.mutations.lock().await;
-            let session = self.retained(id).ok_or_else(|| {
-                AgentError::Unsupported(
-                    "deletion requires a session created by this Gateway".into(),
-                )
-            })?;
-            if !session.connected.load(Ordering::Acquire)
-                || !session.state.lock().await.owned_mutations
-                || !operations::supports_operation(&session.native_capabilities, "delete")
-            {
-                return Err(AgentError::Unsupported(
-                    "deletion requires an idle Gateway-created native session".into(),
-                ));
+            match self.retained(id) {
+                Some(session) => self.delete_live(id, &session).await?,
+                None if P::DELETE_LISTED => self.delete_saved(id).await?,
+                None => {
+                    return Err(AgentError::Unsupported(format!(
+                        "{} deletes only conversations started from Muqun on this computer",
+                        P::LABEL
+                    )))
+                }
             }
-            if session
-                .busy
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
-            {
-                return Err(AgentError::NotAvailable("session is busy".into()));
-            }
-            let _admission = Admission {
-                busy: &session.busy,
-                handed_off: false,
-            };
-            let params = operations::delete_params(id)?;
-            // Qoder resolves deletion through this connection's bound workspace.
-            // An unbound temporary client may acknowledge without deleting it.
-            let result = session
-                .client
-                .request_with_timeout("session/delete", params, RPC_TIMEOUT)
-                .await;
-            self.invalidate_session_lists().await;
-            let value = result.map_err(AgentError::RequestFailed)?;
-            if !value.is_object() {
-                return Err(protocol(
-                    "native deletion outcome is unknown; do not retry automatically",
-                ));
-            }
-            session.connected.store(false, Ordering::Release);
-            session.client.shutdown().await;
-            tokio::time::timeout(Duration::from_secs(5), session.finished.cancelled())
-                .await
-                .map_err(|_| {
-                    AgentError::NotAvailable("deleted session connection has not stopped".into())
-                })?;
             self.sessions.lock().unwrap().remove(id);
             self.dormant.lock().unwrap().remove(id);
             self.owned.lock().unwrap().forget(id);

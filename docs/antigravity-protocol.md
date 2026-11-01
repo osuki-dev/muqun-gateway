@@ -121,6 +121,10 @@ the steps between. A turn counts as stored when the checkpoint taken before the
 prompt is extended by exactly one entry whose user text and last reply text
 match what the live stream showed. Anything else keeps the child running.
 
+A child whose session ran a tool is kept: Antigravity has no record that says
+whether work a tool started (a background command) still runs, and closing
+the child could kill it. Only sessions that ran no tool are released.
+
 ## Feature parity
 
 | Capability | Antigravity ACP | Gateway |

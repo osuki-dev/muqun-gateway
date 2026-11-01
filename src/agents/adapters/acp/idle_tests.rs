@@ -196,6 +196,126 @@ while True:
     driver.shutdown().await;
 }
 
+/// The fixture with an agent-side record of settled work (Claude Code's
+/// session registry): `work-settled` in the workspace says nothing runs.
+struct SettledFixture;
+impl AcpProvider for SettledFixture {
+    const KIND: &'static str = "fx";
+    const LABEL: &'static str = "Settled fixture";
+    const ARGS: &'static [&'static str] = &["acp"];
+    const REQUIRE_MESSAGE_ID: bool = true;
+    const MODEL_SELECTION: bool = true;
+    const IDLE_RETIREMENT: bool = true;
+    fn recovery_snapshot<'a>(
+        binary: &'a str,
+        directory: &'a str,
+        id: &'a str,
+        stop: &'a CancellationToken,
+    ) -> AgentFuture<'a, NativeSnapshot> {
+        RecoverableFixture::recovery_snapshot(binary, directory, id, stop)
+    }
+    fn work_settled(directory: &str, _id: &str, _process: u32) -> bool {
+        std::path::Path::new(directory)
+            .join("work-settled")
+            .exists()
+    }
+    fn starts_background_work(update: &Value) -> bool {
+        update["rawInput"]["run_in_background"] == true
+    }
+}
+
+// A session that ran tools is released once the agent's own record says
+// nothing runs, never while that record says busy, a command it sent to the
+// background may still run, or an approval waits; it then reloads once.
+#[tokio::test]
+async fn tool_turns_retire_only_when_the_agent_records_settled_work() {
+    let fixture = Fixture::new().await;
+    let binary = fixture.directory.join("mock-fx");
+    let script = std::fs::read_to_string(&binary).unwrap().replace(
+        "        turn+=1",
+        "        turn+=1\n        if params['prompt'][0]['text'] in ('tool','background'):update(active,{'sessionUpdate':'tool_call','toolCallId':'tool-'+str(turn),'title':'Run mock tool','status':'completed','rawInput':{'command':'pwd','run_in_background':params['prompt'][0]['text']=='background'}})",
+    );
+    std::fs::write(&binary, script).unwrap();
+    let driver = AcpDriver::<SettledFixture>::new(
+        fixture.driver.binary.clone(),
+        fixture.driver.default_directory.clone(),
+        Arc::new(MemoryMirror::for_agent("fx")),
+        broadcast::channel(256).0,
+    );
+    driver.set_idle_timeout(Duration::from_secs(1));
+    let mut ids = Vec::new();
+    for prompt in ["tool", "background", "approval"] {
+        let info = driver.create_session(None, None, None).await.unwrap();
+        driver
+            .send_prompt(&info.asid.0, prompt, &[], None)
+            .await
+            .unwrap();
+        if prompt == "approval" {
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while driver
+                    .get_pending_permissions(&info.asid.0)
+                    .await
+                    .unwrap()
+                    .is_empty()
+                {
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+            })
+            .await
+            .unwrap();
+        } else {
+            idle(&driver, &info.asid.0).await.unwrap();
+        }
+        assert!(driver
+            .retained(&info.asid.0)
+            .unwrap()
+            .client
+            .has_unverified_live_work());
+        ids.push(info.asid.0);
+    }
+    let [tool, background, approval] = [&ids[0], &ids[1], &ids[2]];
+    let sweep = || async {
+        for id in &ids {
+            driver
+                .retained(id)
+                .unwrap()
+                .state
+                .lock()
+                .await
+                .last_activity = tokio::time::Instant::now() - Duration::from_secs(2);
+        }
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(31)).await;
+        tokio::time::resume();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    sweep().await;
+    assert!(ids.iter().all(|id| driver.retained(id).is_some()));
+
+    std::fs::write(fixture.directory.join("work-settled"), "idle").unwrap();
+    sweep().await;
+    dormant(&driver, tool).await;
+    assert_eq!(
+        driver.dormant.lock().unwrap()[tool].kind,
+        DormantKind::Parked
+    );
+    for kept in [background, approval] {
+        assert!(driver.retained(kept).unwrap().client.is_running());
+    }
+    driver.prepare_selected_session(tool).await.unwrap();
+    driver.prepare_selected_session(tool).await.unwrap();
+    assert!(driver.retained(tool).unwrap().client.is_running());
+    assert_eq!(
+        fixture
+            .methods()
+            .iter()
+            .filter(|method| *method == "session/load")
+            .count(),
+        1
+    );
+    driver.shutdown().await;
+}
+
 #[tokio::test]
 async fn direct_slash_delivery_pins_before_write_and_later_plain_turn_cannot_clear_it() {
     // Native extension commands can be absent from, or newer than, the last
@@ -288,6 +408,81 @@ async fn parked_restore_keeps_a_read_marker_written_while_native_load_is_pending
             .count(),
         1
     );
+    driver.shutdown().await;
+}
+
+// The App's "tap to refresh" while it opens a parked session: its first
+// open gives up (request timeout, closed request) and a refresh commits the
+// parked copy while the native load runs. Neither may kill the process that
+// is loading; the retried open attaches to it, and once the session is live
+// opening or refreshing it again starts nothing.
+#[tokio::test]
+async fn abandoned_open_and_refresh_during_load_attach_to_one_native_process() {
+    use crate::agents::use_cases::SessionService;
+    let fixture = Fixture::new().await;
+    let binary = fixture.directory.join("mock-fx");
+    let script = std::fs::read_to_string(&binary).unwrap().replace(
+        "    elif method=='session/load':",
+        "    elif method=='session/load':\n        if os.path.exists('block-load'):\n            with open('load-entered','w') as f:f.write('ready')\n            while os.path.exists('block-load'):time.sleep(0.002)",
+    );
+    std::fs::write(&binary, script).unwrap();
+    let driver = driver(&fixture);
+    let service = SessionService::with_memory_mirror(driver.clone(), driver.mirror.clone());
+    let info = driver.create_session(None, None, None).await.unwrap();
+    driver
+        .send_prompt(&info.asid.0, "saved turn", &[], None)
+        .await
+        .unwrap();
+    idle(&driver, &info.asid.0).await.unwrap();
+    expire(&driver, &info.asid.0).await;
+    dormant(&driver, &info.asid.0).await;
+    let count = |name: &str| {
+        fixture
+            .methods()
+            .iter()
+            .filter(|method| *method == name)
+            .count()
+    };
+    assert_eq!(count("initialize"), 1);
+
+    std::fs::write(fixture.directory.join("block-load"), "wait").unwrap();
+    let opening = driver.clone();
+    let id = info.asid.0.clone();
+    let abandoned = tokio::spawn(async move { opening.prepare_selected_session(&id).await });
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !fixture.directory.join("load-entered").exists() {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .unwrap();
+    abandoned.abort();
+    assert!(abandoned.await.unwrap_err().is_cancelled());
+    service.refresh_snapshot(&info.asid).await.unwrap();
+    let opening = driver.clone();
+    let id = info.asid.0.clone();
+    let retried = tokio::spawn(async move { opening.prepare_selected_session(&id).await });
+    tokio::task::yield_now().await;
+    std::fs::remove_file(fixture.directory.join("block-load")).unwrap();
+    retried.await.unwrap().unwrap();
+
+    let session = driver.retained(&info.asid.0).unwrap();
+    assert!(session.connected.load(Ordering::Acquire));
+    assert!(session.client.is_running());
+    assert_eq!(
+        driver
+            .mirror
+            .get_snapshot(&info.asid)
+            .await
+            .unwrap()
+            .timeline
+            .len(),
+        2
+    );
+    driver.prepare_selected_session(&info.asid.0).await.unwrap();
+    service.refresh_snapshot(&info.asid).await.unwrap();
+    assert!(session.client.is_running());
+    assert_eq!((count("initialize"), count("session/load")), (2, 1));
     driver.shutdown().await;
 }
 
@@ -705,4 +900,84 @@ async fn native_round_trip<P: AcpProvider>(binary: String) {
         }
         Err(error) => panic!("isolated native idle acceptance failed: {error}"),
     }
+}
+
+/// An agent whose `session/delete` finds any saved session (Claude Code).
+struct ListedDelete;
+impl AcpProvider for ListedDelete {
+    const KIND: &'static str = "fx";
+    const LABEL: &'static str = "Listed fixture";
+    const ARGS: &'static [&'static str] = &["--acp"];
+    const REQUIRE_MESSAGE_ID: bool = false;
+    const MODEL_SELECTION: bool = true;
+    const DELETE_LISTED: bool = true;
+}
+
+// A listed session started elsewhere is deleted through a short-lived child
+// without loading it; an agent that deletes only its own sessions says so.
+#[tokio::test]
+async fn listed_sessions_are_deleted_without_loading_where_the_agent_allows_it() {
+    let fixture = Fixture::new().await;
+    let binary = fixture.directory.join("mock-fx");
+    let script = std::fs::read_to_string(&binary).unwrap().replace(
+        "        if active!=params['sessionId']:",
+        "        if params['sessionId'] not in read():",
+    );
+    std::fs::write(&binary, script).unwrap();
+    let mut ids = Vec::new();
+    for prompt in ["first elsewhere", "second elsewhere"] {
+        let info = fixture
+            .driver
+            .create_session(None, None, None)
+            .await
+            .unwrap();
+        fixture
+            .driver
+            .send_prompt(&info.asid.0, prompt, &[], None)
+            .await
+            .unwrap();
+        idle(&fixture.driver, &info.asid.0).await.unwrap();
+        ids.push(info.asid.0);
+    }
+    fixture.driver.shutdown().await;
+
+    let own_only = driver(&fixture);
+    let refused = own_only.delete_session(&ids[1]).await;
+    assert!(
+        matches!(&refused, Err(AgentError::Unsupported(message)) if message.contains("started from Muqun")),
+        "{refused:?}"
+    );
+    own_only.shutdown().await;
+
+    let listed = AcpDriver::<ListedDelete>::new(
+        fixture.driver.binary.clone(),
+        fixture.driver.default_directory.clone(),
+        Arc::new(MemoryMirror::for_agent("fx")),
+        broadcast::channel(256).0,
+    );
+    let loads = fixture
+        .methods()
+        .iter()
+        .filter(|m| *m == "session/load")
+        .count();
+    listed.delete_session(&ids[0]).await.unwrap();
+    assert_eq!(
+        fixture
+            .methods()
+            .iter()
+            .filter(|m| *m == "session/load")
+            .count(),
+        loads,
+        "deleting must not resume the session"
+    );
+    let remaining: Vec<_> = listed
+        .list_sessions(&Default::default())
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|info| info.asid.0)
+        .collect();
+    assert_eq!(remaining, [ids[1].clone()]);
+    assert!(!listed.has_live_stream());
+    listed.shutdown().await;
 }

@@ -2,6 +2,29 @@
 
 ## Changes and fixes
 
+- **Refreshing a Claude Code session no longer starts and kills processes.**
+  Tapping "Status unknown, tap to refresh" while the session was being opened
+  made the open fail ("ACP session changed while loading") and shut down the
+  process it had just started; each retry and tap started another. A session
+  now loads once at a time, a refresh or an abandoned open no longer discards
+  the load, and opening a live session starts nothing. A long turn is no
+  longer killed after 10 minutes. (Claude Code, Antigravity, Cursor, FX,
+  Qoder.)
+
+- **Idle Claude Code sessions release their processes.** A session that had
+  run any tool kept its adapter and `claude` until the Gateway stopped. After
+  an hour of idleness it is now released once Claude Code itself records the
+  session idle (no turn, background subagent or command), and reopens on the
+  next visit. Antigravity and Cursor still keep a session that ran tools.
+
+- **Any Claude Code session listed on Home can be deleted**, not only those
+  created from Muqun, using Claude Code's own delete; one open in a terminal
+  still cannot. Refusals explain why.
+
+- **Claude Code's permission modes are offered before a session starts**
+  (Manual, Accept edits, Plan, Auto, Bypass permissions), instead of no modes
+  or another agent's. A session open in a terminal offers none.
+
 - **Home names the model an ACP agent actually starts with.** Before a
   session is open, the model list kept from an earlier session has no current
   model, so the App showed the first one listed: "Fable 5" for Claude Code,

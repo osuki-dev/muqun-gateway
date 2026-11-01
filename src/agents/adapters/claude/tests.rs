@@ -76,6 +76,16 @@ async fn listing_starts_nothing_and_sessions_get_launch_mcp_and_model() {
         ..Default::default()
     };
     assert!(driver.list_sessions(&query).await.unwrap().is_empty());
+    // The permission modes are listed before any adapter runs.
+    let modes: Vec<_> = driver
+        .get_catalog(Some(&cwd))
+        .await
+        .unwrap()
+        .modes
+        .into_iter()
+        .map(|mode| mode.id)
+        .collect();
+    assert_eq!(modes[..4], ["default", "acceptEdits", "plan", "auto"]);
     assert!(!directory.join("launch.log").exists());
 
     let model = ModelRef {
@@ -166,10 +176,13 @@ async fn listing_starts_nothing_and_sessions_get_launch_mcp_and_model() {
         driver.get_timeline(id, 100).await.unwrap();
         driver.load_earlier_timeline(id, 50).await.unwrap();
         assert!(driver.get_pending_permissions(id).await.unwrap().is_empty());
-        driver
+        // Its mode belongs to the terminal: none is offered to switch.
+        assert!(driver
             .get_catalog_for_session(Some(id), Some(&cwd))
             .await
-            .unwrap();
+            .unwrap()
+            .modes
+            .is_empty());
         let terminal = |result: Result<(), AgentError>| {
             matches!(result, Err(AgentError::TerminalInteraction(_)))
         };

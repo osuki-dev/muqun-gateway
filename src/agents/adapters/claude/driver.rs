@@ -31,6 +31,9 @@ impl AcpProvider for ClaudeProvider {
     const SYSTEM_PROMPT: bool = true;
     // `_session/rename` is offered to JetBrains AIR clients only.
     const RENAME_COMMAND: Option<&'static str> = Some("/rename");
+    // `session/delete` is the SDK's transcript delete, which finds a saved
+    // session without loading it (adapter 0.99.1).
+    const DELETE_LISTED: bool = true;
     fn recovery_snapshot<'a>(
         _binary: &'a str,
         directory: &'a str,
@@ -52,6 +55,18 @@ impl AcpProvider for ClaudeProvider {
     ) -> AgentFuture<'a, Option<(String, Option<String>)>> {
         Box::pin(super::recovery::transcript_model(directory, id))
     }
+    fn static_modes() -> Vec<crate::agents::domain::ModeInfo> {
+        permission_modes()
+    }
+    fn work_settled(_directory: &str, id: &str, process: u32) -> bool {
+        super::native_sessions::idle_under(id, process)
+    }
+    fn starts_background_work(update: &Value) -> bool {
+        matches!(
+            update["sessionUpdate"].as_str(),
+            Some("tool_call" | "tool_call_update")
+        ) && update["rawInput"]["run_in_background"].as_bool() == Some(true)
+    }
     fn transcript_modified(directory: &str, id: &str) -> Option<std::time::SystemTime> {
         super::recovery::transcript_modified(directory, id)
     }
@@ -69,6 +84,43 @@ impl AcpProvider for ClaudeProvider {
     }
 }
 pub type ClaudeDriver = AcpDriver<ClaudeProvider>;
+
+/// The permission modes claude-agent-acp 0.99.1 offers every session
+/// (`modes.availableModes`, ids and names as it reports them). It offers
+/// `bypassPermissions` unless it runs as root outside a sandbox
+/// (`IS_SANDBOX`) or Claude Code's settings disable it; a live session's own
+/// list replaces this one.
+pub(crate) fn permission_modes() -> Vec<crate::agents::domain::ModeInfo> {
+    let root = unsafe { libc::geteuid() } == 0;
+    let bypass = !root || std::env::var_os("IS_SANDBOX").is_some_and(|value| !value.is_empty());
+    [
+        ("default", "Manual", "Always ask before making changes"),
+        (
+            "acceptEdits",
+            "Accept edits",
+            "Automatically accept all file edits",
+        ),
+        ("plan", "Plan", "Create a plan before making changes"),
+        ("auto", "Auto", "Claude handles permission decisions"),
+        (
+            "bypassPermissions",
+            "Bypass permissions",
+            "Accepts all permissions",
+        ),
+    ]
+    .into_iter()
+    .filter(|(id, _, _)| bypass || *id != "bypassPermissions")
+    .map(|(id, name, description)| crate::agents::domain::ModeInfo {
+        id: id.into(),
+        name: name.into(),
+        model: None,
+        description: Some(description.into()),
+        mode: None,
+        color: None,
+        hidden: false,
+    })
+    .collect()
+}
 
 /// Exact adapter messages only; arbitrary native diagnostics are never shown.
 pub(crate) fn safe_error_message(error: &Value) -> Option<&'static str> {

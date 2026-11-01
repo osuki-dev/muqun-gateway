@@ -48,7 +48,6 @@ struct Reply {
 
 struct State {
     provider: &'static str,
-    #[cfg(test)]
     process_id: Option<u32>,
     safe_error_message: SafeErrorMessage,
     pending: Mutex<HashMap<u64, Reply>>,
@@ -59,6 +58,8 @@ struct State {
     retiring: AtomicBool,
     work_guard_armed: AtomicBool,
     live_execution_seen: AtomicBool,
+    /// Bumped with every execution evidence; see `settle_live_work`.
+    live_executions: AtomicU64,
     exit_success: Mutex<Option<bool>>,
     stdout_drained: CancellationToken,
     stderr_drained: CancellationToken,
@@ -155,6 +156,16 @@ pub struct AcpRequest {
 impl AcpRequest {
     pub async fn wait(self) -> Result<Value, String> {
         self.wait_with_timeout(REQUEST_TIMEOUT).await
+    }
+
+    /// A prompt's turn lasts as long as the agent works: it ends with the
+    /// agent's answer, a cancel or the process exiting, never with a timeout
+    /// that would kill the agent in the middle of a long turn.
+    pub async fn wait_for_turn(mut self) -> Result<Value, String> {
+        let reply = self.reply.take().expect("request waited once");
+        reply
+            .await
+            .unwrap_or_else(|_| Err(self.state.disconnected()))
     }
 
     pub async fn wait_with_timeout(mut self, timeout: Duration) -> Result<Value, String> {
@@ -256,7 +267,6 @@ impl AcpClient {
         let (events, _) = broadcast::channel(EVENT_CAPACITY);
         let state = Arc::new(State {
             provider,
-            #[cfg(test)]
             process_id: child.id(),
             safe_error_message,
             pending: Mutex::new(HashMap::new()),
@@ -267,6 +277,7 @@ impl AcpClient {
             retiring: AtomicBool::new(false),
             work_guard_armed: AtomicBool::new(false),
             live_execution_seen: AtomicBool::new(false),
+            live_executions: AtomicU64::new(0),
             exit_success: Mutex::new(None),
             stdout_drained: CancellationToken::new(),
             stderr_drained: CancellationToken::new(),
@@ -434,7 +445,7 @@ impl AcpClient {
         Ok(client)
     }
 
-    #[cfg(test)]
+    /// The child this client started (the adapter or runner it spawned).
     pub(crate) fn process_id(&self) -> Option<u32> {
         self.state.process_id
     }
@@ -444,7 +455,8 @@ impl AcpClient {
     }
 
     /// Initial native load replay is history, not work owned by this child.
-    /// Once armed, execution evidence is never cleared for this generation.
+    /// Once armed, execution evidence stays for this generation unless the
+    /// agent's own record proves it settled (`settle_live_work`).
     #[cfg(test)]
     pub fn arm_live_work_guard(&self) {
         let _admission = locked(&self.state.pending);
@@ -460,6 +472,26 @@ impl AcpClient {
         self.state
             .live_execution_seen
             .store(true, Ordering::Release);
+        self.state.live_executions.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Where the execution evidence stands; pass it to `settle_live_work`.
+    pub fn live_work_mark(&self) -> u64 {
+        self.state.live_executions.load(Ordering::Acquire)
+    }
+
+    /// Clear the execution evidence once the agent's own record says that
+    /// nothing it started still runs, unless more arrived since `mark` was
+    /// taken (that work is not covered by the record that was read).
+    pub fn settle_live_work(&self, mark: u64) -> bool {
+        let _admission = locked(&self.state.pending);
+        if self.state.live_executions.load(Ordering::Acquire) != mark {
+            return false;
+        }
+        self.state
+            .live_execution_seen
+            .store(false, Ordering::Release);
+        true
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<AcpEvent> {
@@ -813,6 +845,7 @@ async fn dispatch(
             let _admission = locked(&state.pending);
             if state.work_guard_armed.load(Ordering::Acquire) {
                 state.live_execution_seen.store(true, Ordering::Release);
+                state.live_executions.fetch_add(1, Ordering::AcqRel);
             }
         }
         if let Some(id) = value.get("id") {

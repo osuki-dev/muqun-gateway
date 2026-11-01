@@ -317,6 +317,11 @@ impl ClaudeState {
                         .map(crate::discovery::model_info_to_agent_model)
                         .collect();
                     info.features = features_for_models(&info.models);
+                    info.modes = catalog
+                        .modes
+                        .iter()
+                        .map(crate::discovery::mode_info_to_agent_mode)
+                        .collect();
                 }
                 super::apply_acp_capabilities(
                     &mut info.features,
@@ -328,6 +333,10 @@ impl ClaudeState {
         }
         match self.config.probe().await {
             Ok(found) => {
+                info.modes = crate::agents::adapters::claude::driver::permission_modes()
+                    .iter()
+                    .map(crate::discovery::mode_info_to_agent_mode)
+                    .collect();
                 info.version = claude_version(&found.claude).await;
                 info.status = if info.version.is_some() {
                     AgentAvailability::Reachable

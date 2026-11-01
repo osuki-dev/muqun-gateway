@@ -49,6 +49,13 @@ starts on the first session open, create or prompt, serves that session,
 and is released after `idle_timeout_secs` of verified idleness (below).
 Listing sessions never starts it.
 
+A session is loaded once at a time: repeated or concurrent opens (an App
+retry, a refresh while it loads) wait for the same load, a caller that stops
+waiting does not stop it, and an open of a live session starts nothing. A
+refresh committed during the load does not discard the loaded process. A
+turn has no time limit; it ends with the agent's answer, Stop, or the process
+exiting. When a session's process ends unexpectedly the Gateway logs why.
+
 ## Methods used
 
 | Method | Use | Observed shape (0.99.1) |
@@ -100,7 +107,12 @@ modes; the current one is the session's `mode`. Picking one calls
 `session/set_mode`, as does creating a session with a mode. The mode belongs
 to the session: the adapter calls Claude Code's `setPermissionMode` for that
 query only, and a load continues in the transcript's last mode (verified).
-A new session starts in the user's `permissions.defaultMode`. Observed:
+A new session starts in the user's `permissions.defaultMode`.
+These modes are fixed by the adapter, so the catalog and discovery list them
+before any adapter has run (`bypassPermissions` unless the Gateway runs as
+root outside a sandbox; a live session's own list replaces them, which also
+drops bypass when Claude Code's settings disable it). A session held by a
+terminal lists no modes: its mode belongs to that terminal. Observed:
 switching into and out of `plan` can change the session's model (Claude Code's
 plan-mode model); the App sees the new model in the session update.
 
@@ -159,13 +171,15 @@ removed (followed by a resume without it) when the task ends.
 ## Deleting
 
 `session/delete` is the SDK's transcript delete, Claude Code's own semantics
-(an id without a transcript succeeds). Only sessions this Gateway created or
-forked are deleted. Their ids are kept in `claude-owned-sessions.json` in the
-Gateway state directory (at most 4096, newest kept), so a session created
-before a Gateway restart is loaded and deleted by its adapter after it; a
-session started elsewhere answers unsupported, and one held by a terminal
-`409`. Discovery declares `sessionDelete` and `sessionFork` before any
-adapter has started.
+(an id without a transcript succeeds; it finds the transcript in any project
+directory without loading the session). Every listed session can therefore be
+deleted, as in Claude Code's own session list, whether or not this Gateway
+created it: a live one through its own child, which is then stopped (refused
+while a turn runs), a saved one through a short-lived adapter that resumes
+nothing. A session held by a terminal answers `409`. Ids of sessions this
+Gateway created or forked are still kept in `claude-owned-sessions.json`
+(at most 4096) for the other ownership rules. Discovery declares
+`sessionDelete` and `sessionFork` before any adapter has started.
 
 ## muqun MCP
 
@@ -210,7 +224,19 @@ holding that prompt and the text of the turn's final assistant message (one
 record per content block, joined by `message.id`). Interrupt markers, task
 notifications, tool results and sidechains are not prompts. If the transcript
 is unsettled, too large, or does not prove the turn the Gateway saw, the child
-is simply kept.
+is simply kept. A turn without such evidence (steered, interrupted) still
+counts when the transcript's last prompt and reply are the ones the session
+shows. A failed check is retried after another idle period, not every sweep.
+
+A child whose session ran tools may have started work that outlives the turn
+(a background command or subagent), which closing it would kill. It is
+released only when Claude Code's own registry entry for it
+(`<config>/sessions/<pid>.json` of the `claude` under the adapter) says
+`idle`; Claude Code keeps it `busy` while a turn runs and, observed with
+2.1.314, while a background subagent of the session still runs. A session that
+sent a command to the background (`rawInput.run_in_background`) keeps its
+child until it is closed otherwise. Retirement never runs during a turn or
+while an approval or question waits.
 
 ## A conversation that is open in a terminal
 
@@ -271,7 +297,7 @@ does not lock it.
 | Interrupt | `session/cancel` → `stopReason: "cancelled"` | implemented (Escape for a terminal-held session) |
 | Steer while running | `_session/steering` | implemented (`promptSteering`); verified live |
 | Queue while running | native `promptQueueing` (verified) | not offered: the native queue has no list, edit or per-item cancel, and Gateway keeps no ACP inbox |
-| Fork / delete | `sessionCapabilities.fork`, `delete` | implemented for Gateway-created sessions, also after a Gateway restart; delete verified live |
+| Fork / delete | `sessionCapabilities.fork`, `delete` | fork for Gateway-created sessions; delete for every listed session not held by a terminal; delete verified live for a Gateway-created session |
 | Rename / title | generated title (`session_info_update`); `/rename` command (`_session/rename` is AIR-only) | implemented through `/rename`; verified live |
 | Image / file attachments | `promptCapabilities.image`, `embeddedContext` | implemented (shared prompt parts) |
 | Approvals | `session/request_permission` | implemented (shared); asked only when Claude Code's own permission mode asks |
