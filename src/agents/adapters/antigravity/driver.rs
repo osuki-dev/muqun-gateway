@@ -26,8 +26,13 @@ impl AcpProvider for AntigravityProvider {
     // wire shape is undocumented and unverified; until it is, the task
     // sentence goes in the prompt.
     const TASK_SENTENCE_IN_PROMPT: bool = true;
-    // A stored Google login answers in milliseconds; without one `agy`
-    // opens a browser sign-in and waits for it.
+    // Every child pays `authenticate` before `session/load`, which agy
+    // answers only after two Google API calls (2.0-2.7 s measured): a cold
+    // open is ~2.5-3 s, the load itself 0.1-0.4 s. So a released child is
+    // kept an hour, not five minutes, at ~350 MB resident each
+    // (docs/antigravity-protocol.md, "Idle retirement").
+    const IDLE_TIMEOUT: Duration = Duration::from_secs(3600);
+    // Without a stored login `agy` opens a browser sign-in and waits for it.
     const AUTHENTICATE: Option<Authenticate> = Some(Authenticate {
         method: "oauth-personal",
         timeout: Duration::from_secs(20),

@@ -13,7 +13,7 @@ Antigravity. The terminal launcher keeps its separate `agy` kind, so starting
 `agy` in a pane is unchanged.
 
 ```json
-{ "antigravity": { "enabled": true, "binary": "/absolute/path/to/agy", "idle_timeout_secs": 300 } }
+{ "antigravity": { "enabled": true, "binary": "/absolute/path/to/agy", "idle_timeout_secs": 3600 } }
 ```
 
 All three keys are optional and the block is omitted from a saved config while
@@ -36,8 +36,11 @@ when a Google login is already stored on the computer (agy 1.4 keeps it in the
 system keyring). Gateway therefore sends `authenticate` with method
 `oauth-personal` right after `initialize`, when that method is offered:
 
-- Signed in: answered in milliseconds; the result carries the account tier in
-  `_meta.antigravity.tier`.
+- Signed in: answered once agy has made two Google API calls (`loadCodeAssist`,
+  `fetchAvailableModels`), 2.0–2.7 s measured with agy 1.4.12; the result
+  carries the account tier in `_meta.antigravity.tier`. This is most of a cold
+  open (the `session/load` replay itself is 0.1–0.4 s), which is why a child is
+  kept warm for an hour (below).
 - Not signed in: agy starts a loopback browser sign-in
   (`oauth_loopback.go: Opening browser for ACP sign-in`) and does not answer
   until it completes; a cancelled sign-in answers `-32800 Sign-in was
@@ -113,7 +116,13 @@ user's own agy MCP configuration is untouched.
 ## Idle retirement
 
 Verified idle conversations release their child after
-`antigravity.idle_timeout_secs` (default 300, checked every 30 seconds). The
+`antigravity.idle_timeout_secs` (default 3600, checked every 30 seconds). The
+window is an hour rather than the five minutes of the other ACP agents because
+every new child pays the `authenticate` round trip above before it can load,
+so each release makes the next open of that conversation ~2.5–3 s slower; an
+idle `agy acp` costs about 350 MB resident and polls Google every six minutes
+while it waits. The window counts from the last turn end or explicit open;
+reads in the background never extend it. The
 evidence is the conversation's own `~/.gemini/antigravity-cli/conversations/<id>.db`
 read-only: one entry per user-input step (kind 14) with its text (protobuf field
 19.2), the text of each model reply step (kind 15, field 20.1) and the kinds of

@@ -9,7 +9,7 @@ use tokio::sync::{broadcast, mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 
 use super::client::AcpRetirement;
-use super::idle::{IdleSignals, IdleVerdict};
+use super::idle::{IdleSignals, IdleVerdict, Warm};
 use super::mapper::{self, Permission, Projection};
 use super::operations::{self, PromptCapabilities};
 use super::recovery::{self, Checkpoint, NativeSnapshot, TurnEvidence};
@@ -32,6 +32,11 @@ pub trait AcpProvider: Send + Sync + 'static {
     const MODEL_SELECTION: bool;
     const SESSION_NOTICES: bool = false;
     const IDLE_RETIREMENT: bool = false;
+    /// How long a child stays warm after its last turn or explicit open
+    /// before idle retirement is considered, unless the agent's
+    /// `idle_timeout_secs` says otherwise. Longer where starting a child is
+    /// slow (a sign-in round trip), as every release makes the next open cold.
+    const IDLE_TIMEOUT: Duration = Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS);
     /// How long `initialize` may take; a runner that downloads the agent on
     /// first use needs longer than a normal request.
     const INITIALIZE_TIMEOUT: Duration = RPC_TIMEOUT;
@@ -615,7 +620,7 @@ impl<P: AcpProvider> AcpDriver<P> {
             tx,
             sessions: Arc::new(StdMutex::new(HashMap::new())),
             dormant: Arc::new(StdMutex::new(HashMap::new())),
-            idle_timeout_secs: Arc::new(AtomicU64::new(DEFAULT_IDLE_TIMEOUT_SECS)),
+            idle_timeout_secs: Arc::new(AtomicU64::new(P::IDLE_TIMEOUT.as_secs())),
             inspection: Arc::new(Mutex::new(())),
             connections: StdMutex::new(Vec::new()),
             connection_admission: Mutex::new(()),
@@ -3162,13 +3167,13 @@ impl<P: AcpProvider> AcpDriver<P> {
         let window = Duration::from_secs(context.idle_timeout_secs.load(Ordering::Acquire));
         let (id, directory, evidence, baseline) = {
             let state = session.state.lock().await;
-            if state.info.status != AgentSessionStatus::Idle
-                || !state.permissions.is_empty()
-                || !state.forms.is_empty()
-                || state.background_work
-                || !parked_metadata_fits(&state.info)
-                || state.last_activity.elapsed() < window
-            {
+            let warm = Warm {
+                in_turn: state.info.status != AgentSessionStatus::Idle,
+                answer_pending: !state.permissions.is_empty() || !state.forms.is_empty(),
+                background_work: state.background_work,
+                idle_for: state.last_activity.elapsed(),
+            };
+            if warm.keeps(window) || !parked_metadata_fits(&state.info) {
                 return None;
             }
             (
