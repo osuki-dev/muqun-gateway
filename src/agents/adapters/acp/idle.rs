@@ -45,6 +45,29 @@ pub(crate) struct IdleSignals {
     pub store: Option<Work>,
 }
 
+/// What a live child's own session says at a sweep, before any evidence is
+/// read from outside it.
+pub(crate) struct Warm {
+    /// A turn runs: the session is not idle.
+    pub in_turn: bool,
+    /// A permission or a form waits for the user's answer.
+    pub answer_pending: bool,
+    /// This generation started work that outlives its tool call.
+    pub background_work: bool,
+    /// Since the session's last turn end or explicit open.
+    pub idle_for: Duration,
+}
+
+impl Warm {
+    /// The child is kept without reading any evidence: a turn runs, an
+    /// answer is awaited, work it started may still run, or the warm window
+    /// since its last activity has not elapsed. Only past this are the
+    /// [`IdleSignals`] read.
+    pub(crate) fn keeps(&self, window: Duration) -> bool {
+        self.in_turn || self.answer_pending || self.background_work || self.idle_for < window
+    }
+}
+
 /// The process signal: `now` within `baseline`, both read.
 pub(crate) fn process_work(
     now: Option<&HashSet<ProcessKey>>,
@@ -222,6 +245,78 @@ mod tests {
                 store: Some(store_work(store, now, window)),
             };
             assert_eq!(idle_verdict(&signals), want, "{name}");
+        }
+    }
+
+    // The sweep in order: the session's own state first (kept without
+    // reading anything: `None`), the evidence only past the warm window.
+    #[test]
+    fn a_warm_child_is_kept_until_the_window_elapses_and_the_evidence_agrees() {
+        use IdleVerdict::{Rearm, Retire};
+        let window = Duration::from_secs(3600);
+        let quiet = IdleSignals {
+            registry: None,
+            processes: Work::Quiet,
+            store: Some(Work::Quiet),
+        };
+        // A subagent or script the child started: a process not in its baseline.
+        let subagent = IdleSignals {
+            registry: None,
+            processes: Work::Active,
+            store: Some(Work::Quiet),
+        };
+        let idle = |secs| Warm {
+            in_turn: false,
+            answer_pending: false,
+            background_work: false,
+            idle_for: Duration::from_secs(secs),
+        };
+        for (name, warm, signals, want) in [
+            ("idle past the window", idle(3601), &quiet, Some(Retire)),
+            (
+                "idle exactly at the window",
+                idle(3600),
+                &quiet,
+                Some(Retire),
+            ),
+            ("warm window not elapsed", idle(3599), &quiet, None),
+            ("just opened", idle(0), &quiet, None),
+            (
+                "in a turn",
+                Warm {
+                    in_turn: true,
+                    ..idle(7200)
+                },
+                &quiet,
+                None,
+            ),
+            (
+                "pending permission",
+                Warm {
+                    answer_pending: true,
+                    ..idle(7200)
+                },
+                &quiet,
+                None,
+            ),
+            (
+                "background command started",
+                Warm {
+                    background_work: true,
+                    ..idle(7200)
+                },
+                &quiet,
+                None,
+            ),
+            (
+                "subagent process running",
+                idle(7200),
+                &subagent,
+                Some(Rearm),
+            ),
+        ] {
+            let got = (!warm.keeps(window)).then(|| idle_verdict(signals));
+            assert_eq!(got, want, "{name}");
         }
     }
 }

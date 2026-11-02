@@ -28,8 +28,8 @@
 - **Idle ACP sessions release their processes after 5 minutes, only on
   evidence.** A Claude Code session that had run any tool kept its adapter and
   `claude` until the Gateway stopped. The default `idle_timeout_secs` is now
-  300 (was 3600) for Claude Code, Antigravity, Cursor, FX and Qoder (Pi keeps
-  its own hour), and the timer alone never decides: the session must have no
+  300 (was 3600) for Claude Code, Cursor, FX and Qoder (Antigravity and Pi
+  keep an hour, see below), and the timer alone never decides: the session must have no
   turn or question waiting, its process tree no process started after its
   first prompt (a script or background command), its transcript or store no
   write during the window, and -- for Claude Code -- its own registry entry
@@ -37,6 +37,16 @@
   the window again; a signal that cannot be read keeps the process. A released
   session reopens on the next visit. Antigravity and Cursor sessions that ran
   tools are now released on the same evidence.
+
+- **Opening an Antigravity conversation again within the hour is instant.**
+  Each `agy acp` child answers `authenticate` only after two Google API calls
+  (2.0–2.7 s measured), so a conversation whose child had been released cost
+  ~2.5–3 s to open again while the App showed its spinner; released after five
+  idle minutes, most reopens were cold. Antigravity's default
+  `idle_timeout_secs` is now 3600; the idle evidence (no turn or question
+  waiting, no process it started, no store write in the window) is unchanged,
+  and an explicit `antigravity.idle_timeout_secs` is kept. An idle child costs
+  about 350 MB of memory for that hour.
 
 - **Claude Code sessions report their token usage.** The context sheet showed
   session tokens, input, output, thinking and cache counts as unavailable for

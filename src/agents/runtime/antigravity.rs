@@ -17,13 +17,16 @@ pub struct AntigravityConfig {
     /// An absolute executable path, otherwise normal PATH lookup of `agy`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binary: Option<String>,
-    /// Release verified idle native children; background reads never extend it.
+    /// Release verified idle native children after this long (default one
+    /// hour: each new child pays agy's ~2.5 s Google sign-in round trip);
+    /// background reads never extend it.
     #[serde(default = "default_idle_timeout_secs")]
     pub idle_timeout_secs: u64,
 }
 
 fn default_idle_timeout_secs() -> u64 {
-    crate::agents::adapters::acp::session::DEFAULT_IDLE_TIMEOUT_SECS
+    use crate::agents::adapters::acp::session::AcpProvider;
+    crate::agents::adapters::antigravity::driver::AntigravityProvider::IDLE_TIMEOUT.as_secs()
 }
 
 impl Default for AntigravityConfig {
@@ -270,7 +273,7 @@ mod tests {
         let config: AntigravityConfig = serde_json::from_str("{}").unwrap();
         assert_eq!(config, AntigravityConfig::default());
         assert!(config.enabled);
-        assert_eq!(config.idle_timeout_secs, 300);
+        assert_eq!(config.idle_timeout_secs, 3600);
         assert!(serde_json::from_str::<AntigravityConfig>(r#"{"token":"secret"}"#).is_err());
         let relative = AntigravityConfig {
             binary: Some("agy --unsafe".into()),
