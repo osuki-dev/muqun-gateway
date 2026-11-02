@@ -2490,28 +2490,46 @@ macro_rules! session_manager_or_err {
     }};
 }
 
-/// The manager that owns a session. Nothing attached is 503; an agent is
-/// attached but none of them knows the id is 404, so a session id from before
-/// a restart is never handed to an agent that will not recognise it.
+/// The manager that owns a session. A recorded owner that is not attached,
+/// or nothing attached at all, is 503: the session exists and the app
+/// retries. Only an id no route and no attached agent knows is 404, which
+/// the app takes as the session being gone, so a session id from before a
+/// restart is never handed to an agent that will not recognise it either.
 async fn session_manager_or_err(
     state: &AppState,
     asid: &str,
 ) -> ApiResult<std::sync::Arc<super::manager::AgentManager>> {
-    if let Some(manager) = state.agent_runtime.request_manager_for_session(asid).await {
-        return Ok(manager);
+    use super::SessionOwnerMiss;
+    match state.agent_runtime.request_manager_for_session(asid).await {
+        Ok(manager) => Ok(manager),
+        Err(SessionOwnerMiss::OwnerNotAttached(agent_id)) => {
+            tracing::warn!(
+                asid,
+                agent_id,
+                "the agent that owns the session is not attached"
+            );
+            Err(api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "agent_unavailable",
+                &format!("Agent '{agent_id}' owns this session but is not available"),
+            ))
+        }
+        Err(SessionOwnerMiss::Unknown) if state.agent_runtime.all_managers().await.is_empty() => {
+            Err(api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "agent_unavailable",
+                "No agent is available",
+            ))
+        }
+        Err(SessionOwnerMiss::Unknown) => {
+            tracing::warn!(asid, "no attached agent owns the session");
+            Err(api_error(
+                StatusCode::NOT_FOUND,
+                "session_not_found",
+                "No attached agent owns this session",
+            ))
+        }
     }
-    if state.agent_runtime.all_managers().await.is_empty() {
-        return Err(api_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "agent_unavailable",
-            "No agent is available",
-        ));
-    }
-    Err(api_error(
-        StatusCode::NOT_FOUND,
-        "session_not_found",
-        "No attached agent owns this session",
-    ))
 }
 
 fn agent_error(err: super::ports::agent::AgentError) -> (StatusCode, Json<Value>) {
@@ -4339,6 +4357,31 @@ mod tests {
             )
             .await;
             assert_eq!(response.status(), status);
+        }
+    }
+
+    /// A session whose recorded owner is not attached is retryable, never
+    /// "gone": the app deletes its row for a 404 and nothing brings it back.
+    #[tokio::test]
+    async fn reading_a_session_whose_owner_is_not_attached_is_retryable_not_missing() {
+        for (recorded, status, code) in [
+            (
+                Some("claude"),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "agent_unavailable",
+            ),
+            (None, StatusCode::NOT_FOUND, "session_not_found"),
+        ] {
+            let state = state_with(vec![FakeAgent::new("fx")]).await;
+            if let Some(agent_id) = recorded {
+                state
+                    .agent_runtime
+                    .record_session_route("ses_1", agent_id)
+                    .await;
+            }
+            let response = get_response(state, "/api/agent-sessions/ses_1", device_headers()).await;
+            assert_eq!(response.status(), status, "recorded={recorded:?}");
+            assert_eq!(body_json(response).await["error"]["code"], code);
         }
     }
 
