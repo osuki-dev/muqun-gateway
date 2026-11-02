@@ -273,34 +273,117 @@ pub(crate) fn open_store(
 }
 
 async fn forget_delegated(agent: String) -> anyhow::Result<()> {
+    let db = open_store()?;
     let id = agent.clone();
-    let (forgot, block) = open_store()?
-        .call(move |c| {
-            let forgot = crate::tasks::store_sqlite::forget_unrecorded_restriction(c, &id)?;
-            Ok((forgot, crate::tasks::store_sqlite::runtime_block(c, &id)?))
-        })
+    let forgot = db
+        .call(move |c| crate::tasks::store_sqlite::forget_unrecorded_restriction(c, &id))
         .await?;
-    if !forgot {
-        println!("No unnamed delegated-session record for {agent}.");
+    // Sessions deleted in OpenCode itself leave rows the gateway would only
+    // drop at its next adoption; ask OpenCode now. Other agents' sessions
+    // still clear only when deleted through the gateway.
+    let checked = if agent == "opencode" {
+        Some(match crate::agents::runtime::running_opencode().await {
+            Some(endpoint) => {
+                Some(crate::agents::runtime::reconcile_opencode_restrictions(&db, &endpoint).await?)
+            }
+            None => None,
+        })
+    } else {
+        None
+    };
+    let id = agent.clone();
+    let block = db
+        .call(move |c| crate::tasks::store_sqlite::runtime_block(c, &id))
+        .await?;
+    let has_mcp = match (&block, agent.as_str()) {
+        (None, "opencode") => {
+            let binary = crate::load_config(None)
+                .ok()
+                .and_then(|config| config.opencode.binary);
+            match crate::agents::runtime::resolve_binary(binary.as_deref()) {
+                Ok(binary) => crate::agents::runtime::opencode_service_has_mcp(&binary).await,
+                Err(_) => false,
+            }
+        }
+        _ => false,
+    };
+    print!(
+        "{}",
+        forget_report(&agent, forgot, checked, block.as_ref(), has_mcp)
+    );
+    Ok(())
+}
+
+/// What `forget-delegated` tells the owner. `checked` is `None` for an agent
+/// whose sessions are not looked up, `Some(None)` when OpenCode was not
+/// reachable. `has_mcp`: whether OpenCode's service is set up with the tools.
+fn forget_report(
+    agent: &str,
+    forgot: bool,
+    checked: Option<Option<crate::agents::runtime::Reconciled>>,
+    block: Option<&crate::tasks::store_sqlite::RuntimeBlock>,
+    has_mcp: bool,
+) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    if forgot {
+        let _ = writeln!(
+            out,
+            "Forgot the unnamed delegated-session record an earlier gateway kept for {agent}."
+        );
+    }
+    match checked {
+        Some(Some(done)) if done.cleared > 0 => {
+            let _ = writeln!(
+                out,
+                "Cleared {} retained session(s) OpenCode no longer has.",
+                done.cleared
+            );
+        }
+        _ => {}
     }
     match block {
         Some(block) => {
-            println!("{agent}'s Muqun tools stay withheld: {}", block.summary());
+            let _ = writeln!(
+                out,
+                "{agent}'s Muqun tools stay withheld: {}",
+                block.summary()
+            );
             let lines = block.session_lines();
             if !lines.is_empty() {
-                println!("\nSESSION  TITLE  DIRECTORY  SINCE (UTC)  WHY");
+                let _ = writeln!(out, "\nSESSION  TITLE  DIRECTORY  SINCE (UTC)  WHY");
                 for line in &lines {
-                    println!("{line}");
+                    let _ = writeln!(out, "{line}");
                 }
-                println!("\n{}", block.delete_hint());
+                let _ = writeln!(out, "\n{}", block.delete_hint());
+            }
+            match checked {
+                Some(None) if !block.sessions.is_empty() => {
+                    let _ = writeln!(out, "OpenCode is not running, so these could not be checked; start it (`opencode service start`) and run this again.");
+                }
+                Some(Some(done)) if done.unanswered > 0 => {
+                    let _ = writeln!(out, "OpenCode did not answer for {} of them; they stay withheld until it does. Run this again.", done.unanswered);
+                }
+                _ => {}
             }
         }
-        None if agent == "opencode" => println!(
-            "Nothing withholds OpenCode's Muqun tools now. `opencode service stop` lets the gateway start it again with them."
-        ),
-        None => println!("Nothing withholds {agent}'s Muqun tools now."),
+        None if agent == "opencode" => {
+            let _ = writeln!(out, "Nothing withholds OpenCode's Muqun tools now.");
+            let _ = writeln!(
+                out,
+                "{}",
+                if has_mcp {
+                    "The OpenCode service is set up with them; nothing else to do."
+                } else {
+                    "The OpenCode service was started without them. Run `opencode service stop` (this ends turns running in it); the gateway then starts it again with them."
+                }
+            );
+        }
+        None => {
+            let _ = writeln!(out, "Nothing withholds {agent}'s Muqun tools now.");
+        }
     }
-    Ok(())
+    out
 }
 
 async fn revoke(all: bool, id: Option<String>) -> anyhow::Result<()> {
@@ -371,6 +454,87 @@ pub(crate) async fn run_mcp_command(command: McpCommand) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `forget-delegated` agrees with `muqun-gateway agent`: it reports the
+    /// rows left after asking OpenCode, and only says nothing withholds the
+    /// tools when none are, with whether OpenCode still needs a restart.
+    #[test]
+    fn forget_delegated_reports_what_still_withholds_the_tools() {
+        use crate::agents::runtime::Reconciled;
+        use crate::tasks::store_sqlite::{RestrictedSession, Restriction, RuntimeBlock};
+        let block = RuntimeBlock {
+            agent_id: "opencode".into(),
+            sessions: vec!["ses_left".into()],
+            details: vec![RestrictedSession {
+                asid: "ses_left".into(),
+                title: None,
+                cwd: None,
+                since_ms: None,
+                reason: Some(Restriction::Remote),
+            }],
+            unrecorded: false,
+        };
+        let done = |cleared, unanswered| Reconciled {
+            cleared,
+            remaining: 1,
+            unanswered,
+        };
+        let cases: [(_, _, _, &[&str], &[&str]); 5] = [
+            (
+                Some(Some(done(8, 0))),
+                Some(&block),
+                false,
+                &[
+                    "Cleared 8 retained",
+                    "stay withheld: 1 retained",
+                    "ses_left",
+                    "opencode session delete",
+                ],
+                &["Nothing withholds", "not answer", "not running"],
+            ),
+            (
+                Some(Some(done(0, 1))),
+                Some(&block),
+                false,
+                &["did not answer for 1"],
+                &["Cleared"],
+            ),
+            (
+                Some(None),
+                Some(&block),
+                false,
+                &["could not be checked"],
+                &["Nothing withholds"],
+            ),
+            (
+                Some(Some(done(9, 0))),
+                None,
+                false,
+                &[
+                    "Cleared 9",
+                    "Nothing withholds",
+                    "Run `opencode service stop`",
+                ],
+                &["withheld"],
+            ),
+            (
+                Some(Some(done(0, 0))),
+                None,
+                true,
+                &["nothing else to do"],
+                &["service stop", "Cleared"],
+            ),
+        ];
+        for (checked, block, has_mcp, present, absent) in cases {
+            let out = forget_report("opencode", false, checked, block, has_mcp);
+            for p in present {
+                assert!(out.contains(p), "{p:?} missing from:\n{out}");
+            }
+            for a in absent {
+                assert!(!out.contains(a), "{a:?} unexpected in:\n{out}");
+            }
+        }
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
