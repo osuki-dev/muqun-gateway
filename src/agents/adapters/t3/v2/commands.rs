@@ -30,6 +30,12 @@ pub fn message_dispatch(
     command
 }
 
+/// `thread.runtime-mode.set`: the thread's permission policy
+/// (`full-access`, `approval-required`, `auto-accept-edits`, `auto`).
+pub fn runtime_mode_set(id: &str, runtime_mode: &str) -> Value {
+    json!({"type":"thread.runtime-mode.set","commandId":new_id(),"threadId":id,"runtimeMode":runtime_mode})
+}
+
 pub fn interrupt(id: &str, run: &str) -> Value {
     json!({"type":"run.interrupt","commandId":new_id(),"threadId":id,"runId":run})
 }

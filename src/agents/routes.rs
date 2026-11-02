@@ -220,6 +220,13 @@ impl SwitchModeBody {
     }
 }
 
+/// `POST .../auto-approve`: put the session into the agent's own bypass
+/// mode, or take it back out.
+#[derive(Debug, Deserialize)]
+pub struct AutoApproveBody {
+    pub enabled: bool,
+}
+
 /// `POST .../model` accepts both `{"model": {...}}` (what the app sends) and a
 /// bare `ModelRef` (what this route used to require). Accepting only the bare
 /// form made every model switch fail with 422.
@@ -515,6 +522,10 @@ pub fn mount(router: Router<AppState>) -> Router<AppState> {
             post(history_page_global),
         )
         .route("/api/agent-sessions/{asid}/mode", post(switch_mode_global))
+        .route(
+            "/api/agent-sessions/{asid}/auto-approve",
+            get(get_auto_approve_global).post(set_auto_approve_global),
+        )
         .route("/api/agent-files", get(find_agent_files_root_global))
         .route(
             "/api/agent-sessions/{asid}/files",
@@ -1189,6 +1200,52 @@ async fn do_switch_mode(
     remember_switch(state, &manager, asid, None, Some(mode)).await;
 
     Ok(Json(content_envelope(json!({ "ok": true }))))
+}
+
+/// `{enabled, native}`: whether the session runs in the agent's own bypass
+/// mode, and that mode's native name. A bypass is never remembered as a
+/// session default (`session_defaults::ELEVATING_MODES`).
+async fn auto_approve_state(
+    manager: &super::manager::AgentManager,
+    asid: &str,
+) -> ApiResult<Json<Value>> {
+    let native = crate::agents::auto_approve::native_bypass(manager.agent().kind())
+        .map(|bypass| bypass.native);
+    let enabled = manager
+        .agent()
+        .auto_approve(asid)
+        .await
+        .map_err(agent_error)?;
+    Ok(Json(content_envelope(json!({
+        "enabled": enabled,
+        "native": native,
+    }))))
+}
+
+async fn do_get_auto_approve(
+    state: &AppState,
+    asid: &str,
+    headers: &HeaderMap,
+) -> ApiResult<Json<Value>> {
+    require_device(state, headers)?;
+    let manager = session_manager_or_err(state, asid).await?;
+    auto_approve_state(&manager, asid).await
+}
+
+async fn do_set_auto_approve(
+    state: &AppState,
+    asid: &str,
+    enabled: bool,
+    headers: &HeaderMap,
+) -> ApiResult<Json<Value>> {
+    require_device(state, headers)?;
+    let manager = session_manager_or_err(state, asid).await?;
+    manager
+        .agent()
+        .set_auto_approve(asid, enabled)
+        .await
+        .map_err(agent_error)?;
+    auto_approve_state(&manager, asid).await
 }
 
 enum FileSearchScope<'a> {
@@ -2127,6 +2184,23 @@ async fn switch_mode_global(
     Json(body): Json<SwitchModeBody>,
 ) -> ApiResult<Json<Value>> {
     do_switch_mode(&state, &asid, &body.into_mode(), &headers).await
+}
+
+async fn get_auto_approve_global(
+    State(state): State<AppState>,
+    Path(asid): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    do_get_auto_approve(&state, &asid, &headers).await
+}
+
+async fn set_auto_approve_global(
+    State(state): State<AppState>,
+    Path(asid): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<AutoApproveBody>,
+) -> ApiResult<Json<Value>> {
+    do_set_auto_approve(&state, &asid, body.enabled, &headers).await
 }
 
 async fn find_agent_files_root_global(

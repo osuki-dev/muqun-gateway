@@ -784,6 +784,21 @@ pub fn openapi_spec() -> Value {
     spec["paths"]["/api/sessions/{sessionId}/panes/{paneId}/history/segments"] =
         captured_history_segments_path();
     spec["paths"]["/api/sessions/{sessionId}/panes/{paneId}/git/worktrees"] = git_worktrees_path();
+    spec["paths"]["/api/agent-sessions/{asid}/auto-approve"] = json!({
+        "get": {
+            "summary": "Whether the session runs in the agent's own bypass mode",
+            "description": "data: { enabled: true|false|null, native: string|null }. `native` names the agent's own control (Claude Code `bypassPermissions`, Codex `approvalPolicy=never`, ...); `enabled` is null where the agent has no session-scoped control. Discovery's `features.autoApprove` states the scope per agent.",
+            "parameters": [path_param("asid")],
+            "responses": ok_response()
+        },
+        "post": {
+            "summary": "Put the session into the agent's own bypass mode, or take it back out",
+            "description": "Switches the agent itself, never an App-side rule: Claude Code and Qoder `session/set_mode`, Codex a `turn/start` approval-policy and sandbox override carried by the next prompt, OpenCode a session permission rule allowing everything, T3 `thread.runtime-mode.set full-access`. Off restores the mode the session had before. Agents whose bypass is a launch flag answer 501.",
+            "parameters": [path_param("asid")],
+            "requestBody": json_body(object_schema(&[("enabled", "boolean")], &["enabled"])),
+            "responses": ok_response()
+        }
+    });
     spec["paths"]["/api/agents/{agent_id}/sessions/{asid}"] = json!({
         "delete": {
             "summary": "Delete a session from its exact owning agent",

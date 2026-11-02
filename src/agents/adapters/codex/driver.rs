@@ -88,6 +88,11 @@ pub struct CodexDriver {
     /// `mutations`, so a delivery and a cancel never race for one item.
     inbox: std::sync::Mutex<Inbox>,
     inbox_signals: Option<tokio::sync::mpsc::UnboundedSender<InboxSignal>>,
+    /// Each thread's approval policy and sandbox, for the App's auto-approve
+    /// switch: what Codex reported when the thread was opened here, and the
+    /// override the next `turn/start` carries (Codex keeps a turn's override
+    /// for the turns after it).
+    policies: std::sync::Mutex<HashMap<String, ThreadPolicy>>,
 }
 
 /// Why a prompt did not reach Codex. `Unknown` means it may have: the request
@@ -147,6 +152,50 @@ struct QuestionRecoveries {
 struct PendingModel {
     model: ModelRef,
     accepted_revision: Option<u64>,
+}
+
+/// One thread's approval policy and sandbox, as the App's auto-approve
+/// switch sees them. `(approvalPolicy, sandboxPolicy)` pairs are in the
+/// app-server's own shapes, so what Codex reported goes back unchanged.
+#[derive(Clone, Debug, Default)]
+struct ThreadPolicy {
+    /// What Codex reported for the thread when this Gateway opened it
+    /// (`thread/start`, `thread/resume`), unless that already was bypass.
+    baseline: Option<(Value, Value)>,
+    /// Carried by the next `turn/start`, then dropped: Codex keeps it for
+    /// the turns after that one.
+    next: Option<(Value, Value)>,
+    /// The thread runs without approvals or a sandbox, as this Gateway
+    /// last set or observed it.
+    bypass: bool,
+}
+
+impl ThreadPolicy {
+    /// `codex --dangerously-bypass-approvals-and-sandbox`, as a turn
+    /// override: no approvals, no sandbox.
+    fn bypass_pair() -> (Value, Value) {
+        (json!("never"), json!({"type":"dangerFullAccess"}))
+    }
+
+    fn is_bypass(approval: &Value, sandbox: &Value) -> bool {
+        approval == "never" && sandbox["type"] == "dangerFullAccess"
+    }
+
+    /// Record what a thread open reported. A thread already in bypass is
+    /// shown as such, and its pre-bypass policy stays whatever was known.
+    fn observe(&mut self, approval: &Value, sandbox: &Value) {
+        if approval.is_null() || sandbox.is_null() {
+            return;
+        }
+        if Self::is_bypass(approval, sandbox) {
+            self.bypass = true;
+        } else {
+            self.baseline = Some((approval.clone(), sandbox.clone()));
+            if self.next.is_none() {
+                self.bypass = false;
+            }
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -231,6 +280,7 @@ impl CodexDriver {
             slash_catalog: std::sync::atomic::AtomicBool::new(false),
             inbox: std::sync::Mutex::new(Inbox::default()),
             inbox_signals: None,
+            policies: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -1656,6 +1706,14 @@ impl CodexDriver {
 
     async fn selected_response(&self, response: Value) -> Result<AgentSessionInfo, AgentError> {
         let mut thread = response["thread"].clone();
+        if let Some(id) = thread["id"].as_str() {
+            self.policies
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .entry(id.to_owned())
+                .or_default()
+                .observe(&response["approvalPolicy"], &response["sandbox"]);
+        }
         // The response, never the requested model, is the source of truth.
         for key in ["model", "modelProvider", "reasoningEffort"] {
             if let Some(value) = response.get(key) {
@@ -1706,6 +1764,35 @@ impl CodexDriver {
             }
         }
         Ok(())
+    }
+
+    /// The approval policy and sandbox Codex's configuration gives a new
+    /// thread (`config/read`: `approval_policy`, `sandbox_mode`), in the
+    /// shapes `turn/start` takes. Unset values are Codex's documented
+    /// defaults, `on-request` and `read-only`.
+    async fn configured_policy(&self) -> Result<(Value, Value), AgentError> {
+        let config = self
+            .client
+            .call(
+                "config/read",
+                json!({"includeLayers":false,"cwd":self.client.config_cwd()}),
+            )
+            .await?;
+        let approval = match &config["config"]["approval_policy"] {
+            Value::Null => json!("on-request"),
+            policy => policy.clone(),
+        };
+        let sandbox = match config["config"]["sandbox_mode"].as_str() {
+            None | Some("read-only") => json!({"type":"readOnly"}),
+            Some("workspace-write") => json!({"type":"workspaceWrite"}),
+            Some("danger-full-access") => json!({"type":"dangerFullAccess"}),
+            Some(other) => {
+                return Err(AgentError::Protocol(format!(
+                    "Codex configuration names an unknown sandbox mode {other}"
+                )))
+            }
+        };
+        Ok((approval, sandbox))
     }
 
     async fn catalog(&self) -> Result<AgentCatalog, AgentError> {
@@ -1885,6 +1972,16 @@ impl CodexDriver {
             .metadata_revision(id)
             .await
             .map_err(SendFailure::NotSent)?;
+        let policy = self
+            .policies
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(id)
+            .and_then(|policy| policy.next.clone());
+        if let Some((approval, sandbox)) = &policy {
+            params["approvalPolicy"] = approval.clone();
+            params["sandboxPolicy"] = sandbox.clone();
+        }
         if !self.client.is_ready() {
             return Err(SendFailure::NotSent(AgentError::NotAvailable(
                 "Codex is not connected; nothing was sent".into(),
@@ -1896,6 +1993,17 @@ impl CodexDriver {
             .await
             .map_err(SendFailure::after_write)?;
         mapper::string(&response["turn"], "id").map_err(SendFailure::Unknown)?;
+        if policy.is_some() {
+            // Codex keeps the override for the turns after this one.
+            if let Some(entry) = self
+                .policies
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get_mut(id)
+            {
+                entry.next = None;
+            }
+        }
         self.record_native_acceptance(id).await;
         if let Some(choice) = self
             .next_models
@@ -3461,6 +3569,54 @@ impl AgentPort for CodexDriver {
     fn revert_session<'a>(&'a self, _id: &'a str, _message: &'a str) -> AgentFuture<'a, ()> {
         Box::pin(async { unsupported("Codex file-restoring revert") })
     }
+    /// Codex's own bypass is the thread's approval policy and sandbox:
+    /// `turn/start` takes an `approvalPolicy`/`sandboxPolicy` override for
+    /// "this turn and subsequent turns" (app-server protocol v2), so the
+    /// switch is carried by the next prompt. Off sends back what Codex
+    /// reported for the thread when it was opened here, else the policy its
+    /// configuration gives new threads.
+    fn set_auto_approve<'a>(&'a self, id: &'a str, enabled: bool) -> AgentFuture<'a, ()> {
+        Box::pin(async move {
+            validate_id(id)?;
+            self.prepare_shared_interaction(id).await?;
+            self.require_native_interaction(id).await?;
+            let baseline = {
+                let policies = self.policies.lock().unwrap_or_else(|p| p.into_inner());
+                let entry = policies.get(id).cloned().unwrap_or_default();
+                if entry.bypass == enabled && entry.next.is_none() {
+                    return Ok(());
+                }
+                entry.baseline
+            };
+            let next = if enabled {
+                ThreadPolicy::bypass_pair()
+            } else {
+                match baseline {
+                    Some(baseline) => baseline,
+                    None => self.configured_policy().await?,
+                }
+            };
+            let mut policies = self.policies.lock().unwrap_or_else(|p| p.into_inner());
+            let entry = policies.entry(id.to_owned()).or_default();
+            entry.next = Some(next);
+            entry.bypass = enabled;
+            Ok(())
+        })
+    }
+
+    fn auto_approve<'a>(&'a self, id: &'a str) -> AgentFuture<'a, Option<bool>> {
+        Box::pin(async move {
+            validate_id(id)?;
+            Ok(Some(
+                self.policies
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .get(id)
+                    .is_some_and(|policy| policy.bypass),
+            ))
+        })
+    }
+
     fn switch_mode<'a>(&'a self, _id: &'a str, _mode: &'a str) -> AgentFuture<'a, ()> {
         Box::pin(async { unsupported("Codex modes") })
     }
@@ -3550,6 +3706,60 @@ impl AgentPort for CodexDriver {
         _mode: &'a str,
     ) -> AgentFuture<'a, Vec<FileDiffItem>> {
         Box::pin(async { unsupported("Codex VCS diff") })
+    }
+}
+
+#[cfg(test)]
+mod policy_tests {
+    use super::ThreadPolicy;
+    use serde_json::json;
+
+    /// What a thread open reports becomes the policy to return to, unless
+    /// it already is bypass; a missing report changes nothing.
+    #[test]
+    fn a_thread_open_records_its_policy_or_its_bypass() {
+        let full = json!({"type":"dangerFullAccess"});
+        let ws = json!({"type":"workspaceWrite"});
+        for (name, approval, sandbox, bypass, baseline) in [
+            (
+                "on-request",
+                json!("on-request"),
+                ws.clone(),
+                false,
+                Some((json!("on-request"), ws.clone())),
+            ),
+            // The granular object is a policy like any other.
+            (
+                "granular",
+                json!({"granular":{}}),
+                ws.clone(),
+                false,
+                Some((json!({"granular":{}}), ws.clone())),
+            ),
+            ("bypass", json!("never"), full.clone(), true, None),
+            // `never` with a sandbox still asks nothing, but is sandboxed:
+            // not what the switch means by bypass.
+            (
+                "never sandboxed",
+                json!("never"),
+                ws.clone(),
+                false,
+                Some((json!("never"), ws.clone())),
+            ),
+            ("unreported", json!(null), json!(null), false, None),
+        ] {
+            let mut policy = ThreadPolicy::default();
+            policy.observe(&approval, &sandbox);
+            assert_eq!(policy.bypass, bypass, "{name}");
+            assert_eq!(policy.baseline, baseline, "{name}");
+            assert!(policy.next.is_none(), "{name}");
+        }
+        // A thread reopened in bypass keeps the pre-bypass policy it knew.
+        let mut policy = ThreadPolicy::default();
+        policy.observe(&json!("on-request"), &ws);
+        policy.observe(&json!("never"), &full);
+        assert!(policy.bypass);
+        assert_eq!(policy.baseline, Some((json!("on-request"), ws)));
     }
 }
 
