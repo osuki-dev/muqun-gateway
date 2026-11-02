@@ -271,7 +271,7 @@ pub struct DiscoveryPlanes {
 }
 
 /// Build terminal plane discovery from current app state
-pub async fn build_terminal_plane_discovery(state: &AppState) -> TerminalPlaneDiscovery {
+pub(crate) async fn build_terminal_plane_discovery(state: &AppState) -> TerminalPlaneDiscovery {
     let ordered = ordered_sessions(state).await;
     let primary = ordered.first().copied();
 
@@ -351,7 +351,7 @@ pub async fn build_terminal_plane_discovery(state: &AppState) -> TerminalPlaneDi
 }
 
 /// Build combined discovery planes
-pub async fn build_discovery_planes(state: &AppState) -> DiscoveryPlanes {
+pub(crate) async fn build_discovery_planes(state: &AppState) -> DiscoveryPlanes {
     let terminal = build_terminal_plane_discovery(state).await;
     let mut agents = state.agent_runtime.discover_agents().await;
     agents.order_for_picker();
@@ -360,7 +360,7 @@ pub async fn build_discovery_planes(state: &AppState) -> DiscoveryPlanes {
 
 /// Health reports local runtime readiness, never provider catalogs or probes.
 /// Full provider discovery remains on `/api/discovery` and `/api/capabilities`.
-pub async fn build_health_planes(state: &AppState) -> DiscoveryPlanes {
+pub(crate) async fn build_health_planes(state: &AppState) -> DiscoveryPlanes {
     let terminal = build_terminal_plane_discovery(state).await;
     let agents = state.agent_runtime.health_snapshot().await;
     discovery_planes(terminal, agents)
@@ -492,7 +492,7 @@ async fn fill_cached_models(state: &AppState, id: &str, agent: &mut Value) {
 
 /// Build complete capability discovery response. An unauthenticated caller
 /// gets each agent's id, kind, status and features, without endpoints or versions.
-pub async fn build_discovery(state: &AppState, _sealed: bool, authenticated: bool) -> Value {
+pub(crate) async fn build_discovery(state: &AppState, _sealed: bool, authenticated: bool) -> Value {
     let terminal = build_terminal_plane_discovery(state).await;
     let mut agents = state.agent_runtime.discovery_snapshot().await;
     agents.order_for_picker();

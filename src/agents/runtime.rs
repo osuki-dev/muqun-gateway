@@ -291,7 +291,7 @@ pub struct AgentStatus {
 }
 
 /// Configurations for the local service adapters, named to keep construction clear.
-#[derive(Default)]
+#[derive(Clone, Debug, Default)]
 pub struct LocalAgentConfigs {
     pub codex: CodexConfig,
     pub fx: FxConfig,
