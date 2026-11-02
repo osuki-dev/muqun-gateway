@@ -1158,6 +1158,26 @@ async fn close_all(children: Vec<Arc<PiChild>>) {
     while tasks.join_next().await.is_some() {}
 }
 
+/// Test helper: block until a just-written script can be exec'd. A fork on
+/// another test thread while the script was open for writing holds that
+/// descriptor until its own exec, and exec'ing the script meanwhile fails
+/// with ETXTBSY (surfacing as "cannot start pi").
+#[cfg(test)]
+pub(super) fn wait_until_executable(binary: &std::path::Path) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::process::Command::new(binary)
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "fake pi never became executable"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1222,6 +1242,7 @@ for raw in sys.stdin.buffer:
         std::fs::write(&binary, FAKE_PI).unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        wait_until_executable(&binary);
         let cmd = PiCommandLine {
             binary,
             extension: PathBuf::from("/workspace/demo/muqun-extension.js"),
