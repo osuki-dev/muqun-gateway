@@ -55,6 +55,12 @@ pub(crate) const API_CAPABILITIES: &[&str] = &[
     "agent_forms",
     "agent_compaction_references_v1",
     "agent_lifecycle_notifications",
+    // Pushes about a native agent session carry `asid` and `agent_id` (never
+    // the asid in `session_id`): `agent.completed` when its turn ends (after
+    // 30 s of idle, at most one per 2 min per session; not for a child session
+    // or a sub-task), plus `approval` and `question`. A pane that mirrors a
+    // session pushes nothing of its own.
+    "native_agent_push",
     "agent_mcp",
     crate::mcp::files::CAPABILITY,
     "agent_models",

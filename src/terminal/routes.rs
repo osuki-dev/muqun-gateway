@@ -1190,20 +1190,39 @@ pub(crate) fn spawn_agent_notification_watchers(state: AppState) {
     }
 }
 
+/// Pushes about native agent sessions: a pending approval or question, and a
+/// turn that ended ([`AgentPushGates`]).
 pub(crate) fn spawn_agent_permission_watchers(state: AppState) {
     let mut rx = state.agent_runtime.subscribe_events();
     let state = state.clone();
 
     tokio::spawn(async move {
         let mut gates = AgentPushGates::default();
+        // A turn end is confirmed after `COMPLETION_GRACE` of idle, which no
+        // event marks: the same two-second beat the pane watcher polls on.
+        let mut tick = tokio::time::interval(Duration::from_secs(2));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
-            let event = match rx.recv().await {
-                Ok(event) => event,
-                // Falling behind loses the skipped events, not the watcher.
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            let event = tokio::select! {
+                next = rx.recv() => match next {
+                    Ok(event) => event,
+                    // Falling behind loses the skipped events, not the watcher.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                },
+                _ = tick.tick() => {
+                    for asid in gates.completions_ready(Instant::now()) {
+                        // Naming the agent and checking the session is not a
+                        // child takes a round trip; the loop does not wait.
+                        let state = state.clone();
+                        tokio::spawn(async move {
+                            deliver_agent_completion(&state, &asid).await;
+                        });
+                    }
+                    continue;
+                }
             };
-            match gates.admit(&event) {
+            match gates.admit(&event, Instant::now()) {
                 Some(AgentPendingPush::Approval { asid, request }) => {
                     let tokens = match crate::connectivity::push::registered_recipients(&state) {
                         Ok(tokens) => tokens,
@@ -1257,10 +1276,18 @@ pub(crate) enum AgentPendingPush<'a> {
 /// fresh `*Pending` event many times; only the first is news. A resolve
 /// forgets the id. Events are per session, a child session's included --
 /// nothing here looks at `parent_id`.
+///
+/// A turn end is the pane watcher's rule keyed by the agent session: a
+/// busy-to-idle change earns a push once the session stayed idle for
+/// [`COMPLETION_GRACE`] (an agent pausing between steps is not finished), and
+/// not again within [`COMPLETION_COOLDOWN`] of the last one.
 #[derive(Debug, Default)]
 pub(crate) struct AgentPushGates {
     approvals: std::collections::HashSet<(String, String)>,
     forms: std::collections::HashSet<(String, String)>,
+    statuses: HashMap<String, agents::AgentSessionStatus>,
+    idle_since: HashMap<String, Instant>,
+    completed_at: HashMap<String, Instant>,
 }
 
 /// Requests that are never resolved (an agent that went away) must not grow
@@ -1271,6 +1298,7 @@ impl AgentPushGates {
     pub(crate) fn admit<'a>(
         &mut self,
         event: &'a agents::AgentDomainEvent,
+        now: Instant,
     ) -> Option<AgentPendingPush<'a>> {
         use agents::AgentDomainEvent as E;
         match event {
@@ -1300,8 +1328,54 @@ impl AgentPushGates {
                 self.forms.remove(&(asid.0.clone(), form_id.clone()));
                 None
             }
+            E::StatusChanged { asid, status, .. } => {
+                self.observe_status(&asid.0, *status, now);
+                None
+            }
             _ => None,
         }
+    }
+
+    fn observe_status(&mut self, asid: &str, status: agents::AgentSessionStatus, now: Instant) {
+        use agents::AgentSessionStatus as S;
+        if self.statuses.len() >= AGENT_PUSH_GATE_CAPACITY {
+            // A forgotten session's next idle has no busy before it: at most
+            // one turn end goes unannounced.
+            self.statuses.clear();
+        }
+        let previous = self.statuses.insert(asid.to_owned(), status);
+        match status {
+            S::Idle if matches!(previous, Some(S::Busy | S::Retry)) => {
+                self.idle_since.insert(asid.to_owned(), now);
+            }
+            S::Idle => {}
+            // Working again, failed or interrupted: not a turn that finished.
+            _ => {
+                self.idle_since.remove(asid);
+            }
+        }
+    }
+
+    /// The sessions whose turn end is confirmed now; each is forgotten as it
+    /// is handed out.
+    pub(crate) fn completions_ready(&mut self, now: Instant) -> Vec<String> {
+        let ready: Vec<String> = self
+            .idle_since
+            .iter()
+            .filter(|(_, since)| now.saturating_duration_since(**since) >= COMPLETION_GRACE)
+            .map(|(asid, _)| asid.clone())
+            .collect();
+        self.completed_at
+            .retain(|_, sent| now.saturating_duration_since(*sent) < COMPLETION_COOLDOWN);
+        let mut confirmed = Vec::new();
+        for asid in ready {
+            self.idle_since.remove(&asid);
+            if !self.completed_at.contains_key(&asid) {
+                self.completed_at.insert(asid.clone(), now);
+                confirmed.push(asid);
+            }
+        }
+        confirmed
     }
 }
 
@@ -1410,6 +1484,56 @@ async fn deliver_agent_form_notice(state: &AppState, asid: &str, request: &agent
         None => (String::new(), None),
     };
     let notice = form_notification(state, &agent_id, title.as_deref(), asid, request);
+    deliver_agent_notification(state, notice).await;
+}
+
+/// The push a native session's finished turn sends: the pane completion's
+/// words ("{agent} finished running."), routed to the agent session by
+/// `asid` and `agent_id`. Nothing the agent wrote, and not the session's title
+/// either: some agents write that themselves.
+fn completion_notification(
+    server_id: &str,
+    server_label: &str,
+    agent_id: &str,
+    asid: &str,
+) -> AgentPushNotice {
+    let mut data = serde_json::Map::new();
+    data.insert("type".into(), json!("agent.completed"));
+    data.insert("server_id".into(), json!(server_id));
+    data.insert("agent_id".into(), json!(agent_id));
+    data.insert("asid".into(), json!(asid));
+    AgentPushNotice {
+        notice: AgentNotice::AgentCompleted,
+        server_label: server_label.trim().to_owned(),
+        agent_name: agent_display_name(agent_id).map(str::to_owned),
+        data,
+        choices: Vec::new(),
+        detail: None,
+    }
+}
+
+/// Push a native session's confirmed turn end, unless the session is a child
+/// (a subagent, or a sub-task another task delegated): the turn its parent
+/// runs is what the user waits on, and the parent is told of the child's.
+async fn deliver_agent_completion(state: &AppState, asid: &str) {
+    let Some(manager) = state.agent_runtime.manager_for_session(asid).await else {
+        return;
+    };
+    let info = tokio::time::timeout(Duration::from_secs(3), manager.sessions().get_session(asid))
+        .await
+        .ok()
+        .and_then(Result::ok);
+    if info.is_some_and(|info| info.parent_id.is_some())
+        || state.tasks.is_subtask_session(asid).await
+    {
+        return;
+    }
+    let notice = completion_notification(
+        &state.config.server_id,
+        &current_server_label(&state.config.label),
+        manager.agent().kind(),
+        asid,
+    );
     deliver_agent_notification(state, notice).await;
 }
 
@@ -3916,12 +4040,19 @@ mod tests {
         let mut gates = super::AgentPushGates::default();
         let first = pending("ses_child", "form_1");
         assert!(matches!(
-            gates.admit(&first),
+            gates.admit(&first, Instant::now()),
             Some(super::AgentPendingPush::Form { asid: "ses_child", request }) if request.id == "form_1"
         ));
-        assert_eq!(gates.admit(&pending("ses_child", "form_1")), None);
-        assert!(gates.admit(&pending("ses_child", "form_2")).is_some());
-        assert!(gates.admit(&pending("ses_other", "form_1")).is_some());
+        assert_eq!(
+            gates.admit(&pending("ses_child", "form_1"), Instant::now()),
+            None
+        );
+        assert!(gates
+            .admit(&pending("ses_child", "form_2"), Instant::now())
+            .is_some());
+        assert!(gates
+            .admit(&pending("ses_other", "form_1"), Instant::now())
+            .is_some());
 
         let resolved = AgentDomainEvent::FormResolved {
             reason: None,
@@ -3929,8 +4060,108 @@ mod tests {
             form_id: "form_1".into(),
             seq: 2,
         };
-        assert_eq!(gates.admit(&resolved), None);
-        assert!(gates.admit(&pending("ses_child", "form_1")).is_some());
+        assert_eq!(gates.admit(&resolved, Instant::now()), None);
+        assert!(gates
+            .admit(&pending("ses_child", "form_1"), Instant::now())
+            .is_some());
+    }
+
+    /// A native turn end pushes on the pane watcher's rule, keyed by the agent
+    /// session: busy then idle, confirmed after the grace, at most once per
+    /// cooldown. Each row is a status sequence `(seconds, status)` and the
+    /// sessions confirmed at the end.
+    #[test]
+    fn a_native_turn_end_pushes_after_the_grace_and_once_per_cooldown() {
+        use crate::agents::{AgentDomainEvent, AgentSessionId, AgentSessionStatus as S};
+        let grace = COMPLETION_GRACE.as_secs();
+        let cooldown = COMPLETION_COOLDOWN.as_secs();
+        type Case = (&'static str, &'static [(u64, S)], u64, usize);
+        let cases: &[Case] = &[
+            (
+                "busy then idle, held",
+                &[(0, S::Busy), (1, S::Idle)],
+                1 + grace,
+                1,
+            ),
+            ("not yet held", &[(0, S::Busy), (1, S::Idle)], grace, 0),
+            ("idle with no turn before it", &[(0, S::Idle)], 1 + grace, 0),
+            (
+                "retry counts as a turn",
+                &[(0, S::Retry), (1, S::Idle)],
+                1 + grace,
+                1,
+            ),
+            (
+                "busy again within the grace",
+                &[(0, S::Busy), (1, S::Idle), (5, S::Busy)],
+                1 + grace,
+                0,
+            ),
+            (
+                "interrupted is not finished",
+                &[(0, S::Busy), (1, S::Interrupted), (2, S::Idle)],
+                2 + grace,
+                0,
+            ),
+            (
+                "failed is not finished",
+                &[(0, S::Busy), (1, S::Failed)],
+                1 + grace,
+                0,
+            ),
+        ];
+        let start = Instant::now();
+        let at = |secs: u64| start + Duration::from_secs(secs);
+        let status = |status| AgentDomainEvent::StatusChanged {
+            asid: AgentSessionId("ses_1".into()),
+            status,
+            error: None,
+            seq: 1,
+        };
+        for (name, sequence, check, expected) in cases {
+            let mut gates = super::AgentPushGates::default();
+            for (secs, s) in *sequence {
+                assert_eq!(gates.admit(&status(*s), at(*secs)), None, "{name}");
+            }
+            assert_eq!(
+                gates.completions_ready(at(*check)).len(),
+                *expected,
+                "{name}"
+            );
+        }
+
+        // A second turn inside the cooldown is not announced; one after it is.
+        let mut gates = super::AgentPushGates::default();
+        for (secs, s) in [(0, S::Busy), (1, S::Idle)] {
+            gates.admit(&status(s), at(secs));
+        }
+        assert_eq!(
+            gates.completions_ready(at(1 + grace)),
+            vec!["ses_1".to_owned()]
+        );
+        for (secs, s) in [(40, S::Busy), (41, S::Idle)] {
+            gates.admit(&status(s), at(secs));
+        }
+        assert!(gates.completions_ready(at(41 + grace)).is_empty());
+        for (secs, s) in [(cooldown + 40, S::Busy), (cooldown + 41, S::Idle)] {
+            gates.admit(&status(s), at(secs));
+        }
+        assert_eq!(gates.completions_ready(at(cooldown + 41 + grace)).len(), 1);
+    }
+
+    /// A native completion routes to the agent session and says what a pane
+    /// completion says, in the reader's language.
+    #[test]
+    fn a_native_completion_push_carries_the_session_and_no_agent_text() {
+        let notice = super::completion_notification("server-1", "Studio", "opencode", "ses_1");
+        let en = notice.render(Locale::En);
+        assert_eq!(en.title, "Agent done · Studio");
+        assert_eq!(en.body, "OpenCode finished running.");
+        assert_eq!(
+            Value::Object(en.data),
+            json!({"type": "agent.completed", "server_id": "server-1", "agent_id": "opencode", "asid": "ses_1"})
+        );
+        assert_eq!(notice.render(Locale::ZhTw).body, "OpenCode 已執行完畢。");
     }
 
     /// The question push says "{name} needs your input", naming the session

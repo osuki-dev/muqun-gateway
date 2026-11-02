@@ -1131,6 +1131,20 @@ impl TaskService {
         bound
     }
 
+    /// Whether agent session `asid` works for a sub-task: a task another
+    /// task delegated, whose end that task is told about.
+    pub(crate) async fn is_subtask_session(&self, asid: &str) -> bool {
+        let filter = TaskFilter {
+            asid: Some(asid.to_owned()),
+            limit: 1,
+            ..Default::default()
+        };
+        self.store
+            .list(filter)
+            .await
+            .is_ok_and(|tasks| tasks.first().is_some_and(|task| task.parent.is_some()))
+    }
+
     /// A session's timeline changed: the open task bound to it is doing
     /// what its newest item says.
     async fn follow_progress(&self, state: &AppState, asid: &str, items: &[TimelineItem]) {
