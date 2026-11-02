@@ -22,6 +22,10 @@ impl AcpProvider for AntigravityProvider {
     const IDLE_RETIREMENT: bool = true;
     const PROVIDER_CONFIG: bool = false;
     const EFFORT_CONFIG: &'static str = "thought_level";
+    // agy's `run_command` asks with
+    // `rawInput: {CommandLine, WaitMsBeforeAsync, toolSummary}` (agy 1.4);
+    // the ACP `command` stays accepted.
+    const SHELL_COMMAND_FIELDS: &'static [&'static str] = &["CommandLine", "command"];
     // agy 1.4.12 advertises `_meta.antigravity.systemPrompt.append`, but its
     // wire shape is undocumented and unverified; until it is, the task
     // sentence goes in the prompt.

@@ -69,7 +69,7 @@ fn permission_uses_offered_opaque_ids_and_session_only_label() {
         {"optionId":"opaque-1","name":"Allow once","kind":"allow_once"},
         {"optionId":"opaque-2","name":"Allow for this session","kind":"allow_always"},
         {"optionId":"opaque-3","name":"Reject forever","kind":"reject_always"}
-    ]})).unwrap();
+    ]}), crate::agents::adapters::acp::mapper::SHELL_COMMAND_FIELDS).unwrap();
     assert_eq!(permission.rpc_id, json!(42));
     assert_eq!(
         permission.options,

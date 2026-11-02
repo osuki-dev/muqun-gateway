@@ -405,7 +405,17 @@ pub(crate) struct Permission {
     pub options: Vec<(PermissionDecision, String)>,
 }
 
-pub(crate) fn permission(rpc_id: Value, params: &Value) -> Result<Permission, AgentError> {
+/// The ACP convention for a shell tool's command text in `rawInput`.
+pub(crate) const SHELL_COMMAND_FIELDS: &[&str] = &["command"];
+
+/// `shell_command_fields` names, in order, the `rawInput` fields that may
+/// carry an execute permission's complete command text
+/// ([`super::session::AcpProvider::SHELL_COMMAND_FIELDS`]).
+pub(crate) fn permission(
+    rpc_id: Value,
+    params: &Value,
+    shell_command_fields: &[&str],
+) -> Result<Permission, AgentError> {
     let session = params["sessionId"]
         .as_str()
         .ok_or_else(|| AgentError::Protocol("ACP permission missing sessionId".into()))?;
@@ -465,10 +475,14 @@ pub(crate) fn permission(rpc_id: Value, params: &Value) -> Result<Permission, Ag
                 "ACP execute permission has an unsupported shell action".into(),
             ));
         }
-        let command = input
-            .get("command")
-            .and_then(Value::as_str)
-            .filter(|command| !command.trim().is_empty())
+        let command = shell_command_fields
+            .iter()
+            .find_map(|field| {
+                input
+                    .get(*field)
+                    .and_then(Value::as_str)
+                    .filter(|command| !command.trim().is_empty())
+            })
             .ok_or_else(|| {
                 AgentError::Protocol("ACP execute permission has no complete command input".into())
             })?;
@@ -650,7 +664,12 @@ impl Projection {
 
     /// Recover omitted input only from this submitted turn's unfinished call,
     /// never native history or a previous turn that reused an opaque tool id.
-    pub fn permission(&self, rpc_id: Value, params: &Value) -> Result<Permission, AgentError> {
+    pub fn permission(
+        &self,
+        rpc_id: Value,
+        params: &Value,
+        shell_command_fields: &[&str],
+    ) -> Result<Permission, AgentError> {
         let mut complete = params.clone();
         if let Some(context) = params["toolCall"]["toolCallId"]
             .as_str()
@@ -666,7 +685,7 @@ impl Projection {
                 }
             }
         }
-        permission(rpc_id, &complete)
+        permission(rpc_id, &complete, shell_command_fields)
     }
 
     pub fn end_turn(&mut self) {
@@ -1279,11 +1298,12 @@ mod tests {
         ] {
             assert!(permission(
                 json!(1),
-                &json!({"sessionId":"s","toolCall":{"toolCallId":"t"},"options":options})
+                &json!({"sessionId":"s","toolCall":{"toolCallId":"t"},"options":options}),
+                SHELL_COMMAND_FIELDS
             )
             .is_err());
         }
-        assert!(permission(json!(1), &json!({"sessionId":"s","toolCall":{"toolCallId":"t"},"options":[{"optionId":"allow-opaque","kind":"allow_once"},{"optionId":"deny-opaque","kind":"reject_once"}]})).is_ok());
+        assert!(permission(json!(1), &json!({"sessionId":"s","toolCall":{"toolCallId":"t"},"options":[{"optionId":"allow-opaque","kind":"allow_once"},{"optionId":"deny-opaque","kind":"reject_once"}]}), SHELL_COMMAND_FIELDS).is_ok());
     }
 
     fn shell_permission(input: Option<Value>) -> Value {
@@ -1303,7 +1323,7 @@ mod tests {
         ] {
             let mut params = shell_permission(Some(input));
             params["toolCall"]["_meta"] = json!({"qoder":{"toolName":"Bash"}});
-            let parsed = permission(json!(1), &params).unwrap();
+            let parsed = permission(json!(1), &params, SHELL_COMMAND_FIELDS).unwrap();
             assert_eq!(parsed.request.action, "shell");
             assert_eq!(parsed.request.resources, [command]);
         }
@@ -1320,10 +1340,10 @@ mod tests {
             Some(json!({"code":"rm -rf /"})),
             Some(json!({"action":"write","command":"printf misleading"})),
         ] {
-            assert!(permission(json!(1), &shell_permission(input)).is_err());
+            assert!(permission(json!(1), &shell_permission(input), SHELL_COMMAND_FIELDS).is_err());
         }
         let ordinary = json!({"sessionId":"s","toolCall":{"toolCallId":"question","kind":"other","title":"Choose an option"},"options":[{"optionId":"yes","kind":"allow_once"}]});
-        assert!(permission(json!(2), &ordinary).is_ok());
+        assert!(permission(json!(2), &ordinary, SHELL_COMMAND_FIELDS).is_ok());
     }
 
     #[test]
@@ -1333,13 +1353,13 @@ mod tests {
         // History is not a live submitted turn.
         projection.update(&update).unwrap();
         assert!(projection
-            .permission(json!(1), &shell_permission(None))
+            .permission(json!(1), &shell_permission(None), SHELL_COMMAND_FIELDS)
             .is_err());
         projection.submitted("start");
         projection.update(&update).unwrap();
         assert_eq!(
             projection
-                .permission(json!(1), &shell_permission(None))
+                .permission(json!(1), &shell_permission(None), SHELL_COMMAND_FIELDS)
                 .unwrap()
                 .request
                 .resources,
@@ -1347,14 +1367,20 @@ mod tests {
         );
         // Explicitly malformed input never falls back to earlier input.
         assert!(projection
-            .permission(json!(1), &shell_permission(Some(Value::Null)))
+            .permission(
+                json!(1),
+                &shell_permission(Some(Value::Null)),
+                SHELL_COMMAND_FIELDS
+            )
             .is_err());
         let mut other = shell_permission(None);
         other["toolCall"]["toolCallId"] = json!("different");
-        assert!(projection.permission(json!(1), &other).is_err());
+        assert!(projection
+            .permission(json!(1), &other, SHELL_COMMAND_FIELDS)
+            .is_err());
         projection.update(&json!({"sessionUpdate":"tool_call_update","toolCallId":"tool","status":"completed"})).unwrap();
         assert!(projection
-            .permission(json!(1), &shell_permission(None))
+            .permission(json!(1), &shell_permission(None), SHELL_COMMAND_FIELDS)
             .is_err());
 
         let mut projection = Projection::new(false);
@@ -1362,11 +1388,11 @@ mod tests {
         projection.update(&update).unwrap();
         projection.end_turn();
         assert!(projection
-            .permission(json!(1), &shell_permission(None))
+            .permission(json!(1), &shell_permission(None), SHELL_COMMAND_FIELDS)
             .is_err());
         projection.submitted("two");
         assert!(projection
-            .permission(json!(1), &shell_permission(None))
+            .permission(json!(1), &shell_permission(None), SHELL_COMMAND_FIELDS)
             .is_err());
     }
 
