@@ -234,6 +234,10 @@ const MAX_DORMANT_SESSIONS: usize = 512;
 const MAX_DORMANT_INFO_BYTES: usize = 16 * 1024;
 const MAX_CONNECTIONS: usize = 16;
 const MAX_LIST_PAGES: usize = 64;
+/// Session-level updates (title, usage, catalog, mode, config) replayed by
+/// `session/load` wait for its response; the timeline streams past them.
+const MAX_DEFERRED_REPLAY_BYTES: usize = 8 * 1024 * 1024;
+const MAX_DEFERRED_REPLAY_UPDATES: usize = 10_000;
 const SESSION_METADATA_TTL: Duration = Duration::from_secs(30);
 const SESSION_LIST_TTL: Duration = SESSION_METADATA_TTL;
 const SESSION_STORE_MAX_AGE: Duration = Duration::from_secs(600);
@@ -2047,8 +2051,9 @@ impl<P: AcpProvider> AcpDriver<P> {
             .map_err(AgentError::RequestFailed)?;
         let response = request.wait_with_timeout(RPC_TIMEOUT);
         tokio::pin!(response);
-        let mut replay = Vec::new();
-        let mut replay_bytes: usize = 0;
+        let mut projection = Projection::new(P::REQUIRE_MESSAGE_ID);
+        let mut deferred = Vec::new();
+        let mut deferred_bytes: usize = 0;
         // Drain as the full load replays, instead of leaving the bounded transport
         // subscription full while waiting for the response.
         let value = loop {
@@ -2056,12 +2061,10 @@ impl<P: AcpProvider> AcpDriver<P> {
                 biased;
                 event = events.recv() => match event {
                     Ok(AcpEvent::Notification { method, params }) if method == "session/update" => {
-                        replay_bytes = replay_bytes.saturating_add(serde_json::to_vec(&params).map(|bytes| bytes.len()).unwrap_or(usize::MAX));
-                        if replay_bytes > 32 * 1024 * 1024 || replay.len() >= 100_000 {
+                        if let Err(error) = Self::absorb_replay(id.as_deref(), params, &mut projection, &mut deferred, &mut deferred_bytes) {
                             client.shutdown().await;
-                            return Err(AgentError::NotAvailable("ACP whole-history replay exceeds the Gateway budget; open this session in the agent's terminal".into()));
+                            return Err(error);
                         }
-                        replay.push(params);
                     },
                     Ok(AcpEvent::Disconnected { reason }) => { client.shutdown().await; return Err(AgentError::Network(reason)); },
                     Ok(AcpEvent::Request { .. }) => {
@@ -2088,18 +2091,16 @@ impl<P: AcpProvider> AcpDriver<P> {
         while let Ok(event) = events.try_recv() {
             match event {
                 AcpEvent::Notification { method, params } if method == "session/update" => {
-                    replay_bytes = replay_bytes.saturating_add(
-                        serde_json::to_vec(&params)
-                            .map(|bytes| bytes.len())
-                            .unwrap_or(usize::MAX),
-                    );
-                    if replay_bytes > 32 * 1024 * 1024 || replay.len() >= 100_000 {
+                    if let Err(error) = Self::absorb_replay(
+                        id.as_deref(),
+                        params,
+                        &mut projection,
+                        &mut deferred,
+                        &mut deferred_bytes,
+                    ) {
                         client.shutdown().await;
-                        return Err(AgentError::NotAvailable(
-                            "ACP whole-history replay exceeds the Gateway budget".into(),
-                        ));
+                        return Err(error);
                     }
-                    replay.push(params);
                 }
                 AcpEvent::Disconnected { reason } => {
                     client.shutdown().await;
@@ -2145,7 +2146,7 @@ impl<P: AcpProvider> AcpDriver<P> {
             config: value.clone(),
             owned_mutations: self.owns(&id),
             usage: mapper::SessionUsage::new(new_session),
-            projection: Projection::new(P::REQUIRE_MESSAGE_ID),
+            projection,
             permissions: HashMap::new(),
             last_activity: tokio::time::Instant::now(),
             recovery: None,
@@ -2160,7 +2161,7 @@ impl<P: AcpProvider> AcpDriver<P> {
                 .and_then(crate::agents::adapters::codex::process_tree::descendants),
             prompted: false,
         };
-        for params in replay {
+        for params in deferred {
             if params["sessionId"].as_str() != Some(id.as_str()) {
                 client.shutdown().await;
                 return Err(protocol("ACP history replay changed session identity"));
@@ -2169,6 +2170,13 @@ impl<P: AcpProvider> AcpDriver<P> {
                 client.shutdown().await;
                 return Err(error);
             }
+        }
+        if state.projection.elided() > 0 {
+            tracing::info!(
+                session = %id,
+                elided = state.projection.elided(),
+                "ACP history replay was longer than the retained window; its oldest rows are not shown"
+            );
         }
         if self.stop.is_cancelled() {
             client.shutdown().await;
@@ -2322,10 +2330,80 @@ impl<P: AcpProvider> AcpDriver<P> {
         }
     }
 
+    /// Updates that amend the session (title, usage, catalog, mode, config)
+    /// rather than its timeline.
+    fn is_session_update(update: &Value) -> bool {
+        matches!(
+            update["sessionUpdate"].as_str(),
+            Some(
+                "session_info_update"
+                    | "usage_update"
+                    | "available_commands_update"
+                    | "current_mode_update"
+                    | "config_option_update"
+            )
+        )
+    }
+
+    /// A replayed `session/load` update. Timeline rows go straight into the
+    /// projection, which keeps the newest window of them, so a transcript of
+    /// any length loads; only session-level updates wait for the response
+    /// they amend. A `session/new` has no identity yet: everything waits.
+    fn absorb_replay(
+        id: Option<&str>,
+        params: Value,
+        projection: &mut Projection,
+        deferred: &mut Vec<Value>,
+        deferred_bytes: &mut usize,
+    ) -> Result<(), AgentError> {
+        if let Some(id) = id {
+            if params["sessionId"].as_str() != Some(id) {
+                return Err(protocol("ACP history replay changed session identity"));
+            }
+            if !Self::is_session_update(&params["update"]) {
+                return Self::project(projection, false, &params["update"]).map(drop);
+            }
+        }
+        *deferred_bytes = deferred_bytes
+            .saturating_add(serde_json::to_vec(&params).map_or(usize::MAX, |bytes| bytes.len()));
+        if *deferred_bytes > MAX_DEFERRED_REPLAY_BYTES
+            || deferred.len() >= MAX_DEFERRED_REPLAY_UPDATES
+        {
+            return Err(AgentError::NotAvailable("ACP session metadata replay exceeds the Gateway budget; open this session in the agent's terminal".into()));
+        }
+        deferred.push(params);
+        Ok(())
+    }
+
+    fn project(
+        projection: &mut Projection,
+        hidden_command: bool,
+        update: &Value,
+    ) -> Result<Option<TimelineItem>, AgentError> {
+        match update["sessionUpdate"].as_str() {
+            Some("agent_message_chunk" | "agent_thought_chunk") if hidden_command => Ok(None),
+            // A rename leaves its command in the history; it is not a prompt.
+            Some("user_message_chunk")
+                if P::RENAME_COMMAND.is_some_and(|command| {
+                    update["content"]["text"]
+                        .as_str()
+                        .and_then(|text| text.strip_prefix(command))
+                        .is_some_and(|rest| rest.starts_with(' '))
+                }) =>
+            {
+                Ok(None)
+            }
+            _ => projection.update(update),
+        }
+    }
+
     fn reduce(
         state: &mut SessionState,
         update: &Value,
     ) -> Result<Option<TimelineItem>, AgentError> {
+        if !Self::is_session_update(update) {
+            return Self::project(&mut state.projection, state.hidden_command, update);
+        }
         match update["sessionUpdate"].as_str() {
             Some("session_info_update") => {
                 if let Some(title) = update["title"].as_str() {
@@ -2374,19 +2452,7 @@ impl<P: AcpProvider> AcpDriver<P> {
                 }
                 Ok(None)
             }
-            Some("agent_message_chunk" | "agent_thought_chunk") if state.hidden_command => Ok(None),
-            // A rename leaves its command in the history; it is not a prompt.
-            Some("user_message_chunk")
-                if P::RENAME_COMMAND.is_some_and(|command| {
-                    update["content"]["text"]
-                        .as_str()
-                        .and_then(|text| text.strip_prefix(command))
-                        .is_some_and(|rest| rest.starts_with(' '))
-                }) =>
-            {
-                Ok(None)
-            }
-            _ => state.projection.update(update),
+            _ => Ok(None),
         }
     }
 
@@ -2800,7 +2866,6 @@ impl<P: AcpProvider> AcpDriver<P> {
         // native response cannot appear ahead of its submitted user text.
         // Busy is published only after a request was actually flushed.
         let mut state = session.state.lock().await;
-        state.projection.can_submit(&prepared.transcript)?;
         state.recovery = None;
         state.hidden_command = false;
         state.prompt_checkpoint = checkpoint;
@@ -2894,12 +2959,6 @@ impl<P: AcpProvider> AcpDriver<P> {
     ) -> Result<bool, AgentError> {
         let prepared =
             operations::prompt_parts(text, attachments, session.prompt_capabilities).await?;
-        session
-            .state
-            .lock()
-            .await
-            .projection
-            .can_submit(&prepared.transcript)?;
         let outcome = session
             .client
             .request_with_timeout(
@@ -3469,8 +3528,9 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
                     "history page limit must be positive".into(),
                 ));
             }
-            // Each accepted ACP load already validates the complete native replay.
-            // Older retained rows page through MemoryMirror before this hook runs.
+            // An ACP load keeps the newest window of the native replay; the
+            // mirror pages those rows before this hook runs, and nothing older
+            // is served from here.
             if self.readonly_empty_snapshot(id).await? {
                 return Ok(Vec::new());
             }

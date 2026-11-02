@@ -1,7 +1,7 @@
 //! ACP data is projected into the existing agent contract, never exposed as a
 //! second App protocol. Native ids remain opaque within one stream. A native
 //! load generates new ids and replaces its prior snapshot atomically.
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use serde_json::Value;
 
@@ -497,12 +497,38 @@ pub(crate) fn permission(rpc_id: Value, params: &Value) -> Result<Permission, Ag
     })
 }
 
+/// Rows a projection keeps, newest first. The mirror it feeds retains the
+/// same number and the App reads history in pages, so a longer replay
+/// drops its oldest rows here instead of refusing the whole session.
+pub(crate) const MAX_RETAINED_ROWS: usize = 5000;
+/// Row content a projection keeps: the Gateway's memory for one session's
+/// history, not the size of the transcript it was read from.
+pub(crate) const MAX_RETAINED_BYTES: usize = 32 * 1024 * 1024;
+/// Counted per row against [`MAX_RETAINED_BYTES`] besides its content.
+const ROW_OVERHEAD: usize = 256;
+
+fn row_bytes(part: &AgentPart) -> usize {
+    ROW_OVERHEAD
+        + match part {
+            AgentPart::Text { text } | AgentPart::Reasoning { text, .. } => text.len(),
+            other => serde_json::to_vec(other).map_or(0, |bytes| bytes.len()),
+        }
+}
+
 pub(crate) struct Projection {
     require_message_id: bool,
     anonymous: Option<(String, String)>,
     submission_echo: Option<(String, String)>,
     pub rows: HashMap<String, TimelineItem>,
-    observed_bytes: usize,
+    /// Retained rows in display order, oldest first: `(message_id, ordinal, id)`.
+    order: BTreeSet<(String, u64, String)>,
+    retained_bytes: usize,
+    max_rows: usize,
+    max_bytes: usize,
+    /// Rows that left the window. A late update to one is dropped rather
+    /// than recreating a partial row at the end of the timeline.
+    evicted: HashSet<String>,
+    elided: u64,
     groups: HashMap<String, String>,
     next_group: u64,
     next_row: u64,
@@ -520,12 +546,25 @@ impl Default for Projection {
 }
 impl Projection {
     pub fn new(require_message_id: bool) -> Self {
+        Self::with_retention(require_message_id, MAX_RETAINED_ROWS, MAX_RETAINED_BYTES)
+    }
+
+    pub(crate) fn with_retention(
+        require_message_id: bool,
+        max_rows: usize,
+        max_bytes: usize,
+    ) -> Self {
         Self {
             require_message_id,
             anonymous: None,
             submission_echo: None,
             rows: HashMap::new(),
-            observed_bytes: 0,
+            order: BTreeSet::new(),
+            retained_bytes: 0,
+            max_rows,
+            max_bytes,
+            evicted: HashSet::new(),
+            elided: 0,
             groups: HashMap::new(),
             next_group: 0,
             next_row: 0,
@@ -535,6 +574,11 @@ impl Projection {
             permission_contexts: HashMap::new(),
             permission_turn_active: false,
         }
+    }
+
+    /// Rows older than the retained window, dropped since the projection began.
+    pub fn elided(&self) -> u64 {
+        self.elided
     }
 
     fn group(&mut self, native: &str) -> String {
@@ -563,19 +607,6 @@ impl Projection {
             .map(|(_, text)| text)
     }
 
-    pub fn can_submit(&self, text: &str) -> Result<(), AgentError> {
-        if self
-            .observed_bytes
-            .saturating_add(text.len())
-            .saturating_add(512)
-            > 32 * 1024 * 1024
-            || self.rows.len() >= 5000
-        {
-            return Err(AgentError::NotAvailable("ACP transcript exceeds the Gateway history budget; open this session in the agent's terminal".into()));
-        }
-        Ok(())
-    }
-
     /// The ordinary live ACP stream omits user echoes. This row records only
     /// the Gateway's flushed submission, and is replaced by native history on load.
     pub fn submitted(&mut self, text: &str) -> TimelineItem {
@@ -583,7 +614,6 @@ impl Projection {
         if !self.require_message_id {
             self.submission_echo = Some((text.into(), String::new()));
         }
-        self.observed_bytes += text.len() + 512;
         let native = format!("acp-submission:{}", uuid::Uuid::new_v4());
         let group = self.group(&native);
         self.row(
@@ -600,7 +630,6 @@ impl Projection {
         self.current = None;
         self.thought = None;
         self.anonymous = None;
-        self.observed_bytes += text.len() + 512;
         let native = format!("acp-steer:{}", uuid::Uuid::new_v4());
         let group = self.group(&native);
         self.row(
@@ -662,12 +691,19 @@ impl Projection {
         role: TimelineRole,
         part: AgentPart,
     ) -> TimelineItem {
-        let ordinal = if let Some(row) = self.rows.get(&id) {
-            row.ordinal
-        } else {
-            self.next_row += 1;
-            self.next_row
+        let ordinal = match self.rows.get(&id) {
+            Some(row) => {
+                self.retained_bytes = self.retained_bytes.saturating_sub(row_bytes(&row.part));
+                row.ordinal
+            }
+            None => {
+                self.next_row += 1;
+                self.order
+                    .insert((group.clone(), self.next_row, id.clone()));
+                self.next_row
+            }
         };
+        self.retained_bytes += row_bytes(&part);
         let row = TimelineItem {
             id: id.clone(),
             message_id: group,
@@ -680,20 +716,29 @@ impl Projection {
             image_assets: None,
             generation: None,
         };
-        self.rows.insert(id, row.clone());
+        self.rows.insert(id.clone(), row.clone());
+        self.evict(&id);
         row
     }
 
-    pub fn update(&mut self, update: &Value) -> Result<Option<TimelineItem>, AgentError> {
-        // A whole-history ACP replay has no pagination. Refuse a transcript
-        // we cannot retain completely instead of silently claiming exhaustion.
-        let bytes = serde_json::to_vec(update)
-            .map_err(|_| AgentError::Protocol("Invalid ACP update".into()))?
-            .len();
-        if self.observed_bytes.saturating_add(bytes) > 32 * 1024 * 1024 || self.rows.len() >= 5000 {
-            return Err(AgentError::NotAvailable("ACP transcript exceeds the Gateway history budget (5000 rows / 32 MiB); open this session in the agent's terminal".into()));
+    /// Drop the oldest rows until the window fits. The row just written
+    /// stays whatever its size: one row is never split across a page.
+    fn evict(&mut self, keep: &str) {
+        while self.rows.len() > self.max_rows || self.retained_bytes > self.max_bytes {
+            match self.order.first() {
+                Some((_, _, id)) if id != keep => {}
+                _ => break,
+            }
+            let (_, _, id) = self.order.pop_first().expect("checked above");
+            if let Some(row) = self.rows.remove(&id) {
+                self.retained_bytes = self.retained_bytes.saturating_sub(row_bytes(&row.part));
+            }
+            self.evicted.insert(id);
+            self.elided += 1;
         }
-        self.observed_bytes += bytes;
+    }
+
+    pub fn update(&mut self, update: &Value) -> Result<Option<TimelineItem>, AgentError> {
         let kind = update["sessionUpdate"].as_str().unwrap_or_default();
         match kind {
             "notice" => {
@@ -800,6 +845,9 @@ impl Projection {
                     }
                     (format!("acp-message:{native}:text"), group)
                 };
+                if self.evicted.contains(&id) {
+                    return Ok(None);
+                }
                 let mut full = self
                     .rows
                     .get(&id)
@@ -836,6 +884,9 @@ impl Projection {
                     .as_str()
                     .ok_or_else(|| AgentError::Protocol("ACP tool missing toolCallId".into()))?;
                 let id = format!("acp-tool:{native}");
+                if self.evicted.contains(&id) {
+                    return Ok(None);
+                }
                 let mut call = self
                     .rows
                     .get(&id)
@@ -998,6 +1049,64 @@ mod tests {
                 recorded_choice(recorded, &offered).as_deref(),
                 expected,
                 "{recorded}"
+            );
+        }
+    }
+
+    /// A transcript longer than the window loads as its newest rows, in
+    /// order, including one over the limits that used to refuse the session.
+    #[test]
+    fn long_transcripts_keep_their_newest_rows_instead_of_refusing() {
+        for (max_rows, max_bytes, turns, answer_bytes) in [
+            (8, usize::MAX, 20, 16),
+            (usize::MAX, 6 * 1024, 20, 1024),
+            (MAX_RETAINED_ROWS, MAX_RETAINED_BYTES, 2000, 16),
+            (MAX_RETAINED_ROWS, MAX_RETAINED_BYTES, 9, 4 * 1024 * 1024),
+        ] {
+            let mut projection = Projection::with_retention(true, max_rows, max_bytes);
+            let mut all = Vec::new();
+            for turn in 0..turns {
+                let updates = [
+                    json!({"sessionUpdate":"user_message_chunk","messageId":format!("u{turn}"),"content":{"type":"text","text":format!("question {turn}")}}),
+                    json!({"sessionUpdate":"tool_call","toolCallId":format!("t{turn}"),"name":"shell","status":"in_progress","rawInput":{"command":"pwd"}}),
+                    json!({"sessionUpdate":"agent_message_chunk","messageId":format!("a{turn}"),"content":{"type":"text","text":"x".repeat(answer_bytes)}}),
+                ];
+                for update in updates {
+                    let row = projection.update(&update).unwrap().unwrap();
+                    all.push(row.id);
+                }
+            }
+            let rows = projection.timeline();
+            let case = format!("{max_rows} rows / {max_bytes} bytes / {turns} turns");
+            assert!(rows.len() <= max_rows && rows.len() < all.len(), "{case}");
+            assert!(projection.retained_bytes <= max_bytes, "{case}");
+            let ids: Vec<_> = rows.iter().map(|row| row.id.clone()).collect();
+            assert_eq!(
+                ids,
+                all[all.len() - rows.len()..],
+                "{case}: a suffix in order"
+            );
+            assert_eq!(
+                projection.elided(),
+                (all.len() - rows.len()) as u64,
+                "{case}"
+            );
+            assert_eq!(
+                projection.latest_text(TimelineRole::User),
+                Some(format!("question {}", turns - 1).as_str()),
+                "{case}"
+            );
+            // A late result for an evicted tool is dropped; a retained one still updates.
+            let completed = |tool: usize| json!({"sessionUpdate":"tool_call_update","toolCallId":format!("t{tool}"),"status":"completed","rawOutput":"done"});
+            assert!(
+                projection.update(&completed(0)).unwrap().is_none(),
+                "{case}"
+            );
+            assert_eq!(projection.timeline().len(), rows.len(), "{case}");
+            let row = projection.update(&completed(turns - 1)).unwrap().unwrap();
+            assert!(
+                matches!(&row.part, AgentPart::Tool(call) if call.state == ToolCallStatus::Completed),
+                "{case}"
             );
         }
     }
