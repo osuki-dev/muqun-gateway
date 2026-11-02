@@ -1,6 +1,6 @@
 //! How an agent is named and shown: its status word (the gateway's six
 //! words, from `AgentAvailability`), its short badge, and its brand class.
-//! The colours themselves live in `styles.css` as `--agent-<id>`.
+//! The colours themselves are `--agent-<id>` variables from `theme/agents.rs`.
 
 use blinc_layout::prelude::*;
 use muqun_gateway::platform::discovery::{AgentAvailability, AgentDiscoveryInfo};
@@ -43,7 +43,7 @@ impl Standing {
     }
 
     pub fn word(self, strings: &Strings) -> &'static str {
-        match (strings.language, self) {
+        match (strings.language(), self) {
             (Language::En, Self::Usable) => "Available",
             (Language::En, Self::NeedsSetup) => "Needs setup",
             (Language::En, Self::NotRunning) => "Not running",

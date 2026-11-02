@@ -5,6 +5,7 @@
 //! runtime started beside it before the window opens. They meet only at the
 //! command channel (UI → core) and the inbox (core → UI).
 
+mod agent_fields;
 mod branding;
 mod config;
 mod hub;
@@ -25,7 +26,7 @@ use muqun_gateway::agents::compose::{
     attach_store, build_runtime, RuntimeSettings, StoreEncryption,
 };
 
-use crate::config::{DesktopConfig, WindowGeometry, CONFIG_FILE};
+use crate::config::{ConfigEdit, DesktopConfig, WindowGeometry, CONFIG_FILE};
 use crate::model::commands::{self, Command, CommandReceiver};
 use crate::model::drain::Drain;
 use crate::model::inbox::{Inbox, UiAction};
@@ -59,7 +60,7 @@ fn main() -> anyhow::Result<()> {
     let inbox = Arc::new(Inbox::new());
     let drain = Drain::new(inbox.clone());
     let (tx, rx) = commands::channel();
-    start_core(settings, state_dir, inbox, store.clone(), rx)?;
+    start_core(settings, state_dir.clone(), inbox, store.clone(), rx)?;
     commands::send(&tx, Command::Refresh);
 
     ui::text::register_fonts();
@@ -77,10 +78,13 @@ fn main() -> anyhow::Result<()> {
         ..Default::default()
     };
 
-    let strings = ui::strings::Strings {
-        language: config.general.language,
-    };
+    ui::strings::Strings::set_language(config.general.language);
+    let strings = ui::strings::Strings;
     let scheme_watcher = Arc::new(Mutex::new(watcher));
+    let paths = Arc::new(ui::Paths {
+        config_dir: config_dir.clone(),
+        state_dir: state_dir.clone(),
+    });
     let last_size = Arc::new(Mutex::new((geometry.w, geometry.h)));
     let exit_size = last_size.clone();
     let exit_store = store.clone();
@@ -95,7 +99,7 @@ fn main() -> anyhow::Result<()> {
             ui::install_css(ctx);
             let composer = ctx
                 .use_state_keyed("mq-composer-text", || {
-                    text_area_state_with_placeholder(strings.composer_placeholder())
+                    text_area_state_with_placeholder(strings.composer_no_session())
                 })
                 .get();
             let app = ui::App {
@@ -106,17 +110,26 @@ fn main() -> anyhow::Result<()> {
                 config: store.clone(),
                 composer,
                 scheme_watcher: scheme_watcher.clone(),
+                paths: paths.clone(),
             };
+            restore_prefs(&app, &config);
+            ui::new_session::watch_typed_folder(&app);
             let for_actions = app.clone();
             drain.attach(
                 app.bindings.clone(),
                 Arc::new(move |action| match action {
                     UiAction::SubmitComposer => ui::composer::submit(&for_actions),
-                    UiAction::SetDraft { agent, cwd } => for_actions
-                        .bindings
-                        .draft
-                        .signal()
-                        .set(Some(crate::model::view::NewSessionDraft { agent, cwd })),
+                    UiAction::SetDraft { agent, cwd } => {
+                        // Only while that agent's page is still the open one.
+                        let open = for_actions.bindings.draft.get();
+                        if open.is_some_and(|d| d.agent == agent) {
+                            for_actions
+                                .bindings
+                                .chooser
+                                .signal()
+                                .set(cwd.to_string_lossy().into_owned());
+                        }
+                    }
                 }),
             );
             app
@@ -126,28 +139,42 @@ fn main() -> anyhow::Result<()> {
         let mut last = last_size.lock().unwrap();
         if *last != size && size.0 > 0 && size.1 > 0 {
             *last = size;
-            app.send(Command::PersistWindow(WindowGeometry {
+            app.send(Command::Edit(ConfigEdit::Window(WindowGeometry {
                 w: size.0,
                 h: size.1,
                 ..geometry
-            }));
+            })));
         }
         drop(last);
+        ui::sync_agent_colours(ctx);
         ui::root(ctx, app)
     })?;
 
     // The window is gone: write its last size now, not after a debounce
     // that will never fire.
     let (w, h) = *exit_size.lock().unwrap();
-    exit_store.update_blocking(|config| {
+    exit_store.change(|config| {
         config.window.w = w;
         config.window.h = h;
     });
+    exit_store.flush();
     tracing::info!(
         root_builds = ROOT_BUILDS.load(Ordering::Relaxed),
         "muqun-desktop exiting"
     );
     Ok(())
+}
+
+/// Put back what the owner arranged last time: the agent filter and the
+/// sidebar grouping. (Sidebar width is read where the shell is built.)
+fn restore_prefs(app: &ui::App, config: &DesktopConfig) {
+    let filter = config
+        .ui
+        .agent_filter
+        .clone()
+        .filter(|agent| hub::AGENT_PREFERENCE.contains(&agent.as_str()));
+    app.bindings.filter.signal().set(filter);
+    app.bindings.grouping.signal().set(config.ui.grouping);
 }
 
 fn init_tracing() {
@@ -209,7 +236,7 @@ async fn stop_on_signal(store: Arc<ConfigStore>) {
     blinc_layout::window_actions::close_window();
     tokio::time::sleep(platform::shutdown::GRACE).await;
     tracing::warn!("the window did not close in time; exiting");
-    store.update_blocking(|_| {});
+    store.flush();
     std::process::exit(0);
 }
 

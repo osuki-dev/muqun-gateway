@@ -163,7 +163,7 @@ pub fn shift_lightness(c: Color, scheme: ColorScheme, amount: f32) -> Color {
     Color::rgba(r, g, b, c.a)
 }
 
-fn rgb_to_hsl(r: f32, g: f32, b: f32) -> (f32, f32, f32) {
+pub(super) fn rgb_to_hsl(r: f32, g: f32, b: f32) -> (f32, f32, f32) {
     let max = r.max(g).max(b);
     let min = r.min(g).min(b);
     let l = (max + min) / 2.0;
@@ -186,7 +186,7 @@ fn rgb_to_hsl(r: f32, g: f32, b: f32) -> (f32, f32, f32) {
     (h, s, l)
 }
 
-fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (f32, f32, f32) {
+pub(super) fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (f32, f32, f32) {
     if s.abs() < f32::EPSILON {
         return (l, l, l);
     }

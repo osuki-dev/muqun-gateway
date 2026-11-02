@@ -6,6 +6,7 @@
 //! never writes `:root { --primary: … }` itself: a stylesheet variable would
 //! shadow the theme's, and `add_css` cannot take one back.
 
+pub mod agents;
 pub mod muqun_theme;
 pub mod tokens;
 

@@ -18,6 +18,7 @@ use muqun_gateway::agents::{
 use muqun_gateway::platform::discovery::AgentDiscoveryInfo;
 
 use super::inbox::{UiAction, UiError, Update};
+use crate::config::Grouping;
 
 /// How many sessions the sidebar lists. P0 has no paging.
 pub const SESSION_LIST_LIMIT: usize = 100;
@@ -30,6 +31,7 @@ pub struct SessionView {
 }
 
 impl SessionView {
+    #[allow(dead_code)] // for views that read the whole state
     pub fn status(&self) -> AgentSessionStatus {
         self.info.status
     }
@@ -75,6 +77,14 @@ fn shown(
     )
 }
 
+/// An agent's known projects, tagged with the agent so a list that arrives
+/// after the New-session page moved to another agent is not shown for it.
+#[derive(Debug, Clone, Default)]
+pub struct ProjectList {
+    pub agent: String,
+    pub projects: Vec<AgentProject>,
+}
+
 /// The timeline's rows, by id, for the list view to key its item views on.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TimelineOrder {
@@ -95,7 +105,7 @@ pub struct ViewState {
     /// Permissions waiting for an answer, in every session this process has
     /// seen asking, oldest first.
     pub attention: Vec<PermissionRequest>,
-    pub projects: Vec<AgentProject>,
+    pub projects: ProjectList,
     pub completions: Vec<DirectoryEntry>,
     /// The prefix the shown completions answer.
     pub completion_prefix: String,
@@ -165,7 +175,7 @@ impl ViewState {
             }
             Update::SessionCreated(info) => {
                 let asid = info.asid.0.clone();
-                self.upsert_session(info, changes);
+                self.upsert_session(*info, changes);
                 changes.selected |= self.select(&asid);
             }
             Update::Snapshot(snapshot) => {
@@ -196,8 +206,8 @@ impl ViewState {
                 self.error = Some(error);
                 changes.error = true;
             }
-            Update::Projects { projects, .. } => {
-                self.projects = projects;
+            Update::Projects { agent, projects } => {
+                self.projects = ProjectList { agent, projects };
                 changes.projects = true;
             }
             Update::Completions {
@@ -395,8 +405,18 @@ pub struct Bindings {
     pub agents_open: State<bool>,
     /// The New-session page, while it is open. UI-owned.
     pub draft: State<Option<NewSessionDraft>>,
-    pub projects: State<Arc<Vec<AgentProject>>>,
+    pub projects: State<Arc<ProjectList>>,
     pub completions: State<Arc<Vec<DirectoryEntry>>>,
+    /// How the sidebar groups sessions. UI-owned, remembered in the config.
+    pub grouping: State<Grouping>,
+    /// The Settings page, while it is open. UI-owned.
+    pub settings_open: State<bool>,
+    pub settings_tab: State<String>,
+    /// An agent setting changed since start: show "restart to apply".
+    pub restart_note: State<bool>,
+    /// The New-session folder chooser's value: the folder as the owner
+    /// typed or picked it (`~` unexpanded until the session is created).
+    pub chooser: State<String>,
     pub timeline_scroll: blinc_layout::selector::ScrollRef,
 }
 
@@ -415,8 +435,13 @@ impl Bindings {
             filter: ctx.use_state_keyed("mq.filter", || None),
             agents_open: ctx.use_state_keyed("mq.agents_open", || true),
             draft: ctx.use_state_keyed("mq.draft", || None),
-            projects: ctx.use_state_keyed("mq.projects", || Arc::new(Vec::new())),
+            projects: ctx.use_state_keyed("mq.projects", || Arc::new(ProjectList::default())),
             completions: ctx.use_state_keyed("mq.completions", || Arc::new(Vec::new())),
+            grouping: ctx.use_state_keyed("mq.grouping", Grouping::default),
+            settings_open: ctx.use_state_keyed("mq.settings_open", || false),
+            settings_tab: ctx.use_state_keyed("mq.settings_tab", || "agents".to_string()),
+            restart_note: ctx.use_state_keyed("mq.restart_note", || false),
+            chooser: ctx.use_state_keyed("mq.chooser", String::new),
             timeline_scroll,
         }
     }
@@ -426,7 +451,6 @@ impl Bindings {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewSessionDraft {
     pub agent: String,
-    pub cwd: std::path::PathBuf,
 }
 
 /// One timeline item's state, keyed by session and item so its view can
@@ -674,7 +698,10 @@ mod tests {
     fn a_created_session_is_listed_and_selected() {
         let mut view = ViewState::default();
         let mut changes = Changes::default();
-        view.apply(Update::SessionCreated(info("new", 9)), &mut changes);
+        view.apply(
+            Update::SessionCreated(Box::new(info("new", 9))),
+            &mut changes,
+        );
         assert_eq!(view.selected.as_deref(), Some("new"));
         assert!(changes.sessions && changes.selected);
     }

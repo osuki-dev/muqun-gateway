@@ -26,6 +26,7 @@ pub struct DesktopConfig {
     pub agents: AgentConfigs,
     pub general: General,
     pub appearance: Appearance,
+    pub ui: UiPrefs,
     pub window: WindowGeometry,
 }
 
@@ -65,7 +66,7 @@ impl AgentConfigs {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct General {
     /// Where "New session" starts when nothing was remembered for the agent.
@@ -78,17 +79,12 @@ pub struct General {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_agent: Option<String>,
     pub language: Language,
-}
-
-impl Default for General {
-    fn default() -> Self {
-        Self {
-            default_cwd: None,
-            last_cwd: HashMap::new(),
-            last_agent: None,
-            language: Language::from_environment(),
-        }
-    }
+    /// The command "open in editor" will run, for later (`code`, `zed`, ...).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub editor_command: Option<String>,
+    /// Placeholder: closing the window will hide it to the tray instead of
+    /// quitting. Stored, not acted on yet (there is no tray in P0).
+    pub close_to_tray: bool,
 }
 
 impl General {
@@ -169,6 +165,122 @@ pub enum Scheme {
     Dark,
     #[default]
     System,
+}
+
+/// How the sidebar groups sessions.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Grouping {
+    /// Today / Yesterday / This week / Earlier.
+    #[default]
+    Time,
+    Agent,
+    Folder,
+}
+
+impl Grouping {
+    /// The next mode in the cycle the sidebar's button steps through.
+    pub fn next(self) -> Self {
+        match self {
+            Self::Time => Self::Agent,
+            Self::Agent => Self::Folder,
+            Self::Folder => Self::Time,
+        }
+    }
+}
+
+/// Window furniture the owner arranged and expects back.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UiPrefs {
+    /// The sidebar's width in logical pixels.
+    pub sidebar_width: f32,
+    /// The agent the session list is filtered to; absent is "All".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_filter: Option<String>,
+    pub grouping: Grouping,
+}
+
+impl UiPrefs {
+    pub const SIDEBAR_DEFAULT: f32 = 300.0;
+    pub const SIDEBAR_MIN: f32 = 240.0;
+    pub const SIDEBAR_MAX: f32 = 420.0;
+
+    /// The stored width, forced into the range the layout allows (a hand
+    /// edited or NaN value never yields a broken window).
+    pub fn sidebar(&self) -> f32 {
+        if self.sidebar_width.is_finite() {
+            self.sidebar_width
+                .clamp(Self::SIDEBAR_MIN, Self::SIDEBAR_MAX)
+        } else {
+            Self::SIDEBAR_DEFAULT
+        }
+    }
+}
+
+impl Default for UiPrefs {
+    fn default() -> Self {
+        Self {
+            sidebar_width: Self::SIDEBAR_DEFAULT,
+            agent_filter: None,
+            grouping: Grouping::Time,
+        }
+    }
+}
+
+/// One change the owner made, applied by the core thread in the order the
+/// UI sent them (see `model/projection.rs`). Pure data, so applying it is a
+/// plain function ([`DesktopConfig::apply`]) with tests.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConfigEdit {
+    Window(WindowGeometry),
+    SidebarWidth(f32),
+    AgentFilter(Option<String>),
+    Grouping(Grouping),
+    Scheme(Scheme),
+    Language(Language),
+    EditorCommand(Option<String>),
+    /// Where "New session" starts for an agent with no remembered folder.
+    DefaultCwd(Option<PathBuf>),
+    AgentEnabled {
+        agent: String,
+        on: bool,
+    },
+    /// One field of one agent's block, as the owner typed it. An invalid
+    /// value changes nothing (the settings page has already said why).
+    AgentValue {
+        agent: String,
+        field: crate::agent_fields::Field,
+        value: String,
+    },
+}
+
+impl DesktopConfig {
+    /// Fold one edit in.
+    pub fn apply(&mut self, edit: ConfigEdit) {
+        match edit {
+            ConfigEdit::Window(geometry) => self.window = geometry,
+            ConfigEdit::SidebarWidth(width) => self.ui.sidebar_width = width,
+            ConfigEdit::AgentFilter(agent) => self.ui.agent_filter = agent,
+            ConfigEdit::Grouping(grouping) => self.ui.grouping = grouping,
+            ConfigEdit::Scheme(scheme) => self.appearance.scheme = scheme,
+            ConfigEdit::Language(language) => self.general.language = language,
+            ConfigEdit::EditorCommand(command) => {
+                self.general.editor_command = command.filter(|c| !c.trim().is_empty());
+            }
+            ConfigEdit::DefaultCwd(cwd) => self.general.default_cwd = cwd,
+            ConfigEdit::AgentEnabled { agent, on } => self.agents.set_enabled(&agent, on),
+            ConfigEdit::AgentValue {
+                agent,
+                field,
+                value,
+            } => {
+                if let Err(err) = self.agents.set_value(&agent, field, &value) {
+                    tracing::debug!(agent, ?field, %err, "an invalid value was not applied");
+                }
+            }
+        }
+    }
 }
 
 /// Logical pixels. `x`/`y` are absent until a position is known: Wayland
@@ -353,5 +465,73 @@ mod tests {
         assert_eq!(Language::from_locale_tag("zh_CN.UTF-8"), Language::ZhCn);
         assert_eq!(Language::from_locale_tag("en_US.UTF-8"), Language::En);
         assert_eq!(Language::from_locale_tag(""), Language::En);
+    }
+
+    #[test]
+    fn edits_change_only_what_they_name() {
+        use crate::agent_fields::Field;
+        let mut config = DesktopConfig::default();
+        config.apply(ConfigEdit::SidebarWidth(333.0));
+        config.apply(ConfigEdit::AgentFilter(Some("claude".into())));
+        config.apply(ConfigEdit::Grouping(Grouping::Folder));
+        config.apply(ConfigEdit::Language(Language::ZhCn));
+        config.apply(ConfigEdit::Scheme(Scheme::Dark));
+        config.apply(ConfigEdit::DefaultCwd(Some(PathBuf::from("/srv"))));
+        config.apply(ConfigEdit::EditorCommand(Some("  ".into())));
+        config.apply(ConfigEdit::AgentEnabled {
+            agent: "fx".into(),
+            on: false,
+        });
+        config.apply(ConfigEdit::AgentValue {
+            agent: "claude".into(),
+            field: Field::IdleTimeout,
+            value: "90".into(),
+        });
+        // An invalid value is dropped, not stored.
+        config.apply(ConfigEdit::AgentValue {
+            agent: "codex".into(),
+            field: Field::Binary,
+            value: "codex".into(),
+        });
+        assert_eq!(config.ui.sidebar_width, 333.0);
+        assert_eq!(config.ui.agent_filter.as_deref(), Some("claude"));
+        assert_eq!(config.ui.grouping, Grouping::Folder);
+        assert_eq!(config.general.language, Language::ZhCn);
+        assert_eq!(config.appearance.scheme, Scheme::Dark);
+        assert_eq!(config.general.default_cwd, Some(PathBuf::from("/srv")));
+        assert_eq!(config.general.editor_command, None, "blank is unset");
+        assert!(!config.agents.fx.enabled);
+        assert_eq!(config.agents.claude.idle_timeout_secs, 90);
+        assert!(config.agents.codex.binary.is_none());
+        assert!(
+            config.agents.opencode.enabled,
+            "untouched agents keep their defaults"
+        );
+    }
+
+    #[test]
+    fn the_sidebar_width_is_kept_inside_what_the_layout_allows() {
+        let width = |w: f32| {
+            UiPrefs {
+                sidebar_width: w,
+                ..UiPrefs::default()
+            }
+            .sidebar()
+        };
+        assert_eq!(width(10.0), UiPrefs::SIDEBAR_MIN);
+        assert_eq!(width(9000.0), UiPrefs::SIDEBAR_MAX);
+        assert_eq!(width(f32::NAN), UiPrefs::SIDEBAR_DEFAULT);
+        assert_eq!(width(320.0), 320.0);
+    }
+
+    #[test]
+    fn an_old_file_without_the_new_blocks_still_loads_and_grouping_cycles() {
+        let config: DesktopConfig =
+            serde_json::from_str(r#"{"general":{"language":"en"},"ui":{"grouping":"agent"}}"#)
+                .unwrap();
+        assert_eq!(config.ui.grouping, Grouping::Agent);
+        assert_eq!(config.ui.sidebar_width, UiPrefs::SIDEBAR_DEFAULT);
+        assert!(!config.general.close_to_tray);
+        assert_eq!(Grouping::Time.next().next().next(), Grouping::Time);
     }
 }

@@ -13,13 +13,13 @@ use tokio::sync::{broadcast, watch};
 use super::commands::{Command, CommandReceiver};
 use super::inbox::{Inbox, UiError, Update};
 use super::view::SESSION_LIST_LIMIT;
-use crate::config::{DesktopConfig, WindowGeometry};
+use crate::config::{ConfigEdit, DesktopConfig};
 use crate::hub::{HubError, SessionHub, OPENCODE};
 
 /// How long the typed prefix must stand still before folders are listed.
 const COMPLETION_DEBOUNCE: Duration = Duration::from_millis(150);
-/// How long the window size must stand still before it is written.
-const WINDOW_DEBOUNCE: Duration = Duration::from_millis(600);
+/// How long the configuration must stand still before it is written.
+const SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
 /// One agent's session list, at most.
 const LIST_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long after startup newly attached agents are looked for: the gateway
@@ -28,50 +28,73 @@ const WATCH_AGENTS_FOR: Duration = Duration::from_secs(90);
 const ATTACH_POLL: Duration = Duration::from_secs(2);
 const DISCOVERY_POLL: Duration = Duration::from_secs(5);
 
-/// The configuration file and its current contents, shared by the core side.
+/// The configuration file and its current contents, shared by the core side
+/// and, for reading and the last write at exit, the main thread.
 pub struct ConfigStore {
     path: PathBuf,
-    config: Mutex<DesktopConfig>,
+    state: Mutex<(DesktopConfig, bool)>,
 }
 
 impl ConfigStore {
     pub fn new(path: PathBuf, config: DesktopConfig) -> Arc<Self> {
         Arc::new(Self {
             path,
-            config: Mutex::new(config),
+            state: Mutex::new((config, false)),
         })
     }
 
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
     pub fn get(&self) -> DesktopConfig {
-        self.config.lock().unwrap().clone()
+        self.state.lock().unwrap().0.clone()
     }
 
-    /// Change the configuration and write it, off the async threads.
-    pub async fn update(self: &Arc<Self>, change: impl FnOnce(&mut DesktopConfig)) {
-        let snapshot = {
-            let mut config = self.config.lock().unwrap();
-            change(&mut config);
-            config.clone()
-        };
-        let path = self.path.clone();
-        match tokio::task::spawn_blocking(move || snapshot.save(&path)).await {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => tracing::warn!("{err:#}"),
-            Err(err) => tracing::warn!("config save task failed: {err}"),
-        }
+    /// Change the configuration in memory and mark it unwritten.
+    pub fn change(&self, change: impl FnOnce(&mut DesktopConfig)) {
+        let mut state = self.state.lock().unwrap();
+        change(&mut state.0);
+        state.1 = true;
     }
 
-    /// The same change, written synchronously: for the last save at exit.
-    pub fn update_blocking(&self, change: impl FnOnce(&mut DesktopConfig)) {
+    /// Write the file if anything changed since the last write. Blocks on
+    /// the disk: call it off the async threads (or at exit).
+    pub fn flush(&self) {
         let snapshot = {
-            let mut config = self.config.lock().unwrap();
-            change(&mut config);
-            config.clone()
+            let mut state = self.state.lock().unwrap();
+            if !std::mem::take(&mut state.1) {
+                return;
+            }
+            state.0.clone()
         };
         if let Err(err) = snapshot.save(&self.path) {
+            // Keep it dirty so the next change or exit tries again.
+            self.state.lock().unwrap().1 = true;
             tracing::warn!("{err:#}");
         }
     }
+}
+
+/// How long all the existence checks of one project list may take together;
+/// a folder on a stalled mount is left unmarked rather than held against it.
+const EXISTS_BUDGET: Duration = Duration::from_secs(2);
+
+/// Set `missing` on projects whose folder is gone, for agents (and old
+/// entries) whose own listing does not say.
+async fn mark_missing(projects: &mut [muqun_gateway::agents::AgentProject]) {
+    let check = async {
+        for project in projects.iter_mut() {
+            let path = std::path::Path::new(&project.canonical);
+            if !project.missing
+                && path.is_absolute()
+                && matches!(tokio::fs::try_exists(path).await, Ok(false))
+            {
+                project.missing = true;
+            }
+        }
+    };
+    let _ = tokio::time::timeout(EXISTS_BUDGET, check).await;
 }
 
 struct Core {
@@ -81,7 +104,8 @@ struct Core {
     /// The session the user is looking at, for resyncs.
     active: Mutex<Option<AgentSessionId>>,
     completions: watch::Sender<Option<String>>,
-    window: watch::Sender<Option<WindowGeometry>>,
+    /// Bumped on every edit; the saver waits for it to go quiet.
+    edits: watch::Sender<u64>,
 }
 
 /// Start the core side. Returns at once; the tasks live as long as the
@@ -93,18 +117,18 @@ pub fn spawn(
     commands: CommandReceiver,
 ) {
     let (completions, completion_rx) = watch::channel(None);
-    let (window, window_rx) = watch::channel(None);
+    let (edits, edits_rx) = watch::channel(0);
     let core = Arc::new(Core {
         hub,
         inbox,
         config,
         active: Mutex::new(None),
         completions,
-        window,
+        edits,
     });
     tokio::spawn(core.clone().events());
     tokio::spawn(core.clone().complete_directories(completion_rx));
-    tokio::spawn(core.clone().persist_window(window_rx));
+    tokio::spawn(core.clone().save_config(edits_rx));
     tokio::spawn(core.clone().watch_agents());
     tokio::spawn(core.commands(commands));
 }
@@ -117,9 +141,8 @@ impl Core {
                 Command::CompleteDirectory { prefix } => {
                     let _ = self.completions.send(Some(prefix));
                 }
-                Command::PersistWindow(geometry) => {
-                    let _ = self.window.send(Some(geometry));
-                }
+                // In this loop, not a task: edits must apply in the order sent.
+                Command::Edit(edit) => self.edit(edit),
                 command => {
                     tokio::spawn(async move { core.run(command).await });
                 }
@@ -138,15 +161,14 @@ impl Core {
             Command::CreateSession { agent, cwd } => match self.hub.create(&agent, &cwd).await {
                 Ok(info) => {
                     let asid = info.asid.clone();
-                    self.inbox.push(Update::SessionCreated(info));
+                    self.inbox.push(Update::SessionCreated(Box::new(info)));
                     *self.active.lock().unwrap() = Some(asid.clone());
                     self.open(&asid).await;
-                    self.config
-                        .update(|config| {
-                            config.general.last_agent = Some(agent.clone());
-                            config.general.last_cwd.insert(agent, cwd);
-                        })
-                        .await;
+                    self.config.change(|config| {
+                        config.general.last_agent = Some(agent.clone());
+                        config.general.last_cwd.insert(agent, cwd);
+                    });
+                    self.edited();
                 }
                 Err(err) => self.fail(err),
             },
@@ -166,16 +188,14 @@ impl Core {
                 }
             }
             Command::LoadProjects { agent } => match self.hub.projects(&agent).await {
-                Ok(projects) => self.inbox.push(Update::Projects { agent, projects }),
+                Ok(mut projects) => {
+                    mark_missing(&mut projects).await;
+                    self.inbox.push(Update::Projects { agent, projects })
+                }
                 Err(err) => tracing::debug!(%err, "project list unavailable"),
             },
-            Command::PersistScheme(scheme) => {
-                self.config
-                    .update(|config| config.appearance.scheme = scheme)
-                    .await;
-            }
-            Command::CompleteDirectory { .. } | Command::PersistWindow(_) => {
-                unreachable!("handled by their debouncers")
+            Command::CompleteDirectory { .. } | Command::Edit(_) => {
+                unreachable!("handled in the command loop")
             }
         }
     }
@@ -305,30 +325,50 @@ impl Core {
             let Some(prefix) = prefixes.borrow_and_update().clone() else {
                 continue;
             };
+            if prefix.trim().is_empty() {
+                // Nothing typed: nothing to suggest, and any earlier
+                // suggestions stop being offered.
+                self.inbox.push(Update::Completions {
+                    prefix,
+                    entries: Vec::new(),
+                });
+                continue;
+            }
             match self.hub.directories(&prefix).await {
                 Ok(found) => self.inbox.push(Update::Completions {
                     prefix,
                     entries: found.directories,
-                    truncated: found.truncated,
                 }),
                 Err(err) => tracing::debug!(%err, "directory completion failed"),
             }
         }
     }
 
-    async fn persist_window(self: Arc<Self>, mut sizes: watch::Receiver<Option<WindowGeometry>>) {
-        while sizes.changed().await.is_ok() {
+    fn edit(&self, edit: ConfigEdit) {
+        self.config.change(|config| config.apply(edit));
+        self.edited();
+    }
+
+    fn edited(&self) {
+        self.edits.send_modify(|n| *n += 1);
+    }
+
+    /// Write the configuration once edits have stood still for
+    /// [`SAVE_DEBOUNCE`]: dragging the sidebar or typing in a setting is
+    /// many edits and one write.
+    async fn save_config(self: Arc<Self>, mut edits: watch::Receiver<u64>) {
+        while edits.changed().await.is_ok() {
             loop {
-                match tokio::time::timeout(WINDOW_DEBOUNCE, sizes.changed()).await {
+                match tokio::time::timeout(SAVE_DEBOUNCE, edits.changed()).await {
                     Ok(Ok(())) => continue,
                     Ok(Err(_)) => return,
                     Err(_) => break,
                 }
             }
-            let Some(geometry) = *sizes.borrow_and_update() else {
-                continue;
-            };
-            self.config.update(|config| config.window = geometry).await;
+            let config = self.config.clone();
+            if let Err(err) = tokio::task::spawn_blocking(move || config.flush()).await {
+                tracing::warn!("config save task failed: {err}");
+            }
         }
     }
 }
