@@ -902,8 +902,9 @@ pub(crate) async fn watch_pane_approvals(state: AppState, session: SessionConfig
                         None,
                         Some(&approval),
                     );
-                    deliver_agent_notification(
+                    deliver_pane_notification(
                         &state,
+                        &session,
                         approval_notification(
                             &state.config.server_id,
                             &current_server_label(&state.config.label),
@@ -1596,19 +1597,19 @@ pub(crate) async fn watch_agent_notifications(state: AppState, session: SessionC
                                 &state, &session.id, &event, &mut statuses, &mut completions,
                             ) {
                                 enrich_blocked_notification(&state, &session, &mut notification).await;
-                                deliver_agent_notification(&state, notification).await;
+                                deliver_pane_notification(&state, &session, notification).await;
                             }
                             if pending_inputs.observe(&event) {
                                 if let Some(notification) = native_input_notification(
                                     &event, &state.config.server_id,
                                     &current_server_label(&state.config.label), &session.id,
                                 ) {
-                                    deliver_agent_notification(&state, notification).await;
+                                    deliver_pane_notification(&state, &session, notification).await;
                                 }
                             }
                         }
                         for notification in completions.ready(&statuses, &present, Instant::now()) {
-                            deliver_agent_notification(&state, notification).await;
+                            deliver_pane_notification(&state, &session, notification).await;
                         }
                     }
                 }
@@ -1622,7 +1623,7 @@ pub(crate) async fn watch_agent_notifications(state: AppState, session: SessionC
                             &mut completions,
                         ) {
                             enrich_blocked_notification(&state, &session, &mut notification).await;
-                            deliver_agent_notification(&state, notification).await;
+                            deliver_pane_notification(&state, &session, notification).await;
                         }
                     }
                     // The hub logs the failure and rebuilds the stream. This
@@ -1751,6 +1752,25 @@ pub(crate) fn observe_agent_notification(
     let status = data.get("agent_status")?.as_str()?.to_ascii_lowercase();
     let notice = absorb_agent_status_event(state, session_id, event, statuses);
     completions.observe(pane_id, &status, notice, Instant::now())
+}
+
+/// Send a push a terminal pane raised, unless the native agent session the
+/// pane's agent drives already pushes for the same event
+/// ([`crate::tasks::TaskService::pane_mirror`]): a Codex delegation's TUI
+/// asks its approvals, questions and turn ends through that session, whose
+/// pushes route to the conversation. One event, one push.
+pub(crate) async fn deliver_pane_notification(
+    state: &AppState,
+    session: &SessionConfig,
+    notice: AgentPushNotice,
+) {
+    if let Some(pane_id) = notice.data.get("pane_id").and_then(Value::as_str) {
+        if let Some(asid) = state.tasks.pane_mirror(&session.id, pane_id).await {
+            tracing::debug!(pane = pane_id, asid, "pane push left to its agent session");
+            return;
+        }
+    }
+    deliver_agent_notification(state, notice).await;
 }
 
 /// Send one notice to every registered device, each in its own language.

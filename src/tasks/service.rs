@@ -1132,17 +1132,57 @@ impl TaskService {
     }
 
     /// Whether agent session `asid` works for a sub-task: a task another
-    /// task delegated, whose end that task is told about.
+    /// task delegated, whose end that task is told about. The session is
+    /// the task's own, or the one its pane's agent drives.
     pub(crate) async fn is_subtask_session(&self, asid: &str) -> bool {
+        let filters = [
+            TaskFilter {
+                asid: Some(asid.to_owned()),
+                limit: 1,
+                ..Default::default()
+            },
+            TaskFilter {
+                agent_session: Some(asid.to_owned()),
+                limit: 1,
+                ..Default::default()
+            },
+        ];
+        for filter in filters {
+            if let Ok(tasks) = self.store.list(filter).await {
+                if let Some(task) = tasks.first() {
+                    return task.parent.is_some();
+                }
+            }
+        }
+        false
+    }
+
+    /// The native agent session pane `pane_id` of terminal session
+    /// `session_id` mirrors, as `(agent_id, asid)`: the newest task bound to
+    /// that pane started its agent on that session, and that agent is still
+    /// the pane's -- the launched job is in front, or, when none was
+    /// recorded, the task has not ended. A pane reused for anything else is
+    /// no mirror.
+    pub(crate) async fn pane_mirror(&self, session_id: &str, pane_id: &str) -> Option<String> {
         let filter = TaskFilter {
-            asid: Some(asid.to_owned()),
+            pane: Some((session_id.to_owned(), pane_id.to_owned())),
             limit: 1,
             ..Default::default()
         };
-        self.store
-            .list(filter)
-            .await
-            .is_ok_and(|tasks| tasks.first().is_some_and(|task| task.parent.is_some()))
+        let task = self.store.list(filter).await.ok()?.into_iter().next()?;
+        let TaskBinding::Pane {
+            agent_session_id: Some(asid),
+            agent_job,
+            ..
+        } = &task.binding
+        else {
+            return None;
+        };
+        let live = match agent_job {
+            Some(_) => pane_agent::same_live_job(&task).await,
+            None => !task.state.ended(),
+        };
+        live.then(|| asid.clone())
     }
 
     /// A session's timeline changed: the open task bound to it is doing
@@ -1694,6 +1734,7 @@ impl TaskService {
             agent_job: None,
             model,
             variant,
+            agent_session_id: None,
         };
         let dispatching = TaskChange {
             binding: Some(binding),
@@ -1891,9 +1932,15 @@ pub(crate) async fn start_terminal_agent(
     if let TaskBinding::Pane {
         shell_pid,
         agent_job,
+        agent_session_id,
         ..
     } = &mut binding
     {
+        // A Codex TUI started on the shared daemon's session: its pushes
+        // come from that session.
+        *agent_session_id = launched.payload["agent_session_id"]
+            .as_str()
+            .map(str::to_owned);
         // The job the launch started: the only one a told result is ever
         // typed to (`tasks::notices`). Without one, nothing ever is.
         *agent_job = match (*shell_pid, &before) {
@@ -4005,6 +4052,7 @@ mod tests {
                 agent_job: None,
                 model: None,
                 variant: None,
+                agent_session_id: None,
             },
             state: TaskState::Queued,
             summary: None,
@@ -4030,6 +4078,56 @@ mod tests {
             .move_to(&task.id, change(TaskState::Dispatching))
             .await
             .unwrap()
+    }
+
+    /// A pane is a mirror of the native session its task's agent drives
+    /// while that task holds the pane, and a mirrored session of a sub-task
+    /// is a sub-task's session.
+    #[tokio::test]
+    async fn a_pane_mirrors_the_session_its_task_launched_until_the_task_ends() {
+        let state = test_state("admin", vec![]);
+        let session_id = state.config.sessions[0].id.clone();
+        let with_session = |task: &Task, asid: Option<&str>| {
+            let mut binding = task.binding.clone();
+            if let TaskBinding::Pane {
+                agent_session_id, ..
+            } = &mut binding
+            {
+                *agent_session_id = asid.map(str::to_owned);
+            }
+            binding
+        };
+
+        terminal_task(&state, "%1", "a plain claude").await;
+        assert_eq!(state.tasks.pane_mirror(&session_id, "%1").await, None);
+
+        let codex = terminal_task(&state, "%2", "a codex tui").await;
+        let mut working = change(TaskState::Working);
+        working.binding = Some(with_session(&codex, Some("thr_1")));
+        state.tasks.move_to(&codex.id, working).await.unwrap();
+        assert_eq!(
+            state.tasks.pane_mirror(&session_id, "%2").await.as_deref(),
+            Some("thr_1")
+        );
+        assert!(!state.tasks.is_subtask_session("thr_1").await);
+        state
+            .tasks
+            .move_to(&codex.id, change(TaskState::Cancelled))
+            .await
+            .unwrap();
+        assert_eq!(
+            state.tasks.pane_mirror(&session_id, "%2").await,
+            None,
+            "an ended task with no launched job to check holds the pane no more"
+        );
+
+        let parent = terminal_task(&state, "%3", "the parent").await;
+        let mut child = parent.clone();
+        child.id = TaskId::new();
+        child.parent = Some(parent.id.clone());
+        child.binding = with_session(&parent, Some("thr_child"));
+        state.tasks.insert_for_test(&child).await;
+        assert!(state.tasks.is_subtask_session("thr_child").await);
     }
 
     struct TaskStartHerdr {

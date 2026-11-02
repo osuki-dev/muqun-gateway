@@ -194,6 +194,14 @@ impl TaskStore for SqliteTaskStore {
                     args.len()
                 ));
             }
+            if let Some(asid) = &filter.agent_session {
+                args.push(asid.clone());
+                sql.push_str(&format!(
+                    " AND json_extract(binding, '$.kind') = 'pane' \
+                     AND json_extract(binding, '$.agent_session_id') = ?{}",
+                    args.len()
+                ));
+            }
             if let Some(peer_id) = &filter.peer {
                 args.push(peer_id.clone());
                 sql.push_str(&format!(
@@ -1537,6 +1545,7 @@ mod tests {
                 agent_job: None,
                 model: None,
                 variant: None,
+                agent_session_id: None,
             }))
             .await
             .unwrap();
