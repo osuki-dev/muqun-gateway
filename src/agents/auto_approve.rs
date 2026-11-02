@@ -69,6 +69,23 @@ pub fn native_bypass(kind: &str) -> Option<NativeBypass> {
     Some(bypass)
 }
 
+/// The session modes that make an agent stop asking -- its bypass mode and
+/// its "the agent decides" classifier mode -- by the ids its ACP
+/// `modes.availableModes` uses. A device may select one of these (by the
+/// mode route, on session creation, or through the auto-approve switch)
+/// only where the owner allowed it (`allow_remote_auto_approve`).
+pub fn elevating_modes(kind: &str) -> &'static [&'static str] {
+    match kind {
+        "claude" => &["bypassPermissions", "auto"],
+        "qoder" => &["yolo", "bypassPermissions", "auto"],
+        _ => &[],
+    }
+}
+
+pub fn is_elevating(kind: &str, mode: &str) -> bool {
+    elevating_modes(kind).contains(&mode)
+}
+
 /// State each agent's native bypass in its discovery features.
 pub fn annotate(agents: &mut [crate::discovery::AgentDiscoveryInfo]) {
     for agent in agents {
@@ -137,6 +154,24 @@ mod tests {
             let found = native_bypass(kind);
             assert_eq!(found.map(|b| b.native), native, "{kind}");
             assert_eq!(found.map(|b| b.scope), scope, "{kind}");
+        }
+    }
+
+    #[test]
+    fn elevating_modes_are_the_bypass_and_classifier_modes_of_each_agent() {
+        for (kind, mode, elevating) in [
+            ("claude", "bypassPermissions", true),
+            ("claude", "auto", true),
+            ("claude", "acceptEdits", false),
+            ("claude", "plan", false),
+            ("qoder", "yolo", true),
+            ("qoder", "bypassPermissions", true),
+            ("qoder", "dontAsk", false),
+            // OpenCode's modes are personas, never permission policies.
+            ("opencode", "auto", false),
+            ("codex", "bypassPermissions", false),
+        ] {
+            assert_eq!(is_elevating(kind, mode), elevating, "{kind} {mode}");
         }
     }
 

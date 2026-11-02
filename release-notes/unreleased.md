@@ -39,7 +39,9 @@
   the switch answers 501 there and the App says so; DeepSeek has per-request
   approvals only. A bypass mode is still never remembered as a new session's
   default. Switching on from a device needs `allow_remote_auto_approve:
-  true` in `config.json` (off by default); switching off never does.
+  true` in `config.json` (off by default), and so does selecting such a
+  mode through `POST …/mode` or a new session's `mode`; switching off never
+  does.
 
 - **FX and Qoder no longer start a process every minute to re-read an
   unchanged session store.** The task follower reads each open task's session

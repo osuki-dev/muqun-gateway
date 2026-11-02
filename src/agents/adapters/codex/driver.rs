@@ -159,15 +159,26 @@ struct PendingModel {
 /// app-server's own shapes, so what Codex reported goes back unchanged.
 #[derive(Clone, Debug, Default)]
 struct ThreadPolicy {
-    /// What Codex reported for the thread when this Gateway opened it
-    /// (`thread/start`, `thread/resume`), unless that already was bypass.
-    baseline: Option<(Value, Value)>,
+    /// The pair the thread runs under as last known: what Codex reported
+    /// when the thread was opened here (`thread/start`, `thread/resume`),
+    /// or what this Gateway last sent on a `turn/start`.
+    observed: Option<(Value, Value)>,
+    /// The last known pair that was not bypass: what off returns to.
+    pre_bypass: Option<(Value, Value)>,
     /// Carried by the next `turn/start`, then dropped: Codex keeps it for
     /// the turns after that one.
     next: Option<(Value, Value)>,
-    /// The thread runs without approvals or a sandbox, as this Gateway
-    /// last set or observed it.
-    bypass: bool,
+}
+
+/// Sandboxes by what they let a command do; an unknown kind
+/// (`externalSandbox`) is never widened or narrowed, it is kept.
+fn sandbox_width(sandbox: &Value) -> Option<u8> {
+    match sandbox["type"].as_str()? {
+        "readOnly" => Some(0),
+        "workspaceWrite" => Some(1),
+        "dangerFullAccess" => Some(2),
+        _ => None,
+    }
 }
 
 impl ThreadPolicy {
@@ -178,25 +189,49 @@ impl ThreadPolicy {
         (json!("never"), json!({"type":"workspaceWrite"}))
     }
 
-    /// Bypass is "never asks", whatever the sandbox.
-    fn is_bypass(approval: &Value) -> bool {
-        approval == "never"
+    /// Bypass is "never asks" with a sandbox that lets commands write:
+    /// `never` inside a read-only sandbox still cannot change anything.
+    fn is_bypass(approval: &Value, sandbox: &Value) -> bool {
+        approval == "never" && sandbox_width(sandbox).is_some_and(|width| width >= 1)
     }
 
-    /// Record what a thread open reported. A thread already in bypass is
-    /// shown as such, and its pre-bypass policy stays whatever was known.
+    /// Whether the thread runs in bypass, by what is about to be sent or
+    /// else what was last observed.
+    fn bypass(&self) -> bool {
+        self.next
+            .as_ref()
+            .or(self.observed.as_ref())
+            .is_some_and(|(approval, sandbox)| Self::is_bypass(approval, sandbox))
+    }
+
+    /// Record a pair the thread runs under: reported by Codex, or sent by
+    /// this Gateway. Nothing is recorded from a report without both terms.
     fn observe(&mut self, approval: &Value, sandbox: &Value) {
         if approval.is_null() || sandbox.is_null() {
             return;
         }
-        if Self::is_bypass(approval) {
-            self.bypass = true;
-        } else {
-            self.baseline = Some((approval.clone(), sandbox.clone()));
-            if self.next.is_none() {
-                self.bypass = false;
+        let pair = (approval.clone(), sandbox.clone());
+        if !Self::is_bypass(approval, sandbox) {
+            self.pre_bypass = Some(pair.clone());
+        }
+        self.observed = Some(pair);
+    }
+
+    /// What off sends: the last pair that was not bypass, else
+    /// `configured` (Codex's configuration for a new thread), with the
+    /// sandbox never wider than the one the thread was last observed under.
+    fn restore_pair(&self, configured: Option<(Value, Value)>) -> Option<(Value, Value)> {
+        let (approval, mut sandbox) = self.pre_bypass.clone().or(configured)?;
+        if let Some((_, observed)) = &self.observed {
+            if let (Some(target), Some(current)) =
+                (sandbox_width(&sandbox), sandbox_width(observed))
+            {
+                if target > current {
+                    sandbox = observed.clone();
+                }
             }
         }
+        Some((approval, sandbox))
     }
 }
 
@@ -1995,7 +2030,7 @@ impl CodexDriver {
             .await
             .map_err(SendFailure::after_write)?;
         mapper::string(&response["turn"], "id").map_err(SendFailure::Unknown)?;
-        if policy.is_some() {
+        if let Some((approval, sandbox)) = &policy {
             // Codex keeps the override for the turns after this one.
             if let Some(entry) = self
                 .policies
@@ -2003,6 +2038,7 @@ impl CodexDriver {
                 .unwrap_or_else(|p| p.into_inner())
                 .get_mut(id)
             {
+                entry.observe(approval, sandbox);
                 entry.next = None;
             }
         }
@@ -3582,26 +3618,33 @@ impl AgentPort for CodexDriver {
             validate_id(id)?;
             self.prepare_shared_interaction(id).await?;
             self.require_native_interaction(id).await?;
-            let baseline = {
-                let policies = self.policies.lock().unwrap_or_else(|p| p.into_inner());
-                let entry = policies.get(id).cloned().unwrap_or_default();
-                if entry.bypass == enabled && entry.next.is_none() {
-                    return Ok(());
-                }
-                entry.baseline
-            };
+            let entry = self
+                .policies
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(id)
+                .cloned()
+                .unwrap_or_default();
+            if entry.bypass() == enabled {
+                return Ok(());
+            }
             let next = if enabled {
                 ThreadPolicy::bypass_pair()
             } else {
-                match baseline {
-                    Some(baseline) => baseline,
-                    None => self.configured_policy().await?,
-                }
+                let configured = match entry.pre_bypass {
+                    Some(_) => None,
+                    None => Some(self.configured_policy().await?),
+                };
+                entry.restore_pair(configured).ok_or_else(|| {
+                    AgentError::Protocol("Codex stated no policy to return to".into())
+                })?
             };
-            let mut policies = self.policies.lock().unwrap_or_else(|p| p.into_inner());
-            let entry = policies.entry(id.to_owned()).or_default();
-            entry.next = Some(next);
-            entry.bypass = enabled;
+            self.policies
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .entry(id.to_owned())
+                .or_default()
+                .next = Some(next);
             Ok(())
         })
     }
@@ -3614,7 +3657,7 @@ impl AgentPort for CodexDriver {
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
                     .get(id)
-                    .is_some_and(|policy| policy.bypass),
+                    .is_some_and(ThreadPolicy::bypass),
             ))
         })
     }
@@ -3716,50 +3759,97 @@ mod policy_tests {
     use super::ThreadPolicy;
     use serde_json::json;
 
-    /// What a thread open reports becomes the policy to return to, unless
-    /// it already is bypass; a missing report changes nothing.
+    /// What a thread open reports is what the thread runs under; bypass is
+    /// `never` with a sandbox that can write; a missing report changes
+    /// nothing.
     #[test]
-    fn a_thread_open_records_its_policy_or_its_bypass() {
+    fn a_thread_open_records_its_policy_and_whether_it_is_bypass() {
         let ws = json!({"type":"workspaceWrite"});
-        for (name, approval, sandbox, bypass, baseline) in [
-            (
-                "on-request",
-                json!("on-request"),
-                ws.clone(),
-                false,
-                Some((json!("on-request"), ws.clone())),
-            ),
+        let ro = json!({"type":"readOnly"});
+        for (name, approval, sandbox, bypass, pre_bypass) in [
+            ("on-request", json!("on-request"), ws.clone(), false, true),
             // The granular object is a policy like any other.
-            (
-                "granular",
-                json!({"granular":{}}),
-                ws.clone(),
-                false,
-                Some((json!({"granular":{}}), ws.clone())),
-            ),
-            // `never` asks nothing, whatever the sandbox: bypass.
-            ("bypass", json!("never"), ws.clone(), true, None),
+            ("granular", json!({"granular":{}}), ws.clone(), false, true),
+            ("bypass", json!("never"), ws.clone(), true, false),
             (
                 "bypass unsandboxed",
                 json!("never"),
                 json!({"type":"dangerFullAccess"}),
                 true,
-                None,
+                false,
             ),
-            ("unreported", json!(null), json!(null), false, None),
+            // `never` inside a read-only sandbox cannot change anything.
+            ("never read-only", json!("never"), ro.clone(), false, true),
+            ("unreported", json!(null), json!(null), false, false),
         ] {
             let mut policy = ThreadPolicy::default();
             policy.observe(&approval, &sandbox);
-            assert_eq!(policy.bypass, bypass, "{name}");
-            assert_eq!(policy.baseline, baseline, "{name}");
+            assert_eq!(policy.bypass(), bypass, "{name}");
+            assert_eq!(policy.pre_bypass.is_some(), pre_bypass, "{name}");
             assert!(policy.next.is_none(), "{name}");
         }
-        // A thread reopened in bypass keeps the pre-bypass policy it knew.
-        let mut policy = ThreadPolicy::default();
-        policy.observe(&json!("on-request"), &ws);
-        policy.observe(&json!("never"), &ws);
-        assert!(policy.bypass);
-        assert_eq!(policy.baseline, Some((json!("on-request"), ws)));
+    }
+
+    /// Off after a thread was seen in bypass: back to the last policy that
+    /// asked, else Codex's configured one, and never a wider sandbox than
+    /// the thread was last observed under.
+    #[test]
+    fn disabling_after_observed_bypass_restores_without_widening_the_sandbox() {
+        let ws = json!({"type":"workspaceWrite"});
+        let ro = json!({"type":"readOnly"});
+        let full = json!({"type":"dangerFullAccess"});
+        let configured = (json!("on-request"), ro.clone());
+        for (name, observed, want) in [
+            // Reopened already in bypass, nothing known before: the
+            // configuration's policy.
+            (
+                "only bypass",
+                vec![(json!("never"), ws.clone())],
+                (json!("on-request"), ro.clone()),
+            ),
+            // The pre-bypass pair comes back as it was.
+            (
+                "asked before",
+                vec![
+                    (json!("on-request"), ws.clone()),
+                    (json!("never"), ws.clone()),
+                ],
+                (json!("on-request"), ws.clone()),
+            ),
+            // The pair that asked had a wider sandbox than the thread runs
+            // under now: it comes back with the sandbox the thread has.
+            (
+                "narrowed since",
+                vec![
+                    (json!("on-request"), full.clone()),
+                    (json!("never"), ws.clone()),
+                ],
+                (json!("on-request"), ws.clone()),
+            ),
+            // A thread seen without a sandbox at all keeps the narrower
+            // pre-bypass sandbox: restoring never widens.
+            (
+                "full access observed",
+                vec![
+                    (json!("untrusted"), ws.clone()),
+                    (json!("never"), full.clone()),
+                ],
+                (json!("untrusted"), ws.clone()),
+            ),
+        ] {
+            let mut policy = ThreadPolicy::default();
+            for (approval, sandbox) in &observed {
+                policy.observe(approval, sandbox);
+            }
+            assert_eq!(
+                policy.restore_pair(Some(configured.clone())),
+                Some(want.clone()),
+                "{name}"
+            );
+            // Sending it is what takes the thread out of bypass.
+            policy.observe(&want.0, &want.1);
+            assert!(!policy.bypass(), "{name}");
+        }
     }
 }
 

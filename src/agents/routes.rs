@@ -834,6 +834,12 @@ async fn do_create_agent_session(
             )
         })?,
     };
+    refuse_remote_elevation(
+        state,
+        body.mode.as_deref().is_some_and(|mode| {
+            crate::agents::auto_approve::is_elevating(manager.agent().kind(), mode)
+        }),
+    )?;
 
     let directory = expand_directory_param(body.directory.as_deref());
     let validated_dir = match directory.as_deref() {
@@ -1191,6 +1197,10 @@ async fn do_switch_mode(
     require_device(state, headers)?;
 
     let manager = session_manager_or_err(state, asid).await?;
+    refuse_remote_elevation(
+        state,
+        crate::agents::auto_approve::is_elevating(manager.agent().kind(), mode),
+    )?;
 
     manager
         .agent()
@@ -1239,15 +1249,7 @@ async fn do_set_auto_approve(
     headers: &HeaderMap,
 ) -> ApiResult<Json<Value>> {
     require_device(state, headers)?;
-    // Putting an agent into its bypass mode from the phone is the owner's
-    // choice, made in config.json on this computer; taking it out never is.
-    if enabled && !state.config.allow_remote_auto_approve {
-        return Err(api_error(
-            StatusCode::FORBIDDEN,
-            "auto_approve_disabled",
-            "Switching an agent into its bypass mode from a device is off on this computer; set allow_remote_auto_approve to true in the gateway's config.json to allow it",
-        ));
-    }
+    refuse_remote_elevation(state, enabled)?;
     let manager = session_manager_or_err(state, asid).await?;
     manager
         .agent()
@@ -1255,6 +1257,22 @@ async fn do_set_auto_approve(
         .await
         .map_err(agent_error)?;
     auto_approve_state(&manager, asid).await
+}
+
+/// Putting an agent into a mode where it stops asking is the owner's
+/// choice, made in config.json on this computer, never from a device.
+/// Every route that can select such a mode -- the auto-approve switch, the
+/// mode route and session creation -- passes its request through here;
+/// leaving such a mode is never refused.
+fn refuse_remote_elevation(state: &AppState, elevating: bool) -> ApiResult<()> {
+    if elevating && !state.config.allow_remote_auto_approve {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "auto_approve_disabled",
+            "Switching an agent into a mode that stops asking is off for devices on this computer; set allow_remote_auto_approve to true in the gateway's config.json to allow it",
+        ));
+    }
+    Ok(())
 }
 
 enum FileSearchScope<'a> {
@@ -4425,11 +4443,25 @@ mod tests {
         state
     }
 
-    /// A phone may switch an agent into its bypass mode only where the owner
-    /// said so in config.json; switching it off is never refused here.
+    /// A phone may put an agent into a mode that stops asking -- through the
+    /// auto-approve switch, the mode route or a new session's mode -- only
+    /// where the owner said so in config.json; leaving one is never refused.
     #[tokio::test]
-    async fn remote_auto_approve_is_refused_until_the_owner_allows_it_in_config() {
-        let mut state = state_with(vec![FakeAgent::new("opencode")]).await;
+    async fn remote_elevation_is_refused_until_the_owner_allows_it_in_config() {
+        let mut state = state_with(vec![FakeAgent::new("claude")]).await;
+        let session = |mode: Option<&str>| CreateAgentSessionBody {
+            directory: None,
+            model: None,
+            mode: mode.map(str::to_owned),
+            agent_id: Some("claude".into()),
+        };
+        let asid = do_create_agent_session(&state, session(None), &device_headers())
+            .await
+            .expect("a plain session is created")
+            .0["data"]["asid"]
+            .as_str()
+            .expect("the created session has an id")
+            .to_owned();
         for (allowed, enabled, refused) in [
             (false, true, true),
             (false, false, false),
@@ -4437,12 +4469,24 @@ mod tests {
             (true, false, false),
         ] {
             state.config.allow_remote_auto_approve = allowed;
-            let result = do_set_auto_approve(&state, "ses_1", enabled, &device_headers()).await;
-            let status = result.err().map(|refusal| refusal.0);
+            let forbidden = |result: ApiResult<Json<Value>>| {
+                result.err().map(|refusal| refusal.0) == Some(StatusCode::FORBIDDEN)
+            };
+            let switched = do_set_auto_approve(&state, &asid, enabled, &device_headers()).await;
             assert_eq!(
-                status == Some(StatusCode::FORBIDDEN),
+                forbidden(switched),
                 refused,
-                "allowed={allowed} enabled={enabled} -> {status:?}"
+                "switch allowed={allowed} enabled={enabled}"
+            );
+            let mode = if enabled { "bypassPermissions" } else { "plan" };
+            let moded = do_switch_mode(&state, &asid, mode, &device_headers()).await;
+            assert_eq!(forbidden(moded), refused, "mode allowed={allowed} {mode}");
+            let created =
+                do_create_agent_session(&state, session(Some(mode)), &device_headers()).await;
+            assert_eq!(
+                forbidden(created),
+                refused,
+                "create allowed={allowed} {mode}"
             );
         }
     }
