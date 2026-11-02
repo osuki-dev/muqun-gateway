@@ -48,6 +48,12 @@ pub trait AcpProvider: Send + Sync + 'static {
     const STEERING: bool = false;
     /// Advertise form elicitation; questions arrive as `elicitation/create`.
     const FORM_ELICITATION: bool = false;
+    /// The `rawInput` fields, in order, that carry an execute permission's
+    /// complete shell command. The ACP convention is `command`; an agent whose
+    /// own tool schema names it differently lists that name here, so the
+    /// App's shell scanner always receives the real command and no unknown
+    /// shape is guessed at.
+    const SHELL_COMMAND_FIELDS: &'static [&'static str] = mapper::SHELL_COMMAND_FIELDS;
     /// The session takes an appended system prompt (`systemPrompt` on
     /// `session/new`, `session/load`, `session/resume`).
     const SYSTEM_PROMPT: bool = false;
@@ -279,6 +285,9 @@ struct SessionState {
     prompt_checkpoint: Option<Checkpoint>,
     prompt_user_digest: Option<String>,
     turn_had_output: bool,
+    /// A permission request of this turn the Gateway could not read and
+    /// refused; the turn is reported failed instead of ending silently.
+    refused_permission: Option<AgentErrorInfo>,
     forms: HashMap<String, super::elicitation::Elicitation>,
     /// A native command runs that leaves no rows (rename).
     hidden_command: bool,
@@ -2153,6 +2162,7 @@ impl<P: AcpProvider> AcpDriver<P> {
             prompt_checkpoint: None,
             prompt_user_digest: None,
             turn_had_output: false,
+            refused_permission: None,
             forms: HashMap::new(),
             hidden_command: false,
             background_work: false,
@@ -2587,13 +2597,22 @@ impl<P: AcpProvider> AcpDriver<P> {
             AcpEvent::Request { id, method, params } if method == "session/request_permission" => {
                 let mut state = session.state.lock().await;
                 if params["sessionId"].as_str() != Some(state.info.asid.0.as_str()) {
+                    tracing::warn!(
+                        session = %state.info.asid.0,
+                        agent = P::KIND,
+                        requested = params["sessionId"].as_str().unwrap_or("-"),
+                        "ACP permission request names another session; refused"
+                    );
                     let _ = session
                         .client
                         .respond_error(id, -32602, "Session identity mismatch")
                         .await;
                     return true;
                 }
-                match state.projection.permission(id.clone(), &params) {
+                match state
+                    .projection
+                    .permission(id.clone(), &params, P::SHELL_COMMAND_FIELDS)
+                {
                     Ok(mut permission) => {
                         let mut tool = params["toolCall"].clone();
                         tool["sessionUpdate"] = json!("tool_call");
@@ -2649,7 +2668,29 @@ impl<P: AcpProvider> AcpDriver<P> {
                             },
                         );
                     }
-                    Err(_) => {
+                    Err(error) => {
+                        // The agent reads the RPC error as a denial and the
+                        // turn goes on without the tool; the turn's end says why.
+                        let tool = params["toolCall"]["name"]
+                            .as_str()
+                            .or_else(|| params["toolCall"]["kind"].as_str())
+                            .unwrap_or("tool");
+                        tracing::warn!(
+                            session = %state.info.asid.0,
+                            agent = P::KIND,
+                            tool,
+                            %error,
+                            "ACP permission request could not be read; refused"
+                        );
+                        state.refused_permission = Some(AgentErrorInfo {
+                            name: "AcpPermissionUnreadable".into(),
+                            message: format!(
+                                "{} asked to run `{tool}` in a form the Gateway could not read ({error}); the request was refused",
+                                P::LABEL
+                            ),
+                            status: None,
+                            retry_after_ms: None,
+                        });
                         let _ = session
                             .client
                             .respond_error(id, -32602, "Invalid permission request")
@@ -2871,6 +2912,7 @@ impl<P: AcpProvider> AcpDriver<P> {
         state.prompt_checkpoint = checkpoint;
         state.prompt_user_digest = Some(recovery::text_digest(&prepared.transcript));
         state.turn_had_output = false;
+        state.refused_permission = None;
         state.last_activity = tokio::time::Instant::now();
         if P::IDLE_RETIREMENT && !state.prompted {
             // MCP servers may still be starting when the session opens.
@@ -3419,10 +3461,15 @@ impl<P: AcpProvider> AcpDriver<P> {
                         if !session.connected.load(Ordering::Acquire) { break; }
                         Self::finish_usage(&session, &mirror, &tx, result.as_ref().ok()).await;
                         let normal_end = result.as_ref().is_ok_and(|value| value["stopReason"].as_str() == Some("end_turn"));
+                        let refused_permission = session.state.lock().await.refused_permission.take();
                         let (status, error) = match result {
                             Ok(value) => match value["stopReason"].as_str() {
                                 Some("cancelled") => (AgentSessionStatus::Interrupted, None),
-                                Some("end_turn" | "max_tokens" | "max_turn_requests" | "refusal") => (AgentSessionStatus::Idle, None),
+                                // A tool the Gateway refused unseen is not a quiet turn.
+                                Some("end_turn" | "max_tokens" | "max_turn_requests" | "refusal") => match refused_permission {
+                                    Some(error) => (AgentSessionStatus::Failed, Some(error)),
+                                    None => (AgentSessionStatus::Idle, None),
+                                },
                                 _ => (AgentSessionStatus::Unknown, Some(AgentErrorInfo { name: "AcpUnknownStop".into(), message: "ACP returned no recognized stop reason".into(), status: None, retry_after_ms: None })),
                             },
                             Err(error) => (AgentSessionStatus::Failed, Some(AgentErrorInfo { name: "AcpPromptFailed".into(), message: format!("{error}; delivery was not retried"), status: None, retry_after_ms: None })),

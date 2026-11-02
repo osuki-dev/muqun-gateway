@@ -209,10 +209,173 @@ for line in sys.stdin:
         for option in config['configOptions']:
             if option['id'] == p['configId']: option['currentValue'] = p['value']
         send({'jsonrpc': '2.0', 'id': rid, 'result': {'configOptions': config['configOptions']}})
+    elif method == 'session/prompt' and p['prompt'][0]['text'].startswith('run:'):
+        # agy 1.4 asks for its run_command tool with the tool's own input
+        # schema; `run:` carries the CommandLine, `run:` alone omits it.
+        prompt = rid
+        raw = {'WaitMsBeforeAsync': 5000, 'toolSummary': 'Check the working tree'}
+        if p['prompt'][0]['text'][4:]: raw['CommandLine'] = p['prompt'][0]['text'][4:]
+        send({'jsonrpc': '2.0', 'id': 'perm-1', 'method': 'session/request_permission', 'params': {'sessionId': p['sessionId'],
+              'toolCall': {'toolCallId': 'call-1', 'kind': 'execute', 'title': 'run_command', 'rawInput': raw},
+              'options': [{'optionId': 'allow', 'kind': 'allow_once', 'name': 'Allow'}, {'optionId': 'allow_always', 'kind': 'allow_always', 'name': 'Always allow'}, {'optionId': 'reject', 'kind': 'reject_once', 'name': 'Reject'}]}})
+    elif method is None and rid == 'perm-1':
+        if 'result' in m:
+            send({'jsonrpc': '2.0', 'method': 'session/update', 'params': {'sessionId': 'conv-live', 'update': {'sessionUpdate': 'tool_call_update', 'toolCallId': 'call-1', 'status': 'completed'}}})
+        send({'jsonrpc': '2.0', 'id': prompt, 'result': {'stopReason': 'end_turn'}})
     elif method == 'session/prompt':
         send({'jsonrpc': '2.0', 'method': 'session/update', 'params': {'sessionId': p['sessionId'], 'update': {'sessionUpdate': 'agent_message_chunk', 'content': {'type': 'text', 'text': 'PONG'}}}})
         send({'jsonrpc': '2.0', 'id': rid, 'result': {'stopReason': 'end_turn', 'usage': {'inputTokens': 3, 'outputTokens': 1, 'totalTokens': 4}}})
 "#;
+
+/// agy 1.4's `session/request_permission` for `run_command`: the `rawInput`
+/// is the tool's own input, recorded from a real conversation store as
+/// `{"CommandLine": …, "WaitMsBeforeAsync": 5000, "toolSummary": …}`; it has
+/// no ACP `command` field.
+fn agy_shell_permission(raw_input: Value) -> Value {
+    json!({
+        "sessionId": "conv-live",
+        "toolCall": {"toolCallId": "call-1", "kind": "execute", "title": "run_command", "rawInput": raw_input},
+        "options": [
+            {"optionId": "allow", "kind": "allow_once", "name": "Allow"},
+            {"optionId": "allow_always", "kind": "allow_always", "name": "Always allow"},
+            {"optionId": "reject", "kind": "reject_once", "name": "Reject"}
+        ]
+    })
+}
+
+#[test]
+fn run_command_permissions_take_the_command_line_and_refuse_anything_else() {
+    use super::driver::AntigravityProvider;
+    use crate::agents::adapters::acp::{mapper, session::AcpProvider};
+    let agy = AntigravityProvider::SHELL_COMMAND_FIELDS;
+    for (raw_input, expected) in [
+        (
+            json!({"CommandLine": "git status -s", "WaitMsBeforeAsync": 5000, "toolSummary": "Check the working tree"}),
+            Some("git status -s"),
+        ),
+        (json!({"command": "pwd"}), Some("pwd")),
+        (
+            json!({"CommandLine": "  ", "WaitMsBeforeAsync": 5000}),
+            None,
+        ),
+        (
+            json!({"WaitMsBeforeAsync": 5000, "toolSummary": "Check the working tree"}),
+            None,
+        ),
+        (json!({"CommandLine": ["git", "status"]}), None),
+        (Value::Null, None),
+    ] {
+        let parsed = mapper::permission(json!(1), &agy_shell_permission(raw_input.clone()), agy);
+        match expected {
+            Some(command) => {
+                let parsed = parsed.unwrap_or_else(|error| panic!("{raw_input}: {error}"));
+                assert_eq!(parsed.request.action, "shell");
+                assert_eq!(parsed.request.resources, [command]);
+            }
+            None => assert!(parsed.is_err(), "{raw_input} must not parse"),
+        }
+    }
+    // The field is agy's, not a guess every ACP agent gets.
+    assert!(mapper::permission(
+        json!(1),
+        &agy_shell_permission(json!({"CommandLine": "pwd"})),
+        mapper::SHELL_COMMAND_FIELDS
+    )
+    .is_err());
+}
+
+#[tokio::test]
+async fn run_command_permission_reaches_the_app_and_an_unreadable_one_fails_the_turn() {
+    use crate::agents::domain::PermissionDecision;
+    use std::os::unix::fs::PermissionsExt;
+    let root = scratch();
+    let binary = root.0.join("agy");
+    std::fs::write(&binary, FAKE_AGY).unwrap();
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let driver = AntigravityDriver::new(
+        binary.to_string_lossy().into_owned(),
+        root.0.to_string_lossy().into_owned(),
+        Arc::new(MemoryMirror::for_agent("antigravity")),
+        tokio::sync::broadcast::channel(256).0,
+    );
+    let id = driver
+        .create_session(None, None, None)
+        .await
+        .unwrap()
+        .asid
+        .0;
+    let (driver_ref, id_ref) = (&driver, &id);
+    let settled = |expected: AgentSessionStatus| async move {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let info = driver_ref.get_session(id_ref).await.unwrap();
+                if info.status == expected {
+                    break info;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap()
+    };
+
+    driver
+        .send_prompt(&id, "run:git status -s", &[], None)
+        .await
+        .unwrap();
+    let pending = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let pending = driver.get_pending_permissions(&id).await.unwrap();
+            if !pending.is_empty() {
+                break pending;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(pending[0].action, "shell");
+    assert_eq!(pending[0].resources, ["git status -s"]);
+    driver
+        .reply_permission(&id, &pending[0].id, PermissionDecision::Allow, None)
+        .await
+        .unwrap();
+    let info = settled(AgentSessionStatus::Idle).await;
+    assert!(info.error.is_none());
+
+    // No command text at all: refused, and the turn says so instead of
+    // ending as if the agent had simply said nothing.
+    driver.send_prompt(&id, "run:", &[], None).await.unwrap();
+    let info = settled(AgentSessionStatus::Failed).await;
+    let error = info.error.unwrap();
+    assert_eq!(error.name, "AcpPermissionUnreadable");
+    assert!(
+        error
+            .message
+            .starts_with("Antigravity asked to run `execute`"),
+        "{}",
+        error.message
+    );
+    assert!(driver
+        .get_pending_permissions(&id)
+        .await
+        .unwrap()
+        .is_empty());
+    let answers: Vec<Value> = std::fs::read_to_string(root.0.join("requests.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .filter(|r: &Value| r["id"] == "perm-1")
+        .collect();
+    assert_eq!(answers.len(), 2);
+    assert_eq!(answers[0]["result"]["outcome"]["optionId"], "allow");
+    assert_eq!(answers[1]["error"]["code"], -32602);
+
+    // The next turn starts clean.
+    driver.send_prompt(&id, "ping", &[], None).await.unwrap();
+    assert!(settled(AgentSessionStatus::Idle).await.error.is_none());
+    driver.shutdown().await;
+}
 
 #[tokio::test]
 async fn login_gates_sessions_and_choices_reach_agy_with_muqun_tools() {

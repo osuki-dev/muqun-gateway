@@ -153,7 +153,7 @@ cannot be seen.
 | Delete | Not advertised (`session/close` only closes) | Not supported |
 | Title | `session_info_update` | Implemented (read-only; no rename method) |
 | Image / file attachments | No `promptCapabilities` advertised | Not supported |
-| Approvals | `session/request_permission` (allow once / always / reject) | Implemented |
+| Approvals | `session/request_permission` (allow once / always / reject); `run_command` sends `rawInput: {CommandLine, WaitMsBeforeAsync, toolSummary}`, not the ACP `command` | Implemented; `CommandLine` is the shell command (agy 1.4). A request the Gateway cannot read is refused with a WARN log and the turn ends failed (`AcpPermissionUnreadable`) |
 | Questions | Permission requests with `interaction_` ids | Supported by agy, not implemented as questions (shared approval path; not verified live) |
 | Delegated tasks and muqun tools | ACP HTTP `mcpServers` | Implemented (verified against a probe MCP server); the task sentence ends the first prompt and is cut from the served transcript, since `_meta.antigravity.systemPrompt.append` (advertised by agy 1.4.12) is unverified |
 | Subagents | Ordinary tool calls (`invoke_subagent`), no child ids | Shown as tool rows; child conversations not listed |
