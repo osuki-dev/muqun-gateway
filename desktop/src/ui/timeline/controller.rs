@@ -98,6 +98,8 @@ struct Ctl {
     quiet: u32,
     last_top: f32,
     last_content: f32,
+    /// Pixels the viewport moved since the previous frame.
+    speed: f32,
     epoch: u64,
 }
 
@@ -117,6 +119,8 @@ pub struct Controller {
     pub pill: State<usize>,
     /// An older page is on its way.
     pub loading: State<bool>,
+    /// The list's state as text, for the `MUQUN_DEBUG_LIST=1` overlay.
+    pub debug: Option<State<String>>,
     s: Mutex<Ctl>,
 }
 
@@ -126,6 +130,7 @@ pub struct Controller {
 struct Writes {
     epoch: Option<u64>,
     pill: Option<usize>,
+    debug: Option<String>,
     loading: Option<bool>,
     command: Option<Command>,
 }
@@ -143,6 +148,8 @@ impl Controller {
                     window_epoch: ctx.use_state_keyed("mq.timeline.window", || 0u64),
                     pill: ctx.use_state_keyed("mq.timeline.pill", || 0usize),
                     loading: ctx.use_state_keyed("mq.timeline.loading", || false),
+                    debug: std::env::var_os("MUQUN_DEBUG_LIST")
+                        .map(|_| ctx.use_state_keyed("mq.timeline.debug", String::new)),
                     s: Mutex::new(Ctl {
                         width: 800.0,
                         ..Ctl::default()
@@ -193,6 +200,11 @@ impl Controller {
         if let Some(c) = w.command {
             self.app.send(c);
         }
+        if let (Some(text), Some(state)) = (w.debug, self.debug.as_ref()) {
+            if state.get() != text {
+                state.signal().set(text);
+            }
+        }
     }
 
     /// Bring the model in line with `order`. Under the lock.
@@ -216,8 +228,17 @@ impl Controller {
         }
     }
 
-    fn buffer(vh: f32) -> f32 {
-        vh + 240.0
+    /// Rows built beyond the viewport on each side, and the margin the
+    /// window must keep before it is rebuilt. Scrolling faster than most of
+    /// a viewport per frame (a scrollbar fling through thousands of rows),
+    /// a buffer is never reached before it is passed: build just the
+    /// viewport, so each frame shapes a third of the text.
+    fn buffer(vh: f32, speed: f32) -> (f32, f32) {
+        if speed > vh * 0.75 {
+            (0.0, 0.0)
+        } else {
+            (vh + 240.0, vh * 0.5)
+        }
     }
 
     /// The window for the list being built now. Called from the list's
@@ -256,10 +277,11 @@ impl Controller {
                 top - LEAD + shift
             }
         };
-        let window = if s.model.covers(&s.window, expected, vh, vh * 0.5) {
+        let (buffer, margin) = Self::buffer(vh, s.speed);
+        let window = if s.model.covers(&s.window, expected, vh, margin) {
             s.window.clone()
         } else {
-            s.model.window(expected, vh, Self::buffer(vh))
+            s.model.window(expected, vh, buffer)
         };
         s.window = window.clone();
         let (above, below) = s.model.spacers(&window);
@@ -321,8 +343,10 @@ impl Controller {
                 s.model.resum();
                 s.sums_dirty = false;
             }
-            if !s.model.covers(&s.window, top - LEAD, vh, vh * 0.5) {
-                s.window = s.model.window(top - LEAD, vh, Self::buffer(vh));
+            s.speed = (top - s.last_top).abs();
+            let (buffer, margin) = Self::buffer(vh, s.speed);
+            if !s.model.covers(&s.window, top - LEAD, vh, margin) {
+                s.window = s.model.window(top - LEAD, vh, buffer);
                 s.epoch += 1;
                 w.epoch = Some(s.epoch);
             }
@@ -414,6 +438,12 @@ impl Controller {
                 s.sums_dirty = false;
             }
             let max = (content - vh).max(0.0);
+            // 0. Something other than this controller moved the viewport
+            //    since the last frame (a scrollbar drag, a programmatic
+            //    scroll): that is the reader choosing where to be.
+            if (top - s.last_top).abs() > 0.5 && s.restore.is_none() {
+                s.following = top >= max - 2.0;
+            }
             // 1. A session (re)opened: put the reader back.
             let mut restored = false;
             if let Some(r) = s.restore.clone().filter(|r| r.built) {
@@ -475,8 +505,10 @@ impl Controller {
                 let heights = s.heights.entry(s.asid.clone()).or_default();
                 s.model = Model::build(&s.ids, &s.shapes, heights, width);
             }
-            if width_changed || !s.model.covers(&s.window, top - LEAD, vh, vh * 0.5) {
-                s.window = s.model.window(top - LEAD, vh, Self::buffer(vh));
+            s.speed = (top - s.last_top).abs();
+            let (buffer, margin) = Self::buffer(vh, s.speed);
+            if width_changed || !s.model.covers(&s.window, top - LEAD, vh, margin) {
+                s.window = s.model.window(top - LEAD, vh, buffer);
                 s.epoch += 1;
                 w.epoch = Some(s.epoch);
             }
@@ -499,6 +531,24 @@ impl Controller {
                 end = s.window.end,
                 "frame"
             );
+            if self.debug.is_some() {
+                let visible = s.model.rows_between(top - LEAD, top - LEAD + vh);
+                let covered = visible.is_empty()
+                    || (s.window.start <= visible.start && visible.end <= s.window.end);
+                w.debug = Some(format!(
+                    "visible {}..{} · built {}..{} ({}) · total {} · top {:.0} / {:.0}{}{}",
+                    visible.start,
+                    visible.end,
+                    s.window.start,
+                    s.window.end,
+                    s.window.len(),
+                    s.ids.len(),
+                    top,
+                    max,
+                    if s.following { " · following" } else { "" },
+                    if covered { "" } else { " · GAP" },
+                ));
+            }
             // 7. Keep going while anything moves.
             let moved = (top - s.last_top).abs() > 0.1
                 || (content - s.last_content).abs() > 0.1

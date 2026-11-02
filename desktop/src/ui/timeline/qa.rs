@@ -10,7 +10,13 @@
 //! * `MUQUN_QA_SCROLL=1` -- once rows are shown, scroll top to bottom and
 //!   back at three speeds, counting frames where the viewport shows rows
 //!   the window has not built (blank gaps).
+//! * `MUQUN_QA_TOUR=1` -- once rows are shown: hold at the bottom, jump
+//!   to the top, the middle, then fling down at 1600 px a frame, holding
+//!   four seconds at each stop and logging `qa: tour at <stop>` (for
+//!   screenshots).
 //! * `MUQUN_QA_SCHEME=light|dark` -- start in that colour scheme.
+//! * `MUQUN_QA_TOGGLE_AFTER=<secs>` -- flip the scheme once, that long
+//!   after start, the way the top bar's toggle does (live recolouring).
 //!
 //! Frame times come from Blinc's own `blinc_app::frame_timing` trace.
 
@@ -37,8 +43,20 @@ struct Script {
     prompt: Option<(String, Option<String>)>,
     scroll: Option<Scroll>,
     want_scroll: bool,
+    toggle_after: Option<Duration>,
+    tour: Option<Tour>,
     done: bool,
 }
+
+#[derive(Default)]
+struct Tour {
+    stop: usize,
+    since: Option<Instant>,
+    fling: u32,
+    logged: bool,
+}
+
+const TOUR_HOLD: Duration = Duration::from_secs(4);
 
 #[derive(Default)]
 struct Scroll {
@@ -75,7 +93,18 @@ pub fn start(app: &App) {
         Ok("dark") => ThemeState::get().set_scheme(ColorScheme::Dark),
         _ => {}
     }
-    if synth.is_none() && open.is_none() && prompt.is_none() && !want_scroll {
+    let toggle_after = std::env::var("MUQUN_QA_TOGGLE_AFTER")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(Duration::from_secs);
+    let tour = std::env::var_os("MUQUN_QA_TOUR").map(|_| Tour::default());
+    if synth.is_none()
+        && open.is_none()
+        && prompt.is_none()
+        && !want_scroll
+        && toggle_after.is_none()
+        && tour.is_none()
+    {
         return;
     }
     tracing::info!(
@@ -95,6 +124,8 @@ pub fn start(app: &App) {
     let script = Arc::new(Mutex::new(Script {
         prompt: prompt.map(|p| (p, None)),
         want_scroll,
+        toggle_after,
+        tour,
         ..Script::default()
     }));
     if let Some((_, slot)) = script.lock().unwrap().prompt.as_mut() {
@@ -164,7 +195,22 @@ fn tick(app: &App, s: &mut Script) {
             s.want_scroll = false;
         }
     }
-    s.done = s.prompt.is_none() && !s.want_scroll;
+    if let Some(after) = s.toggle_after {
+        if s.started.is_some_and(|t| t.elapsed() >= after) {
+            let theme = ThemeState::get();
+            let next = theme.scheme().toggle();
+            tracing::info!(target: "muqun::qa", ?next, "qa: switching the colour scheme");
+            theme.set_scheme(next);
+            super::theme_changed(app);
+            s.toggle_after = None;
+        }
+    }
+    if let Some(tour) = s.tour.as_mut() {
+        if tour_step(app, tour) {
+            s.tour = None;
+        }
+    }
+    s.done = s.prompt.is_none() && !s.want_scroll && s.toggle_after.is_none() && s.tour.is_none();
 }
 
 /// One frame of the scroll run. True when finished.
@@ -211,6 +257,53 @@ fn scroll_step(app: &App, s: &mut Scroll) -> bool {
     }
     // A wheel's delta: negative scrolls down.
     scroll.scroll_by(0.0, if down { -speed } else { speed });
+    // A programmatic scroll does not pass the wheel handler: make sure the
+    // controller runs next frame (as it would after a scrollbar drag).
+    app.drain.wake();
+    false
+}
+
+/// One frame of the tour. True when finished.
+fn tour_step(app: &App, t: &mut Tour) -> bool {
+    let ctl = Controller::get(app);
+    if ctl.row_count() == 0 {
+        return false;
+    }
+    let since = *t.since.get_or_insert_with(Instant::now);
+    let held = since.elapsed();
+    let max = {
+        let p = ctl.physics();
+        let p = p.lock().unwrap();
+        (p.content_height - p.viewport_height).max(0.0)
+    };
+    let scroll = &app.bindings.timeline_scroll;
+    let stops = ["bottom", "top", "middle", "after-fling"];
+    // Stop 3 flings for 60 frames before it holds.
+    if t.stop == 3 && t.fling < 60 {
+        scroll.scroll_by(0.0, -1600.0);
+        t.fling += 1;
+        t.since = Some(Instant::now());
+        app.drain.wake();
+        return false;
+    }
+    if held < TOUR_HOLD {
+        if !t.logged {
+            t.logged = true;
+            tracing::info!(target: "muqun::qa", stop = stops[t.stop], "qa: tour at");
+        }
+        app.drain.wake();
+        return false;
+    }
+    t.stop += 1;
+    t.logged = false;
+    t.since = Some(Instant::now());
+    match t.stop {
+        1 => scroll.set_scroll_offset(0.0, 0.0),
+        2 => scroll.set_scroll_offset(0.0, max / 2.0),
+        3 => scroll.set_scroll_offset(0.0, max / 4.0),
+        _ => return true,
+    }
+    app.drain.wake();
     false
 }
 

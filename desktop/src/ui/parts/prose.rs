@@ -50,7 +50,11 @@ fn tail(state: &State<String>, kind: TailKind, setting: &Setting) -> Div {
                 .font(UI_FONT)
                 .size(setting.size)
                 .line_height(setting.line_height)
-                .color(setting.color),
+                .class(if setting.color == setting.palette.muted {
+                    "mq-text-muted"
+                } else {
+                    "mq-text"
+                }),
         ),
         TailKind::Code => div().class("mq-code").w_full().child(
             div().class("mq-code-body").w_full().overflow_clip().child(
@@ -58,7 +62,7 @@ fn tail(state: &State<String>, kind: TailKind, setting: &Setting) -> Div {
                     .font(MONO_FONT)
                     .size(scale::FS_13)
                     .line_height(1.5)
-                    .color(setting.palette.text),
+                    .class("mq-text"),
             ),
         ),
     }

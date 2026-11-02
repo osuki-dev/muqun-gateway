@@ -115,6 +115,8 @@ struct Stream {
     throttle: Throttle,
     /// The item changed since the tail was last written.
     dirty: bool,
+    /// When settled blocks last moved into the row's markdown.
+    last_settle: Option<Instant>,
 }
 
 struct Inner {
@@ -371,6 +373,11 @@ impl Drain {
                 }
             }
             *stream = Stream::default();
+            tracing::debug!(
+                target: "muqun::stream",
+                live = live.as_ref().map(|(_, id)| id.as_str()).unwrap_or("-"),
+                "live part changed"
+            );
             if let Some((asid, id)) = live {
                 if let Some(item) = view.item(&id) {
                     let text = part_text(&item);
@@ -433,9 +440,18 @@ impl Drain {
             };
             let text = part_text(&item);
             let boundary = stream::settled_boundary(text);
-            let (kind, tail) = stream::tail(text, boundary);
-            let settled = boundary != stream.boundary || Some(kind) != stream.kind;
-            stream.boundary = boundary;
+            let moved = boundary != stream.boundary;
+            let settled = moved && stream::may_settle(stream.last_settle, now);
+            if settled {
+                stream.boundary = boundary;
+                stream.last_settle = Some(now);
+            } else if moved {
+                // Not yet: the new blocks stay in the tail until the next
+                // settle, which a later frame retries.
+                stream.dirty = true;
+            }
+            let (kind, tail) = stream::tail(text, stream.boundary);
+            let settled = settled || Some(kind) != stream.kind;
             stream.kind = Some(kind);
             ((asid, id, settled), tail.to_string())
         };
@@ -451,7 +467,8 @@ impl Drain {
                 state.signal().set(version);
             }
         });
-        false
+        // A deferred settle keeps the drain ticking until it lands.
+        self.inner.stream.lock().unwrap().dirty
     }
 }
 

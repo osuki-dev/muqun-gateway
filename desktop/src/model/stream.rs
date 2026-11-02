@@ -16,6 +16,16 @@ use std::time::{Duration, Instant};
 
 /// At most this often the tail is replaced: 30 Hz.
 pub const STREAM_INTERVAL: Duration = Duration::from_millis(33);
+/// At most this often settled blocks move from the tail into the markdown
+/// above it. Settling renders the whole row again -- its cost grows with
+/// the message -- while a tail update only replaces one text, so a long
+/// reply settles a few times a second, not once per paragraph.
+pub const SETTLE_INTERVAL: Duration = Duration::from_millis(400);
+
+/// Whether a block that settled may move into the markdown now.
+pub fn may_settle(last: Option<Instant>, now: Instant) -> bool {
+    last.is_none_or(|last| now.duration_since(last) >= SETTLE_INTERVAL)
+}
 
 /// A fence opener or closer: up to three spaces, then at least three
 /// backticks or tildes. Returns the fence character and its length.
@@ -210,6 +220,14 @@ mod tests {
         assert!(t.take_due(ms(34)), "released once due");
         assert!(!t.take_due(ms(80)), "nothing left to release");
         assert!(t.offer(ms(80)));
+    }
+
+    #[test]
+    fn settling_is_limited_to_a_few_times_a_second() {
+        let start = Instant::now();
+        assert!(may_settle(None, start));
+        assert!(!may_settle(Some(start), start + Duration::from_millis(100)));
+        assert!(may_settle(Some(start), start + SETTLE_INTERVAL));
     }
 
     #[test]

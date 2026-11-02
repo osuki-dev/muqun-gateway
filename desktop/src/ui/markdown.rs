@@ -532,6 +532,7 @@ fn render_block(block: &Block, setting: &Setting, chrome: &CodeChrome<'_>, index
             code,
             &format!("{}.{index}", chrome.key),
             chrome,
+            setting.width,
         ),
         Block::Quote(blocks) => {
             let sub = CodeChrome {
@@ -578,7 +579,7 @@ fn render_block(block: &Block, setting: &Setting, chrome: &CodeChrome<'_>, index
                                     .font(UI_FONT)
                                     .size(setting.size)
                                     .line_height(setting.line_height)
-                                    .color(setting.palette.subtle)
+                                    .class("mq-text-subtle")
                                     .no_wrap(),
                             ),
                         )
@@ -629,23 +630,45 @@ fn table(head: &[Inline], rows: &[Vec<Inline>], setting: &Setting) -> Div {
 }
 
 /// A fenced code block: a header with the language and a copy control,
-/// then the highlighted code, one unwrapped rich text per line, clipped at
-/// the block's edge. Not a horizontal scroller: one under the pointer would
-/// take the timeline's wheel events (`renderer/scroll.rs` routes a wheel to
-/// the innermost scroller). Leading indentation is kept with no-break
-/// spaces, which the text layout does not collapse.
-pub fn code_block(lang: Option<&str>, code: &str, key: &str, chrome: &CodeChrome<'_>) -> Div {
+/// then the highlighted code, wrapping only lines longer than the block.
+/// Not a horizontal scroller: one under the pointer would take the
+/// timeline's wheel events (`renderer/scroll.rs` routes a wheel to the
+/// innermost scroller).
+///
+/// The text layout drops whitespace at the start of every line (no-break
+/// spaces and joiners included), so indentation cannot live in the text.
+/// Consecutive lines with the same indentation become one rich text behind
+/// a spacer of that many monospace cells: indentation survives, and a block
+/// costs a node per indentation change rather than per line (a streaming
+/// reply's row is rebuilt as blocks settle, at a cost per node).
+pub fn code_block(
+    lang: Option<&str>,
+    code: &str,
+    key: &str,
+    chrome: &CodeChrome<'_>,
+    width: f32,
+) -> Div {
     let highlighted = highlight::highlight(lang, code);
     let p = Palette::current();
     let label = lang.unwrap_or("text").to_string();
     let copy_text = code.to_string();
+    let inner = if width > 0.0 {
+        (width - CODE_INSET).max(80.0)
+    } else {
+        0.0
+    };
     let mut body = div()
         .class("mq-code-body")
         .w_full()
         .flex_col()
         .overflow_clip();
-    for line in &highlighted.lines {
-        body = body.child(code_line(line, p.text));
+    for group in indent_groups(&highlighted.lines) {
+        body = body.child(code_group(
+            &highlighted.lines[group.lines],
+            group.cells,
+            inner,
+            p.text,
+        ));
     }
     div()
         .class("mq-code")
@@ -662,7 +685,7 @@ pub fn code_block(lang: Option<&str>, code: &str, key: &str, chrome: &CodeChrome
                     text(label)
                         .font(MONO_FONT)
                         .size(scale::FS_11)
-                        .color(p.subtle)
+                        .class("mq-text-subtle")
                         .no_wrap(),
                 )
                 .child(copy_button(
@@ -674,6 +697,9 @@ pub fn code_block(lang: Option<&str>, code: &str, key: &str, chrome: &CodeChrome
         .child(body)
 }
 
+/// The code block's hairlines and padding (`.mq-code`, `.mq-code-body`).
+const CODE_INSET: f32 = 2.0 + 2.0 * 12.0;
+
 /// The advance of one monospace cell at the code size.
 fn mono_cell() -> f32 {
     static CELL: OnceLock<f32> = OnceLock::new();
@@ -682,7 +708,7 @@ fn mono_cell() -> f32 {
             blinc_layout::text_measure::TextLayoutOptions::new().with_font_name(MONO_FONT);
         let w = blinc_layout::text_measure::measure_text_with_options(
             "MMMMMMMMMM",
-            scale::FS_13,
+            scale::MONO,
             &options,
         )
         .width
@@ -690,7 +716,7 @@ fn mono_cell() -> f32 {
         if w > 0.0 {
             w
         } else {
-            scale::FS_13 * 0.6
+            scale::MONO * 0.6
         }
     })
 }
@@ -711,40 +737,68 @@ pub fn indentation(line: &str) -> (usize, usize) {
     (cells, bytes)
 }
 
-/// One line of code, unwrapped. The text layout drops leading whitespace
-/// (no-break spaces included), so indentation is a spacer of that many
-/// monospace cells in front of the text.
-pub fn code_line(line: &StyledLine, color: Color) -> Div {
-    let (cells, indent) = indentation(&line.text);
-    let rest = &line.text[indent..];
-    let spans: Vec<TextSpan> = line
-        .spans
+/// A run of lines sharing one indentation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndentGroup {
+    pub lines: std::ops::Range<usize>,
+    pub cells: usize,
+}
+
+/// Split lines into runs of equal indentation. A blank line joins the run
+/// it is in.
+pub fn indent_groups(lines: &[StyledLine]) -> Vec<IndentGroup> {
+    let mut groups: Vec<IndentGroup> = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        let blank = line.text.trim().is_empty();
+        let cells = indentation(&line.text).0;
+        match groups.last_mut() {
+            Some(g) if blank || g.cells == cells => g.lines.end = i + 1,
+            _ => groups.push(IndentGroup {
+                lines: i..i + 1,
+                cells: if blank { 0 } else { cells },
+            }),
+        }
+    }
+    groups
+}
+
+/// One indentation run: a spacer, then its lines (indentation removed) as
+/// one wrapping rich text.
+fn code_group(lines: &[StyledLine], cells: usize, width: f32, color: Color) -> Div {
+    let stripped: Vec<StyledLine> = lines
         .iter()
-        .filter_map(|s| {
-            let start = s.start.max(indent) - indent;
-            let end = s.end.saturating_sub(indent).min(rest.len());
-            (start < end).then(|| {
-                let mut s = s.clone();
-                s.start = start;
-                s.end = end;
-                s
-            })
+        .map(|line| {
+            let (_, indent) = indentation(&line.text);
+            let rest = &line.text[indent..];
+            let spans = line
+                .spans
+                .iter()
+                .filter_map(|s| {
+                    let start = s.start.max(indent) - indent;
+                    let end = s.end.saturating_sub(indent).min(rest.len());
+                    (start < end).then(|| {
+                        let mut s = s.clone();
+                        s.start = start;
+                        s.end = end;
+                        s
+                    })
+                })
+                .collect();
+            StyledLine::new(rest, spans)
         })
         .collect();
-    let content = if rest.is_empty() { " " } else { rest };
-    // `no_wrap` first: it does not recompute the size estimate, the
-    // setters after it do (`rich_text/mod.rs:404-408`).
-    let text = rich_text_styled(StyledText::from_lines(vec![StyledLine::new(
-        content, spans,
-    )]))
-    .no_wrap()
-    .size(scale::FS_13)
-    .line_height(1.5)
-    .default_color(color)
-    .font_family(FontFamily::named(MONO_FONT));
-    let mut row = div().flex_row().flex_shrink_0();
+    let pad = cells as f32 * mono_cell();
+    let mut text = rich_text_styled(StyledText::from_lines(stripped))
+        .size(scale::MONO)
+        .line_height(1.5)
+        .default_color(color)
+        .font_family(FontFamily::named(MONO_FONT));
+    if width > 0.0 {
+        text = text.w((width - pad).max(40.0));
+    }
+    let mut row = div().w_full().flex_row();
     if cells > 0 {
-        row = row.child(div().w(cells as f32 * mono_cell()).flex_shrink_0());
+        row = row.child(div().w(pad).flex_shrink_0());
     }
     row.child(text)
 }
@@ -849,11 +903,16 @@ mod tests {
     }
 
     #[test]
-    fn indentation_counts_cells_and_bytes() {
-        assert_eq!(indentation("\tlet x = 1;"), (4, 1));
-        assert_eq!(indentation("    i * 2"), (4, 4));
-        assert_eq!(indentation("fn main()"), (0, 0));
-        assert_eq!(indentation("  "), (2, 2));
+    fn code_lines_group_by_indentation_and_blank_lines_join() {
+        let lines: Vec<StyledLine> = ["fn a() {", "    x;", "", "    y;", "}", "\tz"]
+            .iter()
+            .map(|t| StyledLine::new(*t, vec![]))
+            .collect();
+        let groups = indent_groups(&lines);
+        let shape: Vec<(std::ops::Range<usize>, usize)> =
+            groups.into_iter().map(|g| (g.lines, g.cells)).collect();
+        assert_eq!(shape, vec![(0..1, 0), (1..4, 4), (4..5, 0), (5..6, 4)]);
+        assert_eq!(indentation("\tlet"), (4, 1));
     }
 
     #[test]

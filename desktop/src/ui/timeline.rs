@@ -84,10 +84,10 @@ pub fn timeline(app: &App, height: f32) -> impl ElementBuilder {
         .child(
             Scroll::with_physics(ctl.physics())
                 .bind(&app.bindings.timeline_scroll)
-                // Off: rows outside the window are not built at all, and
-                // with a 1.5 M px content (10 000 rows) Blinc's cull test
-                // dropped the rows inside the viewport too (see the report).
-                .viewport_cull(std::env::var_os("MUQUN_QA_CULL").is_some())
+                // Rows outside the window are not built at all; culling
+                // skips painting the parts of built rows (a long streaming
+                // reply) that are off screen.
+                .viewport_cull(std::env::var_os("MUQUN_QA_NOCULL").is_none())
                 .w_full()
                 .h(height)
                 .on_scroll(move |_| on_scroll.scrolled())
@@ -95,6 +95,24 @@ pub fn timeline(app: &App, height: f32) -> impl ElementBuilder {
                 .child(list),
         )
         .child(pill(app, &ctl))
+        .child(debug_overlay(&ctl))
+}
+
+/// `MUQUN_DEBUG_LIST=1`: the list's visible range, built window, total
+/// rows and scroll offset, top right, updated each controller frame.
+fn debug_overlay(ctl: &Arc<Controller>) -> Div {
+    let Some(state) = ctl.debug.clone() else {
+        return div();
+    };
+    div().absolute().left(16.0).top(8.0).child(
+        stateful_with_key::<NoState>("mq-list-debug")
+            .deps([state.signal_id()])
+            .on_state(move |_| {
+                div()
+                    .class("mq-debug")
+                    .child(parts::mono(state.get()).class("mq-text"))
+            }),
+    )
 }
 
 fn build_list(app: &App, ctl: &Arc<Controller>) -> Div {

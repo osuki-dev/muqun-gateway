@@ -382,9 +382,15 @@
     background: var(--surface-elevated);
     border: 1px solid var(--border-secondary);
     color: var(--text-primary);
-    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.18);
 }
 .mq-pill:hover { background: var(--surface-overlay); }
+
+.mq-debug {
+    padding: var(--mq-space-1) var(--mq-space-2);
+    border-radius: var(--mq-radius-sm);
+    border: 1px solid var(--border-secondary);
+    background: var(--surface-elevated);
+}
 
 .mq-teach { padding: var(--mq-space-10) var(--mq-space-6); gap: var(--mq-space-4); }
 .mq-teach-lines { gap: var(--mq-space-1); align-items: center; }
