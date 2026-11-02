@@ -24,7 +24,7 @@ fn expand_home_in(raw: &str, home: Option<&Path>) -> Option<PathBuf> {
 
 /// `~` and `~/…` → the home directory joined; anything else unchanged.
 /// `~user` answers `None`.
-pub(crate) fn expand_home(raw: &str) -> Option<PathBuf> {
+pub fn expand_home(raw: &str) -> Option<PathBuf> {
     expand_home_in(raw, dirs::home_dir().as_deref())
 }
 
@@ -34,7 +34,7 @@ pub(crate) fn expand_home(raw: &str) -> Option<PathBuf> {
 /// stays as it was, and so does one `expand_home` refuses (`~user`) or that is
 /// relative, so it fails exactly as it did before; a missing directory comes
 /// back expanded, for the caller's own not-found answer to name.
-pub(crate) fn expand_directory_param(directory: Option<&str>) -> Option<String> {
+pub fn expand_directory_param(directory: Option<&str>) -> Option<String> {
     let directory = directory?;
     let trimmed = directory.trim();
     if trimmed.is_empty() {
@@ -61,11 +61,11 @@ const SKIPPED: &[&str] = &[
     ".cache",
     "__pycache__",
 ];
-pub(crate) const MAX_RESULTS: usize = 30;
+pub const MAX_RESULTS: usize = 30;
 
 /// Keyword search starts at home, including linked workspaces, with cycle detection.
 /// Explicit path completion remains available for intentionally excluded folders.
-pub(crate) async fn search(query: &str, home: Option<&Path>) -> Completion {
+pub async fn search(query: &str, home: Option<&Path>) -> Completion {
     let query = query.trim().to_lowercase();
     let Some(home) = home.filter(|_| !query.is_empty() && query.len() <= 256) else {
         return Completion::default();
@@ -168,13 +168,13 @@ const MAX_ENTRIES_READ: usize = 2000;
 const READ_BUDGET: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-pub(crate) struct DirectoryEntry {
+pub struct DirectoryEntry {
     pub name: String,
     pub path: String,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
-pub(crate) struct Completion {
+pub struct Completion {
     pub directories: Vec<DirectoryEntry>,
     pub truncated: bool,
 }
@@ -199,7 +199,7 @@ fn split_prefix(prefix: &str, home: Option<&Path>) -> Option<(PathBuf, String)> 
 /// with its last segment. Bounded: at most [`MAX_RESULTS`] answers from at most
 /// 2000 entries read in at most 50 ms, `truncated` saying any bound was hit.
 /// Symlinks are listed when they point at a directory and never read into.
-pub(crate) async fn complete(prefix: &str, home: Option<&Path>) -> Completion {
+pub async fn complete(prefix: &str, home: Option<&Path>) -> Completion {
     let Some((dir, partial)) = split_prefix(prefix, home) else {
         return Completion::default();
     };

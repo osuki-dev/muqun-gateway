@@ -1,0 +1,36 @@
+[package]
+name = "muqun-desktop"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Muqun Desktop: a native client for the coding agents on this computer."
+repository = "https://github.com/osuki-dev/muqun-gateway"
+publish = false
+
+[[bin]]
+name = "muqun-desktop"
+path = "src/main.rs"
+
+# Blinc: the `=0.5.1` crates.io requirement, patched in the workspace root to
+# the muqun fork at a fixed commit (IME pre-edit fix). See the root
+# `Cargo.toml` `[patch.crates-io]` for why it is a git revision.
+[dependencies]
+muqun-gateway = { path = ".." }
+blinc_app = { version = "=0.5.1", features = ["windowed", "dialogs"] }
+blinc_layout = { version = "=0.5.1" }
+blinc_core = { version = "=0.5.1" }
+blinc_theme = { version = "=0.5.1", features = ["watcher"] }
+blinc_cn = { version = "=0.5.1" }
+blinc_animation = { version = "=0.5.1" }
+anyhow = "1.0.103"
+base64 = "0.23.1"
+dirs = "7.0.0"
+libc = "0.2.191"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.154"
+tokio = { version = "1.53.3", features = ["rt-multi-thread", "sync", "time", "macros"] }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.20", default-features = false, features = ["ansi", "env-filter", "fmt", "std"] }
+
+[dev-dependencies]
+tokio = { version = "1.53.3", features = ["test-util"] }

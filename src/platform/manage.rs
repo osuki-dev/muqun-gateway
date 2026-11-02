@@ -3066,7 +3066,7 @@ fn write_dialog(title: &str, details: &[String], choices: ScreenLine) -> anyhow:
 /// A compact "3m ago" / "2h ago" / "5d ago" for the manage device list. Falls
 /// back to "just now" for anything under a minute and "recently" if the clock
 /// looks off (a future timestamp).
-pub(crate) fn relative_since(then_unix_ms: u128) -> String {
+pub fn relative_since(then_unix_ms: u128) -> String {
     let now = now_unix_ms();
     if then_unix_ms > now {
         return String::from("recently");

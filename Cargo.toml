@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["."]
+members = [".", "desktop"]
 
 [package]
 name = "muqun-gateway"
@@ -80,6 +80,19 @@ toml = "1.1.8"
 
 [dev-dependencies]
 tokio = { version = "1.53.3", features = ["test-util"] }
+
+# Muqun Desktop's Blinc: the muqun fork, branch `fix/ime-preedit` (ecc28d1:
+# IME pre-edit on top of upstream 8bfcc12), from its dedicated worktree. This
+# becomes a git dependency on the fork once it is published. Only the
+# desktop crate depends on Blinc; `cargo build -p muqun-gateway` never
+# resolves these.
+[patch.crates-io]
+blinc_app = { path = "/home/ryu/Work/muqun/blinc-ime/crates/blinc_app" }
+blinc_layout = { path = "/home/ryu/Work/muqun/blinc-ime/crates/blinc_layout" }
+blinc_core = { path = "/home/ryu/Work/muqun/blinc-ime/crates/blinc_core" }
+blinc_theme = { path = "/home/ryu/Work/muqun/blinc-ime/crates/blinc_theme" }
+blinc_cn = { path = "/home/ryu/Work/muqun/blinc-ime/crates/blinc_cn" }
+blinc_animation = { path = "/home/ryu/Work/muqun/blinc-ime/crates/blinc_animation" }
 
 [profile.release]
 # The gateway ships as a single prebuilt binary per platform. Thin LTO and one

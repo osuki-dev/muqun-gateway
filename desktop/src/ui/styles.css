@@ -1,0 +1,260 @@
+/* Muqun Desktop. Colours only through the theme's variables, which Blinc
+   derives from the installed theme's ColorTokens (theme/tokens.rs) -- with
+   one deliberate exception below. */
+
+/* Agent brand colours (architecture §6.1b): one fixed hue per agent, the
+   same in every theme, so a badge reads the same everywhere. These are not
+   theme tokens and do not shadow any; a theme may later adjust their
+   lightness, never their hue.
+     codex        #10A37F  green    160°
+     opencode     #F97316  orange    25°
+     deepseek     #4F6BFE  indigo   230°
+     t3           #8B5CF6  violet   260°
+     fx           #D946EF  magenta  292°
+     qoder        #06B6D4  cyan     189°
+     pi           #EAB308  yellow    45°
+     claude       #E5484D  red      358°
+     antigravity  #65A30D  lime      85°
+     cursor       #94A3B8  slate    215° (low saturation)  */
+:root {
+    --agent-codex: #10A37F;
+    --agent-opencode: #F97316;
+    --agent-deepseek: #4F6BFE;
+    --agent-t3: #8B5CF6;
+    --agent-fx: #D946EF;
+    --agent-qoder: #06B6D4;
+    --agent-pi: #EAB308;
+    --agent-claude: #E5484D;
+    --agent-antigravity: #65A30D;
+    --agent-cursor: #94A3B8;
+    --agent-other: #94A3B8;
+}
+.mq-agent--codex { color: var(--agent-codex); border-color: var(--agent-codex); }
+.mq-agent--opencode { color: var(--agent-opencode); border-color: var(--agent-opencode); }
+.mq-agent--deepseek { color: var(--agent-deepseek); border-color: var(--agent-deepseek); }
+.mq-agent--t3 { color: var(--agent-t3); border-color: var(--agent-t3); }
+.mq-agent--fx { color: var(--agent-fx); border-color: var(--agent-fx); }
+.mq-agent--qoder { color: var(--agent-qoder); border-color: var(--agent-qoder); }
+.mq-agent--pi { color: var(--agent-pi); border-color: var(--agent-pi); }
+.mq-agent--claude { color: var(--agent-claude); border-color: var(--agent-claude); }
+.mq-agent--antigravity { color: var(--agent-antigravity); border-color: var(--agent-antigravity); }
+.mq-agent--cursor { color: var(--agent-cursor); border-color: var(--agent-cursor); }
+.mq-agent--other { color: var(--agent-other); border-color: var(--agent-other); }
+.mq-agent-dot.mq-agent--codex { background: var(--agent-codex); }
+.mq-agent-dot.mq-agent--opencode { background: var(--agent-opencode); }
+.mq-agent-dot.mq-agent--deepseek { background: var(--agent-deepseek); }
+.mq-agent-dot.mq-agent--t3 { background: var(--agent-t3); }
+.mq-agent-dot.mq-agent--fx { background: var(--agent-fx); }
+.mq-agent-dot.mq-agent--qoder { background: var(--agent-qoder); }
+.mq-agent-dot.mq-agent--pi { background: var(--agent-pi); }
+.mq-agent-dot.mq-agent--claude { background: var(--agent-claude); }
+.mq-agent-dot.mq-agent--antigravity { background: var(--agent-antigravity); }
+.mq-agent-dot.mq-agent--cursor { background: var(--agent-cursor); }
+.mq-agent-dot.mq-agent--other { background: var(--agent-other); }
+.mq-agent-badge {
+    border: 1px solid;
+    border-radius: 5px;
+    padding: 1px 4px;
+}
+
+.mq-root {
+    background: var(--background);
+    color: var(--text-primary);
+}
+
+.mq-topbar {
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    padding: 0 12px;
+    gap: 10px;
+}
+.mq-brand { gap: 8px; }
+.mq-topbar-sep {
+    width: 1px;
+    height: 18px;
+    background: var(--border);
+}
+
+.mq-sidebar {
+    background: var(--surface);
+    border-right: 1px solid var(--border);
+}
+.mq-sidebar-top {
+    padding: 12px 10px 6px 10px;
+    gap: 6px;
+}
+.mq-nav-item {
+    padding: 7px 10px;
+    border-radius: 8px;
+    color: var(--text-secondary);
+    transition: background 150ms ease-out;
+}
+.mq-nav-item:hover { background: var(--surface-overlay); }
+.mq-nav-item--active { background: var(--accent-subtle); color: var(--text-primary); }
+.mq-chips { gap: 4px; padding: 4px 0; }
+.mq-chip {
+    gap: 5px;
+    padding: 3px 8px;
+    border-radius: 10px;
+    border: 1px solid var(--border);
+    color: var(--text-secondary);
+    transition: background 150ms ease-out;
+}
+.mq-chip:hover { background: var(--surface-overlay); }
+.mq-chip--active { background: var(--accent-subtle); border-color: var(--primary); color: var(--text-primary); }
+.mq-group {
+    padding: 10px 10px 4px 10px;
+    color: var(--text-tertiary);
+}
+.mq-session-list {
+    padding: 0 8px 12px 8px;
+    gap: 1px;
+}
+.mq-session {
+    padding: 7px 10px;
+    gap: 8px;
+    border-radius: 8px;
+    color: var(--text-secondary);
+    transition: background 150ms ease-out;
+}
+.mq-status { border: 1.5px solid var(--text-tertiary); }
+.mq-status--busy { background: var(--primary); border-color: var(--primary); }
+.mq-status--waiting { background: var(--warning); border-color: var(--warning); }
+.mq-status--failed { border-color: var(--error); }
+.mq-status--stopped { border-color: var(--warning); }
+.mq-agents-panel {
+    border-top: 1px solid var(--border);
+    padding: 6px 10px 10px 10px;
+    gap: 2px;
+}
+.mq-agents-header { padding: 6px 0; color: var(--text-secondary); }
+.mq-agent-row { padding: 4px 0; gap: 2px; }
+.mq-agent-name { padding-left: 8px; color: var(--text-primary); }
+.mq-agent-reason { padding-left: 16px; color: var(--text-tertiary); }
+.mq-standing--usable { color: var(--success); }
+.mq-standing--checking { color: var(--text-tertiary); }
+.mq-standing--blocked { color: var(--warning); }
+
+.mq-home { padding: 28px 32px; gap: 24px; }
+.mq-hero {
+    gap: 14px;
+    padding: 18px 20px;
+    border-radius: 14px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+}
+.mq-hero-text { gap: 2px; color: var(--text-secondary); }
+.mq-home-body { gap: 24px; }
+.mq-home-column { gap: 24px; }
+.mq-home-section { gap: 10px; }
+.mq-home-section-title { color: var(--text-tertiary); }
+.mq-launch { gap: 12px; }
+.mq-launch-card {
+    gap: 8px;
+    padding: 14px;
+    border-radius: 12px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    color: var(--text-primary);
+    transition: transform 150ms ease-out;
+}
+.mq-launch-card:hover { transform: translateY(-1px); }
+.mq-launch-name { padding-left: 8px; color: var(--text-primary); }
+.mq-launch-dir { color: var(--text-tertiary); }
+.mq-recent, .mq-attention { gap: 2px; }
+.mq-recent-row, .mq-attention-row {
+    gap: 10px;
+    padding: 8px 10px;
+    border-radius: 8px;
+    color: var(--text-secondary);
+    transition: background 150ms ease-out;
+}
+.mq-recent-row:hover, .mq-attention-row:hover { background: var(--surface-overlay); }
+.mq-recent-main { gap: 2px; color: var(--text-primary); }
+.mq-recent-dir { color: var(--text-tertiary); }
+
+.mq-new-page { padding: 28px 32px; gap: 10px; max-width: 720px; }
+.mq-field-label { padding-top: 10px; color: var(--text-tertiary); }
+.mq-pick-list { gap: 2px; }
+.mq-pick {
+    gap: 8px;
+    padding: 8px 10px;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    color: var(--text-secondary);
+}
+.mq-pick:hover { background: var(--surface-overlay); }
+.mq-pick--active { border-color: var(--primary); background: var(--accent-subtle); }
+.mq-pick--disabled { opacity: 0.6; }
+.mq-pick-name { padding-left: 4px; color: var(--text-primary); }
+.mq-folder {
+    gap: 10px;
+    padding: 8px 10px;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    background: var(--surface);
+}
+.mq-new-actions { gap: 10px; padding-top: 14px; color: var(--text-tertiary); }
+
+.mq-session-header { gap: 8px; color: var(--text-secondary); }
+.mq-header-title { color: var(--text-primary); }
+.mq-right { background: var(--surface); }
+.mq-session:hover { background: var(--surface-overlay); }
+.mq-session--active { background: var(--accent-subtle); }
+.mq-session--active:hover { background: var(--accent-subtle); }
+.mq-session-meta {
+    gap: 6px;
+    color: var(--text-tertiary);
+}
+
+.mq-main { background: var(--background); }
+
+.mq-timeline-list {
+    padding: 16px 20px 24px 20px;
+    gap: 10px;
+}
+.mq-item { gap: 4px; }
+.mq-item--user {
+    background: var(--surface-overlay);
+    border-radius: 10px;
+    padding: 10px 12px;
+}
+.mq-part-reasoning { color: var(--text-tertiary); }
+.mq-part-tool {
+    gap: 8px;
+    padding: 6px 10px;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    background: var(--surface);
+    color: var(--text-secondary);
+}
+.mq-part-status,
+.mq-part-other { color: var(--text-tertiary); }
+
+.mq-approval-body { gap: 8px; padding: 14px; }
+.mq-approval-actions { gap: 8px; }
+
+.mq-empty {
+    padding: 24px 12px;
+    color: var(--text-tertiary);
+}
+
+.mq-alert {
+    gap: 12px;
+    padding: 10px 14px;
+    background: var(--error-bg);
+    border-bottom: 1px solid var(--error);
+    color: var(--error);
+}
+.mq-alert-body { gap: 2px; }
+
+.mq-composer {
+    gap: 10px;
+    padding: 12px 16px 16px 16px;
+    border-top: 1px solid var(--border);
+    background: var(--surface);
+}
+.mq-composer-actions {
+    gap: 8px;
+    align-items: center;
+}

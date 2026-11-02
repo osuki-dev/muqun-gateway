@@ -1,0 +1,232 @@
+//! Muqun Desktop's composition root.
+//!
+//! One process, two threads (architecture §2): Blinc owns the main thread
+//! for the window's whole life; the gateway's agents plane runs on a tokio
+//! runtime started beside it before the window opens. They meet only at the
+//! command channel (UI → core) and the inbox (core → UI).
+
+mod branding;
+mod config;
+mod hub;
+mod model;
+mod platform;
+mod theme;
+mod ui;
+
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
+
+use blinc_app::prelude::*;
+use blinc_app::windowed::WindowedApp;
+use blinc_layout::widgets::text_area::text_area_state_with_placeholder;
+use muqun_gateway::agents::compose::{
+    attach_store, build_runtime, RuntimeSettings, StoreEncryption,
+};
+
+use crate::config::{DesktopConfig, WindowGeometry, CONFIG_FILE};
+use crate::model::commands::{self, Command, CommandReceiver};
+use crate::model::drain::Drain;
+use crate::model::inbox::{Inbox, UiAction};
+use crate::model::projection::{self, ConfigStore};
+use crate::model::view::Bindings;
+use crate::platform::coexist;
+
+/// UI builder invocations (full-tree builds), for the idle measurement.
+static ROOT_BUILDS: AtomicU64 = AtomicU64::new(0);
+
+fn main() -> anyhow::Result<()> {
+    let started = Instant::now();
+    // Before anything else from the gateway crate: every path it resolves
+    // (message images, patches, the store) must land in our directories,
+    // never in a gateway service's.
+    let (config_dir, state_dir) = platform::directories()?;
+    muqun_gateway::set_directories(config_dir.clone(), state_dir.clone())?;
+    init_tracing();
+    tracing::info!(
+        config = %config_dir.display(),
+        state = %state_dir.display(),
+        "muqun-desktop starting (main entry)"
+    );
+
+    let config_path = config_dir.join(CONFIG_FILE);
+    let config = load_config(&config_path);
+    let store = ConfigStore::new(config_path, config.clone());
+
+    let settings = runtime_settings(&config);
+
+    let inbox = Arc::new(Inbox::new());
+    let drain = Drain::new(inbox.clone());
+    let (tx, rx) = commands::channel();
+    start_core(settings, state_dir, inbox, store.clone(), rx)?;
+    commands::send(&tx, Command::Refresh);
+
+    ui::text::register_fonts();
+    let watcher = theme::install(config.appearance.scheme)?;
+
+    let geometry = config.window.clamped();
+    let window = WindowConfig {
+        title: branding::APP_NAME.to_string(),
+        width: geometry.w,
+        height: geometry.h,
+        resizable: true,
+        maximized: geometry.maximized,
+        position: geometry.x.zip(geometry.y),
+        min_size: Some(WindowGeometry::MIN),
+        ..Default::default()
+    };
+
+    let strings = ui::strings::Strings {
+        language: config.general.language,
+    };
+    let scheme_watcher = Arc::new(Mutex::new(watcher));
+    let last_size = Arc::new(Mutex::new((geometry.w, geometry.h)));
+    let exit_size = last_size.clone();
+    let exit_store = store.clone();
+    let mut app: Option<ui::App> = None;
+    WindowedApp::run(window, move |ctx| {
+        let builds = ROOT_BUILDS.fetch_add(1, Ordering::Relaxed) + 1;
+        let app = app.get_or_insert_with(|| {
+            tracing::info!(
+                since_main_ms = started.elapsed().as_millis() as u64,
+                "first build_ui"
+            );
+            ui::install_css(ctx);
+            let composer = ctx
+                .use_state_keyed("mq-composer-text", || {
+                    text_area_state_with_placeholder(strings.composer_placeholder())
+                })
+                .get();
+            let app = ui::App {
+                commands: tx.clone(),
+                drain: drain.clone(),
+                bindings: Bindings::new(ctx.use_scroll_ref_keyed("mq-timeline")),
+                strings,
+                config: store.clone(),
+                composer,
+                scheme_watcher: scheme_watcher.clone(),
+            };
+            let for_actions = app.clone();
+            drain.attach(
+                app.bindings.clone(),
+                Arc::new(move |action| match action {
+                    UiAction::SubmitComposer => ui::composer::submit(&for_actions),
+                    UiAction::SetDraft { agent, cwd } => for_actions
+                        .bindings
+                        .draft
+                        .signal()
+                        .set(Some(crate::model::view::NewSessionDraft { agent, cwd })),
+                }),
+            );
+            app
+        });
+        tracing::debug!(builds, width = ctx.width, height = ctx.height, "build_ui");
+        let size = (ctx.width.round() as u32, ctx.height.round() as u32);
+        let mut last = last_size.lock().unwrap();
+        if *last != size && size.0 > 0 && size.1 > 0 {
+            *last = size;
+            app.send(Command::PersistWindow(WindowGeometry {
+                w: size.0,
+                h: size.1,
+                ..geometry
+            }));
+        }
+        drop(last);
+        ui::root(ctx, app)
+    })?;
+
+    // The window is gone: write its last size now, not after a debounce
+    // that will never fire.
+    let (w, h) = *exit_size.lock().unwrap();
+    exit_store.update_blocking(|config| {
+        config.window.w = w;
+        config.window.h = h;
+    });
+    tracing::info!(
+        root_builds = ROOT_BUILDS.load(Ordering::Relaxed),
+        "muqun-desktop exiting"
+    );
+    Ok(())
+}
+
+fn init_tracing() {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        tracing_subscriber::EnvFilter::new("info,blinc_app::rebuild_source=warn")
+    });
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .init();
+}
+
+/// The configuration, or the defaults. A file that does not parse is moved
+/// aside rather than silently overwritten by the next save.
+fn load_config(path: &std::path::Path) -> DesktopConfig {
+    match DesktopConfig::load(path) {
+        Ok(config) => config,
+        Err(err) => {
+            let aside = path.with_extension("json.invalid");
+            tracing::error!(
+                "{err:#}; starting with defaults and keeping the file as {}",
+                aside.display()
+            );
+            if let Err(err) = std::fs::rename(path, &aside) {
+                tracing::warn!("could not move it aside: {err}");
+            }
+            DesktopConfig::default()
+        }
+    }
+}
+
+/// Every agent the gateway has, with the gateway's defaults (via the
+/// config's `#[serde(default)]` blocks) and the two coexistence overrides of
+/// architecture §4: OpenCode is only adopted while a gateway service runs
+/// here, and a DeepSeek harness is only ever adopted, never spawned -- two
+/// processes racing to spawn it on one port would fight.
+fn runtime_settings(config: &DesktopConfig) -> RuntimeSettings {
+    let mut settings = config.agents.runtime_settings();
+    let presence = coexist::detect(&coexist::gateway_state_dirs());
+    match coexist::apply(&mut settings.opencode, &presence) {
+        Some(why) => tracing::info!("OpenCode autostart off for this run: {why}"),
+        None => tracing::info!(
+            ?presence,
+            autostart = settings.opencode.autostart,
+            "OpenCode ownership"
+        ),
+    }
+    settings.deepseek.autostart = false;
+    settings
+}
+
+/// The tokio runtime and the agents plane, on their own thread.
+fn start_core(
+    settings: RuntimeSettings,
+    state_dir: PathBuf,
+    inbox: Arc<Inbox>,
+    store: Arc<ConfigStore>,
+    commands: CommandReceiver,
+) -> anyhow::Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_name("muqun-core")
+        .build()?;
+    std::thread::Builder::new()
+        .name("muqun-core-main".into())
+        .spawn(move || {
+            runtime.block_on(async move {
+                let agents = build_runtime(settings, true, Some(state_dir.clone()));
+                if let Err(err) = attach_store(&agents, &state_dir, StoreEncryption::Off).await {
+                    tracing::warn!(
+                        "the session store is unavailable, routes are not kept: {err:#}"
+                    );
+                }
+                agents.spawn_supervisor();
+                let hub: Arc<dyn hub::SessionHub> = Arc::new(hub::LocalHub::new(agents));
+                projection::spawn(hub, inbox, store, commands);
+                // Live until the process ends with the window.
+                std::future::pending::<()>().await;
+            });
+        })?;
+    Ok(())
+}

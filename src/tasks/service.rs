@@ -3132,7 +3132,7 @@ const TASK_SESSION_CACHE: usize = 4096;
 /// Whether `title` is what an adapter shows for a session that has not been
 /// named (its id, T3's "New thread", DeepSeek's placeholder): never a
 /// task's title.
-fn untitled_placeholder(asid: &str, title: &str) -> bool {
+pub fn untitled_placeholder(asid: &str, title: &str) -> bool {
     title == asid
         || title == crate::agents::adapters::t3::driver::NEW_THREAD_TITLE
         || title == crate::agents::adapters::deepseek::mapper::UNTITLED
@@ -3217,7 +3217,7 @@ async fn form_waiting(manager: &AgentManager, task: &Task, title: &str) -> TaskC
 /// `dir` named from the home directory: `~` itself, `~/<rest>` below it,
 /// else as it is. Both are canonicalized first, so a home reached through a
 /// symlink still reads `~`.
-fn home_relative(dir: &str, home: Option<&Path>) -> String {
+pub fn home_relative(dir: &str, home: Option<&Path>) -> String {
     let Some(home) = home else {
         return dir.to_owned();
     };

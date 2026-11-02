@@ -30,10 +30,15 @@ pub(crate) use platform::manage::*;
 pub(crate) use platform::metadata::*;
 pub(crate) use platform::server::*;
 pub use platform::set_directories;
+// Small pure helpers an embedding host shows the same way the gateway does:
+// a "3m ago", a folder named from `~`, and whether a title is only an
+// adapter's placeholder for an unnamed session.
+pub use platform::manage::relative_since;
 pub(crate) use platform::setup::*;
 pub(crate) use platform::store::*;
 pub(crate) use platform::uploads::*;
 pub(crate) use platform::{discovery, git, i18n, parts, state_lock};
+pub use tasks::service::{home_relative, untitled_placeholder};
 pub(crate) use terminal::factory::*;
 pub(crate) use terminal::routes::*;
 pub(crate) use terminal::{
