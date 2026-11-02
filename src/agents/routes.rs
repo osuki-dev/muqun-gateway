@@ -1239,6 +1239,15 @@ async fn do_set_auto_approve(
     headers: &HeaderMap,
 ) -> ApiResult<Json<Value>> {
     require_device(state, headers)?;
+    // Putting an agent into its bypass mode from the phone is the owner's
+    // choice, made in config.json on this computer; taking it out never is.
+    if enabled && !state.config.allow_remote_auto_approve {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "auto_approve_disabled",
+            "Switching an agent into its bypass mode from a device is off on this computer; set allow_remote_auto_approve to true in the gateway's config.json to allow it",
+        ));
+    }
     let manager = session_manager_or_err(state, asid).await?;
     manager
         .agent()
@@ -4414,6 +4423,28 @@ mod tests {
             state.agent_runtime.attach_for_test(agent.manager()).await;
         }
         state
+    }
+
+    /// A phone may switch an agent into its bypass mode only where the owner
+    /// said so in config.json; switching it off is never refused here.
+    #[tokio::test]
+    async fn remote_auto_approve_is_refused_until_the_owner_allows_it_in_config() {
+        let mut state = state_with(vec![FakeAgent::new("opencode")]).await;
+        for (allowed, enabled, refused) in [
+            (false, true, true),
+            (false, false, false),
+            (true, true, false),
+            (true, false, false),
+        ] {
+            state.config.allow_remote_auto_approve = allowed;
+            let result = do_set_auto_approve(&state, "ses_1", enabled, &device_headers()).await;
+            let status = result.err().map(|refusal| refusal.0);
+            assert_eq!(
+                status == Some(StatusCode::FORBIDDEN),
+                refused,
+                "allowed={allowed} enabled={enabled} -> {status:?}"
+            );
+        }
     }
 
     #[tokio::test]

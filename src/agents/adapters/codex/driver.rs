@@ -171,14 +171,16 @@ struct ThreadPolicy {
 }
 
 impl ThreadPolicy {
-    /// `codex --dangerously-bypass-approvals-and-sandbox`, as a turn
-    /// override: no approvals, no sandbox.
+    /// No approvals, inside Codex's workspace-write sandbox: the switch
+    /// stops the asking, never the sandbox. `dangerFullAccess` is left to a
+    /// launch the owner makes at the terminal.
     fn bypass_pair() -> (Value, Value) {
-        (json!("never"), json!({"type":"dangerFullAccess"}))
+        (json!("never"), json!({"type":"workspaceWrite"}))
     }
 
-    fn is_bypass(approval: &Value, sandbox: &Value) -> bool {
-        approval == "never" && sandbox["type"] == "dangerFullAccess"
+    /// Bypass is "never asks", whatever the sandbox.
+    fn is_bypass(approval: &Value) -> bool {
+        approval == "never"
     }
 
     /// Record what a thread open reported. A thread already in bypass is
@@ -187,7 +189,7 @@ impl ThreadPolicy {
         if approval.is_null() || sandbox.is_null() {
             return;
         }
-        if Self::is_bypass(approval, sandbox) {
+        if Self::is_bypass(approval) {
             self.bypass = true;
         } else {
             self.baseline = Some((approval.clone(), sandbox.clone()));
@@ -3718,7 +3720,6 @@ mod policy_tests {
     /// it already is bypass; a missing report changes nothing.
     #[test]
     fn a_thread_open_records_its_policy_or_its_bypass() {
-        let full = json!({"type":"dangerFullAccess"});
         let ws = json!({"type":"workspaceWrite"});
         for (name, approval, sandbox, bypass, baseline) in [
             (
@@ -3736,15 +3737,14 @@ mod policy_tests {
                 false,
                 Some((json!({"granular":{}}), ws.clone())),
             ),
-            ("bypass", json!("never"), full.clone(), true, None),
-            // `never` with a sandbox still asks nothing, but is sandboxed:
-            // not what the switch means by bypass.
+            // `never` asks nothing, whatever the sandbox: bypass.
+            ("bypass", json!("never"), ws.clone(), true, None),
             (
-                "never sandboxed",
+                "bypass unsandboxed",
                 json!("never"),
-                ws.clone(),
-                false,
-                Some((json!("never"), ws.clone())),
+                json!({"type":"dangerFullAccess"}),
+                true,
+                None,
             ),
             ("unreported", json!(null), json!(null), false, None),
         ] {
@@ -3757,7 +3757,7 @@ mod policy_tests {
         // A thread reopened in bypass keeps the pre-bypass policy it knew.
         let mut policy = ThreadPolicy::default();
         policy.observe(&json!("on-request"), &ws);
-        policy.observe(&json!("never"), &full);
+        policy.observe(&json!("never"), &ws);
         assert!(policy.bypass);
         assert_eq!(policy.baseline, Some((json!("on-request"), ws)));
     }

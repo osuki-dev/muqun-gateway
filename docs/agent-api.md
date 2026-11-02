@@ -980,15 +980,17 @@ which `GET` reads without changing anything.
 |---|---|---|
 | Claude Code | `session/set_mode` `bypassPermissions` (offered only where Claude Code's settings allow it) | session |
 | Qoder | `session/set_mode` `yolo` ("Bypass Permissions") | session |
-| Codex | the next `turn/start` carries `approvalPolicy: "never"` and `sandboxPolicy: {type: "dangerFullAccess"}`, which Codex keeps for the turns after it; off sends back what `thread/start`/`thread/resume` reported, else the configuration's `approval_policy`/`sandbox_mode` | session |
+| Codex | the next `turn/start` carries `approvalPolicy: "never"` with `sandboxPolicy: {type: "workspaceWrite"}` (the asking stops, the sandbox stays; `dangerFullAccess` is never set from a device), which Codex keeps for the turns after it; off sends back what `thread/start`/`thread/resume` reported, else the configuration's `approval_policy`/`sandbox_mode` | session |
 | OpenCode | a session permission rule `{action: "*", resource: "*", effect: "allow"}` appended last; off removes it | session |
 | T3 Code | `thread.runtime-mode.set` `full-access`; off returns to `runtime_mode` (or `approval-required` when that is `full-access`) | session |
 | Antigravity, Cursor, FX, Pi | a launch flag or environment only (`agy acp --dangerously-skip-permissions`, `agent --force`, `FX_PERMISSION_MODE=full-access`, `MUQUN_PI_APPROVALS=never`): `POST` answers 501 | launch |
 | DeepSeek | per-request approvals only: `POST` answers 501, `enabled` is null | none |
 
-Discovery states the same per agent as `features.autoApprove: {scope:
-"session"|"launch"|"none", native?}`. A bypass mode is never
-remembered as a new session's default.
+`enabled: true` is refused with `403 auto_approve_disabled` until the owner
+sets `allow_remote_auto_approve: true` in the gateway's `config.json` (off by
+default; `false` is always accepted). Discovery states the same per agent as
+`features.autoApprove: {scope: "session"|"launch"|"none", native?}`. A
+bypass mode is never remembered as a new session's default.
 
 ### `POST /api/agent-sessions/{asid}/interrupt` · `/abort`
 

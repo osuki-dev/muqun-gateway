@@ -793,7 +793,7 @@ pub fn openapi_spec() -> Value {
         },
         "post": {
             "summary": "Put the session into the agent's own bypass mode, or take it back out",
-            "description": "Switches the agent itself, never an App-side rule: Claude Code and Qoder `session/set_mode`, Codex a `turn/start` approval-policy and sandbox override carried by the next prompt, OpenCode a session permission rule allowing everything, T3 `thread.runtime-mode.set full-access`. Off restores the mode the session had before. Agents whose bypass is a launch flag answer 501.",
+            "description": "Switches the agent itself, never an App-side rule: Claude Code and Qoder `session/set_mode`, Codex a `turn/start` approval-policy and sandbox override carried by the next prompt, OpenCode a session permission rule allowing everything, T3 `thread.runtime-mode.set full-access`. Off restores the mode the session had before. `enabled: true` answers 403 `auto_approve_disabled` unless config.json sets `allow_remote_auto_approve: true`; agents whose bypass is a launch flag answer 501.",
             "parameters": [path_param("asid")],
             "requestBody": json_body(object_schema(&[("enabled", "boolean")], &["enabled"])),
             "responses": ok_response()
