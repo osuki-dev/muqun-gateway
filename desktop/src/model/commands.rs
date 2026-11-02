@@ -42,6 +42,17 @@ pub enum Command {
     PersistWindow(WindowGeometry),
     /// The owner picked a colour scheme; persisted at once.
     PersistScheme(Scheme),
+    /// Themes (`theme/service.rs`). The library list, and the gallery index
+    /// (from its 1 h cache when fresh) with its card pictures.
+    ThemeRefresh,
+    /// Download theme `id` from the gallery, check its SHA-256, install it.
+    ThemeInstall(String),
+    /// Remove an installed theme (built-ins cannot be).
+    ThemeRemove(String),
+    /// Make theme `id` current in `scheme`, and remember both.
+    ThemeApply(String, Scheme),
+    /// Install a `.muqun-theme` from disk (file dialog or drop).
+    ThemeImportFile(PathBuf),
 }
 
 pub type CommandSender = mpsc::UnboundedSender<Command>;

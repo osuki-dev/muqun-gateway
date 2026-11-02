@@ -59,11 +59,11 @@ fn main() -> anyhow::Result<()> {
     let inbox = Arc::new(Inbox::new());
     let drain = Drain::new(inbox.clone());
     let (tx, rx) = commands::channel();
-    start_core(settings, state_dir, inbox, store.clone(), rx)?;
+    start_core(settings, state_dir.clone(), inbox, store.clone(), rx)?;
     commands::send(&tx, Command::Refresh);
 
     ui::text::register_fonts();
-    let watcher = theme::install(config.appearance.scheme)?;
+    let scheme_watcher = theme::install(&config_dir, &state_dir, &config.appearance)?;
 
     let geometry = config.window.clamped();
     let window = WindowConfig {
@@ -80,7 +80,6 @@ fn main() -> anyhow::Result<()> {
     let strings = ui::strings::Strings {
         language: config.general.language,
     };
-    let scheme_watcher = Arc::new(Mutex::new(watcher));
     let last_size = Arc::new(Mutex::new((geometry.w, geometry.h)));
     let exit_size = last_size.clone();
     let exit_store = store.clone();

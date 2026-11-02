@@ -93,6 +93,7 @@ blinc_core = { path = "/home/ryu/Work/muqun/blinc-ime/crates/blinc_core" }
 blinc_theme = { path = "/home/ryu/Work/muqun/blinc-ime/crates/blinc_theme" }
 blinc_cn = { path = "/home/ryu/Work/muqun/blinc-ime/crates/blinc_cn" }
 blinc_animation = { path = "/home/ryu/Work/muqun/blinc-ime/crates/blinc_animation" }
+blinc_image = { path = "/home/ryu/Work/muqun/blinc-ime/crates/blinc_image" }
 
 [profile.release]
 # The gateway ships as a single prebuilt binary per platform. Thin LTO and one

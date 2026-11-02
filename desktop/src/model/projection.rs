@@ -174,6 +174,13 @@ impl Core {
                     .update(|config| config.appearance.scheme = scheme)
                     .await;
             }
+            command @ (Command::ThemeRefresh
+            | Command::ThemeInstall(_)
+            | Command::ThemeRemove(_)
+            | Command::ThemeApply(..)
+            | Command::ThemeImportFile(_)) => {
+                crate::theme::service::run(command, self.inbox.clone(), self.config.clone()).await;
+            }
             Command::CompleteDirectory { .. } | Command::PersistWindow(_) => {
                 unreachable!("handled by their debouncers")
             }

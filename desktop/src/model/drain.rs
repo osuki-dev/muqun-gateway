@@ -207,6 +207,19 @@ impl Drain {
     }
 
     fn apply(&self, bindings: &Bindings, batch: Vec<Update>) {
+        // Themes have their own bindings (`ui/themes.rs`); they never touch
+        // the session view.
+        let (themes, batch): (Vec<Update>, Vec<Update>) = batch
+            .into_iter()
+            .partition(|u| matches!(u, Update::Theme(_)));
+        for update in themes {
+            if let Update::Theme(update) = update {
+                crate::ui::themes::apply_update(*update);
+            }
+        }
+        if batch.is_empty() {
+            return;
+        }
         // Read before anything grows: was the reader following the tail?
         let was_at_bottom = bindings.timeline_scroll.is_at_bottom();
         let mut changes = Changes::default();

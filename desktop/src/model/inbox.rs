@@ -67,6 +67,8 @@ pub enum Update {
         truncated: bool,
     },
     Ui(UiAction),
+    /// Themes, applied by `ui/themes.rs` on the main thread.
+    Theme(Box<crate::theme::service::ThemeUpdate>),
 }
 
 #[derive(Default)]
