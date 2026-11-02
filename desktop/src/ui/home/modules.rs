@@ -325,13 +325,18 @@ pub fn launch(
             .overflow_clip()
             .child(bar(id))
             .child(
-                div().class("mq-home-launch-name").child(
-                    ui_text(agents::name(id, agent_list))
-                        .size(scale::FONT_15)
-                        .semibold()
-                        .no_wrap()
-                        .no_cursor(),
-                ),
+                div()
+                    .class("mq-home-launch-name")
+                    .flex_row()
+                    .items_center()
+                    .child(agents::mark(id, 20.0))
+                    .child(
+                        ui_text(agents::name(id, agent_list))
+                            .size(scale::FONT_15)
+                            .semibold()
+                            .no_wrap()
+                            .no_cursor(),
+                    ),
             )
             .child(lines)
             .on_click(move |_| match &remembered {
@@ -523,7 +528,7 @@ fn continue_working(
                     )
                     .child(meta),
             )
-            .child(agents::badge(&session.agent_id))
+            .child(agents::mark(&session.agent_id, 18.0))
             .child(
                 div().class("mq-home-row-when").flex_shrink_0().child(
                     mono_text(relative_since(u128::from(session.updated_ms)))
@@ -687,9 +692,9 @@ fn agents_module(ctx: &Ctx, agent_list: &[AgentDiscoveryInfo]) -> Div {
         let mut row = div().class("mq-home-agents-row").w_full().flex_row();
         for (info, standing) in pair {
             let marker = if *standing == Standing::Usable {
-                agents::dot(&info.id)
+                agents::mark(&info.id, 18.0)
             } else {
-                dot("mq-home-dot--idle")
+                agents::mark_idle(&info.id, 18.0)
             };
             row = row.child(
                 div()

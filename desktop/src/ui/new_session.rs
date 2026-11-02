@@ -119,7 +119,7 @@ fn agent_list(app: &App) -> impl ElementBuilder {
                     .w_full()
                     .flex_row()
                     .items_center()
-                    .child(agents::dot(&info.id))
+                    .child(agents::mark(&info.id, 16.0))
                     .child(
                         div().class("mq-pick-name").flex_1().child(
                             ui_text(agents::name(&info.id, &agents_list))

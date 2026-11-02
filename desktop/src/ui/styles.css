@@ -5,11 +5,7 @@
 /* Agent brand colours: `--agent-<id>` and the `.mq-agent--<id>` rules that use
    them come from `theme/agents.rs` (one hue per agent, lightness following the
    scheme), added after this sheet and again on every scheme change. */
-.mq-agent-badge {
-    border: 1px solid;
-    border-radius: 5px;
-    padding: 1px 4px;
-}
+.mq-agent-mark--idle { color: var(--text-tertiary); }
 
 .mq-root {
     background: var(--background);
@@ -182,21 +178,11 @@
 .mq-home-launch-card--primary:hover { border-color: var(--primary-hover); background: var(--primary-hover); }
 .mq-home-launch-key, .mq-home-launch-hint { padding-top: var(--space-4); color: var(--text-inverse); }
 .mq-home-launch-card--more { color: var(--text-secondary); }
-.mq-home-launch-name { color: var(--text-primary); }
+.mq-home-launch-name { color: var(--text-primary); gap: var(--space-8); }
 .mq-home-launch-lines { gap: var(--space-4); }
 .mq-home-launch-meta { color: var(--text-secondary); }
 .mq-home-launch-choose { color: var(--text-tertiary); }
-.mq-home-bar.mq-agent--codex { background: var(--agent-codex); }
-.mq-home-bar.mq-agent--opencode { background: var(--agent-opencode); }
-.mq-home-bar.mq-agent--deepseek { background: var(--agent-deepseek); }
-.mq-home-bar.mq-agent--t3 { background: var(--agent-t3); }
-.mq-home-bar.mq-agent--fx { background: var(--agent-fx); }
-.mq-home-bar.mq-agent--qoder { background: var(--agent-qoder); }
-.mq-home-bar.mq-agent--pi { background: var(--agent-pi); }
-.mq-home-bar.mq-agent--claude { background: var(--agent-claude); }
-.mq-home-bar.mq-agent--antigravity { background: var(--agent-antigravity); }
-.mq-home-bar.mq-agent--cursor { background: var(--agent-cursor); }
-.mq-home-bar.mq-agent--other { background: var(--agent-other); }
+/* .mq-home-bar.mq-agent--<id> (the 3 px brand bar) lives in theme/agents.rs with the variables. */
 
 /* continue working: 72 px rows in one card */
 .mq-home-row {

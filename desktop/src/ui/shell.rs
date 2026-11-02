@@ -51,7 +51,7 @@ pub fn top_bar(app: &App) -> Div {
                     ),
                 )
                 .child(ui_text("·").size(13.0))
-                .child(agents::badge(&info.agent_id))
+                .child(agents::mark(&info.agent_id, 16.0))
                 .child(
                     ui_text(agents::name(&info.agent_id, &agents_list))
                         .size(13.0)
