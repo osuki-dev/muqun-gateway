@@ -1917,6 +1917,7 @@ for raw in sys.stdin.buffer:
         std::fs::write(&binary, FAKE_PI).unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        super::super::rpc::wait_until_executable(&binary);
         let cmd = PiCommandLine {
             binary,
             extension: dir.join("muqun-extension.js"),
