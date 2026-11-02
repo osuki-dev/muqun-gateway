@@ -453,7 +453,8 @@ mod tests {
             include_str!("../terminal/routes.rs")
                 .matches("send_registered_push_notifications(")
                 .count(),
-            2
+            1,
+            "every terminal and agent push goes through deliver_agent_notification"
         );
     }
 }

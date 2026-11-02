@@ -1224,23 +1224,12 @@ pub(crate) fn spawn_agent_permission_watchers(state: AppState) {
             };
             match gates.admit(&event, Instant::now()) {
                 Some(AgentPendingPush::Approval { asid, request }) => {
-                    let tokens = match crate::connectivity::push::registered_recipients(&state) {
-                        Ok(tokens) => tokens,
-                        Err(err) => {
-                            tracing::warn!("agent permission notification skipped: {err:#}");
-                            continue;
-                        }
-                    };
-                    if !tokens.is_empty() {
-                        let _ = crate::connectivity::push::send_registered_push_notifications(
-                            &state,
-                            &tokens,
-                            "Approval Required".to_string(),
-                            request.prompt.clone(),
-                            agent_permission_push_data(&state.config.server_id, asid, &request.id),
-                        )
-                        .await;
-                    }
+                    let state = state.clone();
+                    let asid = asid.to_owned();
+                    let request = request.clone();
+                    tokio::spawn(async move {
+                        deliver_agent_approval_notice(&state, &asid, &request).await;
+                    });
                 }
                 Some(AgentPendingPush::Form { asid, request }) => {
                     // Naming the agent and the session can take a round trip
@@ -1390,10 +1379,11 @@ fn first_sighting(
     open.insert((asid.to_owned(), id.to_owned()))
 }
 
-/// The data of a structured agent's approval push; `session_id` is the agent
-/// session the request belongs to.
+/// The data of a structured agent's approval push. The session is `asid`;
+/// `session_id` is a terminal session to the App, so it is not set.
 fn agent_permission_push_data(
     server_id: &str,
+    agent_id: &str,
     asid: &str,
     request_id: &str,
 ) -> serde_json::Map<String, Value> {
@@ -1401,7 +1391,7 @@ fn agent_permission_push_data(
     data.insert("type".to_string(), json!("approval"));
     data.insert("category".to_string(), json!("approval"));
     data.insert("server_id".to_string(), json!(server_id));
-    data.insert("session_id".to_string(), json!(asid));
+    data.insert("agent_id".to_string(), json!(agent_id));
     data.insert("asid".to_string(), json!(asid));
     data.insert("approval_id".to_string(), json!(request_id));
     data.insert("fingerprint".to_string(), json!(request_id));
@@ -1421,7 +1411,6 @@ fn agent_form_push_data(
     data.insert("category".to_string(), json!("question"));
     data.insert("server_id".to_string(), json!(server_id));
     data.insert("agent_id".to_string(), json!(agent_id));
-    data.insert("session_id".to_string(), json!(asid));
     data.insert("asid".to_string(), json!(asid));
     data.insert("form_id".to_string(), json!(form_id));
     data.insert("fingerprint".to_string(), json!(form_id));
@@ -1436,6 +1425,11 @@ fn agent_display_name(agent_id: &str) -> Option<&'static str> {
         "fx" => Some("FX"),
         "deepseek" => Some("DeepSeek"),
         "t3" => Some("T3 Code"),
+        "codex" => Some("Codex"),
+        "claude" => Some("Claude Code"),
+        "pi" => Some("Pi"),
+        "antigravity" => Some("Antigravity"),
+        "cursor" => Some("Cursor"),
         _ => None,
     }
 }
@@ -1468,6 +1462,42 @@ fn form_notification(
             .then(|| PushDetail::from_question(&request.title))
             .flatten(),
     }
+}
+
+/// The push a native approval sends: the pane approval's words ("{agent} is
+/// waiting for your approval."), never the request's prompt, which quotes the
+/// command or path -- unless the owner turned `rich_agent_pushes` on.
+fn permission_notification(
+    state: &AppState,
+    agent_id: &str,
+    asid: &str,
+    request: &agents::PermissionRequest,
+) -> AgentPushNotice {
+    AgentPushNotice {
+        notice: AgentNotice::ApprovalPending,
+        server_label: current_server_label(&state.config.label).trim().to_owned(),
+        agent_name: agent_display_name(agent_id).map(str::to_owned),
+        data: agent_permission_push_data(&state.config.server_id, agent_id, asid, &request.id),
+        choices: Vec::new(),
+        detail: state
+            .config
+            .rich_agent_pushes
+            .then(|| PushDetail::from_question(&request.prompt))
+            .flatten(),
+    }
+}
+
+async fn deliver_agent_approval_notice(
+    state: &AppState,
+    asid: &str,
+    request: &agents::PermissionRequest,
+) {
+    let agent_id = match state.agent_runtime.manager_for_session(asid).await {
+        Some(manager) => manager.agent().kind().to_owned(),
+        None => String::new(),
+    };
+    let notice = permission_notification(state, &agent_id, asid, request);
+    deliver_agent_notification(state, notice).await;
 }
 
 async fn deliver_agent_form_notice(state: &AppState, asid: &str, request: &agents::FormRequest) {
@@ -3992,32 +4022,73 @@ mod tests {
         }
     }
 
-    /// A structured agent's approval push names the agent session it is for,
-    /// not a placeholder.
+    /// A native approval or question routes by `asid` and `agent_id`, never by
+    /// `session_id` (a terminal session to the App).
     #[test]
-    fn an_agent_permission_push_carries_its_agent_session_id() {
-        let data = super::agent_permission_push_data("server-1", "ses_42", "perm_1");
-        assert_eq!(data["server_id"], "server-1");
-        assert_eq!(data["session_id"], "ses_42");
-        assert_eq!(data["asid"], "ses_42");
-        assert_eq!(data["approval_id"], "perm_1");
-        assert_eq!(data["fingerprint"], "perm_1");
-        assert_eq!(data["type"], "approval");
+    fn native_pushes_carry_the_agent_session_and_not_a_terminal_session() {
+        for (data, kind, id_key) in [
+            (
+                super::agent_permission_push_data("server-1", "codex", "ses_42", "perm_1"),
+                "approval",
+                "approval_id",
+            ),
+            (
+                super::agent_form_push_data("server-1", "t3", "ses_42", "perm_1"),
+                "question",
+                "form_id",
+            ),
+        ] {
+            assert_eq!(data["type"], kind);
+            assert_eq!(data["category"], kind);
+            assert_eq!(data["server_id"], "server-1");
+            assert_eq!(data["asid"], "ses_42");
+            assert!(data["agent_id"].is_string(), "{kind}");
+            assert_eq!(data[id_key], "perm_1");
+            assert_eq!(data["fingerprint"], "perm_1");
+            assert!(!data.contains_key("session_id"), "{kind}");
+        }
     }
 
-    /// A structured agent's question push names the server, the agent and the
-    /// agent session it is for, and the form to answer.
+    /// A native approval says that something needs answering, in the reader's
+    /// language, naming the agent -- never the prompt, which quotes a command.
     #[test]
-    fn an_agent_form_push_carries_its_agent_session_and_form_id() {
-        let data = super::agent_form_push_data("server-1", "t3", "ses_child", "form_1");
-        assert_eq!(data["type"], "question");
-        assert_eq!(data["category"], "question");
-        assert_eq!(data["server_id"], "server-1");
-        assert_eq!(data["agent_id"], "t3");
-        assert_eq!(data["session_id"], "ses_child");
-        assert_eq!(data["asid"], "ses_child");
-        assert_eq!(data["form_id"], "form_1");
-        assert_eq!(data["fingerprint"], "form_1");
+    fn a_native_approval_push_names_the_agent_and_never_the_prompt() {
+        use crate::agents::PermissionRequest;
+        let state = test_state("admin", Vec::new());
+        let request: PermissionRequest = serde_json::from_value(json!({
+            "id": "perm_1",
+            "asid": "ses_1",
+            "action": "bash",
+            "resources": [],
+            "prompt": "Run npm publish --tag secret?",
+            "options": [],
+        }))
+        .unwrap();
+        let label = current_server_label(&state.config.label);
+        for (agent, name) in [
+            ("codex", "Codex"),
+            ("claude", "Claude Code"),
+            ("pi", "Pi"),
+            ("antigravity", "Antigravity"),
+            ("cursor", "Cursor"),
+        ] {
+            let notice = super::permission_notification(&state, agent, "ses_1", &request);
+            let en = notice.render(Locale::En);
+            assert_eq!(en.title, format!("Approval needed · {label}"));
+            assert_eq!(en.body, format!("{name} is waiting for your approval."));
+            assert_eq!(en.data["agent_id"], agent);
+            let zh = notice.render(Locale::ZhTw);
+            assert_eq!(zh.body, format!("{name} 正在等待你的核准。"));
+            for rendered in [en, zh] {
+                let all = format!(
+                    "{} {} {}",
+                    rendered.title,
+                    rendered.body,
+                    Value::Object(rendered.data)
+                );
+                assert!(!all.contains("npm"), "{agent}: the prompt must not travel");
+            }
+        }
     }
 
     /// One question is one push: T3 re-announces open forms on every thread
