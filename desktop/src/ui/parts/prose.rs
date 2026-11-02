@@ -37,7 +37,8 @@ fn body(ctx: &PartCtx<'_>, text: &str, setting: &Setting) -> Div {
         .child(
             div()
                 .class("mq-cursor")
-                .class(format!("mq-agent-dot mq-agent--{}", agent_class(ctx.agent))),
+                .class("mq-agent-dot")
+                .class(format!("mq-agent--{}", agent_class(ctx.agent))),
         )
 }
 
