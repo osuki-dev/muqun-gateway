@@ -67,7 +67,9 @@ fn main() -> anyhow::Result<()> {
 
     let geometry = config.window.clamped();
     let window = WindowConfig {
-        title: branding::APP_NAME.to_string(),
+        // A QA run names its window so compositor rules can keep it from
+        // taking focus (`ui/timeline/qa.rs`).
+        title: std::env::var("MUQUN_QA_TITLE").unwrap_or_else(|_| branding::APP_NAME.to_string()),
         width: geometry.w,
         height: geometry.h,
         resizable: true,
@@ -119,6 +121,7 @@ fn main() -> anyhow::Result<()> {
                         .set(Some(crate::model::view::NewSessionDraft { agent, cwd })),
                 }),
             );
+            ui::timeline::qa::start(&app);
             app
         });
         tracing::debug!(builds, width = ctx.width, height = ctx.height, "build_ui");

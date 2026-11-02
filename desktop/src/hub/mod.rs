@@ -3,7 +3,7 @@
 //!
 //! Every argument and result is the gateway's own `agents::domain` type --
 //! there is no second session model. P0 implements the subset the OpenCode
-//! slice needs; `earlier`, `reply_form`, `catalog`, the switches, `rename`,
+//! slice needs; `catalog`, the switches, `rename`,
 //! `delete` and `fork` join in P1. [`LocalHub`] runs the gateway's agents
 //! plane in this process; a `RemoteHub` over the App's HTTP contract can
 //! implement the same trait later without the UI changing.
@@ -18,7 +18,7 @@ use muqun_gateway::agents::directories::Completion;
 use muqun_gateway::agents::ports::{AgentError, AgentSessionSnapshot};
 use muqun_gateway::agents::{
     AgentDomainEvent, AgentProject, AgentSessionId, AgentSessionInfo, PermissionDecision,
-    SessionQuery,
+    SessionQuery, TimelineItem,
 };
 use muqun_gateway::platform::discovery::AgentDiscoveryInfo;
 use tokio::sync::broadcast;
@@ -55,6 +55,9 @@ pub trait SessionHub: Send + Sync {
     fn create<'a>(&'a self, agent: &'a str, cwd: &'a Path) -> HubFuture<'a, AgentSessionInfo>;
     /// The session's newest history and what it still has pending.
     fn open<'a>(&'a self, asid: &'a AgentSessionId) -> HubFuture<'a, AgentSessionSnapshot>;
+    /// The next older page of the session's history, kept in the mirror;
+    /// empty when there is nothing older.
+    fn earlier<'a>(&'a self, asid: &'a AgentSessionId) -> HubFuture<'a, Vec<TimelineItem>>;
     fn prompt<'a>(&'a self, asid: &'a AgentSessionId, text: &'a str) -> HubFuture<'a, ()>;
     fn interrupt<'a>(&'a self, asid: &'a AgentSessionId) -> HubFuture<'a, ()>;
     fn reply_permission<'a>(
@@ -62,6 +65,12 @@ pub trait SessionHub: Send + Sync {
         asid: &'a AgentSessionId,
         request_id: &'a str,
         decision: PermissionDecision,
+    ) -> HubFuture<'a, ()>;
+    fn reply_form<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+        form_id: &'a str,
+        answers: serde_json::Value,
     ) -> HubFuture<'a, ()>;
     /// Every session event of every agent, in the order the runtime saw them.
     fn events(&self) -> broadcast::Receiver<AgentDomainEvent>;

@@ -43,38 +43,89 @@
 //! once (`blinc_core/src/reactive.rs:1496-1517`). (`State::set` calls the
 //! context's callback directly and would not be batched, reactive.rs:1847.)
 //!
-//! Lock order, everywhere: `tick` → inbox → scheduler. The inbox's emptiness
+//! # Streaming and the timeline
+//!
+//! The streaming item (`SessionView::live`) is not rebuilt per delta: its
+//! row shows the settled markdown blocks plus a `Text::bound` tail
+//! (`stream.rs`), and the drain writes only the tail, at most every
+//! [`STREAM_INTERVAL`](super::stream::STREAM_INTERVAL). Its row rebuilds when
+//! a block settles or the part stops streaming. Every other changed item
+//! bumps its row's version signal, which exists only for rows the list has
+//! built (`view::RowSignals`).
+//!
+//! The timeline view registers a [`FrameHook`]: each drained frame first
+//! gives it the frame (the layout of everything published before is
+//! current by then -- tick callbacks run after layout, `windowed.rs:6538`
+//! vs `:6065`), then reports every batch to it before the batch is
+//! published, so the list's window and scroll anchoring are decided before
+//! the list rebuilds.
+//!
+//! Lock order, everywhere: `tick` → inbox → scheduler. The view lock is never
+//! held while state is published: publishing runs dependent `Stateful`
+//! builders synchronously, and rows read the view. The inbox's emptiness
 //! is checked under the `tick` lock, and a push always takes the `tick` lock
 //! (to arm) after its inbox lock is released, so a push can never land
 //! between "the inbox is empty" and "the callback is gone".
 
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use blinc_animation::TickCallbackId;
+use blinc_theme::ThemeState;
+use muqun_gateway::agents::{AgentPart, FormRequest, PermissionRequest, TimelineItem};
 
 use super::inbox::{Inbox, UiAction, Update};
-use super::view::{item_state, Bindings, Changes, ViewState};
-
-/// Frames the timeline is re-pinned to the bottom after a batch that grew
-/// it: `ScrollRef::scroll_to_bottom` resolves against the content height the
-/// renderer knows at the start of the next frame
-/// (`blinc_layout/src/renderer/scroll.rs:143-145`), which is before that
-/// frame's subtree rebuild lays the new rows out.
-const FOLLOW_FRAMES: u8 = 3;
+use super::stream::{self, TailKind, Throttle};
+use super::view::{Bindings, Changes, TimelineOrder, ViewState};
 
 pub type ActionHandler = Arc<dyn Fn(UiAction) + Send + Sync>;
 
+/// What one batch did to the active timeline, for the timeline view.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TimelineBatch {
+    pub asid: String,
+    /// A snapshot replaced the timeline (a newly opened session or a resync).
+    pub opened: bool,
+    pub appended: usize,
+    pub prepended: usize,
+    /// An older-history reply arrived.
+    pub earlier: bool,
+}
+
+/// The timeline view's per-frame work (see the module docs).
+pub trait FrameHook: Send + Sync {
+    /// Called first in every drained frame. True while the hook wants more
+    /// frames.
+    fn frame(&self) -> bool;
+    /// A batch changed the active timeline; called before it is published.
+    fn batch(&self, batch: &TimelineBatch);
+}
+
 struct Tick {
     id: Option<TickCallbackId>,
-    follow: u8,
+}
+
+/// The streaming item's split, as its row last rendered it.
+#[derive(Default)]
+struct Stream {
+    /// (asid, item id) of the live item.
+    key: Option<(String, String)>,
+    boundary: usize,
+    kind: Option<TailKind>,
+    throttle: Throttle,
+    /// The item changed since the tail was last written.
+    dirty: bool,
 }
 
 struct Inner {
     inbox: Arc<Inbox>,
     tick: Mutex<Tick>,
     view: Mutex<ViewState>,
+    stream: Mutex<Stream>,
     bindings: Mutex<Option<Bindings>>,
     actions: Mutex<Option<ActionHandler>>,
+    hook: Mutex<Option<Arc<dyn FrameHook>>>,
+    scheme: Mutex<Option<blinc_theme::ColorScheme>>,
 }
 
 #[derive(Clone)]
@@ -82,18 +133,31 @@ pub struct Drain {
     inner: Arc<Inner>,
 }
 
+/// The state writes one batch makes, computed under the view lock and
+/// applied after it is released.
+#[derive(Default)]
+struct Plan {
+    asid: String,
+    /// Rows to render again.
+    rows: Vec<String>,
+    tail: Option<String>,
+    order: Option<Arc<TimelineOrder>>,
+    permissions: Option<Arc<Vec<PermissionRequest>>>,
+    forms: Option<Arc<Vec<FormRequest>>>,
+}
+
 impl Drain {
     pub fn new(inbox: Arc<Inbox>) -> Self {
         let drain = Self {
             inner: Arc::new(Inner {
                 inbox: inbox.clone(),
-                tick: Mutex::new(Tick {
-                    id: None,
-                    follow: 0,
-                }),
+                tick: Mutex::new(Tick { id: None }),
                 view: Mutex::new(ViewState::default()),
+                stream: Mutex::new(Stream::default()),
                 bindings: Mutex::new(None),
                 actions: Mutex::new(None),
+                hook: Mutex::new(None),
+                scheme: Mutex::new(None),
             }),
         };
         let weak = Arc::downgrade(&drain.inner);
@@ -114,6 +178,20 @@ impl Drain {
         *self.inner.bindings.lock().unwrap() = Some(bindings);
         *self.inner.actions.lock().unwrap() = Some(actions);
         self.arm();
+    }
+
+    /// Install the timeline view's frame hook. Main thread.
+    pub fn set_frame_hook(&self, hook: Arc<dyn FrameHook>) {
+        *self.inner.hook.lock().unwrap() = Some(hook);
+    }
+
+    /// Ask for frames: the hook is called each frame until it says it is
+    /// done. Main thread.
+    pub fn wake(&self) {
+        self.arm();
+        if let Some(scheduler) = blinc_animation::try_get_scheduler() {
+            scheduler.request_redraw();
+        }
     }
 
     /// Mark `asid` as the session the user picked. Main thread.
@@ -152,14 +230,35 @@ impl Drain {
         }
     }
 
-    /// Read the view under its lock. Main thread; keep it short.
+    /// Read the view under its lock. Main thread; keep it short, and never
+    /// write Blinc state inside.
     pub fn with_view<R>(&self, f: impl FnOnce(&ViewState) -> R) -> R {
         f(&self.inner.view.lock().unwrap())
+    }
+
+    /// One item of the active session.
+    pub fn item(&self, id: &str) -> Option<Arc<TimelineItem>> {
+        self.inner.view.lock().unwrap().item(id)
+    }
+
+    /// When `id` is the streaming item of `asid`: where its settled prefix
+    /// ends, as its row should render it.
+    pub fn live_boundary(&self, asid: &str, id: &str) -> Option<usize> {
+        let stream = self.inner.stream.lock().unwrap();
+        match &stream.key {
+            Some((a, i)) if a == asid && i == id => Some(stream.boundary),
+            _ => None,
+        }
     }
 
     /// Queue UI-originated work for the next drain.
     pub fn post(&self, action: UiAction) {
         self.inner.inbox.push(Update::Ui(action));
+    }
+
+    /// Queue an update as if the core had sent it (the QA harness).
+    pub fn inject(&self, update: Update) {
+        self.inner.inbox.push(update);
     }
 
     /// Register the drain callback unless it already is.
@@ -184,43 +283,65 @@ impl Drain {
         let Some(bindings) = self.inner.bindings.lock().unwrap().clone() else {
             return;
         };
+        let hook = self.inner.hook.lock().unwrap().clone();
+        let hook_wants = hook.as_ref().is_some_and(|h| h.frame());
+        self.check_scheme(&bindings);
         let batch = self.inner.inbox.take();
         if !batch.is_empty() {
-            self.apply(&bindings, batch);
+            self.apply(&bindings, hook.as_deref(), batch);
         }
-        let follow = {
-            let mut tick = self.inner.tick.lock().unwrap();
-            let follow = tick.follow > 0;
-            tick.follow = tick.follow.saturating_sub(1);
-            if tick.follow == 0 && self.inner.inbox.is_empty() {
-                if let (Some(id), Some(scheduler)) =
-                    (tick.id.take(), blinc_animation::try_get_scheduler())
-                {
-                    scheduler.remove_tick_callback(id);
-                }
+        let streaming = self.flush_stream(&bindings);
+        let mut tick = self.inner.tick.lock().unwrap();
+        if !hook_wants && !streaming && self.inner.inbox.is_empty() {
+            if let (Some(id), Some(scheduler)) =
+                (tick.id.take(), blinc_animation::try_get_scheduler())
+            {
+                scheduler.remove_tick_callback(id);
             }
-            follow
-        };
-        if follow {
-            bindings.timeline_scroll.scroll_to_bottom();
         }
     }
 
-    fn apply(&self, bindings: &Bindings, batch: Vec<Update>) {
-        // Read before anything grows: was the reader following the tail?
-        let was_at_bottom = bindings.timeline_scroll.is_at_bottom();
+    /// Rows bake theme colours into their rich text: a scheme switch has to
+    /// render them again.
+    fn check_scheme(&self, bindings: &Bindings) {
+        let Some(theme) = ThemeState::try_get() else {
+            return;
+        };
+        let scheme = theme.scheme();
+        let mut seen = self.inner.scheme.lock().unwrap();
+        if seen.is_some_and(|s| s != scheme) {
+            bindings
+                .theme_epoch
+                .signal()
+                .set(bindings.theme_epoch.get() + 1);
+        }
+        *seen = Some(scheme);
+    }
+
+    fn apply(&self, bindings: &Bindings, hook: Option<&dyn FrameHook>, batch: Vec<Update>) {
         let mut changes = Changes::default();
-        {
+        let (plan, timeline_batch) = {
             let mut view = self.inner.view.lock().unwrap();
             for update in batch {
                 view.apply(update, &mut changes);
             }
-            blinc_core::reactive::batch_stateful_deps(|| publish(&view, bindings, &changes));
+            let touched = changes.timeline() || changes.earlier_reply;
+            let plan = self.plan(&view, &mut changes);
+            let timeline_batch = touched.then(|| TimelineBatch {
+                asid: plan.asid.clone(),
+                opened: changes.opened,
+                appended: changes.appended,
+                prepended: changes.prepended,
+                earlier: changes.earlier_reply,
+            });
+            // The rest of the bindings, under the same lock, as values.
+            let rest = Rest::from_view(&view, &changes);
+            (Planned { plan, rest }, timeline_batch)
+        };
+        if let (Some(hook), Some(batch)) = (hook, timeline_batch.as_ref()) {
+            hook.batch(batch);
         }
-        if changes.timeline() && (was_at_bottom || changes.opened) {
-            bindings.timeline_scroll.scroll_to_bottom();
-            self.inner.tick.lock().unwrap().follow = FOLLOW_FRAMES;
-        }
+        blinc_core::reactive::batch_stateful_deps(|| plan.publish(bindings));
         if !changes.actions.is_empty() {
             let handler = self.inner.actions.lock().unwrap().clone();
             if let Some(handler) = handler {
@@ -230,56 +351,196 @@ impl Drain {
             }
         }
     }
-}
 
-/// Write the bindings `changes` names. Items are written before the order,
-/// so a list rebuilt for a new row finds every row's state already set.
-fn publish(view: &ViewState, b: &Bindings, changes: &Changes) {
-    if let Some(active) = view.active.as_ref() {
-        let asid = &active.info.asid.0;
-        for id in &changes.items {
-            if let Some(item) = view.item(id) {
-                item_state(asid, id).signal().set(Some(item));
+    /// Which rows to render again and what the streaming tail becomes.
+    fn plan(&self, view: &ViewState, changes: &mut Changes) -> Plan {
+        let mut plan = Plan::default();
+        let Some(active) = view.active.as_ref() else {
+            return plan;
+        };
+        plan.asid = active.info.asid.0.clone();
+        let live = view.live().map(|item| (plan.asid.clone(), item.id.clone()));
+        let mut stream = self.inner.stream.lock().unwrap();
+        let mut rows: Vec<String> = std::mem::take(&mut changes.items);
+        if stream.key != live || changes.opened {
+            // The live item changed: the old one renders as markdown now,
+            // the new one as settled blocks plus a tail.
+            if let Some((asid, id)) = stream.key.take() {
+                if asid == plan.asid && !rows.contains(&id) {
+                    rows.push(id);
+                }
+            }
+            *stream = Stream::default();
+            if let Some((asid, id)) = live {
+                if let Some(item) = view.item(&id) {
+                    let text = part_text(&item);
+                    stream.boundary = stream::settled_boundary(text);
+                    let (kind, tail) = stream::tail(text, stream.boundary);
+                    stream.kind = Some(kind);
+                    plan.tail = Some(tail.to_string());
+                    stream.throttle.offer(Instant::now());
+                }
+                if !rows.contains(&id) {
+                    rows.push(id.clone());
+                }
+                stream.key = Some((asid, id));
+            }
+        } else if let Some((_, id)) = live.as_ref() {
+            // Same live item: its deltas go to the tail, throttled.
+            if let Some(at) = rows.iter().position(|r| r == id) {
+                rows.remove(at);
+                stream.dirty = true;
             }
         }
+        drop(stream);
+        plan.rows = rows;
+        if changes.order || changes.opened {
+            plan.order = Some(Arc::new(view.order()));
+        }
+        if changes.permissions || changes.opened {
+            plan.permissions = Some(Arc::new(active.pending_permissions.clone()));
+        }
+        if changes.forms || changes.opened {
+            plan.forms = Some(Arc::new(active.pending_forms.clone()));
+        }
+        plan
     }
-    if changes.order || changes.opened {
-        b.order.signal().set(Arc::new(view.order()));
+
+    /// Write the streaming item's tail when it changed and the throttle
+    /// allows; render its row again when a block settled. True while an
+    /// update is held back.
+    fn flush_stream(&self, bindings: &Bindings) -> bool {
+        let now = Instant::now();
+        let (key, write) = {
+            let mut stream = self.inner.stream.lock().unwrap();
+            if !stream.dirty {
+                return false;
+            }
+            let pass = if stream.throttle.is_pending() {
+                stream.throttle.take_due(now)
+            } else {
+                stream.throttle.offer(now)
+            };
+            if !pass {
+                return true;
+            }
+            stream.dirty = false;
+            let Some((asid, id)) = stream.key.clone() else {
+                return false;
+            };
+            let Some(item) = self.item(&id) else {
+                return false;
+            };
+            let text = part_text(&item);
+            let boundary = stream::settled_boundary(text);
+            let (kind, tail) = stream::tail(text, boundary);
+            let settled = boundary != stream.boundary || Some(kind) != stream.kind;
+            stream.boundary = boundary;
+            stream.kind = Some(kind);
+            ((asid, id, settled), tail.to_string())
+        };
+        let (asid, id, settled) = key;
+        let bumps = if settled {
+            bindings.rows.bump(&asid, [&id])
+        } else {
+            Vec::new()
+        };
+        blinc_core::reactive::batch_stateful_deps(|| {
+            bindings.stream_tail.signal().set(write);
+            for (state, version) in bumps {
+                state.signal().set(version);
+            }
+        });
+        false
     }
-    if changes.permissions || changes.opened {
-        let pending = view
-            .active
-            .as_ref()
-            .map(|a| a.pending_permissions.clone())
-            .unwrap_or_default();
-        b.permissions.signal().set(Arc::new(pending));
+}
+
+/// The text a streaming part shows.
+fn part_text(item: &TimelineItem) -> &str {
+    match &item.part {
+        AgentPart::Text { text } | AgentPart::Reasoning { text, .. } => text,
+        _ => "",
     }
-    if changes.header {
-        b.header
-            .signal()
-            .set(view.active.as_ref().map(|a| Arc::new(a.info.clone())));
+}
+
+/// The non-timeline bindings one batch changed, as values.
+#[derive(Default)]
+struct Rest {
+    header: Option<Option<Arc<muqun_gateway::agents::AgentSessionInfo>>>,
+    sessions: Option<Arc<Vec<muqun_gateway::agents::AgentSessionInfo>>>,
+    selected: Option<Option<String>>,
+    error: Option<Option<super::inbox::UiError>>,
+    agents: Option<Arc<Vec<muqun_gateway::platform::discovery::AgentDiscoveryInfo>>>,
+    attention: Option<Arc<Vec<PermissionRequest>>>,
+    projects: Option<Arc<Vec<muqun_gateway::agents::AgentProject>>>,
+    completions: Option<Arc<Vec<muqun_gateway::agents::directories::DirectoryEntry>>>,
+}
+
+impl Rest {
+    fn from_view(view: &ViewState, c: &Changes) -> Self {
+        Self {
+            header: c
+                .header
+                .then(|| view.active.as_ref().map(|a| Arc::new(a.info.clone()))),
+            sessions: c.sessions.then(|| Arc::new(view.sessions.clone())),
+            selected: c.selected.then(|| view.selected.clone()),
+            error: c.error.then(|| view.error.clone()),
+            agents: c.agents.then(|| Arc::new(view.agents.clone())),
+            attention: c.attention.then(|| Arc::new(view.attention.clone())),
+            projects: c.projects.then(|| Arc::new(view.projects.clone())),
+            completions: c.completions.then(|| Arc::new(view.completions.clone())),
+        }
     }
-    if changes.sessions {
-        b.sessions.signal().set(Arc::new(view.sessions.clone()));
-    }
-    if changes.selected {
-        b.selected.signal().set(view.selected.clone());
-    }
-    if changes.error {
-        b.error.signal().set(view.error.clone());
-    }
-    if changes.agents {
-        b.agents.signal().set(Arc::new(view.agents.clone()));
-    }
-    if changes.attention {
-        b.attention.signal().set(Arc::new(view.attention.clone()));
-    }
-    if changes.projects {
-        b.projects.signal().set(Arc::new(view.projects.clone()));
-    }
-    if changes.completions {
-        b.completions
-            .signal()
-            .set(Arc::new(view.completions.clone()));
+}
+
+struct Planned {
+    plan: Plan,
+    rest: Rest,
+}
+
+impl Planned {
+    /// Write the bindings. Rows and the tail are written before the order,
+    /// so a list rebuilt for a new row finds every row's state already set.
+    fn publish(self, b: &Bindings) {
+        let Planned { plan, rest } = self;
+        if let Some(tail) = plan.tail {
+            b.stream_tail.signal().set(tail);
+        }
+        for (state, version) in b.rows.bump(&plan.asid, &plan.rows) {
+            state.signal().set(version);
+        }
+        if let Some(order) = plan.order {
+            b.order.signal().set(order);
+        }
+        if let Some(permissions) = plan.permissions {
+            b.permissions.signal().set(permissions);
+        }
+        if let Some(forms) = plan.forms {
+            b.forms.signal().set(forms);
+        }
+        if let Some(header) = rest.header {
+            b.header.signal().set(header);
+        }
+        if let Some(sessions) = rest.sessions {
+            b.sessions.signal().set(sessions);
+        }
+        if let Some(selected) = rest.selected {
+            b.selected.signal().set(selected);
+        }
+        if let Some(error) = rest.error {
+            b.error.signal().set(error);
+        }
+        if let Some(agents) = rest.agents {
+            b.agents.signal().set(agents);
+        }
+        if let Some(attention) = rest.attention {
+            b.attention.signal().set(attention);
+        }
+        if let Some(projects) = rest.projects {
+            b.projects.signal().set(projects);
+        }
+        if let Some(completions) = rest.completions {
+            b.completions.signal().set(completions);
+        }
     }
 }

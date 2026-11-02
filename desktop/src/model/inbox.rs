@@ -53,7 +53,7 @@ pub enum Update {
         agent: String,
         sessions: Vec<AgentSessionInfo>,
     },
-    SessionCreated(AgentSessionInfo),
+    SessionCreated(Box<AgentSessionInfo>),
     Snapshot(Box<AgentSessionSnapshot>),
     Event(AgentDomainEvent),
     Error(UiError),
@@ -67,6 +67,13 @@ pub enum Update {
         truncated: bool,
     },
     Ui(UiAction),
+    /// An older page of a session's history, oldest first. `exhausted`:
+    /// the agent has nothing older.
+    Earlier {
+        asid: String,
+        items: Vec<muqun_gateway::agents::TimelineItem>,
+        exhausted: bool,
+    },
 }
 
 #[derive(Default)]

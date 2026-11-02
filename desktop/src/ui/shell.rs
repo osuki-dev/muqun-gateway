@@ -120,6 +120,7 @@ fn scheme_toggle(app: &App) -> impl ElementBuilder {
             let theme = ThemeState::get();
             let next = theme.scheme().toggle();
             theme.set_scheme(next);
+            super::timeline::theme_changed(&app);
             app.send(Command::PersistScheme(match next {
                 ColorScheme::Light => Scheme::Light,
                 ColorScheme::Dark => Scheme::Dark,

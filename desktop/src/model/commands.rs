@@ -29,6 +29,15 @@ pub enum Command {
         id: String,
         decision: PermissionDecision,
     },
+    /// The next older page of the session's history (architecture §3
+    /// `earlier`).
+    LoadEarlier(AgentSessionId),
+    ReplyForm {
+        asid: AgentSessionId,
+        id: String,
+        /// `{ field key: value }`, as the gateway's form route takes it.
+        answers: serde_json::Value,
+    },
     /// Folders under a typed prefix. Debounced on the core side; only the
     /// answer for the newest prefix is delivered.
     CompleteDirectory {
