@@ -902,19 +902,21 @@ pub(crate) async fn watch_pane_approvals(state: AppState, session: SessionConfig
                         None,
                         Some(&approval),
                     );
-                    deliver_pane_notification(
-                        &state,
-                        &session,
-                        approval_notification(
-                            &state.config.server_id,
-                            &current_server_label(&state.config.label),
-                            &session.id,
-                            pane_id,
-                            agent,
-                            &approval,
-                        ),
-                    )
-                    .await;
+                    let mut notice = approval_notification(
+                        &state.config.server_id,
+                        &current_server_label(&state.config.label),
+                        &session.id,
+                        pane_id,
+                        agent,
+                        &approval,
+                    );
+                    // The question, only when the owner asked for it
+                    // (`rich_agent_pushes`). This is the one push a menu
+                    // raises: the blocked push for it is not sent.
+                    if state.config.rich_agent_pushes {
+                        notice.detail = Some(PushDetail::from_approval(&approval));
+                    }
+                    deliver_pane_notification(&state, &session, notice).await;
                 }
                 None => {
                     if let Some(previous) = pending.remove(pane_id) {
@@ -1008,8 +1010,8 @@ pub(crate) fn approval_notification(
         // delivery time. `options` is set on the payload there.
         choices: approval.push_choices(),
         // An approval push carries the fingerprint and the decisions, which is
-        // enough to answer from the lock screen. The question itself is put on
-        // the blocked push, and only when the owner asked for it.
+        // enough to answer from the lock screen. The question itself is added
+        // by the watcher, and only when the owner asked for it.
         detail: None,
     }
 }
@@ -1593,10 +1595,9 @@ pub(crate) async fn watch_agent_notifications(state: AppState, session: SessionC
                             .collect();
                         pending_inputs.retain_present(&events);
                         for event in events {
-                            if let Some(mut notification) = observe_agent_notification(
+                            if let Some(notification) = observe_agent_notification(
                                 &state, &session.id, &event, &mut statuses, &mut completions,
                             ) {
-                                enrich_blocked_notification(&state, &session, &mut notification).await;
                                 deliver_pane_notification(&state, &session, notification).await;
                             }
                             if pending_inputs.observe(&event) {
@@ -1615,14 +1616,13 @@ pub(crate) async fn watch_agent_notifications(state: AppState, session: SessionC
                 }
                 next = activity.recv() => match next {
                     Ok(SessionActivity::Event(event)) if event.name == "pane_agent_status_changed" => {
-                        if let Some(mut notification) = observe_agent_notification(
+                        if let Some(notification) = observe_agent_notification(
                             &state,
                             &session.id,
                             &event.payload,
                             &mut statuses,
                             &mut completions,
                         ) {
-                            enrich_blocked_notification(&state, &session, &mut notification).await;
                             deliver_pane_notification(&state, &session, notification).await;
                         }
                     }
@@ -1759,18 +1759,44 @@ pub(crate) fn observe_agent_notification(
 /// ([`crate::tasks::TaskService::pane_mirror`]): a Codex delegation's TUI
 /// asks its approvals, questions and turn ends through that session, whose
 /// pushes route to the conversation. One event, one push.
+///
+/// A blocked or input push whose pane shows a permission menu is not sent
+/// either: the approval watcher pushes `approval.pending` for that menu.
 pub(crate) async fn deliver_pane_notification(
     state: &AppState,
     session: &SessionConfig,
     notice: AgentPushNotice,
 ) {
-    if let Some(pane_id) = notice.data.get("pane_id").and_then(Value::as_str) {
-        if let Some(asid) = state.tasks.pane_mirror(&session.id, pane_id).await {
-            tracing::debug!(pane = pane_id, asid, "pane push left to its agent session");
-            return;
-        }
+    if !pane_push_covered(state, session, &notice).await {
+        deliver_agent_notification(state, notice).await;
     }
-    deliver_agent_notification(state, notice).await;
+}
+
+async fn pane_push_covered(
+    state: &AppState,
+    session: &SessionConfig,
+    notice: &AgentPushNotice,
+) -> bool {
+    let Some(pane_id) = notice.data.get("pane_id").and_then(Value::as_str) else {
+        return false;
+    };
+    if let Some(asid) = state.tasks.pane_mirror(&session.id, pane_id).await {
+        tracing::debug!(pane = pane_id, asid, "pane push left to its agent session");
+        return true;
+    }
+    // Saying the agent wants something, without saying it is a menu, is what
+    // the menu's `approval.pending` already said.
+    if matches!(
+        notice.notice,
+        AgentNotice::AgentBlocked | AgentNotice::AgentInputRequired
+    ) && read_pane_visible_text(session, pane_id)
+        .await
+        .is_ok_and(|screen| approvals::detect(&screen).is_some())
+    {
+        tracing::debug!(pane = pane_id, "pane push left to its approval push");
+        return true;
+    }
+    false
 }
 
 /// Send one notice to every registered device, each in its own language.
@@ -2110,8 +2136,8 @@ pub(crate) fn notification_for_transition(
         agent_name,
         data: notification_data,
         choices: Vec::new(),
-        // Filled in afterwards, and only for a blocked pane on a gateway whose
-        // owner turned `rich_agent_pushes` on.
+        // A blocked pane with a menu on it pushes its approval instead, which
+        // is where `rich_agent_pushes` puts the question.
         detail: None,
     })
 }
@@ -2149,40 +2175,6 @@ pub(crate) fn absorb_agent_status_event(
         &current_server_label(&state.config.label),
         session_id,
     )
-}
-
-/// Put the agent's own question on a blocked push, if this gateway's owner
-/// asked for that.
-///
-/// The whole of what `rich_agent_pushes` does, in one place and behind one
-/// check, so that "off" is a property of the code path and not a habit. Off, it
-/// costs nothing: no pane is read, and the push is byte-for-byte the one this
-/// gateway has always sent.
-///
-/// On, it reads the pane the way the approvals endpoint does and quotes what it
-/// finds. A pane with no menu on it -- an agent blocked on something the
-/// gateway cannot read -- is left as the content-free push it already was,
-/// which is the right degradation: an empty question is worse than the generic
-/// sentence, not better.
-pub(crate) async fn enrich_blocked_notification(
-    state: &AppState,
-    session: &SessionConfig,
-    notice: &mut AgentPushNotice,
-) {
-    if !state.config.rich_agent_pushes || notice.notice != AgentNotice::AgentBlocked {
-        return;
-    }
-    let Some(pane_id) = notice
-        .data
-        .get("pane_id")
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-    else {
-        return;
-    };
-    if let Ok((_, Some(approval))) = read_pane_approval(session, &pane_id).await {
-        notice.detail = Some(PushDetail::from_approval(&approval));
-    }
 }
 
 /// The two halves in one call, for tests that are about what a push says rather
@@ -4253,6 +4245,41 @@ mod tests {
             json!({"type": "agent.completed", "server_id": "server-1", "agent_id": "opencode", "asid": "ses_1"})
         );
         assert_eq!(notice.render(Locale::ZhTw).body, "OpenCode 已執行完畢。");
+    }
+
+    /// One menu, one push: a blocked or input push for a pane showing a
+    /// permission menu is left to that menu's approval push; anything else a
+    /// pane raises goes out.
+    #[tokio::test]
+    async fn a_pane_showing_a_menu_pushes_only_its_approval() {
+        let state = test_state("admin", Vec::new());
+        let menu = include_str!("../../tests/fixtures/approval-claude-bash.txt");
+        for (screen, has_menu) in [(menu, true), ("› ready for the next task", false)] {
+            let herdr = crate::test_support::FakeHerdr::start(vec![screen], None);
+            let session = herdr.session();
+            for (notice, asks) in [
+                (AgentNotice::AgentBlocked, true),
+                (AgentNotice::AgentInputRequired, true),
+                (AgentNotice::AgentCompleted, false),
+                (AgentNotice::ApprovalPending, false),
+            ] {
+                let push = AgentPushNotice {
+                    notice,
+                    server_label: String::new(),
+                    agent_name: None,
+                    data: [("pane_id".to_owned(), json!("w1:p1"))]
+                        .into_iter()
+                        .collect(),
+                    choices: Vec::new(),
+                    detail: None,
+                };
+                assert_eq!(
+                    super::pane_push_covered(&state, &session, &push).await,
+                    has_menu && asks,
+                    "{notice:?}, menu on screen: {has_menu}"
+                );
+            }
+        }
     }
 
     /// The question push says "{name} needs your input", naming the session

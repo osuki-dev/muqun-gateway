@@ -118,8 +118,8 @@ pub(crate) struct Config {
     /// a written config while on.
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub(crate) agent_trust_folders: bool,
-    /// Put the agent's own question, and the answers it is offering, into a
-    /// blocked push.
+    /// Put the agent's own question, and the answers it is offering, into an
+    /// approval or question push.
     ///
     /// Off, and it has to stay off by default. Everything else this gateway
     /// notifies with is locale-free or a name the user typed; this is the one

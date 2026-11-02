@@ -182,7 +182,7 @@ pub(crate) struct AgentPushNotice {
     pub(crate) detail: Option<PushDetail>,
 }
 
-/// What a blocked push says when the operator has opted into it: the question
+/// What an approval or question push says when the operator has opted into it: the question
 /// the agent asked, and the answers it is offering, both verbatim and both cut
 /// short.
 ///
