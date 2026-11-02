@@ -332,6 +332,7 @@ catalogs. Terminal liveness, compatibility and transport facts remain live.
 | `attachments` | A prompt may carry `attachments`; when false the agent answers `501 feature_unsupported`. |
 | `attachmentsByPath` | The agent has no native attachment API: the gateway lists the attachments as host paths at the end of the prompt text and the agent opens them with its own tools. Only uploads are accepted (see [`POST …/prompt`](#post-apiagent-sessionsasidprompt)). |
 | `timelineEarlier` | `POST …/timeline/earlier` pages older timeline rows after the selected snapshot. Requires global `agent_timeline_earlier_v1` too; absent or false means unsupported. |
+| `savedPermissions` | `GET …/permissions/saved` lists what an `allow_always` reply agreed to, and `DELETE …/permissions/saved/{id}` forgets one. `false` means the agent keeps such rules itself (Claude Code's settings, agy's own store, …) and the gateway cannot list them; the App hides its list instead of showing it empty. Absent means an older gateway, where only OpenCode was driven. |
 
   The App renders agent-specific UI from these flags alone, never from the
   agent's `kind`. The base flags above are always present (booleans, never omitted).
@@ -367,6 +368,7 @@ catalogs. Terminal liveness, compatibility and transport facts remain live.
   | `attachmentsByPath` | no | yes | yes | yes |
   | `sessionPagination` | yes | no | no | yes (forward only) |
   | `timelineEarlier` | yes | yes | no | yes |
+  | `savedPermissions` | yes | no | no | no |
 
   `t3` is `name: "T3 Code"`; its `version` is the T3 server version, its
   `models[]` are every model of the providers T3 has ready (Claude Code,

@@ -341,6 +341,7 @@ pub(super) fn features() -> crate::discovery::AgentFeatures {
         extra: std::collections::BTreeMap::from([
             ("sessionPagination".into(), serde_json::json!(true)),
             ("timelineEarlier".into(), serde_json::json!(true)),
+            ("savedPermissions".into(), serde_json::json!(false)),
             ("sharedDaemon".into(), serde_json::json!(cfg!(unix))),
             ("sharedTaskStartup".into(), serde_json::json!(false)),
             ("sharedDaemonConnected".into(), serde_json::json!(false)),

@@ -2675,6 +2675,8 @@ fn acp_features() -> crate::discovery::AgentFeatures {
             ("sessionPagination", false),
             ("timelineEarlier", true),
             ("accountLimits", false),
+            // Rules an "always" answer leaves behind are the agent's own.
+            ("savedPermissions", false),
             ("computerTools", false),
         ]
         .into_iter()
@@ -2740,6 +2742,7 @@ fn deepseek_features(
             ("sessionFork".into(), serde_json::json!(true)),
             ("sessionPagination".into(), serde_json::Value::Bool(false)),
             ("timelineEarlier".into(), serde_json::json!(true)),
+            ("savedPermissions".into(), serde_json::json!(false)),
         ]),
     }
 }
@@ -2770,6 +2773,8 @@ fn opencode_features(
             ("sessionRename".into(), serde_json::json!(true)),
             ("sessionDelete".into(), serde_json::json!(true)),
             ("sessionFork".into(), serde_json::json!(false)),
+            // `GET …/permissions/saved` lists what "always" agreed to.
+            ("savedPermissions".into(), serde_json::json!(true)),
         ]),
     }
 }

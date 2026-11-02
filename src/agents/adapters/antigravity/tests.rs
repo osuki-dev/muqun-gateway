@@ -247,7 +247,7 @@ fn agy_shell_permission(raw_input: Value) -> Value {
 fn run_command_permissions_take_the_command_line_and_refuse_anything_else() {
     use super::driver::AntigravityProvider;
     use crate::agents::adapters::acp::{mapper, session::AcpProvider};
-    let agy = AntigravityProvider::SHELL_COMMAND_FIELDS;
+    let agy = AntigravityProvider::PERMISSION_FIELDS;
     for (raw_input, expected) in [
         (
             json!({"CommandLine": "git status -s", "WaitMsBeforeAsync": 5000, "toolSummary": "Check the working tree"}),
@@ -279,7 +279,7 @@ fn run_command_permissions_take_the_command_line_and_refuse_anything_else() {
     assert!(mapper::permission(
         json!(1),
         &agy_shell_permission(json!({"CommandLine": "pwd"})),
-        mapper::SHELL_COMMAND_FIELDS
+        mapper::PERMISSION_FIELDS
     )
     .is_err());
 }
