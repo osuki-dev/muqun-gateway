@@ -319,16 +319,32 @@ async fn check_preview(client: &reqwest::Client, current: &str) -> Result<Plan> 
     .await
 }
 
+/// Preview listing bounds. GitHub release bodies and asset lists are large (measured
+/// about 24 KiB per release, 69 KiB at most, in November 2026), so a 100-release page
+/// outgrew a 1 MiB cap. Small pages keep each body bounded; the cap leaves roughly
+/// 3x headroom over today's worst case of a full page (20 x 69 KiB) so growth in
+/// release notes does not break the check again. 50 pages x 20 = 1000 releases.
+const PREVIEW_PAGE_SIZE: usize = 20;
+const PREVIEW_MAX_PAGES: usize = 50;
+const PREVIEW_PAGE_BODY_LIMIT: u64 = 4 * 1024 * 1024;
+
 async fn check_preview_at(client: &reqwest::Client, endpoint: &str, current: &str) -> Result<Plan> {
     let mut releases = Vec::new();
     // Exhaust a bounded listing: never trust ordering or use a partial search.
-    for page in 1..=10 {
-        let url = format!("{endpoint}?per_page=100&page={page}");
-        let body = bounded_body(response(client, &url, 1024 * 1024).await?, 1024 * 1024).await?;
+    for page in 1..=PREVIEW_MAX_PAGES {
+        let url = format!("{endpoint}?per_page={PREVIEW_PAGE_SIZE}&page={page}");
+        let body = bounded_body(
+            response(client, &url, PREVIEW_PAGE_BODY_LIMIT).await?,
+            PREVIEW_PAGE_BODY_LIMIT,
+        )
+        .await?;
         let batch: Vec<Release> =
             serde_json::from_slice(&body).context("invalid preview release metadata")?;
-        anyhow::ensure!(batch.len() <= 100, "unexpected preview page size");
-        let complete = batch.len() < 100;
+        anyhow::ensure!(
+            batch.len() <= PREVIEW_PAGE_SIZE,
+            "unexpected preview page size"
+        );
+        let complete = batch.len() < PREVIEW_PAGE_SIZE;
         releases.extend(batch);
         if complete {
             return select_preview(releases, current, target()?);
@@ -1285,11 +1301,11 @@ mod tests {
             serde_json::json!({
                 "tag_name": "v0.14.0", "draft": false, "prerelease": false, "assets": []
             });
-            100
+            20
         ])
         .unwrap();
         server.set(
-            "/releases?per_page=100&page=1",
+            "/releases?per_page=20&page=1",
             StatusCode::OK,
             full_page.clone(),
         );
@@ -1300,7 +1316,7 @@ mod tests {
         let mut preview = complete_release("v0.15.0-preview.10");
         preview.prerelease = true;
         server.set(
-            "/releases?per_page=100&page=2",
+            "/releases?per_page=20&page=2",
             StatusCode::OK,
             serde_json::to_vec(&vec![preview]).unwrap(),
         );
@@ -1308,9 +1324,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(plan.tag, "v0.15.0-preview.10");
-        for page in 2..=10 {
+        for page in 2..=50 {
             server.set(
-                &format!("/releases?per_page=100&page={page}"),
+                &format!("/releases?per_page=20&page={page}"),
                 StatusCode::OK,
                 full_page.clone(),
             );
@@ -1319,6 +1335,38 @@ mod tests {
             .await
             .unwrap_err_string()
             .contains("search bound"));
+    }
+
+    #[tokio::test]
+    async fn preview_page_larger_than_old_cap_is_accepted_but_oversize_page_fails() {
+        let server = Server::new().await;
+        let endpoint = format!("{}/releases", server.url);
+        let page = |note_bytes: usize| {
+            // One short of a full page, so it is also the last page.
+            serde_json::to_vec(&vec![
+                serde_json::json!({
+                    "tag_name": "v0.14.0", "draft": false, "prerelease": false,
+                    "assets": [], "body": "x".repeat(note_bytes)
+                });
+                PREVIEW_PAGE_SIZE - 1
+            ])
+            .unwrap()
+        };
+        // Over the former 1 MiB cap, under the current one: the final short page ends the listing.
+        let big = page(100 * 1024);
+        assert!(big.len() > 1024 * 1024 && (big.len() as u64) < PREVIEW_PAGE_BODY_LIMIT);
+        server.set("/releases?per_page=20&page=1", StatusCode::OK, big);
+        assert!(check_preview_at(&test_client(), &endpoint, "0.14.0")
+            .await
+            .unwrap_err_string()
+            .contains("no complete official preview release"));
+        let huge = page(250 * 1024);
+        assert!(huge.len() as u64 > PREVIEW_PAGE_BODY_LIMIT);
+        server.set("/releases?per_page=20&page=1", StatusCode::OK, huge);
+        assert!(check_preview_at(&test_client(), &endpoint, "0.14.0")
+            .await
+            .unwrap_err_string()
+            .contains("size limit"));
     }
 
     struct Server {

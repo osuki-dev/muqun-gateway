@@ -2,6 +2,12 @@
 
 ## Changes and fixes
 
+- **`update --channel preview` works again.** The preview check failed with
+  "update response exceeds size limit" because one 100-release GitHub page
+  (release notes and asset lists included) had grown past its 1 MiB cap. It now
+  reads 20 releases per page with a 4 MiB cap per page, still bounded to 1000
+  releases, still exhausting the listing and failing closed.
+
 - **Ended tasks can be deleted from the App.** `DELETE /api/tasks/{id}`
   removes a done, failed, cancelled or idle (unconfirmed) task with its
   history, as the 30-day retention would; the agent session it ran in is kept,
