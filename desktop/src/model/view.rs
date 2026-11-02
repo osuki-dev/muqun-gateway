@@ -431,7 +431,7 @@ impl ViewState {
                 changes.forms = true;
                 changes.opened = true;
             }
-            Update::Event(event) => self.apply_event(event, changes),
+            Update::Event(event) => self.apply_event(*event, changes),
             Update::Error(error) => {
                 self.error = Some(error);
                 changes.error = true;
@@ -932,7 +932,7 @@ mod tests {
         let mut view = opened("s", vec![item("x", "m1", 0), item("y", "m1", 1)]);
         let mut changes = Changes::default();
         view.apply(
-            Update::Event(AgentDomainEvent::TimelineUpsert {
+            Update::event(AgentDomainEvent::TimelineUpsert {
                 asid: AgentSessionId("s".into()),
                 items: vec![item("y", "m1", 1)],
                 seq: 2,
@@ -949,7 +949,7 @@ mod tests {
         let mut view = opened("s", vec![item("a", "m1", 0), item("c", "m3", 0)]);
         let mut changes = Changes::default();
         view.apply(
-            Update::Event(AgentDomainEvent::TimelineUpsert {
+            Update::event(AgentDomainEvent::TimelineUpsert {
                 asid: AgentSessionId("s".into()),
                 items: vec![item("b", "m2", 0), item("d", "m4", 0)],
                 seq: 2,
@@ -965,7 +965,7 @@ mod tests {
         let mut view = opened("s", vec![item("a", "m1", 0)]);
         let mut changes = Changes::default();
         view.apply(
-            Update::Event(AgentDomainEvent::TimelineUpsert {
+            Update::event(AgentDomainEvent::TimelineUpsert {
                 asid: AgentSessionId("t".into()),
                 items: vec![item("z", "m9", 0)],
                 seq: 2,
@@ -981,7 +981,7 @@ mod tests {
         let mut view = opened("s", vec![]);
         let mut changes = Changes::default();
         view.apply(
-            Update::Event(AgentDomainEvent::StatusChanged {
+            Update::event(AgentDomainEvent::StatusChanged {
                 asid: AgentSessionId("s".into()),
                 status: AgentSessionStatus::Busy,
                 error: None,
@@ -1004,7 +1004,7 @@ mod tests {
         .unwrap();
         let mut changes = Changes::default();
         view.apply(
-            Update::Event(AgentDomainEvent::PermissionPending {
+            Update::event(AgentDomainEvent::PermissionPending {
                 asid: AgentSessionId("s".into()),
                 request,
                 seq: 2,
@@ -1015,7 +1015,7 @@ mod tests {
         assert_eq!(view.active.as_ref().unwrap().pending_permissions.len(), 1);
         let mut changes = Changes::default();
         view.apply(
-            Update::Event(AgentDomainEvent::PermissionResolved {
+            Update::event(AgentDomainEvent::PermissionResolved {
                 asid: AgentSessionId("s".into()),
                 request_id: "per_1".into(),
                 seq: 3,
@@ -1038,7 +1038,7 @@ mod tests {
         );
         let mut changes = Changes::default();
         view.apply(
-            Update::Event(AgentDomainEvent::SessionUpdated {
+            Update::event(AgentDomainEvent::SessionUpdated {
                 asid: AgentSessionId("a".into()),
                 info: Box::new(info("a", 6)),
                 seq: 1,
@@ -1047,7 +1047,7 @@ mod tests {
         );
         assert!(!changes.sessions, "same order, same row");
         view.apply(
-            Update::Event(AgentDomainEvent::SessionUpdated {
+            Update::event(AgentDomainEvent::SessionUpdated {
                 asid: AgentSessionId("b".into()),
                 info: Box::new(info("b", 9)),
                 seq: 1,

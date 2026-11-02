@@ -337,7 +337,7 @@ impl Core {
                     tracing::info!(asid = %asid.0, %reason, "resync requested");
                     self.resync(Some(&asid)).await;
                 }
-                Ok(event) => self.inbox.push(Update::Event(event)),
+                Ok(event) => self.inbox.push(Update::event(event)),
                 Err(broadcast::error::RecvError::Lagged(missed)) => {
                     tracing::warn!(missed, "event stream lagged; reading the session again");
                     self.resync(None).await;

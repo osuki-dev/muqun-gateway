@@ -173,7 +173,7 @@ fn pick_theme_file(app: &App) {
             crate::model::commands::send(&commands, Command::ThemeImportFile(path));
         }
     };
-    if cfg!(target_os = "macos") {
+    if crate::platform::shell::dialogs_need_main_thread() {
         pick();
     } else {
         std::thread::spawn(pick);
@@ -537,8 +537,10 @@ fn grid(app: &App, b: &ThemeBindings, width: f32, height: f32) -> impl ElementBu
         .child(scroll().w_full().h(height).child(content))
 }
 
+/// A swatch is the previewed theme's own colour (data, not a token of the
+/// running one); grey when the pack's value does not read.
 fn hex(c: &str) -> Color {
-    Color::from_hex_str(c).unwrap_or(Color::rgba(0.5, 0.5, 0.5, 1.0))
+    Color::from_hex_str(c).unwrap_or(Color::GRAY)
 }
 
 /// A card without a picture: the theme's own light and dark palettes.
