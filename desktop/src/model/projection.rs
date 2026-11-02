@@ -97,12 +97,69 @@ async fn mark_missing(projects: &mut [muqun_gateway::agents::AgentProject]) {
     let _ = tokio::time::timeout(EXISTS_BUDGET, check).await;
 }
 
+/// Whether the UI can show anything of `event`, with `active` the session
+/// that is open. Every agent's sessions stream through one channel, and an
+/// agent working in a session nobody is looking at sends its timeline many
+/// times a second; queueing those would wake the window for nothing. What a
+/// listed row shows (title, status, order, a pending approval) always goes
+/// through; the rest only for the open session -- its snapshot, read after it
+/// became the active one, covers anything dropped before.
+fn wanted(event: &AgentDomainEvent, active: Option<&AgentSessionId>) -> bool {
+    match event {
+        AgentDomainEvent::SessionUpdated { .. }
+        | AgentDomainEvent::StatusChanged { .. }
+        | AgentDomainEvent::PermissionPending { .. }
+        | AgentDomainEvent::PermissionResolved { .. }
+        | AgentDomainEvent::Resync { .. } => true,
+        other => active.is_some_and(|active| active == other.asid()),
+    }
+}
+
+/// One kind of re-read that must not pile up: while one runs, any number of
+/// further requests fold into a single re-run after it finishes.
+#[derive(Default)]
+struct Coalesce {
+    /// (running, asked again while running)
+    state: Mutex<(bool, bool)>,
+}
+
+impl Coalesce {
+    /// True when the caller should start the work now; false when a run is
+    /// in flight and will go once more after it.
+    fn begin(&self) -> bool {
+        let mut state = self.state.lock().unwrap();
+        if state.0 {
+            state.1 = true;
+            false
+        } else {
+            state.0 = true;
+            true
+        }
+    }
+
+    /// End a run. True when it was asked for again meanwhile and must run
+    /// once more.
+    fn again(&self) -> bool {
+        let mut state = self.state.lock().unwrap();
+        if std::mem::take(&mut state.1) {
+            true
+        } else {
+            state.0 = false;
+            false
+        }
+    }
+}
+
 struct Core {
     hub: Arc<dyn SessionHub>,
     inbox: Arc<Inbox>,
     config: Arc<ConfigStore>,
     /// The session the user is looking at, for resyncs.
     active: Mutex<Option<AgentSessionId>>,
+    /// Re-reads of the active session's snapshot, after a resync.
+    reread: Coalesce,
+    /// Re-reads of every agent's list, after a resync.
+    relist: Coalesce,
     completions: watch::Sender<Option<String>>,
     /// Bumped on every edit; the saver waits for it to go quiet.
     edits: watch::Sender<u64>,
@@ -123,6 +180,8 @@ pub fn spawn(
         inbox,
         config,
         active: Mutex::new(None),
+        reread: Coalesce::default(),
+        relist: Coalesce::default(),
         completions,
         edits,
     });
@@ -130,6 +189,9 @@ pub fn spawn(
     tokio::spawn(core.clone().complete_directories(completion_rx));
     tokio::spawn(core.clone().save_config(edits_rx));
     tokio::spawn(core.clone().watch_agents());
+    if let Ok(list) = std::env::var("MUQUN_QA_SWITCH") {
+        tokio::spawn(core.clone().qa_switch(list));
+    }
     tokio::spawn(core.commands(commands));
 }
 
@@ -253,6 +315,27 @@ impl Core {
         }
     }
 
+    /// QA: `MUQUN_QA_SWITCH=<asid>,<asid>,…` opens each session in turn, as
+    /// a click on its row would, starting `MUQUN_QA_SWITCH_AFTER` seconds
+    /// (default 60) after start and `MUQUN_QA_SWITCH_EVERY` (default 8) apart
+    /// -- for measuring a session switch without driving the pointer.
+    async fn qa_switch(self: Arc<Self>, list: String) {
+        let secs = |var: &str, default: u64| {
+            std::env::var(var)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(default)
+        };
+        let every = Duration::from_secs(secs("MUQUN_QA_SWITCH_EVERY", 8));
+        tokio::time::sleep(Duration::from_secs(secs("MUQUN_QA_SWITCH_AFTER", 60))).await;
+        for asid in list.split(',').map(str::trim).filter(|a| !a.is_empty()) {
+            tracing::info!(asid, "qa: opening");
+            self.inbox
+                .push(Update::Ui(super::inbox::UiAction::Open(asid.to_string())));
+            tokio::time::sleep(every).await;
+        }
+    }
+
     async fn open(&self, asid: &AgentSessionId) {
         match self.hub.open(asid).await {
             Ok(snapshot) => self.inbox.push(Update::Snapshot(Box::new(snapshot))),
@@ -291,7 +374,12 @@ impl Core {
                     tracing::info!(asid = %asid.0, %reason, "resync requested");
                     self.resync(Some(&asid)).await;
                 }
-                Ok(event) => self.inbox.push(Update::Event(event)),
+                Ok(event) => {
+                    let active = self.active.lock().unwrap().clone();
+                    if wanted(&event, active.as_ref()) {
+                        self.inbox.push(Update::Event(event));
+                    }
+                }
                 Err(broadcast::error::RecvError::Lagged(missed)) => {
                     tracing::warn!(missed, "event stream lagged; reading the session again");
                     self.resync(None).await;
@@ -301,15 +389,65 @@ impl Core {
         }
     }
 
-    /// Read the active session again (when `asid` is it, or unnamed), and
-    /// the list.
+    /// Read the active session again when `asid` is it (or unnamed), else
+    /// -- or for an unnamed resync, also -- the lists.
+    ///
+    /// Re-reading never prepares the session: preparing a terminal-held ACP
+    /// session starts another transcript follower, and every follower sends
+    /// a resync each time the transcript moves, so answering resyncs with
+    /// `open` doubled the followers -- and the reads -- every second the agent
+    /// worked. Re-reads are also coalesced: a burst of resyncs costs at most
+    /// one read in flight and one after it.
     async fn resync(self: &Arc<Self>, asid: Option<&AgentSessionId>) {
+        let named = asid.filter(|x| !x.0.is_empty());
         let active = self.active.lock().unwrap().clone();
-        if let Some(active) = active.filter(|a| asid.is_none_or(|x| x.0.is_empty() || x == a)) {
+        let reread = active
+            .as_ref()
+            .is_some_and(|a| named.is_none_or(|x| x == a));
+        if reread && self.reread.begin() {
             let core = self.clone();
-            tokio::spawn(async move { core.open(&active).await });
+            tokio::spawn(async move {
+                loop {
+                    let active = core.active.lock().unwrap().clone();
+                    if let Some(active) = active {
+                        match core.hub.snapshot(&active).await {
+                            Ok(snapshot) => core.inbox.push(Update::Snapshot(Box::new(snapshot))),
+                            Err(err) => tracing::debug!(%err, "resync read failed"),
+                        }
+                    }
+                    if !core.reread.again() {
+                        break;
+                    }
+                }
+            });
         }
-        tokio::spawn(self.clone().refresh());
+        if (named.is_none() || !reread) && self.relist.begin() {
+            let core = self.clone();
+            tokio::spawn(async move {
+                loop {
+                    core.clone().relist().await;
+                    if !core.relist.again() {
+                        break;
+                    }
+                }
+            });
+        }
+    }
+
+    /// Agents and every attached agent's sessions, finished before it
+    /// returns (unlike [`Self::refresh`], which lists in the background).
+    async fn relist(self: Arc<Self>) {
+        if let Ok(agents) = self.hub.agents().await {
+            self.inbox.push(Update::Agents(agents));
+        }
+        let attached = self.hub.attached().await.unwrap_or_default();
+        let lists: Vec<_> = attached
+            .into_iter()
+            .map(|agent| tokio::spawn(self.clone().list_sessions(agent)))
+            .collect();
+        for list in lists {
+            let _ = list.await;
+        }
     }
 
     async fn complete_directories(self: Arc<Self>, mut prefixes: watch::Receiver<Option<String>>) {
@@ -370,5 +508,44 @@ impl Core {
                 tracing::warn!("config save task failed: {err}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use muqun_gateway::agents::AgentSessionStatus;
+
+    fn id(s: &str) -> AgentSessionId {
+        AgentSessionId(s.into())
+    }
+
+    #[test]
+    fn a_burst_of_requests_runs_once_and_once_more() {
+        let c = Coalesce::default();
+        assert!(c.begin(), "the first starts");
+        assert!(!c.begin() && !c.begin(), "the rest fold in");
+        assert!(c.again(), "one more run for everything asked meanwhile");
+        assert!(!c.again(), "then it is done");
+        assert!(c.begin(), "and a later request starts again");
+    }
+
+    #[test]
+    fn only_the_open_session_streams_its_timeline_to_the_ui() {
+        let upsert = |asid: &str| AgentDomainEvent::TimelineUpsert {
+            asid: id(asid),
+            items: vec![],
+            seq: 1,
+        };
+        assert!(wanted(&upsert("open"), Some(&id("open"))));
+        assert!(!wanted(&upsert("other"), Some(&id("open"))));
+        assert!(!wanted(&upsert("other"), None));
+        let status = AgentDomainEvent::StatusChanged {
+            asid: id("other"),
+            status: AgentSessionStatus::Busy,
+            error: None,
+            seq: 1,
+        };
+        assert!(wanted(&status, Some(&id("open"))), "a row shows status");
     }
 }

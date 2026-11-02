@@ -43,6 +43,8 @@ pub enum UiAction {
         agent: String,
         cwd: std::path::PathBuf,
     },
+    /// Open a session as a click on its row would (QA, `MUQUN_QA_SWITCH`).
+    Open(String),
 }
 
 // `Event` carries a whole domain event, by far the biggest; updates live in the

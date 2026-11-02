@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use muqun_gateway::agents::directories::{self, Completion};
 use muqun_gateway::agents::manager::AgentManager;
-use muqun_gateway::agents::ports::AgentSessionSnapshot;
+use muqun_gateway::agents::ports::{AgentSessionSnapshot, SessionMirrorPort};
 use muqun_gateway::agents::{
     AgentDomainEvent, AgentProject, AgentRuntime, AgentSessionId, AgentSessionInfo,
     PermissionDecision, SessionQuery,
@@ -141,6 +141,20 @@ impl SessionHub for LocalHub {
             // the retained history can still be read.
             if let Err(err) = manager.sessions().prepare_session(asid).await {
                 tracing::debug!(asid = %asid.0, %err, "session preparation failed; reading history anyway");
+            }
+            Ok(manager.sessions().get_snapshot(asid).await?)
+        })
+    }
+
+    fn snapshot<'a>(&'a self, asid: &'a AgentSessionId) -> HubFuture<'a, AgentSessionSnapshot> {
+        Box::pin(async move {
+            let manager = self.manager_for_session(asid).await?;
+            // The mirror first: the session service's `get_snapshot` runs the
+            // agent's `prepare_observed_session`, which for a terminal-held ACP
+            // session that is not retained starts one more transcript
+            // follower on every call (`acp/session.rs` `follow_terminal`).
+            if let Some(snapshot) = manager.mirror().get_snapshot(asid).await {
+                return Ok(snapshot);
             }
             Ok(manager.sessions().get_snapshot(asid).await?)
         })

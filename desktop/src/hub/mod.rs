@@ -53,8 +53,13 @@ pub trait SessionHub: Send + Sync {
     /// Folders under a typed prefix, on the host the sessions run on.
     fn directories<'a>(&'a self, prefix: &'a str) -> HubFuture<'a, Completion>;
     fn create<'a>(&'a self, agent: &'a str, cwd: &'a Path) -> HubFuture<'a, AgentSessionInfo>;
-    /// The session's newest history and what it still has pending.
+    /// The session's newest history and what it still has pending, after
+    /// preparing it as the App's `/prepare` does (which may restore a dormant
+    /// runtime or start following a terminal). For an explicit selection.
     fn open<'a>(&'a self, asid: &'a AgentSessionId) -> HubFuture<'a, AgentSessionSnapshot>;
+    /// The same snapshot, read without preparing anything where the hub can
+    /// (the gateway's mirror): for re-reading a session that is already open.
+    fn snapshot<'a>(&'a self, asid: &'a AgentSessionId) -> HubFuture<'a, AgentSessionSnapshot>;
     fn prompt<'a>(&'a self, asid: &'a AgentSessionId, text: &'a str) -> HubFuture<'a, ()>;
     fn interrupt<'a>(&'a self, asid: &'a AgentSessionId) -> HubFuture<'a, ()>;
     fn reply_permission<'a>(

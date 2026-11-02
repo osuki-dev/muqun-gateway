@@ -77,12 +77,67 @@ fn shown(
     )
 }
 
+/// Whether two discovery answers describe the agents the same way. The
+/// gateway's type has no `PartialEq`; its serialised form is the contract.
+fn same_agents(a: &[AgentDiscoveryInfo], b: &[AgentDiscoveryInfo]) -> bool {
+    a.len() == b.len()
+        && serde_json::to_value(a)
+            .ok()
+            .is_some_and(|a| serde_json::to_value(b).ok().is_some_and(|b| a == b))
+}
+
+/// Whether a re-read item shows the same as the one held: equal but for the
+/// bookkeeping (`seq`, `updated_ms`) a re-read restamps.
+fn same_content(held: &TimelineItem, read: &TimelineItem) -> bool {
+    let mut read = read.clone();
+    read.seq = held.seq;
+    read.updated_ms = held.updated_ms;
+    *held == read
+}
+
 /// An agent's known projects, tagged with the agent so a list that arrives
 /// after the New-session page moved to another agent is not shown for it.
 #[derive(Debug, Clone, Default)]
 pub struct ProjectList {
     pub agent: String,
     pub projects: Vec<AgentProject>,
+}
+
+/// The local calendar day `ms` falls on, as days since the epoch.
+pub fn local_day(ms: u64, utc_offset_s: i64) -> i64 {
+    (ms as i64 / 1000 + utc_offset_s).div_euclid(86_400)
+}
+
+/// One listed session as the sidebar lays the list out: which session, in
+/// which place, under which heading. Only what decides the layout -- what a
+/// row shows is in its [`SessionRow`], so a status change, a new title or the
+/// selection moving rewrites one row and leaves the list alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListedSession {
+    pub asid: String,
+    pub agent_id: String,
+    pub directory: Option<String>,
+    /// [`local_day`] of `updated_ms`, for the Time grouping.
+    pub day: i64,
+}
+
+/// The sidebar's sessions, newest first.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionListing {
+    pub sessions: Vec<ListedSession>,
+}
+
+/// What one sidebar row shows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRow {
+    pub asid: String,
+    pub agent_id: String,
+    pub title: String,
+    pub status: AgentSessionStatus,
+    /// "5m ago", as of when the row was last written.
+    pub since: String,
+    pub active: bool,
+    pub waiting: bool,
 }
 
 /// The timeline's rows, by id, for the list view to key its item views on.
@@ -132,6 +187,36 @@ pub struct Changes {
 }
 
 impl Changes {
+    /// The bindings this batch writes, for the drain trace.
+    pub fn summary(&self) -> String {
+        let flags = [
+            ("sessions", self.sessions),
+            ("selected", self.selected),
+            ("header", self.header),
+            ("order", self.order),
+            ("permissions", self.permissions),
+            ("error", self.error),
+            ("agents", self.agents),
+            ("attention", self.attention),
+            ("projects", self.projects),
+            ("completions", self.completions),
+            ("opened", self.opened),
+        ];
+        let mut out: Vec<String> = flags
+            .iter()
+            .filter(|(_, on)| *on)
+            .map(|(name, _)| name.to_string())
+            .collect();
+        if !self.items.is_empty() {
+            out.push(format!("items×{}", self.items.len()));
+        }
+        if out.is_empty() {
+            "-".into()
+        } else {
+            out.join(",")
+        }
+    }
+
     pub fn timeline(&self) -> bool {
         self.order || !self.items.is_empty() || self.permissions || self.opened
     }
@@ -150,8 +235,12 @@ impl ViewState {
     pub fn apply(&mut self, update: Update, changes: &mut Changes) {
         match update {
             Update::Agents(agents) => {
-                self.agents = agents;
-                changes.agents = true;
+                // Discovery is polled while cold probes settle; most answers
+                // are the same as the last one and must not rebuild anything.
+                if !same_agents(&self.agents, &agents) {
+                    self.agents = agents;
+                    changes.agents = true;
+                }
             }
             Update::AgentSessions {
                 agent,
@@ -163,10 +252,15 @@ impl ViewState {
                     }
                 }
                 sessions.truncate(SESSION_LIST_LIMIT);
-                self.sessions.retain(|s| s.agent_id != agent);
-                self.sessions.extend(sessions);
+                let before = std::mem::take(&mut self.sessions);
+                self.sessions = before
+                    .iter()
+                    .filter(|s| s.agent_id != agent)
+                    .cloned()
+                    .chain(sessions)
+                    .collect();
                 self.sort_sessions();
-                changes.sessions = true;
+                changes.sessions |= self.sessions != before;
                 if self.error.as_ref().is_some_and(|e| e.unreachable) {
                     // A list that arrived answers "OpenCode is not reachable".
                     self.error = None;
@@ -185,10 +279,38 @@ impl ViewState {
                 self.upsert_session(snapshot.info.clone(), changes);
                 let pending_permissions = snapshot.permissions.clone();
                 let asid = snapshot.info.asid.clone();
+                let before = self.attention.clone();
                 self.attention.retain(|p| p.asid != asid);
                 self.attention.extend(pending_permissions.iter().cloned());
-                changes.attention = true;
+                changes.attention |= self.attention != before;
                 let snapshot = *snapshot;
+                let asid = snapshot.info.asid.0.clone();
+                if let Some(active) = self.active_for(&asid) {
+                    // A re-read of the open session (after a resync): only
+                    // what differs is a change, so a terminal-followed session
+                    // re-read every second rewrites the rows that moved, not
+                    // the whole timeline.
+                    let old: std::collections::HashMap<&str, &Arc<TimelineItem>> =
+                        active.items.iter().map(|i| (i.id.as_str(), i)).collect();
+                    let items: Vec<Arc<TimelineItem>> = snapshot
+                        .timeline
+                        .into_iter()
+                        .map(|item| match old.get(item.id.as_str()) {
+                            Some(same) if same_content(same, &item) => Arc::clone(same),
+                            _ => {
+                                changes.items.push(item.id.clone());
+                                Arc::new(item)
+                            }
+                        })
+                        .collect();
+                    changes.order |= items.len() != active.items.len()
+                        || items.iter().zip(&active.items).any(|(a, b)| a.id != b.id);
+                    changes.permissions |= active.pending_permissions != pending_permissions;
+                    active.items = items;
+                    active.pending_permissions = pending_permissions;
+                    active.info = snapshot.info;
+                    return;
+                }
                 self.active = Some(SessionView {
                     info: snapshot.info,
                     items: snapshot.timeline.into_iter().map(Arc::new).collect(),
@@ -203,8 +325,10 @@ impl ViewState {
             }
             Update::Event(event) => self.apply_event(event, changes),
             Update::Error(error) => {
-                self.error = Some(error);
-                changes.error = true;
+                if self.error.as_ref() != Some(&error) {
+                    self.error = Some(error);
+                    changes.error = true;
+                }
             }
             Update::Projects { agent, projects } => {
                 self.projects = ProjectList { agent, projects };
@@ -371,6 +495,35 @@ impl ViewState {
         }
     }
 
+    /// How the sidebar lays the listed sessions out.
+    pub fn listing(&self, utc_offset_s: i64) -> SessionListing {
+        SessionListing {
+            sessions: self
+                .sessions
+                .iter()
+                .map(|s| ListedSession {
+                    asid: s.asid.0.clone(),
+                    agent_id: s.agent_id.clone(),
+                    directory: s.directory.clone().filter(|d| !d.is_empty()),
+                    day: local_day(s.updated_ms, utc_offset_s),
+                })
+                .collect(),
+        }
+    }
+
+    /// What each listed session's sidebar row shows.
+    pub fn rows(&self) -> impl Iterator<Item = SessionRow> + '_ {
+        self.sessions.iter().map(|s| SessionRow {
+            asid: s.asid.0.clone(),
+            agent_id: s.agent_id.clone(),
+            title: s.title.clone(),
+            status: s.status,
+            since: muqun_gateway::relative_since(u128::from(s.updated_ms)),
+            active: self.selected.as_deref() == Some(s.asid.0.as_str()),
+            waiting: self.attention.iter().any(|p| p.asid == s.asid),
+        })
+    }
+
     pub fn order(&self) -> TimelineOrder {
         self.active
             .as_ref()
@@ -391,7 +544,14 @@ impl ViewState {
 /// thread, after Blinc's context exists (the first `build_ui`).
 #[derive(Clone)]
 pub struct Bindings {
+    /// Every listed session, in full. The sidebar does not read it (see
+    /// `listing` and [`row_state`]); Home and other summaries do.
     pub sessions: State<Arc<Vec<AgentSessionInfo>>>,
+    /// The sidebar list's layout, written only when it changes.
+    pub listing: State<Arc<SessionListing>>,
+    /// Sidebar groups opened past their first rows, by group key, with how
+    /// many rows each shows. UI-owned.
+    pub expanded: State<Arc<std::collections::BTreeMap<String, usize>>>,
     pub selected: State<Option<String>>,
     pub header: State<Option<Arc<AgentSessionInfo>>>,
     pub order: State<Arc<TimelineOrder>>,
@@ -425,6 +585,8 @@ impl Bindings {
         let ctx = blinc_core::BlincContextState::get();
         Self {
             sessions: ctx.use_state_keyed("mq.sessions", || Arc::new(Vec::new())),
+            listing: ctx.use_state_keyed("mq.listing", || Arc::new(SessionListing::default())),
+            expanded: ctx.use_state_keyed("mq.expanded", || Arc::new(Default::default())),
             selected: ctx.use_state_keyed("mq.selected", || None),
             header: ctx.use_state_keyed("mq.header", || None),
             order: ctx.use_state_keyed("mq.order", || Arc::new(TimelineOrder::default())),
@@ -451,6 +613,12 @@ impl Bindings {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewSessionDraft {
     pub agent: String,
+}
+
+/// One sidebar row's state, keyed by session, so the row view finds it again
+/// whenever the list is rebuilt.
+pub fn row_state(asid: &str) -> State<Option<Arc<SessionRow>>> {
+    blinc_core::BlincContextState::get().use_state_keyed(&format!("mq.srow.{asid}"), || None)
 }
 
 /// One timeline item's state, keyed by session and item so its view can
@@ -692,6 +860,81 @@ mod tests {
             &mut changes,
         );
         assert!(changes.sessions, "a reorder is a change");
+    }
+
+    #[test]
+    fn an_unchanged_list_or_discovery_answer_changes_nothing() {
+        let mut view = ViewState::default();
+        let list = || Update::AgentSessions {
+            agent: "opencode".into(),
+            sessions: vec![info("a", 5), info("b", 3)],
+        };
+        view.apply(list(), &mut Changes::default());
+        let agents: Vec<AgentDiscoveryInfo> = serde_json::from_value(serde_json::json!([{
+            "id": "opencode", "name": "OpenCode", "kind": "opencode", "status": "connected",
+            "enabled": true, "models": [], "modes": [], "features": {
+                "streaming": true, "reasoningEffort": false, "modelSelection": true,
+                "toolApprovals": true, "worktrees": false, "revert": false,
+                "stagedRevert": false, "inbox": false, "modes": false, "skills": false,
+                "slashCommands": false, "compaction": false, "backgroundShells": false,
+                "attachments": false, "attachmentsByPath": false
+            }
+        }]))
+        .unwrap();
+        view.apply(Update::Agents(agents.clone()), &mut Changes::default());
+        let mut changes = Changes::default();
+        view.apply(list(), &mut changes);
+        view.apply(Update::Agents(agents), &mut changes);
+        assert_eq!(changes, Changes::default());
+    }
+
+    #[test]
+    fn rows_follow_selection_and_attention_while_the_listing_stays() {
+        let mut view = ViewState::default();
+        view.apply(
+            Update::AgentSessions {
+                agent: "opencode".into(),
+                sessions: vec![info("a", 5), info("b", 3)],
+            },
+            &mut Changes::default(),
+        );
+        let listing = view.listing(0);
+        view.select("b");
+        let rows: Vec<_> = view.rows().collect();
+        assert!(!rows[0].active && rows[1].active);
+        assert_eq!(view.listing(0), listing, "selection is not layout");
+        view.apply(
+            Update::Event(AgentDomainEvent::StatusChanged {
+                asid: AgentSessionId("a".into()),
+                status: AgentSessionStatus::Busy,
+                error: None,
+                seq: 1,
+            }),
+            &mut Changes::default(),
+        );
+        assert_eq!(view.rows().next().unwrap().status, AgentSessionStatus::Busy);
+        assert_eq!(view.listing(0), listing, "status is not layout");
+    }
+
+    #[test]
+    fn a_reread_of_the_open_session_changes_only_what_differs() {
+        let mut view = opened("s", vec![item("x", "m1", 0), item("y", "m1", 1)]);
+        let mut changes = Changes::default();
+        let mut changed = item("y", "m1", 1);
+        changed.part = AgentPart::Text { text: "new".into() };
+        view.apply(
+            snapshot("s", vec![item("x", "m1", 0), changed]),
+            &mut changes,
+        );
+        assert_eq!(changes.items, ["y"]);
+        assert!(!changes.opened && !changes.order && !changes.permissions);
+        let mut changes = Changes::default();
+        view.apply(
+            snapshot("s", vec![item("x", "m1", 0), item("z", "m2", 0)]),
+            &mut changes,
+        );
+        assert!(changes.order, "a row came and went");
+        assert_eq!(view.order().ids, ["x", "z"]);
     }
 
     #[test]

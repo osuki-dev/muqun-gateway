@@ -5,13 +5,21 @@ use blinc_cn::prelude::{button, ButtonSize, ButtonVariant};
 use blinc_layout::prelude::*;
 use muqun_gateway::agents::{AgentSessionInfo, AgentSessionStatus};
 use muqun_gateway::platform::discovery::AgentDiscoveryInfo;
-use muqun_gateway::{relative_since, untitled_placeholder};
+use muqun_gateway::untitled_placeholder;
 
 use super::agents::{self, Standing};
 use super::text::ui_text;
 use super::App;
 use crate::config::{ConfigEdit, Grouping};
 use crate::model::commands::Command;
+use crate::model::view::{local_day, row_state, ListedSession, SessionRow};
+
+/// Rows a sidebar group shows before "Show more". Every row is a few layout
+/// nodes, and Blinc's subtree restyle walks the whole tree once per container
+/// it patches, so the list is kept to what a reader scans; "Show more" opens a
+/// group further, [`GROUP_STEP`] rows at a time.
+pub const GROUP_ROWS: usize = 15;
+pub const GROUP_STEP: usize = 50;
 
 pub fn sidebar(app: &App, height: f32) -> Div {
     div()
@@ -146,7 +154,7 @@ fn home_entry(app: &App) -> impl ElementBuilder {
 
 /// The agents a filter chip is shown for: usable ones, and any with listed
 /// sessions.
-fn chip_agents(agents: &[AgentDiscoveryInfo], sessions: &[AgentSessionInfo]) -> Vec<String> {
+fn chip_agents(agents: &[AgentDiscoveryInfo], sessions: &[ListedSession]) -> Vec<String> {
     agents::by_standing(agents)
         .into_iter()
         .filter(|(a, s)| *s == Standing::Usable || sessions.iter().any(|x| x.agent_id == a.id))
@@ -156,7 +164,7 @@ fn chip_agents(agents: &[AgentDiscoveryInfo], sessions: &[AgentSessionInfo]) -> 
 
 fn filter_chips(app: &App) -> impl ElementBuilder {
     let agents_state = app.bindings.agents.clone();
-    let sessions = app.bindings.sessions.clone();
+    let sessions = app.bindings.listing.clone();
     let filter = app.bindings.filter.clone();
     let strings = app.strings;
     let remember = app.clone();
@@ -190,7 +198,7 @@ fn filter_chips(app: &App) -> impl ElementBuilder {
             };
             let mut row = div().class("mq-chips").w_full().flex_row().flex_wrap();
             row = row.child(chip(strings.all().to_string(), None, None));
-            for id in chip_agents(&agents, &sessions.get()) {
+            for id in chip_agents(&agents, &sessions.get().sessions) {
                 row = row.child(chip(
                     agents::name(&id, &agents),
                     Some(id.clone()),
@@ -211,9 +219,17 @@ pub enum DayGroup {
 }
 
 impl DayGroup {
+    #[cfg(test)]
     pub fn of(updated_ms: u64, now_ms: u64, utc_offset_s: i64) -> Self {
-        let day = |ms: u64| (ms as i64 / 1000 + utc_offset_s).div_euclid(86_400);
-        match day(now_ms) - day(updated_ms) {
+        Self::of_day(
+            local_day(updated_ms, utc_offset_s),
+            local_day(now_ms, utc_offset_s),
+        )
+    }
+
+    /// The group of local day `day` (see [`local_day`]) seen on day `today`.
+    pub fn of_day(day: i64, today: i64) -> Self {
+        match today - day {
             i64::MIN..=0 => Self::Today,
             1 => Self::Yesterday,
             2..=6 => Self::ThisWeek,
@@ -238,30 +254,33 @@ pub fn now_ms() -> u64 {
         .unwrap_or_default()
 }
 
+/// The sidebar list. It is rebuilt only when its layout changes (sessions
+/// listed, their order or grouping, the filter, a group opened further); what
+/// a row shows lives in that row's own keyed state, so a status change, a new
+/// title or the selection moving rebuilds one or two rows, not the list.
 fn session_list(app: &App) -> impl ElementBuilder {
-    let sessions = app.bindings.sessions.clone();
-    let selected = app.bindings.selected.clone();
+    let listing = app.bindings.listing.clone();
     let filter = app.bindings.filter.clone();
-    let attention = app.bindings.attention.clone();
     let grouping = app.bindings.grouping.clone();
     let agents_state = app.bindings.agents.clone();
+    let expanded = app.bindings.expanded.clone();
     let app = app.clone();
     stateful_with_key::<NoState>("mq-session-list")
         .deps([
-            sessions.signal_id(),
-            selected.signal_id(),
+            listing.signal_id(),
             filter.signal_id(),
-            attention.signal_id(),
             grouping.signal_id(),
             agents_state.signal_id(),
+            expanded.signal_id(),
         ])
         .on_state(move |_| {
-            let sessions = sessions.get();
-            let selected = selected.get();
+            let started = std::time::Instant::now();
+            let listing = listing.get();
             let filter = filter.get();
-            let attention = attention.get();
+            let expanded = expanded.get();
             let mut list = div().class("mq-session-list").w_full().flex_col();
-            let shown: Vec<&AgentSessionInfo> = sessions
+            let shown: Vec<&ListedSession> = listing
+                .sessions
                 .iter()
                 .filter(|s| filter.as_deref().is_none_or(|f| s.agent_id == f))
                 .collect();
@@ -273,13 +292,10 @@ fn session_list(app: &App) -> impl ElementBuilder {
                 );
             }
             let agents_list = agents_state.get();
-            let groups = group_sessions(
-                &shown,
-                grouping.get(),
-                now_ms(),
-                crate::platform::shell::local_utc_offset(),
-            );
-            for (heading, members) in groups {
+            let today = local_day(now_ms(), crate::platform::shell::local_utc_offset());
+            let mut built = 0;
+            for (heading, members) in group_sessions(&shown, grouping.get(), today) {
+                let key = heading.key();
                 let label = match heading {
                     Heading::Day(day) => day.label(&app.strings).to_string(),
                     Heading::Agent(id) => agents::name(&id, &agents_list),
@@ -294,14 +310,42 @@ fn session_list(app: &App) -> impl ElementBuilder {
                         .class("mq-group")
                         .child(ui_text(label).size(11.0).semibold().no_wrap()),
                 );
-                for session in members {
-                    let active = selected.as_deref() == Some(session.asid.0.as_str());
-                    let waiting = attention.iter().any(|p| p.asid == session.asid);
-                    list = list.child(row(&app, session, active, waiting));
+                let limit = expanded.get(&key).copied().unwrap_or(GROUP_ROWS);
+                for session in members.iter().take(limit) {
+                    list = list.child(session_row(&app, &session.asid));
+                }
+                built += members.len().min(limit);
+                if members.len() > limit {
+                    list = list.child(show_more(&app, key, limit, members.len() - limit));
                 }
             }
+            tracing::debug!(
+                listed = shown.len(),
+                rows = built,
+                build_us = started.elapsed().as_micros() as u64,
+                "session list built"
+            );
             list
         })
+}
+
+/// "Show 40 more" under a group cut at `limit` rows.
+fn show_more(app: &App, key: String, limit: usize, hidden: usize) -> impl ElementBuilder {
+    let label = match app.strings.language() {
+        crate::config::Language::ZhCn => format!("再显示 {} 个", hidden.min(GROUP_STEP)),
+        crate::config::Language::En => format!("Show {} more", hidden.min(GROUP_STEP)),
+    };
+    let expanded = app.bindings.expanded.clone();
+    div().class("mq-group").w_full().child(
+        button(label)
+            .variant(ButtonVariant::Ghost)
+            .size(ButtonSize::Small)
+            .on_click(move |_| {
+                let mut open = (*expanded.get()).clone();
+                open.insert(key.clone(), limit + GROUP_STEP);
+                expanded.signal().set(std::sync::Arc::new(open));
+            }),
+    )
 }
 
 /// What a group of sessions is called.
@@ -313,22 +357,33 @@ pub enum Heading {
     NoFolder,
 }
 
+impl Heading {
+    /// A stable key for remembering how far the group is open.
+    fn key(&self) -> String {
+        match self {
+            Self::Day(day) => format!("day:{day:?}"),
+            Self::Agent(id) => format!("agent:{id}"),
+            Self::Folder(path) => format!("folder:{path}"),
+            Self::NoFolder => "folder:".to_string(),
+        }
+    }
+}
+
 /// `sessions` (newest first) split into headed groups. Time keeps the
 /// calendar-day order; Agent follows the gateway's preference order; Folder
 /// puts the folder with the most recently active session first. Within a
-/// group the order stays newest first.
+/// group the order stays newest first. `today` is [`local_day`] of now.
 pub fn group_sessions<'a>(
-    sessions: &[&'a AgentSessionInfo],
+    sessions: &[&'a ListedSession],
     grouping: Grouping,
-    now_ms: u64,
-    utc_offset_s: i64,
-) -> Vec<(Heading, Vec<&'a AgentSessionInfo>)> {
-    let mut groups: Vec<(Heading, Vec<&AgentSessionInfo>)> = Vec::new();
+    today: i64,
+) -> Vec<(Heading, Vec<&'a ListedSession>)> {
+    let mut groups: Vec<(Heading, Vec<&ListedSession>)> = Vec::new();
     for session in sessions {
         let heading = match grouping {
-            Grouping::Time => Heading::Day(DayGroup::of(session.updated_ms, now_ms, utc_offset_s)),
+            Grouping::Time => Heading::Day(DayGroup::of_day(session.day, today)),
             Grouping::Agent => Heading::Agent(session.agent_id.clone()),
-            Grouping::Folder => match session.directory.as_deref().filter(|d| !d.is_empty()) {
+            Grouping::Folder => match session.directory.as_deref() {
                 Some(dir) => Heading::Folder(dir.to_string()),
                 None => Heading::NoFolder,
             },
@@ -352,10 +407,15 @@ pub fn group_sessions<'a>(
 }
 
 pub fn title_of(app: &App, session: &AgentSessionInfo) -> String {
-    if session.title.trim().is_empty() || untitled_placeholder(&session.asid.0, &session.title) {
+    display_title(app, &session.asid.0, &session.title)
+}
+
+/// A session's title as shown: "Untitled" for none or a placeholder.
+pub fn display_title(app: &App, asid: &str, title: &str) -> String {
+    if title.trim().is_empty() || untitled_placeholder(asid, title) {
         app.strings.untitled().to_string()
     } else {
-        session.title.clone()
+        title.to_string()
     }
 }
 
@@ -381,28 +441,41 @@ pub fn status_dot(status: AgentSessionStatus, waiting: bool) -> Div {
         .flex_shrink_0()
 }
 
-fn row(app: &App, session: &AgentSessionInfo, active: bool, waiting: bool) -> Div {
-    let asid = session.asid.clone();
+/// One sidebar row, rebuilt when -- and only when -- its own state is
+/// written.
+fn session_row(app: &App, asid: &str) -> impl ElementBuilder {
+    let state = row_state(asid);
+    let app = app.clone();
+    stateful_with_key::<NoState>(format!("mq-srow.{asid}"))
+        .deps([state.signal_id()])
+        .on_state(move |_| match state.get() {
+            Some(row) => render_row(&app, &row),
+            None => div(),
+        })
+}
+
+fn render_row(app: &App, session: &SessionRow) -> Div {
+    let asid = muqun_gateway::agents::AgentSessionId(session.asid.clone());
     let click = app.clone();
     let mut row = div().class("mq-session");
-    if active {
+    if session.active {
         row = row.class("mq-session--active");
     }
     row.w_full()
         .flex_row()
         .items_center()
         .cursor_pointer()
-        .child(status_dot(session.status, waiting))
+        .child(status_dot(session.status, session.waiting))
         .child(
             div().flex_1().min_w(0.0).overflow_clip().child(
-                ui_text(title_of(app, session))
+                ui_text(display_title(app, &session.asid, &session.title))
                     .size(13.0)
                     .no_wrap()
                     .no_cursor(),
             ),
         )
         .child(
-            ui_text(relative_since(u128::from(session.updated_ms)))
+            ui_text(session.since.clone())
                 .size(10.0)
                 .no_wrap()
                 .no_cursor(),
@@ -524,12 +597,13 @@ mod tests {
         );
     }
 
-    fn session(asid: &str, agent: &str, dir: Option<&str>, updated_ms: u64) -> AgentSessionInfo {
-        serde_json::from_value(serde_json::json!({
-            "asid": asid, "title": asid, "status": "idle",
-            "updated_ms": updated_ms, "agent_id": agent, "directory": dir,
-        }))
-        .unwrap()
+    fn session(asid: &str, agent: &str, dir: Option<&str>, updated_ms: u64) -> ListedSession {
+        ListedSession {
+            asid: asid.into(),
+            agent_id: agent.into(),
+            directory: dir.map(Into::into),
+            day: local_day(updated_ms, 0),
+        }
     }
 
     #[test]
@@ -540,8 +614,8 @@ mod tests {
             session("c", "claude", Some("/w/y"), 10),
             session("d", "codex", None, 5),
         ];
-        let refs: Vec<&AgentSessionInfo> = all.iter().collect();
-        let by_agent = group_sessions(&refs, Grouping::Agent, 0, 0);
+        let refs: Vec<&ListedSession> = all.iter().collect();
+        let by_agent = group_sessions(&refs, Grouping::Agent, 0);
         let heads: Vec<_> = by_agent.iter().map(|(h, _)| h.clone()).collect();
         assert_eq!(
             heads,
@@ -553,7 +627,7 @@ mod tests {
         );
         assert_eq!(by_agent[1].1.len(), 2);
 
-        let by_folder = group_sessions(&refs, Grouping::Folder, 0, 0);
+        let by_folder = group_sessions(&refs, Grouping::Folder, 0);
         let heads: Vec<_> = by_folder.iter().map(|(h, _)| h.clone()).collect();
         assert_eq!(
             heads,

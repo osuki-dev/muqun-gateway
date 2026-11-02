@@ -119,6 +119,9 @@ fn main() -> anyhow::Result<()> {
                 app.bindings.clone(),
                 Arc::new(move |action| match action {
                     UiAction::SubmitComposer => ui::composer::submit(&for_actions),
+                    UiAction::Open(asid) => {
+                        for_actions.open_session(&muqun_gateway::agents::AgentSessionId(asid))
+                    }
                     UiAction::SetDraft { agent, cwd } => {
                         // Only while that agent's page is still the open one.
                         let open = for_actions.bindings.draft.get();

@@ -48,12 +48,15 @@
 //! (to arm) after its inbox lock is released, so a push can never land
 //! between "the inbox is empty" and "the callback is gone".
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use blinc_animation::TickCallbackId;
 
 use super::inbox::{Inbox, UiAction, Update};
-use super::view::{item_state, Bindings, Changes, ViewState};
+use super::view::{
+    item_state, row_state, Bindings, Changes, SessionListing, SessionRow, ViewState,
+};
 
 /// Frames the timeline is re-pinned to the bottom after a batch that grew
 /// it: `ScrollRef::scroll_to_bottom` resolves against the content height the
@@ -69,10 +72,19 @@ struct Tick {
     follow: u8,
 }
 
+/// What the sidebar was last given, so a batch writes only the rows -- and
+/// the listing -- that differ. Main thread.
+#[derive(Default)]
+struct Published {
+    listing: Option<Arc<SessionListing>>,
+    rows: HashMap<String, SessionRow>,
+}
+
 struct Inner {
     inbox: Arc<Inbox>,
     tick: Mutex<Tick>,
     view: Mutex<ViewState>,
+    published: Mutex<Published>,
     bindings: Mutex<Option<Bindings>>,
     actions: Mutex<Option<ActionHandler>>,
 }
@@ -92,6 +104,7 @@ impl Drain {
                     follow: 0,
                 }),
                 view: Mutex::new(ViewState::default()),
+                published: Mutex::new(Published::default()),
                 bindings: Mutex::new(None),
                 actions: Mutex::new(None),
             }),
@@ -118,13 +131,15 @@ impl Drain {
 
     /// Mark `asid` as the session the user picked. Main thread.
     pub fn select(&self, asid: &str) {
-        let changed = self.inner.view.lock().unwrap().select(asid);
+        let mut view = self.inner.view.lock().unwrap();
+        let changed = view.select(asid);
         if let Some(bindings) = self.inner.bindings.lock().unwrap().clone() {
             blinc_core::reactive::batch_stateful_deps(|| {
                 bindings.draft.signal().set(None);
                 bindings.settings_open.signal().set(false);
                 if changed {
                     bindings.selected.signal().set(Some(asid.to_string()));
+                    self.publish_sidebar(&view, &bindings);
                 }
             });
         }
@@ -132,7 +147,8 @@ impl Drain {
 
     /// Back to Home. Main thread.
     pub fn go_home(&self) {
-        let changed = self.inner.view.lock().unwrap().deselect();
+        let mut view = self.inner.view.lock().unwrap();
+        let changed = view.deselect();
         if let Some(bindings) = self.inner.bindings.lock().unwrap().clone() {
             blinc_core::reactive::batch_stateful_deps(|| {
                 bindings.draft.signal().set(None);
@@ -141,8 +157,32 @@ impl Drain {
                     bindings.selected.signal().set(None);
                     bindings.header.signal().set(None);
                     bindings.order.signal().set(Arc::new(Default::default()));
+                    self.publish_sidebar(&view, &bindings);
                 }
             });
+        }
+    }
+
+    /// Write the sidebar listing if its layout moved, and each row whose
+    /// content did. Main thread, inside a `batch_stateful_deps`.
+    fn publish_sidebar(&self, view: &ViewState, bindings: &Bindings) {
+        let mut published = self.inner.published.lock().unwrap();
+        let mut live = std::collections::HashSet::with_capacity(view.sessions.len());
+        for row in view.rows() {
+            live.insert(row.asid.clone());
+            if published.rows.get(&row.asid) != Some(&row) {
+                row_state(&row.asid)
+                    .signal()
+                    .set(Some(Arc::new(row.clone())));
+                published.rows.insert(row.asid.clone(), row);
+            }
+        }
+        published.rows.retain(|asid, _| live.contains(asid));
+        let listing = view.listing(crate::platform::shell::local_utc_offset());
+        if published.listing.as_deref() != Some(&listing) {
+            let listing = Arc::new(listing);
+            published.listing = Some(listing.clone());
+            bindings.listing.signal().set(listing);
         }
     }
 
@@ -213,12 +253,31 @@ impl Drain {
         // Read before anything grows: was the reader following the tail?
         let was_at_bottom = bindings.timeline_scroll.is_at_bottom();
         let mut changes = Changes::default();
+        let started = std::time::Instant::now();
+        let kinds = tracing::enabled!(target: "muqun_desktop::drain", tracing::Level::DEBUG)
+            .then(|| batch_kinds(&batch));
         {
             let mut view = self.inner.view.lock().unwrap();
             for update in batch {
                 view.apply(update, &mut changes);
             }
-            blinc_core::reactive::batch_stateful_deps(|| publish(&view, bindings, &changes));
+            let applied = started.elapsed();
+            blinc_core::reactive::batch_stateful_deps(|| {
+                if changes.sessions || changes.selected || changes.attention {
+                    self.publish_sidebar(&view, bindings);
+                }
+                publish(&view, bindings, &changes)
+            });
+            if let Some(kinds) = kinds {
+                tracing::debug!(
+                    target: "muqun_desktop::drain",
+                    batch = %kinds,
+                    changed = %changes.summary(),
+                    apply_us = applied.as_micros() as u64,
+                    publish_us = (started.elapsed() - applied).as_micros() as u64,
+                    "drained"
+                );
+            }
         }
         if changes.timeline() && (was_at_bottom || changes.opened) {
             bindings.timeline_scroll.scroll_to_bottom();
@@ -233,6 +292,33 @@ impl Drain {
             }
         }
     }
+}
+
+/// "event:agent.session.updated×3 agent_sessions×1", for the drain trace.
+fn batch_kinds(batch: &[Update]) -> String {
+    let mut counts: Vec<(&str, usize)> = Vec::new();
+    for update in batch {
+        let kind = match update {
+            Update::Agents(_) => "agents",
+            Update::AgentSessions { .. } => "agent_sessions",
+            Update::SessionCreated(_) => "created",
+            Update::Snapshot(_) => "snapshot",
+            Update::Event(event) => event.event_name(),
+            Update::Error(_) => "error",
+            Update::Projects { .. } => "projects",
+            Update::Completions { .. } => "completions",
+            Update::Ui(_) => "ui",
+        };
+        match counts.iter_mut().find(|(k, _)| *k == kind) {
+            Some((_, n)) => *n += 1,
+            None => counts.push((kind, 1)),
+        }
+    }
+    counts
+        .iter()
+        .map(|(k, n)| format!("{k}×{n}"))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Write the bindings `changes` names. Items are written before the order,
