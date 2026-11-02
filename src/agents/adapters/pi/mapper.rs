@@ -269,6 +269,75 @@ fn compaction_error(message: Option<&str>, aborted: bool) -> AgentErrorInfo {
     }
 }
 
+/// The failure an assistant message records when its turn did not produce a
+/// reply: `stopReason: "error"` (a provider or transport error), or
+/// `"aborted"` written by Pi itself after exhausting retries. Pi then settles
+/// with `aborted: false`, and the message usually has no content at all, so
+/// without this the run would simply go Idle. Known transport classes get a
+/// fixed explanation and an HTTP status is kept; any other upstream text
+/// stays opaque, as everywhere in this adapter.
+fn provider_failure(message: &Value) -> Option<AgentErrorInfo> {
+    let stop = text(message, "stopReason")?;
+    if !matches!(stop, "error" | "aborted") {
+        return None;
+    }
+    let detail = text(message, "errorMessage")
+        .map(str::trim)
+        .unwrap_or_default();
+    let http = detail
+        .split_once(' ')
+        .and_then(|(code, _)| code.parse::<u16>().ok())
+        .filter(|code| (400..600).contains(code));
+    let lower = detail.to_ascii_lowercase();
+    let (name, message, status) = if stop == "aborted" {
+        (
+            "provider_aborted",
+            "Pi gave up on this request after retrying.".to_string(),
+            None,
+        )
+    } else if let Some(code) = http {
+        (
+            "provider_http",
+            format!("The model provider rejected the request (HTTP {code})."),
+            Some(code),
+        )
+    } else if lower.contains("certificate") {
+        (
+            "provider_tls",
+            "The model provider's TLS certificate could not be verified.".to_string(),
+            None,
+        )
+    } else if [
+        "socket",
+        "websocket",
+        "econnreset",
+        "connection",
+        "terminated",
+        "fetch failed",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+    {
+        (
+            "provider_disconnected",
+            "The connection to the model provider was lost.".to_string(),
+            None,
+        )
+    } else {
+        (
+            "provider_error",
+            "The model request failed.".to_string(),
+            None,
+        )
+    };
+    Some(AgentErrorInfo {
+        name: name.into(),
+        message,
+        status,
+        retry_after_ms: None,
+    })
+}
+
 /// The timeline orders rows by `message_id`, and Pi entry ids are random hex,
 /// so the id is prefixed with the message's creation time. The message
 /// timestamp is the same number live (`message_start`) and on disk, which keeps
@@ -650,6 +719,9 @@ pub(super) fn commands(value: &Value) -> Vec<CommandInfo> {
 pub enum LiveChange {
     Model(ModelRef),
     Status(AgentSessionStatus),
+    /// The run settled after its last assistant message ended in a provider
+    /// error: `Failed`, with the reason, instead of a silent `Idle`.
+    Failed(AgentErrorInfo),
     Upsert(Vec<TimelineItem>),
     Remove(Vec<String>),
     Permission(Box<PermissionRequest>),
@@ -701,6 +773,10 @@ pub struct LiveFolder {
     usage_timestamp: Option<u64>,
     compacting: bool,
     compaction_reason: Option<String>,
+    /// What the last assistant message of the run reported, when it was a
+    /// failure; a later successful message clears it, so the settle reports
+    /// how the run actually ended.
+    failure: Option<AgentErrorInfo>,
 }
 
 impl LiveFolder {
@@ -718,6 +794,7 @@ impl LiveFolder {
             usage_timestamp: None,
             compacting: false,
             compaction_reason: None,
+            failure: None,
         }
     }
 
@@ -754,7 +831,10 @@ impl LiveFolder {
 
     pub fn fold(&mut self, record: &Value) -> Vec<LiveChange> {
         match text(record, "type").unwrap_or_default() {
-            "agent_start" => vec![LiveChange::Status(AgentSessionStatus::Busy)],
+            "agent_start" => {
+                self.failure = None;
+                vec![LiveChange::Status(AgentSessionStatus::Busy)]
+            }
             "agent_settled" => {
                 let aborted = record.get("aborted").and_then(Value::as_bool) == Some(true);
                 // A dialog still open when the run ends is dead: an abort
@@ -779,11 +859,14 @@ impl LiveFolder {
                         }),
                     });
                 }
-                changes.push(LiveChange::Status(if aborted {
-                    AgentSessionStatus::Interrupted
-                } else {
-                    AgentSessionStatus::Idle
-                }));
+                // A stop by the user wins over whatever the provider said;
+                // otherwise a run whose last reply was an error failed, and
+                // the App must hear why rather than see a quiet Idle.
+                changes.push(match self.failure.take() {
+                    _ if aborted => LiveChange::Status(AgentSessionStatus::Interrupted),
+                    Some(error) => LiveChange::Failed(error),
+                    None => LiveChange::Status(AgentSessionStatus::Idle),
+                });
                 changes
             }
             "auto_retry_start" => vec![LiveChange::Status(AgentSessionStatus::Retry)],
@@ -1038,6 +1121,7 @@ impl LiveFolder {
                     Some(key) => key,
                     None => self.open(message),
                 };
+                self.failure = provider_failure(message);
                 let ts = message
                     .get("timestamp")
                     .and_then(Value::as_u64)
@@ -1501,6 +1585,93 @@ mod tests {
                 [LiveChange::Status(AgentSessionStatus::Idle)]
             );
         }
+    }
+
+    /// Shapes taken from real Pi 1.4.0 session files: a provider failure is
+    /// an assistant message with `stopReason: "error"`, usually no content,
+    /// followed by `agent_settled {aborted: false}`. The run must end
+    /// `Failed` with a fixed, classified reason, never a quiet `Idle`.
+    #[test]
+    fn provider_failures_fail_the_run_instead_of_settling_idle() {
+        let failed = |stop: &str, detail: &str, content: Value| {
+            json!({"role": "assistant", "content": content, "api": "anthropic-messages",
+                   "provider": "demo", "model": "demo-1", "errorMessage": detail,
+                   "stopReason": stop, "timestamp": 1_787_111_937_227u64,
+                   "usage": {"input": 0, "output": 0, "totalTokens": 0}})
+        };
+        let cases = [
+            (
+                failed("error", "unknown certificate verification error", json!([])),
+                ("provider_tls", "The model provider's TLS certificate could not be verified.", None),
+            ),
+            (
+                failed("error", "400 {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"private account text\"}}", json!([])),
+                ("provider_http", "The model provider rejected the request (HTTP 400).", Some(400)),
+            ),
+            (
+                failed("error", "The socket connection was closed unexpectedly. For more information, pass `verbose: true` in the second argument to fetch()", json!([{"type": "text", "text": "partial"}])),
+                ("provider_disconnected", "The connection to the model provider was lost.", None),
+            ),
+            (
+                failed("error", "WebSocket closed 1006 Connection ended", json!([])),
+                ("provider_disconnected", "The connection to the model provider was lost.", None),
+            ),
+            (
+                failed("aborted", "Aborted after 1 retry attempt", json!([])),
+                ("provider_aborted", "Pi gave up on this request after retrying.", None),
+            ),
+            // Unknown upstream text is never forwarded.
+            (
+                failed("error", "provider said: private prompt text and a token", json!([])),
+                ("provider_error", "The model request failed.", None),
+            ),
+        ];
+        for (message, (name, text, status)) in cases {
+            let mut folder = LiveFolder::new("s1".into());
+            assert_eq!(
+                folder.fold(&json!({"type": "agent_start"})),
+                [LiveChange::Status(AgentSessionStatus::Busy)]
+            );
+            folder.fold(&json!({"type": "message_start", "message":
+                {"role": "assistant", "content": [], "stopReason": "pending",
+                 "timestamp": 1_787_111_937_227u64}}));
+            folder.fold(&json!({"type": "message_end", "message": message}));
+            let settled = folder.fold(&json!({"type": "agent_settled", "aborted": false}));
+            let [LiveChange::Failed(error)] = settled.as_slice() else {
+                panic!("{name}: {settled:?}");
+            };
+            assert_eq!((error.name.as_str(), error.message.as_str()), (name, text));
+            assert_eq!(error.status, status, "{name}");
+            assert!(!error.message.contains("private"), "{name}");
+            // The failure belongs to that run: the next one settles on its own
+            // last message.
+            folder.fold(&json!({"type": "agent_start"}));
+            folder.fold(&json!({"type": "message_end", "message": assistant(json!([{"type": "text", "text": "Recovered."}]))}));
+            assert_eq!(
+                folder.fold(&json!({"type": "agent_settled", "aborted": false})),
+                [LiveChange::Status(AgentSessionStatus::Idle)],
+                "{name}"
+            );
+            // A stop by the user outranks the provider's error.
+            folder.fold(&json!({"type": "agent_start"}));
+            folder.fold(&json!({"type": "message_end", "message": message}));
+            assert_eq!(
+                folder.fold(&json!({"type": "agent_settled", "aborted": true})),
+                [LiveChange::Status(AgentSessionStatus::Interrupted)],
+                "{name}"
+            );
+        }
+        // An error message that was retried into a successful reply is not a
+        // failure: the last assistant message decides.
+        let mut folder = LiveFolder::new("s1".into());
+        folder.fold(&json!({"type": "agent_start"}));
+        folder.fold(&json!({"type": "message_end", "message": failed("error", "529 overloaded", json!([]))}));
+        folder.fold(&json!({"type": "auto_retry_start", "attempt": 1, "maxAttempts": 3, "delayMs": 2000, "errorMessage": "529 overloaded"}));
+        folder.fold(&json!({"type": "message_end", "message": assistant(json!([{"type": "text", "text": "Done."}]))}));
+        assert_eq!(
+            folder.fold(&json!({"type": "agent_settled", "aborted": false})),
+            [LiveChange::Status(AgentSessionStatus::Idle)]
+        );
     }
 
     #[test]

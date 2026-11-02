@@ -32,9 +32,9 @@ use super::mapper::{self, LiveChange, LiveFolder};
 use super::rpc::{PiChild, PiCommandLine, PiHost, PiLaunch, PiLease, PiRecord, RetirementRefusal};
 use super::sessions::{self, SessionFile, SessionStore};
 use crate::agents::domain::{
-    AgentCatalog, AgentProject, AgentSessionId, AgentSessionInfo, AgentSessionStatus, FormRequest,
-    ModelRef, PermissionDecision, PermissionRequest, SessionContextUsage, SessionQuery,
-    TimelineItem, TokensUsage,
+    AgentCatalog, AgentErrorInfo, AgentProject, AgentSessionId, AgentSessionInfo,
+    AgentSessionStatus, FormRequest, ModelRef, PermissionDecision, PermissionRequest,
+    SessionContextUsage, SessionQuery, TimelineItem, TokensUsage,
 };
 use crate::agents::ports::agent::{
     AgentError, AgentFuture, AgentPort, AttachmentMode, FileDiffItem, HistoryCommit,
@@ -457,7 +457,14 @@ impl PiDriver {
                 cleanup.push(LiveChange::Remove(
                     session.rows.iter().map(|r| r.id.clone()).collect(),
                 ));
-                cleanup.push(LiveChange::Status(AgentSessionStatus::Failed));
+                cleanup.push(LiveChange::Failed(AgentErrorInfo {
+                    name: "pi_live_state_overflow".into(),
+                    message:
+                        "Pi's live session state exceeded its memory limit; the child was stopped."
+                            .into(),
+                    status: None,
+                    retry_after_ms: None,
+                }));
                 session.folder = LiveFolder::new(asid.clone());
                 session.rows.clear();
                 session.pending.clear();
@@ -935,6 +942,7 @@ fn apply(session: &mut LiveSession, change: &LiveChange) {
     match change {
         LiveChange::Model(model) => session.model = Some(model.clone()),
         LiveChange::Status(status) => session.status = *status,
+        LiveChange::Failed(_) => session.status = AgentSessionStatus::Failed,
         LiveChange::Upsert(items) => {
             for item in items {
                 match session.rows.iter_mut().find(|r| r.id == item.id) {

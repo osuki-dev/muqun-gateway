@@ -263,8 +263,16 @@ the gateway sends is also folded, which resolves the pending approval.
 The isolated clone probe uses `--no-extensions`; user
 `session_before_fork` handlers do not participate in this copy operation.
 
-Live record → change: `agent_start` Busy; `agent_settled` Idle or
-Interrupted; `auto_retry_start` Retry; `message_update` text/thinking deltas
+Live record → change: `agent_start` Busy; `agent_settled` Idle,
+Interrupted (`aborted: true`), or Failed when the run's last assistant
+message ended in `stopReason: "error"` (or Pi's own `"aborted"` after
+exhausting retries). Such a message usually has no content, so without this
+the run would end as a quiet Idle. The `StatusChanged` error carries a fixed
+classification (`provider_http` with the HTTP status, `provider_tls`,
+`provider_disconnected`, `provider_aborted`, else `provider_error`); the
+upstream `errorMessage` text itself is not forwarded. A later successful
+message in the same run (after `auto_retry_start`) clears the failure, and a
+user stop outranks it. `auto_retry_start` Retry; `message_update` text/thinking deltas
 and `toolcall_end` rows; `tool_execution_start/end` tool state; `message_end`
 the authoritative rows of the message; `compaction_start/end` compaction
 status; `session_info_changed` title; usage from `message_update.usage` and
