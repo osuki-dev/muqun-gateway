@@ -16,13 +16,22 @@ struct Owned {
 
 #[cfg(target_os = "linux")]
 fn identity(pid: u32) -> Option<Identity> {
-    use std::os::unix::fs::MetadataExt;
-    let path = format!("/proc/{pid}/stat");
+    // The effective uid comes from the file contents: the /proc inode's owner
+    // flips to root while the process execs (its new mm is not yet dumpable),
+    // which would make a live process of ours briefly unidentifiable.
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    let euid: u32 = status
+        .lines()
+        .find_map(|line| line.strip_prefix("Uid:"))?
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()?;
     // SAFETY: geteuid takes no arguments and accesses no caller memory.
-    if std::fs::metadata(&path).ok()?.uid() != unsafe { libc::geteuid() } {
+    if euid != unsafe { libc::geteuid() } {
         return None;
     }
-    let stat = std::fs::read_to_string(path).ok()?;
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let fields: Vec<_> = stat
         .get(stat.rfind(')')? + 2..)?
         .split_whitespace()
@@ -383,5 +392,32 @@ impl ProcessTree {
         self.owned
             .iter()
             .any(|(pid, node)| *pid != self.root && node.live())
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// While a process execs, its /proc inode is transiently owned by root
+    /// (the new mm is not yet dumpable). A live process of ours must never
+    /// read as unidentifiable because a read landed in that window.
+    #[test]
+    fn identity_of_own_process_is_stable_across_exec() {
+        let mut unreadable = 0;
+        for _ in 0..60 {
+            let mut child = std::process::Command::new("/bin/sh")
+                .args(["-c", "exec /bin/sleep 0.05"])
+                .spawn()
+                .unwrap();
+            let pid = child.id();
+            let end = std::time::Instant::now() + Duration::from_millis(50);
+            while std::time::Instant::now() < end {
+                unreadable += usize::from(identity(pid).is_none());
+            }
+            child.wait().unwrap();
+        }
+        assert_eq!(unreadable, 0, "identity() lost a live process mid-exec");
     }
 }
