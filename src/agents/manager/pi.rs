@@ -13,7 +13,7 @@ use tokio::sync::broadcast;
 use crate::agents::adapters::memory_mirror::{MemoryMirror, SessionPatch};
 use crate::agents::adapters::pi::mapper::LiveChange;
 use crate::agents::adapters::pi::PiDriver;
-use crate::agents::domain::{AgentDomainEvent, AgentSessionId};
+use crate::agents::domain::{AgentDomainEvent, AgentSessionId, AgentSessionStatus};
 use crate::agents::ports::agent::AgentPort;
 use crate::agents::ports::mirror::SessionMirrorPort;
 
@@ -114,6 +114,24 @@ async fn apply_change(asid: &AgentSessionId, change: LiveChange, ctx: &PiEventCo
                 });
             }
         }
+        // A provider failure ends the run as `failed` with its reason: the
+        // task layer fails the task, and the App shows the error, where a
+        // bare Idle would leave both waiting for a reply that never comes.
+        LiveChange::Failed(error) => {
+            ctx.ensure_session(asid).await;
+            if let Some(seq) = ctx
+                .mirror
+                .update_status(asid, AgentSessionStatus::Failed, Some(error.clone()))
+                .await
+            {
+                ctx.emit(AgentDomainEvent::StatusChanged {
+                    asid: asid.clone(),
+                    status: AgentSessionStatus::Failed,
+                    error: Some(error),
+                    seq,
+                });
+            }
+        }
         LiveChange::Upsert(items) => {
             if items.is_empty() {
                 return;
@@ -196,7 +214,7 @@ async fn apply_change(asid: &AgentSessionId, change: LiveChange, ctx: &PiEventCo
 mod tests {
     use super::*;
     use crate::agents::adapters::pi::{PiCommandLine, SessionStore};
-    use crate::agents::domain::{AgentPart, AgentSessionStatus, TimelineItem, TimelineRole};
+    use crate::agents::domain::{AgentPart, TimelineItem, TimelineRole};
 
     #[tokio::test]
     async fn live_followup_revisions_match_snapshot_revisions_after_other_events() {
