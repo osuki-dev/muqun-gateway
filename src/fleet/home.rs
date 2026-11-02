@@ -196,12 +196,13 @@ pub(crate) async fn local(
             _ = refresh.tick() => { read = true; },
             event = events.recv() => match event {
                 Ok(TaskDomainEvent::Updated { task, .. }) => {
-                    let next = Summary::from(task);
+                    let next = Summary::from(*task);
                     if tasks.get(&next.task_id).is_none_or(|old| old.updated_ms <= next.updated_ms) {
                         tasks.insert(next.task_id.clone(), next);
                         trim(&mut tasks);
                     }
                 }
+                Ok(TaskDomainEvent::Deleted { task_id, .. }) => { tasks.remove(&task_id); }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => { snapshot = true; read = true; },
                 Err(_) => return,
             }

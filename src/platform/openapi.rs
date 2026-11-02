@@ -1063,6 +1063,23 @@ fn tasks_fleet_mcp_paths() -> Vec<(&'static str, Value)> {
     );
     complete_responses["400"] = json!({ "description": "invalid_request: the body is not a JSON object with an optional string summary" });
     complete_responses["409"] = json!({ "description": "task_not_confirmable: the task was not opened on a device (origin device), or it is neither idle_unconfirmed nor waiting" });
+    let mut delete_responses = not_found(
+        json_ok(
+            "The task and its history are gone; task.deleted is published",
+            json!({
+                "type": "object",
+                "required": ["deleted", "task_id"],
+                "properties": {
+                    "deleted": { "const": true },
+                    "task_id": { "type": "string" }
+                }
+            }),
+        ),
+        "task_not_found",
+    );
+    delete_responses["403"] =
+        json!({ "description": "peer_forbidden: another computer's gateway token" });
+    delete_responses["409"] = json!({ "description": "task_active: the task (or a sub-task of it) is queued, dispatching, working or waiting; cancel it first" });
     let mut issue_responses = json_ok(
         "A fresh pane-bound assistant token. The token is shown only here",
         json!({
@@ -1147,6 +1164,10 @@ fn tasks_fleet_mcp_paths() -> Vec<(&'static str, Value)> {
                 "summary": "Read one task and its state history",
                 "parameters": [path_param("id")],
                 "responses": read_responses
+            }, "delete": {
+                "summary": "Delete an ended task (done, failed, cancelled or idle_unconfirmed) with its history; the agent session it was bound to is kept. Requires the task_ledger_delete capability and an app device token (or the admin token)",
+                "parameters": [path_param("id")],
+                "responses": delete_responses
             }}),
         ),
         (
@@ -2467,6 +2488,7 @@ mod history_contract_tests {
         for (path, method) in [
             ("/api/tasks", "get"),
             ("/api/tasks/{id}", "get"),
+            ("/api/tasks/{id}", "delete"),
             ("/api/tasks/{id}/cancel", "post"),
             ("/api/tasks/{id}/complete", "post"),
             ("/api/fleet/self", "get"),

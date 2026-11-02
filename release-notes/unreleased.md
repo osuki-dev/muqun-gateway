@@ -2,6 +2,14 @@
 
 ## Changes and fixes
 
+- **Ended tasks can be deleted from the App.** `DELETE /api/tasks/{id}`
+  removes a done, failed, cancelled or idle (unconfirmed) task with its
+  history, as the 30-day retention would; the agent session it ran in is kept,
+  and a session restricted for work from another computer stays restricted. A
+  running task must be cancelled first (`409 task_active`). Subscribers get
+  `task.deleted`; announced as the `task_ledger_delete` capability, so older
+  Gateways simply do not offer it.
+
 - **Refreshing a Claude Code session no longer starts and kills processes.**
   Tapping "Status unknown, tap to refresh" while the session was being opened
   made the open fail ("ACP session changed while loading") and shut down the

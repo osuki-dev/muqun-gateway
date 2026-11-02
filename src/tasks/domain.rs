@@ -41,6 +41,12 @@ impl TaskState {
         matches!(self, Self::Done | Self::Failed | Self::Cancelled)
     }
 
+    /// Over as far as the user is concerned, so the device may delete it:
+    /// terminal, or an idle delegation the user decides is finished.
+    pub(crate) fn ended(self) -> bool {
+        self.is_terminal() || self == Self::IdleUnconfirmed
+    }
+
     /// Once it works, a task moves freely among working, waiting and
     /// idle_unconfirmed, and can end from any of them: a confirm of a waiting
     /// task, or a pane closing under a paused one, is a direct move, never a

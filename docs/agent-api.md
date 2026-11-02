@@ -2377,6 +2377,7 @@ Server → client:
 | `{"t":"subscribed","asid":"ses_1"}` · `{"t":"subscribed","all":true}` · `{"t":"subscribed","tasks":true}` | The subscription is in effect: matching events published from here on reach this socket. Start catch-up after this, not before. |
 | `{"t":"event","asid":"ses_1","seq":12,"event":"agent.timeline.upsert","data":{…}}` | One domain event. `event` is the SSE `event:` name and `data` is the SSE `data:` payload **byte for byte**, embedded as JSON rather than as a string. `asid` and `seq` repeat the event's own (`asid` is `""` and `seq` 0 for `agent.worktree.changed` and `agent.resync`). |
 | `{"t":"task","asid":null,"seq":12,"event":"task.updated","data":{…}}` | One full `TaskView` on a `subscribe_tasks` socket. |
+| `{"t":"task","asid":null,"seq":13,"event":"task.deleted","data":{"task_id":"…"}}` | The task was deleted (`DELETE /api/tasks/{id}`, capability `task_ledger_delete`): drop it. Under `subscribe_all` it arrives as `t:"event"`. |
 | `{"t":"defaults","default_cwd":"/home/user/project"}` | On a `subscribe_tasks` socket: the directory a task this device opens without `cwd` runs in (`"~"`, the home directory, when it has no usable previous one; `null` when unknown). See **Task updates** below. |
 | `{"t":"resync","asid":"ses_1"}` | This socket fell behind the gateway's event backlog; refetch that session. `asid` `""` means every session. One per subscribed session, or a single `""` under `subscribe_all`. With `"tasks":true` it is about task updates instead: refetch `GET /api/tasks`. |
 | `{"t":"pong"}` | Answer to `ping`. |

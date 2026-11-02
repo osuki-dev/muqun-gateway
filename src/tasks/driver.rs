@@ -118,6 +118,8 @@ pub(crate) fn spawn_instruction_cleanup(state: AppState) {
                         drop_task_instruction(&state, &task.binding).await;
                     }
                 }
+                // Only an ended task is deleted; its end already dropped it.
+                Ok(super::events::TaskDomainEvent::Deleted { .. }) => {}
                 Err(RecvError::Lagged(_)) => sweep_task_instructions(&state).await,
                 Err(RecvError::Closed) => return,
             }

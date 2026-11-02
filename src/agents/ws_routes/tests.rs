@@ -602,7 +602,7 @@ async fn subscribe_all_delivers_every_session() {
 
 fn task_update(seq: u64) -> TaskDomainEvent {
     TaskDomainEvent::Updated {
-        task: crate::tasks::service::TaskView {
+        task: Box::new(crate::tasks::service::TaskView {
             task_id: "task-1".into(),
             state: crate::tasks::domain::TaskState::Working,
             kind: crate::tasks::domain::TaskKind::Command,
@@ -628,7 +628,7 @@ fn task_update(seq: u64) -> TaskDomainEvent {
             model: None,
             variant: None,
             reason: None,
-        },
+        }),
         seq,
     }
 }

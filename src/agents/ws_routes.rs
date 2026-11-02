@@ -274,12 +274,16 @@ pub(crate) fn event_frame(event: &AgentDomainEvent) -> String {
 }
 
 /// A task change. There is no session, so `asid` is `null`; `data` is the task
-/// as `GET /api/tasks` shows it. The all-subscription keeps its existing
-/// `event` type, while a task-only subscription uses `task`.
+/// as `GET /api/tasks` shows it (`{"task_id"}` for `task.deleted`). The
+/// all-subscription keeps its existing `event` type, while a task-only
+/// subscription uses `task`.
 fn task_frame(event: &TaskDomainEvent, kind: &str) -> String {
-    let data = serde_json::to_string(match event {
-        TaskDomainEvent::Updated { task, .. } => task,
-    })
+    let data = match event {
+        TaskDomainEvent::Updated { task, .. } => serde_json::to_string(task),
+        TaskDomainEvent::Deleted { task_id, .. } => {
+            serde_json::to_string(&serde_json::json!({ "task_id": task_id }))
+        }
+    }
     .unwrap_or_else(|_| String::from("null"));
     format!(
         r#"{{"t":{},"asid":null,"seq":{},"event":{},"data":{}}}"#,
@@ -1055,8 +1059,7 @@ impl Connection {
                             // Snapshots and resync reads use `/api/tasks`; live
                             // and finished task frames need the same ownership
                             // check against the store, not display metadata.
-                            let TaskDomainEvent::Updated { task: view, .. } = &task;
-                            if peer && state.tasks.owned(&device, &TaskId(view.task_id.clone())).await.is_err() {
+                            if peer && state.tasks.owned(&device, &TaskId(task.task_id().to_owned())).await.is_err() {
                                 continue;
                             }
                             let frame = if subscriptions.tasks_only() {
@@ -1069,9 +1072,9 @@ impl Connection {
                             }
                             // Only a task the device just opened can change
                             // where its next one runs.
-                            let TaskDomainEvent::Updated { task, .. } = &task;
-                            let opened = task.requested_by.as_ref().is_some_and(|by| by.id == device.id)
-                                && matches!(task.state, TaskState::Queued | TaskState::Dispatching);
+                            let opened = matches!(&task, TaskDomainEvent::Updated { task, .. }
+                                if task.requested_by.as_ref().is_some_and(|by| by.id == device.id)
+                                    && matches!(task.state, TaskState::Queued | TaskState::Dispatching));
                             if subscriptions.tasks_only()
                                 && opened
                                 && self

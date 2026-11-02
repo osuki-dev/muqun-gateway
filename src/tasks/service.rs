@@ -394,6 +394,8 @@ pub(crate) enum TaskError {
     /// The device confirmed a task that is not its own paused or waiting
     /// delegation.
     NotConfirmable,
+    /// The device deleted a task that has not ended ([`TaskState::ended`]).
+    NotEnded,
     /// `tasks.complete` (done) on a task whose sub-tasks are not all over:
     /// a plain sentence naming them.
     ChildrenOpen(String),
@@ -446,6 +448,7 @@ impl std::fmt::Display for TaskError {
                 f,
                 "only a paused or waiting task the device opened can be confirmed"
             ),
+            Self::NotEnded => write!(f, "only an ended task can be deleted"),
             Self::Store(error) => write!(f, "task store: {error:#}"),
             Self::Agent(error) => write!(f, "agent: {error}"),
             Self::Backend(message) => write!(f, "{message}"),
@@ -480,7 +483,7 @@ impl Publishing<'_> {
             return;
         }
         let _ = service.events.send(TaskDomainEvent::Updated {
-            task: service.present(task).await,
+            task: Box::new(service.present(task).await),
             seq: task.seq,
         });
         let Some(parent) = &task.parent else {
@@ -489,7 +492,7 @@ impl Publishing<'_> {
         match service.store.get(parent).await {
             Ok(Some(parent)) => {
                 let _ = service.events.send(TaskDomainEvent::Updated {
-                    task: service.present(&parent).await,
+                    task: Box::new(service.present(&parent).await),
                     seq: parent.seq,
                 });
             }
@@ -601,6 +604,10 @@ impl TaskStore for Publishing<'_> {
 
     fn purge_ended<'a>(&'a self, before_ms: u64) -> TaskFuture<'a, usize> {
         self.0.store.purge_ended(before_ms)
+    }
+
+    fn delete_ended<'a>(&'a self, id: &'a TaskId) -> TaskFuture<'a, (Task, u64)> {
+        self.0.store.delete_ended(id)
     }
 }
 
@@ -1954,7 +1961,7 @@ impl TaskService {
             _ => task.clone(),
         };
         let _ = self.events.send(TaskDomainEvent::Updated {
-            task: self.present(&task).await,
+            task: Box::new(self.present(&task).await),
             seq: task.seq,
         });
     }
@@ -2967,6 +2974,48 @@ impl TaskService {
             ..change(TaskState::Done)
         };
         self.finish(id, done).await
+    }
+
+    /// The device deletes ended task `id` with its history, as retention
+    /// would; the agent session it was bound to is left alone. Published as
+    /// `task.deleted`, then its parent, whose children moved.
+    pub(crate) async fn delete(&self, id: &TaskId) -> Result<(), TaskError> {
+        let (task, seq) =
+            self.store
+                .delete_ended(id)
+                .await
+                .map_err(|error| match error.downcast_ref() {
+                    Some(TaskStoreError::NotFound) => TaskError::NotFound,
+                    Some(TaskStoreError::Open(_)) => TaskError::NotEnded,
+                    Some(TaskStoreError::ChildrenOpen) => {
+                        TaskError::ChildrenOpen("a sub-task of it has not ended".into())
+                    }
+                    _ => TaskError::Store(error),
+                })?;
+        tracing::info!(task = %id.0, state = ?task.state, "task deleted");
+        if let Ok(mut live) = self.live.lock() {
+            live.lines.remove(id);
+            live.titles.remove(id);
+            live.idled.remove(id);
+            live.waiting_on.remove(id);
+            if let TaskBinding::AgentSession { asid, .. } = &task.binding {
+                live.sessions.remove(asid);
+                live.task_sessions.remove(asid);
+            }
+        }
+        let _ = self.events.send(TaskDomainEvent::Deleted {
+            task_id: id.0.clone(),
+            seq,
+        });
+        if let Some(parent) = &task.parent {
+            if let Ok(Some(parent)) = self.store.get(parent).await {
+                let _ = self.events.send(TaskDomainEvent::Updated {
+                    task: Box::new(self.present(&parent).await),
+                    seq: parent.seq,
+                });
+            }
+        }
+        Ok(())
     }
 
     /// `to` (done, or waiting when blocked) through the states between; a
@@ -4514,7 +4563,9 @@ mod tests {
         while let Ok(event) = events.try_recv() {
             assert_eq!(event.event_name(), "task.updated");
             assert!(event.seq() > 0);
-            let TaskDomainEvent::Updated { task, .. } = event;
+            let TaskDomainEvent::Updated { task, .. } = event else {
+                panic!("only updates");
+            };
             assert_eq!(task.task_id, view.task_id);
             states.push(task.state);
         }
@@ -4859,6 +4910,9 @@ mod tests {
         fn purge_ended<'a>(&'a self, before_ms: u64) -> TaskFuture<'a, usize> {
             self.inner.purge_ended(before_ms)
         }
+        fn delete_ended<'a>(&'a self, id: &'a TaskId) -> TaskFuture<'a, (Task, u64)> {
+            self.inner.delete_ended(id)
+        }
     }
 
     /// The store fails once the session exists: the session is interrupted
@@ -5077,7 +5131,9 @@ mod tests {
         assert!(!summary.contains('\n'));
         assert!(summary.chars().count() <= SUMMARY_CHARS && summary.ends_with('…'));
         assert_eq!(task.exit_code, None);
-        let TaskDomainEvent::Updated { task: frame, .. } = updates.try_recv().unwrap();
+        let Ok(TaskDomainEvent::Updated { task: frame, .. }) = updates.try_recv() else {
+            panic!("an update");
+        };
         assert_eq!(frame.state, TaskState::IdleUnconfirmed);
         assert_eq!(frame.summary.as_deref(), Some(summary.as_str()));
         let sources: Vec<String> = state
@@ -5211,6 +5267,9 @@ mod tests {
         }
         fn purge_ended<'a>(&'a self, before_ms: u64) -> TaskFuture<'a, usize> {
             self.inner.purge_ended(before_ms)
+        }
+        fn delete_ended<'a>(&'a self, id: &'a TaskId) -> TaskFuture<'a, (Task, u64)> {
+            self.inner.delete_ended(id)
         }
     }
 
@@ -5523,7 +5582,10 @@ mod tests {
         assert_eq!(progress().await.as_deref(), Some("All 12 tests pass."));
         let published = |updates: &mut broadcast::Receiver<TaskDomainEvent>| {
             std::iter::from_fn(|| updates.try_recv().ok())
-                .map(|TaskDomainEvent::Updated { task, .. }| task.progress)
+                .filter_map(|event| match event {
+                    TaskDomainEvent::Updated { task, .. } => Some(task.progress),
+                    TaskDomainEvent::Deleted { .. } => None,
+                })
                 .collect::<Vec<_>>()
         };
         assert_eq!(
@@ -5570,7 +5632,10 @@ mod tests {
             assert_eq!(title().await, expected, "{name}");
         }
         let titles: Vec<String> = std::iter::from_fn(|| updates.try_recv().ok())
-            .map(|TaskDomainEvent::Updated { task, .. }| task.title)
+            .filter_map(|event| match event {
+                TaskDomainEvent::Updated { task, .. } => Some(task.title),
+                TaskDomainEvent::Deleted { .. } => None,
+            })
             .collect();
         assert!(
             titles.contains(&"Fix the CI build".to_owned()),
@@ -5707,7 +5772,7 @@ mod tests {
         assert_eq!(child.label.as_deref(), Some("sub"));
         let mut frames = Vec::new();
         while let Ok(TaskDomainEvent::Updated { task, .. }) = updates.try_recv() {
-            frames.push(task);
+            frames.push(*task);
         }
         // Queued, Dispatching, Working: each the child's frame, then the parent's.
         assert_eq!(frames.len(), 6);

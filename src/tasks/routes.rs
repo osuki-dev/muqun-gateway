@@ -39,7 +39,7 @@ pub(crate) fn mount(router: Router<AppState>) -> Router<AppState> {
                 .layer(crate::agents::routes::large_body()),
         )
         .route("/api/tasks/defaults", get(defaults))
-        .route("/api/tasks/{id}", get(read))
+        .route("/api/tasks/{id}", get(read).delete(delete))
         .route("/api/tasks/{id}/cancel", post(cancel))
         .route("/api/tasks/{id}/complete", post(complete))
 }
@@ -705,6 +705,35 @@ async fn complete(
     Ok(Json(json!(task)))
 }
 
+/// `DELETE /api/tasks/{id}`: the user removes an ended task (done, failed,
+/// cancelled or idle_unconfirmed) from the ledger, with its history; its
+/// agent session is kept. Published as `task.deleted`.
+async fn delete(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Value>> {
+    require_device(&state, &headers)?;
+    state
+        .tasks
+        .delete(&TaskId(id.clone()))
+        .await
+        .map_err(|error| match error {
+            TaskError::NotEnded => api_error(
+                StatusCode::CONFLICT,
+                "task_active",
+                "The task is still running; cancel it before deleting it",
+            ),
+            TaskError::ChildrenOpen(_) => api_error(
+                StatusCode::CONFLICT,
+                "task_active",
+                "A sub-task of this task is still running; cancel it before deleting this task",
+            ),
+            error => failed(error),
+        })?;
+    Ok(Json(json!({ "deleted": true, "task_id": id })))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -887,6 +916,124 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// The phone deletes an ended task with its history and the restriction on
+    /// its session kept; a running task, another computer's token and an
+    /// unknown id are refused.
+    #[tokio::test]
+    async fn a_device_deletes_only_an_ended_task() {
+        let state = test_state(
+            "admin",
+            vec![
+                test_device("d1", "device"),
+                crate::test_support::test_peer_device("mini", "peer-token"),
+            ],
+        );
+        let store = SqliteTaskStore::new(state.db.clone());
+        let mut events = state.task_events.subscribe();
+        let cases = [
+            (TaskState::Done, "device", StatusCode::OK, None),
+            (TaskState::IdleUnconfirmed, "device", StatusCode::OK, None),
+            (TaskState::Cancelled, "device", StatusCode::OK, None),
+            (
+                TaskState::Working,
+                "device",
+                StatusCode::CONFLICT,
+                Some("task_active"),
+            ),
+            (
+                TaskState::Waiting,
+                "device",
+                StatusCode::CONFLICT,
+                Some("task_active"),
+            ),
+            (
+                TaskState::Done,
+                "peer-token",
+                StatusCode::FORBIDDEN,
+                Some("peer_forbidden"),
+            ),
+        ];
+        for (to, token, status, code) in cases {
+            let now = now_ms();
+            let task = store
+                .insert(&Task {
+                    id: TaskId::new(),
+                    kind: TaskKind::Delegation,
+                    goal: "g".into(),
+                    cwd: None,
+                    // Work from another computer restricts the session it ran.
+                    binding: TaskBinding::AgentSession {
+                        agent_id: "codex".into(),
+                        asid: format!("ses-{}", TaskId::new().0),
+                    },
+                    state: to,
+                    summary: None,
+                    exit_code: None,
+                    created_by: TaskPrincipal {
+                        kind: PrincipalKind::Gateway,
+                        id: "mini".into(),
+                    },
+                    created_ms: now,
+                    updated_ms: now,
+                    seq: 0,
+                    parent: None,
+                    origin: TaskOrigin::Peer,
+                    label: None,
+                    requester_name: None,
+                    session_title: None,
+                    mentions: Vec::new(),
+                    client_ref: None,
+                    requester_server_id: None,
+                    reopened_ms: None,
+                    reopen_count: 0,
+                })
+                .await
+                .unwrap();
+            let id = task.id.0.clone();
+            let mut request = Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/tasks/{id}"));
+            for (name, value) in bearer_headers(token) {
+                request = request.header(name.unwrap(), value);
+            }
+            let response = mount(Router::new())
+                .with_state(state.clone())
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status, "{to:?} as {token}");
+            let body: Value = serde_json::from_slice(
+                &axum::body::to_bytes(response.into_body(), 1 << 20)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(body["error"]["code"].as_str(), code, "{to:?} as {token}");
+            let (read, _) = call(&state, "GET", &format!("/api/tasks/{id}")).await;
+            let gone = status == StatusCode::OK;
+            assert_eq!(read == StatusCode::NOT_FOUND, gone, "{to:?} as {token}");
+            if gone {
+                assert_eq!(body["task_id"], id);
+                let deleted = std::iter::from_fn(|| events.try_recv().ok())
+                    .any(|event| event.event_name() == "task.deleted" && event.task_id() == id);
+                assert!(deleted, "{to:?}: task.deleted published");
+                let TaskBinding::AgentSession { asid, .. } = task.binding else {
+                    unreachable!()
+                };
+                let block = state
+                    .db
+                    .call(|c| crate::tasks::store_sqlite::runtime_block(c, "codex"))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(block.sessions.contains(&asid), "{to:?}: restriction kept");
+            }
+        }
+        let (status, body) = call(&state, "DELETE", "/api/tasks/nope").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"]["code"], "task_not_found");
     }
 
     /// The phone confirms a paused task it opened; nothing else is confirmable.
@@ -1323,7 +1470,10 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(4), async {
             loop {
                 let crate::tasks::events::TaskDomainEvent::Updated { task, .. } =
-                    updates.recv().await.unwrap();
+                    updates.recv().await.unwrap()
+                else {
+                    continue;
+                };
                 if task.task_id == id.0
                     && !matches!(task.state, TaskState::Queued | TaskState::Dispatching)
                 {
