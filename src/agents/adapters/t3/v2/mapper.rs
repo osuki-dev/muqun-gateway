@@ -105,15 +105,35 @@ fn decision(raw: &str) -> Option<PermissionDecision> {
     }
 }
 
-pub fn permission(thread_id: &str, item: &Value) -> Option<PermissionRequest> {
-    let options: Vec<_> = rows(item, "options")
+/// `options` is optional on `approval_request` items: only providers that
+/// advertise their own choices (MCP elicitation, ACP agents) fill it; native
+/// provider approvals carry none. `runtime-request.respond` takes the same
+/// decision vocabulary for every provider, so an item without options still
+/// accepts the one-action pair. No session or permanent grant is invented.
+const DEFAULT_OPTIONS: [(&str, &str); 2] = [("accept", "Allow once"), ("decline", "Deny")];
+
+/// `(decision, label)` as the provider advertised them, else the defaults.
+fn offered(item: &Value) -> Vec<(&str, &str)> {
+    let advertised: Vec<_> = rows(item, "options")
         .iter()
+        .filter_map(|option| Some((string(option, "decision")?, string(option, "label")?)))
+        .collect();
+    if advertised.is_empty() {
+        DEFAULT_OPTIONS.to_vec()
+    } else {
+        advertised
+    }
+}
+
+pub fn permission(thread_id: &str, item: &Value) -> Option<PermissionRequest> {
+    let options: Vec<_> = offered(item)
+        .into_iter()
         .enumerate()
-        .filter_map(|(index, option)| {
+        .filter_map(|(index, (wire, label))| {
             Some(PermissionOption {
                 index,
-                label: string(option, "label")?.to_string(),
-                decision: decision(string(option, "decision")?)?,
+                label: label.to_string(),
+                decision: decision(wire)?,
             })
         })
         .collect();
@@ -247,10 +267,7 @@ pub fn approval_decision(
         PermissionDecision::AllowAlways => "acceptAlways",
         PermissionDecision::Deny => "decline",
     };
-    if !rows(item, "options")
-        .iter()
-        .any(|option| string(option, "decision") == Some(wire))
-    {
+    if !offered(item).iter().any(|(offered, _)| *offered == wire) {
         return Err(AgentError::Unsupported(
             "approval decision was not offered".into(),
         ));

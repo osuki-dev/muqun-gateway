@@ -982,6 +982,101 @@ fn approvals_offer_only_exact_representable_choices() {
     assert!(mapper::permissions("thread", p).is_empty());
 }
 
+/// A native provider's approval item as the v0.1.3 server stores it: the
+/// contract keeps `options` optional and only MCP-elicitation/ACP providers
+/// fill it. The one-action pair is still answerable through
+/// `runtime-request.respond`, so the request must reach the phone.
+#[test]
+fn an_approval_without_advertised_options_offers_allow_once_and_deny() {
+    // Anonymized from a real `approval_request` turn item (claudeAgent,
+    // requestKind command); identities shortened to the fixture's.
+    let real = json!({
+        "id": "turn-item:runtime-request:approval",
+        "threadId": "thread",
+        "runId": "root-run",
+        "nodeId": "approval-node",
+        "providerThreadId": "provider-thread",
+        "providerTurnId": "provider-turn",
+        "nativeItemRef": {"driver": "claudeAgent", "nativeId": "toolu_example", "strength": "strong"},
+        "parentItemId": null,
+        "ordinal": 2000006,
+        "status": "waiting",
+        "title": null,
+        "startedAt": "2026-10-31T09:45:00.000Z",
+        "completedAt": null,
+        "updatedAt": "2026-10-31T09:45:00.000Z",
+        "type": "approval_request",
+        "requestId": "approval",
+        "requestKind": "command",
+        "prompt": "Run a shell command?"
+    });
+    let mut without_key = real.clone();
+    without_key.as_object_mut().unwrap().remove("options");
+    let mut null_options = real.clone();
+    null_options["options"] = Value::Null;
+    let mut empty_options = real.clone();
+    empty_options["options"] = json!([]);
+    let mut advertised = real.clone();
+    advertised["options"] = json!([{"decision":"acceptForSession","label":"Allow for this thread"},{"decision":"decline","label":"Deny"}]);
+    let cases = [
+        (
+            "no options key",
+            without_key,
+            vec![("Allow once", "accept"), ("Deny", "decline")],
+        ),
+        (
+            "options null",
+            null_options,
+            vec![("Allow once", "accept"), ("Deny", "decline")],
+        ),
+        (
+            "options empty",
+            empty_options,
+            vec![("Allow once", "accept"), ("Deny", "decline")],
+        ),
+        // Advertised choices stay exact: no default is added beside them.
+        ("options advertised", advertised, vec![("Deny", "decline")]),
+    ];
+    for (name, item, expected) in cases {
+        let mut snapshot = fixture();
+        snapshot["projection"]["turnItems"][0] = item.clone();
+        snapshot["projection"]["visibleTurnItems"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"sourceThreadId":"thread","sourceItemId":"approval-item","position":2,"item":item}));
+        let p = &snapshot["projection"];
+        let permissions = mapper::permissions("thread", p);
+        assert_eq!(permissions.len(), 1, "{name}");
+        let request = &permissions[0];
+        assert_eq!(request.id, "approval", "{name}");
+        assert_eq!(request.action, "command", "{name}");
+        assert_eq!(request.prompt, "Run a shell command?", "{name}");
+        let labels: Vec<_> = request.options.iter().map(|o| o.label.as_str()).collect();
+        let expected_labels: Vec<_> = expected.iter().map(|(label, _)| *label).collect();
+        assert_eq!(labels, expected_labels, "{name}");
+        for (option, (_, wire)) in request.options.iter().zip(&expected) {
+            assert_eq!(
+                mapper::approval_decision(p, "approval", option.decision).unwrap(),
+                *wire,
+                "{name}"
+            );
+        }
+        assert!(
+            matches!(
+                mapper::approval_decision(p, "approval", PermissionDecision::AllowAlways),
+                Err(AgentError::Unsupported(_))
+            ),
+            "{name}: no permanent grant is invented"
+        );
+        assert!(
+            mapper::timeline("thread", p, 10)
+                .iter()
+                .any(|row| matches!(&row.part, AgentPart::Approval { request } if request.id == "approval")),
+            "{name}: the approval is visible in the timeline"
+        );
+    }
+}
+
 #[test]
 fn expired_cancelled_resolved_and_nonresumable_requests_are_not_clickable() {
     for status in ["expired", "cancelled", "resolved"] {
