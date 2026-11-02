@@ -8,8 +8,10 @@ pub mod errors;
 pub mod glyphs;
 pub mod home;
 pub mod icons;
+pub mod markdown;
 pub mod motion;
 pub mod new_session;
+pub mod parts;
 pub mod sessions;
 pub mod settings;
 pub mod shell;
@@ -159,6 +161,8 @@ impl App {
             }
         }
         drop(watcher);
+        // Rows bake theme colours into their text.
+        timeline::theme_changed(self);
         self.send(Command::Edit(ConfigEdit::Scheme(scheme)));
     }
 

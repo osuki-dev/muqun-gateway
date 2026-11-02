@@ -14,7 +14,7 @@ use blinc_layout::motion::{motion_derived, Motion, StaggerConfig};
 use blinc_layout::prelude::*;
 
 // Tier 1, micro (120–160 ms, ease-out: hover, press, focus, badges) is
-// CSS-only: `--motion-micro` in the scale block of `styles.css`.
+// CSS-only: `--mq-motion-micro` in the scale block of `styles.css`.
 /// Tier 2, medium (220–280 ms): cards entering, panels, tabs, popovers.
 pub const MEDIUM_MS: u32 = 240;
 /// Tier 3, large (320–400 ms): sidebar, sheets, theme cross-fade, covers.

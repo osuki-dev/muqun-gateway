@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use muqun_gateway::agents::ports::AgentError;
 use muqun_gateway::agents::{AgentDomainEvent, AgentSessionId, SessionQuery};
 use tokio::sync::{broadcast, watch};
 
@@ -184,6 +185,44 @@ impl Core {
             }
             Command::ReplyPermission { asid, id, decision } => {
                 if let Err(err) = self.hub.reply_permission(&asid, &id, decision).await {
+                    self.fail(err);
+                }
+            }
+            Command::LoadEarlier(asid) => match self.hub.earlier(&asid).await {
+                Ok(items) => {
+                    let exhausted = items.is_empty();
+                    self.inbox.push(Update::Earlier {
+                        asid: asid.0,
+                        items,
+                        exhausted,
+                    });
+                }
+                Err(HubError::Agent(AgentError::HistoryCursorLost)) => {
+                    // The cursor went with the snapshot it belonged to:
+                    // read the session again, then page on from there.
+                    tracing::info!(asid = %asid.0, "history cursor lost; reading the session again");
+                    self.open(&asid).await;
+                }
+                Err(HubError::Agent(AgentError::Unsupported(_))) => {
+                    self.inbox.push(Update::Earlier {
+                        asid: asid.0,
+                        items: Vec::new(),
+                        exhausted: true,
+                    });
+                }
+                Err(err) => {
+                    // Leave the session pageable; the next approach to the
+                    // top asks again.
+                    tracing::warn!(asid = %asid.0, %err, "older history unavailable");
+                    self.inbox.push(Update::Earlier {
+                        asid: asid.0,
+                        items: Vec::new(),
+                        exhausted: false,
+                    });
+                }
+            },
+            Command::ReplyForm { asid, id, answers } => {
+                if let Err(err) = self.hub.reply_form(&asid, &id, answers).await {
                     self.fail(err);
                 }
             }

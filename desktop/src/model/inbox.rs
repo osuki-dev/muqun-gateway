@@ -69,6 +69,13 @@ pub enum Update {
         entries: Vec<DirectoryEntry>,
     },
     Ui(UiAction),
+    /// An older page of a session's history, oldest first. `exhausted`:
+    /// the agent has nothing older.
+    Earlier {
+        asid: String,
+        items: Vec<muqun_gateway::agents::TimelineItem>,
+        exhausted: bool,
+    },
 }
 
 #[derive(Default)]

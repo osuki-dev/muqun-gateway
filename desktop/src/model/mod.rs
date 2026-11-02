@@ -6,4 +6,5 @@ pub mod commands;
 pub mod drain;
 pub mod inbox;
 pub mod projection;
+pub mod stream;
 pub mod view;

@@ -68,8 +68,10 @@ fn main() -> anyhow::Result<()> {
 
     let geometry = config.window.clamped();
     let window = WindowConfig {
-        // Test builds from several worktrees run side by side; a distinct
-        // title keeps input scripts aimed at the right window.
+        // Test builds from several worktrees run side by side, and a QA run
+        // keeps its window from taking focus by name (`ui/timeline/qa.rs`); a
+        // distinct title keeps input scripts and compositor rules aimed at
+        // the right window.
         title: std::env::var("MUQUN_WINDOW_TITLE")
             .ok()
             .filter(|t| !t.is_empty())
@@ -137,6 +139,7 @@ fn main() -> anyhow::Result<()> {
                     }
                 }),
             );
+            ui::timeline::qa::start(&app);
             app
         });
         tracing::debug!(builds, width = ctx.width, height = ctx.height, "build_ui");

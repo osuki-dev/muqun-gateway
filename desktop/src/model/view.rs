@@ -6,14 +6,14 @@
 //! views depend on; `drain.rs` writes only the ones `Changes` names, so a
 //! streaming delta to one item rebuilds that item's view and nothing else.
 
-use std::collections::HashSet;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 
 use blinc_core::State;
 use muqun_gateway::agents::directories::DirectoryEntry;
 use muqun_gateway::agents::{
-    AgentDomainEvent, AgentProject, AgentSessionInfo, AgentSessionStatus, PermissionRequest,
-    TimelineItem,
+    AgentDomainEvent, AgentPart, AgentProject, AgentSessionInfo, AgentSessionStatus, FormRequest,
+    PermissionRequest, TimelineItem, TimelineRole,
 };
 use muqun_gateway::platform::discovery::AgentDiscoveryInfo;
 
@@ -26,32 +26,230 @@ pub const SESSION_LIST_LIMIT: usize = 100;
 #[derive(Debug, Clone)]
 pub struct SessionView {
     pub info: AgentSessionInfo,
+    /// The timeline in display order.
     pub items: Vec<Arc<TimelineItem>>,
+    /// `items[i]`'s rows: one, or several for a long assistant text
+    /// (`stream::segments`), each with its size descriptor.
+    rows: Vec<Vec<Shape>>,
+    by_id: HashMap<String, Arc<TimelineItem>>,
     pub pending_permissions: Vec<PermissionRequest>,
+    pub pending_forms: Vec<FormRequest>,
+    /// No older history: `load_earlier_timeline` returned an empty page.
+    pub exhausted: bool,
 }
 
 impl SessionView {
-    #[allow(dead_code)] // for views that read the whole state
-    pub fn status(&self) -> AgentSessionStatus {
-        self.info.status
+    fn new(
+        info: AgentSessionInfo,
+        timeline: Vec<TimelineItem>,
+        pending_permissions: Vec<PermissionRequest>,
+        pending_forms: Vec<FormRequest>,
+    ) -> Self {
+        let mut view = Self {
+            info,
+            items: Vec::with_capacity(timeline.len()),
+            rows: Vec::with_capacity(timeline.len()),
+            by_id: HashMap::with_capacity(timeline.len()),
+            pending_permissions,
+            pending_forms,
+            exhausted: false,
+        };
+        let mut timeline = timeline;
+        timeline.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
+        for item in timeline {
+            view.upsert(item);
+        }
+        view
     }
 
+    /// Streaming updates land on the newest rows, so search from the end.
     fn position(&self, id: &str) -> Option<usize> {
-        self.items.iter().position(|item| item.id == id)
+        if !self.by_id.contains_key(id) {
+            return None;
+        }
+        self.items.iter().rposition(|item| item.id == id)
     }
 
     /// Replace the item with `item`'s id, or insert it where its
-    /// [`TimelineItem::sort_key`] puts it. True when the order changed.
-    fn upsert(&mut self, item: TimelineItem) -> bool {
+    /// [`TimelineItem::sort_key`] puts it.
+    fn upsert(&mut self, item: TimelineItem) -> Upserted {
+        let item = Arc::new(item);
+        let rows = Shape::rows(&item);
+        self.by_id.insert(item.id.clone(), item.clone());
         if let Some(at) = self.position(&item.id) {
-            self.items[at] = Arc::new(item);
-            return false;
+            self.items[at] = item;
+            let regrown = self.rows[at].len() != rows.len();
+            self.rows[at] = rows;
+            return if regrown {
+                Upserted::Resegmented
+            } else {
+                Upserted::Replaced
+            };
         }
         let at = self
             .items
             .partition_point(|existing| existing.sort_key() <= item.sort_key());
-        self.items.insert(at, Arc::new(item));
-        true
+        self.items.insert(at, item);
+        self.rows.insert(at, rows);
+        Upserted::Inserted(at)
+    }
+
+    /// The list row ids of item `id`.
+    pub fn row_ids(&self, id: &str) -> Vec<String> {
+        let n = self.position(id).map(|at| self.rows[at].len()).unwrap_or(1);
+        (0..n).map(|k| row_id(id, k)).collect()
+    }
+
+    fn remove(&mut self, gone: &HashSet<&String>) -> bool {
+        let before = self.items.len();
+        let mut keep = Vec::with_capacity(before);
+        let mut rows = Vec::with_capacity(before);
+        for (item, row) in self.items.drain(..).zip(self.rows.drain(..)) {
+            if gone.contains(&item.id) {
+                self.by_id.remove(&item.id);
+            } else {
+                keep.push(item);
+                rows.push(row);
+            }
+        }
+        self.items = keep;
+        self.rows = rows;
+        self.items.len() != before
+    }
+
+    /// The part being written right now: the newest item, when it is the
+    /// assistant's text or reasoning and the session is working.
+    pub fn live(&self) -> Option<&Arc<TimelineItem>> {
+        if !matches!(
+            self.info.status,
+            AgentSessionStatus::Busy | AgentSessionStatus::Retry
+        ) {
+            return None;
+        }
+        self.items.last().filter(|item| {
+            item.role == TimelineRole::Assistant
+                && matches!(
+                    item.part,
+                    AgentPart::Text { .. } | AgentPart::Reasoning { .. }
+                )
+        })
+    }
+}
+
+/// What an upsert did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Upserted {
+    Inserted(usize),
+    Replaced,
+    /// Replaced, and the item is now shown as a different number of rows.
+    Resegmented,
+}
+
+/// Separates an item id from its row number in a list row id.
+const ROW_SEP: char = '\u{1F}';
+
+/// The id of row `k` of item `id`: the item id itself for the first row.
+pub fn row_id(id: &str, k: usize) -> String {
+    if k == 0 {
+        id.to_string()
+    } else {
+        format!("{id}{ROW_SEP}{k}")
+    }
+}
+
+/// The item id and row number in a list row id.
+pub fn split_row_id(row: &str) -> (&str, usize) {
+    match row.split_once(ROW_SEP) {
+        Some((id, k)) => (id, k.parse().unwrap_or(0)),
+        None => (row, 0),
+    }
+}
+
+/// Whether an item's text is shown in segments (`stream::segments`).
+pub fn segmented(item: &TimelineItem) -> Option<&str> {
+    match (&item.part, item.role) {
+        (AgentPart::Text { text }, TimelineRole::Assistant) => Some(text),
+        _ => None,
+    }
+}
+
+/// What kind of row an item makes, and how much text it carries: enough to
+/// guess its height before it has ever been laid out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShapeKind {
+    User,
+    Prose,
+    Reasoning,
+    Tool,
+    Diff,
+    Card,
+    Notice,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Shape {
+    pub kind: ShapeKind,
+    /// Characters of the main text.
+    pub chars: u32,
+    /// Hard line breaks in it, plus one.
+    pub lines: u32,
+}
+
+impl Shape {
+    /// The shapes of the rows `item` is shown as.
+    pub fn rows(item: &TimelineItem) -> Vec<Shape> {
+        match segmented(item) {
+            Some(text) => super::stream::segments(text)
+                .into_iter()
+                .map(|r| Self::text(ShapeKind::Prose, &text[r]))
+                .collect(),
+            None => vec![Self::of(item)],
+        }
+    }
+
+    fn text(kind: ShapeKind, text: &str) -> Self {
+        Self {
+            kind,
+            chars: text.chars().count().min(u32::MAX as usize) as u32,
+            lines: text.bytes().filter(|b| *b == b'\n').count() as u32 + 1,
+        }
+    }
+
+    pub fn of(item: &TimelineItem) -> Self {
+        let text_shape = |kind, text: &str| {
+            let lines = text.bytes().filter(|b| *b == b'\n').count() as u32 + 1;
+            Self {
+                kind,
+                chars: text.chars().count().min(u32::MAX as usize) as u32,
+                lines,
+            }
+        };
+        let fixed = |kind| Self {
+            kind,
+            chars: 0,
+            lines: 1,
+        };
+        match (&item.part, item.role) {
+            (AgentPart::Text { text }, TimelineRole::User) => text_shape(ShapeKind::User, text),
+            (AgentPart::Text { text }, _) => text_shape(ShapeKind::Prose, text),
+            (AgentPart::Reasoning { .. }, _) => fixed(ShapeKind::Reasoning),
+            (AgentPart::Tool(_), _) | (AgentPart::Shell { .. }, _) => fixed(ShapeKind::Tool),
+            (AgentPart::Diff { diff, .. }, _) => text_shape(ShapeKind::Diff, diff),
+            (AgentPart::Todo { items }, _) => Self {
+                kind: ShapeKind::Card,
+                chars: 0,
+                lines: items.len() as u32 + 1,
+            },
+            (AgentPart::Approval { .. }, _) | (AgentPart::Form { .. }, _) => Self {
+                kind: ShapeKind::Card,
+                chars: 0,
+                lines: 5,
+            },
+            (AgentPart::Synthetic { text, .. }, _) | (AgentPart::System { text, .. }, _) => {
+                text_shape(ShapeKind::Prose, text)
+            }
+            _ => fixed(ShapeKind::Notice),
+        }
     }
 }
 
@@ -90,6 +288,10 @@ pub struct ProjectList {
 pub struct TimelineOrder {
     pub asid: String,
     pub ids: Vec<String>,
+    /// `ids[i]`'s shape.
+    pub shapes: Vec<Shape>,
+    /// No older history to load.
+    pub exhausted: bool,
 }
 
 #[derive(Debug, Default)]
@@ -120,7 +322,14 @@ pub struct Changes {
     pub order: bool,
     /// Items whose content changed, by id, in the active session.
     pub items: Vec<String>,
+    /// New rows after the previous last row.
+    pub appended: usize,
+    /// New rows before the previous first row (an older page).
+    pub prepended: usize,
     pub permissions: bool,
+    pub forms: bool,
+    /// An older-history reply for the active session arrived.
+    pub earlier_reply: bool,
     pub error: bool,
     pub agents: bool,
     pub attention: bool,
@@ -133,7 +342,7 @@ pub struct Changes {
 
 impl Changes {
     pub fn timeline(&self) -> bool {
-        self.order || !self.items.is_empty() || self.permissions || self.opened
+        self.order || !self.items.is_empty() || self.permissions || self.forms || self.opened
     }
 }
 
@@ -189,16 +398,37 @@ impl ViewState {
                 self.attention.extend(pending_permissions.iter().cloned());
                 changes.attention = true;
                 let snapshot = *snapshot;
-                self.active = Some(SessionView {
-                    info: snapshot.info,
-                    items: snapshot.timeline.into_iter().map(Arc::new).collect(),
+                // A fresh read of the session already shown (a resync) keeps
+                // the older pages it had loaded and what it knew about them.
+                let kept = self
+                    .active
+                    .take()
+                    .filter(|a| a.info.asid == snapshot.info.asid);
+                let mut view = SessionView::new(
+                    snapshot.info,
+                    snapshot.timeline,
                     pending_permissions,
-                });
+                    snapshot.forms,
+                );
+                if let Some(kept) = kept {
+                    let newest = view.items.first().map(|i| i.sort_key().0.to_string());
+                    for item in kept.items {
+                        let older = newest
+                            .as_deref()
+                            .is_some_and(|n| item.message_id.as_str() < n);
+                        if older && !view.by_id.contains_key(&item.id) {
+                            let _ = view.upsert((*item).clone());
+                        }
+                    }
+                    view.exhausted = kept.exhausted;
+                }
+                self.active = Some(view);
                 let active = self.active.as_ref().expect("just set");
                 changes.items = active.items.iter().map(|i| i.id.clone()).collect();
                 changes.order = true;
                 changes.header = true;
                 changes.permissions = true;
+                changes.forms = true;
                 changes.opened = true;
             }
             Update::Event(event) => self.apply_event(event, changes),
@@ -218,6 +448,40 @@ impl ViewState {
                 changes.completions = true;
             }
             Update::Ui(action) => changes.actions.push(action),
+            Update::Earlier {
+                asid,
+                items,
+                exhausted,
+            } => {
+                let Some(active) = self.active_for(&asid) else {
+                    return;
+                };
+                changes.earlier_reply = true;
+                let first = active.items.first().cloned();
+                for item in items {
+                    let id = item.id.clone();
+                    let older = first
+                        .as_ref()
+                        .is_none_or(|f| item.sort_key() < f.sort_key());
+                    match active.upsert(item) {
+                        Upserted::Inserted(_) => {
+                            changes.order = true;
+                            if older {
+                                changes.prepended += 1;
+                            }
+                        }
+                        Upserted::Resegmented => changes.order = true,
+                        Upserted::Replaced => {}
+                    }
+                    if !changes.items.contains(&id) {
+                        changes.items.push(id);
+                    }
+                }
+                if active.exhausted != exhausted {
+                    active.exhausted = exhausted;
+                    changes.order = true;
+                }
+            }
         }
     }
 
@@ -318,7 +582,16 @@ impl ViewState {
                 };
                 for item in items {
                     let id = item.id.clone();
-                    changes.order |= active.upsert(item);
+                    match active.upsert(item) {
+                        Upserted::Inserted(at) => {
+                            changes.order = true;
+                            if at + 1 == active.items.len() {
+                                changes.appended += 1;
+                            }
+                        }
+                        Upserted::Resegmented => changes.order = true,
+                        Upserted::Replaced => {}
+                    }
                     if !changes.items.contains(&id) {
                         changes.items.push(id);
                     }
@@ -329,9 +602,7 @@ impl ViewState {
                     return;
                 };
                 let gone: HashSet<&String> = ids.iter().collect();
-                let before = active.items.len();
-                active.items.retain(|item| !gone.contains(&item.id));
-                changes.order |= active.items.len() != before;
+                changes.order |= active.remove(&gone);
             }
             AgentDomainEvent::PermissionPending { asid, request, .. } => {
                 match self.attention.iter().position(|p| p.id == request.id) {
@@ -365,8 +636,26 @@ impl ViewState {
                 active.pending_permissions.retain(|p| p.id != request_id);
                 changes.permissions |= active.pending_permissions.len() != before;
             }
-            // Forms, compaction, revert, inbox and worktrees are P1; a
-            // resync is answered on the core side with a fresh snapshot.
+            AgentDomainEvent::FormPending { asid, request, .. } => {
+                let Some(active) = self.active_for(&asid.0) else {
+                    return;
+                };
+                match active.pending_forms.iter().position(|f| f.id == request.id) {
+                    Some(at) => active.pending_forms[at] = request,
+                    None => active.pending_forms.push(request),
+                }
+                changes.forms = true;
+            }
+            AgentDomainEvent::FormResolved { asid, form_id, .. } => {
+                let Some(active) = self.active_for(&asid.0) else {
+                    return;
+                };
+                let before = active.pending_forms.len();
+                active.pending_forms.retain(|f| f.id != form_id);
+                changes.forms |= active.pending_forms.len() != before;
+            }
+            // Compaction, revert, inbox and worktrees are P1; a resync is
+            // answered on the core side with a fresh snapshot.
             _ => {}
         }
     }
@@ -376,14 +665,25 @@ impl ViewState {
             .as_ref()
             .map(|active| TimelineOrder {
                 asid: active.info.asid.0.clone(),
-                ids: active.items.iter().map(|i| i.id.clone()).collect(),
+                ids: active
+                    .items
+                    .iter()
+                    .zip(&active.rows)
+                    .flat_map(|(i, r)| (0..r.len()).map(move |k| row_id(&i.id, k)))
+                    .collect(),
+                shapes: active.rows.iter().flatten().copied().collect(),
+                exhausted: active.exhausted,
             })
             .unwrap_or_default()
     }
 
     pub fn item(&self, id: &str) -> Option<Arc<TimelineItem>> {
-        let active = self.active.as_ref()?;
-        active.position(id).map(|at| active.items[at].clone())
+        self.active.as_ref()?.by_id.get(id).cloned()
+    }
+
+    /// The streaming item of the active session, if one is streaming.
+    pub fn live(&self) -> Option<&Arc<TimelineItem>> {
+        self.active.as_ref()?.live()
     }
 }
 
@@ -418,6 +718,15 @@ pub struct Bindings {
     /// typed or picked it (`~` unexpanded until the session is created).
     pub chooser: State<String>,
     pub timeline_scroll: blinc_layout::selector::ScrollRef,
+    /// Forms waiting for an answer in the active session.
+    pub forms: State<Arc<Vec<FormRequest>>>,
+    /// The streaming item's tail, shown through `Text::bound` (`stream.rs`).
+    pub stream_tail: State<String>,
+    /// Bumped when the colour scheme changes: rows bake theme colours into
+    /// their rich text and render again.
+    pub theme_epoch: State<u64>,
+    /// Each built row's version signal; see [`RowSignals`].
+    pub rows: RowSignals,
 }
 
 impl Bindings {
@@ -443,6 +752,10 @@ impl Bindings {
             restart_note: ctx.use_state_keyed("mq.restart_note", || false),
             chooser: ctx.use_state_keyed("mq.chooser", String::new),
             timeline_scroll,
+            forms: ctx.use_state_keyed("mq.forms", || Arc::new(Vec::new())),
+            stream_tail: ctx.use_state_keyed("mq.stream_tail", String::new),
+            theme_epoch: ctx.use_state_keyed("mq.theme_epoch", || 0),
+            rows: RowSignals::default(),
         }
     }
 }
@@ -453,10 +766,58 @@ pub struct NewSessionDraft {
     pub agent: String,
 }
 
-/// One timeline item's state, keyed by session and item so its view can
-/// find it again on every rebuild of the list.
-pub fn item_state(asid: &str, id: &str) -> State<Option<Arc<TimelineItem>>> {
-    blinc_core::BlincContextState::get().use_state_keyed(&format!("mq.item.{asid}.{id}"), || None)
+/// The version signal of every timeline row that has been built.
+///
+/// A row reads its item from the view when it renders and depends on its
+/// own signal; the drain bumps the signal of a changed item only when that
+/// row exists. Rows outside the list's window are never built, so a session
+/// of 10 000 items costs 10 000 signals only if all of them are visited.
+#[derive(Clone, Default)]
+pub struct RowSignals {
+    inner: Arc<Mutex<RowSignalsInner>>,
+}
+
+#[derive(Default)]
+struct RowSignalsInner {
+    asid: String,
+    rows: HashMap<String, State<u64>>,
+    version: u64,
+}
+
+impl RowSignals {
+    /// The signal of `asid`'s row `id`, created on first use. Main thread,
+    /// with Blinc's context up. Rows of another session are forgotten.
+    pub fn signal(&self, asid: &str, id: &str) -> State<u64> {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.asid != asid {
+            inner.asid = asid.to_string();
+            inner.rows.clear();
+        }
+        if let Some(state) = inner.rows.get(id) {
+            return state.clone();
+        }
+        let state = blinc_core::BlincContextState::get()
+            .use_state_keyed(&format!("mq.row.{asid}.{id}"), || 0u64);
+        inner.rows.insert(id.to_string(), state.clone());
+        state
+    }
+
+    /// The built rows among `ids`, each with a fresh version to write.
+    pub fn bump<'a>(
+        &self,
+        asid: &str,
+        ids: impl IntoIterator<Item = &'a String>,
+    ) -> Vec<(State<u64>, u64)> {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.asid != asid {
+            return Vec::new();
+        }
+        inner.version += 1;
+        let version = inner.version;
+        ids.into_iter()
+            .filter_map(|id| inner.rows.get(id).map(|s| (s.clone(), version)))
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -628,7 +989,7 @@ mod tests {
         );
         assert!(changes.sessions && changes.header);
         assert_eq!(view.sessions[0].status, AgentSessionStatus::Busy);
-        assert_eq!(view.active.unwrap().status(), AgentSessionStatus::Busy);
+        assert_eq!(view.active.unwrap().info.status, AgentSessionStatus::Busy);
     }
 
     #[test]

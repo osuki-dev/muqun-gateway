@@ -29,7 +29,7 @@ pub const CARD_H: f32 = 112.0;
 pub const CARD_CHARS: usize = 17;
 /// The first-run card spans two cards and their gap.
 pub const FIRST_CARD_W: f32 = 2.0 * CARD_W + 12.0;
-/// The gap between launch cards (`--space-12`).
+/// The gap between launch cards (`--mq-space-3`).
 pub const CARD_GAP: f32 = 12.0;
 
 /// How many launch cards one row of `content_width` holds.
