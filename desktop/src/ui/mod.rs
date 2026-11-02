@@ -90,11 +90,7 @@ impl App {
 
 /// "Ctrl+X" or "⌘X".
 pub fn shortcut(key: &str) -> String {
-    if cfg!(target_os = "macos") {
-        format!("⌘{key}")
-    } else {
-        format!("Ctrl+{key}")
-    }
+    format!("{}{key}", crate::platform::shell::primary_modifier())
 }
 
 const KEY_ENTER: u32 = 13;

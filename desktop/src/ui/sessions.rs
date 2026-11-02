@@ -154,22 +154,6 @@ impl DayGroup {
     }
 }
 
-/// The local zone's offset from UTC right now, in seconds.
-pub fn local_utc_offset() -> i64 {
-    #[cfg(unix)]
-    {
-        // SAFETY: `localtime_r` writes only into `tm`, which we own.
-        unsafe {
-            let now = libc::time(std::ptr::null_mut());
-            let mut tm: libc::tm = std::mem::zeroed();
-            if !libc::localtime_r(&now, &mut tm).is_null() {
-                return tm.tm_gmtoff;
-            }
-        }
-    }
-    0
-}
-
 pub fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -195,7 +179,7 @@ fn session_list(app: &App) -> impl ElementBuilder {
             let selected = selected.get();
             let filter = filter.get();
             let attention = attention.get();
-            let (now, offset) = (now_ms(), local_utc_offset());
+            let (now, offset) = (now_ms(), crate::platform::shell::local_utc_offset());
             let mut list = div().class("mq-session-list").w_full().flex_col();
             let shown: Vec<_> = sessions
                 .iter()

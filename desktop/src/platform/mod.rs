@@ -2,6 +2,9 @@
 //! gateway service.
 
 pub mod coexist;
+pub mod fonts;
+pub mod shell;
+pub mod shutdown;
 
 use std::path::PathBuf;
 

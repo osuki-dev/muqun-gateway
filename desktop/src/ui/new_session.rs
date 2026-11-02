@@ -182,7 +182,7 @@ fn pick_folder(app: &App, agent: String, start: PathBuf) {
             drain.post(crate::model::inbox::UiAction::SetDraft { agent, cwd });
         }
     };
-    if cfg!(target_os = "macos") {
+    if crate::platform::shell::dialogs_need_main_thread() {
         pick();
     } else {
         std::thread::spawn(pick);

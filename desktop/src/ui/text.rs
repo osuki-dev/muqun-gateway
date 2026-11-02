@@ -3,38 +3,17 @@
 
 use blinc_layout::prelude::*;
 
+use crate::platform::fonts::{self, FontRole};
+
 /// The UI family: Noto Sans CJK covers Latin and CJK with one face, so mixed
 /// Chinese/English lines share one baseline and weight.
 pub const UI_FONT: &str = "Noto Sans CJK SC";
 pub const MONO_FONT: &str = "JetBrainsMono Nerd Font";
 
-/// Where P0 finds the two families. Bundling a subset is a later task; a
-/// missing file only costs the fallback chain's choice of face.
-#[cfg(target_os = "linux")]
-const SYSTEM_FONTS: &[(&str, &[&str])] = &[
-    (
-        UI_FONT,
-        &[
-            "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
-            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-            "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc",
-        ],
-    ),
-    (
-        MONO_FONT,
-        &[
-            "/usr/share/fonts/TTF/JetBrainsMonoNerdFont-Regular.ttf",
-            "/usr/share/fonts/truetype/jetbrains-mono/JetBrainsMonoNerdFont-Regular.ttf",
-        ],
-    ),
-];
-#[cfg(not(target_os = "linux"))]
-const SYSTEM_FONTS: &[(&str, &[&str])] = &[];
-
 /// Load the families from the system, before the window opens.
 pub fn register_fonts() {
-    for (family, candidates) in SYSTEM_FONTS {
-        let loaded = candidates.iter().find_map(|path| {
+    for (family, role) in [(UI_FONT, FontRole::Ui), (MONO_FONT, FontRole::Mono)] {
+        let loaded = fonts::candidates(role).iter().find_map(|path| {
             let data = std::fs::read(path).ok()?;
             let faces = blinc_app::register_font(data);
             (faces > 0).then_some((*path, faces))

@@ -90,7 +90,7 @@ fn main() -> anyhow::Result<()> {
         let app = app.get_or_insert_with(|| {
             tracing::info!(
                 since_main_ms = started.elapsed().as_millis() as u64,
-                "first build_ui"
+                "first frame"
             );
             ui::install_css(ctx);
             let composer = ctx
@@ -199,6 +199,20 @@ fn runtime_settings(config: &DesktopConfig) -> RuntimeSettings {
     settings
 }
 
+/// SIGTERM / SIGINT: ask the window to close, which ends `WindowedApp::run`
+/// and lets `main` return `Ok` (exit status 0, with the last size saved). If
+/// there is no window to close yet, or it does not go in time, leave anyway,
+/// still with status 0: being told to stop is not a failure.
+async fn stop_on_signal(store: Arc<ConfigStore>) {
+    let signal = platform::shutdown::requested().await;
+    tracing::info!(signal, "stop requested; closing the window");
+    blinc_layout::window_actions::close_window();
+    tokio::time::sleep(platform::shutdown::GRACE).await;
+    tracing::warn!("the window did not close in time; exiting");
+    store.update_blocking(|_| {});
+    std::process::exit(0);
+}
+
 /// The tokio runtime and the agents plane, on their own thread.
 fn start_core(
     settings: RuntimeSettings,
@@ -207,6 +221,7 @@ fn start_core(
     store: Arc<ConfigStore>,
     commands: CommandReceiver,
 ) -> anyhow::Result<()> {
+    let shutdown_store = store.clone();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_name("muqun-core")
@@ -222,6 +237,7 @@ fn start_core(
                     );
                 }
                 agents.spawn_supervisor();
+                tokio::spawn(stop_on_signal(shutdown_store));
                 let hub: Arc<dyn hub::SessionHub> = Arc::new(hub::LocalHub::new(agents));
                 projection::spawn(hub, inbox, store, commands);
                 // Live until the process ends with the window.
