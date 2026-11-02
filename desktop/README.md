@@ -111,3 +111,11 @@ tray and close-to-tray, notifications, command palette, streaming markdown timel
 session search / rename / delete / fork, model and mode switching, attachments, richer themes and
 the theme editor, reduce-motion switch, hot-apply of agent settings, saving window position and
 maximized state (fork patch), three-platform CI runs.
+
+## Icons
+
+The App's glyphs (`app/assets/glyphs`) are the single icon source. After they
+change, run `desktop/scripts/sync-glyphs.sh` (set `MUQUN_APP_DIR` if the App is
+not the sibling `app/` checkout). It refreshes `assets/glyphs/`, adds
+`brand-opencode.svg`, and regenerates `src/ui/glyphs.rs`. Use
+`ui::glyphs::icon(Glyph::X, size).tint(color)`, and `agent_mark(kind)` for brands.

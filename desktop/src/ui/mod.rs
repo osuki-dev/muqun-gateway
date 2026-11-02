@@ -5,6 +5,7 @@
 pub mod agents;
 pub mod composer;
 pub mod errors;
+pub mod glyphs;
 pub mod home;
 pub mod icons;
 pub mod new_session;
