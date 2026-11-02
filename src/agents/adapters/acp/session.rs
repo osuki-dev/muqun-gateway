@@ -269,7 +269,19 @@ impl CachedSessionList {
 
 struct SessionMetadata {
     listed_at: tokio::time::Instant,
+    /// The store token taken before this listing, as `CachedSessionList`.
+    fingerprint: Option<u64>,
     sessions: HashMap<String, AgentSessionInfo>,
+}
+
+impl SessionMetadata {
+    /// The store has not changed since this snapshot, which therefore still
+    /// names every saved session: an identity it lacks is absent, not stale.
+    fn unchanged(&self, fingerprint: Option<u64>) -> bool {
+        fingerprint.is_some()
+            && self.fingerprint == fingerprint
+            && self.listed_at.elapsed() < SESSION_STORE_MAX_AGE
+    }
 }
 
 struct SessionState {
@@ -1457,7 +1469,7 @@ impl<P: AcpProvider> AcpDriver<P> {
             return Ok(sessions);
         }
         let revision = self.metadata_revision.load(Ordering::Acquire);
-        let sessions = self.read_native_sessions(directory).await?;
+        let sessions = self.read_native_sessions(directory, fingerprint).await?;
         let mut lists = self.session_lists.lock().await;
         if self.metadata_revision.load(Ordering::Acquire) == revision {
             lists.retain(|list| list.fresh(fingerprint) && list.directory.as_deref() != directory);
@@ -1512,9 +1524,12 @@ impl<P: AcpProvider> AcpDriver<P> {
         *self.session_metadata.lock().await = None;
     }
 
+    /// `fingerprint` is the store token taken before this read; the metadata
+    /// snapshot remembers it so an unchanged store keeps answering.
     async fn read_native_sessions(
         &self,
         directory: Option<&str>,
+        fingerprint: Option<u64>,
     ) -> Result<Vec<AgentSessionInfo>, AgentError> {
         let revision = self.metadata_revision.load(Ordering::Acquire);
         let owned = self.owned.lock().unwrap().ids.iter().cloned().collect();
@@ -1530,7 +1545,8 @@ impl<P: AcpProvider> AcpDriver<P> {
                     }
                 }
             }
-            self.remember_session_metadata(revision, &sessions).await;
+            self.remember_session_metadata(revision, fingerprint, &sessions)
+                .await;
             return Ok(sessions);
         }
         let (client, _events, capabilities) = self.initialized(&self.default_directory).await?;
@@ -1612,16 +1628,23 @@ impl<P: AcpProvider> AcpDriver<P> {
         .await;
         client.shutdown().await;
         if let Ok(sessions) = &result {
-            self.remember_session_metadata(revision, sessions).await;
+            self.remember_session_metadata(revision, fingerprint, sessions)
+                .await;
         }
         result
     }
 
-    async fn remember_session_metadata(&self, revision: u64, sessions: &[AgentSessionInfo]) {
+    async fn remember_session_metadata(
+        &self,
+        revision: u64,
+        fingerprint: Option<u64>,
+        sessions: &[AgentSessionInfo],
+    ) {
         let mut metadata = self.session_metadata.lock().await;
         if self.metadata_revision.load(Ordering::Acquire) == revision {
             *metadata = Some(SessionMetadata {
                 listed_at: tokio::time::Instant::now(),
+                fingerprint,
                 sessions: sessions
                     .iter()
                     .map(|info| (info.asid.0.clone(), info.clone()))
@@ -1703,26 +1726,42 @@ impl<P: AcpProvider> AcpDriver<P> {
         Ok(sessions)
     }
 
-    async fn cached_session_info(&self, id: &str) -> Option<AgentSessionInfo> {
-        self.session_metadata
-            .lock()
-            .await
-            .as_ref()
-            .filter(|metadata| metadata.listed_at.elapsed() < SESSION_METADATA_TTL)
-            .and_then(|metadata| metadata.sessions.get(id).cloned())
+    /// What the metadata snapshot says about `id`, or `None` when it cannot
+    /// answer: a young snapshot or one the unchanged store vouches for names a
+    /// listed session; only the latter also proves an unlisted one absent.
+    async fn cached_session_info(
+        &self,
+        id: &str,
+        fingerprint: Option<u64>,
+    ) -> Option<Result<AgentSessionInfo, AgentError>> {
+        let metadata = self.session_metadata.lock().await;
+        let metadata = metadata.as_ref()?;
+        let unchanged = metadata.unchanged(fingerprint);
+        match metadata.sessions.get(id) {
+            Some(info) if unchanged || metadata.listed_at.elapsed() < SESSION_METADATA_TTL => {
+                Some(Ok(info.clone()))
+            }
+            None if unchanged => Some(Err(AgentError::SessionNotFound(id.into()))),
+            _ => None,
+        }
     }
 
     async fn native_session_info(&self, id: &str) -> Result<AgentSessionInfo, AgentError> {
-        if let Some(info) = self.cached_session_info(id).await {
-            return Ok(info);
+        // The task follower and Home refresh read saved sessions every minute,
+        // longer than the metadata cache: the store token keeps an unchanged
+        // store's snapshot answering instead of starting a process each time.
+        let probe = *self.session_store.lock().unwrap();
+        let fingerprint = tokio::task::spawn_blocking(probe).await.ok().flatten();
+        if let Some(answer) = self.cached_session_info(id, fingerprint).await {
+            return answer;
         }
         let _refresh = self.metadata_refresh.lock().await;
-        if let Some(info) = self.cached_session_info(id).await {
-            return Ok(info);
+        if let Some(answer) = self.cached_session_info(id, fingerprint).await {
+            return answer;
         }
-        // An inventory snapshot's absence must not become a cached claim that
+        // A snapshot kept only by its age must not become a cached claim that
         // an exact native identity was deleted or never existed.
-        self.read_native_sessions(None)
+        self.read_native_sessions(None, fingerprint)
             .await?
             .into_iter()
             .find(|info| info.asid.0 == id)
@@ -4273,6 +4312,7 @@ mod admission_tests {
         nonempty.runtime = None;
         *driver.session_metadata.lock().await = Some(SessionMetadata {
             listed_at: tokio::time::Instant::now(),
+            fingerprint: None,
             sessions: [empty.clone(), nonempty]
                 .into_iter()
                 .map(|info| (info.asid.0.clone(), info))
@@ -4545,6 +4585,62 @@ mod admission_tests {
     }
 
     #[tokio::test]
+    async fn unchanged_native_store_answers_session_reads_without_a_new_process() {
+        static STORE: AtomicU64 = AtomicU64::new(1);
+        let fixture = Fixture::new().await;
+        let driver = fixture.qoder_driver();
+        std::fs::write(fixture.directory.join("sessions.json"), r#"{"listed":[]}"#).unwrap();
+        let lists = || {
+            fixture
+                .methods()
+                .iter()
+                .filter(|m| *m == "session/list")
+                .count()
+        };
+        // The task follower reads a saved session every minute, longer than
+        // the metadata cache; a dormant task's session may not be listed.
+        // (store token offered, snapshot age, store changed, listings launched
+        // by one read of a listed and one of an unlisted identity)
+        for (fingerprinted, by, changed, relisted) in [
+            (true, SESSION_METADATA_TTL, false, 0),
+            (true, SESSION_METADATA_TTL, true, 1),
+            (true, SESSION_STORE_MAX_AGE, false, 1),
+            // Age alone never proves an identity absent.
+            (false, Duration::ZERO, false, 1),
+            (false, SESSION_METADATA_TTL, false, 2),
+        ] {
+            if fingerprinted {
+                driver.set_session_store(|| Some(STORE.load(Ordering::SeqCst)));
+            } else {
+                driver.set_session_store(|| None);
+            }
+            assert!(driver.get_session("listed").await.is_ok());
+            if changed {
+                STORE.fetch_add(1, Ordering::SeqCst);
+            }
+            driver
+                .session_metadata
+                .lock()
+                .await
+                .as_mut()
+                .unwrap()
+                .listed_at = tokio::time::Instant::now() - by;
+            let before = lists();
+            assert!(driver.get_session("listed").await.is_ok());
+            assert!(matches!(
+                driver.get_session("absent").await,
+                Err(AgentError::SessionNotFound(_))
+            ));
+            assert_eq!(
+                lists() - before,
+                relisted,
+                "{fingerprinted} {by:?} {changed}"
+            );
+        }
+        driver.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn list_expiry_observes_external_sessions_and_failures_are_not_cached() {
         let fixture = Fixture::new().await;
         let driver = fixture.qoder_driver();
@@ -4793,6 +4889,7 @@ mod admission_tests {
         );
         *driver.session_metadata.lock().await = Some(SessionMetadata {
             listed_at: tokio::time::Instant::now(),
+            fingerprint: None,
             sessions: rows
                 .into_iter()
                 .map(|info| (info.asid.0.clone(), info))

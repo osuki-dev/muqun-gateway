@@ -21,6 +21,15 @@ seconds and failures for five. These reads start no ACP session or model prompt.
 succeeded. The first session open is the ACP negotiation boundary. A missing or
 invalid executable does not block other adapters.
 
+Session listings and reads of a saved session that the Gateway does not hold
+go through a short-lived `fx acp` child (`initialize`, `session/list`). That
+child is started again only when FX's saved-session store (`~/.fx/sessions`:
+its indexes, each conversation's log, not blobs or lock files) has changed, or
+at least every 10 minutes; an unchanged store answers from the previous
+listing, including that an unlisted session is not saved. The Home refresh and
+the task follower read every minute, so without this each read was a cold
+process racing the 30-second listing budget.
+
 Each Gateway session owns one private `fx acp` stdio child. The ACP connection
 carries JSON-RPC messages, `session/update` notifications and
 `session/request_permission` requests. Initialization and session creation happen
