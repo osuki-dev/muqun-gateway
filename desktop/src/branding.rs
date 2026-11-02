@@ -11,6 +11,7 @@ use base64::Engine as _;
 pub const APP_NAME: &str = "Muqun Desktop";
 
 /// The full-size icon, 1024×1024, for packaging and the window icon later.
+#[allow(dead_code)] // the window icon and packaging arrive later
 pub const APP_ICON_PNG: &[u8] = include_bytes!("../assets/icons/app-icon.png");
 
 /// The same mark at 64×64 (`magick app-icon.png -resize 64x64 -strip`), for

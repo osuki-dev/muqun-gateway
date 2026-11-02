@@ -122,6 +122,7 @@ impl Drain {
         if let Some(bindings) = self.inner.bindings.lock().unwrap().clone() {
             blinc_core::reactive::batch_stateful_deps(|| {
                 bindings.draft.signal().set(None);
+                bindings.settings_open.signal().set(false);
                 if changed {
                     bindings.selected.signal().set(Some(asid.to_string()));
                 }
@@ -135,6 +136,7 @@ impl Drain {
         if let Some(bindings) = self.inner.bindings.lock().unwrap().clone() {
             blinc_core::reactive::batch_stateful_deps(|| {
                 bindings.draft.signal().set(None);
+                bindings.settings_open.signal().set(false);
                 if changed {
                     bindings.selected.signal().set(None);
                     bindings.header.signal().set(None);
@@ -152,6 +154,7 @@ impl Drain {
         }
     }
 
+    #[allow(dead_code)] // for views that read the whole state
     /// Read the view under its lock. Main thread; keep it short.
     pub fn with_view<R>(&self, f: impl FnOnce(&ViewState) -> R) -> R {
         f(&self.inner.view.lock().unwrap())

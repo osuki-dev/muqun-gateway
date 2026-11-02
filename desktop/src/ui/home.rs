@@ -20,11 +20,11 @@ use blinc_layout::prelude::*;
 use blinc_theme::ThemeState;
 
 use super::motion::{self, MotionPrefs};
-use super::sessions::{local_utc_offset, now_ms};
-use super::shell::SIDEBAR_DEFAULT;
+use super::sessions::now_ms;
 use super::text::{display_text, ui_text};
 use super::App;
-use crate::config::Density;
+use crate::config::{Density, UiPrefs};
+use crate::platform::shell::local_utc_offset;
 use facts::{first_run, DayPart, Layout, LocalTime, Stats};
 use words::Words;
 
@@ -94,7 +94,7 @@ fn window_width(main_width: f32) -> f32 {
     if w > 0.0 {
         w
     } else {
-        main_width + SIDEBAR_DEFAULT
+        main_width + UiPrefs::SIDEBAR_DEFAULT
     }
 }
 
@@ -102,7 +102,7 @@ fn page(app: &App, main_width: f32) -> Div {
     let config = app.config.get();
     let layout = Layout::for_window(window_width(main_width));
     let words = Words {
-        language: app.strings.language,
+        language: app.strings.language(),
     };
     let agents = app.bindings.agents.get();
     let sessions = app.bindings.sessions.get();

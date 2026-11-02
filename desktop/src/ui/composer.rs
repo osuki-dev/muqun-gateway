@@ -24,9 +24,10 @@ pub const COMPOSER_HEIGHT: f32 = 116.0;
 
 pub fn composer(app: &App) -> impl ElementBuilder {
     let header = app.bindings.header.clone();
+    let agents_state = app.bindings.agents.clone();
     let app = app.clone();
     stateful_with_key::<NoState>("mq-composer")
-        .deps([header.signal_id()])
+        .deps([header.signal_id(), agents_state.signal_id()])
         .on_state(move |_| {
             let info = header.get();
             let busy = info.as_ref().is_some_and(|i| {
@@ -36,12 +37,18 @@ pub fn composer(app: &App) -> impl ElementBuilder {
                 )
             });
             let has_session = info.is_some();
+            let placeholder = match &info {
+                Some(i) => app
+                    .strings
+                    .composer_placeholder(&super::agents::name(&i.agent_id, &agents_state.get())),
+                None => app.strings.composer_no_session().to_string(),
+            };
             let asid = info.map(|i| i.asid.clone());
 
             let input = textarea(&app.composer)
                 .rows(3)
                 .w_full()
-                .placeholder(app.strings.composer_placeholder())
+                .placeholder(placeholder)
                 .disabled(!has_session);
 
             let key_app = app.clone();

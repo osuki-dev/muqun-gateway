@@ -45,6 +45,9 @@ pub enum UiAction {
     },
 }
 
+// `Event` carries a whole domain event, by far the biggest; updates live in the
+// queue for one frame, so boxing every event would cost more than the padding.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum Update {
     Agents(Vec<AgentDiscoveryInfo>),
@@ -53,7 +56,7 @@ pub enum Update {
         agent: String,
         sessions: Vec<AgentSessionInfo>,
     },
-    SessionCreated(AgentSessionInfo),
+    SessionCreated(Box<AgentSessionInfo>),
     Snapshot(Box<AgentSessionSnapshot>),
     Event(AgentDomainEvent),
     Error(UiError),
@@ -64,7 +67,6 @@ pub enum Update {
     Completions {
         prefix: String,
         entries: Vec<DirectoryEntry>,
-        truncated: bool,
     },
     Ui(UiAction),
 }

@@ -10,6 +10,8 @@ use muqun_gateway::{relative_since, untitled_placeholder};
 use super::agents::{self, Standing};
 use super::text::ui_text;
 use super::App;
+use crate::config::{ConfigEdit, Grouping};
+use crate::model::commands::Command;
 
 pub fn sidebar(app: &App, height: f32) -> Div {
     div()
@@ -25,7 +27,8 @@ pub fn sidebar(app: &App, height: f32) -> Div {
                 .flex_shrink_0()
                 .child(new_session_button(app))
                 .child(home_entry(app))
-                .child(filter_chips(app)),
+                .child(filter_chips(app))
+                .child(grouping_button(app)),
         )
         .child(
             div()
@@ -36,6 +39,75 @@ pub fn sidebar(app: &App, height: f32) -> Div {
                 .child(scroll().w_full().h_full().child(session_list(app))),
         )
         .child(agents_panel(app))
+        .child(settings_entry(app))
+}
+
+fn settings_entry(app: &App) -> impl ElementBuilder {
+    let open = app.bindings.settings_open.clone();
+    let app = app.clone();
+    stateful_with_key::<NoState>("mq-settings-entry")
+        .deps([open.signal_id()])
+        .on_state(move |_| {
+            let mut row = div().class("mq-nav-item").class("mq-settings-entry");
+            if open.get() {
+                row = row.class("mq-nav-item--active");
+            }
+            let click = app.clone();
+            let row = row
+                .w_full()
+                .flex_row()
+                .items_center()
+                .cursor_pointer()
+                .child(super::icons::settings())
+                .child(
+                    div().class("mq-nav-label").flex_1().child(
+                        ui_text(click.strings.settings())
+                            .size(13.0)
+                            .no_wrap()
+                            .no_cursor(),
+                    ),
+                )
+                .child(
+                    ui_text(super::shortcut(","))
+                        .size(11.0)
+                        .no_wrap()
+                        .no_cursor(),
+                )
+                .on_click(move |_| {
+                    if click.bindings.settings_open.get() {
+                        click.close_settings();
+                    } else {
+                        click.open_settings();
+                    }
+                });
+            div()
+                .class("mq-settings-wrap")
+                .w_full()
+                .flex_shrink_0()
+                .child(row)
+        })
+}
+
+/// One button that steps through Time → Agent → Folder, remembered.
+fn grouping_button(app: &App) -> impl ElementBuilder {
+    let grouping = app.bindings.grouping.clone();
+    let app = app.clone();
+    stateful_with_key::<NoState>("mq-grouping")
+        .deps([grouping.signal_id()])
+        .on_state(move |_| {
+            let current = grouping.get();
+            let step = app.clone();
+            div().w_full().child(
+                button(app.strings.group_by(current))
+                    .variant(ButtonVariant::Ghost)
+                    .size(ButtonSize::Small)
+                    .on_click(move |_| {
+                        let next = step.bindings.grouping.get().next();
+                        step.bindings.grouping.signal().set(next);
+                        step.send(Command::Edit(ConfigEdit::Grouping(next)));
+                    }),
+            )
+        })
 }
 
 fn new_session_button(app: &App) -> impl ElementBuilder {
@@ -87,6 +159,7 @@ fn filter_chips(app: &App) -> impl ElementBuilder {
     let sessions = app.bindings.sessions.clone();
     let filter = app.bindings.filter.clone();
     let strings = app.strings;
+    let remember = app.clone();
     stateful_with_key::<NoState>("mq-filter-chips")
         .deps([
             agents_state.signal_id(),
@@ -105,11 +178,15 @@ fn filter_chips(app: &App) -> impl ElementBuilder {
                     c = c.child(agents::dot(id));
                 }
                 let filter = filter.clone();
+                let remember = remember.clone();
                 c.flex_row()
                     .items_center()
                     .cursor_pointer()
                     .child(ui_text(label).size(11.0).no_wrap().no_cursor())
-                    .on_click(move |_| filter.signal().set(value.clone()))
+                    .on_click(move |_| {
+                        filter.signal().set(value.clone());
+                        remember.send(Command::Edit(ConfigEdit::AgentFilter(value.clone())));
+                    })
             };
             let mut row = div().class("mq-chips").w_full().flex_row().flex_wrap();
             row = row.child(chip(strings.all().to_string(), None, None));
@@ -144,7 +221,7 @@ impl DayGroup {
         }
     }
 
-    fn label(self, strings: &super::strings::Strings) -> &'static str {
+    pub fn label(self, strings: &super::strings::Strings) -> &'static str {
         match self {
             Self::Today => strings.today(),
             Self::Yesterday => strings.yesterday(),
@@ -152,22 +229,6 @@ impl DayGroup {
             Self::Earlier => strings.earlier(),
         }
     }
-}
-
-/// The local zone's offset from UTC right now, in seconds.
-pub fn local_utc_offset() -> i64 {
-    #[cfg(unix)]
-    {
-        // SAFETY: `localtime_r` writes only into `tm`, which we own.
-        unsafe {
-            let now = libc::time(std::ptr::null_mut());
-            let mut tm: libc::tm = std::mem::zeroed();
-            if !libc::localtime_r(&now, &mut tm).is_null() {
-                return tm.tm_gmtoff;
-            }
-        }
-    }
-    0
 }
 
 pub fn now_ms() -> u64 {
@@ -182,6 +243,8 @@ fn session_list(app: &App) -> impl ElementBuilder {
     let selected = app.bindings.selected.clone();
     let filter = app.bindings.filter.clone();
     let attention = app.bindings.attention.clone();
+    let grouping = app.bindings.grouping.clone();
+    let agents_state = app.bindings.agents.clone();
     let app = app.clone();
     stateful_with_key::<NoState>("mq-session-list")
         .deps([
@@ -189,15 +252,16 @@ fn session_list(app: &App) -> impl ElementBuilder {
             selected.signal_id(),
             filter.signal_id(),
             attention.signal_id(),
+            grouping.signal_id(),
+            agents_state.signal_id(),
         ])
         .on_state(move |_| {
             let sessions = sessions.get();
             let selected = selected.get();
             let filter = filter.get();
             let attention = attention.get();
-            let (now, offset) = (now_ms(), local_utc_offset());
             let mut list = div().class("mq-session-list").w_full().flex_col();
-            let shown: Vec<_> = sessions
+            let shown: Vec<&AgentSessionInfo> = sessions
                 .iter()
                 .filter(|s| filter.as_deref().is_none_or(|f| s.agent_id == f))
                 .collect();
@@ -208,23 +272,83 @@ fn session_list(app: &App) -> impl ElementBuilder {
                         .child(ui_text(app.strings.no_sessions()).size(13.0)),
                 );
             }
-            let mut group = None;
-            for session in shown {
-                let this = DayGroup::of(session.updated_ms, now, offset);
-                if group != Some(this) {
-                    group = Some(this);
-                    list = list.child(
-                        div()
-                            .class("mq-group")
-                            .child(ui_text(this.label(&app.strings)).size(11.0).semibold()),
-                    );
+            let agents_list = agents_state.get();
+            let groups = group_sessions(
+                &shown,
+                grouping.get(),
+                now_ms(),
+                crate::platform::shell::local_utc_offset(),
+            );
+            for (heading, members) in groups {
+                let label = match heading {
+                    Heading::Day(day) => day.label(&app.strings).to_string(),
+                    Heading::Agent(id) => agents::name(&id, &agents_list),
+                    Heading::Folder(path) => {
+                        let home = dirs::home_dir();
+                        muqun_gateway::home_relative(&path, home.as_deref())
+                    }
+                    Heading::NoFolder => app.strings.no_folder().to_string(),
+                };
+                list = list.child(
+                    div()
+                        .class("mq-group")
+                        .child(ui_text(label).size(11.0).semibold().no_wrap()),
+                );
+                for session in members {
+                    let active = selected.as_deref() == Some(session.asid.0.as_str());
+                    let waiting = attention.iter().any(|p| p.asid == session.asid);
+                    list = list.child(row(&app, session, active, waiting));
                 }
-                let active = selected.as_deref() == Some(session.asid.0.as_str());
-                let waiting = attention.iter().any(|p| p.asid == session.asid);
-                list = list.child(row(&app, session, active, waiting));
             }
             list
         })
+}
+
+/// What a group of sessions is called.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Heading {
+    Day(DayGroup),
+    Agent(String),
+    Folder(String),
+    NoFolder,
+}
+
+/// `sessions` (newest first) split into headed groups. Time keeps the
+/// calendar-day order; Agent follows the gateway's preference order; Folder
+/// puts the folder with the most recently active session first. Within a
+/// group the order stays newest first.
+pub fn group_sessions<'a>(
+    sessions: &[&'a AgentSessionInfo],
+    grouping: Grouping,
+    now_ms: u64,
+    utc_offset_s: i64,
+) -> Vec<(Heading, Vec<&'a AgentSessionInfo>)> {
+    let mut groups: Vec<(Heading, Vec<&AgentSessionInfo>)> = Vec::new();
+    for session in sessions {
+        let heading = match grouping {
+            Grouping::Time => Heading::Day(DayGroup::of(session.updated_ms, now_ms, utc_offset_s)),
+            Grouping::Agent => Heading::Agent(session.agent_id.clone()),
+            Grouping::Folder => match session.directory.as_deref().filter(|d| !d.is_empty()) {
+                Some(dir) => Heading::Folder(dir.to_string()),
+                None => Heading::NoFolder,
+            },
+        };
+        match groups.iter_mut().find(|(h, _)| *h == heading) {
+            Some((_, members)) => members.push(session),
+            None => groups.push((heading, vec![session])),
+        }
+    }
+    if grouping == Grouping::Agent {
+        let rank = |h: &Heading| match h {
+            Heading::Agent(id) => crate::hub::AGENT_PREFERENCE
+                .iter()
+                .position(|p| p == id)
+                .unwrap_or(usize::MAX),
+            _ => usize::MAX,
+        };
+        groups.sort_by_key(|(h, _)| rank(h));
+    }
+    groups
 }
 
 pub fn title_of(app: &App, session: &AgentSessionInfo) -> String {
@@ -304,23 +428,11 @@ fn agents_panel(app: &App) -> impl ElementBuilder {
                 .flex_row()
                 .items_center()
                 .cursor_pointer()
-                // Lucide chevrons as SVG (as blinc_cn's accordion): the UI face has no ▸/▾.
+                .child(super::icons::chevron(is_open))
                 .child(
-                    svg(if is_open {
-                        r#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>"#
-                    } else {
-                        r#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"/></svg>"#
-                    })
-                    .size(12.0, 12.0)
-                    .color(blinc_theme::ThemeState::get().color(blinc_theme::ColorToken::TextSecondary))
-                    .mr(1.5)
-                    .flex_shrink_0(),
-                )
-                .child(
-                    ui_text(strings.agents())
-                        .size(12.0)
-                        .semibold()
-                        .no_cursor(),
+                    div()
+                        .class("mq-agents-title")
+                        .child(ui_text(strings.agents()).size(12.0).semibold().no_cursor()),
                 )
                 .on_click(move |_| toggle.signal().set(!is_open));
             let mut panel = div()
@@ -410,5 +522,48 @@ mod tests {
             DayGroup::Today,
             "a clock ahead"
         );
+    }
+
+    fn session(asid: &str, agent: &str, dir: Option<&str>, updated_ms: u64) -> AgentSessionInfo {
+        serde_json::from_value(serde_json::json!({
+            "asid": asid, "title": asid, "status": "idle",
+            "updated_ms": updated_ms, "agent_id": agent, "directory": dir,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn sessions_group_by_agent_in_gateway_order_and_by_folder_by_recency() {
+        let all = [
+            session("a", "claude", Some("/w/x"), 30),
+            session("b", "codex", Some("/w/y"), 20),
+            session("c", "claude", Some("/w/y"), 10),
+            session("d", "codex", None, 5),
+        ];
+        let refs: Vec<&AgentSessionInfo> = all.iter().collect();
+        let by_agent = group_sessions(&refs, Grouping::Agent, 0, 0);
+        let heads: Vec<_> = by_agent.iter().map(|(h, _)| h.clone()).collect();
+        assert_eq!(
+            heads,
+            [
+                Heading::Agent("codex".into()),
+                Heading::Agent("claude".into())
+            ],
+            "codex precedes claude in the gateway's order"
+        );
+        assert_eq!(by_agent[1].1.len(), 2);
+
+        let by_folder = group_sessions(&refs, Grouping::Folder, 0, 0);
+        let heads: Vec<_> = by_folder.iter().map(|(h, _)| h.clone()).collect();
+        assert_eq!(
+            heads,
+            [
+                Heading::Folder("/w/x".into()),
+                Heading::Folder("/w/y".into()),
+                Heading::NoFolder
+            ],
+            "first appearance in newest-first order is the most recent folder"
+        );
+        assert_eq!(by_folder[1].1.len(), 2);
     }
 }

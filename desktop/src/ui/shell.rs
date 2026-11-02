@@ -14,15 +14,15 @@ use muqun_gateway::home_relative;
 use super::agents;
 use super::sessions::title_of;
 use super::text::ui_text;
-use super::{composer, errors, home, new_session, sessions, timeline, App};
+use super::{composer, errors, home, new_session, sessions, settings, timeline, App};
 use crate::branding::{mark_data_uri, APP_NAME};
-use crate::config::Scheme;
+use crate::config::{ConfigEdit, Scheme};
 use crate::model::commands::Command;
 
 pub const TOP_BAR_HEIGHT: f32 = 44.0;
-pub const SIDEBAR_DEFAULT: f32 = 300.0;
-pub const SIDEBAR_MIN: f32 = 240.0;
-pub const SIDEBAR_MAX: f32 = 420.0;
+use crate::config::UiPrefs;
+const SIDEBAR_MIN: f32 = UiPrefs::SIDEBAR_MIN;
+const SIDEBAR_MAX: f32 = UiPrefs::SIDEBAR_MAX;
 pub const RIGHT_MAX: f32 = 420.0;
 
 pub fn top_bar(app: &App) -> Div {
@@ -114,38 +114,50 @@ fn scheme_toggle(app: &App) -> impl ElementBuilder {
         .size(ButtonSize::Small)
         .on_click(move |_| {
             // An explicit choice stops following the system.
-            if let Some(mut watcher) = app.scheme_watcher.lock().unwrap().take() {
-                watcher.stop();
-            }
-            let theme = ThemeState::get();
-            let next = theme.scheme().toggle();
-            theme.set_scheme(next);
-            app.send(Command::PersistScheme(match next {
+            let next = match ThemeState::get().scheme().toggle() {
                 ColorScheme::Light => Scheme::Light,
                 ColorScheme::Dark => Scheme::Dark,
-            }));
+            };
+            app.apply_scheme(next);
         })
 }
 
 pub fn body(ctx: &WindowedContext, app: &App) -> Div {
     let height = (ctx.height - TOP_BAR_HEIGHT).max(0.0);
-    let main_width = (ctx.width - SIDEBAR_DEFAULT).max(0.0);
+    let sidebar_width = app.config.get().ui.sidebar();
+    let main_width = (ctx.width - sidebar_width).max(0.0);
+    let remember = app.clone();
     div().class("mq-body").w_full().h(height).child(
         resizable_group()
             .key("mq-shell")
             .horizontal()
             .handle_thickness(1.0)
+            .on_resize(move |sizes| {
+                if let Some(width) = sizes.first().copied().filter(|w| *w > 0.0) {
+                    remember.send(Command::Edit(ConfigEdit::SidebarWidth(width)));
+                }
+            })
             .panel(
                 resizable_panel()
-                    .default_size(SIDEBAR_DEFAULT)
+                    .default_size(sidebar_width)
                     .min_size(SIDEBAR_MIN)
                     .max_size(SIDEBAR_MAX)
                     .child(sessions::sidebar(app, height)),
             )
             .panel(
-                resizable_panel()
-                    .flex_grow()
-                    .child(main_panel(app, main_width, height)),
+                // Absolutely placed, so the panel's width never depends on its
+                // content: a flex panel is sized from its content's natural
+                // width, and a long unwrapped line in a message would shrink
+                // the sidebar below the width asked for.
+                resizable_panel().flex_grow().child(
+                    div()
+                        .absolute()
+                        .left(0.0)
+                        .top(0.0)
+                        .right(0.0)
+                        .bottom(0.0)
+                        .child(main_panel(app, main_width, height)),
+                ),
             )
             .panel(
                 resizable_panel()
@@ -160,11 +172,19 @@ pub fn body(ctx: &WindowedContext, app: &App) -> Div {
 fn main_panel(app: &App, width: f32, height: f32) -> Div {
     let selected = app.bindings.selected.clone();
     let draft = app.bindings.draft.clone();
+    let settings_open = app.bindings.settings_open.clone();
     let strip = errors::strip(app);
     let app = app.clone();
     let view = stateful_with_key::<NoState>("mq-main-view")
-        .deps([selected.signal_id(), draft.signal_id()])
+        .deps([
+            selected.signal_id(),
+            draft.signal_id(),
+            settings_open.signal_id(),
+        ])
         .on_state(move |_| {
+            if settings_open.get() {
+                return settings::page(&app, height);
+            }
             if draft.get().is_some() {
                 return new_session::page(&app, height);
             }

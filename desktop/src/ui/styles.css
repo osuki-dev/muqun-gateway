@@ -2,55 +2,9 @@
    derives from the installed theme's ColorTokens (theme/tokens.rs) -- with
    one deliberate exception below. */
 
-/* Agent brand colours (architecture §6.1b): one fixed hue per agent, the
-   same in every theme, so a badge reads the same everywhere. These are not
-   theme tokens and do not shadow any; a theme may later adjust their
-   lightness, never their hue.
-     codex        #10A37F  green    160°
-     opencode     #F97316  orange    25°
-     deepseek     #4F6BFE  indigo   230°
-     t3           #8B5CF6  violet   260°
-     fx           #D946EF  magenta  292°
-     qoder        #06B6D4  cyan     189°
-     pi           #EAB308  yellow    45°
-     claude       #E5484D  red      358°
-     antigravity  #65A30D  lime      85°
-     cursor       #94A3B8  slate    215° (low saturation)  */
-:root {
-    --agent-codex: #10A37F;
-    --agent-opencode: #F97316;
-    --agent-deepseek: #4F6BFE;
-    --agent-t3: #8B5CF6;
-    --agent-fx: #D946EF;
-    --agent-qoder: #06B6D4;
-    --agent-pi: #EAB308;
-    --agent-claude: #E5484D;
-    --agent-antigravity: #65A30D;
-    --agent-cursor: #94A3B8;
-    --agent-other: #94A3B8;
-}
-.mq-agent--codex { color: var(--agent-codex); border-color: var(--agent-codex); }
-.mq-agent--opencode { color: var(--agent-opencode); border-color: var(--agent-opencode); }
-.mq-agent--deepseek { color: var(--agent-deepseek); border-color: var(--agent-deepseek); }
-.mq-agent--t3 { color: var(--agent-t3); border-color: var(--agent-t3); }
-.mq-agent--fx { color: var(--agent-fx); border-color: var(--agent-fx); }
-.mq-agent--qoder { color: var(--agent-qoder); border-color: var(--agent-qoder); }
-.mq-agent--pi { color: var(--agent-pi); border-color: var(--agent-pi); }
-.mq-agent--claude { color: var(--agent-claude); border-color: var(--agent-claude); }
-.mq-agent--antigravity { color: var(--agent-antigravity); border-color: var(--agent-antigravity); }
-.mq-agent--cursor { color: var(--agent-cursor); border-color: var(--agent-cursor); }
-.mq-agent--other { color: var(--agent-other); border-color: var(--agent-other); }
-.mq-agent-dot.mq-agent--codex { background: var(--agent-codex); }
-.mq-agent-dot.mq-agent--opencode { background: var(--agent-opencode); }
-.mq-agent-dot.mq-agent--deepseek { background: var(--agent-deepseek); }
-.mq-agent-dot.mq-agent--t3 { background: var(--agent-t3); }
-.mq-agent-dot.mq-agent--fx { background: var(--agent-fx); }
-.mq-agent-dot.mq-agent--qoder { background: var(--agent-qoder); }
-.mq-agent-dot.mq-agent--pi { background: var(--agent-pi); }
-.mq-agent-dot.mq-agent--claude { background: var(--agent-claude); }
-.mq-agent-dot.mq-agent--antigravity { background: var(--agent-antigravity); }
-.mq-agent-dot.mq-agent--cursor { background: var(--agent-cursor); }
-.mq-agent-dot.mq-agent--other { background: var(--agent-other); }
+/* Agent brand colours: `--agent-<id>` and the `.mq-agent--<id>` rules that use
+   them come from `theme/agents.rs` (one hue per agent, lightness following the
+   scheme), added after this sheet and again on every scheme change. */
 .mq-agent-badge {
     border: 1px solid;
     border-radius: 5px;
@@ -127,7 +81,7 @@
     padding: 6px 10px 10px 10px;
     gap: 2px;
 }
-.mq-agents-header { padding: 6px 0; color: var(--text-secondary); }
+.mq-agents-header { padding: 6px 0; gap: 4px; color: var(--text-secondary); }
 .mq-agent-row { padding: 4px 0; gap: 2px; }
 .mq-agent-name { padding-left: 8px; color: var(--text-primary); }
 .mq-agent-reason { padding-left: 16px; color: var(--text-tertiary); }
@@ -387,3 +341,51 @@
     gap: 8px;
     align-items: center;
 }
+
+.mq-settings { background: var(--background); }
+.mq-settings-head {
+    gap: 12px;
+    padding: 20px 32px 8px 32px;
+    color: var(--text-tertiary);
+}
+.mq-settings-tabs { padding: 0 32px; }
+.mq-settings-pane { padding: 16px 0 40px 0; }
+.mq-set-col { gap: 14px; }
+.mq-set-title { padding-top: 10px; color: var(--text-tertiary); }
+.mq-set-hint { color: var(--text-tertiary); }
+.mq-set-field { gap: 6px; }
+.mq-set-actions { gap: 8px; padding-top: 2px; }
+.mq-set-choices { gap: 8px; }
+.mq-set-error { color: var(--error); }
+.mq-note {
+    padding: 8px 12px;
+    border-radius: 8px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    color: var(--text-secondary);
+}
+.mq-note--changed {
+    padding: 8px 12px;
+    border-radius: 8px;
+    background: var(--accent-subtle);
+    border: 1px solid var(--primary);
+    color: var(--text-primary);
+}
+.mq-agent-section {
+    gap: 10px;
+    padding: 14px 16px;
+    border-radius: 12px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+}
+.mq-agent-section-head { gap: 10px; }
+.mq-agent-section-name { padding-left: 2px; color: var(--text-primary); }
+.mq-settings-wrap { padding: 0 8px 8px 8px; }
+.mq-settings-entry { gap: 8px; }
+.mq-nav-label { color: inherit; }
+.mq-folder-option { gap: 10px; }
+/* blinc_cn builds the chooser's list with this id and a 200px cap; MAX_OPTIONS
+   rows of the app's height fit in this one. */
+#mq-chooser_options_content { max-height: 380px; }
+.mq-folder-option--missing { opacity: 0.45; }
+.mq-folder-tag { color: var(--text-tertiary); }

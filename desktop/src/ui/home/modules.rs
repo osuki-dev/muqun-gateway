@@ -732,7 +732,7 @@ fn agents_module(ctx: &Ctx, agent_list: &[AgentDiscoveryInfo]) -> Div {
 /// any, the version, and the command-palette shortcut.
 pub fn footer(app: &App, offset: i64) -> Div {
     let words = Words {
-        language: app.strings.language,
+        language: app.strings.language(),
     };
     let sessions = app.bindings.sessions.get();
     let usage = Usage::today(&sessions, now_ms(), offset);

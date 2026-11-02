@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use muqun_gateway::agents::{AgentSessionId, PermissionDecision};
 use tokio::sync::mpsc;
 
-use crate::config::{Scheme, WindowGeometry};
+use crate::config::ConfigEdit;
 
 #[derive(Debug, Clone)]
 pub enum Command {
@@ -38,10 +38,9 @@ pub enum Command {
     LoadProjects {
         agent: String,
     },
-    /// The window's size changed; persisted after it settles.
-    PersistWindow(WindowGeometry),
-    /// The owner picked a colour scheme; persisted at once.
-    PersistScheme(Scheme),
+    /// The owner changed a setting or arranged the window. Applied at once
+    /// in memory, written to disk after 500 ms without another edit.
+    Edit(ConfigEdit),
 }
 
 pub type CommandSender = mpsc::UnboundedSender<Command>;
