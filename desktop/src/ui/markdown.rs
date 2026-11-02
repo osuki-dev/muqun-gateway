@@ -390,7 +390,6 @@ pub fn parse(text: &str) -> Arc<Vec<Block>> {
 pub struct Palette {
     pub text: Color,
     pub muted: Color,
-    pub subtle: Color,
     pub link: Color,
     pub code: Color,
 }
@@ -401,7 +400,6 @@ impl Palette {
         Self {
             text: t.color(ColorToken::TextPrimary),
             muted: t.color(ColorToken::TextSecondary),
-            subtle: t.color(ColorToken::TextTertiary),
             link: t.color(ColorToken::TextLink),
             code: t.color(ColorToken::Info),
         }

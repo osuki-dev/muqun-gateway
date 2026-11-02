@@ -31,6 +31,7 @@ use super::markdown::Palette;
 use super::parts::{self, interact, scale, PartCtx};
 use super::text::ui_text;
 use super::App;
+use crate::model::view::{segmented, split_row_id};
 use controller::{Controller, LEAD};
 
 /// The pending approvals the timeline shows as items of its own (the rest
@@ -221,7 +222,8 @@ fn row(
 ) -> impl ElementBuilder {
     let sig = app.bindings.rows.signal(asid, id);
     let mut deps = vec![sig.signal_id()];
-    let item = app.drain.item(id);
+    let (item_id, _) = split_row_id(id);
+    let item = app.drain.item(item_id);
     if let Some(AgentPart::Form { request }) = item.as_ref().map(|i| &i.part) {
         deps.push(
             app.bindings
@@ -237,14 +239,25 @@ fn row(
     stateful_with_key::<NoState>(format!("mq-row.{asid}.{id}"))
         .deps(deps)
         .on_state(move |_| {
-            let Some(item) = app.drain.item(&id) else {
+            let (item_id, k) = split_row_id(&id);
+            let Some(item) = app.drain.item(item_id) else {
                 return div().class("mq-row");
+            };
+            let (range, last) = match segmented(&item) {
+                Some(text) => {
+                    let segs = crate::model::stream::segments(text);
+                    let n = segs.len();
+                    (segs.get(k).cloned().unwrap_or(0..0), k + 1 >= n)
+                }
+                None => (0..usize::MAX, true),
             };
             let ctx = PartCtx {
                 app: &app,
                 asid: &asid,
                 item: &item,
-                live: app.drain.live_boundary(&asid, &id),
+                live: app.drain.live_boundary(&asid, item_id),
+                range,
+                last,
                 density: scale::Density::current(),
                 palette,
                 width,

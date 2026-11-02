@@ -33,8 +33,13 @@ pub struct PartCtx<'a> {
     pub app: &'a App,
     pub asid: &'a str,
     pub item: &'a TimelineItem,
-    /// Where the settled prefix ends while this part streams.
+    /// Where the settled prefix ends while this part streams (only on the
+    /// row that holds the tail).
     pub live: Option<usize>,
+    /// The bytes of the item's text this row shows (a long assistant text is
+    /// several rows), and whether it is the item's last row.
+    pub range: std::ops::Range<usize>,
+    pub last: bool,
     pub density: Density,
     pub palette: Palette,
     /// The timeline's content width, for proportional limits.

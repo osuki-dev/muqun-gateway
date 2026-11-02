@@ -27,8 +27,9 @@ pub struct SessionView {
     pub info: AgentSessionInfo,
     /// The timeline in display order.
     pub items: Vec<Arc<TimelineItem>>,
-    /// `items[i]`'s size descriptor, for the list's height estimates.
-    shapes: Vec<Shape>,
+    /// `items[i]`'s rows: one, or several for a long assistant text
+    /// (`stream::segments`), each with its size descriptor.
+    rows: Vec<Vec<Shape>>,
     by_id: HashMap<String, Arc<TimelineItem>>,
     pub pending_permissions: Vec<PermissionRequest>,
     pub pending_forms: Vec<FormRequest>,
@@ -46,7 +47,7 @@ impl SessionView {
         let mut view = Self {
             info,
             items: Vec::with_capacity(timeline.len()),
-            shapes: Vec::with_capacity(timeline.len()),
+            rows: Vec::with_capacity(timeline.len()),
             by_id: HashMap::with_capacity(timeline.len()),
             pending_permissions,
             pending_forms,
@@ -69,39 +70,49 @@ impl SessionView {
     }
 
     /// Replace the item with `item`'s id, or insert it where its
-    /// [`TimelineItem::sort_key`] puts it. The insertion index when the
-    /// order changed.
-    fn upsert(&mut self, item: TimelineItem) -> Option<usize> {
+    /// [`TimelineItem::sort_key`] puts it.
+    fn upsert(&mut self, item: TimelineItem) -> Upserted {
         let item = Arc::new(item);
-        let shape = Shape::of(&item);
+        let rows = Shape::rows(&item);
         self.by_id.insert(item.id.clone(), item.clone());
         if let Some(at) = self.position(&item.id) {
             self.items[at] = item;
-            self.shapes[at] = shape;
-            return None;
+            let regrown = self.rows[at].len() != rows.len();
+            self.rows[at] = rows;
+            return if regrown {
+                Upserted::Resegmented
+            } else {
+                Upserted::Replaced
+            };
         }
         let at = self
             .items
             .partition_point(|existing| existing.sort_key() <= item.sort_key());
         self.items.insert(at, item);
-        self.shapes.insert(at, shape);
-        Some(at)
+        self.rows.insert(at, rows);
+        Upserted::Inserted(at)
+    }
+
+    /// The list row ids of item `id`.
+    pub fn row_ids(&self, id: &str) -> Vec<String> {
+        let n = self.position(id).map(|at| self.rows[at].len()).unwrap_or(1);
+        (0..n).map(|k| row_id(id, k)).collect()
     }
 
     fn remove(&mut self, gone: &HashSet<&String>) -> bool {
         let before = self.items.len();
         let mut keep = Vec::with_capacity(before);
-        let mut shapes = Vec::with_capacity(before);
-        for (item, shape) in self.items.drain(..).zip(self.shapes.drain(..)) {
+        let mut rows = Vec::with_capacity(before);
+        for (item, row) in self.items.drain(..).zip(self.rows.drain(..)) {
             if gone.contains(&item.id) {
                 self.by_id.remove(&item.id);
             } else {
                 keep.push(item);
-                shapes.push(shape);
+                rows.push(row);
             }
         }
         self.items = keep;
-        self.shapes = shapes;
+        self.rows = rows;
         self.items.len() != before
     }
 
@@ -121,6 +132,43 @@ impl SessionView {
                     AgentPart::Text { .. } | AgentPart::Reasoning { .. }
                 )
         })
+    }
+}
+
+/// What an upsert did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Upserted {
+    Inserted(usize),
+    Replaced,
+    /// Replaced, and the item is now shown as a different number of rows.
+    Resegmented,
+}
+
+/// Separates an item id from its row number in a list row id.
+const ROW_SEP: char = '\u{1F}';
+
+/// The id of row `k` of item `id`: the item id itself for the first row.
+pub fn row_id(id: &str, k: usize) -> String {
+    if k == 0 {
+        id.to_string()
+    } else {
+        format!("{id}{ROW_SEP}{k}")
+    }
+}
+
+/// The item id and row number in a list row id.
+pub fn split_row_id(row: &str) -> (&str, usize) {
+    match row.split_once(ROW_SEP) {
+        Some((id, k)) => (id, k.parse().unwrap_or(0)),
+        None => (row, 0),
+    }
+}
+
+/// Whether an item's text is shown in segments (`stream::segments`).
+pub fn segmented(item: &TimelineItem) -> Option<&str> {
+    match (&item.part, item.role) {
+        (AgentPart::Text { text }, TimelineRole::Assistant) => Some(text),
+        _ => None,
     }
 }
 
@@ -147,6 +195,25 @@ pub struct Shape {
 }
 
 impl Shape {
+    /// The shapes of the rows `item` is shown as.
+    pub fn rows(item: &TimelineItem) -> Vec<Shape> {
+        match segmented(item) {
+            Some(text) => super::stream::segments(text)
+                .into_iter()
+                .map(|r| Self::text(ShapeKind::Prose, &text[r]))
+                .collect(),
+            None => vec![Self::of(item)],
+        }
+    }
+
+    fn text(kind: ShapeKind, text: &str) -> Self {
+        Self {
+            kind,
+            chars: text.chars().count().min(u32::MAX as usize) as u32,
+            lines: text.bytes().filter(|b| *b == b'\n').count() as u32 + 1,
+        }
+    }
+
     pub fn of(item: &TimelineItem) -> Self {
         let text_shape = |kind, text: &str| {
             let lines = text.bytes().filter(|b| *b == b'\n').count() as u32 + 1;
@@ -341,7 +408,7 @@ impl ViewState {
                             .as_deref()
                             .is_some_and(|n| item.message_id.as_str() < n);
                         if older && !view.by_id.contains_key(&item.id) {
-                            view.upsert((*item).clone());
+                            let _ = view.upsert((*item).clone());
                         }
                     }
                     view.exhausted = kept.exhausted;
@@ -387,11 +454,15 @@ impl ViewState {
                     let older = first
                         .as_ref()
                         .is_none_or(|f| item.sort_key() < f.sort_key());
-                    if active.upsert(item).is_some() {
-                        changes.order = true;
-                        if older {
-                            changes.prepended += 1;
+                    match active.upsert(item) {
+                        Upserted::Inserted(_) => {
+                            changes.order = true;
+                            if older {
+                                changes.prepended += 1;
+                            }
                         }
+                        Upserted::Resegmented => changes.order = true,
+                        Upserted::Replaced => {}
                     }
                     if !changes.items.contains(&id) {
                         changes.items.push(id);
@@ -502,11 +573,15 @@ impl ViewState {
                 };
                 for item in items {
                     let id = item.id.clone();
-                    if let Some(at) = active.upsert(item) {
-                        changes.order = true;
-                        if at + 1 == active.items.len() {
-                            changes.appended += 1;
+                    match active.upsert(item) {
+                        Upserted::Inserted(at) => {
+                            changes.order = true;
+                            if at + 1 == active.items.len() {
+                                changes.appended += 1;
+                            }
                         }
+                        Upserted::Resegmented => changes.order = true,
+                        Upserted::Replaced => {}
                     }
                     if !changes.items.contains(&id) {
                         changes.items.push(id);
@@ -581,8 +656,13 @@ impl ViewState {
             .as_ref()
             .map(|active| TimelineOrder {
                 asid: active.info.asid.0.clone(),
-                ids: active.items.iter().map(|i| i.id.clone()).collect(),
-                shapes: active.shapes.clone(),
+                ids: active
+                    .items
+                    .iter()
+                    .zip(&active.rows)
+                    .flat_map(|(i, r)| (0..r.len()).map(move |k| row_id(&i.id, k)))
+                    .collect(),
+                shapes: active.rows.iter().flatten().copied().collect(),
                 exhausted: active.exhausted,
             })
             .unwrap_or_default()

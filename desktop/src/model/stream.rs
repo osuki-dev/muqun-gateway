@@ -77,6 +77,53 @@ pub fn settled_boundary(text: &str) -> usize {
     boundary
 }
 
+/// A long text is shown as several rows of about this many bytes, cut at
+/// block boundaries, so the windowed list builds only the part of a long
+/// reply that is on screen and a streaming reply rebuilds only its last
+/// row as blocks settle.
+pub const SEGMENT_BYTES: usize = 3 * 1024;
+
+/// The rows a text is shown as: byte ranges cut at the first block
+/// boundary (as [`settled_boundary`] finds them) after every
+/// [`SEGMENT_BYTES`]. The last range always runs to the end. A cut depends
+/// only on the text before it, so the ranges of a growing text never move:
+/// a streaming reply only ever gains rows at its end.
+pub fn segments(text: &str) -> Vec<std::ops::Range<usize>> {
+    let mut cuts = vec![0];
+    let mut open: Option<(char, usize)> = None;
+    let mut at = 0;
+    for line in text.split_inclusive('\n') {
+        let end = at + line.len();
+        let complete = line.ends_with('\n');
+        let content = line.trim_end_matches(['\n', '\r']);
+        let mut boundary = false;
+        match open {
+            Some((ch, len)) => {
+                if let Some((c, l)) = fence(content) {
+                    if c == ch && l >= len && content.trim().chars().all(|x| x == ch) {
+                        open = None;
+                        boundary = complete;
+                    }
+                }
+            }
+            None => {
+                if let Some(f) = fence(content) {
+                    open = Some(f);
+                } else if complete && content.trim().is_empty() {
+                    boundary = true;
+                }
+            }
+        }
+        let last = *cuts.last().expect("starts with 0");
+        if boundary && end - last >= SEGMENT_BYTES && end < text.len() {
+            cuts.push(end);
+        }
+        at = end;
+    }
+    cuts.push(text.len());
+    cuts.windows(2).map(|w| w[0]..w[1]).collect()
+}
+
 /// How the tail is shown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TailKind {
@@ -197,6 +244,33 @@ mod tests {
         let b = settled_boundary(text);
         assert_eq!(tail(text, b), (TailKind::Code, "fn main() {\n"));
         assert_eq!(tail("Hi\n\nthere ", 4), (TailKind::Prose, "there"));
+    }
+
+    #[test]
+    fn long_texts_split_into_stable_segments_at_block_boundaries() {
+        let para = format!("{}\n\n", "word ".repeat(100)); // ~500 bytes
+        let text = para.repeat(20); // ~10 KB
+        let segs = segments(&text);
+        assert!(segs.len() >= 3, "{segs:?}");
+        assert_eq!(segs[0].start, 0);
+        assert_eq!(segs.last().unwrap().end, text.len());
+        for w in segs.windows(2) {
+            assert_eq!(w[0].end, w[1].start);
+            assert!(
+                text[..w[0].end].ends_with("\n\n"),
+                "cut at a block boundary"
+            );
+        }
+        // A prefix of the text keeps every complete cut.
+        let prefix = &text[..text.len() * 2 / 3];
+        let early = segments(prefix);
+        for (a, b) in early.iter().zip(&segs).take(early.len() - 1) {
+            assert_eq!(a, b);
+        }
+        // Short texts and fences are one segment.
+        assert_eq!(segments("short"), vec![0..5]);
+        let fenced = format!("```\n{}```\n", "x\n\n".repeat(2000));
+        assert_eq!(segments(&fenced).len(), 1, "no cut inside a fence");
     }
 
     #[test]

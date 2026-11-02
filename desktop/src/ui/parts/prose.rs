@@ -11,16 +11,18 @@ use crate::model::stream::{self, TailKind};
 use crate::ui::markdown::{self, copy_button, Setting};
 use crate::ui::text::{MONO_FONT, UI_FONT};
 
-/// Markdown for settled text; for the streaming part, the settled blocks
-/// then the tail bound to `stream_tail`, then the cursor.
+/// Markdown for this row's part of the text; on the streaming row, the
+/// settled blocks, then the tail bound to `stream_tail`, then the cursor.
 fn body(ctx: &PartCtx<'_>, text: &str, setting: &Setting) -> Div {
     let key = ctx.key("md");
     let chrome = ctx.chrome(&key);
-    let Some(boundary) = ctx.live else {
-        return markdown::render(&markdown::parse(text), setting, &chrome);
+    let range = ctx.range.start.min(text.len())..ctx.range.end.min(text.len());
+    let Some(boundary) = ctx.live.filter(|_| ctx.last) else {
+        let own = text.get(range).unwrap_or("");
+        return markdown::render(&markdown::parse(own), setting, &chrome);
     };
-    let boundary = boundary.min(text.len());
-    let settled = text.get(..boundary).unwrap_or("");
+    let from = crate::model::drain::tail_from(text, boundary.min(text.len()));
+    let settled = text.get(range.start..from.max(range.start)).unwrap_or("");
     let mut column = div().w_full().flex_col();
     if !settled.trim().is_empty() {
         column = column.child(markdown::render(
@@ -29,7 +31,7 @@ fn body(ctx: &PartCtx<'_>, text: &str, setting: &Setting) -> Div {
             &chrome,
         ));
     }
-    let (kind, _) = stream::tail(text, boundary);
+    let (kind, _) = stream::tail(text, from);
     column
         .child(tail(&ctx.app.bindings.stream_tail, kind, setting))
         .child(
@@ -85,7 +87,7 @@ pub fn text(ctx: &PartCtx<'_>, text: &str) -> Div {
         .w_full()
         .flex_col()
         .child(body(ctx, text, &setting));
-    if ctx.live.is_none() && !text.trim().is_empty() {
+    if ctx.last && ctx.live.is_none() && !text.trim().is_empty() {
         row = row.child(div().class("mq-row-actions").flex_row().child(copy_button(
             &ctx.key("copy"),
             ctx.app.strings.copy(),

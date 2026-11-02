@@ -382,7 +382,7 @@ impl Drain {
                 if let Some(item) = view.item(&id) {
                     let text = part_text(&item);
                     stream.boundary = stream::settled_boundary(text);
-                    let (kind, tail) = stream::tail(text, stream.boundary);
+                    let (kind, tail) = stream::tail(text, tail_from(text, stream.boundary));
                     stream.kind = Some(kind);
                     plan.tail = Some(tail.to_string());
                     stream.throttle.offer(Instant::now());
@@ -400,7 +400,8 @@ impl Drain {
             }
         }
         drop(stream);
-        plan.rows = rows;
+        // Items to rows: a long text is several list rows.
+        plan.rows = rows.iter().flat_map(|id| active.row_ids(id)).collect();
         if changes.order || changes.opened {
             plan.order = Some(Arc::new(view.order()));
         }
@@ -450,10 +451,15 @@ impl Drain {
                 // settle, which a later frame retries.
                 stream.dirty = true;
             }
-            let (kind, tail) = stream::tail(text, stream.boundary);
+            let (kind, tail) = stream::tail(text, tail_from(text, stream.boundary));
             let settled = settled || Some(kind) != stream.kind;
             stream.kind = Some(kind);
-            ((asid, id, settled), tail.to_string())
+            // Only the last row of a segmented text holds the tail.
+            let row = match stream::segments(text).len() {
+                0 | 1 => id.clone(),
+                n => super::view::row_id(&id, n - 1),
+            };
+            ((asid, row, settled), tail.to_string())
         };
         let (asid, id, settled) = key;
         let bumps = if settled {
@@ -470,6 +476,14 @@ impl Drain {
         // A deferred settle keeps the drain ticking until it lands.
         self.inner.stream.lock().unwrap().dirty
     }
+}
+
+/// Where the tail starts: the settled boundary, or the start of the text's
+/// last row when the boundary lags behind it (a settle held back by
+/// [`stream::SETTLE_INTERVAL`] while a new row began).
+pub fn tail_from(text: &str, boundary: usize) -> usize {
+    let last = stream::segments(text).last().map_or(0, |r| r.start);
+    boundary.max(last)
 }
 
 /// The text a streaming part shows.
