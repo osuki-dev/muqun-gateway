@@ -76,6 +76,8 @@ pub enum Update {
         items: Vec<muqun_gateway::agents::TimelineItem>,
         exhausted: bool,
     },
+    /// Themes, applied by `ui/themes.rs` on the main thread.
+    Theme(Box<crate::theme::service::ThemeUpdate>),
 }
 
 #[derive(Default)]

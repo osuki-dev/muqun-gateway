@@ -127,7 +127,8 @@ struct Inner {
     bindings: Mutex<Option<Bindings>>,
     actions: Mutex<Option<ActionHandler>>,
     hook: Mutex<Option<Arc<dyn FrameHook>>>,
-    scheme: Mutex<Option<blinc_theme::ColorScheme>>,
+    /// The colours the rows were last built with: scheme and theme id.
+    scheme: Mutex<Option<(blinc_theme::ColorScheme, Option<String>)>>,
 }
 
 #[derive(Clone)]
@@ -305,24 +306,39 @@ impl Drain {
         }
     }
 
-    /// Rows bake theme colours into their rich text: a scheme switch has to
-    /// render them again.
+    /// Rows bake theme colours into their rich text: a scheme or theme switch
+    /// (from the top bar, Settings or the themes panel alike) has to render
+    /// them again.
     fn check_scheme(&self, bindings: &Bindings) {
         let Some(theme) = ThemeState::try_get() else {
             return;
         };
-        let scheme = theme.scheme();
+        let colours = (theme.scheme(), crate::theme::apply::current_theme_id());
         let mut seen = self.inner.scheme.lock().unwrap();
-        if seen.is_some_and(|s| s != scheme) {
+        if seen.as_ref().is_some_and(|s| *s != colours) {
             bindings
                 .theme_epoch
                 .signal()
                 .set(bindings.theme_epoch.get() + 1);
         }
-        *seen = Some(scheme);
+        *seen = Some(colours);
     }
 
     fn apply(&self, bindings: &Bindings, hook: Option<&dyn FrameHook>, batch: Vec<Update>) {
+        // Themes have their own bindings (`ui/themes.rs`); they never touch
+        // the session view.
+        let (themes, batch): (Vec<Update>, Vec<Update>) = batch
+            .into_iter()
+            .partition(|u| matches!(u, Update::Theme(_)));
+        for update in themes {
+            if let Update::Theme(update) = update {
+                crate::ui::themes::apply_update(*update);
+            }
+        }
+        self.check_scheme(bindings);
+        if batch.is_empty() {
+            return;
+        }
         let mut changes = Changes::default();
         let (plan, timeline_batch) = {
             let mut view = self.inner.view.lock().unwrap();

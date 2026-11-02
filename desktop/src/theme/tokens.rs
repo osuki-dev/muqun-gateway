@@ -231,8 +231,7 @@ mod tests {
     }
 
     fn courier() -> (Palette, Palette) {
-        let theme =
-            crate::theme::muqun_theme::ThemeFile::parse(crate::theme::COVER_COURIER_JSON).unwrap();
+        let theme = crate::theme::pack::Manifest::parse(crate::theme::COVER_COURIER_JSON).unwrap();
         (
             Palette::try_from(&theme.variants.light.colors).unwrap(),
             Palette::try_from(&theme.variants.dark.colors).unwrap(),
@@ -323,7 +322,7 @@ mod tests {
     fn a_bad_colour_names_the_token() {
         let (light, _) = courier();
         let _ = light;
-        let mut raw = crate::theme::muqun_theme::ThemeFile::parse(crate::theme::COVER_COURIER_JSON)
+        let mut raw = crate::theme::pack::Manifest::parse(crate::theme::COVER_COURIER_JSON)
             .unwrap()
             .variants
             .light

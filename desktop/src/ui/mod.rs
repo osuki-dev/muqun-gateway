@@ -17,6 +17,7 @@ pub mod settings;
 pub mod shell;
 pub mod strings;
 pub mod text;
+pub mod themes;
 pub mod timeline;
 
 use std::sync::{Arc, Mutex};
@@ -185,15 +186,22 @@ const KEY_ESCAPE: u32 = 27;
 const KEY_0: u32 = 48;
 const KEY_N: u32 = 78;
 const KEY_COMMA: u32 = 188;
+const KEY_T: u32 = 84;
 
 /// The window-wide shortcuts. Key-down reaches every key handler
 /// (`renderer/events.rs` `broadcast_key_event`), so this one sees all keys
 /// and only acts on its own chords.
 fn on_key(app: &App, ctx: &blinc_layout::event_handler::EventContext) {
     let chord = ctx.ctrl || ctx.meta;
+    let toggle_themes = ctx.key_code == KEY_T && chord && ctx.shift;
+    if !toggle_themes && themes::is_open() && themes::on_key(app, ctx) {
+        return;
+    }
     let composer_focused = app.composer.lock().map(|s| s.is_focused()).unwrap_or(false);
     match ctx.key_code {
         KEY_N if chord => app.open_draft(),
+        // The themes panel, until Settings → Appearance mounts it.
+        KEY_T if toggle_themes => themes::toggle(),
         KEY_0 if chord => app.drain.go_home(),
         KEY_COMMA if chord => {
             if app.bindings.settings_open.get() {
@@ -249,6 +257,7 @@ pub fn install_css(ctx: &mut WindowedContext) {
         ctx.add_css(&css);
     }
     ctx.add_css(STYLES);
+    ctx.add_css(themes::THEMES_CSS);
     sync_agent_colours(ctx);
 }
 
@@ -278,6 +287,11 @@ pub fn root(ctx: &WindowedContext, app: &App) -> Div {
         .h(ctx.height)
         .flex_col()
         .child(shell::top_bar(app))
-        .child(shell::body(ctx, app))
+        .child(themes::shell_body(shell::body(ctx, app)))
+        .child(themes::overlay(
+            app,
+            ctx.width,
+            (ctx.height - shell::TOP_BAR_HEIGHT).max(0.0),
+        ))
         .on_key_down(move |ctx| on_key(&keys, ctx))
 }

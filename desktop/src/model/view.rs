@@ -436,6 +436,8 @@ impl ViewState {
                 self.error = Some(error);
                 changes.error = true;
             }
+            // Routed past the view by the drain (`drain.rs` `apply`).
+            Update::Theme(_) => {}
             Update::Projects { agent, projects } => {
                 self.projects = ProjectList { agent, projects };
                 changes.projects = true;

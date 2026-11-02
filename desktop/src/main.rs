@@ -64,7 +64,7 @@ fn main() -> anyhow::Result<()> {
     commands::send(&tx, Command::Refresh);
 
     ui::text::register_fonts();
-    let watcher = theme::install(config.appearance.scheme)?;
+    let scheme_watcher = theme::install(&config_dir, &state_dir, &config.appearance)?;
 
     let geometry = config.window.clamped();
     let window = WindowConfig {
@@ -87,7 +87,6 @@ fn main() -> anyhow::Result<()> {
 
     ui::strings::Strings::set_language(config.general.language);
     let strings = ui::strings::Strings;
-    let scheme_watcher = Arc::new(Mutex::new(watcher));
     let paths = Arc::new(ui::Paths {
         config_dir: config_dir.clone(),
         state_dir: state_dir.clone(),

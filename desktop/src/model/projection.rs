@@ -233,6 +233,13 @@ impl Core {
                 }
                 Err(err) => tracing::debug!(%err, "project list unavailable"),
             },
+            command @ (Command::ThemeRefresh
+            | Command::ThemeInstall(_)
+            | Command::ThemeRemove(_)
+            | Command::ThemeApply(..)
+            | Command::ThemeImportFile(_)) => {
+                crate::theme::service::run(command, self.inbox.clone(), self.config.clone()).await;
+            }
             Command::CompleteDirectory { .. } | Command::Edit(_) => {
                 unreachable!("handled in the command loop")
             }
