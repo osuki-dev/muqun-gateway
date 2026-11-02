@@ -544,6 +544,9 @@ pub struct AcpDriver<P: AcpProvider> {
     launch: StdMutex<Option<AcpLaunch>>,
     mcp_servers: StdMutex<Value>,
     terminal: StdMutex<Option<Arc<dyn TerminalBridge>>>,
+    /// Terminal-held sessions a follower task is polling, and until when
+    /// (`follow_terminal`). One follower per session.
+    followers: StdMutex<HashMap<String, tokio::time::Instant>>,
     me: Weak<Self>,
     /// The last model catalog a live session offered, kept after its
     /// process is released so choices stay available.
@@ -665,6 +668,7 @@ impl<P: AcpProvider> AcpDriver<P> {
             launch: StdMutex::new(None),
             mcp_servers: StdMutex::new(json!([])),
             terminal: StdMutex::new(None),
+            followers: StdMutex::new(HashMap::new()),
             me: me.clone(),
             last_catalog: StdMutex::new(None),
             owned: StdMutex::new(OwnedSessions::default()),
@@ -861,18 +865,41 @@ impl<P: AcpProvider> AcpDriver<P> {
 
     /// Follow a terminal-held transcript after input from here, so readers
     /// see the turn the terminal runs.
+    ///
+    /// One follower per session: every prepare and every send asks, and
+    /// each follower re-reads the whole transcript on every change, so a
+    /// second ask extends the running follower's window rather than
+    /// adding another reader of the same file.
     fn follow_terminal(&self, id: String) {
+        let deadline = tokio::time::Instant::now() + TERMINAL_FOLLOW;
+        if self
+            .followers
+            .lock()
+            .unwrap()
+            .insert(id.clone(), deadline)
+            .is_some()
+        {
+            return;
+        }
         let driver = self.me.clone();
         tokio::spawn(async move {
-            let started = tokio::time::Instant::now();
             let mut seen = None;
-            while started.elapsed() < TERMINAL_FOLLOW {
+            loop {
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 let Some(driver) = driver.upgrade() else {
                     return;
                 };
-                if driver.stop.is_cancelled() {
-                    return;
+                // Decided under the lock, so an extension that lands as the
+                // window closes keeps this follower rather than losing it.
+                {
+                    let mut followers = driver.followers.lock().unwrap();
+                    let open = followers.get(&id).is_some_and(|deadline| {
+                        tokio::time::Instant::now() < *deadline && !driver.stop.is_cancelled()
+                    });
+                    if !open {
+                        followers.remove(&id);
+                        return;
+                    }
                 }
                 let Some(directory) = driver
                     .native_session_info(&id)
@@ -880,6 +907,7 @@ impl<P: AcpProvider> AcpDriver<P> {
                     .ok()
                     .and_then(|info| info.directory)
                 else {
+                    driver.followers.lock().unwrap().remove(&id);
                     return;
                 };
                 let modified = P::transcript_modified(&directory, &id);
@@ -888,6 +916,7 @@ impl<P: AcpProvider> AcpDriver<P> {
                 }
                 seen = modified;
                 let Some(live) = driver.terminal_live(&id).await else {
+                    driver.followers.lock().unwrap().remove(&id);
                     return;
                 };
                 if driver.refresh_terminal_snapshot(&id, &live).await.is_ok() {
