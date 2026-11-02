@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use muqun_gateway::agents::{AgentSessionId, PermissionDecision};
 use tokio::sync::mpsc;
 
-use crate::config::ConfigEdit;
+use crate::config::{ConfigEdit, Scheme};
 
 #[derive(Debug, Clone)]
 pub enum Command {
@@ -29,6 +29,15 @@ pub enum Command {
         id: String,
         decision: PermissionDecision,
     },
+    /// The next older page of the session's history (architecture §3
+    /// `earlier`).
+    LoadEarlier(AgentSessionId),
+    ReplyForm {
+        asid: AgentSessionId,
+        id: String,
+        /// `{ field key: value }`, as the gateway's form route takes it.
+        answers: serde_json::Value,
+    },
     /// Folders under a typed prefix. Debounced on the core side; only the
     /// answer for the newest prefix is delivered.
     CompleteDirectory {
@@ -41,6 +50,17 @@ pub enum Command {
     /// The owner changed a setting or arranged the window. Applied at once
     /// in memory, written to disk after 500 ms without another edit.
     Edit(ConfigEdit),
+    /// Themes (`theme/service.rs`). The library list, and the gallery index
+    /// (from its 1 h cache when fresh) with its card pictures.
+    ThemeRefresh,
+    /// Download theme `id` from the gallery, check its SHA-256, install it.
+    ThemeInstall(String),
+    /// Remove an installed theme (built-ins cannot be).
+    ThemeRemove(String),
+    /// Make theme `id` current in `scheme`, and remember both.
+    ThemeApply(String, Scheme),
+    /// Install a `.muqun-theme` from disk (file dialog or drop).
+    ThemeImportFile(PathBuf),
 }
 
 pub type CommandSender = mpsc::UnboundedSender<Command>;

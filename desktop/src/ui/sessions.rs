@@ -183,7 +183,7 @@ fn filter_chips(app: &App) -> impl ElementBuilder {
                     c = c.class("mq-chip--active");
                 }
                 if let Some(id) = brand {
-                    c = c.child(agents::dot(id));
+                    c = c.child(agents::mark(id, 14.0));
                 }
                 let filter = filter.clone();
                 let remember = remember.clone();
@@ -219,7 +219,7 @@ pub enum DayGroup {
 }
 
 impl DayGroup {
-    #[cfg(test)]
+    /// The group of an update at `updated_ms`, seen at `now_ms`.
     pub fn of(updated_ms: u64, now_ms: u64, utc_offset_s: i64) -> Self {
         Self::of_day(
             local_day(updated_ms, utc_offset_s),
@@ -480,7 +480,7 @@ fn render_row(app: &App, session: &SessionRow) -> Div {
                 .no_wrap()
                 .no_cursor(),
         )
-        .child(agents::badge(&session.agent_id))
+        .child(agents::mark(&session.agent_id, 16.0))
         .on_click(move |_| click.open_session(&asid))
 }
 

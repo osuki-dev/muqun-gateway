@@ -6,8 +6,6 @@
 //! under whatever is typed, "Browse…" for the system picker, and a typed path
 //! used as typed. `~` is expanded when the session is created.
 
-use std::path::PathBuf;
-
 use blinc_cn::components::combobox::{ComboboxBuilder, ComboboxOption};
 use blinc_cn::prelude::{button, ButtonSize, ButtonVariant};
 use blinc_layout::prelude::*;
@@ -121,7 +119,7 @@ fn agent_list(app: &App) -> impl ElementBuilder {
                     .w_full()
                     .flex_row()
                     .items_center()
-                    .child(agents::dot(&info.id))
+                    .child(agents::mark(&info.id, 16.0))
                     .child(
                         div().class("mq-pick-name").flex_1().child(
                             ui_text(agents::name(&info.id, &agents_list))
@@ -375,15 +373,6 @@ pub fn accept_typed_folder(app: &App) -> bool {
     clear_search();
     ctx.use_state_keyed(CHOOSER_OPEN, || false).set(false);
     true
-}
-
-/// A launch card's button: start `agent` in `cwd` now.
-pub fn launch_button(app: &App, agent: String, cwd: PathBuf) -> impl ElementBuilder {
-    let app = app.clone();
-    button(app.strings.new_session())
-        .variant(ButtonVariant::Outline)
-        .size(ButtonSize::Small)
-        .on_click(move |_| app.create(agent.clone(), cwd.clone()))
 }
 
 /// The system folder picker; the choice goes into the chooser. The

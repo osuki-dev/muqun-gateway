@@ -147,6 +147,12 @@ impl Language {
 pub struct Appearance {
     pub scheme: Scheme,
     pub theme_id: String,
+    /// "Reduce motion" (architecture §6.1 red line 6): the middle and large
+    /// motion tiers become short fades.
+    pub reduced_motion: bool,
+    /// "Reduce transparency" (§6.1d): glass surfaces fall back to solid.
+    pub reduced_transparency: bool,
+    pub density: Density,
 }
 
 impl Default for Appearance {
@@ -154,8 +160,20 @@ impl Default for Appearance {
         Self {
             scheme: Scheme::System,
             theme_id: crate::theme::DEFAULT_THEME_ID.to_string(),
+            reduced_motion: false,
+            reduced_transparency: false,
+            density: Density::Comfortable,
         }
     }
+}
+
+/// Row heights and spacing, scaled together (§6.1d).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Density {
+    #[default]
+    Comfortable,
+    Compact,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -386,6 +404,8 @@ mod tests {
         assert!(!config.agents.deepseek.enabled, "the gateway's default");
         assert_eq!(config.appearance.scheme, Scheme::System);
         assert_eq!(config.appearance.theme_id, "cover-courier");
+        assert!(!config.appearance.reduced_motion && !config.appearance.reduced_transparency);
+        assert_eq!(config.appearance.density, Density::Comfortable);
         assert_eq!(config.window, WindowGeometry::default());
     }
 

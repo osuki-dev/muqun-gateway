@@ -47,9 +47,6 @@ pub enum UiAction {
     Open(String),
 }
 
-// `Event` carries a whole domain event, by far the biggest; updates live in the
-// queue for one frame, so boxing every event would cost more than the padding.
-#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum Update {
     Agents(Vec<AgentDiscoveryInfo>),
@@ -60,7 +57,7 @@ pub enum Update {
     },
     SessionCreated(Box<AgentSessionInfo>),
     Snapshot(Box<AgentSessionSnapshot>),
-    Event(AgentDomainEvent),
+    Event(Box<AgentDomainEvent>),
     Error(UiError),
     Projects {
         agent: String,
@@ -71,6 +68,22 @@ pub enum Update {
         entries: Vec<DirectoryEntry>,
     },
     Ui(UiAction),
+    /// An older page of a session's history, oldest first. `exhausted`:
+    /// the agent has nothing older.
+    Earlier {
+        asid: String,
+        items: Vec<muqun_gateway::agents::TimelineItem>,
+        exhausted: bool,
+    },
+    /// Themes, applied by `ui/themes.rs` on the main thread.
+    Theme(Box<crate::theme::service::ThemeUpdate>),
+}
+
+impl Update {
+    /// A domain event; boxed because it is by far the largest variant.
+    pub fn event(event: AgentDomainEvent) -> Self {
+        Self::Event(Box::new(event))
+    }
 }
 
 #[derive(Default)]
@@ -151,7 +164,7 @@ impl State {
                 self.pending.push(Update::Snapshot(snapshot));
                 true
             }
-            Update::Event(event) => self.accept_event(event),
+            Update::Event(event) => self.accept_event(*event),
             other => {
                 self.pending.push(other);
                 true
@@ -175,19 +188,19 @@ impl State {
             seq,
         } = event
         else {
-            self.pending.push(Update::Event(event));
+            self.pending.push(Update::event(event));
             return true;
         };
         let mut fresh = Vec::with_capacity(items.len());
         for item in items {
             match self.upserts.get(&(asid.clone(), item.id.clone())) {
                 Some(&(at, index)) => {
-                    if let Some(Update::Event(AgentDomainEvent::TimelineUpsert {
-                        items: earlier,
-                        ..
-                    })) = self.pending.get_mut(at)
-                    {
-                        earlier[index] = item;
+                    if let Some(Update::Event(event)) = self.pending.get_mut(at) {
+                        if let AgentDomainEvent::TimelineUpsert { items: earlier, .. } =
+                            &mut **event
+                        {
+                            earlier[index] = item;
+                        }
                     }
                 }
                 None => fresh.push(item),
@@ -202,7 +215,7 @@ impl State {
                 .insert((asid.clone(), item.id.clone()), (at, index));
         }
         self.pending
-            .push(Update::Event(AgentDomainEvent::TimelineUpsert {
+            .push(Update::event(AgentDomainEvent::TimelineUpsert {
                 asid: id,
                 items: fresh,
                 seq,
@@ -235,7 +248,7 @@ mod tests {
     }
 
     fn upsert(asid: &str, seq: u64, items: Vec<TimelineItem>) -> Update {
-        Update::Event(AgentDomainEvent::TimelineUpsert {
+        Update::event(AgentDomainEvent::TimelineUpsert {
             asid: AgentSessionId(asid.into()),
             items,
             seq,
@@ -244,13 +257,16 @@ mod tests {
 
     fn texts(update: &Update) -> Vec<String> {
         match update {
-            Update::Event(AgentDomainEvent::TimelineUpsert { items, .. }) => items
-                .iter()
-                .map(|i| match &i.part {
-                    AgentPart::Text { text } => format!("{}={text}", i.id),
-                    _ => unreachable!(),
-                })
-                .collect(),
+            Update::Event(event) => match &**event {
+                AgentDomainEvent::TimelineUpsert { items, .. } => items
+                    .iter()
+                    .map(|i| match &i.part {
+                        AgentPart::Text { text } => format!("{}={text}", i.id),
+                        _ => unreachable!(),
+                    })
+                    .collect(),
+                other => panic!("{other:?}"),
+            },
             other => panic!("{other:?}"),
         }
     }
@@ -285,7 +301,7 @@ mod tests {
     fn stale_and_replayed_events_are_dropped() {
         let inbox = Inbox::new();
         let status = |seq| {
-            Update::Event(AgentDomainEvent::StatusChanged {
+            Update::event(AgentDomainEvent::StatusChanged {
                 asid: AgentSessionId("s".into()),
                 status: AgentSessionStatus::Busy,
                 error: None,
@@ -330,7 +346,7 @@ mod tests {
             counter.fetch_add(1, Ordering::SeqCst);
         }));
         let resync = || {
-            Update::Event(AgentDomainEvent::Resync {
+            Update::event(AgentDomainEvent::Resync {
                 asid: AgentSessionId(String::new()),
                 reason: "lagged".into(),
             })

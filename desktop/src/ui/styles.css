@@ -2,14 +2,43 @@
    derives from the installed theme's ColorTokens (theme/tokens.rs) -- with
    one deliberate exception below. */
 
+/* scale -- architecture §6.1d: a 4 px baseline; radii 6/8/12; type
+   11/12/13/15/18/24/32/56 (sizes are set on text in code,
+   ui/parts/scale.rs and ui/home/scale.rs, with these numbers); spacing
+   4/8/12/16/20/24/32/40. The one set for the whole app. */
+:root {
+    --mq-base: 4px;
+    --mq-radius-sm: 6px;
+    --mq-radius-md: 8px;
+    --mq-radius-lg: 12px;
+    --mq-fs-11: 11px;
+    --mq-fs-12: 12px;
+    --mq-fs-13: 13px;
+    --mq-fs-15: 15px;
+    --mq-fs-18: 18px;
+    --mq-fs-24: 24px;
+    --mq-fs-32: 32px;
+    --mq-fs-56: 56px;
+    --mq-space-1: 4px;
+    --mq-space-2: 8px;
+    --mq-space-3: 12px;
+    --mq-space-4: 16px;
+    --mq-space-5: 20px;
+    --mq-space-6: 24px;
+    --mq-space-8: 32px;
+    --mq-space-10: 40px;
+    /* Density: the gap under each timeline row. */
+    --mq-row-gap: 16px;
+    --mq-row-gap-compact: 8px;
+    --mq-bar-3: 3px;
+    --mq-hairline: 1px;
+    --mq-motion-micro: 150ms;
+}
+
 /* Agent brand colours: `--agent-<id>` and the `.mq-agent--<id>` rules that use
    them come from `theme/agents.rs` (one hue per agent, lightness following the
    scheme), added after this sheet and again on every scheme change. */
-.mq-agent-badge {
-    border: 1px solid;
-    border-radius: 5px;
-    padding: 1px 4px;
-}
+.mq-agent-mark--idle { color: var(--text-tertiary); }
 
 .mq-root {
     background: var(--background);
@@ -89,43 +118,134 @@
 .mq-standing--checking { color: var(--text-tertiary); }
 .mq-standing--blocked { color: var(--warning); }
 
-.mq-home { padding: 28px 32px; gap: 24px; }
-.mq-hero {
-    gap: 14px;
-    padding: 18px 20px;
-    border-radius: 14px;
-    background: var(--surface);
-    border: 1px solid var(--border);
+/* home ---------------------------------------------------------------
+   Owned by ui/home.rs and ui/home/*. Architecture §6.0 layout, §6.1d
+   visual direction, §5 5b: no colour literal -- every colour is a theme
+   variable (agent hues via --agent-<id>), every size a scale variable. */
+
+.mq-home { background: var(--background); color: var(--text-primary); }
+.mq-home-content {
+    padding: 0 var(--mq-space-10) var(--mq-space-10) var(--mq-space-10);
+    gap: var(--mq-space-10);
 }
-.mq-hero-text { gap: 2px; color: var(--text-secondary); }
-.mq-home-body { gap: 24px; }
-.mq-home-column { gap: 24px; }
-.mq-home-section { gap: 10px; }
-.mq-home-section-title { color: var(--text-tertiary); }
-.mq-launch { gap: 12px; }
-.mq-launch-card {
-    gap: 8px;
-    padding: 14px;
-    border-radius: 12px;
+
+/* hero: the art is a backdrop; its scrim and bottom fade are in the
+   art's alpha (ui/home/cover.rs), so the text stands on the page's own
+   background. Themes without art get this wash from their tokens. */
+.mq-home-art--generated {
+    background: linear-gradient(160deg, var(--surface-elevated) 0%, var(--background) 100%);
+}
+.mq-home-art--glow {
+    background: radial-gradient(circle at 85% 0%, var(--primary) 0%, transparent 70%);
+    opacity: 0.3;
+}
+.mq-home-hero { padding-bottom: var(--mq-space-6); gap: var(--mq-space-2); }
+.mq-home-greeting { color: var(--text-primary); }
+.mq-home-hero-line { gap: var(--mq-space-6); }
+/* the hero's small lines sit over art: text-primary keeps them >= 7:1 in
+   both schemes (Cover Courier's textMuted is 6.7:1 on the light paper) */
+.mq-home-stats, .mq-home-date { color: var(--text-primary); }
+
+/* sections: title 13 px uppercase, 16 px to its content; 40 px between */
+.mq-home-section { gap: var(--mq-space-4); }
+.mq-home-title { color: var(--text-secondary); }
+.mq-home-side { gap: var(--mq-space-10); }
+.mq-home-grid { gap: var(--mq-space-6); }
+
+/* solid content surfaces */
+.mq-home-card {
+    border-radius: var(--mq-radius-lg);
+    border: var(--mq-hairline) solid var(--border);
     background: var(--surface);
-    border: 1px solid var(--border);
+}
+.mq-home-card--padded { padding: var(--mq-space-5); }
+.mq-home-hairline { background: var(--border); }
+.mq-home-teach { color: var(--text-secondary); }
+
+/* launch row */
+.mq-home-launch { gap: var(--mq-space-3); }
+.mq-home-launch-body { gap: var(--mq-space-3); }
+.mq-home-launch-card {
+    padding: var(--mq-space-4) var(--mq-space-4) var(--mq-space-4) var(--mq-space-5);
+    border-radius: var(--mq-radius-lg);
+    border: var(--mq-hairline) solid var(--border);
+    background: var(--surface);
     color: var(--text-primary);
-    transition: transform 150ms ease-out;
+    transition: transform var(--mq-motion-micro) ease-out, border-color var(--mq-motion-micro) ease-out;
 }
-.mq-launch-card:hover { transform: translateY(-1px); }
-.mq-launch-name { padding-left: 8px; color: var(--text-primary); }
-.mq-launch-dir { color: var(--text-tertiary); }
-.mq-recent, .mq-attention { gap: 2px; }
-.mq-recent-row, .mq-attention-row {
-    gap: 10px;
-    padding: 8px 10px;
-    border-radius: 8px;
+.mq-home-launch-card:hover { transform: translateY(-2px); border-color: var(--border-hover); }
+.mq-home-launch-card--primary {
+    padding: var(--mq-space-4);
+    background: var(--primary);
+    border-color: var(--primary);
+    color: var(--text-inverse);
+}
+.mq-home-launch-card--primary:hover { border-color: var(--primary-hover); background: var(--primary-hover); }
+.mq-home-launch-key, .mq-home-launch-hint { padding-top: var(--mq-space-1); color: var(--text-inverse); }
+.mq-home-launch-card--more { color: var(--text-secondary); }
+.mq-home-launch-name { color: var(--text-primary); gap: var(--mq-space-2); }
+.mq-home-launch-lines { gap: var(--mq-space-1); }
+.mq-home-launch-meta { color: var(--text-secondary); }
+.mq-home-launch-choose { color: var(--text-tertiary); }
+/* .mq-home-bar.mq-agent--<id> (the 3 px brand bar) lives in theme/agents.rs with the variables. */
+
+/* continue working: 72 px rows in one card */
+.mq-home-row {
+    height: 72px;
+    padding: 0 var(--mq-space-5);
+    gap: var(--mq-space-3);
+    transition: background var(--mq-motion-micro) ease-out;
+}
+.mq-home-row:hover { background: var(--surface-overlay); }
+.mq-home-row-main { gap: var(--mq-space-1); }
+.mq-home-row-title { color: var(--text-primary); }
+.mq-home-row-meta { gap: var(--mq-space-3); color: var(--text-secondary); }
+.mq-home-row-when { color: var(--text-secondary); }
+.mq-home-dot { border: 1.5px solid var(--text-secondary); }
+.mq-home-dot--busy { background: var(--primary); border-color: var(--primary); }
+.mq-home-dot--waiting { background: var(--warning); border-color: var(--warning); }
+.mq-home-dot--failed { border-color: var(--error); }
+
+/* needs attention */
+.mq-home-attention-body {
+    padding: var(--mq-space-4) var(--mq-space-5) var(--mq-space-4) var(--mq-space-6);
+    gap: var(--mq-space-1);
+}
+.mq-home-attention-prompt { color: var(--text-primary); }
+.mq-home-replies { gap: var(--mq-space-2); padding-top: var(--mq-space-2); }
+.mq-home-reply {
+    padding: var(--mq-space-1) var(--mq-space-3);
+    border-radius: var(--mq-radius-md);
+    transition: background var(--mq-motion-micro) ease-out;
+}
+.mq-home-reply--deny { border: var(--mq-hairline) solid var(--border); color: var(--text-primary); }
+.mq-home-reply--deny:hover { background: var(--surface-overlay); }
+.mq-home-reply--allow { background: var(--primary); color: var(--text-inverse); }
+.mq-home-reply--allow:hover { background: var(--primary-hover); }
+
+/* agents: two columns of rows */
+.mq-home-agents { gap: var(--mq-space-3); }
+.mq-home-agents-row { gap: var(--mq-space-6); }
+.mq-home-agent { gap: var(--mq-space-2); }
+.mq-home-agent-name { color: var(--text-primary); }
+
+/* footer strip */
+.mq-home-footer {
+    padding: 0 var(--mq-space-10);
+    border-top: var(--mq-hairline) solid var(--border);
+    background: var(--background);
     color: var(--text-secondary);
-    transition: background 150ms ease-out;
 }
-.mq-recent-row:hover, .mq-attention-row:hover { background: var(--surface-overlay); }
-.mq-recent-main { gap: 2px; color: var(--text-primary); }
-.mq-recent-dir { color: var(--text-tertiary); }
+.mq-home-footer-part { gap: var(--mq-space-3); }
+
+/* density: compact scales rows and gaps down together */
+.mq-density--compact .mq-home-content { gap: var(--mq-space-8); }
+.mq-density--compact .mq-home-row { height: 56px; }
+.mq-density--compact .mq-home-section { gap: var(--mq-space-3); }
+.mq-density--compact .mq-home-card--padded { padding: var(--mq-space-4); }
+.mq-density--compact .mq-home-attention-body { padding: var(--mq-space-3) var(--mq-space-4) var(--mq-space-3) var(--mq-space-5); }
+
+/* /home -------------------------------------------------------------- */
 
 .mq-new-page { padding: 28px 32px; gap: 10px; max-width: 720px; }
 .mq-field-label { padding-top: 10px; color: var(--text-tertiary); }
@@ -163,30 +283,163 @@
 
 .mq-main { background: var(--background); }
 
+/* ---- timeline (task 0.3) -------------------------------------------
+   Solid, high-contrast content surfaces; no glass. Assistant prose is
+   flush; the user's messages are a quiet solid card; cards are a 1 px
+   hairline with a 3 px left accent. Nothing here transitions except hover
+   colours on controls, and the streaming cursor's own keyframes. */
+.mq-timeline { background: var(--background); }
 .mq-timeline-list {
-    padding: 16px 20px 24px 20px;
-    gap: 10px;
+    padding: 0 var(--mq-space-6) var(--mq-space-8) var(--mq-space-6);
 }
-.mq-item { gap: 4px; }
-.mq-item--user {
-    background: var(--surface-overlay);
-    border-radius: 10px;
-    padding: 10px 12px;
+.mq-row { padding-bottom: var(--mq-row-gap); }
+.mq-density--compact .mq-row { padding-bottom: var(--mq-row-gap-compact); }
+.mq-history { color: var(--text-tertiary); }
+
+.mq-md { gap: var(--mq-space-2); }
+.mq-density--compact .mq-md { gap: var(--mq-space-1); }
+.mq-md-h { padding-top: var(--mq-space-1); }
+.mq-md-list { gap: var(--mq-space-1); }
+.mq-md-quote {
+    border-left: 3px solid var(--border);
+    padding-left: var(--mq-space-3);
 }
-.mq-part-reasoning { color: var(--text-tertiary); }
-.mq-part-tool {
-    gap: 8px;
-    padding: 6px 10px;
-    border-radius: 8px;
+.mq-md-rule { background: var(--border); }
+.mq-md-table { padding: var(--mq-space-1) 0; }
+
+.mq-code {
     border: 1px solid var(--border);
+    border-radius: var(--mq-radius-md);
+    background: var(--surface-elevated);
+}
+.mq-code-head {
+    padding: var(--mq-space-1) var(--mq-space-3);
+    border-bottom: 1px solid var(--border);
+}
+.mq-code-body { padding: var(--mq-space-2) var(--mq-space-3); }
+
+.mq-copy {
+    padding: 2px var(--mq-space-2);
+    border-radius: var(--mq-radius-sm);
+    color: var(--text-tertiary);
+    transition: background 120ms ease-out;
+}
+.mq-copy:hover { background: var(--surface-overlay); color: var(--text-primary); }
+.mq-row-actions { padding-top: var(--mq-space-1); gap: var(--mq-space-1); }
+.mq-link-button {
+    padding: 2px 0;
+    color: var(--text-link);
+}
+
+.mq-user-row { padding-left: var(--mq-space-10); }
+.mq-user {
     background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--mq-radius-lg);
+    padding: var(--mq-space-3) var(--mq-space-4) var(--mq-space-2) var(--mq-space-4);
+    gap: var(--mq-space-1);
+    color: var(--text-primary);
+}
+.mq-density--compact .mq-user { padding: var(--mq-space-2) var(--mq-space-3) var(--mq-space-1) var(--mq-space-3); }
+.mq-user-foot { gap: var(--mq-space-2); justify-content: flex-end; color: var(--text-tertiary); }
+
+.mq-reasoning-head,
+.mq-injected-head {
+    gap: var(--mq-space-2);
+    padding: 2px 0;
+    color: var(--text-tertiary);
+}
+.mq-reasoning-body,
+.mq-injected-body {
+    border-left: 1px solid var(--border);
+    padding-left: var(--mq-space-3);
+}
+
+.mq-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--mq-radius-md);
+}
+.mq-card-body { padding: var(--mq-space-2) var(--mq-space-3); gap: var(--mq-space-2); }
+.mq-density--compact .mq-card-body { padding: var(--mq-space-1) var(--mq-space-3); }
+.mq-card-head { gap: var(--mq-space-2); color: var(--text-secondary); }
+.mq-tool-name { color: var(--text-primary); }
+.mq-tool-title { color: var(--text-secondary); }
+.mq-tool-input, .mq-output, .mq-card-section {
+    gap: var(--mq-space-1);
+    padding-top: var(--mq-space-1);
+    border-top: 1px solid var(--border);
     color: var(--text-secondary);
 }
-.mq-part-status,
-.mq-part-other { color: var(--text-tertiary); }
+.mq-diff-body { padding-top: var(--mq-space-1); }
+.mq-todo { gap: var(--mq-space-2); color: var(--text-primary); }
+.mq-badge {
+    padding: 0 var(--mq-space-2);
+    border-radius: var(--mq-radius-sm);
+    border: 1px solid var(--border);
+}
 
-.mq-approval-body { gap: 8px; padding: 14px; }
-.mq-approval-actions { gap: 8px; }
+.mq-accent { background: var(--text-tertiary); }
+.mq-accent--pending { background: var(--text-tertiary); }
+.mq-accent--running { background: var(--info); }
+.mq-accent--done { background: var(--success); }
+.mq-accent--failed { background: var(--error); }
+.mq-accent--info { background: var(--info); }
+.mq-accent--warning { background: var(--warning); }
+.mq-accent--subtle { background: var(--border-secondary); }
+.mq-tone--pending, .mq-tone--subtle { color: var(--text-tertiary); }
+.mq-tone--running, .mq-tone--info { color: var(--info); }
+.mq-tone--done { color: var(--success); }
+.mq-tone--failed { color: var(--error); }
+.mq-tone--warning { color: var(--warning); }
+.mq-glyph { min-width: 14px; }
+
+.mq-notice { gap: var(--mq-space-2); padding: 2px 0; color: var(--text-tertiary); }
+.mq-status-line { color: var(--text-tertiary); }
+.mq-error-line { color: var(--error); }
+.mq-text { color: var(--text-primary); }
+.mq-text-muted { color: var(--text-secondary); }
+.mq-text-subtle { color: var(--text-tertiary); }
+.mq-text-success { color: var(--success); }
+.mq-text-error { color: var(--error); }
+
+.mq-approval-body { gap: var(--mq-space-2); padding: var(--mq-space-1) 0; }
+.mq-approval-actions { gap: var(--mq-space-2); padding-top: var(--mq-space-1); color: var(--text-tertiary); }
+.mq-form-field { gap: var(--mq-space-1); padding-top: var(--mq-space-1); }
+
+/* The streaming cursor: a small dot in the agent's colour, the only
+   animated element on the streaming path (architecture §6.1 rule 1). */
+@keyframes mq-cursor-pulse {
+    0% { opacity: 1; }
+    50% { opacity: 0.25; }
+    100% { opacity: 1; }
+}
+.mq-cursor {
+    width: 8px;
+    height: 8px;
+    border-radius: 4px;
+    margin-top: var(--mq-space-1);
+    animation: mq-cursor-pulse 1.1s ease-in-out infinite;
+}
+
+.mq-pill {
+    padding: var(--mq-space-1) var(--mq-space-3);
+    border-radius: var(--mq-radius-lg);
+    background: var(--surface-elevated);
+    border: 1px solid var(--border-secondary);
+    color: var(--text-primary);
+}
+.mq-pill:hover { background: var(--surface-overlay); }
+
+.mq-debug {
+    padding: var(--mq-space-1) var(--mq-space-2);
+    border-radius: var(--mq-radius-sm);
+    border: 1px solid var(--border-secondary);
+    background: var(--surface-elevated);
+}
+
+.mq-teach { padding: var(--mq-space-10) var(--mq-space-6); gap: var(--mq-space-4); }
+.mq-teach-lines { gap: var(--mq-space-1); align-items: center; }
 
 .mq-empty {
     padding: 24px 12px;

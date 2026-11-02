@@ -50,8 +50,9 @@ fn hex(c: Color) -> String {
 }
 
 /// A `:root` block defining `--agent-<id>` for `scheme`, and the
-/// `.mq-agent--<id>` rules that use them (text and border for a badge, fill
-/// for a dot). The rules live here, not in `styles.css`, on purpose: Blinc
+/// `.mq-agent--<id>` rules that use them (text colour for a brand mark, fill
+/// for a dot and for Home's 3 px brand bar). The rules live here, not in
+/// `styles.css`, on purpose: Blinc
 /// resolves `var()` when a sheet is parsed, from the variables defined before
 /// it, so the rules must be in the same block as the variables they read.
 /// Added once at start and again whenever the scheme changes; later rules win.
@@ -71,6 +72,9 @@ pub fn css(scheme: ColorScheme) -> String {
         ));
         out.push_str(&format!(
             ".mq-agent-dot.mq-agent--{id} {{ background: var(--agent-{id}); }}\n"
+        ));
+        out.push_str(&format!(
+            ".mq-home-bar.mq-agent--{id} {{ background: var(--agent-{id}); }}\n"
         ));
     }
     out

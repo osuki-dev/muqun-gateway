@@ -85,7 +85,6 @@ strings! {
     browse => "Browse…", "浏览…";
     create => "Create", "创建";
     cancel => "Cancel", "取消";
-    no_usable_agent => "No agent is available on this computer yet.", "这台电脑上还没有可用的 agent。";
     settings => "Settings", "设置";
     no_folder => "No folder", "无文件夹";
     recent => "Recent", "最近";
@@ -95,15 +94,6 @@ strings! {
 }
 
 impl Strings {
-    /// "N agents available on this computer".
-    pub fn agents_available(&self, n: usize) -> String {
-        match self.language() {
-            Language::En if n == 1 => "1 agent available on this computer".to_string(),
-            Language::En => format!("{n} agents available on this computer"),
-            Language::ZhCn => format!("这台电脑上有 {n} 个可用的 agent"),
-        }
-    }
-
     /// "Message Claude Code — Enter to send…": names the session's own agent.
     pub fn composer_placeholder(&self, agent: &str) -> String {
         match self.language() {

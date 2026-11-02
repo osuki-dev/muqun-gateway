@@ -14,7 +14,7 @@ use muqun_gateway::agents::manager::AgentManager;
 use muqun_gateway::agents::ports::{AgentSessionSnapshot, SessionMirrorPort};
 use muqun_gateway::agents::{
     AgentDomainEvent, AgentProject, AgentRuntime, AgentSessionId, AgentSessionInfo,
-    PermissionDecision, SessionQuery,
+    PermissionDecision, SessionQuery, TimelineItem,
 };
 use muqun_gateway::platform::discovery::AgentDiscoveryInfo;
 use tokio::sync::broadcast;
@@ -160,6 +160,13 @@ impl SessionHub for LocalHub {
         })
     }
 
+    fn earlier<'a>(&'a self, asid: &'a AgentSessionId) -> HubFuture<'a, Vec<TimelineItem>> {
+        Box::pin(async move {
+            let manager = self.manager_for_session(asid).await?;
+            Ok(manager.sessions().load_earlier_timeline(asid).await?)
+        })
+    }
+
     fn prompt<'a>(&'a self, asid: &'a AgentSessionId, text: &'a str) -> HubFuture<'a, ()> {
         Box::pin(async move {
             let manager = self.manager_for_session(asid).await?;
@@ -185,6 +192,21 @@ impl SessionHub for LocalHub {
             Ok(manager
                 .interactions()
                 .reply_permission(asid, request_id, decision, None)
+                .await?)
+        })
+    }
+
+    fn reply_form<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+        form_id: &'a str,
+        answers: serde_json::Value,
+    ) -> HubFuture<'a, ()> {
+        Box::pin(async move {
+            let manager = self.manager_for_session(asid).await?;
+            Ok(manager
+                .interactions()
+                .reply_form(asid, form_id, answers)
                 .await?)
         })
     }

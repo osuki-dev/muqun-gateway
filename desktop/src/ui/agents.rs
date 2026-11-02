@@ -5,8 +5,8 @@
 use blinc_layout::prelude::*;
 use muqun_gateway::platform::discovery::{AgentAvailability, AgentDiscoveryInfo};
 
+use super::glyphs;
 use super::strings::Strings;
-use super::text::ui_text;
 use crate::config::Language;
 use crate::hub::AGENT_PREFERENCE;
 
@@ -96,23 +96,6 @@ fn fallback_name(id: &str) -> &str {
     }
 }
 
-/// Two letters for the badge.
-pub fn short(id: &str) -> &'static str {
-    match id {
-        "codex" => "Cx",
-        "opencode" => "OC",
-        "deepseek" => "DS",
-        "t3" => "T3",
-        "fx" => "FX",
-        "qoder" => "Qd",
-        "pi" => "Pi",
-        "claude" => "Cl",
-        "antigravity" => "AG",
-        "cursor" => "Cu",
-        _ => "··",
-    }
-}
-
 /// The CSS class carrying an agent's brand colour; unknown ids get a
 /// neutral one.
 pub fn brand_class(id: &str) -> String {
@@ -123,19 +106,19 @@ pub fn brand_class(id: &str) -> String {
     }
 }
 
-/// The agent's two-letter badge in its brand colour.
-pub fn badge(id: &str) -> Div {
-    div()
-        .class("mq-agent-badge")
+/// The agent's brand mark at `size` px, in its brand colour (`var(--agent-<id>)`
+/// through the `mq-agent--<id>` class). An unknown agent gets the generic glyph.
+pub fn mark(id: &str, size: f32) -> Svg {
+    glyphs::icon(glyphs::agent_mark(id), size)
         .class(brand_class(id))
         .flex_shrink_0()
-        .child(
-            ui_text(short(id))
-                .size(10.0)
-                .semibold()
-                .no_wrap()
-                .no_cursor(),
-        )
+}
+
+/// The mark of an agent that cannot be used yet: the same art, muted.
+pub fn mark_idle(id: &str, size: f32) -> Svg {
+    glyphs::icon(glyphs::agent_mark(id), size)
+        .class("mq-agent-mark--idle")
+        .flex_shrink_0()
 }
 
 /// A small dot in the agent's brand colour.

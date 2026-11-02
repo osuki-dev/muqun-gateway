@@ -64,11 +64,18 @@ fn main() -> anyhow::Result<()> {
     commands::send(&tx, Command::Refresh);
 
     ui::text::register_fonts();
-    let watcher = theme::install(config.appearance.scheme)?;
+    let scheme_watcher = theme::install(&config_dir, &state_dir, &config.appearance)?;
 
     let geometry = config.window.clamped();
     let window = WindowConfig {
-        title: branding::APP_NAME.to_string(),
+        // Test builds from several worktrees run side by side, and a QA run
+        // keeps its window from taking focus by name (`ui/timeline/qa.rs`); a
+        // distinct title keeps input scripts and compositor rules aimed at
+        // the right window.
+        title: std::env::var("MUQUN_WINDOW_TITLE")
+            .ok()
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(|| branding::APP_NAME.to_string()),
         width: geometry.w,
         height: geometry.h,
         resizable: true,
@@ -80,7 +87,6 @@ fn main() -> anyhow::Result<()> {
 
     ui::strings::Strings::set_language(config.general.language);
     let strings = ui::strings::Strings;
-    let scheme_watcher = Arc::new(Mutex::new(watcher));
     let paths = Arc::new(ui::Paths {
         config_dir: config_dir.clone(),
         state_dir: state_dir.clone(),
@@ -135,6 +141,7 @@ fn main() -> anyhow::Result<()> {
                     }
                 }),
             );
+            ui::timeline::qa::start(&app);
             app
         });
         tracing::debug!(builds, width = ctx.width, height = ctx.height, "build_ui");

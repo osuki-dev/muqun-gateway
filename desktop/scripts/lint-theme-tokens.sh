@@ -3,12 +3,13 @@
 # name colours as `var(--token)`. The only files allowed to hold literals are
 #   desktop/src/theme/tokens.rs   (the .muqun-theme -> Blinc token mapping)
 #   desktop/src/theme/agents.rs   (the ten agents' brand colours)
+#   desktop/src/theme/pack.rs     (the pack reader; its tests carry colour strings)
 # Exit 1, listing every hit, when anything else has one.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
 pattern='Color::rgb|#[0-9a-fA-F]{6}|rgba?\('
-allowed=(desktop/src/theme/tokens.rs desktop/src/theme/agents.rs)
+allowed=(desktop/src/theme/tokens.rs desktop/src/theme/agents.rs desktop/src/theme/pack.rs)
 
 hits=$(grep -rnE "$pattern" desktop/src --include='*.rs' --include='*.css' || true)
 for file in "${allowed[@]}"; do

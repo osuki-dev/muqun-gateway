@@ -22,6 +22,14 @@ Linux needs a GPU stack wgpu can use (Vulkan) and, for the fonts the UI looks fo
 and JetBrains Mono Nerd Font (see `src/platform/fonts.rs`; missing fonts fall back to the system
 default).
 
+## Environment
+
+* `MUQUN_WINDOW_TITLE` -- the window's title, so builds from several worktrees can run side by
+  side and input scripts or compositor rules can pick one (also what the QA harness uses to keep
+  its window from taking focus).
+* `MUQUN_QA_*` -- the timeline QA harness (`src/ui/timeline/qa.rs`), off unless set.
+* `MUQUN_DEBUG_LIST=1` -- show the timeline list's window and offset.
+
 ## Files
 
 | What | Linux | macOS | Windows |
@@ -55,14 +63,17 @@ Cursor) use private child processes; T3 needs pairing in the desktop (Settings �
   typed (listed by the core after a 150 ms pause, never on the UI thread), "Browse…" for the
   system picker, a typed path used as typed. `~` is expanded when the session is created. Enter
   creates with the defaults; with text typed, Enter first commits that text.
-* A session: timeline (plain-text parts for now), composer (Enter sends, Shift+Enter newline),
+* A session: a windowed, streaming timeline (Markdown with highlighted code, tool calls, diffs,
+  todos, approvals, forms; long replies are cut into several list rows), composer (Enter sends, Shift+Enter newline),
   approval cards (Approve / Deny), Stop button, **Esc stops a running turn**.
 * Settings (⚙ or Ctrl/Cmd+,): **Agents** (enable switch and config fields per agent, T3 pairing,
-  sign-in hints in the gateway CLI's wording), **Appearance** (Light / Dark / System, live; theme
-  is Cover Courier only), **General** (language zh-CN / en, live; default folder; editor command
+  sign-in hints in the gateway CLI's wording), **Appearance** (Light / Dark / System, live), **General** (language zh-CN / en, live; default folder; editor command
   for later; "close to tray" placeholder, off and disabled), **About**.
   Agent changes are saved at once and take effect when the desktop next starts — the page says so.
-* Not here yet: streaming markdown timeline, forms, search, rename/delete/fork, model/mode
+* Themes: **Ctrl/Cmd+Shift+T** opens the themes panel (installed, gallery, import a
+  `.muqun-theme`; applied live and remembered). Six themes are built in
+  (`assets/themes/README.md`).
+* Not here yet: search, rename/delete/fork, model/mode
   switching, attachments, `@file`, `/commands`, tray, notifications, command palette.
 
 ## Baseline (Linux, 2026-11-02)
@@ -107,9 +118,9 @@ adapting to the scheme, hue never); views and `styles.css` use `var(--token)`.
 ## Later
 
 Window icon (Blinc's `WindowConfig` has no field), packaging and signing (dmg / msi / AppImage),
-tray and close-to-tray, notifications, command palette, streaming markdown timeline, forms,
-session search / rename / delete / fork, model and mode switching, attachments, richer themes and
-the theme editor, reduce-motion switch, hot-apply of agent settings, saving window position and
+tray and close-to-tray, notifications, command palette, session search / rename / delete /
+fork, model and mode switching, attachments, the theme editor and theme art on Home beyond Cover
+Courier's, reduce-motion switch, hot-apply of agent settings, saving window position and
 maximized state (fork patch), three-platform CI runs.
 
 ## Icons

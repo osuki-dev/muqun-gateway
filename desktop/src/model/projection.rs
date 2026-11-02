@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use muqun_gateway::agents::ports::AgentError;
 use muqun_gateway::agents::{AgentDomainEvent, AgentSessionId, SessionQuery};
 use tokio::sync::{broadcast, watch};
 
@@ -249,6 +250,58 @@ impl Core {
                     self.fail(err);
                 }
             }
+            Command::LoadEarlier(asid) => match self.hub.earlier(&asid).await {
+                Ok(items) => {
+                    let exhausted = items.is_empty();
+                    self.inbox.push(Update::Earlier {
+                        asid: asid.0,
+                        items,
+                        exhausted,
+                    });
+                }
+                Err(HubError::Agent(AgentError::HistoryCursorLost)) => {
+                    // The cursor went with the snapshot it belonged to:
+                    // read the session again, then page on from there.
+                    // Re-read, never prepare: preparing a terminal-held ACP
+                    // session starts another transcript follower (see
+                    // `resync`); the hub falls back to the session service
+                    // only when the mirror no longer holds the session.
+                    tracing::info!(asid = %asid.0, "history cursor lost; reading the session again");
+                    match self.hub.snapshot(&asid).await {
+                        Ok(snapshot) => self.inbox.push(Update::Snapshot(Box::new(snapshot))),
+                        Err(err) => tracing::debug!(%err, "re-read after a lost cursor failed"),
+                    }
+                    // Answer the request all the same: the list is waiting on
+                    // it, and asks again after a pause.
+                    self.inbox.push(Update::Earlier {
+                        asid: asid.0,
+                        items: Vec::new(),
+                        exhausted: false,
+                    });
+                }
+                Err(HubError::Agent(AgentError::Unsupported(_))) => {
+                    self.inbox.push(Update::Earlier {
+                        asid: asid.0,
+                        items: Vec::new(),
+                        exhausted: true,
+                    });
+                }
+                Err(err) => {
+                    // Leave the session pageable; the next approach to the
+                    // top asks again.
+                    tracing::warn!(asid = %asid.0, %err, "older history unavailable");
+                    self.inbox.push(Update::Earlier {
+                        asid: asid.0,
+                        items: Vec::new(),
+                        exhausted: false,
+                    });
+                }
+            },
+            Command::ReplyForm { asid, id, answers } => {
+                if let Err(err) = self.hub.reply_form(&asid, &id, answers).await {
+                    self.fail(err);
+                }
+            }
             Command::LoadProjects { agent } => match self.hub.projects(&agent).await {
                 Ok(mut projects) => {
                     mark_missing(&mut projects).await;
@@ -256,6 +309,13 @@ impl Core {
                 }
                 Err(err) => tracing::debug!(%err, "project list unavailable"),
             },
+            command @ (Command::ThemeRefresh
+            | Command::ThemeInstall(_)
+            | Command::ThemeRemove(_)
+            | Command::ThemeApply(..)
+            | Command::ThemeImportFile(_)) => {
+                crate::theme::service::run(command, self.inbox.clone(), self.config.clone()).await;
+            }
             Command::CompleteDirectory { .. } | Command::Edit(_) => {
                 unreachable!("handled in the command loop")
             }
@@ -377,7 +437,7 @@ impl Core {
                 Ok(event) => {
                     let active = self.active.lock().unwrap().clone();
                     if wanted(&event, active.as_ref()) {
-                        self.inbox.push(Update::Event(event));
+                        self.inbox.push(Update::event(event));
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(missed)) => {
@@ -547,5 +607,22 @@ mod tests {
             seq: 1,
         };
         assert!(wanted(&status, Some(&id("open"))), "a row shows status");
+        let removed = |asid: &str| AgentDomainEvent::TimelineRemoved {
+            asid: id(asid),
+            ids: vec!["x".into()],
+            seq: 2,
+        };
+        assert!(wanted(&removed("open"), Some(&id("open"))));
+        assert!(!wanted(&removed("other"), Some(&id("open"))));
+        let resolved = AgentDomainEvent::FormResolved {
+            asid: id("open"),
+            form_id: "f".into(),
+            reason: None,
+            seq: 3,
+        };
+        assert!(
+            wanted(&resolved, Some(&id("open"))),
+            "the open session's forms"
+        );
     }
 }
