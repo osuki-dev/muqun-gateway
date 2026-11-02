@@ -67,7 +67,12 @@ fn main() -> anyhow::Result<()> {
 
     let geometry = config.window.clamped();
     let window = WindowConfig {
-        title: branding::APP_NAME.to_string(),
+        // Test builds from several worktrees run side by side; a distinct
+        // title keeps input scripts aimed at the right window.
+        title: std::env::var("MUQUN_WINDOW_TITLE")
+            .ok()
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(|| branding::APP_NAME.to_string()),
         width: geometry.w,
         height: geometry.h,
         resizable: true,

@@ -304,15 +304,23 @@ fn agents_panel(app: &App) -> impl ElementBuilder {
                 .flex_row()
                 .items_center()
                 .cursor_pointer()
+                // Lucide chevrons as SVG (as blinc_cn's accordion): the UI face has no ▸/▾.
                 .child(
-                    ui_text(format!(
-                        "{} {}",
-                        if is_open { "▾" } else { "▸" },
-                        strings.agents()
-                    ))
-                    .size(12.0)
-                    .semibold()
-                    .no_cursor(),
+                    svg(if is_open {
+                        r#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>"#
+                    } else {
+                        r#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"/></svg>"#
+                    })
+                    .size(12.0, 12.0)
+                    .color(blinc_theme::ThemeState::get().color(blinc_theme::ColorToken::TextSecondary))
+                    .mr(1.5)
+                    .flex_shrink_0(),
+                )
+                .child(
+                    ui_text(strings.agents())
+                        .size(12.0)
+                        .semibold()
+                        .no_cursor(),
                 )
                 .on_click(move |_| toggle.signal().set(!is_open));
             let mut panel = div()

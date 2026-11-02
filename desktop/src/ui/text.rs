@@ -7,6 +7,9 @@ use blinc_layout::prelude::*;
 /// Chinese/English lines share one baseline and weight.
 pub const UI_FONT: &str = "Noto Sans CJK SC";
 pub const MONO_FONT: &str = "JetBrainsMono Nerd Font";
+/// The display family for editorial headlines (Home's greeting): a serif
+/// with the same CJK coverage, so a Chinese greeting reads as designed type.
+pub const DISPLAY_FONT: &str = "Noto Serif CJK SC";
 
 /// Where P0 finds the two families. Bundling a subset is a later task; a
 /// missing file only costs the fallback chain's choice of face.
@@ -25,6 +28,14 @@ const SYSTEM_FONTS: &[(&str, &[&str])] = &[
         &[
             "/usr/share/fonts/TTF/JetBrainsMonoNerdFont-Regular.ttf",
             "/usr/share/fonts/truetype/jetbrains-mono/JetBrainsMonoNerdFont-Regular.ttf",
+        ],
+    ),
+    (
+        DISPLAY_FONT,
+        &[
+            "/usr/share/fonts/noto-cjk/NotoSerifCJK-Medium.ttc",
+            "/usr/share/fonts/opentype/noto/NotoSerifCJK-Medium.ttc",
+            "/usr/share/fonts/google-noto-cjk/NotoSerifCJK-Medium.ttc",
         ],
     ),
 ];
@@ -51,6 +62,10 @@ pub fn register_fonts() {
 
 pub fn ui_text(content: impl Into<String>) -> Text {
     text(content).font(UI_FONT)
+}
+
+pub fn display_text(content: impl Into<String>) -> Text {
+    text(content).font(DISPLAY_FONT)
 }
 
 pub fn mono_text(content: impl Into<String>) -> Text {

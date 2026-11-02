@@ -6,6 +6,7 @@ pub mod agents;
 pub mod composer;
 pub mod errors;
 pub mod home;
+pub mod motion;
 pub mod new_session;
 pub mod sessions;
 pub mod shell;

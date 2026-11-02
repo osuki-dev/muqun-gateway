@@ -57,20 +57,10 @@ strings! {
     browse => "Browse…", "浏览…";
     create => "Create", "创建";
     cancel => "Cancel", "取消";
-    no_usable_agent => "No agent is available on this computer yet.", "这台电脑上还没有可用的 agent。";
     new_session_hint => "Enter creates it with these choices; Esc cancels.", "回车按当前选择创建；Esc 取消。";
 }
 
 impl Strings {
-    /// "N agents available on this computer".
-    pub fn agents_available(&self, n: usize) -> String {
-        match self.language {
-            Language::En if n == 1 => "1 agent available on this computer".to_string(),
-            Language::En => format!("{n} agents available on this computer"),
-            Language::ZhCn => format!("这台电脑上有 {n} 个可用的 agent"),
-        }
-    }
-
     pub fn approve(&self) -> &'static str {
         i18n::t(self.language.locale(), "Approve")
     }

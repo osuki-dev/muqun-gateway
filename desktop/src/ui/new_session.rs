@@ -157,14 +157,6 @@ pub fn page(app: &App, height: f32) -> Div {
 }
 
 /// A launch card's button: start `agent` in `cwd` now.
-pub fn launch_button(app: &App, agent: String, cwd: PathBuf) -> impl ElementBuilder {
-    let app = app.clone();
-    button(app.strings.new_session())
-        .variant(ButtonVariant::Outline)
-        .size(ButtonSize::Small)
-        .on_click(move |_| app.create(agent.clone(), cwd.clone()))
-}
-
 /// The system folder picker; the choice goes back into the draft. The
 /// dialog blocks its caller: on macOS it must run on the main thread,
 /// elsewhere it runs beside the UI so frames keep coming. Either way the
