@@ -1383,6 +1383,23 @@ mod tests {
             let binary = dir.join("tmux");
             std::fs::write(&binary, script).unwrap();
             std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+            // Another test thread forking while the script was open for writing
+            // holds that descriptor until its exec; running the script meanwhile
+            // fails with ETXTBSY, which the backend reads as "tmux is absent".
+            // Wait that out here, then drop the probe's own log line.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while std::process::Command::new(&binary)
+                .arg("-V")
+                .output()
+                .is_err()
+            {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "fake tmux never became executable"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let _ = std::fs::remove_file(dir.join("log"));
             Self { dir }
         }
 
