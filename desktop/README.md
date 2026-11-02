@@ -109,15 +109,10 @@ adapting to the scheme, hue never); views and `styles.css` use `var(--token)`.
   Wayland never reports position to clients anyway. Needs a small fork patch.
 * The combobox list's text is painted outside the list box when its rows overflow it (text is not
   clipped in the foreground layer), so the chooser offers at most 8 rows and shortens long paths.
-* Blinc derives the typed character from the key plus the Shift *modifier* state
-  (`windowed.rs`), not from winit's own text for the key. Real keyboards (Shift held) and IMEs
-  are fine; a virtual keyboard that sends an uppercase keysym without a Shift modifier (plain
-  `wtype 'Hello'`) types lowercase, and Caps Lock or non-US layouts that produce shifted
-  characters without Shift are affected. Needs a fork patch.
 
 ## Later
 
-Window icon (Blinc's `WindowConfig` has no field), packaging and signing (dmg / msi / AppImage),
+Packaging and signing (dmg / msi / AppImage),
 tray and close-to-tray, notifications, command palette, session search / rename / delete /
 fork, model and mode switching, attachments, the theme editor and theme art on Home beyond Cover
 Courier's, reduce-motion switch, hot-apply of agent settings, saving window position and

@@ -82,6 +82,7 @@ fn main() -> anyhow::Result<()> {
         maximized: geometry.maximized,
         position: geometry.x.zip(geometry.y),
         min_size: Some(WindowGeometry::MIN),
+        icon: branding::window_icon(),
         ..Default::default()
     };
 

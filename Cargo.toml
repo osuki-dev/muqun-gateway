@@ -81,8 +81,10 @@ toml = "1.1.8"
 [dev-dependencies]
 tokio = { version = "1.53.3", features = ["test-util"] }
 
-# Muqun Desktop's Blinc: the muqun fork, branch `fix/ime-preedit` (ecc28d1:
-# IME pre-edit on top of upstream 8bfcc12), from its dedicated worktree. This
+# Muqun Desktop's Blinc: the muqun fork at 11aa996 (branch
+# `fix/window-icon-text`: IME pre-edit, input latency, window icon, OS-layout
+# typed text and fence-language highlighting on top of upstream 8bfcc12; see
+# the fork's PATCHES.md), from its dedicated worktree. This
 # becomes a git dependency on the fork once it is published. Only the
 # desktop crate depends on Blinc; `cargo build -p muqun-gateway` never
 # resolves these.

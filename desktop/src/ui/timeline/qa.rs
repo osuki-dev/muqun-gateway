@@ -20,8 +20,9 @@
 //!   recolouring, and the choice is remembered in the configuration).
 //! * `MUQUN_QA_THEMES=<secs>` -- open the themes panel that long after
 //!   start (what Ctrl+Shift+T does).
-//! * `MUQUN_QA_THEME=<id>@<secs>` -- apply theme `<id>` that long after
-//!   start, in the scheme on screen, the way the panel's Apply does.
+//! * `MUQUN_QA_THEME=<id>@<secs>[,<id>@<secs>…]` -- apply theme `<id>` that
+//!   long after start, in the scheme on screen, the way the panel's Apply
+//!   does; several apply in turn (e.g. a theme and back).
 //!
 //! Frame times come from Blinc's own `blinc_app::frame_timing` trace.
 
@@ -50,7 +51,8 @@ struct Script {
     want_scroll: bool,
     toggle_after: Option<Duration>,
     themes_after: Option<Duration>,
-    theme_after: Option<(String, Duration)>,
+    /// Themes still to apply, soonest first.
+    theme_after: Vec<(String, Duration)>,
     tour: Option<Tour>,
     done: bool,
 }
@@ -108,10 +110,15 @@ pub fn start(app: &App) {
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .map(Duration::from_secs);
-    let theme_after = std::env::var("MUQUN_QA_THEME").ok().and_then(|v| {
-        let (id, secs) = v.rsplit_once('@')?;
-        Some((id.to_string(), Duration::from_secs(secs.parse().ok()?)))
-    });
+    let mut theme_after: Vec<(String, Duration)> = std::env::var("MUQUN_QA_THEME")
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|v| {
+            let (id, secs) = v.trim().rsplit_once('@')?;
+            Some((id.to_string(), Duration::from_secs(secs.parse().ok()?)))
+        })
+        .collect();
+    theme_after.sort_by_key(|(_, after)| *after);
     let tour = std::env::var_os("MUQUN_QA_TOUR").map(|_| Tour::default());
     if synth.is_none()
         && open.is_none()
@@ -119,7 +126,7 @@ pub fn start(app: &App) {
         && !want_scroll
         && toggle_after.is_none()
         && themes_after.is_none()
-        && theme_after.is_none()
+        && theme_after.is_empty()
         && tour.is_none()
     {
         return;
@@ -233,17 +240,16 @@ fn tick(app: &App, s: &mut Script) {
         s.themes_after = None;
     }
     if s.theme_after
-        .as_ref()
+        .first()
         .is_some_and(|(_, after)| s.started.is_some_and(|t| t.elapsed() >= *after))
     {
-        if let Some((id, _)) = s.theme_after.take() {
-            let scheme = match ThemeState::get().scheme() {
-                ColorScheme::Light => crate::config::Scheme::Light,
-                ColorScheme::Dark => crate::config::Scheme::Dark,
-            };
-            tracing::info!(target: "muqun::qa", %id, ?scheme, "qa: applying a theme");
-            app.send(Command::ThemeApply(id, scheme));
-        }
+        let (id, _) = s.theme_after.remove(0);
+        let scheme = match ThemeState::get().scheme() {
+            ColorScheme::Light => crate::config::Scheme::Light,
+            ColorScheme::Dark => crate::config::Scheme::Dark,
+        };
+        tracing::info!(target: "muqun::qa", %id, ?scheme, "qa: applying a theme");
+        app.send(Command::ThemeApply(id, scheme));
     }
     if let Some(tour) = s.tour.as_mut() {
         if tour_step(app, tour) {
@@ -254,7 +260,7 @@ fn tick(app: &App, s: &mut Script) {
         && !s.want_scroll
         && s.toggle_after.is_none()
         && s.themes_after.is_none()
-        && s.theme_after.is_none()
+        && s.theme_after.is_empty()
         && s.tour.is_none();
 }
 
