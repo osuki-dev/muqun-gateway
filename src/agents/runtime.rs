@@ -766,46 +766,21 @@ impl AgentRuntime {
         }
     }
 
-    /// Clear restricted OpenCode sessions the provider no longer has, e.g.
-    /// deleted in OpenCode itself rather than through the App.
-    async fn reconcile_restricted_sessions(&self, manager: &AgentManager) {
-        use super::ports::agent::AgentError;
-        let Some(db) = self.route_store.get().cloned() else {
+    /// Clear restricted OpenCode sessions the service at `endpoint` no
+    /// longer has, e.g. deleted in OpenCode itself rather than through the
+    /// App. Runs before the gateway decides anything from the restriction.
+    async fn reconcile_restricted_sessions(&self, endpoint: &OpencodeEndpoint) {
+        let Some(db) = self.route_store.get() else {
             return;
         };
-        let agent_id = manager.agent().kind().to_owned();
-        let id = agent_id.clone();
-        let Ok(Some(block)) = db
-            .call(move |c| crate::tasks::store_sqlite::runtime_block(c, &id))
-            .await
-        else {
-            return;
-        };
-        let mut cleared = 0usize;
-        for asid in block.sessions {
-            let gone = match manager.agent().get_session(&asid).await {
-                Err(AgentError::SessionNotFound(_)) => true,
-                Err(AgentError::RequestFailed(message)) => message.starts_with("HTTP 404"),
-                _ => false,
-            };
-            let id = agent_id.clone();
-            if gone
-                && db
-                    .call(move |c| {
-                        crate::tasks::store_sqlite::clear_restricted_session(c, &id, &asid)
-                    })
-                    .await
-                    .unwrap_or(false)
-            {
-                cleared += 1;
-            }
-        }
-        if cleared > 0 {
-            tracing::info!(
-                agent_id,
-                cleared,
-                "deleted sessions no longer withhold the agent's Muqun tools; if none remain, `opencode service stop` lets the gateway start it again with them"
-            );
+        match reconcile_opencode_restrictions(db, endpoint).await {
+            Ok(done) if done.cleared > 0 => tracing::info!(
+                cleared = done.cleared,
+                remaining = done.remaining,
+                "deleted OpenCode sessions no longer withhold its Muqun tools"
+            ),
+            Ok(_) => {}
+            Err(error) => tracing::warn!("could not reconcile restricted sessions: {error:#}"),
         }
     }
 
@@ -1820,8 +1795,8 @@ impl AgentRuntime {
             .pid
             .and_then(running_binary_path)
             .map(|p| p.display().to_string());
+        self.reconcile_restricted_sessions(&endpoint).await;
         let manager = AgentManager::connect(endpoint, self.events_tx.clone());
-        self.reconcile_restricted_sessions(&manager).await;
         self.install("opencode", manager, origin).await;
         // Publish identity only after installing its manager. Cancellation
         // before this write causes a safe reattachment, never old-client reuse.
@@ -1959,10 +1934,37 @@ impl AgentRuntime {
             "no OpenCode service found, starting one"
         );
 
+        let started = self.launch_with_mcp(&binary).await;
+        // Only the running service can say whether the sessions that withheld
+        // its token still exist. If none do, this start is restarted at once
+        // -- nothing is using it yet -- so the tools are not lost until the
+        // owner restarts it.
+        let Ok((endpoint, _)) = &started else {
+            return started;
+        };
+        if !self.started_without_tools().await || self.restriction_cleared().await {
+            return started;
+        }
+        self.reconcile_restricted_sessions(endpoint).await;
+        if !self.restriction_cleared().await {
+            return started;
+        }
+        tracing::info!("no retained session withholds OpenCode's Muqun tools any more; restarting it with them");
+        if let Err(error) = stop_service(&binary).await {
+            tracing::warn!("{error:#}; OpenCode keeps running without its Muqun tools");
+            return started;
+        }
+        self.launch_with_mcp(&binary).await
+    }
+
+    async fn launch_with_mcp(
+        &self,
+        binary: &std::path::Path,
+    ) -> anyhow::Result<(OpencodeEndpoint, Option<String>)> {
         let mcp = self.opencode_mcp_env().await;
         let started = async {
             launch_service(
-                tokio::process::Command::new(&binary),
+                tokio::process::Command::new(binary),
                 mcp.as_ref().map(|(env, _)| env),
             )
             .await?;
@@ -1973,6 +1975,23 @@ impl AgentRuntime {
             settle_agent_tokens(wiring.tokens.as_ref(), env, previous, started.is_ok()).await;
         }
         started
+    }
+
+    /// The last start went without a token.
+    async fn started_without_tools(&self) -> bool {
+        self.opencode_mcp_missing.read().await.is_some()
+    }
+
+    /// Nothing in the store withholds OpenCode's runtime token now.
+    async fn restriction_cleared(&self) -> bool {
+        let Some(db) = self.route_store.get() else {
+            return false;
+        };
+        matches!(
+            db.call(|c| crate::tasks::store_sqlite::runtime_block(c, "opencode"))
+                .await,
+            Ok(None)
+        )
     }
 }
 
@@ -2138,6 +2157,98 @@ fn adopted_mcp_mismatch(saved: Option<&str>, ours: &str) -> Option<(String, Stri
             format!("the adopted OpenCode service has no MUQUN_MCP_URL, so it has no Muqun tools; {RESTART}"),
         )),
     }
+}
+
+/// What reconciling OpenCode's retained restricted sessions did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Reconciled {
+    /// Rows dropped because OpenCode definitively no longer has the session.
+    pub cleared: usize,
+    /// Sessions that still withhold the tools.
+    pub remaining: usize,
+    /// Of `remaining`, the sessions OpenCode could not answer for.
+    pub unanswered: usize,
+}
+
+/// Drop the restriction of every retained OpenCode session the service at
+/// `endpoint` definitively no longer has. Anything else -- the session is
+/// there, OpenCode did not answer, timed out or answered something
+/// unrecognised -- keeps it: a deleted session that stays restricted costs
+/// the owner a delete, a live one cleared by mistake hands a conversation
+/// that ran remote work owner authority.
+pub(crate) async fn reconcile_opencode_restrictions(
+    db: &crate::platform::store::sqlite::SqliteStore,
+    endpoint: &OpencodeEndpoint,
+) -> anyhow::Result<Reconciled> {
+    let mut done = Reconciled::default();
+    let Some(block) = db
+        .call(|c| crate::tasks::store_sqlite::runtime_block(c, "opencode"))
+        .await?
+    else {
+        return Ok(done);
+    };
+    let client = super::adapters::opencode::OpencodeClient::new(endpoint.clone());
+    for asid in block.sessions {
+        let answer = client.get_session(&asid).await;
+        if !session_missing(&answer) {
+            done.remaining += 1;
+            done.unanswered += usize::from(answer.is_err());
+            continue;
+        }
+        if db
+            .call(move |c| {
+                crate::tasks::store_sqlite::clear_restricted_session(c, "opencode", &asid)
+            })
+            .await?
+        {
+            done.cleared += 1;
+        }
+    }
+    Ok(done)
+}
+
+/// OpenCode's definitive "no such session": a 404 naming a not-found error
+/// (`SessionNotFoundError`). A bare 404 could be a route this OpenCode
+/// lacks, so it does not count.
+fn session_missing(answer: &Result<serde_json::Value, super::ports::agent::AgentError>) -> bool {
+    matches!(answer, Err(super::ports::agent::AgentError::RequestFailed(message))
+        if message.starts_with("HTTP 404") && message.contains("NotFound"))
+}
+
+/// `opencode service stop`, for the service this gateway has just started.
+async fn stop_service(binary: &std::path::Path) -> anyhow::Result<()> {
+    let status = tokio::time::timeout(
+        STARTUP_WAIT,
+        tokio::process::Command::new(binary)
+            .args(["service", "stop"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .status(),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("`opencode service stop` timed out"))?
+    .map_err(|err| anyhow::anyhow!("could not run `opencode service stop`: {err}"))?;
+    anyhow::ensure!(
+        status.success(),
+        "`opencode service stop` exited with {status}"
+    );
+    Ok(())
+}
+
+/// The running OpenCode service, as the gateway would adopt it.
+pub(crate) async fn running_opencode() -> Option<OpencodeEndpoint> {
+    let (endpoint, _) = OpencodeEndpoint::discover_with_registration_id().await?;
+    endpoint.verified(&probe_client()).await
+}
+
+/// Whether OpenCode's saved service env carries a Muqun MCP address, i.e.
+/// whether its service starts (or was started) with Muqun tools.
+pub(crate) async fn opencode_service_has_mcp(binary: &std::path::Path) -> bool {
+    read_service_env(&tokio::process::Command::new(binary), "MUQUN_MCP_URL")
+        .await
+        .is_some()
 }
 
 /// The discovery reason for an attached agent without its Muqun tools.
@@ -4594,5 +4705,77 @@ mod tests {
             !first.supported,
             "nothing is attached to a disabled runtime"
         );
+    }
+}
+
+#[cfg(test)]
+mod restriction_reconcile_tests {
+    use super::*;
+    use axum::{extract::Path, http::StatusCode, routing::get, Json, Router};
+
+    /// Sessions deleted with `opencode session delete` behind the gateway's
+    /// back: only a definitive "no such session" from OpenCode drops a row;
+    /// a live session, an unrecognised 404 and a failing or unreachable
+    /// service all keep theirs.
+    #[tokio::test]
+    async fn only_sessions_opencode_definitively_lacks_stop_withholding_its_tools() {
+        let url = crate::test_support::serve(Router::new().route(
+            "/api/session/{id}",
+            get(|Path(id): Path<String>| async move {
+                match id.as_str() {
+                    // What OpenCode 2.2 answers for a deleted session.
+                    "ses_deleted" => (
+                        StatusCode::NOT_FOUND,
+                        Json(serde_json::json!({"_tag": "SessionNotFoundError", "sessionID": id, "message": format!("Session not found: {id}")})),
+                    ),
+                    "ses_live" => (StatusCode::OK, Json(serde_json::json!({"data": {"id": id}}))),
+                    "ses_bare_404" => (StatusCode::NOT_FOUND, Json(serde_json::json!({}))),
+                    _ => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"message": "boom"}))),
+                }
+            }),
+        ))
+        .await;
+        let unreachable = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            format!("http://{}", listener.local_addr().unwrap())
+        };
+        let all = ["ses_bare_404", "ses_deleted", "ses_failing", "ses_live"];
+        let kept = vec!["ses_bare_404", "ses_failing", "ses_live"];
+        for (url, cleared, left) in [(url, 1, kept), (unreachable, 0, all.to_vec())] {
+            let db = crate::platform::store::sqlite::SqliteStore::open(
+                &crate::test_state_dir()
+                    .join(format!("reconcile-{}.sqlite3", uuid::Uuid::new_v4())),
+                None,
+                crate::platform::store::sqlite::ALL_MIGRATIONS,
+            )
+            .unwrap();
+            db.call(move |c| {
+                for asid in all {
+                    c.execute(
+                        "INSERT INTO task_restricted_sessions(agent_id, asid, reason) VALUES('opencode', ?1, 'remote')",
+                        [asid],
+                    )?;
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+            let endpoint = OpencodeEndpoint {
+                url,
+                password: None,
+                version: None,
+                pid: None,
+            };
+            let done = reconcile_opencode_restrictions(&db, &endpoint)
+                .await
+                .unwrap();
+            assert_eq!((done.cleared, done.remaining), (cleared, left.len()));
+            let block = db
+                .call(|c| crate::tasks::store_sqlite::runtime_block(c, "opencode"))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(block.sessions, left);
+        }
     }
 }
