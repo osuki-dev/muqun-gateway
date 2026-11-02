@@ -108,18 +108,6 @@ fn config_options_supply_actual_model_and_context_is_not_usage() {
     assert_eq!(info.updated_ms, 1_793_329_200_000);
 }
 
-#[test]
-fn oversized_history_is_explicitly_unavailable() {
-    let mut projection = mapper::Projection::default();
-    let update = json!({"sessionUpdate":"agent_message_chunk","messageId":"a","content":{"type":"text","text":"x".repeat(4*1024*1024)}});
-    for _ in 0..7 {
-        projection.update(&update).unwrap();
-    }
-    let error = projection.update(&update).unwrap_err();
-    assert!(error.to_string().contains("history budget"));
-    assert_eq!(projection.timeline().len(), 1);
-}
-
 #[cfg(unix)]
 pub(crate) mod integration {
     use super::*;
@@ -554,6 +542,54 @@ for line in sys.stdin:
         assert_eq!(ids.len(), 300);
         assert!(driver.load_earlier_timeline("not-owned", 80).await.is_err());
         driver.shutdown().await;
+    }
+
+    /// A native session whose replay is longer than the Gateway keeps still
+    /// lists, opens, and serves its newest page and the one before it.
+    #[tokio::test]
+    async fn a_transcript_over_the_retained_window_still_lists_and_serves_its_latest_page() {
+        use crate::agents::domain::AgentSessionId;
+        use crate::agents::use_cases::SessionService;
+        let fixture = Fixture::new().await;
+        let id = "long-session";
+        let turns = crate::agents::adapters::acp::mapper::MAX_RETAINED_ROWS / 2 + 500;
+        let history: Vec<_> = (0..turns)
+            .flat_map(|index| {
+                [
+                    json!([format!("u{index}"), format!("question {index}"), true]),
+                    json!([format!("a{index}"), format!("answer {index}"), false]),
+                ]
+            })
+            .collect();
+        std::fs::write(
+            fixture.directory.join("sessions.json"),
+            serde_json::to_vec(&json!({id: history})).unwrap(),
+        )
+        .unwrap();
+        let listed = fixture
+            .driver
+            .list_sessions(&SessionQuery::default())
+            .await
+            .unwrap();
+        assert!(listed.iter().any(|info| info.asid.0 == id));
+        let asid = AgentSessionId::from(id);
+        let service =
+            SessionService::with_memory_mirror(fixture.driver.clone(), fixture.mirror.clone());
+        service.prepare_session(&asid).await.unwrap();
+        let opening = service.history_window(&asid, None, false).await.unwrap();
+        assert_eq!(opening.snapshot.timeline.len(), 100);
+        let newest = &opening.snapshot.timeline.last().unwrap().part;
+        assert!(
+            matches!(newest, AgentPart::Text { text } if text == &format!("answer {}", turns - 1)),
+            "{newest:?}"
+        );
+        let page = service
+            .history_page(&asid, &opening.history_cursor.unwrap())
+            .await
+            .unwrap();
+        assert_eq!(page.items.len(), 80);
+        assert!(!page.exhausted);
+        fixture.driver.shutdown().await;
     }
 
     #[tokio::test]

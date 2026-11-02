@@ -19,7 +19,9 @@ use crate::agents::adapters::acp::recovery::NativeSnapshot;
 use crate::agents::domain::TokensUsage;
 use crate::agents::ports::agent::AgentError;
 
-/// Larger transcripts are not inspected; their child is simply kept.
+/// The whole-transcript read ([`main_chain`]) parses every record into
+/// memory. Larger transcripts are not inspected: a loaded child is simply
+/// kept, and a terminal-held one reports [`too_large`].
 const MAX_BYTES: u64 = 256 * 1024 * 1024;
 /// A chat record longer than this cannot be verified.
 const MAX_LINE: usize = 8 * 1024 * 1024;
@@ -27,6 +29,14 @@ const MAX_RECORDS: usize = 200_000;
 
 fn unavailable() -> AgentError {
     AgentError::NotAvailable("Claude Code native recovery history is incomplete".into())
+}
+
+fn too_large() -> AgentError {
+    AgentError::NotAvailable(format!(
+        "Claude Code transcript exceeds the Gateway's whole-transcript read limit ({} MiB, {} MiB per record, {MAX_RECORDS} records); open this session in the agent's terminal",
+        MAX_BYTES >> 20,
+        MAX_LINE >> 20
+    ))
 }
 
 pub(super) async fn inspect(
@@ -95,7 +105,7 @@ fn next_line(
         let consumed = end.map_or(take, |index| index + 1);
         *total += consumed as u64;
         if *total > MAX_BYTES {
-            return Err(unavailable());
+            return Err(too_large());
         }
         reader.consume(consumed);
         if end.is_some() {
@@ -210,8 +220,11 @@ fn main_chain(
     }
     let file = options.open(path).map_err(|_| unavailable())?;
     let before = file.metadata().map_err(|_| unavailable())?;
-    if !before.is_file() || before.len() > MAX_BYTES {
+    if !before.is_file() {
         return Err(unavailable());
+    }
+    if before.len() > MAX_BYTES {
+        return Err(too_large());
     }
     let mut reader = std::io::BufReader::with_capacity(256 * 1024, &file);
     let mut buffer = Vec::new();
@@ -238,11 +251,11 @@ fn main_chain(
             continue;
         }
         if matches!(line, Line::Oversized) {
-            return Err(unavailable());
+            return Err(too_large());
         }
         records += 1;
         if records > MAX_RECORDS {
-            return Err(unavailable());
+            return Err(too_large());
         }
         let record: Record = serde_json::from_slice(&buffer).map_err(|_| unavailable())?;
         if record
@@ -762,6 +775,29 @@ mod tests {
             (total.input, total.output, total.reasoning),
             (4, 60, Some(20))
         );
+    }
+
+    /// The whole-transcript read is the one operation that still has a
+    /// limit; it says so instead of a generic failure.
+    #[test]
+    fn whole_transcript_reads_name_their_limit_when_a_record_exceeds_it() {
+        let id = "00000000-0000-4000-8000-000000000003";
+        for (text_bytes, chained) in [(MAX_LINE / 2, Some(1)), (MAX_LINE, None)] {
+            let line = json!({"type":"user","uuid":"u1","parentUuid":null,"sessionId":id,
+                "origin":{"kind":"human"},"message":{"content":[{"type":"text","text":"x".repeat(text_bytes)}]}});
+            let (dir, path) = write(&[line], "");
+            match main_chain(&path, id, &CancellationToken::new(), false) {
+                Ok(chain) => assert_eq!(Some(chain.len()), chained),
+                Err(error) => {
+                    let error = error.to_string();
+                    assert!(
+                        chained.is_none() && error.contains("whole-transcript read limit"),
+                        "{error}"
+                    );
+                }
+            }
+            std::fs::remove_dir_all(dir).unwrap();
+        }
     }
 
     #[test]
