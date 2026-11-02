@@ -2,6 +2,19 @@
 
 ## Changes and fixes
 
+- **FX and Qoder no longer start a process every minute to re-read an
+  unchanged session store.** The task follower reads each open task's session
+  once a minute and the Home view refreshes as often; for a saved FX or Qoder
+  session the Gateway did not hold, every such read past the 30-second
+  metadata cache started a cold `fx acp` / `qodercli --acp` child to list
+  sessions again, although nothing had changed (one child per minute for as
+  long as a task stayed open), and under load those listings ran into their
+  30-second budget ("ACP session listing timed out"), dropping the agent from
+  the session list. Saved-session reads now honor the store fingerprint that
+  listings already used (ten minutes while the store is unchanged, which also
+  settles that an unlisted session is not saved), and FX gets a fingerprint
+  over `~/.fx/sessions` as Qoder has over `~/.qoder/projects`.
+
 - **`update --channel preview` works again.** The preview check failed with
   "update response exceeds size limit" because one 100-release GitHub page
   (release notes and asset lists included) had grown past its 1 MiB cap. It now

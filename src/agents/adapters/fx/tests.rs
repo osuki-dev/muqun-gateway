@@ -264,6 +264,8 @@ for line in sys.stdin:
                 mirror.clone(),
                 tx,
             );
+            // Never fingerprint the real ~/.fx store from tests.
+            driver.set_session_store(|| None);
             Self {
                 directory,
                 driver,
@@ -514,6 +516,7 @@ for line in sys.stdin:
             mirror.clone(),
             tx,
         );
+        driver.set_session_store(|| None);
         let service = SessionService::with_memory_mirror(driver.clone(), mirror);
         service.prepare_session(&info.asid).await.unwrap();
         let opening = service
@@ -893,6 +896,7 @@ for line in sys.stdin:
             second_mirror,
             tx,
         );
+        second.set_session_store(|| None);
         assert_eq!(
             second
                 .list_sessions(&SessionQuery::default())

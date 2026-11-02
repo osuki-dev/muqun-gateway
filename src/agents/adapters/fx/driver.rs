@@ -23,6 +23,9 @@ impl AcpProvider for FxProvider {
         ))
     }
     const SESSION_NOTICES: bool = true;
+    fn session_store_fingerprint() -> Option<u64> {
+        super::store::fingerprint()
+    }
     fn global_catalog<'a>(
         binary: &'a str,
         directory: &'a str,
