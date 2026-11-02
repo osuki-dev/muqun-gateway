@@ -16,7 +16,12 @@
 //!   screenshots).
 //! * `MUQUN_QA_SCHEME=light|dark` -- start in that colour scheme.
 //! * `MUQUN_QA_TOGGLE_AFTER=<secs>` -- flip the scheme once, that long
-//!   after start, the way the top bar's toggle does (live recolouring).
+//!   after start, the way the top bar's toggle does (`App::apply_scheme`: live
+//!   recolouring, and the choice is remembered in the configuration).
+//! * `MUQUN_QA_THEMES=<secs>` -- open the themes panel that long after
+//!   start (what Ctrl+Shift+T does).
+//! * `MUQUN_QA_THEME=<id>@<secs>` -- apply theme `<id>` that long after
+//!   start, in the scheme on screen, the way the panel's Apply does.
 //!
 //! Frame times come from Blinc's own `blinc_app::frame_timing` trace.
 
@@ -44,6 +49,8 @@ struct Script {
     scroll: Option<Scroll>,
     want_scroll: bool,
     toggle_after: Option<Duration>,
+    themes_after: Option<Duration>,
+    theme_after: Option<(String, Duration)>,
     tour: Option<Tour>,
     done: bool,
 }
@@ -97,12 +104,22 @@ pub fn start(app: &App) {
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .map(Duration::from_secs);
+    let themes_after = std::env::var("MUQUN_QA_THEMES")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(Duration::from_secs);
+    let theme_after = std::env::var("MUQUN_QA_THEME").ok().and_then(|v| {
+        let (id, secs) = v.rsplit_once('@')?;
+        Some((id.to_string(), Duration::from_secs(secs.parse().ok()?)))
+    });
     let tour = std::env::var_os("MUQUN_QA_TOUR").map(|_| Tour::default());
     if synth.is_none()
         && open.is_none()
         && prompt.is_none()
         && !want_scroll
         && toggle_after.is_none()
+        && themes_after.is_none()
+        && theme_after.is_none()
         && tour.is_none()
     {
         return;
@@ -125,6 +142,8 @@ pub fn start(app: &App) {
         prompt: prompt.map(|p| (p, None)),
         want_scroll,
         toggle_after,
+        themes_after,
+        theme_after,
         tour,
         ..Script::default()
     }));
@@ -197,12 +216,33 @@ fn tick(app: &App, s: &mut Script) {
     }
     if let Some(after) = s.toggle_after {
         if s.started.is_some_and(|t| t.elapsed() >= after) {
-            let theme = ThemeState::get();
-            let next = theme.scheme().toggle();
+            let next = ThemeState::get().scheme().toggle();
             tracing::info!(target: "muqun::qa", ?next, "qa: switching the colour scheme");
-            theme.set_scheme(next);
-            super::theme_changed(app);
+            app.apply_scheme(match next {
+                ColorScheme::Light => crate::config::Scheme::Light,
+                ColorScheme::Dark => crate::config::Scheme::Dark,
+            });
             s.toggle_after = None;
+        }
+    }
+    if s.themes_after
+        .is_some_and(|after| s.started.is_some_and(|t| t.elapsed() >= after))
+    {
+        tracing::info!(target: "muqun::qa", "qa: opening the themes panel");
+        crate::ui::themes::toggle();
+        s.themes_after = None;
+    }
+    if s.theme_after
+        .as_ref()
+        .is_some_and(|(_, after)| s.started.is_some_and(|t| t.elapsed() >= *after))
+    {
+        if let Some((id, _)) = s.theme_after.take() {
+            let scheme = match ThemeState::get().scheme() {
+                ColorScheme::Light => crate::config::Scheme::Light,
+                ColorScheme::Dark => crate::config::Scheme::Dark,
+            };
+            tracing::info!(target: "muqun::qa", %id, ?scheme, "qa: applying a theme");
+            app.send(Command::ThemeApply(id, scheme));
         }
     }
     if let Some(tour) = s.tour.as_mut() {
@@ -210,7 +250,12 @@ fn tick(app: &App, s: &mut Script) {
             s.tour = None;
         }
     }
-    s.done = s.prompt.is_none() && !s.want_scroll && s.toggle_after.is_none() && s.tour.is_none();
+    s.done = s.prompt.is_none()
+        && !s.want_scroll
+        && s.toggle_after.is_none()
+        && s.themes_after.is_none()
+        && s.theme_after.is_none()
+        && s.tour.is_none();
 }
 
 /// One frame of the scroll run. True when finished.

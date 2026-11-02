@@ -960,6 +960,15 @@ fn set_scheme(app: &App, scheme: Scheme) {
     }
 }
 
+/// The scheme was changed elsewhere (the top bar, Settings): the panel's
+/// Light / Dark / System choice follows.
+pub fn note_scheme(scheme: Scheme) {
+    let b = ThemeBindings::get();
+    if let Some((id, _)) = b.current.get() {
+        b.current.signal().set(Some((id, scheme)));
+    }
+}
+
 /// Whether the overlay is open.
 pub fn is_open() -> bool {
     ThemeBindings::get().open.get()

@@ -164,6 +164,7 @@ impl App {
         drop(watcher);
         // Rows bake theme colours into their text.
         timeline::theme_changed(self);
+        themes::note_scheme(scheme);
         self.send(Command::Edit(ConfigEdit::Scheme(scheme)));
     }
 

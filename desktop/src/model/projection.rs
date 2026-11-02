@@ -202,6 +202,13 @@ impl Core {
                     // read the session again, then page on from there.
                     tracing::info!(asid = %asid.0, "history cursor lost; reading the session again");
                     self.open(&asid).await;
+                    // Answer the request all the same: the list is waiting on
+                    // it, and asks again after a pause.
+                    self.inbox.push(Update::Earlier {
+                        asid: asid.0,
+                        items: Vec::new(),
+                        exhausted: false,
+                    });
                 }
                 Err(HubError::Agent(AgentError::Unsupported(_))) => {
                     self.inbox.push(Update::Earlier {
