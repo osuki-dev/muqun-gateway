@@ -77,6 +77,8 @@ jobs:
             echo "::error::cfg(target_os) is only allowed under desktop/src/platform/"
             exit 1
           fi
+      - name: No colour literals outside the theme
+        run: desktop/scripts/lint-theme-tokens.sh
 
   build:
     name: Build (${{ matrix.os }})
