@@ -1097,6 +1097,8 @@ pub(crate) struct FakeAgent {
     pub catalog: agents::domain::AgentCatalog,
     /// Hold catalog reads to exercise callers that must not wait on providers.
     pub catalog_gate: Option<Arc<tokio::sync::Notify>>,
+    /// Hold `get_session` probes, as a slow agent asked about a foreign id does.
+    pub session_gate: Option<Arc<tokio::sync::Notify>>,
     pub timeline: Vec<agents::domain::TimelineItem>,
     /// A session's own timeline, in place of `timeline`, by asid.
     pub session_timelines: HashMap<String, Vec<agents::domain::TimelineItem>>,
@@ -1138,6 +1140,7 @@ impl FakeAgent {
             failing: false,
             catalog: Default::default(),
             catalog_gate: None,
+            session_gate: None,
             timeline: Vec::new(),
             session_timelines: HashMap::new(),
             permissions: Arc::default(),
@@ -1357,6 +1360,9 @@ impl agents::ports::agent::AgentPort for FakeAgent {
         session_id: &'a str,
     ) -> agents::ports::agent::AgentFuture<'a, agents::domain::AgentSessionInfo> {
         Box::pin(async move {
+            if let Some(gate) = &self.session_gate {
+                gate.notified().await;
+            }
             if self.http_404.iter().any(|asid| asid == session_id) {
                 return Err(agents::ports::agent::AgentError::RequestFailed(
                     "HTTP 404 Not Found: no such session".into(),
