@@ -973,6 +973,8 @@ fn approvals_offer_only_exact_representable_choices() {
     let p = &mut snapshot["projection"];
     let permissions = mapper::permissions("thread", p);
     assert_eq!(permissions[0].options.len(), 3);
+    // `file-change` is the App's `edit`; its auto-approval knows no other word.
+    assert_eq!(permissions[0].action, "edit");
     assert_eq!(
         mapper::approval_decision(p, "approval", PermissionDecision::AllowAlways).unwrap(),
         "acceptAlways"

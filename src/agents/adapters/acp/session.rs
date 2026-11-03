@@ -48,12 +48,14 @@ pub trait AcpProvider: Send + Sync + 'static {
     const STEERING: bool = false;
     /// Advertise form elicitation; questions arrive as `elicitation/create`.
     const FORM_ELICITATION: bool = false;
-    /// The `rawInput` fields, in order, that carry an execute permission's
-    /// complete shell command. The ACP convention is `command`; an agent whose
+    /// What the agent's own tool vocabulary means for a permission: the
+    /// `rawInput` fields, in order, that carry an execute permission's
+    /// complete shell command (the ACP convention is `command`; an agent whose
     /// own tool schema names it differently lists that name here, so the
     /// App's shell scanner always receives the real command and no unknown
-    /// shape is guessed at.
-    const SHELL_COMMAND_FIELDS: &'static [&'static str] = mapper::SHELL_COMMAND_FIELDS;
+    /// shape is guessed at), and the App action of each tool whose `kind` the
+    /// agent does not state.
+    const PERMISSION_FIELDS: mapper::PermissionFields = mapper::PERMISSION_FIELDS;
     /// The session takes an appended system prompt (`systemPrompt` on
     /// `session/new`, `session/load`, `session/resume`).
     const SYSTEM_PROMPT: bool = false;
@@ -2679,7 +2681,7 @@ impl<P: AcpProvider> AcpDriver<P> {
                 }
                 match state
                     .projection
-                    .permission(id.clone(), &params, P::SHELL_COMMAND_FIELDS)
+                    .permission(id.clone(), &params, P::PERMISSION_FIELDS)
                 {
                     Ok(mut permission) => {
                         let mut tool = params["toolCall"].clone();

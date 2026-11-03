@@ -213,6 +213,7 @@ pub(super) fn pi_features(approvals: bool) -> crate::discovery::AgentFeatures {
             ("sessionRename".into(), serde_json::json!(true)),
             ("sessionDelete".into(), serde_json::json!(true)),
             ("sessionFork".into(), serde_json::json!(true)),
+            ("savedPermissions".into(), serde_json::json!(false)),
         ]),
     }
 }

@@ -143,9 +143,15 @@ pub fn permission(thread_id: &str, item: &Value) -> Option<PermissionRequest> {
     Some(PermissionRequest {
         id: string(item, "requestId")?.to_string(),
         asid: thread_id.into(),
-        action: string(item, "requestKind")
-            .unwrap_or("permission")
-            .to_string(),
+        // `file-change` is the App's `edit`, the word its auto-approval and
+        // its card know; `command` carries no command text, so it stays the
+        // provider's own word and a tap.
+        action: match string(item, "requestKind") {
+            Some("file-change") => "edit",
+            Some(kind) => kind,
+            None => "permission",
+        }
+        .to_string(),
         resources: vec![],
         save: vec![],
         prompt: string(item, "prompt")
