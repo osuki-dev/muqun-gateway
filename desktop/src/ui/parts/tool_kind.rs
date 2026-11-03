@@ -363,7 +363,7 @@ pub struct EditFile {
 }
 
 fn count_marked(patch: &str, marker: char) -> u32 {
-    let header: String = std::iter::repeat(marker).take(3).collect();
+    let header: String = std::iter::repeat_n(marker, 3).collect();
     patch
         .lines()
         .filter(|l| l.starts_with(marker) && !l.starts_with(&header))

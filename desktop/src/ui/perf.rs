@@ -26,10 +26,10 @@ struct Meter {
 }
 
 fn enabled() -> bool {
-    match std::env::var("MUQUN_SHOW_FPS").as_deref() {
-        Ok("0") | Ok("false") | Ok("no") | Ok("off") => false,
-        _ => true,
-    }
+    !matches!(
+        std::env::var("MUQUN_SHOW_FPS").as_deref(),
+        Ok("0") | Ok("false") | Ok("no") | Ok("off")
+    )
 }
 
 /// Install once when the meter is on. No-op when disabled so the scheduler

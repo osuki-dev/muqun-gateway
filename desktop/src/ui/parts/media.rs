@@ -59,6 +59,7 @@ fn file_label(path: &str) -> String {
         .to_string()
 }
 
+#[cfg(test)]
 fn fit_size(w: Option<u32>, h: Option<u32>, max_w: f32, max_h: f32) -> (f32, f32) {
     fit_size_with_unknown(w, h, max_w, max_h, max_w, max_h * 0.66)
 }
@@ -175,10 +176,8 @@ pub fn tile(
         mime,
         width,
         height,
-        max_w,
-        max_h,
-        max_w,
-        max_h * 0.66,
+        (max_w, max_h),
+        (max_w, max_h * 0.66),
     )
 }
 
@@ -198,10 +197,8 @@ fn tool_tile(
         mime,
         width,
         height,
-        max_w,
-        max_h,
-        TOOL_UNKNOWN_W,
-        TOOL_UNKNOWN_H,
+        (max_w, max_h),
+        (TOOL_UNKNOWN_W, TOOL_UNKNOWN_H),
     )
 }
 
@@ -211,10 +208,8 @@ fn tile_sized(
     mime: Option<&str>,
     width: Option<u32>,
     height: Option<u32>,
-    max_w: f32,
-    max_h: f32,
-    unknown_w: f32,
-    unknown_h: f32,
+    (max_w, max_h): (f32, f32),
+    (unknown_w, unknown_h): (f32, f32),
 ) -> Div {
     let kind = kind_for(src, mime);
     match resolve(src, cwd) {

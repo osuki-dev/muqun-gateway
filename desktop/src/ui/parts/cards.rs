@@ -1302,7 +1302,7 @@ pub fn todo(ctx: &PartCtx<'_>, items: &[TodoItem]) -> Div {
                 ui_text(item.text.clone())
                     .size(scale::FS_13)
                     .line_height(1.5)
-                    .class(if current { "mq-text" } else { "mq-text" })
+                    .class("mq-text")
             };
             body = body.child(
                 div()

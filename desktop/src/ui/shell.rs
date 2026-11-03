@@ -359,7 +359,7 @@ pub fn open_diff_file(app: &App, file: &str) {
 /// Preferred right width, clamped so left + main keep [`UiPrefs::MAIN_MIN`].
 pub fn clamp_right_width(want: f32, window: f32, side: f32) -> f32 {
     let available = (window - 2.0 * FRAME_PAD - side - UiPrefs::MAIN_MIN - 8.0).max(0.0);
-    let max = available.min(UiPrefs::RIGHT_MAX).max(UiPrefs::RIGHT_MIN);
+    let max = available.clamp(UiPrefs::RIGHT_MIN, UiPrefs::RIGHT_MAX);
     want.clamp(UiPrefs::RIGHT_MIN, max)
 }
 

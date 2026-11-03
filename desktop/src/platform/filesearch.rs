@@ -1,7 +1,7 @@
 //! Local `@` file search when the agent cannot answer (`find_files`
 //! unsupported or empty). Same bounded walk as the gateway terminal pane.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use muqun_gateway::filesearch;
 use serde_json::{json, Value};
@@ -30,7 +30,7 @@ pub async fn find_files(directory: &str, query: &str, limit: usize) -> Vec<Value
 
 /// True when `path` is under `directory` (after normalizing separators).
 #[cfg(test)]
-fn under_root(directory: &Path, path: &str) -> bool {
+fn under_root(directory: &std::path::Path, path: &str) -> bool {
     let candidate = directory.join(path);
     candidate.starts_with(directory)
 }
@@ -66,7 +66,7 @@ mod tests {
             .iter()
             .filter_map(|h| h.get("path").and_then(Value::as_str))
             .collect();
-        assert!(paths.iter().any(|p| *p == "readme.md"));
+        assert!(paths.contains(&"readme.md"));
         for path in &paths {
             assert!(under_root(&root, path));
             assert!(!path.starts_with('/'));

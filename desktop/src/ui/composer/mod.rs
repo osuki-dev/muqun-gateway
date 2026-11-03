@@ -480,9 +480,9 @@ fn popup_rows(app: &App, popup: &state::Popup) -> Vec<triggers::Row> {
             let mut rows = triggers::computer_rows(
                 &trigger.query,
                 &cmp.peers.get(),
-                &app.strings.popup_this_computer(),
-                &app.strings.popup_computer(),
-                &app.strings.popup_computer_offline(),
+                app.strings.popup_this_computer(),
+                app.strings.popup_computer(),
+                app.strings.popup_computer_offline(),
             );
             rows.extend(cmp.files.get().hits.iter().map(|hit| {
                 triggers::Row::item(hit.path.clone(), hit.name.clone(), hit.path.clone())
@@ -1146,7 +1146,7 @@ fn field_width(card: f32) -> f32 {
 /// Card width for a main-panel column of `panel` px: slot inset preserved on
 /// both sides, capped at [`SESSION_MAX`].
 pub(crate) fn session_card_width_for(panel: f32) -> f32 {
-    (panel - 2.0 * SLOT_SIDE).max(0.0).min(SESSION_MAX)
+    (panel - 2.0 * SLOT_SIDE).clamp(0.0, SESSION_MAX)
 }
 
 /// Card width from the window (popup / overlays that are not under `main_panel`).
