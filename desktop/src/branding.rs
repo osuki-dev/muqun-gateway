@@ -7,7 +7,7 @@ use std::sync::OnceLock;
 
 use base64::Engine as _;
 
-pub const APP_NAME: &str = "Muqun Desktop";
+pub const APP_NAME: &str = "Muqun";
 
 /// The full-size icon, 1024×1024, for packaging and the window icon.
 pub const APP_ICON_PNG: &[u8] = include_bytes!("../assets/icons/app-icon.png");

@@ -96,8 +96,16 @@ pub fn top_bar(app: &App) -> Div {
                 .flex_row()
                 .items_center()
                 .flex_shrink_0()
+                .gap(8.0)
                 .cursor_pointer()
                 .child(image(mark_data_uri()).size(24.0, 24.0).rounded(6.0))
+                .child(
+                    ui_text(APP_NAME)
+                        .size(15.0)
+                        .semibold()
+                        .no_wrap()
+                        .no_cursor(),
+                )
                 .on_click(move |_| home_app.drain.go_home()),
         )
         .child(div().flex_1().min_w(0.0).overflow_clip().child(title(app)))
@@ -131,13 +139,8 @@ fn title(app: &App) -> impl ElementBuilder {
                 .min_w(0.0)
                 .overflow_clip();
             let Some(info) = header.get() else {
-                return line.child(
-                    ui_text(APP_NAME)
-                        .size(15.0)
-                        .semibold()
-                        .no_wrap()
-                        .no_cursor(),
-                );
+                // Brand mark + name already sit to the left.
+                return line;
             };
             let branch = info
                 .git_info

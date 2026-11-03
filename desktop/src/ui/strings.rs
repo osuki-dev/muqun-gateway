@@ -116,7 +116,7 @@ strings! {
 // The start page and the composer (v2.1).
 strings! {
     start_title => "What are we doing?", "想做什么？";
-    welcome => "Welcome to Muqun Desktop", "欢迎使用 Muqun Desktop";
+    welcome => "Welcome to Muqun", "欢迎使用 Muqun";
     recent_label => "Recent", "最近";
     recents_empty => "Your first session will appear here", "第一个会话会出现在这里";
     composer_hint => "Send a message, type / for commands, $ for skills, @ for files…", "发送消息，/ 命令，$ 技能，@ 文件…";
