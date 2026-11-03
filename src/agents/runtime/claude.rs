@@ -437,10 +437,16 @@ pub(crate) fn pane_for(
     }
 }
 
-/// The runtime a terminal-held session is shown with.
+/// The runtime a terminal-held session is shown with. `identity` is the
+/// backend's own `instance_id` for the agent in that pane -- the string
+/// `GET /api/sessions/{id}/agents` answers with, and what a client compares
+/// the runtime's against before opening the terminal. When the backend names
+/// none (tmux; Herdr before Claude's hooks report a session) the process's own
+/// identity stays, which a client accepts against the list's null.
 pub(crate) fn terminal_runtime(
     process: &crate::agents::adapters::claude::native_sessions::LiveProcess,
     pane: Option<(String, String)>,
+    identity: Option<String>,
 ) -> crate::agents::adapters::acp::session::TerminalLive {
     use crate::agents::adapters::acp::session::{TerminalLive, TerminalRoute};
     use crate::agents::domain::*;
@@ -459,7 +465,8 @@ pub(crate) fn terminal_runtime(
                 terminal: Some(RuntimeTerminal {
                     session_id: session.clone(),
                     pane_id: pane.clone(),
-                    instance_id: format!("claude:{}:{}", process.pid, process.start),
+                    instance_id: identity
+                        .unwrap_or_else(|| format!("claude:{}:{}", process.pid, process.start)),
                 }),
                 reason: None,
             },
@@ -478,6 +485,64 @@ pub(crate) fn terminal_runtime(
             route: None,
         },
     }
+}
+
+/// The backend's identity for the one agent it lists in `pane`, picked out
+/// the way a client does: by pane id, and only when it is alone there.
+fn pane_identity(agents: &[crate::backend::Agent], pane: &str) -> Option<String> {
+    let mut found = agents.iter().filter(|agent| agent.pane_id.as_str() == pane);
+    match (found.next(), found.next()) {
+        (Some(only), None) => only.instance_id.clone().filter(|id| !id.is_empty()),
+        _ => None,
+    }
+}
+
+/// Where each live Claude process is, read from the configured backends.
+async fn locate(
+    sessions: &[crate::SessionConfig],
+    wanted: Vec<(
+        String,
+        crate::agents::adapters::claude::native_sessions::LiveProcess,
+    )>,
+    descends: fn(u32, u32) -> bool,
+) -> std::collections::HashMap<String, crate::agents::adapters::acp::session::TerminalLive> {
+    let timeout = std::time::Duration::from_secs(2);
+    let mut panes = Vec::new();
+    let mut agents = std::collections::HashMap::new();
+    for session in sessions {
+        let backend = crate::terminal_backend(session);
+        let (listed, listed_agents) = tokio::join!(
+            tokio::time::timeout(timeout, backend.list_panes()),
+            tokio::time::timeout(timeout, backend.list_agents()),
+        );
+        if let Ok(Ok(listed)) = listed {
+            panes.extend(listed.into_iter().filter_map(|pane| {
+                Some((
+                    session.id.clone(),
+                    pane.id.as_str().to_owned(),
+                    pane.shell_pid?,
+                ))
+            }));
+        }
+        if let Ok(Ok(listed)) = listed_agents {
+            agents.insert(session.id.clone(), listed);
+        }
+    }
+    let panes = std::sync::Arc::new(panes);
+    let mut live = std::collections::HashMap::new();
+    for (id, process) in wanted {
+        let panes = panes.clone();
+        let pid = process.pid;
+        let pane = tokio::task::spawn_blocking(move || pane_for(pid, &panes, descends))
+            .await
+            .ok()
+            .flatten();
+        let identity = pane.as_ref().and_then(|(session, pane)| {
+            pane_identity(agents.get(session).map_or(&[], Vec::as_slice), pane)
+        });
+        live.insert(id, terminal_runtime(&process, pane, identity));
+    }
+    live
 }
 
 impl Terminals {
@@ -518,37 +583,12 @@ impl crate::agents::adapters::acp::session::TerminalBridge for Terminals {
             if wanted.is_empty() {
                 return Ok(Default::default());
             }
-            let mut panes = Vec::new();
-            for session in &self.sessions {
-                let listed = tokio::time::timeout(
-                    std::time::Duration::from_secs(2),
-                    crate::terminal_backend(session).list_panes(),
-                )
-                .await;
-                if let Ok(Ok(listed)) = listed {
-                    panes.extend(listed.into_iter().filter_map(|pane| {
-                        Some((
-                            session.id.clone(),
-                            pane.id.as_str().to_owned(),
-                            pane.shell_pid?,
-                        ))
-                    }));
-                }
-            }
-            let panes = std::sync::Arc::new(panes);
-            let mut live = std::collections::HashMap::new();
-            for (id, process) in wanted {
-                let panes = panes.clone();
-                let pid = process.pid;
-                let pane = tokio::task::spawn_blocking(move || {
-                    pane_for(pid, &panes, crate::terminal::backend::descends_from)
-                })
-                .await
-                .ok()
-                .flatten();
-                live.insert(id, terminal_runtime(&process, pane));
-            }
-            Ok(live)
+            Ok(locate(
+                &self.sessions,
+                wanted,
+                crate::terminal::backend::descends_from,
+            )
+            .await)
         })
     }
 
@@ -769,18 +809,71 @@ mod tests {
             start: "9".into(),
             busy: Some(true),
         };
-        let typed = terminal_runtime(&process, Some(("s".into(), "a".into())));
+        let typed = terminal_runtime(&process, Some(("s".into(), "a".into())), None);
         assert_eq!(typed.runtime.interaction, RuntimeInteraction::Terminal);
         assert_eq!(typed.runtime.status, Some(TerminalRuntimeStatus::Working));
         assert_eq!(typed.runtime.terminal.unwrap().instance_id, "claude:300:9");
         assert_eq!(typed.route.unwrap().pane, "a");
-        let shown = terminal_runtime(&process, None);
+        let shown = terminal_runtime(&process, None, None);
         assert_eq!(shown.runtime.interaction, RuntimeInteraction::Unavailable);
         assert_eq!(
             shown.runtime.reason,
             Some(RuntimeReason::TerminalUnavailable)
         );
         assert!(shown.route.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_terminal_runtime_names_its_pane_as_the_agent_list_does() {
+        use crate::agents::adapters::claude::native_sessions::LiveProcess;
+        use serde_json::json;
+        let herdr = crate::test_support::FakeHerdr::start(vec![], None);
+        let session = herdr.session();
+        let pane = |id: &str, shell: u32| json!({"pane_id": id, "workspace_id": "w1", "tab_id": "w1:t1", "shell_pid": shell});
+        herdr.set_panes(json!([pane("w1:p1", 30), pane("w1:p2", 40)]));
+        // Claude started by hand in w1:p1; its hooks report the conversation.
+        let claude = |terminal: &str, conversation: &str| {
+            json!({"pane_id": "w1:p1", "terminal_id": terminal, "agent": "claude",
+                   "agent_status": "idle", "agent_session": {"value": conversation}})
+        };
+        let other = json!({"pane_id": "w1:p2", "terminal_id": "term_b", "agent": "codex",
+                           "agent_session": {"value": "other"}});
+        let process = LiveProcess {
+            pid: 300,
+            start: "9".into(),
+            busy: Some(false),
+        };
+        let runtime_identity = || async {
+            let live = locate(
+                std::slice::from_ref(&session),
+                vec![("c".into(), process.clone())],
+                |pid, ancestor| pid == ancestor || (pid == 300 && ancestor == 30),
+            )
+            .await;
+            live["c"].runtime.terminal.clone().unwrap().instance_id
+        };
+        let listed_identity = || async {
+            let list = crate::terminal::routes::backend_agent_list(&session)
+                .await
+                .unwrap();
+            list["result"]["agents"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|agent| agent["pane_id"] == "w1:p1")
+                .unwrap()["instance_id"]
+                .clone()
+        };
+
+        herdr.set_agents(json!([claude("term_a", "first"), other.clone()]));
+        let first = runtime_identity().await;
+        assert_eq!(json!(first), listed_identity().await);
+
+        // Another agent in the same pane is another identity: the runtime the
+        // client holds no longer matches, and a fresh one names the new agent.
+        herdr.set_agents(json!([claude("term_c", "second"), other]));
+        assert_ne!(json!(first), listed_identity().await);
+        assert_eq!(json!(runtime_identity().await), listed_identity().await);
     }
 
     #[test]

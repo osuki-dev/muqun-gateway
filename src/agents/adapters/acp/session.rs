@@ -15,7 +15,8 @@ use super::operations::{self, PromptCapabilities};
 use super::recovery::{self, Checkpoint, NativeSnapshot, TurnEvidence};
 use super::{AcpClient, AcpEvent};
 use crate::agents::adapters::codex::process_tree::ProcessKey;
-use crate::agents::adapters::memory_mirror::MemoryMirror;
+use crate::agents::adapters::inbox::{Delivery, Inbox, Queued};
+use crate::agents::adapters::memory_mirror::{MemoryMirror, SessionPatch};
 use crate::agents::domain::*;
 use crate::agents::ports::agent::{
     AgentError, AgentFuture, AgentPort, AttachmentMode, FileDiffItem,
@@ -43,6 +44,11 @@ pub trait AcpProvider: Send + Sync + 'static {
     /// Permission modes belong to the session (`session/set_mode`) and are
     /// offered as its modes. Off where a mode change persists elsewhere.
     const SESSION_MODES: bool = false;
+    /// The agent's own bypass-everything permission modes, by the ids its
+    /// `modes.availableModes` uses, most specific first. The App's
+    /// auto-approve switch selects the first one the live session offers
+    /// (`session/set_mode`); empty where the agent has no such mode.
+    const BYPASS_MODES: &'static [&'static str] = &[];
     /// A prompt sent while a turn runs may be steered into it
     /// (`_session/steering`, initialize `_meta.steering.supported`).
     const STEERING: bool = false;
@@ -311,6 +317,57 @@ struct SessionState {
     /// again just before the first prompt (`None` when unreadable).
     process_baseline: Option<HashSet<ProcessKey>>,
     prompted: bool,
+    /// The permission mode the session ran in before auto-approve put it
+    /// into a bypass mode, so switching auto-approve off restores it.
+    restore_mode: Option<String>,
+}
+
+/// The mode the App's auto-approve switch selects, if a change is needed.
+///
+/// On: the first of the provider's `bypass` ids the session `offered`,
+/// unless `current` already is one. Off: the mode remembered from before
+/// (`restore`) when still offered, else `default`; nothing when the session
+/// is not in bypass. `Err` says why the agent cannot do it, in its terms.
+fn bypass_transition(
+    current: Option<&str>,
+    offered: &[String],
+    bypass: &[&str],
+    enabled: bool,
+    restore: Option<&str>,
+) -> Result<Option<String>, &'static str> {
+    let offers = |mode: &str| offered.iter().any(|offered| offered == mode);
+    let in_bypass = current.is_some_and(|mode| bypass.contains(&mode));
+    if enabled {
+        if in_bypass {
+            return Ok(None);
+        }
+        return bypass
+            .iter()
+            .find(|mode| offers(mode))
+            .map(|mode| Some((*mode).to_owned()))
+            .ok_or("does not offer its bypass mode in this session");
+    }
+    if !in_bypass {
+        return Ok(None);
+    }
+    restore
+        .filter(|mode| offers(mode) && !bypass.contains(mode))
+        .or_else(|| offers("default").then_some("default"))
+        .map(|mode| Some(mode.to_owned()))
+        .ok_or("offers no mode to return to in this session")
+}
+
+/// The permission mode ids this session offers: its catalog's (a provider
+/// with `SESSION_MODES`) and whatever `modes.availableModes` the agent
+/// itself reported, in that order, without repeats.
+fn permission_modes(state: &SessionState) -> Vec<String> {
+    let mut ids: Vec<String> = state.catalog.modes.iter().map(|m| m.id.clone()).collect();
+    for mode in mapper::session_modes(&state.config).0 {
+        if !ids.contains(&mode.id) {
+            ids.push(mode.id);
+        }
+    }
+    ids
 }
 
 #[derive(Clone)]
@@ -429,6 +486,36 @@ struct Session {
     prompt_capabilities: PromptCapabilities,
     finished: CancellationToken,
     retirement: Mutex<()>,
+    /// Prompts sent while a turn runs, handed over when it ends normally.
+    inbox: StdMutex<Inbox<QueuedPrompt>>,
+    /// Serializes queueing against a turn's end and a queued delivery, so
+    /// a prompt is either queued behind a running turn or sent now.
+    turn_gate: Arc<Mutex<()>>,
+}
+
+impl Session {
+    fn queue(&self) -> std::sync::MutexGuard<'_, Inbox<QueuedPrompt>> {
+        self.inbox.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// A turn the agent has accepted and not yet ended.
+    async fn in_turn(&self) -> bool {
+        self.connected.load(Ordering::Acquire)
+            && self.state.lock().await.info.status == AgentSessionStatus::Busy
+    }
+}
+
+/// A prompt validated for its session, ready to start a turn.
+#[derive(Clone)]
+struct QueuedPrompt {
+    prepared: operations::PreparedPrompt,
+    attachments: bool,
+    /// A native slash command, whose work may outlive the turn.
+    command: bool,
+}
+
+fn inbox_item_not_found(id: &str) -> AgentError {
+    AgentError::InboxItemNotFound(format!("ACP inbox item {id} is not queued"))
 }
 
 type LiveSessions = Arc<StdMutex<HashMap<String, Arc<Session>>>>;
@@ -1241,19 +1328,25 @@ impl<P: AcpProvider> AcpDriver<P> {
         Ok(())
     }
 
-    /// `session/set_mode` to one of the session's own modes. The agent
-    /// answers with a `config_option_update`, which moves `info.mode`.
+    /// `session/set_mode` to a mode the live session offers (its catalog's,
+    /// or `modes.availableModes` as the agent reported them). The agent
+    /// answers with a `config_option_update` or `current_mode_update`,
+    /// which moves `info.mode`.
     async fn select_mode(&self, session: &Session, mode: &str) -> Result<(), AgentError> {
-        let id = {
-            let state = session.state.lock().await;
-            if !state.catalog.modes.iter().any(|offered| offered.id == mode) {
-                return Err(AgentError::InvalidRequest(format!(
-                    "{} does not offer the mode {mode} in this session",
-                    P::LABEL
-                )));
-            }
-            state.info.asid.0.clone()
-        };
+        let offered = permission_modes(&*session.state.lock().await)
+            .iter()
+            .any(|offered| offered == mode);
+        if !offered {
+            return Err(AgentError::InvalidRequest(format!(
+                "{} does not offer the mode {mode} in this session",
+                P::LABEL
+            )));
+        }
+        self.send_set_mode(session, mode).await
+    }
+
+    async fn send_set_mode(&self, session: &Session, mode: &str) -> Result<(), AgentError> {
+        let id = session.state.lock().await.info.asid.0.clone();
         session
             .client
             .request_with_timeout(
@@ -1267,18 +1360,25 @@ impl<P: AcpProvider> AcpDriver<P> {
         if state.info.mode.as_deref() != Some(mode) {
             state.info.mode = Some(mode.into());
             state.catalog.defaults.mode = Some(mode.into());
-            let info = state.info.clone();
+            let asid = state.info.asid.clone();
             drop(state);
-            let seq = self.mirror.update_session(info.clone()).await;
-            Self::emit(
-                &self.mirror,
-                &self.tx,
-                AgentDomainEvent::SessionUpdated {
-                    asid: info.asid.clone(),
-                    info: Box::new(info),
-                    seq,
-                },
-            );
+            // Only the mode: a copy of the whole info would carry the status
+            // it had here, and a turn that ended meanwhile would read busy.
+            let patch = SessionPatch {
+                agent: Some(mode.into()),
+                ..SessionPatch::default()
+            };
+            if let Some((seq, info)) = self.mirror.merge_session_fields(&asid, patch).await {
+                Self::emit(
+                    &self.mirror,
+                    &self.tx,
+                    AgentDomainEvent::SessionUpdated {
+                        asid,
+                        info: Box::new(info),
+                        seq,
+                    },
+                );
+            }
         }
         Ok(())
     }
@@ -2240,6 +2340,7 @@ impl<P: AcpProvider> AcpDriver<P> {
                 .process_id()
                 .and_then(crate::agents::adapters::codex::process_tree::descendants),
             prompted: false,
+            restore_mode: None,
         };
         for params in deferred {
             if params["sessionId"].as_str() != Some(id.as_str()) {
@@ -2342,6 +2443,8 @@ impl<P: AcpProvider> AcpDriver<P> {
             commands_observed: self.commands_observed.clone(),
             finished: CancellationToken::new(),
             retirement: Mutex::new(()),
+            inbox: StdMutex::new(Inbox::default()),
+            turn_gate: Arc::new(Mutex::new(())),
         });
         self.sessions
             .lock()
@@ -2921,50 +3024,178 @@ impl<P: AcpProvider> AcpDriver<P> {
         delivery: Option<&str>,
         native_command: bool,
     ) -> Result<(), AgentError> {
-        match delivery {
-            None | Some("auto") => {}
+        let queued = match delivery {
+            None | Some("auto") => None,
             Some("steer") if P::STEERING && !native_command => {
                 let running = self.retained(id).filter(|session| {
                     session.connected.load(Ordering::Acquire)
                         && session.busy.load(Ordering::Acquire)
                 });
                 if let Some(session) = running {
-                    if self.steer(&session, id, text, attachments).await? {
+                    let prepared =
+                        operations::prompt_parts(text, attachments, session.prompt_capabilities)
+                            .await?;
+                    if self.steer(&session, id, &prepared).await? {
                         return Ok(());
                     }
                 }
                 // No turn is running (any more): an ordinary prompt.
+                None
             }
-            Some("steer") => {
-                return Err(AgentError::Unsupported("ACP prompt steering".into()));
+            // Without steering, "steer" is the next prompt the turn's end sends.
+            Some(mode) => Some(Delivery::parse(mode).ok_or_else(|| {
+                AgentError::InvalidRequest("delivery must be steer or queue".into())
+            })?),
+        };
+        if let Some(delivery) = queued {
+            if self
+                .enqueue(id, text, attachments, native_command, delivery)
+                .await?
+            {
+                return Ok(());
             }
-            // Gateway keeps no inbox for ACP sessions.
-            Some("queue") => {
-                return Err(AgentError::Unsupported("ACP prompt queueing".into()));
-            }
-            Some(_) => {
-                return Err(AgentError::InvalidRequest(
-                    "delivery must be steer or queue".into(),
-                ));
-            }
+            // Nothing runs: it starts now, as an idle OpenCode session
+            // delivers a queued prompt at once.
         }
         let session = self.activate(id, false, true).await?;
         let mut admission = Admission {
             busy: &session.busy,
             handed_off: false,
         };
-        let prepared =
-            operations::prompt_parts(text, attachments, session.prompt_capabilities).await?;
-        let checkpoint = if P::IDLE_RETIREMENT && attachments.is_empty() {
+        let prompt = Self::prepare(&session, text, attachments, native_command).await?;
+        Self::start_turn(
+            &session,
+            &self.mirror,
+            &self.tx,
+            &self.binary,
+            &self.inspection,
+            &self.stop,
+            &prompt,
+        )
+        .await?;
+        admission.handed_off = true;
+        Ok(())
+    }
+
+    async fn prepare(
+        session: &Session,
+        text: &str,
+        attachments: &[String],
+        native_command: bool,
+    ) -> Result<QueuedPrompt, AgentError> {
+        Ok(QueuedPrompt {
+            prepared: operations::prompt_parts(text, attachments, session.prompt_capabilities)
+                .await?,
+            attachments: !attachments.is_empty(),
+            // Direct prompt delivery can carry the same native slash command
+            // as run_command; catalogs may be stale or omit extension commands.
+            command: native_command || text.trim_start().starts_with('/'),
+        })
+    }
+
+    /// Queue a prompt behind the running turn. `Ok(false)`: no turn runs,
+    /// nothing was queued.
+    async fn enqueue(
+        &self,
+        id: &str,
+        text: &str,
+        attachments: &[String],
+        native_command: bool,
+        delivery: Delivery,
+    ) -> Result<bool, AgentError> {
+        let Some(session) = self.retained(id) else {
+            return Ok(false);
+        };
+        let prompt = Self::prepare(&session, text, attachments, native_command).await?;
+        let _gate = session.turn_gate.lock().await;
+        if !session.in_turn().await {
+            return Ok(false);
+        }
+        session.queue().push(
+            id,
+            Queued {
+                id: format!("inbox_{}", uuid::Uuid::new_v4().simple()),
+                created_ms: mapper::now_ms(),
+                delivery,
+                text: text.to_owned(),
+                files: prompt.prepared.files.clone(),
+                input: prompt,
+            },
+        )?;
+        Self::publish_inbox(&session, &self.mirror, &self.tx).await;
+        Ok(true)
+    }
+
+    async fn publish_inbox(
+        session: &Session,
+        mirror: &MemoryMirror,
+        tx: &broadcast::Sender<AgentDomainEvent>,
+    ) {
+        let asid = session.state.lock().await.info.asid.clone();
+        let items = session.queue().items(&asid.0);
+        let (seq, items) = mirror.set_inbox(&asid, items).await;
+        Self::emit(
+            mirror,
+            tx,
+            AgentDomainEvent::InboxChanged { asid, items, seq },
+        );
+    }
+
+    /// A queued prompt left the queue: published, and when its delivery
+    /// failed it may still have reached the agent, so readers refetch.
+    async fn settle_queued(
+        session: &Session,
+        mirror: &MemoryMirror,
+        tx: &broadcast::Sender<AgentDomainEvent>,
+        item: &str,
+        result: &Result<(), AgentError>,
+    ) {
+        let asid = session.state.lock().await.info.asid.clone();
+        session.queue().remove(&asid.0, item);
+        Self::publish_inbox(session, mirror, tx).await;
+        if let Err(error) = result {
+            tracing::warn!(
+                session = %asid.0,
+                %error,
+                "A queued ACP prompt may have been delivered; removed and not resent"
+            );
+            Self::emit(
+                mirror,
+                tx,
+                AgentDomainEvent::Resync {
+                    asid,
+                    reason: "acp_queued_delivery_outcome_unknown".into(),
+                },
+            );
+        }
+    }
+
+    /// Start a turn with `prompt`. The caller holds `session.busy`; `Ok`
+    /// hands it to the turn's completion.
+    async fn start_turn(
+        session: &Session,
+        mirror: &MemoryMirror,
+        tx: &broadcast::Sender<AgentDomainEvent>,
+        binary: &str,
+        inspection: &Mutex<()>,
+        stop: &CancellationToken,
+        prompt: &QueuedPrompt,
+    ) -> Result<(), AgentError> {
+        let prepared = &prompt.prepared;
+        let (id, initial_empty, directory) = {
             let state = session.state.lock().await;
-            let initial_empty = state.owned_mutations && state.projection.is_empty();
-            let directory = state.info.directory.clone().unwrap_or_default();
-            drop(state);
+            (
+                state.info.asid.0.clone(),
+                state.owned_mutations && state.projection.is_empty(),
+                state.info.directory.clone().unwrap_or_default(),
+            )
+        };
+        let checkpoint = if P::IDLE_RETIREMENT && !prompt.attachments {
             if initial_empty {
-                Some(NativeSnapshot::empty(id).checkpoint())
+                Some(NativeSnapshot::empty(&id).checkpoint())
             } else {
-                let _inspection = self.inspection.lock().await;
-                P::recovery_snapshot(&self.binary, &directory, id, &self.stop)
+                let _inspection = inspection.lock().await;
+                P::recovery_snapshot(binary, &directory, &id, stop)
                     .await
                     .ok()
                     .filter(|snapshot| snapshot.session_id == id)
@@ -2993,9 +3224,7 @@ impl<P: AcpProvider> AcpDriver<P> {
                 .and_then(crate::agents::adapters::codex::process_tree::descendants);
             state.process_baseline = state.process_baseline.take().zip(now).map(|(a, b)| &a | &b);
         }
-        // Direct prompt delivery can carry the same native slash command as
-        // run_command; catalogs may be stale or omit extension commands.
-        if native_command || text.trim_start().starts_with('/') {
+        if prompt.command {
             session.client.protect_unverified_live_work();
         }
         let request = session
@@ -3010,14 +3239,13 @@ impl<P: AcpProvider> AcpDriver<P> {
                 state.info.status = AgentSessionStatus::Busy;
                 state.info.error = None;
                 state.info.updated_ms = mapper::now_ms();
-                if let Some(seq) = self
-                    .mirror
+                if let Some(seq) = mirror
                     .update_status(&state.info.asid, AgentSessionStatus::Busy, None)
                     .await
                 {
                     Self::emit(
-                        &self.mirror,
-                        &self.tx,
+                        mirror,
+                        tx,
                         AgentDomainEvent::StatusChanged {
                             asid: state.info.asid.clone(),
                             status: AgentSessionStatus::Busy,
@@ -3027,17 +3255,15 @@ impl<P: AcpProvider> AcpDriver<P> {
                     );
                 }
                 let row = state.projection.submitted(&prepared.transcript);
-                let event = self
-                    .mirror
+                let event = mirror
                     .record_timeline_upsert(&state.info.asid, vec![row])
                     .await;
-                Self::emit(&self.mirror, &self.tx, event);
+                Self::emit(mirror, tx, event);
                 drop(state);
                 let sender = session.completions.clone();
                 tokio::spawn(async move {
                     let _ = sender.send(request.wait_for_turn().await);
                 });
-                admission.handed_off = true;
                 Ok(())
             }
             Err(error) => {
@@ -3045,14 +3271,7 @@ impl<P: AcpProvider> AcpDriver<P> {
                 // A partial stdio write can be ambiguous. Preserve the uncertainty;
                 // no automatic retry, queue fallback or second delivery is allowed.
                 session.connected.store(false, Ordering::Release);
-                Self::status(
-                    &session,
-                    &self.mirror,
-                    &self.tx,
-                    AgentSessionStatus::Unknown,
-                    None,
-                )
-                .await;
+                Self::status(session, mirror, tx, AgentSessionStatus::Unknown, None).await;
                 Err(AgentError::Network(format!(
                     "{error}; prompt delivery may have occurred; do not retry automatically"
                 )))
@@ -3066,11 +3285,8 @@ impl<P: AcpProvider> AcpDriver<P> {
         &self,
         session: &Session,
         id: &str,
-        text: &str,
-        attachments: &[String],
+        prepared: &operations::PreparedPrompt,
     ) -> Result<bool, AgentError> {
-        let prepared =
-            operations::prompt_parts(text, attachments, session.prompt_capabilities).await?;
         let outcome = session
             .client
             .request_with_timeout(
@@ -3545,6 +3761,9 @@ impl<P: AcpProvider> AcpDriver<P> {
                             Err(error) => (AgentSessionStatus::Failed, Some(AgentErrorInfo { name: "AcpPromptFailed".into(), message: format!("{error}; delivery was not retried"), status: None, retry_after_ms: None })),
                         };
                         Self::clear_permissions(&session, &mirror, &tx).await;
+                        // Held from the turn's end until what waits behind it
+                        // is handed over: a prompt is queued before, or sent after.
+                        let gate = session.turn_gate.clone().lock_owned().await;
                         Self::status(&session, &mirror, &tx, status, error).await;
                         {
                             let mut state = session.state.lock().await;
@@ -3556,7 +3775,23 @@ impl<P: AcpProvider> AcpDriver<P> {
                                 }
                             } else { None };
                         }
-                        session.busy.store(false, Ordering::Release);
+                        // Only a turn that ended normally sends what waits behind it.
+                        let id = session.state.lock().await.info.asid.0.clone();
+                        let next = (status == AgentSessionStatus::Idle).then(|| session.queue().next(&id).cloned()).flatten();
+                        let Some(item) = next else {
+                            session.busy.store(false, Ordering::Release);
+                            continue;
+                        };
+                        // `busy` stays held: the next turn takes it over.
+                        let (session, mirror, tx, binary, inspection, stop) = (session.clone(), mirror.clone(), tx.clone(), context.binary.clone(), context.inspection.clone(), stop.clone());
+                        tokio::spawn(async move {
+                            let _gate = gate;
+                            let result = Self::start_turn(&session, &mirror, &tx, &binary, &inspection, &stop, &item.input).await;
+                            if result.is_err() {
+                                session.busy.store(false, Ordering::Release);
+                            }
+                            Self::settle_queued(&session, &mirror, &tx, &item.id, &result).await;
+                        });
                     }
                     _ = tick.tick(), if P::IDLE_RETIREMENT => {
                         if let Some(kind) = Self::retire_idle(&session, &context, &mut events, &mirror, &tx, &stop).await {
@@ -3567,6 +3802,15 @@ impl<P: AcpProvider> AcpDriver<P> {
             }
             session.connected.store(false, Ordering::Release);
             Self::clear_permissions(&session, &mirror, &tx).await;
+            {
+                // Nothing waits for a process that is gone; the gate lets a
+                // queueing in progress finish first.
+                let _gate = session.turn_gate.lock().await;
+                let id = session.state.lock().await.info.asid.0.clone();
+                if session.queue().clear(&id) {
+                    Self::publish_inbox(&session, &mirror, &tx).await;
+                }
+            }
             session.client.shutdown().await;
             let mut state = session.state.lock().await;
             let id = state.info.asid.0.clone();
@@ -4251,6 +4495,96 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
             Ok(())
         })
     }
+    fn get_inbox<'a>(&'a self, id: &'a str) -> AgentFuture<'a, Vec<Value>> {
+        Box::pin(async move {
+            Ok(self
+                .retained(id)
+                .map(|session| session.queue().items(id))
+                .unwrap_or_default())
+        })
+    }
+    fn cancel_inbox_item<'a>(&'a self, id: &'a str, inbox_id: &'a str) -> AgentFuture<'a, ()> {
+        Box::pin(async move {
+            let session = self
+                .retained(id)
+                .ok_or_else(|| inbox_item_not_found(inbox_id))?;
+            // Waits for an in-flight delivery: a delivered item is not cancelled.
+            let _gate = session.turn_gate.lock().await;
+            session
+                .queue()
+                .remove(id, inbox_id)
+                .ok_or_else(|| inbox_item_not_found(inbox_id))?;
+            Self::publish_inbox(&session, &self.mirror, &self.tx).await;
+            Ok(())
+        })
+    }
+    /// "Send now" (`steer`): into the running turn where the agent steers,
+    /// else next when the turn ends, or at once when no turn runs.
+    fn set_inbox_delivery<'a>(
+        &'a self,
+        id: &'a str,
+        inbox_id: &'a str,
+        delivery: &'a str,
+    ) -> AgentFuture<'a, ()> {
+        Box::pin(async move {
+            let delivery = Delivery::parse(delivery).ok_or_else(|| {
+                AgentError::InvalidRequest("delivery must be steer or queue".into())
+            })?;
+            let session = self
+                .retained(id)
+                .ok_or_else(|| inbox_item_not_found(inbox_id))?;
+            let _gate = session.turn_gate.lock().await;
+            let item = session
+                .queue()
+                .get(id, inbox_id)
+                .cloned()
+                .ok_or_else(|| inbox_item_not_found(inbox_id))?;
+            let running = session.in_turn().await;
+            if delivery == Delivery::Steer && running && P::STEERING && !item.input.command {
+                let result = self.steer(&session, id, &item.input.prepared).await;
+                if !matches!(result, Ok(false)) {
+                    let result = result.map(drop);
+                    Self::settle_queued(&session, &self.mirror, &self.tx, inbox_id, &result).await;
+                    return result;
+                }
+                // The turn is ending: it goes first when it has.
+            }
+            if delivery == Delivery::Queue || running {
+                session.queue().set_delivery(id, inbox_id, delivery);
+                Self::publish_inbox(&session, &self.mirror, &self.tx).await;
+                return Ok(());
+            }
+            if !session.connected.load(Ordering::Acquire) {
+                return Err(AgentError::NotAvailable("ACP connection ended".into()));
+            }
+            if session
+                .busy
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                return Err(AgentError::NotAvailable(
+                    "ACP session is already processing a turn".into(),
+                ));
+            }
+            let mut admission = Admission {
+                busy: &session.busy,
+                handed_off: false,
+            };
+            let result = Self::start_turn(
+                &session,
+                &self.mirror,
+                &self.tx,
+                &self.binary,
+                &self.inspection,
+                &self.stop,
+                &item.input,
+            )
+            .await;
+            admission.handed_off = result.is_ok();
+            Self::settle_queued(&session, &self.mirror, &self.tx, inbox_id, &result).await;
+            result
+        })
+    }
     fn revert_session<'a>(&'a self, _id: &'a str, _message: &'a str) -> AgentFuture<'a, ()> {
         unsupported("revert")
     }
@@ -4267,6 +4601,51 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
             }
             let session = self.ensure_loaded(id).await?;
             self.select_mode(&session, mode).await
+        })
+    }
+    fn set_auto_approve<'a>(&'a self, id: &'a str, enabled: bool) -> AgentFuture<'a, ()> {
+        Box::pin(async move {
+            if P::BYPASS_MODES.is_empty() {
+                return Err(AgentError::Unsupported(format!(
+                    "{} has no session bypass mode",
+                    P::LABEL
+                )));
+            }
+            let session = self.ensure_loaded(id).await?;
+            let (current, offered, restore) = {
+                let state = session.state.lock().await;
+                (
+                    state.info.mode.clone(),
+                    permission_modes(&state),
+                    state.restore_mode.clone(),
+                )
+            };
+            let target = bypass_transition(
+                current.as_deref(),
+                &offered,
+                P::BYPASS_MODES,
+                enabled,
+                restore.as_deref(),
+            )
+            .map_err(|refusal| AgentError::Unsupported(format!("{} {refusal}", P::LABEL)))?;
+            let Some(target) = target else {
+                return Ok(());
+            };
+            session.state.lock().await.restore_mode = if enabled { current } else { None };
+            self.select_mode(&session, &target).await
+        })
+    }
+    fn auto_approve<'a>(&'a self, id: &'a str) -> AgentFuture<'a, Option<bool>> {
+        Box::pin(async move {
+            if P::BYPASS_MODES.is_empty() {
+                return Ok(None);
+            }
+            let session = self.ensure_loaded(id).await?;
+            let mode = session.state.lock().await.info.mode.clone();
+            Ok(Some(
+                mode.as_deref()
+                    .is_some_and(|mode| P::BYPASS_MODES.contains(&mode)),
+            ))
         })
     }
     fn find_files<'a>(
@@ -4318,6 +4697,126 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
         _mode: &'a str,
     ) -> AgentFuture<'a, Vec<FileDiffItem>> {
         unsupported("VCS diff")
+    }
+}
+
+#[cfg(test)]
+mod bypass_tests {
+    use super::bypass_transition;
+
+    /// The switch selects only a bypass mode the live session offers, and
+    /// off returns to the remembered mode -- never to another bypass --
+    /// else to `default`.
+    #[test]
+    fn auto_approve_moves_between_the_sessions_own_modes() {
+        let claude = [
+            "default",
+            "acceptEdits",
+            "plan",
+            "auto",
+            "bypassPermissions",
+        ];
+        let locked = ["default", "acceptEdits", "plan", "auto"];
+        let qoder = ["default", "acceptEdits", "auto", "dontAsk", "yolo"];
+        let owned = |ids: &[&str]| ids.iter().map(|id| (*id).to_owned()).collect::<Vec<_>>();
+        for (name, current, offered, bypass, enabled, restore, want) in [
+            // On: the agent's own bypass mode, first candidate it offers.
+            (
+                "claude on",
+                Some("default"),
+                &claude[..],
+                &["bypassPermissions"][..],
+                true,
+                None,
+                Ok(Some("bypassPermissions")),
+            ),
+            (
+                "qoder on",
+                Some("default"),
+                &qoder[..],
+                &["yolo", "bypassPermissions"][..],
+                true,
+                None,
+                Ok(Some("yolo")),
+            ),
+            (
+                "already on",
+                Some("bypassPermissions"),
+                &claude[..],
+                &["bypassPermissions"][..],
+                true,
+                None,
+                Ok(None),
+            ),
+            // Claude Code's settings disable bypass: refused, nothing sent.
+            (
+                "locked",
+                Some("plan"),
+                &locked[..],
+                &["bypassPermissions"][..],
+                true,
+                None,
+                Err("does not offer its bypass mode in this session"),
+            ),
+            (
+                "no modes",
+                None,
+                &[][..],
+                &["yolo"][..],
+                true,
+                None,
+                Err("does not offer its bypass mode in this session"),
+            ),
+            // Off: back to what the session ran in before, else default.
+            (
+                "off restores",
+                Some("bypassPermissions"),
+                &claude[..],
+                &["bypassPermissions"][..],
+                false,
+                Some("plan"),
+                Ok(Some("plan")),
+            ),
+            (
+                "off default",
+                Some("yolo"),
+                &qoder[..],
+                &["yolo"][..],
+                false,
+                None,
+                Ok(Some("default")),
+            ),
+            (
+                "off never to bypass",
+                Some("bypassPermissions"),
+                &claude[..],
+                &["bypassPermissions"][..],
+                false,
+                Some("bypassPermissions"),
+                Ok(Some("default")),
+            ),
+            (
+                "off while off",
+                Some("acceptEdits"),
+                &claude[..],
+                &["bypassPermissions"][..],
+                false,
+                Some("plan"),
+                Ok(None),
+            ),
+            (
+                "off nowhere",
+                Some("yolo"),
+                &["yolo"][..],
+                &["yolo"][..],
+                false,
+                None,
+                Err("offers no mode to return to in this session"),
+            ),
+        ] {
+            let got = bypass_transition(current, &owned(offered), bypass, enabled, restore);
+            assert_eq!(got, want.map(|mode| mode.map(str::to_owned)), "{name}");
+        }
     }
 }
 
@@ -5034,6 +5533,149 @@ mod admission_tests {
         assert_eq!(snapshot.info.status, AgentSessionStatus::Idle);
         assert!(snapshot.timeline.is_empty());
         assert!(!fixture.methods().contains(&"session/prompt".into()));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod inbox_tests {
+    use super::*;
+    use crate::agents::adapters::fx::tests::integration::Fixture;
+
+    async fn until(what: &str, mut done: impl AsyncFnMut() -> bool) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !done().await {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{what}"));
+    }
+
+    /// The prompts the mock agent received for `id`, in order.
+    fn received(fixture: &Fixture, id: &str) -> Vec<String> {
+        let store: Value = serde_json::from_slice(
+            &std::fs::read(fixture.directory.join("sessions.json")).unwrap(),
+        )
+        .unwrap();
+        store[id]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry[2] == true)
+            .map(|entry| entry[1].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    fn texts(items: &[Value]) -> Vec<&str> {
+        items
+            .iter()
+            .map(|item| item["payload"]["text"].as_str().unwrap())
+            .collect()
+    }
+
+    /// Prompts sent during a turn wait in the inbox (driver and mirror
+    /// alike), "steer" first, and follow only a normal end: an interrupted
+    /// turn keeps them for the user, an ended process drops them.
+    #[tokio::test]
+    async fn prompts_sent_during_a_turn_follow_only_its_normal_end() {
+        #[derive(Debug)]
+        enum End {
+            Answered,
+            Interrupted,
+            ProcessExited,
+        }
+        for (end, status, sent, kept) in [
+            (
+                End::Answered,
+                AgentSessionStatus::Idle,
+                &["approval", "next", "first", "second"][..],
+                &[][..],
+            ),
+            (
+                End::Interrupted,
+                AgentSessionStatus::Interrupted,
+                &["approval"][..],
+                &["first", "second", "next"][..],
+            ),
+            (
+                End::ProcessExited,
+                AgentSessionStatus::Unknown,
+                &["approval"][..],
+                &[][..],
+            ),
+        ] {
+            let fixture = Fixture::new().await;
+            let driver = fixture.driver.clone();
+            let info = driver.create_session(None, None, None).await.unwrap();
+            let (id, asid) = (info.asid.0.as_str(), &info.asid);
+            driver.send_prompt(id, "approval", &[], None).await.unwrap();
+            until("permission asked", async || {
+                !driver.get_pending_permissions(id).await.unwrap().is_empty()
+            })
+            .await;
+            for (text, delivery) in [("first", "queue"), ("second", "queue"), ("next", "steer")] {
+                driver
+                    .send_prompt(id, text, &[], Some(delivery))
+                    .await
+                    .unwrap();
+            }
+            let queued = driver.get_inbox(id).await.unwrap();
+            assert_eq!(texts(&queued), ["first", "second", "next"], "{end:?}");
+            assert_eq!(driver.mirror.inbox(asid).await, queued, "{end:?}");
+            assert_eq!(received(&fixture, id), ["approval"], "{end:?}");
+            match end {
+                End::Answered => {
+                    let permission = driver.get_pending_permissions(id).await.unwrap();
+                    driver
+                        .reply_permission(id, &permission[0].id, PermissionDecision::Allow, None)
+                        .await
+                        .unwrap();
+                }
+                End::Interrupted => driver.interrupt(id).await.unwrap(),
+                End::ProcessExited => {
+                    let process = driver.retained(id).unwrap().client.process_id().unwrap();
+                    // SAFETY: the mock agent's own child process.
+                    unsafe { libc::kill(process as i32, libc::SIGKILL) };
+                }
+            }
+            until("turn settled", async || {
+                driver.get_session(id).await.unwrap().status == status
+                    && received(&fixture, id).len() == sent.len()
+                    && texts(&driver.mirror.inbox(asid).await) == kept
+            })
+            .await;
+            assert_eq!(received(&fixture, id), sent, "{end:?}");
+            assert_eq!(texts(&driver.get_inbox(id).await.unwrap()), kept, "{end:?}");
+            driver.shutdown().await;
+        }
+    }
+
+    /// A mode switch publishes only the mode: a turn whose end was published
+    /// meanwhile stays ended instead of reading busy again.
+    #[tokio::test]
+    async fn a_mode_switch_never_republishes_a_finished_turn_as_busy() {
+        let fixture = Fixture::new().await;
+        let driver = fixture.driver.clone();
+        let info = driver.create_session(None, None, None).await.unwrap();
+        driver
+            .send_prompt(&info.asid.0, "hold", &[], None)
+            .await
+            .unwrap();
+        let session = driver.retained(&info.asid.0).unwrap();
+        assert_eq!(
+            session.state.lock().await.info.status,
+            AgentSessionStatus::Busy
+        );
+        // The turn's end reaches the mirror while the mode answer is on its way.
+        driver
+            .mirror
+            .update_status(&info.asid, AgentSessionStatus::Idle, None)
+            .await;
+        driver.send_set_mode(&session, "plan").await.unwrap();
+        let mirrored = driver.mirror.session_info(&info.asid).await.unwrap();
+        assert_eq!(mirrored.status, AgentSessionStatus::Idle);
+        assert_eq!(mirrored.mode.as_deref(), Some("plan"));
+        driver.shutdown().await;
     }
 }
 

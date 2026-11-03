@@ -4,6 +4,7 @@ pub mod adapters;
 pub mod agent_events;
 pub mod approvals;
 pub(crate) mod attachment_images;
+pub(crate) mod auto_approve;
 pub mod compose;
 pub(crate) mod computer_context;
 pub mod directories;

@@ -28,6 +28,8 @@ use crate::agents::ports::agent::{
 
 /// The title a thread is created with; read back, it means "untitled".
 pub(crate) const NEW_THREAD_TITLE: &str = "New thread";
+/// T3's runtime mode without approvals: its own bypass.
+const FULL_ACCESS: &str = "full-access";
 
 pub struct T3Driver {
     client: Arc<T3Client>,
@@ -510,6 +512,41 @@ impl AgentPort for T3Driver {
     /// `commands::interaction_mode_set`), which are not the app's modes.
     fn switch_mode<'a>(&'a self, _session_id: &'a str, _mode: &'a str) -> AgentFuture<'a, ()> {
         Box::pin(async { Err(AgentError::Unsupported("switch_mode".into())) })
+    }
+
+    /// T3's own bypass is the thread's runtime mode `full-access`
+    /// (`thread.runtime-mode.set`). Off returns the thread to the mode new
+    /// threads get here, or to `approval-required` when that is itself
+    /// `full-access`: T3 keeps the mode on the thread, so there is nothing
+    /// else to return to.
+    fn set_auto_approve<'a>(&'a self, session_id: &'a str, enabled: bool) -> AgentFuture<'a, ()> {
+        Box::pin(async move {
+            let id = validate_id(session_id, "session id")?;
+            let (_, projection) = self.session_from_snapshot(&id).await?;
+            let current = projection["thread"]["runtimeMode"].as_str().unwrap_or("");
+            let target = if enabled {
+                FULL_ACCESS
+            } else if self.runtime_mode != FULL_ACCESS {
+                self.runtime_mode.as_str()
+            } else {
+                "approval-required"
+            };
+            if current == target {
+                return Ok(());
+            }
+            self.client
+                .dispatch(v2::commands::runtime_mode_set(&id, target))
+                .await?;
+            Ok(())
+        })
+    }
+
+    fn auto_approve<'a>(&'a self, session_id: &'a str) -> AgentFuture<'a, Option<bool>> {
+        Box::pin(async move {
+            let id = validate_id(session_id, "session id")?;
+            let (_, projection) = self.session_from_snapshot(&id).await?;
+            Ok(Some(projection["thread"]["runtimeMode"] == FULL_ACCESS))
+        })
     }
 
     fn find_files<'a>(

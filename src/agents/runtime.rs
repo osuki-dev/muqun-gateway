@@ -1324,6 +1324,7 @@ impl AgentRuntime {
                 }
             })
             .collect::<Vec<_>>();
+        crate::agents::auto_approve::annotate(&mut agents);
         crate::discovery::order_agents(&mut agents);
         let supported = agents.iter().any(|agent| {
             matches!(
@@ -1615,6 +1616,7 @@ impl AgentRuntime {
         agents.push(self.claude.discovery(self).await);
         agents.push(self.antigravity.discovery(self).await);
         agents.push(self.cursor.discovery(self).await);
+        crate::agents::auto_approve::annotate(&mut agents);
         crate::discovery::order_agents(&mut agents);
 
         let supported = agents.iter().any(|h| {
@@ -2658,7 +2660,8 @@ fn acp_features() -> crate::discovery::AgentFeatures {
         worktrees: false,
         revert: false,
         staged_revert: false,
-        inbox: false,
+        // The Gateway queues a prompt sent while a turn runs.
+        inbox: true,
         modes: false,
         skills: false,
         slash_commands: false,

@@ -5,6 +5,7 @@ pub mod codex;
 pub mod cursor;
 pub mod deepseek;
 pub mod fx;
+pub(crate) mod inbox;
 pub mod memory_mirror;
 pub mod opencode;
 pub mod pi;

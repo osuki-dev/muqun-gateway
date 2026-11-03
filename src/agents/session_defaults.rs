@@ -148,7 +148,7 @@ async fn choices(db: &SqliteStore, agent_id: &str, folder: Option<String>) -> Ve
 /// session gets one only when it asks and its own live mode list offers it
 /// (ACP `create_session`), never as a remembered default: before a session
 /// exists, the list it will offer is unknown.
-pub(crate) const ELEVATING_MODES: [&str; 2] = ["bypassPermissions", "auto"];
+pub(crate) const ELEVATING_MODES: [&str; 3] = ["bypassPermissions", "auto", "yolo"];
 
 /// The catalog's defaults with the remembered choice in front: this folder's
 /// last, then this computer's last, then what the agent itself reported. A

@@ -440,6 +440,43 @@ impl OpencodeDriver {
 /// OpenCode evaluates session rules last and lets the last match win, so
 /// appending is what makes this an addition rather than a replacement of
 /// whatever the owner set up.
+/// The rule OpenCode's `permission: "allow"` becomes: every action, every
+/// resource. `Permission.Rule` is `{action, resource, effect}` and nothing
+/// else.
+fn allow_all_rule() -> serde_json::Value {
+    serde_json::json!({ "action": "*", "resource": "*", "effect": "allow" })
+}
+
+/// Whether the session's last `*`/`*` rule allows: the last matching rule
+/// decides, so a later wildcard `ask` or `deny` means it does not.
+fn allows_all(rules: &[serde_json::Value]) -> bool {
+    rules
+        .iter()
+        .rev()
+        .find(|rule| rule["action"] == "*" && rule["resource"] == "*")
+        .is_some_and(|rule| rule["effect"] == "allow")
+}
+
+/// The ruleset with the allow-all rule appended last (`enabled`) or every
+/// allow-all rule removed; `None` when the ruleset already says so.
+fn allow_all_rules(
+    existing: &[serde_json::Value],
+    enabled: bool,
+) -> Option<Vec<serde_json::Value>> {
+    if allows_all(existing) == enabled {
+        return None;
+    }
+    let mut rules: Vec<serde_json::Value> = existing
+        .iter()
+        .filter(|rule| **rule != allow_all_rule())
+        .cloned()
+        .collect();
+    if enabled {
+        rules.push(allow_all_rule());
+    }
+    Some(rules)
+}
+
 fn merge_uploads_rule(
     existing: &[serde_json::Value],
     resource: &str,
@@ -684,6 +721,30 @@ impl AgentPort for OpencodeDriver {
         Box::pin(async move {
             self.client.switch_mode(session_id, mode).await?;
             Ok(())
+        })
+    }
+
+    /// OpenCode's own bypass for one session is a session permission rule
+    /// allowing every action on every resource -- the rule its `--auto`
+    /// flag and a `permission: "allow"` config express -- appended last so
+    /// it wins (the last matching rule decides). Off removes that rule and
+    /// nothing else.
+    fn set_auto_approve<'a>(&'a self, session_id: &'a str, enabled: bool) -> AgentFuture<'a, ()> {
+        Box::pin(async move {
+            let existing = self.client.get_session_permission_rules(session_id).await?;
+            let Some(rules) = allow_all_rules(&existing, enabled) else {
+                return Ok(());
+            };
+            self.client
+                .set_session_permission_rules(session_id, &rules)
+                .await
+        })
+    }
+
+    fn auto_approve<'a>(&'a self, session_id: &'a str) -> AgentFuture<'a, Option<bool>> {
+        Box::pin(async move {
+            let rules = self.client.get_session_permission_rules(session_id).await?;
+            Ok(Some(allows_all(&rules)))
         })
     }
 
@@ -1672,6 +1733,48 @@ mod tests {
             total >= Duration::from_millis(1200),
             "and it has to cover the settlement measured on 2.0.1, got {total:?}"
         );
+    }
+
+    /// Auto-approve is the one allow-all rule, last so it decides; off takes
+    /// exactly that rule away and leaves every other rule in place.
+    #[test]
+    fn auto_approve_adds_or_removes_only_the_allow_all_rule() {
+        let allow_all = allow_all_rule();
+        let bash_ask = json!({ "action": "bash", "resource": "*", "effect": "ask" });
+        let wildcard_deny = json!({ "action": "*", "resource": "*", "effect": "deny" });
+        for (existing, enabled, want) in [
+            (vec![], true, Some(vec![allow_all.clone()])),
+            (vec![], false, None),
+            (vec![allow_all.clone()], true, None),
+            (vec![allow_all.clone()], false, Some(vec![])),
+            // Other rules come back unchanged, the allowance last.
+            (
+                vec![bash_ask.clone()],
+                true,
+                Some(vec![bash_ask.clone(), allow_all.clone()]),
+            ),
+            (
+                vec![allow_all.clone(), bash_ask.clone()],
+                false,
+                Some(vec![bash_ask.clone()]),
+            ),
+            // A later wildcard deny means not allowed: the allowance is
+            // appended after it.
+            (
+                vec![allow_all.clone(), wildcard_deny.clone()],
+                true,
+                Some(vec![wildcard_deny.clone(), allow_all.clone()]),
+            ),
+        ] {
+            assert_eq!(
+                allow_all_rules(&existing, enabled),
+                want,
+                "{existing:?} {enabled}"
+            );
+        }
+        assert!(allows_all(std::slice::from_ref(&allow_all)));
+        assert!(!allows_all(&[allow_all, wildcard_deny]));
+        assert!(!allows_all(&[bash_ask]));
     }
 
     /// The rule the gateway adds is exactly the one OpenCode asked about --

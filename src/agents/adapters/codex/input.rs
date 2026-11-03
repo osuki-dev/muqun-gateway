@@ -4,6 +4,7 @@ use std::path::Path;
 
 use serde_json::{json, Value};
 
+use super::inbox::file_entry;
 use crate::agents::ports::agent::{append_attachment_paths, AgentError, AttachmentMode};
 use crate::agents::use_cases::prompt_service::checked_attachments;
 use crate::platform::uploads::{sniff_upload_kind, MAX_UPLOAD_BYTES};
@@ -55,21 +56,6 @@ fn upload_input(
     uploads: &Path,
 ) -> Result<Vec<Value>, AgentError> {
     upload_parts(text, attachments, uploads).map(|prepared| prepared.input)
-}
-
-fn file_entry(path: &str, mime: Option<&str>) -> Value {
-    let name = Path::new(path)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("attachment");
-    let uri = reqwest::Url::from_file_path(path)
-        .map(String::from)
-        .unwrap_or_else(|()| format!("file://{path}"));
-    let mut entry = json!({ "uri": uri, "name": name });
-    if let Some(mime) = mime {
-        entry["mime"] = json!(mime);
-    }
-    entry
 }
 
 fn upload_parts(
