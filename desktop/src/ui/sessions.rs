@@ -3,7 +3,7 @@
 
 use blinc_cn::prelude::{button, ButtonSize, ButtonVariant};
 use blinc_layout::prelude::*;
-use muqun_gateway::agents::{AgentSessionInfo, AgentSessionStatus};
+use muqun_gateway::agents::AgentSessionInfo;
 use muqun_gateway::platform::discovery::AgentDiscoveryInfo;
 use muqun_gateway::untitled_placeholder;
 
@@ -421,28 +421,6 @@ pub fn display_title(app: &App, asid: &str, title: &str) -> String {
     }
 }
 
-/// ● working, ◐ waiting for you, ○ idle; failed and stopped get their own
-/// colour on the idle ring.
-pub fn status_dot(status: AgentSessionStatus, waiting: bool) -> Div {
-    let class = if waiting {
-        "mq-status--waiting"
-    } else {
-        match status {
-            AgentSessionStatus::Busy | AgentSessionStatus::Retry => "mq-status--busy",
-            AgentSessionStatus::Failed => "mq-status--failed",
-            AgentSessionStatus::Interrupted => "mq-status--stopped",
-            AgentSessionStatus::Idle | AgentSessionStatus::Unknown => "mq-status--idle",
-        }
-    };
-    div()
-        .class("mq-status")
-        .class(class)
-        .w(8.0)
-        .h(8.0)
-        .rounded(4.0)
-        .flex_shrink_0()
-}
-
 /// One sidebar row, rebuilt when -- and only when -- its own state is
 /// written.
 fn session_row(app: &App, asid: &str) -> impl ElementBuilder {
@@ -467,9 +445,13 @@ fn render_row(app: &App, session: &SessionRow) -> Div {
         .flex_row()
         .items_center()
         .cursor_pointer()
-        .child(status_dot(session.status, session.waiting))
+        .child(super::home::mark_with_badge(
+            &session.agent_id,
+            session.status,
+            session.waiting,
+        ))
         .child(
-            div().flex_1().min_w(0.0).overflow_clip().child(
+            div().flex_1().min_w(0.0).ml(2.0).overflow_clip().child(
                 ui_text(display_title(app, &session.asid, &session.title))
                     .size(13.0)
                     .no_wrap()
@@ -482,7 +464,6 @@ fn render_row(app: &App, session: &SessionRow) -> Div {
                 .no_wrap()
                 .no_cursor(),
         )
-        .child(agents::mark(&session.agent_id, 16.0))
         .on_click(move |_| click.open_session(&asid))
 }
 

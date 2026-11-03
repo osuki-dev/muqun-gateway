@@ -455,7 +455,7 @@ const ACTIONS_WIDTH: f32 = 96.0;
 /// The agent's 16 px brand mark with a 6 px status badge at its bottom-right
 /// corner, ringed in the page's colour: mint while it works, amber when it
 /// waits for you, red when it failed, none when idle (the sidebar's rule).
-fn mark_with_badge(agent: &str, status: AgentSessionStatus, waiting: bool) -> Div {
+pub fn mark_with_badge(agent: &str, status: AgentSessionStatus, waiting: bool) -> Div {
     let class = if waiting {
         Some("mq-start-badge--waiting")
     } else {
