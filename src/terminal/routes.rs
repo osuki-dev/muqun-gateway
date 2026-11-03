@@ -4061,45 +4061,84 @@ mod tests {
         }
     }
 
-    /// A native approval says that something needs answering, in the reader's
-    /// language, naming the agent -- never the prompt, which quotes a command.
+    /// Every agent the runtime offers, after one turn: exactly one completion
+    /// push and, for a pending request, one approval push, each naming the
+    /// agent in every language and routing by `agent_id` and `asid` -- never
+    /// the prompt, which quotes a command.
     #[test]
-    fn a_native_approval_push_names_the_agent_and_never_the_prompt() {
-        use crate::agents::PermissionRequest;
+    fn every_native_agent_pushes_its_turn_end_and_approval_by_name() {
+        use crate::agents::{
+            runtime::AGENT_PREFERENCE, AgentDomainEvent, AgentSessionId, AgentSessionStatus as S,
+            PermissionRequest,
+        };
         let state = test_state("admin", Vec::new());
-        let request: PermissionRequest = serde_json::from_value(json!({
-            "id": "perm_1",
-            "asid": "ses_1",
-            "action": "bash",
-            "resources": [],
-            "prompt": "Run npm publish --tag secret?",
-            "options": [],
-        }))
-        .unwrap();
         let label = current_server_label(&state.config.label);
-        for (agent, name) in [
-            ("codex", "Codex"),
-            ("claude", "Claude Code"),
-            ("pi", "Pi"),
-            ("antigravity", "Antigravity"),
-            ("cursor", "Cursor"),
-        ] {
-            let notice = super::permission_notification(&state, agent, "ses_1", &request);
-            let en = notice.render(Locale::En);
-            assert_eq!(en.title, format!("Approval needed · {label}"));
-            assert_eq!(en.body, format!("{name} is waiting for your approval."));
-            assert_eq!(en.data["agent_id"], agent);
-            let zh = notice.render(Locale::ZhTw);
-            assert_eq!(zh.body, format!("{name} 正在等待你的核准。"));
-            for rendered in [en, zh] {
-                let all = format!(
-                    "{} {} {}",
-                    rendered.title,
-                    rendered.body,
-                    Value::Object(rendered.data)
-                );
-                assert!(!all.contains("npm"), "{agent}: the prompt must not travel");
+        let start = Instant::now();
+        let mut gates = super::AgentPushGates::default();
+        for (secs, status) in [(0, S::Busy), (1, S::Idle)] {
+            for agent in AGENT_PREFERENCE {
+                let event = AgentDomainEvent::StatusChanged {
+                    asid: AgentSessionId(format!("ses_{agent}")),
+                    status,
+                    error: None,
+                    seq: 1,
+                };
+                gates.admit(&event, start + Duration::from_secs(secs));
             }
+        }
+        let done = start + Duration::from_secs(1) + COMPLETION_GRACE;
+        let mut ended = gates.completions_ready(done);
+        ended.sort();
+        let mut expected: Vec<_> = AGENT_PREFERENCE
+            .iter()
+            .map(|a| format!("ses_{a}"))
+            .collect();
+        expected.sort();
+        assert_eq!(ended, expected, "one push per finished turn");
+        assert!(gates.completions_ready(done).is_empty(), "and only one");
+
+        for agent in AGENT_PREFERENCE {
+            let name = super::agent_display_name(agent)
+                .unwrap_or_else(|| panic!("{agent} has no display name"));
+            let asid = format!("ses_{agent}");
+            let request: PermissionRequest = serde_json::from_value(json!({
+                "id": "perm_1",
+                "asid": asid,
+                "action": "bash",
+                "resources": [],
+                "prompt": "Run npm publish --tag secret?",
+                "options": [],
+            }))
+            .unwrap();
+            let approval = super::permission_notification(&state, agent, &asid, &request);
+            let completion = super::completion_notification("server-1", &label, agent, &asid);
+            for (notice, english) in [
+                (&approval, format!("{name} is waiting for your approval.")),
+                (&completion, format!("{name} finished running.")),
+            ] {
+                for &locale in Locale::ALL {
+                    let rendered = notice.render(locale);
+                    assert!(rendered.body.contains(name), "{agent} {locale:?}");
+                    assert_eq!(
+                        rendered.body == english,
+                        locale == Locale::En,
+                        "{agent} {locale:?}: {}",
+                        rendered.body
+                    );
+                    assert_eq!(rendered.data["agent_id"], agent);
+                    assert_eq!(rendered.data["asid"], asid.as_str());
+                    let all = format!("{} {} {:?}", rendered.title, rendered.body, rendered.data);
+                    assert!(!all.contains("npm"), "{agent}: the prompt must not travel");
+                }
+            }
+            assert_eq!(
+                approval.render(Locale::En).title,
+                format!("Approval needed · {label}")
+            );
+            assert_eq!(
+                Value::Object(completion.render(Locale::En).data),
+                json!({"type": "agent.completed", "server_id": "server-1", "agent_id": agent, "asid": asid})
+            );
         }
     }
 
@@ -4230,21 +4269,6 @@ mod tests {
             gates.admit(&status(s), at(secs));
         }
         assert_eq!(gates.completions_ready(at(cooldown + 41 + grace)).len(), 1);
-    }
-
-    /// A native completion routes to the agent session and says what a pane
-    /// completion says, in the reader's language.
-    #[test]
-    fn a_native_completion_push_carries_the_session_and_no_agent_text() {
-        let notice = super::completion_notification("server-1", "Studio", "opencode", "ses_1");
-        let en = notice.render(Locale::En);
-        assert_eq!(en.title, "Agent done · Studio");
-        assert_eq!(en.body, "OpenCode finished running.");
-        assert_eq!(
-            Value::Object(en.data),
-            json!({"type": "agent.completed", "server_id": "server-1", "agent_id": "opencode", "asid": "ses_1"})
-        );
-        assert_eq!(notice.render(Locale::ZhTw).body, "OpenCode 已執行完畢。");
     }
 
     /// One menu, one push: a blocked or input push for a pane showing a

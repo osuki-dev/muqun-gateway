@@ -64,8 +64,9 @@
   session; child sessions and sub-tasks stay quiet. Native approval pushes
   read like terminal ones -- localized, with the server's label and the
   agent's name, never the agent's prompt -- and carry `agent_id`; neither they
-  nor question pushes put the session id in `session_id` any more. Codex,
-  Claude Code, Pi, Antigravity and Cursor are named instead of "Agent".
+  nor question pushes put the session id in `session_id` any more. All ten
+  native agents (Antigravity, Claude Code, Codex, Cursor, DeepSeek, FX,
+  OpenCode, Pi, Qoder CLI, T3 Code) push both and are named, never "Agent".
   Announced as the `native_agent_push` capability.
 
 - **One event, one push.** A Codex delegation's terminal no longer pushes
