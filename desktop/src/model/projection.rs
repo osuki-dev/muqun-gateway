@@ -23,7 +23,9 @@ const COMPLETION_DEBOUNCE: Duration = Duration::from_millis(150);
 /// How long the configuration must stand still before it is written.
 const SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
 /// One agent's session list, at most.
-const LIST_TIMEOUT: Duration = Duration::from_secs(30);
+/// Local agents answer in milliseconds; a hung adapter must not hold the
+/// sidebar for half a minute.
+const LIST_TIMEOUT: Duration = Duration::from_secs(6);
 /// How long after startup newly attached agents are looked for: the gateway
 /// probes cold agents for up to `DISCOVERY_TIMEOUT` (60 s).
 const WATCH_AGENTS_FOR: Duration = Duration::from_secs(90);
@@ -305,9 +307,17 @@ impl Core {
                     });
                 }
             },
-            Command::OpenDiff { asid, file } => {
-                tracing::info!(asid = %asid.0, ?file, "diff panel: not built yet");
-            }
+            Command::OpenDiff { asid, file } => match file {
+                Some(path) => self
+                    .inbox
+                    .push(Update::Ui(super::inbox::UiAction::OpenDiffFile {
+                        asid: asid.0,
+                        path,
+                    })),
+                None => self
+                    .inbox
+                    .push(Update::Ui(super::inbox::UiAction::ToggleDiffPanel)),
+            },
             Command::StageRevert { asid, file } => {
                 tracing::info!(asid = %asid.0, file, "revert: not built yet");
             }
@@ -328,8 +338,60 @@ impl Core {
             | Command::ThemeInstall(_)
             | Command::ThemeRemove(_)
             | Command::ThemeApply(..)
-            | Command::ThemeImportFile(_)) => {
+            | Command::ThemeImportFile(_)
+            | Command::ThemeImportUrl(_)) => {
                 crate::theme::service::run(command, self.inbox.clone(), self.config.clone()).await;
+            }
+            Command::RenameSession { asid, title } => {
+                let title = title.trim().to_string();
+                if title.is_empty() {
+                    return;
+                }
+                match self.hub.rename(&asid, &title).await {
+                    Ok(()) => match self.hub.snapshot(&asid).await {
+                        Ok(mut snapshot) => {
+                            snapshot.info.title = title;
+                            self.inbox
+                                .push(Update::event(AgentDomainEvent::SessionUpdated {
+                                    asid: asid.clone(),
+                                    info: Box::new(snapshot.info),
+                                    seq: 0,
+                                }));
+                        }
+                        Err(_) => {
+                            // Still refresh lists so the new title shows up.
+                            self.refresh().await;
+                        }
+                    },
+                    Err(err) => self.fail(err),
+                }
+            }
+            Command::DeleteSession(asid) => match self.hub.delete(&asid).await {
+                Ok(()) => {
+                    if self
+                        .active
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .is_some_and(|a| a == &asid)
+                    {
+                        *self.active.lock().unwrap() = None;
+                    }
+                    self.inbox.push(Update::SessionGone(asid.0));
+                }
+                Err(err) => self.fail(err),
+            },
+            Command::ForkSession { asid, message_id } => {
+                match self.hub.fork(&asid, message_id.as_deref()).await {
+                    Ok(info) => {
+                        let new_asid = info.asid.clone();
+                        self.resolve_dirs(info.directory.iter().cloned().collect(), false);
+                        self.inbox.push(Update::SessionCreated(Box::new(info)));
+                        *self.active.lock().unwrap() = Some(new_asid.clone());
+                        self.open(&new_asid).await;
+                    }
+                    Err(err) => self.fail(err),
+                }
             }
             Command::CompleteDirectory { .. } | Command::Edit(_) => {
                 unreachable!("handled in the command loop")
@@ -346,8 +408,17 @@ impl Core {
             delivery,
         } = command
         else {
+            let resync = match &command {
+                ComposeCommand::SwitchModel { asid, .. }
+                | ComposeCommand::SwitchMode { asid, .. } => Some(asid.clone()),
+                _ => None,
+            };
             if let Some(err) = compose::run(command, self.hub.clone(), self.inbox.clone()).await {
                 self.fail(err);
+                // Roll back the optimistic header after a failed switch.
+                if let Some(asid) = resync {
+                    self.open(&asid).await;
+                }
             }
             return;
         };
@@ -558,6 +629,15 @@ impl Core {
                 files: files.len(),
                 added: files.iter().map(|f| f.additions).sum(),
                 removed: files.iter().map(|f| f.deletions).sum(),
+                paths: files
+                    .into_iter()
+                    .take(48)
+                    .map(|f| super::view::DiffFile {
+                        path: f.path,
+                        added: f.additions,
+                        removed: f.deletions,
+                    })
+                    .collect(),
             })),
             Ok(Err(err)) => tracing::debug!(asid = %asid.0, %err, "no diff for the session"),
             Err(_) => tracing::debug!(asid = %asid.0, "diff timed out"),

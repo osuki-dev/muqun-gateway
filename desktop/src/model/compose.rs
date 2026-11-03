@@ -200,10 +200,22 @@ pub enum ComposeCommand {
         item: String,
         steer: bool,
     },
-    /// The checked-out branch of a folder.
+    /// The checked-out branch and local branch list of a folder.
     Branch {
         cwd: String,
     },
+    /// `git checkout` in `cwd`'s repository (start page only).
+    Checkout {
+        cwd: String,
+        branch: String,
+    },
+}
+
+/// What the branch pill knows about one folder.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BranchInfo {
+    pub current: Option<String>,
+    pub local: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -231,7 +243,7 @@ pub enum ComposerUpdate {
     },
     Branch {
         cwd: String,
-        branch: Option<String>,
+        info: BranchInfo,
     },
 }
 
@@ -334,8 +346,9 @@ pub async fn run(
                     )
                 }
                 // Not attached yet, or no answer: nothing is stored, and the
-                // composer asks again after a pause.
-                Err(err) => tracing::debug!(agent, %err, "catalogue unavailable"),
+                // composer asks again after a pause. Session header still shows
+                // the live model/mode without a catalogue.
+                Err(err) => tracing::debug!(agent = %agent, %err, "catalogue unavailable"),
             }
             None
         }
@@ -353,12 +366,32 @@ pub async fn run(
             .err(),
         ComposeCommand::Branch { cwd } => {
             let path = PathBuf::from(&cwd);
-            let branch = tokio::task::spawn_blocking(move || current_branch(&path))
+            let info = tokio::task::spawn_blocking(move || branch_info(&path))
                 .await
-                .ok()
-                .flatten();
-            push(&inbox, ComposerUpdate::Branch { cwd, branch });
+                .unwrap_or_default();
+            push(&inbox, ComposerUpdate::Branch { cwd, info });
             None
+        }
+        ComposeCommand::Checkout { cwd, branch } => {
+            let path = PathBuf::from(&cwd);
+            let target = branch.clone();
+            let result = tokio::task::spawn_blocking(move || checkout_branch(&path, &target)).await;
+            match result {
+                Ok(Ok(())) => {
+                    let path = PathBuf::from(&cwd);
+                    let info = tokio::task::spawn_blocking(move || branch_info(&path))
+                        .await
+                        .unwrap_or_default();
+                    push(&inbox, ComposerUpdate::Branch { cwd, info });
+                    None
+                }
+                Ok(Err(why)) => Some(HubError::Agent(
+                    muqun_gateway::agents::ports::AgentError::RequestFailed(why),
+                )),
+                Err(err) => Some(HubError::Agent(
+                    muqun_gateway::agents::ports::AgentError::RequestFailed(err.to_string()),
+                )),
+            }
         }
         ComposeCommand::Submit { .. } => unreachable!("handled by the core"),
     }
@@ -487,35 +520,124 @@ fn git_root(cwd: &std::path::Path) -> Option<PathBuf> {
     None
 }
 
+fn git_dir(cwd: &std::path::Path) -> Option<PathBuf> {
+    for dir in cwd.ancestors().take(24) {
+        let dot_git = dir.join(".git");
+        if dot_git.is_dir() {
+            return Some(dot_git);
+        }
+        if dot_git.is_file() {
+            let text = std::fs::read_to_string(&dot_git).ok()?;
+            let target = text.trim().strip_prefix("gitdir:")?.trim();
+            let target = PathBuf::from(target);
+            return Some(if target.is_absolute() {
+                target
+            } else {
+                dir.join(target)
+            });
+        }
+    }
+    None
+}
+
 /// The branch checked out in `cwd` (or the repository above it), read from
 /// `.git/HEAD` without running git: `ref: refs/heads/<branch>`, or the short
 /// hash of a detached head. A linked worktree's `.git` is a file naming its
 /// git directory.
 pub fn current_branch(cwd: &std::path::Path) -> Option<String> {
-    for dir in cwd.ancestors().take(24) {
-        let dot_git = dir.join(".git");
-        let git_dir = if dot_git.is_dir() {
-            dot_git
-        } else if dot_git.is_file() {
-            let text = std::fs::read_to_string(&dot_git).ok()?;
-            let target = text.trim().strip_prefix("gitdir:")?.trim();
-            let target = PathBuf::from(target);
-            if target.is_absolute() {
-                target
-            } else {
-                dir.join(target)
+    let git_dir = git_dir(cwd)?;
+    let head = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
+    let head = head.trim();
+    Some(match head.strip_prefix("ref: refs/heads/") {
+        Some(branch) => branch.to_string(),
+        None => head.chars().take(7).collect(),
+    })
+}
+
+/// Current branch plus local branch names under `refs/heads`.
+pub fn branch_info(cwd: &std::path::Path) -> BranchInfo {
+    let current = current_branch(cwd);
+    let mut local = Vec::new();
+    let Some(git_dir) = git_dir(cwd) else {
+        return BranchInfo { current, local };
+    };
+    let heads = git_dir.join("refs/heads");
+    if heads.is_dir() {
+        collect_heads(&heads, "", &mut local);
+    }
+    if let Ok(packed) = std::fs::read_to_string(git_dir.join("packed-refs")) {
+        for line in packed.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') || line.starts_with('^') {
+                continue;
             }
-        } else {
+            let Some(name) = line.split_whitespace().nth(1) else {
+                continue;
+            };
+            if let Some(branch) = name.strip_prefix("refs/heads/") {
+                if !local.iter().any(|b| b == branch) {
+                    local.push(branch.to_string());
+                }
+            }
+        }
+    }
+    local.sort();
+    if let Some(cur) = current.as_ref() {
+        if !local.iter().any(|b| b == cur) && !cur.chars().all(|c| c.is_ascii_hexdigit()) {
+            local.insert(0, cur.clone());
+        }
+    }
+    BranchInfo { current, local }
+}
+
+fn collect_heads(dir: &std::path::Path, prefix: &str, out: &mut Vec<String>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
             continue;
         };
-        let head = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
-        let head = head.trim();
-        return Some(match head.strip_prefix("ref: refs/heads/") {
-            Some(branch) => branch.to_string(),
-            None => head.chars().take(7).collect(),
-        });
+        let path = entry.path();
+        let full = if prefix.is_empty() {
+            name.to_string()
+        } else {
+            format!("{prefix}/{name}")
+        };
+        if path.is_dir() {
+            collect_heads(&path, &full, out);
+        } else if !out.iter().any(|b| b == &full) {
+            out.push(full);
+        }
     }
-    None
+}
+
+/// `git checkout <branch>` at the repository root of `cwd`.
+pub fn checkout_branch(cwd: &std::path::Path, branch: &str) -> Result<(), String> {
+    let root = git_root(cwd).ok_or_else(|| "not a git checkout".to_string())?;
+    let branch = branch.trim();
+    if branch.is_empty() || branch.contains([' ', '\n', '\r', '\0']) {
+        return Err("invalid branch name".into());
+    }
+    let output = std::process::Command::new("git")
+        .args(["checkout", branch])
+        .current_dir(&root)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .map_err(|err| format!("git checkout: {err}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let err = String::from_utf8_lossy(&output.stderr);
+    let err = err.trim();
+    if err.is_empty() {
+        Err("git checkout failed".into())
+    } else {
+        Err(err.lines().next().unwrap_or(err).to_string())
+    }
 }
 
 #[cfg(test)]
@@ -559,13 +681,19 @@ mod tests {
     fn the_branch_comes_from_head() {
         let dir = std::env::temp_dir().join(format!("muqun-branch-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        std::fs::create_dir_all(dir.join(".git/refs/heads/feature")).unwrap();
         std::fs::create_dir_all(dir.join("a/b")).unwrap();
         std::fs::write(dir.join(".git/HEAD"), "ref: refs/heads/feature/x\n").unwrap();
+        std::fs::write(dir.join(".git/refs/heads/feature/x"), "abc\n").unwrap();
+        std::fs::write(dir.join(".git/refs/heads/main"), "def\n").unwrap();
         assert_eq!(
             current_branch(&dir.join("a/b")).as_deref(),
             Some("feature/x")
         );
+        let info = branch_info(&dir.join("a/b"));
+        assert_eq!(info.current.as_deref(), Some("feature/x"));
+        assert!(info.local.iter().any(|b| b == "main"));
+        assert!(info.local.iter().any(|b| b == "feature/x"));
         std::fs::write(dir.join(".git/HEAD"), "0123456789abcdef\n").unwrap();
         assert_eq!(current_branch(&dir).as_deref(), Some("0123456"));
         let _ = std::fs::remove_dir_all(&dir);

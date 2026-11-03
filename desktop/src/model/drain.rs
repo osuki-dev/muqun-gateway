@@ -225,6 +225,7 @@ impl Drain {
                 if changed {
                     bindings.selected.signal().set(Some(asid.to_string()));
                     bindings.diff.signal().set(None);
+                    bindings.diff_panel.signal().set(false);
                 }
                 if let Some(sidebar) = sidebar {
                     sidebar.publish(&bindings);
@@ -247,6 +248,7 @@ impl Drain {
                 bindings.inbox_open.signal().set(false);
                 if changed {
                     bindings.diff.signal().set(None);
+                    bindings.diff_panel.signal().set(false);
                     bindings.selected.signal().set(None);
                     bindings.header.signal().set(None);
                     bindings.order.signal().set(Arc::new(Default::default()));
@@ -597,6 +599,7 @@ fn batch_kinds(batch: &[Update]) -> String {
             Update::Agents(_) => "agents",
             Update::AgentSessions { .. } => "agent_sessions",
             Update::SessionCreated(_) => "created",
+            Update::SessionGone(_) => "gone",
             Update::Snapshot(_) => "snapshot",
             Update::Event(event) => event.event_name(),
             Update::Error(_) => "error",

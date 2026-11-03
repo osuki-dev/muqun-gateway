@@ -11,7 +11,7 @@
 .mq-themes-overlay-bar {
     padding: 0 var(--mq-space-3);
     background: var(--surface);
-    border-bottom: 1px solid var(--border);
+    border-bottom: none;
 }
 
 .mq-themes {
@@ -21,16 +21,18 @@
 .mq-themes-header {
     padding: var(--mq-space-4) var(--mq-space-6) var(--mq-space-2) var(--mq-space-6);
     gap: var(--mq-space-3);
-    border-bottom: 1px solid var(--border);
+    border-bottom: none;
 }
 .mq-themes-title-row { gap: var(--mq-space-3); }
 .mq-segmented {
     gap: var(--mq-space-1);
     padding: 2px;
     border-radius: var(--mq-radius-md);
-    border: 1px solid var(--border);
+    border: none;
+    background: var(--surface-overlay);
 }
 .mq-themes-toolbar { gap: var(--mq-space-2); }
+.mq-themes-link-row { gap: var(--mq-space-2); }
 .mq-themes-tab {
     padding: 6px var(--mq-space-3);
     border-radius: var(--mq-radius-md);
@@ -62,12 +64,12 @@
     padding: var(--mq-card-pad);
     border-radius: var(--mq-radius-lg);
     background: var(--surface);
-    border: 1px solid var(--border);
+    border: none;
     color: var(--text-primary);
-    transition: transform 150ms ease-out;
+    transition: transform 150ms ease-out, background 150ms ease-out;
 }
-.mq-theme-card:hover { transform: translateY(-1px); }
-.mq-theme-card--active { border: 1px solid var(--primary); }
+.mq-theme-card:hover { transform: translateY(-1px); background: var(--surface-elevated); }
+.mq-theme-card--active { background: var(--accent-subtle); }
 .mq-theme-card-picture {
     border-radius: var(--mq-radius-md);
     background: var(--surface-overlay);
@@ -99,16 +101,15 @@
     padding: var(--mq-space-3) var(--mq-space-4);
     border-radius: var(--mq-radius-lg);
     background: var(--surface-overlay);
-    border: 1px solid var(--border-secondary);
+    border: none;
     color: var(--text-primary);
 }
 .mq-themes-notice--error {
     background: var(--error-bg);
-    border: 1px solid var(--error);
+    border: none;
     color: var(--error);
 }
 
-/* Keyboard selection (§6.1c): ring outside the card, so its layout and its
-   own active border stay as they are. */
-.mq-theme-card--selected { box-shadow: 0 0 0 2px var(--border-focus); }
+/* Keyboard selection (§6.1c): soft fill, no stroke frame. */
+.mq-theme-card--selected { background: var(--accent-subtle); }
 .mq-themes-more { padding: var(--mq-space-2) 0; }

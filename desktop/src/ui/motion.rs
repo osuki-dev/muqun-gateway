@@ -74,6 +74,13 @@ pub struct MotionPrefs {
 }
 
 impl MotionPrefs {
+    /// Live preference installed from Settings → Appearance.
+    pub fn current() -> Self {
+        Self {
+            reduced: super::parts::scale::reduced_motion(),
+        }
+    }
+
     /// An entrance that rises `rise_px` while fading in over `duration_ms`
     /// (a tier-2 or tier-3 constant above). Reduced: a [`REDUCED_MS`] fade
     /// with no travel.

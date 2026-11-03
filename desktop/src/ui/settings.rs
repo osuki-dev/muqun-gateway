@@ -4,7 +4,8 @@
 //!   its gateway config block (`agent_fields.rs` holds the table and the
 //!   validation). Changes are written to `config.json` at once but only take
 //!   effect when the desktop next starts, which the page says.
-//! * **Appearance** -- light / dark / follow the system, applied live.
+//! * **Appearance** -- reading density/motion/glass, then themes (gallery,
+//!   import file/link, apply), live.
 //! * **General** -- language (live), the default folder, the editor command
 //!   for later, and the "close to tray" placeholder.
 //! * **About** -- version and where the files are.
@@ -16,8 +17,7 @@
 use blinc_cn::components::input::InputBuilder;
 use blinc_cn::components::select::SelectBuilder;
 use blinc_cn::prelude::{
-    button, input, switch, tabs, ButtonSize, ButtonVariant, ColorToken, InputSize, State, TabsSize,
-    ThemeState,
+    button, input, switch, tabs, ButtonSize, ButtonVariant, InputSize, State, TabsSize,
 };
 use blinc_core::BlincContextState;
 use blinc_layout::prelude::*;
@@ -27,7 +27,7 @@ use super::agents::{self, Standing};
 use super::text::{mono_text, ui_text};
 use super::App;
 use crate::agent_fields::{self, Field, Kind};
-use crate::config::{AgentConfigs, ConfigEdit, Language, Scheme};
+use crate::config::{AgentConfigs, ConfigEdit, Density, Language};
 use crate::hub::AGENT_PREFERENCE;
 use crate::model::commands::Command;
 
@@ -43,7 +43,7 @@ fn tr(app: &App, en: &'static str, zh: &'static str) -> &'static str {
     }
 }
 
-pub fn page(app: &App, height: f32) -> Div {
+pub fn page(app: &App, width: f32, height: f32) -> Div {
     let tab = app.bindings.settings_tab.clone();
     let body_height = (height - CHROME).max(120.0);
     let close = {
@@ -60,7 +60,7 @@ pub fn page(app: &App, height: f32) -> Div {
             pane(body_height, agents_tab(&a))
         })
         .tab("appearance", tr(app, "Appearance", "外观"), move || {
-            pane(body_height, appearance_tab(&b))
+            appearance_tab(&b, width, body_height)
         })
         .tab("general", tr(app, "General", "通用"), move || {
             pane(body_height, general_tab(&c))
@@ -126,12 +126,11 @@ fn hint(text: impl Into<String>) -> Div {
         .child(ui_text(text).size(12.0))
 }
 
-/// A settings text field: small, with a border that stays visible on a card
-/// in either scheme (the default one is the card's own border colour).
+/// A settings text field: small, fill-only (no stroke).
 fn text_field(data: &SharedTextInputData) -> InputBuilder {
     input(data)
         .size(InputSize::Small)
-        .idle_border_color(ThemeState::get().color(ColorToken::BorderSecondary))
+        .idle_border_color(blinc_core::Color::TRANSPARENT)
 }
 
 // --- keyed inputs ---------------------------------------------------------
@@ -177,7 +176,7 @@ fn agents_tab(app: &App) -> Div {
 }
 
 /// "Applies on restart", always on the page; it says "saved" once something
-/// has changed.
+/// has changed, with a one-click restart.
 fn restart_note(app: &App) -> impl ElementBuilder {
     let changed = app.bindings.restart_note.clone();
     let app = app.clone();
@@ -203,10 +202,23 @@ fn restart_note(app: &App) -> impl ElementBuilder {
                     "mq-note",
                 )
             };
-            div()
+            let mut note = div()
                 .class(class)
                 .w_full()
-                .child(ui_text(text).size(12.0))
+                .flex_row()
+                .items_center()
+                .child(div().flex_1().child(ui_text(text).size(12.0)));
+            if changed.get() {
+                note = note.child(
+                    button(app.strings.restart_now())
+                        .variant(ButtonVariant::Outline)
+                        .size(ButtonSize::Small)
+                        .on_click(move |_| {
+                            blinc_layout::window_actions::close_window();
+                        }),
+                );
+            }
+            note
         })
 }
 
@@ -521,7 +533,7 @@ fn pair_t3(app: &App, config: &AgentConfigs) -> Div {
         )))
 }
 
-// --- Appearance -----------------------------------------------------------
+// --- shared choice row (General language, …) ------------------------------
 
 /// A row of buttons, one per choice, the chosen one filled. `current` holds
 /// the chosen value; `pick` runs when another is clicked.
@@ -558,47 +570,70 @@ fn choice_row<T: Copy + PartialEq + Default + Send + Sync + 'static>(
         })
 }
 
-fn appearance_tab(app: &App) -> Div {
+// --- Appearance -----------------------------------------------------------
+
+/// Density / motion / glass above the themes library (own scroll).
+fn appearance_tab(app: &App, width: f32, height: f32) -> Div {
     let ctx = BlincContextState::get();
-    let scheme = ctx.use_state_keyed("mq-set.scheme", {
-        let initial = app.config.get().appearance.scheme;
+    let appearance = app.config.get().appearance;
+
+    let density = ctx.use_state_keyed("mq-set.density", {
+        let initial = appearance.density;
         move || initial
     });
-    let apply = app.clone();
-    let scheme_row = choice_row(
-        "mq-set-scheme",
-        scheme,
+    let density_app = app.clone();
+    let density_row = choice_row(
+        "mq-set-density",
+        density,
         vec![
-            (Scheme::Light, tr(app, "Light", "浅色")),
-            (Scheme::Dark, tr(app, "Dark", "深色")),
-            (Scheme::System, tr(app, "System", "跟随系统")),
+            (Density::Comfortable, tr(app, "Comfortable", "宽松")),
+            (Density::Compact, tr(app, "Compact", "紧凑")),
         ],
-        move |scheme| apply.apply_scheme(scheme),
+        move |density| density_app.apply_density(density),
     );
+
+    let motion = ctx.use_state_keyed("mq-set.reduced_motion", || appearance.reduced_motion);
+    let motion_app = app.clone();
+    let motion_switch = switch(&motion)
+        .label(tr(app, "Reduce motion", "减少动效"))
+        .on_change(move |on| motion_app.apply_reduced_motion(on));
+
+    let glass = ctx.use_state_keyed("mq-set.reduced_transparency", || {
+        appearance.reduced_transparency
+    });
+    let glass_app = app.clone();
+    let glass_switch = switch(&glass)
+        .label(tr(app, "Reduce transparency", "减少透明"))
+        .on_change(move |on| glass_app.apply_reduced_transparency(on));
+
+    // Reading prefs sit above the library; leave the rest for themes_panel.
+    const READING: f32 = 168.0;
+    let themes_h = (height - READING).max(160.0);
+
     div()
         .w_full()
+        .h(height)
         .flex_col()
-        .class("mq-set-col")
-        .child(section_title(tr(app, "Colour scheme", "配色方案")))
-        .child(scheme_row)
-        .child(hint(tr(
-            app,
-            "System follows the operating system's light or dark setting as it changes.",
-            "“跟随系统”会随操作系统的浅色/深色设置变化。",
-        )))
-        .child(section_title(tr(app, "Theme", "主题")))
         .child(
-            div().class("mq-set-choices").flex_row().child(
-                button("Cover Courier")
-                    .variant(ButtonVariant::Primary)
-                    .size(ButtonSize::Small),
-            ),
+            div()
+                .class("mq-set-col")
+                .class("mq-appearance-reading")
+                .w_full()
+                .flex_col()
+                .child(section_title(tr(app, "Reading", "阅读")))
+                .child(
+                    div()
+                        .class("mq-set-field")
+                        .w_full()
+                        .flex_col()
+                        .child(ui_text(tr(app, "Density", "密度")).size(12.0).semibold())
+                        .child(density_row),
+                )
+                .child(motion_switch)
+                .child(glass_switch)
+                .child(section_title(tr(app, "Themes", "主题"))),
         )
-        .child(hint(tr(
-            app,
-            "Cover Courier is the only theme for now; more arrive with theme import.",
-            "目前只有 Cover Courier；更多主题会随主题导入一起提供。",
-        )))
+        .child(super::themes::themes_panel(app, width, themes_h))
 }
 
 // --- General --------------------------------------------------------------

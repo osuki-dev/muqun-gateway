@@ -119,7 +119,10 @@ pub fn color_tokens(p: &Palette, scheme: ColorScheme) -> ColorTokens {
 
         background: p.background,
         surface: p.surface,
-        surface_elevated: p.surface,
+        // App uses surfaceRaised for elevated planes (composer, menus, code);
+        // Blinc's surface_elevated is that role. Overlay is the same raised
+        // plane for "selected / hovered" chrome (sidebar raise, hover fills).
+        surface_elevated: p.surface_raised,
         surface_overlay: p.surface_raised,
 
         text_primary: p.text,
@@ -257,6 +260,8 @@ mod tests {
         let direct = [
             (ColorToken::Background, "#F4F1EA"),
             (ColorToken::Surface, "#FFFCF7"),
+            // App surfaceRaised → Blinc elevated + overlay (menus, raised rows).
+            (ColorToken::SurfaceElevated, "#E8E4DB"),
             (ColorToken::SurfaceOverlay, "#E8E4DB"),
             (ColorToken::Border, "#E0DAD1"),
             (ColorToken::BorderSecondary, "#C2B9AE"),

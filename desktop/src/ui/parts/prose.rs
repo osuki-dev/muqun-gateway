@@ -6,7 +6,7 @@ use blinc_layout::binding::IntoReactive;
 use blinc_layout::prelude::*;
 use blinc_layout::text::Text;
 
-use super::{meta, scale, PartCtx};
+use super::{media, meta, scale, PartCtx};
 use crate::model::stream::{self, TailKind};
 use crate::ui::markdown::{self, copy_button, Setting};
 use crate::ui::text::{MONO_FONT, UI_FONT};
@@ -92,12 +92,25 @@ pub fn text(ctx: &PartCtx<'_>, text: &str) -> Div {
         .w_full()
         .flex_col()
         .child(body(ctx, text, &setting, true));
+    if let Some(assets) = ctx.item.image_assets.as_ref().filter(|a| !a.is_empty()) {
+        row = row.child(media::asset_row(ctx, assets));
+    }
     if ctx.last && ctx.live.is_none() && !text.trim().is_empty() {
-        row = row.child(div().class("mq-row-actions").flex_row().child(copy_button(
+        let mut actions = div().class("mq-row-actions").flex_row().items_center();
+        if let Some(muqun_gateway::agents::MessageGeneration::Message { tokens_per_second }) =
+            &ctx.item.generation
+        {
+            if *tokens_per_second > 0.0 {
+                actions = actions
+                    .child(meta(format!("{tokens_per_second:.1} tok/s")).class("mq-text-subtle"));
+            }
+        }
+        actions = actions.child(copy_button(
             &ctx.key("copy"),
             ctx.app.strings.copy(),
             text.to_string(),
-        )));
+        ));
+        row = row.child(actions);
     }
     row
 }
@@ -168,18 +181,26 @@ pub fn user(ctx: &PartCtx<'_>, text: &str) -> Div {
         .w(inner + pad)
         .flex_col()
         .child(markdown::inline_text(&paragraph, &setting, setting.size, false).w(inner));
-    let attachments = ctx.item.attachments.as_ref().map_or(0, Vec::len)
-        + ctx.item.image_assets.as_ref().map_or(0, Vec::len);
-    let mut foot = div().class("mq-user-foot").flex_row().items_center();
-    if attachments > 0 {
-        foot = foot.child(meta(ctx.app.strings.attachments(attachments)));
+    if let Some(atts) = ctx.item.attachments.as_ref().filter(|a| !a.is_empty()) {
+        card = card.child(media::attachment_row(
+            ctx,
+            atts,
+            ctx.item.image_assets.as_deref(),
+        ));
+    } else if let Some(assets) = ctx.item.image_assets.as_ref().filter(|a| !a.is_empty()) {
+        card = card.child(media::asset_row(ctx, assets));
     }
-    foot = foot.child(copy_button(
-        &ctx.key("copy"),
-        ctx.app.strings.copy(),
-        text.to_string(),
-    ));
-    card = card.child(foot);
+    card = card.child(
+        div()
+            .class("mq-user-foot")
+            .flex_row()
+            .items_center()
+            .child(copy_button(
+                &ctx.key("copy"),
+                ctx.app.strings.copy(),
+                text.to_string(),
+            )),
+    );
     div()
         .class("mq-user-row")
         .w_full()

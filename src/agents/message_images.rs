@@ -24,7 +24,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use crate::agents::domain::{AgentDomainEvent, AgentPart, MessageImageAsset, TimelineItem};
 use crate::{
@@ -81,7 +81,14 @@ impl MessageImages {
 
     /// Note where a session works, from anything that says so.
     pub(crate) fn remember_root(&self, asid: &str, directory: Option<&str>) -> Option<PathBuf> {
-        let root = image_root(directory?)?;
+        let directory = directory?;
+        {
+            let inner = self.inner.lock().ok()?;
+            if let Some(root) = inner.roots.get(asid) {
+                return Some(root.clone());
+            }
+        }
+        let root = image_root(directory)?;
         let mut inner = self.inner.lock().ok()?;
         if inner.roots.insert(asid.to_owned(), root.clone()).is_none() {
             inner.root_order.push_back(asid.to_owned());
@@ -184,6 +191,74 @@ fn may_embed_image(item: &TimelineItem) -> bool {
 pub(crate) fn image_root(directory: &str) -> Option<PathBuf> {
     let root = std::fs::canonicalize(directory.trim()).ok()?;
     (root.is_dir() && root.parent().is_some()).then_some(root)
+}
+
+/// Process-local image map for in-process clients (Muqun Desktop) that never
+/// hit the HTTP attach path. Same fencing rules as the gateway routes.
+fn local_images() -> &'static MessageImages {
+    static IMAGES: OnceLock<MessageImages> = OnceLock::new();
+    IMAGES.get_or_init(Default::default)
+}
+
+/// Attach `image_assets` for markdown/file URIs inside `directory`, for a
+/// desktop (or other in-process) client that does not go through `/api`.
+pub fn enrich_timeline(asid: &str, directory: Option<&str>, items: &mut [TimelineItem]) {
+    // Tool `content` media is resolved at paint time; only text embeds and
+    // attachments need the host map (and must not run on every tool delta).
+    if !items.iter().any(may_embed_image) && !items.iter().any(|item| item.attachments.is_some()) {
+        return;
+    }
+    let Some(directory) = directory.filter(|d| !d.is_empty()) else {
+        return;
+    };
+    let images = local_images();
+    let Some(root) = images.remember_root(asid, Some(directory)) else {
+        return;
+    };
+    images.attach(&root, items);
+}
+
+/// Resolve a media `src` (markdown destination, attachment path, or gateway
+/// `/api/assets|agent-images/…` URL) to a local file the desktop can draw.
+pub fn resolve_host_media(src: &str, session_directory: Option<&str>) -> Option<PathBuf> {
+    let src = src.trim();
+    if src.is_empty() {
+        return None;
+    }
+    if let Some(id) = asset_id_from_api(src) {
+        if let Some(served) = local_images().served(&id) {
+            return Some(served.path);
+        }
+    }
+    if let Some(directory) = session_directory.filter(|d| !d.is_empty()) {
+        if let Some(root) = image_root(directory) {
+            if let Some((path, _)) = hosted_file(src, &root) {
+                return Some(path);
+            }
+        }
+    }
+    // Same machine as the agent: absolute / file:// paths that still exist.
+    let raw = src.strip_prefix("file://").unwrap_or(src);
+    let raw = raw.strip_prefix("localhost").unwrap_or(raw);
+    let path = Path::new(raw);
+    if path.is_absolute() {
+        return std::fs::canonicalize(path).ok().filter(|p| p.is_file());
+    }
+    None
+}
+
+fn asset_id_from_api(src: &str) -> Option<String> {
+    let path = src.split('?').next()?;
+    for prefix in ["/api/assets/", "/api/agent-images/"] {
+        let Some(rest) = path.strip_prefix(prefix) else {
+            continue;
+        };
+        let id = rest.split('/').next()?.trim();
+        if !id.is_empty() {
+            return Some(id.to_string());
+        }
+    }
+    None
 }
 
 /// The directory a session's images are fenced to: remembered, else asked of
@@ -1733,5 +1808,27 @@ mod tests {
         ];
         assert_eq!(image_dimensions(&jpeg), Some((64, 32)));
         assert_eq!(image_dimensions(b"not an image"), None);
+    }
+
+    #[test]
+    fn desktop_resolve_finds_session_and_absolute_paths() {
+        let (_dir, root) = workspace();
+        let flow = root.join("out/flow.png");
+        assert_eq!(
+            resolve_host_media("./out/flow.png", root.to_str()),
+            Some(flow.clone())
+        );
+        assert_eq!(
+            resolve_host_media(flow.to_str().unwrap(), None),
+            Some(std::fs::canonicalize(&flow).unwrap())
+        );
+        assert_eq!(
+            asset_id_from_api(&format!("/api/assets/{}/content", asset_id(&flow))),
+            Some(asset_id(&flow))
+        );
+        assert_eq!(
+            asset_id_from_api("/api/agent-images/ai_abc/thumbnail"),
+            Some("ai_abc".into())
+        );
     }
 }

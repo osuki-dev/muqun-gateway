@@ -1,8 +1,9 @@
 //! The themes panel (architecture §5, §6.1d): what is installed, what the
-//! gallery offers, and importing a `.muqun-theme` from disk.
+//! gallery offers, and importing a `.muqun-theme` from disk or a public HTTPS
+//! package link (App link import, package URL — not a git repo).
 //!
-//! Mounted from Settings → Appearance ([`themes_panel`]); until that page
-//! exists, Ctrl+Shift+T opens it over the window ([`overlay`]).
+//! Mounted from Settings → Appearance ([`themes_panel`]). Ctrl+Shift+T still
+//! opens the same panel as an overlay ([`overlay`]).
 //!
 //! Every action is a `Command::Theme*` (`theme/service.rs`); results come
 //! back as `ThemeUpdate`s, written into the keyed states below by
@@ -34,7 +35,7 @@ const MIN_CARD: f32 = 232.0;
 const GAP: f32 = 16.0;
 const PAD_X: f32 = 24.0;
 const CARD_PAD: f32 = 20.0;
-const HEADER_H: f32 = 112.0;
+const HEADER_H: f32 = 148.0;
 /// Gallery cards built at once. A theme switch rebuilds the whole tree, and
 /// every card is a picture: all 97 made one switch cost up to a second.
 const GALLERY_PAGE: usize = 24;
@@ -64,6 +65,8 @@ pub struct ThemeBindings {
     /// How many gallery cards are built ([`GALLERY_PAGE`] more per "Show more").
     pub limit: State<usize>,
     pub search: SharedTextInputData,
+    /// HTTPS `.muqun-theme` package link (App link import, package URL only).
+    pub link: SharedTextInputData,
 }
 
 impl ThemeBindings {
@@ -83,6 +86,11 @@ impl ThemeBindings {
             search: ctx
                 .use_state_keyed("mq.themes.search", || {
                     text_input_data_with_placeholder("Search name or tag")
+                })
+                .get(),
+            link: ctx
+                .use_state_keyed("mq.themes.link", || {
+                    text_input_data_with_placeholder("https://…/theme.muqun-theme")
                 })
                 .get(),
         }
@@ -130,7 +138,7 @@ fn tr(app: &App, en: &'static str, zh: &'static str) -> &'static str {
 
 /// Ask for the library and the gallery once per run; the panel is rebuilt
 /// on every theme switch and must not re-ask each time.
-fn refresh_once(app: &App) {
+pub(crate) fn refresh_once(app: &App) {
     static ASKED: AtomicBool = AtomicBool::new(false);
     if !ASKED.swap(true, Ordering::Relaxed) {
         app.send(Command::ThemeRefresh);
@@ -274,6 +282,7 @@ fn header(app: &App, b: &ThemeBindings) -> impl ElementBuilder {
         b.gallery.clone(),
     );
     let search = b.search.clone();
+    let link = b.link.clone();
     let query = b.query.clone();
     let app = app.clone();
     stateful_with_key::<NoState>("mq-themes-header")
@@ -315,10 +324,27 @@ fn header(app: &App, b: &ThemeBindings) -> impl ElementBuilder {
             }
             let import = {
                 let app = app.clone();
-                button(tr(&app, "Import .muqun-theme…", "导入 .muqun-theme…"))
+                button(tr(&app, "Import file…", "导入文件…"))
                     .variant(ButtonVariant::Outline)
                     .size(ButtonSize::Small)
                     .on_click(move |_| pick_theme_file(&app))
+            };
+            let import_link = {
+                let app = app.clone();
+                let link = link.clone();
+                button(tr(&app, "Import link", "导入链接"))
+                    .variant(ButtonVariant::Outline)
+                    .size(ButtonSize::Small)
+                    .on_click(move |_| {
+                        let url = link
+                            .lock()
+                            .map(|d| d.value.trim().to_string())
+                            .unwrap_or_default();
+                        if url.is_empty() {
+                            return;
+                        }
+                        app.send(Command::ThemeImportUrl(url));
+                    })
             };
             let active = tab.get();
             let tab_button = |which: Tab, label: String| {
@@ -382,6 +408,15 @@ fn header(app: &App, b: &ThemeBindings) -> impl ElementBuilder {
                                 reset_paging();
                             },
                         ))),
+                )
+                .child(
+                    div()
+                        .class("mq-themes-link-row")
+                        .w_full()
+                        .flex_row()
+                        .items_center()
+                        .child(div().flex_1().min_w(0.0).child(input(&link).w_full()))
+                        .child(import_link),
                 )
         })
 }

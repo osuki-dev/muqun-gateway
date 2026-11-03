@@ -2,9 +2,7 @@
 //! (architecture §3).
 //!
 //! Every argument and result is the gateway's own `agents::domain` type --
-//! there is no second session model. P0 implements the subset the OpenCode
-//! slice needs; `catalog`, the switches, `rename`,
-//! `delete` and `fork` join in P1. [`LocalHub`] runs the gateway's agents
+//! there is no second session model. [`LocalHub`] runs the gateway's agents
 //! plane in this process; a `RemoteHub` over the App's HTTP contract can
 //! implement the same trait later without the UI changing.
 
@@ -128,6 +126,16 @@ pub trait SessionHub: Send + Sync {
         model: &'a ModelRef,
     ) -> HubFuture<'a, ()>;
     fn switch_mode<'a>(&'a self, asid: &'a AgentSessionId, mode: &'a str) -> HubFuture<'a, ()>;
+    /// Rename the session in the agent that owns it.
+    fn rename<'a>(&'a self, asid: &'a AgentSessionId, title: &'a str) -> HubFuture<'a, ()>;
+    /// Delete the session and drop it from the mirror.
+    fn delete<'a>(&'a self, asid: &'a AgentSessionId) -> HubFuture<'a, ()>;
+    /// Fork into a new session (adapter may refuse). `message_id` is optional.
+    fn fork<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+        message_id: Option<&'a str>,
+    ) -> HubFuture<'a, AgentSessionInfo>;
     /// A queued or steered prompt: take it back, or move it between the two
     /// deliveries (`steer` runs at the next step boundary).
     fn inbox_cancel<'a>(&'a self, asid: &'a AgentSessionId, item: &'a str) -> HubFuture<'a, ()>;

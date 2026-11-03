@@ -234,25 +234,62 @@ fn open_in_button(app: &App) -> impl ElementBuilder {
         })
 }
 
+/// Open a changed path with the preferred editor command, else the OS opener.
+pub fn open_diff_file(app: &App, file: &str) {
+    let path = std::path::Path::new(file);
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        match session_root(app) {
+            Some(root) => root.join(file),
+            None => path.to_path_buf(),
+        }
+    };
+    let command = app.config.get().general.editor_command;
+    let mut words = command.as_deref().unwrap_or("").split_whitespace();
+    let Some(program) = words.next() else {
+        crate::platform::shell::open_path(&path);
+        return;
+    };
+    match std::process::Command::new(program)
+        .args(words)
+        .arg(&path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(mut child) => {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
+        Err(err) => tracing::warn!(program, "could not open {}: {err}", path.display()),
+    }
+}
+
 /// `+n −m` from `get_vcs_diff`, only while there are changes; the numbers
-/// alone carry the colour.
+/// alone carry the colour. Opens the changed-files panel.
 fn diff_count(app: &App) -> impl ElementBuilder {
     let diff = app.bindings.diff.clone();
     let header = app.bindings.header.clone();
+    let panel = app.bindings.diff_panel.clone();
     let app = app.clone();
     stateful_with_key::<NoState>("mq-diff-count")
-        .deps([diff.signal_id(), header.signal_id()])
+        .deps([diff.signal_id(), header.signal_id(), panel.signal_id()])
         .on_state(move |_| {
             let open = header.get().map(|h| h.asid.0.clone());
             let Some(stat) = diff
                 .get()
                 .filter(|d| Some(&d.asid) == open.as_ref() && d.files > 0)
             else {
+                if panel.get() {
+                    panel.signal().set(false);
+                }
                 return div();
             };
             let click = app.clone();
-            let asid = muqun_gateway::agents::AgentSessionId(stat.asid.clone());
-            div()
+            let mut row = div()
                 .class("mq-ghost")
                 .class("mq-diff-count")
                 .h(28.0)
@@ -274,13 +311,116 @@ fn diff_count(app: &App) -> impl ElementBuilder {
                             .no_wrap()
                             .no_cursor(),
                     ),
+                );
+            if panel.get() {
+                row = row.class("mq-diff-count--open");
+            }
+            row.on_click(move |_| {
+                let open = !click.bindings.diff_panel.get();
+                click.bindings.diff_panel.signal().set(open);
+            })
+        })
+}
+
+/// Overlay listing changed paths for the open session; click opens in editor.
+pub fn diff_overlay(app: &App) -> impl ElementBuilder {
+    let diff = app.bindings.diff.clone();
+    let panel = app.bindings.diff_panel.clone();
+    let header = app.bindings.header.clone();
+    let app = app.clone();
+    stateful_with_key::<NoState>("mq-diff-panel")
+        .deps([diff.signal_id(), panel.signal_id(), header.signal_id()])
+        .on_state(move |_| {
+            if !panel.get() {
+                return div();
+            }
+            let open = header.get().map(|h| h.asid.0.clone());
+            let Some(stat) = diff
+                .get()
+                .filter(|d| Some(&d.asid) == open.as_ref() && !d.paths.is_empty())
+            else {
+                return div();
+            };
+            let close = app.clone();
+            let mut list = div().class("mq-diff-panel-list").flex_col().w_full();
+            for file in stat.paths.iter().cloned() {
+                let open_app = app.clone();
+                let path = file.path.clone();
+                list = list.child(
+                    div()
+                        .class("mq-diff-panel-row")
+                        .w_full()
+                        .flex_row()
+                        .items_center()
+                        .cursor_pointer()
+                        .child(
+                            div().flex_1().min_w(0.0).overflow_clip().child(
+                                mono_text(file.path.clone())
+                                    .size(12.0)
+                                    .no_wrap()
+                                    .no_cursor(),
+                            ),
+                        )
+                        .child(
+                            div().class("mq-diff-added").child(
+                                mono_text(format!("+{}", file.added))
+                                    .size(11.0)
+                                    .no_wrap()
+                                    .no_cursor(),
+                            ),
+                        )
+                        .child(
+                            div().class("mq-diff-removed").child(
+                                mono_text(format!("−{}", file.removed))
+                                    .size(11.0)
+                                    .no_wrap()
+                                    .no_cursor(),
+                            ),
+                        )
+                        .on_click(move |_| open_diff_file(&open_app, &path)),
+                );
+            }
+            if stat.files > stat.paths.len() {
+                list = list.child(
+                    div().class("mq-menu-dim").child(
+                        ui_text(format!("+{}", stat.files - stat.paths.len()))
+                            .size(11.0)
+                            .no_wrap()
+                            .no_cursor(),
+                    ),
+                );
+            }
+            div()
+                .class("mq-diff-panel")
+                .absolute()
+                .right(12.0)
+                .top(TOP_BAR_HEIGHT + 8.0)
+                .w(360.0)
+                .flex_col()
+                .child(
+                    div()
+                        .class("mq-diff-panel-head")
+                        .w_full()
+                        .flex_row()
+                        .items_center()
+                        .child(
+                            ui_text(app.strings.changed_files())
+                                .size(13.0)
+                                .semibold()
+                                .no_wrap()
+                                .no_cursor(),
+                        )
+                        .child(div().flex_1())
+                        .child(ghost_icon(icons::X).on_click(move |_| {
+                            close.bindings.diff_panel.signal().set(false);
+                        })),
                 )
-                .on_click(move |_| {
-                    click.send(Command::OpenDiff {
-                        asid: asid.clone(),
-                        file: None,
-                    })
-                })
+                .child(
+                    div()
+                        .w_full()
+                        .max_h(320.0)
+                        .child(scroll().w_full().h_full().child(list)),
+                )
         })
 }
 
@@ -430,7 +570,7 @@ fn main_panel(app: &App, width: f32, height: f32) -> Div {
         ])
         .on_state(move |_| {
             if settings_open.get() {
-                return settings::page(&app, height);
+                return settings::page(&app, width, height);
             }
             if inbox_open.get() {
                 return inbox_page(&app, height);

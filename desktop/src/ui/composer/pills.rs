@@ -33,7 +33,8 @@ type MenuAction = Arc<dyn Fn() + Send + Sync + 'static>;
 
 const PILL_HEIGHT: f32 = 28.0;
 /// Menu rows listed at most (a catalogue may hold hundreds of models).
-const MAX_MODELS: usize = 14;
+const MAX_MODELS: usize = 40;
+const MAX_BRANCHES: usize = 24;
 const MAX_PROJECTS: usize = 8;
 const MAX_AGENTS: usize = 10;
 /// Longest label a pill shows, in characters.
@@ -377,24 +378,21 @@ pub fn row(app: &App, aim: &Aim) -> Div {
         .items_center();
     pills = pills.child(project_pill(app, aim, side));
     pills = pills.child(agent_pill(app, aim, side));
-    if let Some(catalog) = aim.catalog.as_ref() {
-        let models: Vec<&ModelInfo> = catalog
-            .catalog
-            .models
-            .iter()
-            .filter(|m| m.enabled)
-            .collect();
-        if !models.is_empty() {
-            pills = pills.child(model_pill(app, aim, &models, side));
-        }
-        let modes = visible_modes(aim);
-        if !modes.is_empty() {
-            pills = pills.child(mode_pill(app, aim, side));
-        }
-        if let Some(model) = selected_model(aim, &models) {
-            if model.variants.as_ref().is_some_and(|v| !v.is_empty()) {
-                pills = pills.child(effort_pill(app, aim, model, side));
-            }
+    let models: Vec<&ModelInfo> = aim
+        .catalog
+        .as_ref()
+        .map(|c| c.catalog.models.iter().filter(|m| m.enabled).collect())
+        .unwrap_or_default();
+    if !models.is_empty() || aim.model.is_some() {
+        pills = pills.child(model_pill(app, aim, &models, side));
+    }
+    let modes = visible_modes(aim);
+    if !modes.is_empty() || aim.mode.is_some() {
+        pills = pills.child(mode_pill(app, aim, side));
+    }
+    if let Some(model) = selected_model(aim, &models) {
+        if model.variants.as_ref().is_some_and(|v| !v.is_empty()) {
+            pills = pills.child(effort_pill(app, aim, model, side));
         }
     }
     if let Some(pill) = branch_pill(app, aim, side) {
@@ -616,11 +614,25 @@ fn model_pill(app: &App, aim: &Aim, models: &[&ModelInfo], side: Side) -> Div {
         (None, Some(chosen)) => chosen.model_id.clone(),
         (None, None) => app.strings.model_default().to_string(),
     };
+    let choosable = !models.is_empty();
     let open = Cmp::get().menu.get() == Some(MenuId::Model);
-    let p = pill(None, clip(&label, LABEL_CHARS), true, open);
+    let p = pill(None, clip(&label, LABEL_CHARS), choosable, open);
+    if !choosable {
+        return p;
+    }
     let mut list: Vec<ModelInfo> = models.iter().map(|m| (*m).clone()).collect();
     list.sort_by_key(|m| m.name.to_lowercase());
     let chosen = aim.model.clone();
+    // Keep the live selection near the top so long catalogues stay usable.
+    if let Some(ref c) = chosen {
+        if let Some(i) = list
+            .iter()
+            .position(|m| m.id == c.model_id && m.provider_id == c.provider_id)
+        {
+            let selected = list.remove(i);
+            list.insert(0, selected);
+        }
+    }
     let asid = aim.asid();
     let app = app.clone();
     let height = menu_height(list.len().min(MAX_MODELS), 0)
@@ -646,11 +658,15 @@ fn model_pill(app: &App, aim: &Aim, models: &[&ModelInfo], side: Side) -> Div {
                 );
             let app = app.clone();
             let asid = asid.clone();
+            let keep_variant = chosen
+                .as_ref()
+                .filter(|c| c.model_id == model.id && c.provider_id == model.provider_id)
+                .and_then(|c| c.variant.clone());
             menu = menu.child(action_row(label, selected, move || {
                 let model = ModelRef {
                     provider_id: model.provider_id.clone(),
                     model_id: model.id.clone(),
-                    variant: None,
+                    variant: keep_variant.clone(),
                 };
                 choose_model(&app, asid.as_ref(), model);
                 close_menu();
@@ -670,13 +686,53 @@ fn model_pill(app: &App, aim: &Aim, models: &[&ModelInfo], side: Side) -> Div {
     })
 }
 
+/// Remember the live choice for this agent+folder, and show it on the pill
+/// before the next `SessionUpdated` arrives.
+fn remember_live(app: &App, model: Option<&ModelRef>, mode: Option<&str>) {
+    let Some(header) = app.bindings.header.get() else {
+        return;
+    };
+    let Some(cwd) = header.directory.clone() else {
+        return;
+    };
+    let agent = header.agent_id.clone();
+    let model_s = model.or(header.model.as_ref()).map(super::model_to_string);
+    let mode_s = mode.map(str::to_string).or_else(|| header.mode.clone());
+    app.send(Command::Edit(crate::config::ConfigEdit::Remember {
+        agent,
+        cwd,
+        model: model_s,
+        mode: mode_s,
+    }));
+}
+
+fn patch_header_model(app: &App, model: ModelRef) {
+    if let Some(header) = app.bindings.header.get() {
+        let mut info = (*header).clone();
+        info.model = Some(model);
+        app.bindings.header.signal().set(Some(Arc::new(info)));
+    }
+}
+
+fn patch_header_mode(app: &App, mode: String) {
+    if let Some(header) = app.bindings.header.get() {
+        let mut info = (*header).clone();
+        info.mode = Some(mode);
+        app.bindings.header.signal().set(Some(Arc::new(info)));
+    }
+}
+
 /// The model (and its effort) the session or the start page will use.
 fn choose_model(app: &App, asid: Option<&muqun_gateway::agents::AgentSessionId>, model: ModelRef) {
     match asid {
-        Some(asid) => app.send(Command::Compose(ComposeCommand::SwitchModel {
-            asid: asid.clone(),
-            model,
-        })),
+        Some(asid) => {
+            remember_live(app, Some(&model), None);
+            patch_header_model(app, model.clone());
+            app.send(Command::Compose(ComposeCommand::SwitchModel {
+                asid: asid.clone(),
+                model,
+            }));
+        }
         None => {
             let cmp = Cmp::get();
             let mut choice = (*cmp.start.get()).clone();
@@ -699,13 +755,17 @@ fn mode_pill(app: &App, aim: &Aim, side: Side) -> Div {
                 .unwrap_or_else(|| mode_label(id, ""))
         })
         .unwrap_or_else(|| app.strings.mode_word().to_string());
+    let choosable = !modes.is_empty();
     let open = Cmp::get().menu.get() == Some(MenuId::Mode);
     let p = pill(
         Some(glyph_box(icons::FILE_TEXT)),
         clip(&label, LABEL_CHARS),
-        true,
+        choosable,
         open,
     );
+    if !choosable {
+        return p;
+    }
     let chosen = aim.mode.clone();
     let asid = aim.asid();
     let app = app.clone();
@@ -721,10 +781,14 @@ fn mode_pill(app: &App, aim: &Aim, side: Side) -> Div {
                 selected,
                 move || {
                     match &asid {
-                        Some(asid) => app.send(Command::Compose(ComposeCommand::SwitchMode {
-                            asid: asid.clone(),
-                            mode: id.clone(),
-                        })),
+                        Some(asid) => {
+                            remember_live(&app, None, Some(&id));
+                            patch_header_mode(&app, id.clone());
+                            app.send(Command::Compose(ComposeCommand::SwitchMode {
+                                asid: asid.clone(),
+                                mode: id.clone(),
+                            }));
+                        }
                         None => {
                             let cmp = Cmp::get();
                             let mut choice = (*cmp.start.get()).clone();
@@ -789,7 +853,8 @@ fn effort_pill(app: &App, aim: &Aim, model: &ModelInfo, side: Side) -> Div {
 
 fn branch_pill(app: &App, aim: &Aim, side: Side) -> Option<Div> {
     let cwd = aim.cwd.clone()?;
-    let branch = Cmp::get().branches.get().get(&cwd).cloned().flatten()?;
+    let info = Cmp::get().branches.get().get(&cwd).cloned()?;
+    let branch = info.current.clone()?;
     let open = Cmp::get().menu.get() == Some(MenuId::Branch);
     let p = pill(
         Some(glyph_box(icons::GIT_BRANCH)),
@@ -799,12 +864,22 @@ fn branch_pill(app: &App, aim: &Aim, side: Side) -> Option<Div> {
     );
     let on_start = aim.place == Place::Start;
     let want_worktree = on_start && Cmp::get().start.get().worktree;
+    let locals: Vec<String> = info
+        .local
+        .iter()
+        .filter(|b| *b != &branch)
+        .cloned()
+        .collect();
+    let shown = locals.len().min(MAX_BRANCHES);
+    let extra = locals.len().saturating_sub(MAX_BRANCHES);
+    let rows = 1 + shown + usize::from(extra > 0) + 1;
+    let seps = 1 + usize::from(shown > 0 || extra > 0);
     let app = app.clone();
     Some(host(
         MenuId::Branch,
         side,
         p,
-        (280.0, menu_height(2, 1)),
+        (300.0, menu_height(rows, seps)),
         move || {
             let current = div()
                 .flex_row()
@@ -818,51 +893,102 @@ fn branch_pill(app: &App, aim: &Aim, side: Side) -> Option<Div> {
                             .no_cursor(),
                     ),
                 );
-            // Switching a checkout the agent is using is not offered; a new
-            // worktree is how to branch off (start page only).
-            let worktree =
+            let mut menu = div()
+                .flex_col()
+                .min_w(280.0)
+                .child(menu_row(current, true, false, false));
+            if shown > 0 || extra > 0 {
+                menu = menu.child(separator());
+            }
+            for name in locals.iter().take(MAX_BRANCHES).cloned() {
+                let selected = false;
                 if on_start {
-                    action_row(
-                        div().child(
-                            ui_text(app.strings.new_worktree())
-                                .size(13.0)
-                                .no_wrap()
-                                .no_cursor(),
-                        ),
-                        want_worktree,
+                    let app = app.clone();
+                    let cwd = cwd.clone();
+                    menu = menu.child(action_row(
+                        div().child(mono_text(name.clone()).size(12.0).no_wrap().no_cursor()),
+                        selected,
                         move || {
-                            let cmp = Cmp::get();
-                            let mut choice = (*cmp.start.get()).clone();
-                            choice.worktree = !choice.worktree;
-                            cmp.start.signal().set(Arc::new(choice));
+                            app.send(Command::Compose(ComposeCommand::Checkout {
+                                cwd: cwd.clone(),
+                                branch: name.clone(),
+                            }));
                             close_menu();
                         },
-                    )
+                    ));
                 } else {
-                    menu_row(
+                    menu = menu.child(menu_row(
                         div()
                             .flex_row()
                             .items_center()
+                            .child(mono_text(name).size(12.0).no_wrap().no_cursor())
                             .child(
-                                ui_text(app.strings.new_worktree())
-                                    .size(13.0)
-                                    .no_wrap()
-                                    .no_cursor(),
-                            )
-                            .child(div().class("mq-menu-dim").child(
-                                ui_text(app.strings.soon()).size(11.0).no_wrap().no_cursor(),
-                            )),
+                                div().class("mq-menu-dim").child(
+                                    ui_text(app.strings.branch_session_only())
+                                        .size(11.0)
+                                        .no_wrap()
+                                        .no_cursor(),
+                                ),
+                            ),
                         false,
                         false,
                         false,
-                    )
-                };
-            div()
-                .flex_col()
-                .min_w(260.0)
-                .child(menu_row(current, true, false, false))
-                .child(separator())
-                .child(worktree)
+                    ));
+                }
+            }
+            if extra > 0 {
+                menu = menu.child(
+                    div().class("mq-menu-dim").child(
+                        ui_text(format!("+{extra}"))
+                            .size(11.0)
+                            .no_wrap()
+                            .no_cursor(),
+                    ),
+                );
+            }
+            menu = menu.child(separator());
+            // A new worktree is how to branch off without moving the agent's
+            // checkout; offered on the start page, and as "new session" while
+            // one is already open.
+            let worktree = if on_start {
+                action_row(
+                    div().child(
+                        ui_text(app.strings.new_worktree())
+                            .size(13.0)
+                            .no_wrap()
+                            .no_cursor(),
+                    ),
+                    want_worktree,
+                    move || {
+                        let cmp = Cmp::get();
+                        let mut choice = (*cmp.start.get()).clone();
+                        choice.worktree = !choice.worktree;
+                        cmp.start.signal().set(Arc::new(choice));
+                        close_menu();
+                    },
+                )
+            } else {
+                let app = app.clone();
+                let cwd = cwd.clone();
+                action_row(
+                    div().child(
+                        ui_text(app.strings.new_session_worktree())
+                            .size(13.0)
+                            .no_wrap()
+                            .no_cursor(),
+                    ),
+                    false,
+                    move || {
+                        app.open_draft_in(std::path::Path::new(&cwd));
+                        let cmp = Cmp::get();
+                        let mut choice = (*cmp.start.get()).clone();
+                        choice.worktree = true;
+                        cmp.start.signal().set(Arc::new(choice));
+                        close_menu();
+                    },
+                )
+            };
+            menu.child(worktree)
         },
     ))
 }

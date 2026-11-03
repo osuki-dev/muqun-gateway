@@ -13,7 +13,7 @@ use muqun_gateway::agents::ModelRef;
 
 use super::triggers::Trigger;
 use crate::hub::CatalogView;
-use crate::model::compose::{ComposerUpdate, FileHit, InboxItem, StagedFile};
+use crate::model::compose::{BranchInfo, ComposerUpdate, FileHit, InboxItem, StagedFile};
 
 /// What the start page will create, as far as the owner has said. Anything
 /// `None` is resolved from the defaults ([`super::resolve`]).
@@ -100,7 +100,7 @@ pub struct Cmp {
     pub submitting: State<Option<u64>>,
     /// The text area's height in rows (2 to 6).
     pub rows: State<usize>,
-    pub branches: State<Arc<HashMap<String, Option<String>>>>,
+    pub branches: State<Arc<HashMap<String, BranchInfo>>>,
 }
 
 impl Cmp {
@@ -268,9 +268,9 @@ pub fn apply_update(update: ComposerUpdate) {
             with(|l| l.inbox_of = Some(asid));
             cmp.inbox.signal().set(Arc::new(items));
         }
-        ComposerUpdate::Branch { cwd, branch } => {
+        ComposerUpdate::Branch { cwd, info } => {
             let mut next = (*cmp.branches.get()).clone();
-            next.insert(cwd, branch);
+            next.insert(cwd, info);
             cmp.branches.signal().set(Arc::new(next));
         }
     }

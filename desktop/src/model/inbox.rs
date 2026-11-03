@@ -58,6 +58,13 @@ pub enum UiAction {
     FilesPicked(Vec<std::path::PathBuf>),
     /// Open a session as a click on its row would (QA, `MUQUN_QA_SWITCH`).
     Open(String),
+    /// Toggle the top-bar working-tree file list.
+    ToggleDiffPanel,
+    /// Open one changed file in the preferred editor.
+    OpenDiffFile {
+        asid: String,
+        path: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -69,6 +76,8 @@ pub enum Update {
         sessions: Vec<AgentSessionInfo>,
     },
     SessionCreated(Box<AgentSessionInfo>),
+    /// The session was deleted locally; drop it from the list and clear if open.
+    SessionGone(String),
     Snapshot(Box<AgentSessionSnapshot>),
     Event(Box<AgentDomainEvent>),
     Error(UiError),

@@ -14,7 +14,7 @@ use serde_json::Value;
 use blinc_cn::prelude::{spinner, SpinnerSize};
 
 use super::summary::count_lines;
-use super::{card, clip_lines, link_button, meta, mono, mono_block, scale, PartCtx};
+use super::{card, clip_lines, link_button, media, meta, mono, mono_block, scale, PartCtx};
 use crate::model::commands::Command;
 use crate::ui::markdown;
 use crate::ui::text::{ui_text, MONO_FONT};
@@ -26,7 +26,7 @@ const INPUT_LINES: usize = 20;
 /// Height of a collapsed tool row, border included.
 const ROW_HEIGHT: f32 = 36.0;
 
-/// The 3 px bar: mint while running, grey once done, red failed.
+/// The 3 px bar: info while running (App busy tone), grey once done, red failed.
 fn status_accent(status: ToolCallStatus) -> &'static str {
     match status {
         ToolCallStatus::Pending | ToolCallStatus::Streaming | ToolCallStatus::Running => {
@@ -47,40 +47,115 @@ fn duration(ms: u64) -> String {
     }
 }
 
-/// The input as short `key: value` lines.
-fn input_summary(input: &Value, partial: Option<&str>) -> String {
-    match input {
-        Value::Object(map) if !map.is_empty() => map
-            .iter()
-            .map(|(k, v)| {
-                let v = match v {
-                    Value::String(s) => s.clone(),
-                    other => other.to_string(),
-                };
-                let one_line: String = v.lines().next().unwrap_or("").chars().take(240).collect();
-                let more = if v.lines().count() > 1 { " …" } else { "" };
-                format!("{k}: {one_line}{more}")
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
-        Value::Null | Value::Object(_) => partial.unwrap_or("").to_string(),
-        other => other.to_string(),
+/// Cheap brace check for auto-open; does not parse.
+fn looks_like_json_object(text: &str) -> bool {
+    let t = text.trim();
+    (t.starts_with('{') && t.ends_with('}')) || (t.starts_with('[') && t.ends_with(']'))
+}
+
+/// Pretty JSON when `value` is an object or array.
+fn pretty_structured(value: &Value) -> Option<String> {
+    matches!(value, Value::Object(_) | Value::Array(_))
+        .then(|| serde_json::to_string_pretty(value).ok())
+        .flatten()
+}
+
+/// Text for display, and whether it should render as a JSON code block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Payload {
+    text: String,
+    json: bool,
+}
+
+impl Payload {
+    fn plain(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            json: false,
+        }
+    }
+
+    fn json(text: String) -> Self {
+        Self { text, json: true }
+    }
+
+    /// Prefer structured pretty-print; otherwise try to parse a JSON string.
+    fn from_value(value: &Value) -> Self {
+        if let Some(pretty) = pretty_structured(value) {
+            return Self::json(pretty);
+        }
+        match value {
+            Value::String(s) => Self::from_text(s),
+            Value::Null => Self::plain(String::new()),
+            other => Self::plain(other.to_string()),
+        }
+    }
+
+    /// Compact `key: value` for tiny flat objects; pretty JSON once nested
+    /// or multi-line values appear.
+    fn from_input(input: &Value, partial: Option<&str>) -> Self {
+        match input {
+            Value::Object(map) if !map.is_empty() => {
+                if map.values().any(|v| {
+                    matches!(v, Value::Object(_) | Value::Array(_))
+                        || matches!(v, Value::String(s) if s.contains('\n') || s.len() > 120)
+                }) {
+                    return pretty_structured(input)
+                        .map(Self::json)
+                        .unwrap_or_else(|| Self::plain(input.to_string()));
+                }
+                let lines: Vec<String> = map
+                    .iter()
+                    .map(|(k, v)| {
+                        let v = match v {
+                            Value::String(s) => s.clone(),
+                            other => other.to_string(),
+                        };
+                        format!("{k}: {}", v.chars().take(240).collect::<String>())
+                    })
+                    .collect();
+                Self::plain(lines.join("\n"))
+            }
+            Value::Array(_) => pretty_structured(input)
+                .map(Self::json)
+                .unwrap_or_else(|| Self::plain(input.to_string())),
+            Value::Null | Value::Object(_) => Self::from_text(partial.unwrap_or("")),
+            other => Self::from_value(other),
+        }
+    }
+
+    fn from_text(text: &str) -> Self {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return Self::plain(String::new());
+        }
+        if looks_like_json_object(trimmed) {
+            if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+                if let Some(pretty) = pretty_structured(&value) {
+                    return Self::json(pretty);
+                }
+            }
+        }
+        Self::plain(text.trim_end().to_string())
     }
 }
 
 /// The output as text: a string, the text items of `content`, or JSON.
-fn output_text(call: &ToolCall) -> String {
+fn output_payload(call: &ToolCall) -> Payload {
     match &call.output {
-        Some(Value::String(s)) => s.clone(),
-        Some(Value::Null) | None => match &call.content {
-            Some(Value::Array(items)) => items
-                .iter()
-                .filter_map(|i| i.get("text").and_then(Value::as_str))
-                .collect::<Vec<_>>()
-                .join("\n"),
-            _ => String::new(),
+        Some(value) => Payload::from_value(value),
+        None => match &call.content {
+            Some(Value::Array(items)) => {
+                let text = items
+                    .iter()
+                    .filter_map(|i| i.get("text").and_then(Value::as_str))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                Payload::from_text(&text)
+            }
+            Some(other) => Payload::from_value(other),
+            None => Payload::plain(String::new()),
         },
-        Some(other) => serde_json::to_string_pretty(other).unwrap_or_default(),
     }
 }
 
@@ -100,27 +175,69 @@ fn header_row(glyph: &'static str, glyph_class: &str) -> Div {
         )
 }
 
-/// A collapsible output section with a line limit and a show-all toggle.
-fn output_section(ctx: &PartCtx<'_>, what: &str, output: &str, truncated: bool) -> Div {
+/// Label + payload body (plain mono or pretty JSON), with a line cap.
+/// No nested chrome: the tool card already has the only hairline (§6.1d).
+fn tool_section(
+    ctx: &PartCtx<'_>,
+    what: &str,
+    label: Option<&str>,
+    payload: &Payload,
+    truncated: bool,
+    line_cap: usize,
+) -> Div {
     let strings = &ctx.app.strings;
     let all = ctx.is_open(&format!("{what}.all"), false);
     let (shown, more) = if all {
-        (output.trim_end().to_string(), 0)
+        (payload.text.trim_end().to_string(), 0)
     } else {
-        clip_lines(output, OUTPUT_LINES)
+        clip_lines(&payload.text, line_cap)
     };
-    let mut section = div()
-        .class("mq-output")
-        .w_full()
-        .flex_col()
-        .child(mono_block(shown));
+    let body = if payload.json {
+        // Highlight flush — same as diffs, not a bordered `.mq-code` box.
+        div().class("mq-tool-plain").w_full().child(
+            rich_text_styled(crate::ui::markdown::highlight::highlight(
+                Some("json"),
+                &shown,
+            ))
+            .size(scale::FS_12)
+            .line_height(1.5)
+            .font_family(FontFamily::named(MONO_FONT)),
+        )
+    } else {
+        div()
+            .class("mq-tool-plain")
+            .w_full()
+            .child(mono_block(shown.clone()))
+    };
+    let mut section = div().class("mq-tool-section").w_full().flex_col();
+    if let Some(label) = label.filter(|s| !s.is_empty()) {
+        let mut head = div()
+            .class("mq-tool-section-head")
+            .w_full()
+            .flex_row()
+            .items_center()
+            .child(
+                meta(label.to_string())
+                    .class("mq-tool-section-label")
+                    .no_cursor(),
+            );
+        if payload.json {
+            head = head.child(div().flex_1()).child(markdown::copy_button(
+                &ctx.key(&format!("{what}.copy")),
+                strings.copy(),
+                shown.clone(),
+            ));
+        }
+        section = section.child(head);
+    }
+    section = section.child(body);
     if more > 0 || all {
-        let label = if all {
+        let expand = if all {
             strings.show_less().to_string()
         } else {
             format!("{} · {}", strings.more_lines(more), strings.show_all())
         };
-        section = section.child(link_button(label, ctx.toggle(&format!("{what}.all"))));
+        section = section.child(link_button(expand, ctx.toggle(&format!("{what}.all"))));
     }
     if truncated {
         section = section.child(meta("…"));
@@ -190,26 +307,41 @@ fn relativise(path: &str, cwd: Option<&str>) -> String {
 /// The call's input on one line: the field that says most (the command, the
 /// path, the pattern) or else the first string.
 fn args_summary(call: &ToolCall, cwd: Option<&str>) -> String {
-    const KEYS: &[&str] = &[
+    const PATH_KEYS: &[&str] = &["filePath", "file_path", "path"];
+    const BODY_KEYS: &[&str] = &[
         "command",
         "cmd",
-        "filePath",
-        "file_path",
-        "path",
         "pattern",
         "url",
         "query",
         "description",
         "prompt",
+        "content",
+        "new_string",
+        "newString",
+        "old_string",
+        "oldString",
     ];
     let line = |v: &str| v.lines().next().unwrap_or("").trim().to_string();
     if let Value::Object(map) = &call.input {
-        let named = KEYS
+        let path = PATH_KEYS
             .iter()
-            .find_map(|k| map.get(*k).and_then(Value::as_str));
-        let first = || map.values().find_map(Value::as_str);
-        if let Some(v) = named.or_else(first) {
-            let shown = relativise(&line(v), cwd);
+            .find_map(|k| map.get(*k).and_then(Value::as_str))
+            .map(|p| relativise(&line(p), cwd));
+        let body = BODY_KEYS
+            .iter()
+            .find_map(|k| map.get(*k).and_then(Value::as_str))
+            .map(line)
+            .filter(|v| !v.is_empty());
+        if let Some(path) = path {
+            let shown = match body.filter(|v| v != &path) {
+                Some(extra) => format!("{path} · {}", extra.chars().take(120).collect::<String>()),
+                None => path,
+            };
+            return shown.chars().take(200).collect();
+        }
+        if let Some(v) = body.or_else(|| map.values().find_map(Value::as_str).map(line)) {
+            let shown = relativise(&v, cwd);
             return shown.chars().take(200).collect();
         }
     }
@@ -221,7 +353,7 @@ fn args_summary(call: &ToolCall, cwd: Option<&str>) -> String {
 }
 
 /// A tool call, one 36 px row: `▸ name  args … duration`, a 3 px bar on the
-/// left for the state (mint running with a spinner at the right, grey done,
+/// left for the state (info running with a spinner at the right, grey done,
 /// red failed, amber while an approval for it waits). Opened, it shows the
 /// input and the output. Completed passive tools render as quiet rows.
 pub fn tool(ctx: &PartCtx<'_>, call: &ToolCall) -> Div {
@@ -244,12 +376,51 @@ pub fn tool(ctx: &PartCtx<'_>, call: &ToolCall) -> Div {
     } else {
         status_accent(status)
     };
+    let has_media = call.content.as_ref().is_some_and(|c| {
+        c.as_array().is_some_and(|items| {
+            items.iter().any(|item| {
+                let mime = item.get("mime").and_then(|v| v.as_str());
+                let uri = item
+                    .get("uri")
+                    .or_else(|| item.get("url"))
+                    .or_else(|| item.get("path"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                matches!(
+                    item.get("type").and_then(|v| v.as_str()),
+                    Some("image" | "video" | "file")
+                ) || matches!(
+                    media::kind_for(uri, mime),
+                    media::MediaKind::Image | media::MediaKind::Video
+                )
+            })
+        })
+    });
+    // Shape only — never parse/pretty here (runs every stream rebuild).
+    let has_structured = match &call.output {
+        Some(Value::Object(_) | Value::Array(_)) => true,
+        Some(Value::String(s)) => looks_like_json_object(s),
+        _ => match &call.input {
+            Value::Array(_) => true,
+            Value::Object(map) => map
+                .values()
+                .any(|v| matches!(v, Value::Object(_) | Value::Array(_))),
+            _ => false,
+        },
+    };
     let quiet = !waiting
         && !unfinished
         && status == ToolCallStatus::Completed
         && !stale
+        && !has_media
+        && !has_structured
         && is_quiet_tool(&call.name);
-    let open = ctx.is_open("tool", false);
+    // Media always opens; structured JSON waits until the call settles so
+    // syntect is not paid on every streaming delta.
+    let open = ctx.is_open(
+        "tool",
+        has_media || (has_structured && !unfinished && !waiting),
+    );
     let cwd = ctx
         .app
         .bindings
@@ -308,31 +479,40 @@ pub fn tool(ctx: &PartCtx<'_>, call: &ToolCall) -> Div {
     head = head.on_click(ctx.toggle("tool"));
     let mut body = div().flex_col().class("mq-tool-body").child(head);
     if open {
-        let input = input_summary(&call.input, call.input_partial.as_deref());
-        if !input.trim().is_empty() {
-            let (shown, more) = clip_lines(&input, INPUT_LINES);
-            let mut section = div()
-                .class("mq-tool-input")
-                .w_full()
-                .flex_col()
-                .child(meta(strings.input()))
-                .child(mono_block(shown));
-            if more > 0 {
-                section = section.child(meta(strings.more_lines(more)));
-            }
-            body = body.child(section);
+        let input = Payload::from_input(&call.input, call.input_partial.as_deref());
+        if !input.text.trim().is_empty() {
+            body = body.child(tool_section(
+                ctx,
+                "in",
+                Some(strings.input()),
+                &input,
+                false,
+                INPUT_LINES,
+            ));
         }
-        let output = output_text(call);
-        if !output.trim().is_empty() {
-            body = body
-                .child(meta(strings.output()).no_cursor())
-                .child(output_section(ctx, "out", &output, call.truncated));
+        let output = output_payload(call);
+        if !output.text.trim().is_empty() {
+            body = body.child(tool_section(
+                ctx,
+                "out",
+                Some(strings.output()),
+                &output,
+                call.truncated,
+                OUTPUT_LINES,
+            ));
+        }
+        if let Some(content) = call.content.as_ref() {
+            if let Some(media_row) = media::tool_content_media(ctx, content) {
+                body = body.child(div().class("mq-tool-section").w_full().child(media_row));
+            }
         }
     }
     if let Some(err) = &call.error {
         body = body.child(error_line(err));
     }
-    if quiet {
+    // Quiet only while collapsed: opened, the same hairline card as every
+    // other tool so input / output have a readable frame.
+    if quiet && !open {
         div()
             .class("mq-tool-quiet")
             .w_full()
@@ -704,15 +884,24 @@ pub fn shell(
         .child(head.on_click(ctx.toggle("shell")));
     if open {
         if command.lines().count() > 1 {
-            body = body.child(
-                div()
-                    .class("mq-tool-input")
-                    .w_full()
-                    .child(mono_block(command.to_string())),
-            );
+            body = body.child(tool_section(
+                ctx,
+                "cmd",
+                None,
+                &Payload::plain(command.to_string()),
+                false,
+                INPUT_LINES,
+            ));
         }
         if let Some(out) = output.filter(|o| !o.trim().is_empty()) {
-            body = body.child(output_section(ctx, "out", out, truncated));
+            body = body.child(tool_section(
+                ctx,
+                "out",
+                None,
+                &Payload::from_text(out),
+                truncated,
+                OUTPUT_LINES,
+            ));
         }
     }
     card(accent, body)
@@ -723,13 +912,40 @@ mod tests {
     use super::*;
 
     #[test]
-    fn inputs_summarise_to_one_line_per_key() {
-        let input = serde_json::json!({"command": "ls -la\nwc -l", "timeout": 30});
+    fn flat_inputs_stay_readable_lines() {
+        let input = serde_json::json!({"command": "ls -la", "timeout": 30});
         assert_eq!(
-            input_summary(&input, None),
-            "command: ls -la …\ntimeout: 30"
+            Payload::from_input(&input, None),
+            Payload::plain("command: ls -la\ntimeout: 30")
         );
-        assert_eq!(input_summary(&Value::Null, Some("{\"pa")), "{\"pa");
+        assert_eq!(
+            Payload::from_input(&Value::Null, Some("{\"pa")),
+            Payload::plain("{\"pa")
+        );
+    }
+
+    #[test]
+    fn nested_or_json_string_outputs_are_pretty() {
+        let nested = serde_json::json!({"ok": true, "items": [1, 2]});
+        let pretty = Payload::from_value(&nested);
+        assert!(pretty.json);
+        assert!(pretty.text.contains("\n"));
+        assert!(pretty.text.contains("\"items\""));
+
+        let as_string = Payload::from_text(r#"{"a":1,"b":[2,3]}"#);
+        assert!(as_string.json);
+        assert!(as_string.text.contains("\n  "));
+
+        assert!(!Payload::from_text("not json {").json);
+        assert!(!Payload::from_text("test result: ok").json);
+    }
+
+    #[test]
+    fn multiline_input_values_open_as_json() {
+        let input = serde_json::json!({"command": "ls -la\nwc -l", "timeout": 30});
+        let payload = Payload::from_input(&input, None);
+        assert!(payload.json);
+        assert!(payload.text.contains("ls -la\\nwc -l") || payload.text.contains("ls -la"));
     }
 
     #[test]
@@ -737,5 +953,33 @@ mod tests {
         assert_eq!(duration(420), "420ms");
         assert_eq!(duration(4200), "4.2s");
         assert_eq!(duration(125_000), "2m 5s");
+    }
+
+    #[test]
+    fn args_prefer_path_then_body() {
+        let call = ToolCall {
+            id: "c".into(),
+            name: "edit".into(),
+            title: None,
+            input: serde_json::json!({
+                "path": "/tmp/opencode/desktop-qa/src/a.rs",
+                "new_string": "fn main() {}"
+            }),
+            output: None,
+            content: None,
+            metadata: None,
+            state: ToolCallStatus::Completed,
+            status: ToolCallStatus::Completed,
+            error: None,
+            child_session_id: None,
+            background: false,
+            input_partial: None,
+            truncated: false,
+            time: Default::default(),
+        };
+        assert_eq!(
+            args_summary(&call, Some("/tmp/opencode/desktop-qa")),
+            "src/a.rs · fn main() {}"
+        );
     }
 }

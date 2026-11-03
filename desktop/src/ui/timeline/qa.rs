@@ -18,6 +18,8 @@
 //! * `MUQUN_QA_TOGGLE_AFTER=<secs>` -- flip the scheme once, that long
 //!   after start, the way the top bar's toggle does (`App::apply_scheme`: live
 //!   recolouring, and the choice is remembered in the configuration).
+//! * `MUQUN_QA_SETTINGS=<secs>` -- open Settings → Appearance that long after
+//!   start (refreshes the theme library).
 //! * `MUQUN_QA_THEMES=<secs>` -- open the themes panel that long after
 //!   start (what Ctrl+Shift+T does).
 //! * `MUQUN_QA_THEME=<id>@<secs>[,<id>@<secs>…]` -- apply theme `<id>` that
@@ -50,6 +52,7 @@ struct Script {
     scroll: Option<Scroll>,
     want_scroll: bool,
     toggle_after: Option<Duration>,
+    settings_after: Option<Duration>,
     themes_after: Option<Duration>,
     /// Themes still to apply, soonest first.
     theme_after: Vec<(String, Duration)>,
@@ -106,6 +109,10 @@ pub fn start(app: &App) {
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .map(Duration::from_secs);
+    let settings_after = std::env::var("MUQUN_QA_SETTINGS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(Duration::from_secs);
     let themes_after = std::env::var("MUQUN_QA_THEMES")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
@@ -125,6 +132,7 @@ pub fn start(app: &App) {
         && prompt.is_none()
         && !want_scroll
         && toggle_after.is_none()
+        && settings_after.is_none()
         && themes_after.is_none()
         && theme_after.is_empty()
         && tour.is_none()
@@ -149,6 +157,7 @@ pub fn start(app: &App) {
         prompt: prompt.map(|p| (p, None)),
         want_scroll,
         toggle_after,
+        settings_after,
         themes_after,
         theme_after,
         tour,
@@ -232,6 +241,13 @@ fn tick(app: &App, s: &mut Script) {
             s.toggle_after = None;
         }
     }
+    if s.settings_after
+        .is_some_and(|after| s.started.is_some_and(|t| t.elapsed() >= after))
+    {
+        tracing::info!(target: "muqun::qa", "qa: opening Settings → Appearance");
+        app.open_settings();
+        s.settings_after = None;
+    }
     if s.themes_after
         .is_some_and(|after| s.started.is_some_and(|t| t.elapsed() >= after))
     {
@@ -259,6 +275,7 @@ fn tick(app: &App, s: &mut Script) {
     s.done = s.prompt.is_none()
         && !s.want_scroll
         && s.toggle_after.is_none()
+        && s.settings_after.is_none()
         && s.themes_after.is_none()
         && s.theme_after.is_empty()
         && s.tour.is_none();
@@ -417,30 +434,81 @@ pub fn synthetic(n: usize) -> AgentSessionSnapshot {
                     ),
                 },
             ),
-            3 => (
-                TimelineRole::Assistant,
-                AgentPart::Tool(ToolCall {
-                    id: format!("call_{i}"),
-                    name: "bash".into(),
-                    title: Some(format!("cargo test -p muqun-desktop # {i}")),
-                    input: serde_json::json!({"command": "cargo test -p muqun-desktop"}),
-                    output: Some(serde_json::Value::String("test result: ok. 42 passed".into())),
-                    content: None,
-                    metadata: None,
-                    state: ToolCallStatus::Completed,
-                    status: ToolCallStatus::Completed,
-                    error: None,
-                    child_session_id: None,
-                    background: false,
-                    input_partial: None,
-                    truncated: false,
-                    time: ToolTime {
-                        created: Some(0),
-                        ran: Some(1000),
-                        completed: Some(3400),
-                    },
-                }),
-            ),
+            3 => {
+                // `i % 6` already picked the tool slot; vary the flavour by
+                // which tool occurrence this is (`i / 6`), not `i % 3`
+                // (every tool index is ≡ 0 mod 3).
+                let (name, title, input, output, status) = match (i / 6) % 3 {
+                    0 => (
+                        "bash",
+                        format!("cargo test -p muqun-desktop # {i}"),
+                        serde_json::json!({"command": "cargo test -p muqun-desktop"}),
+                        Some(serde_json::Value::String(
+                            "test result: ok. 42 passed".into(),
+                        )),
+                        ToolCallStatus::Completed,
+                    ),
+                    1 => (
+                        "read",
+                        format!("src/file_{i}.rs"),
+                        serde_json::json!({"path": format!("/tmp/opencode/desktop-qa/src/file_{i}.rs")}),
+                        Some(serde_json::Value::String("fn main() {}\n".into())),
+                        ToolCallStatus::Completed,
+                    ),
+                    _ => (
+                        "call",
+                        format!("project.status #{i}"),
+                        serde_json::json!({
+                            "path": format!("/tmp/opencode/desktop-qa/src/file_{i}.rs"),
+                            "options": {
+                                "recursive": true,
+                                "include": ["rs", "toml"]
+                            }
+                        }),
+                        Some(serde_json::json!({
+                            "ok": true,
+                            "files": 12,
+                            "results": [
+                                {"path": "src/main.rs", "lines": 240},
+                                {"path": "Cargo.toml", "lines": 48}
+                            ]
+                        })),
+                        if i % 5 == 0 {
+                            ToolCallStatus::Running
+                        } else {
+                            ToolCallStatus::Completed
+                        },
+                    ),
+                };
+                (
+                    TimelineRole::Assistant,
+                    AgentPart::Tool(ToolCall {
+                        id: format!("call_{i}"),
+                        name: name.into(),
+                        title: Some(title),
+                        input,
+                        output,
+                        content: None,
+                        metadata: None,
+                        state: status,
+                        status,
+                        error: None,
+                        child_session_id: None,
+                        background: false,
+                        input_partial: None,
+                        truncated: false,
+                        time: ToolTime {
+                            created: Some(0),
+                            ran: Some(1000),
+                            completed: if status == ToolCallStatus::Completed {
+                                Some(3400)
+                            } else {
+                                None
+                            },
+                        },
+                    }),
+                )
+            }
             4 => (
                 TimelineRole::Assistant,
                 AgentPart::Diff {
@@ -474,7 +542,43 @@ pub fn synthetic(n: usize) -> AgentSessionSnapshot {
                 },
             ),
         };
-        timeline.push(item(i, &msg, ordinal, role, part));
+        let mut row = item(i, &msg, ordinal, role, part);
+        // First user turn + first assistant answer carry a real image so media
+        // chrome is visible in headed QA without a live gateway upload.
+        if k == 0 && message == 1 {
+            row.attachments = Some(vec!["/tmp/opencode/desktop-qa/sample.png".into()]);
+        }
+        if k == 2 && message == 1 {
+            row.image_assets = Some(vec![muqun_gateway::agents::MessageImageAsset {
+                src: "/tmp/opencode/desktop-qa/sample.png".into(),
+                asset_id: "qa_sample".into(),
+                url: "/tmp/opencode/desktop-qa/sample.png".into(),
+                mime: "image/png".into(),
+                width: Some(320),
+                height: Some(200),
+                thumbnail_url: None,
+                preview_url: None,
+                download_url: None,
+                version_url: None,
+                size: None,
+                unavailable_reason: None,
+            }]);
+        }
+        // First tool row exposes an image content entry (App parity).
+        if k == 3 && message == 1 {
+            if let AgentPart::Tool(call) = &mut row.part {
+                call.content = Some(serde_json::json!([
+                    {"type": "text", "text": "Image follows"},
+                    {
+                        "type": "file",
+                        "uri": "/tmp/opencode/desktop-qa/sample.png",
+                        "mime": "image/png",
+                        "name": "sample.png"
+                    }
+                ]));
+            }
+        }
+        timeline.push(row);
         ordinal += 1;
     }
     let info = serde_json::from_value(serde_json::json!({

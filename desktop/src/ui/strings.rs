@@ -103,10 +103,14 @@ strings! {
     unpin => "Unpin", "取消钉选";
     hide => "Hide", "隐藏";
     unhide => "Show again", "取消隐藏";
+    rename_session => "Rename…", "重命名…";
+    delete_session => "Delete", "删除";
+    fork_session => "Fork", "派生";
     terminal => "Terminal", "终端";
     file_manager => "File manager", "文件管理器";
     project_actions => "Project actions", "项目操作";
     toggle_scheme => "Switch light / dark", "切换明暗";
+    restart_now => "Restart now", "立即重启";
 }
 
 // The start page and the composer (v2.1).
@@ -131,6 +135,10 @@ strings! {
     effort_default => "Effort", "强度";
     current_branch => "current", "当前";
     new_worktree => "Start in a new worktree…", "在新 worktree 开始…";
+    new_session_worktree => "New session in a worktree…", "新会话到 worktree…";
+    branch_session_only => "new session to switch", "新会话可切换";
+    changed_files => "Changed files", "变更文件";
+    open_file => "Open", "打开";
     soon => "soon", "即将支持";
 }
 

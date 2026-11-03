@@ -266,6 +266,9 @@ pub enum ConfigEdit {
     Editor(crate::platform::editors::Editor),
     Scheme(Scheme),
     Language(Language),
+    Density(Density),
+    ReducedMotion(bool),
+    ReducedTransparency(bool),
     EditorCommand(Option<String>),
     /// Where "New session" starts for an agent with no remembered folder.
     DefaultCwd(Option<PathBuf>),
@@ -312,6 +315,9 @@ impl DesktopConfig {
             ConfigEdit::Editor(editor) => self.general.editor = editor,
             ConfigEdit::Scheme(scheme) => self.appearance.scheme = scheme,
             ConfigEdit::Language(language) => self.general.language = language,
+            ConfigEdit::Density(density) => self.appearance.density = density,
+            ConfigEdit::ReducedMotion(on) => self.appearance.reduced_motion = on,
+            ConfigEdit::ReducedTransparency(on) => self.appearance.reduced_transparency = on,
             ConfigEdit::EditorCommand(command) => {
                 self.general.editor_command = command.filter(|c| !c.trim().is_empty());
             }
@@ -628,6 +634,9 @@ mod tests {
         config.apply(ConfigEdit::Editor(crate::platform::editors::Editor::Zed));
         config.apply(ConfigEdit::Language(Language::ZhCn));
         config.apply(ConfigEdit::Scheme(Scheme::Dark));
+        config.apply(ConfigEdit::Density(Density::Compact));
+        config.apply(ConfigEdit::ReducedMotion(true));
+        config.apply(ConfigEdit::ReducedTransparency(true));
         config.apply(ConfigEdit::DefaultCwd(Some(PathBuf::from("/srv"))));
         config.apply(ConfigEdit::EditorCommand(Some("  ".into())));
         config.apply(ConfigEdit::AgentEnabled {
@@ -654,6 +663,9 @@ mod tests {
         assert_eq!(config.general.editor, crate::platform::editors::Editor::Zed);
         assert_eq!(config.general.language, Language::ZhCn);
         assert_eq!(config.appearance.scheme, Scheme::Dark);
+        assert_eq!(config.appearance.density, Density::Compact);
+        assert!(config.appearance.reduced_motion);
+        assert!(config.appearance.reduced_transparency);
         assert_eq!(config.general.default_cwd, Some(PathBuf::from("/srv")));
         assert_eq!(config.general.editor_command, None, "blank is unset");
         assert!(!config.agents.fx.enabled);

@@ -13,6 +13,7 @@
 
 pub mod cards;
 pub mod interact;
+pub mod media;
 pub mod notice;
 pub mod prose;
 pub mod scale;

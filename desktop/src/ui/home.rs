@@ -10,10 +10,10 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use blinc_layout::prelude::*;
-use muqun_gateway::agents::{AgentSessionInfo, AgentSessionStatus};
+use muqun_gateway::agents::AgentSessionInfo;
 use muqun_gateway::platform::discovery::AgentDiscoveryInfo;
 
-use super::agents::{self, Standing};
+use super::agents::Standing;
 use super::composer;
 use super::sessions::title_of;
 use super::text::{display_text, mono_text, ui_text};
@@ -323,13 +323,7 @@ fn recents(app: &App, sessions: &[AgentSessionInfo], rows: usize) -> Div {
     let waiting = app.bindings.attention.get();
     let pinned = (*super::sessions::side_pins(app)).clone();
     let mut list = div().class("mq-start-rows").w_full().flex_col();
-    for (index, session) in recent_order(sessions, &pinned, rows)
-        .into_iter()
-        .enumerate()
-    {
-        if index == 0 {
-            list = list.child(div().class("mq-start-hairline").w_full().h(1.0));
-        }
+    for session in recent_order(sessions, &pinned, rows) {
         let project = session
             .directory
             .as_deref()
@@ -349,8 +343,9 @@ fn recents(app: &App, sessions: &[AgentSessionInfo], rows: usize) -> Div {
             .flex_row()
             .items_center()
             .cursor_pointer()
-            .child(mark_with_badge(
+            .child(super::sessions::badged_mark(
                 &session.agent_id,
+                16.0,
                 session.status,
                 waiting.iter().any(|p| p.asid == session.asid),
             ))
@@ -445,52 +440,12 @@ fn recents(app: &App, sessions: &[AgentSessionInfo], rows: usize) -> Div {
             row = row.class("mq-start-row--pinned");
         }
         list = list.child(row);
-        list = list.child(div().class("mq-start-hairline").w_full().h(1.0));
     }
     block.child(list)
 }
 
 /// The room the hover actions keep at a row's end.
 const ACTIONS_WIDTH: f32 = 96.0;
-
-/// The agent's 16 px brand mark with a 6 px status badge at its bottom-right
-/// corner, ringed in the page's colour: mint while it works, amber when it
-/// waits for you, red when it failed, none when idle (the sidebar's rule).
-pub fn mark_with_badge(agent: &str, status: AgentSessionStatus, waiting: bool) -> Div {
-    let class = if waiting {
-        Some("mq-start-badge--waiting")
-    } else {
-        match status {
-            AgentSessionStatus::Busy | AgentSessionStatus::Retry => Some("mq-start-badge--busy"),
-            AgentSessionStatus::Failed => Some("mq-start-badge--failed"),
-            _ => None,
-        }
-    };
-    let mut cell = div()
-        .class("mq-start-mark")
-        .relative()
-        .w(16.0)
-        .h(16.0)
-        .flex_shrink_0()
-        .child(agents::mark(agent, 16.0));
-    if let Some(class) = class {
-        cell = cell.child(
-            div()
-                .class("mq-start-badge")
-                .class(class)
-                .absolute()
-                .right(-3.0)
-                .bottom(-3.0)
-                .w(BADGE)
-                .h(BADGE)
-                .rounded(BADGE / 2.0),
-        );
-    }
-    cell
-}
-
-/// The badge: 6 px of colour inside a 1.5 px ring.
-const BADGE: f32 = 9.0;
 
 #[cfg(test)]
 mod tests {

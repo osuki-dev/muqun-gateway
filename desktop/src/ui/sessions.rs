@@ -66,6 +66,10 @@ struct Side {
     prefs: State<Arc<BTreeMap<String, ProjectPrefs>>>,
     /// Start-page session pins (`general.pinned`); soft-boosts their projects.
     pins: State<Arc<Vec<String>>>,
+    /// Session row currently being renamed (`asid`), if any.
+    renaming: State<Option<String>>,
+    /// Draft title while renaming.
+    rename_draft: State<String>,
     /// Bumped when the scroll leaves the built window.
     epoch: State<u64>,
     physics: SharedScrollPhysics,
@@ -106,6 +110,8 @@ fn side(app: &App) -> &'static Side {
             full: ctx.use_state_keyed("mq.side.full", || Arc::new(HashSet::new())),
             prefs: ctx.use_state_keyed("mq.side.prefs", move || Arc::new(prefs.clone())),
             pins: ctx.use_state_keyed("mq.side.pins", move || Arc::new(pins.clone())),
+            renaming: ctx.use_state_keyed("mq.side.renaming", || None),
+            rename_draft: ctx.use_state_keyed("mq.side.rename_draft", String::new),
             epoch: ctx.use_state_keyed("mq.side.epoch", || 0u64),
             physics: Arc::new(Mutex::new(ScrollPhysics::new(ScrollConfig::no_bounce()))),
             built: Mutex::new(Built::default()),
@@ -1119,9 +1125,9 @@ impl Badge {
 
     fn token(self) -> ColorToken {
         match self {
-            // Success, not primary: a theme's primary may be red (Cover
-            // Courier light), which would read as failed.
-            Self::Running => ColorToken::Success,
+            // App `agentSessionStatusPresentation`: busy/retry → info,
+            // never primary (primary may be red, Cover Courier light).
+            Self::Running => ColorToken::Info,
             Self::Waiting => ColorToken::Warning,
             Self::Failed => ColorToken::Error,
         }
@@ -1184,29 +1190,38 @@ pub fn badged_mark(agent: &str, size: f32, status: AgentSessionStatus, waiting: 
 fn session_row(app: &App, asid: &str) -> Div {
     let state = row_state(asid);
     let selected = app.bindings.selected.clone();
+    let renaming = side(app).renaming.clone();
     let asid_key = asid.to_string();
     let app = app.clone();
     div().w_full().h(SESSION_ROW).flex_shrink_0().child(
         stateful_with_key::<NoState>(format!("mq-srow.{asid}"))
-            .deps([state.signal_id(), selected.signal_id()])
+            .deps([
+                state.signal_id(),
+                selected.signal_id(),
+                renaming.signal_id(),
+            ])
             .on_state(move |_| match state.get() {
                 Some(row) => {
                     let active = selected.get().as_deref() == Some(asid_key.as_str());
-                    render_row(&app, &row, active)
+                    let editing = renaming.get().as_deref() == Some(asid_key.as_str());
+                    render_row(&app, &row, active, editing)
                 }
                 None => div(),
             }),
     )
 }
 
-fn render_row(app: &App, session: &SessionRow, active: bool) -> Div {
+fn render_row(app: &App, session: &SessionRow, active: bool, editing: bool) -> Div {
     let asid = muqun_gateway::agents::AgentSessionId(session.asid.clone());
     let click = app.clone();
-    raised(div(), active)
-        .class("mq-srow")
-        .relative()
-        .w_full()
-        .h(SESSION_ROW)
+    let title = display_title(app, &session.asid, &session.title);
+    let mut main = div()
+        .class("mq-srow-main")
+        .absolute()
+        .left(0.0)
+        .top(0.0)
+        .right(0.0)
+        .bottom(0.0)
         .flex_row()
         .items_center()
         .cursor_pointer()
@@ -1215,22 +1230,32 @@ fn render_row(app: &App, session: &SessionRow, active: bool) -> Div {
             16.0,
             session.status,
             session.waiting,
-        ))
-        .child(
-            div().flex_1().min_w(0.0).ml(2.0).overflow_clip().child(
-                ui_text(display_title(app, &session.asid, &session.title))
-                    .size(13.0)
-                    .no_wrap()
-                    .no_cursor(),
-            ),
-        )
-        // The relative time, only while the row is hovered
-        // (`.mq-srow:hover` in styles.css), over the title's end.
+        ));
+    if editing {
+        main = main.child(rename_field(app, &session.asid, &title));
+    } else {
+        main = main
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(0.0)
+                    .ml(2.0)
+                    .overflow_clip()
+                    .child(ui_text(title).size(13.0).no_wrap().no_cursor()),
+            )
+            .on_click(move |_| click.open_session(&asid));
+    }
+    raised(div(), active)
+        .class("mq-srow")
+        .relative()
+        .w_full()
+        .h(SESSION_ROW)
+        .child(main)
         .child(
             div()
                 .class("mq-srow-time")
                 .absolute()
-                .right(0.0)
+                .right(26.0)
                 .top(0.0)
                 .bottom(0.0)
                 .flex_row()
@@ -1242,7 +1267,163 @@ fn render_row(app: &App, session: &SessionRow, active: bool) -> Div {
                         .no_cursor(),
                 ),
         )
-        .on_click(move |_| click.open_session(&asid))
+        .child(
+            div()
+                .class("mq-srow-menu")
+                .absolute()
+                .right(2.0)
+                .top(0.0)
+                .bottom(0.0)
+                .flex_row()
+                .items_center()
+                .child(session_menu(app, session)),
+        )
+}
+
+fn commit_rename(app: &App, asid: &str) {
+    let s = side(app);
+    let title = s.rename_draft.get().trim().to_string();
+    s.renaming.signal().set(None);
+    if title.is_empty() {
+        return;
+    }
+    app.send(crate::model::commands::Command::RenameSession {
+        asid: muqun_gateway::agents::AgentSessionId(asid.to_string()),
+        title,
+    });
+}
+
+fn rename_field(app: &App, asid: &str, title: &str) -> Div {
+    use blinc_cn::prelude::{input, InputSize};
+    use blinc_layout::widgets::text_input::text_input_data;
+    let key = format!("mq.srow.rename.{asid}");
+    let initial = title.to_string();
+    let data = blinc_core::BlincContextState::get()
+        .use_state_keyed(&key, move || {
+            let data = text_input_data();
+            if let Ok(mut d) = data.lock() {
+                d.cursor = initial.chars().count();
+                d.value = initial;
+            }
+            data
+        })
+        .get();
+    let draft = side(app).rename_draft.clone();
+    let commit_app = app.clone();
+    let commit_asid = asid.to_string();
+    let done_app = app.clone();
+    let done_asid = asid.to_string();
+    let cancel_app = app.clone();
+    div()
+        .class("mq-srow-rename")
+        .flex_1()
+        .min_w(0.0)
+        .ml(2.0)
+        .flex_row()
+        .items_center()
+        .child(
+            div().flex_1().min_w(0.0).child(
+                input(&data)
+                    .size(InputSize::Small)
+                    .w_full()
+                    .border_width(0.0)
+                    .on_change(move |text: &str| {
+                        draft.signal().set(text.to_string());
+                    }),
+            ),
+        )
+        .child(
+            div()
+                .class("mq-icon-button")
+                .class("mq-icon-button--small")
+                .w(22.0)
+                .h(22.0)
+                .flex_row()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .child(icon(icons::CHECK, 14.0))
+                .on_click(move |_| commit_rename(&done_app, &done_asid)),
+        )
+        .child(
+            div()
+                .class("mq-icon-button")
+                .class("mq-icon-button--small")
+                .w(22.0)
+                .h(22.0)
+                .flex_row()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .child(icon(icons::X, 14.0))
+                .on_click(move |_| {
+                    side(&cancel_app).renaming.signal().set(None);
+                }),
+        )
+        .on_key_down(move |ctx| {
+            const ENTER: u32 = 13;
+            const ESC: u32 = 27;
+            match ctx.key_code {
+                ENTER => commit_rename(&commit_app, &commit_asid),
+                ESC => side(&commit_app).renaming.signal().set(None),
+                _ => {}
+            }
+        })
+}
+
+fn session_menu(app: &App, session: &SessionRow) -> impl ElementBuilder {
+    let strings = app.strings;
+    let asid = session.asid.clone();
+    let title = display_title(app, &session.asid, &session.title);
+    let (rename_app, delete_app, fork_app) = (app.clone(), app.clone(), app.clone());
+    let rename_asid = asid.clone();
+    let delete_asid = asid.clone();
+    let fork_asid = asid;
+    dropdown_menu_custom(|_open| {
+        div()
+            .class("mq-icon-button")
+            .class("mq-icon-button--small")
+            .w(22.0)
+            .h(22.0)
+            .flex_row()
+            .items_center()
+            .justify_center()
+            .cursor_pointer()
+            .child(icon(icons::ELLIPSIS, 14.0))
+    })
+    .min_width(160.0)
+    .item(strings.rename_session(), move || {
+        let key = format!("mq.srow.rename.{rename_asid}");
+        let seed = title.clone();
+        let data = blinc_core::BlincContextState::get()
+            .use_state_keyed(&key, move || {
+                let data = blinc_layout::widgets::text_input::text_input_data();
+                if let Ok(mut d) = data.lock() {
+                    d.cursor = seed.chars().count();
+                    d.value = seed;
+                }
+                data
+            })
+            .get();
+        if let Ok(mut d) = data.lock() {
+            d.cursor = title.chars().count();
+            d.value = title.clone();
+        }
+        let s = side(&rename_app);
+        s.rename_draft.signal().set(title.clone());
+        s.renaming.signal().set(Some(rename_asid.clone()));
+    })
+    .item(strings.fork_session(), move || {
+        fork_app.send(crate::model::commands::Command::ForkSession {
+            asid: muqun_gateway::agents::AgentSessionId(fork_asid.clone()),
+            message_id: None,
+        });
+    })
+    .item(strings.delete_session(), move || {
+        delete_app.send(crate::model::commands::Command::DeleteSession(
+            muqun_gateway::agents::AgentSessionId(delete_asid.clone()),
+        ));
+    })
 }
 
 #[cfg(test)]
@@ -1252,6 +1433,19 @@ mod tests {
     use crate::model::view::ListedSession;
 
     const DAY: u64 = 86_400_000;
+
+    #[test]
+    fn session_status_badges_follow_app_tones() {
+        use muqun_gateway::agents::AgentSessionStatus as S;
+        assert_eq!(Badge::of(S::Busy, false), Some(Badge::Running));
+        assert_eq!(Badge::of(S::Retry, false), Some(Badge::Running));
+        assert_eq!(Badge::of(S::Idle, true), Some(Badge::Waiting));
+        assert_eq!(Badge::of(S::Failed, false), Some(Badge::Failed));
+        assert_eq!(Badge::of(S::Idle, false), None);
+        assert_eq!(Badge::Running.token(), ColorToken::Info);
+        assert_eq!(Badge::Waiting.token(), ColorToken::Warning);
+        assert_eq!(Badge::Failed.token(), ColorToken::Error);
+    }
 
     #[test]
     fn sessions_group_by_local_calendar_day() {

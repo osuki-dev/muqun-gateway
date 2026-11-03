@@ -126,7 +126,8 @@ impl Strings {
         }
     }
 
-    /// "2 attachments".
+    /// "2 attachments". Kept for callers that only have a count.
+    #[allow(dead_code)]
     pub fn attachments(&self, n: usize) -> String {
         match self.language() {
             Language::En if n == 1 => "1 attachment".to_string(),

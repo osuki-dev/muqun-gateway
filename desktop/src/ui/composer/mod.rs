@@ -96,7 +96,7 @@ impl Aim {
 }
 
 /// `provider/model#variant` as the config keeps a remembered model.
-fn model_to_string(model: &ModelRef) -> String {
+pub(super) fn model_to_string(model: &ModelRef) -> String {
     let base = format!("{}/{}", model.provider_id, model.model_id);
     match &model.variant {
         Some(v) => format!("{base}#{v}"),

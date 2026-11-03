@@ -308,24 +308,29 @@ impl Shape {
 
 /// What a session row and the session header show, for change detection.
 /// `updated_ms` is in it only through the list's order.
-fn shown(
-    s: &AgentSessionInfo,
-) -> (
-    &str,
-    &str,
-    &str,
-    AgentSessionStatus,
-    Option<&str>,
-    Option<&str>,
-) {
-    (
-        s.asid.0.as_str(),
-        s.agent_id.as_str(),
-        s.title.as_str(),
-        s.status,
-        s.directory.as_deref(),
-        s.model.as_ref().map(|m| m.model_id.as_str()),
-    )
+#[derive(PartialEq, Eq)]
+struct Shown<'a> {
+    asid: &'a str,
+    agent: &'a str,
+    title: &'a str,
+    status: AgentSessionStatus,
+    directory: Option<&'a str>,
+    model: Option<&'a str>,
+    variant: Option<&'a str>,
+    mode: Option<&'a str>,
+}
+
+fn shown(s: &AgentSessionInfo) -> Shown<'_> {
+    Shown {
+        asid: s.asid.0.as_str(),
+        agent: s.agent_id.as_str(),
+        title: s.title.as_str(),
+        status: s.status,
+        directory: s.directory.as_deref(),
+        model: s.model.as_ref().map(|m| m.model_id.as_str()),
+        variant: s.model.as_ref().and_then(|m| m.variant.as_deref()),
+        mode: s.mode.as_deref(),
+    }
 }
 
 /// Whether two discovery answers describe the agents the same way. The
@@ -369,6 +374,14 @@ pub struct ListedSession {
     pub directory: Option<String>,
 }
 
+/// One changed path from `get_vcs_diff`, for the top-bar diff panel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiffFile {
+    pub path: String,
+    pub added: usize,
+    pub removed: usize,
+}
+
 /// What `get_vcs_diff` says about the open session's working tree.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DiffStat {
@@ -376,6 +389,8 @@ pub struct DiffStat {
     pub files: usize,
     pub added: usize,
     pub removed: usize,
+    /// Paths shown in the panel (capped); empty when the agent only gave counts.
+    pub paths: Vec<DiffFile>,
 }
 
 /// The sidebar's sessions, newest first.
@@ -574,6 +589,26 @@ impl ViewState {
                 let asid = info.asid.0.clone();
                 self.upsert_session(*info, changes);
                 changes.selected |= self.select(&asid);
+            }
+            Update::SessionGone(asid) => {
+                let before = self.sessions.len();
+                self.sessions.retain(|s| s.asid.0 != asid);
+                if self.sessions.len() != before {
+                    changes.sessions = true;
+                }
+                let was_selected = self.selected.as_deref() == Some(asid.as_str());
+                let was_active = self.active.as_ref().is_some_and(|a| a.info.asid.0 == asid);
+                if was_selected {
+                    self.selected = None;
+                    changes.selected = true;
+                }
+                if was_active || was_selected {
+                    self.active = None;
+                    self.diff = None;
+                    changes.header = true;
+                    changes.order = true;
+                    changes.opened = true;
+                }
             }
             Update::Snapshot(snapshot) => {
                 if self.selected.as_deref() != Some(snapshot.info.asid.0.as_str()) {
@@ -838,10 +873,18 @@ impl ViewState {
                     changes.error = true;
                 }
             }
-            AgentDomainEvent::TimelineUpsert { asid, items, .. } => {
+            AgentDomainEvent::TimelineUpsert {
+                asid, mut items, ..
+            } => {
                 let Some(active) = self.active_for(&asid.0) else {
                     return;
                 };
+                // Same attach the HTTP routes do: Desktop never hits those.
+                muqun_gateway::agents::message_images::enrich_timeline(
+                    &asid.0,
+                    active.info.directory.as_deref(),
+                    &mut items,
+                );
                 for item in items {
                     let id = item.id.clone();
                     match active.upsert(item) {
@@ -1008,6 +1051,8 @@ pub struct Bindings {
     pub waiting_forms: State<Arc<Vec<FormRequest>>>,
     /// The open session's working-tree change count.
     pub diff: State<Option<DiffStat>>,
+    /// The top-bar diff file list is open. UI-owned.
+    pub diff_panel: State<bool>,
     /// The Inbox page, while it is open. UI-owned.
     pub inbox_open: State<bool>,
     pub selected: State<Option<String>>,
@@ -1048,6 +1093,7 @@ impl Bindings {
             known: ctx.use_state_keyed("mq.known", || Arc::new(Vec::new())),
             waiting_forms: ctx.use_state_keyed("mq.waiting_forms", || Arc::new(Vec::new())),
             diff: ctx.use_state_keyed("mq.diff", || None),
+            diff_panel: ctx.use_state_keyed("mq.diff_panel", || false),
             inbox_open: ctx.use_state_keyed("mq.inbox_open", || false),
             selected: ctx.use_state_keyed("mq.selected", || None),
             header: ctx.use_state_keyed("mq.header", || None),
@@ -1060,7 +1106,7 @@ impl Bindings {
             projects: ctx.use_state_keyed("mq.projects", || Arc::new(ProjectList::default())),
             completions: ctx.use_state_keyed("mq.completions", || Arc::new(Vec::new())),
             settings_open: ctx.use_state_keyed("mq.settings_open", || false),
-            settings_tab: ctx.use_state_keyed("mq.settings_tab", || "agents".to_string()),
+            settings_tab: ctx.use_state_keyed("mq.settings_tab", || "appearance".to_string()),
             restart_note: ctx.use_state_keyed("mq.restart_note", || false),
             timeline_scroll,
             forms: ctx.use_state_keyed("mq.forms", || Arc::new(Vec::new())),

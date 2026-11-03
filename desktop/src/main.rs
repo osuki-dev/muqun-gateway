@@ -64,6 +64,10 @@ fn main() -> anyhow::Result<()> {
     commands::send(&tx, Command::Refresh);
 
     ui::text::register_fonts();
+    // Off the UI thread before the first fence / tool JSON paints.
+    ui::markdown::highlight::warm();
+    ui::parts::scale::Density::from_config(config.appearance.density).install();
+    ui::parts::scale::install_reduced_motion(config.appearance.reduced_motion);
     let scheme_watcher = theme::install(&config_dir, &state_dir, &config.appearance)?;
 
     let geometry = config.window.clamped();
@@ -130,6 +134,13 @@ fn main() -> anyhow::Result<()> {
                     }
                     UiAction::Open(asid) => {
                         for_actions.open_session(&muqun_gateway::agents::AgentSessionId(asid))
+                    }
+                    UiAction::ToggleDiffPanel => {
+                        let open = !for_actions.bindings.diff_panel.get();
+                        for_actions.bindings.diff_panel.signal().set(open);
+                    }
+                    UiAction::OpenDiffFile { path, .. } => {
+                        ui::shell::open_diff_file(&for_actions, &path);
                     }
                     UiAction::ProjectPicked(cwd) => ui::composer::project_picked(cwd),
                     UiAction::FilesPicked(paths) => ui::composer::files_picked(&for_actions, paths),

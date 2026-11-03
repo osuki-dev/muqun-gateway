@@ -170,6 +170,7 @@ pub async fn run(command: Command, inbox: Arc<Inbox>, config: Arc<ConfigStore>) 
         Command::ThemeRemove(id) => service.remove(&inbox, &config, id).await,
         Command::ThemeApply(id, scheme) => service.apply(&inbox, &config, id, scheme).await,
         Command::ThemeImportFile(path) => service.import(&inbox, path).await,
+        Command::ThemeImportUrl(url) => service.import_url(&inbox, url).await,
         other => tracing::warn!(?other, "not a theme command"),
     }
 }
@@ -446,6 +447,96 @@ impl Service {
                 format!("Could not import {shown}: {err:#}"),
                 Some(Command::ThemeImportFile(path)),
             ),
+        }
+        self.library(inbox).await;
+    }
+
+    /// App-style link import: a public HTTPS package URL, not a git repo.
+    async fn import_url(self: &Arc<Self>, inbox: &Arc<Inbox>, url: String) {
+        let shown = url.clone();
+        let job_id = format!("import:{}", digest16(&[url.as_bytes()]));
+        if !self.busy.lock().unwrap().insert(job_id.clone()) {
+            return;
+        }
+        push(
+            inbox,
+            ThemeUpdate::Job {
+                id: job_id.clone(),
+                job: Job::Downloading { read: 0, total: 0 },
+            },
+        );
+        let progress_inbox = inbox.clone();
+        let progress_id = job_id.clone();
+        let mut last = Instant::now();
+        let downloaded = Gallery::download_public(&url, move |read, total| {
+            if last.elapsed() >= PROGRESS_EVERY {
+                last = Instant::now();
+                push(
+                    &progress_inbox,
+                    ThemeUpdate::Job {
+                        id: progress_id.clone(),
+                        job: Job::Downloading { read, total },
+                    },
+                );
+            }
+        })
+        .await;
+        let result = match downloaded {
+            Ok(bytes) => {
+                push(
+                    inbox,
+                    ThemeUpdate::Job {
+                        id: job_id.clone(),
+                        job: Job::Verifying,
+                    },
+                );
+                self.blocking(move |s| -> anyhow::Result<String> {
+                    let pack = unpack(&bytes)?;
+                    let name = pack.manifest.name.clone();
+                    s.store.install(&pack)?;
+                    Ok(name)
+                })
+                .await
+                .and_then(|r| r)
+            }
+            Err(err) => Err(err),
+        };
+        self.busy.lock().unwrap().remove(&job_id);
+        match result {
+            Ok(name) => {
+                tracing::info!(%url, %name, "theme imported from link");
+                push(
+                    inbox,
+                    ThemeUpdate::Job {
+                        id: job_id,
+                        job: Job::Done { verified: false },
+                    },
+                );
+                push(
+                    inbox,
+                    ThemeUpdate::Notice(Notice {
+                        message: format!("Installed {name} from link"),
+                        error: false,
+                        retry: None,
+                    }),
+                );
+            }
+            Err(err) => {
+                push(
+                    inbox,
+                    ThemeUpdate::Job {
+                        id: job_id,
+                        job: Job::Failed {
+                            message: format!("{err:#}"),
+                        },
+                    },
+                );
+                notice(
+                    inbox,
+                    format!("Could not import from link: {err:#}"),
+                    Some(Command::ThemeImportUrl(shown)),
+                );
+            }
         }
         self.library(inbox).await;
     }

@@ -27,6 +27,15 @@ pub struct LocalHub {
     runtime: Arc<AgentRuntime>,
 }
 
+/// Fill `image_assets` the HTTP routes would attach — Desktop never hits those.
+fn enrich_local_media(snapshot: &mut AgentSessionSnapshot) {
+    muqun_gateway::agents::message_images::enrich_timeline(
+        &snapshot.info.asid.0,
+        snapshot.info.directory.as_deref(),
+        &mut snapshot.timeline,
+    );
+}
+
 impl LocalHub {
     pub fn new(runtime: Arc<AgentRuntime>) -> Self {
         Self { runtime }
@@ -144,7 +153,9 @@ impl SessionHub for LocalHub {
             if let Err(err) = manager.sessions().prepare_session(asid).await {
                 tracing::debug!(asid = %asid.0, %err, "session preparation failed; reading history anyway");
             }
-            Ok(manager.sessions().get_snapshot(asid).await?)
+            let mut snapshot = manager.sessions().get_snapshot(asid).await?;
+            enrich_local_media(&mut snapshot);
+            Ok(snapshot)
         })
     }
 
@@ -155,17 +166,35 @@ impl SessionHub for LocalHub {
             // agent's `prepare_observed_session`, which for a terminal-held ACP
             // session that is not retained starts one more transcript
             // follower on every call (`acp/session.rs` `follow_terminal`).
-            if let Some(snapshot) = manager.mirror().get_snapshot(asid).await {
-                return Ok(snapshot);
-            }
-            Ok(manager.sessions().get_snapshot(asid).await?)
+            let mut snapshot = if let Some(snapshot) = manager.mirror().get_snapshot(asid).await {
+                snapshot
+            } else {
+                manager.sessions().get_snapshot(asid).await?
+            };
+            enrich_local_media(&mut snapshot);
+            Ok(snapshot)
         })
     }
 
     fn earlier<'a>(&'a self, asid: &'a AgentSessionId) -> HubFuture<'a, Vec<TimelineItem>> {
         Box::pin(async move {
             let manager = self.manager_for_session(asid).await?;
-            Ok(manager.sessions().load_earlier_timeline(asid).await?)
+            let mut items = manager.sessions().load_earlier_timeline(asid).await?;
+            let directory = match manager.mirror().get_snapshot(asid).await {
+                Some(s) => s.info.directory,
+                None => manager
+                    .sessions()
+                    .get_session(&asid.0)
+                    .await
+                    .ok()
+                    .and_then(|info| info.directory),
+            };
+            muqun_gateway::agents::message_images::enrich_timeline(
+                &asid.0,
+                directory.as_deref(),
+                &mut items,
+            );
+            Ok(items)
         })
     }
 
@@ -304,6 +333,33 @@ impl SessionHub for LocalHub {
         Box::pin(async move {
             let manager = self.manager_for_session(asid).await?;
             Ok(manager.agent().switch_mode(&asid.0, mode).await?)
+        })
+    }
+
+    fn rename<'a>(&'a self, asid: &'a AgentSessionId, title: &'a str) -> HubFuture<'a, ()> {
+        Box::pin(async move {
+            let manager = self.manager_for_session(asid).await?;
+            Ok(manager.agent().rename_session(&asid.0, title).await?)
+        })
+    }
+
+    fn delete<'a>(&'a self, asid: &'a AgentSessionId) -> HubFuture<'a, ()> {
+        Box::pin(async move {
+            let manager = self.manager_for_session(asid).await?;
+            manager.agent().delete_session(&asid.0).await?;
+            manager.mirror().remove_session(asid).await;
+            Ok(())
+        })
+    }
+
+    fn fork<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+        message_id: Option<&'a str>,
+    ) -> HubFuture<'a, AgentSessionInfo> {
+        Box::pin(async move {
+            let manager = self.manager_for_session(asid).await?;
+            Ok(manager.sessions().fork_session(&asid.0, message_id).await?)
         })
     }
 

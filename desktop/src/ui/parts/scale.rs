@@ -3,6 +3,8 @@
 //! line heights are set on the text elements themselves, so they live here
 //! with the same numbers.
 
+use std::sync::atomic::{AtomicU8, Ordering};
+
 pub const FS_11: f32 = 11.0;
 pub const FS_12: f32 = 12.0;
 pub const FS_13: f32 = 13.0;
@@ -25,6 +27,8 @@ pub enum Density {
     Compact,
 }
 
+static DENSITY: AtomicU8 = AtomicU8::new(0);
+
 impl Density {
     /// Body line height as a multiple of [`BODY`]: 24 px and 20 px, both on
     /// the 4 px baseline.
@@ -43,11 +47,43 @@ impl Density {
         }
     }
 
-    /// `MUQUN_DENSITY=compact` until the settings page owns it.
+    /// Remember the owner's choice (Settings → Appearance). Env still wins
+    /// for a one-shot QA override.
+    pub fn install(self) {
+        DENSITY.store(
+            match self {
+                Density::Comfortable => 0,
+                Density::Compact => 1,
+            },
+            Ordering::Relaxed,
+        );
+    }
+
+    /// `MUQUN_DENSITY=compact` overrides the saved setting for a run.
     pub fn current() -> Self {
         match std::env::var("MUQUN_DENSITY").as_deref() {
             Ok("compact") => Density::Compact,
+            Ok("comfortable") => Density::Comfortable,
+            _ if DENSITY.load(Ordering::Relaxed) == 1 => Density::Compact,
             _ => Density::Comfortable,
         }
     }
+
+    pub fn from_config(density: crate::config::Density) -> Self {
+        match density {
+            crate::config::Density::Comfortable => Density::Comfortable,
+            crate::config::Density::Compact => Density::Compact,
+        }
+    }
+}
+
+/// Reduce-motion preference, mirrored from `appearance.reduced_motion`.
+static REDUCED_MOTION: AtomicU8 = AtomicU8::new(0);
+
+pub fn install_reduced_motion(on: bool) {
+    REDUCED_MOTION.store(u8::from(on), Ordering::Relaxed);
+}
+
+pub fn reduced_motion() -> bool {
+    REDUCED_MOTION.load(Ordering::Relaxed) != 0
 }

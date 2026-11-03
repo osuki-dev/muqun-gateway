@@ -91,7 +91,6 @@ impl App {
     }
 
     /// The start page for a project (a project row's `+`; the sidebar calls it).
-    #[allow(dead_code)]
     pub fn open_draft_in(&self, cwd: &std::path::Path) {
         composer::start_in(cwd.to_string_lossy().into_owned());
         self.open_draft();
@@ -99,7 +98,14 @@ impl App {
 
     pub fn open_settings(&self) {
         self.bindings.inbox_open.signal().set(false);
+        self.bindings
+            .settings_tab
+            .signal()
+            .set("appearance".to_string());
         self.bindings.settings_open.signal().set(true);
+        // Once per run: themes_panel also asks; never re-fetch gallery on
+        // every Ctrl+, (that stalls the open).
+        themes::refresh_once(self);
     }
 
     pub fn close_settings(&self) {
@@ -134,7 +140,34 @@ impl App {
     pub fn apply_language(&self, language: crate::config::Language) {
         strings::Strings::set_language(language);
         self.send(Command::Edit(ConfigEdit::Language(language)));
+        // Language strings sit in many keyed rows; bump like a theme change
+        // instead of a full Blinc tree rebuild when possible.
+        timeline::theme_changed(self);
         blinc_core::BlincContextState::get().request_rebuild();
+    }
+
+    /// Row density from Settings → Appearance; CSS class + line height follow.
+    pub fn apply_density(&self, density: crate::config::Density) {
+        parts::scale::Density::from_config(density).install();
+        self.send(Command::Edit(ConfigEdit::Density(density)));
+        // Root class + body line-height need a tree pass; keep it rare.
+        timeline::theme_changed(self);
+        blinc_core::BlincContextState::get().request_rebuild();
+    }
+
+    pub fn apply_reduced_motion(&self, on: bool) {
+        parts::scale::install_reduced_motion(on);
+        self.send(Command::Edit(ConfigEdit::ReducedMotion(on)));
+        // Motion prefs are read at animation build time; no full rebuild.
+    }
+
+    pub fn apply_reduced_transparency(&self, on: bool) {
+        self.send(Command::Edit(ConfigEdit::ReducedTransparency(on)));
+        // Home glass reads config on its next paint via bindings/deps.
+        self.bindings
+            .theme_epoch
+            .signal()
+            .set(self.bindings.theme_epoch.get().wrapping_add(1));
     }
 }
 
@@ -170,7 +203,7 @@ fn on_key(app: &App, ctx: &blinc_layout::event_handler::EventContext) {
     match ctx.key_code {
         KEY_N if chord => app.open_draft(),
         KEY_K if chord => sessions::focus_search(),
-        // The themes panel, until Settings → Appearance mounts it.
+        // Themes panel overlay (also under Settings → Appearance).
         KEY_T if toggle_themes => themes::toggle(),
         KEY_0 if chord => app.drain.go_home(),
         KEY_COMMA if chord => {
@@ -250,14 +283,18 @@ pub fn sync_agent_colours(ctx: &mut WindowedContext) {
 
 pub fn root(ctx: &WindowedContext, app: &App) -> Div {
     let keys = app.clone();
+    let density = parts::scale::Density::current();
     div()
         .id("mq-root")
         .class("mq-root")
+        .class(density.class())
+        .relative()
         .w(ctx.width)
         .h(ctx.height)
         .flex_col()
         .child(shell::top_bar(app))
         .child(themes::shell_body(shell::body(ctx, app)))
+        .child(shell::diff_overlay(app))
         .child(themes::overlay(
             app,
             ctx.width,

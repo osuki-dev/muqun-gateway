@@ -424,6 +424,43 @@ impl Gallery {
         Ok(Some((text, etag)))
     }
 
+    /// Download a public HTTPS `.muqun-theme` link (Settings / paste import).
+    /// Same size and timeout bounds as a catalogue package; redirects only to
+    /// other public HTTPS hosts ([`public_theme_url`]).
+    pub async fn download_public(
+        url: &str,
+        progress: impl FnMut(u64, u64),
+    ) -> anyhow::Result<Vec<u8>> {
+        let url = public_theme_url(url.trim(), None)?;
+        let client = reqwest::Client::builder()
+            .connect_timeout(INDEX_TIMEOUT)
+            .user_agent(concat!("muqun-desktop/", env!("CARGO_PKG_VERSION")))
+            .redirect(reqwest::redirect::Policy::custom(move |attempt| {
+                if attempt.previous().len() >= REDIRECTS {
+                    attempt.error("too many redirects")
+                } else if public_theme_url(attempt.url().as_str(), None).is_ok() {
+                    attempt.follow()
+                } else {
+                    attempt.stop()
+                }
+            }))
+            .build()
+            .map_err(network)?;
+        let response = client
+            .get(url)
+            .timeout(PACKAGE_TIMEOUT)
+            .send()
+            .await
+            .map_err(network)?;
+        if response.status() != StatusCode::OK {
+            anyhow::bail!(
+                "The theme download failed (HTTP {})",
+                response.status().as_u16()
+            );
+        }
+        read_body(response, PACKAGE_BYTES as usize, progress).await
+    }
+
     /// Download `entry`'s package, reporting `(read, total)` as it goes.
     /// Returns the bytes and whether a catalogue SHA-256 vouched for them.
     pub async fn download(

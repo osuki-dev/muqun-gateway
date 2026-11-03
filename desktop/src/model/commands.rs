@@ -31,7 +31,6 @@ pub enum Command {
         decision: PermissionDecision,
     },
     /// Show the session's changes (one file's, or all) in the diff panel.
-    /// Placeholder: the panel is not built yet, the core only logs it.
     OpenDiff {
         asid: AgentSessionId,
         file: Option<String>,
@@ -79,6 +78,20 @@ pub enum Command {
     ThemeApply(String, Scheme),
     /// Install a `.muqun-theme` from disk (file dialog or drop).
     ThemeImportFile(PathBuf),
+    /// Download and install a public HTTPS `.muqun-theme` link (App link import).
+    ThemeImportUrl(String),
+    /// Rename a listed session.
+    RenameSession {
+        asid: AgentSessionId,
+        title: String,
+    },
+    /// Delete a listed session (and clear it if it is open).
+    DeleteSession(AgentSessionId),
+    /// Fork a session into a new one and open it.
+    ForkSession {
+        asid: AgentSessionId,
+        message_id: Option<String>,
+    },
 }
 
 pub type CommandSender = mpsc::UnboundedSender<Command>;
