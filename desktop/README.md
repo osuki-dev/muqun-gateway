@@ -22,6 +22,51 @@ Linux needs a GPU stack wgpu can use (Vulkan) and, for the fonts the UI looks fo
 and JetBrains Mono Nerd Font (see `src/platform/fonts.rs`; missing fonts fall back to the system
 default).
 
+## Daily development
+
+Everything lives in the gateway repository; the desktop is the `desktop/`
+workspace member on branch `feat/desktop-blinc` (not part of the current
+release train — no PRs against `main` until that changes).
+
+```sh
+cd gateway-desktop                       # the worktree on feat/desktop-blinc
+git switch -c desktop/<topic>            # one branch per topic; merge back via the integration branch
+
+cargo run --release -p muqun-desktop     # run (release: the debug build is slow with 300+ sessions)
+cargo build -p muqun-desktop             # type-check fast
+cargo test -p muqun-desktop              # desktop tests only (~130)
+
+# before every commit (CI runs the same):
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace --locked          # gateway must stay 2193 passed / 55 ignored, 16, 1
+desktop/scripts/lint-theme-tokens.sh     # no colour literals outside theme/{tokens,agents,pack}.rs
+grep -rn 'cfg(target_os' desktop/src | grep -v 'desktop/src/platform/'   # must be empty
+```
+
+Blinc comes from our fork through `[patch.crates-io]` in the root
+`Cargo.toml`, pointing at the `blinc-ime` worktree (pinned to a commit;
+see `PATCHES.md` in the fork). To try a fork change: commit it on a fork
+branch, `git -C ../blinc-ime checkout --detach <rev>`, rebuild.
+
+Where things go:
+
+| You want to… | Edit |
+|---|---|
+| render a timeline part differently | `src/ui/parts/<part>.rs` |
+| add a command the UI sends to the core | `model/commands.rs` → handle in `model/projection.rs` |
+| react to a new gateway event | `model/projection.rs` (filter) → `model/view.rs` (state) → `model/drain.rs` (publish) |
+| talk to the gateway | `hub/local.rs` (via `SessionHub` only — never `AgentRuntime` from the UI) |
+| platform-specific behaviour | `src/platform/*.rs` (the only place `cfg(target_os)` is allowed) |
+| colours / fonts / sizes | theme tokens + the `--mq-*` scale variables in `ui/styles.css`; never literals in UI code |
+| a new icon | `assets/glyphs/` via `scripts/sync-glyphs.sh` (App is the source) |
+| strings | `ui/strings.rs` (zh-CN / en for now) |
+
+Rules that CI enforces: UI builders never run on the tokio thread (the
+inbox → `request_redraw` → main-thread drain path in `model/`), one window
+title per worktree when testing (`MUQUN_WINDOW_TITLE`), kill every instance
+you start, and anything shown to a person is a release build.
+
 ## Environment
 
 * `MUQUN_WINDOW_TITLE` -- the window's title, so builds from several worktrees can run side by
