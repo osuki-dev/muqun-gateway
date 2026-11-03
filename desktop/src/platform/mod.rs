@@ -1,6 +1,7 @@
 //! Where Muqun Desktop keeps its files, and how it shares the machine with a
 //! gateway service.
 
+pub mod clipboard;
 pub mod coexist;
 pub mod fonts;
 pub mod shell;

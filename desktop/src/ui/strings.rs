@@ -93,17 +93,92 @@ strings! {
     new_session_hint => "Enter creates it with these choices; Esc cancels.", "回车按当前选择创建；Esc 取消。";
 }
 
+// The start page and the composer (v2.1).
+strings! {
+    start_title => "What are we doing?", "想做什么？";
+    welcome => "Welcome to Muqun Desktop", "欢迎使用 Muqun Desktop";
+    recent_label => "Recent", "最近";
+    recents_empty => "Your first session will appear here", "第一个会话会出现在这里";
+    composer_hint => "Send a message, type / for commands, $ for skills, @ for files…", "发送消息，/ 命令，$ 技能，@ 文件…";
+    composer_hint_files => "Send a message, @ for files…", "发送消息，@ 文件…";
+    open_label => "Open", "打开";
+    pin_label => "Pin", "钉选";
+    unpin_label => "Unpin", "取消钉选";
+    start => "Start", "开始";
+    queue => "Queue", "排队";
+    attach_title => "Attach files", "添加附件";
+    attachments_uploading => "Files are still uploading", "文件还在上传";
+    attachments_word => "attachments", "个附件";
+    next_label => "Next", "下一步";
+    model_default => "Model", "模型";
+    mode_word => "Mode", "模式";
+    effort_default => "Effort", "强度";
+    current_branch => "current", "当前";
+    new_worktree => "Start in a new worktree…", "在新 worktree 开始…";
+    soon => "soon", "即将支持";
+}
+
 impl Strings {
-    /// "Message Claude Code — Enter to send…": names the session's own agent.
-    pub fn composer_placeholder(&self, agent: &str) -> String {
+    pub fn detected_agents(&self, n: usize) -> String {
         match self.language() {
-            Language::En => {
-                format!("Message {agent} — Enter to send")
-            }
-            Language::ZhCn => format!("给 {agent} 发消息 — 回车发送"),
+            Language::En => format!("{n} agent{} detected", if n == 1 { "" } else { "s" }),
+            Language::ZhCn => format!("检测到 {n} 个 agent"),
         }
     }
 
+    pub fn attachment_blocked(&self, name: &str, why: &str) -> String {
+        match self.language() {
+            Language::En => format!("{name}: {why}. Remove it to send."),
+            Language::ZhCn => format!("{name}：{why}。移除后才能发送。"),
+        }
+    }
+
+    pub fn attachments_limit(&self, max: usize) -> String {
+        match self.language() {
+            Language::En => format!("At most {max} files on one message"),
+            Language::ZhCn => format!("一条消息最多 {max} 个文件"),
+        }
+    }
+
+    pub fn skill_args_not_sent(&self, args: &str) -> String {
+        match self.language() {
+            Language::En => {
+                format!("Skill started. “{args}” was not sent: a skill takes no arguments.")
+            }
+            Language::ZhCn => format!("技能已启动。“{args}”未发送：技能不接受参数。"),
+        }
+    }
+
+    pub fn queued_label(&self, summary: &str) -> String {
+        match self.language() {
+            Language::En => format!("Queued: {summary}"),
+            Language::ZhCn => format!("已排队：{summary}"),
+        }
+    }
+
+    pub fn sending_next(&self, summary: &str) -> String {
+        match self.language() {
+            Language::En => format!("Sending next: {summary}"),
+            Language::ZhCn => format!("下一步发送：{summary}"),
+        }
+    }
+
+    pub fn n_queued(&self, n: usize) -> String {
+        match self.language() {
+            Language::En => format!("{n} queued"),
+            Language::ZhCn => format!("{n} 条排队"),
+        }
+    }
+
+    pub fn more_queued(&self, n: usize) -> String {
+        match self.language() {
+            Language::En => format!("+{n} more queued"),
+            Language::ZhCn => format!("另有 {n} 条排队"),
+        }
+    }
+}
+
+impl Strings {
     pub fn group_by(&self, grouping: crate::config::Grouping) -> &'static str {
         use crate::config::Grouping::*;
         match (self.language(), grouping) {

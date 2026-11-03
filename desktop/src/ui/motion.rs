@@ -6,6 +6,11 @@
 //! animation is a one-shot entrance: nothing loops, so a settled screen
 //! draws no frames (red line 3).
 
+// The shared motion system. Its only caller was the old Home dashboard; the
+// start page enters without animation, so it waits here for the views that
+// do animate (architecture §6.1).
+#![allow(dead_code)]
+
 use std::cell::RefCell;
 use std::collections::HashSet;
 

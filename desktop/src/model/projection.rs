@@ -12,6 +12,7 @@ use muqun_gateway::agents::{AgentDomainEvent, AgentSessionId, SessionQuery};
 use tokio::sync::{broadcast, watch};
 
 use super::commands::{Command, CommandReceiver};
+use super::compose::{self, ComposeCommand, ComposerUpdate, Target};
 use super::inbox::{Inbox, UiError, Update};
 use super::view::SESSION_LIST_LIMIT;
 use crate::config::{ConfigEdit, DesktopConfig};
@@ -268,7 +269,7 @@ impl Core {
                     // only when the mirror no longer holds the session.
                     tracing::info!(asid = %asid.0, "history cursor lost; reading the session again");
                     match self.hub.snapshot(&asid).await {
-                        Ok(snapshot) => self.inbox.push(Update::Snapshot(Box::new(snapshot))),
+                        Ok(snapshot) => self.push_snapshot(snapshot),
                         Err(err) => tracing::debug!(%err, "re-read after a lost cursor failed"),
                     }
                     // Answer the request all the same: the list is waiting on
@@ -309,6 +310,7 @@ impl Core {
                 }
                 Err(err) => tracing::debug!(%err, "project list unavailable"),
             },
+            Command::Compose(command) => self.compose(command).await,
             command @ (Command::ThemeRefresh
             | Command::ThemeInstall(_)
             | Command::ThemeRemove(_)
@@ -320,6 +322,81 @@ impl Core {
                 unreachable!("handled in the command loop")
             }
         }
+    }
+
+    async fn compose(self: Arc<Self>, command: ComposeCommand) {
+        let ComposeCommand::Submit {
+            token,
+            target,
+            deliver,
+            attachments,
+            delivery,
+        } = command
+        else {
+            if let Some(err) = compose::run(command, self.hub.clone(), self.inbox.clone()).await {
+                self.fail(err);
+            }
+            return;
+        };
+        let asid = match target {
+            Target::Session(asid) => asid,
+            Target::New {
+                agent,
+                cwd,
+                model,
+                mode,
+            } => match self.hub.create(&agent, &cwd).await {
+                Ok(info) => {
+                    let asid = info.asid.clone();
+                    self.inbox.push(Update::SessionCreated(Box::new(info)));
+                    *self.active.lock().unwrap() = Some(asid.clone());
+                    self.open(&asid).await;
+                    self.config.change(|config| {
+                        config.general.last_agent = Some(agent.clone());
+                        config.general.last_cwd.insert(agent.clone(), cwd);
+                    });
+                    self.edited();
+                    // The choices on the pills are the new session's.
+                    if let Some(model) = model {
+                        if let Err(err) = self.hub.switch_model(&asid, &model).await {
+                            self.fail(err);
+                        }
+                    }
+                    if let Some(mode) = mode {
+                        if let Err(err) = self.hub.switch_mode(&asid, &mode).await {
+                            self.fail(err);
+                        }
+                    }
+                    asid
+                }
+                Err(err) => {
+                    self.fail(err);
+                    self.inbox
+                        .push(Update::Composer(Box::new(ComposerUpdate::Submitted {
+                            token,
+                            ok: false,
+                        })));
+                    return;
+                }
+            },
+        };
+        let result = compose::deliver(
+            self.hub.as_ref(),
+            &asid,
+            &deliver,
+            &attachments,
+            delivery.as_deref(),
+        )
+        .await;
+        let ok = result.is_ok();
+        if let Err(err) = result {
+            self.fail(err);
+        }
+        self.inbox
+            .push(Update::Composer(Box::new(ComposerUpdate::Submitted {
+                token,
+                ok,
+            })));
     }
 
     /// Agents and every attached agent's sessions. Each agent's list is
@@ -396,9 +473,16 @@ impl Core {
         }
     }
 
+    /// A session's snapshot to the view, and its waiting prompts to the
+    /// composer (the view keeps no inbox).
+    fn push_snapshot(&self, snapshot: muqun_gateway::agents::ports::AgentSessionSnapshot) {
+        super::compose::push_inbox(&self.inbox, &snapshot.info.asid.0, &snapshot.inbox);
+        self.inbox.push(Update::Snapshot(Box::new(snapshot)));
+    }
+
     async fn open(&self, asid: &AgentSessionId) {
         match self.hub.open(asid).await {
-            Ok(snapshot) => self.inbox.push(Update::Snapshot(Box::new(snapshot))),
+            Ok(snapshot) => self.push_snapshot(snapshot),
             Err(err) => self.fail(err),
         }
     }
@@ -433,6 +517,12 @@ impl Core {
                 Ok(AgentDomainEvent::Resync { asid, reason }) => {
                     tracing::info!(asid = %asid.0, %reason, "resync requested");
                     self.resync(Some(&asid)).await;
+                }
+                Ok(AgentDomainEvent::InboxChanged { asid, items, .. }) => {
+                    let active = self.active.lock().unwrap().clone();
+                    if active.as_ref() == Some(&asid) {
+                        super::compose::push_inbox(&self.inbox, &asid.0, &items);
+                    }
                 }
                 Ok(event) => {
                     let active = self.active.lock().unwrap().clone();
@@ -471,7 +561,7 @@ impl Core {
                     let active = core.active.lock().unwrap().clone();
                     if let Some(active) = active {
                         match core.hub.snapshot(&active).await {
-                            Ok(snapshot) => core.inbox.push(Update::Snapshot(Box::new(snapshot))),
+                            Ok(snapshot) => core.push_snapshot(snapshot),
                             Err(err) => tracing::debug!(%err, "resync read failed"),
                         }
                     }

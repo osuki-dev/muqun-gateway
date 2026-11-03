@@ -2,8 +2,8 @@
 //! session header, then three columns -- sidebar, main panel, and a right
 //! column that starts collapsed (its panels arrive in later tasks).
 //!
-//! The main panel shows exactly one of: Home (nothing selected), the
-//! New-session page, or the selected session.
+//! The main panel shows exactly one of: Home (the start page, nothing
+//! selected), Settings, or the selected session.
 
 use blinc_app::windowed::WindowedContext;
 use blinc_cn::prelude::{button, resizable_group, resizable_panel, ButtonSize, ButtonVariant};
@@ -14,7 +14,7 @@ use muqun_gateway::home_relative;
 use super::agents;
 use super::sessions::title_of;
 use super::text::ui_text;
-use super::{composer, errors, home, new_session, sessions, settings, timeline, App};
+use super::{composer, errors, home, sessions, settings, timeline, App};
 use crate::branding::{mark_data_uri, APP_NAME};
 use crate::config::{ConfigEdit, Scheme};
 use crate::model::commands::Command;
@@ -171,22 +171,14 @@ pub fn body(ctx: &WindowedContext, app: &App) -> Div {
 
 fn main_panel(app: &App, width: f32, height: f32) -> Div {
     let selected = app.bindings.selected.clone();
-    let draft = app.bindings.draft.clone();
     let settings_open = app.bindings.settings_open.clone();
     let strip = errors::strip(app);
     let app = app.clone();
     let view = stateful_with_key::<NoState>("mq-main-view")
-        .deps([
-            selected.signal_id(),
-            draft.signal_id(),
-            settings_open.signal_id(),
-        ])
+        .deps([selected.signal_id(), settings_open.signal_id()])
         .on_state(move |_| {
             if settings_open.get() {
                 return settings::page(&app, height);
-            }
-            if draft.get().is_some() {
-                return new_session::page(&app, height);
             }
             if selected.get().is_none() {
                 return home::home(&app, width, height);

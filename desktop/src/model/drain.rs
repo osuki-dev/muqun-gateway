@@ -386,6 +386,15 @@ impl Drain {
                 crate::ui::themes::apply_update(*update);
             }
         }
+        // So do the composer's (`ui/composer/state.rs`).
+        let (composer, batch): (Vec<Update>, Vec<Update>) = batch
+            .into_iter()
+            .partition(|u| matches!(u, Update::Composer(_)));
+        for update in composer {
+            if let Update::Composer(update) = update {
+                crate::ui::composer::apply_update(*update);
+            }
+        }
         self.check_scheme(bindings);
         if batch.is_empty() {
             return;
@@ -592,6 +601,7 @@ fn batch_kinds(batch: &[Update]) -> String {
             Update::Ui(_) => "ui",
             Update::Earlier { .. } => "earlier",
             Update::Theme(_) => "theme",
+            Update::Composer(_) => "composer",
         };
         match counts.iter_mut().find(|(k, _)| *k == kind) {
             Some((_, n)) => *n += 1,
