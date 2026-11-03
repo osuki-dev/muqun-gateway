@@ -30,7 +30,8 @@
   agent's native "approve everything" control and takes it back out: Claude
   Code `session/set_mode bypassPermissions`, Qoder `session/set_mode yolo`,
   Codex a `turn/start` `approvalPolicy: never` override carried by the next
-  prompt (its workspace-write sandbox stays), OpenCode a session
+  prompt together with `sandboxPolicy: dangerFullAccess` (no asking and no
+  sandbox), OpenCode a session
   permission rule allowing every action, T3 `thread.runtime-mode.set
   full-access`. Off restores what the session ran in before. Discovery states
   `features.autoApprove = {scope, native}` per agent; Antigravity, Cursor,
