@@ -252,7 +252,6 @@ mod tests {
             "worktrees",
             "revert",
             "stagedRevert",
-            "inbox",
             "modes",
             "skills",
             "slashCommands",
@@ -272,5 +271,6 @@ mod tests {
             assert_eq!(value[key], false, "{key}");
         }
         assert_eq!(value["timelineEarlier"], true);
+        assert_eq!(value["inbox"], true);
     }
 }

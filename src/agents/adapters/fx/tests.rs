@@ -226,6 +226,8 @@ for line in sys.stdin:
             for option in config['configOptions']:
                 if option['id']=='provider':option['currentValue']='other-provider'
         reply(message['id'],config)
+    elif method=='session/set_mode':
+        reply(message['id'],{})
     elif method=='session/prompt':
         turn+=1
         content=params['prompt'][0]['text']

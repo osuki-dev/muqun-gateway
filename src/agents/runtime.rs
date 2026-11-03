@@ -2660,7 +2660,8 @@ fn acp_features() -> crate::discovery::AgentFeatures {
         worktrees: false,
         revert: false,
         staged_revert: false,
-        inbox: false,
+        // The Gateway queues a prompt sent while a turn runs.
+        inbox: true,
         modes: false,
         skills: false,
         slash_commands: false,

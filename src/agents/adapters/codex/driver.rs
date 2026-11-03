@@ -86,7 +86,7 @@ pub struct CodexDriver {
     slash_catalog: std::sync::atomic::AtomicBool,
     /// Prompts waiting for a thread's turn to end. Changed only while holding
     /// `mutations`, so a delivery and a cancel never race for one item.
-    inbox: std::sync::Mutex<Inbox>,
+    inbox: std::sync::Mutex<Inbox<super::presentation::PromptInput>>,
     inbox_signals: Option<tokio::sync::mpsc::UnboundedSender<InboxSignal>>,
     /// Each thread's approval policy and sandbox, for the App's auto-approve
     /// switch: what Codex reported when the thread was opened here, and the
@@ -360,7 +360,7 @@ impl CodexDriver {
         Ok(())
     }
 
-    fn queue(&self) -> std::sync::MutexGuard<'_, Inbox> {
+    fn queue(&self) -> std::sync::MutexGuard<'_, Inbox<super::presentation::PromptInput>> {
         self.inbox.lock().unwrap_or_else(|p| p.into_inner())
     }
 
