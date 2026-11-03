@@ -29,6 +29,18 @@ pub enum Command {
         id: String,
         decision: PermissionDecision,
     },
+    /// Show the session's changes (one file's, or all) in the diff panel.
+    /// Placeholder: the panel is not built yet, the core only logs it.
+    OpenDiff {
+        asid: AgentSessionId,
+        file: Option<String>,
+    },
+    /// Stage the revert of one file's change, to be previewed and confirmed
+    /// (§6.1c item 9). Placeholder: the core only logs it.
+    StageRevert {
+        asid: AgentSessionId,
+        file: String,
+    },
     /// The next older page of the session's history (architecture §3
     /// `earlier`).
     LoadEarlier(AgentSessionId),

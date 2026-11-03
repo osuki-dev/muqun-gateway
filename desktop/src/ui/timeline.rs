@@ -76,6 +76,7 @@ pub fn timeline(app: &App, height: f32) -> impl ElementBuilder {
 
     let on_scroll = ctl.clone();
     let on_press = ctl.clone();
+    let keys = app.clone();
     div()
         .class("mq-timeline")
         .class(scale::Density::current().class())
@@ -97,6 +98,14 @@ pub fn timeline(app: &App, height: f32) -> impl ElementBuilder {
         )
         .child(pill(app, &ctl))
         .child(debug_overlay(&ctl))
+        // Y / N answer the oldest waiting approval whatever has the
+        // keyboard (key-down reaches every handler); `answer_key` keeps out
+        // of the composer's and the forms' way.
+        .on_key_down(move |ctx| {
+            if !(ctx.ctrl || ctx.meta || ctx.alt) {
+                interact::answer_key(&keys, ctx.key_code);
+            }
+        })
 }
 
 /// `MUQUN_DEBUG_LIST=1`: the list's visible range, built window, total
@@ -262,6 +271,7 @@ fn row(
                 palette,
                 width,
                 agent: &agent,
+                turn: app.drain.with_view(|view| view.row_turn(item_id)),
             };
             div().class("mq-row").w_full().child(parts::render(&ctx))
         })
@@ -321,18 +331,34 @@ fn teaching_empty_state(app: &App) -> Div {
         .child(lines)
 }
 
-/// "↓ N new messages", bottom right, while new rows wait below.
+/// "↓ N new messages", bottom right, while the reader is not at the bottom
+/// and rows wait below; while the agent is working it is also the way back
+/// down ("↓ Jump to latest"). Never moves the viewport by itself.
 fn pill(app: &App, ctl: &Arc<Controller>) -> impl ElementBuilder {
     let count = ctl.pill.clone();
+    let at_bottom = ctl.at_bottom.clone();
+    let header = app.bindings.header.clone();
     let app = app.clone();
     let ctl = ctl.clone();
     stateful_with_key::<NoState>("mq-new-pill")
-        .deps([count.signal_id()])
+        .deps([count.signal_id(), at_bottom.signal_id(), header.signal_id()])
         .on_state(move |_| {
             let n = count.get();
-            if n == 0 {
+            let working = header.get().is_some_and(|i| {
+                matches!(
+                    i.status,
+                    muqun_gateway::agents::AgentSessionStatus::Busy
+                        | muqun_gateway::agents::AgentSessionStatus::Retry
+                )
+            });
+            if ctl.is_at_bottom() || (n == 0 && !working) {
                 return div();
             }
+            let label = if n > 0 {
+                app.strings.new_messages(n)
+            } else {
+                app.strings.jump_latest().to_string()
+            };
             let jump = ctl.clone();
             div().absolute().right(24.0).bottom(16.0).child(
                 div()
@@ -340,7 +366,7 @@ fn pill(app: &App, ctl: &Arc<Controller>) -> impl ElementBuilder {
                     .class("mq-pill")
                     .cursor_pointer()
                     .child(
-                        ui_text(app.strings.new_messages(n))
+                        ui_text(label)
                             .size(scale::FS_12)
                             .semibold()
                             .no_wrap()

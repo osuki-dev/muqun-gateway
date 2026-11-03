@@ -18,6 +18,7 @@ use muqun_gateway::agents::{
 use muqun_gateway::platform::discovery::AgentDiscoveryInfo;
 
 use super::inbox::{UiAction, UiError, Update};
+use super::turn::{self, RowTurn, TurnState};
 use crate::config::Grouping;
 
 /// How many sessions the sidebar lists. P0 has no paging.
@@ -135,13 +136,47 @@ impl SessionView {
         self.items.len() != before
     }
 
-    /// The part being written right now: the newest item, when it is the
-    /// assistant's text or reasoning and the session is working.
-    pub fn live(&self) -> Option<&Arc<TimelineItem>> {
-        if !matches!(
+    /// The state of the newest turn.
+    pub fn turn_state(&self) -> TurnState {
+        let range = match self.items.len() {
+            0 => return TurnState::Done,
+            n => turn::range_of(&self.items, n - 1),
+        };
+        turn::derive(
+            &self.items[range],
+            Some(self.info.status),
+            &self.pending_permissions,
+            &self.pending_forms,
+        )
+    }
+
+    /// What item `id`'s row needs to know about its turn.
+    pub fn row_turn(&self, id: &str) -> Option<RowTurn> {
+        let at = self.position(id)?;
+        Some(turn::row_turn(
+            &self.items,
+            at,
             self.info.status,
-            AgentSessionStatus::Busy | AgentSessionStatus::Retry
-        ) {
+            &self.pending_permissions,
+            &self.pending_forms,
+        ))
+    }
+
+    fn turn_snap(&self) -> turn::Snap {
+        turn::snap(
+            &self.info.asid.0,
+            &self.items,
+            self.info.status,
+            &self.pending_permissions,
+            &self.pending_forms,
+        )
+    }
+
+    /// The part being written right now: the newest item, when it is the
+    /// assistant's text or reasoning and the newest turn is `Streaming`
+    /// (never while a tool runs or an approval or form waits).
+    pub fn live(&self) -> Option<&Arc<TimelineItem>> {
+        if self.turn_state() != TurnState::Streaming {
             return None;
         }
         self.items.last().filter(|item| {
@@ -461,7 +496,25 @@ impl ViewState {
         true
     }
 
+    /// Fold `update` in. Then, if the newest turn changed (its state, its
+    /// last item, a tool waiting on an approval), the rows that show that
+    /// are named in `changes.items` so they render again.
     pub fn apply(&mut self, update: Update, changes: &mut Changes) {
+        let before = self.active.as_ref().map(SessionView::turn_snap);
+        self.apply_update(update, changes);
+        let after = self.active.as_ref().map(SessionView::turn_snap);
+        if let (Some(before), Some(after)) = (before, after) {
+            if before.asid == after.asid && before != after {
+                for id in before.touched().into_iter().chain(after.touched()) {
+                    if !changes.items.contains(&id) {
+                        changes.items.push(id);
+                    }
+                }
+            }
+        }
+    }
+
+    fn apply_update(&mut self, update: Update, changes: &mut Changes) {
         match update {
             Update::Agents(agents) => {
                 // Discovery is polled while cold probes settle; most answers
@@ -853,6 +906,11 @@ impl ViewState {
 
     pub fn item(&self, id: &str) -> Option<Arc<TimelineItem>> {
         self.active.as_ref()?.by_id.get(id).cloned()
+    }
+
+    /// Item `id`'s turn, for its row.
+    pub fn row_turn(&self, id: &str) -> Option<RowTurn> {
+        self.active.as_ref()?.row_turn(id)
     }
 
     /// The streaming item of the active session, if one is streaming.
@@ -1340,6 +1398,98 @@ mod tests {
         assert_eq!(changes.items, ["y"]);
         assert!(changes.order && !changes.opened);
         assert_eq!(changes.appended, 1);
+    }
+
+    #[test]
+    fn the_cursor_and_the_waiting_state_exclude_each_other() {
+        let mut busy = info("s", 5);
+        busy.status = AgentSessionStatus::Busy;
+        let user = TimelineItem {
+            role: TimelineRole::User,
+            ..item("u", "m1", 0)
+        };
+        let items = vec![user, item("a", "m2", 0)];
+        let read = |permissions: Vec<PermissionRequest>| {
+            let mut view = ViewState::default();
+            view.select("s");
+            view.apply(
+                Update::Snapshot(Box::new(AgentSessionSnapshot {
+                    info: busy.clone(),
+                    timeline: items.clone(),
+                    permissions,
+                    forms: vec![],
+                    inbox: vec![],
+                    seq: 1,
+                })),
+                &mut Changes::default(),
+            );
+            view
+        };
+        let streaming = read(vec![]);
+        assert!(
+            streaming.live().is_some(),
+            "the cursor belongs to Streaming"
+        );
+        assert_eq!(
+            streaming.active.as_ref().unwrap().turn_state(),
+            TurnState::Streaming
+        );
+        assert!(streaming.row_turn("a").unwrap().items.is_none());
+
+        let request: PermissionRequest = serde_json::from_value(serde_json::json!({
+            "id": "p", "asid": "s", "action": "bash", "resources": ["ls"],
+            "prompt": "run ls", "options": [],
+        }))
+        .unwrap();
+        let waiting = read(vec![request]);
+        assert!(
+            waiting.live().is_none(),
+            "no cursor while an approval waits"
+        );
+        assert_eq!(
+            waiting.active.as_ref().unwrap().turn_state(),
+            TurnState::WaitingApproval(None)
+        );
+    }
+
+    #[test]
+    fn a_turn_that_ends_names_the_rows_that_change() {
+        let mut view = ViewState::default();
+        view.select("s");
+        let mut busy = info("s", 5);
+        busy.status = AgentSessionStatus::Busy;
+        let tool: muqun_gateway::agents::ToolCall = serde_json::from_value(serde_json::json!({
+            "id": "c", "name": "bash", "input": {}, "state": "running", "status": "running"
+        }))
+        .unwrap();
+        let items = vec![
+            TimelineItem {
+                role: TimelineRole::User,
+                ..item("u", "m1", 0)
+            },
+            TimelineItem {
+                part: AgentPart::Tool(tool),
+                ..item("t", "m2", 0)
+            },
+        ];
+        let snap = |info: AgentSessionInfo| {
+            Update::Snapshot(Box::new(AgentSessionSnapshot {
+                info,
+                timeline: items.clone(),
+                permissions: vec![],
+                forms: vec![],
+                inbox: vec![],
+                seq: 1,
+            }))
+        };
+        view.apply(snap(busy), &mut Changes::default());
+        let mut changes = Changes::default();
+        view.apply(snap(info("s", 6)), &mut changes);
+        assert!(
+            changes.items.contains(&"t".to_string()),
+            "the stale tool and the summary bar's row render again: {:?}",
+            changes.items
+        );
     }
 
     #[test]

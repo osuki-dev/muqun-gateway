@@ -123,6 +123,7 @@ impl Strings {
         }
     }
 
+    #[allow(dead_code)] // the approval card says "Allow" (`timeline/words.rs`)
     pub fn approve(&self) -> &'static str {
         i18n::t(self.language().locale(), "Approve")
     }

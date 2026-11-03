@@ -16,6 +16,7 @@ pub mod interact;
 pub mod notice;
 pub mod prose;
 pub mod scale;
+pub mod summary;
 
 use std::collections::HashSet;
 use std::sync::{Mutex, OnceLock};
@@ -26,6 +27,7 @@ use muqun_gateway::agents::{AgentPart, TimelineItem, TimelineRole};
 use super::markdown::{CodeChrome, Palette, Setting};
 use super::text::{mono_text, ui_text};
 use super::App;
+use crate::model::turn::{RowTurn, TurnState};
 use scale::Density;
 
 /// Everything a part renderer needs.
@@ -46,6 +48,8 @@ pub struct PartCtx<'a> {
     pub width: f32,
     /// The session's agent, for its brand accent.
     pub agent: &'a str,
+    /// The turn this item is in (`model/turn.rs`).
+    pub turn: Option<RowTurn>,
 }
 
 impl PartCtx<'_> {
@@ -121,8 +125,34 @@ fn open_sections() -> &'static Mutex<HashSet<String>> {
     OPEN.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
-/// The item's row content.
+impl PartCtx<'_> {
+    /// The turn's state; a row without one counts as finished.
+    pub fn turn_state(&self) -> &TurnState {
+        self.turn.as_ref().map_or(&TurnState::Done, |t| &t.state)
+    }
+}
+
+/// The item's row: its part, and under the last item of a finished turn the
+/// summary bar.
 pub fn render(ctx: &PartCtx<'_>) -> Div {
+    let content = render_part(ctx);
+    let summary = ctx
+        .turn
+        .as_ref()
+        .filter(|_| ctx.last)
+        .and_then(|t| t.items.as_deref())
+        .and_then(summary::summarize);
+    match summary {
+        Some(summary) => div()
+            .w_full()
+            .flex_col()
+            .child(content)
+            .child(summary::bar(ctx, &summary)),
+        None => content,
+    }
+}
+
+fn render_part(ctx: &PartCtx<'_>) -> Div {
     let item = ctx.item;
     match &item.part {
         AgentPart::Text { text } if item.role == TimelineRole::User => prose::user(ctx, text),

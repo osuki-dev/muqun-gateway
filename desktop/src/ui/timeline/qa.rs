@@ -371,7 +371,7 @@ fn item(
         role,
         part,
         seq: n as u64,
-        updated_ms: 0,
+        updated_ms: 1_000 + n as u64 * 4_000,
         ordinal,
         attachments: None,
         image_assets: None,
@@ -445,7 +445,17 @@ pub fn synthetic(n: usize) -> AgentSessionSnapshot {
                 TimelineRole::Assistant,
                 AgentPart::Diff {
                     file: format!("src/file_{i}.rs"),
-                    diff: "@@ -1,3 +1,3 @@\n fn a() {}\n-fn b() {}\n+fn b() -> u8 { 1 }\n fn c() {}".into(),
+                    diff: format!(
+                        "--- a/src/file_{i}.rs\n+++ b/src/file_{i}.rs\n@@ -1,16 +1,16 @@\n fn a() {{}}\n-fn b() {{}}\n+fn b() -> u8 {{ 1 }}\n fn c() {{}}\n{}",
+                        (0..18)
+                            .map(|k| if k % 2 == 0 {
+                                format!("-let x{k} = {k};")
+                            } else {
+                                format!("+let x{k} = {};", k * 2)
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    ),
                 },
             ),
             _ => (

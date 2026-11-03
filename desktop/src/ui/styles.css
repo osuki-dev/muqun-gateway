@@ -283,6 +283,7 @@
 
 .mq-main { background: var(--background); }
 
+/* timeline */
 /* ---- timeline (task 0.3) -------------------------------------------
    Solid, high-contrast content surfaces; no glass. Assistant prose is
    flush; the user's messages are a quiet solid card; cards are a 1 px
@@ -381,14 +382,15 @@
 
 .mq-accent { background: var(--text-tertiary); }
 .mq-accent--pending { background: var(--text-tertiary); }
-.mq-accent--running { background: var(--info); }
-.mq-accent--done { background: var(--success); }
+.mq-accent--running { background: var(--primary); }
+.mq-accent--done { background: var(--border-secondary); }
 .mq-accent--failed { background: var(--error); }
 .mq-accent--info { background: var(--info); }
 .mq-accent--warning { background: var(--warning); }
 .mq-accent--subtle { background: var(--border-secondary); }
 .mq-tone--pending, .mq-tone--subtle { color: var(--text-tertiary); }
-.mq-tone--running, .mq-tone--info { color: var(--info); }
+.mq-tone--running { color: var(--primary); }
+.mq-tone--info { color: var(--info); }
 .mq-tone--done { color: var(--success); }
 .mq-tone--failed { color: var(--error); }
 .mq-tone--warning { color: var(--warning); }
@@ -403,8 +405,21 @@
 .mq-text-success { color: var(--success); }
 .mq-text-error { color: var(--error); }
 
-.mq-approval-body { gap: var(--mq-space-2); padding: var(--mq-space-1) 0; }
-.mq-approval-actions { gap: var(--mq-space-2); padding-top: var(--mq-space-1); color: var(--text-tertiary); }
+.mq-approval-body { gap: var(--mq-space-2); padding: var(--mq-space-1) var(--mq-space-3); }
+.mq-approval-top { gap: var(--mq-space-3); }
+.mq-approval-line { gap: var(--mq-space-2); }
+.mq-approval-remember { gap: var(--mq-space-2); }
+.mq-choice {
+    height: 32px;
+    padding: 0 var(--mq-space-3);
+    gap: var(--mq-space-2);
+    border-radius: var(--mq-radius-sm);
+}
+.mq-choice--deny { border: 1px solid var(--border); background: transparent; min-width: 76px; }
+.mq-choice--deny:hover { background: var(--surface-overlay); }
+.mq-choice--allow { background: var(--primary); min-width: 108px; }
+.mq-choice--allow:hover { background: var(--primary-hover); }
+.mq-on-primary { color: var(--text-inverse); }
 .mq-form-field { gap: var(--mq-space-1); padding-top: var(--mq-space-1); }
 
 /* The streaming cursor: a small dot in the agent's colour, the only
@@ -431,6 +446,30 @@
 }
 .mq-pill:hover { background: var(--surface-overlay); }
 
+/* Tool and diff rows: one 36 px line, the card's padding is sideways only. */
+.mq-tool-body { padding: 0 var(--mq-space-3); gap: 0; }
+.mq-tool-row { gap: var(--mq-space-2); color: var(--text-secondary); }
+.mq-tool-body .mq-tool-input,
+.mq-tool-body .mq-output { padding-bottom: var(--mq-space-2); }
+.mq-diff-head { gap: var(--mq-space-3); color: var(--text-secondary); }
+.mq-diff-title { gap: var(--mq-space-2); }
+.mq-link-button--quiet { color: var(--text-secondary); }
+.mq-chevron-button { padding: var(--mq-space-1); border-radius: var(--mq-radius-sm); }
+.mq-chevron-button:hover { background: var(--surface-overlay); }
+.mq-diff-body { padding-bottom: var(--mq-space-1); }
+.mq-tool-body .mq-link-button { padding: var(--mq-space-1) 0; }
+
+/* The turn summary bar, last item of a finished turn. */
+.mq-summary {
+    margin-top: var(--mq-space-2);
+    padding: var(--mq-space-2) var(--mq-space-3);
+    gap: var(--mq-space-3);
+    border: 1px solid var(--border);
+    border-radius: var(--mq-radius-md);
+    background: var(--surface);
+}
+.mq-summary:hover { background: var(--surface-elevated); }
+
 .mq-debug {
     padding: var(--mq-space-1) var(--mq-space-2);
     border-radius: var(--mq-radius-sm);
@@ -445,6 +484,8 @@
     padding: 24px 12px;
     color: var(--text-tertiary);
 }
+
+/* end timeline */
 
 .mq-alert {
     gap: 12px;
