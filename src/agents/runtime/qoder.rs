@@ -118,6 +118,7 @@ impl QoderState {
             Some(version),
             runtime.events_tx.clone(),
         );
+        driver.observe_terminals(runtime.terminal_runtime.get().cloned());
         driver.set_idle_timeout(std::time::Duration::from_secs(
             self.config.idle_timeout_secs.max(1),
         ));

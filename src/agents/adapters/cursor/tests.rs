@@ -94,28 +94,15 @@ fn field(number: u64, bytes: &[u8]) -> Vec<u8> {
     out
 }
 
-#[test]
-fn recovery_evidence_is_one_entry_per_prompt_with_the_last_reply() {
-    let root = scratch();
-    std::fs::create_dir_all(root.0.join("conv-1")).unwrap();
-    let db = rusqlite::Connection::open(root.0.join("conv-1").join("store.db")).unwrap();
+/// A Cursor `store.db` in `folder` holding `messages` in order.
+fn write_store(folder: &std::path::Path, id: &str, messages: &[Value]) {
+    std::fs::create_dir_all(folder).unwrap();
+    let db = rusqlite::Connection::open(folder.join("store.db")).unwrap();
     db.execute_batch(
         "CREATE TABLE blobs (id TEXT PRIMARY KEY, data BLOB);
          CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);",
     )
     .unwrap();
-    let query = |text: &str| json!({"role":"user","content":[{"type":"text","text":format!("<timestamp>now</timestamp>\n<user_query>\n{text}\n</user_query>")}]});
-    let reply = |text: &str| json!({"role":"assistant","content":[{"type":"reasoning","text":""},{"type":"text","text":text}]});
-    let messages = [
-        json!({"role":"system","content":"You are an AI coding assistant"}),
-        json!({"role":"user","content":"<user_info>\nOS Version: test\n</user_info>"}),
-        query("first"),
-        reply("one"),
-        query("second"),
-        json!({"role":"assistant","content":[{"type":"tool-call","toolName":"Shell"}]}),
-        json!({"role":"tool","content":[{"type":"tool-result"}]}),
-        reply("two"),
-    ];
     let mut root_blob = vec![0x50, 0x01];
     for (index, message) in messages.iter().enumerate() {
         let id = [index as u8; 32];
@@ -135,11 +122,34 @@ fn recovery_evidence_is_one_entry_per_prompt_with_the_last_reply() {
     db.execute(
         "INSERT INTO meta VALUES ('0', ?1)",
         [hex::encode(
-            br#"{"agentId":"conv-1","latestRootBlobId":"root"}"#,
+            json!({"agentId":id,"latestRootBlobId":"root"}).to_string(),
         )],
     )
     .unwrap();
-    drop(db);
+}
+
+fn query(text: &str) -> Value {
+    json!({"role":"user","content":[{"type":"text","text":format!("<timestamp>now</timestamp>\n<user_query>\n{text}\n</user_query>")}]})
+}
+
+fn reply(text: &str) -> Value {
+    json!({"role":"assistant","content":[{"type":"reasoning","text":""},{"type":"text","text":text}]})
+}
+
+#[test]
+fn recovery_evidence_is_one_entry_per_prompt_with_the_last_reply() {
+    let root = scratch();
+    let messages = [
+        json!({"role":"system","content":"You are an AI coding assistant"}),
+        json!({"role":"user","content":"<user_info>\nOS Version: test\n</user_info>"}),
+        query("first"),
+        reply("one"),
+        query("second"),
+        json!({"role":"assistant","content":[{"type":"tool-call","toolName":"Shell"}]}),
+        json!({"role":"tool","content":[{"type":"tool-result"}]}),
+        reply("two"),
+    ];
+    write_store(&root.0.join("conv-1"), "conv-1", &messages);
     let stop = CancellationToken::new();
     let snapshot = store::snapshot_at(&root.0, "conv-1", &stop).unwrap();
     assert_eq!(
@@ -152,6 +162,55 @@ fn recovery_evidence_is_one_entry_per_prompt_with_the_last_reply() {
     assert_eq!(snapshot.last_user.as_deref(), Some("second"));
     assert_eq!(snapshot.last_assistant.as_deref(), Some("two"));
     assert!(store::snapshot_at(&root.0, "missing", &stop).is_err());
+}
+
+#[test]
+fn a_terminal_chat_is_listed_by_its_first_prompt_and_read_as_a_timeline() {
+    let chats = scratch();
+    let folder = chats.0.join("0123abcd");
+    let messages = [query("Fix the build"), reply("Done"), query("Thanks")];
+    for (id, meta) in [
+        (
+            "held",
+            r#"{"schemaVersion":1,"hasConversation":true,"cwd":"/work/app"}"#,
+        ),
+        (
+            "helper",
+            r#"{"schemaVersion":1,"cwd":"/work/app","isSubagent":true}"#,
+        ),
+    ] {
+        write_store(&folder.join(id), id, &messages);
+        std::fs::write(folder.join(id).join("meta.json"), meta).unwrap();
+    }
+    let stop = CancellationToken::new();
+    let ids = ["held", "helper", "absent"].map(String::from);
+    let rows = store::terminal_sessions_at(&chats.0, &ids, &stop);
+    assert_eq!(
+        rows.len(),
+        1,
+        "a subagent's or a missing chat is not listed"
+    );
+    assert_eq!(
+        (&rows[0]["sessionId"], &rows[0]["cwd"], &rows[0]["title"]),
+        (&json!("held"), &json!("/work/app"), &json!("Fix the build"))
+    );
+    let snapshot = store::snapshot_at(&folder, "held", &stop).unwrap();
+    let rows: Vec<_> = store::timeline_of(&snapshot)
+        .into_iter()
+        .map(|item| match item.part {
+            crate::agents::domain::AgentPart::Text { text } => (item.role, text),
+            part => panic!("unexpected {part:?}"),
+        })
+        .collect();
+    use crate::agents::domain::TimelineRole::{Assistant, User};
+    assert_eq!(
+        rows,
+        [
+            (User, "Fix the build".to_owned()),
+            (Assistant, "Done".to_owned()),
+            (User, "Thanks".to_owned()),
+        ]
+    );
 }
 
 #[test]

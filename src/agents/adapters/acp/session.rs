@@ -141,6 +141,10 @@ pub trait AcpProvider: Send + Sync + 'static {
     fn safe_error_message(_: &Value) -> Option<&'static str> {
         None
     }
+    /// Whether [`Self::live_timeline`] reads the native store. Without it a
+    /// terminal-held session's history is read by loading it in a private
+    /// child that is shut down at once, and is not followed.
+    const LIVE_TIMELINE: bool = false;
     /// History of a session another process (a terminal) is writing, read
     /// from the native store without loading it. See [`TerminalBridge`].
     fn live_timeline<'a>(
@@ -185,6 +189,15 @@ pub trait AcpProvider: Send + Sync + 'static {
     ) -> Option<AgentFuture<'a, Vec<Value>>> {
         None
     }
+    /// `session/list` rows for conversations a terminal holds that
+    /// [`Self::offline_sessions`] does not list (a store `agent acp` does
+    /// not read), or `None` when there is no such store.
+    fn terminal_sessions<'a>(
+        _ids: Vec<String>,
+        _stop: &'a CancellationToken,
+    ) -> Option<AgentFuture<'a, Vec<Value>>> {
+        None
+    }
     /// Asked before a child is started, for an agent whose `authenticate`
     /// opens a browser sign-in when no login is stored: `Ok(false)` refuses
     /// with `AUTHENTICATE.refusal` and nothing is spawned.
@@ -216,9 +229,15 @@ pub struct TerminalRoute {
 /// Correlates sessions with terminal processes and reaches their panes.
 pub trait TerminalBridge: Send + Sync {
     fn live<'a>(&'a self, ids: &'a [String]) -> AgentFuture<'a, HashMap<String, TerminalLive>>;
+    /// Conversations the terminals hold, listed or not.
+    fn held(&self) -> AgentFuture<'_, Vec<String>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
     fn send<'a>(&'a self, route: &'a TerminalRoute, text: &'a str) -> AgentFuture<'a, ()>;
     fn interrupt<'a>(&'a self, route: &'a TerminalRoute) -> AgentFuture<'a, ()>;
 }
+
+type TerminalHistory = (Option<std::time::SystemTime>, Vec<TimelineItem>);
 
 /// How long a terminal-held transcript is followed after input from here.
 const TERMINAL_FOLLOW: Duration = Duration::from_secs(600);
@@ -633,6 +652,9 @@ pub struct AcpDriver<P: AcpProvider> {
     launch: StdMutex<Option<AcpLaunch>>,
     mcp_servers: StdMutex<Value>,
     terminal: StdMutex<Option<Arc<dyn TerminalBridge>>>,
+    /// Terminal-held history read by `loaded_timeline`, with the store
+    /// modification it was read at.
+    terminal_history: StdMutex<HashMap<String, TerminalHistory>>,
     /// Terminal-held sessions a follower task is polling, and until when
     /// (`follow_terminal`). One follower per session.
     followers: StdMutex<HashMap<String, tokio::time::Instant>>,
@@ -757,6 +779,7 @@ impl<P: AcpProvider> AcpDriver<P> {
             launch: StdMutex::new(None),
             mcp_servers: StdMutex::new(json!([])),
             terminal: StdMutex::new(None),
+            terminal_history: StdMutex::new(HashMap::new()),
             followers: StdMutex::new(HashMap::new()),
             me: me.clone(),
             last_catalog: StdMutex::new(None),
@@ -824,6 +847,18 @@ impl<P: AcpProvider> AcpDriver<P> {
         *self.terminal.lock().unwrap() = Some(bridge);
     }
 
+    /// Link sessions to the Herdr panes whose agent reports them.
+    pub(crate) fn observe_terminals(
+        &self,
+        observer: Option<Arc<crate::agents::terminal_runtime::TerminalRuntime>>,
+    ) {
+        if let Some(observer) = observer {
+            self.set_terminal_bridge(Arc::new(
+                crate::agents::terminal_runtime::TerminalLink::new(observer, P::KIND),
+            ));
+        }
+    }
+
     fn terminal_bridge(&self) -> Option<Arc<dyn TerminalBridge>> {
         self.terminal.lock().unwrap().clone()
     }
@@ -875,7 +910,11 @@ impl<P: AcpProvider> AcpDriver<P> {
         let directory = info.directory.clone().ok_or_else(|| {
             AgentError::NotAvailable("The session has no verified working directory".into())
         })?;
-        let timeline = P::live_timeline(&directory, id, &self.stop).await?;
+        let timeline = if P::LIVE_TIMELINE {
+            P::live_timeline(&directory, id, &self.stop).await?
+        } else {
+            self.loaded_timeline(&directory, id).await?
+        };
         if let Ok(Some(tokens)) = P::transcript_usage(&directory, id).await {
             info.tokens = Some(tokens);
         }
@@ -889,6 +928,81 @@ impl<P: AcpProvider> AcpDriver<P> {
             inbox: Vec::new(),
             seq: 0,
         })
+    }
+
+    /// A terminal-held session's history for an agent that cannot read its
+    /// store: `session/load` in a private child, shut down at once and never
+    /// prompted. Kept while the store says the session is unchanged.
+    async fn loaded_timeline(
+        &self,
+        directory: &str,
+        id: &str,
+    ) -> Result<Vec<TimelineItem>, AgentError> {
+        let modified = P::transcript_modified(directory, id);
+        if let Some((at, timeline)) = self.terminal_history.lock().unwrap().get(id) {
+            if modified.is_some() && *at == modified {
+                return Ok(timeline.clone());
+            }
+        }
+        let (client, mut events, capabilities) = self.initialized(directory).await?;
+        if capabilities["loadSession"].as_bool() != Some(true) {
+            client.shutdown().await;
+            return Err(AgentError::Unsupported(
+                "ACP native session history loading".into(),
+            ));
+        }
+        // A read needs none of the Gateway's tools.
+        let params = json!({ "cwd": directory, "sessionId": id, "mcpServers": [] });
+        let mut projection = Projection::new(P::REQUIRE_MESSAGE_ID);
+        let result = async {
+            let request = client
+                .start_request("session/load", params)
+                .await
+                .map_err(AgentError::RequestFailed)?;
+            let response = request.wait_with_timeout(RPC_TIMEOUT);
+            tokio::pin!(response);
+            let mut absorb = |event: AcpEvent| -> Result<(), AgentError> {
+                match event {
+                    AcpEvent::Notification { method, params }
+                        if method == "session/update"
+                            && params["sessionId"].as_str() == Some(id) =>
+                    {
+                        // A record this reader cannot render is skipped.
+                        let _ = Self::project(&mut projection, false, &params["update"]);
+                        Ok(())
+                    }
+                    AcpEvent::Disconnected { reason } => Err(AgentError::Network(reason)),
+                    _ => Ok(()),
+                }
+            };
+            loop {
+                tokio::select! {
+                    biased;
+                    event = events.recv() => match event {
+                        Ok(event) => absorb(event)?,
+                        Err(_) => return Err(protocol("ACP history stream was interrupted")),
+                    },
+                    value = &mut response => {
+                        value.map_err(AgentError::RequestFailed)?;
+                        break;
+                    }
+                }
+            }
+            while let Ok(event) = events.try_recv() {
+                absorb(event)?;
+            }
+            Ok(())
+        }
+        .await;
+        client.shutdown().await;
+        result?;
+        let timeline = projection.timeline();
+        let mut history = self.terminal_history.lock().unwrap();
+        if history.len() >= MAX_CONNECTIONS {
+            history.clear();
+        }
+        history.insert(id.to_owned(), (modified, timeline.clone()));
+        Ok(timeline)
     }
 
     async fn refresh_terminal_snapshot(
@@ -1666,16 +1780,7 @@ impl<P: AcpProvider> AcpDriver<P> {
         let owned = self.owned.lock().unwrap().ids.iter().cloned().collect();
         if let Some(rows) = P::offline_sessions(directory, owned, &self.stop) {
             let mut sessions = self.project_listed_sessions(rows.await?).await?;
-            if let Some(bridge) = self.terminal_bridge() {
-                let ids: Vec<_> = sessions.iter().map(|info| info.asid.0.clone()).collect();
-                let mut live = bridge.live(&ids).await.unwrap_or_default();
-                for info in &mut sessions {
-                    if let Some(live) = live.remove(&info.asid.0) {
-                        live.runtime.clone().apply(info);
-                        info.runtime = Some(live.runtime);
-                    }
-                }
-            }
+            self.link_terminals(directory, &mut sessions).await;
             self.remember_session_metadata(revision, fingerprint, &sessions)
                 .await;
             return Ok(sessions);
@@ -1696,7 +1801,7 @@ impl<P: AcpProvider> AcpDriver<P> {
             }
             return Ok(retained);
         }
-        let result = async {
+        let mut result = async {
             let mut cursor = None;
             let mut seen = HashSet::new();
             let mut sessions = Vec::new();
@@ -1758,11 +1863,49 @@ impl<P: AcpProvider> AcpDriver<P> {
         }
         .await;
         client.shutdown().await;
-        if let Ok(sessions) = &result {
+        if let Ok(sessions) = &mut result {
+            self.link_terminals(directory, sessions).await;
             self.remember_session_metadata(revision, fingerprint, sessions)
                 .await;
         }
         result
+    }
+
+    /// Shows each listed session a terminal pane holds as held there, and
+    /// lists the held ones the native listing lacks when the agent can read
+    /// them (`AcpProvider::terminal_sessions`).
+    async fn link_terminals(&self, directory: Option<&str>, sessions: &mut Vec<AgentSessionInfo>) {
+        let Some(bridge) = self.terminal_bridge() else {
+            return;
+        };
+        let listed: HashSet<_> = sessions.iter().map(|info| info.asid.0.clone()).collect();
+        let missing: Vec<_> = bridge
+            .held()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|id| !listed.contains(id))
+            .collect();
+        if !missing.is_empty() {
+            if let Some(rows) = P::terminal_sessions(missing, &self.stop) {
+                let rows = rows
+                    .await
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|row| directory.is_none_or(|cwd| row["cwd"].as_str() == Some(cwd)))
+                    .collect();
+                if let Ok(found) = self.project_listed_sessions(rows).await {
+                    sessions.extend(found);
+                }
+            }
+        }
+        let ids: Vec<_> = sessions.iter().map(|info| info.asid.0.clone()).collect();
+        let mut live = bridge.live(&ids).await.unwrap_or_default();
+        for info in sessions {
+            if let Some(live) = live.remove(&info.asid.0) {
+                live.runtime.apply(info);
+            }
+        }
     }
 
     async fn remember_session_metadata(
@@ -4070,7 +4213,9 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
         Box::pin(async move {
             if let Some(live) = self.terminal_live(id).await {
                 self.refresh_terminal_snapshot(id, &live).await?;
-                self.follow_terminal(id.to_owned());
+                if P::LIVE_TIMELINE {
+                    self.follow_terminal(id.to_owned());
+                }
                 return Ok(());
             }
             if self.readonly_empty_snapshot(id).await? {

@@ -7,8 +7,11 @@ use futures::future::join_all;
 use tokio::sync::Mutex;
 use tokio::time::Instant;
 
+use super::adapters::acp::session::{TerminalBridge, TerminalLive, TerminalRoute};
 use super::domain::*;
+use super::ports::agent::{AgentError, AgentFuture};
 use crate::backend::{Agent, AgentStatus, BackendKind, TerminalBackend};
+use std::collections::HashMap;
 
 const CACHE_TTL: Duration = Duration::from_millis(250);
 const READ_TIMEOUT: Duration = Duration::from_secs(2);
@@ -116,6 +119,73 @@ impl TerminalRuntime {
     }
 }
 
+/// The terminal link for an ACP agent: a Herdr pane whose agent reports the
+/// conversation holds it. Prompts are not typed into the pane (`route` is
+/// `None`), so such a session is viewed here and continued in its terminal.
+pub(crate) struct TerminalLink {
+    observer: Arc<TerminalRuntime>,
+    kind: &'static str,
+}
+
+impl TerminalLink {
+    pub(crate) fn new(observer: Arc<TerminalRuntime>, kind: &'static str) -> Self {
+        Self { observer, kind }
+    }
+}
+
+impl TerminalBridge for TerminalLink {
+    fn live<'a>(&'a self, ids: &'a [String]) -> AgentFuture<'a, HashMap<String, TerminalLive>> {
+        Box::pin(async move {
+            let observations = self.observer.observations(false).await;
+            Ok(ids
+                .iter()
+                .filter_map(|id| {
+                    let mut runtime = matched(&observations, self.kind, id)?;
+                    runtime.transcript = Some(TranscriptSource::Persisted);
+                    Some((
+                        id.clone(),
+                        TerminalLive {
+                            runtime,
+                            route: None,
+                        },
+                    ))
+                })
+                .collect())
+        })
+    }
+
+    fn held(&self) -> AgentFuture<'_, Vec<String>> {
+        Box::pin(async move {
+            let kind = herdr_agent(self.kind);
+            Ok(self
+                .observer
+                .observations(false)
+                .await
+                .agents
+                .iter()
+                .filter(|(_, agent)| agent.kind.as_deref() == Some(kind))
+                .filter_map(|(_, agent)| agent.conversation_id.clone())
+                .collect())
+        })
+    }
+
+    fn send<'a>(&'a self, _: &'a TerminalRoute, _: &'a str) -> AgentFuture<'a, ()> {
+        Box::pin(async {
+            Err(AgentError::Unsupported(
+                "typing into this agent's terminal".into(),
+            ))
+        })
+    }
+
+    fn interrupt<'a>(&'a self, _: &'a TerminalRoute) -> AgentFuture<'a, ()> {
+        Box::pin(async {
+            Err(AgentError::Unsupported(
+                "stopping this agent's terminal".into(),
+            ))
+        })
+    }
+}
+
 fn unavailable(reason: RuntimeReason) -> SessionRuntime {
     SessionRuntime {
         transcript: None,
@@ -127,51 +197,70 @@ fn unavailable(reason: RuntimeReason) -> SessionRuntime {
     }
 }
 
-fn resolve(observations: &Observations, id: &str, native: bool) -> SessionRuntime {
+/// Herdr's name for the agent a Gateway agent kind runs as in a pane.
+fn herdr_agent(kind: &str) -> &str {
+    match kind {
+        "antigravity" => "agy",
+        "qoder" => "qodercli",
+        other => other,
+    }
+}
+
+/// The runtime of the pane whose `kind` agent reports conversation `id`,
+/// `None` when no pane does.
+fn matched(observations: &Observations, kind: &str, id: &str) -> Option<SessionRuntime> {
     // UUID parsing deliberately does not authorize a fuzzy/case-normalized join.
     // Both native strings must compare exactly as supplied by their backends.
+    let kind = herdr_agent(kind);
     let matches: Vec<_> = observations
         .agents
         .iter()
         .filter(|(_, agent)| {
-            agent.kind.as_deref() == Some("codex")
-                && uuid::Uuid::parse_str(id).is_ok()
+            agent.kind.as_deref() == Some(kind)
+                && !id.is_empty()
                 && agent.conversation_id.as_deref() == Some(id)
         })
         .collect();
     if matches.len() > 1 {
-        return unavailable(RuntimeReason::AmbiguousTerminal);
+        return Some(unavailable(RuntimeReason::AmbiguousTerminal));
     }
-    if let Some((session, agent)) = matches.first() {
-        if observations.incomplete {
-            return unavailable(RuntimeReason::TerminalUnavailable);
+    let (session, agent) = matches.first()?;
+    if observations.incomplete {
+        return Some(unavailable(RuntimeReason::TerminalUnavailable));
+    }
+    let Some(instance_id) = agent.instance_id.as_ref().filter(|id| !id.is_empty()) else {
+        return Some(unavailable(RuntimeReason::TerminalUnavailable));
+    };
+    if session.is_empty() || agent.pane_id.as_str().is_empty() {
+        return Some(unavailable(RuntimeReason::TerminalUnavailable));
+    }
+    let status = match agent.status {
+        AgentStatus::Starting => TerminalRuntimeStatus::Starting,
+        AgentStatus::Working => TerminalRuntimeStatus::Working,
+        AgentStatus::Idle => TerminalRuntimeStatus::Idle,
+        AgentStatus::Blocked => TerminalRuntimeStatus::Blocked,
+        AgentStatus::Completed => TerminalRuntimeStatus::Completed,
+        AgentStatus::Unknown => TerminalRuntimeStatus::Unknown,
+    };
+    Some(SessionRuntime {
+        transcript: None,
+        source: RuntimeSource::Terminal,
+        interaction: RuntimeInteraction::Terminal,
+        status: Some(status),
+        terminal: Some(RuntimeTerminal {
+            session_id: session.clone(),
+            pane_id: agent.pane_id.as_str().into(),
+            instance_id: instance_id.clone(),
+        }),
+        reason: None,
+    })
+}
+
+fn resolve(observations: &Observations, id: &str, native: bool) -> SessionRuntime {
+    if uuid::Uuid::parse_str(id).is_ok() {
+        if let Some(runtime) = matched(observations, "codex", id) {
+            return runtime;
         }
-        let Some(instance_id) = agent.instance_id.as_ref().filter(|id| !id.is_empty()) else {
-            return unavailable(RuntimeReason::TerminalUnavailable);
-        };
-        if session.is_empty() || agent.pane_id.as_str().is_empty() {
-            return unavailable(RuntimeReason::TerminalUnavailable);
-        }
-        let status = match agent.status {
-            AgentStatus::Starting => TerminalRuntimeStatus::Starting,
-            AgentStatus::Working => TerminalRuntimeStatus::Working,
-            AgentStatus::Idle => TerminalRuntimeStatus::Idle,
-            AgentStatus::Blocked => TerminalRuntimeStatus::Blocked,
-            AgentStatus::Completed => TerminalRuntimeStatus::Completed,
-            AgentStatus::Unknown => TerminalRuntimeStatus::Unknown,
-        };
-        return SessionRuntime {
-            transcript: None,
-            source: RuntimeSource::Terminal,
-            interaction: RuntimeInteraction::Terminal,
-            status: Some(status),
-            terminal: Some(RuntimeTerminal {
-                session_id: session.clone(),
-                pane_id: agent.pane_id.as_str().into(),
-                instance_id: instance_id.clone(),
-            }),
-            reason: None,
-        };
     }
     if native {
         SessionRuntime {
@@ -381,6 +470,45 @@ mod tests {
             resolve(&observations, ID, true).source,
             RuntimeSource::Native
         );
+    }
+    #[tokio::test]
+    async fn an_acp_agent_in_a_herdr_pane_links_its_session_with_the_backend_identity() {
+        let herdr = crate::test_support::FakeHerdr::start(vec![], None);
+        let observer = TerminalRuntime::new(&[herdr.session()]);
+        let link = TerminalLink::new(observer.clone(), "antigravity");
+        let observe = |agents: Vec<Agent>| {
+            *observer.cache.lock().unwrap() = Some((
+                Instant::now(),
+                Arc::new(Observations {
+                    agents: agents.into_iter().map(|a| ("local".into(), a)).collect(),
+                    incomplete: false,
+                }),
+            ));
+        };
+        let wanted = [ID.to_owned()];
+        // Herdr names Antigravity's pane agent `agy`.
+        observe(vec![agent("agy", ID, AgentStatus::Working)]);
+        let live = link.live(&wanted).await.unwrap().remove(ID).unwrap();
+        assert_eq!(live.route, None, "prompts are not typed into the pane");
+        assert_eq!(live.runtime.interaction, RuntimeInteraction::Terminal);
+        assert_eq!(live.runtime.status, Some(TerminalRuntimeStatus::Working));
+        let terminal = live.runtime.terminal.unwrap();
+        assert_eq!(
+            (terminal.session_id.as_str(), terminal.pane_id.as_str()),
+            ("local", "p1")
+        );
+        assert_eq!(terminal.instance_id, "opaque-incarnation");
+        assert_eq!(link.held().await.unwrap(), wanted);
+        // A replaced agent in that pane, another agent kind, or no pane at
+        // all: the session stays native.
+        for agents in [
+            vec![agent("agy", &format!("{ID}-next"), AgentStatus::Idle)],
+            vec![agent("cursor", ID, AgentStatus::Idle)],
+            vec![],
+        ] {
+            observe(agents);
+            assert!(link.live(&wanted).await.unwrap().is_empty());
+        }
     }
     #[test]
     fn lost_terminal_observation_never_becomes_idle() {

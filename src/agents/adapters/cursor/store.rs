@@ -1,9 +1,10 @@
 //! Read-only views of the Cursor CLI's ACP session folder,
 //! `<config>/acp-sessions/<id>/`: `meta.json` (folder and title) for listing,
 //! and `store.db` (a content-addressed blob store) as retirement evidence.
-//! Chats started in Cursor's terminal UI live in a separate `chats/` store
-//! that `agent acp` cannot open, so they are not read here. Nothing here
-//! starts `agent` or writes to its files.
+//! Chats started in Cursor's terminal UI live in a separate
+//! `<config>/chats/<md5(folder)>/<id>/` store, same layout, that `agent acp`
+//! cannot open: one is listed and read only while a terminal pane holds it.
+//! Nothing here starts `agent` or writes to its files.
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
@@ -26,14 +27,39 @@ fn unavailable() -> AgentError {
 
 /// The CLI's own rule: `CURSOR_CONFIG_DIR`, else `$XDG_CONFIG_HOME/cursor`,
 /// else `~/.cursor`. The `agent acp` child inherits the same environment.
-fn root() -> Option<PathBuf> {
+fn config() -> Option<PathBuf> {
     let set = |name: &str| std::env::var_os(name).filter(|value| !value.is_empty());
-    let config = match (set("CURSOR_CONFIG_DIR"), set("XDG_CONFIG_HOME")) {
+    Some(match (set("CURSOR_CONFIG_DIR"), set("XDG_CONFIG_HOME")) {
         (Some(dir), _) => PathBuf::from(dir),
         (None, Some(xdg)) => PathBuf::from(xdg).join("cursor"),
         (None, None) => dirs::home_dir()?.join(".cursor"),
-    };
-    Some(config.join("acp-sessions"))
+    })
+}
+
+fn root() -> Option<PathBuf> {
+    Some(config()?.join("acp-sessions"))
+}
+
+/// The terminal UI's folder for chat `id` under `chats` (one subfolder per
+/// working folder), when it has a store.
+fn chat_folder(chats: &Path, id: &str) -> Option<PathBuf> {
+    if !valid_id(id) {
+        return None;
+    }
+    std::fs::read_dir(chats)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path().join(id))
+        .find(|folder| folder.join("store.db").is_file())
+}
+
+/// The store a terminal writes for `id`: its terminal chat, else the ACP
+/// session (`agent --resume` of an ACP id starts a terminal chat of that id).
+fn terminal_store(id: &str) -> Option<PathBuf> {
+    let config = config()?;
+    chat_folder(&config.join("chats"), id)
+        .or_else(|| valid_id(id).then(|| config.join("acp-sessions").join(id)))
+        .map(|folder| folder.join("store.db"))
 }
 
 fn valid_id(id: &str) -> bool {
@@ -120,12 +146,16 @@ pub(super) fn list_at(
         .collect())
 }
 
-fn read_meta(path: &Path) -> Option<(String, String)> {
+fn read_json(path: &Path) -> Option<Value> {
     use std::io::Read as _;
     let file = std::fs::File::open(path).ok()?;
     let mut bytes = Vec::new();
     file.take(MAX_META_BYTES).read_to_end(&mut bytes).ok()?;
-    let meta: Value = serde_json::from_slice(&bytes).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+fn read_meta(path: &Path) -> Option<(String, String)> {
+    let meta = read_json(path)?;
     let cwd = meta["cwd"]
         .as_str()
         .filter(|cwd| Path::new(cwd).is_absolute())?;
@@ -138,12 +168,109 @@ fn read_meta(path: &Path) -> Option<(String, String)> {
     (!title.is_empty()).then(|| (cwd.to_owned(), title))
 }
 
-/// When session `id`'s store was last written, for idle retirement.
+/// When session `id`'s store was last written, for idle retirement and to
+/// follow a terminal chat.
 pub(super) fn store_modified(id: &str) -> Option<std::time::SystemTime> {
     if !valid_id(id) {
         return None;
     }
-    crate::agents::adapters::acp::idle::sqlite_modified(&root()?.join(id).join("store.db"))
+    let acp = root()?.join(id).join("store.db");
+    let path = if acp.is_file() {
+        acp
+    } else {
+        terminal_store(id)?
+    };
+    crate::agents::adapters::acp::idle::sqlite_modified(&path)
+}
+
+/// `session/list` rows for the terminal chats among `ids`: prompted, not a
+/// subagent's, titled by their first prompt.
+pub(super) async fn terminal_sessions(
+    ids: Vec<String>,
+    stop: &CancellationToken,
+) -> Result<Vec<Value>, AgentError> {
+    let Some(config) = config() else {
+        return Ok(Vec::new());
+    };
+    blocking(stop, move |stop| {
+        Ok(terminal_sessions_at(&config.join("chats"), &ids, &stop))
+    })
+    .await
+}
+
+pub(super) fn terminal_sessions_at(
+    chats: &Path,
+    ids: &[String],
+    stop: &CancellationToken,
+) -> Vec<Value> {
+    ids.iter()
+        .filter_map(|id| {
+            let folder = chat_folder(chats, id)?;
+            let meta = read_json(&folder.join("meta.json"))?;
+            let cwd = meta["cwd"]
+                .as_str()
+                .filter(|cwd| Path::new(cwd).is_absolute())?;
+            if meta["isSubagent"] == true {
+                return None;
+            }
+            let snapshot = snapshot_of(&folder.join("store.db"), id, stop).ok()?;
+            let title: String = snapshot.entries.first()?["user"]
+                .as_str()?
+                .trim()
+                .chars()
+                .take(MAX_TITLE_CHARS)
+                .collect();
+            let mut row = json!({ "sessionId": id, "cwd": cwd, "title": title });
+            if let Some(updated) = ["store.db-wal", "store.db", "meta.json"]
+                .iter()
+                .filter_map(|name| modified_ms(&folder.join(name)))
+                .max()
+            {
+                row["updatedAt"] = json!(crate::agents::adapters::t3::client::iso_from_ms(updated));
+            }
+            Some(row)
+        })
+        .collect()
+}
+
+/// A terminal-held conversation's prompts and replies, read from its store.
+pub(super) async fn live_timeline(
+    id: &str,
+    stop: &CancellationToken,
+) -> Result<Vec<crate::agents::domain::TimelineItem>, AgentError> {
+    let path = terminal_store(id).ok_or_else(unavailable)?;
+    let id = id.to_owned();
+    blocking(stop, move |stop| {
+        Ok(timeline_of(&snapshot_of(&path, &id, &stop)?))
+    })
+    .await
+}
+
+pub(super) fn timeline_of(snapshot: &NativeSnapshot) -> Vec<crate::agents::domain::TimelineItem> {
+    let mut projection = crate::agents::adapters::acp::mapper::Projection::new(false);
+    for entry in &snapshot.entries {
+        let replies: Vec<_> = entry["replies"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect();
+        for (kind, text) in [
+            (
+                "user_message_chunk",
+                entry["user"].as_str().unwrap_or_default().to_owned(),
+            ),
+            ("agent_message_chunk", replies.join("\n\n")),
+        ] {
+            if !text.is_empty() {
+                let _ = projection.update(&json!({
+                    "sessionUpdate": kind,
+                    "content": { "type": "text", "text": text },
+                }));
+            }
+        }
+    }
+    projection.timeline()
 }
 
 fn modified_ms(path: &Path) -> Option<u64> {
@@ -170,14 +297,21 @@ pub(super) fn snapshot_at(
     id: &str,
     stop: &CancellationToken,
 ) -> Result<NativeSnapshot, AgentError> {
+    snapshot_of(&root.join(id).join("store.db"), id, stop)
+}
+
+fn snapshot_of(
+    path: &Path,
+    id: &str,
+    stop: &CancellationToken,
+) -> Result<NativeSnapshot, AgentError> {
     use rusqlite::OpenFlags;
-    let path = root.join(id).join("store.db");
-    let stat = std::fs::symlink_metadata(&path).map_err(|_| unavailable())?;
+    let stat = std::fs::symlink_metadata(path).map_err(|_| unavailable())?;
     if !stat.is_file() {
         return Err(unavailable());
     }
     let db = rusqlite::Connection::open_with_flags(
-        &path,
+        path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .map_err(|_| unavailable())?;
