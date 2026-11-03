@@ -252,7 +252,7 @@ impl SessionHub for RemoteHub {
                 .call(Method::GET, &["api", "discovery"], &[], None)
                 .await?;
             let agents = json
-                .pointer("/agents/agents")
+                .pointer("/planes/agents/agents")
                 .cloned()
                 .unwrap_or(Value::Array(Vec::new()));
             decode(agents)
