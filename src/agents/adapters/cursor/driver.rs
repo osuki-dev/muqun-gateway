@@ -58,6 +58,20 @@ impl AcpProvider for CursorProvider {
     fn transcript_modified(_directory: &str, id: &str) -> Option<std::time::SystemTime> {
         super::store::store_modified(id)
     }
+    const LIVE_TIMELINE: bool = true;
+    fn live_timeline<'a>(
+        _directory: &'a str,
+        id: &'a str,
+        stop: &'a CancellationToken,
+    ) -> AgentFuture<'a, Vec<crate::agents::domain::TimelineItem>> {
+        Box::pin(super::store::live_timeline(id, stop))
+    }
+    fn terminal_sessions<'a>(
+        ids: Vec<String>,
+        stop: &'a CancellationToken,
+    ) -> Option<AgentFuture<'a, Vec<Value>>> {
+        Some(Box::pin(super::store::terminal_sessions(ids, stop)))
+    }
     fn offline_sessions<'a>(
         directory: Option<&'a str>,
         _owned: std::collections::HashSet<String>,
