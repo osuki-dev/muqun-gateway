@@ -33,6 +33,9 @@
     --mq-bar-3: 3px;
     --mq-hairline: 1px;
     --mq-motion-micro: 150ms;
+    /* Shared interaction fills: overlay on bare surfaces; stronger on already-raised chips. */
+    --mq-hover: var(--surface-overlay);
+    --mq-hover-strong: var(--input-bg-hover);
 }
 
 /* Agent brand colours: `--agent-<id>` and the `.mq-agent--<id>` rules that use
@@ -51,10 +54,10 @@
 .mq-topbar {
     background: var(--surface);
     border-bottom: none;
-    padding: 0 var(--mq-space-3);
+    padding: 0 var(--mq-space-4);
     gap: var(--mq-space-3);
 }
-.mq-brand { padding-right: var(--mq-space-1); }
+.mq-brand { padding-right: var(--mq-space-2); gap: var(--mq-space-2); }
 .mq-topbar-title { gap: var(--mq-space-3); color: var(--text-primary); }
 .mq-topbar-session { color: var(--text-primary); }
 .mq-topbar-branch { gap: var(--mq-space-1); color: var(--text-secondary); }
@@ -63,7 +66,7 @@
     border-radius: var(--mq-radius-sm);
     transition: background var(--mq-motion-micro) ease-out, color var(--mq-motion-micro) ease-out;
 }
-.mq-icon-button:hover { background: var(--surface-overlay); color: var(--text-primary); }
+.mq-icon-button:hover { background: var(--mq-hover); color: var(--text-primary); }
 .mq-ghost {
     padding: 0 var(--mq-space-2);
     gap: var(--mq-space-2);
@@ -71,7 +74,7 @@
     color: var(--text-secondary);
     transition: background var(--mq-motion-micro) ease-out, color var(--mq-motion-micro) ease-out;
 }
-.mq-ghost:hover { background: var(--surface-overlay); color: var(--text-primary); }
+.mq-ghost:hover { background: var(--mq-hover); color: var(--text-primary); }
 .mq-ghost--chevron { padding: 0 var(--mq-space-1); }
 .mq-open-in { gap: 0; }
 .mq-diff-count { gap: var(--mq-space-1); }
@@ -98,9 +101,10 @@
     color: var(--text-secondary);
 }
 .mq-diff-panel-row:hover {
-    background: var(--surface-overlay);
+    background: var(--mq-hover);
     color: var(--text-primary);
 }
+.mq-diff-open:hover { color: var(--primary-hover); }
 .mq-diff-panel-row--open { background: var(--accent-subtle); color: var(--text-primary); }
 .mq-diff-open {
     padding: 0 var(--mq-space-2);
@@ -146,7 +150,7 @@
     border-radius: var(--mq-radius-sm);
     transition: background var(--mq-motion-micro) ease-out;
 }
-.mq-prow:hover { background: var(--surface-overlay); }
+.mq-prow:hover { background: var(--mq-hover); }
 .mq-prow-main { padding: 0 var(--mq-space-2) 0 var(--mq-space-2); gap: var(--mq-space-2); color: var(--text-primary); }
 .mq-prow-parent { color: var(--text-tertiary); }
 .mq-prow-missing { color: var(--text-tertiary); padding-left: var(--mq-space-2); }
@@ -162,7 +166,7 @@
     transition: background var(--mq-motion-micro) ease-out, color var(--mq-motion-micro) ease-out;
 }
 .mq-srow:has(.mq-raised) { color: var(--text-primary); }
-.mq-srow:hover { background: var(--surface-overlay); color: var(--text-primary); }
+.mq-srow:hover { background: var(--mq-hover); color: var(--text-primary); }
 .mq-srow--more { color: var(--text-tertiary); }
 .mq-srow-time {
     padding: 0 var(--mq-space-2) 0 var(--mq-space-3);
@@ -191,7 +195,7 @@
     color: var(--text-secondary);
     transition: background var(--mq-motion-micro) ease-out, color var(--mq-motion-micro) ease-out;
 }
-.mq-side-entry:hover { background: var(--surface-overlay); color: var(--text-primary); }
+.mq-side-entry:hover { background: var(--mq-hover); color: var(--text-primary); }
 .mq-side-entry--rail { padding: 0; }
 .mq-nav-label { color: inherit; }
 .mq-badge-count {
@@ -207,7 +211,7 @@
     border-radius: var(--mq-radius-md);
     transition: background var(--mq-motion-micro) ease-out;
 }
-.mq-rail-item:hover { background: var(--input-bg-hover); }
+.mq-rail-item:hover { background: var(--mq-hover); }
 .mq-inbox { padding: var(--mq-space-8) var(--mq-space-10); gap: var(--mq-space-3); background: var(--background); color: var(--text-primary); }
 .mq-inbox-list { gap: var(--mq-space-1); padding-top: var(--mq-space-3); }
 .mq-inbox-row {
@@ -216,7 +220,7 @@
     border-radius: var(--mq-radius-md);
     transition: background var(--mq-motion-micro) ease-out;
 }
-.mq-inbox-row:hover { background: var(--surface-overlay); }
+.mq-inbox-row:hover { background: var(--mq-hover); }
 /* /sidebar */
 
 .mq-chips { gap: 4px; padding: 4px 0; }
@@ -227,9 +231,9 @@
     border: none;
     background: var(--surface-overlay);
     color: var(--text-secondary);
-    transition: background 150ms ease-out;
+    transition: background var(--mq-motion-micro) ease-out, color var(--mq-motion-micro) ease-out;
 }
-.mq-chip:hover { background: var(--input-bg-hover); }
+.mq-chip:hover { background: var(--mq-hover-strong); color: var(--text-primary); }
 .mq-chip--active { background: var(--accent-subtle); color: var(--text-primary); }
 .mq-standing--usable { color: var(--success); }
 .mq-standing--checking { color: var(--text-tertiary); }
@@ -247,15 +251,21 @@
 }
 .mq-start-title { color: var(--text-primary); }
 .mq-start-subtitle { color: var(--text-secondary); }
+.mq-start-column { gap: var(--mq-space-3); }
+.mq-start-card { padding-top: var(--mq-space-4); }
+.mq-start-recent { padding-top: var(--mq-space-2); }
+.mq-start-rows { gap: var(--mq-space-1); }
 .mq-start-label { padding: var(--mq-space-8) 0 var(--mq-space-2) 0; color: var(--text-tertiary); }
 .mq-start-empty { padding: var(--mq-space-3) 0; color: var(--text-tertiary); }
 .mq-start-row {
     gap: var(--mq-space-3);
+    padding: var(--mq-space-2) var(--mq-space-2);
+    margin: 0 calc(-1 * var(--mq-space-2));
     color: var(--text-primary);
     border-radius: var(--mq-radius-sm);
     transition: background var(--mq-motion-micro) ease-out;
 }
-.mq-start-row:hover { background: var(--surface-overlay); }
+.mq-start-row:hover { background: var(--mq-hover); }
 .mq-start-row-project, .mq-start-row-when { color: var(--text-tertiary); }
 .mq-start-main { gap: var(--mq-space-3); }
 /* hover actions: Open / Pin — soft fade over the trailing meta */
@@ -274,8 +284,9 @@
     padding: 2px var(--mq-space-2);
     border-radius: var(--mq-radius-sm);
     color: var(--text-secondary);
+    transition: background var(--mq-motion-micro) ease-out, color var(--mq-motion-micro) ease-out;
 }
-.mq-start-action:hover { background: var(--surface-elevated); color: var(--text-primary); }
+.mq-start-action:hover { background: var(--mq-hover-strong); color: var(--text-primary); }
 /* Status dots: Home reuses sessions::badged_mark (Success/Warning/Error). */
 /* /start ------------------------------------------------------------- */
 
@@ -326,12 +337,14 @@
     color: var(--text-tertiary);
     transition: background 120ms ease-out;
 }
-.mq-copy:hover { background: var(--surface-overlay); color: var(--text-primary); }
+.mq-copy:hover { background: var(--mq-hover); color: var(--text-primary); }
 .mq-row-actions { padding-top: var(--mq-space-1); gap: var(--mq-space-1); }
 .mq-link-button {
     padding: 2px 0;
     color: var(--text-link);
+    transition: color var(--mq-motion-micro) ease-out;
 }
+.mq-link-button:hover { color: var(--primary-hover); }
 
 .mq-user-row { padding-left: var(--mq-space-10); }
 .mq-user {
@@ -370,7 +383,7 @@
     align-items: center;
     justify-content: center;
 }
-.mq-media-file:hover { color: var(--text-primary); background: var(--surface-overlay); }
+.mq-media-file:hover { color: var(--text-primary); background: var(--mq-hover); }
 .mq-attach-chip {
     height: 24px;
     padding: 0 var(--mq-space-2);
@@ -379,7 +392,9 @@
     background: var(--surface-overlay);
     color: var(--text-secondary);
     align-items: center;
+    transition: background var(--mq-motion-micro) ease-out, color var(--mq-motion-micro) ease-out;
 }
+.mq-attach-chip:hover { background: var(--mq-hover-strong); color: var(--text-primary); }
 
 .mq-reasoning-head,
 .mq-injected-head {
@@ -416,7 +431,7 @@
     margin: 0 calc(-1 * var(--mq-space-1));
     transition: background var(--mq-motion-micro) ease-out;
 }
-.mq-tool-row:hover { background: var(--surface-overlay); }
+.mq-tool-row:hover { background: var(--mq-hover); }
 .mq-card-body { padding: var(--mq-space-2) var(--mq-space-3); gap: var(--mq-space-2); }
 .mq-density--compact .mq-card-body { padding: var(--mq-space-1) var(--mq-space-3); }
 .mq-card-head { gap: var(--mq-space-2); color: var(--text-secondary); }
@@ -488,7 +503,7 @@
     border-radius: var(--mq-radius-sm);
 }
 .mq-choice--deny { border: none; background: var(--surface-overlay); min-width: 76px; }
-.mq-choice--deny:hover { background: var(--input-bg-hover); }
+.mq-choice--deny:hover { background: var(--mq-hover-strong); }
 .mq-choice--allow { background: var(--primary); min-width: 108px; }
 .mq-choice--allow:hover { background: var(--primary-hover); }
 .mq-on-primary { color: var(--text-inverse); }
@@ -509,17 +524,9 @@
     animation: mq-cursor-pulse 1.1s ease-in-out infinite;
 }
 
-.mq-pill {
-    padding: var(--mq-space-1) var(--mq-space-3);
-    border-radius: var(--mq-radius-lg);
-    background: var(--surface-elevated);
-    border: none;
-    color: var(--text-primary);
-}
-.mq-pill:hover { background: var(--surface-overlay); }
-
-/* Tool and diff rows: one 36 px line, the card's padding is sideways only. */
-.mq-tool-body { padding: 0 var(--mq-space-3) var(--mq-space-2); gap: 0; }
+/* Tool rows: flush with timeline; card-body owns padding for diff/shell cards. */
+.mq-tool-body { padding: 0 0 var(--mq-space-1) 0; gap: var(--mq-space-1); }
+.mq-card-body > .mq-tool-body { padding: 0; gap: var(--mq-space-1); }
 .mq-tool-row { gap: var(--mq-space-2); color: var(--text-secondary); }
 .mq-tool-body .mq-tool-section,
 .mq-tool-body .mq-tool-input,
@@ -527,8 +534,9 @@
 .mq-diff-head { gap: var(--mq-space-3); color: var(--text-secondary); }
 .mq-diff-title { gap: var(--mq-space-2); }
 .mq-link-button--quiet { color: var(--text-secondary); }
+.mq-link-button--quiet:hover { color: var(--text-primary); }
 .mq-chevron-button { padding: var(--mq-space-1); border-radius: var(--mq-radius-sm); }
-.mq-chevron-button:hover { background: var(--surface-overlay); }
+.mq-chevron-button:hover { background: var(--mq-hover); }
 .mq-diff-body { padding-bottom: var(--mq-space-1); }
 .mq-tool-body .mq-link-button { padding: var(--mq-space-1) 0; }
 
@@ -541,7 +549,7 @@
     border-radius: var(--mq-radius-md);
     background: transparent;
 }
-.mq-summary:hover { background: var(--surface-overlay); }
+.mq-summary:hover { background: var(--mq-hover); }
 
 .mq-debug {
     padding: var(--mq-space-1) var(--mq-space-2);
@@ -574,17 +582,23 @@
    the field, staged files, waiting prompts, the 28 px mono pills. */
 
 .mq-cmp-strip { background: transparent; }
-.mq-cmp-slot { padding: 0 var(--mq-space-4) var(--mq-space-4) var(--mq-space-4); }
+.mq-cmp-slot { padding: 0 var(--mq-space-5) var(--mq-space-5) var(--mq-space-5); }
 .mq-cmp-card {
     background: var(--surface);
     border: none;
     border-radius: var(--mq-radius-lg);
-    padding: var(--mq-space-2) var(--mq-space-3) var(--mq-space-2) var(--mq-space-3);
+    padding: var(--mq-space-3) var(--mq-space-3) var(--mq-space-2) var(--mq-space-3);
     gap: var(--mq-space-2);
 }
 .mq-cmp-card:focus-within { background: var(--surface-elevated); }
 .mq-cmp-input-row { gap: var(--mq-space-2); }
-.mq-cmp-attach { padding: var(--mq-space-2) var(--mq-space-1); }
+.mq-cmp-attach {
+    padding: var(--mq-space-2) var(--mq-space-1);
+    border-radius: var(--mq-radius-sm);
+    color: var(--text-tertiary);
+    transition: background var(--mq-motion-micro) ease-out, color var(--mq-motion-micro) ease-out;
+}
+.mq-cmp-attach:hover { background: var(--mq-hover); color: var(--text-primary); }
 /* the field has no chrome of its own: the card carries the ring */
 .mq-cmp-input, .mq-cmp-input:hover, .mq-cmp-input:focus {
     background: transparent;
@@ -595,6 +609,7 @@
 .mq-cmp-pill-row { gap: var(--mq-space-2); }
 .mq-pills { gap: var(--mq-space-2); }
 .mq-cmp-right { gap: var(--mq-space-3); color: var(--text-tertiary); }
+/* Pills sit on surface-overlay — hover must step up (--mq-hover-strong), not restate overlay. */
 .mq-pill {
     padding: 0 var(--mq-space-2);
     gap: 6px;
@@ -602,10 +617,11 @@
     border: none;
     background: var(--surface-overlay);
     color: var(--text-secondary);
-    transition: background var(--mq-motion-micro) ease-out;
+    transition: background var(--mq-motion-micro) ease-out, color var(--mq-motion-micro) ease-out;
 }
-.mq-pill:hover { background: var(--surface-overlay); color: var(--text-primary); }
+.mq-pill:hover { background: var(--mq-hover-strong); color: var(--text-primary); }
 .mq-pill--open { background: var(--accent-subtle); color: var(--text-primary); }
+.mq-pill--open:hover { background: var(--accent-subtle); }
 .mq-pill--static { background: transparent; }
 .mq-pill--static:hover { background: transparent; }
 .mq-usage { padding: 0 var(--mq-space-1); color: var(--text-tertiary); }
@@ -620,8 +636,9 @@
     border: none;
     background: var(--surface-overlay);
     color: var(--text-secondary);
+    transition: background var(--mq-motion-micro) ease-out, color var(--mq-motion-micro) ease-out;
 }
-.mq-cmp-stop:hover { background: var(--input-bg-hover); }
+.mq-cmp-stop:hover { background: var(--mq-hover-strong); color: var(--text-primary); }
 .mq-cmp-primary {
     gap: 6px;
     height: 28px;
@@ -650,12 +667,14 @@
     background: var(--input-bg);
     color: var(--text-secondary);
 }
+.mq-menu-search:focus-within { background: var(--mq-hover-strong); }
 .mq-menu-row, .mq-popup-row {
     padding: 0 var(--mq-space-2);
     gap: var(--mq-space-2);
     border-radius: var(--mq-radius-sm);
+    transition: background var(--mq-motion-micro) ease-out;
 }
-.mq-menu-row:hover, .mq-popup-row:hover { background: var(--surface-overlay); }
+.mq-menu-row:hover, .mq-popup-row:hover { background: var(--mq-hover); }
 .mq-menu-row--sel, .mq-popup-row--sel { background: var(--accent-subtle); }
 .mq-menu-row--focus { background: var(--accent-subtle); outline: none; }
 .mq-menu-row--off { opacity: 0.55; }
@@ -663,6 +682,7 @@
 .mq-menu-dim, .mq-popup-detail { color: var(--text-tertiary); padding-left: var(--mq-space-2); }
 .mq-menu-gap { padding-left: var(--mq-space-2); }
 .mq-menu-link { color: var(--primary); padding-left: var(--mq-space-2); }
+.mq-menu-link:hover { color: var(--primary-hover); }
 .mq-menu-sep { background: transparent; height: 0; margin: var(--mq-space-1) 0; }
 
 /* waiting prompts and staged files above the field */
@@ -679,10 +699,13 @@
     border: none;
     background: var(--surface-overlay);
     color: var(--text-secondary);
+    transition: background var(--mq-motion-micro) ease-out, color var(--mq-motion-micro) ease-out;
 }
+.mq-chip-toggle:hover { background: var(--mq-hover-strong); color: var(--text-primary); }
 .mq-chip-toggle--on { background: var(--warning-bg); color: var(--text-primary); }
+.mq-chip-toggle--on:hover { background: var(--warning-bg); }
 .mq-chip-x { padding: 2px; border-radius: var(--mq-radius-sm); }
-.mq-chip-x:hover { background: var(--surface-overlay); }
+.mq-chip-x:hover { background: var(--mq-hover-strong); }
 .mq-chips { gap: var(--mq-space-2); padding: var(--mq-space-1) 0; }
 .mq-chip {
     gap: 6px;
@@ -691,8 +714,11 @@
     border: none;
     background: var(--surface-overlay);
     color: var(--text-secondary);
+    transition: background var(--mq-motion-micro) ease-out, color var(--mq-motion-micro) ease-out;
 }
+.mq-chip:hover { background: var(--mq-hover-strong); color: var(--text-primary); }
 .mq-chip--failed { background: var(--error-bg); color: var(--error); }
+.mq-chip--failed:hover { background: var(--error-bg); color: var(--error); }
 /* /composer ---------------------------------------------------------- */
 
 .mq-settings { background: var(--background); }
@@ -737,7 +763,7 @@
 }
 .mq-agent-section-head { gap: 10px; }
 .mq-agent-section-name { padding-left: 2px; color: var(--text-primary); }
-.mq-settings-wrap { padding: 0 8px 8px 8px; }
+.mq-settings-wrap { padding: 0 24px 24px 24px; }
 .mq-settings-entry { gap: 8px; }
 .mq-nav-label { color: inherit; }
 .mq-folder-option { gap: 10px; }
