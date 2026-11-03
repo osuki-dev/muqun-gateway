@@ -30,7 +30,8 @@
   agent's native "approve everything" control and takes it back out: Claude
   Code `session/set_mode bypassPermissions`, Qoder `session/set_mode yolo`,
   Codex a `turn/start` `approvalPolicy: never` override carried by the next
-  prompt (its workspace-write sandbox stays), OpenCode a session
+  prompt together with `sandboxPolicy: dangerFullAccess` (no asking and no
+  sandbox), OpenCode a session
   permission rule allowing every action, T3 `thread.runtime-mode.set
   full-access`. Off restores what the session ran in before. Discovery states
   `features.autoApprove = {scope, native}` per agent; Antigravity, Cursor,
@@ -38,10 +39,10 @@
   `--force`, `FX_PERMISSION_MODE=full-access`, `MUQUN_PI_APPROVALS=never`), so
   the switch answers 501 there and the App says so; DeepSeek has per-request
   approvals only. A bypass mode is still never remembered as a new session's
-  default. Switching on from a device needs `allow_remote_auto_approve:
-  true` in `config.json` (off by default), and so does selecting such a
-  mode through `POST …/mode` or a new session's `mode`; switching off never
-  does.
+  default. Switching on from a device is allowed by default; an owner who
+  wants to keep phones from doing it sets `allow_remote_auto_approve: false`
+  in `config.json`, which also refuses selecting such a mode through
+  `POST …/mode` or a new session's `mode`; switching off never is.
 
 - **FX and Qoder no longer start a process every minute to re-read an
   unchanged session store.** The task follower reads each open task's session

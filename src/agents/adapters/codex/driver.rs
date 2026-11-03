@@ -182,11 +182,11 @@ fn sandbox_width(sandbox: &Value) -> Option<u8> {
 }
 
 impl ThreadPolicy {
-    /// No approvals, inside Codex's workspace-write sandbox: the switch
-    /// stops the asking, never the sandbox. `dangerFullAccess` is left to a
-    /// launch the owner makes at the terminal.
+    /// No approvals and no sandbox: the switch lets the agent do anything,
+    /// as `--dangerously-bypass-approvals-and-sandbox` does at the terminal.
+    /// Off restores the pair the thread ran under before, never wider.
     fn bypass_pair() -> (Value, Value) {
-        (json!("never"), json!({"type":"workspaceWrite"}))
+        (json!("never"), json!({"type":"dangerFullAccess"}))
     }
 
     /// Bypass is "never asks" with a sandbox that lets commands write:
