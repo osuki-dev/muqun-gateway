@@ -1042,3 +1042,36 @@ async fn listed_sessions_are_deleted_without_loading_where_the_agent_allows_it()
     assert!(!listed.has_live_stream());
     listed.shutdown().await;
 }
+
+/// Every prepare and every send of a terminal-held session asks to follow
+/// its transcript. One follower per session: a repeated ask extends the
+/// running follower's window, and a follower that ends leaves the table so
+/// the next ask starts a fresh one.
+#[tokio::test]
+async fn repeated_follows_of_one_terminal_session_keep_one_follower() {
+    let fixture = Fixture::new().await;
+    let driver = driver(&fixture);
+    tokio::time::pause();
+    driver.follow_terminal("held".into());
+    let first = driver.followers.lock().unwrap()["held"];
+    tokio::time::advance(Duration::from_millis(500)).await;
+    driver.follow_terminal("held".into());
+    driver.follow_terminal("other".into());
+    {
+        let followers = driver.followers.lock().unwrap();
+        assert_eq!(followers.len(), 2, "one follower per session");
+        assert_eq!(followers["held"], first + Duration::from_millis(500));
+    }
+    // Neither session is known here, so each follower's first tick finds no
+    // directory and ends, taking its entry with it. Real time: the lookup
+    // asks the fixture process, which a paused clock would race past.
+    tokio::time::resume();
+    for _ in 0..200 {
+        if driver.followers.lock().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(driver.followers.lock().unwrap().is_empty());
+    driver.shutdown().await;
+}
