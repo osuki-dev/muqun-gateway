@@ -14,7 +14,7 @@ use crate::ui::text::{mono_text, ui_text};
 use crate::ui::App;
 
 /// Queued prompts shown; the rest are a count.
-const SHOWN: usize = 3;
+pub(super) const SHOWN: usize = 3;
 /// A summary's longest line, in characters.
 const SUMMARY_CHARS: usize = 64;
 /// Staged image thumbnails in the chip row.
@@ -140,8 +140,14 @@ pub fn waiting(app: &App, aim: &Aim) -> Option<Div> {
                         .overflow_clip()
                         .child(ui_text(label).size(12.0).no_wrap().no_cursor()),
                 )
-                .child(toggle)
-                .child(cancel),
+                .child(
+                    div()
+                        .class("mq-queued-actions")
+                        .flex_row()
+                        .items_center()
+                        .child(toggle)
+                        .child(cancel),
+                ),
         );
     }
     if items.len() > SHOWN {

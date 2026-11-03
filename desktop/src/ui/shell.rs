@@ -703,6 +703,7 @@ fn main_panel(app: &App, width: f32, height: f32) -> Div {
     let selected = app.bindings.selected.clone();
     let settings_open = app.bindings.settings_open.clone();
     let inbox_open = app.bindings.inbox_open.clone();
+    let cmp = composer::state::Cmp::get();
     let strip = errors::strip(app);
     let app = app.clone();
     let view = stateful_with_key::<NoState>("mq-main-view")
@@ -710,6 +711,9 @@ fn main_panel(app: &App, width: f32, height: f32) -> Div {
             selected.signal_id(),
             settings_open.signal_id(),
             inbox_open.signal_id(),
+            cmp.inbox.signal_id(),
+            cmp.staged.signal_id(),
+            cmp.rows.signal_id(),
         ])
         .on_state(move |_| {
             if settings_open.get() {
@@ -721,7 +725,7 @@ fn main_panel(app: &App, width: f32, height: f32) -> Div {
             if selected.get().is_none() {
                 return home::home(&app, width, height);
             }
-            let timeline_height = (height - composer::COMPOSER_HEIGHT).max(0.0);
+            let timeline_height = (height - composer::reserved_height()).max(0.0);
             div()
                 .w_full()
                 .h(height)

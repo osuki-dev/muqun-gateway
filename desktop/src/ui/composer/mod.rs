@@ -17,7 +17,7 @@ mod chips;
 pub mod pills;
 mod popup;
 pub mod qa;
-mod state;
+pub(crate) mod state;
 pub mod triggers;
 mod usage;
 
@@ -53,13 +53,40 @@ const KEY_UP: u32 = 38;
 const KEY_DOWN: u32 = 40;
 const KEY_V: u32 = 86;
 
-/// The session page's reserved height for the composer; the timeline takes
-/// the rest. The card grows upward over the timeline's foot when the text,
-/// the staged files or the waiting prompts need more.
+/// The session page's reserved height for the default two-row card (slot
+/// padding + field + pills). Extra text rows, staged files and the waiting
+/// queue add on top via [`reserved_height`] so the timeline never shows
+/// through a translucent overlay.
 pub const COMPOSER_HEIGHT: f32 = 148.0;
 /// Text area rows: 56 px at two, then up to six.
 const MIN_ROWS: usize = 2;
 const MAX_ROWS: usize = 6;
+const EXTRA_ROW_PX: f32 = 20.0;
+const QUEUED_ROW_PX: f32 = 32.0;
+const QUEUED_CHROME_PX: f32 = 12.0;
+const STAGED_ROW_PX: f32 = 36.0;
+
+/// Strip height for the open session: base card plus whatever sits above the
+/// field right now. Shell subtracts this from the column so the timeline
+/// ends above the card instead of painting under it.
+pub fn reserved_height() -> f32 {
+    let cmp = Cmp::get();
+    let extra_rows = cmp.rows.get().saturating_sub(MIN_ROWS) as f32 * EXTRA_ROW_PX;
+    let queued = cmp.inbox.get().len();
+    let queued_h = if queued == 0 {
+        0.0
+    } else {
+        QUEUED_CHROME_PX
+            + queued.min(chips::SHOWN) as f32 * QUEUED_ROW_PX
+            + if queued > chips::SHOWN { 18.0 } else { 0.0 }
+    };
+    let staged_h = if cmp.staged.get().is_empty() {
+        0.0
+    } else {
+        STAGED_ROW_PX
+    };
+    COMPOSER_HEIGHT + extra_rows + queued_h + staged_h
+}
 /// Most files staged on one message.
 const MAX_STAGED: usize = 10;
 /// The start page's composer card, wide; narrower windows take 100 % − 80.
@@ -1013,23 +1040,26 @@ pub fn composer(app: &App) -> impl ElementBuilder {
             let aim = aim(&app, Place::Session);
             sync_surface(&app, &aim.key);
             ensure_loaded(&app, &aim);
+            let height = reserved_height();
             div()
-                .class("mq-cmp-slot")
-                .absolute()
-                .left(0.0)
-                .right(0.0)
-                .bottom(0.0)
+                .class("mq-cmp-strip")
+                .w_full()
+                .h(height)
                 .flex_row()
+                .items_end()
                 .justify_center()
-                .child(card(&app, &aim, session_card_width(&app)))
+                .child(
+                    div()
+                        .class("mq-cmp-slot")
+                        .w_full()
+                        .flex_row()
+                        .justify_center()
+                        .child(card(&app, &aim, session_card_width(&app))),
+                )
         });
-    div()
-        .class("mq-cmp-strip")
-        .relative()
-        .w_full()
-        .h(COMPOSER_HEIGHT)
-        .flex_shrink_0()
-        .child(strip)
+    // Outer shell reserves max space via [`reserved_height`]; this wrapper
+    // rebuilds with the inbox / staged / rows so the strip matches.
+    div().w_full().flex_shrink_0().child(strip)
 }
 
 /// The widest the session page's card gets (the content column's width).

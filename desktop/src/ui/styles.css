@@ -585,8 +585,10 @@
 
 .mq-cmp-strip { background: transparent; }
 .mq-cmp-slot { padding: 0 var(--mq-space-5) var(--mq-space-5) var(--mq-space-5); }
+/* Elevated + opaque: the card grows up over the timeline, so a glass or
+   page-matching surface lets tool text bleed through the queue and field. */
 .mq-cmp-card {
-    background: var(--surface);
+    background: var(--surface-elevated);
     border: none;
     border-radius: var(--mq-radius-lg);
     padding: var(--mq-space-3) var(--mq-space-3) var(--mq-space-2) var(--mq-space-3);
@@ -688,13 +690,29 @@
 .mq-menu-sep { background: transparent; height: 0; margin: var(--mq-space-1) 0; }
 
 /* waiting prompts and staged files above the field */
-.mq-queued-list { gap: var(--mq-space-1); }
+.mq-queued-list {
+    gap: var(--mq-space-1);
+    padding: var(--mq-space-1);
+    border-radius: var(--mq-radius-md);
+    background: var(--background);
+}
 .mq-queued {
     gap: var(--mq-space-2);
-    padding: 2px 0;
-    color: var(--text-secondary);
+    padding: var(--mq-space-1) var(--mq-space-2);
+    min-height: 28px;
+    border-radius: var(--mq-radius-sm);
+    background: var(--surface);
+    color: var(--text-primary);
 }
-.mq-queued-more { color: var(--text-tertiary); }
+.mq-queued-actions {
+    gap: var(--mq-space-1);
+    flex-shrink: 0;
+    padding-left: var(--mq-space-2);
+}
+.mq-queued-more {
+    padding: 0 var(--mq-space-2);
+    color: var(--text-tertiary);
+}
 .mq-chip-toggle {
     padding: 2px var(--mq-space-2);
     border-radius: var(--mq-radius-sm);
@@ -703,11 +721,15 @@
     color: var(--text-secondary);
     transition: background var(--mq-motion-micro) ease-out, color var(--mq-motion-micro) ease-out;
 }
-.mq-chip-toggle:hover { background: var(--mq-hover-strong); }
+.mq-chip-toggle:hover { background: var(--mq-hover-strong); color: var(--text-primary); }
 .mq-chip-toggle--on { background: var(--warning-bg); color: var(--text-primary); }
 .mq-chip-toggle--on:hover { background: var(--warning-bg); }
-.mq-chip-x { padding: 2px; border-radius: var(--mq-radius-sm); }
-.mq-chip-x:hover { background: var(--mq-hover-strong); }
+.mq-chip-x {
+    padding: var(--mq-space-1);
+    border-radius: var(--mq-radius-sm);
+    color: var(--text-tertiary);
+}
+.mq-chip-x:hover { background: var(--mq-hover-strong); color: var(--text-primary); }
 .mq-chips { gap: var(--mq-space-2); padding: var(--mq-space-1) 0; }
 .mq-chip {
     gap: 6px;
