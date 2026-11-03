@@ -395,12 +395,8 @@ pub fn tool(ctx: &PartCtx<'_>, call: &ToolCall) -> Div {
         && !has_media
         && !has_structured
         && is_quiet_tool(&call.name);
-    // Media always opens; structured JSON waits until the call settles so
-    // syntect is not paid on every streaming delta.
-    let open = ctx.is_open(
-        "tool",
-        has_media || (has_structured && !unfinished && !waiting),
-    );
+    // Tools stay collapsed until the reader opens them (App-style).
+    let open = ctx.is_open("tool", false);
     let cwd = ctx
         .app
         .bindings
