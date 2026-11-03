@@ -6,7 +6,7 @@
 //! [`OpencodeConfig`], serialized exactly as the gateway's `config.json`
 //! names it, so the two files read the same.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -17,6 +17,8 @@ use muqun_gateway::agents::{
     OpencodeConfig, PiConfig, QoderConfig, T3Config,
 };
 use serde::{Deserialize, Serialize};
+
+use crate::model::projects::ProjectPrefs;
 
 pub const CONFIG_FILE: &str = "config.json";
 
@@ -93,6 +95,8 @@ pub struct General {
     /// The command "open in editor" will run, for later (`code`, `zed`, ...).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub editor_command: Option<String>,
+    /// The top bar's "Open in …": the editor used last.
+    pub editor: crate::platform::editors::Editor,
     /// Placeholder: closing the window will hide it to the tray instead of
     /// quitting. Stored, not acted on yet (there is no tray in P0).
     pub close_to_tray: bool,
@@ -208,44 +212,22 @@ pub enum Scheme {
     System,
 }
 
-/// How the sidebar groups sessions.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Grouping {
-    /// Today / Yesterday / This week / Earlier.
-    #[default]
-    Time,
-    Agent,
-    Folder,
-}
-
-impl Grouping {
-    /// The next mode in the cycle the sidebar's button steps through.
-    pub fn next(self) -> Self {
-        match self {
-            Self::Time => Self::Agent,
-            Self::Agent => Self::Folder,
-            Self::Folder => Self::Time,
-        }
-    }
-}
-
 /// Window furniture the owner arranged and expects back.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UiPrefs {
     /// The sidebar's width in logical pixels.
     pub sidebar_width: f32,
-    /// The agent the session list is filtered to; absent is "All".
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub agent_filter: Option<String>,
-    pub grouping: Grouping,
+    /// Pins, hidden projects and names given to projects, by project root
+    /// (`model/projects.rs`). Only projects with a choice are kept.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub projects: BTreeMap<String, ProjectPrefs>,
 }
 
 impl UiPrefs {
-    pub const SIDEBAR_DEFAULT: f32 = 300.0;
-    pub const SIDEBAR_MIN: f32 = 240.0;
-    pub const SIDEBAR_MAX: f32 = 420.0;
+    pub const SIDEBAR_DEFAULT: f32 = 260.0;
+    pub const SIDEBAR_MIN: f32 = 220.0;
+    pub const SIDEBAR_MAX: f32 = 360.0;
 
     /// The stored width, forced into the range the layout allows (a hand
     /// edited or NaN value never yields a broken window).
@@ -263,8 +245,7 @@ impl Default for UiPrefs {
     fn default() -> Self {
         Self {
             sidebar_width: Self::SIDEBAR_DEFAULT,
-            agent_filter: None,
-            grouping: Grouping::Time,
+            projects: BTreeMap::new(),
         }
     }
 }
@@ -276,8 +257,13 @@ impl Default for UiPrefs {
 pub enum ConfigEdit {
     Window(WindowGeometry),
     SidebarWidth(f32),
-    AgentFilter(Option<String>),
-    Grouping(Grouping),
+    /// What the owner chose for one project (pin, hide, name), by root.
+    Project {
+        root: String,
+        prefs: ProjectPrefs,
+    },
+    /// The editor "Open in …" uses.
+    Editor(crate::platform::editors::Editor),
     Scheme(Scheme),
     Language(Language),
     EditorCommand(Option<String>),
@@ -316,8 +302,14 @@ impl DesktopConfig {
         match edit {
             ConfigEdit::Window(geometry) => self.window = geometry,
             ConfigEdit::SidebarWidth(width) => self.ui.sidebar_width = width,
-            ConfigEdit::AgentFilter(agent) => self.ui.agent_filter = agent,
-            ConfigEdit::Grouping(grouping) => self.ui.grouping = grouping,
+            ConfigEdit::Project { root, prefs } => {
+                if prefs.is_default() {
+                    self.ui.projects.remove(&root);
+                } else {
+                    self.ui.projects.insert(root, prefs);
+                }
+            }
+            ConfigEdit::Editor(editor) => self.general.editor = editor,
             ConfigEdit::Scheme(scheme) => self.appearance.scheme = scheme,
             ConfigEdit::Language(language) => self.general.language = language,
             ConfigEdit::EditorCommand(command) => {
@@ -622,8 +614,18 @@ mod tests {
         use crate::agent_fields::Field;
         let mut config = DesktopConfig::default();
         config.apply(ConfigEdit::SidebarWidth(333.0));
-        config.apply(ConfigEdit::AgentFilter(Some("claude".into())));
-        config.apply(ConfigEdit::Grouping(Grouping::Folder));
+        config.apply(ConfigEdit::Project {
+            root: "/w/x".into(),
+            prefs: ProjectPrefs {
+                pinned: true,
+                ..ProjectPrefs::default()
+            },
+        });
+        config.apply(ConfigEdit::Project {
+            root: "/w/y".into(),
+            prefs: ProjectPrefs::default(),
+        });
+        config.apply(ConfigEdit::Editor(crate::platform::editors::Editor::Zed));
         config.apply(ConfigEdit::Language(Language::ZhCn));
         config.apply(ConfigEdit::Scheme(Scheme::Dark));
         config.apply(ConfigEdit::DefaultCwd(Some(PathBuf::from("/srv"))));
@@ -644,8 +646,12 @@ mod tests {
             value: "codex".into(),
         });
         assert_eq!(config.ui.sidebar_width, 333.0);
-        assert_eq!(config.ui.agent_filter.as_deref(), Some("claude"));
-        assert_eq!(config.ui.grouping, Grouping::Folder);
+        assert!(config.ui.projects["/w/x"].pinned);
+        assert!(
+            !config.ui.projects.contains_key("/w/y"),
+            "a project with nothing chosen is not kept"
+        );
+        assert_eq!(config.general.editor, crate::platform::editors::Editor::Zed);
         assert_eq!(config.general.language, Language::ZhCn);
         assert_eq!(config.appearance.scheme, Scheme::Dark);
         assert_eq!(config.general.default_cwd, Some(PathBuf::from("/srv")));
@@ -675,13 +681,25 @@ mod tests {
     }
 
     #[test]
-    fn an_old_file_without_the_new_blocks_still_loads_and_grouping_cycles() {
-        let config: DesktopConfig =
-            serde_json::from_str(r#"{"general":{"language":"en"},"ui":{"grouping":"agent"}}"#)
-                .unwrap();
-        assert_eq!(config.ui.grouping, Grouping::Agent);
+    fn an_old_file_without_the_new_blocks_still_loads() {
+        // `grouping` and `agent_filter` were the v1 sidebar's; they are
+        // ignored now, not an error.
+        let config: DesktopConfig = serde_json::from_str(
+            r#"{"general":{"language":"en"},"ui":{"grouping":"agent","agent_filter":"codex"}}"#,
+        )
+        .unwrap();
         assert_eq!(config.ui.sidebar_width, UiPrefs::SIDEBAR_DEFAULT);
+        assert!(config.ui.projects.is_empty());
         assert!(!config.general.close_to_tray);
-        assert_eq!(Grouping::Time.next().next().next(), Grouping::Time);
+        assert_eq!(
+            config.general.editor,
+            crate::platform::editors::Editor::VsCode
+        );
+        let config: DesktopConfig = serde_json::from_str(
+            r#"{"ui":{"projects":{"/w/x":{"pinned":true,"name":"X"}}},"general":{"editor":"zed"}}"#,
+        )
+        .unwrap();
+        assert_eq!(config.ui.projects["/w/x"].name.as_deref(), Some("X"));
+        assert_eq!(config.general.editor, crate::platform::editors::Editor::Zed);
     }
 }

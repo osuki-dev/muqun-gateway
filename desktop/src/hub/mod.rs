@@ -15,7 +15,7 @@ use std::path::Path;
 use std::pin::Pin;
 
 use muqun_gateway::agents::directories::Completion;
-use muqun_gateway::agents::ports::{AgentError, AgentSessionSnapshot};
+use muqun_gateway::agents::ports::{AgentError, AgentSessionSnapshot, FileDiffItem};
 use muqun_gateway::agents::{
     AgentCatalog, AgentDomainEvent, AgentProject, AgentSessionId, AgentSessionInfo, ModelRef,
     PermissionDecision, SessionQuery, TimelineItem,
@@ -142,6 +142,9 @@ pub trait SessionHub: Send + Sync {
     /// executables). The result's path is what [`SessionHub::send`] takes.
     fn store_attachment<'a>(&'a self, name: &'a str, bytes: Vec<u8>)
         -> HubFuture<'a, StoredUpload>;
+    /// The working-tree changes in the session's folder, as the agent's
+    /// `get_vcs_diff` reports them (`working` mode).
+    fn vcs_diff<'a>(&'a self, asid: &'a AgentSessionId) -> HubFuture<'a, Vec<FileDiffItem>>;
     /// Every session event of every agent, in the order the runtime saw them.
     fn events(&self) -> broadcast::Receiver<AgentDomainEvent>;
 }

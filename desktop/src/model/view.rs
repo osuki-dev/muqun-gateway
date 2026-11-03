@@ -18,8 +18,8 @@ use muqun_gateway::agents::{
 use muqun_gateway::platform::discovery::AgentDiscoveryInfo;
 
 use super::inbox::{UiAction, UiError, Update};
+use super::projects::DirInfo;
 use super::turn::{self, RowTurn, TurnState};
-use crate::config::Grouping;
 
 /// How many sessions the sidebar lists. P0 has no paging.
 pub const SESSION_LIST_LIMIT: usize = 100;
@@ -360,16 +360,22 @@ pub fn local_day(ms: u64, utc_offset_s: i64) -> i64 {
 }
 
 /// One listed session as the sidebar lays the list out: which session, in
-/// which place, under which heading. Only what decides the layout -- what a
+/// which place, under which project. Only what decides the layout -- what a
 /// row shows is in its [`SessionRow`], so a status change, a new title or the
 /// selection moving rewrites one row and leaves the list alone.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListedSession {
     pub asid: String,
-    pub agent_id: String,
     pub directory: Option<String>,
-    /// [`local_day`] of `updated_ms`, for the Time grouping.
-    pub day: i64,
+}
+
+/// What `get_vcs_diff` says about the open session's working tree.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DiffStat {
+    pub asid: String,
+    pub files: usize,
+    pub added: usize,
+    pub removed: usize,
 }
 
 /// The sidebar's sessions, newest first.
@@ -419,6 +425,14 @@ pub struct ViewState {
     pub completions: Vec<DirectoryEntry>,
     /// The prefix the shown completions answer.
     pub completion_prefix: String,
+    /// Forms waiting for an answer, in every session seen asking.
+    pub waiting_forms: Vec<FormRequest>,
+    /// What each session folder resolved to, by folder (`projects.rs`).
+    pub dirs: HashMap<String, DirInfo>,
+    /// Each agent's own project list, by agent.
+    pub known: std::collections::BTreeMap<String, Vec<AgentProject>>,
+    /// The open session's working-tree change count.
+    pub diff: Option<DiffStat>,
 }
 
 /// What one batch moved.
@@ -443,6 +457,9 @@ pub struct Changes {
     pub attention: bool,
     pub projects: bool,
     pub completions: bool,
+    pub dirs: bool,
+    pub known: bool,
+    pub diff: bool,
     /// A different session (or a fresh snapshot) is now shown.
     pub opened: bool,
     pub actions: Vec<UiAction>,
@@ -464,6 +481,9 @@ impl Changes {
             ("attention", self.attention),
             ("projects", self.projects),
             ("completions", self.completions),
+            ("dirs", self.dirs),
+            ("known", self.known),
+            ("diff", self.diff),
             ("opened", self.opened),
         ];
         let mut out: Vec<String> = flags
@@ -493,6 +513,7 @@ impl ViewState {
             return false;
         }
         self.selected = Some(asid.to_string());
+        self.diff = None;
         true
     }
 
@@ -565,6 +586,10 @@ impl ViewState {
                 self.attention.retain(|p| p.asid != asid);
                 self.attention.extend(pending_permissions.iter().cloned());
                 changes.attention |= self.attention != before;
+                let before = self.waiting_forms.clone();
+                self.waiting_forms.retain(|f| f.asid != asid);
+                self.waiting_forms.extend(snapshot.forms.iter().cloned());
+                changes.attention |= self.waiting_forms != before;
                 let snapshot = *snapshot;
                 // A fresh read of the session already shown (a resync) keeps
                 // the older pages it had loaded and what it knew about them.
@@ -645,6 +670,28 @@ impl ViewState {
                 changes.completions = true;
             }
             Update::Ui(action) => changes.actions.push(action),
+            Update::Directories(found) => {
+                for (dir, info) in found {
+                    if self.dirs.get(&dir) != Some(&info) {
+                        self.dirs.insert(dir, info);
+                        changes.dirs = true;
+                    }
+                }
+            }
+            Update::KnownProjects { agent, projects } => {
+                if self.known.get(&agent) != Some(&projects) {
+                    self.known.insert(agent, projects);
+                    changes.known = true;
+                }
+            }
+            Update::Diff(stat) => {
+                let fresh = self.selected.as_deref() == Some(stat.asid.as_str());
+                let stat = fresh.then_some(stat);
+                if self.diff != stat {
+                    self.diff = stat;
+                    changes.diff = true;
+                }
+            }
             Update::Earlier {
                 asid,
                 items,
@@ -689,6 +736,7 @@ impl ViewState {
     /// Back to Home: no session selected.
     pub fn deselect(&mut self) -> bool {
         self.active = None;
+        self.diff = None;
         self.selected.take().is_some()
     }
 
@@ -834,6 +882,11 @@ impl ViewState {
                 changes.permissions |= active.pending_permissions.len() != before;
             }
             AgentDomainEvent::FormPending { asid, request, .. } => {
+                match self.waiting_forms.iter().position(|f| f.id == request.id) {
+                    Some(at) => self.waiting_forms[at] = request.clone(),
+                    None => self.waiting_forms.push(request.clone()),
+                }
+                changes.attention = true;
                 let Some(active) = self.active_for(&asid.0) else {
                     return;
                 };
@@ -844,6 +897,9 @@ impl ViewState {
                 changes.forms = true;
             }
             AgentDomainEvent::FormResolved { asid, form_id, .. } => {
+                let before = self.waiting_forms.len();
+                self.waiting_forms.retain(|f| f.id != form_id);
+                changes.attention |= self.waiting_forms.len() != before;
                 let Some(active) = self.active_for(&asid.0) else {
                     return;
                 };
@@ -858,16 +914,14 @@ impl ViewState {
     }
 
     /// How the sidebar lays the listed sessions out.
-    pub fn listing(&self, utc_offset_s: i64) -> SessionListing {
+    pub fn listing(&self) -> SessionListing {
         SessionListing {
             sessions: self
                 .sessions
                 .iter()
                 .map(|s| ListedSession {
                     asid: s.asid.0.clone(),
-                    agent_id: s.agent_id.clone(),
                     directory: s.directory.clone().filter(|d| !d.is_empty()),
-                    day: local_day(s.updated_ms, utc_offset_s),
                 })
                 .collect(),
         }
@@ -882,7 +936,8 @@ impl ViewState {
             status: s.status,
             since: muqun_gateway::relative_since(u128::from(s.updated_ms)),
             active: self.selected.as_deref() == Some(s.asid.0.as_str()),
-            waiting: self.attention.iter().any(|p| p.asid == s.asid),
+            waiting: self.attention.iter().any(|p| p.asid == s.asid)
+                || self.waiting_forms.iter().any(|f| f.asid == s.asid),
         })
     }
 
@@ -928,9 +983,16 @@ pub struct Bindings {
     pub sessions: State<Arc<Vec<AgentSessionInfo>>>,
     /// The sidebar list's layout, written only when it changes.
     pub listing: State<Arc<SessionListing>>,
-    /// Sidebar groups opened past their first rows, by group key, with how
-    /// many rows each shows. UI-owned.
-    pub expanded: State<Arc<std::collections::BTreeMap<String, usize>>>,
+    /// What each session folder resolved to (`projects.rs`).
+    pub dirs: State<Arc<HashMap<String, DirInfo>>>,
+    /// Every agent's own projects, together.
+    pub known: State<Arc<Vec<AgentProject>>>,
+    /// Forms waiting in any session, for the Inbox count.
+    pub waiting_forms: State<Arc<Vec<FormRequest>>>,
+    /// The open session's working-tree change count.
+    pub diff: State<Option<DiffStat>>,
+    /// The Inbox page, while it is open. UI-owned.
+    pub inbox_open: State<bool>,
     pub selected: State<Option<String>>,
     pub header: State<Option<Arc<AgentSessionInfo>>>,
     pub order: State<Arc<TimelineOrder>>,
@@ -938,16 +1000,10 @@ pub struct Bindings {
     pub error: State<Option<UiError>>,
     pub agents: State<Arc<Vec<AgentDiscoveryInfo>>>,
     pub attention: State<Arc<Vec<PermissionRequest>>>,
-    /// The agent the sidebar is filtered to; `None` is "All". UI-owned.
-    pub filter: State<Option<String>>,
-    /// Whether the sidebar's Agents panel is open. UI-owned.
-    pub agents_open: State<bool>,
     /// The New-session page, while it is open. UI-owned.
     pub draft: State<Option<NewSessionDraft>>,
     pub projects: State<Arc<ProjectList>>,
     pub completions: State<Arc<Vec<DirectoryEntry>>>,
-    /// How the sidebar groups sessions. UI-owned, remembered in the config.
-    pub grouping: State<Grouping>,
     /// The Settings page, while it is open. UI-owned.
     pub settings_open: State<bool>,
     pub settings_tab: State<String>,
@@ -971,7 +1027,11 @@ impl Bindings {
         Self {
             sessions: ctx.use_state_keyed("mq.sessions", || Arc::new(Vec::new())),
             listing: ctx.use_state_keyed("mq.listing", || Arc::new(SessionListing::default())),
-            expanded: ctx.use_state_keyed("mq.expanded", || Arc::new(Default::default())),
+            dirs: ctx.use_state_keyed("mq.dirs", || Arc::new(HashMap::new())),
+            known: ctx.use_state_keyed("mq.known", || Arc::new(Vec::new())),
+            waiting_forms: ctx.use_state_keyed("mq.waiting_forms", || Arc::new(Vec::new())),
+            diff: ctx.use_state_keyed("mq.diff", || None),
+            inbox_open: ctx.use_state_keyed("mq.inbox_open", || false),
             selected: ctx.use_state_keyed("mq.selected", || None),
             header: ctx.use_state_keyed("mq.header", || None),
             order: ctx.use_state_keyed("mq.order", || Arc::new(TimelineOrder::default())),
@@ -979,12 +1039,9 @@ impl Bindings {
             error: ctx.use_state_keyed("mq.error", || None),
             agents: ctx.use_state_keyed("mq.agents", || Arc::new(Vec::new())),
             attention: ctx.use_state_keyed("mq.attention", || Arc::new(Vec::new())),
-            filter: ctx.use_state_keyed("mq.filter", || None),
-            agents_open: ctx.use_state_keyed("mq.agents_open", || true),
             draft: ctx.use_state_keyed("mq.draft", || None),
             projects: ctx.use_state_keyed("mq.projects", || Arc::new(ProjectList::default())),
             completions: ctx.use_state_keyed("mq.completions", || Arc::new(Vec::new())),
-            grouping: ctx.use_state_keyed("mq.grouping", Grouping::default),
             settings_open: ctx.use_state_keyed("mq.settings_open", || false),
             settings_tab: ctx.use_state_keyed("mq.settings_tab", || "agents".to_string()),
             restart_note: ctx.use_state_keyed("mq.restart_note", || false),
@@ -1334,11 +1391,11 @@ mod tests {
             },
             &mut Changes::default(),
         );
-        let listing = view.listing(0);
+        let listing = view.listing();
         view.select("b");
         let rows: Vec<_> = view.rows().collect();
         assert!(!rows[0].active && rows[1].active);
-        assert_eq!(view.listing(0), listing, "selection is not layout");
+        assert_eq!(view.listing(), listing, "selection is not layout");
         view.apply(
             Update::event(AgentDomainEvent::StatusChanged {
                 asid: AgentSessionId("a".into()),
@@ -1349,7 +1406,7 @@ mod tests {
             &mut Changes::default(),
         );
         assert_eq!(view.rows().next().unwrap().status, AgentSessionStatus::Busy);
-        assert_eq!(view.listing(0), listing, "status is not layout");
+        assert_eq!(view.listing(), listing, "status is not layout");
     }
 
     #[test]

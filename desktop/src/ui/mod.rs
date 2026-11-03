@@ -62,6 +62,7 @@ impl App {
     }
 
     pub fn open_session(&self, asid: &muqun_gateway::agents::AgentSessionId) {
+        sessions::reveal(self, &asid.0);
         self.drain.select(&asid.0);
         self.send(Command::OpenSession(asid.clone()));
     }
@@ -86,6 +87,7 @@ impl App {
         self.bindings.settings_open.signal().set(false);
         self.drain.go_home();
         composer::focus_input(self);
+        self.bindings.inbox_open.signal().set(false);
     }
 
     /// The start page for a project (a project row's `+`; the sidebar calls it).
@@ -96,6 +98,7 @@ impl App {
     }
 
     pub fn open_settings(&self) {
+        self.bindings.inbox_open.signal().set(false);
         self.bindings.settings_open.signal().set(true);
     }
 
@@ -135,14 +138,16 @@ impl App {
     }
 }
 
-/// "Ctrl+X" or "⌘X".
+/// `Primary+<key>` as this platform writes it: "Ctrl+X" or "⌘X"
+/// (`platform/keys.rs`).
 pub fn shortcut(key: &str) -> String {
-    format!("{}{key}", crate::platform::shell::primary_modifier())
+    crate::platform::keys::label(&format!("Primary+{key}"))
 }
 
 const KEY_ENTER: u32 = 13;
 const KEY_ESCAPE: u32 = 27;
 const KEY_0: u32 = 48;
+const KEY_K: u32 = 75;
 const KEY_N: u32 = 78;
 const KEY_COMMA: u32 = 188;
 const KEY_T: u32 = 84;
@@ -160,6 +165,7 @@ fn on_key(app: &App, ctx: &blinc_layout::event_handler::EventContext) {
     let composer_focused = app.composer.lock().map(|s| s.is_focused()).unwrap_or(false);
     match ctx.key_code {
         KEY_N if chord => app.open_draft(),
+        KEY_K if chord => sessions::focus_search(),
         // The themes panel, until Settings → Appearance mounts it.
         KEY_T if toggle_themes => themes::toggle(),
         KEY_0 if chord => app.drain.go_home(),

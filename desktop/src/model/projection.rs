@@ -14,7 +14,7 @@ use tokio::sync::{broadcast, watch};
 use super::commands::{Command, CommandReceiver};
 use super::compose::{self, ComposeCommand, ComposerUpdate, Target};
 use super::inbox::{Inbox, UiError, Update};
-use super::view::SESSION_LIST_LIMIT;
+use super::view::{DiffStat, SESSION_LIST_LIMIT};
 use crate::config::{ConfigEdit, DesktopConfig};
 use crate::hub::{HubError, SessionHub, OPENCODE};
 
@@ -112,6 +112,9 @@ fn wanted(event: &AgentDomainEvent, active: Option<&AgentSessionId>) -> bool {
         | AgentDomainEvent::StatusChanged { .. }
         | AgentDomainEvent::PermissionPending { .. }
         | AgentDomainEvent::PermissionResolved { .. }
+        // The Inbox counts every session's open forms.
+        | AgentDomainEvent::FormPending { .. }
+        | AgentDomainEvent::FormResolved { .. }
         | AgentDomainEvent::Resync { .. } => true,
         other => active.is_some_and(|active| active == other.asid()),
     }
@@ -165,6 +168,8 @@ struct Core {
     completions: watch::Sender<Option<String>>,
     /// Bumped on every edit; the saver waits for it to go quiet.
     edits: watch::Sender<u64>,
+    /// Session folders already resolved to their projects.
+    resolved: Mutex<std::collections::HashSet<String>>,
 }
 
 /// Start the core side. Returns at once; the tasks live as long as the
@@ -186,6 +191,7 @@ pub fn spawn(
         relist: Coalesce::default(),
         completions,
         edits,
+        resolved: Mutex::new(Default::default()),
     });
     tokio::spawn(core.clone().events());
     tokio::spawn(core.clone().complete_directories(completion_rx));
@@ -225,6 +231,7 @@ impl Core {
             Command::CreateSession { agent, cwd } => match self.hub.create(&agent, &cwd).await {
                 Ok(info) => {
                     let asid = info.asid.clone();
+                    self.resolve_dirs(info.directory.iter().cloned().collect(), false);
                     self.inbox.push(Update::SessionCreated(Box::new(info)));
                     *self.active.lock().unwrap() = Some(asid.clone());
                     self.open(&asid).await;
@@ -427,7 +434,16 @@ impl Core {
         match tokio::time::timeout(LIST_TIMEOUT, self.hub.sessions(&agent, query)).await {
             Ok(Ok(sessions)) => {
                 tracing::info!(agent, count = sessions.len(), "sessions listed");
-                self.inbox.push(Update::AgentSessions { agent, sessions });
+                let dirs = sessions
+                    .iter()
+                    .filter_map(|s| s.directory.clone())
+                    .collect();
+                self.inbox.push(Update::AgentSessions {
+                    agent: agent.clone(),
+                    sessions,
+                });
+                self.resolve_dirs(dirs, false);
+                self.known_projects(agent).await;
             }
             Ok(Err(err)) => tracing::warn!(agent, %err, "session list failed"),
             Err(_) => tracing::warn!(agent, "session list timed out"),
@@ -486,11 +502,94 @@ impl Core {
         self.inbox.push(Update::Snapshot(Box::new(snapshot)));
     }
 
-    async fn open(&self, asid: &AgentSessionId) {
+    async fn open(self: &Arc<Self>, asid: &AgentSessionId) {
         match self.hub.open(asid).await {
-            Ok(snapshot) => self.push_snapshot(snapshot),
+            Ok(snapshot) => {
+                // Its branch may have moved since the folder was resolved.
+                self.resolve_dirs(snapshot.info.directory.iter().cloned().collect(), true);
+                self.push_snapshot(snapshot);
+                tokio::spawn(self.clone().diff(asid.clone()));
+            }
             Err(err) => self.fail(err),
         }
+    }
+
+    /// The open session's working-tree change count, when the agent can
+    /// say; nothing is shown when it cannot.
+    async fn diff(self: Arc<Self>, asid: AgentSessionId) {
+        match tokio::time::timeout(LIST_TIMEOUT, self.hub.vcs_diff(&asid)).await {
+            Ok(Ok(files)) => self.inbox.push(Update::Diff(DiffStat {
+                asid: asid.0,
+                files: files.len(),
+                added: files.iter().map(|f| f.additions).sum(),
+                removed: files.iter().map(|f| f.deletions).sum(),
+            })),
+            Ok(Err(err)) => tracing::debug!(asid = %asid.0, %err, "no diff for the session"),
+            Err(_) => tracing::debug!(asid = %asid.0, "diff timed out"),
+        }
+    }
+
+    /// One agent's own projects, for the sidebar: listed, their folders
+    /// checked and resolved like session folders.
+    async fn known_projects(self: &Arc<Self>, agent: String) {
+        match tokio::time::timeout(LIST_TIMEOUT, self.hub.projects(&agent)).await {
+            Ok(Ok(mut projects)) => {
+                mark_missing(&mut projects).await;
+                let dirs = projects
+                    .iter()
+                    .filter(|p| !p.missing)
+                    .map(|p| p.canonical.clone())
+                    .collect();
+                self.inbox.push(Update::KnownProjects { agent, projects });
+                self.resolve_dirs(dirs, false);
+            }
+            Ok(Err(err)) => tracing::debug!(agent, %err, "no project list"),
+            Err(_) => tracing::debug!(agent, "project list timed out"),
+        }
+    }
+
+    /// Resolve session folders to their projects (`projects::resolve`) off
+    /// the async threads; each folder once unless `again`.
+    fn resolve_dirs(self: &Arc<Self>, dirs: Vec<String>, again: bool) {
+        let fresh: Vec<String> = {
+            let mut resolved = self.resolved.lock().unwrap();
+            dirs.into_iter()
+                .filter(|d| !d.is_empty())
+                .filter(|d| resolved.insert(d.clone()) || again)
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect()
+        };
+        if fresh.is_empty() {
+            return;
+        }
+        let core = self.clone();
+        tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            let found = tokio::task::spawn_blocking(move || {
+                fresh
+                    .into_iter()
+                    .map(|dir| {
+                        let info = super::projects::resolve(std::path::Path::new(
+                            dir.trim_end_matches(['/', '\\']),
+                        ));
+                        (dir.trim_end_matches(['/', '\\']).to_string(), info)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .await;
+            match found {
+                Ok(found) => {
+                    tracing::debug!(
+                        count = found.len(),
+                        us = started.elapsed().as_micros() as u64,
+                        "session folders resolved"
+                    );
+                    core.inbox.push(Update::Directories(found));
+                }
+                Err(err) => tracing::warn!("folder resolution failed: {err}"),
+            }
+        });
     }
 
     fn fail(&self, err: HubError) {
@@ -532,6 +631,19 @@ impl Core {
                 }
                 Ok(event) => {
                     let active = self.active.lock().unwrap().clone();
+                    match &event {
+                        AgentDomainEvent::SessionUpdated { info, .. } => {
+                            self.resolve_dirs(info.directory.iter().cloned().collect(), false);
+                        }
+                        // A turn ended in the open session: its changes moved.
+                        AgentDomainEvent::StatusChanged { asid, status, .. }
+                            if active.as_ref() == Some(asid)
+                                && *status == muqun_gateway::agents::AgentSessionStatus::Idle =>
+                        {
+                            tokio::spawn(self.clone().diff(asid.clone()));
+                        }
+                        _ => {}
+                    }
                     if wanted(&event, active.as_ref()) {
                         self.inbox.push(Update::event(event));
                     }

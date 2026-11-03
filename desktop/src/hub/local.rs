@@ -12,7 +12,7 @@ use std::sync::Arc;
 use muqun_gateway::agents::directories::{self, Completion};
 use muqun_gateway::agents::manager::AgentManager;
 use muqun_gateway::agents::ports::AgentError;
-use muqun_gateway::agents::ports::{AgentSessionSnapshot, SessionMirrorPort};
+use muqun_gateway::agents::ports::{AgentSessionSnapshot, FileDiffItem, SessionMirrorPort};
 use muqun_gateway::agents::{
     AgentDomainEvent, AgentProject, AgentRuntime, AgentSessionId, AgentSessionInfo, ModelRef,
     PermissionDecision, SessionQuery, TimelineItem,
@@ -343,6 +343,13 @@ impl SessionHub for LocalHub {
             .await
             .map_err(|err| HubError::Agent(AgentError::InvalidRequest(err.to_string())))?
             .map_err(HubError::Upload)
+        })
+    }
+
+    fn vcs_diff<'a>(&'a self, asid: &'a AgentSessionId) -> HubFuture<'a, Vec<FileDiffItem>> {
+        Box::pin(async move {
+            let manager = self.manager_for_session(asid).await?;
+            Ok(manager.sessions().get_vcs_diff(asid, "working").await?)
         })
     }
 

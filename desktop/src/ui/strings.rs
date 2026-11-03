@@ -91,6 +91,21 @@ strings! {
     folder_missing => "folder not found", "文件夹不存在";
     folder_placeholder => "Type a path, or pick a recent folder", "输入路径，或选择最近的文件夹";
     new_session_hint => "Enter creates it with these choices; Esc cancels.", "回车按当前选择创建；Esc 取消。";
+    // sidebar and top bar (v2.1)
+    search => "Search", "搜索";
+    inbox => "Inbox", "收件箱";
+    inbox_empty => "Nothing is waiting for you.", "没有等你处理的事。";
+    inbox_soon => "Approvals and questions from every session will be answered here. For now, open the session to answer.", "所有会话里等你的审批和提问会集中在这里处理。现在请打开对应的会话作答。";
+    no_match => "No project or session matches.", "没有匹配的项目或会话。";
+    new_session_here => "New session here", "在此新建会话";
+    pin => "Pin", "钉选";
+    unpin => "Unpin", "取消钉选";
+    hide => "Hide", "隐藏";
+    unhide => "Show again", "取消隐藏";
+    terminal => "Terminal", "终端";
+    file_manager => "File manager", "文件管理器";
+    project_actions => "Project actions", "项目操作";
+    toggle_scheme => "Switch light / dark", "切换明暗";
 }
 
 // The start page and the composer (v2.1).
@@ -179,15 +194,25 @@ impl Strings {
 }
 
 impl Strings {
-    pub fn group_by(&self, grouping: crate::config::Grouping) -> &'static str {
-        use crate::config::Grouping::*;
-        match (self.language(), grouping) {
-            (Language::En, Time) => "Group: by time",
-            (Language::En, Agent) => "Group: by agent",
-            (Language::En, Folder) => "Group: by folder",
-            (Language::ZhCn, Time) => "分组：按时间",
-            (Language::ZhCn, Agent) => "分组：按 Agent",
-            (Language::ZhCn, Folder) => "分组：按文件夹",
+    /// "More (12)" under a project's first sessions.
+    pub fn more_count(&self, hidden: usize) -> String {
+        match self.language() {
+            Language::En => format!("More ({hidden})"),
+            Language::ZhCn => format!("更多 ({hidden})"),
+        }
+    }
+
+    /// "Open in VS Code", "Open in Terminal".
+    pub fn open_in(&self, editor: crate::platform::editors::Editor) -> String {
+        use crate::platform::editors::Editor;
+        let name = editor.product().unwrap_or(match editor {
+            Editor::Terminal => self.terminal(),
+            _ => self.file_manager(),
+        });
+        match self.language() {
+            Language::En => format!("Open in {name}"),
+            Language::ZhCn if editor.product().is_some() => format!("在 {name} 中打开"),
+            Language::ZhCn => format!("在{name}中打开"),
         }
     }
 
