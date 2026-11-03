@@ -244,7 +244,8 @@ impl crate::agents::adapters::acp::session::TerminalBridge for FakeTerminal {
                         .pane
                         .load(std::sync::atomic::Ordering::SeqCst)
                         .then(|| ("terminal".to_owned(), "pane-1".to_owned()));
-                    let live = crate::agents::runtime::claude::terminal_runtime(&process, pane);
+                    let live =
+                        crate::agents::runtime::claude::terminal_runtime(&process, pane, None);
                     (id.clone(), live)
                 })
                 .collect())
