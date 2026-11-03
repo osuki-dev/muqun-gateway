@@ -361,20 +361,28 @@ fn pill(app: &App, ctl: &Arc<Controller>) -> impl ElementBuilder {
                 app.strings.jump_latest().to_string()
             };
             let jump = ctl.clone();
-            div().absolute().right(24.0).bottom(16.0).child(
-                div()
-                    .id("mq-new-pill")
-                    .class("mq-pill")
-                    .cursor_pointer()
-                    .child(
-                        ui_text(label)
-                            .size(scale::FS_12)
-                            .semibold()
-                            .no_wrap()
-                            .no_cursor(),
-                    )
-                    .on_click(move |_| jump.jump_to_bottom()),
-            )
+            div()
+                .class("mq-jump-pill-slot")
+                .absolute()
+                .right(24.0)
+                .bottom(16.0)
+                .child(
+                    div()
+                        .id("mq-new-pill")
+                        .class("mq-jump-pill")
+                        .h(32.0)
+                        .flex_row()
+                        .items_center()
+                        .cursor_pointer()
+                        .child(
+                            ui_text(label)
+                                .size(scale::FS_12)
+                                .semibold()
+                                .no_wrap()
+                                .no_cursor(),
+                        )
+                        .on_click(move |_| jump.jump_to_bottom()),
+                )
         })
 }
 

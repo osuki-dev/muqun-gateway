@@ -120,6 +120,18 @@
 .mq-follow-dot { background: var(--primary); }
 /* /topbar */
 
+/* "↓ N new messages": above row chrome (Copy) so the click always lands. */
+.mq-jump-pill-slot { z-index: 30; }
+.mq-jump-pill {
+    padding: 0 var(--mq-space-3);
+    border-radius: var(--mq-radius-lg);
+    border: none;
+    background: var(--surface-elevated);
+    color: var(--text-primary);
+    transition: background var(--mq-motion-micro) ease-out;
+}
+.mq-jump-pill:hover { background: var(--mq-hover-strong); }
+
 /* sidebar ------------------------------------------------------------
    Owned by ui/sessions.rs. Search 36 px, project rows 32 px, session rows
    30 px, bottom entries 36 px (§6.0‴ A). Row actions and the relative time

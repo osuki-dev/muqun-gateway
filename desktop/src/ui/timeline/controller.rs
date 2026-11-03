@@ -383,13 +383,16 @@ impl Controller {
         self.app.drain.wake();
     }
 
-    /// The "↓ N new messages" pill was clicked.
+    /// The "↓ N new messages" pill was clicked: scroll to the tail now and
+    /// rebuild the window around it. Do not wait for the next settle frame —
+    /// that left the pill gone while the viewport stayed mid-list.
     pub fn jump_to_bottom(&self) {
         let writes = {
             let mut guard = self.s.lock().unwrap();
             let s = &mut *guard;
             s.following = true;
             s.pill = 0;
+            s.quiet = 0;
             s.restore = Some(Restore {
                 to: Saved::Bottom,
                 built: false,
@@ -403,6 +406,9 @@ impl Controller {
             s.report_bottom(&mut w);
             w
         };
+        let (_, vh, content, _) = self.read();
+        let max = (content - vh).max(0.0);
+        self.write_top(max);
         self.apply(writes);
         self.app.drain.wake();
     }
@@ -479,12 +485,16 @@ impl Controller {
                 s.restore = None;
                 restored = true;
                 match r.to {
-                    Saved::Bottom => s.following = true,
+                    Saved::Bottom => {
+                        s.following = true;
+                        top = self.write_top(max);
+                    }
                     Saved::Anchor { id, below_top } => {
                         if let Some(&i) = s.index.get(&id) {
                             top = self.write_top(LEAD + s.model.top(i) - below_top);
                         } else {
                             s.following = true;
+                            top = self.write_top(max);
                         }
                     }
                 }
