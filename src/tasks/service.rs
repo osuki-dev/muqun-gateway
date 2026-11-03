@@ -1329,7 +1329,19 @@ impl TaskService {
             let in_pane = match request.delivery {
                 Some(Delivery::Pane) => true,
                 Some(Delivery::Session) => false,
-                None => runs_in_pane(state, kind).await,
+                // Restricted work cannot use a session adapter (no credential
+                // bound to the task); Codex and Claude Code can still take it
+                // in a pane, where a bound helper is installed.
+                None => {
+                    runs_in_pane(state, kind).await
+                        || (matches!(kind, "codex" | "claude")
+                            && crate::mcp::inject::enabled(&state.config)
+                            && pane_agent::is_terminal_agent(state, kind)
+                            && self
+                                .allow_forwarding(&by, "shared agent runtime")
+                                .await
+                                .is_err())
+                }
             };
             if in_pane {
                 // Restricted work must not inherit a shared owner's runtime
@@ -1789,13 +1801,16 @@ impl TaskService {
 /// unavailable. Explicit Codex task requests retain their existing terminal
 /// route, independent of the private Codex agent-session adapter's readiness.
 pub(crate) async fn runs_in_pane(state: &AppState, kind: &str) -> bool {
-    // Codex and Claude Code are both terminal and native agents: a goal
-    // without an explicit delivery keeps starting in a pane.
-    if matches!(kind, "codex" | "claude") {
-        return pane_agent::is_terminal_agent(state, kind);
+    // A goal without an explicit delivery goes to the agent's native session
+    // whenever its adapter is attached: structured replies, approvals, turn
+    // ends and queued prompts. Without one, a pane is for a terminal agent:
+    // Codex and Claude Code have a terminal launch, an agent the gateway has
+    // no native integration for runs only there, and any other native agent
+    // stays unavailable rather than typed into a terminal.
+    if state.agent_runtime.manager_for_agent(kind).await.is_some() {
+        return false;
     }
-    !AGENT_PREFERENCE.contains(&kind)
-        && state.agent_runtime.manager_for_agent(kind).await.is_none()
+    (matches!(kind, "codex" | "claude") || !AGENT_PREFERENCE.contains(&kind))
         && pane_agent::is_terminal_agent(state, kind)
 }
 
