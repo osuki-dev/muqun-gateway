@@ -383,6 +383,33 @@ impl Controller {
         self.app.drain.wake();
     }
 
+    /// Explicit "Load earlier" click (also still auto-fires near the top).
+    pub fn request_earlier(&self) {
+        let writes = {
+            let mut guard = self.s.lock().unwrap();
+            let s = &mut *guard;
+            if s.exhausted || s.loading || s.asid.is_empty() {
+                return;
+            }
+            let can_retry = s.retry_at.is_none_or(|at| Instant::now() >= at);
+            if !can_retry {
+                return;
+            }
+            s.loading = true;
+            s.retry_at = None;
+            // Prefer rows trimmed from an oversized snapshot before asking
+            // the hub (which pages the agent's own earlier cursor).
+            let local = self.app.drain.queue_pending_earlier(&s.asid, 20);
+            Writes {
+                loading: Some(true),
+                command: (!local)
+                    .then(|| Command::LoadEarlier(AgentSessionId(s.asid.clone()))),
+                ..Writes::default()
+            }
+        };
+        self.apply(writes);
+    }
+
     /// The "↓ N new messages" pill was clicked: scroll to the tail now and
     /// rebuild the window around it. Do not wait for the next settle frame —
     /// that left the pill gone while the viewport stayed mid-list.
@@ -558,7 +585,9 @@ impl Controller {
                 s.loading = true;
                 s.retry_at = None;
                 w.loading = Some(true);
-                w.command = Some(Command::LoadEarlier(AgentSessionId(s.asid.clone())));
+                let local = self.app.drain.queue_pending_earlier(&s.asid, 20);
+                w.command = (!local)
+                    .then(|| Command::LoadEarlier(AgentSessionId(s.asid.clone())));
             }
             tracing::trace!(
                 target: "muqun::timeline",

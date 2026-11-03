@@ -34,8 +34,18 @@ pub const THEMES_CSS: &str = include_str!("themes.css");
 const MIN_CARD: f32 = 232.0;
 const GAP: f32 = 16.0;
 const PAD_X: f32 = 24.0;
+/// Matches `--mq-card-pad` in themes.css.
 const CARD_PAD: f32 = 20.0;
+/// Matches `--mq-radius-md` (preview inside `--mq-radius-lg` card).
+const RADIUS_MD: f32 = 8.0;
+/// One row of `.mq-theme-tag` pills (padding + 11px type).
+const TAGS_H: f32 = 22.0;
+/// Small-button action row; status truncates inside this height.
+const ACTIONS_H: f32 = 28.0;
+/// Standalone overlay: title + scheme + import, then tabs/search, then link.
 const HEADER_H: f32 = 148.0;
+/// Settings → Appearance: no title/scheme row (Reading owns those); tabs + link only.
+const HEADER_H_EMBEDDED: f32 = 88.0;
 /// Gallery cards built at once. A theme switch rebuilds the whole tree, and
 /// every card is a picture: all 97 made one switch cost up to a second.
 const GALLERY_PAGE: usize = 24;
@@ -247,21 +257,45 @@ pub fn overlay(app: &App, width: f32, height: f32) -> impl ElementBuilder {
 
 /// The themes panel: Installed / Gallery, search, import.
 pub fn themes_panel(app: &App, width: f32, height: f32) -> Div {
+    panel(app, width, height, false)
+}
+
+/// Settings → Appearance already pads the tab; skip the panel's own inset
+/// so the library lines up with Reading.
+pub fn themes_panel_embedded(app: &App, width: f32, height: f32) -> Div {
+    panel(app, width, height, true)
+}
+
+fn panel(app: &App, width: f32, height: f32, embedded: bool) -> Div {
     refresh_once(app);
     install_drop_handler(app);
     let b = ThemeBindings::get();
-    div()
-        .class("mq-themes")
-        .relative()
+    let pad_x = if embedded { 0.0 } else { PAD_X };
+    let header_h = if embedded {
+        HEADER_H_EMBEDDED
+    } else {
+        HEADER_H
+    };
+    let mut root = div().class("mq-themes");
+    if embedded {
+        root = root.class("mq-themes--embedded");
+    }
+    root.relative()
         .w(width)
         .h(height)
         .flex_col()
-        .child(header(app, &b))
-        .child(grid(app, &b, width, (height - HEADER_H).max(0.0)))
-        .child(notice_strip(app, &b))
+        .child(header(app, &b, header_h, embedded))
+        .child(grid(
+            app,
+            &b,
+            width,
+            (height - header_h).max(0.0),
+            pad_x,
+        ))
+        .child(notice_strip(app, &b, pad_x))
 }
 
-fn header(app: &App, b: &ThemeBindings) -> impl ElementBuilder {
+fn header(app: &App, b: &ThemeBindings, header_h: f32, embedded: bool) -> impl ElementBuilder {
     let (current, tab, library, gallery) = (
         b.current.clone(),
         b.tab.clone(),
@@ -272,7 +306,13 @@ fn header(app: &App, b: &ThemeBindings) -> impl ElementBuilder {
     let link = b.link.clone();
     let query = b.query.clone();
     let app = app.clone();
-    stateful_with_key::<NoState>("mq-themes-header")
+    // Embedded: Appearance owns "Themes" + scheme; header is tabs/search + import only.
+    let key = if embedded {
+        "mq-themes-header-embedded"
+    } else {
+        "mq-themes-header"
+    };
+    stateful_with_key::<NoState>(key)
         .deps([
             current.signal_id(),
             tab.signal_id(),
@@ -280,35 +320,6 @@ fn header(app: &App, b: &ThemeBindings) -> impl ElementBuilder {
             gallery.signal_id(),
         ])
         .on_state(move |_| {
-            let choice = current.get();
-            let scheme = choice.as_ref().map(|c| c.1).unwrap_or(Scheme::System);
-            let mut schemes = div().class("mq-segmented").flex_row().items_center();
-            for (s, label) in [
-                (Scheme::Light, tr(&app, "Light", "浅色")),
-                (Scheme::Dark, tr(&app, "Dark", "深色")),
-                (Scheme::System, tr(&app, "System", "跟随系统")),
-            ] {
-                let app2 = app.clone();
-                let id = choice.as_ref().map(|c| c.0.clone());
-                schemes = schemes.child(
-                    button(label)
-                        .variant(if s == scheme {
-                            ButtonVariant::Secondary
-                        } else {
-                            ButtonVariant::Ghost
-                        })
-                        .size(ButtonSize::Small)
-                        .on_click(move |_| {
-                            if let Some(id) = id.clone() {
-                                crate::theme::apply::trace(
-                                    "mq.theme.click",
-                                    format_args!("id={id} scheme={s:?}"),
-                                );
-                                app2.send(Command::ThemeApply(id, s));
-                            }
-                        }),
-                );
-            }
             let import = {
                 let app = app.clone();
                 button(tr(&app, "Import file…", "导入文件…"))
@@ -354,13 +365,73 @@ fn header(app: &App, b: &ThemeBindings) -> impl ElementBuilder {
             let installed_n = library.get().len();
             let gallery_n = gallery.get().entries.len();
             let query = query.clone();
-            div()
+            let toolbar = div()
+                .class("mq-themes-toolbar")
+                .w_full()
+                .flex_row()
+                .items_center()
+                .child(tab_button(
+                    Tab::Installed,
+                    format!("{} · {installed_n}", tr(&app, "Installed", "已安装")),
+                ))
+                .child(tab_button(
+                    Tab::Gallery,
+                    format!("{} · {gallery_n}", tr(&app, "Gallery", "画廊")),
+                ))
+                .child(div().flex_1())
+                .child(div().w(240.0).child(input(&search).w_full().on_change(
+                    move |text: &str| {
+                        query.signal().set(text.trim().to_lowercase());
+                        reset_paging();
+                    },
+                )));
+            let link_row = div()
+                .class("mq-themes-link-row")
+                .w_full()
+                .flex_row()
+                .items_center()
+                .child(div().flex_1().min_w(0.0).child(input(&link).w_full()))
+                .child(import_link)
+                .child(import);
+
+            let mut head = div()
                 .class("mq-themes-header")
                 .w_full()
-                .h(HEADER_H)
+                .h(header_h)
                 .flex_col()
-                .flex_shrink_0()
-                .child(
+                .flex_shrink_0();
+
+            if !embedded {
+                let choice = current.get();
+                let scheme = choice.as_ref().map(|c| c.1).unwrap_or(Scheme::System);
+                let mut schemes = div().class("mq-segmented").flex_row().items_center();
+                for (s, label) in [
+                    (Scheme::Light, tr(&app, "Light", "浅色")),
+                    (Scheme::Dark, tr(&app, "Dark", "深色")),
+                    (Scheme::System, tr(&app, "System", "跟随系统")),
+                ] {
+                    let app2 = app.clone();
+                    let id = choice.as_ref().map(|c| c.0.clone());
+                    schemes = schemes.child(
+                        button(label)
+                            .variant(if s == scheme {
+                                ButtonVariant::Secondary
+                            } else {
+                                ButtonVariant::Ghost
+                            })
+                            .size(ButtonSize::Small)
+                            .on_click(move |_| {
+                                if let Some(id) = id.clone() {
+                                    crate::theme::apply::trace(
+                                        "mq.theme.click",
+                                        format_args!("id={id} scheme={s:?}"),
+                                    );
+                                    app2.send(Command::ThemeApply(id, s));
+                                }
+                            }),
+                    );
+                }
+                head = head.child(
                     div()
                         .class("mq-themes-title-row")
                         .w_full()
@@ -369,42 +440,13 @@ fn header(app: &App, b: &ThemeBindings) -> impl ElementBuilder {
                         .child(
                             div()
                                 .flex_1()
-                                .child(ui_text(tr(&app, "Themes", "主题")).size(18.0).semibold()),
+                                .child(ui_text(tr(&app, "Themes", "主题")).size(15.0).semibold()),
                         )
-                        .child(schemes)
-                        .child(import),
-                )
-                .child(
-                    div()
-                        .class("mq-themes-toolbar")
-                        .w_full()
-                        .flex_row()
-                        .items_center()
-                        .child(tab_button(
-                            Tab::Installed,
-                            format!("{} · {installed_n}", tr(&app, "Installed", "已安装")),
-                        ))
-                        .child(tab_button(
-                            Tab::Gallery,
-                            format!("{} · {gallery_n}", tr(&app, "Gallery", "画廊")),
-                        ))
-                        .child(div().flex_1())
-                        .child(div().w(260.0).child(input(&search).w_full().on_change(
-                            move |text: &str| {
-                                query.signal().set(text.trim().to_lowercase());
-                                reset_paging();
-                            },
-                        ))),
-                )
-                .child(
-                    div()
-                        .class("mq-themes-link-row")
-                        .w_full()
-                        .flex_row()
-                        .items_center()
-                        .child(div().flex_1().min_w(0.0).child(input(&link).w_full()))
-                        .child(import_link),
-                )
+                        .child(schemes),
+                );
+            }
+
+            head.child(toolbar).child(link_row)
         })
 }
 
@@ -416,15 +458,15 @@ fn matches(query: &str, name: &str, id: &str, author: Option<&str>, tags: &[Stri
         || tags.iter().any(|t| t.contains(query))
 }
 
-/// Columns and card width for `width`.
-fn layout(width: f32) -> (usize, f32) {
-    let inner = (width - 2.0 * PAD_X).max(MIN_CARD);
+/// Columns and card width for `width`, after the panel's horizontal pad.
+fn layout(width: f32, pad_x: f32) -> (usize, f32) {
+    let inner = (width - 2.0 * pad_x).max(MIN_CARD);
     let columns = (((inner + GAP) / (MIN_CARD + GAP)).floor() as usize).max(1);
     let card = (inner - GAP * (columns as f32 - 1.0)) / columns as f32;
     (columns, card)
 }
 
-fn grid(app: &App, b: &ThemeBindings, width: f32, height: f32) -> impl ElementBuilder {
+fn grid(app: &App, b: &ThemeBindings, width: f32, height: f32, pad_x: f32) -> impl ElementBuilder {
     let b = b.clone();
     let app = app.clone();
     let content = stateful_with_key::<NoState>("mq-themes-grid")
@@ -438,7 +480,7 @@ fn grid(app: &App, b: &ThemeBindings, width: f32, height: f32) -> impl ElementBu
             b.limit.signal_id(),
         ])
         .on_state(move |_| {
-            let (columns, card_w) = layout(width);
+            let (columns, card_w) = layout(width, pad_x);
             COLUMNS.store(columns, Ordering::Relaxed);
             let selected = b.selected.get();
             let mark = |card: Div, at: usize| {
@@ -455,7 +497,8 @@ fn grid(app: &App, b: &ThemeBindings, width: f32, height: f32) -> impl ElementBu
                 .class("mq-themes-grid")
                 .w_full()
                 .flex_row()
-                .flex_wrap();
+                .flex_wrap()
+                .items_stretch();
             let mut shown = 0;
             match b.tab.get() {
                 Tab::Installed => {
@@ -585,8 +628,9 @@ fn swatches(light: &Swatch, dark: &Swatch, w: f32, h: f32) -> Div {
     };
     div()
         .class("mq-theme-card-picture")
-        .w(w)
+        .w_full()
         .h(h)
+        .flex_shrink_0()
         .flex_row()
         .overflow_clip()
         .child(half(light))
@@ -596,23 +640,32 @@ fn swatches(light: &Swatch, dark: &Swatch, w: f32, h: f32) -> Div {
 fn picture(path: &std::path::Path, w: f32, h: f32) -> Div {
     div()
         .class("mq-theme-card-picture")
-        .w(w)
+        .w_full()
         .h(h)
+        .flex_shrink_0()
         .overflow_clip()
         .child(
             image(path.to_string_lossy().to_string())
                 .size(w, h)
                 .cover()
-                .rounded(8.0),
+                .rounded(RADIUS_MD),
         )
 }
 
 fn tags(tags: &[String]) -> Div {
-    let mut row = div().class("mq-theme-tags").w_full().flex_row().flex_wrap();
+    let mut row = div()
+        .class("mq-theme-tags")
+        .w_full()
+        .h(TAGS_H)
+        .flex_shrink_0()
+        .flex_row()
+        .items_center()
+        .overflow_clip();
     for tag in tags.iter().take(4) {
         row = row.child(
             div()
                 .class("mq-theme-tag")
+                .flex_shrink_0()
                 .child(ui_text(tag.clone()).size(11.0).no_wrap()),
         );
     }
@@ -620,7 +673,11 @@ fn tags(tags: &[String]) -> Div {
 }
 
 fn card_shell(card_w: f32, active: bool) -> Div {
-    let mut card = div().class("mq-theme-card").w(card_w).flex_col();
+    let mut card = div()
+        .class("mq-theme-card")
+        .w(card_w)
+        .flex_col()
+        .self_stretch();
     if active {
         card = card.class("mq-theme-card--active");
     }
@@ -628,21 +685,49 @@ fn card_shell(card_w: f32, active: bool) -> Div {
 }
 
 fn title_block(name: &str, author: Option<&str>, meta: String) -> Div {
-    let mut block = div()
-        .class("mq-theme-card-title")
-        .w_full()
-        .flex_col()
-        .child(ui_text(name.to_string()).size(15.0).semibold().no_wrap());
     let byline = match author {
         Some(a) => format!("{a} · {meta}"),
         None => meta,
     };
-    block = block.child(
-        div()
-            .class("mq-theme-card-meta")
-            .child(ui_text(byline).size(12.0).no_wrap()),
-    );
-    block
+    div()
+        .class("mq-theme-card-title")
+        .w_full()
+        .min_w(0.0)
+        .flex_shrink_0()
+        .flex_col()
+        .overflow_clip()
+        .child(ui_text(name.to_string()).size(15.0).semibold().no_wrap())
+        .child(
+            div()
+                .class("mq-theme-card-meta")
+                .w_full()
+                .min_w(0.0)
+                .overflow_clip()
+                .child(ui_text(byline).size(12.0).no_wrap()),
+        )
+}
+
+fn card_spacer() -> Div {
+    div().class("mq-theme-card-spacer").w_full().flex_1().min_h(0.0)
+}
+
+fn actions_row() -> Div {
+    div()
+        .class("mq-theme-card-actions")
+        .w_full()
+        .h(ACTIONS_H)
+        .flex_shrink_0()
+        .flex_row()
+        .items_center()
+}
+
+fn status_label(text: String) -> Div {
+    div()
+        .class("mq-theme-status")
+        .flex_1()
+        .min_w(0.0)
+        .overflow_clip()
+        .child(ui_text(text).size(12.0).no_wrap())
 }
 
 fn library_card(app: &App, entry: &ThemeEntry, card_w: f32, current: Option<&str>) -> Div {
@@ -660,11 +745,8 @@ fn library_card(app: &App, entry: &ThemeEntry, card_w: f32, current: Option<&str
             tr(app, "Installed (updates built-in)", "已安装（覆盖内置）")
         }
     };
-    let mut actions = div()
-        .class("mq-theme-card-actions")
-        .w_full()
-        .flex_row()
-        .items_center();
+    // Status slot left (empty here — origin lives in meta); actions pinned right.
+    let mut actions = actions_row().child(div().flex_1().min_w(0.0));
     if is_current {
         actions = actions.child(
             button(tr(app, "Applied", "使用中"))
@@ -680,7 +762,6 @@ fn library_card(app: &App, entry: &ThemeEntry, card_w: f32, current: Option<&str
                 .on_click(move |_| apply(&app2, id.clone())),
         );
     }
-    actions = actions.child(div().flex_1());
     if entry.origin.removable() {
         let (app2, id) = (app.clone(), entry.id.clone());
         actions = actions.child(
@@ -698,6 +779,7 @@ fn library_card(app: &App, entry: &ThemeEntry, card_w: f32, current: Option<&str
             format!("v{} · {origin}", entry.version),
         ))
         .child(tags(&entry.tags))
+        .child(card_spacer())
         .child(actions)
 }
 
@@ -745,8 +827,9 @@ fn gallery_card(
                 None => div()
                     .class("mq-theme-card-picture")
                     .class("mq-theme-card-placeholder")
-                    .w(inner)
+                    .w_full()
                     .h(pic_h)
+                    .flex_shrink_0()
                     .flex_col()
                     .justify_center()
                     .items_center()
@@ -759,9 +842,7 @@ fn gallery_card(
         let is_current = current == Some(entry.id.as_str());
         stateful_with_key::<NoState>(format!("mq-themes-gact-{}", entry.id))
             .deps([job.signal_id()])
-            .on_state(move |_| {
-                gallery_actions(&app, &entry, job.get(), installed, is_current, inner)
-            })
+            .on_state(move |_| gallery_actions(&app, &entry, job.get(), installed, is_current))
     };
     card_shell(card_w, current == Some(entry.id.as_str()))
         .child(picture_part)
@@ -771,6 +852,7 @@ fn gallery_card(
             format!("v{} · {}", entry.version, size_text(entry.bytes)),
         ))
         .child(tags(&entry.tags))
+        .child(card_spacer())
         .child(action_part)
 }
 
@@ -780,20 +862,8 @@ fn gallery_actions(
     job: Option<Job>,
     installed: bool,
     is_current: bool,
-    inner: f32,
 ) -> Div {
-    let row = div()
-        .class("mq-theme-card-actions")
-        .w_full()
-        .flex_row()
-        .items_center();
-    let status = |text: String| {
-        div()
-            .class("mq-theme-status")
-            .flex_1()
-            .min_w(0.0)
-            .child(ui_text(text).size(12.0))
-    };
+    let row = actions_row();
     let install = |label: &'static str| {
         let (app, id) = (app.clone(), entry.id.clone());
         button(label)
@@ -828,30 +898,24 @@ fn gallery_actions(
             } else {
                 0.0
             };
-            div()
-                .class("mq-theme-card-actions")
-                .w_full()
-                .flex_col()
-                .child(
-                    ui_text(format!(
-                        "{} {}% · {} / {}",
-                        tr(app, "Downloading", "正在下载"),
-                        (fraction * 100.0).round(),
-                        size_text(read),
-                        size_text(total)
-                    ))
-                    .size(12.0),
-                )
-                .child(
-                    div().class("mq-theme-progress").w(inner).h(4.0).child(
-                        div()
-                            .class("mq-theme-progress-bar")
-                            .w(inner * fraction)
-                            .h(4.0),
-                    ),
-                )
+            const BAR_W: f32 = 56.0;
+            row.child(status_label(format!(
+                "{} {}% · {} / {}",
+                tr(app, "Downloading", "正在下载"),
+                (fraction * 100.0).round(),
+                size_text(read),
+                size_text(total)
+            )))
+            .child(
+                div().class("mq-theme-progress").w(BAR_W).h(4.0).flex_shrink_0().child(
+                    div()
+                        .class("mq-theme-progress-bar")
+                        .w(BAR_W * fraction)
+                        .h(4.0),
+                ),
+            )
         }
-        Some(Job::Verifying) => row.child(status(
+        Some(Job::Verifying) => row.child(status_label(
             tr(
                 app,
                 "Checking SHA-256 and the package…",
@@ -859,9 +923,11 @@ fn gallery_actions(
             )
             .into(),
         )),
-        Some(Job::Installing) => row.child(status(tr(app, "Installing…", "正在安装…").into())),
+        Some(Job::Installing) => {
+            row.child(status_label(tr(app, "Installing…", "正在安装…").into()))
+        }
         Some(Job::Done { verified }) => row
-            .child(status(
+            .child(status_label(
                 if verified {
                     tr(
                         app,
@@ -878,26 +944,21 @@ fn gallery_actions(
                 .into(),
             ))
             .child(apply_button()),
-        Some(Job::Failed { message }) => div()
-            .class("mq-theme-card-actions")
-            .w_full()
-            .flex_col()
+        Some(Job::Failed { message }) => row
             .child(
                 div()
                     .class("mq-theme-error")
-                    .w_full()
-                    .child(ui_text(message).size(12.0)),
+                    .flex_1()
+                    .min_w(0.0)
+                    .overflow_clip()
+                    .child(ui_text(message).size(12.0).no_wrap()),
             )
-            .child(
-                div()
-                    .flex_row()
-                    .child(install(tr(app, "Retry install", "重试安装"))),
-            ),
+            .child(install(tr(app, "Retry install", "重试安装"))),
         None if installed => row
-            .child(status(tr(app, "Installed", "已安装").into()))
+            .child(status_label(tr(app, "Installed", "已安装").into()))
             .child(apply_button()),
         None => row
-            .child(status(checksum.into()))
+            .child(status_label(checksum.into()))
             .child(install(tr(app, "Install", "安装"))),
     }
 }
@@ -1051,7 +1112,7 @@ pub fn on_key(app: &App, ctx: &blinc_layout::event_handler::EventContext) -> boo
     true
 }
 
-fn notice_strip(app: &App, b: &ThemeBindings) -> impl ElementBuilder {
+fn notice_strip(app: &App, b: &ThemeBindings, pad_x: f32) -> impl ElementBuilder {
     let notice = b.notice.clone();
     let app = app.clone();
     stateful_with_key::<NoState>("mq-themes-notice")
@@ -1075,8 +1136,8 @@ fn notice_strip(app: &App, b: &ThemeBindings) -> impl ElementBuilder {
                 .stack_layer()
                 .absolute()
                 .bottom(16.0)
-                .left(PAD_X)
-                .right(PAD_X)
+                .left(pad_x)
+                .right(pad_x)
                 .flex_row()
                 .items_center()
                 .child(
@@ -1108,12 +1169,16 @@ mod tests {
 
     #[test]
     fn the_grid_fits_whole_cards() {
-        let (cols, w) = layout(1200.0);
+        let (cols, w) = layout(1200.0, PAD_X);
         assert!(cols >= 4);
         let used = cols as f32 * w + (cols as f32 - 1.0) * GAP;
         assert!((used - (1200.0 - 2.0 * PAD_X)).abs() < 0.5);
         assert!(w >= MIN_CARD);
-        assert_eq!(layout(300.0).0, 1);
+        assert_eq!(layout(300.0, PAD_X).0, 1);
+        let (embedded_cols, embedded_w) = layout(720.0, 0.0);
+        let embedded_used =
+            embedded_cols as f32 * embedded_w + (embedded_cols as f32 - 1.0) * GAP;
+        assert!((embedded_used - 720.0).abs() < 0.5);
     }
 
     #[test]

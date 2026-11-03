@@ -149,12 +149,15 @@ fn build_list_inner(app: &App, ctl: &Arc<Controller>) -> Div {
     };
     let order = b.order.get();
     if order.asid != selected {
-        // The snapshot is on its way.
-        return list;
+        // Selection moved before the order binding caught up.
+        return list.child(opening_state(app));
     }
     let permissions = b.permissions.get();
     let forms = b.forms.get();
     if order.ids.is_empty() && permissions.is_empty() && forms.is_empty() {
+        if order.opening {
+            return list.child(opening_state(app));
+        }
         return list.child(teaching_empty_state(app));
     }
     let plan = ctl.plan(&order);
@@ -253,12 +256,11 @@ fn row(
             let Some(item) = app.drain.item(item_id) else {
                 return div().class("mq-row");
             };
+            // Assistant prose is one list row (clipped in the renderer).
+            // `k` is only non-zero for legacy multi-segment ids mid-rebuild.
             let (range, last) = match segmented(&item) {
-                Some(text) => {
-                    let segs = crate::model::stream::segments(text);
-                    let n = segs.len();
-                    (segs.get(k).cloned().unwrap_or(0..0), k + 1 >= n)
-                }
+                Some(text) if k == 0 => (0..text.len(), true),
+                Some(_) => (0..0, false),
                 None => (0..usize::MAX, true),
             };
             let ctx = PartCtx {
@@ -279,30 +281,57 @@ fn row(
         .on_layout(move |bounds| measure.measured(&m_asid, &m_id, bounds.height))
 }
 
-/// Fixed-height header above the first row: loading, the beginning of the
-/// conversation, or a hint that there is more above.
+/// Fixed-height header above the first row: loading, the start of the
+/// conversation, or a clickable "Load earlier" control (scroll-to-top still
+/// auto-requests as well).
 fn history_header(app: &App, ctl: &Arc<Controller>, exhausted: bool) -> impl ElementBuilder {
     let loading = ctl.loading.clone();
     let app = app.clone();
+    let ctl = ctl.clone();
     stateful_with_key::<NoState>("mq-history-header")
         .deps([loading.signal_id()])
         .on_state(move |_| {
-            let label = if loading.get() {
+            let busy = loading.get();
+            let label = if busy {
                 app.strings.loading_earlier()
             } else if exhausted {
                 app.strings.start_of_history()
             } else {
                 app.strings.earlier_available()
             };
-            div()
+            let mut row = div()
                 .class("mq-history")
                 .w_full()
                 .h(LEAD)
                 .flex_row()
                 .items_center()
                 .justify_center()
-                .child(parts::meta(label))
+                .child(parts::meta(label));
+            if !busy && !exhausted {
+                let ctl = ctl.clone();
+                row = row
+                    .class("mq-history--more")
+                    .cursor_pointer()
+                    .on_click(move |_| ctl.request_earlier());
+            }
+            row
         })
+}
+
+/// Waiting on the first snapshot after a click — never leave a blank pane.
+fn opening_state(app: &App) -> Div {
+    div()
+        .class("mq-teach")
+        .w_full()
+        .flex_col()
+        .items_center()
+        .justify_center()
+        .child(
+            ui_text(app.strings.opening_session())
+                .size(scale::FS_13)
+                .class("mq-text-muted")
+                .no_cursor(),
+        )
 }
 
 /// A session with nothing in it teaches what to do (architecture §6.1d

@@ -218,6 +218,10 @@ pub enum Scheme {
 pub struct UiPrefs {
     /// The sidebar's width in logical pixels.
     pub sidebar_width: f32,
+    /// The right panel's preferred width (Queue / Git tabs). Clamped further
+    /// at layout time so the left column and main stay usable.
+    #[serde(default = "UiPrefs::right_default")]
+    pub right_width: f32,
     /// Pins, hidden projects and names given to projects, by project root
     /// (`model/projects.rs`). Only projects with a choice are kept.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
@@ -228,6 +232,15 @@ impl UiPrefs {
     pub const SIDEBAR_DEFAULT: f32 = 260.0;
     pub const SIDEBAR_MIN: f32 = 220.0;
     pub const SIDEBAR_MAX: f32 = 360.0;
+    pub const RIGHT_DEFAULT: f32 = 320.0;
+    pub const RIGHT_MIN: f32 = 240.0;
+    pub const RIGHT_MAX: f32 = 720.0;
+    /// Main column must keep at least this much (timeline + composer).
+    pub const MAIN_MIN: f32 = 420.0;
+
+    fn right_default() -> f32 {
+        Self::RIGHT_DEFAULT
+    }
 
     /// The stored width, forced into the range the layout allows (a hand
     /// edited or NaN value never yields a broken window).
@@ -239,12 +252,23 @@ impl UiPrefs {
             Self::SIDEBAR_DEFAULT
         }
     }
+
+    /// Preferred right-panel width before the live window clamp.
+    pub fn right(&self) -> f32 {
+        if self.right_width.is_finite() {
+            self.right_width
+                .clamp(Self::RIGHT_MIN, Self::RIGHT_MAX)
+        } else {
+            Self::RIGHT_DEFAULT
+        }
+    }
 }
 
 impl Default for UiPrefs {
     fn default() -> Self {
         Self {
             sidebar_width: Self::SIDEBAR_DEFAULT,
+            right_width: Self::RIGHT_DEFAULT,
             projects: BTreeMap::new(),
         }
     }
@@ -257,6 +281,7 @@ impl Default for UiPrefs {
 pub enum ConfigEdit {
     Window(WindowGeometry),
     SidebarWidth(f32),
+    RightWidth(f32),
     /// What the owner chose for one project (pin, hide, name), by root.
     Project {
         root: String,
@@ -305,6 +330,7 @@ impl DesktopConfig {
         match edit {
             ConfigEdit::Window(geometry) => self.window = geometry,
             ConfigEdit::SidebarWidth(width) => self.ui.sidebar_width = width,
+            ConfigEdit::RightWidth(width) => self.ui.right_width = width,
             ConfigEdit::Project { root, prefs } => {
                 if prefs.is_default() {
                     self.ui.projects.remove(&root);
@@ -701,6 +727,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(config.ui.sidebar_width, UiPrefs::SIDEBAR_DEFAULT);
+        assert_eq!(config.ui.right_width, UiPrefs::RIGHT_DEFAULT);
         assert!(config.ui.projects.is_empty());
         assert!(!config.general.close_to_tray);
         assert_eq!(

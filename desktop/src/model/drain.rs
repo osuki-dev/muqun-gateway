@@ -201,6 +201,34 @@ impl Drain {
         *self.inner.hook.lock().unwrap() = Some(hook);
     }
 
+    /// Drain a page of snapshot-trimmed older rows into the inbox. True when
+    /// a page was queued (the hub must not be asked). Main thread.
+    pub fn queue_pending_earlier(&self, asid: &str, n: usize) -> bool {
+        let update = {
+            let mut view = self.inner.view.lock().unwrap();
+            let Some(active) = view
+                .active
+                .as_mut()
+                .filter(|a| a.info.asid.0 == asid)
+            else {
+                return false;
+            };
+            let Some((items, exhausted)) = active.take_pending_earlier(n) else {
+                return false;
+            };
+            // If local surplus remains, the session is not exhausted yet even
+            // when this page emptied the buffer — the hub may still have more.
+            let exhausted = exhausted && active.exhausted;
+            Update::Earlier {
+                asid: asid.to_string(),
+                items,
+                exhausted,
+            }
+        };
+        self.inner.inbox.push(update);
+        true
+    }
+
     /// Ask for frames: the hook is called each frame until it says it is
     /// done. Main thread.
     pub fn wake(&self) {
@@ -212,10 +240,19 @@ impl Drain {
 
     /// Mark `asid` as the session the user picked. Main thread.
     pub fn select(&self, asid: &str) {
-        let (changed, sidebar) = {
+        let (changed, sidebar, header, order) = {
             let mut view = self.inner.view.lock().unwrap();
             let changed = view.select(asid);
-            (changed, changed.then(|| self.plan_sidebar(&view)))
+            if !changed {
+                (false, None, None, None)
+            } else {
+                (
+                    true,
+                    Some(self.plan_sidebar(&view)),
+                    Some(view.active.as_ref().map(|a| Arc::new(a.info.clone()))),
+                    Some(Arc::new(view.order())),
+                )
+            }
         };
         if let Some(bindings) = self.inner.bindings.lock().unwrap().clone() {
             blinc_core::reactive::batch_stateful_deps(|| {
@@ -227,6 +264,15 @@ impl Drain {
                     bindings.diff.signal().set(None);
                     bindings.diff_panel.signal().set(false);
                     bindings.diff_focus.signal().set(None);
+                    if let Some(header) = header {
+                        bindings.header.signal().set(header);
+                    }
+                    if let Some(order) = order {
+                        bindings.order.signal().set(order);
+                    }
+                    bindings.stream_tail.signal().set(String::new());
+                    bindings.permissions.signal().set(Arc::new(Vec::new()));
+                    bindings.forms.signal().set(Arc::new(Vec::new()));
                 }
                 if let Some(sidebar) = sidebar {
                     sidebar.publish(&bindings);
@@ -569,12 +615,8 @@ impl Drain {
             let (kind, tail) = stream::tail(text, tail_from(text, stream.boundary));
             let settled = settled || Some(kind) != stream.kind;
             stream.kind = Some(kind);
-            // Only the last row of a segmented text holds the tail.
-            let row = match stream::segments(text).len() {
-                0 | 1 => id.clone(),
-                n => super::view::row_id(&id, n - 1),
-            };
-            ((asid, row, settled), tail.to_string())
+            // Assistant prose is a single list row; bump that row for the tail.
+            ((asid, id.clone(), settled), tail.to_string())
         };
         let (asid, id, settled) = key;
         let bumps = if settled {
@@ -627,12 +669,10 @@ fn batch_kinds(batch: &[Update]) -> String {
         .join(" ")
 }
 
-/// Where the tail starts: the settled boundary, or the start of the text's
-/// last row when the boundary lags behind it (a settle held back by
-/// [`stream::SETTLE_INTERVAL`] while a new row began).
+/// Where the tail starts for the live row. Assistant prose is one list row,
+/// so this is just the settled boundary (clamped to the text).
 pub fn tail_from(text: &str, boundary: usize) -> usize {
-    let last = stream::segments(text).last().map_or(0, |r| r.start);
-    boundary.max(last)
+    boundary.min(text.len())
 }
 
 /// The text a streaming part shows.

@@ -71,6 +71,14 @@ fn main() -> anyhow::Result<()> {
     let scheme_watcher = theme::install(&config_dir, &state_dir, &config.appearance)?;
 
     let geometry = config.window.clamped();
+    // Cap at 60 and skip Adaptive: the fps_adapter otherwise claws the cap
+    // down to ~30 when a tick (or a heavy frame) keeps the loop hot. Set
+    // MUQUN_ANIMATION_FPS=adaptive to restore the default heuristic.
+    let animation_fps_cap = match std::env::var("MUQUN_ANIMATION_FPS").as_deref() {
+        Ok("adaptive") | Ok("Adaptive") => None,
+        Ok(raw) => Some(raw.parse::<u32>().unwrap_or(60).max(1)),
+        _ => Some(60),
+    };
     let window = WindowConfig {
         // Test builds from several worktrees run side by side, and a QA run
         // keeps its window from taking focus by name (`ui/timeline/qa.rs`); a
@@ -87,6 +95,7 @@ fn main() -> anyhow::Result<()> {
         position: geometry.x.zip(geometry.y),
         min_size: Some(WindowGeometry::MIN),
         icon: branding::window_icon(),
+        animation_fps_cap,
         ..Default::default()
     };
 
@@ -136,8 +145,10 @@ fn main() -> anyhow::Result<()> {
                         for_actions.open_session(&muqun_gateway::agents::AgentSessionId(asid))
                     }
                     UiAction::ToggleDiffPanel => {
-                        let open = !for_actions.bindings.diff_panel.get();
-                        for_actions.bindings.diff_panel.signal().set(open);
+                        ui::shell::toggle_right(
+                            &for_actions,
+                            crate::model::view::RightTab::Git,
+                        );
                     }
                     UiAction::OpenDiffFile { path, .. } => {
                         ui::shell::open_diff_file(&for_actions, &path);

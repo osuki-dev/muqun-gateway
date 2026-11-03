@@ -9,7 +9,7 @@
 use std::cell::RefCell;
 use std::sync::Arc;
 
-use blinc_cn::prelude::{icons, input, to_svg, ColorToken, InputSize, ThemeState};
+use blinc_cn::prelude::{input, InputSize};
 use blinc_layout::prelude::*;
 use blinc_layout::widgets::overlay::AnchorDirection;
 use blinc_layout::widgets::overlay_stack::{OverlayBuilder, OverlayHandle};
@@ -22,6 +22,8 @@ use super::{actions, Aim, Place};
 use crate::model::commands::Command;
 use crate::model::compose::ComposeCommand;
 use crate::ui::agents::{self, Standing};
+use crate::ui::glyphs::Glyph;
+use crate::ui::icons;
 use crate::ui::text::{mono_text, ui_text};
 use crate::ui::App;
 
@@ -44,11 +46,8 @@ const MENU_SEARCH_HEIGHT: f32 = 36.0;
 /// Longest label a pill shows, in characters.
 const LABEL_CHARS: usize = 22;
 
-fn ico(path: &str, size: f32) -> impl ElementBuilder {
-    svg(to_svg(path, size))
-        .size(size, size)
-        .tint(ThemeState::get().color(ColorToken::TextSecondary))
-        .flex_shrink_0()
+fn ico(glyph: Glyph, size: f32) -> impl ElementBuilder {
+    icons::tinted(glyph, size)
 }
 
 fn clip(text: &str, max: usize) -> String {
@@ -120,19 +119,20 @@ fn pill(icon: Option<Div>, label: String, chevron: bool, open: bool) -> Div {
     }
     pill = pill.child(mono_text(label).size(12.0).no_wrap().no_cursor());
     if chevron {
-        pill = pill.child(ico(icons::CHEVRON_DOWN, 12.0));
+        pill = pill.child(ico(Glyph::DisclosureDown, 12.0));
     }
     pill
 }
 
-fn glyph_box(path: &str) -> Div {
-    div().flex_shrink_0().child(ico(path, 14.0))
+fn glyph_box(glyph: Glyph) -> Div {
+    div().flex_shrink_0().child(ico(glyph, 14.0))
 }
 
 /// Which side of its pill a menu opens on.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Side {
     Above,
+    #[allow(dead_code)]
     Below,
 }
 
@@ -353,7 +353,7 @@ fn menu_row(label: Div, selected: bool, enabled: bool, focused: bool) -> Div {
         row = row.class("mq-menu-row--focus");
     }
     if selected {
-        row = row.class("mq-menu-row--sel").child(ico(icons::CHECK, 14.0));
+        row = row.class("mq-menu-row--sel").child(ico(Glyph::Done, 14.0));
     }
     if enabled {
         row.cursor_pointer()
@@ -377,8 +377,8 @@ fn separator() -> Div {
 /// The whole selector row.
 pub fn row(app: &App, aim: &Aim) -> Div {
     let cmp = Cmp::get();
-    let start = aim.place == Place::Start;
-    let side = if start { Side::Below } else { Side::Above };
+    // Composer sits at the foot on both pages; menus open upward.
+    let side = Side::Above;
     let mut pills = div()
         .class("mq-pills")
         .flex_1()
@@ -406,9 +406,8 @@ pub fn row(app: &App, aim: &Aim) -> Div {
             pills = pills.child(effort_pill(app, aim, model, side));
         }
     }
-    if let Some(pill) = branch_pill(app, aim, side) {
-        pills = pills.child(pill);
-    }
+    // Branch name lives in the right git column; a compact control opens it.
+    pills = pills.child(git_toggle(app, aim));
 
     let mut right = div()
         .class("mq-cmp-right")
@@ -418,11 +417,23 @@ pub fn row(app: &App, aim: &Aim) -> Div {
     if aim.place == Place::Session {
         let queued = cmp.inbox.get().len();
         if queued > 0 {
+            let open_q = app.clone();
             right = right.child(
-                mono_text(app.strings.n_queued(queued))
-                    .size(11.0)
-                    .no_wrap()
-                    .no_cursor(),
+                div()
+                    .class("mq-queued-jump")
+                    .cursor_pointer()
+                    .child(
+                        mono_text(app.strings.n_queued(queued))
+                            .size(11.0)
+                            .no_wrap()
+                            .no_cursor(),
+                    )
+                    .on_click(move |_| {
+                        crate::ui::shell::open_right(
+                            &open_q,
+                            crate::model::view::RightTab::Queue,
+                        );
+                    }),
             );
         }
         if let Some(pill) = usage_readout(aim) {
@@ -449,10 +460,10 @@ fn project_pill(app: &App, aim: &Aim, side: Side) -> Div {
     let label = clip(&label, LABEL_CHARS);
     if aim.place == Place::Session {
         // A session lives in its folder.
-        return pill(Some(glyph_box(icons::FOLDER)), label, false, false).class("mq-pill--static");
+        return pill(Some(glyph_box(Glyph::Folder)), label, false, false).class("mq-pill--static");
     }
     let open = Cmp::get().menu.get() == Some(MenuId::Project);
-    let p = pill(Some(glyph_box(icons::FOLDER)), label, true, open);
+    let p = pill(Some(glyph_box(Glyph::Folder)), label, true, open);
     let current = aim.cwd.clone();
     let app = app.clone();
     let height = menu_height(recent_projects(&app, current.as_deref()).len() + 1, 1);
@@ -841,7 +852,7 @@ fn mode_pill(app: &App, aim: &Aim, side: Side) -> Div {
     let choosable = !modes.is_empty();
     let open = Cmp::get().menu.get() == Some(MenuId::Mode);
     let p = pill(
-        Some(glyph_box(icons::FILE_TEXT)),
+        Some(glyph_box(Glyph::Document)),
         clip(&label, LABEL_CHARS),
         choosable,
         open,
@@ -934,13 +945,37 @@ fn effort_pill(app: &App, aim: &Aim, model: &ModelInfo, side: Side) -> Div {
     })
 }
 
+/// Compact git control: opens the right column on the Git tab, no label.
+fn git_toggle(app: &App, aim: &Aim) -> Div {
+    let open = app.bindings.diff_panel.get()
+        && app.bindings.right_tab.get() == crate::model::view::RightTab::Git;
+    let has_git = aim
+        .cwd
+        .as_ref()
+        .is_some_and(|cwd| Cmp::get().branches.get().contains_key(cwd));
+    if !has_git && aim.place == Place::Start {
+        return div();
+    }
+    let app = app.clone();
+    let mut p = pill(Some(glyph_box(Glyph::Branch)), String::new(), false, open)
+        .cursor_pointer()
+        .on_click(move |_| {
+            crate::ui::shell::toggle_right(&app, crate::model::view::RightTab::Git);
+        });
+    if open {
+        p = p.class("mq-pill--open");
+    }
+    p
+}
+
+#[allow(dead_code)] // Branch switching moves into the right git column.
 fn branch_pill(app: &App, aim: &Aim, side: Side) -> Option<Div> {
     let cwd = aim.cwd.clone()?;
     let info = Cmp::get().branches.get().get(&cwd).cloned()?;
     let branch = info.current.clone()?;
     let open = Cmp::get().menu.get() == Some(MenuId::Branch);
     let p = pill(
-        Some(glyph_box(icons::GIT_BRANCH)),
+        Some(glyph_box(Glyph::Branch)),
         clip(&branch, LABEL_CHARS),
         true,
         open,

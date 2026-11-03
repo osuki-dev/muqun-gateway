@@ -24,6 +24,8 @@ use blinc_layout::prelude::*;
 use blinc_layout::widgets::text_input::{text_input_data, SharedTextInputData};
 
 use super::agents::{self, Standing};
+use super::glyphs::Glyph;
+use super::icons;
 use super::text::{mono_text, ui_text};
 use super::App;
 use crate::agent_fields::{self, Field, Kind};
@@ -48,9 +50,16 @@ pub fn page(app: &App, width: f32, height: f32) -> Div {
     let body_height = (height - CHROME).max(120.0);
     let close = {
         let app = app.clone();
-        button(tr(&app, "Close", "关闭"))
-            .variant(ButtonVariant::Ghost)
-            .size(ButtonSize::Small)
+        div()
+            .class("mq-icon-button")
+            .w(28.0)
+            .h(28.0)
+            .flex_row()
+            .items_center()
+            .justify_center()
+            .flex_shrink_0()
+            .cursor_pointer()
+            .child(icons::tinted(Glyph::Close, 16.0))
             .on_click(move |_| app.close_settings())
     };
     let (a, b, c, d) = (app.clone(), app.clone(), app.clone(), app.clone());
@@ -80,14 +89,18 @@ pub fn page(app: &App, width: f32, height: f32) -> Div {
                 .flex_row()
                 .items_center()
                 .child(
-                    div().flex_1().child(
+                    div().class("mq-settings-title").flex_1().child(
                         ui_text(tr(app, "Settings", "设置"))
-                            .size(20.0)
+                            .size(18.0)
                             .semibold()
                             .no_wrap(),
                     ),
                 )
-                .child(ui_text("Esc").size(11.0).no_wrap())
+                .child(
+                    div()
+                        .class("mq-kbd")
+                        .child(ui_text("Esc").size(11.0).no_wrap()),
+                )
                 .child(close),
         )
         .child(
@@ -95,6 +108,7 @@ pub fn page(app: &App, width: f32, height: f32) -> Div {
                 .class("mq-settings-tabs")
                 .w_full()
                 .flex_grow()
+                .min_h(0.0)
                 .child(strip),
         )
 }
@@ -104,11 +118,17 @@ fn pane(height: f32, content: Div) -> Div {
     div().w_full().h(height).child(
         scroll().w_full().h(height).child(
             div()
-                .class("mq-settings-pane")
                 .w_full()
-                .max_w(PAGE_WIDTH)
-                .flex_col()
-                .child(content),
+                .flex_row()
+                .justify_center()
+                .child(
+                    div()
+                        .class("mq-settings-pane")
+                        .w_full()
+                        .max_w(PAGE_WIDTH)
+                        .flex_col()
+                        .child(content),
+                ),
         ),
     )
 }
@@ -116,7 +136,7 @@ fn pane(height: f32, content: Div) -> Div {
 fn section_title(text: &str) -> Div {
     div()
         .class("mq-set-title")
-        .child(ui_text(text.to_string()).size(12.0).semibold())
+        .child(ui_text(text.to_string()).size(13.0).semibold())
 }
 
 fn hint(text: impl Into<String>) -> Div {
@@ -124,6 +144,32 @@ fn hint(text: impl Into<String>) -> Div {
         .class("mq-set-hint")
         .w_full()
         .child(ui_text(text).size(12.0))
+}
+
+/// A surface card wrapping one settings section (App chrome ladder).
+fn section_card(title: Option<&str>, body: Div) -> Div {
+    let mut card = div().class("mq-set-card").w_full().flex_col();
+    if let Some(title) = title {
+        card = card.child(section_title(title));
+    }
+    card.child(body.class("mq-set-card-body").w_full().flex_col())
+}
+
+/// Label on the left, control on the right — one settings row.
+fn setting_row(label: &str, control: impl ElementBuilder + 'static) -> Div {
+    div()
+        .class("mq-set-row")
+        .w_full()
+        .flex_row()
+        .items_center()
+        .child(
+            div()
+                .class("mq-set-row-label")
+                .flex_1()
+                .min_w(0.0)
+                .child(ui_text(label.to_string()).size(13.0).no_wrap()),
+        )
+        .child(div().flex_shrink_0().child(control))
 }
 
 /// A settings text field: small, fill-only (no stroke).
@@ -296,7 +342,7 @@ fn agent_section(app: &App, agent: &'static str) -> Div {
         })
     };
 
-    let mut section = div().class("mq-agent-section").w_full().flex_col().child(
+    let mut body = div().w_full().flex_col().child(
         div()
             .w_full()
             .flex_row()
@@ -304,9 +350,9 @@ fn agent_section(app: &App, agent: &'static str) -> Div {
             .class("mq-agent-section-head")
             .child(agents::dot(agent))
             .child(
-                div().class("mq-agent-section-name").flex_1().child(
+                div().class("mq-agent-section-name").flex_1().min_w(0.0).child(
                     ui_text(agents::name(agent, &infos))
-                        .size(14.0)
+                        .size(13.0)
                         .semibold()
                         .no_wrap(),
                 ),
@@ -315,20 +361,27 @@ fn agent_section(app: &App, agent: &'static str) -> Div {
                 div()
                     .class("mq-standing")
                     .class(standing.class())
+                    .flex_shrink_0()
                     .child(ui_text(standing.word(&app.strings)).size(11.0).no_wrap()),
             )
             .child(toggle),
     );
     if let Some(text) = agent_hint(app, agent) {
-        section = section.child(hint(text));
+        body = body.child(hint(text));
     }
     for field in agent_fields::fields(agent) {
-        section = section.child(field_row(app, agent, *field, &config));
+        body = body.child(field_row(app, agent, *field, &config));
     }
     if agent == "t3" {
-        section = section.child(pair_t3(app, &config));
+        body = body.child(pair_t3(app, &config));
     }
-    section
+    // Same surface card as Appearance / General — one agent per card.
+    div()
+        .class("mq-set-card")
+        .class("mq-agent-section")
+        .w_full()
+        .flex_col()
+        .child(body.class("mq-set-card-body").w_full().flex_col())
 }
 
 fn clear_text(key: &str) {
@@ -573,7 +626,7 @@ fn choice_row<T: Copy + PartialEq + Default + Send + Sync + 'static>(
 
 // --- Appearance -----------------------------------------------------------
 
-/// Density / motion / glass above the themes library (own scroll).
+/// Reading prefs in a card, then the themes library (no second "Themes" title).
 fn appearance_tab(app: &App, width: f32, height: f32) -> Div {
     let ctx = BlincContextState::get();
     let appearance = app.config.get().appearance;
@@ -595,46 +648,93 @@ fn appearance_tab(app: &App, width: f32, height: f32) -> Div {
 
     let motion = ctx.use_state_keyed("mq-set.reduced_motion", || appearance.reduced_motion);
     let motion_app = app.clone();
-    let motion_switch = switch(&motion)
-        .label(tr(app, "Reduce motion", "减少动效"))
-        .on_change(move |on| motion_app.apply_reduced_motion(on));
+    let motion_switch = switch(&motion).on_change(move |on| motion_app.apply_reduced_motion(on));
 
     let glass = ctx.use_state_keyed("mq-set.reduced_transparency", || {
         appearance.reduced_transparency
     });
     let glass_app = app.clone();
-    let glass_switch = switch(&glass)
-        .label(tr(app, "Reduce transparency", "减少透明"))
-        .on_change(move |on| glass_app.apply_reduced_transparency(on));
+    let glass_switch =
+        switch(&glass).on_change(move |on| glass_app.apply_reduced_transparency(on));
 
-    // Reading prefs sit above the library; leave the rest for themes_panel.
-    const READING: f32 = 168.0;
+    let scheme_row = scheme_choice(app);
+
+    let reading = section_card(
+        Some(tr(app, "Reading", "阅读")),
+        div()
+            .w_full()
+            .flex_col()
+            .child(setting_row(tr(app, "Density", "密度"), density_row))
+            .child(setting_row(tr(app, "Color scheme", "配色"), scheme_row))
+            .child(setting_row(
+                tr(app, "Reduce motion", "减少动效"),
+                motion_switch,
+            ))
+            .child(setting_row(
+                tr(app, "Reduce transparency", "减少透明"),
+                glass_switch,
+            )),
+    );
+
+    // Reading card + Themes label; themes panel drops its own title when embedded.
+    const READING: f32 = 220.0;
+    const TABS_PAD_X: f32 = 64.0;
     let themes_h = (height - READING).max(160.0);
+    let themes_w = (width - TABS_PAD_X).max(320.0);
 
     div()
+        .class("mq-appearance")
         .w_full()
         .h(height)
         .flex_col()
         .child(
             div()
-                .class("mq-set-col")
                 .class("mq-appearance-reading")
                 .w_full()
                 .flex_col()
-                .child(section_title(tr(app, "Reading", "阅读")))
-                .child(
-                    div()
-                        .class("mq-set-field")
-                        .w_full()
-                        .flex_col()
-                        .child(ui_text(tr(app, "Density", "密度")).size(12.0).semibold())
-                        .child(density_row),
-                )
-                .child(motion_switch)
-                .child(glass_switch)
+                .flex_shrink_0()
+                .child(reading)
                 .child(section_title(tr(app, "Themes", "主题"))),
         )
-        .child(super::themes::themes_panel(app, width, themes_h))
+        .child(super::themes::themes_panel_embedded(app, themes_w, themes_h))
+}
+
+/// Light / Dark / System for the active theme (moved out of the themes header).
+fn scheme_choice(app: &App) -> impl ElementBuilder {
+    use crate::config::Scheme;
+    let b = super::themes::ThemeBindings::get();
+    let current = b.current.clone();
+    let app = app.clone();
+    stateful_with_key::<NoState>("mq-set-scheme")
+        .deps([current.signal_id()])
+        .on_state(move |_| {
+            let choice = current.get();
+            let scheme = choice.as_ref().map(|c| c.1).unwrap_or(Scheme::System);
+            let mut row = div().class("mq-set-choices").flex_row().items_center();
+            for (s, label) in [
+                (Scheme::Light, tr(&app, "Light", "浅色")),
+                (Scheme::Dark, tr(&app, "Dark", "深色")),
+                (Scheme::System, tr(&app, "System", "跟随系统")),
+            ] {
+                let app2 = app.clone();
+                let id = choice.as_ref().map(|c| c.0.clone());
+                row = row.child(
+                    button(label)
+                        .variant(if s == scheme {
+                            ButtonVariant::Primary
+                        } else {
+                            ButtonVariant::Outline
+                        })
+                        .size(ButtonSize::Small)
+                        .on_click(move |_| {
+                            if let Some(id) = id.clone() {
+                                app2.send(Command::ThemeApply(id, s));
+                            }
+                        }),
+                );
+            }
+            row
+        })
 }
 
 // --- General --------------------------------------------------------------
@@ -718,41 +818,45 @@ fn general_tab(app: &App) -> Div {
         .w_full()
         .flex_col()
         .class("mq-set-col")
-        .child(section_title(tr(app, "Language", "语言")))
-        .child(language_row)
-        .child(section_title(tr(app, "Sessions", "会话")))
-        .child(
+        .child(section_card(
+            Some(tr(app, "Language", "语言")),
+            setting_row(tr(app, "Interface language", "界面语言"), language_row),
+        ))
+        .child(section_card(
+            Some(tr(app, "Sessions", "会话")),
             div()
-                .class("mq-set-field")
                 .w_full()
                 .flex_col()
                 .child(cwd_field)
                 .child(error_line("mq-set.default_cwd.err-line".into(), cwd_shown)),
-        )
-        .child(section_title(tr(app, "Editor", "编辑器")))
-        .child(
+        ))
+        .child(section_card(
+            Some(tr(app, "Editor", "编辑器")),
             div()
-                .class("mq-set-field")
                 .w_full()
                 .flex_col()
-                .child(editor_field),
-        )
-        .child(hint(tr(
-            app,
-            "Used by “Open in editor”, which arrives in a later version.",
-            "供之后的“在编辑器中打开”使用，该功能将在后续版本提供。",
-        )))
-        .child(section_title(tr(app, "Window", "窗口")))
-        .child(
-            switch(&tray)
-                .label(tr(app, "Close to tray", "关闭窗口时收起到托盘"))
-                .disabled(true),
-        )
-        .child(hint(tr(
-            app,
-            "Not available yet: closing the window quits the app.",
-            "暂不可用：目前关闭窗口即退出应用。",
-        )))
+                .child(editor_field)
+                .child(hint(tr(
+                    app,
+                    "Used by “Open in editor”, which arrives in a later version.",
+                    "供之后的“在编辑器中打开”使用，该功能将在后续版本提供。",
+                ))),
+        ))
+        .child(section_card(
+            Some(tr(app, "Window", "窗口")),
+            div()
+                .w_full()
+                .flex_col()
+                .child(setting_row(
+                    tr(app, "Close to tray", "关闭时收起到托盘"),
+                    switch(&tray).disabled(true),
+                ))
+                .child(hint(tr(
+                    app,
+                    "Not available yet: closing the window quits the app.",
+                    "暂不可用：目前关闭窗口即退出应用。",
+                ))),
+        ))
 }
 
 // --- About ----------------------------------------------------------------
@@ -776,27 +880,41 @@ fn about_tab(app: &App) -> Div {
         .w_full()
         .flex_col()
         .class("mq-set-col")
-        .child(
-            ui_text(format!(
-                "{} {}",
-                crate::branding::APP_NAME,
-                env!("CARGO_PKG_VERSION")
-            ))
-            .size(16.0)
-            .semibold(),
-        )
-        .child(hint(tr(
-            app,
-            "Muqun keeps its own files, apart from a Muqun gateway's.",
-            "Muqun 使用自己的文件夹，与 Muqun gateway 的互不相干。",
-        )))
-        .child(path_row(
-            tr(app, "Config file", "配置文件"),
-            config_file.to_string_lossy().into_owned(),
+        .child(section_card(
+            None,
+            div()
+                .w_full()
+                .flex_col()
+                .child(
+                    div().class("mq-set-about-name").child(
+                        ui_text(format!(
+                            "{} {}",
+                            crate::branding::APP_NAME,
+                            env!("CARGO_PKG_VERSION")
+                        ))
+                        .size(18.0)
+                        .semibold(),
+                    ),
+                )
+                .child(hint(tr(
+                    app,
+                    "Muqun keeps its own files, apart from a Muqun gateway's.",
+                    "Muqun 使用自己的文件夹，与 Muqun gateway 的互不相干。",
+                ))),
         ))
-        .child(path_row(
-            tr(app, "State folder", "状态文件夹"),
-            app.paths.state_dir.to_string_lossy().into_owned(),
+        .child(section_card(
+            Some(tr(app, "Files", "文件")),
+            div()
+                .w_full()
+                .flex_col()
+                .child(path_row(
+                    tr(app, "Config file", "配置文件"),
+                    config_file.to_string_lossy().into_owned(),
+                ))
+                .child(path_row(
+                    tr(app, "State folder", "状态文件夹"),
+                    app.paths.state_dir.to_string_lossy().into_owned(),
+                ))
+                .child(div().class("mq-set-actions").flex_row().child(open)),
         ))
-        .child(div().class("mq-set-actions").flex_row().child(open))
 }

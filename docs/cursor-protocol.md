@@ -169,7 +169,8 @@ arguments from `args`. The model reaches the tools through Cursor's
 | Image attachments | `promptCapabilities.image` | Implemented (shared prompt parts; not verified live) |
 | Approvals | `session/request_permission` (allow-once / allow-always / reject-once) | Implemented (shared); asked only when Cursor's own approval mode asks, not verified live |
 | Questions / plan approval | `cursor/ask_question`, `cursor/create_plan` (blocking) | Not implemented: answered "method not supported", not verified live |
-| Todos / subagents / images | `cursor/update_todos`, `cursor/task`, `cursor/generate_image` notifications | Not shown |
+| Todos | `cursor/update_todos` (+ updateTodos tool) | Implemented (`AgentPart::Todo`) |
+| Subagents / images | `cursor/task`, `cursor/generate_image` | Not shown |
 | Delegated tasks and muqun tools | ACP HTTP `mcpServers` | Implemented (verified against a probe MCP server); no system prompt, so the task sentence ends the first prompt and is cut from the served transcript |
 | Worktrees | `agent -w` only in the terminal UI | Not supported |
 | File-change listing | No | Not supported |

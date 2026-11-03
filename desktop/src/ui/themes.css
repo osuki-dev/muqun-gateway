@@ -17,11 +17,25 @@
 .mq-themes {
     background: var(--background);
     color: var(--text-primary);
+    min-height: 0;
 }
 .mq-themes-header {
     padding: var(--mq-space-4) var(--mq-space-6) var(--mq-space-2) var(--mq-space-6);
-    gap: var(--mq-space-3);
+    gap: var(--mq-space-2);
     border-bottom: none;
+}
+/* Settings → Appearance already pads the tab; drop the panel's outer inset
+   so the library lines up with Reading above. */
+.mq-themes--embedded .mq-themes-header {
+    padding-left: 0;
+    padding-right: 0;
+    padding-top: 0;
+    padding-bottom: var(--mq-space-2);
+}
+.mq-themes--embedded .mq-themes-scroll {
+    padding-left: 0;
+    padding-right: 0;
+    padding-top: var(--mq-space-3);
 }
 .mq-themes-title-row { gap: var(--mq-space-3); }
 .mq-segmented {
@@ -45,8 +59,8 @@
     color: var(--text-primary);
 }
 
-.mq-themes-scroll { padding: var(--mq-space-6) var(--mq-space-6) 96px var(--mq-space-6); }
-.mq-themes-grid { gap: var(--mq-space-4); }
+.mq-themes-scroll { padding: var(--mq-space-4) var(--mq-space-6) 96px var(--mq-space-6); }
+.mq-themes-grid { gap: var(--mq-space-3); }
 .mq-themes-stale {
     padding: var(--mq-space-2) var(--mq-space-3);
     border-radius: var(--mq-radius-md);
@@ -70,26 +84,63 @@
 }
 .mq-theme-card:hover { transform: translateY(-1px); background: var(--surface-elevated); }
 .mq-theme-card--active { background: var(--accent-subtle); }
+/* Preview: full content width, --mq-radius-md inside the card's --mq-radius-lg. */
 .mq-theme-card-picture {
+    width: 100%;
+    flex-shrink: 0;
     border-radius: var(--mq-radius-md);
     background: var(--surface-overlay);
+    overflow: clip;
 }
 .mq-theme-card-placeholder { color: var(--text-tertiary); }
-.mq-theme-card-title { gap: 2px; }
-.mq-theme-card-meta { color: var(--text-tertiary); }
-.mq-theme-tags { gap: var(--mq-space-1); }
+.mq-theme-card-title {
+    gap: 2px;
+    flex-shrink: 0;
+    min-width: 0;
+    overflow: clip;
+}
+.mq-theme-card-meta {
+    color: var(--text-tertiary);
+    min-width: 0;
+    overflow: clip;
+}
+/* Fixed one-row pill strip; overflow clips rather than growing the card. */
+.mq-theme-tags {
+    gap: var(--mq-space-1);
+    height: 22px;
+    flex-shrink: 0;
+    align-items: center;
+    overflow: clip;
+}
 .mq-theme-tag {
     padding: 1px 6px;
     border-radius: var(--mq-radius-sm);
     background: var(--surface-overlay);
     color: var(--text-secondary);
+    flex-shrink: 0;
 }
-.mq-theme-card-actions { gap: var(--mq-space-2); }
-.mq-theme-status { color: var(--text-secondary); }
-.mq-theme-error { color: var(--error); }
+.mq-theme-card-spacer { flex-grow: 1; min-height: 0; }
+/* Status left / buttons right; fixed height so Apply aligns across a row. */
+.mq-theme-card-actions {
+    gap: var(--mq-space-2);
+    height: 28px;
+    flex-shrink: 0;
+    align-items: center;
+}
+.mq-theme-status {
+    color: var(--text-secondary);
+    min-width: 0;
+    overflow: clip;
+}
+.mq-theme-error {
+    color: var(--error);
+    min-width: 0;
+    overflow: clip;
+}
 .mq-theme-progress {
     border-radius: 2px;
     background: var(--surface-overlay);
+    flex-shrink: 0;
 }
 .mq-theme-progress-bar {
     border-radius: 2px;

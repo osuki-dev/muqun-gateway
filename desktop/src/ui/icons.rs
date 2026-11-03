@@ -1,31 +1,32 @@
-//! Lucide icons (through `blinc_cn`), tinted from the theme. Drawn as SVG so
-//! they never depend on a font having the glyph.
+//! App glyphs ([`crate::ui::glyphs`]), tinted from the theme. Chrome must not
+//! invent Lucide paths — the App set in `assets/glyphs` is the single source
+//! (`scripts/sync-glyphs.sh`).
 
-use blinc_cn::prelude::{icons, to_svg, ColorToken, ThemeState};
+use blinc_cn::prelude::{ColorToken, ThemeState};
 use blinc_layout::prelude::*;
 
-const SIZE: f32 = 14.0;
+use super::glyphs::{self, Glyph};
 
-fn tinted(path: &str, size: f32) -> impl ElementBuilder {
-    svg(to_svg(path, size))
-        .size(size, size)
+/// Theme-tinted App glyph at `size`.
+pub fn tinted(glyph: Glyph, size: f32) -> Svg {
+    glyphs::icon(glyph, size)
         .tint(ThemeState::get().color(ColorToken::TextSecondary))
         .flex_shrink_0()
 }
 
-/// A disclosure chevron: down when `open`, right when closed.
+/// A disclosure chevron: down when `open`, right when closed (App glyphs).
 pub fn chevron(open: bool) -> impl ElementBuilder {
     tinted(
         if open {
-            icons::CHEVRON_DOWN
+            Glyph::DisclosureDown
         } else {
-            icons::CHEVRON_RIGHT
+            Glyph::Next
         },
-        SIZE,
+        14.0,
     )
 }
 
 /// The settings gear.
 pub fn settings() -> impl ElementBuilder {
-    tinted(icons::SETTINGS, 16.0)
+    tinted(Glyph::Settings, 16.0)
 }

@@ -223,6 +223,7 @@ fn on_key(app: &App, ctx: &blinc_layout::event_handler::EventContext) {
         // Esc closes what is open, nearest first: a pill menu or the
         // `@` list, then Settings, else it stops the running turn.
         KEY_ESCAPE if composer::dismiss() => {}
+        KEY_ESCAPE if app.bindings.diff_panel.get() => shell::close_right(app),
         KEY_ESCAPE if app.bindings.settings_open.get() => app.close_settings(),
         KEY_ESCAPE => interrupt(app),
         KEY_PERIOD if chord => interrupt(app),
@@ -298,7 +299,7 @@ pub fn root(ctx: &WindowedContext, app: &App) -> Div {
         .w(ctx.width)
         .h(ctx.height)
         .flex_col()
-        .child(shell::top_bar(app))
+        .child(shell::top_bar(app, ctx.width))
         .child(themes::shell_body(shell::body(ctx, app)))
         .child(shell::diff_overlay(app))
         .child(themes::overlay(
@@ -306,6 +307,5 @@ pub fn root(ctx: &WindowedContext, app: &App) -> Div {
             ctx.width,
             (ctx.height - shell::TOP_BAR_HEIGHT).max(0.0),
         ))
-        .child(perf::overlay())
         .on_key_down(move |ctx| on_key(&keys, ctx))
 }

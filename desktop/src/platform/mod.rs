@@ -4,6 +4,7 @@
 pub mod clipboard;
 pub mod coexist;
 pub mod editors;
+pub mod filesearch;
 pub mod fonts;
 pub mod keys;
 pub mod shell;

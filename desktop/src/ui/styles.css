@@ -11,6 +11,9 @@
     --mq-radius-sm: 6px;
     --mq-radius-md: 8px;
     --mq-radius-lg: 12px;
+    /* Shell chrome: elliptical / stadium corners (topbar pills + columns). */
+    --mq-radius-chrome: 24px;
+    --mq-radius-pill: 999px;
     --mq-fs-11: 11px;
     --mq-fs-12: 12px;
     --mq-fs-13: 13px;
@@ -30,6 +33,9 @@
     /* Density: the gap under each timeline row. */
     --mq-row-gap: 16px;
     --mq-row-gap-compact: 8px;
+    /* Disclosure column (14px chevron + gap) hangs into timeline pad so
+       tool/todo labels share the same left edge as assistant prose. */
+    --mq-disclose: 22px;
     --mq-bar-3: 3px;
     --mq-hairline: 1px;
     --mq-motion-micro: 150ms;
@@ -51,19 +57,90 @@
 }
 
 /* topbar -------------------------------------------------------------
-   Owned by ui/shell.rs. 44 px; every control on the right is the same
-   ghost treatment: no border, a surface on hover (§6.0‴ A, C′ 5). */
+   Owned by ui/shell.rs. Three floating capsules: brand (sidebar width) |
+   title+actions (content width, centred) | optional right (§6.0‴ A). */
 .mq-topbar {
-    background: var(--surface);
+    background: transparent;
     border-bottom: none;
-    padding: 0 var(--mq-space-4);
-    gap: var(--mq-space-3);
+    padding: 6px var(--mq-space-3);
+    gap: var(--mq-space-2);
 }
-.mq-brand { padding-right: var(--mq-space-2); gap: var(--mq-space-2); }
-.mq-topbar-title { gap: var(--mq-space-3); color: var(--text-primary); }
+.mq-topbar-pill {
+    background: var(--surface-elevated);
+    border-radius: var(--mq-radius-pill);
+    padding: 0 var(--mq-space-3);
+    gap: var(--mq-space-2);
+}
+.mq-topbar-left {
+    gap: var(--mq-space-2);
+    color: var(--text-primary);
+    padding: 0 var(--mq-space-3);
+}
+.mq-brand { gap: var(--mq-space-2); color: var(--text-primary); }
+.mq-topbar-center-slot { gap: 0; }
+.mq-topbar-center {
+    gap: var(--mq-space-3);
+    color: var(--text-primary);
+    padding: 0 var(--mq-space-3);
+}
+.mq-topbar-title { gap: var(--mq-space-2); color: var(--text-primary); }
 .mq-topbar-session { color: var(--text-primary); }
-.mq-topbar-branch { gap: var(--mq-space-1); color: var(--text-secondary); }
 .mq-topbar-actions { gap: var(--mq-space-1); }
+.mq-topbar-right {
+    gap: var(--mq-space-1);
+    padding: 0 var(--mq-space-2);
+}
+.mq-right-column {
+    background: var(--surface);
+    border-left: none;
+    border-radius: var(--mq-radius-chrome);
+    overflow: hidden;
+}
+.mq-right-body { background: var(--surface); }
+.mq-right-git { background: var(--surface); }
+.mq-right-queue { background: var(--surface); padding: var(--mq-space-2); }
+.mq-right-head {
+    padding: var(--mq-space-2) var(--mq-space-3);
+    gap: var(--mq-space-2);
+    color: var(--text-primary);
+    border-bottom: 1px solid var(--border);
+}
+.mq-right-tabs { gap: var(--mq-space-1); }
+.mq-right-tab {
+    padding: 4px 10px;
+    border-radius: var(--mq-radius-sm);
+    color: var(--text-secondary);
+    gap: 6px;
+    transition: background var(--mq-motion-micro) ease-out, color var(--mq-motion-micro) ease-out;
+}
+.mq-right-tab:hover { background: var(--mq-hover); color: var(--text-primary); }
+.mq-right-tab--active {
+    background: var(--surface-overlay);
+    color: var(--text-primary);
+}
+.mq-right-tab-badge {
+    min-width: 16px;
+    padding: 0 5px;
+    border-radius: 999px;
+    background: var(--mq-hover-strong);
+    color: var(--text-secondary);
+    justify-content: center;
+}
+.mq-right-section {
+    padding: var(--mq-space-2) var(--mq-space-3);
+    color: var(--text-tertiary);
+}
+.mq-right-empty {
+    padding: var(--mq-space-4) var(--mq-space-3);
+    gap: var(--mq-space-2);
+    color: var(--text-secondary);
+}
+.mq-queued-jump {
+    color: var(--text-secondary);
+    padding: 2px 4px;
+    border-radius: var(--mq-radius-sm);
+}
+.mq-queued-jump:hover { color: var(--text-primary); background: var(--mq-hover); }
 .mq-icon-button {
     border-radius: var(--mq-radius-sm);
     transition: background var(--mq-motion-micro) ease-out, color var(--mq-motion-micro) ease-out;
@@ -120,12 +197,8 @@
 .mq-follow-dot { background: var(--primary); }
 /* /topbar */
 
-/* Frame meter: above chrome, out of the way of the brand. */
-.mq-fps { z-index: 50; pointer-events: none; }
+/* Frame meter lives in the topbar's right capsule. */
 .mq-fps-label {
-    padding: 2px 8px;
-    border-radius: var(--mq-radius-sm);
-    background: var(--surface-elevated);
     color: var(--text-secondary);
 }
 
@@ -133,7 +206,7 @@
 .mq-jump-pill-slot { z-index: 30; }
 .mq-jump-pill {
     padding: 0 var(--mq-space-3);
-    border-radius: var(--mq-radius-lg);
+    border-radius: var(--mq-radius-pill);
     border: none;
     background: var(--surface-elevated);
     color: var(--text-primary);
@@ -141,25 +214,38 @@
 }
 .mq-jump-pill:hover { background: var(--mq-hover-strong); }
 
+/* body under the pill: side inset matches the topbar; bottom inset is the
+   FRAME_PAD shortfall on the column height so the sidebar radius shows. */
+.mq-body {
+    padding: 0 var(--mq-space-3);
+    gap: var(--mq-space-2);
+    background: transparent;
+}
+
 /* sidebar ------------------------------------------------------------
-   Owned by ui/sessions.rs. Search 36 px, project rows 32 px, session rows
-   30 px, bottom entries 36 px (§6.0‴ A). Row actions and the relative time
+   Owned by ui/sessions.rs. Search 36 px, project rows 34 px, session rows
+   32 px, bottom entries 36 px (§6.0‴ A). Row actions and the relative time
    only show on hover (C′ 1, 2). Hover is the faint input-hover shade; the
    selected row and open page are the raised surface (surface-overlay and
    surface-elevated both map to the theme's surfaceRaised, as on App), set
    inline on a .mq-raised wrapper by ui/sessions.rs `raised`. */
-.mq-side-column { background: var(--surface); }
+.mq-side-column {
+    background: var(--surface);
+    border-radius: var(--mq-radius-chrome);
+    overflow: hidden;
+}
 .mq-sidebar {
     background: var(--surface);
     border-right: none;
+    border-radius: var(--mq-radius-chrome);
 }
 .mq-side-handle { background: transparent; }
 .mq-side-handle:hover { background: var(--border-hover); }
-.mq-side-search-wrap { padding: var(--mq-space-2) var(--mq-space-2) var(--mq-space-2) var(--mq-space-2); }
+.mq-side-search-wrap { padding: var(--mq-space-3) var(--mq-space-3) var(--mq-space-2); }
 .mq-side-search {
-    padding: 0 var(--mq-space-2) 0 var(--mq-space-2);
-    gap: var(--mq-space-1);
-    border-radius: var(--mq-radius-md);
+    padding: 0 var(--mq-space-3) 0 var(--mq-space-3);
+    gap: var(--mq-space-2);
+    border-radius: var(--mq-radius-pill);
     border: none;
     background: var(--input-bg);
     color: var(--text-secondary);
@@ -167,26 +253,36 @@
 }
 .mq-side-search:hover { background: var(--input-bg-hover); }
 .mq-kbd { color: var(--text-tertiary); padding-left: var(--mq-space-1); }
-/* Tight inset: session marks share the chevron column, then a small gap to text. */
-.mq-tree-list { padding: 0 var(--mq-space-2); }
+/* Tree gutter: chevron and session mark share one left edge. Padding must
+   live on the absolute mains — parent padding is ignored by inset(0) children. */
+.mq-tree-list { padding: var(--mq-space-1) var(--mq-space-2); }
 .mq-prow {
     border-radius: var(--mq-radius-sm);
     transition: background var(--mq-motion-micro) ease-out;
 }
 .mq-prow:hover { background: var(--mq-hover); }
-.mq-prow-main { padding: 0 var(--mq-space-2) 0 var(--mq-space-1); gap: var(--mq-space-1); color: var(--text-primary); }
+.mq-prow-main {
+    padding: 0 var(--mq-space-2) 0 var(--mq-space-2);
+    gap: 6px;
+    color: var(--text-primary);
+}
 .mq-prow-parent { color: var(--text-tertiary); }
 .mq-prow-missing { color: var(--text-tertiary); padding-left: var(--mq-space-2); }
 .mq-prow--missing .mq-prow-main { opacity: 0.55; }
-.mq-prow-actions { gap: 2px; opacity: 0; transition: opacity var(--mq-motion-micro) ease-out; }
+.mq-prow-actions {
+    gap: 2px;
+    opacity: 0;
+    transition: opacity var(--mq-motion-micro) ease-out;
+}
 .mq-prow:hover .mq-prow-actions { opacity: 1; }
 .mq-srow {
-    /* Same left edge as the project chevron; mark is 12 px, then a small gap. */
-    padding: 0 var(--mq-space-2) 0 var(--mq-space-1);
-    gap: var(--mq-space-1);
     border-radius: var(--mq-radius-sm);
     color: var(--text-secondary);
     transition: background var(--mq-motion-micro) ease-out, color var(--mq-motion-micro) ease-out;
+}
+.mq-srow-main {
+    padding: 0 var(--mq-space-2) 0 var(--mq-space-2);
+    gap: 6px;
 }
 .mq-srow:has(.mq-raised) { color: var(--text-primary); }
 .mq-srow:hover { background: var(--mq-hover); }
@@ -199,17 +295,69 @@
     opacity: 0;
 }
 .mq-srow:hover .mq-srow-time { opacity: 1; }
-.mq-srow-menu { opacity: 0; flex-shrink: 0; }
-.mq-srow:hover .mq-srow-menu,
-.mq-srow:focus-within .mq-srow-menu { opacity: 1; }
-.mq-srow-rename { flex: 1; min-width: 0; }
+/* Hidden until the row is hovered. Triggers must be text (not SVG): Blinc's
+   SVG paint path ignores ancestor opacity, so glyph ⋯ stayed always visible. */
+.mq-srow-menu {
+    opacity: 0;
+    flex-shrink: 0;
+    transition: opacity var(--mq-motion-micro) ease-out;
+}
+.mq-srow:hover .mq-srow-menu { opacity: 1; }
+/* Inline rename: sit inside the 32px row — no cn focus ring, tight actions. */
+.mq-srow-rename {
+    flex: 1;
+    min-width: 0;
+    gap: 2px;
+    padding-right: 2px;
+}
+.mq-srow-rename-field {
+    min-height: 0;
+    border-radius: var(--mq-radius-sm);
+    background: var(--input-bg);
+}
+.mq-srow-rename .cn-input {
+    height: 24px;
+    min-height: 24px;
+    padding: 0 6px;
+    font-size: 13px;
+    line-height: 24px;
+    border: none;
+    border-radius: var(--mq-radius-sm);
+    background: transparent;
+    box-shadow: none;
+    outline: none;
+}
+.mq-srow-rename .cn-input:focus,
+.mq-srow-rename .cn-input:focus-visible {
+    border: none;
+    box-shadow: none;
+    outline: none;
+}
+.mq-srow-rename-btn { color: var(--text-secondary); }
+.mq-srow-rename-btn:hover { color: var(--text-primary); }
+
+/* Session ⋯ menu: padded panel + rounded item hover (cn defaults are flush/square). */
+.cn-dropdown-menu {
+    padding: 4px;
+    border: none;
+    border-radius: var(--mq-radius-md);
+    background: var(--surface-elevated);
+}
+.cn-dropdown-item {
+    border-radius: var(--mq-radius-sm);
+    padding: 6px 10px;
+    font-size: 13px;
+}
+.cn-dropdown-item:hover {
+    background: var(--mq-hover);
+}
 /* The status badge (a 6 px dot in a 1.5 px ring of the sidebar's colour,
    over the mark's bottom-right corner; none while idle) is coloured inline
    from the theme by ui/sessions.rs `badge`. */
 .mq-raised { border-radius: var(--mq-radius-sm); }
 .mq-side-bottom {
     border-top: none;
-    padding: var(--mq-space-2);
+    padding: var(--mq-space-2) var(--mq-space-3);
 }
 .mq-side-entry {
     padding: 0 var(--mq-space-2);
@@ -223,7 +371,7 @@
 .mq-nav-label { color: inherit; }
 .mq-badge-count {
     padding: 0 var(--mq-space-1);
-    border-radius: 9px;
+    border-radius: var(--mq-radius-md);
     /* Attention count: warning, never primary (primary may be red). */
     background: var(--warning);
     color: var(--text-inverse);
@@ -250,7 +398,7 @@
 .mq-chip {
     gap: 5px;
     padding: 3px 8px;
-    border-radius: 10px;
+    border-radius: var(--mq-radius-md);
     border: none;
     background: var(--surface-overlay);
     color: var(--text-secondary);
@@ -264,21 +412,22 @@
 
 /* start ---------------------------------------------------------------
    Owned by ui/home.rs. Architecture §6.0‴ B: the start page is the
-   composer. Every colour is a theme variable, every size a scale value. */
+   composer. Title + recents above; composer pinned at the foot. */
 
 .mq-start { background: var(--background); color: var(--text-primary); }
-/* the theme's cover, upper right, fading towards the page; its opacity is
-   set on the image (8 % dark, 6 % light) */
+/* the theme's cover, upper right, fading towards the page; opacity is set
+   on the image (~22 % dark, ~16 % light) */
 .mq-start-cover {
-    mask-image: linear-gradient(to bottom left, black 25%, transparent 90%);
+    mask-image: linear-gradient(to bottom left, black 35%, transparent 92%);
 }
 .mq-start-title { color: var(--text-primary); }
 .mq-start-subtitle { color: var(--text-secondary); }
-.mq-start-column { gap: var(--mq-space-3); }
-.mq-start-card { padding-top: var(--mq-space-4); }
+.mq-start-column { gap: 0; }
+.mq-start-upper { gap: var(--mq-space-2); }
+.mq-start-card { padding-top: var(--mq-space-3); }
 .mq-start-recent { padding-top: var(--mq-space-2); }
 .mq-start-rows { gap: var(--mq-space-1); }
-.mq-start-label { padding: var(--mq-space-8) 0 var(--mq-space-2) 0; color: var(--text-tertiary); }
+.mq-start-label { padding: var(--mq-space-4) 0 var(--mq-space-2) 0; color: var(--text-tertiary); }
 .mq-start-empty { padding: var(--mq-space-3) 0; color: var(--text-tertiary); }
 .mq-start-row {
     gap: var(--mq-space-3);
@@ -331,6 +480,8 @@
 .mq-row:has(.mq-tool-quiet) { padding-bottom: 4px; }
 .mq-density--compact .mq-row:has(.mq-tool-quiet) { padding-bottom: 2px; }
 .mq-history { color: var(--text-tertiary); }
+.mq-history--more { color: var(--text-link); }
+.mq-history--more:hover { color: var(--primary-hover); }
 
 .mq-md { gap: var(--mq-space-2); }
 .mq-density--compact .mq-md { gap: var(--mq-space-1); }
@@ -369,7 +520,7 @@
 }
 .mq-link-button:hover { color: var(--primary-hover); }
 
-.mq-user-row { padding-left: var(--mq-space-10); }
+.mq-user-row { padding-right: var(--mq-space-10); }
 .mq-user {
     background: var(--surface);
     border: none;
@@ -400,7 +551,8 @@
 .mq-media-play {
     width: 44px;
     height: 44px;
-    border-radius: 22px;
+    /* Full round control (not shell chrome). */
+    border-radius: 999px;
     background: var(--primary);
     color: var(--text-inverse);
     align-items: center;
@@ -423,14 +575,15 @@
 .mq-injected-head {
     gap: var(--mq-space-2);
     padding: 2px 0;
+    margin-left: calc(-1 * var(--mq-disclose));
     color: var(--text-tertiary);
 }
 .mq-reasoning-body,
 .mq-injected-body {
     border-left: none;
-    padding-left: var(--mq-space-3);
+    padding-left: 0;
     background: var(--surface-overlay);
-    border-radius: 0 var(--mq-radius-sm) var(--mq-radius-sm) 0;
+    border-radius: var(--mq-radius-sm);
 }
 
 /* Diff / shell / approval: thin left accent on the block, no outer stroke. */
@@ -448,18 +601,20 @@
 }
 .mq-tool-quiet .mq-tool-name { color: var(--text-secondary); }
 .mq-tool-quiet .mq-tool-title { color: var(--text-tertiary); }
+/* Hang the chevron into the timeline pad; name/title line up with prose. */
 .mq-tool-row {
     border-radius: var(--mq-radius-sm);
-    padding: 0 var(--mq-space-1);
-    margin: 0 calc(-1 * var(--mq-space-1));
+    padding: 0;
+    margin-left: calc(-1 * var(--mq-disclose));
+    margin-right: 0;
     transition: background var(--mq-motion-micro) ease-out;
 }
 .mq-tool-row:hover { background: var(--mq-hover); }
-.mq-card-body { padding: var(--mq-space-2) var(--mq-space-3); gap: var(--mq-space-2); }
-.mq-density--compact .mq-card-body { padding: var(--mq-space-1) var(--mq-space-3); }
+.mq-card-body { padding: var(--mq-space-2) 0; gap: var(--mq-space-2); }
+.mq-density--compact .mq-card-body { padding: var(--mq-space-1) 0; }
 .mq-card-head { gap: var(--mq-space-2); color: var(--text-secondary); }
-.mq-tool-name { color: var(--text-primary); }
-.mq-tool-title { color: var(--text-secondary); }
+.mq-tool-name { gap: 6px; color: var(--text-primary); }
+.mq-tool-title { gap: 1px; color: var(--text-secondary); }
 .mq-tool-section, .mq-tool-input, .mq-output, .mq-card-section {
     gap: var(--mq-space-1);
     padding-top: var(--mq-space-1);
@@ -481,7 +636,39 @@
     border-top: none;
 }
 .mq-diff-body { padding-top: var(--mq-space-1); }
+.mq-todo-card { gap: 0; overflow: clip; }
+.mq-todo-head {
+    gap: var(--mq-space-2);
+    padding: var(--mq-space-2) 0;
+    margin-left: calc(-1 * var(--mq-disclose));
+}
+.mq-todo-count {
+    padding: 1px var(--mq-space-2);
+    border-radius: var(--mq-radius-sm);
+    background: color-mix(in srgb, var(--primary) 12%, transparent);
+    color: var(--primary);
+}
+.mq-todo-count--done {
+    background: color-mix(in srgb, var(--success) 14%, transparent);
+    color: var(--success);
+}
+.mq-todo-progress {
+    height: 2px;
+    width: 100%;
+    background: color-mix(in srgb, var(--border) 55%, transparent);
+}
+.mq-todo-progress > div {
+    height: 100%;
+    background: var(--primary);
+}
+.mq-todo-progress--done > div { background: var(--success); }
+.mq-todo-body {
+    gap: 7px;
+    padding: var(--mq-space-2) 0 var(--mq-space-3);
+}
 .mq-todo { gap: var(--mq-space-2); color: var(--text-primary); }
+.mq-todo--done { color: var(--text-tertiary); }
+.mq-todo--current { color: var(--text-primary); font-weight: 600; }
 .mq-badge {
     padding: 0 var(--mq-space-2);
     border-radius: var(--mq-radius-sm);
@@ -542,7 +729,7 @@
 .mq-cursor {
     width: 8px;
     height: 8px;
-    border-radius: 4px;
+    border-radius: var(--mq-radius-sm);
     margin-top: var(--mq-space-1);
     animation: mq-cursor-pulse 1.1s ease-in-out infinite;
 }
@@ -554,7 +741,11 @@
 .mq-tool-body .mq-tool-section,
 .mq-tool-body .mq-tool-input,
 .mq-tool-body .mq-output { padding-bottom: var(--mq-space-1); }
-.mq-diff-head { gap: var(--mq-space-3); color: var(--text-secondary); }
+.mq-diff-head {
+    gap: var(--mq-space-3);
+    color: var(--text-secondary);
+    margin-left: calc(-1 * var(--mq-disclose));
+}
 .mq-diff-title { gap: var(--mq-space-2); }
 .mq-link-button--quiet { color: var(--text-secondary); }
 .mq-link-button--quiet:hover { color: var(--text-primary); }
@@ -778,52 +969,97 @@
 .mq-chip--failed:hover { background: var(--error-bg); color: var(--error); }
 /* /composer ---------------------------------------------------------- */
 
-.mq-settings { background: var(--background); }
-.mq-settings-head {
-    gap: 12px;
-    padding: 20px 32px 8px 32px;
-    color: var(--text-tertiary);
+/* settings ------------------------------------------------------------
+   Owned by ui/settings.rs. Same inset language as the inbox: primary page
+   title, shrink-to-content tab tray, readable column, surface cards only
+   where a section is an interactive unit (agent config). */
+.mq-settings {
+    background: var(--background);
+    color: var(--text-primary);
 }
-.mq-settings-tabs { padding: 0 32px; }
-.mq-settings-pane { padding: 16px 0 40px 0; }
-.mq-set-col { gap: 14px; }
+.mq-settings-head {
+    gap: var(--mq-space-3);
+    padding: var(--mq-space-6) var(--mq-space-8) var(--mq-space-2) var(--mq-space-8);
+}
+.mq-settings-title { color: var(--text-primary); }
+.mq-settings-tabs {
+    padding: 0 var(--mq-space-8);
+    min-height: 0;
+}
+/* Shrink the cn tray to the triggers; a full-bleed tray reads as debug chrome. */
+.mq-settings-tabs .cn-tabs-list {
+    width: fit-content;
+    max-width: 100%;
+}
+.mq-settings-tabs .cn-tabs-trigger--active { box-shadow: none; }
+.mq-settings-pane {
+    padding: var(--mq-space-4) 0 var(--mq-space-10) 0;
+    gap: 0;
+}
+.mq-set-col { gap: var(--mq-space-4); }
+.mq-appearance { min-height: 0; gap: 0; }
 .mq-appearance-reading {
     flex-shrink: 0;
-    padding: 16px 0 8px 0;
+    gap: var(--mq-space-3);
+    padding: var(--mq-space-4) 0 var(--mq-space-2) 0;
 }
-.mq-set-title { padding-top: 10px; color: var(--text-tertiary); }
+.mq-set-card {
+    gap: var(--mq-space-3);
+    padding: var(--mq-space-4) var(--mq-space-5);
+    border-radius: var(--mq-radius-lg);
+    background: var(--surface);
+}
+.mq-set-card-body { gap: var(--mq-space-3); }
+.mq-set-title {
+    color: var(--text-secondary);
+    letter-spacing: 0.01em;
+}
+.mq-set-card > .mq-set-title { padding-top: 0; }
+.mq-set-col > .mq-set-title:first-child,
+.mq-appearance-reading > .mq-set-title:first-child {
+    padding-top: 0;
+}
+.mq-set-row {
+    gap: var(--mq-space-4);
+    min-height: 32px;
+}
+.mq-set-row-label { color: var(--text-primary); }
 .mq-set-hint { color: var(--text-tertiary); }
-.mq-set-field { gap: 6px; }
-.mq-set-actions { gap: 8px; padding-top: 2px; }
-.mq-set-choices { gap: 8px; }
+.mq-set-field { gap: var(--mq-space-2); }
+.mq-set-actions { gap: var(--mq-space-2); padding-top: var(--mq-space-1); }
+.mq-set-choices { gap: var(--mq-space-2); }
 .mq-set-error { color: var(--error); }
+.mq-set-about-name { color: var(--text-primary); }
 .mq-note {
-    padding: 8px 12px;
-    border-radius: 8px;
+    gap: var(--mq-space-3);
+    padding: var(--mq-space-2) var(--mq-space-3);
+    border-radius: var(--mq-radius-md);
     background: var(--surface);
     border: none;
     color: var(--text-secondary);
 }
 .mq-note--changed {
-    padding: 8px 12px;
-    border-radius: 8px;
+    gap: var(--mq-space-3);
+    padding: var(--mq-space-2) var(--mq-space-3);
+    border-radius: var(--mq-radius-md);
     background: var(--accent-subtle);
     border: none;
     color: var(--text-primary);
 }
 .mq-agent-section {
-    gap: 10px;
-    padding: 14px 16px;
-    border-radius: 12px;
-    background: var(--surface);
-    border: none;
+    /* Surface/padding from .mq-set-card; agent-only extras stay here. */
+    gap: var(--mq-space-3);
 }
-.mq-agent-section-head { gap: 10px; }
-.mq-agent-section-name { padding-left: 2px; color: var(--text-primary); }
-.mq-settings-wrap { padding: 0 24px 24px 24px; }
-.mq-settings-entry { gap: 8px; }
-.mq-nav-label { color: inherit; }
-.mq-folder-option { gap: 10px; }
+.mq-agent-section-head { gap: var(--mq-space-3); min-height: 32px; }
+.mq-agent-section-name { color: var(--text-primary); }
+.mq-standing {
+    padding: 0 var(--mq-space-2);
+    border-radius: var(--mq-radius-sm);
+    color: var(--text-tertiary);
+}
+.mq-settings-wrap { padding: 0 var(--mq-space-6) var(--mq-space-6) var(--mq-space-6); }
+.mq-settings-entry { gap: var(--mq-space-2); }
+.mq-folder-option { gap: var(--mq-space-3); }
 /* blinc_cn builds the chooser's list with this id and a 200px cap; MAX_OPTIONS
    rows of the app's height fit in this one. */
 #mq-chooser_options_content { max-height: 380px; }

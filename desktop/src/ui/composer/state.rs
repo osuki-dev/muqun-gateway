@@ -13,7 +13,7 @@ use blinc_layout::widgets::text_input::{text_input_data_with_placeholder, Shared
 use muqun_gateway::agents::ModelRef;
 
 use super::triggers::Trigger;
-use crate::hub::CatalogView;
+use crate::hub::{CatalogView, PeerMention};
 use crate::model::compose::{BranchInfo, ComposerUpdate, FileHit, InboxItem, StagedFile};
 
 /// What the start page will create, as far as the owner has said. Anything
@@ -85,6 +85,8 @@ pub struct Cmp {
     pub start: State<Arc<StartChoice>>,
     pub catalogs: State<Arc<Catalogs>>,
     pub files: State<Arc<FileState>>,
+    /// Computers `@` may name (this machine + linked peers when available).
+    pub peers: State<Arc<Vec<PeerMention>>>,
     pub staged: State<Arc<Vec<Staged>>>,
     pub inbox: State<Arc<Vec<InboxItem>>>,
     pub popup: State<Arc<Popup>>,
@@ -115,6 +117,7 @@ impl Cmp {
             start: ctx.use_state_keyed("mq.cmp.start", || Arc::new(StartChoice::default())),
             catalogs: ctx.use_state_keyed("mq.cmp.catalogs", || Arc::new(Catalogs::default())),
             files: ctx.use_state_keyed("mq.cmp.files", || Arc::new(FileState::default())),
+            peers: ctx.use_state_keyed("mq.cmp.peers", || Arc::new(Vec::new())),
             staged: ctx.use_state_keyed("mq.cmp.staged", || Arc::new(Vec::new())),
             inbox: ctx.use_state_keyed("mq.cmp.inbox", || Arc::new(Vec::new())),
             popup: ctx.use_state_keyed("mq.cmp.popup", || Arc::new(Popup::default())),
@@ -298,6 +301,10 @@ pub fn apply_update(update: ComposerUpdate) {
             let mut next = (*cmp.branches.get()).clone();
             next.insert(cwd, info);
             cmp.branches.signal().set(Arc::new(next));
+        }
+        ComposerUpdate::Peers { peers } => {
+            cmp.peers.signal().set(Arc::new(peers));
+            super::sync_popup();
         }
     }
 }

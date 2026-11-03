@@ -283,6 +283,38 @@ pub fn asset_row(ctx: &PartCtx<'_>, assets: &[MessageImageAsset]) -> Div {
     row
 }
 
+/// Inline preview for a host path the tool named (e.g. `read` of a `.png`).
+pub fn path_media(ctx: &PartCtx<'_>, path: &str) -> Option<Div> {
+    if path.is_empty() {
+        return None;
+    }
+    if !matches!(
+        kind_for(path, None),
+        MediaKind::Image | MediaKind::Video
+    ) {
+        return None;
+    }
+    let cwd = session_cwd(ctx);
+    let max_w = (ctx.width - 24.0).min(MAX_MEDIA_W);
+    Some(
+        div()
+            .class("mq-attach-row")
+            .class("mq-attach-row--tool")
+            .w_full()
+            .flex_row()
+            .flex_wrap()
+            .child(tile(
+                path,
+                cwd.as_deref(),
+                None,
+                None,
+                None,
+                max_w,
+                MAX_MEDIA_H,
+            )),
+    )
+}
+
 /// File / image / video entries inside a tool call's `content` array.
 pub fn tool_content_media(ctx: &PartCtx<'_>, content: &serde_json::Value) -> Option<Div> {
     let items = content.as_array()?;

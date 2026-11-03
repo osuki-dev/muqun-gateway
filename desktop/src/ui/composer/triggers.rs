@@ -8,6 +8,8 @@
 
 use muqun_gateway::agents::{CommandInfo, SkillInfo};
 
+use crate::hub::PeerMention;
+
 /// Past this many characters the word stopped being a file query (the App's
 /// `MAX_FILE_MENTION_QUERY`).
 pub const MAX_FILE_QUERY: usize = 96;
@@ -197,6 +199,28 @@ pub struct Row {
     pub insert: String,
     pub label: String,
     pub detail: String,
+    /// False for muted status rows (Loading… / empty) — never inserted.
+    pub selectable: bool,
+}
+
+impl Row {
+    pub fn item(insert: impl Into<String>, label: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self {
+            insert: insert.into(),
+            label: label.into(),
+            detail: detail.into(),
+            selectable: true,
+        }
+    }
+
+    pub fn status(label: impl Into<String>) -> Self {
+        Self {
+            insert: String::new(),
+            label: label.into(),
+            detail: String::new(),
+            selectable: false,
+        }
+    }
 }
 
 /// Rows of `/` for a query: the catalogue's commands and its slash skills,
@@ -204,16 +228,17 @@ pub struct Row {
 pub fn command_rows(query: &str, commands: &[CommandInfo], skills: &[SkillInfo]) -> Vec<Row> {
     let mut rows: Vec<Row> = commands
         .iter()
-        .map(|c| Row {
-            insert: format!("/{}", command_key(&c.name)),
-            label: format!("/{}", command_key(&c.name)),
-            detail: c.description.clone().unwrap_or_default(),
+        .map(|c| {
+            let key = command_key(&c.name);
+            Row::item(
+                format!("/{key}"),
+                format!("/{key}"),
+                c.description.clone().unwrap_or_default(),
+            )
         })
         .collect();
-    rows.extend(skills.iter().filter(|s| s.slash).map(|s| Row {
-        insert: format!("/{}", s.id),
-        label: format!("/{}", s.id),
-        detail: skill_detail(s),
+    rows.extend(skills.iter().filter(|s| s.slash).map(|s| {
+        Row::item(format!("/{}", s.id), format!("/{}", s.id), skill_detail(s))
     }));
     filter_rows(rows, query)
 }
@@ -222,11 +247,7 @@ pub fn command_rows(query: &str, commands: &[CommandInfo], skills: &[SkillInfo])
 pub fn skill_rows(query: &str, skills: &[SkillInfo]) -> Vec<Row> {
     let rows = skills
         .iter()
-        .map(|s| Row {
-            insert: format!("${}", s.id),
-            label: format!("${}", s.id),
-            detail: skill_detail(s),
-        })
+        .map(|s| Row::item(format!("${}", s.id), format!("${}", s.id), skill_detail(s)))
         .collect();
     filter_rows(rows, query)
 }
@@ -261,6 +282,60 @@ fn filter_rows(rows: Vec<Row>, query: &str) -> Vec<Row> {
     }
     prefix.extend(inside);
     prefix
+}
+
+/// App `orderMentionComputers`: current, then reachable, then unreachable;
+/// each group keeps input order; name prefix filter (case-insensitive).
+pub fn order_computers<'a>(
+    computers: &'a [PeerMention],
+    query: &str,
+) -> Vec<&'a PeerMention> {
+    let wanted = query.trim().to_lowercase();
+    let mut ranked: Vec<(u8, usize, &PeerMention)> = computers
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| wanted.is_empty() || c.name.to_lowercase().starts_with(&wanted))
+        .map(|(order, computer)| {
+            let rank = if computer.current {
+                0
+            } else if computer.reachable {
+                1
+            } else {
+                2
+            };
+            (rank, order, computer)
+        })
+        .collect();
+    ranked.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    ranked.into_iter().map(|(_, _, c)| c).collect()
+}
+
+/// `@` computer rows ahead of file hits. Insert is `@name` (replaces the
+/// whole trigger span, same as the App).
+pub fn computer_rows(
+    query: &str,
+    computers: &[PeerMention],
+    this_label: &str,
+    computer_label: &str,
+    offline_label: &str,
+) -> Vec<Row> {
+    order_computers(computers, query)
+        .into_iter()
+        .map(|computer| {
+            let detail = if computer.current {
+                this_label.to_string()
+            } else if computer.reachable {
+                computer_label.to_string()
+            } else {
+                offline_label.to_string()
+            };
+            Row::item(
+                format!("@{}", computer.name),
+                computer.name.clone(),
+                detail,
+            )
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -378,5 +453,38 @@ mod tests {
         );
         assert_eq!(command_rows("", &commands, &skills).len(), 3);
         assert_eq!(skill_rows("x", &[skill("a", false)]).len(), 0);
+    }
+
+    fn peer(name: &str, current: bool, reachable: bool) -> PeerMention {
+        PeerMention {
+            server_id: name.into(),
+            name: name.into(),
+            current,
+            reachable,
+        }
+    }
+
+    #[test]
+    fn computers_rank_current_then_reachable_then_offline() {
+        let peers = [
+            peer("zeta", false, false),
+            peer("alpha", false, true),
+            peer("home", true, true),
+            peer("beta", false, true),
+        ];
+        let names: Vec<&str> = order_computers(&peers, "")
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect();
+        assert_eq!(names, ["home", "alpha", "beta", "zeta"]);
+        let filtered: Vec<&str> = order_computers(&peers, "b")
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect();
+        assert_eq!(filtered, ["beta"]);
+        let rows = computer_rows("", &peers, "This computer", "Computer", "Offline");
+        assert_eq!(rows[0].insert, "@home");
+        assert_eq!(rows[0].detail, "This computer");
+        assert!(rows[0].selectable);
     }
 }

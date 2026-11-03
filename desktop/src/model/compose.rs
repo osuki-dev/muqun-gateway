@@ -16,7 +16,7 @@ use muqun_gateway::agents::{AgentSessionId, ModelRef};
 use serde_json::Value;
 
 use super::inbox::{Inbox, Update};
-use crate::hub::{CatalogView, HubError, SessionHub};
+use crate::hub::{CatalogView, HubError, PeerMention, SessionHub};
 
 /// The quiet period before a typed `@word` is searched (the App's 200 ms).
 pub const FILE_DEBOUNCE: Duration = Duration::from_millis(200);
@@ -209,6 +209,8 @@ pub enum ComposeCommand {
         cwd: String,
         branch: String,
     },
+    /// Computers `@` may name (this machine + linked peers when available).
+    ListPeers,
 }
 
 /// What the branch pill knows about one folder.
@@ -244,6 +246,9 @@ pub enum ComposerUpdate {
     Branch {
         cwd: String,
         info: BranchInfo,
+    },
+    Peers {
+        peers: Vec<PeerMention>,
     },
 }
 
@@ -392,6 +397,11 @@ pub async fn run(
                     muqun_gateway::agents::ports::AgentError::RequestFailed(err.to_string()),
                 )),
             }
+        }
+        ComposeCommand::ListPeers => {
+            let peers = hub.list_peers().await.unwrap_or_default();
+            push(&inbox, ComposerUpdate::Peers { peers });
+            None
         }
         ComposeCommand::Submit { .. } => unreachable!("handled by the core"),
     }

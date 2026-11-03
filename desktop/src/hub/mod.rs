@@ -40,6 +40,16 @@ pub struct CatalogView {
     pub catalog: AgentCatalog,
 }
 
+/// One computer the `@` popup may name (App `MentionComputer`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerMention {
+    pub server_id: String,
+    pub name: String,
+    pub reachable: bool,
+    /// The computer this composer already talks to.
+    pub current: bool,
+}
+
 pub trait SessionHub: Send + Sync {
     /// Every agent this hub knows, with the gateway's availability words.
     /// Never waits on a probe: the answer is what is known now (attached
@@ -63,6 +73,11 @@ pub trait SessionHub: Send + Sync {
     /// preparing it as the App's `/prepare` does (which may restore a dormant
     /// runtime or start following a terminal). For an explicit selection.
     fn open<'a>(&'a self, asid: &'a AgentSessionId) -> HubFuture<'a, AgentSessionSnapshot>;
+    /// Retained history only — never wakes an agent. `None` means a cold open.
+    fn peek<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+    ) -> HubFuture<'a, Option<AgentSessionSnapshot>>;
     /// The same snapshot, read without preparing anything where the hub can
     /// (the gateway's mirror): for re-reading a session that is already open.
     fn snapshot<'a>(&'a self, asid: &'a AgentSessionId) -> HubFuture<'a, AgentSessionSnapshot>;
@@ -153,6 +168,9 @@ pub trait SessionHub: Send + Sync {
     /// The working-tree changes in the session's folder, as the agent's
     /// `get_vcs_diff` reports them (`working` mode).
     fn vcs_diff<'a>(&'a self, asid: &'a AgentSessionId) -> HubFuture<'a, Vec<FileDiffItem>>;
+    /// Computers `@` may name: this machine first, then linked fleet peers
+    /// when the hub has them (App `GET /api/peers`).
+    fn list_peers(&self) -> HubFuture<'_, Vec<PeerMention>>;
     /// Every session event of every agent, in the order the runtime saw them.
     fn events(&self) -> broadcast::Receiver<AgentDomainEvent>;
 }

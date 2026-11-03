@@ -1,7 +1,7 @@
-//! The start page (architecture §6.0‴ B): "What are we doing?", the
-//! composer card, and the recent sessions. Nothing else -- no statistics, no
-//! launch cards, no agents panel. Home *is* the composer: the caret is in it
-//! on entry, and Enter starts a session with every default.
+//! The start page (architecture §6.0‴ B): "What are we doing?", recent
+//! sessions above, the composer card pinned at the foot. Nothing else -- no
+//! statistics, no launch cards, no agents panel. Home *is* the composer: the
+//! caret is in it on entry, and Enter starts a session with every default.
 //!
 //! No colour or family literal lives here: colours come from theme variables
 //! in `styles.css` (`/* start */`), text families from `ui::text`.
@@ -26,19 +26,18 @@ const TITLE_SIZE: f32 = 28.0;
 const RECENT_ROWS: usize = 8;
 const ROW_HEIGHT: f32 = 44.0;
 /// Opacity of the theme's cover behind the page (dark / light).
-const COVER_DARK: f32 = 0.06;
-const COVER_LIGHT: f32 = 0.04;
+const COVER_DARK: f32 = 0.22;
+const COVER_LIGHT: f32 = 0.16;
 /// The cover fills this much of the page's width, anchored at the upper right.
-const COVER_WIDTH_SHARE: f32 = 0.62;
-const COVER_HEIGHT_SHARE: f32 = 0.78;
-/// Vertical space the page spends outside the recent rows: top margin share,
-/// title, gaps, the card, the label, the bottom margin.
-/// The title's box (28 px type, 24 px below it) and the subtitle's.
+const COVER_WIDTH_SHARE: f32 = 0.72;
+const COVER_HEIGHT_SHARE: f32 = 0.88;
 const TITLE_BLOCK: f32 = 58.0;
 const SUBTITLE_BLOCK: f32 = 28.0;
 const CARD_ESTIMATE: f32 = 150.0;
 const LABEL_BLOCK: f32 = 28.0;
-const BOTTOM_MARGIN: f32 = 24.0;
+/// Foot padding under the composer card (matches the session slot).
+const BOTTOM_PAD: f32 = 16.0;
+const TOP_PAD: f32 = 28.0;
 
 /// Nothing to continue and no session ever started from this app. Before the
 /// agents are known nothing is decided.
@@ -57,22 +56,18 @@ fn detected(agents: &[AgentDiscoveryInfo]) -> usize {
         .count()
 }
 
-/// Where the start page puts its composer card: margin above the title,
-/// then the title (and the first-run subtitle), then the card, centred.
+/// Where the start page puts its composer card: centred, pinned to the foot.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct StartLayout {
-    pub top: f32,
     pub card_width: f32,
-    /// The card's top edge inside the main panel.
-    pub card_top: f32,
+    /// Estimated card height used for popup placement.
+    pub card_height: f32,
 }
 
-pub fn start_layout(main_width: f32, main_height: f32, subtitle: bool) -> StartLayout {
-    let top = (main_height * 0.17).clamp(24.0, 150.0);
+pub fn start_layout(main_width: f32) -> StartLayout {
     StartLayout {
-        top,
         card_width: START_CARD_MAX.min((main_width - 80.0).max(320.0)),
-        card_top: top + TITLE_BLOCK + if subtitle { SUBTITLE_BLOCK } else { 0.0 },
+        card_height: CARD_ESTIMATE,
     }
 }
 
@@ -80,17 +75,13 @@ pub fn start_layout(main_width: f32, main_height: f32, subtitle: bool) -> StartL
 /// that hangs from it (the registry's element bounds are parent-local).
 pub fn start_card_origin(app: &App) -> (f32, f32, f32) {
     let (vw, vh) = blinc_core::BlincContextState::get().viewport_size();
-    let sidebar = super::shell::side_width(app, vw);
-    let main = (vw - sidebar).max(0.0);
-    let top_bar = super::shell::TOP_BAR_HEIGHT;
-    let config = app.config.get();
-    let agents = app.bindings.agents.get();
-    let sessions = app.bindings.sessions.get();
-    let first = first_run(!agents.is_empty(), &sessions, &config.general);
-    let layout = start_layout(main, (vh - top_bar).max(0.0), first);
+    let left = super::shell::side_width(app, vw);
+    let right = super::shell::right_width(app);
+    let main = (vw - left - right).max(0.0);
+    let layout = start_layout(main);
     (
-        sidebar + (main - layout.card_width) / 2.0,
-        top_bar + layout.card_top,
+        left + (main - layout.card_width) / 2.0,
+        vh - BOTTOM_PAD - layout.card_height,
         layout.card_width,
     )
 }
@@ -134,16 +125,27 @@ fn page(app: &App, width: f32, height: f32) -> Div {
         (app.strings.start_title().to_string(), None)
     };
 
-    let layout = start_layout(width, height, subtitle.is_some());
-    let (top, card_width) = (layout.top, layout.card_width);
-    let fixed = layout.card_top + CARD_ESTIMATE + LABEL_BLOCK + BOTTOM_MARGIN + 24.0;
-    let fit = ((height - fixed) / ROW_HEIGHT).floor().max(0.0) as usize;
+    let layout = start_layout(width);
+    let card_width = layout.card_width;
+    let head = TOP_PAD
+        + TITLE_BLOCK
+        + if subtitle.is_some() {
+            SUBTITLE_BLOCK
+        } else {
+            0.0
+        }
+        + LABEL_BLOCK;
+    let foot = layout.card_height + BOTTOM_PAD + 24.0;
+    let fit = ((height - head - foot) / ROW_HEIGHT).floor().max(0.0) as usize;
     let rows = RECENT_ROWS.min(fit);
 
-    let mut column = div()
-        .class("mq-start-column")
+    let mut upper = div()
+        .class("mq-start-upper")
         .w(card_width)
+        .flex_1()
+        .min_h(0.0)
         .flex_col()
+        .child(div().h(TOP_PAD).flex_shrink_0())
         .child(
             div()
                 .class("mq-start-title")
@@ -158,7 +160,7 @@ fn page(app: &App, width: f32, height: f32) -> Div {
                 ),
         );
     if let Some(subtitle) = subtitle {
-        column = column.child(
+        upper = upper.child(
             div()
                 .class("mq-start-subtitle")
                 .w_full()
@@ -169,13 +171,28 @@ fn page(app: &App, width: f32, height: f32) -> Div {
                 .child(ui_text(subtitle).size(13.0).no_wrap()),
         );
     }
-    column = column
+    upper = upper.child(
+        div()
+            .w_full()
+            .flex_1()
+            .min_h(0.0)
+            .child(scroll().w_full().h_full().child(recents(app, &sessions, rows))),
+    );
+
+    let column = div()
+        .class("mq-start-column")
+        .w(card_width)
+        .h_full()
+        .flex_col()
+        .child(upper)
         .child(
             div()
                 .class("mq-start-card")
+                .w_full()
+                .flex_shrink_0()
                 .child(composer::start_card(app, card_width)),
         )
-        .child(recents(app, &sessions, rows));
+        .child(div().h(BOTTOM_PAD).flex_shrink_0());
 
     let mut page = div()
         .class("mq-start-page")
@@ -183,7 +200,6 @@ fn page(app: &App, width: f32, height: f32) -> Div {
         .inset(0.0)
         .flex_col()
         .items_center()
-        .child(div().h(top).flex_shrink_0())
         .child(column);
     if let Some(cover) = cover(app, width, height) {
         // Under everything: the page's own content is added after it.

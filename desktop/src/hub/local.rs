@@ -21,7 +21,7 @@ use muqun_gateway::platform::discovery::AgentDiscoveryInfo;
 use muqun_gateway::platform::StoredUpload;
 use tokio::sync::broadcast;
 
-use super::{CatalogView, HubError, HubFuture, SessionHub};
+use super::{CatalogView, HubError, HubFuture, PeerMention, SessionHub};
 
 pub struct LocalHub {
     runtime: Arc<AgentRuntime>,
@@ -147,9 +147,25 @@ impl SessionHub for LocalHub {
     fn open<'a>(&'a self, asid: &'a AgentSessionId) -> HubFuture<'a, AgentSessionSnapshot> {
         Box::pin(async move {
             let manager = self.manager_for_session(asid).await?;
-            // An explicit foreground selection, as the App's `/prepare`: it
-            // may restore a dormant native runtime. A refusal is not fatal --
-            // the retained history can still be read.
+            // Retained history paints immediately. Activating an ACP agent
+            // (spawn + session/load + replay) can take many seconds; do that
+            // in the background and let `acp_session_loaded` refresh.
+            if let Some(mut snapshot) = manager.mirror().get_snapshot(asid).await {
+                enrich_local_media(&mut snapshot);
+                let manager = Arc::clone(&manager);
+                let asid = asid.clone();
+                tokio::spawn(async move {
+                    if let Err(err) = manager.sessions().prepare_session(&asid).await {
+                        tracing::debug!(
+                            asid = %asid.0,
+                            %err,
+                            "background session preparation failed"
+                        );
+                    }
+                });
+                return Ok(snapshot);
+            }
+            // Cold open: nothing retained yet, so prepare must finish first.
             if let Err(err) = manager.sessions().prepare_session(asid).await {
                 tracing::debug!(asid = %asid.0, %err, "session preparation failed; reading history anyway");
             }
@@ -161,6 +177,20 @@ impl SessionHub for LocalHub {
             };
             enrich_local_media(&mut snapshot);
             Ok(snapshot)
+        })
+    }
+
+    fn peek<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+    ) -> HubFuture<'a, Option<AgentSessionSnapshot>> {
+        Box::pin(async move {
+            let manager = self.manager_for_session(asid).await?;
+            let Some(mut snapshot) = manager.mirror().get_snapshot(asid).await else {
+                return Ok(None);
+            };
+            enrich_local_media(&mut snapshot);
+            Ok(Some(snapshot))
         })
     }
 
@@ -275,11 +305,21 @@ impl SessionHub for LocalHub {
             if !Path::new(directory).is_absolute() || !Path::new(directory).is_dir() {
                 return Ok(Vec::new());
             }
-            let manager = self.manager_for_agent(agent).await?;
-            Ok(manager
-                .agent()
-                .find_files(query, limit, Some(directory))
-                .await?)
+            // Prefer the agent (App parity). ACP/Cursor have no find_files;
+            // empty or unsupported falls back to the local walk so `@` still
+            // answers.
+            if let Ok(manager) = self.manager_for_agent(agent).await {
+                match manager
+                    .agent()
+                    .find_files(query, limit, Some(directory))
+                    .await
+                {
+                    Ok(hits) if !hits.is_empty() => return Ok(hits),
+                    Ok(_) => {}
+                    Err(err) => tracing::debug!(agent, %err, "agent find_files; local fallback"),
+                }
+            }
+            Ok(crate::platform::filesearch::find_files(directory, query, limit).await)
         })
     }
 
@@ -414,7 +454,39 @@ impl SessionHub for LocalHub {
         })
     }
 
+    fn list_peers(&self) -> HubFuture<'_, Vec<PeerMention>> {
+        Box::pin(async move {
+            // This computer always leads the `@` list. Linked fleet peers
+            // need the gateway PeerStore on the desktop runtime (follow-up);
+            // until then the popup still offers a real `@hostname` insert.
+            Ok(vec![PeerMention {
+                server_id: "self".into(),
+                name: computer_name(),
+                reachable: true,
+                current: true,
+            }])
+        })
+    }
+
     fn events(&self) -> broadcast::Receiver<AgentDomainEvent> {
         self.runtime.subscribe_events()
     }
+}
+
+fn computer_name() -> String {
+    if let Ok(value) = std::env::var("HOSTNAME") {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    if let Ok(output) = std::process::Command::new("hostname").output() {
+        if let Ok(name) = String::from_utf8(output.stdout) {
+            let name = name.trim().trim_end_matches(".local").trim();
+            if !name.is_empty() {
+                return name.to_string();
+            }
+        }
+    }
+    "This computer".into()
 }

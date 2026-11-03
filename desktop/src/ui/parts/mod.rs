@@ -18,6 +18,7 @@ pub mod notice;
 pub mod prose;
 pub mod scale;
 pub mod summary;
+pub mod tool_kind;
 
 use std::collections::HashSet;
 use std::sync::{Mutex, OnceLock};

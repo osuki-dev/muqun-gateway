@@ -126,6 +126,8 @@ strings! {
     unpin_label => "Unpin", "取消钉选";
     start => "Start", "开始";
     queue => "Queue", "排队";
+    git_tab => "Git", "Git";
+    queue_empty => "Nothing queued", "没有排队的消息";
     attach_title => "Attach files", "添加附件";
     attachments_uploading => "Files are still uploading", "文件还在上传";
     attachments_word => "attachments", "个附件";
@@ -143,6 +145,13 @@ strings! {
     open_file => "Open", "打开";
     diff_no_preview => "No patch preview — open in editor", "没有补丁预览，请用编辑器打开";
     soon => "soon", "即将支持";
+    popup_loading => "Loading…", "加载中…";
+    popup_no_commands => "No commands", "没有命令";
+    popup_no_skills => "No skills", "没有技能";
+    popup_no_matches => "No matches", "没有匹配";
+    popup_this_computer => "This computer", "本机";
+    popup_computer => "Computer", "电脑";
+    popup_computer_offline => "Offline", "离线";
 }
 
 impl Strings {

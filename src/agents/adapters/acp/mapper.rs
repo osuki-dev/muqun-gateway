@@ -593,6 +593,65 @@ fn row_bytes(part: &AgentPart) -> usize {
         }
 }
 
+fn is_todo_tool_name(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "updatetodos" | "update_todos" | "todowrite" | "todoread" | "todo" | "tasks"
+    )
+}
+
+fn is_todo_tool(call: &ToolCall) -> bool {
+    if is_todo_tool_name(&call.name) {
+        return true;
+    }
+    if call.title.as_deref().is_some_and(is_todo_tool_name) {
+        return true;
+    }
+    call.input
+        .get("_toolName")
+        .and_then(Value::as_str)
+        .is_some_and(is_todo_tool_name)
+}
+
+/// `(id, optional text, optional done)` — merge may omit fields that stay.
+fn todo_entries(params: &Value) -> Vec<(String, Option<String>, Option<bool>)> {
+    let Some(arr) = params
+        .get("todos")
+        .or_else(|| params.get("items"))
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+    arr.iter()
+        .enumerate()
+        .filter_map(|(i, item)| {
+            if let Some(s) = item.as_str() {
+                return Some((format!("todo-{i}"), Some(s.to_owned()), Some(false)));
+            }
+            let id = item
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("todo-{i}"));
+            let text = item
+                .get("content")
+                .or_else(|| item.get("text"))
+                .or_else(|| item.get("title"))
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let done = item
+                .get("status")
+                .and_then(Value::as_str)
+                .map(|s| s.eq_ignore_ascii_case("completed"))
+                .or_else(|| item.get("done").and_then(Value::as_bool));
+            if text.is_none() && done.is_none() && item.get("id").is_none() {
+                return None;
+            }
+            Some((id, text, done))
+        })
+        .collect()
+}
+
 pub(crate) struct Projection {
     require_message_id: bool,
     anonymous: Option<(String, String)>,
@@ -613,6 +672,11 @@ pub(crate) struct Projection {
     current: Option<String>,
     thought: Option<String>,
     tool_groups: HashMap<String, String>,
+    /// Stable checklist from `cursor/update_todos` / updateTodos tool calls.
+    todo_order: Vec<String>,
+    todos: HashMap<String, TodoItem>,
+    /// ACP toolCallIds folded into the checklist (never shown as tool cards).
+    todo_tool_ids: HashSet<String>,
     permission_contexts: HashMap<String, Value>,
     permission_turn_active: bool,
 }
@@ -649,6 +713,9 @@ impl Projection {
             current: None,
             thought: None,
             tool_groups: HashMap::new(),
+            todo_order: Vec::new(),
+            todos: HashMap::new(),
+            todo_tool_ids: HashSet::new(),
             permission_contexts: HashMap::new(),
             permission_turn_active: false,
         }
@@ -755,6 +822,65 @@ impl Projection {
     pub fn end_turn(&mut self) {
         self.permission_contexts.clear();
         self.permission_turn_active = false;
+    }
+
+    /// Cursor `cursor/update_todos` (and the updateTodos tool): one checklist row.
+    pub fn apply_todos(&mut self, params: &Value) -> Result<Option<TimelineItem>, AgentError> {
+        let merge = params
+            .get("merge")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        self.upsert_todos(params, merge)
+    }
+
+    fn upsert_todos(
+        &mut self,
+        params: &Value,
+        merge: bool,
+    ) -> Result<Option<TimelineItem>, AgentError> {
+        let entries = todo_entries(params);
+        if entries.is_empty() {
+            return Ok(None);
+        }
+        if !merge {
+            self.todo_order.clear();
+            self.todos.clear();
+        }
+        for (id, text, done) in entries {
+            if let Some(existing) = self.todos.get_mut(&id) {
+                if let Some(text) = text {
+                    existing.text = text;
+                }
+                if let Some(done) = done {
+                    existing.done = done;
+                }
+            } else {
+                self.todo_order.push(id.clone());
+                self.todos.insert(
+                    id,
+                    TodoItem {
+                        text: text.unwrap_or_default(),
+                        done: done.unwrap_or(false),
+                    },
+                );
+            }
+        }
+        let items: Vec<TodoItem> = self
+            .todo_order
+            .iter()
+            .filter_map(|id| self.todos.get(id).cloned())
+            .collect();
+        if items.is_empty() {
+            return Ok(None);
+        }
+        let id = "acp-todo:list".to_string();
+        let group = self.group("acp-todo:list");
+        Ok(Some(self.row(
+            id,
+            group,
+            TimelineRole::Assistant,
+            AgentPart::Todo { items },
+        )))
     }
 
     fn assistant_group(&mut self) -> String {
@@ -1061,6 +1187,24 @@ impl Projection {
                     } else {
                         self.permission_contexts.remove(native);
                     }
+                }
+                // Cursor/OpenCode checklists are a Todo part, never a tool card.
+                let todo_tool = is_todo_tool(&call)
+                    || update["kind"]
+                        .as_str()
+                        .is_some_and(is_todo_tool_name)
+                    || self.todo_tool_ids.contains(native);
+                if todo_tool {
+                    self.todo_tool_ids.insert(native.into());
+                    let merge = call
+                        .input
+                        .get("merge")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    if let Some(row) = self.upsert_todos(&call.input, merge)? {
+                        return Ok(Some(row));
+                    }
+                    return Ok(None);
                 }
                 let group = if let Some(group) = self.tool_groups.get(native) {
                     group.clone()
@@ -1681,5 +1825,81 @@ mod tests {
         assert!(catalog.modes.is_empty());
         assert_eq!(catalog.defaults.model, Some(model));
         assert!(catalog.defaults.mode.is_none());
+    }
+
+    #[test]
+    fn cursor_update_todos_merges_into_one_checklist_row() {
+        let mut projection = Projection::new(true);
+        let first = projection
+            .apply_todos(&json!({
+                "todos": [
+                    {"id": "a", "content": "Wire todos", "status": "in_progress"},
+                    {"id": "b", "content": "Polish UI", "status": "pending"}
+                ],
+                "merge": false
+            }))
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.id, "acp-todo:list");
+        match &first.part {
+            AgentPart::Todo { items } => {
+                assert_eq!(items.len(), 2);
+                assert!(!items[0].done);
+                assert_eq!(items[0].text, "Wire todos");
+            }
+            other => panic!("expected Todo, got {other:?}"),
+        }
+        let second = projection
+            .apply_todos(&json!({
+                "todos": [
+                    {"id": "a", "status": "completed"},
+                    {"id": "c", "content": "Ship it", "status": "pending"}
+                ],
+                "merge": true
+            }))
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.id, "acp-todo:list");
+        match &second.part {
+            AgentPart::Todo { items } => {
+                assert_eq!(items.len(), 3);
+                assert!(items[0].done);
+                assert_eq!(items[0].text, "Wire todos");
+                assert_eq!(items[2].text, "Ship it");
+            }
+            other => panic!("expected Todo, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn update_todos_tool_call_folds_into_todo_part() {
+        let mut projection = Projection::new(true);
+        let row = projection
+            .update(&json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "tc-1",
+                "name": "updateTodos",
+                "status": "completed",
+                "rawInput": {
+                    "_toolName": "updateTodos",
+                    "merge": false,
+                    "todos": [
+                        {"id": "1", "content": "Show checklist", "status": "completed"}
+                    ]
+                }
+            }))
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.id, "acp-todo:list");
+        assert!(matches!(row.part, AgentPart::Todo { .. }));
+        assert!(projection
+            .update(&json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "tc-1",
+                "status": "completed"
+            }))
+            .unwrap()
+            .is_none());
+        assert!(!projection.rows.contains_key("acp-tool:tc-1"));
     }
 }

@@ -1,8 +1,9 @@
-//! On-screen frame meter so stutter is measurable while polishing.
+//! On-screen frame meter for polishing. **Off by default.**
 //!
-//! A permanent animation tick keeps the loop running and samples every
-//! frame; the label refreshes a few times a second so the overlay itself
-//! does not thrash the tree.
+//! Blinc treats any registered tick callback as "animations still active",
+//! so a permanent meter tick forces a continuous redraw loop and lets the
+//! Adaptive FPS adapter claw the cap down to ~30 under load. Enable with
+//! `MUQUN_SHOW_FPS=1` when measuring; leave it unset for normal use.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -23,9 +24,19 @@ struct Meter {
     label: State<String>,
 }
 
-/// Install once (main thread, Blinc up). Keeps a tick callback for the
-/// life of the process so FPS stays current while idle or busy.
+fn enabled() -> bool {
+    matches!(
+        std::env::var("MUQUN_SHOW_FPS").as_deref(),
+        Ok("1") | Ok("true") | Ok("yes")
+    )
+}
+
+/// Install once when `MUQUN_SHOW_FPS=1`. No-op otherwise so the scheduler
+/// can idle with an empty tick list.
 pub fn install() {
+    if !enabled() {
+        return;
+    }
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.swap(true, Ordering::Relaxed) {
         return;
@@ -47,7 +58,6 @@ pub fn install() {
             return;
         };
         m.frames += 1;
-        // `dt` is seconds since the last scheduler tick.
         if dt.is_finite() && dt > 0.000_1 {
             let ms = dt * 1000.0;
             m.ema_ms = if m.ema_ms <= 0.0 {
@@ -68,26 +78,32 @@ pub fn install() {
             m.label.signal().set(text);
         }
     });
-    // Keep the loop alive so idle FPS is still measured.
     scheduler.request_redraw();
 }
 
-/// Corner overlay; reads the shared label state.
-pub fn overlay() -> Div {
+/// Topbar right capsule when the meter is on; `None` hides the zone.
+pub fn pill() -> Option<Div> {
+    if !enabled() {
+        return None;
+    }
     let label = blinc_core::BlincContextState::get()
         .use_state_keyed("mq.perf.fps", || "— FPS".to_string());
-    div()
-        .class("mq-fps")
-        .absolute()
-        .right(12.0)
-        .top(8.0)
-        .child(
-            stateful_with_key::<NoState>("mq-fps-label")
-                .deps([label.signal_id()])
-                .on_state(move |_| {
-                    div()
-                        .class("mq-fps-label")
-                        .child(mono_text(label.get()).size(11.0).no_wrap().no_cursor())
-                }),
-        )
+    Some(
+        div()
+            .class("mq-topbar-pill")
+            .class("mq-topbar-right")
+            .h(36.0)
+            .flex_row()
+            .items_center()
+            .flex_shrink_0()
+            .child(
+                stateful_with_key::<NoState>("mq-fps-label")
+                    .deps([label.signal_id()])
+                    .on_state(move |_| {
+                        div()
+                            .class("mq-fps-label")
+                            .child(mono_text(label.get()).size(11.0).no_wrap().no_cursor())
+                    }),
+            ),
+    )
 }

@@ -6,10 +6,15 @@ use blinc_layout::binding::IntoReactive;
 use blinc_layout::prelude::*;
 use blinc_layout::text::Text;
 
-use super::{media, meta, scale, PartCtx};
+use super::{clip_lines, link_button, media, meta, scale, PartCtx};
 use crate::model::stream::{self, TailKind};
 use crate::ui::markdown::{self, copy_button, Setting};
 use crate::ui::text::{MONO_FONT, UI_FONT};
+
+/// Settled assistant prose shown before "Expand all". Streaming stays live.
+const ASSISTANT_LINES: usize = 40;
+/// Settled user prose shown before "Expand all".
+const USER_LINES: usize = 24;
 
 /// Markdown for this row's part of the text; on the streaming row, the
 /// settled blocks, then the tail bound to `stream_tail`, then the cursor.
@@ -84,18 +89,47 @@ fn agent_class(agent: &str) -> &str {
     }
 }
 
+/// Expand / collapse control for clipped prose.
+fn prose_more(ctx: &PartCtx<'_>, more: usize, all: bool) -> Div {
+    let strings = &ctx.app.strings;
+    let label = if all {
+        strings.show_less().to_string()
+    } else {
+        format!("{} · {}", strings.more_lines(more), strings.show_all())
+    };
+    link_button(label, ctx.toggle("prose.all"))
+}
+
 /// Assistant text: flush, no bubble, with a quiet copy control once done.
+/// Long settled replies show a clipped preview until expanded. Streaming
+/// stays live (settled prefix + tail) without clipping.
 pub fn text(ctx: &PartCtx<'_>, text: &str) -> Div {
     let setting = ctx.setting(false);
-    let mut row = div()
-        .class("mq-assistant")
-        .w_full()
-        .flex_col()
-        .child(body(ctx, text, &setting, true));
+    let all = ctx.is_open("prose.all", false);
+    let clipped = ctx.live.is_none() && !all;
+
+    let mut row = div().class("mq-assistant").w_full().flex_col();
+    if clipped {
+        let (shown, more) = clip_lines(text, ASSISTANT_LINES);
+        let key = ctx.key("md");
+        row = row.child(markdown::render(
+            &markdown::parse(&shown),
+            &setting,
+            &ctx.chrome(&key),
+        ));
+        if more > 0 {
+            row = row.child(prose_more(ctx, more, false));
+        }
+    } else {
+        row = row.child(body(ctx, text, &setting, true));
+        if all && text.lines().count() > ASSISTANT_LINES {
+            row = row.child(prose_more(ctx, 0, true));
+        }
+    }
     if let Some(assets) = ctx.item.image_assets.as_ref().filter(|a| !a.is_empty()) {
         row = row.child(media::asset_row(ctx, assets));
     }
-    if ctx.last && ctx.live.is_none() && !text.trim().is_empty() {
+    if ctx.live.is_none() && !text.trim().is_empty() {
         let mut actions = div().class("mq-row-actions").flex_row().items_center();
         if let Some(muqun_gateway::agents::MessageGeneration::Message { tokens_per_second }) =
             &ctx.item.generation
@@ -153,7 +187,7 @@ pub fn reasoning(ctx: &PartCtx<'_>, text: &str, duration_ms: Option<u64>) -> Div
     row
 }
 
-/// The user's message: a quiet solid card on the right.
+/// The user's message: a quiet solid card, flush left like the rest.
 pub fn user(ctx: &PartCtx<'_>, text: &str) -> Div {
     // ByPath / ACP agents bake uploads into the wire text; strip that block
     // for display and paint the paths as thumbs (same as the App).
@@ -171,12 +205,18 @@ pub fn user(ctx: &PartCtx<'_>, text: &str) -> Div {
         }
     }
     let display = display.trim_end();
+    let all = ctx.is_open("prose.all", false);
+    let (shown, more) = if all {
+        (display.to_string(), 0)
+    } else {
+        clip_lines(display, USER_LINES)
+    };
     // The card is as wide as its longest line, up to 80 % of the column;
     // its text gets that width explicitly (see `markdown::Setting::width`).
     let max = (ctx.width * 0.8).max(240.0);
     let pad = 2.0 * 16.0 + 2.0;
     let options = blinc_layout::text_measure::TextLayoutOptions::new().with_font_name(UI_FONT);
-    let widest = display
+    let widest = shown
         .lines()
         .take(200)
         .map(|l| {
@@ -195,14 +235,17 @@ pub fn user(ctx: &PartCtx<'_>, text: &str) -> Div {
         ..ctx.setting(false)
     };
     let mut card = div().class("mq-user").w(inner + pad).flex_col();
-    if !display.is_empty() {
+    if !shown.is_empty() {
         let paragraph = markdown::Inline {
-            text: display.to_string(),
+            text: shown,
             spans: Vec::new(),
         };
         card = card.child(
             markdown::inline_text(&paragraph, &setting, setting.size, false).w(inner),
         );
+    }
+    if more > 0 || (all && display.lines().count() > USER_LINES) {
+        card = card.child(prose_more(ctx, more, all));
     }
     if !atts.is_empty() {
         card = card.child(media::attachment_row(
@@ -232,7 +275,6 @@ pub fn user(ctx: &PartCtx<'_>, text: &str) -> Div {
         .class("mq-user-row")
         .w_full()
         .flex_row()
-        .justify_end()
         .child(card)
 }
 
@@ -255,7 +297,12 @@ fn injected(ctx: &PartCtx<'_>, label: &str, text: &str, description: Option<&str
         .flex_col()
         .child(head.on_click(ctx.toggle("injected")));
     if open {
-        let (shown, more) = super::clip_lines(text, 200);
+        let all = ctx.is_open("injected.all", false);
+        let (shown, more) = if all {
+            (text.trim_end().to_string(), 0)
+        } else {
+            clip_lines(text, 200)
+        };
         block = block.child(
             div()
                 .class("mq-injected-body")
@@ -269,8 +316,14 @@ fn injected(ctx: &PartCtx<'_>, label: &str, text: &str, description: Option<&str
                     &ctx.chrome(&ctx.key("md")),
                 )),
         );
-        if more > 0 {
-            block = block.child(meta(ctx.app.strings.more_lines(more)));
+        if more > 0 || all {
+            let strings = &ctx.app.strings;
+            let label = if all {
+                strings.show_less().to_string()
+            } else {
+                format!("{} · {}", strings.more_lines(more), strings.show_all())
+            };
+            block = block.child(link_button(label, ctx.toggle("injected.all")));
         }
     }
     block

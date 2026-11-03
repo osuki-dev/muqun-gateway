@@ -615,13 +615,50 @@ impl Core {
     }
 
     async fn open(self: &Arc<Self>, asid: &AgentSessionId) {
-        match self.hub.open(asid).await {
-            Ok(snapshot) => {
-                // Prefer the cached resolve; only miss paths hit the disk.
+        let started = std::time::Instant::now();
+        // Warm path: paint retained history now, wake the agent in the
+        // background. Cold path still prepares, while the UI already shows
+        // the opening placeholder or a desktop-cached timeline.
+        match self.hub.peek(asid).await {
+            Ok(Some(snapshot)) => {
                 self.resolve_dirs(snapshot.info.directory.iter().cloned().collect(), false);
                 self.push_snapshot(snapshot);
+                tracing::info!(
+                    asid = %asid.0,
+                    ms = started.elapsed().as_millis() as u64,
+                    cached = true,
+                    "session open"
+                );
+                let hub = Arc::clone(&self.hub);
+                let wake = asid.clone();
+                tokio::spawn(async move {
+                    if let Err(err) = hub.open(&wake).await {
+                        tracing::debug!(asid = %wake.0, %err, "background wake after peek failed");
+                    }
+                });
                 tokio::spawn(self.clone().diff(asid.clone()));
             }
+            Ok(None) => match self.hub.open(asid).await {
+                Ok(snapshot) => {
+                    if self.active.lock().unwrap().as_ref() != Some(asid) {
+                        return;
+                    }
+                    self.resolve_dirs(snapshot.info.directory.iter().cloned().collect(), false);
+                    self.push_snapshot(snapshot);
+                    tracing::info!(
+                        asid = %asid.0,
+                        ms = started.elapsed().as_millis() as u64,
+                        cached = false,
+                        "session open"
+                    );
+                    tokio::spawn(self.clone().diff(asid.clone()));
+                }
+                Err(err) => {
+                    if self.active.lock().unwrap().as_ref() == Some(asid) {
+                        self.fail(err);
+                    }
+                }
+            },
             Err(err) => self.fail(err),
         }
     }

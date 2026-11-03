@@ -17,7 +17,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use blinc_cn::prelude::{dropdown_menu_custom, icons, to_svg, ColorToken, ThemeState};
+use blinc_cn::prelude::{dropdown_menu_custom, tooltip, ColorToken, ThemeState, TooltipSide};
 use blinc_core::State;
 use blinc_layout::prelude::*;
 use blinc_layout::widgets::text_input::{text_input_data_with_placeholder, SharedTextInputData};
@@ -34,12 +34,12 @@ use crate::model::view::{local_day, row_state, SessionRow};
 use crate::platform::keys;
 
 /// Heights of the tree's rows (architecture §6.0‴ A).
-pub const PROJECT_ROW: f32 = 32.0;
-pub const SESSION_ROW: f32 = 30.0;
-const GAP_ROW: f32 = 8.0;
+pub const PROJECT_ROW: f32 = 34.0;
+pub const SESSION_ROW: f32 = 32.0;
+const GAP_ROW: f32 = 10.0;
 /// The search field, and the block it sits in.
 const SEARCH_FIELD: f32 = 36.0;
-const SEARCH_BLOCK: f32 = SEARCH_FIELD + 12.0 + 8.0;
+const SEARCH_BLOCK: f32 = SEARCH_FIELD + 16.0 + 8.0;
 /// One bottom entry (Inbox, Settings), and the block of both.
 const ENTRY_ROW: f32 = 36.0;
 const BOTTOM_BLOCK: f32 = 2.0 * ENTRY_ROW + 1.0 + 16.0;
@@ -156,13 +156,6 @@ pub fn focus_search() {
 /// The search field's state once the sidebar has been built.
 static SIDE_READY: OnceLock<SharedTextInputData> = OnceLock::new();
 
-fn tinted(path: &str, size: f32, token: ColorToken) -> Svg {
-    svg(to_svg(path, size))
-        .size(size, size)
-        .tint(ThemeState::get().color(token))
-        .flex_shrink_0()
-}
-
 /// `row`, still empty, given the raised surface while it is the selected
 /// session or the open page: a first child filling it, so everything added
 /// after paints over it.
@@ -187,9 +180,9 @@ fn raised(row: Div, on: bool) -> Div {
     )
 }
 
-/// A lucide icon at `size` in the secondary text colour.
-pub fn icon(path: &str, size: f32) -> Svg {
-    tinted(path, size, ColorToken::TextSecondary)
+/// An App glyph at `size` in the secondary text colour (theme-tinted).
+pub fn icon(glyph: super::glyphs::Glyph, size: f32) -> Svg {
+    super::icons::tinted(glyph, size)
 }
 
 pub fn sidebar(app: &App, height: f32) -> Div {
@@ -433,18 +426,34 @@ fn rail_item(app: &App, asid: &str) -> impl ElementBuilder {
             };
             let active = selected.get().as_deref() == Some(asid_key.as_str());
             let asid = muqun_gateway::agents::AgentSessionId(row.asid.clone());
+            let title = display_title(&app, &row.asid, &row.title);
             let click = app.clone();
-            raised(div(), active)
-                .class("mq-rail-item")
-                .relative()
-                .w(RAIL_ITEM)
-                .h(RAIL_ITEM)
-                .flex_row()
-                .items_center()
-                .justify_center()
-                .cursor_pointer()
-                .child(badged_mark(&row.agent_id, 20.0, row.status, row.waiting))
-                .on_click(move |_| click.open_session(&asid))
+            let agent_id = row.agent_id.clone();
+            let status = row.status;
+            let waiting = row.waiting;
+            // Collapsed rail: only the mark shows — hover reveals the session title.
+            // `on_state` must return Div; wrap the tooltip ElementBuilder.
+            div().child(
+                tooltip(move || {
+                    let click = click.clone();
+                    let asid = asid.clone();
+                    raised(div(), active)
+                        .class("mq-rail-item")
+                        .relative()
+                        .w(RAIL_ITEM)
+                        .h(RAIL_ITEM)
+                        .flex_row()
+                        .items_center()
+                        .justify_center()
+                        .cursor_pointer()
+                        .child(badged_mark(&agent_id, 20.0, status, waiting))
+                        .on_click(move |_| click.open_session(&asid))
+                })
+                .text(title)
+                .side(TooltipSide::Right)
+                .open_delay_ms(250)
+                .offset(8.0),
+            )
         })
 }
 
@@ -463,7 +472,7 @@ fn search_field(app: &App) -> Div {
                 .h(SEARCH_FIELD)
                 .flex_row()
                 .items_center()
-                .child(icon(icons::SEARCH, 14.0))
+                .child(icon(super::glyphs::Glyph::Search, 14.0))
                 .child(
                     div().flex_1().min_w(0.0).child(
                         blinc_cn::prelude::input(&s.search)
@@ -865,7 +874,9 @@ fn new_here_button(app: &App, project: &Project) -> Div {
         .items_center()
         .justify_center()
         .cursor_pointer()
-        .child(icon(icons::PLUS, 14.0))
+        // Text, not SVG: Blinc's SVG paint path ignores ancestor opacity, so
+        // `.mq-prow-actions { opacity: 0 }` would not hide a glyph icon.
+        .child(ui_text("+").size(14.0).semibold().no_cursor())
         .on_click(move |_| {
             app.open_draft_in(&root);
         })
@@ -889,7 +900,9 @@ fn project_menu(app: &App, project: &Project) -> impl ElementBuilder {
             .items_center()
             .justify_center()
             .cursor_pointer()
-            .child(icon(icons::ELLIPSIS, 14.0))
+            // One glyph (`…`): three middots wrapped vertically in the 22px hit
+            // target and looked like a kebab menu.
+            .child(ui_text("…").size(14.0).semibold().no_wrap().no_cursor())
     })
     .min_width(180.0)
     .item(strings.open_in(editor), move || {
@@ -926,8 +939,10 @@ fn more_row(app: &App, project: &str, hidden: usize) -> Div {
         .flex_row()
         .items_center()
         .cursor_pointer()
-        // Match session title: 12 px mark + 6 px gap.
-        .child(div().w(18.0).h(1.0).flex_shrink_0())
+        // Match `.mq-srow-main`: left inset + 14 px mark slot + 6 px gap.
+        .child(div().w(8.0).h(1.0).flex_shrink_0())
+        .child(div().w(14.0).h(1.0).flex_shrink_0())
+        .child(div().w(6.0).h(1.0).flex_shrink_0())
         .child(ui_text(label).size(13.0).no_wrap().no_cursor())
         .on_click(move |_| {
             let state = &side(&app).full;
@@ -954,7 +969,7 @@ fn inbox_entry(app: &App, rail: bool) -> impl ElementBuilder {
         let count = b.attention.get().len() + b.waiting_forms.get().len();
         let click = app.clone();
         let mut row = entry(rail, b.inbox_open.get())
-            .child(icon(icons::INBOX, 16.0))
+            .child(icon(super::glyphs::Glyph::Inbox, 16.0))
             .on_click(move |_| {
                 click.bindings.draft.signal().set(None);
                 click.bindings.settings_open.signal().set(false);
@@ -1216,6 +1231,20 @@ fn render_row(app: &App, session: &SessionRow, active: bool, editing: bool) -> D
     let asid = muqun_gateway::agents::AgentSessionId(session.asid.clone());
     let click = app.clone();
     let title = display_title(app, &session.asid, &session.title);
+    // Same width as the project chevron (14) so marks and titles share one column.
+    let mark = div()
+        .w(14.0)
+        .h(14.0)
+        .flex_shrink_0()
+        .flex_row()
+        .items_center()
+        .justify_center()
+        .child(badged_mark(
+            &session.agent_id,
+            12.0,
+            session.status,
+            session.waiting,
+        ));
     let mut main = div()
         .class("mq-srow-main")
         .absolute()
@@ -1226,12 +1255,7 @@ fn render_row(app: &App, session: &SessionRow, active: bool, editing: bool) -> D
         .flex_row()
         .items_center()
         .cursor_pointer()
-        .child(badged_mark(
-            &session.agent_id,
-            12.0,
-            session.status,
-            session.waiting,
-        ));
+        .child(mark);
     if editing {
         main = main.child(rename_field(app, &session.asid, &title));
     } else {
@@ -1240,45 +1264,49 @@ fn render_row(app: &App, session: &SessionRow, active: bool, editing: bool) -> D
                 div()
                     .flex_1()
                     .min_w(0.0)
-                    .ml(6.0)
                     .overflow_clip()
                     .child(ui_text(title).size(13.0).no_wrap().no_cursor()),
             )
             .on_click(move |_| click.open_session(&asid));
     }
-    raised(div(), active)
+    // While renaming, drop time + ⋯ so the field + confirm/cancel own the row.
+    let mut row = raised(div(), active)
         .class("mq-srow")
         .relative()
         .w_full()
         .h(SESSION_ROW)
-        .child(main)
-        .child(
-            div()
-                .class("mq-srow-time")
-                .absolute()
-                .right(26.0)
-                .top(0.0)
-                .bottom(0.0)
-                .flex_row()
-                .items_center()
-                .child(
-                    ui_text(session.since.clone())
-                        .size(11.0)
-                        .no_wrap()
-                        .no_cursor(),
-                ),
-        )
-        .child(
-            div()
-                .class("mq-srow-menu")
-                .absolute()
-                .right(2.0)
-                .top(0.0)
-                .bottom(0.0)
-                .flex_row()
-                .items_center()
-                .child(session_menu(app, session)),
-        )
+        .child(main);
+    if !editing {
+        row = row
+            .child(
+                div()
+                    .class("mq-srow-time")
+                    .absolute()
+                    .right(26.0)
+                    .top(0.0)
+                    .bottom(0.0)
+                    .flex_row()
+                    .items_center()
+                    .child(
+                        ui_text(session.since.clone())
+                            .size(11.0)
+                            .no_wrap()
+                            .no_cursor(),
+                    ),
+            )
+            .child(
+                div()
+                    .class("mq-srow-menu")
+                    .absolute()
+                    .right(2.0)
+                    .top(0.0)
+                    .bottom(0.0)
+                    .flex_row()
+                    .items_center()
+                    .child(session_menu(app, session)),
+            );
+    }
+    row
 }
 
 fn commit_rename(app: &App, asid: &str) {
@@ -1296,6 +1324,7 @@ fn commit_rename(app: &App, asid: &str) {
 
 fn rename_field(app: &App, asid: &str, title: &str) -> Div {
     use blinc_cn::prelude::{input, InputSize};
+    use blinc_core::Color;
     use blinc_layout::widgets::text_input::text_input_data;
     let key = format!("mq.srow.rename.{asid}");
     let initial = title.to_string();
@@ -1315,52 +1344,52 @@ fn rename_field(app: &App, asid: &str, title: &str) -> Div {
     let done_app = app.clone();
     let done_asid = asid.to_string();
     let cancel_app = app.clone();
+    let action = |glyph: super::glyphs::Glyph| {
+        div()
+            .class("mq-icon-button")
+            .class("mq-icon-button--small")
+            .class("mq-srow-rename-btn")
+            .w(20.0)
+            .h(20.0)
+            .flex_row()
+            .items_center()
+            .justify_center()
+            .flex_shrink_0()
+            .cursor_pointer()
+            .child(icon(glyph, 12.0))
+    };
     div()
         .class("mq-srow-rename")
         .flex_1()
         .min_w(0.0)
-        .ml(2.0)
+        .h(SESSION_ROW - 4.0)
         .flex_row()
         .items_center()
         .child(
-            div().flex_1().min_w(0.0).child(
+            div().class("mq-srow-rename-field").flex_1().min_w(0.0).child(
                 input(&data)
                     .size(InputSize::Small)
                     .w_full()
                     .border_width(0.0)
+                    .border_colors(
+                        Color::TRANSPARENT,
+                        Color::TRANSPARENT,
+                        Color::TRANSPARENT,
+                        Color::TRANSPARENT,
+                    )
+                    .bg_colors(Color::TRANSPARENT, Color::TRANSPARENT, Color::TRANSPARENT)
                     .on_change(move |text: &str| {
                         draft.signal().set(text.to_string());
                     }),
             ),
         )
         .child(
-            div()
-                .class("mq-icon-button")
-                .class("mq-icon-button--small")
-                .w(22.0)
-                .h(22.0)
-                .flex_row()
-                .items_center()
-                .justify_center()
-                .cursor_pointer()
-                .child(icon(icons::CHECK, 14.0))
+            action(super::glyphs::Glyph::Done)
                 .on_click(move |_| commit_rename(&done_app, &done_asid)),
         )
-        .child(
-            div()
-                .class("mq-icon-button")
-                .class("mq-icon-button--small")
-                .w(22.0)
-                .h(22.0)
-                .flex_row()
-                .items_center()
-                .justify_center()
-                .cursor_pointer()
-                .child(icon(icons::X, 14.0))
-                .on_click(move |_| {
-                    side(&cancel_app).renaming.signal().set(None);
-                }),
-        )
+        .child(action(super::glyphs::Glyph::Close).on_click(move |_| {
+            side(&cancel_app).renaming.signal().set(None);
+        }))
         .on_key_down(move |ctx| {
             const ENTER: u32 = 13;
             const ESC: u32 = 27;
@@ -1390,7 +1419,11 @@ fn session_menu(app: &App, session: &SessionRow) -> impl ElementBuilder {
             .items_center()
             .justify_center()
             .cursor_pointer()
-            .child(icon(icons::ELLIPSIS, 14.0))
+            // Text trigger so `.mq-srow-menu { opacity: 0 }` actually hides it
+            // (SVG glyphs ignore ancestor opacity in Blinc's paint path).
+            // One glyph (`…`): three middots wrapped vertically in the 22px hit
+            // target and looked like a kebab menu.
+            .child(ui_text("…").size(14.0).semibold().no_wrap().no_cursor())
     })
     .min_width(160.0)
     .item(strings.rename_session(), move || {

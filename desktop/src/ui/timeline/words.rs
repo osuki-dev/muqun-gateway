@@ -22,8 +22,9 @@ words! {
     show_all => "Expand all", "展开全部";
     show_less => "Show less", "收起";
     loading_earlier => "Loading earlier messages…", "正在加载更早的消息…";
+    opening_session => "Opening session…", "正在打开会话…";
     start_of_history => "Beginning of the conversation", "对话开始";
-    earlier_available => "Scroll up for earlier messages", "向上滚动查看更早的消息";
+    earlier_available => "Load earlier messages", "加载更早的消息";
     input => "Input", "输入";
     output => "Output", "输出";
     tool_failed => "failed", "失败";
@@ -35,7 +36,7 @@ words! {
     diff => "Diff", "Diff";
     jump_latest => "↓ Jump to latest", "↓ 回到最新";
     unknown_agent => "The agent", "Agent";
-    todo_title => "To-do", "待办";
+    todo_title => "Tasks", "任务";
     answer_needed => "Answer needed", "需要回答";
     submit => "Submit", "提交";
     answered => "Answered", "已回答";

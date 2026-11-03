@@ -83,6 +83,7 @@ fn list(app: &App) -> impl ElementBuilder {
         .deps([
             cmp.popup.signal_id(),
             cmp.files.signal_id(),
+            cmp.peers.signal_id(),
             cmp.catalogs.signal_id(),
         ])
         .on_state(move |_| {
@@ -121,13 +122,20 @@ fn list(app: &App) -> impl ElementBuilder {
                             .overflow_clip()
                             .child(ui_text(row.detail.clone()).size(12.0).no_wrap().no_cursor()),
                     );
-                if index == selected {
+                if index == selected && row.selectable {
                     line = line.class("mq-popup-row--sel");
                 }
-                panel = panel.child(line.on_click(move |_| {
-                    pick(&click, index);
-                    super::focus_input(&click);
-                }));
+                if !row.selectable {
+                    line = line.class("mq-popup-detail");
+                }
+                panel = panel.child(if row.selectable {
+                    line.on_click(move |_| {
+                        pick(&click, index);
+                        super::focus_input(&click);
+                    })
+                } else {
+                    line
+                });
             }
             panel
         })
@@ -140,10 +148,16 @@ fn origin(app: &App, card_height: f32) -> (f32, f32, f32) {
         return crate::ui::home::start_card_origin(app);
     }
     let (vw, vh) = blinc_core::BlincContextState::get().viewport_size();
-    let sidebar = crate::ui::shell::side_width(app, vw);
+    let left = crate::ui::shell::FRAME_PAD + crate::ui::shell::side_width(app, vw) + 8.0;
     let width = super::session_card_width(app);
+    let panel = (vw
+        - 2.0 * crate::ui::shell::FRAME_PAD
+        - crate::ui::shell::side_width(app, vw)
+        - crate::ui::shell::right_width(app)
+        - 8.0)
+        .max(0.0);
     (
-        sidebar + ((vw - sidebar) - width) / 2.0,
+        left + (panel - width) / 2.0,
         vh - super::SLOT_BOTTOM - card_height,
         width,
     )

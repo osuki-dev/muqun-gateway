@@ -3,28 +3,29 @@
 
 use std::sync::Arc;
 
-use blinc_cn::prelude::{icons, to_svg, ColorToken, ThemeState};
 use blinc_layout::prelude::*;
+
+use muqun_gateway::agents::AgentSessionId;
 
 use super::state::{Cmp, StagedStatus};
 use super::Aim;
 use crate::model::commands::Command;
 use crate::model::compose::{ComposeCommand, InboxItem};
+use crate::ui::glyphs::Glyph;
+use crate::ui::icons;
 use crate::ui::text::{mono_text, ui_text};
 use crate::ui::App;
 
-/// Queued prompts shown; the rest are a count.
+/// Queued prompts shown above the composer (legacy cap); the right panel
+/// lists every item.
 pub(super) const SHOWN: usize = 3;
 /// A summary's longest line, in characters.
 const SUMMARY_CHARS: usize = 64;
 /// Staged image thumbnails in the chip row.
 const THUMB: f32 = 28.0;
 
-fn small_icon(path: &str) -> impl ElementBuilder {
-    svg(to_svg(path, 12.0))
-        .size(12.0, 12.0)
-        .tint(ThemeState::get().color(ColorToken::TextSecondary))
-        .flex_shrink_0()
+fn small_icon(glyph: Glyph) -> impl ElementBuilder {
+    icons::tinted(glyph, 12.0)
 }
 
 /// The one line a waiting prompt shows: its first line, shortened.
@@ -50,15 +51,30 @@ pub fn summary(item: &InboxItem, attachments: &str) -> String {
     }
 }
 
+/// Full queue for the right-panel Queue tab (every item, scrollable).
+pub fn queue_panel(app: &App) -> Option<Div> {
+    let asid = AgentSessionId(app.bindings.selected.get()?);
+    let items = Cmp::get().inbox.get();
+    if items.is_empty() {
+        return None;
+    }
+    Some(queue_list(app, &asid, &items, usize::MAX))
+}
+
 /// The waiting prompts of the open session, with what can be done to each.
+#[allow(dead_code)]
 pub fn waiting(app: &App, aim: &Aim) -> Option<Div> {
     let asid = aim.asid()?;
     let items = Cmp::get().inbox.get();
     if items.is_empty() {
         return None;
     }
+    Some(queue_list(app, &asid, &items, SHOWN))
+}
+
+fn queue_list(app: &App, asid: &AgentSessionId, items: &[InboxItem], limit: usize) -> Div {
     let mut list = div().class("mq-queued-list").w_full().flex_col();
-    for item in items.iter().take(SHOWN) {
+    for item in items.iter().take(limit) {
         let line = summary(item, app.strings.attachments_word());
         let label = if item.steer {
             app.strings.sending_next(&line)
@@ -102,6 +118,38 @@ pub fn waiting(app: &App, aim: &Aim) -> Option<Div> {
                     }));
                 })
         };
+        // Edit returns the text to the draft (App parity). Attachments cannot
+        // follow, so a prompt that carries them is only cancelled.
+        let edit = (item.attachments == 0).then(|| {
+            let app = app.clone();
+            let asid = asid.clone();
+            let id = item.id.clone();
+            let text = item.text.clone();
+            div()
+                .class("mq-chip-x")
+                .cursor_pointer()
+                .flex_shrink_0()
+                .child(small_icon(Glyph::Edit))
+                .on_click(move |_| {
+                    let cmp = Cmp::get();
+                    let next: Vec<InboxItem> = cmp
+                        .inbox
+                        .get()
+                        .iter()
+                        .filter(|i| i.id != id)
+                        .cloned()
+                        .collect();
+                    cmp.inbox.signal().set(Arc::new(next));
+                    app.send(Command::Compose(ComposeCommand::InboxCancel {
+                        asid: asid.clone(),
+                        item: id.clone(),
+                    }));
+                    let end = text.chars().count();
+                    super::set_text(&app, &text, end);
+                    super::edited(&app);
+                    super::focus_input(&app);
+                })
+        });
         let cancel = {
             let app = app.clone();
             let asid = asid.clone();
@@ -110,7 +158,7 @@ pub fn waiting(app: &App, aim: &Aim) -> Option<Div> {
                 .class("mq-chip-x")
                 .cursor_pointer()
                 .flex_shrink_0()
-                .child(small_icon(icons::X))
+                .child(small_icon(Glyph::Close))
                 .on_click(move |_| {
                     let cmp = Cmp::get();
                     let next: Vec<InboxItem> = cmp
@@ -127,6 +175,15 @@ pub fn waiting(app: &App, aim: &Aim) -> Option<Div> {
                     }));
                 })
         };
+        let mut actions = div()
+            .class("mq-queued-actions")
+            .flex_row()
+            .items_center()
+            .child(toggle);
+        if let Some(edit) = edit {
+            actions = actions.child(edit);
+        }
+        actions = actions.child(cancel);
         list = list.child(
             div()
                 .class("mq-queued")
@@ -140,27 +197,20 @@ pub fn waiting(app: &App, aim: &Aim) -> Option<Div> {
                         .overflow_clip()
                         .child(ui_text(label).size(12.0).no_wrap().no_cursor()),
                 )
-                .child(
-                    div()
-                        .class("mq-queued-actions")
-                        .flex_row()
-                        .items_center()
-                        .child(toggle)
-                        .child(cancel),
-                ),
+                .child(actions),
         );
     }
-    if items.len() > SHOWN {
+    if limit < usize::MAX && items.len() > limit {
         list = list.child(
             div().class("mq-queued-more").child(
-                ui_text(app.strings.more_queued(items.len() - SHOWN))
+                ui_text(app.strings.more_queued(items.len() - limit))
                     .size(11.0)
                     .no_wrap()
                     .no_cursor(),
             ),
         );
     }
-    Some(list)
+    list
 }
 
 /// The staged files, each with its state and a way to remove it.
@@ -178,17 +228,17 @@ pub fn staged(app: &App) -> Option<Div> {
             _ => None,
         };
         let (mark, class, note) = match &entry.status {
-            StagedStatus::Uploading => (icons::FILE, "mq-chip--up", Some("…".to_string())),
+            StagedStatus::Uploading => (Glyph::File, "mq-chip--up", Some("…".to_string())),
             StagedStatus::Ready(file) => (
                 if file.image {
-                    icons::IMAGE
+                    Glyph::Photo
                 } else {
-                    icons::FILE
+                    Glyph::File
                 },
                 "mq-chip--ready",
                 None,
             ),
-            StagedStatus::Failed(why) => (icons::FILE, "mq-chip--failed", Some(why.clone())),
+            StagedStatus::Failed(why) => (Glyph::File, "mq-chip--failed", Some(why.clone())),
         };
         let mut name: String = entry.name.chars().take(28).collect();
         if entry.name.chars().count() > 28 {
@@ -200,7 +250,7 @@ pub fn staged(app: &App) -> Option<Div> {
                 .class("mq-chip-x")
                 .cursor_pointer()
                 .flex_shrink_0()
-                .child(small_icon(icons::X))
+                .child(small_icon(Glyph::Close))
                 .on_click(move |_| {
                     let cmp = Cmp::get();
                     let next: Vec<_> = cmp

@@ -34,6 +34,13 @@ pub use platform::set_directories;
 // a "3m ago", a folder named from `~`, and whether a title is only an
 // adapter's placeholder for an unnamed session.
 pub use platform::manage::relative_since;
+/// Workspace `@` file search: the same bounded walk the terminal pane uses.
+/// Desktop falls back here when the agent has no `find_files` (ACP/Cursor).
+pub mod filesearch {
+    pub use crate::terminal::composer::{
+        kind_for_name, search_files, FileHit, FILE_SEARCH_DEFAULT_LIMIT, FILE_SEARCH_MAX_LIMIT,
+    };
+}
 pub(crate) use platform::setup::*;
 pub(crate) use platform::store::*;
 pub(crate) use platform::uploads::*;

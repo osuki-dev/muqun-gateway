@@ -1,8 +1,8 @@
-//! The window's frame (architecture §6.0‴ A): the 44 px top bar, then the
-//! sidebar (a resizable 260 px column, or a 56 px rail under 960 px of
-//! window / when folded with Ctrl/Cmd+B) and the main panel. A third
-//! column on the right is planned; keep the main panel as the flexible
-//! centre so it can sit between sidebars later.
+//! The window's frame (architecture §6.0‴ A): three floating top capsules
+//! (brand = sidebar width, centred title+actions, optional right), then the
+//! left sidebar (a resizable 260 px column, or a 56 px rail under 960 px /
+//! when folded with Ctrl/Cmd+B), the flexible main panel, and an optional
+//! resizable right column with Queue / Git tabs (and room for more later).
 //!
 //! The main panel shows exactly one of: Settings, the Inbox, Home (the
 //! start page, nothing selected), or the selected session.
@@ -11,20 +11,25 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use blinc_app::windowed::WindowedContext;
-use blinc_cn::prelude::{dropdown_menu_custom, icons};
+use blinc_cn::prelude::dropdown_menu_custom;
 use blinc_core::State;
 use blinc_layout::prelude::*;
-use blinc_theme::{ColorScheme, ThemeState};
-
-use super::sessions::{self, icon, title_of};
+use super::composer::{self, chips};
+use super::glyphs::Glyph;
+use super::icons;
+use super::sessions::{self, title_of};
 use super::text::{display_text, mono_text, ui_text};
-use super::{composer, errors, home, settings, timeline, App};
+use super::{errors, home, settings, timeline, App};
 use crate::branding::{mark_data_uri, APP_NAME};
-use crate::config::{ConfigEdit, Scheme, UiPrefs};
+use crate::config::{ConfigEdit, UiPrefs};
 use crate::model::commands::Command;
+use crate::model::view::RightTab;
 use crate::platform::editors::{self, Editor};
 
-pub const TOP_BAR_HEIGHT: f32 = 44.0;
+pub const TOP_BAR_HEIGHT: f32 = 48.0;
+/// Matches `--mq-space-3`: body inset under the pill and beside the columns,
+/// so the sidebar's bottom radius reads against the window background.
+pub const FRAME_PAD: f32 = 12.0;
 /// Under this window width the sidebar folds to its rail.
 pub const RAIL_BELOW: f32 = 960.0;
 /// A second press on the sidebar's edge within this resets its width.
@@ -68,8 +73,8 @@ fn session_root(app: &App) -> Option<std::path::PathBuf> {
     )
 }
 
-/// A 28 px ghost button holding one icon: no border, a surface on hover.
-fn ghost_icon(path: &str) -> Div {
+/// A 28 px ghost button holding one App glyph: no border, a surface on hover.
+fn ghost_icon(glyph: Glyph) -> Div {
     div()
         .class("mq-icon-button")
         .w(28.0)
@@ -79,79 +84,123 @@ fn ghost_icon(path: &str) -> Div {
         .justify_center()
         .flex_shrink_0()
         .cursor_pointer()
-        .child(icon(path, 16.0))
+        .child(icons::tinted(glyph, 16.0))
 }
 
-pub fn top_bar(app: &App) -> Div {
-    let home_app = app.clone();
-    let new_app = app.clone();
-    div()
-        .class("mq-topbar")
-        .w_full()
-        .h(TOP_BAR_HEIGHT)
-        .flex_row()
-        .items_center()
-        .flex_shrink_0()
-        .child(
-            div()
-                .class("mq-brand")
+/// Three floating capsules: brand (sidebar width) | title+actions (content
+/// width, centred) | optional right (FPS for now; omitted when empty).
+pub fn top_bar(app: &App, window_width: f32) -> Div {
+    let collapsed = sidebar_collapsed();
+    let width = sidebar_width(app);
+    let app = app.clone();
+    let bar = stateful_with_key::<NoState>("mq-topbar")
+        .deps([collapsed.signal_id(), width.signal_id()])
+        .on_state(move |_| {
+            let rail = collapsed.get() || window_width < RAIL_BELOW;
+            let side = if rail {
+                sessions::RAIL_WIDTH
+            } else {
+                width.get()
+            };
+            let home_app = app.clone();
+            let mut row = div()
+                .class("mq-topbar")
+                .w_full()
+                .h(TOP_BAR_HEIGHT)
                 .flex_row()
                 .items_center()
                 .flex_shrink_0()
-                .cursor_pointer()
-                .child(image(mark_data_uri()).size(24.0, 24.0).rounded(6.0))
-                .on_click(move |_| home_app.drain.go_home()),
-        )
-        .child(div().flex_1().min_w(0.0).overflow_clip().child(title(app)))
-        .child(
-            div()
-                .class("mq-topbar-actions")
-                .flex_row()
-                .items_center()
-                .flex_shrink_0()
-                .child(ghost_icon(icons::PLUS).on_click(move |_| new_app.open_draft()))
-                .child(open_in_button(app))
-                .child(diff_count(app))
-                .child(ghost_icon(icons::SEARCH).on_click(|_| sessions::focus_search()))
-                .child(scheme_toggle(app)),
-        )
+                .child(
+                    div()
+                        .class("mq-topbar-pill")
+                        .class("mq-topbar-left")
+                        .w(side)
+                        .h(36.0)
+                        .flex_row()
+                        .items_center()
+                        .flex_shrink_0()
+                        .overflow_clip()
+                        .child(
+                            div()
+                                .class("mq-brand")
+                                .flex_row()
+                                .items_center()
+                                .flex_shrink_0()
+                                .cursor_pointer()
+                                .child(image(mark_data_uri()).size(22.0, 22.0).rounded(6.0))
+                                .child(
+                                    ui_text(APP_NAME)
+                                        .size(14.0)
+                                        .semibold()
+                                        .no_wrap()
+                                        .no_cursor(),
+                                )
+                                .on_click(move |_| home_app.drain.go_home()),
+                        ),
+                )
+                .child(
+                    div()
+                        .class("mq-topbar-center-slot")
+                        .flex_1()
+                        .min_w(0.0)
+                        .h(36.0)
+                        .flex_row()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            div()
+                                .class("mq-topbar-pill")
+                                .class("mq-topbar-center")
+                                .h(36.0)
+                                .flex_row()
+                                .items_center()
+                                .flex_shrink_0()
+                                .overflow_clip()
+                                .child(title(&app))
+                                .child(
+                                    div()
+                                        .class("mq-topbar-actions")
+                                        .flex_row()
+                                        .items_center()
+                                        .flex_shrink_0()
+                                        .child(open_in_button(&app))
+                                        .child(git_toggle(&app)),
+                                ),
+                        ),
+                );
+            // Right capsule only when it has something to show.
+            if let Some(right) = topbar_right() {
+                row = row.child(right);
+            }
+            row
+        });
+    div().w_full().h(TOP_BAR_HEIGHT).flex_shrink_0().child(bar)
 }
 
-/// The open session's title (15 px display serif) and `⎇ branch` (12 px
-/// mono); the app's name otherwise.
+/// Right-zone capsule. `None` hides the zone entirely (no reserved width).
+fn topbar_right() -> Option<Div> {
+    super::perf::pill()
+}
+
+/// The open session's title (15 px display serif); empty on the start page
+/// (the brand already names the app in the pill).
 fn title(app: &App) -> impl ElementBuilder {
     let header = app.bindings.header.clone();
-    let dirs = app.bindings.dirs.clone();
     let app = app.clone();
     stateful_with_key::<NoState>("mq-topbar-title")
-        .deps([header.signal_id(), dirs.signal_id()])
+        .deps([header.signal_id()])
         .on_state(move |_| {
             let line = div()
                 .class("mq-topbar-title")
                 .flex_row()
                 .items_center()
+                .justify_center()
                 .min_w(0.0)
                 .overflow_clip();
             let Some(info) = header.get() else {
-                return line.child(
-                    ui_text(APP_NAME)
-                        .size(15.0)
-                        .semibold()
-                        .no_wrap()
-                        .no_cursor(),
-                );
+                return line;
             };
-            let branch = info
-                .git_info
-                .as_ref()
-                .and_then(|g| g.branch.clone())
-                .or_else(|| {
-                    let dir = info.directory.as_deref()?;
-                    dirs.get()
-                        .get(dir.trim_end_matches(['/', '\\']))
-                        .and_then(|d| d.branch.clone())
-                });
-            let mut line = line.child(
+            line.child(
                 div()
                     .class("mq-topbar-session")
                     .min_w(0.0)
@@ -162,19 +211,56 @@ fn title(app: &App) -> impl ElementBuilder {
                             .no_wrap()
                             .no_cursor(),
                     ),
-            );
-            if let Some(branch) = branch {
-                line = line.child(
-                    div()
-                        .class("mq-topbar-branch")
-                        .flex_row()
-                        .items_center()
-                        .flex_shrink_0()
-                        .child(icon(icons::GIT_BRANCH, 12.0))
-                        .child(mono_text(branch).size(12.0).no_wrap().no_cursor()),
-                );
+            )
+        })
+}
+
+/// Git control in the top pill: shows `+n −m` while a session has changes,
+/// otherwise the branch icon. Always toggles the right column.
+fn git_toggle(app: &App) -> impl ElementBuilder {
+    let diff = app.bindings.diff.clone();
+    let header = app.bindings.header.clone();
+    let panel = app.bindings.diff_panel.clone();
+    let app = app.clone();
+    stateful_with_key::<NoState>("mq-git-toggle")
+        .deps([diff.signal_id(), header.signal_id(), panel.signal_id()])
+        .on_state(move |_| {
+            let open = header.get().map(|h| h.asid.0.clone());
+            let stat = diff
+                .get()
+                .filter(|d| Some(&d.asid) == open.as_ref() && d.files > 0);
+            let click = app.clone();
+            let mut row = if let Some(stat) = stat {
+                div()
+                    .class("mq-ghost")
+                    .class("mq-diff-count")
+                    .h(28.0)
+                    .flex_row()
+                    .items_center()
+                    .cursor_pointer()
+                    .child(
+                        div().class("mq-diff-added").child(
+                            mono_text(format!("+{}", stat.added))
+                                .size(12.0)
+                                .no_wrap()
+                                .no_cursor(),
+                        ),
+                    )
+                    .child(
+                        div().class("mq-diff-removed").child(
+                            mono_text(format!("−{}", stat.removed))
+                                .size(12.0)
+                                .no_wrap()
+                                .no_cursor(),
+                        ),
+                    )
+            } else {
+                ghost_icon(Glyph::Branch)
+            };
+            if panel.get() {
+                row = row.class("mq-diff-count--open");
             }
-            line
+            row.on_click(move |_| toggle_right(&click, RightTab::Git))
         })
 }
 
@@ -202,7 +288,7 @@ fn open_in_button(app: &App) -> impl ElementBuilder {
                     .flex_row()
                     .items_center()
                     .cursor_pointer()
-                    .child(icon(icons::CHEVRON_DOWN, 14.0))
+                    .child(icons::tinted(Glyph::DisclosureDown, 14.0))
             })
             .min_width(200.0);
             for choice in Editor::ALL {
@@ -223,7 +309,7 @@ fn open_in_button(app: &App) -> impl ElementBuilder {
                         .flex_row()
                         .items_center()
                         .cursor_pointer()
-                        .child(icon(icons::CODE, 14.0))
+                        .child(icons::tinted(Glyph::Code, 14.0))
                         .child(
                             ui_text(app.strings.open_in(current))
                                 .size(13.0)
@@ -270,203 +356,391 @@ pub fn open_diff_file(app: &App, file: &str) {
     }
 }
 
-/// `+n −m` from `get_vcs_diff`, only while there are changes; the numbers
-/// alone carry the colour. Opens the changed-files panel.
-fn diff_count(app: &App) -> impl ElementBuilder {
-    let diff = app.bindings.diff.clone();
-    let header = app.bindings.header.clone();
-    let panel = app.bindings.diff_panel.clone();
-    let app = app.clone();
-    stateful_with_key::<NoState>("mq-diff-count")
-        .deps([diff.signal_id(), header.signal_id(), panel.signal_id()])
-        .on_state(move |_| {
-            let open = header.get().map(|h| h.asid.0.clone());
-            let Some(stat) = diff
-                .get()
-                .filter(|d| Some(&d.asid) == open.as_ref() && d.files > 0)
-            else {
-                if panel.get() {
-                    panel.signal().set(false);
-                }
-                return div();
-            };
-            let click = app.clone();
-            let mut row = div()
-                .class("mq-ghost")
-                .class("mq-diff-count")
-                .h(28.0)
-                .flex_row()
-                .items_center()
-                .cursor_pointer()
-                .child(
-                    div().class("mq-diff-added").child(
-                        mono_text(format!("+{}", stat.added))
-                            .size(12.0)
-                            .no_wrap()
-                            .no_cursor(),
-                    ),
-                )
-                .child(
-                    div().class("mq-diff-removed").child(
-                        mono_text(format!("−{}", stat.removed))
-                            .size(12.0)
-                            .no_wrap()
-                            .no_cursor(),
-                    ),
-                );
-            if panel.get() {
-                row = row.class("mq-diff-count--open");
+/// Preferred right width, clamped so left + main keep [`UiPrefs::MAIN_MIN`].
+pub fn clamp_right_width(want: f32, window: f32, side: f32) -> f32 {
+    let available = (window - 2.0 * FRAME_PAD - side - UiPrefs::MAIN_MIN - 8.0).max(0.0);
+    let max = available.min(UiPrefs::RIGHT_MAX).max(UiPrefs::RIGHT_MIN);
+    want.clamp(UiPrefs::RIGHT_MIN, max)
+}
+
+/// Width the right column occupies (0 while closed).
+pub fn right_width(app: &App) -> f32 {
+    if !app.bindings.diff_panel.get() {
+        return 0.0;
+    }
+    let (vw, _) = blinc_core::BlincContextState::get().viewport_size();
+    let side = side_width(app, vw);
+    clamp_right_width(app.config.get().ui.right(), vw, side)
+}
+
+/// Open the right column on `tab` (or switch tab if already open).
+pub fn open_right(app: &App, tab: RightTab) {
+    app.bindings.right_tab.signal().set(tab);
+    app.bindings.diff_panel.signal().set(true);
+}
+
+/// Toggle: same tab while open closes; otherwise opens onto `tab`.
+pub fn toggle_right(app: &App, tab: RightTab) {
+    if app.bindings.diff_panel.get() && app.bindings.right_tab.get() == tab {
+        close_right(app);
+    } else {
+        open_right(app, tab);
+    }
+}
+
+/// Close the right column (Esc / leaving a session).
+pub fn close_right(app: &App) {
+    if app.bindings.diff_panel.get() {
+        app.bindings.diff_panel.signal().set(false);
+        app.bindings.diff_focus.signal().set(None);
+    }
+}
+
+/// Right-column stub kept for the root tree call site (content is in-column).
+pub fn diff_overlay(app: &App) -> impl ElementBuilder {
+    let _ = app;
+    div()
+}
+
+fn right_panel_width(app: &App) -> State<f32> {
+    let width = app.config.get().ui.right();
+    blinc_core::BlincContextState::get().use_state_keyed("mq.right.width", move || width)
+}
+
+/// Drag handle on the left edge of the right column.
+fn right_resize_handle(app: &App, width: State<f32>, window: f32, side: f32) -> Div {
+    static RIGHT_DRAG: OnceLock<Mutex<(f32, f32, Option<Instant>)>> = OnceLock::new();
+    let drag = RIGHT_DRAG.get_or_init(|| Mutex::new((0.0, 0.0, None)));
+    let (down_w, move_w, end_w) = (width.clone(), width.clone(), width);
+    let (reset_app, end_app) = (app.clone(), app.clone());
+    div()
+        .class("mq-side-handle")
+        .class("mq-right-handle")
+        .absolute()
+        .top(0.0)
+        .bottom(0.0)
+        .left(-3.0)
+        .w(6.0)
+        .cursor(CursorStyle::ResizeEW)
+        .on_mouse_down(move |e| {
+            let mut d = drag.lock().unwrap();
+            let now = Instant::now();
+            if d.2.is_some_and(|last| now - last < DOUBLE_CLICK) {
+                d.2 = None;
+                let reset = clamp_right_width(UiPrefs::RIGHT_DEFAULT, window, side);
+                down_w.set(reset);
+                reset_app.send(Command::Edit(ConfigEdit::RightWidth(reset)));
+                return;
             }
-            row.on_click(move |_| {
-                let open = !click.bindings.diff_panel.get();
-                click.bindings.diff_panel.signal().set(open);
-            })
+            *d = (e.mouse_x, down_w.get(), Some(now));
+        })
+        .on_drag(move |e| {
+            let (x, start, _) = *drag.lock().unwrap();
+            // Dragging the left edge right shrinks the panel.
+            let next = clamp_right_width(start - (e.mouse_x - x), window, side);
+            if (move_w.get() - next).abs() >= 0.5 {
+                move_w.set(next);
+            }
+        })
+        .on_drag_end(move |_| {
+            end_app.send(Command::Edit(ConfigEdit::RightWidth(end_w.get())));
         })
 }
 
-/// Overlay listing changed paths for the open session. Click a row to expand
-/// its patch preview (when the agent sent one); the open icon sends it to the
-/// preferred editor.
-pub fn diff_overlay(app: &App) -> impl ElementBuilder {
+fn right_tab_chip(app: &App, tab: RightTab, label: &str, badge: Option<usize>) -> Div {
+    let active = app.bindings.right_tab.get() == tab;
+    let click = app.clone();
+    let mut chip = div()
+        .class("mq-right-tab")
+        .flex_row()
+        .items_center()
+        .cursor_pointer()
+        .child(
+            ui_text(label.to_string())
+                .size(12.0)
+                .semibold()
+                .no_wrap()
+                .no_cursor(),
+        )
+        .on_click(move |_| {
+            click.bindings.right_tab.signal().set(tab);
+        });
+    if active {
+        chip = chip.class("mq-right-tab--active");
+    }
+    if let Some(n) = badge.filter(|n| *n > 0) {
+        chip = chip.child(
+            div().class("mq-right-tab-badge").child(
+                mono_text(format!("{n}"))
+                    .size(10.0)
+                    .no_wrap()
+                    .no_cursor(),
+            ),
+        );
+    }
+    chip
+}
+
+fn right_column(app: &App, height: f32, width: State<f32>, window: f32, side: f32) -> Div {
     let diff = app.bindings.diff.clone();
     let panel = app.bindings.diff_panel.clone();
+    let tab = app.bindings.right_tab.clone();
     let focus = app.bindings.diff_focus.clone();
     let header = app.bindings.header.clone();
+    let dirs = app.bindings.dirs.clone();
+    let cmp_inbox = composer::state::Cmp::get().inbox.clone();
     let app = app.clone();
-    stateful_with_key::<NoState>("mq-diff-panel")
+    let handle_app = app.clone();
+    let panel_w = width.get();
+    let body = stateful_with_key::<NoState>("mq-right-panel")
         .deps([
             diff.signal_id(),
             panel.signal_id(),
+            tab.signal_id(),
             focus.signal_id(),
             header.signal_id(),
+            dirs.signal_id(),
+            cmp_inbox.signal_id(),
+            width.signal_id(),
         ])
         .on_state(move |_| {
-            if !panel.get() {
-                return div();
-            }
-            let open = header.get().map(|h| h.asid.0.clone());
-            let Some(stat) = diff
-                .get()
-                .filter(|d| Some(&d.asid) == open.as_ref() && !d.paths.is_empty())
-            else {
-                return div();
-            };
-            let focused = focus.get();
             let close = app.clone();
-            let mut list = div().class("mq-diff-panel-list").flex_col().w_full();
-            for file in stat.paths.iter().cloned() {
-                let selected = focused.as_deref() == Some(file.path.as_str());
-                let toggle = app.clone();
-                let path = file.path.clone();
-                let open_app = app.clone();
-                let open_path = file.path.clone();
-                let mut row = div()
-                    .class("mq-diff-panel-row")
-                    .w_full()
-                    .flex_row()
-                    .items_center()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(0.0)
-                            .overflow_clip()
-                            .cursor_pointer()
-                            .child(
-                                mono_text(file.path.clone())
-                                    .size(12.0)
-                                    .no_wrap()
-                                    .no_cursor(),
-                            )
-                            .on_click(move |_| {
-                                let next = if toggle.bindings.diff_focus.get().as_deref()
-                                    == Some(path.as_str())
-                                {
-                                    None
-                                } else {
-                                    Some(path.clone())
-                                };
-                                toggle.bindings.diff_focus.signal().set(next);
-                            }),
-                    )
-                    .child(
-                        div().class("mq-diff-added").child(
-                            mono_text(format!("+{}", file.added))
-                                .size(11.0)
-                                .no_wrap()
-                                .no_cursor(),
-                        ),
-                    )
-                    .child(
-                        div().class("mq-diff-removed").child(
-                            mono_text(format!("−{}", file.removed))
-                                .size(11.0)
-                                .no_wrap()
-                                .no_cursor(),
-                        ),
-                    )
-                    .child(
-                        div()
-                            .class("mq-diff-open")
-                            .cursor_pointer()
-                            .child(
-                                ui_text(app.strings.open_file())
-                                    .size(11.0)
-                                    .no_wrap()
-                                    .no_cursor(),
-                            )
-                            .on_click(move |_| open_diff_file(&open_app, &open_path)),
-                    );
-                if selected {
-                    row = row.class("mq-diff-panel-row--open");
-                }
-                list = list.child(row);
-                if selected {
-                    list = list.child(diff_patch_preview(&file.patch, &app));
-                }
-            }
-            if stat.files > stat.paths.len() {
-                list = list.child(
+            let queued = cmp_inbox.get().len();
+            let current = tab.get();
+            let head = div()
+                .class("mq-right-head")
+                .w_full()
+                .flex_row()
+                .items_center()
+                .child(
+                    div()
+                        .class("mq-right-tabs")
+                        .flex_1()
+                        .min_w(0.0)
+                        .flex_row()
+                        .items_center()
+                        .child(right_tab_chip(
+                            &app,
+                            RightTab::Queue,
+                            app.strings.queue(),
+                            Some(queued),
+                        ))
+                        .child(right_tab_chip(
+                            &app,
+                            RightTab::Git,
+                            app.strings.git_tab(),
+                            None,
+                        )),
+                )
+                .child(ghost_icon(Glyph::Close).on_click(move |_| close_right(&close)));
+
+            let content = match current {
+                RightTab::Queue => queue_tab_body(&app),
+                RightTab::Git => git_tab_body(&app),
+            };
+            div()
+                .class("mq-right-body")
+                .w_full()
+                .h(height)
+                .flex_col()
+                .child(head)
+                .child(
+                    div()
+                        .w_full()
+                        .flex_1()
+                        .min_h(0.0)
+                        .child(content),
+                )
+        });
+    div()
+        .class("mq-right-column")
+        .relative()
+        .w(panel_w)
+        .h(height)
+        .flex_shrink_0()
+        .child(body)
+        .child(right_resize_handle(&handle_app, width, window, side))
+}
+
+fn queue_tab_body(app: &App) -> Div {
+    let Some(list) = chips::queue_panel(app) else {
+        return div()
+            .class("mq-right-empty")
+            .w_full()
+            .h_full()
+            .flex_col()
+            .child(
+                ui_text(app.strings.queue_empty())
+                    .size(12.0)
+                    .no_wrap()
+                    .no_cursor(),
+            );
+    };
+    div()
+        .class("mq-right-queue")
+        .w_full()
+        .h_full()
+        .child(scroll().w_full().h_full().child(list))
+}
+
+fn git_tab_body(app: &App) -> Div {
+    let header = app.bindings.header.get();
+    let dirs = app.bindings.dirs.get();
+    let branch = header.as_ref().and_then(|info| {
+        info.git_info
+            .as_ref()
+            .and_then(|g| g.branch.clone())
+            .or_else(|| {
+                let dir = info.directory.as_deref()?;
+                dirs.get(dir.trim_end_matches(['/', '\\']))
+                    .and_then(|d| d.branch.clone())
+            })
+    });
+    let open = header.as_ref().map(|h| h.asid.0.clone());
+    let stat = app
+        .bindings
+        .diff
+        .get()
+        .filter(|d| Some(&d.asid) == open.as_ref() && !d.paths.is_empty());
+    let focused = app.bindings.diff_focus.get();
+
+    let mut col = div().class("mq-right-git").w_full().h_full().flex_col().child(
+        div()
+            .class("mq-right-section")
+            .w_full()
+            .flex_row()
+            .items_center()
+            .child(icons::tinted(Glyph::Branch, 14.0))
+            .child(
+                div().flex_1().min_w(0.0).overflow_clip().child(
+                    mono_text(branch.unwrap_or_else(|| "—".into()))
+                        .size(13.0)
+                        .no_wrap()
+                        .no_cursor(),
+                ),
+            ),
+    );
+
+    let Some(stat) = stat else {
+        return col.child(
+            div()
+                .class("mq-right-empty")
+                .w_full()
+                .flex_1()
+                .child(
+                    ui_text(app.strings.changed_files())
+                        .size(12.0)
+                        .no_wrap()
+                        .no_cursor(),
+                )
+                .child(
                     div().class("mq-menu-dim").child(
-                        ui_text(format!("+{}", stat.files - stat.paths.len()))
-                            .size(11.0)
+                        ui_text(app.strings.diff_no_preview())
+                            .size(12.0)
                             .no_wrap()
                             .no_cursor(),
                     ),
-                );
-            }
-            div()
-                .class("mq-diff-panel")
-                .absolute()
-                .right(12.0)
-                .top(TOP_BAR_HEIGHT + 8.0)
-                .w(420.0)
-                .flex_col()
-                .child(
-                    div()
-                        .class("mq-diff-panel-head")
-                        .w_full()
-                        .flex_row()
-                        .items_center()
-                        .child(
-                            ui_text(app.strings.changed_files())
-                                .size(13.0)
-                                .semibold()
-                                .no_wrap()
-                                .no_cursor(),
-                        )
-                        .child(div().flex_1())
-                        .child(ghost_icon(icons::X).on_click(move |_| {
-                            close.bindings.diff_panel.signal().set(false);
-                            close.bindings.diff_focus.signal().set(None);
-                        })),
-                )
-                .child(
-                    div()
-                        .w_full()
-                        .max_h(420.0)
-                        .child(scroll().w_full().h_full().child(list)),
-                )
-        })
+                ),
+        );
+    };
+
+    let mut list = div().class("mq-diff-panel-list").flex_col().w_full();
+    for file in stat.paths.iter().cloned() {
+        let selected = focused.as_deref() == Some(file.path.as_str());
+        let toggle = app.clone();
+        let path = file.path.clone();
+        let open_app = app.clone();
+        let open_path = file.path.clone();
+        let mut row = div()
+            .class("mq-diff-panel-row")
+            .w_full()
+            .flex_row()
+            .items_center()
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(0.0)
+                    .overflow_clip()
+                    .cursor_pointer()
+                    .child(
+                        mono_text(file.path.clone())
+                            .size(12.0)
+                            .no_wrap()
+                            .no_cursor(),
+                    )
+                    .on_click(move |_| {
+                        let next = if toggle.bindings.diff_focus.get().as_deref()
+                            == Some(path.as_str())
+                        {
+                            None
+                        } else {
+                            Some(path.clone())
+                        };
+                        toggle.bindings.diff_focus.signal().set(next);
+                    }),
+            )
+            .child(
+                div().class("mq-diff-added").child(
+                    mono_text(format!("+{}", file.added))
+                        .size(11.0)
+                        .no_wrap()
+                        .no_cursor(),
+                ),
+            )
+            .child(
+                div().class("mq-diff-removed").child(
+                    mono_text(format!("−{}", file.removed))
+                        .size(11.0)
+                        .no_wrap()
+                        .no_cursor(),
+                ),
+            )
+            .child(
+                div()
+                    .class("mq-diff-open")
+                    .cursor_pointer()
+                    .child(
+                        ui_text(app.strings.open_file())
+                            .size(11.0)
+                            .no_wrap()
+                            .no_cursor(),
+                    )
+                    .on_click(move |_| open_diff_file(&open_app, &open_path)),
+            );
+        if selected {
+            row = row.class("mq-diff-panel-row--open");
+        }
+        list = list.child(row);
+        if selected {
+            list = list.child(diff_patch_preview(&file.patch, app));
+        }
+    }
+    if stat.files > stat.paths.len() {
+        list = list.child(
+            div().class("mq-menu-dim").child(
+                ui_text(format!("+{}", stat.files - stat.paths.len()))
+                    .size(11.0)
+                    .no_wrap()
+                    .no_cursor(),
+            ),
+        );
+    }
+    col = col.child(
+        div().class("mq-right-section").w_full().child(
+            ui_text(app.strings.changed_files())
+                .size(11.0)
+                .semibold()
+                .no_wrap()
+                .no_cursor(),
+        ),
+    );
+    col.child(
+        div()
+            .w_full()
+            .flex_1()
+            .min_h(0.0)
+            .child(scroll().w_full().h_full().child(list)),
+    )
 }
 
 const DIFF_PANEL_PREVIEW_LINES: usize = 28;
@@ -531,42 +805,6 @@ fn diff_patch_preview(patch: &str, app: &App) -> Div {
         );
     }
     body
-}
-
-/// The moon (or sun, in light) switches the scheme; a dot on it while the
-/// system's scheme is followed.
-fn scheme_toggle(app: &App) -> Div {
-    let following = app
-        .scheme_watcher
-        .lock()
-        .map(|w| w.is_some())
-        .unwrap_or(false);
-    let path = match ThemeState::get().scheme() {
-        ColorScheme::Dark => icons::MOON,
-        ColorScheme::Light => icons::SUN,
-    };
-    let mut button = ghost_icon(path).relative();
-    if following {
-        button = button.child(
-            div()
-                .class("mq-follow-dot")
-                .absolute()
-                .right(5.0)
-                .top(5.0)
-                .w(5.0)
-                .h(5.0)
-                .rounded(2.5),
-        );
-    }
-    let app = app.clone();
-    button.on_click(move |_| {
-        // An explicit choice stops following the system.
-        let next = match ThemeState::get().scheme().toggle() {
-            ColorScheme::Light => Scheme::Light,
-            ColorScheme::Dark => Scheme::Dark,
-        };
-        app.apply_scheme(next);
-    })
 }
 
 /// The sidebar's width, bound to its column so a drag moves it without a
@@ -642,14 +880,27 @@ fn resize_handle(app: &App, width: State<f32>) -> Div {
 }
 
 pub fn body(ctx: &WindowedContext, app: &App) -> Div {
-    let height = (ctx.height - TOP_BAR_HEIGHT).max(0.0);
+    // Full slot under the topbar; columns are shorter by FRAME_PAD so the
+    // sidebar's bottom radius sits above the window edge.
+    let slot = (ctx.height - TOP_BAR_HEIGHT).max(0.0);
+    let height = (slot - FRAME_PAD).max(0.0);
     let window = ctx.width;
     let collapsed = sidebar_collapsed();
     let width = sidebar_width(app);
+    let right_w = right_panel_width(app);
+    let right_open = app.bindings.diff_panel.clone();
+    let right_tab = app.bindings.right_tab.clone();
     let app = app.clone();
-    // Rebuild when Ctrl/Cmd+B folds the column; drag width binds reactively.
+    // Rebuild when Ctrl/Cmd+B folds the left column, the right panel toggles /
+    // resizes, or its tab changes.
     let body = stateful_with_key::<NoState>("mq-shell-body")
-        .deps([collapsed.signal_id()])
+        .deps([
+            collapsed.signal_id(),
+            right_open.signal_id(),
+            right_tab.signal_id(),
+            right_w.signal_id(),
+            width.signal_id(),
+        ])
         .on_state(move |_| {
             let rail = collapsed.get() || window < RAIL_BELOW;
             let side = if rail {
@@ -657,7 +908,17 @@ pub fn body(ctx: &WindowedContext, app: &App) -> Div {
             } else {
                 width.get()
             };
-            let main_width = (window - side).max(0.0);
+            let right = if right_open.get() {
+                let clamped = clamp_right_width(right_w.get(), window, side);
+                if (right_w.get() - clamped).abs() >= 0.5 {
+                    right_w.set(clamped);
+                }
+                clamped
+            } else {
+                0.0
+            };
+            // Horizontal FRAME_PAD + column gap (--mq-space-2) match the CSS.
+            let main_width = (window - 2.0 * FRAME_PAD - side - right - 8.0).max(0.0);
             let column = if rail {
                 div()
                     .class("mq-side-column")
@@ -675,7 +936,7 @@ pub fn body(ctx: &WindowedContext, app: &App) -> Div {
                     .child(sessions::sidebar(&app, height))
                     .child(resize_handle(&app, width.clone()))
             };
-            div()
+            let mut row = div()
                 .class("mq-body")
                 .w_full()
                 .h(height)
@@ -694,9 +955,19 @@ pub fn body(ctx: &WindowedContext, app: &App) -> Div {
                             .bottom(0.0)
                             .child(main_panel(&app, main_width, height)),
                     ),
-                )
+                );
+            if right_open.get() {
+                row = row.child(right_column(
+                    &app,
+                    height,
+                    right_w.clone(),
+                    window,
+                    side,
+                ));
+            }
+            row
         });
-    div().w_full().h(height).child(body)
+    div().w_full().h(slot).flex_col().child(body)
 }
 
 fn main_panel(app: &App, width: f32, height: f32) -> Div {
@@ -706,6 +977,7 @@ fn main_panel(app: &App, width: f32, height: f32) -> Div {
     let cmp = composer::state::Cmp::get();
     let strip = errors::strip(app);
     let app = app.clone();
+    let right_open = app.bindings.diff_panel.clone();
     let view = stateful_with_key::<NoState>("mq-main-view")
         .deps([
             selected.signal_id(),
@@ -714,6 +986,9 @@ fn main_panel(app: &App, width: f32, height: f32) -> Div {
             cmp.inbox.signal_id(),
             cmp.staged.signal_id(),
             cmp.rows.signal_id(),
+            // Composer / timeline share this panel width; rebuild when the
+            // git column opens so the input card shrinks with the column.
+            right_open.signal_id(),
         ])
         .on_state(move |_| {
             if settings_open.get() {
@@ -731,7 +1006,7 @@ fn main_panel(app: &App, width: f32, height: f32) -> Div {
                 .h(height)
                 .flex_col()
                 .child(timeline::timeline(&app, timeline_height))
-                .child(composer::composer(&app))
+                .child(composer::composer(&app, width))
         });
     div()
         .class("mq-main")

@@ -1,8 +1,8 @@
 //! The composer, shared by the start page and the session page: a growing
 //! text area, 📎 attach (dialog or a pasted image), staged files above it,
-//! the waiting prompts of a busy agent, a row of selector pills under it
-//! (project, agent, model, mode / effort, branch), the context readout and
-//! the primary action (architecture §6.0‴ B and C, §6.1c).
+//! a row of selector pills under it (project, agent, model, mode / effort,
+//! branch), the context readout and the primary action (architecture
+//! §6.0‴ B and C, §6.1c). Waiting prompts live in the right-panel Queue tab.
 //!
 //! The text area inserts a newline on every Enter itself
 //! (`blinc_layout/src/widgets/text_area/handlers.rs`, key 13) and moves the
@@ -13,7 +13,7 @@
 //! dispatched to everyone -- by which time the newline is in (and is taken
 //! back out) or the caret has moved (and is put back).
 
-mod chips;
+pub(crate) mod chips;
 pub mod pills;
 mod popup;
 pub mod qa;
@@ -26,7 +26,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use blinc_cn::prelude::{icons, to_svg, ColorToken, ThemeState};
+use crate::ui::glyphs::Glyph;
+use crate::ui::icons;
 use blinc_layout::prelude::*;
 use blinc_layout::widgets::text_area::{focus_text_area_deferred, refresh_text_area};
 use muqun_gateway::agents::{AgentSessionId, AgentSessionInfo, AgentSessionStatus, ModelRef};
@@ -54,16 +55,14 @@ const KEY_DOWN: u32 = 40;
 const KEY_V: u32 = 86;
 
 /// The session page's reserved height for the default two-row card (slot
-/// padding + field + pills). Extra text rows, staged files and the waiting
-/// queue add on top via [`reserved_height`] so the timeline never shows
-/// through a translucent overlay.
+/// padding + field + pills). Extra text rows and staged files add on top via
+/// [`reserved_height`] so the timeline never shows through a translucent
+/// overlay. The prompt queue lives in the right panel, not here.
 pub const COMPOSER_HEIGHT: f32 = 148.0;
 /// Text area rows: 56 px at two, then up to six.
 const MIN_ROWS: usize = 2;
 const MAX_ROWS: usize = 6;
 const EXTRA_ROW_PX: f32 = 20.0;
-const QUEUED_ROW_PX: f32 = 32.0;
-const QUEUED_CHROME_PX: f32 = 12.0;
 const STAGED_ROW_PX: f32 = 36.0;
 
 /// Strip height for the open session: base card plus whatever sits above the
@@ -72,20 +71,12 @@ const STAGED_ROW_PX: f32 = 36.0;
 pub fn reserved_height() -> f32 {
     let cmp = Cmp::get();
     let extra_rows = cmp.rows.get().saturating_sub(MIN_ROWS) as f32 * EXTRA_ROW_PX;
-    let queued = cmp.inbox.get().len();
-    let queued_h = if queued == 0 {
-        0.0
-    } else {
-        QUEUED_CHROME_PX
-            + queued.min(chips::SHOWN) as f32 * QUEUED_ROW_PX
-            + if queued > chips::SHOWN { 18.0 } else { 0.0 }
-    };
     let staged_h = if cmp.staged.get().is_empty() {
         0.0
     } else {
         STAGED_ROW_PX
     };
-    COMPOSER_HEIGHT + extra_rows + queued_h + staged_h
+    COMPOSER_HEIGHT + extra_rows + staged_h
 }
 /// Most files staged on one message.
 const MAX_STAGED: usize = 10;
@@ -258,9 +249,17 @@ pub fn aim(app: &App, place: Place) -> Aim {
 /// Ask the core for what the pills and popups need, once per agent and
 /// folder (and once per folder for its branch).
 fn ensure_loaded(app: &App, aim: &Aim) {
+    // Don't fight a cold session open for CPU with a 500-model catalogue.
+    if app.bindings.order.get().opening {
+        return;
+    }
+    // Catalogues (OpenCode: hundreds of models) can take well over 6s; a short
+    // retry stampedes concurrent RPCs and fights session open for CPU.
+    let catalog_retry = std::time::Duration::from_secs(45);
     let retry = std::time::Duration::from_secs(6);
     let key = state::catalog_key(&aim.agent, aim.cwd.as_deref());
-    if aim.standing == Standing::Usable && state::ask_due(&key, aim.catalog.is_some(), retry) {
+    if aim.standing == Standing::Usable && state::ask_due(&key, aim.catalog.is_some(), catalog_retry)
+    {
         app.send(Command::Compose(ComposeCommand::Catalog {
             agent: aim.agent.clone(),
             directory: aim.cwd.clone(),
@@ -282,6 +281,10 @@ fn ensure_loaded(app: &App, aim: &Aim) {
                 agent: aim.agent.clone(),
             });
         }
+    }
+    let peers_known = !Cmp::get().peers.get().is_empty();
+    if state::ask_due("peers", peers_known, std::time::Duration::from_secs(30)) {
+        app.send(Command::Compose(ComposeCommand::ListPeers));
     }
 }
 
@@ -400,13 +403,15 @@ fn update_popup(app: &App, key: &str, text: &str, caret: usize) {
     let current = cmp.popup.get();
     let found = triggers::find(text, caret);
     let aim = aim(app, place_of(key));
-    // A trigger only opens what the composer can answer.
+    // A trigger only opens what the composer can answer. `@` always may open
+    // (computers need no folder; files need cwd for the walk). `/` and `$`
+    // open as soon as the agent is usable so a cold catalogue still shows
+    // Loading… instead of a dead caret.
     let found = found.filter(|t| match t.kind {
-        Kind::File => aim.cwd.is_some() && aim.standing == Standing::Usable,
-        Kind::Command | Kind::Skill => aim
-            .catalog
-            .as_ref()
-            .is_some_and(|c| !c.catalog.commands.is_empty() || !c.catalog.skills.is_empty()),
+        Kind::File => true,
+        Kind::Command | Kind::Skill => {
+            aim.standing == Standing::Usable || aim.catalog.is_some()
+        }
     });
     let found = found.filter(|t| current.dismissed_at != Some(t.start));
     let dismissed_at = match (&found, current.dismissed_at) {
@@ -438,6 +443,23 @@ fn update_popup(app: &App, key: &str, text: &str, caret: usize) {
                 }));
             }
         }
+        if matches!(trigger.kind, Kind::Command | Kind::Skill)
+            && aim.standing == Standing::Usable
+            && aim.catalog.is_none()
+        {
+            // Popup-path refresh: do not wait on the 45s pill retry.
+            let key = format!(
+                "slash-cat\u{1f}{}",
+                state::catalog_key(&aim.agent, aim.cwd.as_deref())
+            );
+            if state::ask_due(&key, false, std::time::Duration::from_secs(2)) {
+                app.send(Command::Compose(ComposeCommand::Catalog {
+                    agent: aim.agent.clone(),
+                    directory: aim.cwd.clone(),
+                    asid: aim.asid(),
+                }));
+            }
+        }
     }
     set_popup(state::Popup {
         trigger: found,
@@ -454,23 +476,53 @@ fn popup_rows(app: &App, popup: &state::Popup) -> Vec<triggers::Row> {
     let key = state::current_surface().unwrap_or_default();
     let aim = aim(app, place_of(&key));
     match trigger.kind {
-        Kind::File => Cmp::get()
-            .files
-            .get()
-            .hits
-            .iter()
-            .map(|hit| triggers::Row {
-                insert: hit.path.clone(),
-                label: hit.name.clone(),
-                detail: hit.path.clone(),
-            })
-            .collect(),
-        Kind::Command => aim.catalog.as_ref().map_or_else(Vec::new, |c| {
-            triggers::command_rows(&trigger.query, &c.catalog.commands, &c.catalog.skills)
-        }),
-        Kind::Skill => aim.catalog.as_ref().map_or_else(Vec::new, |c| {
-            triggers::skill_rows(&trigger.query, &c.catalog.skills)
-        }),
+        Kind::File => {
+            let cmp = Cmp::get();
+            let mut rows = triggers::computer_rows(
+                &trigger.query,
+                &cmp.peers.get(),
+                &app.strings.popup_this_computer(),
+                &app.strings.popup_computer(),
+                &app.strings.popup_computer_offline(),
+            );
+            rows.extend(cmp.files.get().hits.iter().map(|hit| {
+                triggers::Row::item(hit.path.clone(), hit.name.clone(), hit.path.clone())
+            }));
+            rows
+        }
+        Kind::Command => match aim.catalog.as_ref() {
+            None => vec![triggers::Row::status(app.strings.popup_loading())],
+            Some(c) => {
+                let rows =
+                    triggers::command_rows(&trigger.query, &c.catalog.commands, &c.catalog.skills);
+                if rows.is_empty() {
+                    let has_any = !c.catalog.commands.is_empty()
+                        || c.catalog.skills.iter().any(|s| s.slash);
+                    vec![triggers::Row::status(if has_any {
+                        app.strings.popup_no_matches()
+                    } else {
+                        app.strings.popup_no_commands()
+                    })]
+                } else {
+                    rows
+                }
+            }
+        },
+        Kind::Skill => match aim.catalog.as_ref() {
+            None => vec![triggers::Row::status(app.strings.popup_loading())],
+            Some(c) => {
+                let rows = triggers::skill_rows(&trigger.query, &c.catalog.skills);
+                if rows.is_empty() {
+                    vec![triggers::Row::status(if c.catalog.skills.is_empty() {
+                        app.strings.popup_no_skills()
+                    } else {
+                        app.strings.popup_no_matches()
+                    })]
+                } else {
+                    rows
+                }
+            }
+        },
     }
 }
 
@@ -482,6 +534,9 @@ fn pick(app: &App, index: usize) {
     let (Some(trigger), Some(row)) = (popup.trigger.clone(), rows.get(index)) else {
         return;
     };
+    if !row.selectable {
+        return;
+    }
     let (text, _) = current_text(app);
     let (next, caret) = triggers::insert(&text, &trigger, &row.insert);
     set_text(app, &next, caret);
@@ -612,7 +667,10 @@ pub fn on_key(app: &App, key: u32, line: usize, column: usize) {
             if key == KEY_ENTER {
                 undo_enter(app);
             }
-            pick(app, popup.selected.min(rows.len() - 1));
+            let index = popup.selected.min(rows.len() - 1);
+            if rows.get(index).is_some_and(|r| r.selectable) {
+                pick(app, index);
+            }
         }
         KEY_ENTER => submit_after_enter(app),
         _ => edited(app),
@@ -763,12 +821,16 @@ pub fn submit(app: &App) {
     cmp.submitting.signal().set(Some(token));
     state::remember_sent(&key, &text);
     IN_FLIGHT.with(|f| *f.borrow_mut() = Some(InFlight { key, text, staged }));
+    let queued = place == Place::Session && aim.busy;
+    if queued {
+        crate::ui::shell::open_right(app, crate::model::view::RightTab::Queue);
+    }
     app.send(Command::Compose(ComposeCommand::Submit {
         token,
         target,
         deliver,
         attachments: paths,
-        delivery: (place == Place::Session && aim.busy).then(|| "queue".to_string()),
+        delivery: queued.then(|| "queue".to_string()),
     }));
 }
 
@@ -1009,17 +1071,16 @@ pub fn focus_input(app: &App) {
 // Views
 // ---------------------------------------------------------------------------
 
-fn glyph(path: &str, size: f32) -> impl ElementBuilder {
-    svg(to_svg(path, size))
-        .size(size, size)
-        .tint(ThemeState::get().color(ColorToken::TextSecondary))
-        .flex_shrink_0()
+fn glyph(g: Glyph, size: f32) -> impl ElementBuilder {
+    icons::tinted(g, size)
 }
 
 /// The session page's composer, in its reserved strip at the foot.
-pub fn composer(app: &App) -> impl ElementBuilder {
+/// `panel_width` is the main column width (already minus sidebar / right git).
+pub fn composer(app: &App, panel_width: f32) -> impl ElementBuilder {
     let cmp = Cmp::get();
     let header = app.bindings.header.clone();
+    let right = app.bindings.diff_panel.clone();
     let app = app.clone();
     let deps = [
         header.signal_id(),
@@ -1027,6 +1088,8 @@ pub fn composer(app: &App) -> impl ElementBuilder {
         cmp.staged.signal_id(),
         cmp.inbox.signal_id(),
         cmp.rows.signal_id(),
+        // Recompute card width when the git column opens/closes.
+        right.signal_id(),
     ];
     let strip = stateful_with_key::<NoState>("mq-composer")
         .deps(deps)
@@ -1041,6 +1104,9 @@ pub fn composer(app: &App) -> impl ElementBuilder {
             sync_surface(&app, &aim.key);
             ensure_loaded(&app, &aim);
             let height = reserved_height();
+            // Always keep SLOT_SIDE inset; never grow past SESSION_MAX. Do not
+            // clamp up to 320 when the panel is narrower — that ate the margins.
+            let card_w = session_card_width_for(panel_width);
             div()
                 .class("mq-cmp-strip")
                 .w_full()
@@ -1054,7 +1120,7 @@ pub fn composer(app: &App) -> impl ElementBuilder {
                         .w_full()
                         .flex_row()
                         .justify_center()
-                        .child(card(&app, &aim, session_card_width(&app))),
+                        .child(div().w(card_w).child(card(&app, &aim, card_w))),
                 )
         });
     // Outer shell reserves max space via [`reserved_height`]; this wrapper
@@ -1062,14 +1128,14 @@ pub fn composer(app: &App) -> impl ElementBuilder {
     div().w_full().flex_shrink_0().child(strip)
 }
 
-/// The widest the session page's card gets (the content column's width).
+/// The widest the session page's card gets.
 const SESSION_MAX: f32 = 860.0;
 /// Card padding (12 px a side) and the attach column (24 px) with its gap
 /// (8 px): what the card's width loses before the text.
 const FIELD_INSET: f32 = 24.0 + 32.0;
-/// The slot's side and bottom padding on the session page.
-const SLOT_SIDE: f32 = 16.0;
-const SLOT_BOTTOM: f32 = 16.0;
+/// The slot's side padding (matches `.mq-cmp-slot` → `--mq-space-5`).
+const SLOT_SIDE: f32 = 20.0;
+pub(crate) const SLOT_BOTTOM: f32 = 20.0;
 
 /// The text area's width inside a card `card` wide. The field lays its lines
 /// out at its configured width (it does not read the layout's), so the width
@@ -1078,12 +1144,23 @@ fn field_width(card: f32) -> f32 {
     (card - FIELD_INSET).max(160.0)
 }
 
-/// The session page's card: the main panel less the slot's padding, at most
-/// the content column.
+/// Card width for a main-panel column of `panel` px: slot inset preserved on
+/// both sides, capped at [`SESSION_MAX`].
+pub(crate) fn session_card_width_for(panel: f32) -> f32 {
+    (panel - 2.0 * SLOT_SIDE).max(0.0).min(SESSION_MAX)
+}
+
+/// Card width from the window (popup / overlays that are not under `main_panel`).
 pub(crate) fn session_card_width(app: &App) -> f32 {
     let (window, _) = blinc_core::BlincContextState::get().viewport_size();
-    let main = window - crate::ui::shell::side_width(app, window);
-    (main - 2.0 * SLOT_SIDE).clamp(320.0, SESSION_MAX)
+    // Match `shell::body`'s main column: frame pad + column gap + side + right.
+    let panel = (window
+        - 2.0 * crate::ui::shell::FRAME_PAD
+        - crate::ui::shell::side_width(app, window)
+        - crate::ui::shell::right_width(app)
+        - 8.0)
+        .max(0.0);
+    session_card_width_for(panel)
 }
 
 /// The start page's composer card, `width` wide.
@@ -1140,7 +1217,7 @@ fn card(app: &App, aim: &Aim, width: f32) -> Div {
             .class("mq-cmp-attach")
             .cursor_pointer()
             .flex_shrink_0()
-            .child(glyph(icons::PAPERCLIP, 16.0))
+            .child(glyph(Glyph::Attachment, 16.0))
             .on_click(move |_| pick_files(&app))
     };
     let input = blinc_layout::widgets::text_area::text_area(&app.composer)
@@ -1180,11 +1257,6 @@ fn card(app: &App, aim: &Aim, width: f32) -> Div {
         .flex_col()
         .id("mq-cmp-card");
     body = body.w(width);
-    if aim.place == Place::Session {
-        if let Some(waiting) = chips::waiting(app, aim) {
-            body = body.child(waiting);
-        }
-    }
     if let Some(staged) = chips::staged(app) {
         body = body.child(staged);
     }
@@ -1205,6 +1277,8 @@ fn pill_row(app: &App, place: Place) -> impl ElementBuilder {
     .deps([
         app.bindings.header.signal_id(),
         app.bindings.agents.signal_id(),
+        app.bindings.diff_panel.signal_id(),
+        app.bindings.right_tab.signal_id(),
         cmp.menu.signal_id(),
         cmp.catalogs.signal_id(),
         cmp.branches.signal_id(),

@@ -24,6 +24,21 @@ use super::turn::{self, RowTurn, TurnState};
 /// How many sessions the sidebar lists. P0 has no paging.
 pub const SESSION_LIST_LIMIT: usize = 100;
 
+/// Newest rows shown when a snapshot first opens; older rows stay in
+/// [`SessionView::pending_earlier`] until "Load earlier".
+const INITIAL_VISIBLE: usize = 20;
+
+fn split_newest(
+    mut rows: Vec<TimelineItem>,
+    keep: usize,
+) -> (Vec<TimelineItem>, Vec<TimelineItem>) {
+    if keep == 0 || rows.len() <= keep {
+        return (rows, Vec::new());
+    }
+    let pending = rows.drain(..rows.len() - keep).collect();
+    (rows, pending)
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionView {
     pub info: AgentSessionInfo,
@@ -35,8 +50,13 @@ pub struct SessionView {
     by_id: HashMap<String, Arc<TimelineItem>>,
     pub pending_permissions: Vec<PermissionRequest>,
     pub pending_forms: Vec<FormRequest>,
+    /// Older rows trimmed from a large snapshot, oldest first. Drained by
+    /// "Load earlier" before the hub is asked.
+    pending_earlier: Vec<TimelineItem>,
     /// No older history: `load_earlier_timeline` returned an empty page.
     pub exhausted: bool,
+    /// Selected, but the first snapshot has not arrived yet.
+    pub opening: bool,
 }
 
 impl SessionView {
@@ -48,19 +68,34 @@ impl SessionView {
     ) -> Self {
         let mut view = Self {
             info,
-            items: Vec::with_capacity(timeline.len()),
-            rows: Vec::with_capacity(timeline.len()),
-            by_id: HashMap::with_capacity(timeline.len()),
+            items: Vec::with_capacity(INITIAL_VISIBLE.min(timeline.len())),
+            rows: Vec::with_capacity(INITIAL_VISIBLE.min(timeline.len())),
+            by_id: HashMap::with_capacity(INITIAL_VISIBLE.min(timeline.len())),
             pending_permissions,
             pending_forms,
+            pending_earlier: Vec::new(),
             exhausted: false,
+            opening: false,
         };
         let mut timeline = timeline;
         timeline.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
-        for item in timeline {
+        let (visible, pending) = split_newest(timeline, INITIAL_VISIBLE);
+        view.pending_earlier = pending;
+        for item in visible {
             view.upsert(item);
         }
         view
+    }
+
+    /// Take up to `n` oldest-near rows from [`Self::pending_earlier`].
+    pub(crate) fn take_pending_earlier(&mut self, n: usize) -> Option<(Vec<TimelineItem>, bool)> {
+        if self.pending_earlier.is_empty() || n == 0 {
+            return None;
+        }
+        let start = self.pending_earlier.len().saturating_sub(n);
+        let items = self.pending_earlier.split_off(start);
+        let exhausted = self.pending_earlier.is_empty();
+        Some((items, exhausted))
     }
 
     /// Streaming updates land on the newest rows, so search from the end.
@@ -248,14 +283,25 @@ pub struct Shape {
     pub lines: u32,
 }
 
+/// Lines of assistant prose the list estimates for a clipped preview.
+const PROSE_PREVIEW_LINES: u32 = 40;
+
 impl Shape {
     /// The shapes of the rows `item` is shown as.
+    ///
+    /// Assistant text is always one row: settled replies clip in the
+    /// renderer, and a streaming reply keeps its settled/tail split inside
+    /// that row. Multi-row segments left zero-height placeholders after
+    /// clipping and the windowed list tried to fill the viewport with the
+    /// whole history (FPS → 0 on open).
     pub fn rows(item: &TimelineItem) -> Vec<Shape> {
         match segmented(item) {
-            Some(text) => super::stream::segments(text)
-                .into_iter()
-                .map(|r| Self::text(ShapeKind::Prose, &text[r]))
-                .collect(),
+            Some(text) => {
+                let mut shape = Self::text(ShapeKind::Prose, text);
+                shape.lines = shape.lines.min(PROSE_PREVIEW_LINES);
+                shape.chars = shape.chars.min(PROSE_PREVIEW_LINES.saturating_mul(100));
+                vec![shape]
+            }
             None => vec![Self::of(item)],
         }
     }
@@ -288,10 +334,11 @@ impl Shape {
             (AgentPart::Reasoning { .. }, _) => fixed(ShapeKind::Reasoning),
             (AgentPart::Tool(_), _) | (AgentPart::Shell { .. }, _) => fixed(ShapeKind::Tool),
             (AgentPart::Diff { diff, .. }, _) => text_shape(ShapeKind::Diff, diff),
+            // Collapsed accordion (App default); expand bumps the row version.
             (AgentPart::Todo { items }, _) => Self {
                 kind: ShapeKind::Card,
                 chars: 0,
-                lines: items.len() as u32 + 1,
+                lines: if items.is_empty() { 0 } else { 2 },
             },
             (AgentPart::Approval { .. }, _) | (AgentPart::Form { .. }, _) => Self {
                 kind: ShapeKind::Card,
@@ -423,7 +470,12 @@ pub struct TimelineOrder {
     pub shapes: Vec<Shape>,
     /// No older history to load.
     pub exhausted: bool,
+    /// Waiting on the first snapshot for this selection.
+    pub opening: bool,
 }
+
+/// How many recently opened timelines to keep for instant re-open (web-like).
+const TIMELINE_CACHE: usize = 8;
 
 #[derive(Debug, Default)]
 pub struct ViewState {
@@ -432,6 +484,8 @@ pub struct ViewState {
     /// The session the user picked; its snapshot may still be on the way.
     pub selected: Option<String>,
     pub active: Option<SessionView>,
+    /// Last opened timelines by asid, newest first — reopen without waiting.
+    timeline_cache: Vec<(String, SessionView)>,
     pub error: Option<UiError>,
     /// Every agent the gateway knows, as discovery last described them.
     pub agents: Vec<AgentDiscoveryInfo>,
@@ -529,9 +583,53 @@ impl ViewState {
         if self.selected.as_deref() == Some(asid) {
             return false;
         }
+        self.cache_active();
         self.selected = Some(asid.to_string());
         self.diff = None;
+        // Prefer a recently shown timeline (instant, like the web App), else
+        // a chrome-only placeholder until the snapshot arrives.
+        if self.active.as_ref().is_none_or(|a| a.info.asid.0 != asid) {
+            self.active = self
+                .take_cached(asid)
+                .or_else(|| {
+                    self.sessions
+                        .iter()
+                        .find(|s| s.asid.0 == asid)
+                        .cloned()
+                        .map(|info| {
+                            let mut view =
+                                SessionView::new(info, Vec::new(), Vec::new(), Vec::new());
+                            view.opening = true;
+                            view
+                        })
+                });
+        }
         true
+    }
+
+    fn cache_active(&mut self) {
+        let Some(active) = self.active.as_ref() else {
+            return;
+        };
+        if active.opening || active.items.is_empty() {
+            return;
+        }
+        let asid = active.info.asid.0.clone();
+        self.timeline_cache.retain(|(id, _)| id != &asid);
+        self.timeline_cache.insert(0, (asid, active.clone()));
+        self.timeline_cache.truncate(TIMELINE_CACHE);
+    }
+
+    fn take_cached(&mut self, asid: &str) -> Option<SessionView> {
+        let at = self.timeline_cache.iter().position(|(id, _)| id == asid)?;
+        let mut view = self.timeline_cache.remove(at).1;
+        view.opening = false;
+        self.timeline_cache.insert(0, (asid.to_string(), view.clone()));
+        Some(view)
+    }
+
+    fn remember_active(&mut self) {
+        self.cache_active();
     }
 
     /// Fold `update` in. Then, if the newest turn changed (its state, its
@@ -657,8 +755,9 @@ impl ViewState {
                     pending_permissions,
                     pending_forms,
                 );
-                let Some(kept) = kept else {
+                let Some(mut kept) = kept else {
                     self.active = Some(view);
+                    self.remember_active();
                     let active = self.active.as_ref().expect("just set");
                     changes.items = active.items.iter().map(|i| i.id.clone()).collect();
                     changes.order = true;
@@ -677,7 +776,18 @@ impl ViewState {
                         let _ = view.upsert((**item).clone());
                     }
                 }
-                view.exhausted = kept.exhausted;
+                // Snapshot trim surplus + any surplus still waiting on the
+                // previous view.
+                if view.pending_earlier.is_empty() {
+                    view.pending_earlier = std::mem::take(&mut kept.pending_earlier);
+                } else if !kept.pending_earlier.is_empty() {
+                    view.pending_earlier
+                        .extend(std::mem::take(&mut kept.pending_earlier));
+                    view.pending_earlier
+                        .sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
+                    view.pending_earlier.dedup_by(|a, b| a.id == b.id);
+                }
+                view.exhausted = kept.exhausted && view.pending_earlier.is_empty();
                 // Only what differs is a change: a terminal-followed session
                 // is re-read every time its transcript moves, and that must
                 // render the rows that moved, not reopen the timeline.
@@ -702,6 +812,7 @@ impl ViewState {
                 changes.permissions |= view.pending_permissions != kept.pending_permissions;
                 changes.forms |= view.pending_forms != kept.pending_forms;
                 self.active = Some(view);
+                self.remember_active();
             }
             Update::Event(event) => self.apply_event(*event, changes),
             Update::Error(error) => {
@@ -1018,6 +1129,7 @@ impl ViewState {
                 .collect(),
             shapes: active.rows.iter().flatten().copied().collect(),
             exhausted: active.exhausted,
+            opening: active.opening,
         }
     }
 
@@ -1034,6 +1146,14 @@ impl ViewState {
     pub fn live(&self) -> Option<&Arc<TimelineItem>> {
         self.active.as_ref()?.live()
     }
+}
+
+/// Tabs hosted in the right column (architecture §6.0‴ right panel).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RightTab {
+    Queue,
+    #[default]
+    Git,
 }
 
 /// The keyed Blinc state the views depend on. Created once, on the main
@@ -1053,9 +1173,11 @@ pub struct Bindings {
     pub waiting_forms: State<Arc<Vec<FormRequest>>>,
     /// The open session's working-tree change count.
     pub diff: State<Option<DiffStat>>,
-    /// The top-bar diff file list is open. UI-owned.
+    /// The right panel (Queue / Git tabs) is open. UI-owned.
     pub diff_panel: State<bool>,
-    /// Path whose patch is expanded inside the diff panel, if any.
+    /// Which tab the right panel shows while open.
+    pub right_tab: State<RightTab>,
+    /// Path whose patch is expanded inside the Git tab, if any.
     pub diff_focus: State<Option<String>>,
     /// The Inbox page, while it is open. UI-owned.
     pub inbox_open: State<bool>,
@@ -1098,6 +1220,7 @@ impl Bindings {
             waiting_forms: ctx.use_state_keyed("mq.waiting_forms", || Arc::new(Vec::new())),
             diff: ctx.use_state_keyed("mq.diff", || None),
             diff_panel: ctx.use_state_keyed("mq.diff_panel", || false),
+            right_tab: ctx.use_state_keyed("mq.right_tab", || RightTab::Git),
             diff_focus: ctx.use_state_keyed("mq.diff_focus", || None),
             inbox_open: ctx.use_state_keyed("mq.inbox_open", || false),
             selected: ctx.use_state_keyed("mq.selected", || None),
