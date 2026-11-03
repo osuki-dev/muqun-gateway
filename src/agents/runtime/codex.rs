@@ -907,22 +907,31 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn codex_explicit_terminal_tasks_keep_their_pane_route_with_or_without_service_manager() {
+    async fn a_goal_without_a_delivery_runs_natively_once_the_adapter_is_attached() {
         let mut state = crate::test_support::test_state("synthetic-admin", vec![]);
-        state
-            .config
-            .agent_commands
-            .insert("codex".into(), "sh".into());
-        assert!(crate::tasks::service::runs_in_pane(&state, "codex").await);
-        let adapter = crate::test_support::FakeAgent::new("codex");
-        state.agent_runtime.attach_for_test(adapter.manager()).await;
-        assert!(state
-            .agent_runtime
-            .manager_for_agent("codex")
-            .await
-            .is_some());
-        assert!(crate::tasks::service::runs_in_pane(&state, "codex").await);
-        for service in ["opencode", "deepseek", "t3", "fx", "qoder", "pi"] {
+        for kind in ["codex", "claude", "opencode"] {
+            state.config.agent_commands.insert(kind.into(), "sh".into());
+        }
+        // No adapter: Codex and Claude Code start in a pane; a session-only
+        // native agent does not, even with a terminal command configured.
+        for kind in ["codex", "claude"] {
+            assert!(
+                crate::tasks::service::runs_in_pane(&state, kind).await,
+                "{kind}"
+            );
+        }
+        assert!(!crate::tasks::service::runs_in_pane(&state, "opencode").await);
+        // With its adapter attached each runs as a native session.
+        for kind in ["codex", "claude", "opencode"] {
+            let adapter = crate::test_support::FakeAgent::new(kind);
+            state.agent_runtime.attach_for_test(adapter.manager()).await;
+            assert!(
+                !crate::tasks::service::runs_in_pane(&state, kind).await,
+                "{kind}"
+            );
+        }
+        // Other native agents never go to a pane.
+        for service in ["deepseek", "t3", "fx", "qoder", "pi"] {
             assert!(!crate::tasks::service::runs_in_pane(&state, service).await);
         }
     }
