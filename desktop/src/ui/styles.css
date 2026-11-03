@@ -33,9 +33,11 @@
     --mq-bar-3: 3px;
     --mq-hairline: 1px;
     --mq-motion-micro: 150ms;
-    /* Shared interaction fills: overlay on bare surfaces; stronger on already-raised chips. */
-    --mq-hover: var(--surface-overlay);
-    --mq-hover-strong: var(--input-bg-hover);
+    /* Hover = faint input shade (not surface-raised — that reads as a dirty block
+       on cream backgrounds). Stronger step is the hairline border tone for chips
+       that already sit on overlay/raised. Selected chrome still uses overlay. */
+    --mq-hover: var(--input-bg-hover);
+    --mq-hover-strong: var(--border);
 }
 
 /* Agent brand colours: `--agent-<id>` and the `.mq-agent--<id>` rules that use
@@ -66,7 +68,7 @@
     border-radius: var(--mq-radius-sm);
     transition: background var(--mq-motion-micro) ease-out, color var(--mq-motion-micro) ease-out;
 }
-.mq-icon-button:hover { background: var(--mq-hover); color: var(--text-primary); }
+.mq-icon-button:hover { background: var(--mq-hover); }
 .mq-ghost {
     padding: 0 var(--mq-space-2);
     gap: var(--mq-space-2);
@@ -74,7 +76,7 @@
     color: var(--text-secondary);
     transition: background var(--mq-motion-micro) ease-out, color var(--mq-motion-micro) ease-out;
 }
-.mq-ghost:hover { background: var(--mq-hover); color: var(--text-primary); }
+.mq-ghost:hover { background: var(--mq-hover); }
 .mq-ghost--chevron { padding: 0 var(--mq-space-1); }
 .mq-open-in { gap: 0; }
 .mq-diff-count { gap: var(--mq-space-1); }
@@ -166,7 +168,7 @@
     transition: background var(--mq-motion-micro) ease-out, color var(--mq-motion-micro) ease-out;
 }
 .mq-srow:has(.mq-raised) { color: var(--text-primary); }
-.mq-srow:hover { background: var(--mq-hover); color: var(--text-primary); }
+.mq-srow:hover { background: var(--mq-hover); }
 .mq-srow--more { color: var(--text-tertiary); }
 .mq-srow-time {
     padding: 0 var(--mq-space-2) 0 var(--mq-space-3);
@@ -195,7 +197,7 @@
     color: var(--text-secondary);
     transition: background var(--mq-motion-micro) ease-out, color var(--mq-motion-micro) ease-out;
 }
-.mq-side-entry:hover { background: var(--mq-hover); color: var(--text-primary); }
+.mq-side-entry:hover { background: var(--mq-hover); }
 .mq-side-entry--rail { padding: 0; }
 .mq-nav-label { color: inherit; }
 .mq-badge-count {
@@ -233,7 +235,7 @@
     color: var(--text-secondary);
     transition: background var(--mq-motion-micro) ease-out, color var(--mq-motion-micro) ease-out;
 }
-.mq-chip:hover { background: var(--mq-hover-strong); color: var(--text-primary); }
+.mq-chip:hover { background: var(--mq-hover-strong); }
 .mq-chip--active { background: var(--accent-subtle); color: var(--text-primary); }
 .mq-standing--usable { color: var(--success); }
 .mq-standing--checking { color: var(--text-tertiary); }
@@ -286,7 +288,7 @@
     color: var(--text-secondary);
     transition: background var(--mq-motion-micro) ease-out, color var(--mq-motion-micro) ease-out;
 }
-.mq-start-action:hover { background: var(--mq-hover-strong); color: var(--text-primary); }
+.mq-start-action:hover { background: var(--mq-hover); color: var(--text-primary); }
 /* Status dots: Home reuses sessions::badged_mark (Success/Warning/Error). */
 /* /start ------------------------------------------------------------- */
 
@@ -337,7 +339,7 @@
     color: var(--text-tertiary);
     transition: background 120ms ease-out;
 }
-.mq-copy:hover { background: var(--mq-hover); color: var(--text-primary); }
+.mq-copy:hover { background: var(--mq-hover); }
 .mq-row-actions { padding-top: var(--mq-space-1); gap: var(--mq-space-1); }
 .mq-link-button {
     padding: 2px 0;
@@ -394,7 +396,7 @@
     align-items: center;
     transition: background var(--mq-motion-micro) ease-out, color var(--mq-motion-micro) ease-out;
 }
-.mq-attach-chip:hover { background: var(--mq-hover-strong); color: var(--text-primary); }
+.mq-attach-chip:hover { background: var(--mq-hover-strong); }
 
 .mq-reasoning-head,
 .mq-injected-head {
@@ -598,7 +600,7 @@
     color: var(--text-tertiary);
     transition: background var(--mq-motion-micro) ease-out, color var(--mq-motion-micro) ease-out;
 }
-.mq-cmp-attach:hover { background: var(--mq-hover); color: var(--text-primary); }
+.mq-cmp-attach:hover { background: var(--mq-hover); color: var(--text-secondary); }
 /* the field has no chrome of its own: the card carries the ring */
 .mq-cmp-input, .mq-cmp-input:hover, .mq-cmp-input:focus {
     background: transparent;
@@ -619,7 +621,7 @@
     color: var(--text-secondary);
     transition: background var(--mq-motion-micro) ease-out, color var(--mq-motion-micro) ease-out;
 }
-.mq-pill:hover { background: var(--mq-hover-strong); color: var(--text-primary); }
+.mq-pill:hover { background: var(--mq-hover-strong); }
 .mq-pill--open { background: var(--accent-subtle); color: var(--text-primary); }
 .mq-pill--open:hover { background: var(--accent-subtle); }
 .mq-pill--static { background: transparent; }
@@ -638,7 +640,7 @@
     color: var(--text-secondary);
     transition: background var(--mq-motion-micro) ease-out, color var(--mq-motion-micro) ease-out;
 }
-.mq-cmp-stop:hover { background: var(--mq-hover-strong); color: var(--text-primary); }
+.mq-cmp-stop:hover { background: var(--mq-hover-strong); }
 .mq-cmp-primary {
     gap: 6px;
     height: 28px;
@@ -701,7 +703,7 @@
     color: var(--text-secondary);
     transition: background var(--mq-motion-micro) ease-out, color var(--mq-motion-micro) ease-out;
 }
-.mq-chip-toggle:hover { background: var(--mq-hover-strong); color: var(--text-primary); }
+.mq-chip-toggle:hover { background: var(--mq-hover-strong); }
 .mq-chip-toggle--on { background: var(--warning-bg); color: var(--text-primary); }
 .mq-chip-toggle--on:hover { background: var(--warning-bg); }
 .mq-chip-x { padding: 2px; border-radius: var(--mq-radius-sm); }
@@ -716,7 +718,7 @@
     color: var(--text-secondary);
     transition: background var(--mq-motion-micro) ease-out, color var(--mq-motion-micro) ease-out;
 }
-.mq-chip:hover { background: var(--mq-hover-strong); color: var(--text-primary); }
+.mq-chip:hover { background: var(--mq-hover-strong); }
 .mq-chip--thumb {
     padding: 2px 6px 2px 2px;
     gap: var(--mq-space-2);
