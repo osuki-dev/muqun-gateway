@@ -61,15 +61,15 @@
 .mq-topbar-actions { gap: var(--mq-space-1); }
 .mq-icon-button {
     border-radius: var(--mq-radius-sm);
-    transition: background var(--mq-motion-micro) ease-out;
+    transition: background var(--mq-motion-micro) ease-out, color var(--mq-motion-micro) ease-out;
 }
-.mq-icon-button:hover { background: var(--surface-overlay); }
+.mq-icon-button:hover { background: var(--surface-overlay); color: var(--text-primary); }
 .mq-ghost {
     padding: 0 var(--mq-space-2);
     gap: var(--mq-space-2);
     border-radius: var(--mq-radius-sm);
     color: var(--text-secondary);
-    transition: background var(--mq-motion-micro) ease-out;
+    transition: background var(--mq-motion-micro) ease-out, color var(--mq-motion-micro) ease-out;
 }
 .mq-ghost:hover { background: var(--surface-overlay); color: var(--text-primary); }
 .mq-ghost--chevron { padding: 0 var(--mq-space-1); }
@@ -128,7 +128,7 @@
 }
 .mq-side-handle { background: transparent; }
 .mq-side-handle:hover { background: var(--border-hover); }
-.mq-side-search-wrap { padding: var(--mq-space-3) var(--mq-space-3) var(--mq-space-2) var(--mq-space-3); }
+.mq-side-search-wrap { padding: var(--mq-space-3) var(--mq-space-4) var(--mq-space-2) var(--mq-space-4); }
 .mq-side-search {
     padding: 0 var(--mq-space-2) 0 var(--mq-space-3);
     gap: var(--mq-space-1);
@@ -136,31 +136,33 @@
     border: none;
     background: var(--input-bg);
     color: var(--text-secondary);
+    transition: background var(--mq-motion-micro) ease-out;
 }
+.mq-side-search:hover { background: var(--input-bg-hover); }
 .mq-kbd { color: var(--text-tertiary); padding-left: var(--mq-space-1); }
-.mq-tree-list { padding: 0 var(--mq-space-2); }
+/* Leave the window edge alone — list content sits inset, not flush. */
+.mq-tree-list { padding: 0 var(--mq-space-3) 0 var(--mq-space-4); }
 .mq-prow {
     border-radius: var(--mq-radius-sm);
     transition: background var(--mq-motion-micro) ease-out;
 }
-.mq-prow:hover { background: var(--input-bg-hover); }
-.mq-prow-main { padding: 0 var(--mq-space-2) 0 var(--mq-space-1); gap: var(--mq-space-2); color: var(--text-primary); }
+.mq-prow:hover { background: var(--surface-overlay); }
+.mq-prow-main { padding: 0 var(--mq-space-2) 0 var(--mq-space-2); gap: var(--mq-space-2); color: var(--text-primary); }
 .mq-prow-parent { color: var(--text-tertiary); }
 .mq-prow-missing { color: var(--text-tertiary); padding-left: var(--mq-space-2); }
 .mq-prow--missing .mq-prow-main { opacity: 0.55; }
 .mq-prow-actions { gap: 2px; opacity: 0; transition: opacity var(--mq-motion-micro) ease-out; }
 .mq-prow:hover .mq-prow-actions { opacity: 1; }
 .mq-srow {
-    /* Left inset = chevron (14) + prow gap (8) so the 16 px mark sits under
-       the project name, not under the chevron (§6.0‴ A / handoff). */
-    padding: 0 var(--mq-space-2) 0 26px;
+    /* Under the project name: chevron width + gap, then the shared list inset. */
+    padding: 0 var(--mq-space-2) 0 28px;
     gap: var(--mq-space-2);
     border-radius: var(--mq-radius-sm);
     color: var(--text-secondary);
-    transition: background var(--mq-motion-micro) ease-out;
+    transition: background var(--mq-motion-micro) ease-out, color var(--mq-motion-micro) ease-out;
 }
 .mq-srow:has(.mq-raised) { color: var(--text-primary); }
-.mq-srow:hover { background: var(--input-bg-hover); color: var(--text-primary); }
+.mq-srow:hover { background: var(--surface-overlay); color: var(--text-primary); }
 .mq-srow--more { color: var(--text-tertiary); }
 .mq-srow-time {
     padding: 0 var(--mq-space-2) 0 var(--mq-space-3);
@@ -180,16 +182,16 @@
 .mq-raised { border-radius: var(--mq-radius-sm); }
 .mq-side-bottom {
     border-top: none;
-    padding: var(--mq-space-2);
+    padding: var(--mq-space-2) var(--mq-space-4);
 }
 .mq-side-entry {
     padding: 0 var(--mq-space-3);
     gap: var(--mq-space-3);
     border-radius: var(--mq-radius-md);
     color: var(--text-secondary);
-    transition: background var(--mq-motion-micro) ease-out;
+    transition: background var(--mq-motion-micro) ease-out, color var(--mq-motion-micro) ease-out;
 }
-.mq-side-entry:hover { background: var(--input-bg-hover); color: var(--text-primary); }
+.mq-side-entry:hover { background: var(--surface-overlay); color: var(--text-primary); }
 .mq-side-entry--rail { padding: 0; }
 .mq-nav-label { color: inherit; }
 .mq-badge-count {
@@ -283,9 +285,8 @@
 /* timeline */
 /* ---- timeline (task 0.3) -------------------------------------------
    Solid, high-contrast content surfaces; no glass. Assistant prose is
-   flush; the user's messages are a quiet solid card; tool cards keep a
-   3 px left accent only (borderless). Nothing here transitions except
-   hover colours on controls, and the streaming cursor's own keyframes. */
+   flush; the user's messages are a quiet solid card. Tools: header flush,
+   soft pane only around expanded content (not a frame around the row). */
 .mq-timeline { background: var(--background); }
 .mq-timeline-list {
     padding: 0 var(--mq-space-6) var(--mq-space-8) var(--mq-space-6);
@@ -349,15 +350,17 @@
 .mq-attach-thumb, .mq-media {
     border: none;
     border-radius: var(--mq-radius-md);
-    background: var(--surface-elevated);
+    background: var(--surface);
+    transition: background var(--mq-motion-micro) ease-out;
 }
 .mq-media--image { background: var(--surface); }
+.mq-media--image:hover { background: var(--surface-elevated); }
 .mq-media--video {
-    background: var(--surface-elevated);
+    background: var(--surface);
     color: var(--text-primary);
     gap: var(--mq-space-2);
 }
-.mq-media--video:hover { background: var(--surface-overlay); }
+.mq-media--video:hover { background: var(--surface-elevated); }
 .mq-media-play {
     width: 44px;
     height: 44px;
@@ -392,13 +395,14 @@
     border-radius: 0 var(--mq-radius-sm) var(--mq-radius-sm) 0;
 }
 
-/* Tool / diff / shell / approval: 3 px left accent only (§6.1d), no frame. */
+/* Diff / shell / approval: thin left accent on the block, no outer stroke. */
 .mq-card {
     background: transparent;
     border: none;
     border-radius: var(--mq-radius-md);
 }
-/* Completed read/search/… collapsed: no chrome, just a quiet line. */
+/* Tools: no whole-row frame. Expanded input/output/media sit in a soft pane. */
+.mq-tool { gap: var(--mq-space-1); }
 .mq-tool-quiet {
     background: transparent;
     border: none;
@@ -406,20 +410,35 @@
 }
 .mq-tool-quiet .mq-tool-name { color: var(--text-secondary); }
 .mq-tool-quiet .mq-tool-title { color: var(--text-tertiary); }
+.mq-tool-row {
+    border-radius: var(--mq-radius-sm);
+    padding: 0 var(--mq-space-1);
+    margin: 0 calc(-1 * var(--mq-space-1));
+    transition: background var(--mq-motion-micro) ease-out;
+}
+.mq-tool-row:hover { background: var(--surface-overlay); }
 .mq-card-body { padding: var(--mq-space-2) var(--mq-space-3); gap: var(--mq-space-2); }
 .mq-density--compact .mq-card-body { padding: var(--mq-space-1) var(--mq-space-3); }
 .mq-card-head { gap: var(--mq-space-2); color: var(--text-secondary); }
 .mq-tool-name { color: var(--text-primary); }
 .mq-tool-title { color: var(--text-secondary); }
-/* Section split is spacing only — no nested frames. */
 .mq-tool-section, .mq-tool-input, .mq-output, .mq-card-section {
     gap: var(--mq-space-1);
-    padding-top: var(--mq-space-2);
+    padding-top: var(--mq-space-1);
     color: var(--text-secondary);
 }
 .mq-tool-section-head { gap: var(--mq-space-2); }
 .mq-tool-section-label { color: var(--text-tertiary); }
 .mq-tool-plain { color: var(--text-secondary); }
+.mq-tool-pane {
+    background: var(--surface);
+    border-radius: var(--mq-radius-md);
+    padding: var(--mq-space-2) var(--mq-space-3);
+    gap: var(--mq-space-1);
+}
+.mq-tool-pane--media {
+    padding: var(--mq-space-2);
+}
 .mq-card-section {
     border-top: none;
 }
@@ -585,7 +604,7 @@
     color: var(--text-secondary);
     transition: background var(--mq-motion-micro) ease-out;
 }
-.mq-pill:hover { background: var(--input-bg-hover); }
+.mq-pill:hover { background: var(--surface-overlay); color: var(--text-primary); }
 .mq-pill--open { background: var(--accent-subtle); color: var(--text-primary); }
 .mq-pill--static { background: transparent; }
 .mq-pill--static:hover { background: transparent; }

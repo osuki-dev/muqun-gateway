@@ -2,9 +2,9 @@
 //!
 //! Visual rules (architecture §6.1d): content is solid and high-contrast;
 //! assistant prose sits flush with no bubble; the user's messages are a
-//! quiet solid card; tool, diff and shell cards have a 1 px hairline and a
-//! 3 px left accent and nothing else; paths, commands and models are
-//! monospace. Nothing here animates: the only moving element on the
+//! quiet solid card; tools keep a flush header with soft panes on expanded
+//! content; diff/shell keep a thin left accent; paths, commands and models
+//! are monospace. Nothing here animates: the only moving element on the
 //! streaming path is the cursor (`styles.css` `mq-cursor`).
 //!
 //! Renderers are pure functions of the item and a little UI state (which
@@ -198,8 +198,8 @@ fn render_part(ctx: &PartCtx<'_>) -> Div {
     }
 }
 
-/// A card: 1 px hairline, a 3 px left accent of `accent` (a class naming a
-/// theme colour), then `body`.
+/// A card: thin left accent of `accent` (theme colour class), then `body`.
+/// Used for diff / shell / approval — tools use flush headers + content panes.
 pub fn card(accent: &str, body: Div) -> Div {
     div()
         .class("mq-card")
@@ -211,7 +211,7 @@ pub fn card(accent: &str, body: Div) -> Div {
             div()
                 .class("mq-accent")
                 .class(accent)
-                .w(3.0)
+                .w(2.0)
                 .flex_shrink_0(),
         )
         .child(body.class("mq-card-body").flex_1().min_w(0.0))

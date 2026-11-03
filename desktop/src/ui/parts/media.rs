@@ -12,10 +12,10 @@ use super::{meta, mono, PartCtx};
 use crate::platform::shell::open_path;
 
 /// Cap for a single inline image / video frame in the column.
-const MAX_MEDIA_W: f32 = 420.0;
-const MAX_MEDIA_H: f32 = 280.0;
+const MAX_MEDIA_W: f32 = 480.0;
+const MAX_MEDIA_H: f32 = 320.0;
 /// Compact strip thumb when several images share a row.
-const STRIP_THUMB: f32 = 96.0;
+const STRIP_THUMB: f32 = 112.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MediaKind {

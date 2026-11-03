@@ -26,17 +26,6 @@ const INPUT_LINES: usize = 20;
 /// Height of a collapsed tool row, border included.
 const ROW_HEIGHT: f32 = 36.0;
 
-/// The 3 px bar: info while running (App busy tone), grey once done, red failed.
-fn status_accent(status: ToolCallStatus) -> &'static str {
-    match status {
-        ToolCallStatus::Pending | ToolCallStatus::Streaming | ToolCallStatus::Running => {
-            "mq-accent--running"
-        }
-        ToolCallStatus::Completed => "mq-accent--done",
-        ToolCallStatus::Failed => "mq-accent--failed",
-    }
-}
-
 fn duration(ms: u64) -> String {
     if ms < 1000 {
         format!("{ms}ms")
@@ -176,7 +165,7 @@ fn header_row(glyph: &'static str, glyph_class: &str) -> Div {
 }
 
 /// Label + payload body (plain mono or pretty JSON), with a line cap.
-/// No nested chrome: the tool card already has the only hairline (§6.1d).
+/// Soft pane around the content only — the tool header stays flush.
 fn tool_section(
     ctx: &PartCtx<'_>,
     what: &str,
@@ -193,7 +182,6 @@ fn tool_section(
         clip_lines(&payload.text, line_cap)
     };
     let body = if payload.json {
-        // Highlight flush — same as diffs, not a bordered `.mq-code` box.
         div().class("mq-tool-plain").w_full().child(
             rich_text_styled(crate::ui::markdown::highlight::highlight(
                 Some("json"),
@@ -230,23 +218,22 @@ fn tool_section(
         }
         section = section.child(head);
     }
-    section = section.child(body);
+    let mut pane = div().class("mq-tool-pane").w_full().flex_col().child(body);
     if more > 0 || all {
         let expand = if all {
             strings.show_less().to_string()
         } else {
             format!("{} · {}", strings.more_lines(more), strings.show_all())
         };
-        section = section.child(link_button(expand, ctx.toggle(&format!("{what}.all"))));
+        pane = pane.child(link_button(expand, ctx.toggle(&format!("{what}.all"))));
     }
     if truncated {
-        section = section.child(meta("…"));
+        pane = pane.child(meta("…"));
     }
-    section
+    section.child(pane)
 }
 
-/// Tools that stay quiet once done (no card chrome). Active / failed /
-/// approval-waiting ones keep the hairline card.
+/// Tools that stay quiet once done (no pane chrome while collapsed).
 fn is_quiet_tool(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
@@ -369,13 +356,6 @@ pub fn tool(ctx: &PartCtx<'_>, call: &ToolCall) -> Div {
     );
     // A call still "running" in a turn that has ended was cut off.
     let stale = unfinished && ctx.turn_state().finished();
-    let accent = if waiting {
-        "mq-accent--warning"
-    } else if stale {
-        "mq-accent--done"
-    } else {
-        status_accent(status)
-    };
     let has_media = call.content.as_ref().is_some_and(|c| {
         c.as_array().is_some_and(|items| {
             items.iter().any(|item| {
@@ -429,6 +409,24 @@ pub fn tool(ctx: &PartCtx<'_>, call: &ToolCall) -> Div {
         .and_then(|h| h.directory.clone());
     let args = args_summary(call, cwd.as_deref());
     let label = tool_label(&call.name);
+    let name_tone = if waiting {
+        "mq-tone--warning"
+    } else if status == ToolCallStatus::Failed {
+        "mq-tone--failed"
+    } else if unfinished && !stale {
+        "mq-tone--running"
+    } else {
+        ""
+    };
+    let mut name = div().class("mq-tool-name").flex_shrink_0();
+    if !name_tone.is_empty() {
+        name = name.class(name_tone);
+    }
+    name = name.child(if quiet {
+        meta(label).no_cursor()
+    } else {
+        mono(label).no_cursor()
+    });
     let mut head = div()
         .id(ctx.key("tool"))
         .class("mq-tool-row")
@@ -439,11 +437,7 @@ pub fn tool(ctx: &PartCtx<'_>, call: &ToolCall) -> Div {
         .min_w(0.0)
         .cursor_pointer()
         .child(crate::ui::icons::chevron(open))
-        .child(div().class("mq-tool-name").flex_shrink_0().child(if quiet {
-            meta(label).no_cursor()
-        } else {
-            mono(label).no_cursor()
-        }))
+        .child(name)
         .child(
             div()
                 .class("mq-tool-title")
@@ -503,15 +497,26 @@ pub fn tool(ctx: &PartCtx<'_>, call: &ToolCall) -> Div {
         }
         if let Some(content) = call.content.as_ref() {
             if let Some(media_row) = media::tool_content_media(ctx, content) {
-                body = body.child(div().class("mq-tool-section").w_full().child(media_row));
+                body = body.child(
+                    div()
+                        .class("mq-tool-section")
+                        .w_full()
+                        .child(
+                            div()
+                                .class("mq-tool-pane")
+                                .class("mq-tool-pane--media")
+                                .w_full()
+                                .child(media_row),
+                        ),
+                );
             }
         }
     }
     if let Some(err) = &call.error {
         body = body.child(error_line(err));
     }
-    // Quiet only while collapsed: opened, the same hairline card as every
-    // other tool so input / output have a readable frame.
+    // Quiet collapsed stays a single line. Everything else is a flush header
+    // with soft panes on expanded content — no whole-row accent frame.
     if quiet && !open {
         div()
             .class("mq-tool-quiet")
@@ -520,7 +525,7 @@ pub fn tool(ctx: &PartCtx<'_>, call: &ToolCall) -> Div {
             .items_stretch()
             .child(body.flex_1().min_w(0.0))
     } else {
-        card(accent, body)
+        body.class("mq-tool").w_full()
     }
 }
 
