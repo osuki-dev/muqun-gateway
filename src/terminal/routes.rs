@@ -1420,23 +1420,6 @@ fn agent_form_push_data(
     data
 }
 
-/// An agent's own name, for a push about one of its sessions.
-fn agent_display_name(agent_id: &str) -> Option<&'static str> {
-    match agent_id {
-        "opencode" => Some("OpenCode"),
-        "qoder" => Some("Qoder CLI"),
-        "fx" => Some("FX"),
-        "deepseek" => Some("DeepSeek"),
-        "t3" => Some("T3 Code"),
-        "codex" => Some("Codex"),
-        "claude" => Some("Claude Code"),
-        "pi" => Some("Pi"),
-        "antigravity" => Some("Antigravity"),
-        "cursor" => Some("Cursor"),
-        _ => None,
-    }
-}
-
 /// The push a pending question sends, before it is put into words: "{name}
 /// needs your input", where the name is the session's title when there is one
 /// and the agent's otherwise. The form's own title is the body only when the
@@ -1451,7 +1434,7 @@ fn form_notification(
     let agent_name = session_title
         .map(str::trim)
         .filter(|title| !title.is_empty())
-        .or_else(|| agent_display_name(agent_id))
+        .or_else(|| agents::runtime::agent_display_name(agent_id))
         .map(str::to_owned);
     AgentPushNotice {
         notice: AgentNotice::AgentBlocked,
@@ -1479,7 +1462,7 @@ fn permission_notification(
     AgentPushNotice {
         notice: AgentNotice::ApprovalPending,
         server_label: current_server_label(&state.config.label).trim().to_owned(),
-        agent_name: agent_display_name(agent_id).map(str::to_owned),
+        agent_name: agents::runtime::agent_display_name(agent_id).map(str::to_owned),
         data: agent_permission_push_data(&state.config.server_id, agent_id, asid, &request.id),
         choices: Vec::new(),
         detail: state
@@ -1538,7 +1521,7 @@ fn completion_notification(
     AgentPushNotice {
         notice: AgentNotice::AgentCompleted,
         server_label: server_label.trim().to_owned(),
-        agent_name: agent_display_name(agent_id).map(str::to_owned),
+        agent_name: agents::runtime::agent_display_name(agent_id).map(str::to_owned),
         data,
         choices: Vec::new(),
         detail: None,
@@ -4068,8 +4051,8 @@ mod tests {
     #[test]
     fn every_native_agent_pushes_its_turn_end_and_approval_by_name() {
         use crate::agents::{
-            runtime::AGENT_PREFERENCE, AgentDomainEvent, AgentSessionId, AgentSessionStatus as S,
-            PermissionRequest,
+            runtime::{agent_display_name, AGENT_PREFERENCE},
+            AgentDomainEvent, AgentSessionId, AgentSessionStatus as S, PermissionRequest,
         };
         let state = test_state("admin", Vec::new());
         let label = current_server_label(&state.config.label);
@@ -4098,8 +4081,8 @@ mod tests {
         assert!(gates.completions_ready(done).is_empty(), "and only one");
 
         for agent in AGENT_PREFERENCE {
-            let name = super::agent_display_name(agent)
-                .unwrap_or_else(|| panic!("{agent} has no display name"));
+            let name =
+                agent_display_name(agent).unwrap_or_else(|| panic!("{agent} has no display name"));
             let asid = format!("ses_{agent}");
             let request: PermissionRequest = serde_json::from_value(json!({
                 "id": "perm_1",
@@ -4131,10 +4114,10 @@ mod tests {
                     assert!(!all.contains("npm"), "{agent}: the prompt must not travel");
                 }
             }
-            assert_eq!(
-                approval.render(Locale::En).title,
-                format!("Approval needed · {label}")
-            );
+            let en = approval.render(Locale::En);
+            assert_eq!(en.title, format!("Approval needed · {label}"));
+            assert_eq!(en.data["approval_id"], "perm_1");
+            assert_eq!(en.data["server_id"], state.config.server_id.as_str());
             assert_eq!(
                 Value::Object(completion.render(Locale::En).data),
                 json!({"type": "agent.completed", "server_id": "server-1", "agent_id": agent, "asid": asid})

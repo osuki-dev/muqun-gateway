@@ -3349,7 +3349,10 @@ pub(crate) async fn session_failure(
     since_ms: u64,
 ) -> String {
     if let Some(error) = error {
-        let agent = manager.map_or("the agent", |manager| agent_name(manager.agent().kind()));
+        let agent = manager.map_or("the agent", |manager| {
+            crate::agents::runtime::agent_display_name(manager.agent().kind())
+                .unwrap_or("the agent")
+        });
         return provider_failure(agent, error).unwrap_or_else(|| {
             one_line(&format!("{}: {}", error.name, error.message), SUMMARY_CHARS)
         });
@@ -3367,20 +3370,6 @@ pub(crate) async fn session_failure(
     match detail {
         Some(detail) => one_line(&format!("{SESSION_FAILED}: {detail}"), SUMMARY_CHARS),
         None => SESSION_FAILED.to_owned(),
-    }
-}
-
-/// An agent kind as a person names it.
-fn agent_name(kind: &str) -> &str {
-    match kind {
-        "opencode" => "OpenCode",
-        "qoder" => "Qoder CLI",
-        "fx" => "FX",
-        "deepseek" => "DeepSeek",
-        "t3" => "T3 Code",
-        "claude" => "Claude Code",
-        "codex" => "Codex",
-        other => other,
     }
 }
 

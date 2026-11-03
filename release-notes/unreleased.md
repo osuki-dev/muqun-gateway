@@ -66,8 +66,8 @@
   agent's name, never the agent's prompt -- and carry `agent_id`; neither they
   nor question pushes put the session id in `session_id` any more. All ten
   native agents (Antigravity, Claude Code, Codex, Cursor, DeepSeek, FX,
-  OpenCode, Pi, Qoder CLI, T3 Code) push both and are named, never "Agent".
-  Announced as the `native_agent_push` capability.
+  OpenCode, Pi, Qoder CLI, T3 Code) push both and are named, never "Agent";
+  a failed task's summary now names Pi, Antigravity and Cursor too. Announced as the `native_agent_push` capability.
 
 - **One event, one push.** A Codex delegation's terminal no longer pushes
   beside its native session (one approval raised up to three pushes, two of
