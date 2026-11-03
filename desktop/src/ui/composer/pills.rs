@@ -622,12 +622,123 @@ pub fn mode_label(id: &str, name: &str) -> String {
     out.replace(['-', '_'], " ")
 }
 
-fn selected_model<'a>(aim: &Aim, models: &[&'a ModelInfo]) -> Option<&'a ModelInfo> {
-    let chosen = aim.model.as_ref()?;
+/// Catalog id without bracketed parameters (`default[]` → `default`).
+fn bare_catalog_id(id: &str) -> &str {
+    match id.rfind('[') {
+        Some(at) if at > 0 => {
+            let head = id[..at].trim();
+            if head.is_empty() {
+                id
+            } else {
+                head
+            }
+        }
+        _ => id,
+    }
+}
+
+fn catalog_entry<'a>(
+    models: &[&'a ModelInfo],
+    id: &str,
+    default_id: Option<&str>,
+) -> Option<&'a ModelInfo> {
+    let find = |wanted: &str| {
+        models
+            .iter()
+            .find(|m| m.id == wanted)
+            .or_else(|| {
+                models
+                    .iter()
+                    .find(|m| bare_catalog_id(&m.id) == bare_catalog_id(wanted))
+            })
+            .copied()
+    };
+    if let Some(hit) = find(id) {
+        return Some(hit);
+    }
+    let default_id = default_id?;
+    if bare_catalog_id(id).eq_ignore_ascii_case("default") {
+        find(default_id)
+    } else {
+        None
+    }
+}
+
+/// App `catalogModelInfo`: exact provider match first, then bare-id / default.
+fn catalog_model_info<'a>(
+    models: &[&'a ModelInfo],
+    model: &ModelRef,
+    default_model: Option<&ModelRef>,
+) -> Option<&'a ModelInfo> {
+    if model.model_id.is_empty() {
+        return None;
+    }
     models
         .iter()
-        .find(|m| m.id == chosen.model_id && m.provider_id == chosen.provider_id)
+        .find(|m| {
+            m.id == model.model_id
+                && (model.provider_id.is_empty() || m.provider_id == model.provider_id)
+        })
         .copied()
+        .or_else(|| {
+            catalog_entry(
+                models,
+                &model.model_id,
+                default_model.map(|d| d.model_id.as_str()),
+            )
+        })
+}
+
+fn known_model_name(id: &str) -> Option<&'static str> {
+    Some(match bare_catalog_id(id) {
+        "gemini-3.8-flash" => "Gemini 3.8 Flash",
+        "deepseek-v4.1-flash" => "DeepSeek V4.1 Flash",
+        "deepseek-v4-flash-free" => "DeepSeek V4 Flash",
+        "gpt-5.6-sol" => "GPT-5.6 Sol",
+        "gpt-5.6-luna" => "GPT-5.6 Luna",
+        "gpt-6-astra" => "GPT-6 Astra",
+        "gpt-6-astra-fast" => "GPT-6 Astra Fast",
+        "muse-spark-1.3-contributor-free" => "Muse Spark 1.3",
+        "nemotron-3.5-lightning-free" => "Nemotron 3.5 Lightning",
+        "ling-3.0-flash-fin-free" => "Ling 3.0 Flash",
+        _ => return None,
+    })
+}
+
+/// App `formatModelName` without folding variant into the chip (effort pill
+/// owns that). Never leave a raw id on the pill when a readable form exists.
+fn format_model_name(model: &ModelRef, fallback: &str, catalog_name: Option<&str>) -> String {
+    if model.model_id.is_empty() {
+        return fallback.to_string();
+    }
+    let id = bare_catalog_id(&model.model_id);
+    if let Some(name) = catalog_name.map(str::trim).filter(|s| !s.is_empty()) {
+        return name.to_string();
+    }
+    if let Some(known) = known_model_name(id) {
+        return known.to_string();
+    }
+    id.split(['-', '_'])
+        .filter(|w| !w.is_empty())
+        .map(|word| {
+            if word.len() <= 3 {
+                word.to_ascii_uppercase()
+            } else {
+                let mut chars = word.chars();
+                match chars.next() {
+                    Some(c) => format!("{}{}", c.to_ascii_uppercase(), chars.as_str()),
+                    None => String::new(),
+                }
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn selected_model<'a>(aim: &Aim, models: &[&'a ModelInfo]) -> Option<&'a ModelInfo> {
+    let chosen = aim.model.as_ref()?;
+    let default = aim.catalog.as_ref().and_then(|c| c.catalog.defaults.model.as_ref());
+    catalog_model_info(models, chosen, default)
 }
 
 fn model_matches(model: &ModelInfo, query: &str) -> bool {
@@ -682,10 +793,13 @@ fn model_search_field(app: &App) -> Div {
 }
 
 fn model_pill(app: &App, aim: &Aim, models: &[&ModelInfo], side: Side) -> Div {
-    let label = match (selected_model(aim, models), &aim.model) {
-        (Some(model), _) => model.name.clone(),
-        (None, Some(chosen)) => chosen.model_id.clone(),
-        (None, None) => app.strings.model_default().to_string(),
+    let fallback = app.strings.model_default();
+    let label = match &aim.model {
+        Some(chosen) => {
+            let name = selected_model(aim, models).map(|m| m.name.as_str());
+            format_model_name(chosen, fallback, name)
+        }
+        None => fallback.to_string(),
     };
     let choosable = !models.is_empty();
     let open = Cmp::get().menu.get() == Some(MenuId::Model);
@@ -1222,5 +1336,51 @@ mod tests {
         assert!(model_matches(&model, "OPENAI"));
         assert!(model_matches(&model, "5"));
         assert!(!model_matches(&model, "claude"));
+    }
+
+    #[test]
+    fn model_names_never_fall_back_to_a_raw_id() {
+        assert_eq!(bare_catalog_id("default[]"), "default");
+        let listed = ModelInfo {
+            id: "default".into(),
+            provider_id: "opencode".into(),
+            name: "Auto".into(),
+            family: None,
+            limit: None,
+            variants: None,
+            cost: None,
+            enabled: true,
+            status: None,
+        };
+        let models = [&listed];
+        let chosen = ModelRef {
+            provider_id: "other".into(),
+            model_id: "default[]".into(),
+            variant: None,
+        };
+        let info = catalog_model_info(&models, &chosen, None).unwrap();
+        assert_eq!(info.name, "Auto");
+        assert_eq!(
+            format_model_name(&chosen, "Model", Some(info.name.as_str())),
+            "Auto"
+        );
+        let unknown = ModelRef {
+            provider_id: String::new(),
+            model_id: "gpt-6-astra".into(),
+            variant: None,
+        };
+        assert_eq!(
+            format_model_name(&unknown, "Model", None),
+            "GPT-6 Astra"
+        );
+        let free = ModelRef {
+            provider_id: String::new(),
+            model_id: "nemotron-3.5-lightning-free".into(),
+            variant: None,
+        };
+        assert_eq!(
+            format_model_name(&free, "Model", None),
+            "Nemotron 3.5 Lightning"
+        );
     }
 }

@@ -11,9 +11,15 @@ use muqun_gateway::agents::MessageImageAsset;
 use super::{meta, mono, PartCtx};
 use crate::platform::shell::open_path;
 
-/// Cap for a single inline image / video frame in the column.
+/// Cap for a single inline image / video frame in the column (message assets).
 const MAX_MEDIA_W: f32 = 480.0;
 const MAX_MEDIA_H: f32 = 320.0;
+/// Tool / `read` path previews: App-like caps (`content-image-layout` ~280).
+const TOOL_MEDIA_W: f32 = 280.0;
+const TOOL_MEDIA_H: f32 = 240.0;
+/// Unknown tool image size before decode (App's 160×110).
+const TOOL_UNKNOWN_W: f32 = 160.0;
+const TOOL_UNKNOWN_H: f32 = 110.0;
 /// Compact strip thumb when several images share a row.
 const STRIP_THUMB: f32 = 112.0;
 
@@ -54,9 +60,20 @@ fn file_label(path: &str) -> String {
 }
 
 fn fit_size(w: Option<u32>, h: Option<u32>, max_w: f32, max_h: f32) -> (f32, f32) {
+    fit_size_with_unknown(w, h, max_w, max_h, max_w, max_h * 0.66)
+}
+
+fn fit_size_with_unknown(
+    w: Option<u32>,
+    h: Option<u32>,
+    max_w: f32,
+    max_h: f32,
+    unknown_w: f32,
+    unknown_h: f32,
+) -> (f32, f32) {
     let (ow, oh) = match (w, h) {
         (Some(w), Some(h)) if w > 0 && h > 0 => (w as f32, h as f32),
-        _ => (max_w, max_h * 0.66),
+        _ => (unknown_w.min(max_w), unknown_h.min(max_h)),
     };
     let scale = (max_w / ow).min(max_h / oh).min(1.0);
     (
@@ -152,14 +169,59 @@ pub fn tile(
     max_w: f32,
     max_h: f32,
 ) -> Div {
+    tile_sized(src, cwd, mime, width, height, max_w, max_h, max_w, max_h * 0.66)
+}
+
+/// Tool / `read` preview: tighter caps and App-like unknown size.
+fn tool_tile(
+    src: &str,
+    cwd: Option<&str>,
+    mime: Option<&str>,
+    width: Option<u32>,
+    height: Option<u32>,
+    max_w: f32,
+    max_h: f32,
+) -> Div {
+    tile_sized(
+        src,
+        cwd,
+        mime,
+        width,
+        height,
+        max_w,
+        max_h,
+        TOOL_UNKNOWN_W,
+        TOOL_UNKNOWN_H,
+    )
+}
+
+fn tile_sized(
+    src: &str,
+    cwd: Option<&str>,
+    mime: Option<&str>,
+    width: Option<u32>,
+    height: Option<u32>,
+    max_w: f32,
+    max_h: f32,
+    unknown_w: f32,
+    unknown_h: f32,
+) -> Div {
     let kind = kind_for(src, mime);
     match resolve(src, cwd) {
         Some(path) if kind == MediaKind::Image => {
-            let (w, h) = fit_size(width, height, max_w, max_h);
+            let (w, h) =
+                fit_size_with_unknown(width, height, max_w, max_h, unknown_w, unknown_h);
             image_frame(path, w, h, true)
         }
         Some(path) if kind == MediaKind::Video => {
-            let (w, h) = fit_size(width.or(Some(16)), height.or(Some(9)), max_w, max_h);
+            let (w, h) = fit_size_with_unknown(
+                width.or(Some(16)),
+                height.or(Some(9)),
+                max_w,
+                max_h,
+                unknown_w,
+                unknown_h,
+            );
             video_frame(path, w, h, file_label(src))
         }
         Some(path) => {
@@ -295,7 +357,7 @@ pub fn path_media(ctx: &PartCtx<'_>, path: &str) -> Option<Div> {
         return None;
     }
     let cwd = session_cwd(ctx);
-    let max_w = (ctx.width - 24.0).min(MAX_MEDIA_W);
+    let max_w = (ctx.width - 24.0).min(TOOL_MEDIA_W);
     Some(
         div()
             .class("mq-attach-row")
@@ -303,14 +365,14 @@ pub fn path_media(ctx: &PartCtx<'_>, path: &str) -> Option<Div> {
             .w_full()
             .flex_row()
             .flex_wrap()
-            .child(tile(
+            .child(tool_tile(
                 path,
                 cwd.as_deref(),
                 None,
                 None,
                 None,
                 max_w,
-                MAX_MEDIA_H,
+                TOOL_MEDIA_H,
             )),
     )
 }
@@ -319,7 +381,7 @@ pub fn path_media(ctx: &PartCtx<'_>, path: &str) -> Option<Div> {
 pub fn tool_content_media(ctx: &PartCtx<'_>, content: &serde_json::Value) -> Option<Div> {
     let items = content.as_array()?;
     let cwd = session_cwd(ctx);
-    let max_w = (ctx.width - 24.0).min(MAX_MEDIA_W);
+    let max_w = (ctx.width - 24.0).min(TOOL_MEDIA_W);
     let mut row = div()
         .class("mq-attach-row")
         .class("mq-attach-row--tool")
@@ -344,14 +406,14 @@ pub fn tool_content_media(ctx: &PartCtx<'_>, content: &serde_json::Value) -> Opt
             || matches!(kind, MediaKind::Image | MediaKind::Video)
         {
             any = true;
-            row = row.child(tile(
+            row = row.child(tool_tile(
                 uri,
                 cwd.as_deref(),
                 mime,
                 None,
                 None,
                 max_w,
-                MAX_MEDIA_H,
+                TOOL_MEDIA_H,
             ));
         }
     }
@@ -377,5 +439,19 @@ mod tests {
         let (w, h) = fit_size(Some(2000), Some(1000), 400.0, 280.0);
         assert!((w - 400.0).abs() < 1.0);
         assert!((h - 200.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn tool_unknown_size_stays_compact() {
+        let (w, h) = fit_size_with_unknown(
+            None,
+            None,
+            TOOL_MEDIA_W,
+            TOOL_MEDIA_H,
+            TOOL_UNKNOWN_W,
+            TOOL_UNKNOWN_H,
+        );
+        assert!((w - TOOL_UNKNOWN_W).abs() < 1.0, "{w}");
+        assert!((h - TOOL_UNKNOWN_H).abs() < 1.0, "{h}");
     }
 }

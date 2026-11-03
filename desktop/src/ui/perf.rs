@@ -1,9 +1,10 @@
-//! On-screen frame meter for polishing. **Off by default.**
+//! On-screen frame meter for polishing. **On by default** (including
+//! release) so frame time is always visible while tuning.
 //!
 //! Blinc treats any registered tick callback as "animations still active",
-//! so a permanent meter tick forces a continuous redraw loop and lets the
-//! Adaptive FPS adapter claw the cap down to ~30 under load. Enable with
-//! `MUQUN_SHOW_FPS=1` when measuring; leave it unset for normal use.
+//! so the meter keeps a redraw loop alive. Cap animation FPS with
+//! `MUQUN_ANIMATION_FPS` (default 60) rather than Adaptive. Set
+//! `MUQUN_SHOW_FPS=0` to hide the pill and idle the scheduler.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -25,13 +26,13 @@ struct Meter {
 }
 
 fn enabled() -> bool {
-    matches!(
-        std::env::var("MUQUN_SHOW_FPS").as_deref(),
-        Ok("1") | Ok("true") | Ok("yes")
-    )
+    match std::env::var("MUQUN_SHOW_FPS").as_deref() {
+        Ok("0") | Ok("false") | Ok("no") | Ok("off") => false,
+        _ => true,
+    }
 }
 
-/// Install once when `MUQUN_SHOW_FPS=1`. No-op otherwise so the scheduler
+/// Install once when the meter is on. No-op when disabled so the scheduler
 /// can idle with an empty tick list.
 pub fn install() {
     if !enabled() {
