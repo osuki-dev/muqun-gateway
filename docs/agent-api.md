@@ -986,8 +986,8 @@ which `GET` reads without changing anything.
 | Antigravity, Cursor, FX, Pi | a launch flag or environment only (`agy acp --dangerously-skip-permissions`, `agent --force`, `FX_PERMISSION_MODE=full-access`, `MUQUN_PI_APPROVALS=never`): `POST` answers 501 | launch |
 | DeepSeek | per-request approvals only: `POST` answers 501, `enabled` is null | none |
 
-`enabled: true` is refused with `403 auto_approve_disabled` until the owner
-sets `allow_remote_auto_approve: true` in the gateway's `config.json` (off by
+`enabled: true` is refused with `403 auto_approve_disabled` when the owner
+sets `allow_remote_auto_approve: false` in the gateway's `config.json` (on by
 default; `false` is always accepted). The same refusal covers `POST …/mode`
 and `mode` on `POST /api/agent-sessions` when the mode is one in which the
 agent stops asking (Claude Code `bypassPermissions`/`auto`, Qoder

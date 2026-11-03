@@ -38,10 +38,10 @@
   `--force`, `FX_PERMISSION_MODE=full-access`, `MUQUN_PI_APPROVALS=never`), so
   the switch answers 501 there and the App says so; DeepSeek has per-request
   approvals only. A bypass mode is still never remembered as a new session's
-  default. Switching on from a device needs `allow_remote_auto_approve:
-  true` in `config.json` (off by default), and so does selecting such a
-  mode through `POST …/mode` or a new session's `mode`; switching off never
-  does.
+  default. Switching on from a device is allowed by default; an owner who
+  wants to keep phones from doing it sets `allow_remote_auto_approve: false`
+  in `config.json`, which also refuses selecting such a mode through
+  `POST …/mode` or a new session's `mode`; switching off never is.
 
 - **FX and Qoder no longer start a process every minute to re-read an
   unchanged session store.** The task follower reads each open task's session
