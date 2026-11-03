@@ -101,9 +101,12 @@ Chats started in the terminal UI or with `agent -p` live in
 `session/load` of such an id answers `-32602 Session "<id>" not found`, and
 `agent --resume <acp-session-id>` silently starts a new, empty terminal chat
 with that id. The two stores never share a conversation, so there is no second
-writer to guard against, and terminal chats are not listed in the App. Showing
-them read-only would need a decoder for Cursor's private blob store (and
-typing into the pane, as for Claude Code); that is not implemented.
+writer to guard against. A terminal chat is listed only while a Herdr pane's
+`cursor` agent reports it (`agent_session.value`): titled by its first prompt,
+read-only (`runtime.interaction: terminal`, no `terminalInput`), its history
+the prompts and reply texts of the same blob store (below), and followed while
+its `store.db` changes. Tool calls and summarized (compacted) turns are not
+shown; prompts are not typed into the pane.
 
 ### Idle retirement evidence
 

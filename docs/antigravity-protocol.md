@@ -26,7 +26,11 @@ its settings or `~/.gemini`. Discovery runs a bounded `agy --version`; nothing
 else starts until a session is opened, created or prompted. Each such session
 owns a private `agy acp` child started in the session's folder; shutdown stops
 and reaps Gateway-owned children. A conversation open in a terminal `agy` is not
-shared with a Gateway child.
+shared with a Gateway child: when a Herdr pane's `agy` agent reports it, it is
+listed held by that pane (`runtime.terminal`, `interaction: terminal`, no
+`terminalInput`), prompts are refused, and its history is read by a private
+`session/load` child that is shut down at once (kept until `agy`'s store
+changes).
 
 ## Sign-in
 

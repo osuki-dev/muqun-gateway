@@ -45,6 +45,7 @@ impl AcpProvider for ClaudeProvider {
     ) -> AgentFuture<'a, crate::agents::adapters::acp::recovery::NativeSnapshot> {
         Box::pin(super::recovery::inspect(directory, id, stop))
     }
+    const LIVE_TIMELINE: bool = true;
     fn live_timeline<'a>(
         directory: &'a str,
         id: &'a str,
