@@ -15,6 +15,31 @@ pub fn open_folder(folder: &Path) {
     open_path(folder);
 }
 
+/// Start a fresh process of this binary, then return. The caller should
+/// close the current window so config and agents are picked up again.
+pub fn relaunch_self() {
+    let Ok(exe) = std::env::current_exe() else {
+        tracing::warn!("could not resolve current executable for relaunch");
+        return;
+    };
+    match std::process::Command::new(&exe)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(mut child) => {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
+        Err(err) => tracing::warn!(
+            exe = %exe.display(),
+            "could not relaunch Muqun: {err}"
+        ),
+    }
+}
+
 /// Open a file or folder with the OS default handler (images, video, …).
 pub fn open_path(path: &Path) {
     #[cfg(target_os = "macos")]

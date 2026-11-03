@@ -187,8 +187,8 @@ fn restart_note(app: &App) -> impl ElementBuilder {
                 (
                     tr(
                         &app,
-                        "Saved. Restart Muqun Desktop for agent changes to take effect.",
-                        "已保存。重启 Muqun Desktop 后，agent 的改动才会生效。",
+                        "Saved. Restart Muqun for agent changes to take effect.",
+                        "已保存。重启 Muqun 后，agent 的改动才会生效。",
                     ),
                     "mq-note--changed",
                 )
@@ -196,8 +196,8 @@ fn restart_note(app: &App) -> impl ElementBuilder {
                 (
                     tr(
                         &app,
-                        "Agent changes are saved at once and take effect the next time Muqun Desktop starts.",
-                        "agent 的改动会立即保存，下次启动 Muqun Desktop 时生效。",
+                        "Agent changes are saved at once and take effect the next time Muqun starts.",
+                        "agent 的改动会立即保存，下次启动 Muqun 时生效。",
                     ),
                     "mq-note",
                 )
@@ -214,6 +214,7 @@ fn restart_note(app: &App) -> impl ElementBuilder {
                         .variant(ButtonVariant::Outline)
                         .size(ButtonSize::Small)
                         .on_click(move |_| {
+                            crate::platform::shell::relaunch_self();
                             blinc_layout::window_actions::close_window();
                         }),
                 );
@@ -262,8 +263,8 @@ fn agent_hint(app: &App, agent: &str) -> Option<&'static str> {
         ),
         "deepseek" => tr(
             app,
-            "Muqun Desktop only joins a DeepSeek harness that is already running; it never starts one.",
-            "Muqun Desktop 只会接入已经在运行的 DeepSeek harness，不会自己启动。",
+            "Muqun only joins a DeepSeek harness that is already running; it never starts one.",
+            "Muqun 只会接入已经在运行的 DeepSeek harness，不会自己启动。",
         ),
         _ => return None,
     })
@@ -507,8 +508,8 @@ fn pair_t3(app: &App, config: &AgentConfigs) -> Div {
                 div().class("mq-set-hint").w_full().child(
                     ui_text(tr(
                         &app,
-                        "Pairing token saved. It is exchanged once when Muqun Desktop starts; restart to finish pairing.",
-                        "配对令牌已保存。它会在 Muqun Desktop 启动时兑换一次；请重启以完成配对。",
+                        "Pairing token saved. It is exchanged once when Muqun starts; restart to finish pairing.",
+                        "配对令牌已保存。它会在 Muqun 启动时兑换一次；请重启以完成配对。",
                     ))
                     .size(12.0),
                 )
@@ -528,8 +529,8 @@ fn pair_t3(app: &App, config: &AgentConfigs) -> Div {
         .child(note)
         .child(hint(tr(
             app,
-            "Run `t3 pair` on the T3 host. Muqun Desktop keeps its own T3 credential, separate from the gateway's.",
-            "在 T3 所在的电脑上运行 `t3 pair`。Muqun Desktop 保存自己的 T3 凭据，与 gateway 的互不相干。",
+            "Run `t3 pair` on the T3 host. Muqun keeps its own T3 credential, separate from the gateway's.",
+            "在 T3 所在的电脑上运行 `t3 pair`。Muqun 保存自己的 T3 凭据，与 gateway 的互不相干。",
         )))
 }
 
@@ -786,8 +787,8 @@ fn about_tab(app: &App) -> Div {
         )
         .child(hint(tr(
             app,
-            "Muqun Desktop keeps its own files, apart from a Muqun gateway's.",
-            "Muqun Desktop 使用自己的文件夹，与 Muqun gateway 的互不相干。",
+            "Muqun keeps its own files, apart from a Muqun gateway's.",
+            "Muqun 使用自己的文件夹，与 Muqun gateway 的互不相干。",
         )))
         .child(path_row(
             tr(app, "Config file", "配置文件"),
