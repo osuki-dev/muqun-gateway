@@ -256,9 +256,18 @@
 .mq-start-row:hover { background: var(--surface-overlay); }
 .mq-start-row-project, .mq-start-row-when { color: var(--text-tertiary); }
 .mq-start-main { gap: var(--mq-space-3); }
-/* hover actions: Open / Pin */
-.mq-start-actions { gap: var(--mq-space-2); opacity: 0; }
-.mq-start-row:hover .mq-start-actions { opacity: 1; }
+/* hover actions: Open / Pin — soft fade over the trailing meta */
+.mq-start-actions {
+    gap: var(--mq-space-2);
+    padding-left: var(--mq-space-6);
+    opacity: 0;
+    pointer-events: none;
+    background: linear-gradient(to right, transparent, var(--background) 28%);
+}
+.mq-start-row:hover .mq-start-actions {
+    opacity: 1;
+    pointer-events: auto;
+}
 .mq-start-action {
     padding: 2px var(--mq-space-2);
     border-radius: var(--mq-radius-sm);

@@ -516,11 +516,12 @@ impl Core {
         self.spawn_lists(attached).await;
     }
 
-    /// Kick off one `list_sessions` per agent, 75 ms apart.
+    /// Kick off one `list_sessions` per agent, briefly staggered so a cold
+    /// attach storm does not spike the first frames.
     async fn spawn_lists(self: &Arc<Self>, agents: Vec<String>) {
         for (i, agent) in agents.into_iter().enumerate() {
             if i > 0 {
-                tokio::time::sleep(std::time::Duration::from_millis(75)).await;
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             }
             tokio::spawn(self.clone().list_sessions(agent));
         }
@@ -543,8 +544,13 @@ impl Core {
                     agent: agent.clone(),
                     sessions,
                 });
+                // Paint the list first; project catalogues and folder resolve
+                // continue in the background so a slow agent does not stall Home.
                 self.resolve_dirs(dirs, false);
-                self.known_projects(agent).await;
+                let core = self.clone();
+                tokio::spawn(async move {
+                    core.known_projects(agent).await;
+                });
             }
             Ok(Err(err)) => tracing::warn!(agent, %err, "session list failed"),
             Err(_) => tracing::warn!(agent, "session list timed out"),
@@ -611,8 +617,8 @@ impl Core {
     async fn open(self: &Arc<Self>, asid: &AgentSessionId) {
         match self.hub.open(asid).await {
             Ok(snapshot) => {
-                // Its branch may have moved since the folder was resolved.
-                self.resolve_dirs(snapshot.info.directory.iter().cloned().collect(), true);
+                // Prefer the cached resolve; only miss paths hit the disk.
+                self.resolve_dirs(snapshot.info.directory.iter().cloned().collect(), false);
                 self.push_snapshot(snapshot);
                 tokio::spawn(self.clone().diff(asid.clone()));
             }

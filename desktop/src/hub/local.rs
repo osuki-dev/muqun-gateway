@@ -153,7 +153,12 @@ impl SessionHub for LocalHub {
             if let Err(err) = manager.sessions().prepare_session(asid).await {
                 tracing::debug!(asid = %asid.0, %err, "session preparation failed; reading history anyway");
             }
-            let mut snapshot = manager.sessions().get_snapshot(asid).await?;
+            // Mirror first: `get_snapshot` may re-prepare an ACP follower.
+            let mut snapshot = if let Some(snapshot) = manager.mirror().get_snapshot(asid).await {
+                snapshot
+            } else {
+                manager.sessions().get_snapshot(asid).await?
+            };
             enrich_local_media(&mut snapshot);
             Ok(snapshot)
         })

@@ -64,8 +64,8 @@ fn main() -> anyhow::Result<()> {
     commands::send(&tx, Command::Refresh);
 
     ui::text::register_fonts();
-    // Off the UI thread before the first fence / tool JSON paints.
-    ui::markdown::highlight::warm();
+    // Grammar set is tens of ms: warm it beside the first frames, not before.
+    std::thread::spawn(ui::markdown::highlight::warm);
     ui::parts::scale::Density::from_config(config.appearance.density).install();
     ui::parts::scale::install_reduced_motion(config.appearance.reduced_motion);
     let scheme_watcher = theme::install(&config_dir, &state_dir, &config.appearance)?;

@@ -26,8 +26,8 @@ const TITLE_SIZE: f32 = 28.0;
 const RECENT_ROWS: usize = 8;
 const ROW_HEIGHT: f32 = 44.0;
 /// Opacity of the theme's cover behind the page (dark / light).
-const COVER_DARK: f32 = 0.08;
-const COVER_LIGHT: f32 = 0.06;
+const COVER_DARK: f32 = 0.06;
+const COVER_LIGHT: f32 = 0.04;
 /// The cover fills this much of the page's width, anchored at the upper right.
 const COVER_WIDTH_SHARE: f32 = 0.62;
 const COVER_HEIGHT_SHARE: f32 = 0.78;
@@ -421,17 +421,19 @@ fn recents(app: &App, sessions: &[AgentSessionInfo], rows: usize) -> Div {
             .class("mq-start-row")
             .w_full()
             .h(ROW_HEIGHT)
+            .relative()
             .flex_row()
             .items_center()
             .child(main)
             .child(
-                // Shown on hover only (the row's class reveals it); the
-                // space is kept so the row does not move.
+                // Overlay on hover so the when/project columns keep their place.
                 div()
                     .class("mq-start-actions")
-                    .w(ACTIONS_WIDTH)
-                    .flex_shrink_0()
+                    .absolute()
+                    .right(0.0)
+                    .h(ROW_HEIGHT)
                     .flex_row()
+                    .items_center()
                     .justify_end()
                     .child(open_label)
                     .child(pin),
@@ -443,9 +445,6 @@ fn recents(app: &App, sessions: &[AgentSessionInfo], rows: usize) -> Div {
     }
     block.child(list)
 }
-
-/// The room the hover actions keep at a row's end.
-const ACTIONS_WIDTH: f32 = 96.0;
 
 #[cfg(test)]
 mod tests {
