@@ -11,6 +11,7 @@ pub mod icons;
 pub mod markdown;
 pub mod motion;
 pub mod parts;
+pub mod perf;
 pub mod sessions;
 pub mod settings;
 pub mod shell;
@@ -286,6 +287,7 @@ pub fn sync_agent_colours(ctx: &mut WindowedContext) {
 pub fn root(ctx: &WindowedContext, app: &App) -> Div {
     // Once per process: theme packs + composer attachments from file drops.
     composer::install_file_drop(app);
+    perf::install();
     let keys = app.clone();
     let density = parts::scale::Density::current();
     div()
@@ -304,5 +306,6 @@ pub fn root(ctx: &WindowedContext, app: &App) -> Div {
             ctx.width,
             (ctx.height - shell::TOP_BAR_HEIGHT).max(0.0),
         ))
+        .child(perf::overlay())
         .on_key_down(move |ctx| on_key(&keys, ctx))
 }

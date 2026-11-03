@@ -120,6 +120,15 @@
 .mq-follow-dot { background: var(--primary); }
 /* /topbar */
 
+/* Frame meter: above chrome, out of the way of the brand. */
+.mq-fps { z-index: 50; pointer-events: none; }
+.mq-fps-label {
+    padding: 2px 8px;
+    border-radius: var(--mq-radius-sm);
+    background: var(--surface-elevated);
+    color: var(--text-secondary);
+}
+
 /* "↓ N new messages": above row chrome (Copy) so the click always lands. */
 .mq-jump-pill-slot { z-index: 30; }
 .mq-jump-pill {
