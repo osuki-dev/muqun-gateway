@@ -354,7 +354,7 @@ pub(crate) struct DelegateArgs {
     /// Absolute project directory on this computer (any existing one; for a terminal agent, where its pane opens).
     #[serde(default)]
     pub cwd: Option<String>,
-    /// Agent to use: a structured agent, e.g. "opencode", or a terminal agent from the agent catalog, e.g. "codex" or "claude" (started in a new terminal pane; model and variant are passed to its launch, mode does not apply). Default: the primary agent.
+    /// Agent to use: a structured agent, e.g. "opencode", or any of the ten native agents (e.g. "claude", "codex", "cursor") runs as a native session; an agent this computer has no adapter for, from the agent catalog, starts in a new terminal pane (model and variant are passed to its launch, mode does not apply). Default: the primary agent.
     #[serde(default)]
     pub agent_id: Option<String>,
     /// Agent mode, e.g. "build" or "plan".
@@ -729,7 +729,7 @@ impl MuqunMcp {
 
     #[tool(
         name = "tasks.delegate",
-        description = "Start a sub-task on an agent, on this computer or (machine) on a linked one: a new session in cwd with your goal as the first prompt (for a terminal agent such as codex or claude, a new terminal pane running it). Returns task_id. If the work will take long, end your turn after delegating; you will be told when it finishes. Use tasks.wait only for short jobs. One hop only: a task another computer handed here cannot hand work to a linked computer (delegation_loop)."
+        description = "Start a sub-task on an agent, on this computer or (machine) on a linked one: a new native agent session in cwd with your goal as the first prompt (an agent with no native adapter here starts in a new terminal pane). Returns task_id. If the work will take long, end your turn after delegating; you will be told when it finishes. Use tasks.wait only for short jobs. One hop only: a task another computer handed here cannot hand work to a linked computer (delegation_loop)."
     )]
     async fn tasks_delegate(
         &self,
