@@ -580,16 +580,6 @@ impl ViewState {
                     return;
                 }
                 self.upsert_session(snapshot.info.clone(), changes);
-                let pending_permissions = snapshot.permissions.clone();
-                let asid = snapshot.info.asid.clone();
-                let before = self.attention.clone();
-                self.attention.retain(|p| p.asid != asid);
-                self.attention.extend(pending_permissions.iter().cloned());
-                changes.attention |= self.attention != before;
-                let before = self.waiting_forms.clone();
-                self.waiting_forms.retain(|f| f.asid != asid);
-                self.waiting_forms.extend(snapshot.forms.iter().cloned());
-                changes.attention |= self.waiting_forms != before;
                 let snapshot = *snapshot;
                 // A fresh read of the session already shown (a resync) keeps
                 // the older pages it had loaded and what it knew about them.
@@ -597,11 +587,38 @@ impl ViewState {
                     .active
                     .take()
                     .filter(|a| a.info.asid == snapshot.info.asid);
+                // An empty permissions/forms list on a resync can be the
+                // gateway follower lagging; keep what we already showed until
+                // a non-empty read or a resolve event clears it.
+                let pending_permissions = match &kept {
+                    Some(kept)
+                        if snapshot.permissions.is_empty()
+                            && !kept.pending_permissions.is_empty() =>
+                    {
+                        kept.pending_permissions.clone()
+                    }
+                    _ => snapshot.permissions.clone(),
+                };
+                let pending_forms = match &kept {
+                    Some(kept) if snapshot.forms.is_empty() && !kept.pending_forms.is_empty() => {
+                        kept.pending_forms.clone()
+                    }
+                    _ => snapshot.forms.clone(),
+                };
+                let asid = snapshot.info.asid.clone();
+                let before = self.attention.clone();
+                self.attention.retain(|p| p.asid != asid);
+                self.attention.extend(pending_permissions.iter().cloned());
+                changes.attention |= self.attention != before;
+                let before = self.waiting_forms.clone();
+                self.waiting_forms.retain(|f| f.asid != asid);
+                self.waiting_forms.extend(pending_forms.iter().cloned());
+                changes.attention |= self.waiting_forms != before;
                 let mut view = SessionView::new(
                     snapshot.info,
                     snapshot.timeline,
                     pending_permissions,
-                    snapshot.forms,
+                    pending_forms,
                 );
                 let Some(kept) = kept else {
                     self.active = Some(view);
@@ -1503,6 +1520,38 @@ mod tests {
             waiting.active.as_ref().unwrap().turn_state(),
             TurnState::WaitingApproval(None)
         );
+    }
+
+    #[test]
+    fn an_empty_resync_keeps_pending_approvals() {
+        let mut view = ViewState::default();
+        view.select("s");
+        let request: PermissionRequest = serde_json::from_value(serde_json::json!({
+            "id": "p", "asid": "s", "action": "bash", "resources": ["ls"],
+            "prompt": "run ls", "options": [],
+        }))
+        .unwrap();
+        let snap = |permissions: Vec<PermissionRequest>| {
+            Update::Snapshot(Box::new(AgentSessionSnapshot {
+                info: info("s", 5),
+                timeline: vec![item("a", "m1", 0)],
+                permissions,
+                forms: vec![],
+                inbox: vec![],
+                seq: 1,
+            }))
+        };
+        view.apply(snap(vec![request.clone()]), &mut Changes::default());
+        assert_eq!(view.active.as_ref().unwrap().pending_permissions.len(), 1);
+        let mut changes = Changes::default();
+        view.apply(snap(vec![]), &mut changes);
+        assert_eq!(
+            view.active.as_ref().unwrap().pending_permissions.len(),
+            1,
+            "empty resync must not wipe a waiting approval"
+        );
+        assert!(!changes.permissions);
+        assert_eq!(view.attention.len(), 1);
     }
 
     #[test]

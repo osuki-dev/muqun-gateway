@@ -18,8 +18,7 @@ use super::composer;
 use super::sessions::title_of;
 use super::text::{display_text, mono_text, ui_text};
 use super::App;
-use crate::config::{ConfigEdit, General};
-use crate::model::commands::Command;
+use crate::config::General;
 
 /// The title's size.
 const TITLE_SIZE: f32 = 28.0;
@@ -103,11 +102,13 @@ pub fn home(app: &App, width: f32, height: f32) -> Div {
     let sessions = app.bindings.sessions.clone();
     let theme_epoch = app.bindings.theme_epoch.clone();
     let page_app = app.clone();
+    let pins = super::sessions::pins_signal_id(app);
     let page = stateful_with_key::<NoState>("mq-start")
         .deps([
             agents_state.signal_id(),
             sessions.signal_id(),
             theme_epoch.signal_id(),
+            pins,
         ])
         .on_state(move |_| page(&page_app, width, height));
     div()
@@ -320,7 +321,7 @@ fn recents(app: &App, sessions: &[AgentSessionInfo], rows: usize) -> Div {
         );
     }
     let waiting = app.bindings.attention.get();
-    let pinned = app.config.get().general.pinned;
+    let pinned = (*super::sessions::side_pins(app)).clone();
     let mut list = div().class("mq-start-rows").w_full().flex_col();
     for (index, session) in recent_order(sessions, &pinned, rows)
         .into_iter()
@@ -418,7 +419,7 @@ fn recents(app: &App, sessions: &[AgentSessionInfo], rows: usize) -> Div {
                     .no_cursor(),
                 )
                 .on_click(move |_| {
-                    pin_app.send(Command::Edit(ConfigEdit::TogglePin(asid.clone())));
+                    super::sessions::toggle_session_pin(&pin_app, &asid);
                 })
         };
         let mut row = div()

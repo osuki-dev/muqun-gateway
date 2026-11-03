@@ -14,7 +14,7 @@
 //! back out) or the caret has moved (and is put back).
 
 mod chips;
-mod pills;
+pub mod pills;
 mod popup;
 pub mod qa;
 mod state;
@@ -544,6 +544,16 @@ pub fn on_key(app: &App, key: u32, line: usize, column: usize) {
         }
         refresh_text_area(&app.composer);
     };
+    // An open pill menu takes ↑ / ↓ / Enter before the popup or submit.
+    if pills::menu_open() && matches!(key, KEY_UP | KEY_DOWN | KEY_ENTER) {
+        if key == KEY_ENTER {
+            undo_enter(app);
+        } else {
+            restore(app);
+        }
+        let _ = pills::on_menu_key(key);
+        return;
+    }
     match key {
         KEY_UP | KEY_DOWN if open => {
             restore(app);
@@ -717,6 +727,7 @@ pub fn submit(app: &App) {
                 cwd,
                 model: aim.model.clone(),
                 mode: aim.mode.clone(),
+                worktree: Cmp::get().start.get().worktree,
             }
         }
     };
@@ -764,10 +775,14 @@ fn after_submit_ok() {
             Cmp::get().rows.signal().set(MIN_ROWS);
         }
     }
-    Cmp::get()
-        .popup
-        .signal()
-        .set(Arc::new(state::Popup::default()));
+    let cmp = Cmp::get();
+    cmp.popup.signal().set(Arc::new(state::Popup::default()));
+    // A start-page worktree choice is one-shot.
+    if cmp.start.get().worktree {
+        let mut choice = (*cmp.start.get()).clone();
+        choice.worktree = false;
+        cmp.start.signal().set(Arc::new(choice));
+    }
 }
 
 thread_local! {

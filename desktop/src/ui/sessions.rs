@@ -64,6 +64,8 @@ struct Side {
     /// Pins, hidden projects and names, as the owner set them; written to
     /// the config as they change.
     prefs: State<Arc<BTreeMap<String, ProjectPrefs>>>,
+    /// Start-page session pins (`general.pinned`); soft-boosts their projects.
+    pins: State<Arc<Vec<String>>>,
     /// Bumped when the scroll leaves the built window.
     epoch: State<u64>,
     physics: SharedScrollPhysics,
@@ -81,7 +83,9 @@ fn side(app: &App) -> &'static Side {
     static SIDE: OnceLock<Side> = OnceLock::new();
     SIDE.get_or_init(|| {
         let ctx = blinc_core::BlincContextState::get();
-        let prefs = app.config.get().ui.projects;
+        let config = app.config.get();
+        let prefs = config.ui.projects;
+        let pins = config.general.pinned;
         let placeholder = app.strings.search().to_string();
         // QA: start with this search typed (`MUQUN_QA_SIDEBAR_QUERY`).
         let typed = std::env::var("MUQUN_QA_SIDEBAR_QUERY").unwrap_or_default();
@@ -101,11 +105,38 @@ fn side(app: &App) -> &'static Side {
             open: ctx.use_state_keyed("mq.side.open", || Arc::new(HashMap::new())),
             full: ctx.use_state_keyed("mq.side.full", || Arc::new(HashSet::new())),
             prefs: ctx.use_state_keyed("mq.side.prefs", move || Arc::new(prefs.clone())),
+            pins: ctx.use_state_keyed("mq.side.pins", move || Arc::new(pins.clone())),
             epoch: ctx.use_state_keyed("mq.side.epoch", || 0u64),
             physics: Arc::new(Mutex::new(ScrollPhysics::new(ScrollConfig::no_bounce()))),
             built: Mutex::new(Built::default()),
         }
     })
+}
+
+/// Signal id for start-page session pins (home + sidebar share this).
+pub fn pins_signal_id(app: &App) -> blinc_core::SignalId {
+    side(app).pins.signal_id()
+}
+
+/// The start-page session pins, as the sidebar mirrors them.
+pub fn side_pins(app: &App) -> Arc<Vec<String>> {
+    side(app).pins.get()
+}
+
+/// Pin or unpin a session from the start page; keeps the sidebar in step.
+pub fn toggle_session_pin(app: &App, asid: &str) {
+    let state = &side(app).pins;
+    let mut pins = (*state.get()).clone();
+    match pins.iter().position(|p| p == asid) {
+        Some(at) => {
+            pins.remove(at);
+        }
+        None => pins.insert(0, asid.to_string()),
+    }
+    state.signal().set(Arc::new(pins));
+    app.send(crate::model::commands::Command::Edit(
+        ConfigEdit::TogglePin(asid.to_string()),
+    ));
 }
 
 /// Put the caret in the sidebar's search field (Ctrl/⌘K, the top bar's
@@ -475,6 +506,7 @@ fn tree(app: &App, height: f32) -> impl ElementBuilder {
         s.open.signal_id(),
         s.full.signal_id(),
         s.prefs.signal_id(),
+        s.pins.signal_id(),
         s.epoch.signal_id(),
     ];
     let list_app = app.clone();
@@ -535,12 +567,14 @@ pub fn current_projects(app: &App) -> Vec<Project> {
     let prefs = side(app).prefs.get();
     let recent: Vec<std::path::PathBuf> = app.config.get().general.last_cwd.into_values().collect();
     let home = dirs::home_dir();
+    let session_pins = side(app).pins.get();
     projects::derive(&projects::Sources {
         sessions: &listing.sessions,
         dirs: &dirs,
         known: &known,
         recent: &recent,
         prefs: &prefs,
+        session_pins: &session_pins,
         home: home.as_deref(),
     })
 }
@@ -1274,6 +1308,7 @@ mod tests {
                 known: &[],
                 recent: &[],
                 prefs: &BTreeMap::new(),
+                session_pins: &[],
                 home: None,
             });
             let all: HashSet<String> = projects.iter().map(|p| p.id.clone()).collect();

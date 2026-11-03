@@ -163,6 +163,10 @@ fn on_key(app: &App, ctx: &blinc_layout::event_handler::EventContext) {
         return;
     }
     let composer_focused = app.composer.lock().map(|s| s.is_focused()).unwrap_or(false);
+    // Pill menus when the caret is elsewhere (composer::on_key covers focus).
+    if !composer_focused && composer::pills::on_menu_key(ctx.key_code) {
+        return;
+    }
     match ctx.key_code {
         KEY_N if chord => app.open_draft(),
         KEY_K if chord => sessions::focus_search(),

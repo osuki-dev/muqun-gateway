@@ -194,6 +194,9 @@ pub struct Sources<'a> {
     /// Folders sessions were last started in.
     pub recent: &'a [PathBuf],
     pub prefs: &'a BTreeMap<String, ProjectPrefs>,
+    /// Start-page session pins (`general.pinned`): a project that holds one
+    /// stays out of Other, same as an explicit project pin.
+    pub session_pins: &'a [String],
     pub home: Option<&'a Path>,
 }
 
@@ -255,6 +258,20 @@ pub fn derive(src: &Sources) -> Vec<Project> {
         found.add(&dir.to_string_lossy(), false, usize::MAX);
     }
     let mut projects = found.projects;
+    // Session pins and project prefs share the same seat: either keeps the
+    // project in the primary list.
+    if !src.session_pins.is_empty() {
+        for project in &mut projects {
+            if !project.pinned
+                && project
+                    .sessions
+                    .iter()
+                    .any(|s| src.session_pins.iter().any(|p| p == s))
+            {
+                project.pinned = true;
+            }
+        }
+    }
     // Stable: equal ranks keep the order they were found in.
     projects.sort_by_key(|p| (!p.pinned, p.last_active));
     if !loose.is_empty() {
@@ -516,6 +533,7 @@ mod tests {
         known: Vec<AgentProject>,
         recent: Vec<PathBuf>,
         prefs: BTreeMap<String, ProjectPrefs>,
+        session_pins: Vec<String>,
     }
 
     impl Fixture {
@@ -526,6 +544,7 @@ mod tests {
                 known: &self.known,
                 recent: &self.recent,
                 prefs: &self.prefs,
+                session_pins: &self.session_pins,
                 home: Some(Path::new("/home/u")),
             })
         }
@@ -557,6 +576,7 @@ mod tests {
             known: vec![],
             recent: vec![],
             prefs: BTreeMap::new(),
+            session_pins: vec![],
         }
     }
 
@@ -836,6 +856,7 @@ mod tests {
             known: vec![],
             recent: vec![],
             prefs: BTreeMap::new(),
+            session_pins: vec![],
         };
         f.sessions.push(listed("tmp", Some("/tmp/opencode/qa")));
         f.prefs.insert(
@@ -859,6 +880,23 @@ mod tests {
         assert!(
             projects.iter().any(|p| p.id == "/home/u/w/p9" && p.pinned),
             "pinned keeps a seat"
+        );
+
+        // A start-page session pin soft-boosts its project the same way.
+        let f = Fixture {
+            sessions: (0..10)
+                .map(|i| listed(&format!("s{i}"), Some(&format!("/home/u/w/p{i}"))))
+                .collect(),
+            dirs: HashMap::new(),
+            known: vec![],
+            recent: vec![],
+            prefs: BTreeMap::new(),
+            session_pins: vec!["s9".into()],
+        };
+        let projects = f.derive();
+        assert!(
+            projects.iter().any(|p| p.id == "/home/u/w/p9" && p.pinned),
+            "session pin keeps its project seated"
         );
     }
 }

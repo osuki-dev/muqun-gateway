@@ -3,7 +3,10 @@
 //! count, the context readout and the primary action. A pill only appears
 //! when there is something to choose: the model, mode and effort pills come
 //! from the agent's catalogue and are left out when it has none.
+//!
+//! Open menus answer ↑ / ↓ / Enter (see [`on_menu_key`]).
 
+use std::cell::RefCell;
 use std::sync::Arc;
 
 use blinc_cn::prelude::{icons, to_svg, ColorToken, ThemeState};
@@ -21,6 +24,12 @@ use crate::model::compose::ComposeCommand;
 use crate::ui::agents::{self, Standing};
 use crate::ui::text::{mono_text, ui_text};
 use crate::ui::App;
+
+const KEY_UP: u32 = 38;
+const KEY_DOWN: u32 = 40;
+const KEY_ENTER: u32 = 13;
+
+type MenuAction = Arc<dyn Fn() + Send + Sync + 'static>;
 
 const PILL_HEIGHT: f32 = 28.0;
 /// Menu rows listed at most (a catalogue may hold hundreds of models).
@@ -142,8 +151,60 @@ type Opener = Arc<dyn Fn(Anchor) + Send + Sync>;
 thread_local! {
     /// Each pill's way to open its menu, by menu; the pill's click calls it,
     /// and so does the QA harness (`composer/qa.rs`).
-    static OPENERS: std::cell::RefCell<std::collections::HashMap<MenuId, Opener>> =
-        std::cell::RefCell::new(std::collections::HashMap::new());
+    static OPENERS: RefCell<std::collections::HashMap<MenuId, Opener>> =
+        RefCell::new(std::collections::HashMap::new());
+    /// Enabled rows of the open menu, in order, for ↑ / ↓ / Enter.
+    static MENU_ACTIONS: RefCell<Vec<MenuAction>> = RefCell::new(Vec::new());
+}
+
+fn clear_menu_actions() {
+    MENU_ACTIONS.with(|a| a.borrow_mut().clear());
+}
+
+fn push_menu_action(action: MenuAction) -> usize {
+    MENU_ACTIONS.with(|a| {
+        let i = a.borrow().len();
+        a.borrow_mut().push(action);
+        i
+    })
+}
+
+/// Whether a pill menu is open.
+pub fn menu_open() -> bool {
+    Cmp::get().menu.get().is_some()
+}
+
+/// ↑ / ↓ move the focus; Enter takes the focused row. True when handled.
+pub fn on_menu_key(key: u32) -> bool {
+    if !menu_open() {
+        return false;
+    }
+    let n = MENU_ACTIONS.with(|a| a.borrow().len());
+    if n == 0 {
+        return key == KEY_UP || key == KEY_DOWN || key == KEY_ENTER;
+    }
+    let cmp = Cmp::get();
+    match key {
+        KEY_UP => {
+            let cur = cmp.menu_cursor.get();
+            cmp.menu_cursor.signal().set(cur.saturating_sub(1));
+            true
+        }
+        KEY_DOWN => {
+            let cur = cmp.menu_cursor.get();
+            cmp.menu_cursor.signal().set((cur + 1).min(n - 1));
+            true
+        }
+        KEY_ENTER => {
+            let cur = cmp.menu_cursor.get().min(n - 1);
+            let action = MENU_ACTIONS.with(|a| a.borrow().get(cur).cloned());
+            if let Some(action) = action {
+                action();
+            }
+            true
+        }
+        _ => false,
+    }
 }
 
 /// The element id of a menu's pill.
@@ -188,6 +249,7 @@ fn host(
             Side::Above => (at.x, at.y - 4.0 - size.1, AnchorDirection::Bottom),
         };
         let closed = cmp.clone();
+        cmp.menu_cursor.signal().set(0);
         let handle = OverlayBuilder::popover()
             .at(x, y)
             .size(size.0, size.1)
@@ -195,14 +257,32 @@ fn host(
             .on_close(move |_| {
                 closed.menu.signal().set(None);
                 closed.menu_handle.signal().set(None);
+                clear_menu_actions();
                 blinc_layout::click_outside::unregister_click_outside("mq-cmp-menu");
             })
             .content(move || {
+                let cursor = Cmp::get().menu_cursor;
+                let menu = menu.clone();
                 div()
                     .class("mq-menu")
                     .id("mq-cmp-menu-panel")
                     .flex_col()
-                    .child(menu())
+                    .child(
+                        stateful_with_key::<NoState>("mq-cmp-menu-body")
+                            .deps([cursor.signal_id()])
+                            .on_state(move |_| {
+                                clear_menu_actions();
+                                let body = menu();
+                                let n = MENU_ACTIONS.with(|a| a.borrow().len());
+                                if n > 0 {
+                                    let cur = Cmp::get().menu_cursor.get();
+                                    if cur >= n {
+                                        Cmp::get().menu_cursor.signal().set(n - 1);
+                                    }
+                                }
+                                body
+                            }),
+                    )
             })
             .show();
         let raw = handle.raw();
@@ -247,9 +327,10 @@ pub fn close_menu() {
     }
     cmp.menu.signal().set(None);
     cmp.menu_handle.signal().set(None);
+    clear_menu_actions();
 }
 
-fn menu_row(label: Div, selected: bool, enabled: bool) -> Div {
+fn menu_row(label: Div, selected: bool, enabled: bool, focused: bool) -> Div {
     let mut row = div()
         .class("mq-menu-row")
         .h(32.0)
@@ -257,6 +338,9 @@ fn menu_row(label: Div, selected: bool, enabled: bool) -> Div {
         .flex_row()
         .items_center()
         .child(label.flex_1().min_w(0.0));
+    if focused {
+        row = row.class("mq-menu-row--focus");
+    }
     if selected {
         row = row.class("mq-menu-row--sel").child(ico(icons::CHECK, 14.0));
     }
@@ -265,6 +349,14 @@ fn menu_row(label: Div, selected: bool, enabled: bool) -> Div {
     } else {
         row.class("mq-menu-row--off")
     }
+}
+
+/// An enabled row that Enter / click can take; registers for keyboard nav.
+fn action_row(label: Div, selected: bool, action: impl Fn() + Send + Sync + 'static) -> Div {
+    let action: MenuAction = Arc::new(action);
+    let index = push_menu_action(action.clone());
+    let focused = Cmp::get().menu_cursor.get() == index;
+    menu_row(label, selected, true, focused).on_click(move |_| action())
 }
 
 fn separator() -> Div {
@@ -370,28 +462,25 @@ fn project_pill(app: &App, aim: &Aim, side: Side) -> Div {
                         .class("mq-menu-dim")
                         .child(mono_text(shown).size(11.0).no_wrap().no_cursor()),
                 );
-            menu = menu.child(menu_row(label, selected, true).on_click(move |_| {
+            menu = menu.child(action_row(label, selected, move || {
                 super::set_project(path.clone());
                 close_menu();
             }));
         }
         let browse = app.clone();
-        menu.child(separator()).child(
-            menu_row(
-                div().child(
-                    ui_text(app.strings.browse())
-                        .size(13.0)
-                        .no_wrap()
-                        .no_cursor(),
-                ),
-                false,
-                true,
-            )
-            .on_click(move |_| {
+        menu.child(separator()).child(action_row(
+            div().child(
+                ui_text(app.strings.browse())
+                    .size(13.0)
+                    .no_wrap()
+                    .no_cursor(),
+            ),
+            false,
+            move || {
                 close_menu();
                 super::browse_project(&browse);
-            }),
-        )
+            },
+        ))
     })
 }
 
@@ -443,10 +532,9 @@ fn agent_pill(app: &App, aim: &Aim, side: Side) -> Div {
                     .flex_1()
                     .child(ui_text(word).size(11.0).no_wrap().no_cursor()),
             );
-            let mut row = menu_row(label, ok && info.id == current, ok);
-            if ok {
+            let row = if ok {
                 let id = info.id.clone();
-                row = row.on_click(move |_| {
+                action_row(label, info.id == current, move || {
                     let cmp = Cmp::get();
                     let mut choice = (*cmp.start.get()).clone();
                     choice.agent = Some(id.clone());
@@ -454,11 +542,11 @@ fn agent_pill(app: &App, aim: &Aim, side: Side) -> Div {
                     choice.mode = None;
                     cmp.start.signal().set(Arc::new(choice));
                     close_menu();
-                });
+                })
             } else {
                 // The way to fix it, beside the reason.
                 let go = app.clone();
-                row = row.child(
+                menu_row(label, false, false, false).child(
                     div()
                         .class("mq-menu-link")
                         .cursor_pointer()
@@ -472,8 +560,8 @@ fn agent_pill(app: &App, aim: &Aim, side: Side) -> Div {
                                 .no_wrap()
                                 .no_cursor(),
                         ),
-                );
-            }
+                )
+            };
             menu = menu.child(row);
         }
         menu
@@ -558,7 +646,7 @@ fn model_pill(app: &App, aim: &Aim, models: &[&ModelInfo], side: Side) -> Div {
                 );
             let app = app.clone();
             let asid = asid.clone();
-            menu = menu.child(menu_row(label, selected, true).on_click(move |_| {
+            menu = menu.child(action_row(label, selected, move || {
                 let model = ModelRef {
                     provider_id: model.provider_id.clone(),
                     model_id: model.id.clone(),
@@ -628,13 +716,10 @@ fn mode_pill(app: &App, aim: &Aim, side: Side) -> Div {
             let selected = chosen.as_deref() == Some(id.as_str());
             let app = app.clone();
             let asid = asid.clone();
-            menu = menu.child(
-                menu_row(
-                    div().child(ui_text(label).size(13.0).no_wrap().no_cursor()),
-                    selected,
-                    true,
-                )
-                .on_click(move |_| {
+            menu = menu.child(action_row(
+                div().child(ui_text(label).size(13.0).no_wrap().no_cursor()),
+                selected,
+                move || {
                     match &asid {
                         Some(asid) => app.send(Command::Compose(ComposeCommand::SwitchMode {
                             asid: asid.clone(),
@@ -648,8 +733,8 @@ fn mode_pill(app: &App, aim: &Aim, side: Side) -> Div {
                         }
                     }
                     close_menu();
-                }),
-            );
+                },
+            ));
         }
         menu
     })
@@ -682,13 +767,10 @@ fn effort_pill(app: &App, aim: &Aim, model: &ModelInfo, side: Side) -> Div {
             let app = app.clone();
             let asid = asid.clone();
             let base = base.clone();
-            menu = menu.child(
-                menu_row(
-                    div().child(mono_text(variant.clone()).size(12.0).no_wrap().no_cursor()),
-                    selected,
-                    true,
-                )
-                .on_click(move |_| {
+            menu = menu.child(action_row(
+                div().child(mono_text(variant.clone()).size(12.0).no_wrap().no_cursor()),
+                selected,
+                move || {
                     choose_model(
                         &app,
                         asid.as_ref(),
@@ -698,8 +780,8 @@ fn effort_pill(app: &App, aim: &Aim, model: &ModelInfo, side: Side) -> Div {
                         },
                     );
                     close_menu();
-                }),
-            );
+                },
+            ));
         }
         menu
     })
@@ -715,6 +797,8 @@ fn branch_pill(app: &App, aim: &Aim, side: Side) -> Option<Div> {
         true,
         open,
     );
+    let on_start = aim.place == Place::Start;
+    let want_worktree = on_start && Cmp::get().start.get().worktree;
     let app = app.clone();
     Some(host(
         MenuId::Branch,
@@ -735,31 +819,50 @@ fn branch_pill(app: &App, aim: &Aim, side: Side) -> Option<Div> {
                     ),
                 );
             // Switching a checkout the agent is using is not offered; a new
-            // worktree is the way to branch off, and waits on the gateway's
-            // worktree API.
-            div()
-                .flex_col()
-                .min_w(260.0)
-                .child(menu_row(current, true, false))
-                .child(separator())
-                .child(menu_row(
-                    div()
-                        .flex_row()
-                        .items_center()
-                        .child(
+            // worktree is how to branch off (start page only).
+            let worktree =
+                if on_start {
+                    action_row(
+                        div().child(
                             ui_text(app.strings.new_worktree())
                                 .size(13.0)
                                 .no_wrap()
                                 .no_cursor(),
-                        )
-                        .child(
-                            div().class("mq-menu-dim").child(
-                                ui_text(app.strings.soon()).size(11.0).no_wrap().no_cursor(),
-                            ),
                         ),
-                    false,
-                    false,
-                ))
+                        want_worktree,
+                        move || {
+                            let cmp = Cmp::get();
+                            let mut choice = (*cmp.start.get()).clone();
+                            choice.worktree = !choice.worktree;
+                            cmp.start.signal().set(Arc::new(choice));
+                            close_menu();
+                        },
+                    )
+                } else {
+                    menu_row(
+                        div()
+                            .flex_row()
+                            .items_center()
+                            .child(
+                                ui_text(app.strings.new_worktree())
+                                    .size(13.0)
+                                    .no_wrap()
+                                    .no_cursor(),
+                            )
+                            .child(div().class("mq-menu-dim").child(
+                                ui_text(app.strings.soon()).size(11.0).no_wrap().no_cursor(),
+                            )),
+                        false,
+                        false,
+                        false,
+                    )
+                };
+            div()
+                .flex_col()
+                .min_w(260.0)
+                .child(menu_row(current, true, false, false))
+                .child(separator())
+                .child(worktree)
         },
     ))
 }

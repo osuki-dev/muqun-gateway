@@ -135,6 +135,8 @@ pub enum Target {
         cwd: PathBuf,
         model: Option<ModelRef>,
         mode: Option<String>,
+        /// Create a sibling git worktree of `cwd` first, then start there.
+        worktree: bool,
     },
 }
 
@@ -399,6 +401,92 @@ fn too_large(max_mib: usize) -> String {
     format!("too large ({max_mib} MB max)")
 }
 
+/// First few words of `hint` as a path-safe slug (`fix-the-login` …).
+pub fn worktree_slug(hint: &str) -> String {
+    let raw: String = hint
+        .chars()
+        .take(48)
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let slug: String = raw
+        .split('-')
+        .filter(|s| !s.is_empty())
+        .take(4)
+        .collect::<Vec<_>>()
+        .join("-");
+    if slug.is_empty() {
+        "session".into()
+    } else {
+        slug
+    }
+}
+
+/// Make a linked worktree next to the repo root of `cwd`, named from `hint`.
+pub fn ensure_worktree(cwd: &std::path::Path, hint: &str) -> Result<PathBuf, HubError> {
+    create_worktree(cwd, &worktree_slug(hint)).map_err(|err| {
+        HubError::Agent(muqun_gateway::agents::ports::AgentError::RequestFailed(err))
+    })
+}
+
+/// Make a linked worktree next to the repo root of `cwd`, named with `slug`
+/// (or a short id). Returns the new worktree path.
+pub fn create_worktree(cwd: &std::path::Path, slug: &str) -> Result<PathBuf, String> {
+    let root = git_root(cwd).ok_or_else(|| "not a git checkout".to_string())?;
+    let base = root
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("worktree");
+    let slug = slug.trim_matches('-');
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() % 100_000)
+        .unwrap_or(0);
+    let name = if slug.is_empty() {
+        format!("{base}-wt-{stamp}")
+    } else {
+        format!("{base}-{slug}")
+    };
+    let parent = root
+        .parent()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/"));
+    let mut path = parent.join(&name);
+    let mut n = 2u32;
+    while path.exists() {
+        path = parent.join(format!("{name}-{n}"));
+        n += 1;
+    }
+    let status = std::process::Command::new("git")
+        .args(["worktree", "add", "--detach"])
+        .arg(&path)
+        .current_dir(&root)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .status()
+        .map_err(|err| format!("git worktree: {err}"))?;
+    if !status.success() {
+        return Err("git worktree add failed".into());
+    }
+    Ok(path)
+}
+
+fn git_root(cwd: &std::path::Path) -> Option<PathBuf> {
+    for dir in cwd.ancestors().take(24) {
+        let dot_git = dir.join(".git");
+        if dot_git.is_dir() || dot_git.is_file() {
+            return Some(dir.to_path_buf());
+        }
+    }
+    None
+}
+
 /// The branch checked out in `cwd` (or the repository above it), read from
 /// `.git/HEAD` without running git: `ref: refs/heads/<branch>`, or the short
 /// hash of a detached head. A linked worktree's `.git` is a file naming its
@@ -455,6 +543,16 @@ mod tests {
         assert!(FileHit::from_value(&json!({"type": "file"})).is_none());
         let hit = FileHit::from_value(&json!({"path": "src/lib.rs"})).unwrap();
         assert_eq!((hit.name.as_str(), hit.kind.as_str()), ("lib.rs", "file"));
+    }
+
+    #[test]
+    fn worktree_slug_keeps_a_few_words() {
+        assert_eq!(
+            worktree_slug("Fix the login flow now"),
+            "fix-the-login-flow"
+        );
+        assert_eq!(worktree_slug("!!!"), "session");
+        assert_eq!(worktree_slug(""), "session");
     }
 
     #[test]

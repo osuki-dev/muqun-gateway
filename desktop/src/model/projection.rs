@@ -12,7 +12,7 @@ use muqun_gateway::agents::{AgentDomainEvent, AgentSessionId, SessionQuery};
 use tokio::sync::{broadcast, watch};
 
 use super::commands::{Command, CommandReceiver};
-use super::compose::{self, ComposeCommand, ComposerUpdate, Target};
+use super::compose::{self, ComposeCommand, ComposerUpdate, Deliver, Target};
 use super::inbox::{Inbox, UiError, Update};
 use super::view::{DiffStat, SESSION_LIST_LIMIT};
 use crate::config::{ConfigEdit, DesktopConfig};
@@ -358,40 +358,61 @@ impl Core {
                 cwd,
                 model,
                 mode,
-            } => match self.hub.create(&agent, &cwd).await {
-                Ok(info) => {
-                    let asid = info.asid.clone();
-                    self.inbox.push(Update::SessionCreated(Box::new(info)));
-                    *self.active.lock().unwrap() = Some(asid.clone());
-                    self.open(&asid).await;
-                    self.config.change(|config| {
-                        config.general.last_agent = Some(agent.clone());
-                        config.general.last_cwd.insert(agent.clone(), cwd);
-                    });
-                    self.edited();
-                    // The choices on the pills are the new session's.
-                    if let Some(model) = model {
-                        if let Err(err) = self.hub.switch_model(&asid, &model).await {
+                worktree,
+            } => {
+                let hint = match &deliver {
+                    Deliver::Prompt(text) => text.as_str(),
+                    Deliver::Command { name, .. } | Deliver::Skill { name, .. } => name.as_str(),
+                };
+                let cwd = if worktree {
+                    match compose::ensure_worktree(&cwd, hint) {
+                        Ok(path) => path,
+                        Err(err) => {
                             self.fail(err);
+                            self.inbox.push(Update::Composer(Box::new(
+                                ComposerUpdate::Submitted { token, ok: false },
+                            )));
+                            return;
                         }
                     }
-                    if let Some(mode) = mode {
-                        if let Err(err) = self.hub.switch_mode(&asid, &mode).await {
-                            self.fail(err);
+                } else {
+                    cwd
+                };
+                match self.hub.create(&agent, &cwd).await {
+                    Ok(info) => {
+                        let asid = info.asid.clone();
+                        self.inbox.push(Update::SessionCreated(Box::new(info)));
+                        *self.active.lock().unwrap() = Some(asid.clone());
+                        self.open(&asid).await;
+                        self.config.change(|config| {
+                            config.general.last_agent = Some(agent.clone());
+                            config.general.last_cwd.insert(agent.clone(), cwd);
+                        });
+                        self.edited();
+                        // The choices on the pills are the new session's.
+                        if let Some(model) = model {
+                            if let Err(err) = self.hub.switch_model(&asid, &model).await {
+                                self.fail(err);
+                            }
                         }
+                        if let Some(mode) = mode {
+                            if let Err(err) = self.hub.switch_mode(&asid, &mode).await {
+                                self.fail(err);
+                            }
+                        }
+                        asid
                     }
-                    asid
+                    Err(err) => {
+                        self.fail(err);
+                        self.inbox
+                            .push(Update::Composer(Box::new(ComposerUpdate::Submitted {
+                                token,
+                                ok: false,
+                            })));
+                        return;
+                    }
                 }
-                Err(err) => {
-                    self.fail(err);
-                    self.inbox
-                        .push(Update::Composer(Box::new(ComposerUpdate::Submitted {
-                            token,
-                            ok: false,
-                        })));
-                    return;
-                }
-            },
+            }
         };
         let result = compose::deliver(
             self.hub.as_ref(),

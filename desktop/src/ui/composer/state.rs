@@ -24,8 +24,7 @@ pub struct StartChoice {
     pub agent: Option<String>,
     pub model: Option<ModelRef>,
     pub mode: Option<String>,
-    /// Begin in a new worktree: kept and shown, but creating one is the
-    /// agent's work and waits on the gateway's worktree API.
+    /// Begin in a new git worktree of the chosen project (start page).
     pub worktree: bool,
 }
 
@@ -89,6 +88,8 @@ pub struct Cmp {
     pub inbox: State<Arc<Vec<InboxItem>>>,
     pub popup: State<Arc<Popup>>,
     pub menu: State<Option<MenuId>>,
+    /// Keyboard focus among the open menu's enabled rows.
+    pub menu_cursor: State<usize>,
     /// The overlay showing it.
     pub menu_handle: State<Option<u64>>,
     /// The overlay showing the `@` / `/` / `$` list.
@@ -113,6 +114,7 @@ impl Cmp {
             inbox: ctx.use_state_keyed("mq.cmp.inbox", || Arc::new(Vec::new())),
             popup: ctx.use_state_keyed("mq.cmp.popup", || Arc::new(Popup::default())),
             menu: ctx.use_state_keyed("mq.cmp.menu", || None),
+            menu_cursor: ctx.use_state_keyed("mq.cmp.menu_cursor", || 0usize),
             menu_handle: ctx.use_state_keyed("mq.cmp.menu_handle", || None),
             popup_handle: ctx.use_state_keyed("mq.cmp.popup_handle", || None),
             popup_shown: ctx.use_state_keyed("mq.cmp.popup_shown", || 0usize),

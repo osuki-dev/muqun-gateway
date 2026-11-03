@@ -308,8 +308,9 @@
     padding-left: var(--mq-space-3);
 }
 
+/* Tool / diff / shell: hairline + 3 px accent only (architecture §6.1d). */
 .mq-card {
-    background: var(--surface);
+    background: transparent;
     border: 1px solid var(--border);
     border-radius: var(--mq-radius-md);
 }
@@ -526,6 +527,7 @@
 }
 .mq-menu-row:hover, .mq-popup-row:hover { background: var(--surface-overlay); }
 .mq-menu-row--sel, .mq-popup-row--sel { background: var(--accent-subtle); }
+.mq-menu-row--focus { background: var(--surface-overlay); outline: 1px solid var(--border-focus); outline-offset: -1px; }
 .mq-menu-row--off { opacity: 0.55; }
 .mq-menu-row--off:hover { background: transparent; }
 .mq-menu-dim, .mq-popup-detail { color: var(--text-tertiary); padding-left: var(--mq-space-2); }
