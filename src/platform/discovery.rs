@@ -848,6 +848,13 @@ mod tests {
             assert_eq!(agent["features"]["timelineEarlier"], supported, "{id}");
             assert!(agent["features"].get("timeline_earlier").is_none());
             assert!(agent["features"].get("extra").is_none());
+            // Only OpenCode can list what an "always" answer agreed to; the
+            // App hides that list for the others instead of showing it empty.
+            assert_eq!(
+                agent["features"]["savedPermissions"],
+                id == "opencode",
+                "{id}"
+            );
         }
     }
 

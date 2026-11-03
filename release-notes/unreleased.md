@@ -2,6 +2,42 @@
 
 ## Changes and fixes
 
+- **The App's "Auto-approve supported requests" switch now answers an ACP
+  agent's file, search and fetch permissions, and T3's file changes.** The
+  App auto-approves only requests whose `action` is one of the OpenCode
+  permission names it knows; every non-shell ACP permission (Antigravity,
+  Claude Code, Cursor, Qoder, FX) carried the agent's own tool name
+  instead (`write_to_file`, `Read`, …) and no `resources`, and T3's
+  carried `file-change`, so with the switch on those prompts still waited
+  for a tap. A non-shell ACP permission is now classified by its ACP
+  `kind` (`read`, `edit`, `delete`, `move`, `search`, `fetch` → `webfetch`),
+  with the files it names in `locations` as its resources; for agy, which
+  names the tool in `title` and states no kind the App has a word for, the
+  tool names its binary schemas declare (`view_file`, `write_to_file`,
+  `replace_file_content`, …) map the same way. T3's `file-change` is
+  `edit`. Shells are unchanged: the command must be readable. Pairs with
+  the App change that stops requiring a resource on non-shell operations.
+
+- **Discovery says which agents can list "Always allow" rules.**
+  `features.savedPermissions` is `true` for OpenCode, whose
+  `GET …/permissions/saved` lists them, and `false` for every other agent,
+  which keeps such rules itself (Claude Code's settings, agy's own store);
+  the App hides its list instead of showing "Nothing yet" after an "Always
+  allow" that did land, in the agent.
+
+- **FX and Qoder no longer start a process every minute to re-read an
+  unchanged session store.** The task follower reads each open task's session
+  once a minute and the Home view refreshes as often; for a saved FX or Qoder
+  session the Gateway did not hold, every such read past the 30-second
+  metadata cache started a cold `fx acp` / `qodercli --acp` child to list
+  sessions again, although nothing had changed (one child per minute for as
+  long as a task stayed open), and under load those listings ran into their
+  30-second budget ("ACP session listing timed out"), dropping the agent from
+  the session list. Saved-session reads now honor the store fingerprint that
+  listings already used (ten minutes while the store is unchanged, which also
+  settles that an unlisted session is not saved), and FX gets a fingerprint
+  over `~/.fx/sessions` as Qoder has over `~/.qoder/projects`.
+
 - **`update --channel preview` works again.** The preview check failed with
   "update response exceeds size limit" because one 100-release GitHub page
   (release notes and asset lists included) had grown past its 1 MiB cap. It now

@@ -46,7 +46,7 @@ impl LocalHub {
         self.runtime
             .request_manager_for_session(&asid.0)
             .await
-            .ok_or_else(|| HubError::SessionNotFound(asid.0.clone()))
+            .map_err(|_| HubError::SessionNotFound(asid.0.clone()))
     }
 
     /// The gateway's own reason an agent is not attached, when it has one.

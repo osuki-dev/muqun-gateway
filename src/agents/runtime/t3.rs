@@ -320,6 +320,7 @@ fn t3_features_for_protocol(protocol: u64) -> crate::discovery::AgentFeatures {
             ("sessionDelete".into(), serde_json::json!(true)),
             ("sessionFork".into(), serde_json::json!(false)),
             ("orchestrationProtocols".into(), serde_json::json!([1, 2])),
+            ("savedPermissions".into(), serde_json::json!(false)),
         ]),
     }
 }

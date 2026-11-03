@@ -69,7 +69,7 @@ fn permission_uses_offered_opaque_ids_and_session_only_label() {
         {"optionId":"opaque-1","name":"Allow once","kind":"allow_once"},
         {"optionId":"opaque-2","name":"Allow for this session","kind":"allow_always"},
         {"optionId":"opaque-3","name":"Reject forever","kind":"reject_always"}
-    ]}), crate::agents::adapters::acp::mapper::SHELL_COMMAND_FIELDS).unwrap();
+    ]}), crate::agents::adapters::acp::mapper::PERMISSION_FIELDS).unwrap();
     assert_eq!(permission.rpc_id, json!(42));
     assert_eq!(
         permission.options,
@@ -264,6 +264,8 @@ for line in sys.stdin:
                 mirror.clone(),
                 tx,
             );
+            // Never fingerprint the real ~/.fx store from tests.
+            driver.set_session_store(|| None);
             Self {
                 directory,
                 driver,
@@ -514,6 +516,7 @@ for line in sys.stdin:
             mirror.clone(),
             tx,
         );
+        driver.set_session_store(|| None);
         let service = SessionService::with_memory_mirror(driver.clone(), mirror);
         service.prepare_session(&info.asid).await.unwrap();
         let opening = service
@@ -893,6 +896,7 @@ for line in sys.stdin:
             second_mirror,
             tx,
         );
+        second.set_session_store(|| None);
         assert_eq!(
             second
                 .list_sessions(&SessionQuery::default())

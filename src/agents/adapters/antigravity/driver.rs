@@ -5,6 +5,7 @@ use std::time::Duration;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
+use crate::agents::adapters::acp::mapper::PermissionFields;
 use crate::agents::adapters::acp::recovery::NativeSnapshot;
 use crate::agents::adapters::acp::session::{AcpDriver, AcpProvider, Authenticate};
 use crate::agents::ports::agent::AgentFuture;
@@ -24,8 +25,24 @@ impl AcpProvider for AntigravityProvider {
     const EFFORT_CONFIG: &'static str = "thought_level";
     // agy's `run_command` asks with
     // `rawInput: {CommandLine, WaitMsBeforeAsync, toolSummary}` (agy 1.4);
-    // the ACP `command` stays accepted.
-    const SHELL_COMMAND_FIELDS: &'static [&'static str] = &["CommandLine", "command"];
+    // the ACP `command` stays accepted. agy names the tool in the request's
+    // `title`, not `name` (`run_command` recorded live); the other tools are
+    // the ones its binary's tool schemas name (agy 1.4, read from the
+    // binary, not verified live) -- where agy states a `kind` of its own,
+    // that kind wins.
+    const PERMISSION_FIELDS: PermissionFields = PermissionFields {
+        shell_command: &["CommandLine", "command"],
+        tool_actions: &[
+            ("view_file", "read"),
+            ("list_dir", "list"),
+            ("find_by_name", "glob"),
+            ("grep_search", "grep"),
+            ("read_url_content", "webfetch"),
+            ("write_to_file", "write"),
+            ("replace_file_content", "edit"),
+            ("multi_replace_file_content", "edit"),
+        ],
+    };
     // agy 1.4.12 advertises `_meta.antigravity.systemPrompt.append`, but its
     // wire shape is undocumented and unverified; until it is, the task
     // sentence goes in the prompt.

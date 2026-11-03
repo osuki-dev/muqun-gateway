@@ -94,6 +94,16 @@ const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(60);
 /// The longest one agent may take to say whether it owns a session.
 const SESSION_LOOKUP_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Why [`AgentRuntime::request_manager_for_session`] found no owner.
+#[derive(Debug, PartialEq)]
+pub enum SessionOwnerMiss {
+    /// The recorded owner is an agent this gateway knows but has not
+    /// attached; the session exists and the request is worth retrying.
+    OwnerNotAttached(String),
+    /// No route names an owner and no attached agent recognises the id.
+    Unknown,
+}
+
 /// The entry of `map` for the most preferred agent present.
 fn pick_primary<T>(map: &BTreeMap<String, T>) -> Option<&T> {
     AGENT_PREFERENCE.iter().find_map(|id| map.get(*id))
@@ -878,12 +888,44 @@ impl AgentRuntime {
     }
 
     /// [`Self::manager_for_session`] for a request; see [`Self::request_manager_for_agent`].
-    pub async fn request_manager_for_session(&self, asid: &str) -> Option<Arc<AgentManager>> {
-        match self.manager_for_session(asid).await {
-            Some(manager) => Some(manager),
-            None if self.await_first_pass().await => self.manager_for_session(asid).await,
-            None => None,
+    ///
+    /// A recorded route to a known agent is authoritative: while that agent
+    /// is not attached the request waits for the first pass and looks again,
+    /// instead of asking the other agents about an id they cannot know and
+    /// letting their "no" pass for a missing session. Claude is attached
+    /// last in the pass, so a phone reconnecting on restart hit exactly
+    /// that: its owner arrived while the probes ran, after which the pass
+    /// counted as finished and nothing looked again.
+    pub async fn request_manager_for_session(
+        &self,
+        asid: &str,
+    ) -> Result<Arc<AgentManager>, SessionOwnerMiss> {
+        let recorded = self.session_routes.read().await.map.get(asid).cloned();
+        if let Some(agent_id) = recorded.filter(|id| self.is_known_agent(id)) {
+            if let Some(manager) = self.manager_for_agent(&agent_id).await {
+                return Ok(manager);
+            }
+            // Re-check whether or not the pass finished during this wait:
+            // it may have ended between the lookup above and the wait.
+            self.await_first_pass().await;
+            return self
+                .manager_for_agent(&agent_id)
+                .await
+                .ok_or(SessionOwnerMiss::OwnerNotAttached(agent_id));
         }
+        let pass_done_before = *self.first_pass.borrow();
+        if let Some(manager) = self.manager_for_session(asid).await {
+            return Ok(manager);
+        }
+        // The probes take seconds; an owner that attached meanwhile is
+        // worth one more lookup even when the pass finished during them.
+        let finished_during_probe = !pass_done_before && *self.first_pass.borrow();
+        if self.await_first_pass().await || finished_during_probe {
+            if let Some(manager) = self.manager_for_session(asid).await {
+                return Ok(manager);
+            }
+        }
+        Err(SessionOwnerMiss::Unknown)
     }
 
     /// Wait, bounded, for a running supervisor's first pass. True when it
@@ -2633,6 +2675,8 @@ fn acp_features() -> crate::discovery::AgentFeatures {
             ("sessionPagination", false),
             ("timelineEarlier", true),
             ("accountLimits", false),
+            // Rules an "always" answer leaves behind are the agent's own.
+            ("savedPermissions", false),
             ("computerTools", false),
         ]
         .into_iter()
@@ -2698,6 +2742,7 @@ fn deepseek_features(
             ("sessionFork".into(), serde_json::json!(true)),
             ("sessionPagination".into(), serde_json::Value::Bool(false)),
             ("timelineEarlier".into(), serde_json::json!(true)),
+            ("savedPermissions".into(), serde_json::json!(false)),
         ]),
     }
 }
@@ -2728,6 +2773,8 @@ fn opencode_features(
             ("sessionRename".into(), serde_json::json!(true)),
             ("sessionDelete".into(), serde_json::json!(true)),
             ("sessionFork".into(), serde_json::json!(false)),
+            // `GET …/permissions/saved` lists what "always" agreed to.
+            ("savedPermissions".into(), serde_json::json!(true)),
         ]),
     }
 }
@@ -4201,6 +4248,91 @@ mod tests {
                 "supervising={supervising} attaches={attaches}"
             );
             assert!(started.elapsed() < FIRST_PASS_WAIT);
+        }
+    }
+
+    /// A session whose recorded owner has not attached yet waits for that
+    /// owner instead of being declared unknown; only an id nobody knows is.
+    #[tokio::test]
+    async fn session_requests_wait_for_the_recorded_owner_before_answering() {
+        // (case, recorded owner, pass already done, the pass attaches the owner,
+        //  the other agent's probe outlasts the pass, expected)
+        let cases = [
+            (
+                "owner attaches during the lookup",
+                Some("claude"),
+                false,
+                true,
+                true,
+                Ok("claude"),
+            ),
+            (
+                "owner never attaches",
+                Some("claude"),
+                false,
+                false,
+                false,
+                Err(SessionOwnerMiss::OwnerNotAttached("claude".into())),
+            ),
+            (
+                "unknown session",
+                None,
+                false,
+                false,
+                false,
+                Err(SessionOwnerMiss::Unknown),
+            ),
+            (
+                "pass done, owner attached",
+                Some("claude"),
+                true,
+                true,
+                false,
+                Ok("claude"),
+            ),
+        ];
+        for (case, recorded, pass_done, attaches, slow_probe, expected) in cases {
+            let runtime = AgentRuntime::disabled();
+            runtime.supervising.store(true, Ordering::SeqCst);
+            // An agent the pass attached before the owner; it does not know
+            // the id, and a slow one answers so only after the pass is over.
+            let mut other = crate::test_support::FakeAgent::new("fx");
+            let probe = Arc::new(tokio::sync::Notify::new());
+            if slow_probe {
+                other.session_gate = Some(probe.clone());
+            }
+            runtime
+                .attach_for_test(Arc::new(AgentManager::for_test(Arc::new(other))))
+                .await;
+            if let Some(agent_id) = recorded {
+                runtime.record_session_route("ses_1", agent_id).await;
+            }
+            let pass = runtime.clone();
+            let finish_pass = move || async move {
+                if attaches {
+                    pass.attach_for_test(Arc::new(AgentManager::for_test(Arc::new(
+                        crate::test_support::FakeAgent::new("claude"),
+                    ))))
+                    .await;
+                }
+                pass.first_pass.send_replace(true);
+                probe.notify_one();
+            };
+            if pass_done {
+                finish_pass().await;
+            } else {
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    finish_pass().await;
+                });
+            }
+            let started = tokio::time::Instant::now();
+            let found = runtime
+                .request_manager_for_session("ses_1")
+                .await
+                .map(|manager| manager.agent().kind());
+            assert_eq!(found, expected, "{case}");
+            assert!(started.elapsed() < FIRST_PASS_WAIT, "{case}");
         }
     }
 

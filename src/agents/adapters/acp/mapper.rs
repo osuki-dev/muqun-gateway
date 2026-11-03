@@ -405,16 +405,50 @@ pub(crate) struct Permission {
     pub options: Vec<(PermissionDecision, String)>,
 }
 
-/// The ACP convention for a shell tool's command text in `rawInput`.
-pub(crate) const SHELL_COMMAND_FIELDS: &[&str] = &["command"];
+/// What an agent's own tool vocabulary means for a permission
+/// ([`super::session::AcpProvider::PERMISSION_FIELDS`]).
+#[derive(Clone, Copy)]
+pub struct PermissionFields {
+    /// The `rawInput` fields, in order, that may carry an execute
+    /// permission's complete command text. The ACP convention is `command`.
+    pub shell_command: &'static [&'static str],
+    /// `(tool, action)`: the App's action for a tool whose `kind` the agent
+    /// leaves `other` or omits, matched on the tool's `name`, then its `title`.
+    pub tool_actions: &'static [(&'static str, &'static str)],
+}
 
-/// `shell_command_fields` names, in order, the `rawInput` fields that may
-/// carry an execute permission's complete command text
-/// ([`super::session::AcpProvider::SHELL_COMMAND_FIELDS`]).
+/// The ACP conventions alone: `command`, and no agent-specific tool names.
+pub(crate) const PERMISSION_FIELDS: PermissionFields = PermissionFields {
+    shell_command: &["command"],
+    tool_actions: &[],
+};
+
+/// The App's action for an ACP tool kind that says what the tool does.
+///
+/// These are the words the App's auto-approval and its permission card know
+/// (OpenCode's permission names); a tool name such as `Read` or
+/// `write_to_file` is not, so an App told the name left every such request
+/// waiting for a tap with auto-approval on. `execute` is the shell's and is
+/// handled apart, as its command must be read; `think`, `switch_mode` and
+/// `other` say nothing about the tool.
+fn kind_action(kind: &str) -> Option<&'static str> {
+    Some(match kind {
+        "read" => "read",
+        "edit" => "edit",
+        "delete" => "delete",
+        "move" => "move",
+        "search" => "search",
+        "fetch" => "webfetch",
+        _ => return None,
+    })
+}
+
+/// `fields` names what the agent's own tool vocabulary means
+/// ([`super::session::AcpProvider::PERMISSION_FIELDS`]).
 pub(crate) fn permission(
     rpc_id: Value,
     params: &Value,
-    shell_command_fields: &[&str],
+    fields: PermissionFields,
 ) -> Result<Permission, AgentError> {
     let session = params["sessionId"]
         .as_str()
@@ -461,9 +495,10 @@ pub(crate) fn permission(
     // The App's shell safety scanner needs the actual command, never a title
     // or lossy argv rendering. Unknown execute inputs must not reach older
     // Apps as empty-resource requests that YOLO would automatically allow.
-    let shell = tool["kind"].as_str() == Some("execute")
-        || matches!(name, "shell" | "bash" | "Bash" | "run_shell_command");
-    let resources = if shell {
+    let kind = tool["kind"].as_str();
+    let shell =
+        kind == Some("execute") || matches!(name, "shell" | "bash" | "Bash" | "run_shell_command");
+    let (action, resources) = if shell {
         let input = tool["rawInput"].as_object().ok_or_else(|| {
             AgentError::Protocol("ACP execute permission has no complete command input".into())
         })?;
@@ -475,7 +510,8 @@ pub(crate) fn permission(
                 "ACP execute permission has an unsupported shell action".into(),
             ));
         }
-        let command = shell_command_fields
+        let command = fields
+            .shell_command
             .iter()
             .find_map(|field| {
                 input
@@ -486,14 +522,42 @@ pub(crate) fn permission(
             .ok_or_else(|| {
                 AgentError::Protocol("ACP execute permission has no complete command input".into())
             })?;
-        vec![command.to_string()]
+        ("shell", vec![command.to_string()])
     } else {
-        Vec::new()
+        let action = kind
+            .and_then(kind_action)
+            .or_else(|| {
+                [tool["name"].as_str(), tool["title"].as_str()]
+                    .into_iter()
+                    .flatten()
+                    .find_map(|tool| {
+                        fields
+                            .tool_actions
+                            .iter()
+                            .find(|(known, _)| *known == tool)
+                            .map(|(_, action)| *action)
+                    })
+            })
+            .unwrap_or(name);
+        // The files the tool touches, which the card shows under the action.
+        let mut resources: Vec<String> = Vec::new();
+        for path in tool["locations"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|location| location["path"].as_str())
+            .filter(|path| !path.trim().is_empty())
+        {
+            if !resources.iter().any(|known| known == path) {
+                resources.push(path.to_owned());
+            }
+        }
+        (action, resources)
     };
     let request = PermissionRequest {
         id,
         asid: session.into(),
-        action: if shell { "shell" } else { name }.into(),
+        action: action.into(),
         resources,
         save: Vec::new(),
         prompt: tool["title"].as_str().unwrap_or(name).into(),
@@ -668,7 +732,7 @@ impl Projection {
         &self,
         rpc_id: Value,
         params: &Value,
-        shell_command_fields: &[&str],
+        fields: PermissionFields,
     ) -> Result<Permission, AgentError> {
         let mut complete = params.clone();
         if let Some(context) = params["toolCall"]["toolCallId"]
@@ -685,7 +749,7 @@ impl Projection {
                 }
             }
         }
-        permission(rpc_id, &complete, shell_command_fields)
+        permission(rpc_id, &complete, fields)
     }
 
     pub fn end_turn(&mut self) {
@@ -1299,11 +1363,11 @@ mod tests {
             assert!(permission(
                 json!(1),
                 &json!({"sessionId":"s","toolCall":{"toolCallId":"t"},"options":options}),
-                SHELL_COMMAND_FIELDS
+                PERMISSION_FIELDS
             )
             .is_err());
         }
-        assert!(permission(json!(1), &json!({"sessionId":"s","toolCall":{"toolCallId":"t"},"options":[{"optionId":"allow-opaque","kind":"allow_once"},{"optionId":"deny-opaque","kind":"reject_once"}]}), SHELL_COMMAND_FIELDS).is_ok());
+        assert!(permission(json!(1), &json!({"sessionId":"s","toolCall":{"toolCallId":"t"},"options":[{"optionId":"allow-opaque","kind":"allow_once"},{"optionId":"deny-opaque","kind":"reject_once"}]}), PERMISSION_FIELDS).is_ok());
     }
 
     fn shell_permission(input: Option<Value>) -> Value {
@@ -1323,7 +1387,7 @@ mod tests {
         ] {
             let mut params = shell_permission(Some(input));
             params["toolCall"]["_meta"] = json!({"qoder":{"toolName":"Bash"}});
-            let parsed = permission(json!(1), &params, SHELL_COMMAND_FIELDS).unwrap();
+            let parsed = permission(json!(1), &params, PERMISSION_FIELDS).unwrap();
             assert_eq!(parsed.request.action, "shell");
             assert_eq!(parsed.request.resources, [command]);
         }
@@ -1340,10 +1404,96 @@ mod tests {
             Some(json!({"code":"rm -rf /"})),
             Some(json!({"action":"write","command":"printf misleading"})),
         ] {
-            assert!(permission(json!(1), &shell_permission(input), SHELL_COMMAND_FIELDS).is_err());
+            assert!(permission(json!(1), &shell_permission(input), PERMISSION_FIELDS).is_err());
         }
         let ordinary = json!({"sessionId":"s","toolCall":{"toolCallId":"question","kind":"other","title":"Choose an option"},"options":[{"optionId":"yes","kind":"allow_once"}]});
-        assert!(permission(json!(2), &ordinary, SHELL_COMMAND_FIELDS).is_ok());
+        assert!(permission(json!(2), &ordinary, PERMISSION_FIELDS).is_ok());
+    }
+
+    /// A non-shell permission is classified by the ACP `kind`, in the words
+    /// the App's auto-approval and its card know; the tool's own name is
+    /// what is left when the agent states no kind it has a word for. The
+    /// files it names in `locations` are its resources.
+    #[test]
+    fn non_shell_permissions_take_the_app_action_from_the_acp_kind() {
+        let options =
+            json!([{"optionId":"y","kind":"allow_once"},{"optionId":"n","kind":"reject_once"}]);
+        let agy = PermissionFields {
+            shell_command: &["CommandLine"],
+            tool_actions: &[("write_to_file", "write"), ("view_file", "read")],
+        };
+        for (name, tool, fields, action, resources) in [
+            (
+                "claude-agent-acp Read: kind and _meta tool name",
+                json!({"toolCallId":"toolu_1","name":"Read","kind":"read","title":"Read notes.md","locations":[{"path":"/w/notes.md"}],"_meta":{"claudeCode":{"toolName":"Read"}}}),
+                PERMISSION_FIELDS,
+                "read",
+                vec!["/w/notes.md"],
+            ),
+            (
+                "claude-agent-acp Edit: kind edit, one file named twice",
+                json!({"toolCallId":"toolu_2","name":"Edit","kind":"edit","locations":[{"path":"/w/a.rs","line":1},{"path":"/w/a.rs","line":9}]}),
+                PERMISSION_FIELDS,
+                "edit",
+                vec!["/w/a.rs"],
+            ),
+            (
+                "cursor web fetch: kind only, no name",
+                json!({"toolCallId":"web_fetch_1","title":"Fetch https://example.test","kind":"fetch"}),
+                PERMISSION_FIELDS,
+                "webfetch",
+                vec![],
+            ),
+            (
+                "kinds delete, move and search keep their own word",
+                json!({"toolCallId":"t","name":"Delete","kind":"delete","locations":[{"path":"/w/old.txt"}]}),
+                PERMISSION_FIELDS,
+                "delete",
+                vec!["/w/old.txt"],
+            ),
+            (
+                "agy names the tool in title, with no kind it has a word for",
+                json!({"toolCallId":"call-2","kind":"other","title":"write_to_file","rawInput":{"TargetFile":"/w/README.md","CodeContent":"# Hi"}}),
+                agy,
+                "write",
+                vec![],
+            ),
+            (
+                "a stated kind wins over the provider's tool table",
+                json!({"toolCallId":"call-3","kind":"read","title":"write_to_file"}),
+                agy,
+                "read",
+                vec![],
+            ),
+            (
+                "a tool nobody has a word for keeps its name",
+                json!({"toolCallId":"t","name":"NotebookEdit","kind":"other","locations":[{"path":""}]}),
+                PERMISSION_FIELDS,
+                "NotebookEdit",
+                vec![],
+            ),
+            (
+                "think and switch_mode say nothing about the tool",
+                json!({"toolCallId":"t","name":"Think","kind":"think"}),
+                PERMISSION_FIELDS,
+                "Think",
+                vec![],
+            ),
+        ] {
+            let parsed = permission(
+                json!(1),
+                &json!({"sessionId":"s","toolCall":tool,"options":options}),
+                fields,
+            )
+            .unwrap_or_else(|error| panic!("{name}: {error}"));
+            assert_eq!(parsed.request.action, action, "{name}");
+            assert_eq!(parsed.request.resources, resources, "{name}");
+        }
+        // The shell is the shell whatever the table says: its command is read.
+        let shell = json!({"sessionId":"s","toolCall":{"toolCallId":"c","kind":"execute","title":"run_command","rawInput":{"CommandLine":"ls"}},"options":options});
+        let parsed = permission(json!(1), &shell, agy).unwrap();
+        assert_eq!(parsed.request.action, "shell");
+        assert_eq!(parsed.request.resources, ["ls"]);
     }
 
     #[test]
@@ -1353,13 +1503,13 @@ mod tests {
         // History is not a live submitted turn.
         projection.update(&update).unwrap();
         assert!(projection
-            .permission(json!(1), &shell_permission(None), SHELL_COMMAND_FIELDS)
+            .permission(json!(1), &shell_permission(None), PERMISSION_FIELDS)
             .is_err());
         projection.submitted("start");
         projection.update(&update).unwrap();
         assert_eq!(
             projection
-                .permission(json!(1), &shell_permission(None), SHELL_COMMAND_FIELDS)
+                .permission(json!(1), &shell_permission(None), PERMISSION_FIELDS)
                 .unwrap()
                 .request
                 .resources,
@@ -1370,17 +1520,17 @@ mod tests {
             .permission(
                 json!(1),
                 &shell_permission(Some(Value::Null)),
-                SHELL_COMMAND_FIELDS
+                PERMISSION_FIELDS
             )
             .is_err());
         let mut other = shell_permission(None);
         other["toolCall"]["toolCallId"] = json!("different");
         assert!(projection
-            .permission(json!(1), &other, SHELL_COMMAND_FIELDS)
+            .permission(json!(1), &other, PERMISSION_FIELDS)
             .is_err());
         projection.update(&json!({"sessionUpdate":"tool_call_update","toolCallId":"tool","status":"completed"})).unwrap();
         assert!(projection
-            .permission(json!(1), &shell_permission(None), SHELL_COMMAND_FIELDS)
+            .permission(json!(1), &shell_permission(None), PERMISSION_FIELDS)
             .is_err());
 
         let mut projection = Projection::new(false);
@@ -1388,11 +1538,11 @@ mod tests {
         projection.update(&update).unwrap();
         projection.end_turn();
         assert!(projection
-            .permission(json!(1), &shell_permission(None), SHELL_COMMAND_FIELDS)
+            .permission(json!(1), &shell_permission(None), PERMISSION_FIELDS)
             .is_err());
         projection.submitted("two");
         assert!(projection
-            .permission(json!(1), &shell_permission(None), SHELL_COMMAND_FIELDS)
+            .permission(json!(1), &shell_permission(None), PERMISSION_FIELDS)
             .is_err());
     }
 

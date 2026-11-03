@@ -75,8 +75,12 @@ matching active provider session/thread identity (and active provider turn,
 when specified). Resolved, expired, cancelled and `not_resumable` requests
 cannot be clicked. The neutral choices map **only** to offered `accept`,
 `acceptAlways` and `decline`; `acceptForSession` is not misrepresented as
-permanent approval. Nonempty approval reasons return Unsupported: V2 has no
-reason field. Dynamic-tool/auth-refresh requests, attached answers and
+permanent approval. `options` is optional on `approval_request` items and
+native providers (for example `claudeAgent`) send none; such an item offers
+the provider-independent `accept`/`decline` pair that `runtime-request.respond`
+accepts, never a session or permanent grant. Advertised options are taken as
+they are, with no default added beside them. Nonempty approval reasons return
+Unsupported: V2 has no reason field. Dynamic-tool/auth-refresh requests, attached answers and
 multiselect answer encoding are not supported.
 
 `responseCapability: {"type":"message"}` is supported only for normal
