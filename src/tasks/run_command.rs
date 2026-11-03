@@ -139,6 +139,7 @@ async fn launch(
                     agent_job: None,
                     model: None,
                     variant: None,
+                    agent_session_id: None,
                 },
                 state: TaskState::Queued,
                 summary: None,

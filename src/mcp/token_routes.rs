@@ -128,6 +128,7 @@ mod tests {
                     agent_job: None,
                     model: None,
                     variant: None,
+                    agent_session_id: None,
                 },
                 state: TaskState::Working,
                 summary: None,

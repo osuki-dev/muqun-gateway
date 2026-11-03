@@ -85,6 +85,23 @@ pub const AGENT_PREFERENCE: [&str; 10] = [
     "antigravity",
     "cursor",
 ];
+/// An agent kind as a person names it -- in pushes, task summaries and the
+/// agent list alike. A brand, so the same in every language.
+pub fn agent_display_name(kind: &str) -> Option<&'static str> {
+    Some(match kind {
+        "codex" => "Codex",
+        "opencode" => "OpenCode",
+        "deepseek" => "DeepSeek",
+        "t3" => "T3 Code",
+        "fx" => "FX",
+        "qoder" => "Qoder CLI",
+        "pi" => "Pi",
+        "claude" => "Claude Code",
+        "antigravity" => "Antigravity",
+        "cursor" => "Cursor",
+        _ => return None,
+    })
+}
 /// Most session-to-agent routes remembered; the oldest go first.
 const MAX_SESSION_ROUTES: usize = 4096;
 /// How long an agent discovery result is reused.

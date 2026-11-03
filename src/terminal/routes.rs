@@ -902,18 +902,21 @@ pub(crate) async fn watch_pane_approvals(state: AppState, session: SessionConfig
                         None,
                         Some(&approval),
                     );
-                    deliver_agent_notification(
-                        &state,
-                        approval_notification(
-                            &state.config.server_id,
-                            &current_server_label(&state.config.label),
-                            &session.id,
-                            pane_id,
-                            agent,
-                            &approval,
-                        ),
-                    )
-                    .await;
+                    let mut notice = approval_notification(
+                        &state.config.server_id,
+                        &current_server_label(&state.config.label),
+                        &session.id,
+                        pane_id,
+                        agent,
+                        &approval,
+                    );
+                    // The question, only when the owner asked for it
+                    // (`rich_agent_pushes`). This is the one push a menu
+                    // raises: the blocked push for it is not sent.
+                    if state.config.rich_agent_pushes {
+                        notice.detail = Some(PushDetail::from_approval(&approval));
+                    }
+                    deliver_pane_notification(&state, &session, notice).await;
                 }
                 None => {
                     if let Some(previous) = pending.remove(pane_id) {
@@ -1007,8 +1010,8 @@ pub(crate) fn approval_notification(
         // delivery time. `options` is set on the payload there.
         choices: approval.push_choices(),
         // An approval push carries the fingerprint and the decisions, which is
-        // enough to answer from the lock screen. The question itself is put on
-        // the blocked push, and only when the owner asked for it.
+        // enough to answer from the lock screen. The question itself is added
+        // by the watcher, and only when the owner asked for it.
         detail: None,
     }
 }
@@ -1190,38 +1193,46 @@ pub(crate) fn spawn_agent_notification_watchers(state: AppState) {
     }
 }
 
+/// Pushes about native agent sessions: a pending approval or question, and a
+/// turn that ended ([`AgentPushGates`]).
 pub(crate) fn spawn_agent_permission_watchers(state: AppState) {
     let mut rx = state.agent_runtime.subscribe_events();
     let state = state.clone();
 
     tokio::spawn(async move {
         let mut gates = AgentPushGates::default();
+        // A turn end is confirmed after `COMPLETION_GRACE` of idle, which no
+        // event marks: the same two-second beat the pane watcher polls on.
+        let mut tick = tokio::time::interval(Duration::from_secs(2));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
-            let event = match rx.recv().await {
-                Ok(event) => event,
-                // Falling behind loses the skipped events, not the watcher.
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-            };
-            match gates.admit(&event) {
-                Some(AgentPendingPush::Approval { asid, request }) => {
-                    let tokens = match crate::connectivity::push::registered_recipients(&state) {
-                        Ok(tokens) => tokens,
-                        Err(err) => {
-                            tracing::warn!("agent permission notification skipped: {err:#}");
-                            continue;
-                        }
-                    };
-                    if !tokens.is_empty() {
-                        let _ = crate::connectivity::push::send_registered_push_notifications(
-                            &state,
-                            &tokens,
-                            "Approval Required".to_string(),
-                            request.prompt.clone(),
-                            agent_permission_push_data(&state.config.server_id, asid, &request.id),
-                        )
-                        .await;
+            let event = tokio::select! {
+                next = rx.recv() => match next {
+                    Ok(event) => event,
+                    // Falling behind loses the skipped events, not the watcher.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                },
+                _ = tick.tick() => {
+                    for asid in gates.completions_ready(Instant::now()) {
+                        // Naming the agent and checking the session is not a
+                        // child takes a round trip; the loop does not wait.
+                        let state = state.clone();
+                        tokio::spawn(async move {
+                            deliver_agent_completion(&state, &asid).await;
+                        });
                     }
+                    continue;
+                }
+            };
+            match gates.admit(&event, Instant::now()) {
+                Some(AgentPendingPush::Approval { asid, request }) => {
+                    let state = state.clone();
+                    let asid = asid.to_owned();
+                    let request = request.clone();
+                    tokio::spawn(async move {
+                        deliver_agent_approval_notice(&state, &asid, &request).await;
+                    });
                 }
                 Some(AgentPendingPush::Form { asid, request }) => {
                     // Naming the agent and the session can take a round trip
@@ -1257,10 +1268,18 @@ pub(crate) enum AgentPendingPush<'a> {
 /// fresh `*Pending` event many times; only the first is news. A resolve
 /// forgets the id. Events are per session, a child session's included --
 /// nothing here looks at `parent_id`.
+///
+/// A turn end is the pane watcher's rule keyed by the agent session: a
+/// busy-to-idle change earns a push once the session stayed idle for
+/// [`COMPLETION_GRACE`] (an agent pausing between steps is not finished), and
+/// not again within [`COMPLETION_COOLDOWN`] of the last one.
 #[derive(Debug, Default)]
 pub(crate) struct AgentPushGates {
     approvals: std::collections::HashSet<(String, String)>,
     forms: std::collections::HashSet<(String, String)>,
+    statuses: HashMap<String, agents::AgentSessionStatus>,
+    idle_since: HashMap<String, Instant>,
+    completed_at: HashMap<String, Instant>,
 }
 
 /// Requests that are never resolved (an agent that went away) must not grow
@@ -1271,6 +1290,7 @@ impl AgentPushGates {
     pub(crate) fn admit<'a>(
         &mut self,
         event: &'a agents::AgentDomainEvent,
+        now: Instant,
     ) -> Option<AgentPendingPush<'a>> {
         use agents::AgentDomainEvent as E;
         match event {
@@ -1300,8 +1320,54 @@ impl AgentPushGates {
                 self.forms.remove(&(asid.0.clone(), form_id.clone()));
                 None
             }
+            E::StatusChanged { asid, status, .. } => {
+                self.observe_status(&asid.0, *status, now);
+                None
+            }
             _ => None,
         }
+    }
+
+    fn observe_status(&mut self, asid: &str, status: agents::AgentSessionStatus, now: Instant) {
+        use agents::AgentSessionStatus as S;
+        if self.statuses.len() >= AGENT_PUSH_GATE_CAPACITY {
+            // A forgotten session's next idle has no busy before it: at most
+            // one turn end goes unannounced.
+            self.statuses.clear();
+        }
+        let previous = self.statuses.insert(asid.to_owned(), status);
+        match status {
+            S::Idle if matches!(previous, Some(S::Busy | S::Retry)) => {
+                self.idle_since.insert(asid.to_owned(), now);
+            }
+            S::Idle => {}
+            // Working again, failed or interrupted: not a turn that finished.
+            _ => {
+                self.idle_since.remove(asid);
+            }
+        }
+    }
+
+    /// The sessions whose turn end is confirmed now; each is forgotten as it
+    /// is handed out.
+    pub(crate) fn completions_ready(&mut self, now: Instant) -> Vec<String> {
+        let ready: Vec<String> = self
+            .idle_since
+            .iter()
+            .filter(|(_, since)| now.saturating_duration_since(**since) >= COMPLETION_GRACE)
+            .map(|(asid, _)| asid.clone())
+            .collect();
+        self.completed_at
+            .retain(|_, sent| now.saturating_duration_since(*sent) < COMPLETION_COOLDOWN);
+        let mut confirmed = Vec::new();
+        for asid in ready {
+            self.idle_since.remove(&asid);
+            if !self.completed_at.contains_key(&asid) {
+                self.completed_at.insert(asid.clone(), now);
+                confirmed.push(asid);
+            }
+        }
+        confirmed
     }
 }
 
@@ -1316,10 +1382,11 @@ fn first_sighting(
     open.insert((asid.to_owned(), id.to_owned()))
 }
 
-/// The data of a structured agent's approval push; `session_id` is the agent
-/// session the request belongs to.
+/// The data of a structured agent's approval push. The session is `asid`;
+/// `session_id` is a terminal session to the App, so it is not set.
 fn agent_permission_push_data(
     server_id: &str,
+    agent_id: &str,
     asid: &str,
     request_id: &str,
 ) -> serde_json::Map<String, Value> {
@@ -1327,7 +1394,7 @@ fn agent_permission_push_data(
     data.insert("type".to_string(), json!("approval"));
     data.insert("category".to_string(), json!("approval"));
     data.insert("server_id".to_string(), json!(server_id));
-    data.insert("session_id".to_string(), json!(asid));
+    data.insert("agent_id".to_string(), json!(agent_id));
     data.insert("asid".to_string(), json!(asid));
     data.insert("approval_id".to_string(), json!(request_id));
     data.insert("fingerprint".to_string(), json!(request_id));
@@ -1347,23 +1414,10 @@ fn agent_form_push_data(
     data.insert("category".to_string(), json!("question"));
     data.insert("server_id".to_string(), json!(server_id));
     data.insert("agent_id".to_string(), json!(agent_id));
-    data.insert("session_id".to_string(), json!(asid));
     data.insert("asid".to_string(), json!(asid));
     data.insert("form_id".to_string(), json!(form_id));
     data.insert("fingerprint".to_string(), json!(form_id));
     data
-}
-
-/// An agent's own name, for a push about one of its sessions.
-fn agent_display_name(agent_id: &str) -> Option<&'static str> {
-    match agent_id {
-        "opencode" => Some("OpenCode"),
-        "qoder" => Some("Qoder CLI"),
-        "fx" => Some("FX"),
-        "deepseek" => Some("DeepSeek"),
-        "t3" => Some("T3 Code"),
-        _ => None,
-    }
 }
 
 /// The push a pending question sends, before it is put into words: "{name}
@@ -1380,7 +1434,7 @@ fn form_notification(
     let agent_name = session_title
         .map(str::trim)
         .filter(|title| !title.is_empty())
-        .or_else(|| agent_display_name(agent_id))
+        .or_else(|| agents::runtime::agent_display_name(agent_id))
         .map(str::to_owned);
     AgentPushNotice {
         notice: AgentNotice::AgentBlocked,
@@ -1394,6 +1448,42 @@ fn form_notification(
             .then(|| PushDetail::from_question(&request.title))
             .flatten(),
     }
+}
+
+/// The push a native approval sends: the pane approval's words ("{agent} is
+/// waiting for your approval."), never the request's prompt, which quotes the
+/// command or path -- unless the owner turned `rich_agent_pushes` on.
+fn permission_notification(
+    state: &AppState,
+    agent_id: &str,
+    asid: &str,
+    request: &agents::PermissionRequest,
+) -> AgentPushNotice {
+    AgentPushNotice {
+        notice: AgentNotice::ApprovalPending,
+        server_label: current_server_label(&state.config.label).trim().to_owned(),
+        agent_name: agents::runtime::agent_display_name(agent_id).map(str::to_owned),
+        data: agent_permission_push_data(&state.config.server_id, agent_id, asid, &request.id),
+        choices: Vec::new(),
+        detail: state
+            .config
+            .rich_agent_pushes
+            .then(|| PushDetail::from_question(&request.prompt))
+            .flatten(),
+    }
+}
+
+async fn deliver_agent_approval_notice(
+    state: &AppState,
+    asid: &str,
+    request: &agents::PermissionRequest,
+) {
+    let agent_id = match state.agent_runtime.manager_for_session(asid).await {
+        Some(manager) => manager.agent().kind().to_owned(),
+        None => String::new(),
+    };
+    let notice = permission_notification(state, &agent_id, asid, request);
+    deliver_agent_notification(state, notice).await;
 }
 
 async fn deliver_agent_form_notice(state: &AppState, asid: &str, request: &agents::FormRequest) {
@@ -1410,6 +1500,56 @@ async fn deliver_agent_form_notice(state: &AppState, asid: &str, request: &agent
         None => (String::new(), None),
     };
     let notice = form_notification(state, &agent_id, title.as_deref(), asid, request);
+    deliver_agent_notification(state, notice).await;
+}
+
+/// The push a native session's finished turn sends: the pane completion's
+/// words ("{agent} finished running."), routed to the agent session by
+/// `asid` and `agent_id`. Nothing the agent wrote, and not the session's title
+/// either: some agents write that themselves.
+fn completion_notification(
+    server_id: &str,
+    server_label: &str,
+    agent_id: &str,
+    asid: &str,
+) -> AgentPushNotice {
+    let mut data = serde_json::Map::new();
+    data.insert("type".into(), json!("agent.completed"));
+    data.insert("server_id".into(), json!(server_id));
+    data.insert("agent_id".into(), json!(agent_id));
+    data.insert("asid".into(), json!(asid));
+    AgentPushNotice {
+        notice: AgentNotice::AgentCompleted,
+        server_label: server_label.trim().to_owned(),
+        agent_name: agents::runtime::agent_display_name(agent_id).map(str::to_owned),
+        data,
+        choices: Vec::new(),
+        detail: None,
+    }
+}
+
+/// Push a native session's confirmed turn end, unless the session is a child
+/// (a subagent, or a sub-task another task delegated): the turn its parent
+/// runs is what the user waits on, and the parent is told of the child's.
+async fn deliver_agent_completion(state: &AppState, asid: &str) {
+    let Some(manager) = state.agent_runtime.manager_for_session(asid).await else {
+        return;
+    };
+    let info = tokio::time::timeout(Duration::from_secs(3), manager.sessions().get_session(asid))
+        .await
+        .ok()
+        .and_then(Result::ok);
+    if info.is_some_and(|info| info.parent_id.is_some())
+        || state.tasks.is_subtask_session(asid).await
+    {
+        return;
+    }
+    let notice = completion_notification(
+        &state.config.server_id,
+        &current_server_label(&state.config.label),
+        manager.agent().kind(),
+        asid,
+    );
     deliver_agent_notification(state, notice).await;
 }
 
@@ -1438,37 +1578,35 @@ pub(crate) async fn watch_agent_notifications(state: AppState, session: SessionC
                             .collect();
                         pending_inputs.retain_present(&events);
                         for event in events {
-                            if let Some(mut notification) = observe_agent_notification(
+                            if let Some(notification) = observe_agent_notification(
                                 &state, &session.id, &event, &mut statuses, &mut completions,
                             ) {
-                                enrich_blocked_notification(&state, &session, &mut notification).await;
-                                deliver_agent_notification(&state, notification).await;
+                                deliver_pane_notification(&state, &session, notification).await;
                             }
                             if pending_inputs.observe(&event) {
                                 if let Some(notification) = native_input_notification(
                                     &event, &state.config.server_id,
                                     &current_server_label(&state.config.label), &session.id,
                                 ) {
-                                    deliver_agent_notification(&state, notification).await;
+                                    deliver_pane_notification(&state, &session, notification).await;
                                 }
                             }
                         }
                         for notification in completions.ready(&statuses, &present, Instant::now()) {
-                            deliver_agent_notification(&state, notification).await;
+                            deliver_pane_notification(&state, &session, notification).await;
                         }
                     }
                 }
                 next = activity.recv() => match next {
                     Ok(SessionActivity::Event(event)) if event.name == "pane_agent_status_changed" => {
-                        if let Some(mut notification) = observe_agent_notification(
+                        if let Some(notification) = observe_agent_notification(
                             &state,
                             &session.id,
                             &event.payload,
                             &mut statuses,
                             &mut completions,
                         ) {
-                            enrich_blocked_notification(&state, &session, &mut notification).await;
-                            deliver_agent_notification(&state, notification).await;
+                            deliver_pane_notification(&state, &session, notification).await;
                         }
                     }
                     // The hub logs the failure and rebuilds the stream. This
@@ -1597,6 +1735,51 @@ pub(crate) fn observe_agent_notification(
     let status = data.get("agent_status")?.as_str()?.to_ascii_lowercase();
     let notice = absorb_agent_status_event(state, session_id, event, statuses);
     completions.observe(pane_id, &status, notice, Instant::now())
+}
+
+/// Send a push a terminal pane raised, unless the native agent session the
+/// pane's agent drives already pushes for the same event
+/// ([`crate::tasks::TaskService::pane_mirror`]): a Codex delegation's TUI
+/// asks its approvals, questions and turn ends through that session, whose
+/// pushes route to the conversation. One event, one push.
+///
+/// A blocked or input push whose pane shows a permission menu is not sent
+/// either: the approval watcher pushes `approval.pending` for that menu.
+pub(crate) async fn deliver_pane_notification(
+    state: &AppState,
+    session: &SessionConfig,
+    notice: AgentPushNotice,
+) {
+    if !pane_push_covered(state, session, &notice).await {
+        deliver_agent_notification(state, notice).await;
+    }
+}
+
+async fn pane_push_covered(
+    state: &AppState,
+    session: &SessionConfig,
+    notice: &AgentPushNotice,
+) -> bool {
+    let Some(pane_id) = notice.data.get("pane_id").and_then(Value::as_str) else {
+        return false;
+    };
+    if let Some(asid) = state.tasks.pane_mirror(&session.id, pane_id).await {
+        tracing::debug!(pane = pane_id, asid, "pane push left to its agent session");
+        return true;
+    }
+    // Saying the agent wants something, without saying it is a menu, is what
+    // the menu's `approval.pending` already said.
+    if matches!(
+        notice.notice,
+        AgentNotice::AgentBlocked | AgentNotice::AgentInputRequired
+    ) && read_pane_visible_text(session, pane_id)
+        .await
+        .is_ok_and(|screen| approvals::detect(&screen).is_some())
+    {
+        tracing::debug!(pane = pane_id, "pane push left to its approval push");
+        return true;
+    }
+    false
 }
 
 /// Send one notice to every registered device, each in its own language.
@@ -1936,8 +2119,8 @@ pub(crate) fn notification_for_transition(
         agent_name,
         data: notification_data,
         choices: Vec::new(),
-        // Filled in afterwards, and only for a blocked pane on a gateway whose
-        // owner turned `rich_agent_pushes` on.
+        // A blocked pane with a menu on it pushes its approval instead, which
+        // is where `rich_agent_pushes` puts the question.
         detail: None,
     })
 }
@@ -1975,40 +2158,6 @@ pub(crate) fn absorb_agent_status_event(
         &current_server_label(&state.config.label),
         session_id,
     )
-}
-
-/// Put the agent's own question on a blocked push, if this gateway's owner
-/// asked for that.
-///
-/// The whole of what `rich_agent_pushes` does, in one place and behind one
-/// check, so that "off" is a property of the code path and not a habit. Off, it
-/// costs nothing: no pane is read, and the push is byte-for-byte the one this
-/// gateway has always sent.
-///
-/// On, it reads the pane the way the approvals endpoint does and quotes what it
-/// finds. A pane with no menu on it -- an agent blocked on something the
-/// gateway cannot read -- is left as the content-free push it already was,
-/// which is the right degradation: an empty question is worse than the generic
-/// sentence, not better.
-pub(crate) async fn enrich_blocked_notification(
-    state: &AppState,
-    session: &SessionConfig,
-    notice: &mut AgentPushNotice,
-) {
-    if !state.config.rich_agent_pushes || notice.notice != AgentNotice::AgentBlocked {
-        return;
-    }
-    let Some(pane_id) = notice
-        .data
-        .get("pane_id")
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-    else {
-        return;
-    };
-    if let Ok((_, Some(approval))) = read_pane_approval(session, &pane_id).await {
-        notice.detail = Some(PushDetail::from_approval(&approval));
-    }
 }
 
 /// The two halves in one call, for tests that are about what a push says rather
@@ -3868,32 +4017,112 @@ mod tests {
         }
     }
 
-    /// A structured agent's approval push names the agent session it is for,
-    /// not a placeholder.
+    /// A native approval or question routes by `asid` and `agent_id`, never by
+    /// `session_id` (a terminal session to the App).
     #[test]
-    fn an_agent_permission_push_carries_its_agent_session_id() {
-        let data = super::agent_permission_push_data("server-1", "ses_42", "perm_1");
-        assert_eq!(data["server_id"], "server-1");
-        assert_eq!(data["session_id"], "ses_42");
-        assert_eq!(data["asid"], "ses_42");
-        assert_eq!(data["approval_id"], "perm_1");
-        assert_eq!(data["fingerprint"], "perm_1");
-        assert_eq!(data["type"], "approval");
+    fn native_pushes_carry_the_agent_session_and_not_a_terminal_session() {
+        for (data, kind, id_key) in [
+            (
+                super::agent_permission_push_data("server-1", "codex", "ses_42", "perm_1"),
+                "approval",
+                "approval_id",
+            ),
+            (
+                super::agent_form_push_data("server-1", "t3", "ses_42", "perm_1"),
+                "question",
+                "form_id",
+            ),
+        ] {
+            assert_eq!(data["type"], kind);
+            assert_eq!(data["category"], kind);
+            assert_eq!(data["server_id"], "server-1");
+            assert_eq!(data["asid"], "ses_42");
+            assert!(data["agent_id"].is_string(), "{kind}");
+            assert_eq!(data[id_key], "perm_1");
+            assert_eq!(data["fingerprint"], "perm_1");
+            assert!(!data.contains_key("session_id"), "{kind}");
+        }
     }
 
-    /// A structured agent's question push names the server, the agent and the
-    /// agent session it is for, and the form to answer.
+    /// Every agent the runtime offers, after one turn: exactly one completion
+    /// push and, for a pending request, one approval push, each naming the
+    /// agent in every language and routing by `agent_id` and `asid` -- never
+    /// the prompt, which quotes a command.
     #[test]
-    fn an_agent_form_push_carries_its_agent_session_and_form_id() {
-        let data = super::agent_form_push_data("server-1", "t3", "ses_child", "form_1");
-        assert_eq!(data["type"], "question");
-        assert_eq!(data["category"], "question");
-        assert_eq!(data["server_id"], "server-1");
-        assert_eq!(data["agent_id"], "t3");
-        assert_eq!(data["session_id"], "ses_child");
-        assert_eq!(data["asid"], "ses_child");
-        assert_eq!(data["form_id"], "form_1");
-        assert_eq!(data["fingerprint"], "form_1");
+    fn every_native_agent_pushes_its_turn_end_and_approval_by_name() {
+        use crate::agents::{
+            runtime::{agent_display_name, AGENT_PREFERENCE},
+            AgentDomainEvent, AgentSessionId, AgentSessionStatus as S, PermissionRequest,
+        };
+        let state = test_state("admin", Vec::new());
+        let label = current_server_label(&state.config.label);
+        let start = Instant::now();
+        let mut gates = super::AgentPushGates::default();
+        for (secs, status) in [(0, S::Busy), (1, S::Idle)] {
+            for agent in AGENT_PREFERENCE {
+                let event = AgentDomainEvent::StatusChanged {
+                    asid: AgentSessionId(format!("ses_{agent}")),
+                    status,
+                    error: None,
+                    seq: 1,
+                };
+                gates.admit(&event, start + Duration::from_secs(secs));
+            }
+        }
+        let done = start + Duration::from_secs(1) + COMPLETION_GRACE;
+        let mut ended = gates.completions_ready(done);
+        ended.sort();
+        let mut expected: Vec<_> = AGENT_PREFERENCE
+            .iter()
+            .map(|a| format!("ses_{a}"))
+            .collect();
+        expected.sort();
+        assert_eq!(ended, expected, "one push per finished turn");
+        assert!(gates.completions_ready(done).is_empty(), "and only one");
+
+        for agent in AGENT_PREFERENCE {
+            let name =
+                agent_display_name(agent).unwrap_or_else(|| panic!("{agent} has no display name"));
+            let asid = format!("ses_{agent}");
+            let request: PermissionRequest = serde_json::from_value(json!({
+                "id": "perm_1",
+                "asid": asid,
+                "action": "bash",
+                "resources": [],
+                "prompt": "Run npm publish --tag secret?",
+                "options": [],
+            }))
+            .unwrap();
+            let approval = super::permission_notification(&state, agent, &asid, &request);
+            let completion = super::completion_notification("server-1", &label, agent, &asid);
+            for (notice, english) in [
+                (&approval, format!("{name} is waiting for your approval.")),
+                (&completion, format!("{name} finished running.")),
+            ] {
+                for &locale in Locale::ALL {
+                    let rendered = notice.render(locale);
+                    assert!(rendered.body.contains(name), "{agent} {locale:?}");
+                    assert_eq!(
+                        rendered.body == english,
+                        locale == Locale::En,
+                        "{agent} {locale:?}: {}",
+                        rendered.body
+                    );
+                    assert_eq!(rendered.data["agent_id"], agent);
+                    assert_eq!(rendered.data["asid"], asid.as_str());
+                    let all = format!("{} {} {:?}", rendered.title, rendered.body, rendered.data);
+                    assert!(!all.contains("npm"), "{agent}: the prompt must not travel");
+                }
+            }
+            let en = approval.render(Locale::En);
+            assert_eq!(en.title, format!("Approval needed · {label}"));
+            assert_eq!(en.data["approval_id"], "perm_1");
+            assert_eq!(en.data["server_id"], state.config.server_id.as_str());
+            assert_eq!(
+                Value::Object(completion.render(Locale::En).data),
+                json!({"type": "agent.completed", "server_id": "server-1", "agent_id": agent, "asid": asid})
+            );
+        }
     }
 
     /// One question is one push: T3 re-announces open forms on every thread
@@ -3916,12 +4145,19 @@ mod tests {
         let mut gates = super::AgentPushGates::default();
         let first = pending("ses_child", "form_1");
         assert!(matches!(
-            gates.admit(&first),
+            gates.admit(&first, Instant::now()),
             Some(super::AgentPendingPush::Form { asid: "ses_child", request }) if request.id == "form_1"
         ));
-        assert_eq!(gates.admit(&pending("ses_child", "form_1")), None);
-        assert!(gates.admit(&pending("ses_child", "form_2")).is_some());
-        assert!(gates.admit(&pending("ses_other", "form_1")).is_some());
+        assert_eq!(
+            gates.admit(&pending("ses_child", "form_1"), Instant::now()),
+            None
+        );
+        assert!(gates
+            .admit(&pending("ses_child", "form_2"), Instant::now())
+            .is_some());
+        assert!(gates
+            .admit(&pending("ses_other", "form_1"), Instant::now())
+            .is_some());
 
         let resolved = AgentDomainEvent::FormResolved {
             reason: None,
@@ -3929,8 +4165,128 @@ mod tests {
             form_id: "form_1".into(),
             seq: 2,
         };
-        assert_eq!(gates.admit(&resolved), None);
-        assert!(gates.admit(&pending("ses_child", "form_1")).is_some());
+        assert_eq!(gates.admit(&resolved, Instant::now()), None);
+        assert!(gates
+            .admit(&pending("ses_child", "form_1"), Instant::now())
+            .is_some());
+    }
+
+    /// A native turn end pushes on the pane watcher's rule, keyed by the agent
+    /// session: busy then idle, confirmed after the grace, at most once per
+    /// cooldown. Each row is a status sequence `(seconds, status)` and the
+    /// sessions confirmed at the end.
+    #[test]
+    fn a_native_turn_end_pushes_after_the_grace_and_once_per_cooldown() {
+        use crate::agents::{AgentDomainEvent, AgentSessionId, AgentSessionStatus as S};
+        let grace = COMPLETION_GRACE.as_secs();
+        let cooldown = COMPLETION_COOLDOWN.as_secs();
+        type Case = (&'static str, &'static [(u64, S)], u64, usize);
+        let cases: &[Case] = &[
+            (
+                "busy then idle, held",
+                &[(0, S::Busy), (1, S::Idle)],
+                1 + grace,
+                1,
+            ),
+            ("not yet held", &[(0, S::Busy), (1, S::Idle)], grace, 0),
+            ("idle with no turn before it", &[(0, S::Idle)], 1 + grace, 0),
+            (
+                "retry counts as a turn",
+                &[(0, S::Retry), (1, S::Idle)],
+                1 + grace,
+                1,
+            ),
+            (
+                "busy again within the grace",
+                &[(0, S::Busy), (1, S::Idle), (5, S::Busy)],
+                1 + grace,
+                0,
+            ),
+            (
+                "interrupted is not finished",
+                &[(0, S::Busy), (1, S::Interrupted), (2, S::Idle)],
+                2 + grace,
+                0,
+            ),
+            (
+                "failed is not finished",
+                &[(0, S::Busy), (1, S::Failed)],
+                1 + grace,
+                0,
+            ),
+        ];
+        let start = Instant::now();
+        let at = |secs: u64| start + Duration::from_secs(secs);
+        let status = |status| AgentDomainEvent::StatusChanged {
+            asid: AgentSessionId("ses_1".into()),
+            status,
+            error: None,
+            seq: 1,
+        };
+        for (name, sequence, check, expected) in cases {
+            let mut gates = super::AgentPushGates::default();
+            for (secs, s) in *sequence {
+                assert_eq!(gates.admit(&status(*s), at(*secs)), None, "{name}");
+            }
+            assert_eq!(
+                gates.completions_ready(at(*check)).len(),
+                *expected,
+                "{name}"
+            );
+        }
+
+        // A second turn inside the cooldown is not announced; one after it is.
+        let mut gates = super::AgentPushGates::default();
+        for (secs, s) in [(0, S::Busy), (1, S::Idle)] {
+            gates.admit(&status(s), at(secs));
+        }
+        assert_eq!(
+            gates.completions_ready(at(1 + grace)),
+            vec!["ses_1".to_owned()]
+        );
+        for (secs, s) in [(40, S::Busy), (41, S::Idle)] {
+            gates.admit(&status(s), at(secs));
+        }
+        assert!(gates.completions_ready(at(41 + grace)).is_empty());
+        for (secs, s) in [(cooldown + 40, S::Busy), (cooldown + 41, S::Idle)] {
+            gates.admit(&status(s), at(secs));
+        }
+        assert_eq!(gates.completions_ready(at(cooldown + 41 + grace)).len(), 1);
+    }
+
+    /// One menu, one push: a blocked or input push for a pane showing a
+    /// permission menu is left to that menu's approval push; anything else a
+    /// pane raises goes out.
+    #[tokio::test]
+    async fn a_pane_showing_a_menu_pushes_only_its_approval() {
+        let state = test_state("admin", Vec::new());
+        let menu = include_str!("../../tests/fixtures/approval-claude-bash.txt");
+        for (screen, has_menu) in [(menu, true), ("› ready for the next task", false)] {
+            let herdr = crate::test_support::FakeHerdr::start(vec![screen], None);
+            let session = herdr.session();
+            for (notice, asks) in [
+                (AgentNotice::AgentBlocked, true),
+                (AgentNotice::AgentInputRequired, true),
+                (AgentNotice::AgentCompleted, false),
+                (AgentNotice::ApprovalPending, false),
+            ] {
+                let push = AgentPushNotice {
+                    notice,
+                    server_label: String::new(),
+                    agent_name: None,
+                    data: [("pane_id".to_owned(), json!("w1:p1"))]
+                        .into_iter()
+                        .collect(),
+                    choices: Vec::new(),
+                    detail: None,
+                };
+                assert_eq!(
+                    super::pane_push_covered(&state, &session, &push).await,
+                    has_menu && asks,
+                    "{notice:?}, menu on screen: {has_menu}"
+                );
+            }
+        }
     }
 
     /// The question push says "{name} needs your input", naming the session

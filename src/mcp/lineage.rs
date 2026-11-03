@@ -598,6 +598,7 @@ mod tests {
             agent_job: None,
             model: None,
             variant: None,
+            agent_session_id: None,
         };
         let mine = working(&state, binding.clone()).await;
         let other = working(&state, binding).await;
@@ -814,6 +815,7 @@ mod tests {
                 agent_job: None,
                 model: None,
                 variant: None,
+                agent_session_id: None,
             },
         )
         .await;
@@ -874,6 +876,7 @@ mod tests {
                     agent_job: None,
                     model: None,
                     variant: None,
+                    agent_session_id: None,
                 },
             )
             .await;
@@ -980,6 +983,7 @@ mod tests {
             agent_job: None,
             model: None,
             variant: None,
+            agent_session_id: None,
         };
         let in_pane = working(&state, pane("%4")).await;
         assert_eq!(

@@ -56,6 +56,26 @@
   settles that an unlisted session is not saved), and FX gets a fingerprint
   over `~/.fx/sessions` as Qoder has over `~/.qoder/projects`.
 
+- **A finished agent turn is pushed, and the push opens the conversation.**
+  Every "Agent done" push used to come from a terminal pane and opened the
+  terminal; a native session's turn end pushed nothing. Now a native session
+  whose turn ends (idle for 30 s, at most one push per 2 minutes) pushes
+  `agent.completed` with `asid` and `agent_id`, so tapping it opens the
+  session; child sessions and sub-tasks stay quiet. Native approval pushes
+  read like terminal ones -- localized, with the server's label and the
+  agent's name, never the agent's prompt -- and carry `agent_id`; neither they
+  nor question pushes put the session id in `session_id` any more. All ten
+  native agents (Antigravity, Claude Code, Codex, Cursor, DeepSeek, FX,
+  OpenCode, Pi, Qoder CLI, T3 Code) push both and are named, never "Agent";
+  a failed task's summary now names Pi, Antigravity and Cursor too. Announced as the `native_agent_push` capability.
+
+- **One event, one push.** A Codex delegation's terminal no longer pushes
+  beside its native session (one approval raised up to three pushes, two of
+  them opening the terminal), and a terminal approval menu no longer adds an
+  "Agent blocked" push to its "Approval needed". Approval pushes now carry
+  their category where Expo reads it, so approve and deny can show on the
+  lock screen.
+
 - **`update --channel preview` works again.** The preview check failed with
   "update response exceeds size limit" because one 100-release GitHub page
   (release notes and asset lists included) had grown past its 1 MiB cap. It now
