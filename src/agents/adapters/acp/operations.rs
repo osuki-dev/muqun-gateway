@@ -25,9 +25,12 @@ pub(crate) struct PromptCapabilities {
     pub embedded_context: bool,
 }
 
+#[derive(Clone)]
 pub(crate) struct PreparedPrompt {
     pub content: Vec<Value>,
     pub transcript: String,
+    /// The uploads as an inbox item lists them.
+    pub files: Vec<Value>,
 }
 
 fn invalid(message: &str) -> AgentError {
@@ -48,6 +51,7 @@ pub(crate) async fn prompt_parts(
         return Ok(PreparedPrompt {
             content,
             transcript: text.into(),
+            files: Vec::new(),
         });
     }
     let uploads = crate::uploads_dir().map_err(|_| invalid("no upload directory"))?;
@@ -70,6 +74,7 @@ pub(crate) fn upload_parts(
     let paths = checked_attachments(AttachmentMode::NativeUploads, attachments, uploads)?;
     let transcript = append_attachment_paths(text, &paths);
     let mut content = vec![json!({"type":"text","text":transcript})];
+    let mut files = Vec::with_capacity(paths.len());
     let mut total = transcript.len();
     for path in &paths {
         let mut options = std::fs::OpenOptions::new();
@@ -124,6 +129,10 @@ pub(crate) fn upload_parts(
                 ));
             }
             content.push(json!({"type":"image","mimeType":kind.mime,"data":base64::engine::general_purpose::STANDARD.encode(&bytes)}));
+            files.push(crate::agents::adapters::inbox::file_entry(
+                path,
+                Some(kind.mime),
+            ));
         } else {
             if !capabilities.embedded_context {
                 return Err(AgentError::Unsupported(
@@ -140,12 +149,14 @@ pub(crate) fn upload_parts(
             let uri = reqwest::Url::from_file_path(path)
                 .map_err(|_| invalid("upload has no file URI"))?;
             content.push(json!({"type":"resource","resource":{"uri":uri.as_str(),"mimeType":"text/plain","text":text}}));
+            files.push(crate::agents::adapters::inbox::file_entry(path, None));
         }
     }
     prompt_budget(&content)?;
     Ok(PreparedPrompt {
         content,
         transcript,
+        files,
     })
 }
 

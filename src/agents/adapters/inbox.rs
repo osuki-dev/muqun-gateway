@@ -1,9 +1,9 @@
-//! Gateway-owned queue of prompts waiting for a Codex thread's turn to end.
+//! Gateway-owned queue of prompts waiting for a session's turn to end.
 //!
-//! Codex has no inbox of its own, so the Gateway holds one per thread, in
-//! memory. It does not survive a Gateway restart or a reconnect to Codex.
-//! Items use the same JSON shape as OpenCode's `Session.Inbox.Info`, so the
-//! App reads both agents' queues with one parser.
+//! Codex and ACP agents have no inbox of their own, so the Gateway holds one
+//! per session, in memory. It does not survive a Gateway restart or a
+//! reconnect to the agent. Items use the same JSON shape as OpenCode's
+//! `Session.Inbox.Info`, so the App reads every agent's queue with one parser.
 use std::collections::HashMap;
 
 use serde_json::{json, Value};
@@ -13,6 +13,22 @@ use crate::agents::ports::agent::AgentError;
 /// Per thread. A queue this long is a stuck session, not a backlog.
 const MAX_ITEMS: usize = 64;
 const MAX_THREADS: usize = 4096;
+
+/// How an inbox item lists an uploaded file: `{uri, name, mime?}`.
+pub(crate) fn file_entry(path: &str, mime: Option<&str>) -> Value {
+    let name = std::path::Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("attachment");
+    let uri = reqwest::Url::from_file_path(path)
+        .map(String::from)
+        .unwrap_or_else(|()| format!("file://{path}"));
+    let mut entry = json!({ "uri": uri, "name": name });
+    if let Some(mime) = mime {
+        entry["mime"] = json!(mime);
+    }
+    entry
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Delivery {
@@ -42,24 +58,24 @@ impl Delivery {
 pub(crate) enum InboxSignal {
     /// The queue changed; publish the whole list.
     Changed(String),
-    /// A queued item was sent and the transport failed before Codex answered.
+    /// A queued item was sent and the transport failed before the agent answered.
     /// It was removed and is not resent; the App must refetch.
     Uncertain(String),
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct Queued {
+pub(crate) struct Queued<T> {
     pub id: String,
     pub created_ms: u64,
     pub delivery: Delivery,
     pub text: String,
     /// `[{uri, name, mime?}]`, as OpenCode lists a prompt's files.
     pub files: Vec<Value>,
-    /// The prepared Codex `UserInput` list, validated when it was queued.
-    pub input: super::presentation::PromptInput,
+    /// The agent's prepared prompt, validated when it was queued.
+    pub input: T,
 }
 
-impl Queued {
+impl<T> Queued<T> {
     fn to_json(&self, thread: &str) -> Value {
         let mut payload = json!({ "text": self.text });
         if !self.files.is_empty() {
@@ -76,31 +92,38 @@ impl Queued {
     }
 }
 
-#[derive(Default)]
-pub(crate) struct Inbox {
-    queues: HashMap<String, Vec<Queued>>,
+pub(crate) struct Inbox<T> {
+    queues: HashMap<String, Vec<Queued<T>>>,
 }
 
-impl Inbox {
-    pub(crate) fn push(&mut self, thread: &str, item: Queued) -> Result<(), AgentError> {
+impl<T> Default for Inbox<T> {
+    fn default() -> Self {
+        Self {
+            queues: HashMap::new(),
+        }
+    }
+}
+
+impl<T> Inbox<T> {
+    pub(crate) fn push(&mut self, thread: &str, item: Queued<T>) -> Result<(), AgentError> {
         if self.queues.len() >= MAX_THREADS && !self.queues.contains_key(thread) {
             return Err(AgentError::NotAvailable(
-                "Codex queued-prompt capacity exhausted".into(),
+                "queued-prompt capacity exhausted".into(),
             ));
         }
         let queue = self.queues.entry(thread.into()).or_default();
         if queue.len() >= MAX_ITEMS {
             return Err(AgentError::InvalidRequest(format!(
-                "Codex already has {MAX_ITEMS} prompts waiting; send or cancel one first"
+                "{MAX_ITEMS} prompts are already waiting; send or cancel one first"
             )));
         }
         queue.push(item);
         Ok(())
     }
 
-    /// The item a normally completed turn hands to Codex next: the oldest one
+    /// The item a normally completed turn hands to the agent next: the oldest one
     /// marked to send now (the App shows it as "Next"), else the oldest queued.
-    pub(crate) fn next(&self, thread: &str) -> Option<&Queued> {
+    pub(crate) fn next(&self, thread: &str) -> Option<&Queued<T>> {
         let queue = self.queues.get(thread)?;
         queue
             .iter()
@@ -108,11 +131,11 @@ impl Inbox {
             .or_else(|| queue.first())
     }
 
-    pub(crate) fn get(&self, thread: &str, id: &str) -> Option<&Queued> {
+    pub(crate) fn get(&self, thread: &str, id: &str) -> Option<&Queued<T>> {
         self.queues.get(thread)?.iter().find(|item| item.id == id)
     }
 
-    pub(crate) fn remove(&mut self, thread: &str, id: &str) -> Option<Queued> {
+    pub(crate) fn remove(&mut self, thread: &str, id: &str) -> Option<Queued<T>> {
         let queue = self.queues.get_mut(thread)?;
         let index = queue.iter().position(|item| item.id == id)?;
         let item = queue.remove(index);
@@ -152,14 +175,14 @@ impl Inbox {
 mod tests {
     use super::*;
 
-    fn item(id: &str, delivery: Delivery) -> Queued {
+    fn item(id: &str, delivery: Delivery) -> Queued<()> {
         Queued {
             id: id.into(),
             created_ms: 1,
             delivery,
             text: id.into(),
             files: Vec::new(),
-            input: vec![json!({"type":"text","text":id,"text_elements":[]})].into(),
+            input: (),
         }
     }
 

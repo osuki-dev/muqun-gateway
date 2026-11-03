@@ -546,10 +546,6 @@ async fn real_modes_instruction_question_steer_rename_and_owned_delete() {
         .last()
         .unwrap()
         .contains("PONG"));
-    assert!(matches!(
-        driver.send_prompt(&id, "x", &[], Some("queue")).await,
-        Err(AgentError::Unsupported(_))
-    ));
 
     // Rename: Claude Code's own command; no rows, the title moves.
     let before = driver.get_timeline(&id, 300).await.unwrap().len();
