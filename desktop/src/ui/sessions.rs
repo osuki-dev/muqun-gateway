@@ -926,7 +926,8 @@ fn more_row(app: &App, project: &str, hidden: usize) -> Div {
         .flex_row()
         .items_center()
         .cursor_pointer()
-        .child(div().w(6.0).h(6.0).flex_shrink_0())
+        // Match session title: 12 px mark + 6 px gap.
+        .child(div().w(18.0).h(1.0).flex_shrink_0())
         .child(ui_text(label).size(13.0).no_wrap().no_cursor())
         .on_click(move |_| {
             let state = &side(&app).full;
@@ -1227,7 +1228,7 @@ fn render_row(app: &App, session: &SessionRow, active: bool, editing: bool) -> D
         .cursor_pointer()
         .child(badged_mark(
             &session.agent_id,
-            16.0,
+            12.0,
             session.status,
             session.waiting,
         ));
@@ -1239,7 +1240,7 @@ fn render_row(app: &App, session: &SessionRow, active: bool, editing: bool) -> D
                 div()
                     .flex_1()
                     .min_w(0.0)
-                    .ml(2.0)
+                    .ml(6.0)
                     .overflow_clip()
                     .child(ui_text(title).size(13.0).no_wrap().no_cursor()),
             )

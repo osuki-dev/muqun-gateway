@@ -132,9 +132,9 @@
 }
 .mq-side-handle { background: transparent; }
 .mq-side-handle:hover { background: var(--border-hover); }
-.mq-side-search-wrap { padding: var(--mq-space-3) var(--mq-space-4) var(--mq-space-2) var(--mq-space-4); }
+.mq-side-search-wrap { padding: var(--mq-space-2) var(--mq-space-2) var(--mq-space-2) var(--mq-space-2); }
 .mq-side-search {
-    padding: 0 var(--mq-space-2) 0 var(--mq-space-3);
+    padding: 0 var(--mq-space-2) 0 var(--mq-space-2);
     gap: var(--mq-space-1);
     border-radius: var(--mq-radius-md);
     border: none;
@@ -144,23 +144,23 @@
 }
 .mq-side-search:hover { background: var(--input-bg-hover); }
 .mq-kbd { color: var(--text-tertiary); padding-left: var(--mq-space-1); }
-/* Leave the window edge alone — list content sits inset, not flush. */
-.mq-tree-list { padding: 0 var(--mq-space-3) 0 var(--mq-space-4); }
+/* Tight inset: session marks share the chevron column, then a small gap to text. */
+.mq-tree-list { padding: 0 var(--mq-space-2); }
 .mq-prow {
     border-radius: var(--mq-radius-sm);
     transition: background var(--mq-motion-micro) ease-out;
 }
 .mq-prow:hover { background: var(--mq-hover); }
-.mq-prow-main { padding: 0 var(--mq-space-2) 0 var(--mq-space-2); gap: var(--mq-space-2); color: var(--text-primary); }
+.mq-prow-main { padding: 0 var(--mq-space-2) 0 var(--mq-space-1); gap: var(--mq-space-1); color: var(--text-primary); }
 .mq-prow-parent { color: var(--text-tertiary); }
 .mq-prow-missing { color: var(--text-tertiary); padding-left: var(--mq-space-2); }
 .mq-prow--missing .mq-prow-main { opacity: 0.55; }
 .mq-prow-actions { gap: 2px; opacity: 0; transition: opacity var(--mq-motion-micro) ease-out; }
 .mq-prow:hover .mq-prow-actions { opacity: 1; }
 .mq-srow {
-    /* Under the project name: chevron width + gap, then the shared list inset. */
-    padding: 0 var(--mq-space-2) 0 28px;
-    gap: var(--mq-space-2);
+    /* Same left edge as the project chevron; mark is 12 px, then a small gap. */
+    padding: 0 var(--mq-space-2) 0 var(--mq-space-1);
+    gap: var(--mq-space-1);
     border-radius: var(--mq-radius-sm);
     color: var(--text-secondary);
     transition: background var(--mq-motion-micro) ease-out, color var(--mq-motion-micro) ease-out;
@@ -186,11 +186,11 @@
 .mq-raised { border-radius: var(--mq-radius-sm); }
 .mq-side-bottom {
     border-top: none;
-    padding: var(--mq-space-2) var(--mq-space-4);
+    padding: var(--mq-space-2);
 }
 .mq-side-entry {
-    padding: 0 var(--mq-space-3);
-    gap: var(--mq-space-3);
+    padding: 0 var(--mq-space-2);
+    gap: var(--mq-space-2);
     border-radius: var(--mq-radius-md);
     color: var(--text-secondary);
     transition: background var(--mq-motion-micro) ease-out, color var(--mq-motion-micro) ease-out;
@@ -717,6 +717,18 @@
     transition: background var(--mq-motion-micro) ease-out, color var(--mq-motion-micro) ease-out;
 }
 .mq-chip:hover { background: var(--mq-hover-strong); color: var(--text-primary); }
+.mq-chip--thumb {
+    padding: 2px 6px 2px 2px;
+    gap: var(--mq-space-2);
+}
+.mq-chip-thumb {
+    width: 28px;
+    height: 28px;
+    border-radius: var(--mq-radius-sm);
+    overflow: hidden;
+    background: var(--surface);
+    flex-shrink: 0;
+}
 .mq-chip--failed { background: var(--error-bg); color: var(--error); }
 .mq-chip--failed:hover { background: var(--error-bg); color: var(--error); }
 /* /composer ---------------------------------------------------------- */

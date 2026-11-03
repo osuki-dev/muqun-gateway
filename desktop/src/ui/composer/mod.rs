@@ -1052,7 +1052,7 @@ fn field_width(card: f32) -> f32 {
 /// the content column.
 pub(crate) fn session_card_width(app: &App) -> f32 {
     let (window, _) = blinc_core::BlincContextState::get().viewport_size();
-    let main = window - app.config.get().ui.sidebar();
+    let main = window - crate::ui::shell::side_width(app, window);
     (main - 2.0 * SLOT_SIDE).clamp(320.0, SESSION_MAX)
 }
 

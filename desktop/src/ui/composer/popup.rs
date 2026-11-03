@@ -140,7 +140,7 @@ fn origin(app: &App, card_height: f32) -> (f32, f32, f32) {
         return crate::ui::home::start_card_origin(app);
     }
     let (vw, vh) = blinc_core::BlincContextState::get().viewport_size();
-    let sidebar = app.config.get().ui.sidebar();
+    let sidebar = crate::ui::shell::side_width(app, vw);
     let width = super::session_card_width(app);
     (
         sidebar + ((vw - sidebar) - width) / 2.0,

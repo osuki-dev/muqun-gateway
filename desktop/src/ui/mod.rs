@@ -180,6 +180,7 @@ pub fn shortcut(key: &str) -> String {
 const KEY_ENTER: u32 = 13;
 const KEY_ESCAPE: u32 = 27;
 const KEY_0: u32 = 48;
+const KEY_B: u32 = 66;
 const KEY_K: u32 = 75;
 const KEY_N: u32 = 78;
 const KEY_COMMA: u32 = 188;
@@ -203,6 +204,7 @@ fn on_key(app: &App, ctx: &blinc_layout::event_handler::EventContext) {
     match ctx.key_code {
         KEY_N if chord => app.open_draft(),
         KEY_K if chord => sessions::focus_search(),
+        KEY_B if chord && !ctx.shift && !ctx.alt => shell::toggle_sidebar(),
         // Themes panel overlay (also under Settings → Appearance).
         KEY_T if toggle_themes => themes::toggle(),
         KEY_0 if chord => app.drain.go_home(),

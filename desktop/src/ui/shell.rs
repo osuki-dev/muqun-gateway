@@ -1,6 +1,8 @@
 //! The window's frame (architecture §6.0‴ A): the 44 px top bar, then the
 //! sidebar (a resizable 260 px column, or a 56 px rail under 960 px of
-//! window) and the main panel.
+//! window / when folded with Ctrl/Cmd+B) and the main panel. A third
+//! column on the right is planned; keep the main panel as the flexible
+//! centre so it can sit between sidebars later.
 //!
 //! The main panel shows exactly one of: Settings, the Inbox, Home (the
 //! start page, nothing selected), or the selected session.
@@ -574,6 +576,31 @@ fn sidebar_width(app: &App) -> State<f32> {
     blinc_core::BlincContextState::get().use_state_keyed("mq.sidebar.width", move || width)
 }
 
+/// Folded to the rail by Ctrl/Cmd+B (independent of the narrow-window rail).
+fn sidebar_collapsed() -> State<bool> {
+    blinc_core::BlincContextState::get().use_state_keyed("mq.sidebar.collapsed", || false)
+}
+
+/// Toggle the left sidebar between the full tree and the icon rail.
+pub fn toggle_sidebar() {
+    let state = sidebar_collapsed();
+    state.signal().set(!state.get());
+}
+
+/// True while the left column is the rail (narrow window or Ctrl/Cmd+B).
+pub fn is_rail(window_width: f32) -> bool {
+    sidebar_collapsed().get() || window_width < RAIL_BELOW
+}
+
+/// Width the left column occupies for the current window.
+pub fn side_width(app: &App, window_width: f32) -> f32 {
+    if is_rail(window_width) {
+        sessions::RAIL_WIDTH
+    } else {
+        app.config.get().ui.sidebar()
+    }
+}
+
 /// (pointer x at the press, width then, when the last press was).
 static DRAG: OnceLock<Mutex<(f32, f32, Option<Instant>)>> = OnceLock::new();
 
@@ -616,51 +643,60 @@ fn resize_handle(app: &App, width: State<f32>) -> Div {
 
 pub fn body(ctx: &WindowedContext, app: &App) -> Div {
     let height = (ctx.height - TOP_BAR_HEIGHT).max(0.0);
-    let rail = ctx.width < RAIL_BELOW;
+    let window = ctx.width;
+    let collapsed = sidebar_collapsed();
     let width = sidebar_width(app);
-    let side_width = if rail {
-        sessions::RAIL_WIDTH
-    } else {
-        width.get()
-    };
-    let main_width = (ctx.width - side_width).max(0.0);
-    let column = if rail {
-        div()
-            .class("mq-side-column")
-            .w(sessions::RAIL_WIDTH)
-            .h(height)
-            .flex_shrink_0()
-            .child(sessions::rail(app, height))
-    } else {
-        div()
-            .class("mq-side-column")
-            .relative()
-            .w(&width)
-            .h(height)
-            .flex_shrink_0()
-            .child(sessions::sidebar(app, height))
-            .child(resize_handle(app, width.clone()))
-    };
-    div()
-        .class("mq-body")
-        .w_full()
-        .h(height)
-        .flex_row()
-        .child(column)
-        .child(
-            // Absolutely placed, so the panel's width never depends on its
-            // content: a long unwrapped line in a message would otherwise
-            // push the sidebar narrower than asked.
-            div().relative().flex_1().min_w(0.0).h(height).child(
+    let app = app.clone();
+    // Rebuild when Ctrl/Cmd+B folds the column; drag width binds reactively.
+    let body = stateful_with_key::<NoState>("mq-shell-body")
+        .deps([collapsed.signal_id()])
+        .on_state(move |_| {
+            let rail = collapsed.get() || window < RAIL_BELOW;
+            let side = if rail {
+                sessions::RAIL_WIDTH
+            } else {
+                width.get()
+            };
+            let main_width = (window - side).max(0.0);
+            let column = if rail {
                 div()
-                    .absolute()
-                    .left(0.0)
-                    .top(0.0)
-                    .right(0.0)
-                    .bottom(0.0)
-                    .child(main_panel(app, main_width, height)),
-            ),
-        )
+                    .class("mq-side-column")
+                    .w(sessions::RAIL_WIDTH)
+                    .h(height)
+                    .flex_shrink_0()
+                    .child(sessions::rail(&app, height))
+            } else {
+                div()
+                    .class("mq-side-column")
+                    .relative()
+                    .w(&width)
+                    .h(height)
+                    .flex_shrink_0()
+                    .child(sessions::sidebar(&app, height))
+                    .child(resize_handle(&app, width.clone()))
+            };
+            div()
+                .class("mq-body")
+                .w_full()
+                .h(height)
+                .flex_row()
+                .child(column)
+                .child(
+                    // Absolutely placed, so the panel's width never depends on
+                    // its content: a long unwrapped line in a message would
+                    // otherwise push the sidebar narrower than asked.
+                    div().relative().flex_1().min_w(0.0).h(height).child(
+                        div()
+                            .absolute()
+                            .left(0.0)
+                            .top(0.0)
+                            .right(0.0)
+                            .bottom(0.0)
+                            .child(main_panel(&app, main_width, height)),
+                    ),
+                )
+        });
+    div().w_full().h(height).child(body)
 }
 
 fn main_panel(app: &App, width: f32, height: f32) -> Div {

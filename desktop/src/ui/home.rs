@@ -80,7 +80,7 @@ pub fn start_layout(main_width: f32, main_height: f32, subtitle: bool) -> StartL
 /// that hangs from it (the registry's element bounds are parent-local).
 pub fn start_card_origin(app: &App) -> (f32, f32, f32) {
     let (vw, vh) = blinc_core::BlincContextState::get().viewport_size();
-    let sidebar = app.config.get().ui.sidebar();
+    let sidebar = super::shell::side_width(app, vw);
     let main = (vw - sidebar).max(0.0);
     let top_bar = super::shell::TOP_BAR_HEIGHT;
     let config = app.config.get();

@@ -17,6 +17,8 @@ pub const STOP: &str = "Primary+.";
 pub const HOME: &str = "Primary+0";
 #[allow(dead_code)]
 pub const THEMES: &str = "Primary+Shift+T";
+#[allow(dead_code)]
+pub const TOGGLE_SIDEBAR: &str = "Primary+B";
 
 /// Which convention to write a shortcut in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,6 +104,7 @@ mod tests {
         assert_eq!(label_in(SETTINGS, Style::Words), "Ctrl+,");
         assert_eq!(label_in(NEW_SESSION, Style::Symbols), "⌘N");
         assert_eq!(label_in(HOME, Style::Words), "Ctrl+0");
+        assert_eq!(label_in(TOGGLE_SIDEBAR, Style::Words), "Ctrl+B");
     }
 
     #[test]

@@ -17,6 +17,8 @@ use crate::ui::App;
 const SHOWN: usize = 3;
 /// A summary's longest line, in characters.
 const SUMMARY_CHARS: usize = 64;
+/// Staged image thumbnails in the chip row.
+const THUMB: f32 = 28.0;
 
 fn small_icon(path: &str) -> impl ElementBuilder {
     svg(to_svg(path, 12.0))
@@ -165,6 +167,10 @@ pub fn staged(app: &App) -> Option<Div> {
     let mut row = div().class("mq-chips").w_full().flex_row().flex_wrap();
     for entry in staged.iter() {
         let id = entry.id;
+        let thumb = match &entry.status {
+            StagedStatus::Ready(file) if file.image => Some(file.path.clone()),
+            _ => None,
+        };
         let (mark, class, note) = match &entry.status {
             StagedStatus::Uploading => (icons::FILE, "mq-chip--up", Some("…".to_string())),
             StagedStatus::Ready(file) => (
@@ -205,10 +211,23 @@ pub fn staged(app: &App) -> Option<Div> {
         let mut chip = div()
             .class("mq-chip")
             .class(class)
+            .class_when("mq-chip--thumb", thumb.is_some())
             .flex_row()
-            .items_center()
-            .child(small_icon(mark))
-            .child(mono_text(name).size(11.0).no_wrap().no_cursor());
+            .items_center();
+        if let Some(path) = thumb {
+            chip = chip.child(
+                div()
+                    .class("mq-chip-thumb")
+                    .w(THUMB)
+                    .h(THUMB)
+                    .overflow_clip()
+                    .flex_shrink_0()
+                    .child(image(path).size(THUMB, THUMB).cover()),
+            );
+        } else {
+            chip = chip.child(small_icon(mark));
+        }
+        chip = chip.child(mono_text(name).size(11.0).no_wrap().no_cursor());
         if let Some(note) = note {
             chip = chip.child(ui_text(note).size(11.0).no_wrap().no_cursor());
         }
