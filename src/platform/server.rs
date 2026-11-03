@@ -108,6 +108,34 @@ pub(crate) async fn run(config_path: Option<String>) -> anyhow::Result<()> {
             None
         }
     };
+    // The desktop on this computer reaches the App routes on loopback with a
+    // token read from `local-client.json`. A listen address that does not
+    // serve loopback gets its own loopback listeners (the MCP ones when they
+    // exist) that serve the same routes.
+    let mut local_listeners = mcp_listeners;
+    if local_listeners.is_none() && crate::mcp::loopback_warning(&config.listen).is_some() {
+        local_listeners = crate::mcp::bind_loopback(&config.listen)
+            .await
+            .unwrap_or_else(|error| {
+                tracing::warn!(%error, "no loopback listener for the local desktop client");
+                None
+            });
+    }
+    let local_port = match local_listeners.as_ref().and_then(|l| l.first()) {
+        Some(listener) => Some(listener.local_addr()?.port()),
+        None if crate::mcp::loopback_warning(&config.listen).is_none() => {
+            Some(listener.local_addr()?.port())
+        }
+        None => None,
+    };
+    let _local_client = match local_port {
+        Some(port) => crate::platform::local_client::mint(port)
+            .map_err(
+                |error| tracing::warn!(%error, "could not publish the local client credential"),
+            )
+            .ok(),
+        None => None,
+    };
     // One background attempt per opted-in backend; no restart/logging loop.
     backend_startup::spawn(&config);
 
@@ -180,19 +208,6 @@ pub(crate) async fn run(config_path: Option<String>) -> anyhow::Result<()> {
             crate::mcp::local_url(&state.config.listen),
         );
     }
-    for listener in mcp_listeners.into_iter().flatten() {
-        let app = crate::mcp::loopback_router(state.clone());
-        tokio::spawn(async move {
-            if let Err(error) = axum::serve(
-                listener,
-                app.into_make_service_with_connect_info::<SocketAddr>(),
-            )
-            .await
-            {
-                tracing::error!(%error, "the loopback MCP listener stopped");
-            }
-        });
-    }
     tracing::info!(
         "agents started from a phone or an MCP caller launch with: {}",
         crate::agents::tasks::launch_defaults(
@@ -256,6 +271,9 @@ pub(crate) async fn run(config_path: Option<String>) -> anyhow::Result<()> {
         state.clone(),
         encrypted_transport,
     ))
+    // Outside the encrypted transport: the local token is plaintext, from
+    // loopback only.
+    .layer(middleware::from_fn(super::local_client::gate))
     .layer(middleware::from_fn_with_state(
         known_hosts(&state.config),
         known_host,
@@ -264,6 +282,21 @@ pub(crate) async fn run(config_path: Option<String>) -> anyhow::Result<()> {
     .layer(middleware::from_fn(request_locale))
     .with_state(state);
 
+    // The loopback listeners beside a non-loopback listen address serve the
+    // whole app: `/mcp` and the local desktop's App routes.
+    for listener in local_listeners.into_iter().flatten() {
+        let app = app.clone();
+        tokio::spawn(async move {
+            if let Err(error) = axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            {
+                tracing::error!(%error, "the loopback listener stopped");
+            }
+        });
+    }
     if let Some(warning) = listen_warning {
         tracing::warn!("{warning}");
     }

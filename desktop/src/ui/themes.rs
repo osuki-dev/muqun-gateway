@@ -285,13 +285,7 @@ fn panel(app: &App, width: f32, height: f32, embedded: bool) -> Div {
         .h(height)
         .flex_col()
         .child(header(app, &b, header_h, embedded))
-        .child(grid(
-            app,
-            &b,
-            width,
-            (height - header_h).max(0.0),
-            pad_x,
-        ))
+        .child(grid(app, &b, width, (height - header_h).max(0.0), pad_x))
         .child(notice_strip(app, &b, pad_x))
 }
 
@@ -708,7 +702,11 @@ fn title_block(name: &str, author: Option<&str>, meta: String) -> Div {
 }
 
 fn card_spacer() -> Div {
-    div().class("mq-theme-card-spacer").w_full().flex_1().min_h(0.0)
+    div()
+        .class("mq-theme-card-spacer")
+        .w_full()
+        .flex_1()
+        .min_h(0.0)
 }
 
 fn actions_row() -> Div {
@@ -907,12 +905,17 @@ fn gallery_actions(
                 size_text(total)
             )))
             .child(
-                div().class("mq-theme-progress").w(BAR_W).h(4.0).flex_shrink_0().child(
-                    div()
-                        .class("mq-theme-progress-bar")
-                        .w(BAR_W * fraction)
-                        .h(4.0),
-                ),
+                div()
+                    .class("mq-theme-progress")
+                    .w(BAR_W)
+                    .h(4.0)
+                    .flex_shrink_0()
+                    .child(
+                        div()
+                            .class("mq-theme-progress-bar")
+                            .w(BAR_W * fraction)
+                            .h(4.0),
+                    ),
             )
         }
         Some(Job::Verifying) => row.child(status_label(
@@ -1176,8 +1179,7 @@ mod tests {
         assert!(w >= MIN_CARD);
         assert_eq!(layout(300.0, PAD_X).0, 1);
         let (embedded_cols, embedded_w) = layout(720.0, 0.0);
-        let embedded_used =
-            embedded_cols as f32 * embedded_w + (embedded_cols as f32 - 1.0) * GAP;
+        let embedded_used = embedded_cols as f32 * embedded_w + (embedded_cols as f32 - 1.0) * GAP;
         assert!((embedded_used - 720.0).abs() < 0.5);
     }
 

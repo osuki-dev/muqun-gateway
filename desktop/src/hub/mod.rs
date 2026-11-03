@@ -7,6 +7,7 @@
 //! implement the same trait later without the UI changing.
 
 mod local;
+mod remote;
 
 use std::future::Future;
 use std::path::Path;
@@ -23,6 +24,7 @@ use muqun_gateway::platform::StoredUpload;
 use tokio::sync::broadcast;
 
 pub use local::LocalHub;
+pub use remote::{discover_local_gateway, RemoteHub};
 
 /// The agent a fresh install suggests first.
 pub const OPENCODE: &str = "opencode";
@@ -74,10 +76,7 @@ pub trait SessionHub: Send + Sync {
     /// runtime or start following a terminal). For an explicit selection.
     fn open<'a>(&'a self, asid: &'a AgentSessionId) -> HubFuture<'a, AgentSessionSnapshot>;
     /// Retained history only — never wakes an agent. `None` means a cold open.
-    fn peek<'a>(
-        &'a self,
-        asid: &'a AgentSessionId,
-    ) -> HubFuture<'a, Option<AgentSessionSnapshot>>;
+    fn peek<'a>(&'a self, asid: &'a AgentSessionId) -> HubFuture<'a, Option<AgentSessionSnapshot>>;
     /// The same snapshot, read without preparing anything where the hub can
     /// (the gateway's mirror): for re-reading a session that is already open.
     fn snapshot<'a>(&'a self, asid: &'a AgentSessionId) -> HubFuture<'a, AgentSessionSnapshot>;

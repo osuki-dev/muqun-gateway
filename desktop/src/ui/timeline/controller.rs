@@ -402,8 +402,7 @@ impl Controller {
             let local = self.app.drain.queue_pending_earlier(&s.asid, 20);
             Writes {
                 loading: Some(true),
-                command: (!local)
-                    .then(|| Command::LoadEarlier(AgentSessionId(s.asid.clone()))),
+                command: (!local).then(|| Command::LoadEarlier(AgentSessionId(s.asid.clone()))),
                 ..Writes::default()
             }
         };
@@ -586,8 +585,7 @@ impl Controller {
                 s.retry_at = None;
                 w.loading = Some(true);
                 let local = self.app.drain.queue_pending_earlier(&s.asid, 20);
-                w.command = (!local)
-                    .then(|| Command::LoadEarlier(AgentSessionId(s.asid.clone())));
+                w.command = (!local).then(|| Command::LoadEarlier(AgentSessionId(s.asid.clone())));
             }
             tracing::trace!(
                 target: "muqun::timeline",

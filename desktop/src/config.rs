@@ -256,8 +256,7 @@ impl UiPrefs {
     /// Preferred right-panel width before the live window clamp.
     pub fn right(&self) -> f32 {
         if self.right_width.is_finite() {
-            self.right_width
-                .clamp(Self::RIGHT_MIN, Self::RIGHT_MAX)
+            self.right_width.clamp(Self::RIGHT_MIN, Self::RIGHT_MAX)
         } else {
             Self::RIGHT_DEFAULT
         }

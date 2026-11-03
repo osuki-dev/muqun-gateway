@@ -169,7 +169,17 @@ pub fn tile(
     max_w: f32,
     max_h: f32,
 ) -> Div {
-    tile_sized(src, cwd, mime, width, height, max_w, max_h, max_w, max_h * 0.66)
+    tile_sized(
+        src,
+        cwd,
+        mime,
+        width,
+        height,
+        max_w,
+        max_h,
+        max_w,
+        max_h * 0.66,
+    )
 }
 
 /// Tool / `read` preview: tighter caps and App-like unknown size.
@@ -209,8 +219,7 @@ fn tile_sized(
     let kind = kind_for(src, mime);
     match resolve(src, cwd) {
         Some(path) if kind == MediaKind::Image => {
-            let (w, h) =
-                fit_size_with_unknown(width, height, max_w, max_h, unknown_w, unknown_h);
+            let (w, h) = fit_size_with_unknown(width, height, max_w, max_h, unknown_w, unknown_h);
             image_frame(path, w, h, true)
         }
         Some(path) if kind == MediaKind::Video => {
@@ -350,10 +359,7 @@ pub fn path_media(ctx: &PartCtx<'_>, path: &str) -> Option<Div> {
     if path.is_empty() {
         return None;
     }
-    if !matches!(
-        kind_for(path, None),
-        MediaKind::Image | MediaKind::Video
-    ) {
+    if !matches!(kind_for(path, None), MediaKind::Image | MediaKind::Video) {
         return None;
     }
     let cwd = session_cwd(ctx);

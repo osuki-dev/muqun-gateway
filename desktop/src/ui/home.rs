@@ -172,11 +172,12 @@ fn page(app: &App, width: f32, height: f32) -> Div {
         );
     }
     upper = upper.child(
-        div()
-            .w_full()
-            .flex_1()
-            .min_h(0.0)
-            .child(scroll().w_full().h_full().child(recents(app, &sessions, rows))),
+        div().w_full().flex_1().min_h(0.0).child(
+            scroll()
+                .w_full()
+                .h_full()
+                .child(recents(app, &sessions, rows)),
+        ),
     );
 
     let column = div()

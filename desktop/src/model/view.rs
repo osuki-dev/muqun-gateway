@@ -589,20 +589,17 @@ impl ViewState {
         // Prefer a recently shown timeline (instant, like the web App), else
         // a chrome-only placeholder until the snapshot arrives.
         if self.active.as_ref().is_none_or(|a| a.info.asid.0 != asid) {
-            self.active = self
-                .take_cached(asid)
-                .or_else(|| {
-                    self.sessions
-                        .iter()
-                        .find(|s| s.asid.0 == asid)
-                        .cloned()
-                        .map(|info| {
-                            let mut view =
-                                SessionView::new(info, Vec::new(), Vec::new(), Vec::new());
-                            view.opening = true;
-                            view
-                        })
-                });
+            self.active = self.take_cached(asid).or_else(|| {
+                self.sessions
+                    .iter()
+                    .find(|s| s.asid.0 == asid)
+                    .cloned()
+                    .map(|info| {
+                        let mut view = SessionView::new(info, Vec::new(), Vec::new(), Vec::new());
+                        view.opening = true;
+                        view
+                    })
+            });
         }
         true
     }
@@ -624,7 +621,8 @@ impl ViewState {
         let at = self.timeline_cache.iter().position(|(id, _)| id == asid)?;
         let mut view = self.timeline_cache.remove(at).1;
         view.opening = false;
-        self.timeline_cache.insert(0, (asid.to_string(), view.clone()));
+        self.timeline_cache
+            .insert(0, (asid.to_string(), view.clone()));
         Some(view)
     }
 

@@ -429,10 +429,7 @@ pub fn row(app: &App, aim: &Aim) -> Div {
                             .no_cursor(),
                     )
                     .on_click(move |_| {
-                        crate::ui::shell::open_right(
-                            &open_q,
-                            crate::model::view::RightTab::Queue,
-                        );
+                        crate::ui::shell::open_right(&open_q, crate::model::view::RightTab::Queue);
                     }),
             );
         }
@@ -737,7 +734,10 @@ fn format_model_name(model: &ModelRef, fallback: &str, catalog_name: Option<&str
 
 fn selected_model<'a>(aim: &Aim, models: &[&'a ModelInfo]) -> Option<&'a ModelInfo> {
     let chosen = aim.model.as_ref()?;
-    let default = aim.catalog.as_ref().and_then(|c| c.catalog.defaults.model.as_ref());
+    let default = aim
+        .catalog
+        .as_ref()
+        .and_then(|c| c.catalog.defaults.model.as_ref());
     catalog_model_info(models, chosen, default)
 }
 
@@ -1369,10 +1369,7 @@ mod tests {
             model_id: "gpt-6-astra".into(),
             variant: None,
         };
-        assert_eq!(
-            format_model_name(&unknown, "Model", None),
-            "GPT-6 Astra"
-        );
+        assert_eq!(format_model_name(&unknown, "Model", None), "GPT-6 Astra");
         let free = ModelRef {
             provider_id: String::new(),
             model_id: "nemotron-3.5-lightning-free".into(),

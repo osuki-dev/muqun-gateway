@@ -1190,9 +1190,7 @@ impl Projection {
                 }
                 // Cursor/OpenCode checklists are a Todo part, never a tool card.
                 let todo_tool = is_todo_tool(&call)
-                    || update["kind"]
-                        .as_str()
-                        .is_some_and(is_todo_tool_name)
+                    || update["kind"].as_str().is_some_and(is_todo_tool_name)
                     || self.todo_tool_ids.contains(native);
                 if todo_tool {
                     self.todo_tool_ids.insert(native.into());

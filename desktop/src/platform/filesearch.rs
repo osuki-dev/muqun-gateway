@@ -91,6 +91,8 @@ mod tests {
     #[tokio::test]
     async fn refuses_relative_or_missing_roots() {
         assert!(find_files("relative", "x", 5).await.is_empty());
-        assert!(find_files("/no/such/mq-desktop-root", "x", 5).await.is_empty());
+        assert!(find_files("/no/such/mq-desktop-root", "x", 5)
+            .await
+            .is_empty());
     }
 }

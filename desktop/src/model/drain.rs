@@ -206,11 +206,7 @@ impl Drain {
     pub fn queue_pending_earlier(&self, asid: &str, n: usize) -> bool {
         let update = {
             let mut view = self.inner.view.lock().unwrap();
-            let Some(active) = view
-                .active
-                .as_mut()
-                .filter(|a| a.info.asid.0 == asid)
-            else {
+            let Some(active) = view.active.as_mut().filter(|a| a.info.asid.0 == asid) else {
                 return false;
             };
             let Some((items, exhausted)) = active.take_pending_earlier(n) else {

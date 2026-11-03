@@ -28,7 +28,7 @@ pub struct LocalHub {
 }
 
 /// Fill `image_assets` the HTTP routes would attach — Desktop never hits those.
-fn enrich_local_media(snapshot: &mut AgentSessionSnapshot) {
+pub(super) fn enrich_local_media(snapshot: &mut AgentSessionSnapshot) {
     muqun_gateway::agents::message_images::enrich_timeline(
         &snapshot.info.asid.0,
         snapshot.info.directory.as_deref(),
@@ -180,10 +180,7 @@ impl SessionHub for LocalHub {
         })
     }
 
-    fn peek<'a>(
-        &'a self,
-        asid: &'a AgentSessionId,
-    ) -> HubFuture<'a, Option<AgentSessionSnapshot>> {
+    fn peek<'a>(&'a self, asid: &'a AgentSessionId) -> HubFuture<'a, Option<AgentSessionSnapshot>> {
         Box::pin(async move {
             let manager = self.manager_for_session(asid).await?;
             let Some(mut snapshot) = manager.mirror().get_snapshot(asid).await else {
@@ -473,7 +470,7 @@ impl SessionHub for LocalHub {
     }
 }
 
-fn computer_name() -> String {
+pub(super) fn computer_name() -> String {
     if let Ok(value) = std::env::var("HOSTNAME") {
         let trimmed = value.trim();
         if !trimmed.is_empty() {

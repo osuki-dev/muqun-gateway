@@ -3156,16 +3156,10 @@ impl<P: AcpProvider> AcpDriver<P> {
                     }
                 }
             }
-            AcpEvent::Request {
-                id,
-                method,
-                params,
-            } if method == "cursor/update_todos" => {
+            AcpEvent::Request { id, method, params } if method == "cursor/update_todos" => {
                 Self::cursor_todos(session, mirror, tx, Some(id), params).await;
             }
-            AcpEvent::Notification { method, params }
-                if method == "cursor/update_todos" =>
-            {
+            AcpEvent::Notification { method, params } if method == "cursor/update_todos" => {
                 Self::cursor_todos(session, mirror, tx, None, params).await;
             }
             AcpEvent::Request { id, .. } => {
@@ -4668,11 +4662,7 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
             }
         })
     }
-    fn get_timeline<'a>(
-        &'a self,
-        id: &'a str,
-        limit: usize,
-    ) -> AgentFuture<'a, Vec<TimelineItem>> {
+    fn get_timeline<'a>(&'a self, id: &'a str, limit: usize) -> AgentFuture<'a, Vec<TimelineItem>> {
         Box::pin(async move {
             if self.readonly_empty_snapshot(id).await? {
                 return Ok(Vec::new());

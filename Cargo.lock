@@ -2963,6 +2963,7 @@ dependencies = [
  "crc32fast",
  "dirs",
  "flate2",
+ "futures",
  "hex",
  "image",
  "libc",
@@ -2974,6 +2975,7 @@ dependencies = [
  "sha2",
  "syntect",
  "tokio",
+ "tokio-tungstenite 0.30.0",
  "tracing",
  "tracing-subscriber",
 ]

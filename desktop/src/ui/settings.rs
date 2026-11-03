@@ -117,18 +117,14 @@ pub fn page(app: &App, width: f32, height: f32) -> Div {
 fn pane(height: f32, content: Div) -> Div {
     div().w_full().h(height).child(
         scroll().w_full().h(height).child(
-            div()
-                .w_full()
-                .flex_row()
-                .justify_center()
-                .child(
-                    div()
-                        .class("mq-settings-pane")
-                        .w_full()
-                        .max_w(PAGE_WIDTH)
-                        .flex_col()
-                        .child(content),
-                ),
+            div().w_full().flex_row().justify_center().child(
+                div()
+                    .class("mq-settings-pane")
+                    .w_full()
+                    .max_w(PAGE_WIDTH)
+                    .flex_col()
+                    .child(content),
+            ),
         ),
     )
 }
@@ -350,12 +346,16 @@ fn agent_section(app: &App, agent: &'static str) -> Div {
             .class("mq-agent-section-head")
             .child(agents::dot(agent))
             .child(
-                div().class("mq-agent-section-name").flex_1().min_w(0.0).child(
-                    ui_text(agents::name(agent, &infos))
-                        .size(13.0)
-                        .semibold()
-                        .no_wrap(),
-                ),
+                div()
+                    .class("mq-agent-section-name")
+                    .flex_1()
+                    .min_w(0.0)
+                    .child(
+                        ui_text(agents::name(agent, &infos))
+                            .size(13.0)
+                            .semibold()
+                            .no_wrap(),
+                    ),
             )
             .child(
                 div()
@@ -654,8 +654,7 @@ fn appearance_tab(app: &App, width: f32, height: f32) -> Div {
         appearance.reduced_transparency
     });
     let glass_app = app.clone();
-    let glass_switch =
-        switch(&glass).on_change(move |on| glass_app.apply_reduced_transparency(on));
+    let glass_switch = switch(&glass).on_change(move |on| glass_app.apply_reduced_transparency(on));
 
     let scheme_row = scheme_choice(app);
 
@@ -696,7 +695,9 @@ fn appearance_tab(app: &App, width: f32, height: f32) -> Div {
                 .child(reading)
                 .child(section_title(tr(app, "Themes", "主题"))),
         )
-        .child(super::themes::themes_panel_embedded(app, themes_w, themes_h))
+        .child(super::themes::themes_panel_embedded(
+            app, themes_w, themes_h,
+        ))
 }
 
 /// Light / Dark / System for the active theme (moved out of the themes header).
@@ -832,15 +833,11 @@ fn general_tab(app: &App) -> Div {
         ))
         .child(section_card(
             Some(tr(app, "Editor", "编辑器")),
-            div()
-                .w_full()
-                .flex_col()
-                .child(editor_field)
-                .child(hint(tr(
-                    app,
-                    "Used by “Open in editor”, which arrives in a later version.",
-                    "供之后的“在编辑器中打开”使用，该功能将在后续版本提供。",
-                ))),
+            div().w_full().flex_col().child(editor_field).child(hint(tr(
+                app,
+                "Used by “Open in editor”, which arrives in a later version.",
+                "供之后的“在编辑器中打开”使用，该功能将在后续版本提供。",
+            ))),
         ))
         .child(section_card(
             Some(tr(app, "Window", "窗口")),
