@@ -20,7 +20,7 @@ const CHAR_WIDTH: f32 = 8.0;
 /// A body line, comfortable density (`parts::scale`).
 const BODY_LINE: f32 = 24.0;
 /// Rows of a diff a collapsed card shows.
-pub const DIFF_PREVIEW_LINES: u32 = 24;
+pub const DIFF_PREVIEW_LINES: u32 = 12;
 
 /// A row's height before it has been laid out, at content width `width`.
 pub fn estimate(shape: &Shape, width: f32) -> f32 {
@@ -33,8 +33,8 @@ pub fn estimate(shape: &Shape, width: f32) -> f32 {
         ShapeKind::Prose => wrapped(shape.chars, shape.lines) * BODY_LINE + 8.0,
         ShapeKind::User => wrapped(shape.chars, shape.lines) * BODY_LINE + 42.0,
         ShapeKind::Reasoning => 28.0,
-        ShapeKind::Tool => 38.0,
-        ShapeKind::Diff => shape.lines.min(DIFF_PREVIEW_LINES) as f32 * 18.0 + 44.0,
+        ShapeKind::Tool => 36.0,
+        ShapeKind::Diff => shape.lines.min(DIFF_PREVIEW_LINES) as f32 * 18.0 + 64.0,
         ShapeKind::Card => shape.lines as f32 * 24.0 + 36.0,
         ShapeKind::Notice => 24.0,
     };

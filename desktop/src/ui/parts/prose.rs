@@ -13,7 +13,7 @@ use crate::ui::text::{MONO_FONT, UI_FONT};
 
 /// Markdown for this row's part of the text; on the streaming row, the
 /// settled blocks, then the tail bound to `stream_tail`, then the cursor.
-fn body(ctx: &PartCtx<'_>, text: &str, setting: &Setting) -> Div {
+fn body(ctx: &PartCtx<'_>, text: &str, setting: &Setting, cursor: bool) -> Div {
     let key = ctx.key("md");
     let chrome = ctx.chrome(&key);
     let range = ctx.range.start.min(text.len())..ctx.range.end.min(text.len());
@@ -32,14 +32,18 @@ fn body(ctx: &PartCtx<'_>, text: &str, setting: &Setting) -> Div {
         ));
     }
     let (kind, _) = stream::tail(text, from);
-    column
-        .child(tail(&ctx.app.bindings.stream_tail, kind, setting))
-        .child(
-            div()
-                .class("mq-cursor")
-                .class("mq-agent-dot")
-                .class(format!("mq-agent--{}", agent_class(ctx.agent))),
-        )
+    let column = column.child(tail(&ctx.app.bindings.stream_tail, kind, setting));
+    if !cursor {
+        return column;
+    }
+    // Only while the turn is streaming (`TurnState::Streaming`), at the end
+    // of the newest assistant text.
+    column.child(
+        div()
+            .class("mq-cursor")
+            .class("mq-agent-dot")
+            .class(format!("mq-agent--{}", agent_class(ctx.agent))),
+    )
 }
 
 /// The streaming tail: replaced in place on every (throttled) delta, never
@@ -87,7 +91,7 @@ pub fn text(ctx: &PartCtx<'_>, text: &str) -> Div {
         .class("mq-assistant")
         .w_full()
         .flex_col()
-        .child(body(ctx, text, &setting));
+        .child(body(ctx, text, &setting, true));
     if ctx.last && ctx.live.is_none() && !text.trim().is_empty() {
         row = row.child(div().class("mq-row-actions").flex_row().child(copy_button(
             &ctx.key("copy"),
@@ -130,6 +134,7 @@ pub fn reasoning(ctx: &PartCtx<'_>, text: &str, duration_ms: Option<u64>) -> Div
                 width: ctx.width - 13.0,
                 ..ctx.setting(true)
             },
+            false,
         )));
     }
     row

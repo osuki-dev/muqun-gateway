@@ -3,21 +3,21 @@
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
-use blinc_cn::prelude::{input, ButtonBuilder, ButtonSize, ButtonVariant};
+use blinc_cn::prelude::{input, kbd, switch, KbdSize, SwitchSize};
+use blinc_core::State;
 use blinc_layout::prelude::*;
 use blinc_layout::widgets::text_input::{text_input_state, SharedTextInputData};
-use muqun_gateway::agents::{
-    AgentSessionId, FormField, FormRequest, PermissionDecision, PermissionRequest,
-};
+use blinc_theme::{ColorToken, ThemeState};
+use muqun_gateway::agents::{FormField, FormRequest, PermissionDecision, PermissionRequest};
 use serde_json::Value;
 
-use super::{card, meta, mono_block, scale};
+use super::{card, meta, mono, scale};
 use crate::model::commands::Command;
 use crate::ui::text::ui_text;
 use crate::ui::App;
 
-const KEY_Y: u32 = 89;
-const KEY_N: u32 = 78;
+pub const KEY_Y: u32 = 89;
+pub const KEY_N: u32 = 78;
 
 fn pending(app: &App, request_id: &str) -> bool {
     app.bindings
@@ -27,98 +27,200 @@ fn pending(app: &App, request_id: &str) -> bool {
         .any(|p| p.id == request_id)
 }
 
-/// The first permission still waiting in the shown session: the one Y / N
-/// answer.
-fn first_pending(app: &App) -> Option<String> {
-    app.bindings.permissions.get().first().map(|p| p.id.clone())
+/// Whether the agent can remember an answer for the rest of the session
+/// ("always" replies): OpenCode names what it would save, ACP agents offer
+/// an allow-always option.
+fn supports_remember(request: &PermissionRequest) -> bool {
+    !request.save.is_empty()
+        || request
+            .options
+            .iter()
+            .any(|o| o.decision == PermissionDecision::AllowAlways)
 }
 
-fn reply(app: &App, asid: &AgentSessionId, id: &str, decision: PermissionDecision) {
+/// The "remember for this session" switch of a request.
+fn remembered(id: &str) -> State<bool> {
+    blinc_core::BlincContextState::get()
+        .use_state_keyed(&format!("mq.perm.remember.{id}"), || false)
+}
+
+/// Answer `request`: Allow becomes "always" when the switch is on.
+fn decide(app: &App, request: &PermissionRequest, allow: bool) {
+    let decision = match (
+        allow,
+        supports_remember(request) && remembered(&request.id).get(),
+    ) {
+        (false, _) => PermissionDecision::Deny,
+        (true, true) => PermissionDecision::AllowAlways,
+        (true, false) => PermissionDecision::Allow,
+    };
     app.send(Command::ReplyPermission {
-        asid: asid.clone(),
-        id: id.to_string(),
+        asid: request.asid.clone(),
+        id: request.id.clone(),
         decision,
     });
 }
 
-/// A permission card. While it waits: Allow / Deny, and Y / N while the
-/// composer does not have the keyboard and this is the oldest waiting
-/// request. Once answered: a muted line.
+/// Y / N: answer the oldest waiting approval of the shown session. For the
+/// timeline's key handler, which runs whatever has the keyboard: it keeps out
+/// of the way of the composer, a form's fields and the pages that cover the
+/// timeline. True when the key was an answer.
+pub fn answer_key(app: &App, key_code: u32) -> bool {
+    if !matches!(key_code, KEY_Y | KEY_N)
+        || app.composer.lock().map(|s| s.is_focused()).unwrap_or(true)
+        || app.bindings.settings_open.get()
+        || app.bindings.draft.get().is_some()
+        || !app.bindings.forms.get().is_empty()
+    {
+        return false;
+    }
+    let Some(request) = app.bindings.permissions.get().first().cloned() else {
+        return false;
+    };
+    decide(app, &request, key_code == KEY_Y);
+    true
+}
+
+/// "Claude Code wants to run", from the session's agent.
+fn lead(app: &App, action: &str) -> String {
+    let agent = match app.bindings.header.get() {
+        Some(info) => crate::ui::agents::name(&info.agent_id, &app.bindings.agents.get()),
+        None => app.strings.unknown_agent().to_string(),
+    };
+    app.strings.wants_to(&agent, action)
+}
+
+/// What the request is about, on one line: the command or path (several
+/// patterns read as one line, joined).
+fn subject(request: &PermissionRequest) -> String {
+    let one = |s: &str| s.lines().next().unwrap_or("").trim().to_string();
+    let joined = request
+        .resources
+        .iter()
+        .map(|r| one(r))
+        .collect::<Vec<_>>()
+        .join(" · ");
+    if !joined.is_empty() {
+        return joined;
+    }
+    request
+        .metadata
+        .as_ref()
+        .and_then(|m| m.get("command"))
+        .and_then(Value::as_str)
+        .map(one)
+        .unwrap_or_else(|| one(&request.prompt))
+}
+
+/// A button with its key cap: ghost for Deny, mint (and wider) for Allow.
+fn choice(label: &str, key: &str, class: &str, id: String, on_click: impl Fn() + 'static) -> Div {
+    div()
+        .id(id)
+        .class("mq-choice")
+        .class(class)
+        .flex_row()
+        .items_center()
+        .justify_center()
+        .cursor_pointer()
+        .child(
+            ui_text(label.to_string())
+                .size(scale::FS_13)
+                .semibold()
+                .no_cursor()
+                .class(if class.ends_with("allow") {
+                    "mq-on-primary"
+                } else {
+                    "mq-text"
+                }),
+        )
+        .child(kbd(key).size(KbdSize::Small))
+        .on_click(move |_| on_click())
+}
+
+/// A permission card: an amber bar, one line (who, what, the command), and
+/// at the right Deny `N` and Allow `Y`; under it, when the agent can, the
+/// switch that makes Allow last for the session. Y / N answer from anywhere
+/// in the timeline (`answer_key`). Once answered: a muted line.
 pub fn approval(app: &App, request: &PermissionRequest, item: Option<&str>) -> Div {
     let strings = &app.strings;
     let waiting = pending(app, &request.id);
-    let mut body = div()
-        .class("mq-approval-body")
-        .flex_col()
+    let line = div()
+        .class("mq-approval-line")
+        .flex_1()
+        .min_w(0.0)
+        .flex_row()
+        .items_center()
         .child(
-            ui_text(if waiting {
-                strings.permission_needed()
-            } else {
-                strings.resolved()
-            })
-            .size(scale::FS_12)
-            .semibold(),
+            ui_text(lead(app, &request.action))
+                .size(scale::BODY)
+                .no_wrap()
+                .class(if waiting { "mq-text" } else { "mq-text-muted" }),
         )
         .child(
-            ui_text(request.prompt.clone())
-                .size(scale::BODY)
-                .line_height(1.5),
+            div()
+                .class("mq-approval-subject")
+                .flex_1()
+                .min_w(0.0)
+                .overflow_clip()
+                .child(mono(subject(request)).class("mq-text")),
         );
-    if !request.resources.is_empty() {
-        body = body.child(mono_block(request.resources.join("\n")));
-    }
     if !waiting {
-        return card("mq-accent--subtle", body);
-    }
-    let button = |label: &'static str, variant: ButtonVariant, decision: PermissionDecision| {
-        let app = app.clone();
-        let asid = request.asid.clone();
-        let id = request.id.clone();
-        let key = format!(
-            "mq-perm.{}.{}.{}",
-            id,
-            item.unwrap_or("pending"),
-            decision.as_str()
+        return card(
+            "mq-accent--subtle",
+            div()
+                .flex_row()
+                .items_center()
+                .child(line)
+                .child(meta(strings.resolved()).class("mq-text-subtle")),
         );
-        ButtonBuilder::with_key(key, label)
-            .variant(variant)
-            .size(ButtonSize::Small)
-            .on_click(move |_| reply(&app, &asid, &id, decision))
+    }
+    let key = |what: &str| {
+        format!(
+            "mq-perm.{}.{}.{what}",
+            request.id,
+            item.unwrap_or("pending")
+        )
     };
-    body = body.child(
-        div()
-            .class("mq-approval-actions")
-            .flex_row()
-            .items_center()
-            .child(button(
-                strings.approve(),
-                ButtonVariant::Primary,
-                PermissionDecision::Allow,
-            ))
-            .child(button(
-                strings.deny(),
-                ButtonVariant::Outline,
-                PermissionDecision::Deny,
-            ))
-            .child(meta("Y / N")),
-    );
-    let keys = app.clone();
-    let asid = request.asid.clone();
-    let id = request.id.clone();
-    card("mq-accent--warning", body).on_key_down(move |ctx| {
-        if ctx.ctrl || ctx.meta || ctx.alt {
-            return;
-        }
-        let composing = keys.composer.lock().map(|s| s.is_focused()).unwrap_or(true);
-        if composing || first_pending(&keys).as_deref() != Some(id.as_str()) {
-            return;
-        }
-        match ctx.key_code {
-            KEY_Y => reply(&keys, &asid, &id, PermissionDecision::Allow),
-            KEY_N => reply(&keys, &asid, &id, PermissionDecision::Deny),
-            _ => {}
-        }
-    })
+    let (allow_app, allow_req) = (app.clone(), request.clone());
+    let (deny_app, deny_req) = (app.clone(), request.clone());
+    let mut top = div()
+        .class("mq-approval-top")
+        .w_full()
+        .flex_row()
+        .items_center()
+        .child(line)
+        .child(choice(
+            strings.deny(),
+            "N",
+            "mq-choice--deny",
+            key("deny"),
+            move || decide(&deny_app, &deny_req, false),
+        ))
+        .child(choice(
+            strings.allow(),
+            "Y",
+            "mq-choice--allow",
+            key("allow"),
+            move || decide(&allow_app, &allow_req, true),
+        ));
+    top = top.class("mq-approval-top");
+    let mut body = div().class("mq-approval-body").flex_col().child(top);
+    if supports_remember(request) {
+        let state = remembered(&request.id);
+        body = body.child(
+            div()
+                .class("mq-approval-remember")
+                .flex_row()
+                .items_center()
+                .child(
+                    switch(&state)
+                        .size(SwitchSize::Small)
+                        .off_color(ThemeState::get().color(ColorToken::BorderSecondary)),
+                )
+                .child(meta(strings.remember_session())),
+        );
+    }
+    card("mq-accent--warning", body)
 }
 
 /// A form's draft answers and text fields, by form id.
@@ -299,26 +401,71 @@ fn answers(form: &FormRequest) -> Value {
 pub fn form(app: &App, request: &FormRequest) -> Div {
     let strings = &app.strings;
     let waiting = app.bindings.forms.get().iter().any(|f| f.id == request.id);
-    let mut body = div()
-        .class("mq-approval-body")
-        .flex_col()
+    let line = div()
+        .class("mq-approval-line")
+        .flex_1()
+        .min_w(0.0)
+        .flex_row()
+        .items_center()
         .child(
             ui_text(if waiting {
                 strings.answer_needed()
             } else {
                 strings.answered()
             })
-            .size(scale::FS_12)
-            .semibold(),
+            .size(scale::BODY)
+            .no_wrap()
+            .class(if waiting { "mq-text" } else { "mq-text-muted" }),
         )
         .child(
-            ui_text(request.title.clone())
-                .size(scale::BODY)
-                .line_height(1.5),
+            div()
+                .class("mq-approval-subject")
+                .flex_1()
+                .min_w(0.0)
+                .overflow_clip()
+                .child(
+                    ui_text(request.title.clone())
+                        .size(scale::BODY)
+                        .no_wrap()
+                        .class("mq-text-muted"),
+                ),
         );
     if !waiting {
-        return card("mq-accent--subtle", body);
+        return card("mq-accent--subtle", div().flex_row().child(line));
     }
+    let submit_app = app.clone();
+    let submitted = request.clone();
+    let top = div()
+        .class("mq-approval-top")
+        .w_full()
+        .flex_row()
+        .items_center()
+        .child(line)
+        .child(
+            div()
+                .id(format!("mq-form.{}.submit", request.id))
+                .class("mq-choice")
+                .class("mq-choice--allow")
+                .flex_row()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .child(
+                    ui_text(strings.submit())
+                        .size(scale::FS_13)
+                        .semibold()
+                        .no_cursor()
+                        .class("mq-on-primary"),
+                )
+                .on_click(move |_| {
+                    submit_app.send(Command::ReplyForm {
+                        asid: submitted.asid.clone(),
+                        id: submitted.id.clone(),
+                        answers: answers(&submitted),
+                    });
+                }),
+        );
+    let mut body = div().class("mq-approval-body").flex_col().child(top);
     for field in &request.fields {
         let (key, title, description) = field_key(field);
         let mut block = div()
@@ -394,21 +541,5 @@ pub fn form(app: &App, request: &FormRequest) -> Div {
         };
         body = body.child(block.child(control));
     }
-    let submit_app = app.clone();
-    let form = request.clone();
-    body = body.child(
-        div().class("mq-approval-actions").flex_row().child(
-            ButtonBuilder::with_key(format!("mq-form.{}.submit", request.id), strings.submit())
-                .variant(ButtonVariant::Primary)
-                .size(ButtonSize::Small)
-                .on_click(move |_| {
-                    submit_app.send(Command::ReplyForm {
-                        asid: form.asid.clone(),
-                        id: form.id.clone(),
-                        answers: answers(&form),
-                    });
-                }),
-        ),
-    );
     card("mq-accent--warning", body)
 }

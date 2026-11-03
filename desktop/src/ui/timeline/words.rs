@@ -19,17 +19,22 @@ macro_rules! words {
 words! {
     copy => "Copy", "复制";
     thinking_live => "Thinking…", "思考中…";
-    show_all => "Show all", "全部显示";
+    show_all => "Expand all", "展开全部";
     show_less => "Show less", "收起";
     loading_earlier => "Loading earlier messages…", "正在加载更早的消息…";
     start_of_history => "Beginning of the conversation", "对话开始";
     earlier_available => "Scroll up for earlier messages", "向上滚动查看更早的消息";
     input => "Input", "输入";
     output => "Output", "输出";
-    tool_pending => "Pending", "等待";
-    tool_running => "Running", "运行中";
-    tool_done => "Done", "完成";
-    tool_failed => "Failed", "失败";
+    tool_failed => "failed", "失败";
+    waiting_approval => "waiting for approval", "等待批准";
+    remember_session => "Remember for this session", "本会话记住";
+    open_in_editor => "Open in editor", "在编辑器打开";
+    allow => "Allow", "允许";
+    revert => "Revert", "撤回";
+    diff => "Diff", "Diff";
+    jump_latest => "↓ Jump to latest", "↓ 回到最新";
+    unknown_agent => "The agent", "Agent";
     todo_title => "To-do", "待办";
     answer_needed => "Answer needed", "需要回答";
     submit => "Submit", "提交";
@@ -55,6 +60,44 @@ words! {
 }
 
 impl Strings {
+    /// "3 files".
+    pub fn files(&self, n: usize) -> String {
+        match self.language() {
+            Language::En if n == 1 => "1 file".to_string(),
+            Language::En => format!("{n} files"),
+            Language::ZhCn => format!("{n} 个文件"),
+        }
+    }
+
+    /// "Claude Code wants to run": the start of an approval's one line.
+    pub fn wants_to(&self, agent: &str, action: &str) -> String {
+        let a = action.to_lowercase();
+        let en = match a.as_str() {
+            "bash" | "shell" | "exec" | "command" => "run".to_string(),
+            "edit" | "write" | "patch" | "apply_patch" | "multiedit" => "edit".to_string(),
+            "read" => "read".to_string(),
+            "webfetch" | "fetch" => "fetch".to_string(),
+            "glob" | "grep" | "list" | "search" => "search".to_string(),
+            "task" | "subagent" => "start a subtask".to_string(),
+            other => format!("use {other}"),
+        };
+        match self.language() {
+            Language::En => format!("{agent} wants to {en}"),
+            Language::ZhCn => {
+                let zh = match a.as_str() {
+                    "bash" | "shell" | "exec" | "command" => "运行".to_string(),
+                    "edit" | "write" | "patch" | "apply_patch" | "multiedit" => "修改".to_string(),
+                    "read" => "读取".to_string(),
+                    "webfetch" | "fetch" => "访问".to_string(),
+                    "glob" | "grep" | "list" | "search" => "搜索".to_string(),
+                    "task" | "subagent" => "启动子任务".to_string(),
+                    other => format!("使用 {other}"),
+                };
+                format!("{agent} 想要{zh}")
+            }
+        }
+    }
+
     /// "↓ 3 new messages".
     pub fn new_messages(&self, n: usize) -> String {
         match self.language() {

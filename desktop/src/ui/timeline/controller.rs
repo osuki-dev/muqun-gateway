@@ -95,12 +95,24 @@ struct Ctl {
     loading: bool,
     retry_at: Option<Instant>,
     pill: usize,
+    /// What `Controller::at_bottom` last said.
+    reported_bottom: bool,
     quiet: u32,
     last_top: f32,
     last_content: f32,
     /// Pixels the viewport moved since the previous frame.
     speed: f32,
     epoch: u64,
+}
+
+impl Ctl {
+    /// Record a change of "at the bottom" for [`Controller::at_bottom`].
+    fn report_bottom(&mut self, w: &mut Writes) {
+        if self.following != self.reported_bottom {
+            self.reported_bottom = self.following;
+            w.at_bottom = Some(self.following);
+        }
+    }
 }
 
 /// One window of the list, as the list builder renders it.
@@ -117,6 +129,8 @@ pub struct Controller {
     pub window_epoch: State<u64>,
     /// New rows that arrived while the reader was away from the bottom.
     pub pill: State<usize>,
+    /// The viewport is at the end of the list (following the tail).
+    pub at_bottom: State<bool>,
     /// An older page is on its way.
     pub loading: State<bool>,
     /// The list's state as text, for the `MUQUN_DEBUG_LIST=1` overlay.
@@ -130,6 +144,7 @@ pub struct Controller {
 struct Writes {
     epoch: Option<u64>,
     pill: Option<usize>,
+    at_bottom: Option<bool>,
     debug: Option<String>,
     loading: Option<bool>,
     command: Option<Command>,
@@ -147,11 +162,13 @@ impl Controller {
                     physics: Arc::new(Mutex::new(ScrollPhysics::new(ScrollConfig::no_bounce()))),
                     window_epoch: ctx.use_state_keyed("mq.timeline.window", || 0u64),
                     pill: ctx.use_state_keyed("mq.timeline.pill", || 0usize),
+                    at_bottom: ctx.use_state_keyed("mq.timeline.at_bottom", || true),
                     loading: ctx.use_state_keyed("mq.timeline.loading", || false),
                     debug: std::env::var_os("MUQUN_DEBUG_LIST")
                         .map(|_| ctx.use_state_keyed("mq.timeline.debug", String::new)),
                     s: Mutex::new(Ctl {
                         width: 800.0,
+                        reported_bottom: true,
                         ..Ctl::default()
                     }),
                 });
@@ -161,6 +178,12 @@ impl Controller {
                 controller
             })
             .clone()
+    }
+
+    /// Whether the reader is at the end of the list: the "↓" pill shows only
+    /// when not.
+    pub fn is_at_bottom(&self) -> bool {
+        self.at_bottom.get()
     }
 
     pub fn physics(&self) -> SharedScrollPhysics {
@@ -193,6 +216,9 @@ impl Controller {
         }
         if let Some(p) = w.pill {
             self.pill.signal().set(p);
+        }
+        if let Some(b) = w.at_bottom {
+            self.at_bottom.signal().set(b);
         }
         if let Some(l) = w.loading {
             self.loading.signal().set(l);
@@ -339,6 +365,7 @@ impl Controller {
             s.following = top >= (content - vh).max(0.0) - 2.0;
             s.restore = None;
             let mut w = Writes::default();
+            s.report_bottom(&mut w);
             if s.sums_dirty {
                 s.model.resum();
                 s.sums_dirty = false;
@@ -368,11 +395,13 @@ impl Controller {
                 built: false,
             });
             s.epoch += 1;
-            Writes {
+            let mut w = Writes {
                 epoch: Some(s.epoch),
                 pill: Some(0),
                 ..Writes::default()
-            }
+            };
+            s.report_bottom(&mut w);
+            w
         };
         self.apply(writes);
         self.app.drain.wake();
@@ -480,6 +509,7 @@ impl Controller {
                 s.pill = 0;
                 w.pill = Some(0);
             }
+            s.report_bottom(&mut w);
             // 4. The new anchor.
             let i = s.model.row_at((top - LEAD).max(0.0));
             if let Some(id) = s.ids.get(i).cloned() {

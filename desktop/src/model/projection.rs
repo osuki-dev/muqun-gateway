@@ -297,6 +297,12 @@ impl Core {
                     });
                 }
             },
+            Command::OpenDiff { asid, file } => {
+                tracing::info!(asid = %asid.0, ?file, "diff panel: not built yet");
+            }
+            Command::StageRevert { asid, file } => {
+                tracing::info!(asid = %asid.0, file, "revert: not built yet");
+            }
             Command::ReplyForm { asid, id, answers } => {
                 if let Err(err) = self.hub.reply_form(&asid, &id, answers).await {
                     self.fail(err);
