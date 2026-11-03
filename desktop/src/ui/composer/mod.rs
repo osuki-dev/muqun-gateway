@@ -264,6 +264,11 @@ fn ensure_loaded(app: &App, aim: &Aim) {
 /// Called whenever the composer is built: when the surface changed, put that
 /// surface's own draft into the text area. Nothing is saved here -- drafts
 /// are saved as they are typed.
+///
+/// Must not notify deps that this same view rebuilds on unless the value
+/// actually changed: start and session composers share `staged` / `rows`, and
+/// a spurious `set` while both still answer those signals flips
+/// `current_surface` forever until the stack overflows.
 fn sync_surface(app: &App, key: &str) {
     if state::current_surface().as_deref() == Some(key) {
         return;
@@ -286,10 +291,15 @@ fn sync_surface(app: &App, key: &str) {
     }
     refresh_text_area(&app.composer);
     state::draft_changed(key, &draft);
-    cmp.staged.signal().set(Arc::new(Vec::new()));
+    if !cmp.staged.get().is_empty() {
+        cmp.staged.signal().set(Arc::new(Vec::new()));
+    }
     set_popup(state::Popup::default());
     pills::close_menu();
-    cmp.rows.signal().set(rows_for(&draft));
+    let rows = rows_for(&draft);
+    if cmp.rows.get() != rows {
+        cmp.rows.signal().set(rows);
+    }
     if key == START_DRAFT || state::inbox_of().as_deref() != Some(key) {
         state::clear_inbox();
     }
@@ -950,6 +960,11 @@ pub fn composer(app: &App) -> impl ElementBuilder {
         .deps(deps)
         .on_state(move |_| {
             APP.with(|a| *a.borrow_mut() = Some(app.clone()));
+            // Home may still notify these shared signals while a session
+            // strip is answering them; do not sync until a session is open.
+            if app.bindings.selected.get().is_none() {
+                return div().class("mq-cmp-slot");
+            }
             let aim = aim(&app, Place::Session);
             sync_surface(&app, &aim.key);
             ensure_loaded(&app, &aim);
@@ -1010,6 +1025,11 @@ pub fn start_card(app: &App, width: f32) -> impl ElementBuilder {
         .deps(deps)
         .on_state(move |_| {
             APP.with(|a| *a.borrow_mut() = Some(app.clone()));
+            // Session composer may still notify these shared signals while a
+            // start-card stateful is answering them; do not steal the surface.
+            if app.bindings.selected.get().is_some() {
+                return div().w(width);
+            }
             let aim = aim(&app, Place::Start);
             sync_surface(&app, &aim.key);
             ensure_loaded(&app, &aim);
