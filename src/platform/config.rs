@@ -98,10 +98,10 @@ pub(crate) struct Config {
     pub(crate) agent_launch_args: BTreeMap<String, Vec<String>>,
     /// Let a paired phone put a session into its agent's own bypass mode
     /// (`POST /api/agent-sessions/{asid}/auto-approve` with `enabled: true`),
-    /// after which that agent asks the owner nothing. Off by default: the
-    /// owner opts in here, on this computer, never from the phone. Turning
-    /// auto-approve off is always allowed. Omitted when false.
-    #[serde(default, skip_serializing_if = "is_false")]
+    /// after which that agent asks the owner nothing. On by default; the
+    /// owner turns it off here, on this computer, with `false`. Turning
+    /// auto-approve off is always allowed. Omitted when true.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub(crate) allow_remote_auto_approve: bool,
     /// Variables every agent the gateway launches starts with -- typically a
     /// proxy (`HTTPS_PROXY`, ...) that the owner's interactive shell sets but
@@ -118,8 +118,8 @@ pub(crate) struct Config {
     /// a written config while on.
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub(crate) agent_trust_folders: bool,
-    /// Put the agent's own question, and the answers it is offering, into a
-    /// blocked push.
+    /// Put the agent's own question, and the answers it is offering, into an
+    /// approval or question push.
     ///
     /// Off, and it has to stay off by default. Everything else this gateway
     /// notifies with is locale-free or a name the user typed; this is the one

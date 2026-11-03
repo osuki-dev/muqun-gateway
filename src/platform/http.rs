@@ -362,6 +362,30 @@ pub(crate) fn validate_push_token(token: &str) -> ApiResult<()> {
     Ok(())
 }
 
+/// One Expo message. A notification category (`data.categoryId`, the
+/// client's registered approve/deny actions) is also set on the message
+/// itself: Expo reads it there, and only there does the lock screen show
+/// the actions.
+fn expo_message(
+    token: &str,
+    title: &str,
+    body: &str,
+    data: &serde_json::Map<String, Value>,
+) -> Value {
+    let mut message = json!({
+        "to": token,
+        "title": title,
+        "body": body,
+        "data": data,
+        "sound": "default",
+        "channelId": "gateway"
+    });
+    if let Some(category) = data.get("categoryId") {
+        message["categoryId"] = category.clone();
+    }
+    message
+}
+
 pub(crate) async fn send_expo_push_notifications(
     tokens: &[PushTokenRecord],
     title: String,
@@ -373,16 +397,7 @@ pub(crate) async fn send_expo_push_notifications(
     }
     let messages = tokens
         .iter()
-        .map(|record| {
-            json!({
-                "to": record.token,
-                "title": title,
-                "body": body,
-                "data": data,
-                "sound": "default",
-                "channelId": "gateway"
-            })
-        })
+        .map(|record| expo_message(&record.token, &title, &body, &data))
         .collect::<Vec<_>>();
     let response = reqwest::Client::new()
         .post("https://exp.host/--/api/v2/push/send")
@@ -460,6 +475,25 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use crate::*;
+
+    /// Expo shows a category's lock-screen actions only when the message
+    /// itself names it; the data keeps its copy for the App.
+    #[test]
+    fn a_push_with_a_category_names_it_on_the_message() {
+        for (data, category) in [
+            (
+                json!({"type": "approval.pending", "categoryId": "approval"}),
+                json!("approval"),
+            ),
+            (json!({"type": "agent.completed"}), Value::Null),
+        ] {
+            let data = data.as_object().unwrap().clone();
+            let message = super::expo_message("ExpoPushToken[x]", "t", "b", &data);
+            assert_eq!(message["categoryId"], category);
+            assert_eq!(message["data"], Value::Object(data));
+            assert_eq!(message["channelId"], "gateway");
+        }
+    }
 
     #[test]
     fn control_routes_accept_a_device_token_and_report_which_device() {

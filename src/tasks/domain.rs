@@ -113,6 +113,12 @@ pub(crate) enum TaskBinding {
         /// The reasoning effort that goes with `model`, likewise.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         variant: Option<String>,
+        /// The native agent session the launched agent drives (a Codex TUI
+        /// started on the shared daemon's session): that session's watcher
+        /// pushes for it, so the pane does not (`terminal::routes`). Not
+        /// `asid`, which names an agent-session binding to the store.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_session_id: Option<String>,
     },
     /// A delegation running on another of the owner's computers: this task is
     /// its mirror here, kept in step with task `remote_task_id` on peer
@@ -335,6 +341,9 @@ pub(crate) struct TaskFilter {
     pub agent_id: Option<String>,
     /// Only tasks bound to this agent session.
     pub asid: Option<String>,
+    /// Only pane tasks whose agent drives this native agent session
+    /// (`TaskBinding::Pane::agent_session_id`).
+    pub agent_session: Option<String>,
     /// Only tasks bound to this pane: `(session_id, pane_id)`.
     pub pane: Option<(String, String)>,
     /// Only mirrors of tasks on this peer (`TaskBinding::Peer`).
@@ -430,6 +439,7 @@ mod tests {
                 agent_job: None,
                 model: None,
                 variant: None,
+                agent_session_id: None,
             }
         );
         assert_eq!(serde_json::to_string(&binding).unwrap(), stored);
@@ -442,6 +452,7 @@ mod tests {
             agent_job: None,
             model: None,
             variant: None,
+            agent_session_id: None,
         };
         let json = serde_json::to_string(&pinned).unwrap();
         assert_eq!(serde_json::from_str::<TaskBinding>(&json).unwrap(), pinned);

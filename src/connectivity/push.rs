@@ -182,7 +182,7 @@ pub(crate) struct AgentPushNotice {
     pub(crate) detail: Option<PushDetail>,
 }
 
-/// What a blocked push says when the operator has opted into it: the question
+/// What an approval or question push says when the operator has opted into it: the question
 /// the agent asked, and the answers it is offering, both verbatim and both cut
 /// short.
 ///
@@ -453,7 +453,8 @@ mod tests {
             include_str!("../terminal/routes.rs")
                 .matches("send_registered_push_notifications(")
                 .count(),
-            2
+            1,
+            "every terminal and agent push goes through deliver_agent_notification"
         );
     }
 }

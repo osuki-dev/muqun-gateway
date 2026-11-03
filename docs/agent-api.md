@@ -980,14 +980,14 @@ which `GET` reads without changing anything.
 |---|---|---|
 | Claude Code | `session/set_mode` `bypassPermissions` (offered only where Claude Code's settings allow it) | session |
 | Qoder | `session/set_mode` `yolo` ("Bypass Permissions") | session |
-| Codex | the next `turn/start` carries `approvalPolicy: "never"` with `sandboxPolicy: {type: "workspaceWrite"}` (the asking stops, the sandbox stays; `dangerFullAccess` is never set from a device), which Codex keeps for the turns after it; off sends back the last policy the thread was seen asking under, else the configuration's `approval_policy`/`sandbox_mode`, never with a sandbox wider than the thread was last observed in. `enabled` reads true only for `never` with a sandbox that can write | session |
+| Codex | the next `turn/start` carries `approvalPolicy: "never"` with `sandboxPolicy: {type: "dangerFullAccess"}` (no asking and no sandbox, as `--dangerously-bypass-approvals-and-sandbox` at the terminal), which Codex keeps for the turns after it; off sends back the last policy the thread was seen asking under, else the configuration's `approval_policy`/`sandbox_mode`, never with a sandbox wider than the thread was last observed in. `enabled` reads true only for `never` with a sandbox that can write | session |
 | OpenCode | a session permission rule `{action: "*", resource: "*", effect: "allow"}` appended last; off removes it | session |
 | T3 Code | `thread.runtime-mode.set` `full-access`; off returns to `runtime_mode` (or `approval-required` when that is `full-access`) | session |
 | Antigravity, Cursor, FX, Pi | a launch flag or environment only (`agy acp --dangerously-skip-permissions`, `agent --force`, `FX_PERMISSION_MODE=full-access`, `MUQUN_PI_APPROVALS=never`): `POST` answers 501 | launch |
 | DeepSeek | per-request approvals only: `POST` answers 501, `enabled` is null | none |
 
-`enabled: true` is refused with `403 auto_approve_disabled` until the owner
-sets `allow_remote_auto_approve: true` in the gateway's `config.json` (off by
+`enabled: true` is refused with `403 auto_approve_disabled` when the owner
+sets `allow_remote_auto_approve: false` in the gateway's `config.json` (on by
 default; `false` is always accepted). The same refusal covers `POST …/mode`
 and `mode` on `POST /api/agent-sessions` when the mode is one in which the
 agent stops asking (Claude Code `bypassPermissions`/`auto`, Qoder
@@ -1628,23 +1628,52 @@ Forms are v2's question mechanism; there is no separate question event.
 
 ### Push notifications
 
-Every registered device is pushed once per pending approval and once per
-pending form, for any agent session -- a child session's included. A repeat of
-the same request id (T3 re-announces open requests on every thread snapshot)
-pushes nothing until that request is resolved.
+Capability `native_agent_push`. A push about an agent conversation carries
+`asid` and `agent_id`, and the App opens that session; only a plain terminal
+agent's push is routed by `session_id` (the terminal session) and `pane_id`.
+One event raises one push.
 
-| | approval | question (form) |
-|---|---|---|
-| `type`, `category` | `approval` | `question` |
-| `server_id` | the gateway's server id | the gateway's server id |
-| `session_id`, `asid` | the agent session | the agent session |
-| request id | `approval_id` | `form_id` |
-| `fingerprint` | the request id | the form id |
-| `agent_id` | — | the owning agent (`opencode`, `deepseek`, `t3`, `codex`) |
+Every registered device is pushed once per pending approval, once per pending
+form and once per finished turn, for any agent session. A repeat of the same
+request id (T3 re-announces open requests on every thread snapshot) pushes
+nothing until that request is resolved. A turn end pushes after the session
+has been idle for 30 s following a busy (or retry) status, at most once per
+2 minutes per session, and never for a child session (`parent_id`) or a
+sub-task's session (a task another task delegated, whose end that task is
+told about). Failed and interrupted turns push nothing.
 
-A question push reads "*name* needs your input", where *name* is the session's
-title, or the agent's name when the session has none. With `rich_agent_pushes`
-on, the body is the form's title instead and the data carries it as `question`.
+| | approval | question (form) | turn end |
+|---|---|---|---|
+| `type` | `approval` | `question` | `agent.completed` |
+| `category` | `approval` | `question` | — |
+| `server_id` | the gateway's server id | the gateway's server id | the gateway's server id |
+| `asid` | the agent session | the agent session | the agent session |
+| `agent_id` | the owning agent | the owning agent | the owning agent |
+| request id | `approval_id` | `form_id` | — |
+| `fingerprint` | the request id | the form id | — |
+
+`session_id` is not set on these: to the App it names a terminal session.
+
+```json
+{"type": "agent.completed", "server_id": "srv_1", "agent_id": "codex", "asid": "thr_1"}
+```
+
+The words are the pane pushes' own, in the device's language, with the server
+label in the title and the agent's name in the body: "Agent done · Studio" /
+"Codex finished running.", "Approval needed · Studio" / "Codex is waiting for
+your approval." A question reads "*name* needs your input", where *name* is the
+session's title, or the agent's name when the session has none. The agent's
+own words (an approval's prompt, a form's title) are never sent, unless the
+owner turned `rich_agent_pushes` on: then they are the body and travel as
+`question`.
+
+A terminal pane whose agent drives a native session -- a Codex delegation's
+TUI on the shared daemon's session, recorded on the task's pane binding as
+`agent_session_id` -- pushes nothing of its own while that task's launched
+agent holds the pane: the session's pushes cover it. A pane showing a
+permission menu pushes `approval.pending` and not also `agent.blocked` or
+`agent.input_required`. A push whose data has `categoryId` (a pane approval)
+carries it on the Expo message too, so the lock screen offers its actions.
 
 ---
 
