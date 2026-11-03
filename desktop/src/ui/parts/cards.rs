@@ -128,9 +128,68 @@ fn output_section(ctx: &PartCtx<'_>, what: &str, output: &str, truncated: bool) 
     section
 }
 
+/// Tools that stay quiet once done (no card chrome). Active / failed /
+/// approval-waiting ones keep the hairline card.
+fn is_quiet_tool(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "read"
+            | "readfile"
+            | "read_file"
+            | "search"
+            | "grep"
+            | "glob"
+            | "list"
+            | "ls"
+            | "find"
+            | "fetch"
+            | "webfetch"
+            | "web_fetch"
+            | "get"
+            | "cat"
+            | "view"
+            | "other"
+    )
+}
+
+fn tool_label(name: &str) -> String {
+    let lower = name.to_ascii_lowercase();
+    match lower.as_str() {
+        "read" | "readfile" | "read_file" | "cat" | "view" => "Read".into(),
+        "search" | "grep" => "Search".into(),
+        "glob" | "find" => "Glob".into(),
+        "list" | "ls" => "List".into(),
+        "fetch" | "webfetch" | "web_fetch" | "get" => "Fetch".into(),
+        "bash" | "shell" | "run" | "terminal" => "Run".into(),
+        "edit" | "write" | "apply_patch" | "applypatch" => "Edit".into(),
+        "other" => "Other".into(),
+        _ if !name.is_empty() => {
+            let mut chars = name.chars();
+            match chars.next() {
+                Some(c) => format!("{}{}", c.to_uppercase(), chars.as_str()),
+                None => name.to_string(),
+            }
+        }
+        _ => name.to_string(),
+    }
+}
+
+/// Drop the session cwd prefix so args read as relative paths.
+fn relativise(path: &str, cwd: Option<&str>) -> String {
+    let Some(cwd) = cwd.filter(|c| !c.is_empty()) else {
+        return path.to_string();
+    };
+    let cwd = cwd.trim_end_matches(['/', '\\']);
+    path.strip_prefix(cwd)
+        .map(|rest| rest.trim_start_matches(['/', '\\']))
+        .filter(|rest| !rest.is_empty())
+        .unwrap_or(path)
+        .to_string()
+}
+
 /// The call's input on one line: the field that says most (the command, the
 /// path, the pattern) or else the first string.
-fn args_summary(call: &ToolCall) -> String {
+fn args_summary(call: &ToolCall, cwd: Option<&str>) -> String {
     const KEYS: &[&str] = &[
         "command",
         "cmd",
@@ -150,12 +209,13 @@ fn args_summary(call: &ToolCall) -> String {
             .find_map(|k| map.get(*k).and_then(Value::as_str));
         let first = || map.values().find_map(Value::as_str);
         if let Some(v) = named.or_else(first) {
-            return line(v).chars().take(200).collect();
+            let shown = relativise(&line(v), cwd);
+            return shown.chars().take(200).collect();
         }
     }
     match (&call.title, &call.input_partial) {
-        (Some(title), _) if title != &call.name => line(title),
-        (_, Some(partial)) => line(partial).chars().take(200).collect(),
+        (Some(title), _) if title != &call.name => relativise(&line(title), cwd),
+        (_, Some(partial)) => relativise(&line(partial), cwd).chars().take(200).collect(),
         _ => String::new(),
     }
 }
@@ -163,7 +223,7 @@ fn args_summary(call: &ToolCall) -> String {
 /// A tool call, one 36 px row: `▸ name  args … duration`, a 3 px bar on the
 /// left for the state (mint running with a spinner at the right, grey done,
 /// red failed, amber while an approval for it waits). Opened, it shows the
-/// input and the output.
+/// input and the output. Completed passive tools render as quiet rows.
 pub fn tool(ctx: &PartCtx<'_>, call: &ToolCall) -> Div {
     let strings = &ctx.app.strings;
     let status = call.state;
@@ -184,24 +244,35 @@ pub fn tool(ctx: &PartCtx<'_>, call: &ToolCall) -> Div {
     } else {
         status_accent(status)
     };
+    let quiet = !waiting
+        && !unfinished
+        && status == ToolCallStatus::Completed
+        && !stale
+        && is_quiet_tool(&call.name);
     let open = ctx.is_open("tool", false);
-    let args = args_summary(call);
+    let cwd = ctx
+        .app
+        .bindings
+        .header
+        .get()
+        .and_then(|h| h.directory.clone());
+    let args = args_summary(call, cwd.as_deref());
+    let label = tool_label(&call.name);
     let mut head = div()
         .id(ctx.key("tool"))
         .class("mq-tool-row")
         .w_full()
-        .h(ROW_HEIGHT - 2.0)
+        .h(if quiet { 28.0 } else { ROW_HEIGHT - 2.0 })
         .flex_row()
         .items_center()
         .min_w(0.0)
         .cursor_pointer()
         .child(crate::ui::icons::chevron(open))
-        .child(
-            div()
-                .class("mq-tool-name")
-                .flex_shrink_0()
-                .child(mono(call.name.clone()).no_cursor()),
-        )
+        .child(div().class("mq-tool-name").flex_shrink_0().child(if quiet {
+            meta(label).no_cursor()
+        } else {
+            mono(label).no_cursor()
+        }))
         .child(
             div()
                 .class("mq-tool-title")
@@ -261,7 +332,16 @@ pub fn tool(ctx: &PartCtx<'_>, call: &ToolCall) -> Div {
     if let Some(err) = &call.error {
         body = body.child(error_line(err));
     }
-    card(accent, body)
+    if quiet {
+        div()
+            .class("mq-tool-quiet")
+            .w_full()
+            .flex_row()
+            .items_stretch()
+            .child(body.flex_1().min_w(0.0))
+    } else {
+        card(accent, body)
+    }
 }
 
 fn error_line(err: &AgentErrorInfo) -> Div {

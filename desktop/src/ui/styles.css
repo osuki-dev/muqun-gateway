@@ -247,6 +247,9 @@
 }
 .mq-row { padding-bottom: var(--mq-row-gap); }
 .mq-density--compact .mq-row { padding-bottom: var(--mq-row-gap-compact); }
+/* Completed passive tools sit closer than prose (C′ G1). */
+.mq-row:has(.mq-tool-quiet) { padding-bottom: 4px; }
+.mq-density--compact .mq-row:has(.mq-tool-quiet) { padding-bottom: 2px; }
 .mq-history { color: var(--text-tertiary); }
 
 .mq-md { gap: var(--mq-space-2); }
@@ -314,6 +317,14 @@
     border: 1px solid var(--border);
     border-radius: var(--mq-radius-md);
 }
+/* Completed read/search/…: no chrome, just a quiet line. */
+.mq-tool-quiet {
+    background: transparent;
+    border: none;
+    border-radius: 0;
+}
+.mq-tool-quiet .mq-tool-name { color: var(--text-secondary); }
+.mq-tool-quiet .mq-tool-title { color: var(--text-tertiary); }
 .mq-card-body { padding: var(--mq-space-2) var(--mq-space-3); gap: var(--mq-space-2); }
 .mq-density--compact .mq-card-body { padding: var(--mq-space-1) var(--mq-space-3); }
 .mq-card-head { gap: var(--mq-space-2); color: var(--text-secondary); }
@@ -335,14 +346,14 @@
 
 .mq-accent { background: var(--text-tertiary); }
 .mq-accent--pending { background: var(--text-tertiary); }
-.mq-accent--running { background: var(--primary); }
+.mq-accent--running { background: var(--success); }
 .mq-accent--done { background: var(--border-secondary); }
 .mq-accent--failed { background: var(--error); }
 .mq-accent--info { background: var(--info); }
 .mq-accent--warning { background: var(--warning); }
 .mq-accent--subtle { background: var(--border-secondary); }
 .mq-tone--pending, .mq-tone--subtle { color: var(--text-tertiary); }
-.mq-tone--running { color: var(--primary); }
+.mq-tone--running { color: var(--success); }
 .mq-tone--info { color: var(--info); }
 .mq-tone--done { color: var(--success); }
 .mq-tone--failed { color: var(--error); }
