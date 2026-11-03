@@ -623,19 +623,6 @@ type CatalogCacheEntry = (
     Result<AgentCatalog, AgentError>,
 );
 
-/// Newest projection rows already handed to the mirror. ACP keeps the full
-/// transcript in the projection; the App only opens with a short tail and
-/// pages older rows through [`AcpDriver::load_earlier_timeline`].
-#[derive(Clone)]
-struct EarlierCursor {
-    /// How many newest rows have been delivered so far.
-    held: usize,
-    /// Id of the oldest delivered row (cut for the next earlier page).
-    oldest_id: String,
-    /// Nothing older than `oldest_id` remains in the projection.
-    exhausted: bool,
-}
-
 pub struct AcpDriver<P: AcpProvider> {
     provider: PhantomData<P>,
     binary: String,
@@ -682,8 +669,6 @@ pub struct AcpDriver<P: AcpProvider> {
     /// When `session/new` or `session/load` last answered ACP's
     /// `auth_required`; cleared by the next one that succeeds.
     signin_failure: StdMutex<Option<u64>>,
-    /// Where timeline paging stands per session (newest window delivered).
-    earlier: StdMutex<HashMap<String, EarlierCursor>>,
     stop: CancellationToken,
 }
 
@@ -801,51 +786,8 @@ impl<P: AcpProvider> AcpDriver<P> {
             owned: StdMutex::new(OwnedSessions::default()),
             instructions: StdMutex::new(HashMap::new()),
             signin_failure: StdMutex::new(None),
-            earlier: StdMutex::new(HashMap::new()),
             stop: CancellationToken::new(),
         })
-    }
-
-    /// Remember the newest `page` as delivered for `session_id`. A shallower
-    /// read than one already held does not move the cursor back up.
-    fn hold_newest(&self, session_id: &str, page: &[TimelineItem], total: usize) {
-        let Some(oldest_id) = page.first().map(|row| row.id.clone()) else {
-            return;
-        };
-        let mut earlier = self.earlier.lock().unwrap_or_else(|p| p.into_inner());
-        if earlier
-            .get(session_id)
-            .is_some_and(|held| held.held >= page.len())
-        {
-            return;
-        }
-        earlier.insert(
-            session_id.to_owned(),
-            EarlierCursor {
-                held: page.len(),
-                oldest_id,
-                exhausted: page.len() >= total,
-            },
-        );
-    }
-
-    fn clear_earlier(&self, session_id: &str) {
-        self.earlier
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .remove(session_id);
-    }
-
-    /// Newest `limit` rows of an oldest-first timeline (empty when limit is 0).
-    fn newest_page(rows: &[TimelineItem], limit: usize) -> Vec<TimelineItem> {
-        if limit == 0 || rows.is_empty() {
-            return Vec::new();
-        }
-        if rows.len() <= limit {
-            rows.to_vec()
-        } else {
-            rows[rows.len() - limit..].to_vec()
-        }
     }
 
     /// Tests point the store probe away from the real native store.
@@ -4156,77 +4098,21 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
                     "history page limit must be positive".into(),
                 ));
             }
+            // An ACP load keeps the newest window of the native replay; the
+            // mirror pages those rows before this hook runs, and nothing older
+            // is served from here.
             if self.readonly_empty_snapshot(id).await? {
                 return Ok(Vec::new());
             }
-            // Wake a parked / terminal-held session so the projection holds
-            // the native replay we page from.
             if self.retained(id).is_none() {
+                // A terminal-held transcript is mirrored whole; nothing older.
                 if self.terminal_live(id).await.is_none() {
-                    let _ = self.observed_snapshot(id).await?;
+                    self.observed_snapshot(id).await?;
                 }
-                if self.retained(id).is_none() {
-                    let _ = self.ensure_loaded(id).await?;
-                }
-            }
-            let session = self.retained(id).ok_or_else(|| {
-                AgentError::NotAvailable("ACP generation changed during observation".into())
-            })?;
-            let cursor = self
-                .earlier
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .get(id)
-                .cloned();
-            let Some(cursor) = cursor else {
-                return Err(AgentError::HistoryCursorLost);
-            };
-            if cursor.exhausted {
                 return Ok(Vec::new());
             }
-            let all = session.state.lock().await.projection.timeline();
-            let Some(cut) = all.iter().position(|row| row.id == cursor.oldest_id) else {
-                return Err(AgentError::HistoryCursorLost);
-            };
-            if cut == 0 {
-                self.earlier
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .insert(
-                        id.to_owned(),
-                        EarlierCursor {
-                            exhausted: true,
-                            ..cursor
-                        },
-                    );
-                return Ok(Vec::new());
-            }
-            let start = cut.saturating_sub(limit);
-            let older: Vec<TimelineItem> = all[start..cut]
-                .iter()
-                .cloned()
-                .map(|mut row| {
-                    row.seq = 0;
-                    row
-                })
-                .collect();
-            let exhausted = start == 0;
-            let oldest_id = older
-                .first()
-                .map(|row| row.id.clone())
-                .unwrap_or(cursor.oldest_id);
-            self.earlier
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .insert(
-                    id.to_owned(),
-                    EarlierCursor {
-                        held: all.len() - start,
-                        oldest_id,
-                        exhausted,
-                    },
-                );
-            Ok(older)
+
+            Ok(Vec::new())
         })
     }
     fn probe(&self) -> AgentFuture<'_, bool> {
@@ -4662,21 +4548,22 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
             }
         })
     }
-    fn get_timeline<'a>(&'a self, id: &'a str, limit: usize) -> AgentFuture<'a, Vec<TimelineItem>> {
+    fn get_timeline<'a>(
+        &'a self,
+        id: &'a str,
+        _limit: usize,
+    ) -> AgentFuture<'a, Vec<TimelineItem>> {
         Box::pin(async move {
             if self.readonly_empty_snapshot(id).await? {
                 return Ok(Vec::new());
             }
             if let Some(snapshot) = self.observed_snapshot(id).await? {
-                let total = snapshot.timeline.len();
-                let page = Self::newest_page(&snapshot.timeline, limit);
-                self.hold_newest(id, &page, total);
-                return Ok(page);
+                return Ok(snapshot.timeline);
             }
             let session = self.retained(id).ok_or_else(|| {
                 AgentError::NotAvailable("ACP generation changed during observation".into())
             })?;
-            let all: Vec<TimelineItem> = session
+            let timeline = session
                 .state
                 .lock()
                 .await
@@ -4688,10 +4575,7 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
                     row
                 })
                 .collect();
-            let total = all.len();
-            let page = Self::newest_page(&all, limit);
-            self.hold_newest(id, &page, total);
-            Ok(page)
+            Ok(timeline)
         })
     }
     /// ACP's `pending` covers a tool call the agent is already executing:
@@ -4816,7 +4700,6 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
             self.dormant.lock().unwrap().remove(id);
             self.owned.lock().unwrap().forget(id);
             self.instructions.lock().unwrap().remove(id);
-            self.clear_earlier(id);
             if let Some(metadata) = self.session_metadata.lock().await.as_mut() {
                 metadata.sessions.remove(id);
             }
