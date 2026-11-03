@@ -636,6 +636,7 @@ impl Core {
                         path: f.path,
                         added: f.additions,
                         removed: f.deletions,
+                        patch: f.patch,
                     })
                     .collect(),
             })),

@@ -226,6 +226,7 @@ impl Drain {
                     bindings.selected.signal().set(Some(asid.to_string()));
                     bindings.diff.signal().set(None);
                     bindings.diff_panel.signal().set(false);
+                    bindings.diff_focus.signal().set(None);
                 }
                 if let Some(sidebar) = sidebar {
                     sidebar.publish(&bindings);
@@ -249,6 +250,7 @@ impl Drain {
                 if changed {
                     bindings.diff.signal().set(None);
                     bindings.diff_panel.signal().set(false);
+                    bindings.diff_focus.signal().set(None);
                     bindings.selected.signal().set(None);
                     bindings.header.signal().set(None);
                     bindings.order.signal().set(Arc::new(Default::default()));

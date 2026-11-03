@@ -282,6 +282,8 @@ pub fn sync_agent_colours(ctx: &mut WindowedContext) {
 }
 
 pub fn root(ctx: &WindowedContext, app: &App) -> Div {
+    // Once per process: theme packs + composer attachments from file drops.
+    composer::install_file_drop(app);
     let keys = app.clone();
     let density = parts::scale::Density::current();
     div()

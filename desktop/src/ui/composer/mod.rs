@@ -23,6 +23,7 @@ mod usage;
 
 use std::cell::RefCell;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use blinc_cn::prelude::{icons, to_svg, ColorToken, ThemeState};
@@ -842,6 +843,35 @@ pub fn files_picked(app: &App, paths: Vec<PathBuf>) {
             .unwrap_or_else(|| "file".to_string());
         stage(app, name, Source::Path(path));
     }
+}
+
+/// Window-level file drop: `.muqun-theme` imports a theme; every other file
+/// is staged on the composer. Installed once (themes panel used to own this).
+///
+/// winit 0.30 delivers drops on X11, macOS and Windows; native Wayland has no
+/// drag-and-drop, so Attach… remains the way in there.
+pub fn install_file_drop(app: &App) {
+    static SET: AtomicBool = AtomicBool::new(false);
+    if SET.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let drain = app.drain.clone();
+    let commands = app.commands.clone();
+    blinc_app::dnd::on_file_drop(move |event| {
+        if let blinc_app::dnd::DropEvent::Dropped(paths) = event {
+            let mut files = Vec::new();
+            for path in paths {
+                if path.extension().and_then(|e| e.to_str()) == Some("muqun-theme") {
+                    crate::model::commands::send(&commands, Command::ThemeImportFile(path));
+                } else if path.is_file() {
+                    files.push(path);
+                }
+            }
+            if !files.is_empty() {
+                drain.post(UiAction::FilesPicked(files));
+            }
+        }
+    });
 }
 
 /// An image came off the clipboard.

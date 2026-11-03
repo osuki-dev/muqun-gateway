@@ -322,14 +322,22 @@ fn diff_count(app: &App) -> impl ElementBuilder {
         })
 }
 
-/// Overlay listing changed paths for the open session; click opens in editor.
+/// Overlay listing changed paths for the open session. Click a row to expand
+/// its patch preview (when the agent sent one); the open icon sends it to the
+/// preferred editor.
 pub fn diff_overlay(app: &App) -> impl ElementBuilder {
     let diff = app.bindings.diff.clone();
     let panel = app.bindings.diff_panel.clone();
+    let focus = app.bindings.diff_focus.clone();
     let header = app.bindings.header.clone();
     let app = app.clone();
     stateful_with_key::<NoState>("mq-diff-panel")
-        .deps([diff.signal_id(), panel.signal_id(), header.signal_id()])
+        .deps([
+            diff.signal_id(),
+            panel.signal_id(),
+            focus.signal_id(),
+            header.signal_id(),
+        ])
         .on_state(move |_| {
             if !panel.get() {
                 return div();
@@ -341,44 +349,78 @@ pub fn diff_overlay(app: &App) -> impl ElementBuilder {
             else {
                 return div();
             };
+            let focused = focus.get();
             let close = app.clone();
             let mut list = div().class("mq-diff-panel-list").flex_col().w_full();
             for file in stat.paths.iter().cloned() {
-                let open_app = app.clone();
+                let selected = focused.as_deref() == Some(file.path.as_str());
+                let toggle = app.clone();
                 let path = file.path.clone();
-                list = list.child(
-                    div()
-                        .class("mq-diff-panel-row")
-                        .w_full()
-                        .flex_row()
-                        .items_center()
-                        .cursor_pointer()
-                        .child(
-                            div().flex_1().min_w(0.0).overflow_clip().child(
+                let open_app = app.clone();
+                let open_path = file.path.clone();
+                let mut row = div()
+                    .class("mq-diff-panel-row")
+                    .w_full()
+                    .flex_row()
+                    .items_center()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(0.0)
+                            .overflow_clip()
+                            .cursor_pointer()
+                            .child(
                                 mono_text(file.path.clone())
                                     .size(12.0)
                                     .no_wrap()
                                     .no_cursor(),
-                            ),
-                        )
-                        .child(
-                            div().class("mq-diff-added").child(
-                                mono_text(format!("+{}", file.added))
+                            )
+                            .on_click(move |_| {
+                                let next = if toggle.bindings.diff_focus.get().as_deref()
+                                    == Some(path.as_str())
+                                {
+                                    None
+                                } else {
+                                    Some(path.clone())
+                                };
+                                toggle.bindings.diff_focus.signal().set(next);
+                            }),
+                    )
+                    .child(
+                        div().class("mq-diff-added").child(
+                            mono_text(format!("+{}", file.added))
+                                .size(11.0)
+                                .no_wrap()
+                                .no_cursor(),
+                        ),
+                    )
+                    .child(
+                        div().class("mq-diff-removed").child(
+                            mono_text(format!("−{}", file.removed))
+                                .size(11.0)
+                                .no_wrap()
+                                .no_cursor(),
+                        ),
+                    )
+                    .child(
+                        div()
+                            .class("mq-diff-open")
+                            .cursor_pointer()
+                            .child(
+                                ui_text(app.strings.open_file())
                                     .size(11.0)
                                     .no_wrap()
                                     .no_cursor(),
-                            ),
-                        )
-                        .child(
-                            div().class("mq-diff-removed").child(
-                                mono_text(format!("−{}", file.removed))
-                                    .size(11.0)
-                                    .no_wrap()
-                                    .no_cursor(),
-                            ),
-                        )
-                        .on_click(move |_| open_diff_file(&open_app, &path)),
-                );
+                            )
+                            .on_click(move |_| open_diff_file(&open_app, &open_path)),
+                    );
+                if selected {
+                    row = row.class("mq-diff-panel-row--open");
+                }
+                list = list.child(row);
+                if selected {
+                    list = list.child(diff_patch_preview(&file.patch, &app));
+                }
             }
             if stat.files > stat.paths.len() {
                 list = list.child(
@@ -395,7 +437,7 @@ pub fn diff_overlay(app: &App) -> impl ElementBuilder {
                 .absolute()
                 .right(12.0)
                 .top(TOP_BAR_HEIGHT + 8.0)
-                .w(360.0)
+                .w(420.0)
                 .flex_col()
                 .child(
                     div()
@@ -413,15 +455,80 @@ pub fn diff_overlay(app: &App) -> impl ElementBuilder {
                         .child(div().flex_1())
                         .child(ghost_icon(icons::X).on_click(move |_| {
                             close.bindings.diff_panel.signal().set(false);
+                            close.bindings.diff_focus.signal().set(None);
                         })),
                 )
                 .child(
                     div()
                         .w_full()
-                        .max_h(320.0)
+                        .max_h(420.0)
                         .child(scroll().w_full().h_full().child(list)),
                 )
         })
+}
+
+const DIFF_PANEL_PREVIEW_LINES: usize = 28;
+
+fn diff_patch_preview(patch: &str, app: &App) -> Div {
+    let mut body = div()
+        .class("mq-diff-preview")
+        .w_full()
+        .flex_col()
+        .overflow_clip();
+    if patch.trim().is_empty() {
+        return body.child(
+            div().class("mq-menu-dim").child(
+                ui_text(app.strings.diff_no_preview())
+                    .size(11.0)
+                    .no_wrap()
+                    .no_cursor(),
+            ),
+        );
+    }
+    let lines: Vec<&str> = patch
+        .lines()
+        .filter(|l| {
+            !(l.starts_with("diff --git")
+                || l.starts_with("index ")
+                || l.starts_with("--- ")
+                || l.starts_with("+++ ")
+                || l.starts_with("new file mode")
+                || l.starts_with("deleted file mode")
+                || l.starts_with("similarity index")
+                || l.starts_with("rename "))
+        })
+        .collect();
+    let total = lines.len();
+    for line in lines.iter().take(DIFF_PANEL_PREVIEW_LINES) {
+        let class = if line.starts_with('+') {
+            "mq-diff-added"
+        } else if line.starts_with('-') {
+            "mq-diff-removed"
+        } else if line.starts_with("@@") {
+            "mq-diff-hunk"
+        } else {
+            "mq-menu-dim"
+        };
+        body = body.child(
+            div().class(class).w_full().overflow_clip().child(
+                mono_text((*line).to_string())
+                    .size(11.0)
+                    .no_wrap()
+                    .no_cursor(),
+            ),
+        );
+    }
+    if total > DIFF_PANEL_PREVIEW_LINES {
+        body = body.child(
+            div().class("mq-menu-dim").child(
+                ui_text(format!("+{}…", total - DIFF_PANEL_PREVIEW_LINES))
+                    .size(11.0)
+                    .no_wrap()
+                    .no_cursor(),
+            ),
+        );
+    }
+    body
 }
 
 /// The moon (or sun, in light) switches the scheme; a dot on it while the

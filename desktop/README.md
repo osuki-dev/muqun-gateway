@@ -161,7 +161,7 @@ Packaging and signing (dmg / msi / AppImage),
 tray and close-to-tray, notifications, command palette,
 session fork on agents that refuse it, the theme editor and theme art on Home beyond Cover
 Courier's, hot-apply of agent settings (restart button exists), saving window position and
-maximized state (fork patch), three-platform CI runs, composer file drag-and-drop.
+maximized state (fork patch), three-platform CI runs.
 
 ## Icons
 

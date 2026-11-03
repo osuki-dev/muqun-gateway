@@ -78,6 +78,7 @@
 .mq-diff-count--open { background: var(--surface-overlay); color: var(--text-primary); }
 .mq-diff-added { color: var(--success); }
 .mq-diff-removed { color: var(--error); }
+.mq-diff-hunk { color: var(--info); }
 .mq-diff-panel {
     background: var(--surface-elevated);
     border: none;
@@ -99,6 +100,16 @@
 .mq-diff-panel-row:hover {
     background: var(--surface-overlay);
     color: var(--text-primary);
+}
+.mq-diff-panel-row--open { background: var(--accent-subtle); color: var(--text-primary); }
+.mq-diff-open {
+    padding: 0 var(--mq-space-2);
+    color: var(--text-link);
+}
+.mq-diff-preview {
+    padding: var(--mq-space-2) var(--mq-space-3) var(--mq-space-3) var(--mq-space-3);
+    gap: 1px;
+    background: var(--surface);
 }
 .mq-follow-dot { background: var(--primary); }
 /* /topbar */

@@ -380,6 +380,8 @@ pub struct DiffFile {
     pub path: String,
     pub added: usize,
     pub removed: usize,
+    /// Unified patch text when the agent provided it (may be empty).
+    pub patch: String,
 }
 
 /// What `get_vcs_diff` says about the open session's working tree.
@@ -1053,6 +1055,8 @@ pub struct Bindings {
     pub diff: State<Option<DiffStat>>,
     /// The top-bar diff file list is open. UI-owned.
     pub diff_panel: State<bool>,
+    /// Path whose patch is expanded inside the diff panel, if any.
+    pub diff_focus: State<Option<String>>,
     /// The Inbox page, while it is open. UI-owned.
     pub inbox_open: State<bool>,
     pub selected: State<Option<String>>,
@@ -1094,6 +1098,7 @@ impl Bindings {
             waiting_forms: ctx.use_state_keyed("mq.waiting_forms", || Arc::new(Vec::new())),
             diff: ctx.use_state_keyed("mq.diff", || None),
             diff_panel: ctx.use_state_keyed("mq.diff_panel", || false),
+            diff_focus: ctx.use_state_keyed("mq.diff_focus", || None),
             inbox_open: ctx.use_state_keyed("mq.inbox_open", || false),
             selected: ctx.use_state_keyed("mq.selected", || None),
             header: ctx.use_state_keyed("mq.header", || None),

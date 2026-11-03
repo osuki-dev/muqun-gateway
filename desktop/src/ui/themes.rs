@@ -148,23 +148,10 @@ pub(crate) fn refresh_once(app: &App) {
 /// Files dropped on the window: every `.muqun-theme` among them is
 /// imported. Process-wide (Blinc keeps one drop handler), so it is set once.
 ///
-/// winit 0.30 delivers drops on X11, macOS and Windows; it has no drag and
-/// drop on native Wayland, where Import… is the way in.
+/// Themes share the window drop handler with the composer (`.muqun-theme`
+/// imports; other files stage as attachments).
 pub fn install_drop_handler(app: &App) {
-    static SET: AtomicBool = AtomicBool::new(false);
-    if SET.swap(true, Ordering::Relaxed) {
-        return;
-    }
-    let commands = app.commands.clone();
-    blinc_app::dnd::on_file_drop(move |event| {
-        if let blinc_app::dnd::DropEvent::Dropped(paths) = event {
-            for path in paths {
-                if path.extension().and_then(|e| e.to_str()) == Some("muqun-theme") {
-                    crate::model::commands::send(&commands, Command::ThemeImportFile(path));
-                }
-            }
-        }
-    });
+    super::composer::install_file_drop(app);
 }
 
 /// The system file dialog for a `.muqun-theme`. It blocks its caller: on

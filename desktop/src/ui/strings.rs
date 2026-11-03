@@ -141,6 +141,7 @@ strings! {
     no_model_matches => "No matching models", "没有匹配的模型";
     changed_files => "Changed files", "变更文件";
     open_file => "Open", "打开";
+    diff_no_preview => "No patch preview — open in editor", "没有补丁预览，请用编辑器打开";
     soon => "soon", "即将支持";
 }
 
