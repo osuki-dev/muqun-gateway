@@ -131,12 +131,14 @@ strings! {
     attachments_word => "attachments", "个附件";
     next_label => "Next", "下一步";
     model_default => "Model", "模型";
+    model_search => "Search models", "搜索模型";
     mode_word => "Mode", "模式";
     effort_default => "Effort", "强度";
     current_branch => "current", "当前";
     new_worktree => "Start in a new worktree…", "在新 worktree 开始…";
     new_session_worktree => "New session in a worktree…", "新会话到 worktree…";
-    branch_session_only => "new session to switch", "新会话可切换";
+    branch_search => "Search branches", "搜索分支";
+    no_model_matches => "No matching models", "没有匹配的模型";
     changed_files => "Changed files", "变更文件";
     open_file => "Open", "打开";
     soon => "soon", "即将支持";

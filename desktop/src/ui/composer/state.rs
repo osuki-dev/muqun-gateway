@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use blinc_core::{BlincContextState, State};
+use blinc_layout::widgets::text_input::{text_input_data_with_placeholder, SharedTextInputData};
 use muqun_gateway::agents::ModelRef;
 
 use super::triggers::Trigger;
@@ -90,6 +91,10 @@ pub struct Cmp {
     pub menu: State<Option<MenuId>>,
     /// Keyboard focus among the open menu's enabled rows.
     pub menu_cursor: State<usize>,
+    /// Live filter text for the open model (or branch) menu.
+    pub menu_query: State<String>,
+    /// The model menu's search field.
+    pub model_filter: SharedTextInputData,
     /// The overlay showing it.
     pub menu_handle: State<Option<u64>>,
     /// The overlay showing the `@` / `/` / `$` list.
@@ -115,6 +120,12 @@ impl Cmp {
             popup: ctx.use_state_keyed("mq.cmp.popup", || Arc::new(Popup::default())),
             menu: ctx.use_state_keyed("mq.cmp.menu", || None),
             menu_cursor: ctx.use_state_keyed("mq.cmp.menu_cursor", || 0usize),
+            menu_query: ctx.use_state_keyed("mq.cmp.menu_query", String::new),
+            model_filter: ctx
+                .use_state_keyed("mq.cmp.model_filter", || {
+                    text_input_data_with_placeholder("Search models")
+                })
+                .get(),
             menu_handle: ctx.use_state_keyed("mq.cmp.menu_handle", || None),
             popup_handle: ctx.use_state_keyed("mq.cmp.popup_handle", || None),
             popup_shown: ctx.use_state_keyed("mq.cmp.popup_shown", || 0usize),
@@ -123,6 +134,21 @@ impl Cmp {
             branches: ctx.use_state_keyed("mq.cmp.branches", || Arc::new(HashMap::new())),
         }
     }
+}
+
+/// Clear the open menu's typeahead / search field.
+pub fn clear_menu_query() {
+    let cmp = Cmp::get();
+    if !cmp.menu_query.get().is_empty() {
+        cmp.menu_query.signal().set(String::new());
+    }
+    let filter = cmp.model_filter.clone();
+    if let Ok(mut data) = filter.lock() {
+        if !data.value.is_empty() {
+            data.value.clear();
+            data.cursor = 0;
+        }
+    };
 }
 
 /// Main-thread bookkeeping that is not rendered.

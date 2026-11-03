@@ -9,14 +9,14 @@
 use std::cell::RefCell;
 use std::sync::Arc;
 
-use blinc_cn::prelude::{icons, to_svg, ColorToken, ThemeState};
+use blinc_cn::prelude::{icons, input, to_svg, ColorToken, InputSize, ThemeState};
 use blinc_layout::prelude::*;
 use blinc_layout::widgets::overlay::AnchorDirection;
 use blinc_layout::widgets::overlay_stack::{OverlayBuilder, OverlayHandle};
 use muqun_gateway::agents::{ModelInfo, ModelRef};
 use muqun_gateway::home_relative;
 
-use super::state::{Cmp, MenuId};
+use super::state::{self, Cmp, MenuId};
 use super::usage;
 use super::{actions, Aim, Place};
 use crate::model::commands::Command;
@@ -37,6 +37,10 @@ const MAX_MODELS: usize = 40;
 const MAX_BRANCHES: usize = 24;
 const MAX_PROJECTS: usize = 8;
 const MAX_AGENTS: usize = 10;
+/// Show a search field once the catalogue has more than this many models.
+const MODEL_SEARCH_AFTER: usize = 8;
+/// Search field height inside a menu (padding included).
+const MENU_SEARCH_HEIGHT: f32 = 36.0;
 /// Longest label a pill shows, in characters.
 const LABEL_CHARS: usize = 22;
 
@@ -259,10 +263,13 @@ fn host(
                 closed.menu.signal().set(None);
                 closed.menu_handle.signal().set(None);
                 clear_menu_actions();
+                state::clear_menu_query();
                 blinc_layout::click_outside::unregister_click_outside("mq-cmp-menu");
             })
             .content(move || {
-                let cursor = Cmp::get().menu_cursor;
+                let cmp = Cmp::get();
+                let cursor = cmp.menu_cursor;
+                let query = cmp.menu_query;
                 let menu = menu.clone();
                 div()
                     .class("mq-menu")
@@ -270,7 +277,7 @@ fn host(
                     .flex_col()
                     .child(
                         stateful_with_key::<NoState>("mq-cmp-menu-body")
-                            .deps([cursor.signal_id()])
+                            .deps([cursor.signal_id(), query.signal_id()])
                             .on_state(move |_| {
                                 clear_menu_actions();
                                 let body = menu();
@@ -295,6 +302,8 @@ fn host(
                 OverlayHandle::from_raw(raw).close();
             },
         );
+        state::clear_menu_query();
+        cmp.menu_cursor.signal().set(0);
         cmp.menu_handle.signal().set(Some(raw));
         cmp.menu.signal().set(Some(id));
     });
@@ -329,6 +338,7 @@ pub fn close_menu() {
     cmp.menu.signal().set(None);
     cmp.menu_handle.signal().set(None);
     clear_menu_actions();
+    state::clear_menu_query();
 }
 
 fn menu_row(label: Div, selected: bool, enabled: bool, focused: bool) -> Div {
@@ -386,8 +396,9 @@ pub fn row(app: &App, aim: &Aim) -> Div {
     if !models.is_empty() || aim.model.is_some() {
         pills = pills.child(model_pill(app, aim, &models, side));
     }
+    // Mode is catalogue-backed: hide when the agent has nothing to choose.
     let modes = visible_modes(aim);
-    if !modes.is_empty() || aim.mode.is_some() {
+    if !modes.is_empty() {
         pills = pills.child(mode_pill(app, aim, side));
     }
     if let Some(model) = selected_model(aim, &models) {
@@ -608,6 +619,57 @@ fn selected_model<'a>(aim: &Aim, models: &[&'a ModelInfo]) -> Option<&'a ModelIn
         .copied()
 }
 
+fn model_matches(model: &ModelInfo, query: &str) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+    let q = query.to_lowercase();
+    model.name.to_lowercase().contains(&q)
+        || model.id.to_lowercase().contains(&q)
+        || model.provider_id.to_lowercase().contains(&q)
+}
+
+fn model_search_field(app: &App) -> Div {
+    let filter = Cmp::get().model_filter.clone();
+    let placeholder = app.strings.model_search().to_string();
+    if let Ok(mut data) = filter.lock() {
+        data.placeholder = placeholder;
+    }
+    div()
+        .class("mq-menu-search")
+        .w_full()
+        .h(MENU_SEARCH_HEIGHT)
+        .flex_row()
+        .items_center()
+        .child(
+            div().flex_1().min_w(0.0).child(
+                input(&filter)
+                    .size(InputSize::Small)
+                    .w_full()
+                    .border_width(0.0)
+                    .border_colors(
+                        blinc_core::Color::TRANSPARENT,
+                        blinc_core::Color::TRANSPARENT,
+                        blinc_core::Color::TRANSPARENT,
+                        blinc_core::Color::TRANSPARENT,
+                    )
+                    .bg_colors(
+                        blinc_core::Color::TRANSPARENT,
+                        blinc_core::Color::TRANSPARENT,
+                        blinc_core::Color::TRANSPARENT,
+                    )
+                    .on_change(move |text: &str| {
+                        let next = text.trim().to_lowercase();
+                        let cmp = Cmp::get();
+                        if cmp.menu_query.get() != next {
+                            cmp.menu_query.signal().set(next);
+                            cmp.menu_cursor.signal().set(0);
+                        }
+                    }),
+            ),
+        )
+}
+
 fn model_pill(app: &App, aim: &Aim, models: &[&ModelInfo], side: Side) -> Div {
     let label = match (selected_model(aim, models), &aim.model) {
         (Some(model), _) => model.name.clone(),
@@ -635,12 +697,33 @@ fn model_pill(app: &App, aim: &Aim, models: &[&ModelInfo], side: Side) -> Div {
     }
     let asid = aim.asid();
     let app = app.clone();
-    let height = menu_height(list.len().min(MAX_MODELS), 0)
+    let searchable = list.len() > MODEL_SEARCH_AFTER;
+    let height = menu_height(list.len().clamp(1, MAX_MODELS), 0)
+        + if searchable { MENU_SEARCH_HEIGHT } else { 0.0 }
         + if list.len() > MAX_MODELS { 18.0 } else { 0.0 };
     host(MenuId::Model, side, p, (300.0, height), move || {
+        let query = Cmp::get().menu_query.get();
+        let matched: Vec<ModelInfo> = list
+            .iter()
+            .filter(|m| model_matches(m, &query))
+            .cloned()
+            .collect();
+        let total = matched.len();
         let mut menu = div().flex_col().min_w(260.0);
-        let total = list.len();
-        for model in list.iter().take(MAX_MODELS).cloned() {
+        if searchable {
+            menu = menu.child(model_search_field(&app));
+        }
+        if total == 0 {
+            return menu.child(
+                div().class("mq-menu-dim").child(
+                    ui_text(app.strings.no_model_matches())
+                        .size(12.0)
+                        .no_wrap()
+                        .no_cursor(),
+                ),
+            );
+        }
+        for model in matched.iter().take(MAX_MODELS).cloned() {
             let selected = chosen
                 .as_ref()
                 .is_some_and(|c| c.model_id == model.id && c.provider_id == model.provider_id);
@@ -870,127 +953,157 @@ fn branch_pill(app: &App, aim: &Aim, side: Side) -> Option<Div> {
         .filter(|b| *b != &branch)
         .cloned()
         .collect();
+    let searchable = locals.len() > MODEL_SEARCH_AFTER;
     let shown = locals.len().min(MAX_BRANCHES);
     let extra = locals.len().saturating_sub(MAX_BRANCHES);
-    let rows = 1 + shown + usize::from(extra > 0) + 1;
+    let rows = 1 + shown.max(1) + usize::from(extra > 0) + 1;
     let seps = 1 + usize::from(shown > 0 || extra > 0);
+    let height = menu_height(rows, seps) + if searchable { MENU_SEARCH_HEIGHT } else { 0.0 };
     let app = app.clone();
-    Some(host(
-        MenuId::Branch,
-        side,
-        p,
-        (300.0, menu_height(rows, seps)),
-        move || {
-            let current = div()
-                .flex_row()
-                .items_center()
-                .child(mono_text(branch.clone()).size(12.0).no_wrap().no_cursor())
-                .child(
-                    div().class("mq-menu-dim").child(
-                        ui_text(app.strings.current_branch())
-                            .size(11.0)
-                            .no_wrap()
-                            .no_cursor(),
-                    ),
-                );
-            let mut menu = div()
-                .flex_col()
-                .min_w(280.0)
-                .child(menu_row(current, true, false, false));
-            if shown > 0 || extra > 0 {
-                menu = menu.child(separator());
-            }
-            for name in locals.iter().take(MAX_BRANCHES).cloned() {
-                let selected = false;
-                if on_start {
-                    let app = app.clone();
-                    let cwd = cwd.clone();
-                    menu = menu.child(action_row(
-                        div().child(mono_text(name.clone()).size(12.0).no_wrap().no_cursor()),
-                        selected,
-                        move || {
-                            app.send(Command::Compose(ComposeCommand::Checkout {
-                                cwd: cwd.clone(),
-                                branch: name.clone(),
-                            }));
-                            close_menu();
-                        },
-                    ));
-                } else {
-                    menu = menu.child(menu_row(
-                        div()
-                            .flex_row()
-                            .items_center()
-                            .child(mono_text(name).size(12.0).no_wrap().no_cursor())
-                            .child(
-                                div().class("mq-menu-dim").child(
-                                    ui_text(app.strings.branch_session_only())
-                                        .size(11.0)
-                                        .no_wrap()
-                                        .no_cursor(),
-                                ),
-                            ),
-                        false,
-                        false,
-                        false,
-                    ));
-                }
-            }
-            if extra > 0 {
-                menu = menu.child(
-                    div().class("mq-menu-dim").child(
-                        ui_text(format!("+{extra}"))
-                            .size(11.0)
-                            .no_wrap()
-                            .no_cursor(),
-                    ),
-                );
-            }
+    Some(host(MenuId::Branch, side, p, (300.0, height), move || {
+        let query = Cmp::get().menu_query.get();
+        let matched: Vec<String> = locals
+            .iter()
+            .filter(|name| query.is_empty() || name.to_lowercase().contains(query.as_str()))
+            .cloned()
+            .collect();
+        let shown = matched.len().min(MAX_BRANCHES);
+        let extra = matched.len().saturating_sub(MAX_BRANCHES);
+        let current = div()
+            .flex_row()
+            .items_center()
+            .child(mono_text(branch.clone()).size(12.0).no_wrap().no_cursor())
+            .child(
+                div().class("mq-menu-dim").child(
+                    ui_text(app.strings.current_branch())
+                        .size(11.0)
+                        .no_wrap()
+                        .no_cursor(),
+                ),
+            );
+        let mut menu = div()
+            .flex_col()
+            .min_w(280.0)
+            .child(menu_row(current, true, false, false));
+        if searchable {
+            menu = menu.child(branch_search_field(&app));
+        }
+        if shown > 0 || extra > 0 {
             menu = menu.child(separator());
-            // A new worktree is how to branch off without moving the agent's
-            // checkout; offered on the start page, and as "new session" while
-            // one is already open.
-            let worktree = if on_start {
-                action_row(
-                    div().child(
-                        ui_text(app.strings.new_worktree())
-                            .size(13.0)
-                            .no_wrap()
-                            .no_cursor(),
-                    ),
-                    want_worktree,
-                    move || {
+        }
+        for name in matched.iter().take(MAX_BRANCHES) {
+            let app = app.clone();
+            let cwd = cwd.clone();
+            let name = name.clone();
+            menu = menu.child(action_row(
+                div().child(mono_text(name.clone()).size(12.0).no_wrap().no_cursor()),
+                false,
+                move || {
+                    // Live checkout of the project root — same path on Home and
+                    // in a session; failures surface through the composer error.
+                    app.send(Command::Compose(ComposeCommand::Checkout {
+                        cwd: cwd.clone(),
+                        branch: name.clone(),
+                    }));
+                    close_menu();
+                },
+            ));
+        }
+        if extra > 0 {
+            menu = menu.child(
+                div().class("mq-menu-dim").child(
+                    ui_text(format!("+{extra}"))
+                        .size(11.0)
+                        .no_wrap()
+                        .no_cursor(),
+                ),
+            );
+        }
+        menu = menu.child(separator());
+        // A new worktree is how to branch off without moving the agent's
+        // checkout; offered on the start page, and as "new session" while
+        // one is already open.
+        let worktree = if on_start {
+            action_row(
+                div().child(
+                    ui_text(app.strings.new_worktree())
+                        .size(13.0)
+                        .no_wrap()
+                        .no_cursor(),
+                ),
+                want_worktree,
+                move || {
+                    let cmp = Cmp::get();
+                    let mut choice = (*cmp.start.get()).clone();
+                    choice.worktree = !choice.worktree;
+                    cmp.start.signal().set(Arc::new(choice));
+                    close_menu();
+                },
+            )
+        } else {
+            let app = app.clone();
+            let cwd = cwd.clone();
+            action_row(
+                div().child(
+                    ui_text(app.strings.new_session_worktree())
+                        .size(13.0)
+                        .no_wrap()
+                        .no_cursor(),
+                ),
+                false,
+                move || {
+                    app.open_draft_in(std::path::Path::new(&cwd));
+                    let cmp = Cmp::get();
+                    let mut choice = (*cmp.start.get()).clone();
+                    choice.worktree = true;
+                    cmp.start.signal().set(Arc::new(choice));
+                    close_menu();
+                },
+            )
+        };
+        menu.child(worktree)
+    }))
+}
+
+fn branch_search_field(app: &App) -> Div {
+    let filter = Cmp::get().model_filter.clone();
+    let placeholder = app.strings.branch_search().to_string();
+    if let Ok(mut data) = filter.lock() {
+        data.placeholder = placeholder;
+    }
+    div()
+        .class("mq-menu-search")
+        .w_full()
+        .h(MENU_SEARCH_HEIGHT)
+        .flex_row()
+        .items_center()
+        .child(
+            div().flex_1().min_w(0.0).child(
+                input(&filter)
+                    .size(InputSize::Small)
+                    .w_full()
+                    .border_width(0.0)
+                    .border_colors(
+                        blinc_core::Color::TRANSPARENT,
+                        blinc_core::Color::TRANSPARENT,
+                        blinc_core::Color::TRANSPARENT,
+                        blinc_core::Color::TRANSPARENT,
+                    )
+                    .bg_colors(
+                        blinc_core::Color::TRANSPARENT,
+                        blinc_core::Color::TRANSPARENT,
+                        blinc_core::Color::TRANSPARENT,
+                    )
+                    .on_change(move |text: &str| {
+                        let next = text.trim().to_lowercase();
                         let cmp = Cmp::get();
-                        let mut choice = (*cmp.start.get()).clone();
-                        choice.worktree = !choice.worktree;
-                        cmp.start.signal().set(Arc::new(choice));
-                        close_menu();
-                    },
-                )
-            } else {
-                let app = app.clone();
-                let cwd = cwd.clone();
-                action_row(
-                    div().child(
-                        ui_text(app.strings.new_session_worktree())
-                            .size(13.0)
-                            .no_wrap()
-                            .no_cursor(),
-                    ),
-                    false,
-                    move || {
-                        app.open_draft_in(std::path::Path::new(&cwd));
-                        let cmp = Cmp::get();
-                        let mut choice = (*cmp.start.get()).clone();
-                        choice.worktree = true;
-                        cmp.start.signal().set(Arc::new(choice));
-                        close_menu();
-                    },
-                )
-            };
-            menu.child(worktree)
-        },
-    ))
+                        if cmp.menu_query.get() != next {
+                            cmp.menu_query.signal().set(next);
+                            cmp.menu_cursor.signal().set(0);
+                        }
+                    }),
+            ),
+        )
 }
 
 /// "12.4k / 200k · $0.42", with the breakdown in a tooltip on click.
@@ -1054,5 +1167,25 @@ mod tests {
         assert_eq!(short_project("/srv/work/gateway"), "work/gateway");
         assert_eq!(short_project("/gateway"), "gateway");
         assert_eq!(clip("abcdefghij", 5), "abcd…");
+    }
+
+    #[test]
+    fn model_search_matches_name_id_and_provider() {
+        let model = ModelInfo {
+            id: "gpt-5".into(),
+            provider_id: "openai".into(),
+            name: "GPT-5".into(),
+            family: None,
+            limit: None,
+            variants: None,
+            cost: None,
+            enabled: true,
+            status: None,
+        };
+        assert!(model_matches(&model, ""));
+        assert!(model_matches(&model, "gpt"));
+        assert!(model_matches(&model, "OPENAI"));
+        assert!(model_matches(&model, "5"));
+        assert!(!model_matches(&model, "claude"));
     }
 }

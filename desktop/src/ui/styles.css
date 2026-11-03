@@ -604,6 +604,13 @@
     padding: var(--mq-space-1);
     color: var(--text-primary);
 }
+.mq-menu-search {
+    padding: 0 var(--mq-space-2);
+    margin-bottom: var(--mq-space-1);
+    border-radius: var(--mq-radius-sm);
+    background: var(--input-bg);
+    color: var(--text-secondary);
+}
 .mq-menu-row, .mq-popup-row {
     padding: 0 var(--mq-space-2);
     gap: var(--mq-space-2);
