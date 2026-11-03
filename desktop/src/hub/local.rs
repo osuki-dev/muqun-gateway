@@ -11,15 +11,17 @@ use std::sync::Arc;
 
 use muqun_gateway::agents::directories::{self, Completion};
 use muqun_gateway::agents::manager::AgentManager;
+use muqun_gateway::agents::ports::AgentError;
 use muqun_gateway::agents::ports::{AgentSessionSnapshot, SessionMirrorPort};
 use muqun_gateway::agents::{
-    AgentDomainEvent, AgentProject, AgentRuntime, AgentSessionId, AgentSessionInfo,
+    AgentDomainEvent, AgentProject, AgentRuntime, AgentSessionId, AgentSessionInfo, ModelRef,
     PermissionDecision, SessionQuery, TimelineItem,
 };
 use muqun_gateway::platform::discovery::AgentDiscoveryInfo;
+use muqun_gateway::platform::StoredUpload;
 use tokio::sync::broadcast;
 
-use super::{HubError, HubFuture, SessionHub};
+use super::{CatalogView, HubError, HubFuture, SessionHub};
 
 pub struct LocalHub {
     runtime: Arc<AgentRuntime>,
@@ -208,6 +210,139 @@ impl SessionHub for LocalHub {
                 .interactions()
                 .reply_form(asid, form_id, answers)
                 .await?)
+        })
+    }
+
+    fn send<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+        text: &'a str,
+        attachments: &'a [String],
+        delivery: Option<&'a str>,
+    ) -> HubFuture<'a, ()> {
+        Box::pin(async move {
+            let manager = self.manager_for_session(asid).await?;
+            Ok(manager
+                .prompts()
+                .send_prompt(asid, text, attachments, delivery)
+                .await?)
+        })
+    }
+
+    fn find_files<'a>(
+        &'a self,
+        agent: &'a str,
+        directory: &'a str,
+        query: &'a str,
+        limit: usize,
+    ) -> HubFuture<'a, Vec<serde_json::Value>> {
+        Box::pin(async move {
+            // As the route: a workspace is an absolute folder that exists.
+            if !Path::new(directory).is_absolute() || !Path::new(directory).is_dir() {
+                return Ok(Vec::new());
+            }
+            let manager = self.manager_for_agent(agent).await?;
+            Ok(manager
+                .agent()
+                .find_files(query, limit, Some(directory))
+                .await?)
+        })
+    }
+
+    fn catalog<'a>(
+        &'a self,
+        agent: &'a str,
+        asid: Option<&'a AgentSessionId>,
+        directory: Option<&'a str>,
+    ) -> HubFuture<'a, CatalogView> {
+        Box::pin(async move {
+            let manager = self.manager_for_agent(agent).await?;
+            let catalog = manager
+                .sessions()
+                .get_catalog_for_session(asid.map(|a| a.0.as_str()), directory)
+                .await?;
+            Ok(CatalogView { catalog })
+        })
+    }
+
+    fn run_command<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+        name: &'a str,
+        arguments: &'a str,
+        delivery: Option<&'a str>,
+    ) -> HubFuture<'a, serde_json::Value> {
+        Box::pin(async move {
+            let manager = self.manager_for_session(asid).await?;
+            let name = name.trim().trim_start_matches('/');
+            Ok(manager
+                .agent()
+                .execute_command(&asid.0, name, arguments, delivery)
+                .await?)
+        })
+    }
+
+    fn activate_skill<'a>(&'a self, asid: &'a AgentSessionId, skill: &'a str) -> HubFuture<'a, ()> {
+        Box::pin(async move {
+            let manager = self.manager_for_session(asid).await?;
+            Ok(manager.agent().activate_skill(&asid.0, skill, None).await?)
+        })
+    }
+
+    fn switch_model<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+        model: &'a ModelRef,
+    ) -> HubFuture<'a, ()> {
+        Box::pin(async move {
+            let manager = self.manager_for_session(asid).await?;
+            Ok(manager.sessions().switch_model(asid, model).await?)
+        })
+    }
+
+    fn switch_mode<'a>(&'a self, asid: &'a AgentSessionId, mode: &'a str) -> HubFuture<'a, ()> {
+        Box::pin(async move {
+            let manager = self.manager_for_session(asid).await?;
+            Ok(manager.agent().switch_mode(&asid.0, mode).await?)
+        })
+    }
+
+    fn inbox_cancel<'a>(&'a self, asid: &'a AgentSessionId, item: &'a str) -> HubFuture<'a, ()> {
+        Box::pin(async move {
+            let manager = self.manager_for_session(asid).await?;
+            Ok(manager.agent().cancel_inbox_item(&asid.0, item).await?)
+        })
+    }
+
+    fn inbox_delivery<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+        item: &'a str,
+        delivery: &'a str,
+    ) -> HubFuture<'a, ()> {
+        Box::pin(async move {
+            let manager = self.manager_for_session(asid).await?;
+            Ok(manager
+                .agent()
+                .set_inbox_delivery(&asid.0, item, delivery)
+                .await?)
+        })
+    }
+
+    fn store_attachment<'a>(
+        &'a self,
+        name: &'a str,
+        bytes: Vec<u8>,
+    ) -> HubFuture<'a, StoredUpload> {
+        Box::pin(async move {
+            let name = name.to_string();
+            // Sniffing and writing up to 64 MiB: not on a runtime thread.
+            tokio::task::spawn_blocking(move || {
+                muqun_gateway::platform::store_upload(&name, &bytes)
+            })
+            .await
+            .map_err(|err| HubError::Agent(AgentError::InvalidRequest(err.to_string())))?
+            .map_err(HubError::Upload)
         })
     }
 

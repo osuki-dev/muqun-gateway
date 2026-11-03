@@ -37,12 +37,25 @@ pub struct UiError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UiAction {
     SubmitComposer,
-    /// A folder came back from the system picker (which may run on its own
-    /// thread); put it in the New-session draft.
-    SetDraft {
-        agent: String,
-        cwd: std::path::PathBuf,
+    /// The composer's text or caret may have changed (posted from its key
+    /// handlers, run once the keystroke has reached the text area).
+    ComposerEdited,
+    /// A key the composer's popup or history wants, with the caret as it was
+    /// before the text area saw the key (it moves or inserts on its own).
+    ComposerKey {
+        key: u32,
+        line: usize,
+        column: usize,
     },
+    /// A folder came back from the system picker (which may run on its own
+    /// thread): the start page's project.
+    ProjectPicked(std::path::PathBuf),
+    /// One step of the composer's QA script (`MUQUN_QA_COMPOSER`).
+    QaStep(String),
+    /// A PNG came off the clipboard (read on its own thread).
+    ImagePasted(Vec<u8>),
+    /// Files came back from the attach dialog.
+    FilesPicked(Vec<std::path::PathBuf>),
     /// Open a session as a click on its row would (QA, `MUQUN_QA_SWITCH`).
     Open(String),
 }
@@ -75,6 +88,8 @@ pub enum Update {
         items: Vec<muqun_gateway::agents::TimelineItem>,
         exhausted: bool,
     },
+    /// The composer's, applied by `ui/composer/state.rs` on the main thread.
+    Composer(Box<super::compose::ComposerUpdate>),
     /// Themes, applied by `ui/themes.rs` on the main thread.
     Theme(Box<crate::theme::service::ThemeUpdate>),
 }

@@ -80,6 +80,8 @@ pub struct Notice {
 }
 
 #[derive(Debug, Clone)]
+// Boxed by `Update::Theme` already; one rare update is not worth boxing each field.
+#[allow(clippy::large_enum_variant)]
 pub enum ThemeUpdate {
     Library(Arc<Vec<ThemeEntry>>),
     Gallery(Arc<GalleryView>),

@@ -101,34 +101,99 @@ pub(crate) async fn upload_file(
             "the file field must carry a filename",
         ));
     };
-    if bytes.is_empty() {
-        return Err(api_error(
-            StatusCode::BAD_REQUEST,
-            "empty_file",
-            "the file field is empty",
-        ));
+    let stored = store_upload(&client_name, &bytes)
+        .map_err(|refusal| api_error(refusal.status(), refusal.code(), &refusal.message()))?;
+
+    Ok(Json(json!({
+        // `path` is for the agent, which reads the file off this host.
+        "path": stored.path.to_string_lossy(),
+        // `url` is for the app, which cannot. Same file, the two ways of
+        // reaching it, so the transcript can draw what was sent.
+        "url": upload_url(&stored.stored_name),
+        "name": stored.name,
+        "size": stored.size,
+        "mime": stored.mime
+    })))
+}
+
+/// One accepted upload, as stored under the upload directory.
+#[derive(Debug, Clone)]
+pub struct StoredUpload {
+    /// Where the agent reads it (absolute, inside the upload directory).
+    pub path: PathBuf,
+    /// The generated on-disk name (UUID plus the extension the content earned).
+    pub stored_name: String,
+    /// The client's name, reduced to something safe to show.
+    pub name: String,
+    pub size: usize,
+    pub mime: &'static str,
+}
+
+/// Why a file was not stored. The same decisions `POST /api/uploads` makes;
+/// a client that is not HTTP (the desktop) asks through [`store_upload`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UploadRefusal {
+    Empty,
+    Executable,
+    Unsupported,
+    /// Over the ceiling for what the content turned out to be.
+    TooLarge {
+        max_mib: usize,
+    },
+    Storage,
+}
+
+impl UploadRefusal {
+    pub(crate) fn status(&self) -> StatusCode {
+        match self {
+            Self::Empty => StatusCode::BAD_REQUEST,
+            Self::Executable | Self::Unsupported => StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            Self::TooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
+            Self::Storage => StatusCode::INTERNAL_SERVER_ERROR,
+        }
     }
 
-    // Executables are checked separately from the content allow-list so the
-    // refusal says what it means, and so adding a document format cannot
-    // accidentally make an executable acceptable.
-    if looks_executable(&bytes) {
-        return Err(api_error(
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "executable_rejected",
-            "executables and scripts are not accepted",
-        ));
+    pub(crate) fn code(&self) -> &'static str {
+        match self {
+            Self::Empty => "empty_file",
+            Self::Executable => "executable_rejected",
+            Self::Unsupported => "unsupported_file_type",
+            Self::TooLarge { .. } => "upload_too_large",
+            Self::Storage => "upload_failed",
+        }
     }
-    let Some(kind) = sniff_upload_kind(&bytes)
-        .or_else(|| sniff_video_upload_kind(&bytes))
-        .or_else(|| sniff_office_upload_kind(&bytes))
-        .or_else(|| sniff_document_upload_kind(&bytes, &client_name))
+
+    pub fn message(&self) -> String {
+        match self {
+            Self::Empty => "the file field is empty".into(),
+            Self::Executable => "executables and scripts are not accepted".into(),
+            Self::Unsupported => {
+                "only supported images, videos, office documents, PDF, and UTF-8 text are accepted"
+                    .into()
+            }
+            Self::TooLarge { max_mib } => format!("this file may be at most {max_mib} MiB"),
+            Self::Storage => "failed to store the upload".into(),
+        }
+    }
+}
+
+/// Check `bytes` as the upload route does and park them in the upload
+/// directory. Executables are checked separately from the content allow-list
+/// so the refusal says what it means, and so adding a document format cannot
+/// accidentally make an executable acceptable.
+pub fn store_upload(client_name: &str, bytes: &[u8]) -> Result<StoredUpload, UploadRefusal> {
+    if bytes.is_empty() {
+        return Err(UploadRefusal::Empty);
+    }
+    if looks_executable(bytes) {
+        return Err(UploadRefusal::Executable);
+    }
+    let Some(kind) = sniff_upload_kind(bytes)
+        .or_else(|| sniff_video_upload_kind(bytes))
+        .or_else(|| sniff_office_upload_kind(bytes))
+        .or_else(|| sniff_document_upload_kind(bytes, client_name))
     else {
-        return Err(api_error(
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "unsupported_file_type",
-            "only supported images, videos, office documents, PDF, and UTF-8 text are accepted",
-        ));
+        return Err(UploadRefusal::Unsupported);
     };
     // The route's body limit is the video ceiling; everything else keeps the
     // smaller one, decided by what the content turned out to be.
@@ -138,42 +203,27 @@ pub(crate) async fn upload_file(
         MAX_UPLOAD_BYTES
     };
     if bytes.len() > maximum {
-        return Err(api_error(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "upload_too_large",
-            &format!("this file may be at most {} MiB", maximum / (1024 * 1024)),
-        ));
+        return Err(UploadRefusal::TooLarge {
+            max_mib: maximum / (1024 * 1024),
+        });
     }
-
     let dir = ensure_uploads_dir().map_err(|err| {
         tracing::warn!("failed to prepare the upload directory: {err:#}");
-        api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "upload_failed",
-            "failed to store the upload",
-        )
+        UploadRefusal::Storage
     })?;
     let stored_name = stored_upload_name(kind);
     let path = dir.join(&stored_name);
-    write_upload_file(&path, &bytes).map_err(|err| {
+    write_upload_file(&path, bytes).map_err(|err| {
         tracing::warn!("failed to write upload {}: {err:#}", path.display());
-        api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "upload_failed",
-            "failed to store the upload",
-        )
+        UploadRefusal::Storage
     })?;
-
-    Ok(Json(json!({
-        // `path` is for the agent, which reads the file off this host.
-        "path": path.to_string_lossy(),
-        // `url` is for the app, which cannot. Same file, the two ways of
-        // reaching it, so the transcript can draw what was sent.
-        "url": upload_url(&stored_name),
-        "name": sanitize_upload_name(&client_name),
-        "size": bytes.len(),
-        "mime": kind.mime
-    })))
+    Ok(StoredUpload {
+        path,
+        stored_name,
+        name: sanitize_upload_name(client_name),
+        size: bytes.len(),
+        mime: kind.mime,
+    })
 }
 
 /// Where a stored upload is readable over the API. The stored name is

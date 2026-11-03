@@ -632,7 +632,7 @@ impl ViewState {
                 }
             }
             // Routed past the view by the drain (`drain.rs` `apply`).
-            Update::Theme(_) => {}
+            Update::Theme(_) | Update::Composer(_) => {}
             Update::Projects { agent, projects } => {
                 self.projects = ProjectList { agent, projects };
                 changes.projects = true;
@@ -953,9 +953,6 @@ pub struct Bindings {
     pub settings_tab: State<String>,
     /// An agent setting changed since start: show "restart to apply".
     pub restart_note: State<bool>,
-    /// The New-session folder chooser's value: the folder as the owner
-    /// typed or picked it (`~` unexpanded until the session is created).
-    pub chooser: State<String>,
     pub timeline_scroll: blinc_layout::selector::ScrollRef,
     /// Forms waiting for an answer in the active session.
     pub forms: State<Arc<Vec<FormRequest>>>,
@@ -991,7 +988,6 @@ impl Bindings {
             settings_open: ctx.use_state_keyed("mq.settings_open", || false),
             settings_tab: ctx.use_state_keyed("mq.settings_tab", || "agents".to_string()),
             restart_note: ctx.use_state_keyed("mq.restart_note", || false),
-            chooser: ctx.use_state_keyed("mq.chooser", String::new),
             timeline_scroll,
             forms: ctx.use_state_keyed("mq.forms", || Arc::new(Vec::new())),
             stream_tail: ctx.use_state_keyed("mq.stream_tail", String::new),

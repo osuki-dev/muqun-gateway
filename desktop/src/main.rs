@@ -120,29 +120,26 @@ fn main() -> anyhow::Result<()> {
                 paths: paths.clone(),
             };
             restore_prefs(&app, &config);
-            ui::new_session::watch_typed_folder(&app);
             let for_actions = app.clone();
             drain.attach(
                 app.bindings.clone(),
                 Arc::new(move |action| match action {
-                    UiAction::SubmitComposer => ui::composer::submit(&for_actions),
+                    UiAction::SubmitComposer => ui::composer::submit_from_button(&for_actions),
+                    UiAction::ComposerEdited => ui::composer::edited(&for_actions),
+                    UiAction::ComposerKey { key, line, column } => {
+                        ui::composer::on_key(&for_actions, key, line, column)
+                    }
                     UiAction::Open(asid) => {
                         for_actions.open_session(&muqun_gateway::agents::AgentSessionId(asid))
                     }
-                    UiAction::SetDraft { agent, cwd } => {
-                        // Only while that agent's page is still the open one.
-                        let open = for_actions.bindings.draft.get();
-                        if open.is_some_and(|d| d.agent == agent) {
-                            for_actions
-                                .bindings
-                                .chooser
-                                .signal()
-                                .set(cwd.to_string_lossy().into_owned());
-                        }
-                    }
+                    UiAction::ProjectPicked(cwd) => ui::composer::project_picked(cwd),
+                    UiAction::FilesPicked(paths) => ui::composer::files_picked(&for_actions, paths),
+                    UiAction::QaStep(step) => ui::composer::qa::run(&for_actions, &step),
+                    UiAction::ImagePasted(png) => ui::composer::image_pasted(&for_actions, png),
                 }),
             );
             ui::timeline::qa::start(&app);
+            ui::composer::qa::start(&app);
             app
         });
         tracing::debug!(builds, width = ctx.width, height = ctx.height, "build_ui");

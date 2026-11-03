@@ -3,6 +3,7 @@
 //! main thread applies them in [`drain`].
 
 pub mod commands;
+pub mod compose;
 pub mod drain;
 pub mod inbox;
 pub mod projection;

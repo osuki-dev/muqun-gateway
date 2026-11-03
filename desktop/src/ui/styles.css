@@ -118,157 +118,44 @@
 .mq-standing--checking { color: var(--text-tertiary); }
 .mq-standing--blocked { color: var(--warning); }
 
-/* home ---------------------------------------------------------------
-   Owned by ui/home.rs and ui/home/*. Architecture §6.0 layout, §6.1d
-   visual direction, §5 5b: no colour literal -- every colour is a theme
-   variable (agent hues via --agent-<id>), every size a scale variable. */
+/* start ---------------------------------------------------------------
+   Owned by ui/home.rs. Architecture §6.0‴ B: the start page is the
+   composer. Every colour is a theme variable, every size a scale value. */
 
-.mq-home { background: var(--background); color: var(--text-primary); }
-.mq-home-content {
-    padding: 0 var(--mq-space-10) var(--mq-space-10) var(--mq-space-10);
-    gap: var(--mq-space-10);
+.mq-start { background: var(--background); color: var(--text-primary); }
+/* the theme's cover, upper right, fading towards the page; its opacity is
+   set on the image (8 % dark, 6 % light) */
+.mq-start-cover {
+    mask-image: linear-gradient(to bottom left, black 25%, transparent 90%);
 }
-
-/* hero: the art is a backdrop; its scrim and bottom fade are in the
-   art's alpha (ui/home/cover.rs), so the text stands on the page's own
-   background. Themes without art get this wash from their tokens. */
-.mq-home-art--generated {
-    background: linear-gradient(160deg, var(--surface-elevated) 0%, var(--background) 100%);
-}
-.mq-home-art--glow {
-    background: radial-gradient(circle at 85% 0%, var(--primary) 0%, transparent 70%);
-    opacity: 0.3;
-}
-.mq-home-hero { padding-bottom: var(--mq-space-6); gap: var(--mq-space-2); }
-.mq-home-greeting { color: var(--text-primary); }
-.mq-home-hero-line { gap: var(--mq-space-6); }
-/* the hero's small lines sit over art: text-primary keeps them >= 7:1 in
-   both schemes (Cover Courier's textMuted is 6.7:1 on the light paper) */
-.mq-home-stats, .mq-home-date { color: var(--text-primary); }
-
-/* sections: title 13 px uppercase, 16 px to its content; 40 px between */
-.mq-home-section { gap: var(--mq-space-4); }
-.mq-home-title { color: var(--text-secondary); }
-.mq-home-side { gap: var(--mq-space-10); }
-.mq-home-grid { gap: var(--mq-space-6); }
-
-/* solid content surfaces */
-.mq-home-card {
-    border-radius: var(--mq-radius-lg);
-    border: var(--mq-hairline) solid var(--border);
-    background: var(--surface);
-}
-.mq-home-card--padded { padding: var(--mq-space-5); }
-.mq-home-hairline { background: var(--border); }
-.mq-home-teach { color: var(--text-secondary); }
-
-/* launch row */
-.mq-home-launch { gap: var(--mq-space-3); }
-.mq-home-launch-body { gap: var(--mq-space-3); }
-.mq-home-launch-card {
-    padding: var(--mq-space-4) var(--mq-space-4) var(--mq-space-4) var(--mq-space-5);
-    border-radius: var(--mq-radius-lg);
-    border: var(--mq-hairline) solid var(--border);
-    background: var(--surface);
-    color: var(--text-primary);
-    transition: transform var(--mq-motion-micro) ease-out, border-color var(--mq-motion-micro) ease-out;
-}
-.mq-home-launch-card:hover { transform: translateY(-2px); border-color: var(--border-hover); }
-.mq-home-launch-card--primary {
-    padding: var(--mq-space-4);
-    background: var(--primary);
-    border-color: var(--primary);
-    color: var(--text-inverse);
-}
-.mq-home-launch-card--primary:hover { border-color: var(--primary-hover); background: var(--primary-hover); }
-.mq-home-launch-key, .mq-home-launch-hint { padding-top: var(--mq-space-1); color: var(--text-inverse); }
-.mq-home-launch-card--more { color: var(--text-secondary); }
-.mq-home-launch-name { color: var(--text-primary); gap: var(--mq-space-2); }
-.mq-home-launch-lines { gap: var(--mq-space-1); }
-.mq-home-launch-meta { color: var(--text-secondary); }
-.mq-home-launch-choose { color: var(--text-tertiary); }
-/* .mq-home-bar.mq-agent--<id> (the 3 px brand bar) lives in theme/agents.rs with the variables. */
-
-/* continue working: 72 px rows in one card */
-.mq-home-row {
-    height: 72px;
-    padding: 0 var(--mq-space-5);
+.mq-start-title { color: var(--text-primary); }
+.mq-start-subtitle { color: var(--text-secondary); }
+.mq-start-label { padding: var(--mq-space-8) 0 var(--mq-space-2) 0; color: var(--text-tertiary); }
+.mq-start-empty { padding: var(--mq-space-3) 0; color: var(--text-tertiary); }
+.mq-start-hairline { background: var(--border); }
+.mq-start-row {
     gap: var(--mq-space-3);
+    color: var(--text-primary);
     transition: background var(--mq-motion-micro) ease-out;
 }
-.mq-home-row:hover { background: var(--surface-overlay); }
-.mq-home-row-main { gap: var(--mq-space-1); }
-.mq-home-row-title { color: var(--text-primary); }
-.mq-home-row-meta { gap: var(--mq-space-3); color: var(--text-secondary); }
-.mq-home-row-when { color: var(--text-secondary); }
-.mq-home-dot { border: 1.5px solid var(--text-secondary); }
-.mq-home-dot--busy { background: var(--primary); border-color: var(--primary); }
-.mq-home-dot--waiting { background: var(--warning); border-color: var(--warning); }
-.mq-home-dot--failed { border-color: var(--error); }
-
-/* needs attention */
-.mq-home-attention-body {
-    padding: var(--mq-space-4) var(--mq-space-5) var(--mq-space-4) var(--mq-space-6);
-    gap: var(--mq-space-1);
-}
-.mq-home-attention-prompt { color: var(--text-primary); }
-.mq-home-replies { gap: var(--mq-space-2); padding-top: var(--mq-space-2); }
-.mq-home-reply {
-    padding: var(--mq-space-1) var(--mq-space-3);
-    border-radius: var(--mq-radius-md);
-    transition: background var(--mq-motion-micro) ease-out;
-}
-.mq-home-reply--deny { border: var(--mq-hairline) solid var(--border); color: var(--text-primary); }
-.mq-home-reply--deny:hover { background: var(--surface-overlay); }
-.mq-home-reply--allow { background: var(--primary); color: var(--text-inverse); }
-.mq-home-reply--allow:hover { background: var(--primary-hover); }
-
-/* agents: two columns of rows */
-.mq-home-agents { gap: var(--mq-space-3); }
-.mq-home-agents-row { gap: var(--mq-space-6); }
-.mq-home-agent { gap: var(--mq-space-2); }
-.mq-home-agent-name { color: var(--text-primary); }
-
-/* footer strip */
-.mq-home-footer {
-    padding: 0 var(--mq-space-10);
-    border-top: var(--mq-hairline) solid var(--border);
-    background: var(--background);
+.mq-start-row:hover { background: var(--surface-overlay); }
+.mq-start-row-project, .mq-start-row-when { color: var(--text-tertiary); }
+.mq-start-main { gap: var(--mq-space-3); }
+/* hover actions: Open / Pin */
+.mq-start-actions { gap: var(--mq-space-2); opacity: 0; }
+.mq-start-row:hover .mq-start-actions { opacity: 1; }
+.mq-start-action {
+    padding: 2px var(--mq-space-2);
+    border-radius: var(--mq-radius-sm);
     color: var(--text-secondary);
 }
-.mq-home-footer-part { gap: var(--mq-space-3); }
-
-/* density: compact scales rows and gaps down together */
-.mq-density--compact .mq-home-content { gap: var(--mq-space-8); }
-.mq-density--compact .mq-home-row { height: 56px; }
-.mq-density--compact .mq-home-section { gap: var(--mq-space-3); }
-.mq-density--compact .mq-home-card--padded { padding: var(--mq-space-4); }
-.mq-density--compact .mq-home-attention-body { padding: var(--mq-space-3) var(--mq-space-4) var(--mq-space-3) var(--mq-space-5); }
-
-/* /home -------------------------------------------------------------- */
-
-.mq-new-page { padding: 28px 32px; gap: 10px; max-width: 720px; }
-.mq-field-label { padding-top: 10px; color: var(--text-tertiary); }
-.mq-pick-list { gap: 2px; }
-.mq-pick {
-    gap: 8px;
-    padding: 8px 10px;
-    border-radius: 8px;
-    border: 1px solid var(--border);
-    color: var(--text-secondary);
-}
-.mq-pick:hover { background: var(--surface-overlay); }
-.mq-pick--active { border-color: var(--primary); background: var(--accent-subtle); }
-.mq-pick--disabled { opacity: 0.6; }
-.mq-pick-name { padding-left: 4px; color: var(--text-primary); }
-.mq-folder {
-    gap: 10px;
-    padding: 8px 10px;
-    border-radius: 8px;
-    border: 1px solid var(--border);
-    background: var(--surface);
-}
-.mq-new-actions { gap: 10px; padding-top: 14px; color: var(--text-tertiary); }
+.mq-start-action:hover { background: var(--surface-elevated); color: var(--text-primary); }
+/* the status badge: ringed in the page's colour */
+.mq-start-badge { border: 1.5px solid var(--background); }
+.mq-start-badge--busy { background: var(--primary); }
+.mq-start-badge--waiting { background: var(--warning); }
+.mq-start-badge--failed { background: var(--error); }
+/* /start ------------------------------------------------------------- */
 
 .mq-session-header { gap: 8px; color: var(--text-secondary); }
 .mq-header-title { color: var(--text-primary); }
@@ -496,16 +383,118 @@
 }
 .mq-alert-body { gap: 2px; }
 
-.mq-composer {
-    gap: 10px;
-    padding: 12px 16px 16px 16px;
-    border-top: 1px solid var(--border);
+/* composer ------------------------------------------------------------
+   Owned by ui/composer/*. One card for the start page and the session page:
+   the field, staged files, waiting prompts, the 28 px mono pills. */
+
+.mq-cmp-strip { background: transparent; }
+.mq-cmp-slot { padding: 0 var(--mq-space-4) var(--mq-space-4) var(--mq-space-4); }
+.mq-cmp-card {
     background: var(--surface);
+    border: var(--mq-hairline) solid var(--border);
+    border-radius: var(--mq-radius-lg);
+    padding: var(--mq-space-2) var(--mq-space-3) var(--mq-space-2) var(--mq-space-3);
+    gap: var(--mq-space-2);
 }
-.mq-composer-actions {
-    gap: 8px;
-    align-items: center;
+.mq-cmp-card:focus-within { border-color: var(--border-focus); }
+.mq-cmp-input-row { gap: var(--mq-space-2); }
+.mq-cmp-attach { padding: var(--mq-space-2) var(--mq-space-1); }
+/* the field has no chrome of its own: the card carries the ring */
+.mq-cmp-input, .mq-cmp-input:hover, .mq-cmp-input:focus {
+    background: transparent;
+    border-color: transparent;
+    outline: 0px solid transparent;
+    outline-offset: 0px;
 }
+.mq-cmp-pill-row { gap: var(--mq-space-2); }
+.mq-pills { gap: var(--mq-space-2); }
+.mq-cmp-right { gap: var(--mq-space-3); color: var(--text-tertiary); }
+.mq-pill {
+    padding: 0 var(--mq-space-2);
+    gap: 6px;
+    border-radius: var(--mq-radius-sm);
+    border: var(--mq-hairline) solid var(--border);
+    color: var(--text-secondary);
+    transition: background var(--mq-motion-micro) ease-out, border-color var(--mq-motion-micro) ease-out;
+}
+.mq-pill:hover { background: var(--surface-overlay); border-color: var(--border-hover); }
+.mq-pill--open { border-color: var(--border-focus); color: var(--text-primary); }
+.mq-pill--static:hover { background: transparent; border-color: var(--border); }
+.mq-usage { padding: 0 var(--mq-space-1); color: var(--text-tertiary); }
+.mq-usage:hover { color: var(--text-secondary); }
+.mq-usage-tip { gap: 2px; color: var(--text-secondary); padding: var(--mq-space-1); }
+.mq-cmp-actions { gap: var(--mq-space-2); }
+.mq-cmp-stop {
+    gap: 6px;
+    height: 28px;
+    padding: 0 var(--mq-space-2);
+    border-radius: var(--mq-radius-sm);
+    border: var(--mq-hairline) solid var(--border);
+    color: var(--text-secondary);
+}
+.mq-cmp-stop:hover { background: var(--surface-overlay); }
+.mq-cmp-primary {
+    gap: 6px;
+    height: 28px;
+    padding: 0 var(--mq-space-3);
+    border-radius: var(--mq-radius-sm);
+    background: var(--primary);
+    color: var(--text-inverse);
+    transition: background var(--mq-motion-micro) ease-out;
+}
+.mq-cmp-primary:hover { background: var(--primary-hover); }
+.mq-cmp-primary--off { opacity: 0.45; }
+.mq-cmp-primary--off:hover { background: var(--primary); }
+
+/* menus: solid, hairline, 32 px rows */
+.mq-menu, .mq-popup {
+    background: var(--surface-elevated);
+    border: var(--mq-hairline) solid var(--border);
+    border-radius: var(--mq-radius-md);
+    padding: var(--mq-space-1);
+    color: var(--text-primary);
+}
+.mq-menu-row, .mq-popup-row {
+    padding: 0 var(--mq-space-2);
+    gap: var(--mq-space-2);
+    border-radius: var(--mq-radius-sm);
+}
+.mq-menu-row:hover, .mq-popup-row:hover { background: var(--surface-overlay); }
+.mq-menu-row--sel, .mq-popup-row--sel { background: var(--accent-subtle); }
+.mq-menu-row--off { opacity: 0.55; }
+.mq-menu-row--off:hover { background: transparent; }
+.mq-menu-dim, .mq-popup-detail { color: var(--text-tertiary); padding-left: var(--mq-space-2); }
+.mq-menu-gap { padding-left: var(--mq-space-2); }
+.mq-menu-link { color: var(--primary); padding-left: var(--mq-space-2); }
+.mq-menu-sep { background: var(--border); margin: var(--mq-space-1) 0; }
+
+/* waiting prompts and staged files above the field */
+.mq-queued-list { gap: var(--mq-space-1); }
+.mq-queued {
+    gap: var(--mq-space-2);
+    padding: 2px 0;
+    color: var(--text-secondary);
+}
+.mq-queued-more { color: var(--text-tertiary); }
+.mq-chip-toggle {
+    padding: 2px var(--mq-space-2);
+    border-radius: var(--mq-radius-sm);
+    border: var(--mq-hairline) solid var(--border);
+    color: var(--text-secondary);
+}
+.mq-chip-toggle--on { background: var(--accent-subtle); border-color: var(--warning); color: var(--text-primary); }
+.mq-chip-x { padding: 2px; border-radius: var(--mq-radius-sm); }
+.mq-chip-x:hover { background: var(--surface-overlay); }
+.mq-chips { gap: var(--mq-space-2); padding: var(--mq-space-1) 0; }
+.mq-chip {
+    gap: 6px;
+    padding: 2px 6px 2px var(--mq-space-2);
+    border-radius: var(--mq-radius-sm);
+    border: var(--mq-hairline) solid var(--border);
+    color: var(--text-secondary);
+}
+.mq-chip--failed { border-color: var(--error); color: var(--error); }
+/* /composer ---------------------------------------------------------- */
 
 .mq-settings { background: var(--background); }
 .mq-settings-head {
@@ -548,9 +537,3 @@
 .mq-settings-wrap { padding: 0 8px 8px 8px; }
 .mq-settings-entry { gap: 8px; }
 .mq-nav-label { color: inherit; }
-.mq-folder-option { gap: 10px; }
-/* blinc_cn builds the chooser's list with this id and a 200px cap; MAX_OPTIONS
-   rows of the app's height fit in this one. */
-#mq-chooser_options_content { max-height: 380px; }
-.mq-folder-option--missing { opacity: 0.45; }
-.mq-folder-tag { color: var(--text-tertiary); }

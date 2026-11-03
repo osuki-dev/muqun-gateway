@@ -14,7 +14,8 @@ pub enum Command {
     Refresh,
     /// Make a session the active one and read its snapshot.
     OpenSession(AgentSessionId),
-    /// Start a session for `agent` in `cwd`, remember `cwd`, open it.
+    /// Start a session for `agent` in `cwd`, remember `cwd`, open it. (The
+    /// composer starts sessions through `Compose`; the QA harness uses this.)
     CreateSession {
         agent: String,
         cwd: PathBuf,
@@ -51,7 +52,9 @@ pub enum Command {
         answers: serde_json::Value,
     },
     /// Folders under a typed prefix. Debounced on the core side; only the
-    /// answer for the newest prefix is delivered.
+    /// answer for the newest prefix is delivered. (The start page picks
+    /// folders with the system dialog; this waits for a typed path field.)
+    #[allow(dead_code)]
     CompleteDirectory {
         prefix: String,
     },
@@ -62,6 +65,9 @@ pub enum Command {
     /// The owner changed a setting or arranged the window. Applied at once
     /// in memory, written to disk after 500 ms without another edit.
     Edit(ConfigEdit),
+    /// The composer's work (`model/compose.rs`): files, catalogue, staging,
+    /// delivery, the queue.
+    Compose(super::compose::ComposeCommand),
     /// Themes (`theme/service.rs`). The library list, and the gallery index
     /// (from its 1 h cache when fresh) with its card pictures.
     ThemeRefresh,

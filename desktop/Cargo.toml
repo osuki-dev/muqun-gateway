@@ -49,6 +49,9 @@ pulldown-cmark = { version = "0.10", default-features = false }
 # Rust regexes, the bundled Sublime grammars, no bundled themes (colours
 # come from the app theme).
 syntect = { version = "5.3", default-features = false, features = ["default-syntaxes", "regex-fancy"] }
+# Pasting an image into the composer (`platform/clipboard.rs`). Blinc's
+# `clipboard_read` is text only. The same crate Blinc uses for text.
+arboard = { version = "3", default-features = false, features = ["image-data"] }
 # Not used directly: Blinc's `clipboard_write` goes through arboard, which
 # without this feature talks X11 only and loses copies on Wayland.
 [target.'cfg(target_os = "linux")'.dependencies]

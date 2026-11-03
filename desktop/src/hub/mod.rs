@@ -17,10 +17,11 @@ use std::pin::Pin;
 use muqun_gateway::agents::directories::Completion;
 use muqun_gateway::agents::ports::{AgentError, AgentSessionSnapshot};
 use muqun_gateway::agents::{
-    AgentDomainEvent, AgentProject, AgentSessionId, AgentSessionInfo, PermissionDecision,
-    SessionQuery, TimelineItem,
+    AgentCatalog, AgentDomainEvent, AgentProject, AgentSessionId, AgentSessionInfo, ModelRef,
+    PermissionDecision, SessionQuery, TimelineItem,
 };
 use muqun_gateway::platform::discovery::AgentDiscoveryInfo;
+use muqun_gateway::platform::StoredUpload;
 use tokio::sync::broadcast;
 
 pub use local::LocalHub;
@@ -33,6 +34,13 @@ pub const OPENCODE: &str = "opencode";
 pub use muqun_gateway::agents::runtime::AGENT_PREFERENCE;
 
 pub type HubFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, HubError>> + Send + 'a>>;
+
+/// What the composer offers for one agent in one folder: the gateway's
+/// catalogue (models, modes, slash commands, skills).
+#[derive(Debug, Clone, Default)]
+pub struct CatalogView {
+    pub catalog: AgentCatalog,
+}
 
 pub trait SessionHub: Send + Sync {
     /// Every agent this hub knows, with the gateway's availability words.
@@ -77,6 +85,63 @@ pub trait SessionHub: Send + Sync {
         form_id: &'a str,
         answers: serde_json::Value,
     ) -> HubFuture<'a, ()>;
+    /// The prompt with files the hub already stored ([`SessionHub::store_attachment`])
+    /// and the delivery the owner asked for (`steer` / `queue`; `None` is the
+    /// agent's own default). One call for both, as the App's send.
+    fn send<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+        text: &'a str,
+        attachments: &'a [String],
+        delivery: Option<&'a str>,
+    ) -> HubFuture<'a, ()>;
+    /// Files under `directory` matching `query`, as the agent finds them
+    /// (`@` mentions). Each hit is the gateway's `{path, type}` object.
+    fn find_files<'a>(
+        &'a self,
+        agent: &'a str,
+        directory: &'a str,
+        query: &'a str,
+        limit: usize,
+    ) -> HubFuture<'a, Vec<serde_json::Value>>;
+    /// Models, modes, skills and slash commands for the agent in `directory`
+    /// (or for the exact session when one is given).
+    fn catalog<'a>(
+        &'a self,
+        agent: &'a str,
+        asid: Option<&'a AgentSessionId>,
+        directory: Option<&'a str>,
+    ) -> HubFuture<'a, CatalogView>;
+    /// Run a host slash command in the session (never sent as typed text).
+    fn run_command<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+        name: &'a str,
+        arguments: &'a str,
+        delivery: Option<&'a str>,
+    ) -> HubFuture<'a, serde_json::Value>;
+    /// Activate a catalogue skill in the session.
+    fn activate_skill<'a>(&'a self, asid: &'a AgentSessionId, skill: &'a str) -> HubFuture<'a, ()>;
+    fn switch_model<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+        model: &'a ModelRef,
+    ) -> HubFuture<'a, ()>;
+    fn switch_mode<'a>(&'a self, asid: &'a AgentSessionId, mode: &'a str) -> HubFuture<'a, ()>;
+    /// A queued or steered prompt: take it back, or move it between the two
+    /// deliveries (`steer` runs at the next step boundary).
+    fn inbox_cancel<'a>(&'a self, asid: &'a AgentSessionId, item: &'a str) -> HubFuture<'a, ()>;
+    fn inbox_delivery<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+        item: &'a str,
+        delivery: &'a str,
+    ) -> HubFuture<'a, ()>;
+    /// Store a file the owner attached, under the gateway's own upload rules
+    /// (type sniffed from the bytes, 25 MiB / 64 MiB for video, no
+    /// executables). The result's path is what [`SessionHub::send`] takes.
+    fn store_attachment<'a>(&'a self, name: &'a str, bytes: Vec<u8>)
+        -> HubFuture<'a, StoredUpload>;
     /// Every session event of every agent, in the order the runtime saw them.
     fn events(&self) -> broadcast::Receiver<AgentDomainEvent>;
 }
@@ -94,6 +159,8 @@ pub enum HubError {
     SessionNotFound(String),
     /// The agent refused or failed; the gateway's error, for display.
     Agent(AgentError),
+    /// A file was not accepted as an attachment (the gateway's own words).
+    Upload(muqun_gateway::platform::UploadRefusal),
 }
 
 impl From<AgentError> for HubError {
@@ -114,6 +181,7 @@ impl std::fmt::Display for HubError {
             }
             Self::SessionNotFound(asid) => write!(f, "Agent session not found: {asid}"),
             Self::Agent(err) => err.fmt(f),
+            Self::Upload(refusal) => f.write_str(&refusal.message()),
         }
     }
 }

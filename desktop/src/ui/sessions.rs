@@ -219,7 +219,9 @@ pub enum DayGroup {
 }
 
 impl DayGroup {
-    /// The group of an update at `updated_ms`, seen at `now_ms`.
+    /// The group of an update at `updated_ms`, seen at `now_ms`. (Its only
+    /// caller was the old Home dashboard; the sidebar's grouping rewrite owns it.)
+    #[allow(dead_code)]
     pub fn of(updated_ms: u64, now_ms: u64, utc_offset_s: i64) -> Self {
         Self::of_day(
             local_day(updated_ms, utc_offset_s),

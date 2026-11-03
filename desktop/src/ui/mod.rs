@@ -10,7 +10,6 @@ pub mod home;
 pub mod icons;
 pub mod markdown;
 pub mod motion;
-pub mod new_session;
 pub mod parts;
 pub mod sessions;
 pub mod settings;
@@ -31,7 +30,7 @@ use crate::config::{ConfigEdit, Scheme};
 use crate::model::commands::{self, Command, CommandSender};
 use crate::model::drain::Drain;
 use crate::model::projection::ConfigStore;
-use crate::model::view::{Bindings, NewSessionDraft};
+use crate::model::view::Bindings;
 use strings::Strings;
 
 /// The app's own stylesheet. Colours only through theme variables.
@@ -81,63 +80,22 @@ impl App {
             .or_else(|| usable.first().cloned())
     }
 
-    /// Open the New-session page with the defaults filled in.
+    /// New session (Ctrl/Cmd+N, the sidebar's `+`): the start page, with the
+    /// caret in its composer and every default filled in.
     pub fn open_draft(&self) {
-        let agent = self
-            .default_agent()
-            .unwrap_or_else(|| crate::hub::OPENCODE.to_string());
         self.bindings.settings_open.signal().set(false);
-        self.draft_for(agent);
+        self.drain.go_home();
+        composer::focus_input(self);
     }
 
-    /// The New-session page for `agent`: its last folder preselected, its
-    /// known projects on the way. (The folder lives in the chooser's value,
-    /// not in the draft, so choosing one does not rebuild the page.)
-    pub fn draft_for(&self, agent: String) {
-        let cwd = self.config.get().general.initial_cwd(&agent);
-        self.bindings
-            .chooser
-            .signal()
-            .set(cwd.to_string_lossy().into_owned());
-        self.bindings.projects.signal().set(Arc::default());
-        self.send(Command::LoadProjects {
-            agent: agent.clone(),
-        });
-        self.bindings
-            .draft
-            .signal()
-            .set(Some(NewSessionDraft { agent }));
-    }
-
-    /// Start a session for `agent` in `cwd` straight away.
-    pub fn create(&self, agent: String, cwd: std::path::PathBuf) {
-        self.bindings.draft.signal().set(None);
-        self.send(Command::CreateSession { agent, cwd });
-    }
-
-    /// Create from the New-session page: the chooser's folder, `~` expanded
-    /// first. A `~user` the gateway cannot expand is said, not guessed at.
-    pub fn create_from_draft(&self) {
-        let Some(draft) = self.bindings.draft.get() else {
-            return;
-        };
-        let raw = self.bindings.chooser.get();
-        match muqun_gateway::agents::directories::expand_home(raw.trim()) {
-            Some(cwd) if !raw.trim().is_empty() => self.create(draft.agent, cwd),
-            _ => self
-                .bindings
-                .error
-                .signal()
-                .set(Some(crate::model::inbox::UiError {
-                    message: self.strings.folder_unusable(&raw),
-                    detail: None,
-                    unreachable: false,
-                })),
-        }
+    /// The start page for a project (a project row's `+`; the sidebar calls it).
+    #[allow(dead_code)]
+    pub fn open_draft_in(&self, cwd: &std::path::Path) {
+        composer::start_in(cwd.to_string_lossy().into_owned());
+        self.open_draft();
     }
 
     pub fn open_settings(&self) {
-        self.bindings.draft.signal().set(None);
         self.bindings.settings_open.signal().set(true);
     }
 
@@ -188,6 +146,7 @@ const KEY_0: u32 = 48;
 const KEY_N: u32 = 78;
 const KEY_COMMA: u32 = 188;
 const KEY_T: u32 = 84;
+const KEY_PERIOD: u32 = 190;
 
 /// The window-wide shortcuts. Key-down reaches every key handler
 /// (`renderer/events.rs` `broadcast_key_event`), so this one sees all keys
@@ -215,36 +174,36 @@ fn on_key(app: &App, ctx: &blinc_layout::event_handler::EventContext) {
         // the composer having focus: the text area gives up focus on the same
         // Esc, and key-down reaches every handler in no fixed order, so by
         // the time this runs `composer_focused` may already be false.
+        // Esc closes what is open, nearest first: a pill menu or the
+        // `@` list, then Settings, else it stops the running turn.
+        KEY_ESCAPE if composer::dismiss() => {}
         KEY_ESCAPE if app.bindings.settings_open.get() => app.close_settings(),
-        KEY_ESCAPE if app.bindings.draft.get().is_some() => {
-            // An open folder list closes first; the page only then.
-            if !new_session::close_chooser() {
-                app.bindings.draft.signal().set(None);
-            }
-        }
-        KEY_ESCAPE => {
-            if let Some(info) = app.bindings.header.get() {
-                if matches!(
-                    info.status,
-                    muqun_gateway::agents::AgentSessionStatus::Busy
-                        | muqun_gateway::agents::AgentSessionStatus::Retry
-                ) {
-                    app.send(Command::Interrupt(info.asid.clone()));
-                }
-            }
-        }
-        KEY_ENTER if !chord && !composer_focused => {
-            if app.bindings.draft.get().is_some() {
-                // Typed text in the folder list is committed first; Enter
-                // again creates. Nothing typed: Enter takes the defaults.
-                if !new_session::accept_typed_folder(app) {
-                    app.create_from_draft();
-                }
-            } else if app.bindings.selected.get().is_none() && !app.bindings.settings_open.get() {
-                app.open_draft();
-            }
+        KEY_ESCAPE => interrupt(app),
+        KEY_PERIOD if chord => interrupt(app),
+        // On the start page with the caret elsewhere, Enter goes back to the
+        // composer (typing then starts the message).
+        KEY_ENTER
+            if !chord
+                && !composer_focused
+                && app.bindings.selected.get().is_none()
+                && !app.bindings.settings_open.get() =>
+        {
+            composer::focus_input(app)
         }
         _ => {}
+    }
+}
+
+/// Stop the running turn of the open session, if there is one.
+fn interrupt(app: &App) {
+    if let Some(info) = app.bindings.header.get() {
+        if matches!(
+            info.status,
+            muqun_gateway::agents::AgentSessionStatus::Busy
+                | muqun_gateway::agents::AgentSessionStatus::Retry
+        ) {
+            app.send(Command::Interrupt(info.asid.clone()));
+        }
     }
 }
 

@@ -28,6 +28,7 @@ pub(crate) mod video;
 #[allow(unused_imports)]
 pub use openapi::{openapi_spec, DOCS_HTML};
 pub use store::set_directories;
+pub use uploads::{store_upload, StoredUpload, UploadRefusal};
 
 #[cfg(all(test, unix))]
 pub(crate) mod installer_tests;

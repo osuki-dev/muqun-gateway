@@ -78,6 +78,17 @@ pub struct General {
     /// The agent the last session was started with.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_agent: Option<String>,
+    /// The model last chosen for an agent in a folder, by [`choice_key`]
+    /// (the composer preselects it next time).
+    pub last_model: HashMap<String, String>,
+    /// The mode last chosen, likewise.
+    pub last_mode: HashMap<String, String>,
+    /// Unsent composer text: the start page under [`START_DRAFT`], each
+    /// session under its id. Survives switching sessions and restarts.
+    pub drafts: HashMap<String, String>,
+    /// Pinned sessions (ids), newest pin first: the start page's recent
+    /// list shows them first.
+    pub pinned: Vec<String>,
     pub language: Language,
     /// The command "open in editor" will run, for later (`code`, `zed`, ...).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -85,6 +96,18 @@ pub struct General {
     /// Placeholder: closing the window will hide it to the tray instead of
     /// quitting. Stored, not acted on yet (there is no tray in P0).
     pub close_to_tray: bool,
+}
+
+/// The draft key of the start page.
+pub const START_DRAFT: &str = "start";
+/// The most drafts kept; the oldest-written are not tracked, so past this the
+/// session drafts of a few arbitrary sessions go (the start page's never).
+const MAX_DRAFTS: usize = 64;
+
+/// What "an agent in a folder" is called in [`General::last_model`] and
+/// [`General::last_mode`].
+pub fn choice_key(agent: &str, cwd: &str) -> String {
+    format!("{agent}\u{1f}{cwd}")
 }
 
 impl General {
@@ -264,6 +287,20 @@ pub enum ConfigEdit {
         agent: String,
         on: bool,
     },
+    /// What the composer chose for an agent in a folder. `None` clears.
+    Remember {
+        agent: String,
+        cwd: String,
+        model: Option<String>,
+        mode: Option<String>,
+    },
+    /// Pin the session, or unpin it when it is pinned.
+    TogglePin(String),
+    /// The unsent text under a draft key; empty removes it.
+    Draft {
+        key: String,
+        text: String,
+    },
     /// One field of one agent's block, as the owner typed it. An invalid
     /// value changes nothing (the settings page has already said why).
     AgentValue {
@@ -287,6 +324,47 @@ impl DesktopConfig {
                 self.general.editor_command = command.filter(|c| !c.trim().is_empty());
             }
             ConfigEdit::DefaultCwd(cwd) => self.general.default_cwd = cwd,
+            ConfigEdit::Remember {
+                agent,
+                cwd,
+                model,
+                mode,
+            } => {
+                let key = choice_key(&agent, &cwd);
+                let g = &mut self.general;
+                match model {
+                    Some(m) => g.last_model.insert(key.clone(), m),
+                    None => g.last_model.remove(&key),
+                };
+                match mode {
+                    Some(m) => g.last_mode.insert(key, m),
+                    None => g.last_mode.remove(&key),
+                };
+            }
+            ConfigEdit::TogglePin(asid) => {
+                let pinned = &mut self.general.pinned;
+                match pinned.iter().position(|p| *p == asid) {
+                    Some(at) => {
+                        pinned.remove(at);
+                    }
+                    None => pinned.insert(0, asid),
+                }
+            }
+            ConfigEdit::Draft { key, text } => {
+                let drafts = &mut self.general.drafts;
+                if text.trim().is_empty() {
+                    drafts.remove(&key);
+                } else {
+                    drafts.insert(key, text);
+                    while drafts.len() > MAX_DRAFTS {
+                        let Some(victim) = drafts.keys().find(|k| *k != START_DRAFT).cloned()
+                        else {
+                            break;
+                        };
+                        drafts.remove(&victim);
+                    }
+                }
+            }
             ConfigEdit::AgentEnabled { agent, on } => self.agents.set_enabled(&agent, on),
             ConfigEdit::AgentValue {
                 agent,
@@ -424,6 +502,58 @@ mod tests {
         assert_eq!(config.general.language, Language::ZhCn);
         assert_eq!(config.window.w, 900);
         assert_eq!(config.window.h, 800);
+    }
+
+    #[test]
+    fn choices_and_drafts_are_remembered_and_cleared() {
+        let mut config = DesktopConfig::default();
+        config.apply(ConfigEdit::Remember {
+            agent: "codex".into(),
+            cwd: "/work/a".into(),
+            model: Some("gpt".into()),
+            mode: None,
+        });
+        let key = choice_key("codex", "/work/a");
+        assert_eq!(
+            config.general.last_model.get(&key).map(String::as_str),
+            Some("gpt")
+        );
+        assert!(!config.general.last_mode.contains_key(&key));
+        config.apply(ConfigEdit::Draft {
+            key: START_DRAFT.into(),
+            text: "hello".into(),
+        });
+        assert_eq!(config.general.drafts[START_DRAFT], "hello");
+        config.apply(ConfigEdit::Draft {
+            key: START_DRAFT.into(),
+            text: "  ".into(),
+        });
+        assert!(
+            config.general.drafts.is_empty(),
+            "an empty draft is removed"
+        );
+        for n in 0..(MAX_DRAFTS + 10) {
+            config.apply(ConfigEdit::Draft {
+                key: format!("s{n}"),
+                text: "x".into(),
+            });
+        }
+        config.apply(ConfigEdit::Draft {
+            key: START_DRAFT.into(),
+            text: "keep".into(),
+        });
+        assert!(config.general.drafts.len() <= MAX_DRAFTS);
+        assert!(config.general.drafts.contains_key(START_DRAFT));
+    }
+
+    #[test]
+    fn pinning_toggles() {
+        let mut config = DesktopConfig::default();
+        config.apply(ConfigEdit::TogglePin("a".into()));
+        config.apply(ConfigEdit::TogglePin("b".into()));
+        assert_eq!(config.general.pinned, ["b", "a"]);
+        config.apply(ConfigEdit::TogglePin("b".into()));
+        assert_eq!(config.general.pinned, ["a"]);
     }
 
     #[test]
