@@ -155,36 +155,59 @@ pub fn reasoning(ctx: &PartCtx<'_>, text: &str, duration_ms: Option<u64>) -> Div
 
 /// The user's message: a quiet solid card on the right.
 pub fn user(ctx: &PartCtx<'_>, text: &str) -> Div {
+    // ByPath / ACP agents bake uploads into the wire text; strip that block
+    // for display and paint the paths as thumbs (same as the App).
+    let (display, from_text) =
+        muqun_gateway::agents::ports::agent::split_attachment_paths(text);
+    let mut atts: Vec<String> = ctx
+        .item
+        .attachments
+        .as_ref()
+        .cloned()
+        .unwrap_or_default();
+    for path in from_text {
+        if !atts.iter().any(|a| a == path) {
+            atts.push(path.to_string());
+        }
+    }
+    let display = display.trim_end();
     // The card is as wide as its longest line, up to 80 % of the column;
     // its text gets that width explicitly (see `markdown::Setting::width`).
     let max = (ctx.width * 0.8).max(240.0);
     let pad = 2.0 * 16.0 + 2.0;
     let options = blinc_layout::text_measure::TextLayoutOptions::new().with_font_name(UI_FONT);
-    let widest = text
+    let widest = display
         .lines()
         .take(200)
         .map(|l| {
             blinc_layout::text_measure::measure_text_with_options(l, scale::BODY, &options).width
         })
         .fold(0.0f32, f32::max);
-    let inner = (widest + 2.0).clamp(120.0, max - pad);
+    // Keep room for a strip of thumbs when the prose is short or empty.
+    let media_floor = match atts.len() {
+        0 => 0.0,
+        1 => 200.0,
+        n => ((n as f32) * 120.0).min(max - pad),
+    };
+    let inner = (widest.max(media_floor) + 2.0).clamp(120.0, max - pad);
     let setting = Setting {
         width: inner,
         ..ctx.setting(false)
     };
-    let paragraph = markdown::Inline {
-        text: text.trim_end().to_string(),
-        spans: Vec::new(),
-    };
-    let mut card = div()
-        .class("mq-user")
-        .w(inner + pad)
-        .flex_col()
-        .child(markdown::inline_text(&paragraph, &setting, setting.size, false).w(inner));
-    if let Some(atts) = ctx.item.attachments.as_ref().filter(|a| !a.is_empty()) {
+    let mut card = div().class("mq-user").w(inner + pad).flex_col();
+    if !display.is_empty() {
+        let paragraph = markdown::Inline {
+            text: display.to_string(),
+            spans: Vec::new(),
+        };
+        card = card.child(
+            markdown::inline_text(&paragraph, &setting, setting.size, false).w(inner),
+        );
+    }
+    if !atts.is_empty() {
         card = card.child(media::attachment_row(
             ctx,
-            atts,
+            &atts,
             ctx.item.image_assets.as_deref(),
         ));
     } else if let Some(assets) = ctx.item.image_assets.as_ref().filter(|a| !a.is_empty()) {
@@ -198,7 +221,11 @@ pub fn user(ctx: &PartCtx<'_>, text: &str) -> Div {
             .child(copy_button(
                 &ctx.key("copy"),
                 ctx.app.strings.copy(),
-                text.to_string(),
+                if display.is_empty() {
+                    text.to_string()
+                } else {
+                    display.to_string()
+                },
             )),
     );
     div()

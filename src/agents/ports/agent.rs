@@ -133,18 +133,39 @@ pub struct PreparedTerminalLaunch {
     pub arguments: Vec<String>,
 }
 
+/// Marker the gateway appends for agents that read host paths themselves.
+pub const ATTACHED_FILES_MARKER: &str = "\n\nAttached files (on this host):";
+
 /// `text` followed by a block listing `paths` for an agent that reads files
 /// itself. Unchanged when there are no paths.
 pub fn append_attachment_paths(text: &str, paths: &[String]) -> String {
     if paths.is_empty() {
         return text.to_string();
     }
-    let mut out = format!("{text}\n\nAttached files (on this host):");
+    let mut out = format!("{text}{ATTACHED_FILES_MARKER}");
     for path in paths {
         out.push_str("\n- ");
         out.push_str(path);
     }
     out
+}
+
+/// Inverse of [`append_attachment_paths`]: prose for the reader, and the
+/// host paths listed under the marker (for thumbs). Wire text stays as-is;
+/// clients strip this only when painting a user row.
+pub fn split_attachment_paths(text: &str) -> (&str, Vec<&str>) {
+    let Some(at) = text.find(ATTACHED_FILES_MARKER) else {
+        return (text, Vec::new());
+    };
+    let body = text[..at].trim_end();
+    let paths = text[at + ATTACHED_FILES_MARKER.len()..]
+        .lines()
+        .filter_map(|line| {
+            let path = line.strip_prefix("- ").unwrap_or(line).trim();
+            (!path.is_empty()).then_some(path)
+        })
+        .collect();
+    (body, paths)
 }
 
 pub trait AgentPort: Send + Sync {
