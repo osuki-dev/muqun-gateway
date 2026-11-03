@@ -383,16 +383,21 @@ pub fn rail(app: &App, height: f32) -> Div {
 
 fn rail_item(app: &App, asid: &str) -> impl ElementBuilder {
     let state = row_state(asid);
+    let selected = app.bindings.selected.clone();
+    let asid_key = asid.to_string();
     let app = app.clone();
+    // `selected` is a dep of its own: baking `active` into the row state alone
+    // missed the highlight when the row was built before `drain.select` wrote it.
     stateful_with_key::<NoState>(format!("mq-rrow.{asid}"))
-        .deps([state.signal_id()])
+        .deps([state.signal_id(), selected.signal_id()])
         .on_state(move |_| {
             let Some(row) = state.get() else {
                 return div();
             };
+            let active = selected.get().as_deref() == Some(asid_key.as_str());
             let asid = muqun_gateway::agents::AgentSessionId(row.asid.clone());
             let click = app.clone();
-            raised(div(), row.active)
+            raised(div(), active)
                 .class("mq-rail-item")
                 .relative()
                 .w(RAIL_ITEM)
@@ -731,6 +736,14 @@ fn project_row(app: &App, project: &Project, open: bool) -> Div {
                 .no_wrap()
                 .no_cursor(),
         );
+    } else if project.is_other() {
+        name = name.child(
+            ui_text(strings.other_count(project.sessions.len()))
+                .size(13.0)
+                .medium()
+                .no_wrap()
+                .no_cursor(),
+        );
     } else {
         let (parent, base) = &project.display;
         if !parent.is_empty() {
@@ -781,7 +794,7 @@ fn project_row(app: &App, project: &Project, open: bool) -> Div {
         .h(PROJECT_ROW)
         .flex_shrink_0()
         .child(main);
-    if !project.is_no_folder() {
+    if !project.is_no_folder() && !project.is_other() {
         // A sibling of the clickable row, not a child: a click on an action
         // must not also open or close the project (clicks bubble).
         row = row.child(
@@ -1133,25 +1146,29 @@ pub fn badged_mark(agent: &str, size: f32, status: AgentSessionStatus, waiting: 
     mark
 }
 
-/// One session row, rebuilt when -- and only when -- its own state is
-/// written.
+/// One session row, rebuilt when its own state or the selection changes.
 fn session_row(app: &App, asid: &str) -> Div {
     let state = row_state(asid);
+    let selected = app.bindings.selected.clone();
+    let asid_key = asid.to_string();
     let app = app.clone();
     div().w_full().h(SESSION_ROW).flex_shrink_0().child(
         stateful_with_key::<NoState>(format!("mq-srow.{asid}"))
-            .deps([state.signal_id()])
+            .deps([state.signal_id(), selected.signal_id()])
             .on_state(move |_| match state.get() {
-                Some(row) => render_row(&app, &row),
+                Some(row) => {
+                    let active = selected.get().as_deref() == Some(asid_key.as_str());
+                    render_row(&app, &row, active)
+                }
                 None => div(),
             }),
     )
 }
 
-fn render_row(app: &App, session: &SessionRow) -> Div {
+fn render_row(app: &App, session: &SessionRow, active: bool) -> Div {
     let asid = muqun_gateway::agents::AgentSessionId(session.asid.clone());
     let click = app.clone();
-    raised(div(), session.active)
+    raised(div(), active)
         .class("mq-srow")
         .relative()
         .w_full()
@@ -1272,7 +1289,17 @@ mod tests {
                 },
                 |_| None,
             );
-            assert_eq!(projects.len(), 25);
+            let ordinary = projects.iter().filter(|p| !p.is_other()).count();
+            assert!(
+                ordinary <= projects::Project::MAX_PRIMARY,
+                "ordinary projects capped; overflow in Other: {ordinary}"
+            );
+            let kept: usize = projects.iter().map(|p| p.sessions.len()).sum();
+            assert_eq!(kept, 320, "every session still listed under some project");
+            assert!(
+                projects.iter().any(|p| p.is_other()),
+                "overflow lands in Other"
+            );
             let mut model = Model {
                 heights: rows.iter().map(row_height).collect(),
                 offsets: Vec::new(),

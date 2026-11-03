@@ -414,13 +414,22 @@ impl Core {
 
     /// Agents and every attached agent's sessions. Each agent's list is
     /// delivered on its own as it arrives, so a slow one never holds the
-    /// others back.
+    /// others back. Starts are staggered so ten agents listing at once do
+    /// not spike the first second of startup.
     async fn refresh(self: Arc<Self>) {
         if let Ok(agents) = self.hub.agents().await {
             self.inbox.push(Update::Agents(agents));
         }
         let attached = self.hub.attached().await.unwrap_or_default();
-        for agent in attached {
+        self.spawn_lists(attached).await;
+    }
+
+    /// Kick off one `list_sessions` per agent, 75 ms apart.
+    async fn spawn_lists(self: &Arc<Self>, agents: Vec<String>) {
+        for (i, agent) in agents.into_iter().enumerate() {
+            if i > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(75)).await;
+            }
             tokio::spawn(self.clone().list_sessions(agent));
         }
     }
@@ -460,8 +469,13 @@ impl Core {
         let mut next_discovery = started;
         while started.elapsed() < WATCH_AGENTS_FOR {
             let attached = self.hub.attached().await.unwrap_or_default();
-            for agent in attached.iter().filter(|a| !listed.contains(a)) {
-                tokio::spawn(self.clone().list_sessions(agent.clone()));
+            let fresh: Vec<String> = attached
+                .iter()
+                .filter(|a| !listed.contains(a))
+                .cloned()
+                .collect();
+            if !fresh.is_empty() {
+                self.spawn_lists(fresh).await;
             }
             listed = attached;
             if tokio::time::Instant::now() >= next_discovery {

@@ -117,12 +117,15 @@
 .mq-prow-actions { gap: 2px; opacity: 0; transition: opacity var(--mq-motion-micro) ease-out; }
 .mq-prow:hover .mq-prow-actions { opacity: 1; }
 .mq-srow {
-    padding: 0 var(--mq-space-2) 0 var(--mq-space-6);
+    /* Left inset = chevron (14) + prow gap (8) so the 16 px mark sits under
+       the project name, not under the chevron (§6.0‴ A / handoff). */
+    padding: 0 var(--mq-space-2) 0 26px;
     gap: var(--mq-space-2);
     border-radius: var(--mq-radius-sm);
     color: var(--text-secondary);
     transition: background var(--mq-motion-micro) ease-out;
 }
+.mq-srow:has(.mq-raised) { color: var(--text-primary); }
 .mq-srow:hover { background: var(--input-bg-hover); color: var(--text-primary); }
 .mq-srow--more { color: var(--text-tertiary); }
 .mq-srow-time {

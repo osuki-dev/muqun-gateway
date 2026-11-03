@@ -65,6 +65,7 @@ pub fn timeline(app: &App, height: f32) -> impl ElementBuilder {
         b.permissions.signal_id(),
         b.forms.signal_id(),
         b.selected.signal_id(),
+        b.diff.signal_id(),
         b.theme_epoch.signal_id(),
         ctl.window_epoch.signal_id(),
     ];

@@ -152,10 +152,35 @@ pub struct Project {
 impl Project {
     /// The id of the group of sessions without a folder.
     pub const NO_FOLDER: &'static str = "";
+    /// Scratch / overflow projects folded into one collapsed group.
+    pub const OTHER: &'static str = "__other__";
+    /// How many ordinary projects the sidebar shows before the rest join
+    /// [`Self::OTHER`] (pinned ones always keep a seat).
+    pub const MAX_PRIMARY: usize = 8;
 
     pub fn is_no_folder(&self) -> bool {
         self.id.is_empty()
     }
+
+    pub fn is_other(&self) -> bool {
+        self.id == Self::OTHER
+    }
+}
+
+/// Temp, cache and missing folders: not worth a project row of their own.
+pub fn is_scratch(root: &Path, missing: bool, home: Option<&Path>) -> bool {
+    if missing {
+        return true;
+    }
+    if root.starts_with("/tmp") || root.starts_with("/var/tmp") {
+        return true;
+    }
+    if let Ok(cache) = std::env::var("XDG_CACHE_HOME") {
+        if !cache.is_empty() && root.starts_with(Path::new(&cache)) {
+            return true;
+        }
+    }
+    home.is_some_and(|home| root.starts_with(home.join(".cache")))
 }
 
 /// Everything a project list is derived from.
@@ -246,7 +271,53 @@ pub fn derive(src: &Sources) -> Vec<Project> {
             sessions: loose,
         });
     }
-    projects
+    fold_other(projects, src.home)
+}
+
+/// Scratch folders and projects past [`Project::MAX_PRIMARY`] share one
+/// collapsed "Other (N)" row; pinned projects always keep a seat.
+fn fold_other(projects: Vec<Project>, home: Option<&Path>) -> Vec<Project> {
+    let mut primary: Vec<Project> = Vec::new();
+    let mut other_sessions: Vec<String> = Vec::new();
+    let mut other_active = usize::MAX;
+    let mut seats = 0usize;
+    for project in projects {
+        if project.is_no_folder() {
+            primary.push(project);
+            continue;
+        }
+        let scratch = is_scratch(&project.root, project.missing, home);
+        let take = project.pinned || (!scratch && seats < Project::MAX_PRIMARY);
+        if take {
+            seats += 1;
+            primary.push(project);
+        } else {
+            other_active = other_active.min(project.last_active);
+            other_sessions.extend(project.sessions);
+        }
+    }
+    if !other_sessions.is_empty() {
+        let n = other_sessions.len();
+        let other = Project {
+            id: Project::OTHER.to_string(),
+            root: PathBuf::new(),
+            // UI replaces this with a localised "Other (N)".
+            display: (String::new(), format!("Other ({n})")),
+            kind: ProjectKind::Plain,
+            pinned: false,
+            hidden: false,
+            missing: false,
+            last_active: other_active,
+            branch: None,
+            sessions: other_sessions,
+        };
+        // Keep the folder-less group last, after Other.
+        match primary.iter().position(|p| p.is_no_folder()) {
+            Some(at) => primary.insert(at, other),
+            None => primary.push(other),
+        }
+    }
+    primary
 }
 
 /// The projects found so far, by root.
@@ -579,11 +650,20 @@ mod tests {
             1,
             "a known project with sessions is one project"
         );
-        let old = projects.iter().find(|p| p.id == "/home/u/w/old").unwrap();
-        assert!(old.missing, "a folder that has gone is flagged");
+        assert!(
+            !all.contains(&"/home/u/w/old"),
+            "a missing folder folds into Other"
+        );
+        let folded = projects.iter().find(|p| p.is_other()).expect("other");
+        assert!(folded.sessions.contains(&"z".into()));
         let other = projects.iter().position(|p| p.id == "/home/u/w/other");
-        let old = projects.iter().position(|p| p.id == "/home/u/w/old");
-        assert!(old < other, "projects with sessions before those without");
+        let with_sessions = projects
+            .iter()
+            .position(|p| p.id == "/home/u/w/muqun/gateway");
+        assert!(
+            with_sessions < other,
+            "projects with sessions before those without"
+        );
         assert_eq!(projects.last().unwrap().id, "", "no-folder group last");
     }
 
@@ -731,5 +811,54 @@ mod tests {
         // tests (the temp dir rarely is); only its existence is certain.
         assert!(resolve(&plain).exists);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn scratch_and_overflow_fold_into_other() {
+        assert!(is_scratch(Path::new("/tmp/qa"), false, None));
+        assert!(is_scratch(
+            Path::new("/home/u/.cache/x"),
+            false,
+            Some(Path::new("/home/u"))
+        ));
+        assert!(is_scratch(Path::new("/home/u/w/gone"), true, None));
+        assert!(!is_scratch(
+            Path::new("/home/u/w/app"),
+            false,
+            Some(Path::new("/home/u"))
+        ));
+
+        let mut f = Fixture {
+            sessions: (0..10)
+                .map(|i| listed(&format!("s{i}"), Some(&format!("/home/u/w/p{i}"))))
+                .collect(),
+            dirs: HashMap::new(),
+            known: vec![],
+            recent: vec![],
+            prefs: BTreeMap::new(),
+        };
+        f.sessions.push(listed("tmp", Some("/tmp/opencode/qa")));
+        f.prefs.insert(
+            "/home/u/w/p9".into(),
+            ProjectPrefs {
+                pinned: true,
+                ..ProjectPrefs::default()
+            },
+        );
+        let projects = f.derive();
+        let other = projects.iter().find(|p| p.is_other()).expect("other");
+        assert!(other.sessions.contains(&"tmp".into()));
+        assert!(
+            projects
+                .iter()
+                .filter(|p| !p.is_other() && !p.is_no_folder())
+                .count()
+                <= Project::MAX_PRIMARY,
+            "at most eight ordinary projects"
+        );
+        assert!(
+            projects.iter().any(|p| p.id == "/home/u/w/p9" && p.pinned),
+            "pinned keeps a seat"
+        );
     }
 }

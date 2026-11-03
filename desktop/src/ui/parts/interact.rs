@@ -151,10 +151,12 @@ pub fn approval(app: &App, request: &PermissionRequest, item: Option<&str>) -> D
         .flex_row()
         .items_center()
         .child(
-            ui_text(lead(app, &request.action))
-                .size(scale::BODY)
-                .no_wrap()
-                .class(if waiting { "mq-text" } else { "mq-text-muted" }),
+            div().flex_shrink_0().child(
+                ui_text(lead(app, &request.action))
+                    .size(scale::BODY)
+                    .no_wrap()
+                    .class(if waiting { "mq-text" } else { "mq-text-muted" }),
+            ),
         )
         .child(
             div()
@@ -167,11 +169,11 @@ pub fn approval(app: &App, request: &PermissionRequest, item: Option<&str>) -> D
     if !waiting {
         return card(
             "mq-accent--subtle",
-            div()
-                .flex_row()
-                .items_center()
-                .child(line)
-                .child(meta(strings.resolved()).class("mq-text-subtle")),
+            div().flex_row().items_center().child(line).child(
+                div()
+                    .flex_shrink_0()
+                    .child(meta(strings.resolved()).class("mq-text-subtle")),
+            ),
         );
     }
     let key = |what: &str| {
@@ -189,20 +191,26 @@ pub fn approval(app: &App, request: &PermissionRequest, item: Option<&str>) -> D
         .flex_row()
         .items_center()
         .child(line)
-        .child(choice(
-            strings.deny(),
-            "N",
-            "mq-choice--deny",
-            key("deny"),
-            move || decide(&deny_app, &deny_req, false),
-        ))
-        .child(choice(
-            strings.allow(),
-            "Y",
-            "mq-choice--allow",
-            key("allow"),
-            move || decide(&allow_app, &allow_req, true),
-        ));
+        .child(
+            choice(
+                strings.deny(),
+                "N",
+                "mq-choice--deny",
+                key("deny"),
+                move || decide(&deny_app, &deny_req, false),
+            )
+            .flex_shrink_0(),
+        )
+        .child(
+            choice(
+                strings.allow(),
+                "Y",
+                "mq-choice--allow",
+                key("allow"),
+                move || decide(&allow_app, &allow_req, true),
+            )
+            .flex_shrink_0(),
+        );
     top = top.class("mq-approval-top");
     let mut body = div().class("mq-approval-body").flex_col().child(top);
     if supports_remember(request) {

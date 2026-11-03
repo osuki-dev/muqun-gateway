@@ -87,6 +87,7 @@ strings! {
     cancel => "Cancel", "取消";
     settings => "Settings", "设置";
     no_folder => "No folder", "无文件夹";
+    other_projects => "Other", "其它";
     recent => "Recent", "最近";
     folder_missing => "folder not found", "文件夹不存在";
     folder_placeholder => "Type a path, or pick a recent folder", "输入路径，或选择最近的文件夹";
@@ -199,6 +200,14 @@ impl Strings {
         match self.language() {
             Language::En => format!("More ({hidden})"),
             Language::ZhCn => format!("更多 ({hidden})"),
+        }
+    }
+
+    /// "Other (12)": scratch / overflow projects folded into one group.
+    pub fn other_count(&self, sessions: usize) -> String {
+        match self.language() {
+            Language::En => format!("Other ({sessions})"),
+            Language::ZhCn => format!("其它 ({sessions})"),
         }
     }
 

@@ -5,8 +5,8 @@
 //! source is left out, never guessed: files and lines from the turn's Diff
 //! parts (else the `files` metadata of its edit calls), tests from shell
 //! runs whose command is a test command, the duration from the first to the
-//! last timestamp in the turn. The gateway's `get_vcs_diff` is not on the
-//! `SessionHub` port yet, so the turn's own parts are the only source.
+//! last timestamp in the turn. When `get_vcs_diff` has answered for this
+//! session (`bindings.diff`), its file and line counts replace the turn's.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -236,8 +236,26 @@ pub fn clock(ms: u64) -> String {
     }
 }
 
+/// Prefer the live working-tree diff when it is for this session.
+fn with_vcs(summary: &Summary, ctx: &PartCtx<'_>) -> Summary {
+    let Some(diff) = ctx.app.bindings.diff.get() else {
+        return summary.clone();
+    };
+    if diff.asid != ctx.asid {
+        return summary.clone();
+    }
+    if diff.files == 0 && diff.added == 0 && diff.removed == 0 {
+        return summary.clone();
+    }
+    let mut out = summary.clone();
+    out.files = Some(diff.files);
+    out.lines = Some((diff.added as u32, diff.removed as u32));
+    out
+}
+
 /// The bar. `Diff ›` opens the diff panel when there are changes to show.
 pub fn bar(ctx: &PartCtx<'_>, summary: &Summary) -> Div {
+    let summary = with_vcs(summary, ctx);
     let strings = &ctx.app.strings;
     let sep = || mono("·").class("mq-text-subtle");
     let mut parts: Vec<Div> = Vec::new();
