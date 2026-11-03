@@ -77,6 +77,15 @@ pub enum Update {
     },
     /// Themes, applied by `ui/themes.rs` on the main thread.
     Theme(Box<crate::theme::service::ThemeUpdate>),
+    /// Session folders resolved to their projects (`projects.rs`).
+    Directories(Vec<(String, super::projects::DirInfo)>),
+    /// One agent's own project list, for the sidebar's projects.
+    KnownProjects {
+        agent: String,
+        projects: Vec<AgentProject>,
+    },
+    /// The open session's working-tree change count.
+    Diff(super::view::DiffStat),
 }
 
 impl Update {

@@ -61,6 +61,9 @@ pub enum Command {
     ThemeApply(String, Scheme),
     /// Install a `.muqun-theme` from disk (file dialog or drop).
     ThemeImportFile(PathBuf),
+    /// Show the session's changes in the right-hand Diff panel. The panel
+    /// is a later task; for now the request is only logged.
+    OpenDiff(AgentSessionId),
 }
 
 pub type CommandSender = mpsc::UnboundedSender<Command>;

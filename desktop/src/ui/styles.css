@@ -45,35 +45,136 @@
     color: var(--text-primary);
 }
 
+/* topbar -------------------------------------------------------------
+   Owned by ui/shell.rs. 44 px; every control on the right is the same
+   ghost treatment: no border, a surface on hover (§6.0‴ A, C′ 5). */
 .mq-topbar {
     background: var(--surface);
-    border-bottom: 1px solid var(--border);
-    padding: 0 12px;
-    gap: 10px;
+    border-bottom: var(--mq-hairline) solid var(--border);
+    padding: 0 var(--mq-space-3);
+    gap: var(--mq-space-3);
 }
-.mq-brand { gap: 8px; }
-.mq-topbar-sep {
-    width: 1px;
-    height: 18px;
-    background: var(--border);
+.mq-brand { padding-right: var(--mq-space-1); }
+.mq-topbar-title { gap: var(--mq-space-3); color: var(--text-primary); }
+.mq-topbar-session { color: var(--text-primary); }
+.mq-topbar-branch { gap: var(--mq-space-1); color: var(--text-secondary); }
+.mq-topbar-actions { gap: var(--mq-space-1); }
+.mq-icon-button {
+    border-radius: var(--mq-radius-sm);
+    transition: background var(--mq-motion-micro) ease-out;
 }
+.mq-icon-button:hover { background: var(--surface-overlay); }
+.mq-ghost {
+    padding: 0 var(--mq-space-2);
+    gap: var(--mq-space-2);
+    border-radius: var(--mq-radius-sm);
+    color: var(--text-secondary);
+    transition: background var(--mq-motion-micro) ease-out;
+}
+.mq-ghost:hover { background: var(--surface-overlay); color: var(--text-primary); }
+.mq-ghost--chevron { padding: 0 var(--mq-space-1); }
+.mq-open-in { gap: 0; }
+.mq-diff-count { gap: var(--mq-space-1); }
+.mq-diff-added { color: var(--success); }
+.mq-diff-removed { color: var(--error); }
+.mq-follow-dot { background: var(--primary); }
+/* /topbar */
 
+/* sidebar ------------------------------------------------------------
+   Owned by ui/sessions.rs. Search 36 px, project rows 32 px, session rows
+   30 px, bottom entries 36 px (§6.0‴ A). Row actions and the relative time
+   only show on hover (C′ 1, 2). Hover is the faint input-hover shade; the
+   selected row and open page are the raised surface (surface-overlay is
+   the theme's surface_raised; surface-elevated is plain surface), set
+   inline on a .mq-raised wrapper by ui/sessions.rs `raised`. */
+.mq-side-column { background: var(--surface); }
 .mq-sidebar {
     background: var(--surface);
-    border-right: 1px solid var(--border);
+    border-right: var(--mq-hairline) solid var(--border);
 }
-.mq-sidebar-top {
-    padding: 12px 10px 6px 10px;
-    gap: 6px;
-}
-.mq-nav-item {
-    padding: 7px 10px;
-    border-radius: 8px;
+.mq-side-handle { background: transparent; }
+.mq-side-handle:hover { background: var(--border-hover); }
+.mq-side-search-wrap { padding: var(--mq-space-3) var(--mq-space-3) var(--mq-space-2) var(--mq-space-3); }
+.mq-side-search {
+    padding: 0 var(--mq-space-2) 0 var(--mq-space-3);
+    gap: var(--mq-space-1);
+    border-radius: var(--mq-radius-md);
+    border: var(--mq-hairline) solid var(--border);
+    background: var(--input-bg);
     color: var(--text-secondary);
-    transition: background 150ms ease-out;
 }
-.mq-nav-item:hover { background: var(--surface-overlay); }
-.mq-nav-item--active { background: var(--accent-subtle); color: var(--text-primary); }
+.mq-kbd { color: var(--text-tertiary); padding-left: var(--mq-space-1); }
+.mq-tree-list { padding: 0 var(--mq-space-2); }
+.mq-prow {
+    border-radius: var(--mq-radius-sm);
+    transition: background var(--mq-motion-micro) ease-out;
+}
+.mq-prow:hover { background: var(--input-bg-hover); }
+.mq-prow-main { padding: 0 var(--mq-space-2) 0 var(--mq-space-1); gap: var(--mq-space-2); color: var(--text-primary); }
+.mq-prow-parent { color: var(--text-tertiary); }
+.mq-prow-missing { color: var(--text-tertiary); padding-left: var(--mq-space-2); }
+.mq-prow--missing .mq-prow-main { opacity: 0.55; }
+.mq-prow-actions { gap: 2px; opacity: 0; transition: opacity var(--mq-motion-micro) ease-out; }
+.mq-prow:hover .mq-prow-actions { opacity: 1; }
+.mq-srow {
+    padding: 0 var(--mq-space-2) 0 var(--mq-space-6);
+    gap: var(--mq-space-2);
+    border-radius: var(--mq-radius-sm);
+    color: var(--text-secondary);
+    transition: background var(--mq-motion-micro) ease-out;
+}
+.mq-srow:hover { background: var(--input-bg-hover); color: var(--text-primary); }
+.mq-srow--more { color: var(--text-tertiary); }
+.mq-srow-time {
+    padding: 0 var(--mq-space-2) 0 var(--mq-space-3);
+    border-radius: var(--mq-radius-sm);
+    color: var(--text-tertiary);
+    background: var(--input-bg-hover);
+    opacity: 0;
+}
+.mq-srow:hover .mq-srow-time { opacity: 1; }
+/* The status badge (a 6 px dot in a 1.5 px ring of the sidebar's colour,
+   over the mark's bottom-right corner; none while idle) is coloured inline
+   from the theme by ui/sessions.rs `badge`. */
+.mq-raised { border-radius: var(--mq-radius-sm); }
+.mq-side-bottom {
+    border-top: var(--mq-hairline) solid var(--border);
+    padding: var(--mq-space-2);
+}
+.mq-side-entry {
+    padding: 0 var(--mq-space-3);
+    gap: var(--mq-space-3);
+    border-radius: var(--mq-radius-md);
+    color: var(--text-secondary);
+    transition: background var(--mq-motion-micro) ease-out;
+}
+.mq-side-entry:hover { background: var(--input-bg-hover); color: var(--text-primary); }
+.mq-side-entry--rail { padding: 0; }
+.mq-nav-label { color: inherit; }
+.mq-badge-count {
+    padding: 0 var(--mq-space-1);
+    border-radius: 9px;
+    background: var(--primary);
+    color: var(--text-inverse);
+}
+.mq-rail { align-items: center; }
+.mq-rail-list { padding-top: var(--mq-space-2); gap: var(--mq-space-1); }
+.mq-rail-item {
+    border-radius: var(--mq-radius-md);
+    transition: background var(--mq-motion-micro) ease-out;
+}
+.mq-rail-item:hover { background: var(--input-bg-hover); }
+.mq-inbox { padding: var(--mq-space-8) var(--mq-space-10); gap: var(--mq-space-3); background: var(--background); color: var(--text-primary); }
+.mq-inbox-list { gap: var(--mq-space-1); padding-top: var(--mq-space-3); }
+.mq-inbox-row {
+    padding: var(--mq-space-2) var(--mq-space-3);
+    gap: var(--mq-space-3);
+    border-radius: var(--mq-radius-md);
+    transition: background var(--mq-motion-micro) ease-out;
+}
+.mq-inbox-row:hover { background: var(--surface-overlay); }
+/* /sidebar */
+
 .mq-chips { gap: 4px; padding: 4px 0; }
 .mq-chip {
     gap: 5px;
@@ -85,35 +186,6 @@
 }
 .mq-chip:hover { background: var(--surface-overlay); }
 .mq-chip--active { background: var(--accent-subtle); border-color: var(--primary); color: var(--text-primary); }
-.mq-group {
-    padding: 10px 10px 4px 10px;
-    color: var(--text-tertiary);
-}
-.mq-session-list {
-    padding: 0 8px 12px 8px;
-    gap: 1px;
-}
-.mq-session {
-    padding: 7px 10px;
-    gap: 8px;
-    border-radius: 8px;
-    color: var(--text-secondary);
-    transition: background 150ms ease-out;
-}
-.mq-status { border: 1.5px solid var(--text-tertiary); }
-.mq-status--busy { background: var(--primary); border-color: var(--primary); }
-.mq-status--waiting { background: var(--warning); border-color: var(--warning); }
-.mq-status--failed { border-color: var(--error); }
-.mq-status--stopped { border-color: var(--warning); }
-.mq-agents-panel {
-    border-top: 1px solid var(--border);
-    padding: 6px 10px 10px 10px;
-    gap: 2px;
-}
-.mq-agents-header { padding: 6px 0; gap: 4px; color: var(--text-secondary); }
-.mq-agent-row { padding: 4px 0; gap: 2px; }
-.mq-agent-name { padding-left: 8px; color: var(--text-primary); }
-.mq-agent-reason { padding-left: 16px; color: var(--text-tertiary); }
 .mq-standing--usable { color: var(--success); }
 .mq-standing--checking { color: var(--text-tertiary); }
 .mq-standing--blocked { color: var(--warning); }
@@ -270,16 +342,6 @@
 }
 .mq-new-actions { gap: 10px; padding-top: 14px; color: var(--text-tertiary); }
 
-.mq-session-header { gap: 8px; color: var(--text-secondary); }
-.mq-header-title { color: var(--text-primary); }
-.mq-right { background: var(--surface); }
-.mq-session:hover { background: var(--surface-overlay); }
-.mq-session--active { background: var(--accent-subtle); }
-.mq-session--active:hover { background: var(--accent-subtle); }
-.mq-session-meta {
-    gap: 6px;
-    color: var(--text-tertiary);
-}
 
 .mq-main { background: var(--background); }
 
@@ -504,9 +566,6 @@
 }
 .mq-agent-section-head { gap: 10px; }
 .mq-agent-section-name { padding-left: 2px; color: var(--text-primary); }
-.mq-settings-wrap { padding: 0 8px 8px 8px; }
-.mq-settings-entry { gap: 8px; }
-.mq-nav-label { color: inherit; }
 .mq-folder-option { gap: 10px; }
 /* blinc_cn builds the chooser's list with this id and a 200px cap; MAX_OPTIONS
    rows of the app's height fit in this one. */

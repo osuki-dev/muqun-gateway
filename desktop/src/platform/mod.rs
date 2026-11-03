@@ -2,7 +2,9 @@
 //! gateway service.
 
 pub mod coexist;
+pub mod editors;
 pub mod fonts;
+pub mod keys;
 pub mod shell;
 pub mod shutdown;
 

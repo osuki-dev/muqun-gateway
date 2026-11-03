@@ -119,7 +119,6 @@ fn main() -> anyhow::Result<()> {
                 scheme_watcher: scheme_watcher.clone(),
                 paths: paths.clone(),
             };
-            restore_prefs(&app, &config);
             ui::new_session::watch_typed_folder(&app);
             let for_actions = app.clone();
             drain.attach(
@@ -174,18 +173,6 @@ fn main() -> anyhow::Result<()> {
         "muqun-desktop exiting"
     );
     Ok(())
-}
-
-/// Put back what the owner arranged last time: the agent filter and the
-/// sidebar grouping. (Sidebar width is read where the shell is built.)
-fn restore_prefs(app: &ui::App, config: &DesktopConfig) {
-    let filter = config
-        .ui
-        .agent_filter
-        .clone()
-        .filter(|agent| hub::AGENT_PREFERENCE.contains(&agent.as_str()));
-    app.bindings.filter.signal().set(filter);
-    app.bindings.grouping.signal().set(config.ui.grouping);
 }
 
 fn init_tracing() {

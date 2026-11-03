@@ -2,16 +2,6 @@
 
 use std::path::Path;
 
-/// How the platform's primary shortcut modifier is written in hints:
-/// `⌘` on macOS, `Ctrl+` elsewhere. Prefix it to a key name.
-pub fn primary_modifier() -> &'static str {
-    if cfg!(target_os = "macos") {
-        "⌘"
-    } else {
-        "Ctrl+"
-    }
-}
-
 /// Whether a native file dialog must be opened from the main (UI) thread.
 /// macOS requires it; elsewhere it runs on its own thread so frames keep
 /// coming while it is up.

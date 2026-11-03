@@ -15,7 +15,7 @@ use std::path::Path;
 use std::pin::Pin;
 
 use muqun_gateway::agents::directories::Completion;
-use muqun_gateway::agents::ports::{AgentError, AgentSessionSnapshot};
+use muqun_gateway::agents::ports::{AgentError, AgentSessionSnapshot, FileDiffItem};
 use muqun_gateway::agents::{
     AgentDomainEvent, AgentProject, AgentSessionId, AgentSessionInfo, PermissionDecision,
     SessionQuery, TimelineItem,
@@ -77,6 +77,9 @@ pub trait SessionHub: Send + Sync {
         form_id: &'a str,
         answers: serde_json::Value,
     ) -> HubFuture<'a, ()>;
+    /// The working-tree changes in the session's folder, as the agent's
+    /// `get_vcs_diff` reports them (`working` mode).
+    fn vcs_diff<'a>(&'a self, asid: &'a AgentSessionId) -> HubFuture<'a, Vec<FileDiffItem>>;
     /// Every session event of every agent, in the order the runtime saw them.
     fn events(&self) -> broadcast::Receiver<AgentDomainEvent>;
 }

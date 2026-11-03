@@ -221,8 +221,10 @@ impl Drain {
             blinc_core::reactive::batch_stateful_deps(|| {
                 bindings.draft.signal().set(None);
                 bindings.settings_open.signal().set(false);
+                bindings.inbox_open.signal().set(false);
                 if changed {
                     bindings.selected.signal().set(Some(asid.to_string()));
+                    bindings.diff.signal().set(None);
                 }
                 if let Some(sidebar) = sidebar {
                     sidebar.publish(&bindings);
@@ -242,7 +244,9 @@ impl Drain {
             blinc_core::reactive::batch_stateful_deps(|| {
                 bindings.draft.signal().set(None);
                 bindings.settings_open.signal().set(false);
+                bindings.inbox_open.signal().set(false);
                 if changed {
+                    bindings.diff.signal().set(None);
                     bindings.selected.signal().set(None);
                     bindings.header.signal().set(None);
                     bindings.order.signal().set(Arc::new(Default::default()));
@@ -269,7 +273,7 @@ impl Drain {
             }
         }
         published.rows.retain(|asid, _| live.contains(asid));
-        let listing = view.listing(crate::platform::shell::local_utc_offset());
+        let listing = view.listing();
         if published.listing.as_deref() != Some(&listing) {
             let listing = Arc::new(listing);
             published.listing = Some(listing.clone());
@@ -592,6 +596,9 @@ fn batch_kinds(batch: &[Update]) -> String {
             Update::Ui(_) => "ui",
             Update::Earlier { .. } => "earlier",
             Update::Theme(_) => "theme",
+            Update::Directories(_) => "directories",
+            Update::KnownProjects { .. } => "known_projects",
+            Update::Diff(_) => "diff",
         };
         match counts.iter_mut().find(|(k, _)| *k == kind) {
             Some((_, n)) => *n += 1,
@@ -632,6 +639,10 @@ struct Rest {
     attention: Option<Arc<Vec<PermissionRequest>>>,
     projects: Option<Arc<super::view::ProjectList>>,
     completions: Option<Arc<Vec<muqun_gateway::agents::directories::DirectoryEntry>>>,
+    waiting_forms: Option<Arc<Vec<FormRequest>>>,
+    dirs: Option<Arc<HashMap<String, super::projects::DirInfo>>>,
+    known: Option<Arc<Vec<muqun_gateway::agents::AgentProject>>>,
+    diff: Option<Option<super::view::DiffStat>>,
 }
 
 impl Rest {
@@ -647,6 +658,12 @@ impl Rest {
             attention: c.attention.then(|| Arc::new(view.attention.clone())),
             projects: c.projects.then(|| Arc::new(view.projects.clone())),
             completions: c.completions.then(|| Arc::new(view.completions.clone())),
+            waiting_forms: c.attention.then(|| Arc::new(view.waiting_forms.clone())),
+            dirs: c.dirs.then(|| Arc::new(view.dirs.clone())),
+            known: c
+                .known
+                .then(|| Arc::new(view.known.values().flatten().cloned().collect())),
+            diff: (c.diff || c.selected).then(|| view.diff.clone()),
         }
     }
 }
@@ -727,6 +744,20 @@ impl Planned {
         }
         if let Some(completions) = rest.completions {
             b.completions.signal().set(completions);
+        }
+        if let Some(forms) = rest.waiting_forms {
+            b.waiting_forms.signal().set(forms);
+        }
+        if let Some(dirs) = rest.dirs {
+            b.dirs.signal().set(dirs);
+        }
+        if let Some(known) = rest.known {
+            b.known.signal().set(known);
+        }
+        if let Some(diff) = rest.diff {
+            if b.diff.get() != diff {
+                b.diff.signal().set(diff);
+            }
         }
     }
 }
