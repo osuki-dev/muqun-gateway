@@ -25,6 +25,24 @@
   the App hides its list instead of showing "Nothing yet" after an "Always
   allow" that did land, in the agent.
 
+- **The App's auto-approve switch is the agent's own bypass mode.** `GET`/
+  `POST /api/agent-sessions/{asid}/auto-approve` puts the session into the
+  agent's native "approve everything" control and takes it back out: Claude
+  Code `session/set_mode bypassPermissions`, Qoder `session/set_mode yolo`,
+  Codex a `turn/start` `approvalPolicy: never` override carried by the next
+  prompt (its workspace-write sandbox stays), OpenCode a session
+  permission rule allowing every action, T3 `thread.runtime-mode.set
+  full-access`. Off restores what the session ran in before. Discovery states
+  `features.autoApprove = {scope, native}` per agent; Antigravity, Cursor,
+  FX and Pi only take their bypass at launch (`--dangerously-skip-permissions`,
+  `--force`, `FX_PERMISSION_MODE=full-access`, `MUQUN_PI_APPROVALS=never`), so
+  the switch answers 501 there and the App says so; DeepSeek has per-request
+  approvals only. A bypass mode is still never remembered as a new session's
+  default. Switching on from a device needs `allow_remote_auto_approve:
+  true` in `config.json` (off by default), and so does selecting such a
+  mode through `POST …/mode` or a new session's `mode`; switching off never
+  does.
+
 - **FX and Qoder no longer start a process every minute to re-read an
   unchanged session store.** The task follower reads each open task's session
   once a minute and the Home view refreshes as often; for a saved FX or Qoder

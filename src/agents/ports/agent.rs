@@ -349,6 +349,20 @@ pub trait AgentPort: Send + Sync {
     /// Switch session active agent mode
     fn switch_mode<'a>(&'a self, session_id: &'a str, mode: &'a str) -> AgentFuture<'a, ()>;
 
+    /// Put the session into the agent's own bypass mode (`enabled`), or
+    /// back to the mode it had before. Only an agent whose bypass is a
+    /// session-scoped control implements this
+    /// (`crate::agents::auto_approve`); the rest answer `Unsupported`.
+    fn set_auto_approve<'a>(&'a self, _session_id: &'a str, _enabled: bool) -> AgentFuture<'a, ()> {
+        Box::pin(async { Err(AgentError::Unsupported("session auto-approve".into())) })
+    }
+
+    /// Whether the session runs in the agent's own bypass mode right now,
+    /// read from the agent; `None` where that control does not exist.
+    fn auto_approve<'a>(&'a self, _session_id: &'a str) -> AgentFuture<'a, Option<bool>> {
+        Box::pin(async { Ok(None) })
+    }
+
     /// Search files in workspace, optionally scoped to a directory
     fn find_files<'a>(
         &'a self,

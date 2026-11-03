@@ -14,6 +14,12 @@ impl AcpProvider for QoderProvider {
     const REQUIRE_MESSAGE_ID: bool = false;
     const MODEL_SELECTION: bool = true;
     const IDLE_RETIREMENT: bool = true;
+    // qodercli 1.1.81 lists its permission modes as the session's ACP modes
+    // (`default`, `acceptEdits`, `auto`, `dontAsk`, `yolo` "Bypass
+    // Permissions") and takes `session/set_mode`; `bypassPermissions` is
+    // the SDK spelling its CLI also accepts, kept in case a release
+    // reports that id instead.
+    const BYPASS_MODES: &'static [&'static str] = &["yolo", "bypassPermissions"];
     fn recovery_snapshot<'a>(
         _binary: &'a str,
         _directory: &'a str,

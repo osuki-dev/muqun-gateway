@@ -96,6 +96,13 @@ pub(crate) struct Config {
     /// for that kind. Omitted when empty.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) agent_launch_args: BTreeMap<String, Vec<String>>,
+    /// Let a paired phone put a session into its agent's own bypass mode
+    /// (`POST /api/agent-sessions/{asid}/auto-approve` with `enabled: true`),
+    /// after which that agent asks the owner nothing. Off by default: the
+    /// owner opts in here, on this computer, never from the phone. Turning
+    /// auto-approve off is always allowed. Omitted when false.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub(crate) allow_remote_auto_approve: bool,
     /// Variables every agent the gateway launches starts with -- typically a
     /// proxy (`HTTPS_PROXY`, ...) that the owner's interactive shell sets but
     /// the gateway's own environment lacks. Values are never logged.

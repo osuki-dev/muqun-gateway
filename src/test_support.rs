@@ -45,6 +45,7 @@ pub(crate) fn test_config(token: &str) -> Config {
         agent_commands: BTreeMap::new(),
         agent_visibility: BTreeMap::new(),
         agent_launch_args: BTreeMap::new(),
+        allow_remote_auto_approve: false,
         agent_env: Default::default(),
         agent_trust_folders: true,
         rich_agent_pushes: false,

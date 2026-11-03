@@ -43,6 +43,11 @@ pub trait AcpProvider: Send + Sync + 'static {
     /// Permission modes belong to the session (`session/set_mode`) and are
     /// offered as its modes. Off where a mode change persists elsewhere.
     const SESSION_MODES: bool = false;
+    /// The agent's own bypass-everything permission modes, by the ids its
+    /// `modes.availableModes` uses, most specific first. The App's
+    /// auto-approve switch selects the first one the live session offers
+    /// (`session/set_mode`); empty where the agent has no such mode.
+    const BYPASS_MODES: &'static [&'static str] = &[];
     /// A prompt sent while a turn runs may be steered into it
     /// (`_session/steering`, initialize `_meta.steering.supported`).
     const STEERING: bool = false;
@@ -311,6 +316,57 @@ struct SessionState {
     /// again just before the first prompt (`None` when unreadable).
     process_baseline: Option<HashSet<ProcessKey>>,
     prompted: bool,
+    /// The permission mode the session ran in before auto-approve put it
+    /// into a bypass mode, so switching auto-approve off restores it.
+    restore_mode: Option<String>,
+}
+
+/// The mode the App's auto-approve switch selects, if a change is needed.
+///
+/// On: the first of the provider's `bypass` ids the session `offered`,
+/// unless `current` already is one. Off: the mode remembered from before
+/// (`restore`) when still offered, else `default`; nothing when the session
+/// is not in bypass. `Err` says why the agent cannot do it, in its terms.
+fn bypass_transition(
+    current: Option<&str>,
+    offered: &[String],
+    bypass: &[&str],
+    enabled: bool,
+    restore: Option<&str>,
+) -> Result<Option<String>, &'static str> {
+    let offers = |mode: &str| offered.iter().any(|offered| offered == mode);
+    let in_bypass = current.is_some_and(|mode| bypass.contains(&mode));
+    if enabled {
+        if in_bypass {
+            return Ok(None);
+        }
+        return bypass
+            .iter()
+            .find(|mode| offers(mode))
+            .map(|mode| Some((*mode).to_owned()))
+            .ok_or("does not offer its bypass mode in this session");
+    }
+    if !in_bypass {
+        return Ok(None);
+    }
+    restore
+        .filter(|mode| offers(mode) && !bypass.contains(mode))
+        .or_else(|| offers("default").then_some("default"))
+        .map(|mode| Some(mode.to_owned()))
+        .ok_or("offers no mode to return to in this session")
+}
+
+/// The permission mode ids this session offers: its catalog's (a provider
+/// with `SESSION_MODES`) and whatever `modes.availableModes` the agent
+/// itself reported, in that order, without repeats.
+fn permission_modes(state: &SessionState) -> Vec<String> {
+    let mut ids: Vec<String> = state.catalog.modes.iter().map(|m| m.id.clone()).collect();
+    for mode in mapper::session_modes(&state.config).0 {
+        if !ids.contains(&mode.id) {
+            ids.push(mode.id);
+        }
+    }
+    ids
 }
 
 #[derive(Clone)]
@@ -1241,19 +1297,25 @@ impl<P: AcpProvider> AcpDriver<P> {
         Ok(())
     }
 
-    /// `session/set_mode` to one of the session's own modes. The agent
-    /// answers with a `config_option_update`, which moves `info.mode`.
+    /// `session/set_mode` to a mode the live session offers (its catalog's,
+    /// or `modes.availableModes` as the agent reported them). The agent
+    /// answers with a `config_option_update` or `current_mode_update`,
+    /// which moves `info.mode`.
     async fn select_mode(&self, session: &Session, mode: &str) -> Result<(), AgentError> {
-        let id = {
-            let state = session.state.lock().await;
-            if !state.catalog.modes.iter().any(|offered| offered.id == mode) {
-                return Err(AgentError::InvalidRequest(format!(
-                    "{} does not offer the mode {mode} in this session",
-                    P::LABEL
-                )));
-            }
-            state.info.asid.0.clone()
-        };
+        let offered = permission_modes(&*session.state.lock().await)
+            .iter()
+            .any(|offered| offered == mode);
+        if !offered {
+            return Err(AgentError::InvalidRequest(format!(
+                "{} does not offer the mode {mode} in this session",
+                P::LABEL
+            )));
+        }
+        self.send_set_mode(session, mode).await
+    }
+
+    async fn send_set_mode(&self, session: &Session, mode: &str) -> Result<(), AgentError> {
+        let id = session.state.lock().await.info.asid.0.clone();
         session
             .client
             .request_with_timeout(
@@ -2240,6 +2302,7 @@ impl<P: AcpProvider> AcpDriver<P> {
                 .process_id()
                 .and_then(crate::agents::adapters::codex::process_tree::descendants),
             prompted: false,
+            restore_mode: None,
         };
         for params in deferred {
             if params["sessionId"].as_str() != Some(id.as_str()) {
@@ -4269,6 +4332,51 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
             self.select_mode(&session, mode).await
         })
     }
+    fn set_auto_approve<'a>(&'a self, id: &'a str, enabled: bool) -> AgentFuture<'a, ()> {
+        Box::pin(async move {
+            if P::BYPASS_MODES.is_empty() {
+                return Err(AgentError::Unsupported(format!(
+                    "{} has no session bypass mode",
+                    P::LABEL
+                )));
+            }
+            let session = self.ensure_loaded(id).await?;
+            let (current, offered, restore) = {
+                let state = session.state.lock().await;
+                (
+                    state.info.mode.clone(),
+                    permission_modes(&state),
+                    state.restore_mode.clone(),
+                )
+            };
+            let target = bypass_transition(
+                current.as_deref(),
+                &offered,
+                P::BYPASS_MODES,
+                enabled,
+                restore.as_deref(),
+            )
+            .map_err(|refusal| AgentError::Unsupported(format!("{} {refusal}", P::LABEL)))?;
+            let Some(target) = target else {
+                return Ok(());
+            };
+            session.state.lock().await.restore_mode = if enabled { current } else { None };
+            self.select_mode(&session, &target).await
+        })
+    }
+    fn auto_approve<'a>(&'a self, id: &'a str) -> AgentFuture<'a, Option<bool>> {
+        Box::pin(async move {
+            if P::BYPASS_MODES.is_empty() {
+                return Ok(None);
+            }
+            let session = self.ensure_loaded(id).await?;
+            let mode = session.state.lock().await.info.mode.clone();
+            Ok(Some(
+                mode.as_deref()
+                    .is_some_and(|mode| P::BYPASS_MODES.contains(&mode)),
+            ))
+        })
+    }
     fn find_files<'a>(
         &'a self,
         _query: &'a str,
@@ -4318,6 +4426,126 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
         _mode: &'a str,
     ) -> AgentFuture<'a, Vec<FileDiffItem>> {
         unsupported("VCS diff")
+    }
+}
+
+#[cfg(test)]
+mod bypass_tests {
+    use super::bypass_transition;
+
+    /// The switch selects only a bypass mode the live session offers, and
+    /// off returns to the remembered mode -- never to another bypass --
+    /// else to `default`.
+    #[test]
+    fn auto_approve_moves_between_the_sessions_own_modes() {
+        let claude = [
+            "default",
+            "acceptEdits",
+            "plan",
+            "auto",
+            "bypassPermissions",
+        ];
+        let locked = ["default", "acceptEdits", "plan", "auto"];
+        let qoder = ["default", "acceptEdits", "auto", "dontAsk", "yolo"];
+        let owned = |ids: &[&str]| ids.iter().map(|id| (*id).to_owned()).collect::<Vec<_>>();
+        for (name, current, offered, bypass, enabled, restore, want) in [
+            // On: the agent's own bypass mode, first candidate it offers.
+            (
+                "claude on",
+                Some("default"),
+                &claude[..],
+                &["bypassPermissions"][..],
+                true,
+                None,
+                Ok(Some("bypassPermissions")),
+            ),
+            (
+                "qoder on",
+                Some("default"),
+                &qoder[..],
+                &["yolo", "bypassPermissions"][..],
+                true,
+                None,
+                Ok(Some("yolo")),
+            ),
+            (
+                "already on",
+                Some("bypassPermissions"),
+                &claude[..],
+                &["bypassPermissions"][..],
+                true,
+                None,
+                Ok(None),
+            ),
+            // Claude Code's settings disable bypass: refused, nothing sent.
+            (
+                "locked",
+                Some("plan"),
+                &locked[..],
+                &["bypassPermissions"][..],
+                true,
+                None,
+                Err("does not offer its bypass mode in this session"),
+            ),
+            (
+                "no modes",
+                None,
+                &[][..],
+                &["yolo"][..],
+                true,
+                None,
+                Err("does not offer its bypass mode in this session"),
+            ),
+            // Off: back to what the session ran in before, else default.
+            (
+                "off restores",
+                Some("bypassPermissions"),
+                &claude[..],
+                &["bypassPermissions"][..],
+                false,
+                Some("plan"),
+                Ok(Some("plan")),
+            ),
+            (
+                "off default",
+                Some("yolo"),
+                &qoder[..],
+                &["yolo"][..],
+                false,
+                None,
+                Ok(Some("default")),
+            ),
+            (
+                "off never to bypass",
+                Some("bypassPermissions"),
+                &claude[..],
+                &["bypassPermissions"][..],
+                false,
+                Some("bypassPermissions"),
+                Ok(Some("default")),
+            ),
+            (
+                "off while off",
+                Some("acceptEdits"),
+                &claude[..],
+                &["bypassPermissions"][..],
+                false,
+                Some("plan"),
+                Ok(None),
+            ),
+            (
+                "off nowhere",
+                Some("yolo"),
+                &["yolo"][..],
+                &["yolo"][..],
+                false,
+                None,
+                Err("offers no mode to return to in this session"),
+            ),
+        ] {
+            let got = bypass_transition(current, &owned(offered), bypass, enabled, restore);
+            assert_eq!(got, want.map(|mode| mode.map(str::to_owned)), "{name}");
+        }
     }
 }
 

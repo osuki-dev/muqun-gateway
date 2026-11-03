@@ -25,6 +25,9 @@ impl AcpProvider for ClaudeProvider {
     // Permission modes are the session's own (`session/set_mode`; a load
     // continues in the transcript's last mode).
     const SESSION_MODES: bool = true;
+    // Claude Code's own bypass: offered only where its settings allow it
+    // (`permission_modes`), so the switch fails honestly elsewhere.
+    const BYPASS_MODES: &'static [&'static str] = &["bypassPermissions"];
     const STEERING: bool = true;
     // AskUserQuestion arrives as a form elicitation.
     const FORM_ELICITATION: bool = true;
