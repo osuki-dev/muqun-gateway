@@ -22,8 +22,8 @@ use muqun_gateway::platform::StoredUpload;
 use tokio::sync::broadcast;
 
 use super::{
-    CatalogView, HubError, HubFuture, HubMode, PeerMention, SessionHub, TaskDefaults, TaskRow,
-    TimelineCatchUp,
+    CatalogView, HubError, HubFuture, HubMode, PeerMention, SavedPermission, SessionHub,
+    TaskDefaults, TaskRow, TimelineCatchUp,
 };
 
 /// How deep `descendants` walks below the session asked about, and how many
@@ -588,6 +588,60 @@ impl SessionHub for LocalHub {
             }
             found.sort_by_key(|session| std::cmp::Reverse(session.updated_ms));
             Ok(found)
+        })
+    }
+
+    fn list_saved_permissions<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+    ) -> HubFuture<'a, Vec<SavedPermission>> {
+        Box::pin(async move {
+            let manager = self.manager_for_session(asid).await?;
+            let agent = manager.agent();
+            let session = agent.get_session(&asid.0).await?;
+            let Some(project_id) = session.project_id.filter(|p| !p.is_empty()) else {
+                return Ok(Vec::new());
+            };
+            match agent.list_saved_permissions(Some(&project_id)).await {
+                Ok(items) => Ok(items
+                    .into_iter()
+                    .filter_map(|v| serde_json::from_value(v).ok())
+                    .filter(|p: &SavedPermission| !p.id.is_empty())
+                    .collect()),
+                Err(AgentError::Unsupported(_)) => Ok(Vec::new()),
+                Err(err) => Err(err.into()),
+            }
+        })
+    }
+
+    fn forget_saved_permission<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+        id: &'a str,
+    ) -> HubFuture<'a, ()> {
+        Box::pin(async move {
+            let manager = self.manager_for_session(asid).await?;
+            let agent = manager.agent();
+            let session = agent.get_session(&asid.0).await?;
+            let project_id = session
+                .project_id
+                .filter(|p| !p.is_empty())
+                .ok_or_else(|| {
+                    HubError::Agent(AgentError::InvalidRequest(
+                        "the session reported no project".into(),
+                    ))
+                })?;
+            let known = agent
+                .list_saved_permissions(Some(&project_id))
+                .await?
+                .iter()
+                .any(|item| item.get("id").and_then(|v| v.as_str()) == Some(id));
+            if !known {
+                return Err(HubError::Agent(AgentError::InvalidRequest(
+                    "no such saved permission in this session's project".into(),
+                )));
+            }
+            Ok(agent.delete_saved_permission(id).await?)
         })
     }
 

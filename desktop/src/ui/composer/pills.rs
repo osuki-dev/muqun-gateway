@@ -1423,9 +1423,18 @@ fn usage_readout(app: &App, aim: &Aim) -> Option<Div> {
             .iter()
             .any(|a| a.id == aim.agent && a.features.compaction)
     });
+    let saved = aim.asid();
     let compact_app = app.clone();
+    let saved_app = app.clone();
     let compact_label = app.strings.compact_context();
-    let extra = if compact.is_some() { 24.0 } else { 0.0 };
+    let saved_label = app.strings.saved_open();
+    let mut extra = 0.0;
+    if compact.is_some() {
+        extra += 24.0;
+    }
+    if saved.is_some() {
+        extra += 24.0;
+    }
     Some(host(
         MenuId::Usage,
         Side::Above,
@@ -1441,6 +1450,14 @@ fn usage_readout(app: &App, aim: &Aim) -> Option<Div> {
                 tip = tip.child(crate::ui::parts::link_button(compact_label, move |_| {
                     close_menu();
                     app.send(Command::CompactSession { asid: asid.clone() });
+                }));
+            }
+            if let Some(asid) = saved.clone() {
+                let app = saved_app.clone();
+                tip = tip.child(crate::ui::parts::link_button(saved_label, move |_| {
+                    close_menu();
+                    app.send(Command::LoadSavedPermissions { asid: asid.clone() });
+                    crate::ui::shell::open_right(&app, crate::model::view::RightTab::Saved);
                 }));
             }
             tip

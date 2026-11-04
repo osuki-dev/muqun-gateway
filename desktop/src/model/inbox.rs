@@ -125,6 +125,11 @@ pub enum Update {
         asid: String,
         sessions: Vec<AgentSessionInfo>,
     },
+    /// Remembered "always allow" decisions for the open session's project.
+    SavedPermissions {
+        asid: String,
+        items: Vec<crate::hub::SavedPermission>,
+    },
     /// Where this desktop's sessions run, applied by the drain to a binding.
     HubMode(crate::hub::HubMode),
 }

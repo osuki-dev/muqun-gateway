@@ -3196,14 +3196,12 @@ async fn list_saved_agent_permissions(
     let manager = session_manager_or_err!(&state, &headers, &asid);
     let agent = manager.agent();
     let project_id = session_project_id(agent.as_ref(), &asid).await?;
+    // OpenCode's driver already renames into snake_case; remapping here would
+    // look for `projectID` again and blank `project_id`.
     let items = agent
         .list_saved_permissions(Some(&project_id))
         .await
         .map_err(agent_error)?;
-    let items: Vec<Value> = items
-        .iter()
-        .filter_map(super::adapters::opencode::mapper::map_saved_permission)
-        .collect();
     Ok(Json(content_envelope(json!({ "items": items }))))
 }
 

@@ -262,6 +262,10 @@ impl Drain {
                     bindings.diff_panel.signal().set(false);
                     bindings.diff_focus.signal().set(None);
                     bindings.descendants.signal().set(Arc::new(Vec::new()));
+                    bindings
+                        .saved_permissions
+                        .signal()
+                        .set(Arc::new(Vec::new()));
                     if let Some(header) = header {
                         bindings.header.signal().set(header);
                     }
@@ -298,6 +302,10 @@ impl Drain {
                     bindings.diff_focus.signal().set(None);
                     bindings.selected.signal().set(None);
                     bindings.descendants.signal().set(Arc::new(Vec::new()));
+                    bindings
+                        .saved_permissions
+                        .signal()
+                        .set(Arc::new(Vec::new()));
                     bindings.header.signal().set(None);
                     bindings.order.signal().set(Arc::new(Default::default()));
                 }
@@ -667,6 +675,7 @@ fn batch_kinds(batch: &[Update]) -> String {
             Update::Diff(_) => "diff",
             Update::Tasks { .. } => "tasks",
             Update::Descendants { .. } => "descendants",
+            Update::SavedPermissions { .. } => "saved",
             Update::HubMode(_) => "hub_mode",
         };
         match counts.iter_mut().find(|(k, _)| *k == kind) {
@@ -713,6 +722,7 @@ struct Rest {
     tasks: Option<Arc<Vec<crate::hub::TaskRow>>>,
     task_cwd: Option<Option<String>>,
     descendants: Option<Arc<Vec<muqun_gateway::agents::AgentSessionInfo>>>,
+    saved_permissions: Option<Arc<Vec<crate::hub::SavedPermission>>>,
 }
 
 impl Rest {
@@ -737,6 +747,9 @@ impl Rest {
             tasks: c.tasks.then(|| Arc::new(view.tasks.clone())),
             task_cwd: c.tasks.then(|| view.task_cwd.clone()),
             descendants: c.descendants.then(|| Arc::new(view.descendants.clone())),
+            saved_permissions: c
+                .saved_permissions
+                .then(|| Arc::new(view.saved_permissions.clone())),
         }
     }
 }
@@ -837,6 +850,9 @@ impl Planned {
         }
         if let Some(descendants) = rest.descendants {
             b.descendants.signal().set(descendants);
+        }
+        if let Some(saved) = rest.saved_permissions {
+            b.saved_permissions.signal().set(saved);
         }
         if let Some(cwd) = rest.task_cwd {
             if b.task_cwd.get() != cwd {

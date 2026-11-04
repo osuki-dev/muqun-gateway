@@ -512,6 +512,8 @@ pub struct ViewState {
     pub task_cwd: Option<String>,
     /// The open session's sub-agents, at any depth, newest first.
     pub descendants: Vec<AgentSessionInfo>,
+    /// Remembered "always allow" decisions for the open session's project.
+    pub saved_permissions: Vec<crate::hub::SavedPermission>,
 }
 
 /// What one batch moved.
@@ -541,6 +543,7 @@ pub struct Changes {
     pub diff: bool,
     pub tasks: bool,
     pub descendants: bool,
+    pub saved_permissions: bool,
     /// A different session (or a fresh snapshot) is now shown.
     pub opened: bool,
     pub actions: Vec<UiAction>,
@@ -567,6 +570,7 @@ impl Changes {
             ("diff", self.diff),
             ("tasks", self.tasks),
             ("descendants", self.descendants),
+            ("saved", self.saved_permissions),
             ("opened", self.opened),
         ];
         let mut out: Vec<String> = flags
@@ -599,6 +603,7 @@ impl ViewState {
         self.selected = Some(asid.to_string());
         self.diff = None;
         self.descendants.clear();
+        self.saved_permissions.clear();
         // Prefer a recently shown timeline (instant, like the web App), else
         // a chrome-only placeholder until the snapshot arrives.
         if self.active.as_ref().is_none_or(|a| a.info.asid.0 != asid) {
@@ -875,6 +880,14 @@ impl ViewState {
                     changes.descendants = true;
                 }
             }
+            Update::SavedPermissions { asid, items } => {
+                if self.selected.as_deref() == Some(asid.as_str())
+                    && self.saved_permissions != items
+                {
+                    self.saved_permissions = items;
+                    changes.saved_permissions = true;
+                }
+            }
             Update::Tasks { rows, default_cwd } => {
                 if self.tasks != rows || self.task_cwd != default_cwd {
                     self.tasks = rows;
@@ -928,6 +941,7 @@ impl ViewState {
         self.active = None;
         self.diff = None;
         self.descendants.clear();
+        self.saved_permissions.clear();
         self.selected.take().is_some()
     }
 
@@ -1203,6 +1217,8 @@ pub enum RightTab {
     Git,
     /// The open session's sub-agents (shown while it has any).
     Subagents,
+    /// Remembered "always allow" decisions for the open session's project.
+    Saved,
 }
 
 /// The keyed Blinc state the views depend on. Created once, on the main
@@ -1240,6 +1256,8 @@ pub struct Bindings {
     pub task_cwd: State<Option<String>>,
     /// The open session's sub-agents, newest first (the Subagents tab).
     pub descendants: State<Arc<Vec<AgentSessionInfo>>>,
+    /// Remembered "always allow" decisions (the Saved tab).
+    pub saved_permissions: State<Arc<Vec<crate::hub::SavedPermission>>>,
     pub selected: State<Option<String>>,
     pub header: State<Option<Arc<AgentSessionInfo>>>,
     pub order: State<Arc<TimelineOrder>>,
@@ -1287,6 +1305,7 @@ impl Bindings {
             tasks_open: ctx.use_state_keyed("mq.tasks_open", || false),
             task_cwd: ctx.use_state_keyed("mq.task_cwd", || None),
             descendants: ctx.use_state_keyed("mq.descendants", || Arc::new(Vec::new())),
+            saved_permissions: ctx.use_state_keyed("mq.saved_permissions", || Arc::new(Vec::new())),
             selected: ctx.use_state_keyed("mq.selected", || None),
             header: ctx.use_state_keyed("mq.header", || None),
             order: ctx.use_state_keyed("mq.order", || Arc::new(TimelineOrder::default())),

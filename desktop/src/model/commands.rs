@@ -108,6 +108,15 @@ pub enum Command {
     LoadDescendants {
         asid: AgentSessionId,
     },
+    /// Read the project's remembered "always allow" decisions.
+    LoadSavedPermissions {
+        asid: AgentSessionId,
+    },
+    /// Forget one remembered decision.
+    ForgetSavedPermission {
+        asid: AgentSessionId,
+        id: String,
+    },
     /// Re-read the delegated task list (and the default folder).
     RefreshTasks,
     /// Delegate `goal` as a task (`agent` / `cwd` default on the gateway).

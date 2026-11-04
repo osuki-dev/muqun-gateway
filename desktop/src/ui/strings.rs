@@ -128,6 +128,10 @@ strings! {
     queue => "Queue", "排队";
     git_tab => "Git", "Git";
     subagents => "Subagents", "子代理";
+    saved_tab => "Allowed", "已允许";
+    saved_empty => "No always-allowed rules", "没有始终允许的规则";
+    saved_forget => "Forget", "忘记";
+    saved_open => "Always allowed…", "始终允许…";
     queue_empty => "Nothing queued", "没有排队的消息";
     attach_title => "Attach files", "添加附件";
     attachments_uploading => "Files are still uploading", "文件还在上传";

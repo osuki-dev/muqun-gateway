@@ -26,8 +26,8 @@ use tokio::sync::broadcast;
 
 use super::local::enrich_local_media;
 use super::{
-    CatalogView, HubError, HubFuture, HubMode, PeerMention, SessionHub, TaskDefaults, TaskHubEvent,
-    TaskRow, TimelineCatchUp,
+    CatalogView, HubError, HubFuture, HubMode, PeerMention, SavedPermission, SessionHub,
+    TaskDefaults, TaskHubEvent, TaskRow, TimelineCatchUp,
 };
 
 const EVENT_CAPACITY: usize = 4096;
@@ -959,6 +959,41 @@ impl SessionHub for RemoteHub {
                 json.pointer("/data/data")
                     .cloned()
                     .unwrap_or(Value::Array(Vec::new())),
+            )
+        })
+    }
+
+    fn list_saved_permissions<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+    ) -> HubFuture<'a, Vec<SavedPermission>> {
+        Box::pin(async move {
+            let json = self
+                .session_call(Method::GET, asid, &["permissions", "saved"], &[], None)
+                .await?;
+            let items = json
+                .pointer("/data/items")
+                .cloned()
+                .unwrap_or(Value::Array(Vec::new()));
+            decode(items)
+        })
+    }
+
+    fn forget_saved_permission<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+        id: &'a str,
+    ) -> HubFuture<'a, ()> {
+        Box::pin(async move {
+            Self::unit(
+                self.session_call(
+                    Method::DELETE,
+                    asid,
+                    &["permissions", "saved", id],
+                    &[],
+                    None,
+                )
+                .await,
             )
         })
     }

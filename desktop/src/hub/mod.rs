@@ -127,6 +127,20 @@ impl TaskRow {
     }
 }
 
+/// One "always allow" decision remembered for a session's project
+/// (`PermissionSaved.Info` in snake_case).
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Deserialize)]
+pub struct SavedPermission {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub project_id: String,
+    #[serde(default)]
+    pub action: String,
+    #[serde(default)]
+    pub resource: String,
+}
+
 /// A task's direct children by state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
 pub struct TaskChildren {
@@ -340,6 +354,19 @@ pub trait SessionHub: Send + Sync {
     /// Every session below `asid`, at any depth (sub-agents and theirs),
     /// newest update first. Empty for a session with no children.
     fn descendants<'a>(&'a self, asid: &'a AgentSessionId) -> HubFuture<'a, Vec<AgentSessionInfo>>;
+    /// Decisions this session's project remembered as "always allow"
+    /// (`GET …/permissions/saved`). Empty when the agent has none or no such
+    /// list.
+    fn list_saved_permissions<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+    ) -> HubFuture<'a, Vec<SavedPermission>>;
+    /// Forget one remembered decision (`DELETE …/permissions/saved/{id}`).
+    fn forget_saved_permission<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+        id: &'a str,
+    ) -> HubFuture<'a, ()>;
     /// Timeline rows with a sequence above `after`, from the mirror.
     fn timeline_after<'a>(
         &'a self,

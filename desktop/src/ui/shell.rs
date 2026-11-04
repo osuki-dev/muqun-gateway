@@ -25,6 +25,7 @@ use blinc_app::windowed::WindowedContext;
 use blinc_cn::prelude::{button, dropdown_menu_custom, ButtonSize, ButtonVariant};
 use blinc_core::State;
 use blinc_layout::prelude::*;
+use muqun_gateway::agents::AgentSessionId;
 
 pub const TOP_BAR_HEIGHT: f32 = 48.0;
 /// Matches `--mq-space-3`: body inset under the pill and beside the columns,
@@ -513,6 +514,19 @@ fn right_tab_chip(app: &App, tab: RightTab, label: &str, badge: Option<usize>) -
         )
         .on_click(move |_| {
             click.bindings.right_tab.signal().set(tab);
+            if matches!(tab, RightTab::Saved | RightTab::Subagents) {
+                if let Some(info) = click.bindings.header.get() {
+                    match tab {
+                        RightTab::Saved => click.send(Command::LoadSavedPermissions {
+                            asid: info.asid.clone(),
+                        }),
+                        RightTab::Subagents => click.send(Command::LoadDescendants {
+                            asid: info.asid.clone(),
+                        }),
+                        _ => {}
+                    }
+                }
+            }
         });
     if active {
         chip = chip.class("mq-right-tab--active");
@@ -535,6 +549,7 @@ fn right_column(app: &App, height: f32, width: State<f32>, window: f32, side: f3
     let header = app.bindings.header.clone();
     let dirs = app.bindings.dirs.clone();
     let descendants = app.bindings.descendants.clone();
+    let saved_permissions = app.bindings.saved_permissions.clone();
     let cmp_inbox = composer::state::Cmp::get().inbox.clone();
     let app = app.clone();
     let handle_app = app.clone();
@@ -548,6 +563,7 @@ fn right_column(app: &App, height: f32, width: State<f32>, window: f32, side: f3
             header.signal_id(),
             dirs.signal_id(),
             descendants.signal_id(),
+            saved_permissions.signal_id(),
             cmp_inbox.signal_id(),
             width.signal_id(),
         ])
@@ -555,6 +571,7 @@ fn right_column(app: &App, height: f32, width: State<f32>, window: f32, side: f3
             let close = app.clone();
             let queued = cmp_inbox.get().len();
             let subagents = descendants.get().len();
+            let saved = saved_permissions.get().len();
             let current = tab.get();
             let head = div()
                 .class("mq-right-head")
@@ -585,6 +602,12 @@ fn right_column(app: &App, height: f32, width: State<f32>, window: f32, side: f3
                             RightTab::Subagents,
                             app.strings.subagents(),
                             Some(subagents),
+                        ))
+                        .child(right_tab_chip(
+                            &app,
+                            RightTab::Saved,
+                            app.strings.saved_tab(),
+                            Some(saved),
                         )),
                 )
                 .child(ghost_icon(Glyph::Close).on_click(move |_| close_right(&close)));
@@ -593,6 +616,7 @@ fn right_column(app: &App, height: f32, width: State<f32>, window: f32, side: f3
                 RightTab::Queue => queue_tab_body(&app),
                 RightTab::Git => git_tab_body(&app),
                 RightTab::Subagents => subagents_tab_body(&app),
+                RightTab::Saved => saved_tab_body(&app),
             };
             div()
                 .class("mq-right-body")
@@ -628,6 +652,77 @@ fn queue_tab_body(app: &App) -> Div {
     };
     div()
         .class("mq-right-queue")
+        .w_full()
+        .h_full()
+        .child(scroll().w_full().h_full().child(list))
+}
+
+/// Remembered "always allow" rules for the open session's project.
+fn saved_tab_body(app: &App) -> Div {
+    let items = app.bindings.saved_permissions.get();
+    if items.is_empty() {
+        return div()
+            .class("mq-right-empty")
+            .w_full()
+            .h_full()
+            .flex_col()
+            .child(
+                ui_text(app.strings.saved_empty())
+                    .size(12.0)
+                    .no_wrap()
+                    .no_cursor(),
+            );
+    }
+    let asid = app
+        .bindings
+        .selected
+        .get()
+        .map(AgentSessionId)
+        .unwrap_or_else(|| AgentSessionId(String::new()));
+    let mut list = div().class("mq-diff-panel-list").flex_col().w_full();
+    for item in items.iter() {
+        let label = if item.resource.is_empty() {
+            item.action.clone()
+        } else {
+            format!("{} · {}", item.action, item.resource)
+        };
+        let forget = app.clone();
+        let asid = asid.clone();
+        let id = item.id.clone();
+        list = list.child(
+            div()
+                .class("mq-diff-panel-row")
+                .w_full()
+                .flex_row()
+                .items_center()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(0.0)
+                        .overflow_clip()
+                        .child(ui_text(label).size(12.0).no_wrap().no_cursor()),
+                )
+                .child(
+                    div()
+                        .class("mq-diff-open")
+                        .cursor_pointer()
+                        .child(
+                            ui_text(app.strings.saved_forget())
+                                .size(11.0)
+                                .no_wrap()
+                                .no_cursor(),
+                        )
+                        .on_click(move |_| {
+                            forget.send(Command::ForgetSavedPermission {
+                                asid: asid.clone(),
+                                id: id.clone(),
+                            });
+                        }),
+                ),
+        );
+    }
+    div()
+        .class("mq-right-git")
         .w_full()
         .h_full()
         .child(scroll().w_full().h_full().child(list))

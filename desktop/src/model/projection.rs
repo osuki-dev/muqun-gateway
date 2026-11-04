@@ -429,6 +429,13 @@ impl Core {
                 }
             }
             Command::LoadDescendants { asid } => self.descendants(asid).await,
+            Command::LoadSavedPermissions { asid } => self.saved_permissions(asid).await,
+            Command::ForgetSavedPermission { asid, id } => {
+                match self.hub.forget_saved_permission(&asid, &id).await {
+                    Ok(()) => self.saved_permissions(asid).await,
+                    Err(err) => self.fail(err),
+                }
+            }
             Command::RefreshTasks => self.refresh_tasks().await,
             Command::CreateTask { goal, agent, cwd } => {
                 let goal = goal.trim().to_string();
@@ -609,6 +616,20 @@ impl Core {
             }),
             Ok(Err(err)) => tracing::debug!(asid = %asid.0, %err, "descendants unavailable"),
             Err(_) => tracing::debug!(asid = %asid.0, "descendants timed out"),
+        }
+    }
+
+    /// Remembered "always allow" decisions for the session's project.
+    async fn saved_permissions(self: Arc<Self>, asid: AgentSessionId) {
+        match tokio::time::timeout(LIST_TIMEOUT, self.hub.list_saved_permissions(&asid)).await {
+            Ok(Ok(items)) => self.inbox.push(Update::SavedPermissions {
+                asid: asid.0,
+                items,
+            }),
+            Ok(Err(err)) => {
+                tracing::debug!(asid = %asid.0, %err, "saved permissions unavailable")
+            }
+            Err(_) => tracing::debug!(asid = %asid.0, "saved permissions timed out"),
         }
     }
 
