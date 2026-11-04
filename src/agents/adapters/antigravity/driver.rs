@@ -7,7 +7,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::agents::adapters::acp::mapper::PermissionFields;
 use crate::agents::adapters::acp::recovery::NativeSnapshot;
-use crate::agents::adapters::acp::session::{AcpDriver, AcpProvider, Authenticate};
+use crate::agents::adapters::acp::session::{AcpDriver, AcpProvider, Authenticate, LaunchBypass};
 use crate::agents::ports::agent::AgentFuture;
 
 pub(crate) const NOT_SIGNED_IN: &str =
@@ -18,6 +18,11 @@ impl AcpProvider for AntigravityProvider {
     const KIND: &'static str = "antigravity";
     const LABEL: &'static str = "Antigravity";
     const ARGS: &'static [&'static str] = &["acp"];
+    const LAUNCH_BYPASS: Option<LaunchBypass> = Some(LaunchBypass {
+        before: &[],
+        after: &["--dangerously-skip-permissions"],
+        env: &[],
+    });
     const REQUIRE_MESSAGE_ID: bool = false;
     const MODEL_SELECTION: bool = true;
     const IDLE_RETIREMENT: bool = true;

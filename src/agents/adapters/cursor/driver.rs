@@ -8,7 +8,7 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use crate::agents::adapters::acp::recovery::NativeSnapshot;
-use crate::agents::adapters::acp::session::{AcpDriver, AcpProvider, Authenticate};
+use crate::agents::adapters::acp::session::{AcpDriver, AcpProvider, Authenticate, LaunchBypass};
 use crate::agents::ports::agent::{AgentError, AgentFuture};
 
 pub(crate) const NOT_SIGNED_IN: &str =
@@ -23,6 +23,12 @@ impl AcpProvider for CursorProvider {
     const KIND: &'static str = "cursor";
     const LABEL: &'static str = "Cursor";
     const ARGS: &'static [&'static str] = &["acp"];
+    // `--force` is a global option of `agent`, so it precedes `acp`.
+    const LAUNCH_BYPASS: Option<LaunchBypass> = Some(LaunchBypass {
+        before: &["--force"],
+        after: &[],
+        env: &[],
+    });
     const REQUIRE_MESSAGE_ID: bool = false;
     // Effort is part of each Cursor model value (`name[reasoning=…]`); there
     // is no separate effort option.

@@ -34,10 +34,13 @@
   sandbox), OpenCode a session
   permission rule allowing every action, T3 `thread.runtime-mode.set
   full-access`. Off restores what the session ran in before. Discovery states
-  `features.autoApprove = {scope, native}` per agent; Antigravity, Cursor,
-  FX and Pi only take their bypass at launch (`--dangerously-skip-permissions`,
-  `--force`, `FX_PERMISSION_MODE=full-access`, `MUQUN_PI_APPROVALS=never`), so
-  the switch answers 501 there and the App says so; DeepSeek has per-request
+  `features.autoApprove = {scope, native}` per agent; Antigravity, Cursor
+  and FX take their bypass only at launch (`--dangerously-skip-permissions`,
+  `--force`, `FX_PERMISSION_MODE=full-access`), so the switch relaunches that
+  session's agent process with or without it and loads the same session
+  again (an agent that is working refuses: switch when it is idle; the
+  setting lasts until the Gateway restarts). Pi's `MUQUN_PI_APPROVALS=never`
+  is launch-only and the switch answers 501; DeepSeek has per-request
   approvals only. A bypass mode is still never remembered as a new session's
   default. Switching on from a device is allowed by default; an owner who
   wants to keep phones from doing it sets `allow_remote_auto_approve: false`
