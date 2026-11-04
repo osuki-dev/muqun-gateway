@@ -988,6 +988,10 @@ struct HistoryWindowQuery {
     cursor: Option<String>,
     #[serde(default)]
     refresh: bool,
+    /// Answer only from what the mirror already holds: never read the agent,
+    /// never start or wake it.
+    #[serde(default)]
+    retained: bool,
 }
 
 async fn history_window_global(
@@ -997,6 +1001,9 @@ async fn history_window_global(
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
+    if query.retained {
+        return retained_history_window(&state, &asid, query.cursor.as_deref()).await;
+    }
     socket_history_window(&state, &asid, query.cursor.as_deref(), query.refresh).await
 }
 
@@ -1034,11 +1041,44 @@ async fn socket_history_window(
         // snapshot; otherwise opening a bounded window would hide history.
         return socket_read_agent_session(state, asid, refresh).await;
     }
-    let mut window = manager
+    let window = manager
         .sessions()
         .history_window(&AgentSessionId(asid.to_owned()), cursor, refresh)
         .await
         .map_err(agent_error)?;
+    project_history_window(state, asid, window).await
+}
+
+/// A peek at what the Gateway already retains for a session. A session the
+/// mirror has no history for is `404 not_retained`; answering it must not
+/// start the agent or read its transcript.
+async fn retained_history_window(
+    state: &AppState,
+    asid: &str,
+    cursor: Option<&str>,
+) -> ApiResult<Json<Value>> {
+    validate_history_cursor(cursor)?;
+    let manager = session_manager_or_err(state, asid).await?;
+    let window = manager
+        .sessions()
+        .retained_window(&AgentSessionId(asid.to_owned()), cursor)
+        .await
+        .map_err(agent_error)?
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::NOT_FOUND,
+                "not_retained",
+                "The Gateway holds no history for this session",
+            )
+        })?;
+    project_history_window(state, asid, window).await
+}
+
+async fn project_history_window(
+    state: &AppState,
+    asid: &str,
+    mut window: super::adapters::memory_mirror::history_window::HistoryWindow,
+) -> ApiResult<Json<Value>> {
     let snapshot = &mut window.snapshot;
     let plumbing = for_session(state, asid).await;
     hide_in_items(&mut snapshot.timeline, plumbing);
@@ -1359,7 +1399,12 @@ async fn do_send_agent_prompt(
     body: SendAgentPromptBody,
     headers: &HeaderMap,
 ) -> ApiResult<Json<Value>> {
-    require_device(state, headers)?;
+    // The same gate as `require_device`, keeping the caller so the sent
+    // message can say which device it came from.
+    let caller = crate::platform::http::require_device_or_peer(state, headers)?;
+    if caller.kind == crate::DeviceKind::Gateway {
+        return Err(crate::platform::http::peer_forbidden());
+    }
 
     let manager = session_manager_or_err(state, asid).await?;
 
@@ -1418,6 +1463,17 @@ async fn do_send_agent_prompt(
             | super::ports::agent::AgentError::OpenRequired(_) => agent_error(e),
             _ => api_error(StatusCode::BAD_GATEWAY, "agent_error", &e.to_string()),
         })?;
+
+    // The prompt is already with the agent: showing who sent it is best effort
+    // and never turns an accepted prompt into an error.
+    let origin = super::domain::MessageOrigin {
+        device_id: caller.device_id,
+        name: caller.name,
+    };
+    manager
+        .mirror()
+        .present_user_prompt(&AgentSessionId(asid.to_string()), &body.text, origin)
+        .await;
 
     let mut accepted = json!({ "submitted": true });
     if let Some(client_ref) = body.client_ref {
@@ -4784,6 +4840,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retained_window_answers_only_from_the_mirror_and_labels_sent_prompts() {
+        let state = state_with(vec![FakeAgent::new("claude")]).await;
+        let asid = do_create_agent_session(
+            &state,
+            CreateAgentSessionBody {
+                directory: None,
+                model: None,
+                mode: None,
+                agent_id: Some("claude".into()),
+            },
+            &device_headers(),
+        )
+        .await
+        .expect("a session is created")
+        .0["data"]["asid"]
+            .as_str()
+            .expect("the created session has an id")
+            .to_owned();
+        let _ = do_send_agent_prompt(
+            &state,
+            &asid,
+            SendAgentPromptBody {
+                text: "from the phone".into(),
+                client_ref: None,
+                computer_ids: Vec::new(),
+                attachments: None,
+                delivery: None,
+                model: None,
+                reasoning_effort: None,
+            },
+            &device_headers(),
+        )
+        .await
+        .expect("the prompt is accepted");
+        let Ok(manager) = state.agent_runtime.request_manager_for_session(&asid).await else {
+            panic!("the session has an owner");
+        };
+        let Json(window) = retained_history_window(&state, &asid, None)
+            .await
+            .expect("the mirror holds the new session");
+        let rows = window["data"]["timeline"].as_array().unwrap();
+        let sent: Vec<_> = rows
+            .iter()
+            .filter(|row| row["part"]["text"] == "from the phone")
+            .collect();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0]["origin"]["device_id"], "phone-1");
+        assert_eq!(sent[0]["origin"]["name"], "device phone-1");
+
+        manager
+            .mirror()
+            .remove_session(&AgentSessionId(asid.clone()))
+            .await;
+        let refusal = retained_history_window(&state, &asid, None)
+            .await
+            .expect_err("the mirror no longer holds the session");
+        assert_eq!(refusal.0, StatusCode::NOT_FOUND);
+        assert_eq!(
+            crate::test_support::error_body(&refusal)["error"]["code"],
+            "not_retained"
+        );
+    }
+
+    #[tokio::test]
     async fn timeline_earlier_route_uses_codex_owner_and_retains_bounded_rows_in_snapshot() {
         use crate::agents::adapters::codex::{
             tests::{golden, Fixture},
@@ -6356,6 +6476,7 @@ mod tests {
             attachments: None,
             image_assets: None,
             generation: None,
+            origin: None,
         };
         manager
             .mirror()

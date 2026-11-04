@@ -285,6 +285,7 @@ pub fn item(thread: &str, turn: &str, value: &Value, at_ms: u64) -> Vec<Timeline
                 attachments: (ordinal == 0).then(|| attachments.clone()).flatten(),
                 image_assets: None,
                 generation: None,
+                origin: None,
             }
         })
         .collect()
@@ -338,6 +339,7 @@ pub fn turn_update(thread: &str, turn: &str, method: &str, params: &Value) -> Ve
             attachments: None,
             image_assets: None,
             generation: None,
+            origin: None,
         })
         .collect()
 }

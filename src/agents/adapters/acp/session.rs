@@ -1233,6 +1233,7 @@ impl<P: AcpProvider> AcpDriver<P> {
             attachments: None,
             image_assets: None,
             generation: None,
+            origin: None,
         };
         let event = self
             .mirror

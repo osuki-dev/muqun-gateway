@@ -533,6 +533,7 @@ pub(crate) async fn attach_to_inbox(state: &AppState, asid: &str, items: &mut [s
                 attachments: Some(sources),
                 image_assets: None,
                 generation: None,
+                origin: None,
             },
         ));
     }
@@ -1464,6 +1465,7 @@ mod tests {
             attachments: None,
             image_assets: None,
             generation: None,
+            origin: None,
         }
     }
 

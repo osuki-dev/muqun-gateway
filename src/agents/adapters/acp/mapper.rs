@@ -924,6 +924,7 @@ impl Projection {
             attachments: None,
             image_assets: None,
             generation: None,
+            origin: None,
         };
         self.rows.insert(id.clone(), row.clone());
         self.evict(&id);

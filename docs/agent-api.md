@@ -718,6 +718,15 @@ range, including its oldest boundary. Omit it when reopening at the latest page.
 Providers without older paging retain their existing full snapshot and omit the
 cursor, so cached history does not become inaccessible.
 
+`GET .../timeline/window?retained=true` is a non-waking peek: it answers only from
+history the Gateway's mirror already holds, never prepares, reads or starts the
+agent, and returns `404 not_retained` when there is none (open the session
+normally then). A user `TimelineItem` sent through `POST .../prompt` by a paired
+device carries optional `origin: { device_id, name }`; the Gateway shows it at
+once as a `presented:<uuid>` row, and the agent's own echo replaces that row
+(an `agent.timeline.removed` for the presented id precedes the echo's upsert) and keeps
+the `origin`. Prompts typed in the agent itself have no `origin`.
+
 Cursors are scoped to the session incarnation and removal generation. Invalid,
 evicted or obsolete boundaries return `409 history_cursor_lost`, not exhaustion.
 Recover with a new window; do not silently jump to another reader's provider

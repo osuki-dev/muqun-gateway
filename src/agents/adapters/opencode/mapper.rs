@@ -430,6 +430,7 @@ fn map_message_with_budget(
                 attachments: $attachments,
                 image_assets: attachment_assets.take(),
                 generation: None,
+                origin: None,
             })
         };
     }

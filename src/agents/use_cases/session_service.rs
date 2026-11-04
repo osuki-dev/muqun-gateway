@@ -346,6 +346,30 @@ impl SessionService {
         Ok(window)
     }
 
+    /// The newest window of what the mirror already holds, or `None` when it
+    /// holds no read history for the session. Never reads or wakes the agent.
+    pub(crate) async fn retained_window(
+        &self,
+        asid: &AgentSessionId,
+        cursor: Option<&str>,
+    ) -> Result<
+        Option<crate::agents::adapters::memory_mirror::history_window::HistoryWindow>,
+        AgentError,
+    > {
+        let Some(memory) = self.memory.as_ref() else {
+            return Ok(None);
+        };
+        if !memory.history_initialized(asid).await {
+            return Ok(None);
+        }
+        match memory.history_window(asid, cursor).await {
+            Ok(window) => Ok(Some(window)),
+            // Evicted between the check and the read.
+            Err(AgentError::HistoryCursorLost) if cursor.is_none() => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     pub(crate) async fn history_page(
         &self,
         asid: &AgentSessionId,
