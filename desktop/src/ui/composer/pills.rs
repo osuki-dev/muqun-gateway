@@ -1075,7 +1075,7 @@ pub(super) fn session_bypass(app: &App, agent: &str) -> Option<String> {
 
 /// Ask the gateway to switch YOLO; one switch at a time, and the chip moves
 /// only when the agent has answered.
-fn switch_yolo(app: &App, asid: &muqun_gateway::agents::AgentSessionId, enabled: bool) {
+pub(super) fn switch_yolo(app: &App, asid: &muqun_gateway::agents::AgentSessionId, enabled: bool) {
     if state::begin_yolo_switch() {
         app.send(Command::Compose(ComposeCommand::SetAutoApprove {
             asid: asid.clone(),

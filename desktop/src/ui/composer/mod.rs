@@ -965,19 +965,28 @@ pub fn install_file_drop(app: &App) {
             DropEvent::Cancelled => drain.post(UiAction::DropHover(false)),
             DropEvent::Dropped(paths) => {
                 drain.post(UiAction::DropHover(false));
-                let routed = dropped::route(paths);
-                for theme in routed.themes {
-                    crate::model::commands::send(&commands, Command::ThemeImportFile(theme));
-                }
-                if !routed.files.is_empty() {
-                    drain.post(UiAction::FilesPicked(routed.files));
-                }
-                if !routed.folders.is_empty() {
-                    drain.post(UiAction::FoldersDropped(routed.folders));
-                }
+                route_drop(&drain, &commands, paths);
             }
         }
     });
+}
+
+/// Send each dropped path where it goes ([`dropped::route`]).
+fn route_drop(
+    drain: &crate::model::drain::Drain,
+    commands: &crate::model::commands::CommandSender,
+    paths: Vec<PathBuf>,
+) {
+    let routed = dropped::route(paths);
+    for theme in routed.themes {
+        crate::model::commands::send(commands, Command::ThemeImportFile(theme));
+    }
+    if !routed.files.is_empty() {
+        drain.post(UiAction::FilesPicked(routed.files));
+    }
+    if !routed.folders.is_empty() {
+        drain.post(UiAction::FoldersDropped(routed.folders));
+    }
 }
 
 /// A drag entered or left the window.

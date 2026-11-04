@@ -8,7 +8,7 @@
 //!
 //! * `text:<s>` -- the draft becomes `<s>` with the caret at its end, as
 //!   typing it would (the popup follows).
-//! * `menu:<project|agent|model|mode|effort|branch|usage>` -- open that pill's
+//! * `menu:<project|agent|model|mode|effort|branch|usage|yolo>` -- open that pill's
 //!   menu as a click would; `menu:close` closes it.
 //! * `key:<up|down|enter|tab>` -- the key reaches the composer.
 //! * `esc` -- Esc as the window handles it.
@@ -17,6 +17,9 @@
 //! * `submit` -- send as Enter does.
 //! * `scheme:<light|dark>` -- switch the colour scheme.
 //! * `agent:<id>` -- choose the start page's agent.
+//! * `yolo:<on|off>[:asid]` -- switch YOLO on the open (or named) session, as the chip does
+//!   after its confirmation.
+//! * `drop:<path>` -- drop that file or folder on the window.
 
 use std::time::Duration;
 
@@ -64,6 +67,7 @@ pub fn run(app: &App, step: &str) {
                     "effort" => MenuId::Effort,
                     "branch" => MenuId::Branch,
                     "usage" => MenuId::Usage,
+                    "yolo" => MenuId::Yolo,
                     _ => return,
                 };
                 if !pills::open_by_id(id) {
@@ -113,6 +117,18 @@ pub fn run(app: &App, step: &str) {
             choice.mode = None;
             cmp.start.signal().set(std::sync::Arc::new(choice));
         }
+        "yolo" => {
+            let (state, named) = arg.split_once(':').unwrap_or((arg, ""));
+            let asid = if named.is_empty() {
+                super::aim(app, super::Place::Session).asid()
+            } else {
+                Some(muqun_gateway::agents::AgentSessionId(named.to_string()))
+            };
+            if let Some(asid) = asid {
+                pills::switch_yolo(app, &asid, state == "on");
+            }
+        }
+        "drop" => super::route_drop(&app.drain, &app.commands, vec![arg.into()]),
         other => tracing::warn!(other, "qa: unknown composer step"),
     }
 }
