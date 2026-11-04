@@ -104,6 +104,10 @@ pub enum Command {
         asid: AgentSessionId,
         message_id: Option<String>,
     },
+    /// Read the sessions below `asid` (its sub-agents, at any depth).
+    LoadDescendants {
+        asid: AgentSessionId,
+    },
     /// Re-read the delegated task list (and the default folder).
     RefreshTasks,
     /// Delegate `goal` as a task (`agent` / `cwd` default on the gateway).

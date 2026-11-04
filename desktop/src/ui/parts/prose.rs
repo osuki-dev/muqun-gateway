@@ -269,21 +269,19 @@ pub fn user(ctx: &PartCtx<'_>, text: &str) -> Div {
     } else if let Some(assets) = ctx.item.image_assets.as_ref().filter(|a| !a.is_empty()) {
         card = card.child(media::asset_row(ctx, assets, media_cap));
     }
-    card = card.child(
-        div()
-            .class("mq-user-foot")
-            .flex_row()
-            .items_center()
-            .child(copy_button(
-                &ctx.key("copy"),
-                ctx.app.strings.copy(),
-                if display.is_empty() {
-                    text.to_string()
-                } else {
-                    display.to_string()
-                },
-            )),
-    );
+    let mut foot = div().class("mq-user-foot").flex_row().items_center();
+    if let Some(origin) = &ctx.item.origin {
+        foot = foot.child(meta(ctx.app.strings.origin_label(&origin.name)));
+    }
+    card = card.child(foot.child(copy_button(
+        &ctx.key("copy"),
+        ctx.app.strings.copy(),
+        if display.is_empty() {
+            text.to_string()
+        } else {
+            display.to_string()
+        },
+    )));
     div().class("mq-user-row").w_full().flex_row().child(card)
 }
 

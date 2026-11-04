@@ -127,6 +127,7 @@ strings! {
     start => "Start", "开始";
     queue => "Queue", "排队";
     git_tab => "Git", "Git";
+    subagents => "Subagents", "子代理";
     queue_empty => "Nothing queued", "没有排队的消息";
     attach_title => "Attach files", "添加附件";
     attachments_uploading => "Files are still uploading", "文件还在上传";
@@ -274,7 +275,6 @@ impl Strings {
         i18n::t(self.language().locale(), "Deny")
     }
 
-    #[allow(dead_code)] // the timeline renders status words
     pub fn status(&self, status: AgentSessionStatus) -> &'static str {
         use AgentSessionStatus::*;
         match (self.language(), status) {

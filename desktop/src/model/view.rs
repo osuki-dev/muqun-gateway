@@ -510,6 +510,8 @@ pub struct ViewState {
     pub tasks: Vec<crate::hub::TaskRow>,
     /// Where a task opened without a folder would run.
     pub task_cwd: Option<String>,
+    /// The open session's sub-agents, at any depth, newest first.
+    pub descendants: Vec<AgentSessionInfo>,
 }
 
 /// What one batch moved.
@@ -538,6 +540,7 @@ pub struct Changes {
     pub known: bool,
     pub diff: bool,
     pub tasks: bool,
+    pub descendants: bool,
     /// A different session (or a fresh snapshot) is now shown.
     pub opened: bool,
     pub actions: Vec<UiAction>,
@@ -563,6 +566,7 @@ impl Changes {
             ("known", self.known),
             ("diff", self.diff),
             ("tasks", self.tasks),
+            ("descendants", self.descendants),
             ("opened", self.opened),
         ];
         let mut out: Vec<String> = flags
@@ -594,6 +598,7 @@ impl ViewState {
         self.cache_active();
         self.selected = Some(asid.to_string());
         self.diff = None;
+        self.descendants.clear();
         // Prefer a recently shown timeline (instant, like the web App), else
         // a chrome-only placeholder until the snapshot arrives.
         if self.active.as_ref().is_none_or(|a| a.info.asid.0 != asid) {
@@ -863,6 +868,13 @@ impl ViewState {
                     changes.diff = true;
                 }
             }
+            Update::Descendants { asid, sessions } => {
+                // An answer for a session that is no longer the open one.
+                if self.selected.as_deref() == Some(asid.as_str()) && self.descendants != sessions {
+                    self.descendants = sessions;
+                    changes.descendants = true;
+                }
+            }
             Update::Tasks { rows, default_cwd } => {
                 if self.tasks != rows || self.task_cwd != default_cwd {
                     self.tasks = rows;
@@ -915,6 +927,7 @@ impl ViewState {
     pub fn deselect(&mut self) -> bool {
         self.active = None;
         self.diff = None;
+        self.descendants.clear();
         self.selected.take().is_some()
     }
 
@@ -1188,6 +1201,8 @@ pub enum RightTab {
     Queue,
     #[default]
     Git,
+    /// The open session's sub-agents (shown while it has any).
+    Subagents,
 }
 
 /// The keyed Blinc state the views depend on. Created once, on the main
@@ -1223,6 +1238,8 @@ pub struct Bindings {
     pub tasks_open: State<bool>,
     /// The folder a task opened without one runs in (shown as a hint).
     pub task_cwd: State<Option<String>>,
+    /// The open session's sub-agents, newest first (the Subagents tab).
+    pub descendants: State<Arc<Vec<AgentSessionInfo>>>,
     pub selected: State<Option<String>>,
     pub header: State<Option<Arc<AgentSessionInfo>>>,
     pub order: State<Arc<TimelineOrder>>,
@@ -1269,6 +1286,7 @@ impl Bindings {
             tasks: ctx.use_state_keyed("mq.tasks", || Arc::new(Vec::new())),
             tasks_open: ctx.use_state_keyed("mq.tasks_open", || false),
             task_cwd: ctx.use_state_keyed("mq.task_cwd", || None),
+            descendants: ctx.use_state_keyed("mq.descendants", || Arc::new(Vec::new())),
             selected: ctx.use_state_keyed("mq.selected", || None),
             header: ctx.use_state_keyed("mq.header", || None),
             order: ctx.use_state_keyed("mq.order", || Arc::new(TimelineOrder::default())),
@@ -1382,6 +1400,7 @@ mod tests {
             attachments: None,
             image_assets: None,
             generation: None,
+            origin: None,
         }
     }
 

@@ -164,6 +164,7 @@ pub fn top_bar(app: &App, window_width: f32) -> Div {
                                         .items_center()
                                         .flex_shrink_0()
                                         .child(open_in_button(&app))
+                                        .child(subagents_toggle(&app))
                                         .child(git_toggle(&app)),
                                 ),
                         ),
@@ -261,6 +262,54 @@ fn git_toggle(app: &App) -> impl ElementBuilder {
                 row = row.class("mq-diff-count--open");
             }
             row.on_click(move |_| toggle_right(&click, RightTab::Git))
+        })
+}
+
+/// "Subagents n" in the top pill, only while the open session has any:
+/// toggles the right column onto its Subagents tab.
+fn subagents_toggle(app: &App) -> impl ElementBuilder {
+    let descendants = app.bindings.descendants.clone();
+    let panel = app.bindings.diff_panel.clone();
+    let tab = app.bindings.right_tab.clone();
+    let app = app.clone();
+    stateful_with_key::<NoState>("mq-subagents-toggle")
+        .deps([descendants.signal_id(), panel.signal_id(), tab.signal_id()])
+        .on_state(move |_| {
+            let count = descendants.get().len();
+            if count == 0 {
+                return div();
+            }
+            let click = app.clone();
+            let mut row = div()
+                .class("mq-ghost")
+                .h(28.0)
+                .flex_row()
+                .items_center()
+                .cursor_pointer()
+                .child(
+                    ui_text(app.strings.subagents())
+                        .size(13.0)
+                        .no_wrap()
+                        .no_cursor(),
+                )
+                .child(
+                    mono_text(format!("{count}"))
+                        .size(11.0)
+                        .no_wrap()
+                        .no_cursor(),
+                );
+            if panel.get() && tab.get() == RightTab::Subagents {
+                row = row.class("mq-diff-count--open");
+            }
+            row.on_click(move |_| {
+                // Read again as the panel opens: sub-agents may have started.
+                if let Some(info) = click.bindings.header.get() {
+                    click.send(Command::LoadDescendants {
+                        asid: info.asid.clone(),
+                    });
+                }
+                toggle_right(&click, RightTab::Subagents)
+            })
         })
 }
 
@@ -485,6 +534,7 @@ fn right_column(app: &App, height: f32, width: State<f32>, window: f32, side: f3
     let focus = app.bindings.diff_focus.clone();
     let header = app.bindings.header.clone();
     let dirs = app.bindings.dirs.clone();
+    let descendants = app.bindings.descendants.clone();
     let cmp_inbox = composer::state::Cmp::get().inbox.clone();
     let app = app.clone();
     let handle_app = app.clone();
@@ -497,12 +547,14 @@ fn right_column(app: &App, height: f32, width: State<f32>, window: f32, side: f3
             focus.signal_id(),
             header.signal_id(),
             dirs.signal_id(),
+            descendants.signal_id(),
             cmp_inbox.signal_id(),
             width.signal_id(),
         ])
         .on_state(move |_| {
             let close = app.clone();
             let queued = cmp_inbox.get().len();
+            let subagents = descendants.get().len();
             let current = tab.get();
             let head = div()
                 .class("mq-right-head")
@@ -527,6 +579,12 @@ fn right_column(app: &App, height: f32, width: State<f32>, window: f32, side: f3
                             RightTab::Git,
                             app.strings.git_tab(),
                             None,
+                        ))
+                        .child(right_tab_chip(
+                            &app,
+                            RightTab::Subagents,
+                            app.strings.subagents(),
+                            Some(subagents),
                         )),
                 )
                 .child(ghost_icon(Glyph::Close).on_click(move |_| close_right(&close)));
@@ -534,6 +592,7 @@ fn right_column(app: &App, height: f32, width: State<f32>, window: f32, side: f3
             let content = match current {
                 RightTab::Queue => queue_tab_body(&app),
                 RightTab::Git => git_tab_body(&app),
+                RightTab::Subagents => subagents_tab_body(&app),
             };
             div()
                 .class("mq-right-body")
@@ -569,6 +628,56 @@ fn queue_tab_body(app: &App) -> Div {
     };
     div()
         .class("mq-right-queue")
+        .w_full()
+        .h_full()
+        .child(scroll().w_full().h_full().child(list))
+}
+
+/// The open session's sub-agents: title and status, and a link to each.
+fn subagents_tab_body(app: &App) -> Div {
+    let sessions = app.bindings.descendants.get();
+    let mut list = div().class("mq-diff-panel-list").flex_col().w_full();
+    for session in sessions.iter() {
+        let open = app.clone();
+        let asid = session.asid.clone();
+        list = list.child(
+            div()
+                .class("mq-diff-panel-row")
+                .w_full()
+                .flex_row()
+                .items_center()
+                .child(
+                    div().flex_1().min_w(0.0).overflow_clip().child(
+                        ui_text(title_of(app, session))
+                            .size(12.0)
+                            .no_wrap()
+                            .no_cursor(),
+                    ),
+                )
+                .child(
+                    div().class("mq-menu-dim").child(
+                        ui_text(app.strings.status(session.status))
+                            .size(11.0)
+                            .no_wrap()
+                            .no_cursor(),
+                    ),
+                )
+                .child(
+                    div()
+                        .class("mq-diff-open")
+                        .cursor_pointer()
+                        .child(
+                            ui_text(app.strings.open_label())
+                                .size(11.0)
+                                .no_wrap()
+                                .no_cursor(),
+                        )
+                        .on_click(move |_| open.open_session(&asid)),
+                ),
+        );
+    }
+    div()
+        .class("mq-right-git")
         .w_full()
         .h_full()
         .child(scroll().w_full().h_full().child(list))

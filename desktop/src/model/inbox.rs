@@ -120,6 +120,11 @@ pub enum Update {
         rows: Vec<crate::hub::TaskRow>,
         default_cwd: Option<String>,
     },
+    /// The sessions below `asid`, newest first, replacing the last read.
+    Descendants {
+        asid: String,
+        sessions: Vec<AgentSessionInfo>,
+    },
     /// Where this desktop's sessions run, applied by the drain to a binding.
     HubMode(crate::hub::HubMode),
 }
@@ -289,6 +294,7 @@ mod tests {
             attachments: None,
             image_assets: None,
             generation: None,
+            origin: None,
         }
     }
 

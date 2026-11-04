@@ -18,7 +18,7 @@ use super::compose::{self, ComposeCommand, ComposerUpdate, Deliver, Target};
 use super::inbox::{Inbox, UiError, Update};
 use super::view::{DiffStat, SESSION_LIST_LIMIT};
 use crate::config::{ConfigEdit, DesktopConfig};
-use crate::hub::{HubError, SessionHub, OPENCODE};
+use crate::hub::{HubError, SessionHub, TaskHubEvent, OPENCODE};
 
 /// How long the typed prefix must stand still before folders are listed.
 const COMPLETION_DEBOUNCE: Duration = Duration::from_millis(150);
@@ -171,6 +171,8 @@ struct Core {
     reread: Coalesce,
     /// Re-reads of every agent's list, after a resync.
     relist: Coalesce,
+    /// Re-reads of the task list, after a task event.
+    retask: Coalesce,
     completions: watch::Sender<Option<String>>,
     /// Bumped on every edit; the saver waits for it to go quiet.
     edits: watch::Sender<u64>,
@@ -200,6 +202,7 @@ pub fn spawn(
         active: Mutex::new(None),
         reread: Coalesce::default(),
         relist: Coalesce::default(),
+        retask: Coalesce::default(),
         completions,
         edits,
         resolved: Mutex::new(Default::default()),
@@ -208,6 +211,9 @@ pub fn spawn(
     });
     core.inbox.push(Update::HubMode(core.hub.mode()));
     tokio::spawn(core.clone().events());
+    if let Some(tasks) = core.hub.task_events() {
+        tokio::spawn(core.clone().task_events(tasks));
+    }
     tokio::spawn(core.clone().complete_directories(completion_rx));
     tokio::spawn(core.clone().save_config(edits_rx));
     tokio::spawn(core.clone().watch_agents());
@@ -422,6 +428,7 @@ impl Core {
                     Err(err) => self.fail(err),
                 }
             }
+            Command::LoadDescendants { asid } => self.descendants(asid).await,
             Command::RefreshTasks => self.refresh_tasks().await,
             Command::CreateTask { goal, agent, cwd } => {
                 let goal = goal.trim().to_string();
@@ -592,6 +599,19 @@ impl Core {
         }
     }
 
+    /// The sessions below `asid` for the sub-agent panel. A failure leaves
+    /// the panel as it was.
+    async fn descendants(self: Arc<Self>, asid: AgentSessionId) {
+        match tokio::time::timeout(LIST_TIMEOUT, self.hub.descendants(&asid)).await {
+            Ok(Ok(sessions)) => self.inbox.push(Update::Descendants {
+                asid: asid.0,
+                sessions,
+            }),
+            Ok(Err(err)) => tracing::debug!(asid = %asid.0, %err, "descendants unavailable"),
+            Err(_) => tracing::debug!(asid = %asid.0, "descendants timed out"),
+        }
+    }
+
     /// Kick off one `list_sessions` per agent, briefly staggered so a cold
     /// attach storm does not spike the first frames.
     async fn spawn_lists(self: &Arc<Self>, agents: Vec<String>) {
@@ -718,6 +738,7 @@ impl Core {
                     }
                 });
                 tokio::spawn(self.clone().diff(asid.clone()));
+                tokio::spawn(self.clone().descendants(asid.clone()));
             }
             Ok(None) => match self.hub.open(asid).await {
                 Ok(snapshot) => {
@@ -734,6 +755,7 @@ impl Core {
                         "session open"
                     );
                     tokio::spawn(self.clone().diff(asid.clone()));
+                    tokio::spawn(self.clone().descendants(asid.clone()));
                 }
                 Err(err) => {
                     if self.active.lock().unwrap().as_ref() == Some(asid) {
@@ -942,6 +964,7 @@ impl Core {
                                 && *status == muqun_gateway::agents::AgentSessionStatus::Idle =>
                         {
                             tokio::spawn(self.clone().diff(asid.clone()));
+                            tokio::spawn(self.clone().descendants(asid.clone()));
                         }
                         _ => {}
                     }
@@ -964,6 +987,34 @@ impl Core {
                 Err(broadcast::error::RecvError::Closed) => return,
             }
         }
+    }
+
+    /// Follow the hub's task changes: any of them (or a lag, or a resync)
+    /// re-reads the task list, which stays the one source of the rows.
+    async fn task_events(self: Arc<Self>, mut events: broadcast::Receiver<TaskHubEvent>) {
+        loop {
+            match events.recv().await {
+                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => self.refresh_tasks_soon(),
+                Err(broadcast::error::RecvError::Closed) => return,
+            }
+        }
+    }
+
+    /// Re-read the task list in the background; a burst of events costs at
+    /// most one read in flight and one after it.
+    fn refresh_tasks_soon(self: &Arc<Self>) {
+        if !self.retask.begin() {
+            return;
+        }
+        let core = self.clone();
+        tokio::spawn(async move {
+            loop {
+                core.clone().refresh_tasks().await;
+                if !core.retask.again() {
+                    break;
+                }
+            }
+        });
     }
 
     /// Read the active session again when `asid` is it (or unnamed), else

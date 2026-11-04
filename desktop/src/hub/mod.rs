@@ -147,6 +147,19 @@ pub struct TaskDefaults {
     pub default_cwd: Option<String>,
 }
 
+/// A change to the delegated task list, from a hub that is told of them
+/// (the gateway's `task.updated` / `task.deleted` frames on `/api/ws`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskHubEvent {
+    Updated(Box<TaskRow>),
+    Deleted {
+        task_id: String,
+    },
+    /// Task events were missed (reconnect, or the gateway dropped some):
+    /// read the list again.
+    Resync,
+}
+
 /// Where a hub's sessions run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum HubMode {
@@ -324,6 +337,9 @@ pub trait SessionHub: Send + Sync {
         asid: &'a AgentSessionId,
         delivery: Option<&'a str>,
     ) -> HubFuture<'a, ()>;
+    /// Every session below `asid`, at any depth (sub-agents and theirs),
+    /// newest update first. Empty for a session with no children.
+    fn descendants<'a>(&'a self, asid: &'a AgentSessionId) -> HubFuture<'a, Vec<AgentSessionInfo>>;
     /// Timeline rows with a sequence above `after`, from the mirror.
     fn timeline_after<'a>(
         &'a self,
@@ -359,6 +375,11 @@ pub trait SessionHub: Send + Sync {
     fn list_peers(&self) -> HubFuture<'_, Vec<PeerMention>>;
     /// Every session event of every agent, in the order the runtime saw them.
     fn events(&self) -> broadcast::Receiver<AgentDomainEvent>;
+    /// Task changes as they happen, for a hub that is told of them; `None`
+    /// when the hub has no task ledger to follow.
+    fn task_events(&self) -> Option<broadcast::Receiver<TaskHubEvent>> {
+        None
+    }
 }
 
 /// Why a hub call did not happen.

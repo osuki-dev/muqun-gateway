@@ -26,6 +26,11 @@ use super::{
     TimelineCatchUp,
 };
 
+/// How deep `descendants` walks below the session asked about, and how many
+/// sessions it keeps (the gateway route's own bounds).
+const MAX_DESCENDANT_DEPTH: usize = 8;
+const MAX_DESCENDANTS: usize = 500;
+
 pub struct LocalHub {
     runtime: Arc<AgentRuntime>,
 }
@@ -537,6 +542,52 @@ impl SessionHub for LocalHub {
             let manager = self.manager_for_session(asid).await?;
             manager.agent().compact_session(&asid.0, delivery).await?;
             Ok(())
+        })
+    }
+
+    /// The gateway's `/descendants` walk: breadth first over every attached
+    /// agent's children listing, bounded in depth and size; an agent that
+    /// fails is skipped.
+    fn descendants<'a>(&'a self, asid: &'a AgentSessionId) -> HubFuture<'a, Vec<AgentSessionInfo>> {
+        Box::pin(async move {
+            let managers = self.runtime.all_managers().await;
+            let mut seen: std::collections::HashSet<String> =
+                [asid.0.clone()].into_iter().collect();
+            let mut found = Vec::new();
+            let mut frontier = vec![asid.0.clone()];
+            'walk: for _ in 0..MAX_DESCENDANT_DEPTH {
+                let mut next = Vec::new();
+                for parent in &frontier {
+                    let query = SessionQuery {
+                        parent_id: Some(parent.clone()),
+                        ..SessionQuery::default()
+                    };
+                    for manager in &managers {
+                        let Ok(children) = manager.sessions().list_sessions(&query).await else {
+                            continue;
+                        };
+                        for child in children {
+                            if !seen.insert(child.asid.0.clone()) {
+                                continue;
+                            }
+                            if found.len() >= MAX_DESCENDANTS {
+                                break 'walk;
+                            }
+                            self.runtime
+                                .record_session_route(&child.asid.0, manager.agent().kind())
+                                .await;
+                            next.push(child.asid.0.clone());
+                            found.push(child);
+                        }
+                    }
+                }
+                if next.is_empty() {
+                    break;
+                }
+                frontier = next;
+            }
+            found.sort_by_key(|session| std::cmp::Reverse(session.updated_ms));
+            Ok(found)
         })
     }
 

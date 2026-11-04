@@ -26,8 +26,8 @@ use tokio::sync::broadcast;
 
 use super::local::enrich_local_media;
 use super::{
-    CatalogView, HubError, HubFuture, HubMode, PeerMention, SessionHub, TaskDefaults, TaskRow,
-    TimelineCatchUp,
+    CatalogView, HubError, HubFuture, HubMode, PeerMention, SessionHub, TaskDefaults, TaskHubEvent,
+    TaskRow, TimelineCatchUp,
 };
 
 const EVENT_CAPACITY: usize = 4096;
@@ -91,6 +91,8 @@ pub struct RemoteHub {
     base: reqwest::Url,
     token: String,
     events: broadcast::Sender<AgentDomainEvent>,
+    /// `task.*` frames, which are not the session plane's events.
+    task_events: broadcast::Sender<TaskHubEvent>,
     /// Per session, the cursor of the next older history page.
     cursors: Mutex<HashMap<String, String>>,
 }
@@ -107,6 +109,7 @@ impl RemoteHub {
             base: reqwest::Url::parse(gateway.url.trim_end_matches('/'))?,
             token: gateway.token,
             events: broadcast::channel(EVENT_CAPACITY).0,
+            task_events: broadcast::channel(EVENT_CAPACITY).0,
             cursors: Mutex::new(HashMap::new()),
         });
         tokio::spawn(event_socket(hub.clone()));
@@ -183,8 +186,18 @@ impl RemoteHub {
     }
 
     async fn read_snapshot(&self, asid: &AgentSessionId) -> Result<AgentSessionSnapshot, HubError> {
+        self.read_window(asid, &[]).await
+    }
+
+    /// The newest history window; `retained=true` in `query` asks the gateway
+    /// to answer from what it already holds, without preparing the session.
+    async fn read_window(
+        &self,
+        asid: &AgentSessionId,
+        query: &[(&str, &str)],
+    ) -> Result<AgentSessionSnapshot, HubError> {
         let json = self
-            .session_call(Method::GET, asid, &["timeline", "window"], &[], None)
+            .session_call(Method::GET, asid, &["timeline", "window"], query, None)
             .await?;
         let data = json.get("data").cloned().unwrap_or(Value::Null);
         {
@@ -283,6 +296,10 @@ fn map_error(status: u16, body: &Value, asid: &str, raw: &str) -> HubError {
                 .to_string(),
         )),
         (_, Some("history_cursor_lost")) => HubError::Agent(AgentError::HistoryCursorLost),
+        // A retained-only read of a session the gateway holds nothing for.
+        (404, Some("not_retained")) => {
+            HubError::Agent(AgentError::SessionNotFound(asid.to_string()))
+        }
         (_, Some("inbox_item_not_found")) => {
             HubError::Agent(AgentError::InboxItemNotFound(message))
         }
@@ -424,13 +441,16 @@ impl SessionHub for RemoteHub {
         })
     }
 
-    /// The gateway has no route that reads retained history without possibly
-    /// waking the agent, so a remote open is always a cold one.
-    fn peek<'a>(
-        &'a self,
-        _asid: &'a AgentSessionId,
-    ) -> HubFuture<'a, Option<AgentSessionSnapshot>> {
-        Box::pin(async { Ok(None) })
+    /// What the gateway already retains, read without preparing the session
+    /// (`retained=true`). `None` when it holds nothing: the open is cold.
+    fn peek<'a>(&'a self, asid: &'a AgentSessionId) -> HubFuture<'a, Option<AgentSessionSnapshot>> {
+        Box::pin(async move {
+            match self.read_window(asid, &[("retained", "true")]).await {
+                Ok(snapshot) => Ok(Some(snapshot)),
+                Err(HubError::Agent(AgentError::SessionNotFound(_))) => Ok(None),
+                Err(err) => Err(err),
+            }
+        })
     }
 
     fn snapshot<'a>(&'a self, asid: &'a AgentSessionId) -> HubFuture<'a, AgentSessionSnapshot> {
@@ -930,6 +950,19 @@ impl SessionHub for RemoteHub {
         })
     }
 
+    fn descendants<'a>(&'a self, asid: &'a AgentSessionId) -> HubFuture<'a, Vec<AgentSessionInfo>> {
+        Box::pin(async move {
+            let json = self
+                .session_call(Method::GET, asid, &["descendants"], &[], None)
+                .await?;
+            decode(
+                json.pointer("/data/data")
+                    .cloned()
+                    .unwrap_or(Value::Array(Vec::new())),
+            )
+        })
+    }
+
     fn timeline_after<'a>(
         &'a self,
         asid: &'a AgentSessionId,
@@ -1069,6 +1102,10 @@ impl SessionHub for RemoteHub {
     fn events(&self) -> broadcast::Receiver<AgentDomainEvent> {
         self.events.subscribe()
     }
+
+    fn task_events(&self) -> Option<broadcast::Receiver<TaskHubEvent>> {
+        Some(self.task_events.subscribe())
+    }
 }
 
 impl RemoteHub {
@@ -1161,14 +1198,19 @@ async fn run_socket(hub: &RemoteHub, first: &mut bool) -> Result<(), String> {
             asid: AgentSessionId(String::new()),
             reason: "reconnected".into(),
         });
+        let _ = hub.task_events.send(TaskHubEvent::Resync);
     }
     while let Some(message) = socket.next().await {
         match message.map_err(|e| e.to_string())? {
-            Message::Text(text) => {
-                if let Some(event) = parse_frame(text.as_str()) {
-                    let _ = hub.events.send(event);
+            Message::Text(text) => match parse_frame(text.as_str()) {
+                Some(Frame::Agent(event)) => {
+                    let _ = hub.events.send(*event);
                 }
-            }
+                Some(Frame::Task(event)) => {
+                    let _ = hub.task_events.send(event);
+                }
+                None => {}
+            },
             Message::Close(_) => return Ok(()),
             _ => {}
         }
@@ -1176,25 +1218,58 @@ async fn run_socket(hub: &RemoteHub, first: &mut bool) -> Result<(), String> {
     Ok(())
 }
 
-/// One server frame as a domain event: `event` frames carry the event's own
-/// JSON in `data`; `resync` asks for a re-read. Everything else (hello,
-/// subscribed, task frames) is not the session plane's.
-fn parse_frame(text: &str) -> Option<AgentDomainEvent> {
+/// What one server frame carries: a session event, or a task change.
+#[derive(Debug, PartialEq)]
+enum Frame {
+    Agent(Box<AgentDomainEvent>),
+    Task(TaskHubEvent),
+}
+
+/// One server frame. `event` frames carry the event's own JSON in `data`: a
+/// session event, or -- named `task.updated` / `task.deleted` -- the task as
+/// `GET /api/tasks` shows it. `resync` asks for a re-read, of the tasks when
+/// it says `tasks: true`. Everything else (hello, subscribed) is neither's.
+fn parse_frame(text: &str) -> Option<Frame> {
     let frame: Value = serde_json::from_str(text).ok()?;
     match frame.get("t")?.as_str()? {
+        "event" if frame_event_name(&frame).is_some_and(|n| n.starts_with("task.")) => {
+            parse_task_frame(&frame).map(Frame::Task)
+        }
         "event" => match serde_json::from_value(frame.get("data")?.clone()) {
-            Ok(event) => Some(event),
+            Ok(event) => Some(Frame::Agent(Box::new(event))),
             Err(err) => {
                 tracing::debug!(%err, "event frame not understood");
                 None
             }
         },
-        "resync" if frame.get("tasks").and_then(Value::as_bool) != Some(true) => {
-            Some(AgentDomainEvent::Resync {
-                asid: AgentSessionId(frame.get("asid")?.as_str()?.to_string()),
-                reason: "gateway".into(),
-            })
+        "resync" if frame.get("tasks").and_then(Value::as_bool) == Some(true) => {
+            Some(Frame::Task(TaskHubEvent::Resync))
         }
+        "resync" => Some(Frame::Agent(Box::new(AgentDomainEvent::Resync {
+            asid: AgentSessionId(frame.get("asid")?.as_str()?.to_string()),
+            reason: "gateway".into(),
+        }))),
+        _ => None,
+    }
+}
+
+fn frame_event_name(frame: &Value) -> Option<&str> {
+    frame.get("event")?.as_str()
+}
+
+fn parse_task_frame(frame: &Value) -> Option<TaskHubEvent> {
+    let data = frame.get("data")?;
+    match frame_event_name(frame)? {
+        "task.updated" => match TaskRow::from_json(data) {
+            Ok(row) => Some(TaskHubEvent::Updated(Box::new(row))),
+            Err(err) => {
+                tracing::debug!(%err, "task frame not understood");
+                None
+            }
+        },
+        "task.deleted" => Some(TaskHubEvent::Deleted {
+            task_id: data.get("task_id")?.as_str()?.to_string(),
+        }),
         _ => None,
     }
 }
@@ -1279,8 +1354,44 @@ mod tests {
             (r#"{"t":"resync","asid":"","tasks":true}"#, None),
             (r#"{"t":"hello","connection_id":"c"}"#, None),
             (r#"{"t":"event","data":{"type":"nonsense"}}"#, None),
+            (
+                r#"{"t":"event","asid":null,"seq":1,"event":"task.updated","data":{"task_id":"t"}}"#,
+                None,
+            ),
         ] {
-            assert_eq!(parse_frame(frame).map(|e| e.event_name()), want, "{frame}");
+            let got = match parse_frame(frame) {
+                Some(Frame::Agent(event)) => Some(event.event_name()),
+                _ => None,
+            };
+            assert_eq!(got, want, "{frame}");
+        }
+    }
+
+    #[test]
+    fn task_frames_become_task_events() {
+        let updated = r#"{"t":"event","asid":null,"seq":3,"event":"task.updated","data":{"task_id":"t_1","state":"working","goal":"g","title":"g","origin":"device","binding":{"kind":"agent_session","agent_id":"codex","asid":"ses_1"}}}"#;
+        let Some(Frame::Task(TaskHubEvent::Updated(row))) = parse_frame(updated) else {
+            panic!("a task.updated frame is a task update");
+        };
+        assert_eq!((row.id.as_str(), row.state.as_str()), ("t_1", "working"));
+        assert_eq!(row.asid.as_deref(), Some("ses_1"));
+        assert_eq!(
+            parse_frame(
+                r#"{"t":"event","asid":null,"seq":4,"event":"task.deleted","data":{"task_id":"t_1"}}"#
+            ),
+            Some(Frame::Task(TaskHubEvent::Deleted {
+                task_id: "t_1".into()
+            }))
+        );
+        assert_eq!(
+            parse_frame(r#"{"t":"resync","asid":"","tasks":true}"#),
+            Some(Frame::Task(TaskHubEvent::Resync))
+        );
+        for bad in [
+            r#"{"t":"event","event":"task.deleted","data":{}}"#,
+            r#"{"t":"event","event":"task.unknown","data":{}}"#,
+        ] {
+            assert_eq!(parse_frame(bad), None, "{bad}");
         }
     }
 
@@ -1290,6 +1401,10 @@ mod tests {
         assert!(matches!(
             map_error(404, &body("session_not_found"), "x", ""),
             HubError::SessionNotFound(a) if a == "x"
+        ));
+        assert!(matches!(
+            map_error(404, &body("not_retained"), "x", ""),
+            HubError::Agent(AgentError::SessionNotFound(a)) if a == "x"
         ));
         assert!(matches!(
             map_error(409, &body("history_cursor_lost"), "x", ""),

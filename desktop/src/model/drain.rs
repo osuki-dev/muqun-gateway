@@ -261,6 +261,7 @@ impl Drain {
                     bindings.diff.signal().set(None);
                     bindings.diff_panel.signal().set(false);
                     bindings.diff_focus.signal().set(None);
+                    bindings.descendants.signal().set(Arc::new(Vec::new()));
                     if let Some(header) = header {
                         bindings.header.signal().set(header);
                     }
@@ -296,6 +297,7 @@ impl Drain {
                     bindings.diff_panel.signal().set(false);
                     bindings.diff_focus.signal().set(None);
                     bindings.selected.signal().set(None);
+                    bindings.descendants.signal().set(Arc::new(Vec::new()));
                     bindings.header.signal().set(None);
                     bindings.order.signal().set(Arc::new(Default::default()));
                 }
@@ -664,6 +666,7 @@ fn batch_kinds(batch: &[Update]) -> String {
             Update::KnownProjects { .. } => "known_projects",
             Update::Diff(_) => "diff",
             Update::Tasks { .. } => "tasks",
+            Update::Descendants { .. } => "descendants",
             Update::HubMode(_) => "hub_mode",
         };
         match counts.iter_mut().find(|(k, _)| *k == kind) {
@@ -709,6 +712,7 @@ struct Rest {
     diff: Option<Option<super::view::DiffStat>>,
     tasks: Option<Arc<Vec<crate::hub::TaskRow>>>,
     task_cwd: Option<Option<String>>,
+    descendants: Option<Arc<Vec<muqun_gateway::agents::AgentSessionInfo>>>,
 }
 
 impl Rest {
@@ -732,6 +736,7 @@ impl Rest {
             diff: (c.diff || c.selected).then(|| view.diff.clone()),
             tasks: c.tasks.then(|| Arc::new(view.tasks.clone())),
             task_cwd: c.tasks.then(|| view.task_cwd.clone()),
+            descendants: c.descendants.then(|| Arc::new(view.descendants.clone())),
         }
     }
 }
@@ -829,6 +834,9 @@ impl Planned {
         }
         if let Some(tasks) = rest.tasks {
             b.tasks.signal().set(tasks);
+        }
+        if let Some(descendants) = rest.descendants {
+            b.descendants.signal().set(descendants);
         }
         if let Some(cwd) = rest.task_cwd {
             if b.task_cwd.get() != cwd {

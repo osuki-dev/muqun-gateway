@@ -132,6 +132,14 @@ impl Strings {
         }
     }
 
+    /// "from Pixel": the device a message was sent from.
+    pub fn origin_label(&self, name: &str) -> String {
+        match self.language() {
+            Language::En => format!("from {name}"),
+            Language::ZhCn => format!("来自 {name}"),
+        }
+    }
+
     /// "2 attachments". Kept for callers that only have a count.
     #[allow(dead_code)]
     pub fn attachments(&self, n: usize) -> String {
