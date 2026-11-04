@@ -6127,4 +6127,88 @@ mod tests {
         delegate(open(None, Some("high"))).await.unwrap();
         assert_eq!(created.lock().unwrap().last().unwrap(), &None);
     }
+
+    /// A goal another computer handed here, as `POST /api/tasks` records it
+    /// for a gateway caller.
+    fn from_peer() -> Requested {
+        Requested {
+            forwarding: crate::tasks::domain::ForwardingContext::Unknown,
+            by: TaskPrincipal {
+                kind: PrincipalKind::Device,
+                id: "studio".into(),
+            },
+            origin: TaskOrigin::Peer,
+            parent: None,
+            name: Some("studio".into()),
+            server_id: Some("server-studio".into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_peer_goal_for_claude_or_codex_takes_the_pane_while_a_local_one_runs_natively() {
+        for kind in ["claude", "codex"] {
+            let mut state = test_state("admin", Vec::new());
+            state.config.agent_commands.insert(kind.into(), "sh".into());
+            assert!(crate::mcp::inject::enabled(&state.config));
+            let agent = FakeAgent::new(kind).with_sessions(&[("native_new", 1)]);
+            let calls = agent.calls.clone();
+            state.agent_runtime.attach_for_test(agent.manager()).await;
+            let asked = || {
+                let mut asked = request(None);
+                asked.agent_id = Some(kind.into());
+                asked
+            };
+
+            // From another computer: the native session would inherit the
+            // shared runtime credential, so the goal goes to the pane, whose
+            // helper is bound to the task. It is not refused, and the native
+            // adapter is never asked (the test has no terminal to start in).
+            let peer = state
+                .tasks
+                .delegate(&state, from_peer(), asked())
+                .await
+                .unwrap_err();
+            assert!(
+                !matches!(peer, TaskError::DelegationScopeUnsupported),
+                "{kind}: {peer:?}"
+            );
+            assert!(matches!(peer, TaskError::Backend(_)), "{kind}: {peer:?}");
+            assert!(calls.lock().unwrap().is_empty(), "{kind}");
+
+            // From this computer: the agent's native session.
+            let local = state
+                .tasks
+                .delegate(&state, Requested::mcp(assistant("a")), asked())
+                .await
+                .unwrap();
+            assert!(
+                matches!(local.binding, TaskBinding::AgentSession { .. }),
+                "{kind}: {:?}",
+                local.binding
+            );
+            assert_eq!(*calls.lock().unwrap(), ["create_session", "send_prompt"]);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_peer_goal_is_refused_when_no_pane_can_bind_its_credential() {
+        let mut state = test_state("admin", Vec::new());
+        state
+            .config
+            .agent_commands
+            .insert("claude".into(), "sh".into());
+        state.config.mcp.inject_into_agents = false;
+        let agent = FakeAgent::new("claude").with_sessions(&[("native_new", 1)]);
+        let calls = agent.calls.clone();
+        state.agent_runtime.attach_for_test(agent.manager()).await;
+        let mut asked = request(None);
+        asked.agent_id = Some("claude".into());
+        let refused = state
+            .tasks
+            .delegate(&state, from_peer(), asked)
+            .await
+            .unwrap_err();
+        assert!(matches!(refused, TaskError::DelegationScopeUnsupported));
+        assert!(calls.lock().unwrap().is_empty());
+    }
 }
