@@ -1075,3 +1075,104 @@ async fn repeated_follows_of_one_terminal_session_keep_one_follower() {
     assert!(driver.followers.lock().unwrap().is_empty());
     driver.shutdown().await;
 }
+
+/// An agent whose bypass is a launch flag and an environment variable.
+struct LaunchBypassFixture;
+impl AcpProvider for LaunchBypassFixture {
+    const KIND: &'static str = "cursor";
+    const LABEL: &'static str = "Bypass fixture";
+    const ARGS: &'static [&'static str] = &["acp"];
+    const REQUIRE_MESSAGE_ID: bool = true;
+    const MODEL_SELECTION: bool = true;
+    const LAUNCH_BYPASS: Option<LaunchBypass> = Some(LaunchBypass {
+        before: &["--force"],
+        after: &["--after"],
+        env: &[("FX_PERMISSION_MODE", "full-access")],
+    });
+}
+
+fn launches(fixture: &Fixture) -> Vec<String> {
+    std::fs::read_to_string(fixture.directory.join("launches.log"))
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+// The switch relaunches the session's own child with the flag (and its
+// environment) added or removed and loads the same session; a running turn
+// is refused, not killed, and its pending approval is left to the owner.
+#[tokio::test]
+async fn launch_scoped_auto_approve_relaunches_the_session_and_refuses_a_busy_one() {
+    let fixture = Fixture::new().await;
+    let binary = fixture.directory.join("mock-fx");
+    let script = std::fs::read_to_string(&binary).unwrap().replace(
+        "    if method=='initialize':\n",
+        "    if method=='initialize':\n        open('launches.log','a').write(' '.join(sys.argv[1:])+'|'+os.environ.get('FX_PERMISSION_MODE','-')+'\\n')\n",
+    );
+    std::fs::write(&binary, script).unwrap();
+    let driver = AcpDriver::<LaunchBypassFixture>::new(
+        fixture.driver.binary.clone(),
+        fixture.driver.default_directory.clone(),
+        Arc::new(MemoryMirror::for_agent("cursor")),
+        broadcast::channel(256).0,
+    );
+    let info = driver.create_session(None, None, None).await.unwrap();
+    let id = info.asid.0.as_str();
+    assert_eq!(launches(&fixture), ["acp|-"]);
+    assert_eq!(driver.auto_approve(id).await.unwrap(), Some(false));
+
+    for (enabled, launched) in [(true, "--force acp --after|full-access"), (false, "acp|-")] {
+        driver.set_auto_approve(id, enabled).await.unwrap();
+        assert_eq!(driver.auto_approve(id).await.unwrap(), Some(enabled));
+        assert_eq!(launches(&fixture).last().unwrap(), launched);
+        assert!(driver
+            .retained(id)
+            .unwrap()
+            .connected
+            .load(Ordering::Acquire));
+    }
+    assert_eq!(launches(&fixture).len(), 3);
+    let loads = |fixture: &Fixture| {
+        fixture
+            .methods()
+            .iter()
+            .filter(|method| *method == "session/load")
+            .count()
+    };
+    assert_eq!(loads(&fixture), 2);
+
+    // A turn waits on an approval: refused, same process, nothing resolved.
+    driver.send_prompt(id, "approval", &[], None).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while driver
+            .retained(id)
+            .unwrap()
+            .state
+            .lock()
+            .await
+            .permissions
+            .is_empty()
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let refusal = driver.set_auto_approve(id, true).await.unwrap_err();
+    assert!(refusal
+        .to_string()
+        .contains("Bypass fixture is working; switch YOLO when it is idle"));
+    assert_eq!(driver.auto_approve(id).await.unwrap(), Some(false));
+    assert_eq!(launches(&fixture).len(), 3);
+    assert_eq!(loads(&fixture), 2);
+    assert!(!driver
+        .retained(id)
+        .unwrap()
+        .state
+        .lock()
+        .await
+        .permissions
+        .is_empty());
+    driver.shutdown().await;
+}

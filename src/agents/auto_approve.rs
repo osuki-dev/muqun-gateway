@@ -11,9 +11,11 @@ use serde_json::{json, Value};
 /// Where the agent's bypass control lives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BypassScope {
-    /// Switchable on a live session through the agent's own protocol.
+    /// Switchable on a live session: through the agent's own protocol, or
+    /// (a launch flag) by relaunching that session's process with it.
     Session,
-    /// A process flag or environment of the agent: new processes only.
+    /// A process flag or environment of the agent that no session switch
+    /// reaches: new processes only.
     Launch,
 }
 
@@ -50,15 +52,15 @@ pub fn native_bypass(kind: &str) -> Option<NativeBypass> {
         },
         "antigravity" => NativeBypass {
             native: "--dangerously-skip-permissions",
-            scope: BypassScope::Launch,
+            scope: BypassScope::Session,
         },
         "cursor" => NativeBypass {
             native: "--force",
-            scope: BypassScope::Launch,
+            scope: BypassScope::Session,
         },
         "fx" => NativeBypass {
             native: "full-access",
-            scope: BypassScope::Launch,
+            scope: BypassScope::Session,
         },
         "pi" => NativeBypass {
             native: "MUQUN_PI_APPROVALS=never",
@@ -138,10 +140,10 @@ mod tests {
             (
                 "antigravity",
                 Some("--dangerously-skip-permissions"),
-                Some(BypassScope::Launch),
+                Some(BypassScope::Session),
             ),
-            ("cursor", Some("--force"), Some(BypassScope::Launch)),
-            ("fx", Some("full-access"), Some(BypassScope::Launch)),
+            ("cursor", Some("--force"), Some(BypassScope::Session)),
+            ("fx", Some("full-access"), Some(BypassScope::Session)),
             (
                 "pi",
                 Some("MUQUN_PI_APPROVALS=never"),
@@ -179,7 +181,8 @@ mod tests {
     fn the_feature_states_scope_and_native_name() {
         assert_eq!(feature("claude")["scope"], "session");
         assert_eq!(feature("claude")["native"], "bypassPermissions");
-        assert_eq!(feature("antigravity")["scope"], "launch");
+        assert_eq!(feature("antigravity")["scope"], "session");
+        assert_eq!(feature("pi")["scope"], "launch");
         assert_eq!(feature("deepseek"), json!({ "scope": "none" }));
     }
 }
