@@ -140,6 +140,17 @@ pub trait SessionHub: Send + Sync {
         model: &'a ModelRef,
     ) -> HubFuture<'a, ()>;
     fn switch_mode<'a>(&'a self, asid: &'a AgentSessionId, mode: &'a str) -> HubFuture<'a, ()>;
+    /// Whether the session runs in the agent's own bypass mode ("YOLO": the
+    /// agent stops asking). `false` for an agent without such a control.
+    fn auto_approve<'a>(&'a self, asid: &'a AgentSessionId) -> HubFuture<'a, bool>;
+    /// Switch that bypass mode for this session; the answer is what the
+    /// agent reports afterwards. The gateway may refuse
+    /// (`allow_remote_auto_approve` off), which is an error here.
+    fn set_auto_approve<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+        enabled: bool,
+    ) -> HubFuture<'a, bool>;
     /// Rename the session in the agent that owns it.
     fn rename<'a>(&'a self, asid: &'a AgentSessionId, title: &'a str) -> HubFuture<'a, ()>;
     /// Delete the session and drop it from the mirror.

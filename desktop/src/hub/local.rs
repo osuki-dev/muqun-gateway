@@ -378,6 +378,35 @@ impl SessionHub for LocalHub {
         })
     }
 
+    fn auto_approve<'a>(&'a self, asid: &'a AgentSessionId) -> HubFuture<'a, bool> {
+        Box::pin(async move {
+            let manager = self.manager_for_session(asid).await?;
+            Ok(manager
+                .agent()
+                .auto_approve(&asid.0)
+                .await?
+                .unwrap_or(false))
+        })
+    }
+
+    // The route's use case (`do_set_auto_approve`) minus its device gate:
+    // in this process the owner is the only caller.
+    fn set_auto_approve<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+        enabled: bool,
+    ) -> HubFuture<'a, bool> {
+        Box::pin(async move {
+            let manager = self.manager_for_session(asid).await?;
+            manager.agent().set_auto_approve(&asid.0, enabled).await?;
+            Ok(manager
+                .agent()
+                .auto_approve(&asid.0)
+                .await?
+                .unwrap_or(false))
+        })
+    }
+
     fn rename<'a>(&'a self, asid: &'a AgentSessionId, title: &'a str) -> HubFuture<'a, ()> {
         Box::pin(async move {
             let manager = self.manager_for_session(asid).await?;

@@ -78,6 +78,7 @@ pub enum MenuId {
     Effort,
     Branch,
     Usage,
+    Yolo,
 }
 
 #[derive(Clone)]
@@ -108,6 +109,11 @@ pub struct Cmp {
     /// The text area's height in rows (2 to 6).
     pub rows: State<usize>,
     pub branches: State<Arc<HashMap<String, BranchInfo>>>,
+    /// Per session: does the agent run in its bypass mode (YOLO)? Absent
+    /// until the gateway has answered.
+    pub yolo: State<Arc<HashMap<String, bool>>>,
+    /// A files drag is over the window (the card's drop highlight).
+    pub drop_hover: State<bool>,
 }
 
 impl Cmp {
@@ -135,6 +141,8 @@ impl Cmp {
             submitting: ctx.use_state_keyed("mq.cmp.submitting", || None),
             rows: ctx.use_state_keyed("mq.cmp.rows", || 2usize),
             branches: ctx.use_state_keyed("mq.cmp.branches", || Arc::new(HashMap::new())),
+            yolo: ctx.use_state_keyed("mq.cmp.yolo", || Arc::new(HashMap::new())),
+            drop_hover: ctx.use_state_keyed("mq.cmp.drop_hover", || false),
         }
     }
 }
@@ -172,6 +180,8 @@ struct Local {
     /// When the menu last closed itself on an outside press: the press that
     /// closed it must not also reopen it through the pill's click.
     menu_closed_at: Option<(MenuId, std::time::Instant)>,
+    /// A YOLO switch has been asked of the gateway and not yet answered.
+    yolo_switching: bool,
 }
 
 thread_local! {
@@ -219,6 +229,18 @@ pub fn ask_due(key: &str, answered: bool, retry: std::time::Duration) -> bool {
         }
         due
     })
+}
+
+/// Forget that `key` was asked, so the next [`ask_due`] fires at once.
+pub fn forget_asked(key: &str) {
+    with(|l| {
+        l.asked.remove(key);
+    });
+}
+
+/// Claim the one YOLO switch that may be in flight; false when one is.
+pub fn begin_yolo_switch() -> bool {
+    with(|l| !std::mem::replace(&mut l.yolo_switching, true))
 }
 
 pub fn draft_changed(key: &str, text: &str) -> bool {
@@ -301,6 +323,16 @@ pub fn apply_update(update: ComposerUpdate) {
             let mut next = (*cmp.branches.get()).clone();
             next.insert(cwd, info);
             cmp.branches.signal().set(Arc::new(next));
+        }
+        ComposerUpdate::AutoApprove { asid, enabled } => {
+            with(|l| l.yolo_switching = false);
+            if let Some(on) = enabled {
+                if cmp.yolo.get().get(&asid) != Some(&on) {
+                    let mut next = (*cmp.yolo.get()).clone();
+                    next.insert(asid, on);
+                    cmp.yolo.signal().set(Arc::new(next));
+                }
+            }
         }
         ComposerUpdate::Peers { peers } => {
             cmp.peers.signal().set(Arc::new(peers));

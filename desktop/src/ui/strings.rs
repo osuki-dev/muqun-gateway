@@ -135,6 +135,8 @@ strings! {
     model_default => "Model", "模型";
     model_search => "Search models", "搜索模型";
     mode_word => "Mode", "模式";
+    yolo_word => "YOLO", "YOLO";
+    yolo_turn_on => "Turn it on", "开启";
     effort_default => "Effort", "强度";
     current_branch => "current", "当前";
     new_worktree => "Start in a new worktree…", "在新 worktree 开始…";
@@ -166,6 +168,17 @@ impl Strings {
         match self.language() {
             Language::En => format!("{name}: {why}. Remove it to send."),
             Language::ZhCn => format!("{name}：{why}。移除后才能发送。"),
+        }
+    }
+
+    pub fn yolo_confirm(&self, agent: &str, native: &str) -> String {
+        match self.language() {
+            Language::En => format!(
+                "{agent} will run tools without asking, in its own {native} mode. Nothing is checked on the way. Only this session."
+            ),
+            Language::ZhCn => format!(
+                "{agent} 将以自己的 {native} 模式直接运行工具，不再询问，途中不做任何检查。仅对本会话生效。"
+            ),
         }
     }
 

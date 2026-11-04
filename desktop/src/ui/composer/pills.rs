@@ -9,7 +9,7 @@
 use std::cell::RefCell;
 use std::sync::Arc;
 
-use blinc_cn::prelude::{input, InputSize};
+use blinc_cn::prelude::{input, ColorToken, InputSize, ThemeState};
 use blinc_layout::prelude::*;
 use blinc_layout::widgets::overlay::AnchorDirection;
 use blinc_layout::widgets::overlay_stack::{OverlayBuilder, OverlayHandle};
@@ -400,6 +400,9 @@ pub fn row(app: &App, aim: &Aim) -> Div {
     let modes = visible_modes(aim);
     if !modes.is_empty() {
         pills = pills.child(mode_pill(app, aim, side));
+    }
+    if let Some(pill) = yolo_pill(app, aim, side) {
+        pills = pills.child(pill);
     }
     if let Some(model) = selected_model(aim, &models) {
         if model.variants.as_ref().is_some_and(|v| !v.is_empty()) {
@@ -1055,6 +1058,89 @@ fn mode_pill(app: &App, aim: &Aim, side: Side) -> Div {
         }
         menu
     })
+}
+
+/// What discovery says about the agent's own "approve everything" control:
+/// its native name, when a running session can be switched
+/// (`features.autoApprove.scope == "session"`).
+pub(super) fn session_bypass(app: &App, agent: &str) -> Option<String> {
+    let agents = app.bindings.agents.get();
+    let found = agents.iter().find(|a| a.id == agent)?;
+    let control = found.features.extra.get("autoApprove")?;
+    if control.get("scope")?.as_str()? != "session" {
+        return None;
+    }
+    Some(control.get("native")?.as_str()?.to_string())
+}
+
+/// Ask the gateway to switch YOLO; one switch at a time, and the chip moves
+/// only when the agent has answered.
+fn switch_yolo(app: &App, asid: &muqun_gateway::agents::AgentSessionId, enabled: bool) {
+    if state::begin_yolo_switch() {
+        app.send(Command::Compose(ComposeCommand::SetAutoApprove {
+            asid: asid.clone(),
+            enabled,
+        }));
+    }
+}
+
+/// YOLO, as the App's context sheet offers it, for an open session whose
+/// agent has a session-scoped bypass. Off: a click asks first (the App's
+/// confirmation); on: a click turns it off. A new conversation has no
+/// session to switch yet -- the App offers nothing there either.
+fn yolo_pill(app: &App, aim: &Aim, side: Side) -> Option<Div> {
+    let asid = aim.asid()?;
+    let native = session_bypass(app, &aim.agent)?;
+    let on = Cmp::get().yolo.get().get(&asid.0).copied() == Some(true);
+    let label = app.strings.yolo_word().to_string();
+    if on {
+        let icon = crate::ui::glyphs::icon(Glyph::TrustWarning, 14.0)
+            .tint(ThemeState::get().color(ColorToken::Warning));
+        let app = app.clone();
+        let off = pill(Some(div().flex_shrink_0().child(icon)), label, false, false)
+            .class("mq-pill--yolo")
+            .cursor_pointer()
+            .on_click(move |_| switch_yolo(&app, &asid, false));
+        return Some(div().flex_shrink_0().child(off));
+    }
+    let open = Cmp::get().menu.get() == Some(MenuId::Yolo);
+    let p = pill(Some(glyph_box(Glyph::TrustWarning)), label, false, open).cursor_pointer();
+    let app = app.clone();
+    let warning = app.strings.yolo_confirm(&aim.agent_name, &native);
+    // The note (about three wrapped lines) plus two rows.
+    let height = menu_height(2, 0) + 64.0;
+    Some(host(MenuId::Yolo, side, p, (280.0, height), move || {
+        let mut menu = div().flex_col().w(260.0).child(
+            div()
+                .class("mq-menu-note")
+                .child(ui_text(warning.clone()).size(12.0).no_cursor()),
+        );
+        let turn_on = app.clone();
+        let asid = asid.clone();
+        menu = menu.child(action_row(
+            div().child(
+                ui_text(turn_on.strings.yolo_turn_on())
+                    .size(13.0)
+                    .no_wrap()
+                    .no_cursor(),
+            ),
+            false,
+            move || {
+                switch_yolo(&turn_on, &asid, true);
+                close_menu();
+            },
+        ));
+        menu.child(action_row(
+            div().child(
+                ui_text(app.strings.cancel())
+                    .size(13.0)
+                    .no_wrap()
+                    .no_cursor(),
+            ),
+            false,
+            close_menu,
+        ))
+    }))
 }
 
 fn effort_pill(app: &App, aim: &Aim, model: &ModelInfo, side: Side) -> Div {

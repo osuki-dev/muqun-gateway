@@ -191,6 +191,15 @@ pub enum ComposeCommand {
         asid: AgentSessionId,
         mode: String,
     },
+    /// Read whether the session runs in the agent's bypass mode (YOLO).
+    AutoApprove {
+        asid: AgentSessionId,
+    },
+    /// Switch it; the answer is the state the agent reports afterwards.
+    SetAutoApprove {
+        asid: AgentSessionId,
+        enabled: bool,
+    },
     InboxCancel {
         asid: AgentSessionId,
         item: String,
@@ -249,6 +258,12 @@ pub enum ComposerUpdate {
     },
     Peers {
         peers: Vec<PeerMention>,
+    },
+    /// The bypass state of one session; `None` when it could not be read
+    /// (the shown state stays, and a pending switch is over).
+    AutoApprove {
+        asid: String,
+        enabled: Option<bool>,
     },
 }
 
@@ -364,6 +379,32 @@ pub async fn run(
         }
         ComposeCommand::SwitchModel { asid, model } => hub.switch_model(&asid, &model).await.err(),
         ComposeCommand::SwitchMode { asid, mode } => hub.switch_mode(&asid, &mode).await.err(),
+        ComposeCommand::AutoApprove { asid } => {
+            let enabled = hub.auto_approve(&asid).await.ok();
+            push(
+                &inbox,
+                ComposerUpdate::AutoApprove {
+                    asid: asid.0,
+                    enabled,
+                },
+            );
+            None
+        }
+        ComposeCommand::SetAutoApprove { asid, enabled } => {
+            let (shown, error) = match hub.set_auto_approve(&asid, enabled).await {
+                Ok(now) => (Some(now), None),
+                // Show what the agent really has, and the gateway's reason.
+                Err(err) => (hub.auto_approve(&asid).await.ok(), Some(err)),
+            };
+            push(
+                &inbox,
+                ComposerUpdate::AutoApprove {
+                    asid: asid.0,
+                    enabled: shown,
+                },
+            );
+            error
+        }
         ComposeCommand::InboxCancel { asid, item } => hub.inbox_cancel(&asid, &item).await.err(),
         ComposeCommand::InboxDelivery { asid, item, steer } => hub
             .inbox_delivery(&asid, &item, if steer { "steer" } else { "queue" })

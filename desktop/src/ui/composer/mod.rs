@@ -14,6 +14,7 @@
 //! back out) or the caret has moved (and is put back).
 
 pub(crate) mod chips;
+mod dropped;
 pub mod pills;
 mod popup;
 pub mod qa;
@@ -283,6 +284,14 @@ fn ensure_loaded(app: &App, aim: &Aim) {
             });
         }
     }
+    if let Some(asid) = aim.asid() {
+        if pills::session_bypass(app, &aim.agent).is_some() {
+            let known = Cmp::get().yolo.get().contains_key(&asid.0);
+            if state::ask_due(&format!("yolo\u{1f}{}", asid.0), known, retry) {
+                app.send(Command::Compose(ComposeCommand::AutoApprove { asid }));
+            }
+        }
+    }
     let peers_known = !Cmp::get().peers.get().is_empty();
     if state::ask_due("peers", peers_known, std::time::Duration::from_secs(30)) {
         app.send(Command::Compose(ComposeCommand::ListPeers));
@@ -332,6 +341,8 @@ fn sync_surface(app: &App, key: &str) {
     if cmp.rows.get() != rows {
         cmp.rows.signal().set(rows);
     }
+    // A session's YOLO state is read again each time it comes to the front.
+    state::forget_asked(&format!("yolo\u{1f}{key}"));
     if key == START_DRAFT || state::inbox_of().as_deref() != Some(key) {
         state::clear_inbox();
     }
@@ -933,8 +944,10 @@ pub fn files_picked(app: &App, paths: Vec<PathBuf>) {
     }
 }
 
-/// Window-level file drop: `.muqun-theme` imports a theme; every other file
-/// is staged on the composer. Installed once (themes panel used to own this).
+/// Window-level drop: a `.muqun-theme` imports a theme; every other file is
+/// staged on the composer; a folder's path goes into the draft. While a drag
+/// hovers, the card is highlighted. Installed once (themes panel used to own
+/// this).
 ///
 /// winit 0.30 delivers drops on X11, macOS and Windows; native Wayland has no
 /// drag-and-drop, so Attach… remains the way in there.
@@ -946,20 +959,46 @@ pub fn install_file_drop(app: &App) {
     let drain = app.drain.clone();
     let commands = app.commands.clone();
     blinc_app::dnd::on_file_drop(move |event| {
-        if let blinc_app::dnd::DropEvent::Dropped(paths) = event {
-            let mut files = Vec::new();
-            for path in paths {
-                if path.extension().and_then(|e| e.to_str()) == Some("muqun-theme") {
-                    crate::model::commands::send(&commands, Command::ThemeImportFile(path));
-                } else if path.is_file() {
-                    files.push(path);
+        use blinc_app::dnd::DropEvent;
+        match event {
+            DropEvent::Hovered(_) => drain.post(UiAction::DropHover(true)),
+            DropEvent::Cancelled => drain.post(UiAction::DropHover(false)),
+            DropEvent::Dropped(paths) => {
+                drain.post(UiAction::DropHover(false));
+                let routed = dropped::route(paths);
+                for theme in routed.themes {
+                    crate::model::commands::send(&commands, Command::ThemeImportFile(theme));
                 }
-            }
-            if !files.is_empty() {
-                drain.post(UiAction::FilesPicked(files));
+                if !routed.files.is_empty() {
+                    drain.post(UiAction::FilesPicked(routed.files));
+                }
+                if !routed.folders.is_empty() {
+                    drain.post(UiAction::FoldersDropped(routed.folders));
+                }
             }
         }
     });
+}
+
+/// A drag entered or left the window.
+pub fn drop_hover(on: bool) {
+    let cmp = Cmp::get();
+    if cmp.drop_hover.get() != on {
+        cmp.drop_hover.signal().set(on);
+    }
+}
+
+/// Folders were dropped: their paths go into the draft at the caret, the way
+/// an `@` pick puts one.
+pub fn folders_dropped(app: &App, folders: Vec<PathBuf>) {
+    if state::current_surface().is_none() {
+        return;
+    }
+    let (text, caret) = current_text(app);
+    let (next, caret) = dropped::insert_folders(&text, caret, &folders);
+    set_text(app, &next, caret);
+    edited(app);
+    focus_input(app);
 }
 
 /// An image came off the clipboard.
@@ -1089,6 +1128,7 @@ pub fn composer(app: &App, panel_width: f32) -> impl ElementBuilder {
         cmp.rows.signal_id(),
         // Recompute card width when the git column opens/closes.
         right.signal_id(),
+        cmp.drop_hover.signal_id(),
     ];
     let strip = stateful_with_key::<NoState>("mq-composer")
         .deps(deps)
@@ -1171,6 +1211,7 @@ pub fn start_card(app: &App, width: f32) -> impl ElementBuilder {
         cmp.staged.signal_id(),
         cmp.rows.signal_id(),
         cmp.start.signal_id(),
+        cmp.drop_hover.signal_id(),
     ];
     stateful_with_key::<NoState>("mq-start-composer")
         .deps(deps)
@@ -1256,6 +1297,9 @@ fn card(app: &App, aim: &Aim, width: f32) -> Div {
         .flex_col()
         .id("mq-cmp-card");
     body = body.w(width);
+    if cmp.drop_hover.get() {
+        body = body.class("mq-cmp-card--drop");
+    }
     if let Some(staged) = chips::staged(app) {
         body = body.child(staged);
     }
@@ -1284,6 +1328,7 @@ fn pill_row(app: &App, place: Place) -> impl ElementBuilder {
         cmp.start.signal_id(),
         cmp.submitting.signal_id(),
         cmp.inbox.signal_id(),
+        cmp.yolo.signal_id(),
     ])
     .on_state(move |_| {
         let aim = aim(&app, place);

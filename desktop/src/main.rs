@@ -152,6 +152,10 @@ fn main() -> anyhow::Result<()> {
                     }
                     UiAction::ProjectPicked(cwd) => ui::composer::project_picked(cwd),
                     UiAction::FilesPicked(paths) => ui::composer::files_picked(&for_actions, paths),
+                    UiAction::FoldersDropped(paths) => {
+                        ui::composer::folders_dropped(&for_actions, paths)
+                    }
+                    UiAction::DropHover(on) => ui::composer::drop_hover(on),
                     UiAction::QaStep(step) => ui::composer::qa::run(&for_actions, &step),
                     UiAction::ImagePasted(png) => ui::composer::image_pasted(&for_actions, png),
                 }),

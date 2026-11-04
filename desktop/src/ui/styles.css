@@ -809,6 +809,8 @@
     gap: var(--mq-space-2);
 }
 .mq-cmp-card:focus-within { background: var(--surface-elevated); }
+/* Files dragged over the window: the card says where they will land. */
+.mq-cmp-card--drop { background: var(--accent-subtle); border: 1px solid var(--primary); }
 .mq-cmp-input-row { gap: var(--mq-space-2); }
 .mq-cmp-attach {
     padding: var(--mq-space-2) var(--mq-space-1);
@@ -840,6 +842,9 @@
 .mq-pill:hover { background: var(--mq-hover-strong); }
 .mq-pill--open { background: var(--accent-subtle); color: var(--text-primary); }
 .mq-pill--open:hover { background: var(--accent-subtle); }
+.mq-pill--yolo { background: var(--warning-bg); color: var(--warning); }
+.mq-pill--yolo:hover { background: var(--warning-bg); }
+.mq-menu-note { padding: var(--mq-space-2); color: var(--text-secondary); }
 .mq-pill--static { background: transparent; }
 .mq-pill--static:hover { background: transparent; }
 .mq-usage { padding: 0 var(--mq-space-1); color: var(--text-tertiary); }

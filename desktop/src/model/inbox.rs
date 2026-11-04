@@ -56,6 +56,10 @@ pub enum UiAction {
     ImagePasted(Vec<u8>),
     /// Files came back from the attach dialog.
     FilesPicked(Vec<std::path::PathBuf>),
+    /// Folders were dropped on the window: their paths go into the draft.
+    FoldersDropped(Vec<std::path::PathBuf>),
+    /// A file drag entered (`true`) or left the window.
+    DropHover(bool),
     /// Open a session as a click on its row would (QA, `MUQUN_QA_SWITCH`).
     Open(String),
     /// Toggle the top-bar working-tree file list.

@@ -201,6 +201,13 @@ impl RemoteHub {
     }
 }
 
+/// `data.enabled` of an auto-approve answer; `null` (no session control) is off.
+fn enabled_of(json: &Value) -> bool {
+    json.pointer("/data/enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
 fn decode<T: DeserializeOwned>(value: Value) -> Result<T, HubError> {
     serde_json::from_value(value).map_err(|err| {
         HubError::Agent(AgentError::Protocol(format!(
@@ -645,6 +652,34 @@ impl SessionHub for RemoteHub {
         })
     }
 
+    fn auto_approve<'a>(&'a self, asid: &'a AgentSessionId) -> HubFuture<'a, bool> {
+        Box::pin(async move {
+            let json = self
+                .session_call(Method::GET, asid, &["auto-approve"], &[], None)
+                .await?;
+            Ok(enabled_of(&json))
+        })
+    }
+
+    fn set_auto_approve<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+        enabled: bool,
+    ) -> HubFuture<'a, bool> {
+        Box::pin(async move {
+            let json = self
+                .session_call(
+                    Method::POST,
+                    asid,
+                    &["auto-approve"],
+                    &[],
+                    Some(json!({"enabled": enabled})),
+                )
+                .await?;
+            Ok(enabled_of(&json))
+        })
+    }
+
     fn rename<'a>(&'a self, asid: &'a AgentSessionId, title: &'a str) -> HubFuture<'a, ()> {
         Box::pin(async move {
             Self::unit(
@@ -954,6 +989,29 @@ fn parse_frame(text: &str) -> Option<AgentDomainEvent> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auto_approve_answers_read_as_on_or_off() {
+        for (body, want) in [
+            (
+                r#"{"data":{"enabled":true,"native":"bypassPermissions"}}"#,
+                true,
+            ),
+            (
+                r#"{"data":{"enabled":false,"native":"bypassPermissions"}}"#,
+                false,
+            ),
+            // An agent without a session control answers null: off.
+            (r#"{"data":{"enabled":null,"native":null}}"#, false),
+            (r#"{}"#, false),
+        ] {
+            assert_eq!(
+                enabled_of(&serde_json::from_str(body).unwrap()),
+                want,
+                "{body}"
+            );
+        }
+    }
 
     #[test]
     fn frames_become_events() {
