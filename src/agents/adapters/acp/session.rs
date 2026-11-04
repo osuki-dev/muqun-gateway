@@ -326,6 +326,10 @@ impl SessionMetadata {
 
 struct SessionState {
     info: AgentSessionInfo,
+    /// ACP `sessionId` for RPC. Equals `info.asid` except after an empty
+    /// launch-bypass rebind, where the App keeps the old asid and ACP talks
+    /// to a fresh native identity that was never saved under the old one.
+    native_id: String,
     catalog: AgentCatalog,
     config: Value,
     owned_mutations: bool,
@@ -352,6 +356,12 @@ struct SessionState {
     /// The permission mode the session ran in before auto-approve put it
     /// into a bypass mode, so switching auto-approve off restores it.
     restore_mode: Option<String>,
+}
+
+impl SessionState {
+    fn acp_id(&self) -> &str {
+        &self.native_id
+    }
 }
 
 /// The mode the App's auto-approve switch selects, if a change is needed.
@@ -666,6 +676,10 @@ pub struct AcpDriver<P: AcpProvider> {
     /// Sessions whose child is launched with the provider's bypass flag
     /// (`P::LAUNCH_BYPASS`). In memory: a restart of the Gateway forgets it.
     launch_bypass: StdMutex<HashSet<String>>,
+    /// App-facing asid → current ACP `sessionId` after an empty launch-bypass
+    /// rebind. Later `session/load`s must use the native id; the App keeps
+    /// the original asid. Forgotten when the Gateway restarts.
+    native_ids: StdMutex<HashMap<String, String>>,
     mcp_servers: StdMutex<Value>,
     terminal: StdMutex<Option<Arc<dyn TerminalBridge>>>,
     /// Terminal-held history read by `loaded_timeline`, with the store
@@ -794,6 +808,7 @@ impl<P: AcpProvider> AcpDriver<P> {
             commands_observed: Arc::new(AtomicBool::new(false)),
             launch: StdMutex::new(None),
             launch_bypass: StdMutex::new(HashSet::new()),
+            native_ids: StdMutex::new(HashMap::new()),
             mcp_servers: StdMutex::new(json!([])),
             terminal: StdMutex::new(None),
             terminal_history: StdMutex::new(HashMap::new()),
@@ -822,8 +837,11 @@ impl<P: AcpProvider> AcpDriver<P> {
         self.launch_bypass.lock().unwrap().contains(id)
     }
 
-    /// Relaunch `id`'s child with the bypass flag on or off and load the same
-    /// session again. A running turn is never killed for it.
+    /// Relaunch `id`'s child with the bypass flag on or off. A session that
+    /// already has turns is `session/load`'d again. A brand-new empty one
+    /// (Cursor/FX have not saved it yet) is replaced through `session/new`
+    /// under the same App-facing asid — `session/load` would answer -32602
+    /// and leave the conversation broken. A running turn is never killed.
     async fn set_launch_bypass(&self, id: &str, enabled: bool) -> Result<(), AgentError> {
         if self.launch_bypassed(id) == enabled {
             return Ok(());
@@ -862,25 +880,102 @@ impl<P: AcpProvider> AcpDriver<P> {
             busy: &session.busy,
             handed_off: false,
         };
-        if session.state.lock().await.info.status == AgentSessionStatus::Busy {
+        let (status, empty, directory) = {
+            let state = session.state.lock().await;
+            (
+                state.info.status,
+                state.projection.is_empty(),
+                state.info.directory.clone(),
+            )
+        };
+        if status == AgentSessionStatus::Busy {
             return Err(busy());
         }
         set(enabled);
         // The listener resolves the old child's pending requests and parks
-        // the session; the load below starts the new child.
+        // the session; the start below opens a new child.
         session.client.shutdown().await;
-        let reloaded =
+        let restarted =
             match tokio::time::timeout(RETIREMENT_TIMEOUT, session.finished.cancelled()).await {
+                Ok(()) if empty => {
+                    // Unsaved empty identity: session/new under the new flag, keep
+                    // the App-facing asid (see adopt_empty_launch_rebind).
+                    self.sessions.lock().unwrap().remove(id);
+                    let Some(directory) = directory else {
+                        set(!enabled);
+                        return Err(AgentError::NotAvailable(format!(
+                            "{} empty session has no workspace; try again",
+                            P::LABEL
+                        )));
+                    };
+                    match self
+                        .open_launch(&directory, None, self.launch_bypassed(id))
+                        .await
+                    {
+                        Ok(fresh) => self.adopt_empty_launch_rebind(id, fresh).await,
+                        Err(error) => Err(error),
+                    }
+                }
                 Ok(()) => self.load_once(id).await.map(|_| ()),
                 Err(_) => Err(AgentError::NotAvailable(format!(
                     "{} did not stop; try again",
                     P::LABEL
                 ))),
             };
-        if reloaded.is_err() {
+        if restarted.is_err() {
             set(!enabled);
         }
-        reloaded
+        restarted
+    }
+
+    /// Move a freshly `session/new`'d child onto `app_id` so the App keeps
+    /// its open conversation while ACP talks to the new native identity.
+    async fn adopt_empty_launch_rebind(
+        &self,
+        app_id: &str,
+        fresh: Arc<Session>,
+    ) -> Result<(), AgentError> {
+        let native_id = {
+            let mut state = fresh.state.lock().await;
+            let native = state.info.asid.0.clone();
+            state.native_id = native.clone();
+            if native != app_id {
+                state.info.asid = AgentSessionId::from(app_id);
+            }
+            state.owned_mutations = true;
+            native
+        };
+        self.native_ids
+            .lock()
+            .unwrap()
+            .insert(app_id.to_owned(), native_id.clone());
+        if native_id != app_id {
+            {
+                let mut sessions = self.sessions.lock().unwrap();
+                sessions.remove(&native_id);
+                sessions.insert(app_id.to_owned(), fresh.clone());
+            }
+            {
+                let mut owned = self.owned.lock().unwrap();
+                owned.forget(&native_id);
+                owned.mark(app_id);
+            }
+            self.mirror
+                .remove_session(&AgentSessionId::from(native_id.as_str()))
+                .await;
+        }
+        let info = fresh.state.lock().await.info.clone();
+        let seq = self.mirror.update_session(info.clone()).await;
+        Self::emit(
+            &self.mirror,
+            &self.tx,
+            AgentDomainEvent::SessionUpdated {
+                asid: info.asid.clone(),
+                info: Box::new(info),
+                seq,
+            },
+        );
+        Ok(())
     }
 
     fn owns(&self, id: &str) -> bool {
@@ -1478,7 +1573,7 @@ impl<P: AcpProvider> AcpDriver<P> {
             .request_with_timeout(
                 "session/set_config_option",
                 json!({
-                    "sessionId": state.info.asid.0, "configId": config_id, "value": value
+                    "sessionId": state.acp_id(), "configId": config_id, "value": value
                 }),
                 RPC_TIMEOUT,
             )
@@ -1542,7 +1637,7 @@ impl<P: AcpProvider> AcpDriver<P> {
     }
 
     async fn send_set_mode(&self, session: &Session, mode: &str) -> Result<(), AgentError> {
-        let id = session.state.lock().await.info.asid.0.clone();
+        let id = session.state.lock().await.acp_id().to_owned();
         session
             .client
             .request_with_timeout(
@@ -2414,6 +2509,21 @@ impl<P: AcpProvider> AcpDriver<P> {
         directory: &str,
         existing: Option<AgentSessionInfo>,
     ) -> Result<Arc<Session>, AgentError> {
+        let bypass = existing
+            .as_ref()
+            .is_some_and(|info| self.launch_bypassed(&info.asid.0));
+        self.open_launch(directory, existing, bypass).await
+    }
+
+    /// `bypass`: start the child with the provider's launch bypass flag. Used
+    /// for an empty launch-bypass rebind that must `session/new` under the
+    /// flag (there is no existing native id to load).
+    async fn open_launch(
+        &self,
+        directory: &str,
+        existing: Option<AgentSessionInfo>,
+        bypass: bool,
+    ) -> Result<Arc<Session>, AgentError> {
         {
             let sessions = self.sessions.lock().unwrap();
             let dormant = self.dormant.lock().unwrap();
@@ -2433,8 +2543,18 @@ impl<P: AcpProvider> AcpDriver<P> {
             }
         }
         let new_session = existing.is_none();
-        let id = existing.as_ref().map(|info| info.asid.0.clone());
-        let revision = match &id {
+        // App-facing asid (stable across empty launch-bypass rebinds).
+        let app_id = existing.as_ref().map(|info| info.asid.0.clone());
+        // ACP identity to load: the rebound native id when one was recorded.
+        let acp_id = app_id.as_ref().map(|id| {
+            self.native_ids
+                .lock()
+                .unwrap()
+                .get(id)
+                .cloned()
+                .unwrap_or_else(|| id.clone())
+        });
+        let revision = match &app_id {
             Some(id) => {
                 self.mirror
                     .native_reload_revision(&AgentSessionId::from(id.as_str()))
@@ -2442,30 +2562,29 @@ impl<P: AcpProvider> AcpDriver<P> {
             }
             None => Default::default(),
         };
-        if let Some(id) = &id {
+        if let Some(id) = &app_id {
             if let Some(live) = self.terminal_live(id).await {
                 return Err(AgentError::TerminalInteraction(Box::new(live.runtime)));
             }
         }
-        let bypass = id.as_deref().is_some_and(|id| self.launch_bypassed(id));
         let (client, mut events, capabilities) = self.initialized_for(directory, bypass).await?;
-        if id.is_some() && capabilities["loadSession"].as_bool() != Some(true) {
+        if acp_id.is_some() && capabilities["loadSession"].as_bool() != Some(true) {
             client.shutdown().await;
             return Err(AgentError::Unsupported(
                 "ACP native session history loading".into(),
             ));
         }
-        let method = if id.is_some() {
+        let method = if acp_id.is_some() {
             "session/load"
         } else {
             "session/new"
         };
         let mut params = json!({ "cwd": directory });
         self.add_mcp_servers(&mut params);
-        if let Some(id) = &id {
+        if let Some(id) = &acp_id {
             params["sessionId"] = json!(id);
         }
-        if let Some(prompt) = self.system_prompt(id.as_deref()) {
+        if let Some(prompt) = self.system_prompt(app_id.as_deref()) {
             params["systemPrompt"] = prompt;
         }
         let request = client
@@ -2484,7 +2603,7 @@ impl<P: AcpProvider> AcpDriver<P> {
                 biased;
                 event = events.recv() => match event {
                     Ok(AcpEvent::Notification { method, params }) if method == "session/update" => {
-                        if let Err(error) = Self::absorb_replay(id.as_deref(), params, &mut projection, &mut deferred, &mut deferred_bytes) {
+                        if let Err(error) = Self::absorb_replay(acp_id.as_deref(), params, &mut projection, &mut deferred, &mut deferred_bytes) {
                             client.shutdown().await;
                             return Err(error);
                         }
@@ -2515,7 +2634,7 @@ impl<P: AcpProvider> AcpDriver<P> {
             match event {
                 AcpEvent::Notification { method, params } if method == "session/update" => {
                     if let Err(error) = Self::absorb_replay(
-                        id.as_deref(),
+                        acp_id.as_deref(),
                         params,
                         &mut projection,
                         &mut deferred,
@@ -2536,14 +2655,24 @@ impl<P: AcpProvider> AcpDriver<P> {
                 _ => {}
             }
         }
-        let id = id.or_else(|| value["sessionId"].as_str().map(str::to_owned)).ok_or_else(|| protocol("ACP session creation returned no sessionId; do not retry creation automatically"))?;
-        if id.is_empty() || id.len() > 256 || id.chars().any(char::is_control) {
+        let native_id = acp_id
+            .or_else(|| value["sessionId"].as_str().map(str::to_owned))
+            .ok_or_else(|| {
+                protocol(
+                    "ACP session creation returned no sessionId; do not retry creation automatically",
+                )
+            })?;
+        if native_id.is_empty() || native_id.len() > 256 || native_id.chars().any(char::is_control)
+        {
             client.shutdown().await;
             return Err(protocol(
                 "ACP returned an invalid native session identity; do not retry creation",
             ));
         }
+        // App-facing asid: keep a rebound identity; otherwise the native one.
+        let id = app_id.unwrap_or_else(|| native_id.clone());
         let mut info = existing.unwrap_or_else(|| mapper::session(&id, directory, &value));
+        info.asid = AgentSessionId::from(id.as_str());
         info.status = AgentSessionStatus::Idle;
         info.runtime = None;
         info.error = None;
@@ -2564,6 +2693,7 @@ impl<P: AcpProvider> AcpDriver<P> {
         }
         let (completions, completed) = mpsc::unbounded_channel();
         let mut state = SessionState {
+            native_id: native_id.clone(),
             info,
             catalog,
             config: value.clone(),
@@ -2587,7 +2717,7 @@ impl<P: AcpProvider> AcpDriver<P> {
             restore_mode: None,
         };
         for params in deferred {
-            if params["sessionId"].as_str() != Some(id.as_str()) {
+            if params["sessionId"].as_str() != Some(native_id.as_str()) {
                 client.shutdown().await;
                 return Err(protocol("ACP history replay changed session identity"));
             }
@@ -2612,9 +2742,9 @@ impl<P: AcpProvider> AcpDriver<P> {
         if P::IDLE_RETIREMENT {
             let _inspection = self.inspection.lock().await;
             if let Ok(snapshot) =
-                P::recovery_snapshot(&self.binary, directory, &id, &self.stop).await
+                P::recovery_snapshot(&self.binary, directory, &native_id, &self.stop).await
             {
-                if snapshot.session_id == id
+                if snapshot.session_id == native_id
                     && Self::snapshot_matches_projection(&snapshot, &state.projection)
                 {
                     state.recovery = Some(RecoveryEvidence::Loaded(snapshot.checkpoint()));
@@ -2891,7 +3021,7 @@ impl<P: AcpProvider> AcpDriver<P> {
     ) {
         let mut state = session.state.lock().await;
         let asid = state.info.asid.clone();
-        if params["sessionId"].as_str() != Some(asid.0.as_str()) {
+        if params["sessionId"].as_str() != Some(state.acp_id()) {
             session.connected.store(false, Ordering::Release);
             state.info.status = AgentSessionStatus::Unknown;
             if let Some(seq) = mirror
@@ -3011,7 +3141,7 @@ impl<P: AcpProvider> AcpDriver<P> {
     ) {
         let mut state = session.state.lock().await;
         if let Some(sid) = params["sessionId"].as_str() {
-            if sid != state.info.asid.0 {
+            if sid != state.acp_id() {
                 tracing::warn!(
                     session = %state.info.asid.0,
                     agent = P::KIND,
@@ -3073,7 +3203,7 @@ impl<P: AcpProvider> AcpDriver<P> {
             }
             AcpEvent::Request { id, method, params } if method == "session/request_permission" => {
                 let mut state = session.state.lock().await;
-                if params["sessionId"].as_str() != Some(state.info.asid.0.as_str()) {
+                if params["sessionId"].as_str() != Some(state.acp_id()) {
                     tracing::warn!(
                         session = %state.info.asid.0,
                         agent = P::KIND,
@@ -3298,7 +3428,7 @@ impl<P: AcpProvider> AcpDriver<P> {
     async fn transcript_tokens(session: &Session) -> Option<TokensUsage> {
         let (directory, id) = {
             let state = session.state.lock().await;
-            (state.info.directory.clone()?, state.info.asid.0.clone())
+            (state.info.directory.clone()?, state.acp_id().to_owned())
         };
         P::transcript_usage(&directory, &id).await.ok().flatten()
     }
@@ -3492,23 +3622,23 @@ impl<P: AcpProvider> AcpDriver<P> {
         prompt: &QueuedPrompt,
     ) -> Result<(), AgentError> {
         let prepared = &prompt.prepared;
-        let (id, initial_empty, directory) = {
+        let (acp_id, initial_empty, directory) = {
             let state = session.state.lock().await;
             (
-                state.info.asid.0.clone(),
+                state.acp_id().to_owned(),
                 state.owned_mutations && state.projection.is_empty(),
                 state.info.directory.clone().unwrap_or_default(),
             )
         };
         let checkpoint = if P::IDLE_RETIREMENT && !prompt.attachments {
             if initial_empty {
-                Some(NativeSnapshot::empty(&id).checkpoint())
+                Some(NativeSnapshot::empty(&acp_id).checkpoint())
             } else {
                 let _inspection = inspection.lock().await;
-                P::recovery_snapshot(binary, &directory, &id, stop)
+                P::recovery_snapshot(binary, &directory, &acp_id, stop)
                     .await
                     .ok()
-                    .filter(|snapshot| snapshot.session_id == id)
+                    .filter(|snapshot| snapshot.session_id == acp_id)
                     .map(|snapshot| snapshot.checkpoint())
             }
         } else {
@@ -3541,7 +3671,7 @@ impl<P: AcpProvider> AcpDriver<P> {
             .client
             .start_request(
                 "session/prompt",
-                json!({ "sessionId": id, "prompt": prepared.content }),
+                json!({ "sessionId": acp_id, "prompt": prepared.content }),
             )
             .await;
         match request {
@@ -3594,15 +3724,16 @@ impl<P: AcpProvider> AcpDriver<P> {
     async fn steer(
         &self,
         session: &Session,
-        id: &str,
+        _id: &str,
         prepared: &operations::PreparedPrompt,
     ) -> Result<bool, AgentError> {
+        let acp_id = session.state.lock().await.acp_id().to_owned();
         let outcome = session
             .client
             .request_with_timeout(
                 "_session/steering",
                 json!({
-                    "sessionId": id,
+                    "sessionId": acp_id,
                     "prompt": prepared.content,
                     "_meta": { "steering": { "idleBehavior": "promptRequired" } },
                 }),
@@ -3642,12 +3773,16 @@ impl<P: AcpProvider> AcpDriver<P> {
             busy: &session.busy,
             handed_off: false,
         };
-        session.state.lock().await.hidden_command = true;
+        let acp_id = {
+            let mut state = session.state.lock().await;
+            state.hidden_command = true;
+            state.acp_id().to_owned()
+        };
         let result = session
             .client
             .request_with_timeout(
                 "session/prompt",
-                json!({ "sessionId": id, "prompt": [{ "type": "text", "text": format!("{command} {title}") }] }),
+                json!({ "sessionId": acp_id, "prompt": [{ "type": "text", "text": format!("{command} {title}") }] }),
                 RPC_TIMEOUT,
             )
             .await;
@@ -3700,15 +3835,16 @@ impl<P: AcpProvider> AcpDriver<P> {
             busy: &session.busy,
             handed_off: false,
         };
-        let (directory, model, mode) = {
+        let (directory, model, mode, acp_id) = {
             let state = session.state.lock().await;
             (
                 state.info.directory.clone().unwrap_or_default(),
                 state.info.model.clone(),
                 state.info.mode.clone(),
+                state.acp_id().to_owned(),
             )
         };
-        let mut params = json!({ "sessionId": id, "cwd": directory });
+        let mut params = json!({ "sessionId": acp_id, "cwd": directory });
         self.add_mcp_servers(&mut params);
         if let Some(prompt) = self.system_prompt(Some(id)) {
             params["systemPrompt"] = prompt;
@@ -3862,7 +3998,7 @@ impl<P: AcpProvider> AcpDriver<P> {
             handed_off: false,
         };
         let window = Duration::from_secs(context.idle_timeout_secs.load(Ordering::Acquire));
-        let (id, directory, evidence, baseline) = {
+        let (id, acp_id, directory, evidence, baseline) = {
             let state = session.state.lock().await;
             let warm = Warm {
                 in_turn: state.info.status != AgentSessionStatus::Idle,
@@ -3875,6 +4011,7 @@ impl<P: AcpProvider> AcpDriver<P> {
             }
             (
                 state.info.asid.0.clone(),
+                state.acp_id().to_owned(),
                 state.info.directory.clone()?,
                 state.recovery.clone(),
                 state.process_baseline.clone(),
@@ -3885,7 +4022,7 @@ impl<P: AcpProvider> AcpDriver<P> {
         let mark = session.client.live_work_mark();
         let process = session.client.process_id()?;
         let signals = {
-            let (directory, id) = (directory.clone(), id.clone());
+            let (directory, id) = (directory.clone(), acp_id.clone());
             tokio::task::spawn_blocking(move || IdleSignals {
                 registry: P::registry_work(&directory, &id, process),
                 processes: super::idle::process_work(
@@ -4430,9 +4567,10 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
             if !session.connected.load(Ordering::Acquire) {
                 return Err(AgentError::NotAvailable("ACP connection ended".into()));
             }
+            let acp_id = session.state.lock().await.acp_id().to_owned();
             session
                 .client
-                .notify("session/cancel", json!({"sessionId":id}))
+                .notify("session/cancel", json!({"sessionId": acp_id}))
                 .await
                 .map_err(AgentError::Network)
         })

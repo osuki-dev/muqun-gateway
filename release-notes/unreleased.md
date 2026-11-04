@@ -38,8 +38,11 @@
   and FX take their bypass only at launch (`--dangerously-skip-permissions`,
   `--force`, `FX_PERMISSION_MODE=full-access`), so the switch relaunches that
   session's agent process with or without it and loads the same session
-  again (an agent that is working refuses: switch when it is idle; the
-  setting lasts until the Gateway restarts). Pi's `MUQUN_PI_APPROVALS=never`
+  again; a brand-new empty Cursor/FX session is replaced through
+  `session/new` under the same App-facing asid instead of `session/load`
+  (which would answer -32602 and leave the conversation broken). An agent
+  that is working refuses: switch when it is idle; the setting lasts until
+  the Gateway restarts. Pi's `MUQUN_PI_APPROVALS=never`
   is launch-only and the switch answers 501; DeepSeek has per-request
   approvals only. A bypass mode is still never remembered as a new session's
   default. Switching on from a device is allowed by default; an owner who
