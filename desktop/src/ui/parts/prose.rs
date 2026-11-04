@@ -127,7 +127,7 @@ pub fn text(ctx: &PartCtx<'_>, text: &str) -> Div {
         }
     }
     if let Some(assets) = ctx.item.image_assets.as_ref().filter(|a| !a.is_empty()) {
-        row = row.child(media::asset_row(ctx, assets));
+        row = row.child(media::asset_row(ctx, assets, ctx.width.min(media::MAX_MEDIA_W)));
     }
     if ctx.live.is_none() && !text.trim().is_empty() {
         let mut actions = div().class("mq-row-actions").flex_row().items_center();
@@ -211,10 +211,17 @@ pub fn user(ctx: &PartCtx<'_>, text: &str) -> Div {
     } else {
         clip_lines(display, USER_LINES)
     };
-    // The card is as wide as its longest line, up to 80 % of the column;
-    // its text gets that width explicitly (see `markdown::Setting::width`).
+    // The card hugs the longest line and any fitted attachment, up to 80 %
+    // of the column (see `markdown::Setting::width`).
     let max = (ctx.width * 0.8).max(240.0);
     let pad = 2.0 * 16.0 + 2.0;
+    let media_cap = (max - pad).min(media::MAX_MEDIA_W);
+    let cwd = ctx
+        .app
+        .bindings
+        .header
+        .get()
+        .and_then(|h| h.directory.clone());
     let options = blinc_layout::text_measure::TextLayoutOptions::new().with_font_name(UI_FONT);
     let widest = shown
         .lines()
@@ -223,13 +230,21 @@ pub fn user(ctx: &PartCtx<'_>, text: &str) -> Div {
             blinc_layout::text_measure::measure_text_with_options(l, scale::BODY, &options).width
         })
         .fold(0.0f32, f32::max);
-    // Keep room for a strip of thumbs when the prose is short or empty.
-    let media_floor = match atts.len() {
-        0 => 0.0,
-        1 => 200.0,
-        n => ((n as f32) * 120.0).min(max - pad),
+    // Size from the real fitted preview — not a fixed floor that leaves the
+    // bubble wider than a portrait shot, and not the full column width.
+    let media_w = if !atts.is_empty() {
+        media::measure_attachments_width(
+            &atts,
+            ctx.item.image_assets.as_deref(),
+            cwd.as_deref(),
+            media_cap,
+        )
+    } else if let Some(assets) = ctx.item.image_assets.as_ref().filter(|a| !a.is_empty()) {
+        media::measure_assets_width(assets, cwd.as_deref(), media_cap)
+    } else {
+        0.0
     };
-    let inner = (widest.max(media_floor) + 2.0).clamp(120.0, max - pad);
+    let inner = (widest.max(media_w) + 2.0).clamp(120.0, max - pad);
     let setting = Setting {
         width: inner,
         ..ctx.setting(false)
@@ -252,9 +267,10 @@ pub fn user(ctx: &PartCtx<'_>, text: &str) -> Div {
             ctx,
             &atts,
             ctx.item.image_assets.as_deref(),
+            media_cap,
         ));
     } else if let Some(assets) = ctx.item.image_assets.as_ref().filter(|a| !a.is_empty()) {
-        card = card.child(media::asset_row(ctx, assets));
+        card = card.child(media::asset_row(ctx, assets, media_cap));
     }
     card = card.child(
         div()

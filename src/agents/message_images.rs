@@ -970,6 +970,17 @@ fn percent_decode(text: &str) -> Option<String> {
     String::from_utf8(out).ok()
 }
 
+/// Width / height from an image file's header when the format is known.
+/// Best effort: layout can proceed without them.
+pub fn peek_image_dimensions(path: &Path) -> Option<(u32, u32)> {
+    use std::io::Read as _;
+    let file = std::fs::File::open(path).ok()?;
+    // JPEG SOF can sit past the first few KB; 256 KiB covers typical EXIF.
+    let mut head = Vec::new();
+    file.take(256 * 1024).read_to_end(&mut head).ok()?;
+    image_dimensions(&head)
+}
+
 /// Width and height from the first bytes of a PNG, GIF, WebP or JPEG, when
 /// they are there. Best effort: a client lays out without them.
 pub(crate) fn image_dimensions(head: &[u8]) -> Option<(u32, u32)> {

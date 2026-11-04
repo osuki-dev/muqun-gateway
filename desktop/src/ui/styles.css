@@ -537,11 +537,13 @@
 .mq-attach-thumb, .mq-media {
     border: none;
     border-radius: var(--mq-radius-md);
-    background: var(--surface);
+    background: transparent;
     transition: background var(--mq-motion-micro) ease-out;
 }
-.mq-media--image { background: var(--surface); }
-.mq-media--image:hover { background: var(--surface-elevated); }
+/* Image frame hugs pixels; keep chrome transparent so letterbox (if any)
+   does not read as a second surface beside the photo. */
+.mq-media--image { background: transparent; }
+.mq-media--image:hover { background: transparent; }
 .mq-media--video {
     background: var(--surface);
     color: var(--text-primary);

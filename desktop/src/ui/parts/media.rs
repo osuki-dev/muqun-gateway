@@ -5,23 +5,29 @@
 use std::path::{Path, PathBuf};
 
 use blinc_layout::prelude::*;
-use muqun_gateway::agents::message_images::resolve_host_media;
+use muqun_gateway::agents::message_images::{peek_image_dimensions, resolve_host_media};
 use muqun_gateway::agents::MessageImageAsset;
 
 use super::{meta, mono, PartCtx};
 use crate::platform::shell::open_path;
 
 /// Cap for a single inline image / video frame in the column (message assets).
-const MAX_MEDIA_W: f32 = 480.0;
-const MAX_MEDIA_H: f32 = 320.0;
+pub const MAX_MEDIA_W: f32 = 480.0;
+pub const MAX_MEDIA_H: f32 = 320.0;
 /// Tool / `read` path previews: App-like caps (`content-image-layout` ~280).
 const TOOL_MEDIA_W: f32 = 280.0;
 const TOOL_MEDIA_H: f32 = 240.0;
 /// Unknown tool image size before decode (App's 160×110).
 const TOOL_UNKNOWN_W: f32 = 160.0;
 const TOOL_UNKNOWN_H: f32 = 110.0;
+/// Unknown message attachment before header probe (must stay narrow so a
+/// user bubble does not stretch to the column while waiting on dims).
+const ATTACH_UNKNOWN_W: f32 = 200.0;
+const ATTACH_UNKNOWN_H: f32 = 150.0;
 /// Compact strip thumb when several images share a row.
 const STRIP_THUMB: f32 = 112.0;
+/// Gap between strip thumbs (matches `.mq-attach-row` gap).
+const ATTACH_GAP: f32 = 8.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MediaKind {
@@ -57,10 +63,6 @@ fn file_label(path: &str) -> String {
         .and_then(|n| n.to_str())
         .unwrap_or(path)
         .to_string()
-}
-
-fn fit_size(w: Option<u32>, h: Option<u32>, max_w: f32, max_h: f32) -> (f32, f32) {
-    fit_size_with_unknown(w, h, max_w, max_h, max_w, max_h * 0.66)
 }
 
 fn fit_size_with_unknown(
@@ -113,6 +115,44 @@ fn resolve(src: &str, cwd: Option<&str>) -> Option<PathBuf> {
         guard.insert(key, path.clone());
     }
     path
+}
+
+type DimsCache = std::collections::HashMap<PathBuf, Option<(u32, u32)>>;
+
+/// Header probe for layout; cached across row rebuilds.
+fn dims_of(path: &Path) -> Option<(u32, u32)> {
+    use std::sync::{Mutex, OnceLock};
+    const CAP: usize = 256;
+    static CACHE: OnceLock<Mutex<DimsCache>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(DimsCache::new()));
+    if let Ok(guard) = cache.lock() {
+        if let Some(hit) = guard.get(path) {
+            return *hit;
+        }
+    }
+    let dims = peek_image_dimensions(path);
+    if let Ok(mut guard) = cache.lock() {
+        if guard.len() >= CAP {
+            guard.clear();
+        }
+        guard.insert(path.to_path_buf(), dims);
+    }
+    dims
+}
+
+fn resolve_dims(
+    src: &str,
+    cwd: Option<&str>,
+    width: Option<u32>,
+    height: Option<u32>,
+) -> (Option<u32>, Option<u32>) {
+    if matches!((width, height), (Some(w), Some(h)) if w > 0 && h > 0) {
+        return (width, height);
+    }
+    resolve(src, cwd)
+        .and_then(|path| dims_of(&path))
+        .map(|(w, h)| (Some(w), Some(h)))
+        .unwrap_or((width, height))
 }
 
 fn chip(label: String) -> Div {
@@ -169,7 +209,93 @@ pub fn tile(
     max_w: f32,
     max_h: f32,
 ) -> Div {
-    tile_sized(src, cwd, mime, width, height, max_w, max_h, max_w, max_h * 0.66)
+    tile_sized(
+        src,
+        cwd,
+        mime,
+        width,
+        height,
+        max_w,
+        max_h,
+        ATTACH_UNKNOWN_W,
+        ATTACH_UNKNOWN_H,
+    )
+}
+
+/// Fitted width of user / assistant attachments so the bubble can hug them.
+pub fn measure_attachments_width(
+    paths: &[String],
+    assets: Option<&[MessageImageAsset]>,
+    cwd: Option<&str>,
+    max_w: f32,
+) -> f32 {
+    if paths.is_empty() {
+        return 0.0;
+    }
+    if paths.len() > 1 {
+        let n = paths.len() as f32;
+        return (n * STRIP_THUMB + (n - 1.0) * ATTACH_GAP).min(max_w);
+    }
+    let path = &paths[0];
+    let asset = assets.and_then(|list| {
+        list.iter()
+            .find(|a| a.src == *path || a.url == *path || a.asset_id == *path)
+    });
+    let src = asset
+        .map(|a| {
+            a.thumbnail_url
+                .as_deref()
+                .or(a.preview_url.as_deref())
+                .or(a.download_url.as_deref())
+                .unwrap_or(a.url.as_str())
+        })
+        .filter(|s| !s.is_empty())
+        .unwrap_or(path.as_str());
+    let try_src = match resolve(path, cwd) {
+        Some(_) => path.as_str(),
+        None => src,
+    };
+    let (w, h) = resolve_dims(
+        try_src,
+        cwd,
+        asset.and_then(|a| a.width),
+        asset.and_then(|a| a.height),
+    );
+    fit_size_with_unknown(w, h, max_w, MAX_MEDIA_H, ATTACH_UNKNOWN_W, ATTACH_UNKNOWN_H).0
+}
+
+/// Fitted width of markdown `image_assets` for bubble sizing.
+pub fn measure_assets_width(assets: &[MessageImageAsset], cwd: Option<&str>, max_w: f32) -> f32 {
+    let usable: Vec<_> = assets
+        .iter()
+        .filter(|a| a.unavailable_reason.is_none())
+        .filter(|a| !a.src.is_empty() || !a.url.is_empty())
+        .collect();
+    if usable.is_empty() {
+        return 0.0;
+    }
+    if usable.len() > 1 {
+        let n = usable.len() as f32;
+        return (n * STRIP_THUMB + (n - 1.0) * ATTACH_GAP).min(max_w);
+    }
+    let asset = usable[0];
+    let candidates = [
+        asset.src.as_str(),
+        asset.url.as_str(),
+        asset.preview_url.as_deref().unwrap_or(""),
+        asset.thumbnail_url.as_deref().unwrap_or(""),
+        asset.download_url.as_deref().unwrap_or(""),
+    ];
+    let src = candidates
+        .into_iter()
+        .find(|s| !s.is_empty() && resolve(s, cwd).is_some())
+        .or_else(|| candidates.into_iter().find(|s| !s.is_empty()))
+        .unwrap_or("");
+    if src.is_empty() {
+        return ATTACH_UNKNOWN_W.min(max_w);
+    }
+    let (w, h) = resolve_dims(src, cwd, asset.width, asset.height);
+    fit_size_with_unknown(w, h, max_w, MAX_MEDIA_H, ATTACH_UNKNOWN_W, ATTACH_UNKNOWN_H).0
 }
 
 /// Tool / `read` preview: tighter caps and App-like unknown size.
@@ -207,6 +333,7 @@ fn tile_sized(
     unknown_h: f32,
 ) -> Div {
     let kind = kind_for(src, mime);
+    let (width, height) = resolve_dims(src, cwd, width, height);
     match resolve(src, cwd) {
         Some(path) if kind == MediaKind::Image => {
             let (w, h) =
@@ -240,13 +367,17 @@ fn tile_sized(
 }
 
 /// Attachment paths under a user / assistant row.
+///
+/// `max_w` caps a single hero preview (caller passes the bubble / column
+/// budget so the frame never forces the card wider than content).
 pub fn attachment_row(
     ctx: &PartCtx<'_>,
     paths: &[String],
     assets: Option<&[MessageImageAsset]>,
+    max_w: f32,
 ) -> Div {
     let cwd = session_cwd(ctx);
-    let max_w = ctx.width.min(MAX_MEDIA_W);
+    let max_w = max_w.min(MAX_MEDIA_W).max(48.0);
     let many = paths.len() > 1;
     let thumb_w = if many { STRIP_THUMB } else { max_w };
     let thumb_h = if many { STRIP_THUMB } else { MAX_MEDIA_H };
@@ -257,9 +388,12 @@ pub fn attachment_row(
         } else {
             "mq-attach-row--hero"
         })
-        .w_full()
         .flex_row()
         .flex_wrap();
+    // Strips may wrap; hero hugs the tile so the bubble stays tight.
+    if many {
+        row = row.w_full();
+    }
     for path in paths {
         let asset = assets.and_then(|list| {
             list.iter()
@@ -294,9 +428,9 @@ pub fn attachment_row(
 }
 
 /// `image_assets` embedded from markdown (assistant / user).
-pub fn asset_row(ctx: &PartCtx<'_>, assets: &[MessageImageAsset]) -> Div {
+pub fn asset_row(ctx: &PartCtx<'_>, assets: &[MessageImageAsset], max_w: f32) -> Div {
     let cwd = session_cwd(ctx);
-    let max_w = ctx.width.min(MAX_MEDIA_W);
+    let max_w = max_w.min(MAX_MEDIA_W).max(48.0);
     let many = assets.len() > 1;
     let thumb_w = if many { STRIP_THUMB } else { max_w };
     let thumb_h = if many { STRIP_THUMB } else { MAX_MEDIA_H };
@@ -307,9 +441,11 @@ pub fn asset_row(ctx: &PartCtx<'_>, assets: &[MessageImageAsset]) -> Div {
         } else {
             "mq-attach-row--hero"
         })
-        .w_full()
         .flex_row()
         .flex_wrap();
+    if many {
+        row = row.w_full();
+    }
     for asset in assets {
         if asset.unavailable_reason.is_some() {
             continue;
@@ -436,7 +572,14 @@ mod tests {
 
     #[test]
     fn fit_keeps_aspect_inside_the_box() {
-        let (w, h) = fit_size(Some(2000), Some(1000), 400.0, 280.0);
+        let (w, h) = fit_size_with_unknown(
+            Some(2000),
+            Some(1000),
+            400.0,
+            280.0,
+            ATTACH_UNKNOWN_W,
+            ATTACH_UNKNOWN_H,
+        );
         assert!((w - 400.0).abs() < 1.0);
         assert!((h - 200.0).abs() < 1.0);
     }
@@ -453,5 +596,35 @@ mod tests {
         );
         assert!((w - TOOL_UNKNOWN_W).abs() < 1.0, "{w}");
         assert!((h - TOOL_UNKNOWN_H).abs() < 1.0, "{h}");
+    }
+
+    #[test]
+    fn attach_unknown_stays_narrower_than_column() {
+        let (w, h) = fit_size_with_unknown(
+            None,
+            None,
+            MAX_MEDIA_W,
+            MAX_MEDIA_H,
+            ATTACH_UNKNOWN_W,
+            ATTACH_UNKNOWN_H,
+        );
+        assert!((w - ATTACH_UNKNOWN_W).abs() < 1.0, "{w}");
+        assert!((h - ATTACH_UNKNOWN_H).abs() < 1.0, "{h}");
+        assert!(w < MAX_MEDIA_W);
+    }
+
+    #[test]
+    fn portrait_attach_hugs_fitted_width() {
+        // Tall settings shot capped by height → frame narrower than max_w.
+        let (w, h) = fit_size_with_unknown(
+            Some(400),
+            Some(900),
+            MAX_MEDIA_W,
+            MAX_MEDIA_H,
+            ATTACH_UNKNOWN_W,
+            ATTACH_UNKNOWN_H,
+        );
+        assert!((h - MAX_MEDIA_H).abs() < 1.0, "{h}");
+        assert!(w < MAX_MEDIA_W * 0.5, "{w}");
     }
 }

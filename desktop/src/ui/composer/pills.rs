@@ -623,17 +623,56 @@ pub fn mode_label(id: &str, name: &str) -> String {
 }
 
 /// Catalog id without bracketed parameters (`default[]` → `default`).
+/// Matches App `bareCatalogId`.
 fn bare_catalog_id(id: &str) -> &str {
-    match id.rfind('[') {
-        Some(at) if at > 0 => {
-            let head = id[..at].trim();
-            if head.is_empty() {
-                id
-            } else {
-                head
+    let bytes = id.as_bytes();
+    if let Some(open) = id.rfind('[') {
+        if open > 0 && bytes.last() == Some(&b']') {
+            let head = id[..open].trim();
+            if !head.is_empty() {
+                return head;
             }
         }
-        _ => id,
+    }
+    id
+}
+
+/// App `readableCatalogId`: camelCase / kebab ids → a short title.
+/// `default[]` → `Default`, `bypassPermissions` → `Bypass permissions`.
+fn readable_catalog_id(id: &str) -> String {
+    let bare = bare_catalog_id(id);
+    let mut spaced = String::with_capacity(bare.len() + 4);
+    let mut prev = '\0';
+    for ch in bare.chars() {
+        if ch == '-' || ch == '_' || ch.is_whitespace() {
+            if !spaced.ends_with(' ') && !spaced.is_empty() {
+                spaced.push(' ');
+            }
+        } else if prev.is_ascii_lowercase() || prev.is_ascii_digit() {
+            if ch.is_ascii_uppercase() {
+                spaced.push(' ');
+            }
+            spaced.push(ch);
+        } else {
+            spaced.push(ch);
+        }
+        prev = ch;
+    }
+    let words: Vec<String> = spaced
+        .split_whitespace()
+        .map(|word| {
+            if word.len() > 1 && word.chars().all(|c| c.is_ascii_uppercase()) {
+                word.to_string()
+            } else {
+                word.to_ascii_lowercase()
+            }
+        })
+        .collect();
+    let sentence = words.join(" ");
+    let mut chars = sentence.chars();
+    match chars.next() {
+        Some(c) => format!("{}{}", c.to_ascii_uppercase(), chars.as_str()),
+        None => id.to_string(),
     }
 }
 
@@ -706,7 +745,7 @@ fn known_model_name(id: &str) -> Option<&'static str> {
 }
 
 /// App `formatModelName` without folding variant into the chip (effort pill
-/// owns that). Never leave a raw id on the pill when a readable form exists.
+/// owns that). Never leave a raw id (`default[]`) on the pill.
 fn format_model_name(model: &ModelRef, fallback: &str, catalog_name: Option<&str>) -> String {
     if model.model_id.is_empty() {
         return fallback.to_string();
@@ -718,21 +757,27 @@ fn format_model_name(model: &ModelRef, fallback: &str, catalog_name: Option<&str
     if let Some(known) = known_model_name(id) {
         return known.to_string();
     }
-    id.split(['-', '_'])
-        .filter(|w| !w.is_empty())
-        .map(|word| {
-            if word.len() <= 3 {
-                word.to_ascii_uppercase()
-            } else {
-                let mut chars = word.chars();
-                match chars.next() {
-                    Some(c) => format!("{}{}", c.to_ascii_uppercase(), chars.as_str()),
-                    None => String::new(),
+    // Prefer the split used by App for dotted ids (`gpt-6-astra` → title
+    // words); fall back to readableCatalogId for camelCase.
+    if id.contains('-') || id.contains('_') || id.contains('.') {
+        return id
+            .split(['-', '_', '.'])
+            .filter(|w| !w.is_empty())
+            .map(|word| {
+                if word.len() <= 3 {
+                    word.to_ascii_uppercase()
+                } else {
+                    let mut chars = word.chars();
+                    match chars.next() {
+                        Some(c) => format!("{}{}", c.to_ascii_uppercase(), chars.as_str()),
+                        None => String::new(),
+                    }
                 }
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+    }
+    readable_catalog_id(id)
 }
 
 fn selected_model<'a>(aim: &Aim, models: &[&'a ModelInfo]) -> Option<&'a ModelInfo> {
@@ -1341,6 +1386,8 @@ mod tests {
     #[test]
     fn model_names_never_fall_back_to_a_raw_id() {
         assert_eq!(bare_catalog_id("default[]"), "default");
+        assert_eq!(readable_catalog_id("default[]"), "Default");
+        assert_eq!(readable_catalog_id("bypassPermissions"), "Bypass permissions");
         let listed = ModelInfo {
             id: "default".into(),
             provider_id: "opencode".into(),
@@ -1363,6 +1410,11 @@ mod tests {
         assert_eq!(
             format_model_name(&chosen, "Model", Some(info.name.as_str())),
             "Auto"
+        );
+        // Cursor often reports `default[]` before the catalogue lands.
+        assert_eq!(
+            format_model_name(&chosen, "Model", None),
+            "Default"
         );
         let unknown = ModelRef {
             provider_id: String::new(),

@@ -447,7 +447,7 @@ pub fn tool(ctx: &PartCtx<'_>, call: &ToolCall) -> Div {
     );
     let open = ctx.is_open("tool", path_is_media && kind == ToolKind::Read);
     let skill = tool_kind::skill_name(call.metadata.as_ref());
-    let (mut title, caption) = if kind == ToolKind::Skill {
+    let (mut title, mut caption) = if kind == ToolKind::Skill {
         (
             skill.clone().unwrap_or_else(|| target.clone()),
             String::new(),
@@ -462,6 +462,14 @@ pub fn tool(ctx: &PartCtx<'_>, call: &ToolCall) -> Div {
             .filter(|t| t != &call.name)
             .unwrap_or_default();
     }
+    // App headers are `numberOfLines={1}`; hard newlines in titles used to
+    // paint a squashed two-line row inside the fixed-height tool head.
+    let scrub = |s: &str| match kind {
+        ToolKind::Shell | ToolKind::Execute => tool_kind::command_line(s),
+        _ => tool_kind::one_line(s),
+    };
+    title = scrub(&title);
+    caption = scrub(&caption);
     let label = tool_name_label(kind, wire_name);
     // Never echo the chip name twice ("SendMessage SendMessage", "Agent Agent").
     if title.eq_ignore_ascii_case(&label) || title.eq_ignore_ascii_case(wire_name) {
@@ -1456,7 +1464,7 @@ pub fn shell(
                 .flex_1()
                 .min_w(0.0)
                 .overflow_clip()
-                .child(mono(command.lines().next().unwrap_or("").to_string()).no_cursor()),
+                .child(mono(tool_kind::command_line(command)).no_cursor()),
         );
     if running {
         head = head.child(spinner().size(SpinnerSize::Small));

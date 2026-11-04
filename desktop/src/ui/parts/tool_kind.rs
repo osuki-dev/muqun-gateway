@@ -205,14 +205,39 @@ fn partial_json_strings(text: &str) -> Vec<(String, String)> {
 
 const PATH_KEYS: &[&str] = &["path", "filePath", "file_path", "file"];
 
+/// First non-empty line. Headers are one row; hard newlines must not stack.
+pub fn one_line(text: &str) -> String {
+    text.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("")
+        .to_string()
+}
+
+/// Shell / execute header: skip leading `#` comments when a real command
+/// follows, so `# OCR…\ntesseract …` becomes the tesseract line — not two rows.
+pub fn command_line(text: &str) -> String {
+    let mut first = None;
+    for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        if first.is_none() {
+            first = Some(line);
+        }
+        if !line.starts_with('#') {
+            return line.to_string();
+        }
+    }
+    first.unwrap_or("").to_string()
+}
+
 /// One-line target the card header shows.
 pub fn extract_target(kind: ToolKind, input: &Value, partial: Option<&str>) -> String {
     let Some(rec) = tool_input_record(input, partial) else {
         return String::new();
     };
-    let first_line = |s: String| s.lines().next().unwrap_or("").to_string();
     match kind {
-        ToolKind::Shell => pick_string(&rec, &["command", "cmd"]).unwrap_or_default(),
+        ToolKind::Shell => {
+            command_line(&pick_string(&rec, &["command", "cmd"]).unwrap_or_default())
+        }
         ToolKind::Read | ToolKind::Edit | ToolKind::Write => {
             pick_string(&rec, PATH_KEYS).unwrap_or_default()
         }
@@ -236,20 +261,38 @@ pub fn extract_target(kind: ToolKind, input: &Value, partial: Option<&str>) -> S
                 "prompt",
             ],
         )
-        .map(first_line)
+        .map(|s| one_line(&s))
         .unwrap_or_default(),
         ToolKind::Skill => {
             pick_string(&rec, &["id", "skillID", "skill_id", "skillId", "skill"]).unwrap_or_default()
         }
         ToolKind::Question => String::new(),
-        ToolKind::Execute => first_line(pick_string(&rec, &["code"]).unwrap_or_default()),
+        // Cursor's `execute` often carries a shell script in `code` (comment +
+        // command); also accept `command` / `cmd` the way shell tools do.
+        ToolKind::Execute => command_line(
+            &pick_string(&rec, &["code", "command", "cmd"]).unwrap_or_default(),
+        ),
         ToolKind::Browser => pick_string(&rec, &["url", "action", "tabID"]).unwrap_or_default(),
-        ToolKind::Image => pick_string(&rec, &["prompt", "description"]).unwrap_or_default(),
-        ToolKind::Todo | ToolKind::Mcp => pick_string(
-            &rec,
-            &["command", "cmd", "path", "filePath", "file_path", "query", "url", "pattern", "name"],
-        )
-        .unwrap_or_default(),
+        ToolKind::Image => {
+            one_line(&pick_string(&rec, &["prompt", "description"]).unwrap_or_default())
+        }
+        ToolKind::Todo | ToolKind::Mcp => one_line(
+            &pick_string(
+                &rec,
+                &[
+                    "command",
+                    "cmd",
+                    "path",
+                    "filePath",
+                    "file_path",
+                    "query",
+                    "url",
+                    "pattern",
+                    "name",
+                ],
+            )
+            .unwrap_or_default(),
+        ),
     }
 }
 
@@ -312,10 +355,11 @@ pub fn split_url(url: &str) -> (String, String) {
 ///
 /// File tools keep the path on **one** line on desktop (wide timeline). The
 /// App's phone layout splits basename / folder; that wasted a second row here.
+/// Shell / execute always stay a single clipped row (App `numberOfLines={1}`).
 pub fn header_lines(kind: ToolKind, target: &str, title: Option<&str>) -> (String, String) {
     match kind {
         ToolKind::Read | ToolKind::Edit | ToolKind::Write | ToolKind::Patch => {
-            (target.to_string(), String::new())
+            (one_line(target), String::new())
         }
         ToolKind::Web => {
             let (host, path) = split_url(target);
@@ -323,21 +367,20 @@ pub fn header_lines(kind: ToolKind, target: &str, title: Option<&str>) -> (Strin
                 (host, path)
             } else {
                 (
-                    title.filter(|t| !t.is_empty())
-                        .unwrap_or(target)
-                        .to_string(),
+                    one_line(title.filter(|t| !t.is_empty()).unwrap_or(target)),
                     String::new(),
                 )
             }
         }
-        ToolKind::Shell => (target.to_string(), String::new()),
-        _ => (
-            title
-                .filter(|t| !t.is_empty() && t != &target)
-                .unwrap_or(target)
-                .to_string(),
-            String::new(),
-        ),
+        // Prefer the extracted command over a multiline `part.title` that
+        // would otherwise reintroduce the comment + command pair.
+        ToolKind::Shell | ToolKind::Execute => (command_line(target), String::new()),
+        _ => {
+            let chosen = title
+                .filter(|t| !t.is_empty() && *t != target)
+                .unwrap_or(target);
+            (one_line(chosen), String::new())
+        }
     }
 }
 
@@ -713,6 +756,26 @@ mod tests {
         let (title, cap) = header_lines(ToolKind::Read, "desktop/src/ui/a.rs", None);
         assert_eq!(title, "desktop/src/ui/a.rs");
         assert!(cap.is_empty());
+    }
+
+    #[test]
+    fn shell_and_execute_headers_stay_one_line() {
+        let script = "# OCR the queue screenshot for full text\ntesseract /tmp/a.png stdout -l chi_sim+eng";
+        assert_eq!(
+            command_line(script),
+            "tesseract /tmp/a.png stdout -l chi_sim+eng"
+        );
+        let input = json!({ "code": script });
+        let target = extract_target(ToolKind::Execute, &input, None);
+        let (title, cap) = header_lines(ToolKind::Execute, &target, Some(script));
+        assert_eq!(title, "tesseract /tmp/a.png stdout -l chi_sim+eng");
+        assert!(cap.is_empty());
+        assert!(!title.contains('\n'));
+
+        let shell = json!({ "command": "echo hi\necho bye" });
+        let target = extract_target(ToolKind::Shell, &shell, None);
+        let (title, _) = header_lines(ToolKind::Shell, &target, Some("echo hi\necho bye"));
+        assert_eq!(title, "echo hi");
     }
 
     #[test]
