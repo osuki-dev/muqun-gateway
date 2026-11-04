@@ -983,7 +983,8 @@ which `GET` reads without changing anything.
 | Codex | the next `turn/start` carries `approvalPolicy: "never"` with `sandboxPolicy: {type: "dangerFullAccess"}` (no asking and no sandbox, as `--dangerously-bypass-approvals-and-sandbox` at the terminal), which Codex keeps for the turns after it; off sends back the last policy the thread was seen asking under, else the configuration's `approval_policy`/`sandbox_mode`, never with a sandbox wider than the thread was last observed in. `enabled` reads true only for `never` with a sandbox that can write | session |
 | OpenCode | a session permission rule `{action: "*", resource: "*", effect: "allow"}` appended last; off removes it | session |
 | T3 Code | `thread.runtime-mode.set` `full-access`; off returns to `runtime_mode` (or `approval-required` when that is `full-access`) | session |
-| Antigravity, Cursor, FX, Pi | a launch flag or environment only (`agy acp --dangerously-skip-permissions`, `agent --force`, `FX_PERMISSION_MODE=full-access`, `MUQUN_PI_APPROVALS=never`): `POST` answers 501 | launch |
+| Antigravity, Cursor, FX | a launch flag or environment (`agy acp --dangerously-skip-permissions`, `agent --force acp`, `FX_PERMISSION_MODE=full-access`): `POST` relaunches that session's agent process with or without it and loads the same session again; an agent that is working refuses (502, "switch YOLO when it is idle"); the flag lasts until the Gateway restarts | session |
+| Pi | environment only (`MUQUN_PI_APPROVALS=never`): `POST` answers 501 | launch |
 | DeepSeek | per-request approvals only: `POST` answers 501, `enabled` is null | none |
 
 `enabled: true` is refused with `403 auto_approve_disabled` when the owner

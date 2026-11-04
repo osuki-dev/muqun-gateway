@@ -25,6 +25,15 @@ use crate::agents::ports::mirror::{AgentSessionSnapshot, SessionMirrorPort};
 use std::marker::PhantomData;
 
 /// Native launch and verified differences; protocol lifecycle is shared.
+/// An agent whose bypass is a launch flag: the session's child is started
+/// again with `before` ahead of and `after` behind its arguments, and `env`
+/// added to its environment.
+pub struct LaunchBypass {
+    pub before: &'static [&'static str],
+    pub after: &'static [&'static str],
+    pub env: &'static [(&'static str, &'static str)],
+}
+
 pub trait AcpProvider: Send + Sync + 'static {
     const KIND: &'static str;
     const LABEL: &'static str;
@@ -49,6 +58,10 @@ pub trait AcpProvider: Send + Sync + 'static {
     /// auto-approve switch selects the first one the live session offers
     /// (`session/set_mode`); empty where the agent has no such mode.
     const BYPASS_MODES: &'static [&'static str] = &[];
+    /// The agent's bypass is a launch flag, not a session mode: the App's
+    /// switch relaunches that session's child with the flag added or removed
+    /// and loads the same session again.
+    const LAUNCH_BYPASS: Option<LaunchBypass> = None;
     /// A prompt sent while a turn runs may be steered into it
     /// (`_session/steering`, initialize `_meta.steering.supported`).
     const STEERING: bool = false;
@@ -650,6 +663,9 @@ pub struct AcpDriver<P: AcpProvider> {
     native_capabilities: StdMutex<Value>,
     commands_observed: Arc<AtomicBool>,
     launch: StdMutex<Option<AcpLaunch>>,
+    /// Sessions whose child is launched with the provider's bypass flag
+    /// (`P::LAUNCH_BYPASS`). In memory: a restart of the Gateway forgets it.
+    launch_bypass: StdMutex<HashSet<String>>,
     mcp_servers: StdMutex<Value>,
     terminal: StdMutex<Option<Arc<dyn TerminalBridge>>>,
     /// Terminal-held history read by `loaded_timeline`, with the store
@@ -777,6 +793,7 @@ impl<P: AcpProvider> AcpDriver<P> {
             native_capabilities: StdMutex::new(Value::Null),
             commands_observed: Arc::new(AtomicBool::new(false)),
             launch: StdMutex::new(None),
+            launch_bypass: StdMutex::new(HashSet::new()),
             mcp_servers: StdMutex::new(json!([])),
             terminal: StdMutex::new(None),
             terminal_history: StdMutex::new(HashMap::new()),
@@ -799,6 +816,71 @@ impl<P: AcpProvider> AcpDriver<P> {
     /// Keep the ids of Gateway-created sessions in `path` across restarts.
     pub fn set_owned_store(&self, path: std::path::PathBuf) {
         *self.owned.lock().unwrap() = OwnedSessions::load(path);
+    }
+
+    fn launch_bypassed(&self, id: &str) -> bool {
+        self.launch_bypass.lock().unwrap().contains(id)
+    }
+
+    /// Relaunch `id`'s child with the bypass flag on or off and load the same
+    /// session again. A running turn is never killed for it.
+    async fn set_launch_bypass(&self, id: &str, enabled: bool) -> Result<(), AgentError> {
+        if self.launch_bypassed(id) == enabled {
+            return Ok(());
+        }
+        let set = |on: bool| {
+            let mut flags = self.launch_bypass.lock().unwrap();
+            if on {
+                flags.insert(id.to_owned());
+            } else {
+                flags.remove(id);
+            }
+        };
+        let live = self
+            .retained(id)
+            .filter(|session| session.connected.load(Ordering::Acquire));
+        let Some(session) = live else {
+            // No child to change: the flag applies to the next launch.
+            set(enabled);
+            return Ok(());
+        };
+        let busy = || {
+            AgentError::NotAvailable(format!(
+                "{} is working; switch YOLO when it is idle",
+                P::LABEL
+            ))
+        };
+        let _retirement = session.retirement.lock().await;
+        if session
+            .busy
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(busy());
+        }
+        let _admission = Admission {
+            busy: &session.busy,
+            handed_off: false,
+        };
+        if session.state.lock().await.info.status == AgentSessionStatus::Busy {
+            return Err(busy());
+        }
+        set(enabled);
+        // The listener resolves the old child's pending requests and parks
+        // the session; the load below starts the new child.
+        session.client.shutdown().await;
+        let reloaded =
+            match tokio::time::timeout(RETIREMENT_TIMEOUT, session.finished.cancelled()).await {
+                Ok(()) => self.load_once(id).await.map(|_| ()),
+                Err(_) => Err(AgentError::NotAvailable(format!(
+                    "{} did not stop; try again",
+                    P::LABEL
+                ))),
+            };
+        if reloaded.is_err() {
+            set(!enabled);
+        }
+        reloaded
     }
 
     fn owns(&self, id: &str) -> bool {
@@ -1541,6 +1623,15 @@ impl<P: AcpProvider> AcpDriver<P> {
         &self,
         directory: &str,
     ) -> Result<(Arc<AcpClient>, broadcast::Receiver<AcpEvent>, Value), AgentError> {
+        self.initialized_for(directory, false).await
+    }
+
+    /// `bypass`: start the child with the provider's launch bypass flag.
+    async fn initialized_for(
+        &self,
+        directory: &str,
+        bypass: bool,
+    ) -> Result<(Arc<AcpClient>, broadcast::Receiver<AcpEvent>, Value), AgentError> {
         let _starting = self.starting.read().await;
         if self.stop.is_cancelled() {
             return Err(AgentError::NotAvailable("ACP runtime stopped".into()));
@@ -1564,12 +1655,21 @@ impl<P: AcpProvider> AcpDriver<P> {
                 ));
             }
         }
-        let launch = self.launch.lock().unwrap().clone().unwrap_or_default();
-        let args: Vec<&str> = if launch.args.is_empty() {
+        let mut launch = self.launch.lock().unwrap().clone().unwrap_or_default();
+        let mut args: Vec<&str> = if launch.args.is_empty() {
             P::ARGS.to_vec()
         } else {
             launch.args.iter().map(String::as_str).collect()
         };
+        if let Some(flag) = P::LAUNCH_BYPASS.as_ref().filter(|_| bypass) {
+            args.splice(0..0, flag.before.iter().copied());
+            args.extend(flag.after.iter().copied());
+            launch.env.extend(
+                flag.env
+                    .iter()
+                    .map(|(key, value)| ((*key).to_owned(), (*value).to_owned())),
+            );
+        }
         let client = AcpClient::spawn_with_env(
             &self.binary,
             &args,
@@ -2347,7 +2447,8 @@ impl<P: AcpProvider> AcpDriver<P> {
                 return Err(AgentError::TerminalInteraction(Box::new(live.runtime)));
             }
         }
-        let (client, mut events, capabilities) = self.initialized(directory).await?;
+        let bypass = id.as_deref().is_some_and(|id| self.launch_bypassed(id));
+        let (client, mut events, capabilities) = self.initialized_for(directory, bypass).await?;
         if id.is_some() && capabilities["loadSession"].as_bool() != Some(true) {
             client.shutdown().await;
             return Err(AgentError::Unsupported(
@@ -4750,6 +4851,9 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
     }
     fn set_auto_approve<'a>(&'a self, id: &'a str, enabled: bool) -> AgentFuture<'a, ()> {
         Box::pin(async move {
+            if P::LAUNCH_BYPASS.is_some() {
+                return self.set_launch_bypass(id, enabled).await;
+            }
             if P::BYPASS_MODES.is_empty() {
                 return Err(AgentError::Unsupported(format!(
                     "{} has no session bypass mode",
@@ -4782,6 +4886,9 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
     }
     fn auto_approve<'a>(&'a self, id: &'a str) -> AgentFuture<'a, Option<bool>> {
         Box::pin(async move {
+            if P::LAUNCH_BYPASS.is_some() {
+                return Ok(Some(self.launch_bypassed(id)));
+            }
             if P::BYPASS_MODES.is_empty() {
                 return Ok(None);
             }
