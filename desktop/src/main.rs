@@ -145,10 +145,7 @@ fn main() -> anyhow::Result<()> {
                         for_actions.open_session(&muqun_gateway::agents::AgentSessionId(asid))
                     }
                     UiAction::ToggleDiffPanel => {
-                        ui::shell::toggle_right(
-                            &for_actions,
-                            crate::model::view::RightTab::Git,
-                        );
+                        ui::shell::toggle_right(&for_actions, crate::model::view::RightTab::Git);
                     }
                     UiAction::OpenDiffFile { path, .. } => {
                         ui::shell::open_diff_file(&for_actions, &path);
@@ -274,19 +271,40 @@ fn start_core(
         .name("muqun-core-main".into())
         .spawn(move || {
             runtime.block_on(async move {
-                let agents = build_runtime(settings, true, Some(state_dir.clone()));
-                if let Err(err) = attach_store(&agents, &state_dir, StoreEncryption::Off).await {
-                    tracing::warn!(
-                        "the session store is unavailable, routes are not kept: {err:#}"
-                    );
-                }
-                agents.spawn_supervisor();
+                // A gateway service on this computer owns the one agents
+                // plane (and shares its sessions live with the phone); only
+                // without one does this process run its own.
+                let hub = select_hub(settings, &state_dir).await;
                 tokio::spawn(stop_on_signal(shutdown_store));
-                let hub: Arc<dyn hub::SessionHub> = Arc::new(hub::LocalHub::new(agents));
                 projection::spawn(hub, inbox, store, commands);
                 // Live until the process ends with the window.
                 std::future::pending::<()>().await;
             });
         })?;
     Ok(())
+}
+
+/// The gateway on this computer over loopback when it answers, else the
+/// agents plane in this process. The in-process runtime is not even built
+/// in the first case: no agent child process belongs to the desktop.
+async fn select_hub(
+    settings: RuntimeSettings,
+    state_dir: &std::path::Path,
+) -> Arc<dyn hub::SessionHub> {
+    if let Some(gateway) = hub::discover_local_gateway().await {
+        match hub::RemoteHub::start(gateway.clone()) {
+            Ok(remote) => {
+                tracing::info!("hub: local gateway at {}", gateway.url);
+                return remote;
+            }
+            Err(err) => tracing::warn!("local gateway found but unusable: {err:#}"),
+        }
+    }
+    tracing::info!("hub: in-process");
+    let agents = build_runtime(settings, true, Some(state_dir.to_path_buf()));
+    if let Err(err) = attach_store(&agents, state_dir, StoreEncryption::Off).await {
+        tracing::warn!("the session store is unavailable, routes are not kept: {err:#}");
+    }
+    agents.spawn_supervisor();
+    Arc::new(hub::LocalHub::new(agents))
 }

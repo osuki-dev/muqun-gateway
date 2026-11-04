@@ -96,7 +96,10 @@ fn pick_string(map: &serde_json::Map<String, Value>, keys: &[&str]) -> Option<St
 }
 
 /// Parsed tool input, or string fields pulled from a half-written JSON object.
-pub fn tool_input_record(input: &Value, partial: Option<&str>) -> Option<serde_json::Map<String, Value>> {
+pub fn tool_input_record(
+    input: &Value,
+    partial: Option<&str>,
+) -> Option<serde_json::Map<String, Value>> {
     match input {
         Value::Object(map) if !map.is_empty() => Some(map.clone()),
         Value::String(s) => parse_object_or_partial(s),
@@ -263,15 +266,14 @@ pub fn extract_target(kind: ToolKind, input: &Value, partial: Option<&str>) -> S
         )
         .map(|s| one_line(&s))
         .unwrap_or_default(),
-        ToolKind::Skill => {
-            pick_string(&rec, &["id", "skillID", "skill_id", "skillId", "skill"]).unwrap_or_default()
-        }
+        ToolKind::Skill => pick_string(&rec, &["id", "skillID", "skill_id", "skillId", "skill"])
+            .unwrap_or_default(),
         ToolKind::Question => String::new(),
         // Cursor's `execute` often carries a shell script in `code` (comment +
         // command); also accept `command` / `cmd` the way shell tools do.
-        ToolKind::Execute => command_line(
-            &pick_string(&rec, &["code", "command", "cmd"]).unwrap_or_default(),
-        ),
+        ToolKind::Execute => {
+            command_line(&pick_string(&rec, &["code", "command", "cmd"]).unwrap_or_default())
+        }
         ToolKind::Browser => pick_string(&rec, &["url", "action", "tabID"]).unwrap_or_default(),
         ToolKind::Image => {
             one_line(&pick_string(&rec, &["prompt", "description"]).unwrap_or_default())
@@ -393,7 +395,7 @@ pub struct EditFile {
 }
 
 fn count_marked(patch: &str, marker: char) -> u32 {
-    let header: String = std::iter::repeat(marker).take(3).collect();
+    let header: String = std::iter::repeat_n(marker, 3).collect();
     patch
         .lines()
         .filter(|l| l.starts_with(marker) && !l.starts_with(&header))
@@ -519,9 +521,7 @@ pub fn strip_read_line_numbers(output: &str) -> String {
         return String::new();
     }
     let lines: Vec<&str> = output.split('\n').collect();
-    let has_header = lines
-        .first()
-        .is_some_and(|l| l.starts_with("Read file "));
+    let has_header = lines.first().is_some_and(|l| l.starts_with("Read file "));
     let body: &[&str] = if has_header { &lines[1..] } else { &lines };
     if !has_header {
         let meaningful: Vec<&str> = body
@@ -562,7 +562,10 @@ pub fn prepare_read_text(output: &str, path: &str) -> String {
 fn unwrap_read_envelope(output: &str) -> Option<String> {
     // `<path>…</path>\n<type>file</type>\n<content>\n…\n</content>`
     let rest = output.strip_prefix("<path>")?;
-    let rest = rest.split_once("</path>")?.1.trim_start_matches(['\r', '\n']);
+    let rest = rest
+        .split_once("</path>")?
+        .1
+        .trim_start_matches(['\r', '\n']);
     let rest = rest.strip_prefix("<type>")?;
     let (kind, rest) = rest.split_once("</type>")?;
     if kind.trim() != "file" {
@@ -760,7 +763,8 @@ mod tests {
 
     #[test]
     fn shell_and_execute_headers_stay_one_line() {
-        let script = "# OCR the queue screenshot for full text\ntesseract /tmp/a.png stdout -l chi_sim+eng";
+        let script =
+            "# OCR the queue screenshot for full text\ntesseract /tmp/a.png stdout -l chi_sim+eng";
         assert_eq!(
             command_line(script),
             "tesseract /tmp/a.png stdout -l chi_sim+eng"

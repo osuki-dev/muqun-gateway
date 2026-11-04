@@ -613,10 +613,33 @@ mod tests {
         view.select(SYNTH_ASID);
         let mut changes = Changes::default();
         view.apply(Update::Snapshot(Box::new(snapshot)), &mut changes);
-        let order = view.order();
+        // A snapshot opens on its newest rows only; the rest waits to be paged in.
+        let opened = view.order();
         eprintln!("10k synthetic snapshot applied in {:?}", started.elapsed());
+        assert_eq!(opened.ids.len(), 20);
+        assert!(changes.opened);
+        let newest = opened.ids.last().cloned();
+        while let Some((items, exhausted)) = view
+            .active
+            .as_mut()
+            .and_then(|a| a.take_pending_earlier(20))
+        {
+            view.apply(
+                Update::Earlier {
+                    asid: SYNTH_ASID.to_string(),
+                    items,
+                    exhausted,
+                },
+                &mut changes,
+            );
+        }
+        let order = view.order();
         assert_eq!(order.ids.len(), 10_000);
         assert_eq!(order.shapes.len(), 10_000);
-        assert!(changes.opened);
+        assert_eq!(
+            order.ids.last().cloned(),
+            newest,
+            "paging adds only older rows"
+        );
     }
 }

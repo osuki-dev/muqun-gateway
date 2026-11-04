@@ -10,10 +10,6 @@
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use blinc_app::windowed::WindowedContext;
-use blinc_cn::prelude::dropdown_menu_custom;
-use blinc_core::State;
-use blinc_layout::prelude::*;
 use super::composer::{self, chips};
 use super::glyphs::Glyph;
 use super::icons;
@@ -25,6 +21,10 @@ use crate::config::{ConfigEdit, UiPrefs};
 use crate::model::commands::Command;
 use crate::model::view::RightTab;
 use crate::platform::editors::{self, Editor};
+use blinc_app::windowed::WindowedContext;
+use blinc_cn::prelude::dropdown_menu_custom;
+use blinc_core::State;
+use blinc_layout::prelude::*;
 
 pub const TOP_BAR_HEIGHT: f32 = 48.0;
 /// Matches `--mq-space-3`: body inset under the pill and beside the columns,
@@ -359,7 +359,7 @@ pub fn open_diff_file(app: &App, file: &str) {
 /// Preferred right width, clamped so left + main keep [`UiPrefs::MAIN_MIN`].
 pub fn clamp_right_width(want: f32, window: f32, side: f32) -> f32 {
     let available = (window - 2.0 * FRAME_PAD - side - UiPrefs::MAIN_MIN - 8.0).max(0.0);
-    let max = available.min(UiPrefs::RIGHT_MAX).max(UiPrefs::RIGHT_MIN);
+    let max = available.clamp(UiPrefs::RIGHT_MIN, UiPrefs::RIGHT_MAX);
     want.clamp(UiPrefs::RIGHT_MIN, max)
 }
 
@@ -470,12 +470,9 @@ fn right_tab_chip(app: &App, tab: RightTab, label: &str, badge: Option<usize>) -
     }
     if let Some(n) = badge.filter(|n| *n > 0) {
         chip = chip.child(
-            div().class("mq-right-tab-badge").child(
-                mono_text(format!("{n}"))
-                    .size(10.0)
-                    .no_wrap()
-                    .no_cursor(),
-            ),
+            div()
+                .class("mq-right-tab-badge")
+                .child(mono_text(format!("{n}")).size(10.0).no_wrap().no_cursor()),
         );
     }
     chip
@@ -544,13 +541,7 @@ fn right_column(app: &App, height: f32, width: State<f32>, window: f32, side: f3
                 .h(height)
                 .flex_col()
                 .child(head)
-                .child(
-                    div()
-                        .w_full()
-                        .flex_1()
-                        .min_h(0.0)
-                        .child(content),
-                )
+                .child(div().w_full().flex_1().min_h(0.0).child(content))
         });
     div()
         .class("mq-right-column")
@@ -604,22 +595,27 @@ fn git_tab_body(app: &App) -> Div {
         .filter(|d| Some(&d.asid) == open.as_ref() && !d.paths.is_empty());
     let focused = app.bindings.diff_focus.get();
 
-    let mut col = div().class("mq-right-git").w_full().h_full().flex_col().child(
-        div()
-            .class("mq-right-section")
-            .w_full()
-            .flex_row()
-            .items_center()
-            .child(icons::tinted(Glyph::Branch, 14.0))
-            .child(
-                div().flex_1().min_w(0.0).overflow_clip().child(
-                    mono_text(branch.unwrap_or_else(|| "—".into()))
-                        .size(13.0)
-                        .no_wrap()
-                        .no_cursor(),
+    let mut col = div()
+        .class("mq-right-git")
+        .w_full()
+        .h_full()
+        .flex_col()
+        .child(
+            div()
+                .class("mq-right-section")
+                .w_full()
+                .flex_row()
+                .items_center()
+                .child(icons::tinted(Glyph::Branch, 14.0))
+                .child(
+                    div().flex_1().min_w(0.0).overflow_clip().child(
+                        mono_text(branch.unwrap_or_else(|| "—".into()))
+                            .size(13.0)
+                            .no_wrap()
+                            .no_cursor(),
+                    ),
                 ),
-            ),
-    );
+        );
 
     let Some(stat) = stat else {
         return col.child(
@@ -669,13 +665,12 @@ fn git_tab_body(app: &App) -> Div {
                             .no_cursor(),
                     )
                     .on_click(move |_| {
-                        let next = if toggle.bindings.diff_focus.get().as_deref()
-                            == Some(path.as_str())
-                        {
-                            None
-                        } else {
-                            Some(path.clone())
-                        };
+                        let next =
+                            if toggle.bindings.diff_focus.get().as_deref() == Some(path.as_str()) {
+                                None
+                            } else {
+                                Some(path.clone())
+                            };
                         toggle.bindings.diff_focus.signal().set(next);
                     }),
             )
@@ -957,13 +952,7 @@ pub fn body(ctx: &WindowedContext, app: &App) -> Div {
                     ),
                 );
             if right_open.get() {
-                row = row.child(right_column(
-                    &app,
-                    height,
-                    right_w.clone(),
-                    window,
-                    side,
-                ));
+                row = row.child(right_column(&app, height, right_w.clone(), window, side));
             }
             row
         });

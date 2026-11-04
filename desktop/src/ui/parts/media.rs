@@ -215,10 +215,8 @@ pub fn tile(
         mime,
         width,
         height,
-        max_w,
-        max_h,
-        ATTACH_UNKNOWN_W,
-        ATTACH_UNKNOWN_H,
+        (max_w, max_h),
+        (ATTACH_UNKNOWN_W, ATTACH_UNKNOWN_H),
     )
 }
 
@@ -314,10 +312,8 @@ fn tool_tile(
         mime,
         width,
         height,
-        max_w,
-        max_h,
-        TOOL_UNKNOWN_W,
-        TOOL_UNKNOWN_H,
+        (max_w, max_h),
+        (TOOL_UNKNOWN_W, TOOL_UNKNOWN_H),
     )
 }
 
@@ -327,17 +323,14 @@ fn tile_sized(
     mime: Option<&str>,
     width: Option<u32>,
     height: Option<u32>,
-    max_w: f32,
-    max_h: f32,
-    unknown_w: f32,
-    unknown_h: f32,
+    (max_w, max_h): (f32, f32),
+    (unknown_w, unknown_h): (f32, f32),
 ) -> Div {
     let kind = kind_for(src, mime);
     let (width, height) = resolve_dims(src, cwd, width, height);
     match resolve(src, cwd) {
         Some(path) if kind == MediaKind::Image => {
-            let (w, h) =
-                fit_size_with_unknown(width, height, max_w, max_h, unknown_w, unknown_h);
+            let (w, h) = fit_size_with_unknown(width, height, max_w, max_h, unknown_w, unknown_h);
             image_frame(path, w, h, true)
         }
         Some(path) if kind == MediaKind::Video => {
@@ -377,7 +370,7 @@ pub fn attachment_row(
     max_w: f32,
 ) -> Div {
     let cwd = session_cwd(ctx);
-    let max_w = max_w.min(MAX_MEDIA_W).max(48.0);
+    let max_w = max_w.clamp(48.0, MAX_MEDIA_W);
     let many = paths.len() > 1;
     let thumb_w = if many { STRIP_THUMB } else { max_w };
     let thumb_h = if many { STRIP_THUMB } else { MAX_MEDIA_H };
@@ -430,7 +423,7 @@ pub fn attachment_row(
 /// `image_assets` embedded from markdown (assistant / user).
 pub fn asset_row(ctx: &PartCtx<'_>, assets: &[MessageImageAsset], max_w: f32) -> Div {
     let cwd = session_cwd(ctx);
-    let max_w = max_w.min(MAX_MEDIA_W).max(48.0);
+    let max_w = max_w.clamp(48.0, MAX_MEDIA_W);
     let many = assets.len() > 1;
     let thumb_w = if many { STRIP_THUMB } else { max_w };
     let thumb_h = if many { STRIP_THUMB } else { MAX_MEDIA_H };
@@ -486,10 +479,7 @@ pub fn path_media(ctx: &PartCtx<'_>, path: &str) -> Option<Div> {
     if path.is_empty() {
         return None;
     }
-    if !matches!(
-        kind_for(path, None),
-        MediaKind::Image | MediaKind::Video
-    ) {
+    if !matches!(kind_for(path, None), MediaKind::Image | MediaKind::Video) {
         return None;
     }
     let cwd = session_cwd(ctx);

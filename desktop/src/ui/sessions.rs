@@ -1366,22 +1366,26 @@ fn rename_field(app: &App, asid: &str, title: &str) -> Div {
         .flex_row()
         .items_center()
         .child(
-            div().class("mq-srow-rename-field").flex_1().min_w(0.0).child(
-                input(&data)
-                    .size(InputSize::Small)
-                    .w_full()
-                    .border_width(0.0)
-                    .border_colors(
-                        Color::TRANSPARENT,
-                        Color::TRANSPARENT,
-                        Color::TRANSPARENT,
-                        Color::TRANSPARENT,
-                    )
-                    .bg_colors(Color::TRANSPARENT, Color::TRANSPARENT, Color::TRANSPARENT)
-                    .on_change(move |text: &str| {
-                        draft.signal().set(text.to_string());
-                    }),
-            ),
+            div()
+                .class("mq-srow-rename-field")
+                .flex_1()
+                .min_w(0.0)
+                .child(
+                    input(&data)
+                        .size(InputSize::Small)
+                        .w_full()
+                        .border_width(0.0)
+                        .border_colors(
+                            Color::TRANSPARENT,
+                            Color::TRANSPARENT,
+                            Color::TRANSPARENT,
+                            Color::TRANSPARENT,
+                        )
+                        .bg_colors(Color::TRANSPARENT, Color::TRANSPARENT, Color::TRANSPARENT)
+                        .on_change(move |text: &str| {
+                            draft.signal().set(text.to_string());
+                        }),
+                ),
         )
         .child(
             action(super::glyphs::Glyph::Done)

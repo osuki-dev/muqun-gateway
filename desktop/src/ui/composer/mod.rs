@@ -258,7 +258,8 @@ fn ensure_loaded(app: &App, aim: &Aim) {
     let catalog_retry = std::time::Duration::from_secs(45);
     let retry = std::time::Duration::from_secs(6);
     let key = state::catalog_key(&aim.agent, aim.cwd.as_deref());
-    if aim.standing == Standing::Usable && state::ask_due(&key, aim.catalog.is_some(), catalog_retry)
+    if aim.standing == Standing::Usable
+        && state::ask_due(&key, aim.catalog.is_some(), catalog_retry)
     {
         app.send(Command::Compose(ComposeCommand::Catalog {
             agent: aim.agent.clone(),
@@ -409,9 +410,7 @@ fn update_popup(app: &App, key: &str, text: &str, caret: usize) {
     // Loading… instead of a dead caret.
     let found = found.filter(|t| match t.kind {
         Kind::File => true,
-        Kind::Command | Kind::Skill => {
-            aim.standing == Standing::Usable || aim.catalog.is_some()
-        }
+        Kind::Command | Kind::Skill => aim.standing == Standing::Usable || aim.catalog.is_some(),
     });
     let found = found.filter(|t| current.dismissed_at != Some(t.start));
     let dismissed_at = match (&found, current.dismissed_at) {
@@ -481,9 +480,9 @@ fn popup_rows(app: &App, popup: &state::Popup) -> Vec<triggers::Row> {
             let mut rows = triggers::computer_rows(
                 &trigger.query,
                 &cmp.peers.get(),
-                &app.strings.popup_this_computer(),
-                &app.strings.popup_computer(),
-                &app.strings.popup_computer_offline(),
+                app.strings.popup_this_computer(),
+                app.strings.popup_computer(),
+                app.strings.popup_computer_offline(),
             );
             rows.extend(cmp.files.get().hits.iter().map(|hit| {
                 triggers::Row::item(hit.path.clone(), hit.name.clone(), hit.path.clone())
@@ -496,8 +495,8 @@ fn popup_rows(app: &App, popup: &state::Popup) -> Vec<triggers::Row> {
                 let rows =
                     triggers::command_rows(&trigger.query, &c.catalog.commands, &c.catalog.skills);
                 if rows.is_empty() {
-                    let has_any = !c.catalog.commands.is_empty()
-                        || c.catalog.skills.iter().any(|s| s.slash);
+                    let has_any =
+                        !c.catalog.commands.is_empty() || c.catalog.skills.iter().any(|s| s.slash);
                     vec![triggers::Row::status(if has_any {
                         app.strings.popup_no_matches()
                     } else {
@@ -1147,7 +1146,7 @@ fn field_width(card: f32) -> f32 {
 /// Card width for a main-panel column of `panel` px: slot inset preserved on
 /// both sides, capped at [`SESSION_MAX`].
 pub(crate) fn session_card_width_for(panel: f32) -> f32 {
-    (panel - 2.0 * SLOT_SIDE).max(0.0).min(SESSION_MAX)
+    (panel - 2.0 * SLOT_SIDE).clamp(0.0, SESSION_MAX)
 }
 
 /// Card width from the window (popup / overlays that are not under `main_panel`).

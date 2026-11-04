@@ -204,7 +204,11 @@ pub struct Row {
 }
 
 impl Row {
-    pub fn item(insert: impl Into<String>, label: impl Into<String>, detail: impl Into<String>) -> Self {
+    pub fn item(
+        insert: impl Into<String>,
+        label: impl Into<String>,
+        detail: impl Into<String>,
+    ) -> Self {
         Self {
             insert: insert.into(),
             label: label.into(),
@@ -237,9 +241,12 @@ pub fn command_rows(query: &str, commands: &[CommandInfo], skills: &[SkillInfo])
             )
         })
         .collect();
-    rows.extend(skills.iter().filter(|s| s.slash).map(|s| {
-        Row::item(format!("/{}", s.id), format!("/{}", s.id), skill_detail(s))
-    }));
+    rows.extend(
+        skills
+            .iter()
+            .filter(|s| s.slash)
+            .map(|s| Row::item(format!("/{}", s.id), format!("/{}", s.id), skill_detail(s))),
+    );
     filter_rows(rows, query)
 }
 
@@ -286,10 +293,7 @@ fn filter_rows(rows: Vec<Row>, query: &str) -> Vec<Row> {
 
 /// App `orderMentionComputers`: current, then reachable, then unreachable;
 /// each group keeps input order; name prefix filter (case-insensitive).
-pub fn order_computers<'a>(
-    computers: &'a [PeerMention],
-    query: &str,
-) -> Vec<&'a PeerMention> {
+pub fn order_computers<'a>(computers: &'a [PeerMention], query: &str) -> Vec<&'a PeerMention> {
     let wanted = query.trim().to_lowercase();
     let mut ranked: Vec<(u8, usize, &PeerMention)> = computers
         .iter()
@@ -329,11 +333,7 @@ pub fn computer_rows(
             } else {
                 offline_label.to_string()
             };
-            Row::item(
-                format!("@{}", computer.name),
-                computer.name.clone(),
-                detail,
-            )
+            Row::item(format!("@{}", computer.name), computer.name.clone(), detail)
         })
         .collect()
 }

@@ -136,6 +136,11 @@ fn synthetic_caller(device_id: &str) -> Caller {
 /// not authorise them (outside cleartext mode): it sits in plaintext on
 /// disk for the manage UI, and these routes can run commands on the host.
 pub(crate) fn require_device_or_peer(state: &AppState, headers: &HeaderMap) -> ApiResult<Caller> {
+    // The desktop on this computer: verified as loopback by the outermost
+    // layer, accepted in every transport mode without a proof.
+    if let Some(caller) = super::local_client::caller(headers) {
+        return Ok(caller);
+    }
     if state.config.transport_encryption == TransportEncryptionMode::Disabled {
         // Cleartext mode drops the envelope and the per-device transport
         // proof; it does not drop authentication. A device paired while
@@ -253,6 +258,9 @@ pub(crate) fn clock_skew(server_time_ms: u128) -> (StatusCode, Json<Value>) {
 /// from everything else regardless -- `require_device` fails closed on the same
 /// lock, so it cannot open a new stream or make any other request.
 pub(crate) fn still_paired(state: &AppState, device_id: &str) -> bool {
+    if super::local_client::is_live(device_id) {
+        return true;
+    }
     match state.devices.lock() {
         Ok(devices) => devices.iter().any(|device| device.id == device_id),
         Err(_) => true,
@@ -492,6 +500,106 @@ mod tests {
             assert_eq!(message["categoryId"], category);
             assert_eq!(message["data"], Value::Object(data));
             assert_eq!(message["channelId"], "gateway");
+        }
+    }
+
+    /// The desktop's local token: accepted only from a loopback peer, in both
+    /// transport modes and without a proof; refused from any other address
+    /// and when wrong; a client cannot fake the marker.
+    #[tokio::test]
+    async fn the_local_client_token_is_accepted_from_loopback_only() {
+        use axum::body::Body;
+        use axum::extract::{ConnectInfo, State};
+        use axum::http::Request;
+        use tower::ServiceExt as _;
+
+        async fn whoami(
+            State(state): State<AppState>,
+            headers: HeaderMap,
+        ) -> axum::response::Response {
+            use axum::response::IntoResponse as _;
+            match require_device_or_peer(&state, &headers) {
+                Ok(caller) => caller.device_id.into_response(),
+                Err(refusal) => refusal.into_response(),
+            }
+        }
+        super::super::local_client::set_token_for_test("local-secret");
+        let required = required_test_state("secret", vec![test_device("device-1", "device-token")]);
+        let mut cleartext = required.clone();
+        cleartext.config.transport_encryption = TransportEncryptionMode::Disabled;
+        for (state, peer, bearer, marker, want) in [
+            (
+                &required,
+                "127.0.0.1:5000",
+                "local-secret",
+                false,
+                StatusCode::OK,
+            ),
+            (
+                &cleartext,
+                "[::1]:5000",
+                "local-secret",
+                false,
+                StatusCode::OK,
+            ),
+            (
+                &required,
+                "192.168.1.9:5000",
+                "local-secret",
+                false,
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                &cleartext,
+                "100.64.0.5:5000",
+                "local-secret",
+                false,
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                &required,
+                "127.0.0.1:5000",
+                "wrong",
+                false,
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                &cleartext,
+                "127.0.0.1:5000",
+                "wrong",
+                false,
+                StatusCode::FORBIDDEN,
+            ),
+            // A forged marker makes nobody local: judged as ever (426, no transport key).
+            (
+                &required,
+                "192.168.1.9:5000",
+                "device-token",
+                true,
+                StatusCode::UPGRADE_REQUIRED,
+            ),
+        ] {
+            let app = axum::Router::new()
+                .route("/who", axum::routing::get(whoami))
+                .layer(axum::middleware::from_fn(super::super::local_client::gate))
+                .with_state(state.clone());
+            let mut request = Request::get("/who")
+                .header("authorization", format!("Bearer {bearer}"))
+                .extension(ConnectInfo(peer.parse::<std::net::SocketAddr>().unwrap()));
+            if marker {
+                request = request.header("x-muqun-local-client", "1");
+            }
+            let answer = app
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(answer.status(), want, "{peer} {bearer}");
+            if want == StatusCode::OK {
+                let body = axum::body::to_bytes(answer.into_body(), 1024)
+                    .await
+                    .unwrap();
+                assert_eq!(&body[..], b"local-desktop");
+            }
         }
     }
 

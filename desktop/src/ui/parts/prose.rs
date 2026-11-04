@@ -127,7 +127,11 @@ pub fn text(ctx: &PartCtx<'_>, text: &str) -> Div {
         }
     }
     if let Some(assets) = ctx.item.image_assets.as_ref().filter(|a| !a.is_empty()) {
-        row = row.child(media::asset_row(ctx, assets, ctx.width.min(media::MAX_MEDIA_W)));
+        row = row.child(media::asset_row(
+            ctx,
+            assets,
+            ctx.width.min(media::MAX_MEDIA_W),
+        ));
     }
     if ctx.live.is_none() && !text.trim().is_empty() {
         let mut actions = div().class("mq-row-actions").flex_row().items_center();
@@ -191,14 +195,8 @@ pub fn reasoning(ctx: &PartCtx<'_>, text: &str, duration_ms: Option<u64>) -> Div
 pub fn user(ctx: &PartCtx<'_>, text: &str) -> Div {
     // ByPath / ACP agents bake uploads into the wire text; strip that block
     // for display and paint the paths as thumbs (same as the App).
-    let (display, from_text) =
-        muqun_gateway::agents::ports::agent::split_attachment_paths(text);
-    let mut atts: Vec<String> = ctx
-        .item
-        .attachments
-        .as_ref()
-        .cloned()
-        .unwrap_or_default();
+    let (display, from_text) = muqun_gateway::agents::ports::agent::split_attachment_paths(text);
+    let mut atts: Vec<String> = ctx.item.attachments.as_ref().cloned().unwrap_or_default();
     for path in from_text {
         if !atts.iter().any(|a| a == path) {
             atts.push(path.to_string());
@@ -255,9 +253,8 @@ pub fn user(ctx: &PartCtx<'_>, text: &str) -> Div {
             text: shown,
             spans: Vec::new(),
         };
-        card = card.child(
-            markdown::inline_text(&paragraph, &setting, setting.size, false).w(inner),
-        );
+        card =
+            card.child(markdown::inline_text(&paragraph, &setting, setting.size, false).w(inner));
     }
     if more > 0 || (all && display.lines().count() > USER_LINES) {
         card = card.child(prose_more(ctx, more, all));
@@ -287,11 +284,7 @@ pub fn user(ctx: &PartCtx<'_>, text: &str) -> Div {
                 },
             )),
     );
-    div()
-        .class("mq-user-row")
-        .w_full()
-        .flex_row()
-        .child(card)
+    div().class("mq-user-row").w_full().flex_row().child(card)
 }
 
 fn injected(ctx: &PartCtx<'_>, label: &str, text: &str, description: Option<&str>) -> Div {

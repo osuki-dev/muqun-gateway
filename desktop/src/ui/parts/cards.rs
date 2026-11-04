@@ -150,10 +150,7 @@ fn parse_tool_output(raw: &Value, depth: usize) -> Payload {
             for item in items {
                 let text = match item {
                     Value::String(s) => s.as_str(),
-                    other => other
-                        .get("text")
-                        .and_then(Value::as_str)
-                        .unwrap_or(""),
+                    other => other.get("text").and_then(Value::as_str).unwrap_or(""),
                 };
                 if text.is_empty() {
                     continue;
@@ -434,11 +431,7 @@ pub fn tool(ctx: &PartCtx<'_>, call: &ToolCall) -> Div {
         .header
         .get()
         .and_then(|h| h.directory.clone());
-    let raw_target = tool_kind::extract_target(
-        kind,
-        &call.input,
-        call.input_partial.as_deref(),
-    );
+    let raw_target = tool_kind::extract_target(kind, &call.input, call.input_partial.as_deref());
     let target = relativise(&raw_target, cwd.as_deref());
     // `read` of a picture: show the image (App ToolFiles preview), don't quiet-collapse.
     let path_is_media = matches!(
@@ -547,11 +540,7 @@ pub fn tool(ctx: &PartCtx<'_>, call: &ToolCall) -> Div {
         .child(name)
         .child(title_col);
     if let Some(n) = tool_kind::result_count(call.metadata.as_ref()) {
-        head = head.child(
-            meta(format!("{n}"))
-                .class("mq-text-subtle")
-                .no_cursor(),
-        );
+        head = head.child(meta(format!("{n}")).class("mq-text-subtle").no_cursor());
     }
     if let Some(code) = shell_exit {
         let chip = if code == 0 {
@@ -597,7 +586,8 @@ pub fn tool(ctx: &PartCtx<'_>, call: &ToolCall) -> Div {
     head = head.on_click(ctx.toggle("tool"));
     let mut body = div().flex_col().class("mq-tool-body").child(head);
     if open {
-        if matches!(kind, ToolKind::Edit | ToolKind::Patch | ToolKind::Write) && !edit_files.is_empty()
+        if matches!(kind, ToolKind::Edit | ToolKind::Patch | ToolKind::Write)
+            && !edit_files.is_empty()
         {
             for (i, file) in edit_files.iter().enumerate() {
                 let (shown, more) = clip_lines(&file.patch, DIFF_PREVIEW_LINES as usize);
@@ -635,31 +625,20 @@ pub fn tool(ctx: &PartCtx<'_>, call: &ToolCall) -> Div {
                 let _ = i;
             }
         } else {
-            body = append_tool_body(
-                body,
-                ctx,
-                call,
-                kind,
-                &target,
-                &raw_target,
-                call.truncated,
-            );
+            body = append_tool_body(body, ctx, call, kind, &target, &raw_target, call.truncated);
         }
         let mut showed_media = false;
         if let Some(content) = call.content.as_ref() {
             if let Some(media_row) = media::tool_content_media(ctx, content) {
                 showed_media = true;
                 body = body.child(
-                    div()
-                        .class("mq-tool-section")
-                        .w_full()
-                        .child(
-                            div()
-                                .class("mq-tool-pane")
-                                .class("mq-tool-pane--media")
-                                .w_full()
-                                .child(media_row),
-                        ),
+                    div().class("mq-tool-section").w_full().child(
+                        div()
+                            .class("mq-tool-pane")
+                            .class("mq-tool-pane--media")
+                            .w_full()
+                            .child(media_row),
+                    ),
                 );
             }
         }
@@ -667,16 +646,13 @@ pub fn tool(ctx: &PartCtx<'_>, call: &ToolCall) -> Div {
         if !showed_media && kind == ToolKind::Read {
             if let Some(media_row) = media::path_media(ctx, &raw_target) {
                 body = body.child(
-                    div()
-                        .class("mq-tool-section")
-                        .w_full()
-                        .child(
-                            div()
-                                .class("mq-tool-pane")
-                                .class("mq-tool-pane--media")
-                                .w_full()
-                                .child(media_row),
-                        ),
+                    div().class("mq-tool-section").w_full().child(
+                        div()
+                            .class("mq-tool-pane")
+                            .class("mq-tool-pane--media")
+                            .w_full()
+                            .child(media_row),
+                    ),
                 );
             }
         }
@@ -858,21 +834,13 @@ fn append_tool_body(
                 let setting = ctx.setting(false);
                 let key = ctx.key("web");
                 let chrome = ctx.chrome(&key);
-                body = body.child(
-                    div()
-                        .class("mq-tool-section")
-                        .w_full()
-                        .child(
-                            div()
-                                .class("mq-tool-pane")
-                                .w_full()
-                                .child(markdown::render(
-                                    &markdown::parse(&output.text),
-                                    &setting,
-                                    &chrome,
-                                )),
-                        ),
-                );
+                body = body.child(div().class("mq-tool-section").w_full().child(
+                    div().class("mq-tool-pane").w_full().child(markdown::render(
+                        &markdown::parse(&output.text),
+                        &setting,
+                        &chrome,
+                    )),
+                ));
             }
         }
         ToolKind::Skill => {
@@ -886,7 +854,13 @@ fn append_tool_body(
                 .unwrap_or_else(|| output.text.clone());
             if !desc.trim().is_empty() {
                 body = body.child(code_section(
-                    ctx, "out", None, &desc, None, truncated, OUTPUT_LINES,
+                    ctx,
+                    "out",
+                    None,
+                    &desc,
+                    None,
+                    truncated,
+                    OUTPUT_LINES,
                 ));
             }
         }
@@ -997,11 +971,7 @@ fn grep_groups_pane(groups: &[tool_kind::GrepFileMatches]) -> Div {
                 Some(n) => format!("{n}: {}", hit.text),
                 None => hit.text.clone(),
             };
-            pane = pane.child(
-                meta(line)
-                    .class("mq-text-subtle")
-                    .no_cursor(),
-            );
+            pane = pane.child(meta(line).class("mq-text-subtle").no_cursor());
         }
         if group.lines.len() > 8 {
             pane = pane.child(
@@ -1274,14 +1244,17 @@ pub fn todo(ctx: &PartCtx<'_>, items: &[TodoItem]) -> Div {
         .items_center()
         .cursor_pointer()
         .child(glyphs::icon(glyphs::Glyph::TaskList, 14.0).tint(tint))
-        .child(div().flex_1().min_w(0.0).child(meta(ctx.app.strings.todo_title())))
         .child(
-            meta(format!("{done}/{total}")).class(if all_done {
-                "mq-todo-count mq-todo-count--done"
-            } else {
-                "mq-todo-count"
-            }),
+            div()
+                .flex_1()
+                .min_w(0.0)
+                .child(meta(ctx.app.strings.todo_title())),
         )
+        .child(meta(format!("{done}/{total}")).class(if all_done {
+            "mq-todo-count mq-todo-count--done"
+        } else {
+            "mq-todo-count"
+        }))
         .child(crate::ui::icons::chevron(open))
         .on_click(ctx.toggle("todo"));
 
@@ -1313,8 +1286,7 @@ pub fn todo(ctx: &PartCtx<'_>, items: &[TodoItem]) -> Div {
         for (idx, item) in items.iter().enumerate() {
             let current = !item.done && Some(idx) == first_pending;
             let mark = if item.done {
-                glyphs::icon(glyphs::Glyph::Done, 14.0)
-                    .tint(theme.color(ColorToken::Success))
+                glyphs::icon(glyphs::Glyph::Done, 14.0).tint(theme.color(ColorToken::Success))
             } else if current {
                 glyphs::icon(glyphs::Glyph::Time, 14.0).tint(tint)
             } else {
@@ -1338,7 +1310,7 @@ pub fn todo(ctx: &PartCtx<'_>, items: &[TodoItem]) -> Div {
                 ui_text(item.text.clone())
                     .size(scale::FS_13)
                     .line_height(1.5)
-                    .class(if current { "mq-text" } else { "mq-text" })
+                    .class("mq-text")
             };
             body = body.child(
                 div()

@@ -10,6 +10,7 @@ pub mod i18n;
 #[cfg(any(target_os = "macos", test))]
 pub(crate) mod launchd;
 pub(crate) mod lifecycle;
+pub(crate) mod local_client;
 pub(crate) mod manage;
 pub(crate) mod metadata;
 pub(crate) mod openapi;

@@ -81,6 +81,7 @@ pub fn settled_boundary(text: &str) -> usize {
 /// block boundaries, so the windowed list builds only the part of a long
 /// reply that is on screen and a streaming reply rebuilds only its last
 /// row as blocks settle.
+#[cfg(test)]
 pub const SEGMENT_BYTES: usize = 3 * 1024;
 
 /// The rows a text is shown as: byte ranges cut at the first block
@@ -88,6 +89,7 @@ pub const SEGMENT_BYTES: usize = 3 * 1024;
 /// [`SEGMENT_BYTES`]. The last range always runs to the end. A cut depends
 /// only on the text before it, so the ranges of a growing text never move:
 /// a streaming reply only ever gains rows at its end.
+#[cfg(test)]
 pub fn segments(text: &str) -> Vec<std::ops::Range<usize>> {
     let mut cuts = vec![0];
     let mut open: Option<(char, usize)> = None;

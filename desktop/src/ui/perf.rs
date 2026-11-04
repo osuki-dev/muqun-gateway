@@ -26,10 +26,10 @@ struct Meter {
 }
 
 fn enabled() -> bool {
-    match std::env::var("MUQUN_SHOW_FPS").as_deref() {
-        Ok("0") | Ok("false") | Ok("no") | Ok("off") => false,
-        _ => true,
-    }
+    !matches!(
+        std::env::var("MUQUN_SHOW_FPS").as_deref(),
+        Ok("0") | Ok("false") | Ok("no") | Ok("off")
+    )
 }
 
 /// Install once when the meter is on. No-op when disabled so the scheduler
@@ -46,8 +46,8 @@ pub fn install() {
         DONE.store(false, Ordering::Relaxed);
         return;
     };
-    let label = blinc_core::BlincContextState::get()
-        .use_state_keyed("mq.perf.fps", || "— FPS".to_string());
+    let label =
+        blinc_core::BlincContextState::get().use_state_keyed("mq.perf.fps", || "— FPS".to_string());
     let meter = Arc::new(Mutex::new(Meter {
         frames: 0,
         sample_start: Instant::now(),
@@ -87,8 +87,8 @@ pub fn pill() -> Option<Div> {
     if !enabled() {
         return None;
     }
-    let label = blinc_core::BlincContextState::get()
-        .use_state_keyed("mq.perf.fps", || "— FPS".to_string());
+    let label =
+        blinc_core::BlincContextState::get().use_state_keyed("mq.perf.fps", || "— FPS".to_string());
     Some(
         div()
             .class("mq-topbar-pill")

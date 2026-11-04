@@ -8,9 +8,11 @@ use crate::agents::ports::mirror::{AgentSessionSnapshot, SessionMirrorPort};
 
 /// Newest timeline items a snapshot / refresh opens with. Older pages come
 /// from [`Self::load_earlier_timeline`] (scroll-to-top or "Load earlier").
-const INITIAL_TIMELINE_LIMIT: usize = 20;
+/// Shared by every client: the desktop shows fewer rows on open by trimming
+/// client-side, not by shrinking what the gateway reads.
+const INITIAL_TIMELINE_LIMIT: usize = 100;
 /// Items per older-history page.
-const EARLIER_TIMELINE_LIMIT: usize = 20;
+const EARLIER_TIMELINE_LIMIT: usize = 80;
 
 pub struct SessionService {
     agent: Arc<dyn AgentPort>,
