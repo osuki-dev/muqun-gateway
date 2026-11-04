@@ -151,6 +151,11 @@ fn record_endpoint(file: std::path::PathBuf, url: &str) -> Option<FileRecord> {
 pub(crate) struct FileRecord(std::path::PathBuf);
 
 impl FileRecord {
+    /// Hold `file` until this is dropped.
+    pub(crate) fn keep(file: std::path::PathBuf) -> Self {
+        Self(file)
+    }
+
     #[cfg(test)]
     pub(crate) fn path(&self) -> &std::path::Path {
         &self.0
@@ -201,6 +206,7 @@ pub(crate) fn configured_url(listen: &str) -> String {
 }
 
 /// `/mcp` alone, for the loopback listener: none of the device routes.
+#[cfg(test)]
 pub(crate) fn loopback_router(state: AppState) -> Router {
     mount(Router::new())
         .layer(axum::extract::DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
