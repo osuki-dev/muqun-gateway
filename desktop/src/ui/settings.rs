@@ -30,7 +30,7 @@ use super::text::{mono_text, ui_text};
 use super::App;
 use crate::agent_fields::{self, Field, Kind};
 use crate::config::{AgentConfigs, ConfigEdit, Density, Language};
-use crate::hub::AGENT_PREFERENCE;
+use crate::hub::{HubMode, AGENT_PREFERENCE};
 use crate::model::commands::Command;
 
 const PAGE_WIDTH: f32 = 720.0;
@@ -38,7 +38,7 @@ const PAGE_WIDTH: f32 = 720.0;
 const CHROME: f32 = 112.0;
 
 /// One string in the current language.
-fn tr(app: &App, en: &'static str, zh: &'static str) -> &'static str {
+pub(super) fn tr(app: &App, en: &'static str, zh: &'static str) -> &'static str {
     match app.strings.language() {
         Language::En => en,
         Language::ZhCn => zh,
@@ -135,7 +135,7 @@ fn section_title(text: &str) -> Div {
         .child(ui_text(text.to_string()).size(13.0).semibold())
 }
 
-fn hint(text: impl Into<String>) -> Div {
+pub(super) fn hint(text: impl Into<String>) -> Div {
     div()
         .class("mq-set-hint")
         .w_full()
@@ -143,7 +143,7 @@ fn hint(text: impl Into<String>) -> Div {
 }
 
 /// A surface card wrapping one settings section (App chrome ladder).
-fn section_card(title: Option<&str>, body: Div) -> Div {
+pub(super) fn section_card(title: Option<&str>, body: Div) -> Div {
     let mut card = div().class("mq-set-card").w_full().flex_col();
     if let Some(title) = title {
         card = card.child(section_title(title));
@@ -169,7 +169,7 @@ fn setting_row(label: &str, control: impl ElementBuilder + 'static) -> Div {
 }
 
 /// A settings text field: small, fill-only (no stroke).
-fn text_field(data: &SharedTextInputData) -> InputBuilder {
+pub(super) fn text_field(data: &SharedTextInputData) -> InputBuilder {
     input(data)
         .size(InputSize::Small)
         .idle_border_color(blinc_core::Color::TRANSPARENT)
@@ -177,7 +177,7 @@ fn text_field(data: &SharedTextInputData) -> InputBuilder {
 
 // --- keyed inputs ---------------------------------------------------------
 
-fn text_data(key: &str, initial: &str) -> SharedTextInputData {
+pub(super) fn text_data(key: &str, initial: &str) -> SharedTextInputData {
     let initial = initial.to_string();
     BlincContextState::get()
         .use_state_keyed(key, move || {
@@ -384,7 +384,7 @@ fn agent_section(app: &App, agent: &'static str) -> Div {
         .child(body.class("mq-set-card-body").w_full().flex_col())
 }
 
-fn clear_text(key: &str) {
+pub(super) fn clear_text(key: &str) {
     let data = text_data(key, "");
     if let Ok(mut d) = data.lock() {
         d.value.clear();
@@ -814,11 +814,22 @@ fn general_tab(app: &App) -> Div {
         });
 
     let tray = ctx.use_state_keyed("mq-set.close_to_tray", || false);
+    let hub = match app.bindings.hub_mode.get() {
+        HubMode::LocalGateway => app.strings.hub_local_gateway(),
+        HubMode::Standalone => app.strings.hub_standalone(),
+    };
 
     div()
         .w_full()
         .flex_col()
         .class("mq-set-col")
+        .child(section_card(
+            Some(tr(app, "Connection", "连接")),
+            setting_row(
+                tr(app, "Sessions run on", "会话运行于"),
+                mono_text(hub).size(12.0),
+            ),
+        ))
         .child(section_card(
             Some(tr(app, "Language", "语言")),
             setting_row(tr(app, "Interface language", "界面语言"), language_row),

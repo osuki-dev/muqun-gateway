@@ -33,6 +33,11 @@ words! {
     open_in_editor => "Open in editor", "在编辑器打开";
     allow => "Allow", "允许";
     revert => "Revert", "撤回";
+    revert_staged => "Revert staged", "已暂存撤回";
+    confirm => "Confirm", "确认";
+    compact_context => "Compact context", "压缩上下文";
+    hub_local_gateway => "Connected to local gateway", "已连接本机 gateway";
+    hub_standalone => "Standalone (in-process)", "独立运行（进程内）";
     diff => "Diff", "Diff";
     jump_latest => "↓ Jump to latest", "↓ 回到最新";
     unknown_agent => "The agent", "Agent";

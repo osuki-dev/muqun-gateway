@@ -21,7 +21,10 @@ use muqun_gateway::platform::discovery::AgentDiscoveryInfo;
 use muqun_gateway::platform::StoredUpload;
 use tokio::sync::broadcast;
 
-use super::{CatalogView, HubError, HubFuture, PeerMention, SessionHub};
+use super::{
+    CatalogView, HubError, HubFuture, HubMode, PeerMention, SessionHub, TaskDefaults, TaskRow,
+    TimelineCatchUp,
+};
 
 pub struct LocalHub {
     runtime: Arc<AgentRuntime>,
@@ -76,6 +79,10 @@ impl LocalHub {
 }
 
 impl SessionHub for LocalHub {
+    fn mode(&self) -> HubMode {
+        HubMode::Standalone
+    }
+
     fn agents(&self) -> HubFuture<'_, Vec<AgentDiscoveryInfo>> {
         Box::pin(async move { Ok(self.runtime.discovery_snapshot().await.agents) })
     }
@@ -480,6 +487,114 @@ impl SessionHub for LocalHub {
         })
     }
 
+    fn view<'a>(&'a self, asid: &'a AgentSessionId) -> HubFuture<'a, ()> {
+        Box::pin(async move {
+            let manager = self.manager_for_session(asid).await?;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            Ok(manager.view_session(&asid.0, now).await?)
+        })
+    }
+
+    fn stage_revert<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+        message_id: &'a str,
+        files: bool,
+    ) -> HubFuture<'a, ()> {
+        Box::pin(async move {
+            let manager = self.manager_for_session(asid).await?;
+            manager
+                .agent()
+                .stage_revert(&asid.0, message_id, Some(files))
+                .await?;
+            Ok(())
+        })
+    }
+
+    fn commit_revert<'a>(&'a self, asid: &'a AgentSessionId) -> HubFuture<'a, ()> {
+        Box::pin(async move {
+            let manager = self.manager_for_session(asid).await?;
+            Ok(manager.agent().commit_revert(&asid.0).await?)
+        })
+    }
+
+    fn clear_revert<'a>(&'a self, asid: &'a AgentSessionId) -> HubFuture<'a, ()> {
+        Box::pin(async move {
+            let manager = self.manager_for_session(asid).await?;
+            Ok(manager.agent().clear_revert(&asid.0).await?)
+        })
+    }
+
+    fn compact<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+        delivery: Option<&'a str>,
+    ) -> HubFuture<'a, ()> {
+        Box::pin(async move {
+            let manager = self.manager_for_session(asid).await?;
+            manager.agent().compact_session(&asid.0, delivery).await?;
+            Ok(())
+        })
+    }
+
+    fn timeline_after<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+        after: u64,
+    ) -> HubFuture<'a, TimelineCatchUp> {
+        Box::pin(async move {
+            let manager = self.manager_for_session(asid).await?;
+            let (mut items, _status, resync, latest_seq) =
+                manager.mirror().get_timeline_delta(asid, after).await;
+            let directory = manager.mirror().session_directory(&asid.0).await;
+            muqun_gateway::agents::message_images::enrich_timeline(
+                &asid.0,
+                directory.as_deref(),
+                &mut items,
+            );
+            Ok(TimelineCatchUp {
+                items,
+                latest_seq,
+                resync,
+            })
+        })
+    }
+
+    // The task ledger belongs to the gateway service (`TaskService` is not
+    // part of the embeddable agents plane), so a standalone desktop has none.
+    fn list_tasks<'a>(
+        &'a self,
+        _root: Option<&'a str>,
+        _state: Option<&'a str>,
+    ) -> HubFuture<'a, Vec<TaskRow>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    fn create_task<'a>(
+        &'a self,
+        _goal: &'a str,
+        _agent_id: Option<&'a str>,
+        _cwd: Option<&'a str>,
+        _peer_server_id: Option<&'a str>,
+    ) -> HubFuture<'a, TaskRow> {
+        Box::pin(async { Err(tasks_unsupported()) })
+    }
+
+    fn cancel_task<'a>(&'a self, _id: &'a str) -> HubFuture<'a, ()> {
+        Box::pin(async { Err(tasks_unsupported()) })
+    }
+
+    fn complete_task<'a>(&'a self, _id: &'a str) -> HubFuture<'a, ()> {
+        Box::pin(async { Err(tasks_unsupported()) })
+    }
+
+    fn task_defaults(&self) -> HubFuture<'_, TaskDefaults> {
+        Box::pin(async { Ok(TaskDefaults::default()) })
+    }
+
     fn list_peers(&self) -> HubFuture<'_, Vec<PeerMention>> {
         Box::pin(async move {
             // This computer always leads the `@` list. Linked fleet peers
@@ -497,6 +612,12 @@ impl SessionHub for LocalHub {
     fn events(&self) -> broadcast::Receiver<AgentDomainEvent> {
         self.runtime.subscribe_events()
     }
+}
+
+fn tasks_unsupported() -> HubError {
+    HubError::Agent(AgentError::Unsupported(
+        "task delegation (needs the Muqun gateway service on this computer)".into(),
+    ))
 }
 
 pub(super) fn computer_name() -> String {

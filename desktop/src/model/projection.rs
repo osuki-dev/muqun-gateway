@@ -3,7 +3,9 @@
 //!
 //! Nothing here touches Blinc except through the inbox's wake-up.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -31,6 +33,8 @@ const LIST_TIMEOUT: Duration = Duration::from_secs(6);
 const WATCH_AGENTS_FOR: Duration = Duration::from_secs(90);
 const ATTACH_POLL: Duration = Duration::from_secs(2);
 const DISCOVERY_POLL: Duration = Duration::from_secs(5);
+/// How often the open session is marked read again while it stays open.
+const VIEW_HEARTBEAT: Duration = Duration::from_secs(30);
 
 /// The configuration file and its current contents, shared by the core side
 /// and, for reading and the last write at exit, the main thread.
@@ -172,6 +176,11 @@ struct Core {
     edits: watch::Sender<u64>,
     /// Session folders already resolved to their projects.
     resolved: Mutex<std::collections::HashSet<String>>,
+    /// The newest sequence handed to the UI per session, for catching up
+    /// after a resync.
+    last_seq: Mutex<HashMap<String, u64>>,
+    /// Which view-heartbeat task is current; older ones end at their next tick.
+    beat: AtomicU64,
 }
 
 /// Start the core side. Returns at once; the tasks live as long as the
@@ -194,7 +203,10 @@ pub fn spawn(
         completions,
         edits,
         resolved: Mutex::new(Default::default()),
+        last_seq: Mutex::new(HashMap::new()),
+        beat: AtomicU64::new(0),
     });
+    core.inbox.push(Update::HubMode(core.hub.mode()));
     tokio::spawn(core.clone().events());
     tokio::spawn(core.clone().complete_directories(completion_rx));
     tokio::spawn(core.clone().save_config(edits_rx));
@@ -318,8 +330,25 @@ impl Core {
                     .inbox
                     .push(Update::Ui(super::inbox::UiAction::ToggleDiffPanel)),
             },
-            Command::StageRevert { asid, file } => {
-                tracing::info!(asid = %asid.0, file, "revert: not built yet");
+            Command::StageRevert { asid, message_id } => {
+                if let Err(err) = self.hub.stage_revert(&asid, &message_id, true).await {
+                    self.fail(err);
+                }
+            }
+            Command::CommitRevert { asid } => {
+                if let Err(err) = self.hub.commit_revert(&asid).await {
+                    self.fail(err);
+                }
+            }
+            Command::ClearRevert { asid } => {
+                if let Err(err) = self.hub.clear_revert(&asid).await {
+                    self.fail(err);
+                }
+            }
+            Command::CompactSession { asid } => {
+                if let Err(err) = self.hub.compact(&asid, None).await {
+                    self.fail(err);
+                }
             }
             Command::ReplyForm { asid, id, answers } => {
                 if let Err(err) = self.hub.reply_form(&asid, &id, answers).await {
@@ -393,6 +422,32 @@ impl Core {
                     Err(err) => self.fail(err),
                 }
             }
+            Command::RefreshTasks => self.refresh_tasks().await,
+            Command::CreateTask { goal, agent, cwd } => {
+                let goal = goal.trim().to_string();
+                if goal.is_empty() {
+                    return;
+                }
+                match self
+                    .hub
+                    .create_task(&goal, agent.as_deref(), cwd.as_deref(), None)
+                    .await
+                {
+                    Ok(task) => {
+                        tracing::info!(task = %task.id, state = %task.state, "task delegated");
+                        self.refresh_tasks().await;
+                    }
+                    Err(err) => self.fail(err),
+                }
+            }
+            Command::CancelTask { id } => match self.hub.cancel_task(&id).await {
+                Ok(()) => self.refresh_tasks().await,
+                Err(err) => self.fail(err),
+            },
+            Command::CompleteTask { id } => match self.hub.complete_task(&id).await {
+                Ok(()) => self.refresh_tasks().await,
+                Err(err) => self.fail(err),
+            },
             Command::CompleteDirectory { .. } | Command::Edit(_) => {
                 unreachable!("handled in the command loop")
             }
@@ -509,11 +564,32 @@ impl Core {
     /// others back. Starts are staggered so ten agents listing at once do
     /// not spike the first second of startup.
     async fn refresh(self: Arc<Self>) {
+        tokio::spawn(self.clone().refresh_tasks());
         if let Ok(agents) = self.hub.agents().await {
             self.inbox.push(Update::Agents(agents));
         }
         let attached = self.hub.attached().await.unwrap_or_default();
         self.spawn_lists(attached).await;
+    }
+
+    /// The delegated task list and the default folder. A gateway without
+    /// task routes (or an unreachable one) leaves the list as it was.
+    async fn refresh_tasks(self: Arc<Self>) {
+        let list = tokio::time::timeout(LIST_TIMEOUT, self.hub.list_tasks(None, None));
+        match list.await {
+            Ok(Ok(rows)) => {
+                let default_cwd = match self.hub.task_defaults().await {
+                    Ok(defaults) => defaults.default_cwd,
+                    Err(err) => {
+                        tracing::debug!(%err, "task defaults unavailable");
+                        None
+                    }
+                };
+                self.inbox.push(Update::Tasks { rows, default_cwd });
+            }
+            Ok(Err(err)) => tracing::warn!(%err, "task list unavailable"),
+            Err(_) => tracing::warn!("task list timed out"),
+        }
     }
 
     /// Kick off one `list_sessions` per agent, briefly staggered so a cold
@@ -610,6 +686,10 @@ impl Core {
     /// A session's snapshot to the view, and its waiting prompts to the
     /// composer (the view keeps no inbox).
     fn push_snapshot(&self, snapshot: muqun_gateway::agents::ports::AgentSessionSnapshot) {
+        self.last_seq
+            .lock()
+            .unwrap()
+            .insert(snapshot.info.asid.0.clone(), snapshot.seq);
         super::compose::push_inbox(&self.inbox, &snapshot.info.asid.0, &snapshot.inbox);
         self.inbox.push(Update::Snapshot(Box::new(snapshot)));
     }
@@ -623,6 +703,7 @@ impl Core {
             Ok(Some(snapshot)) => {
                 self.resolve_dirs(snapshot.info.directory.iter().cloned().collect(), false);
                 self.push_snapshot(snapshot);
+                self.watch_viewed(asid);
                 tracing::info!(
                     asid = %asid.0,
                     ms = started.elapsed().as_millis() as u64,
@@ -645,6 +726,7 @@ impl Core {
                     }
                     self.resolve_dirs(snapshot.info.directory.iter().cloned().collect(), false);
                     self.push_snapshot(snapshot);
+                    self.watch_viewed(asid);
                     tracing::info!(
                         asid = %asid.0,
                         ms = started.elapsed().as_millis() as u64,
@@ -660,6 +742,66 @@ impl Core {
                 }
             },
             Err(err) => self.fail(err),
+        }
+    }
+
+    /// Mark the session read now, and again every [`VIEW_HEARTBEAT`] while it
+    /// stays the open one. A newer call ends the heartbeat of an older one.
+    fn watch_viewed(self: &Arc<Self>, asid: &AgentSessionId) {
+        let beat = self.beat.fetch_add(1, Ordering::SeqCst) + 1;
+        let core = self.clone();
+        let asid = asid.clone();
+        tokio::spawn(async move {
+            loop {
+                let open = core.active.lock().unwrap().as_ref() == Some(&asid);
+                if !open || core.beat.load(Ordering::SeqCst) != beat {
+                    return;
+                }
+                if let Err(err) = core.hub.view(&asid).await {
+                    tracing::debug!(asid = %asid.0, %err, "marking the session viewed failed");
+                }
+                tokio::time::sleep(VIEW_HEARTBEAT).await;
+            }
+        });
+    }
+
+    /// Hand the UI the rows newer than what it has, instead of a whole
+    /// snapshot. False when the mirror cannot say (a resync, or an error),
+    /// and the snapshot must be read.
+    async fn catch_up(&self, asid: &AgentSessionId) -> bool {
+        let after = self
+            .last_seq
+            .lock()
+            .unwrap()
+            .get(&asid.0)
+            .copied()
+            .unwrap_or(0);
+        if after == 0 {
+            return false;
+        }
+        match self.hub.timeline_after(asid, after).await {
+            Ok(found) if !found.resync => {
+                if !found.items.is_empty() {
+                    self.last_seq
+                        .lock()
+                        .unwrap()
+                        .entry(asid.0.clone())
+                        .and_modify(|seq| *seq = (*seq).max(found.latest_seq))
+                        .or_insert(found.latest_seq);
+                    self.inbox
+                        .push(Update::event(AgentDomainEvent::TimelineUpsert {
+                            asid: asid.clone(),
+                            items: found.items,
+                            seq: found.latest_seq,
+                        }));
+                }
+                true
+            }
+            Ok(_) => false,
+            Err(err) => {
+                tracing::debug!(asid = %asid.0, %err, "catch-up failed; reading the snapshot");
+                false
+            }
         }
     }
 
@@ -804,6 +946,14 @@ impl Core {
                         _ => {}
                     }
                     if wanted(&event, active.as_ref()) {
+                        if event.seq() != 0 {
+                            self.last_seq
+                                .lock()
+                                .unwrap()
+                                .entry(event.asid().0.clone())
+                                .and_modify(|seq| *seq = (*seq).max(event.seq()))
+                                .or_insert(event.seq());
+                        }
                         self.inbox.push(Update::event(event));
                     }
                 }
@@ -837,9 +987,11 @@ impl Core {
                 loop {
                     let active = core.active.lock().unwrap().clone();
                     if let Some(active) = active {
-                        match core.hub.snapshot(&active).await {
-                            Ok(snapshot) => core.push_snapshot(snapshot),
-                            Err(err) => tracing::debug!(%err, "resync read failed"),
+                        if !core.catch_up(&active).await {
+                            match core.hub.snapshot(&active).await {
+                                Ok(snapshot) => core.push_snapshot(snapshot),
+                                Err(err) => tracing::debug!(%err, "resync read failed"),
+                            }
                         }
                     }
                     if !core.reread.again() {

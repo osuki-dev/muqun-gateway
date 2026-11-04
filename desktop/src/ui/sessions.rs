@@ -40,9 +40,9 @@ const GAP_ROW: f32 = 10.0;
 /// The search field, and the block it sits in.
 const SEARCH_FIELD: f32 = 36.0;
 const SEARCH_BLOCK: f32 = SEARCH_FIELD + 16.0 + 8.0;
-/// One bottom entry (Inbox, Settings), and the block of both.
+/// One bottom entry (Inbox, Tasks, Settings), and the block of all three.
 const ENTRY_ROW: f32 = 36.0;
-const BOTTOM_BLOCK: f32 = 2.0 * ENTRY_ROW + 1.0 + 16.0;
+const BOTTOM_BLOCK: f32 = 3.0 * ENTRY_ROW + 1.0 + 16.0;
 /// The folded sidebar.
 pub const RAIL_WIDTH: f32 = 56.0;
 const RAIL_ITEM: f32 = 40.0;
@@ -210,6 +210,7 @@ pub fn sidebar(app: &App, height: f32) -> Div {
                 .flex_col()
                 .flex_shrink_0()
                 .child(inbox_entry(app, false))
+                .child(tasks_entry(app, false))
                 .child(settings_entry(app, false)),
         )
 }
@@ -407,6 +408,7 @@ pub fn rail(app: &App, height: f32) -> Div {
                 .flex_col()
                 .flex_shrink_0()
                 .child(inbox_entry(app, true))
+                .child(tasks_entry(app, true))
                 .child(settings_entry(app, true)),
         )
 }
@@ -973,12 +975,76 @@ fn inbox_entry(app: &App, rail: bool) -> impl ElementBuilder {
             .on_click(move |_| {
                 click.bindings.draft.signal().set(None);
                 click.bindings.settings_open.signal().set(false);
+                click.bindings.tasks_open.signal().set(false);
                 click.bindings.inbox_open.signal().set(true);
             });
         if !rail {
             row = row.child(
                 div().class("mq-nav-label").flex_1().child(
                     ui_text(app.strings.inbox())
+                        .size(13.0)
+                        .no_wrap()
+                        .no_cursor(),
+                ),
+            );
+        }
+        if count > 0 {
+            let badge = div()
+                .class("mq-badge-count")
+                .h(18.0)
+                .min_w(18.0)
+                .flex_row()
+                .items_center()
+                .justify_center()
+                .child(
+                    ui_text(count.to_string())
+                        .size(11.0)
+                        .semibold()
+                        .no_wrap()
+                        .no_cursor(),
+                );
+            row = if rail {
+                row.child(div().absolute().right(4.0).top(2.0).child(badge))
+            } else {
+                row.child(badge)
+            };
+        }
+        row
+    })
+}
+
+/// Delegated tasks (`ui/tasks.rs`); a count badge for the ones in progress.
+fn tasks_entry(app: &App, rail: bool) -> impl ElementBuilder {
+    let b = app.bindings.clone();
+    let app = app.clone();
+    stateful_with_key::<NoState>(if rail {
+        "mq-tasks-entry-rail"
+    } else {
+        "mq-tasks-entry"
+    })
+    .deps([b.tasks.signal_id(), b.tasks_open.signal_id()])
+    .on_state(move |_| {
+        let open = b.tasks_open.get();
+        let count = b
+            .tasks
+            .get()
+            .iter()
+            .filter(|t| matches!(t.state.as_str(), "queued" | "dispatching" | "working"))
+            .count();
+        let click = app.clone();
+        let mut row = entry(rail, open)
+            .child(icon(super::glyphs::Glyph::TaskList, 16.0))
+            .on_click(move |_| {
+                if click.bindings.tasks_open.get() {
+                    super::tasks::close(&click);
+                } else {
+                    super::tasks::open(&click);
+                }
+            });
+        if !rail {
+            row = row.child(
+                div().class("mq-nav-label").flex_1().child(
+                    ui_text(super::settings::tr(&app, "Tasks", "任务"))
                         .size(13.0)
                         .no_wrap()
                         .no_cursor(),

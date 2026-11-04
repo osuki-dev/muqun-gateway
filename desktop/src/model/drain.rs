@@ -255,6 +255,7 @@ impl Drain {
                 bindings.draft.signal().set(None);
                 bindings.settings_open.signal().set(false);
                 bindings.inbox_open.signal().set(false);
+                bindings.tasks_open.signal().set(false);
                 if changed {
                     bindings.selected.signal().set(Some(asid.to_string()));
                     bindings.diff.signal().set(None);
@@ -289,6 +290,7 @@ impl Drain {
                 bindings.draft.signal().set(None);
                 bindings.settings_open.signal().set(false);
                 bindings.inbox_open.signal().set(false);
+                bindings.tasks_open.signal().set(false);
                 if changed {
                     bindings.diff.signal().set(None);
                     bindings.diff_panel.signal().set(false);
@@ -443,6 +445,15 @@ impl Drain {
         for update in composer {
             if let Update::Composer(update) = update {
                 crate::ui::composer::apply_update(*update);
+            }
+        }
+        // And the hub's mode, a plain binding.
+        let (modes, batch): (Vec<Update>, Vec<Update>) = batch
+            .into_iter()
+            .partition(|u| matches!(u, Update::HubMode(_)));
+        for update in modes {
+            if let Update::HubMode(mode) = update {
+                bindings.hub_mode.signal().set(mode);
             }
         }
         self.check_scheme(bindings);
@@ -652,6 +663,8 @@ fn batch_kinds(batch: &[Update]) -> String {
             Update::Directories(_) => "directories",
             Update::KnownProjects { .. } => "known_projects",
             Update::Diff(_) => "diff",
+            Update::Tasks { .. } => "tasks",
+            Update::HubMode(_) => "hub_mode",
         };
         match counts.iter_mut().find(|(k, _)| *k == kind) {
             Some((_, n)) => *n += 1,
@@ -694,6 +707,8 @@ struct Rest {
     dirs: Option<Arc<HashMap<String, super::projects::DirInfo>>>,
     known: Option<Arc<Vec<muqun_gateway::agents::AgentProject>>>,
     diff: Option<Option<super::view::DiffStat>>,
+    tasks: Option<Arc<Vec<crate::hub::TaskRow>>>,
+    task_cwd: Option<Option<String>>,
 }
 
 impl Rest {
@@ -715,6 +730,8 @@ impl Rest {
                 .known
                 .then(|| Arc::new(view.known.values().flatten().cloned().collect())),
             diff: (c.diff || c.selected).then(|| view.diff.clone()),
+            tasks: c.tasks.then(|| Arc::new(view.tasks.clone())),
+            task_cwd: c.tasks.then(|| view.task_cwd.clone()),
         }
     }
 }
@@ -808,6 +825,14 @@ impl Planned {
         if let Some(diff) = rest.diff {
             if b.diff.get() != diff {
                 b.diff.signal().set(diff);
+            }
+        }
+        if let Some(tasks) = rest.tasks {
+            b.tasks.signal().set(tasks);
+        }
+        if let Some(cwd) = rest.task_cwd {
+            if b.task_cwd.get() != cwd {
+                b.task_cwd.signal().set(cwd);
             }
         }
     }

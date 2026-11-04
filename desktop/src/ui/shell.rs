@@ -22,7 +22,7 @@ use crate::model::commands::Command;
 use crate::model::view::RightTab;
 use crate::platform::editors::{self, Editor};
 use blinc_app::windowed::WindowedContext;
-use blinc_cn::prelude::dropdown_menu_custom;
+use blinc_cn::prelude::{button, dropdown_menu_custom, ButtonSize, ButtonVariant};
 use blinc_core::State;
 use blinc_layout::prelude::*;
 
@@ -963,8 +963,10 @@ fn main_panel(app: &App, width: f32, height: f32) -> Div {
     let selected = app.bindings.selected.clone();
     let settings_open = app.bindings.settings_open.clone();
     let inbox_open = app.bindings.inbox_open.clone();
+    let tasks_open = app.bindings.tasks_open.clone();
     let cmp = composer::state::Cmp::get();
     let strip = errors::strip(app);
+    let plate = revert_plate(app);
     let app = app.clone();
     let right_open = app.bindings.diff_panel.clone();
     let view = stateful_with_key::<NoState>("mq-main-view")
@@ -972,6 +974,7 @@ fn main_panel(app: &App, width: f32, height: f32) -> Div {
             selected.signal_id(),
             settings_open.signal_id(),
             inbox_open.signal_id(),
+            tasks_open.signal_id(),
             cmp.inbox.signal_id(),
             cmp.staged.signal_id(),
             cmp.rows.signal_id(),
@@ -985,6 +988,9 @@ fn main_panel(app: &App, width: f32, height: f32) -> Div {
             }
             if inbox_open.get() {
                 return inbox_page(&app, height);
+            }
+            if tasks_open.get() {
+                return super::tasks::page(&app, height);
             }
             if selected.get().is_none() {
                 return home::home(&app, width, height);
@@ -1003,9 +1009,54 @@ fn main_panel(app: &App, width: f32, height: f32) -> Div {
         .w_full()
         .h(height)
         .child(view)
-        // Last, and absolutely placed over the top, so the strip never
-        // moves the layout under the reader.
+        // Absolutely placed over the top, so neither moves the layout under
+        // the reader; the alert strip goes last, above the plate.
+        .child(plate)
         .child(strip)
+}
+
+/// "Revert staged · Confirm · Cancel", while the open session has a
+/// rollback waiting for an answer.
+fn revert_plate(app: &App) -> impl ElementBuilder {
+    let header = app.bindings.header.clone();
+    let app = app.clone();
+    stateful_with_key::<NoState>("mq-revert-plate")
+        .deps([header.signal_id()])
+        .on_state(move |_| {
+            let Some(info) = header.get().filter(|i| i.revert.is_some()) else {
+                return div();
+            };
+            let confirm = {
+                let (app, asid) = (app.clone(), info.asid.clone());
+                button(app.strings.confirm())
+                    .variant(ButtonVariant::Primary)
+                    .size(ButtonSize::Small)
+                    .on_click(move |_| app.send(Command::CommitRevert { asid: asid.clone() }))
+            };
+            let cancel = {
+                let (app, asid) = (app.clone(), info.asid.clone());
+                button(app.strings.cancel())
+                    .variant(ButtonVariant::Ghost)
+                    .size(ButtonSize::Small)
+                    .on_click(move |_| app.send(Command::ClearRevert { asid: asid.clone() }))
+            };
+            div()
+                .class("mq-revert-plate")
+                .absolute()
+                .top(0.0)
+                .left(0.0)
+                .w_full()
+                .flex_row()
+                .items_center()
+                .flex_shrink_0()
+                .child(
+                    div()
+                        .flex_1()
+                        .child(ui_text(app.strings.revert_staged()).size(13.0)),
+                )
+                .child(confirm)
+                .child(cancel)
+        })
 }
 
 /// The Inbox (a placeholder for its route): what waits for an answer in

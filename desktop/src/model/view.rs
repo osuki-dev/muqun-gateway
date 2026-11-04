@@ -13,7 +13,7 @@ use blinc_core::State;
 use muqun_gateway::agents::directories::DirectoryEntry;
 use muqun_gateway::agents::{
     AgentDomainEvent, AgentPart, AgentProject, AgentSessionInfo, AgentSessionStatus, FormRequest,
-    PermissionRequest, TimelineItem, TimelineRole,
+    PermissionRequest, RevertState, TimelineItem, TimelineRole,
 };
 use muqun_gateway::platform::discovery::AgentDiscoveryInfo;
 
@@ -365,6 +365,7 @@ struct Shown<'a> {
     model: Option<&'a str>,
     variant: Option<&'a str>,
     mode: Option<&'a str>,
+    revert: Option<&'a str>,
 }
 
 fn shown(s: &AgentSessionInfo) -> Shown<'_> {
@@ -377,6 +378,7 @@ fn shown(s: &AgentSessionInfo) -> Shown<'_> {
         model: s.model.as_ref().map(|m| m.model_id.as_str()),
         variant: s.model.as_ref().and_then(|m| m.variant.as_deref()),
         mode: s.mode.as_deref(),
+        revert: s.revert.as_ref().map(|r| r.message_id.as_str()),
     }
 }
 
@@ -504,6 +506,10 @@ pub struct ViewState {
     pub known: std::collections::BTreeMap<String, Vec<AgentProject>>,
     /// The open session's working-tree change count.
     pub diff: Option<DiffStat>,
+    /// Delegated tasks, newest update first.
+    pub tasks: Vec<crate::hub::TaskRow>,
+    /// Where a task opened without a folder would run.
+    pub task_cwd: Option<String>,
 }
 
 /// What one batch moved.
@@ -531,6 +537,7 @@ pub struct Changes {
     pub dirs: bool,
     pub known: bool,
     pub diff: bool,
+    pub tasks: bool,
     /// A different session (or a fresh snapshot) is now shown.
     pub opened: bool,
     pub actions: Vec<UiAction>,
@@ -555,6 +562,7 @@ impl Changes {
             ("dirs", self.dirs),
             ("known", self.known),
             ("diff", self.diff),
+            ("tasks", self.tasks),
             ("opened", self.opened),
         ];
         let mut out: Vec<String> = flags
@@ -820,7 +828,7 @@ impl ViewState {
                 }
             }
             // Routed past the view by the drain (`drain.rs` `apply`).
-            Update::Theme(_) | Update::Composer(_) => {}
+            Update::Theme(_) | Update::Composer(_) | Update::HubMode(_) => {}
             Update::Projects { agent, projects } => {
                 self.projects = ProjectList { agent, projects };
                 changes.projects = true;
@@ -853,6 +861,13 @@ impl ViewState {
                 if self.diff != stat {
                     self.diff = stat;
                     changes.diff = true;
+                }
+            }
+            Update::Tasks { rows, default_cwd } => {
+                if self.tasks != rows || self.task_cwd != default_cwd {
+                    self.tasks = rows;
+                    self.task_cwd = default_cwd;
+                    changes.tasks = true;
                 }
             }
             Update::Earlier {
@@ -1078,8 +1093,29 @@ impl ViewState {
                 active.pending_forms.retain(|f| f.id != form_id);
                 changes.forms |= active.pending_forms.len() != before;
             }
-            // Compaction, revert, inbox and worktrees are P1; a resync is
-            // answered on the core side with a fresh snapshot.
+            AgentDomainEvent::RevertChanged {
+                asid,
+                state,
+                revert,
+                ..
+            } => {
+                let Some(active) = self.active_for(&asid.0) else {
+                    return;
+                };
+                let revert = match state {
+                    RevertState::Staged => revert,
+                    RevertState::Committed | RevertState::Cleared => None,
+                };
+                if active.info.revert != revert {
+                    active.info.revert = revert;
+                    changes.header = true;
+                }
+            }
+            // The boundary row arrives as a timeline item; nothing else shows
+            // a running compaction yet.
+            AgentDomainEvent::CompactionChanged { .. } => {}
+            // Inbox and worktrees are P1; a resync is answered on the core
+            // side with a fresh snapshot.
             _ => {}
         }
     }
@@ -1171,6 +1207,8 @@ pub struct Bindings {
     pub waiting_forms: State<Arc<Vec<FormRequest>>>,
     /// The open session's working-tree change count.
     pub diff: State<Option<DiffStat>>,
+    /// Where this desktop's sessions run (`Update::HubMode`).
+    pub hub_mode: State<crate::hub::HubMode>,
     /// The right panel (Queue / Git tabs) is open. UI-owned.
     pub diff_panel: State<bool>,
     /// Which tab the right panel shows while open.
@@ -1179,6 +1217,12 @@ pub struct Bindings {
     pub diff_focus: State<Option<String>>,
     /// The Inbox page, while it is open. UI-owned.
     pub inbox_open: State<bool>,
+    /// Delegated tasks, newest update first.
+    pub tasks: State<Arc<Vec<crate::hub::TaskRow>>>,
+    /// The Tasks page, while it is open. UI-owned.
+    pub tasks_open: State<bool>,
+    /// The folder a task opened without one runs in (shown as a hint).
+    pub task_cwd: State<Option<String>>,
     pub selected: State<Option<String>>,
     pub header: State<Option<Arc<AgentSessionInfo>>>,
     pub order: State<Arc<TimelineOrder>>,
@@ -1217,10 +1261,14 @@ impl Bindings {
             known: ctx.use_state_keyed("mq.known", || Arc::new(Vec::new())),
             waiting_forms: ctx.use_state_keyed("mq.waiting_forms", || Arc::new(Vec::new())),
             diff: ctx.use_state_keyed("mq.diff", || None),
+            hub_mode: ctx.use_state_keyed("mq.hub_mode", || crate::hub::HubMode::Standalone),
             diff_panel: ctx.use_state_keyed("mq.diff_panel", || false),
             right_tab: ctx.use_state_keyed("mq.right_tab", || RightTab::Git),
             diff_focus: ctx.use_state_keyed("mq.diff_focus", || None),
             inbox_open: ctx.use_state_keyed("mq.inbox_open", || false),
+            tasks: ctx.use_state_keyed("mq.tasks", || Arc::new(Vec::new())),
+            tasks_open: ctx.use_state_keyed("mq.tasks_open", || false),
+            task_cwd: ctx.use_state_keyed("mq.task_cwd", || None),
             selected: ctx.use_state_keyed("mq.selected", || None),
             header: ctx.use_state_keyed("mq.header", || None),
             order: ctx.use_state_keyed("mq.order", || Arc::new(TimelineOrder::default())),

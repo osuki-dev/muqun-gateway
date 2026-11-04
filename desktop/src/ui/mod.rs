@@ -16,6 +16,7 @@ pub mod sessions;
 pub mod settings;
 pub mod shell;
 pub mod strings;
+pub mod tasks;
 pub mod text;
 pub mod themes;
 pub mod timeline;
@@ -89,6 +90,7 @@ impl App {
         self.drain.go_home();
         composer::focus_input(self);
         self.bindings.inbox_open.signal().set(false);
+        self.bindings.tasks_open.signal().set(false);
     }
 
     /// The start page for a project (a project row's `+`; the sidebar calls it).
@@ -99,6 +101,7 @@ impl App {
 
     pub fn open_settings(&self) {
         self.bindings.inbox_open.signal().set(false);
+        self.bindings.tasks_open.signal().set(false);
         self.bindings
             .settings_tab
             .signal()
@@ -225,6 +228,7 @@ fn on_key(app: &App, ctx: &blinc_layout::event_handler::EventContext) {
         KEY_ESCAPE if composer::dismiss() => {}
         KEY_ESCAPE if app.bindings.diff_panel.get() => shell::close_right(app),
         KEY_ESCAPE if app.bindings.settings_open.get() => app.close_settings(),
+        KEY_ESCAPE if app.bindings.tasks_open.get() => tasks::close(app),
         KEY_ESCAPE => interrupt(app),
         KEY_PERIOD if chord => interrupt(app),
         // On the start page with the caret elsewhere, Enter goes back to the

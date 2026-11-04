@@ -25,7 +25,10 @@ use serde_json::{json, Value};
 use tokio::sync::broadcast;
 
 use super::local::enrich_local_media;
-use super::{CatalogView, HubError, HubFuture, PeerMention, SessionHub};
+use super::{
+    CatalogView, HubError, HubFuture, HubMode, PeerMention, SessionHub, TaskDefaults, TaskRow,
+    TimelineCatchUp,
+};
 
 const EVENT_CAPACITY: usize = 4096;
 const BACKOFF_START: Duration = Duration::from_millis(500);
@@ -216,6 +219,44 @@ fn decode<T: DeserializeOwned>(value: Value) -> Result<T, HubError> {
     })
 }
 
+/// `{"tasks": [TaskView]}` as rows.
+fn task_rows(json: &Value) -> Result<Vec<TaskRow>, HubError> {
+    json.get("tasks")
+        .and_then(Value::as_array)
+        .map(|tasks| tasks.iter().map(task_row).collect())
+        .unwrap_or_else(|| Ok(Vec::new()))
+}
+
+/// One `TaskView` (a list entry, or the answer of `POST /api/tasks`).
+fn task_row(json: &Value) -> Result<TaskRow, HubError> {
+    TaskRow::from_json(json).map_err(|err| {
+        HubError::Agent(AgentError::Protocol(format!(
+            "unexpected task from the local gateway: {err}"
+        )))
+    })
+}
+
+/// The `POST /api/tasks` body: only what was given, so the gateway's own
+/// defaults (primary agent, the device's last folder) apply to the rest.
+fn create_task_body(
+    goal: &str,
+    agent_id: Option<&str>,
+    cwd: Option<&str>,
+    peer_server_id: Option<&str>,
+) -> Value {
+    let mut body = json!({ "goal": goal });
+    if let Some(agent) = agent_id.filter(|a| !a.is_empty()) {
+        body["agent_id"] = json!(agent);
+    }
+    if let Some(cwd) = cwd.filter(|c| !c.is_empty()) {
+        body["cwd"] = json!(cwd);
+    }
+    if let Some(peer) = peer_server_id.filter(|p| !p.is_empty()) {
+        body["computer_ids"] = json!([peer]);
+    }
+    body
+}
+
 /// The gateway's `{"error": {"code", "message"}}` as the hub's own errors.
 fn map_error(status: u16, body: &Value, asid: &str, raw: &str) -> HubError {
     let code = body.pointer("/error/code").and_then(Value::as_str);
@@ -253,6 +294,10 @@ fn map_error(status: u16, body: &Value, asid: &str, raw: &str) -> HubError {
 }
 
 impl SessionHub for RemoteHub {
+    fn mode(&self) -> HubMode {
+        HubMode::LocalGateway
+    }
+
     fn agents(&self) -> HubFuture<'_, Vec<AgentDiscoveryInfo>> {
         Box::pin(async move {
             let json = self
@@ -820,6 +865,174 @@ impl SessionHub for RemoteHub {
         })
     }
 
+    fn view<'a>(&'a self, asid: &'a AgentSessionId) -> HubFuture<'a, ()> {
+        Box::pin(async move {
+            // The route defaults `idle` to now.
+            Self::unit(
+                self.session_call(Method::POST, asid, &["view"], &[], Some(json!({})))
+                    .await,
+            )
+        })
+    }
+
+    fn stage_revert<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+        message_id: &'a str,
+        files: bool,
+    ) -> HubFuture<'a, ()> {
+        Box::pin(async move {
+            Self::unit(
+                self.session_call(
+                    Method::POST,
+                    asid,
+                    &["revert", "stage"],
+                    &[],
+                    Some(json!({"message_id": message_id, "files": files})),
+                )
+                .await,
+            )
+        })
+    }
+
+    fn commit_revert<'a>(&'a self, asid: &'a AgentSessionId) -> HubFuture<'a, ()> {
+        Box::pin(async move {
+            Self::unit(
+                self.session_call(Method::POST, asid, &["revert", "commit"], &[], None)
+                    .await,
+            )
+        })
+    }
+
+    fn clear_revert<'a>(&'a self, asid: &'a AgentSessionId) -> HubFuture<'a, ()> {
+        Box::pin(async move {
+            Self::unit(
+                self.session_call(Method::POST, asid, &["revert", "clear"], &[], None)
+                    .await,
+            )
+        })
+    }
+
+    fn compact<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+        delivery: Option<&'a str>,
+    ) -> HubFuture<'a, ()> {
+        Box::pin(async move {
+            let body = match delivery {
+                Some(delivery) => json!({"delivery": delivery}),
+                None => json!({}),
+            };
+            Self::unit(
+                self.session_call(Method::POST, asid, &["compact"], &[], Some(body))
+                    .await,
+            )
+        })
+    }
+
+    fn timeline_after<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+        after: u64,
+    ) -> HubFuture<'a, TimelineCatchUp> {
+        Box::pin(async move {
+            let after = after.to_string();
+            let json = self
+                .session_call(Method::GET, asid, &["timeline"], &[("after", &after)], None)
+                .await?;
+            let data = json.get("data").cloned().unwrap_or(Value::Null);
+            let mut items: Vec<TimelineItem> = decode(
+                data.get("items")
+                    .cloned()
+                    .unwrap_or(Value::Array(Vec::new())),
+            )?;
+            let directory = self.snapshot_directory(asid).await;
+            muqun_gateway::agents::message_images::enrich_timeline(
+                &asid.0,
+                directory.as_deref(),
+                &mut items,
+            );
+            Ok(TimelineCatchUp {
+                items,
+                latest_seq: data.get("latest_seq").and_then(Value::as_u64).unwrap_or(0),
+                resync: data.get("resync").and_then(Value::as_bool).unwrap_or(false),
+            })
+        })
+    }
+
+    fn list_tasks<'a>(
+        &'a self,
+        root: Option<&'a str>,
+        state: Option<&'a str>,
+    ) -> HubFuture<'a, Vec<TaskRow>> {
+        Box::pin(async move {
+            let mut pairs = Vec::new();
+            if let Some(root) = root {
+                pairs.push(("root", root));
+            }
+            if let Some(state) = state {
+                pairs.push(("state", state));
+            }
+            let json = self
+                .call(Method::GET, &["api", "tasks"], &pairs, None)
+                .await?;
+            task_rows(&json)
+        })
+    }
+
+    fn create_task<'a>(
+        &'a self,
+        goal: &'a str,
+        agent_id: Option<&'a str>,
+        cwd: Option<&'a str>,
+        peer_server_id: Option<&'a str>,
+    ) -> HubFuture<'a, TaskRow> {
+        Box::pin(async move {
+            let json = self
+                .call(
+                    Method::POST,
+                    &["api", "tasks"],
+                    &[],
+                    Some(create_task_body(goal, agent_id, cwd, peer_server_id)),
+                )
+                .await?;
+            task_row(&json)
+        })
+    }
+
+    fn cancel_task<'a>(&'a self, id: &'a str) -> HubFuture<'a, ()> {
+        Box::pin(async move {
+            Self::unit(
+                self.call(Method::POST, &["api", "tasks", id, "cancel"], &[], None)
+                    .await,
+            )
+        })
+    }
+
+    fn complete_task<'a>(&'a self, id: &'a str) -> HubFuture<'a, ()> {
+        Box::pin(async move {
+            // The body is optional; an empty object keeps the task's own hint.
+            Self::unit(
+                self.call(
+                    Method::POST,
+                    &["api", "tasks", id, "complete"],
+                    &[],
+                    Some(json!({})),
+                )
+                .await,
+            )
+        })
+    }
+
+    fn task_defaults(&self) -> HubFuture<'_, TaskDefaults> {
+        Box::pin(async move {
+            let json = self
+                .call(Method::GET, &["api", "tasks", "defaults"], &[], None)
+                .await?;
+            decode(json)
+        })
+    }
+
     fn list_peers(&self) -> HubFuture<'_, Vec<PeerMention>> {
         Box::pin(async move {
             let mut peers = vec![PeerMention {
@@ -1011,6 +1224,48 @@ mod tests {
                 "{body}"
             );
         }
+    }
+
+    #[test]
+    fn task_lists_and_creates_read_as_rows() {
+        let json = json!({"tasks": [{
+            "task_id": "t_1", "state": "working", "kind": "delegation", "goal": "fix it",
+            "title": "fix it", "summary": null, "origin": "device", "updated_ms": 5,
+            "binding": {"kind": "agent_session", "agent_id": "opencode", "asid": "ses_1"},
+            "children": {"total": 2, "active": 1, "waiting": 0, "failed": 1},
+            "future_field": true
+        }, {
+            "task_id": "t_2", "state": "idle_unconfirmed", "goal": "g", "origin": "device",
+            "binding": {"kind": "pane", "pane_id": "w1:p9", "agent_id": "codex"}
+        }]});
+        let rows = task_rows(&json).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].id, "t_1");
+        assert_eq!(rows[0].agent_id.as_deref(), Some("opencode"));
+        assert_eq!(rows[0].asid.as_deref(), Some("ses_1"));
+        assert_eq!(rows[0].children.failed, 1);
+        assert!(!rows[0].completable && !rows[0].is_ended());
+        assert!(rows[1].completable, "a paused device task can be confirmed");
+        assert_eq!(rows[1].agent_id.as_deref(), Some("codex"));
+        assert!(task_rows(&json!({})).unwrap().is_empty());
+        let created = task_row(&json!({"task_id": "t_3", "state": "working", "asid": "ses_3"}));
+        assert_eq!(created.unwrap().asid.as_deref(), Some("ses_3"));
+    }
+
+    #[test]
+    fn a_new_task_sends_only_what_was_given() {
+        assert_eq!(
+            create_task_body("g", None, None, None),
+            json!({"goal": "g"})
+        );
+        assert_eq!(
+            create_task_body("g", Some("codex"), Some("~/w"), Some("srv")),
+            json!({"goal": "g", "agent_id": "codex", "cwd": "~/w", "computer_ids": ["srv"]})
+        );
+        assert_eq!(
+            create_task_body("g", Some(""), Some(""), None),
+            json!({"goal": "g"})
+        );
     }
 
     #[test]

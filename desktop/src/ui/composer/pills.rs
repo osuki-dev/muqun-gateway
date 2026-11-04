@@ -436,7 +436,7 @@ pub fn row(app: &App, aim: &Aim) -> Div {
                     }),
             );
         }
-        if let Some(pill) = usage_readout(aim) {
+        if let Some(pill) = usage_readout(app, aim) {
             right = right.child(pill);
         }
     }
@@ -1387,7 +1387,7 @@ fn branch_search_field(app: &App) -> Div {
 }
 
 /// "12.4k / 200k · $0.42", with the breakdown in a tooltip on click.
-fn usage_readout(aim: &Aim) -> Option<Div> {
+fn usage_readout(app: &App, aim: &Aim) -> Option<Div> {
     let info = aim.info.as_ref()?;
     let catalog_limit = aim.catalog.as_ref().and_then(|c| {
         let chosen = aim.model.as_ref()?;
@@ -1415,15 +1415,33 @@ fn usage_readout(aim: &Aim) -> Option<Div> {
                 .no_cursor(),
         );
     let lines = usage.lines.clone();
+    // Compaction only where discovery says the agent has it.
+    let compact = aim.asid().filter(|_| {
+        app.bindings
+            .agents
+            .get()
+            .iter()
+            .any(|a| a.id == aim.agent && a.features.compaction)
+    });
+    let compact_app = app.clone();
+    let compact_label = app.strings.compact_context();
+    let extra = if compact.is_some() { 24.0 } else { 0.0 };
     Some(host(
         MenuId::Usage,
         Side::Above,
         readout,
-        (220.0, lines.len() as f32 * 15.0 + 14.0),
+        (220.0, lines.len() as f32 * 15.0 + 14.0 + extra),
         move || {
             let mut tip = div().flex_col().min_w(180.0).class("mq-usage-tip");
             for line in lines.iter().cloned() {
                 tip = tip.child(mono_text(line).size(11.0).no_wrap().no_cursor());
+            }
+            if let Some(asid) = compact.clone() {
+                let app = compact_app.clone();
+                tip = tip.child(crate::ui::parts::link_button(compact_label, move |_| {
+                    close_menu();
+                    app.send(Command::CompactSession { asid: asid.clone() });
+                }));
             }
             tip
         },

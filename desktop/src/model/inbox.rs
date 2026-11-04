@@ -114,6 +114,14 @@ pub enum Update {
     },
     /// The open session's working-tree change count.
     Diff(super::view::DiffStat),
+    /// The delegated task list, replacing the last, with the folder a new
+    /// task would run in.
+    Tasks {
+        rows: Vec<crate::hub::TaskRow>,
+        default_cwd: Option<String>,
+    },
+    /// Where this desktop's sessions run, applied by the drain to a binding.
+    HubMode(crate::hub::HubMode),
 }
 
 impl Update {

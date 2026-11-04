@@ -559,6 +559,12 @@ pub fn tool(ctx: &PartCtx<'_>, call: &ToolCall) -> Div {
                 .no_cursor(),
         );
     }
+    if let Some(child) = call.child_session_id.clone() {
+        let open_app = ctx.app.clone();
+        head = head.child(link_button(strings.open_link(), move |_| {
+            open_app.open_session(&muqun_gateway::agents::AgentSessionId(child.clone()));
+        }));
+    }
     if waiting {
         head = head.child(
             meta(strings.waiting_approval())
@@ -1175,7 +1181,7 @@ pub fn diff(ctx: &PartCtx<'_>, file: &str, diff: &str) -> Div {
         let edit_app = ctx.app.clone();
         let edit_file = file.to_string();
         let revert_app = ctx.app.clone();
-        let revert_file = file.to_string();
+        let revert_message = ctx.item.message_id.clone();
         head = head
             .child(link_button(strings.open_in_editor(), move |_| {
                 open_in_editor(&edit_app, &edit_file)
@@ -1184,7 +1190,7 @@ pub fn diff(ctx: &PartCtx<'_>, file: &str, diff: &str) -> Div {
                 link_button(strings.revert(), move |_| {
                     revert_app.send(Command::StageRevert {
                         asid: asid.clone(),
-                        file: revert_file.clone(),
+                        message_id: revert_message.clone(),
                     })
                 })
                 .class("mq-link-button--quiet"),

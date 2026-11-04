@@ -35,11 +35,23 @@ pub enum Command {
         asid: AgentSessionId,
         file: Option<String>,
     },
-    /// Stage the revert of one file's change, to be previewed and confirmed
-    /// (§6.1c item 9). Placeholder: the core only logs it.
+    /// Stage a rollback to `message_id`, to be confirmed or cancelled
+    /// (§6.1c item 9).
     StageRevert {
         asid: AgentSessionId,
-        file: String,
+        message_id: String,
+    },
+    /// Apply the staged rollback.
+    CommitRevert {
+        asid: AgentSessionId,
+    },
+    /// Drop the staged rollback.
+    ClearRevert {
+        asid: AgentSessionId,
+    },
+    /// Compact the session into a summary.
+    CompactSession {
+        asid: AgentSessionId,
     },
     /// The next older page of the session's history (architecture §3
     /// `earlier`).
@@ -91,6 +103,22 @@ pub enum Command {
     ForkSession {
         asid: AgentSessionId,
         message_id: Option<String>,
+    },
+    /// Re-read the delegated task list (and the default folder).
+    RefreshTasks,
+    /// Delegate `goal` as a task (`agent` / `cwd` default on the gateway).
+    CreateTask {
+        goal: String,
+        agent: Option<String>,
+        cwd: Option<String>,
+    },
+    /// Cancel a task.
+    CancelTask {
+        id: String,
+    },
+    /// Confirm a paused delegation is finished.
+    CompleteTask {
+        id: String,
     },
 }
 

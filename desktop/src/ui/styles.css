@@ -792,6 +792,12 @@
     color: var(--error);
 }
 .mq-alert-body { gap: 2px; }
+.mq-revert-plate {
+    gap: var(--mq-space-2);
+    padding: var(--mq-space-2) 14px;
+    background: var(--surface-overlay);
+    color: var(--text-primary);
+}
 
 /* composer ------------------------------------------------------------
    Owned by ui/composer/*. One card for the start page and the session page:
