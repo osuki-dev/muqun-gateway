@@ -117,6 +117,37 @@ pub enum Command {
         asid: AgentSessionId,
         id: String,
     },
+    /// Re-read background shells for the open session's agent/folder.
+    LoadShells {
+        agent: String,
+        directory: Option<String>,
+    },
+    /// Stop one background shell.
+    KillShell {
+        agent: String,
+        id: String,
+        directory: Option<String>,
+    },
+    /// Park the open session's current turn in the background.
+    BackgroundSession {
+        asid: AgentSessionId,
+    },
+    /// Re-read worktrees for the open session's project folder.
+    LoadWorktrees {
+        agent: String,
+        directory: String,
+    },
+    /// Remove a linked worktree.
+    RemoveWorktree {
+        agent: String,
+        project: String,
+        worktree: String,
+    },
+    /// Rediscover worktrees for a project folder.
+    RefreshWorktrees {
+        agent: String,
+        directory: String,
+    },
     /// Re-read the delegated task list (and the default folder).
     RefreshTasks,
     /// Delegate `goal` as a task (`agent` / `cwd` default on the gateway).

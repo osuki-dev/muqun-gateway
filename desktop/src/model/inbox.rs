@@ -130,6 +130,10 @@ pub enum Update {
         asid: String,
         items: Vec<crate::hub::SavedPermission>,
     },
+    /// Background shells for the open session's agent/folder.
+    Shells(Vec<crate::hub::ShellRow>),
+    /// Worktrees under the open session's project folder.
+    Worktrees(Vec<crate::hub::WorktreeRow>),
     /// Where this desktop's sessions run, applied by the drain to a binding.
     HubMode(crate::hub::HubMode),
 }

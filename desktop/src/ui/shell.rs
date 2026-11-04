@@ -514,17 +514,27 @@ fn right_tab_chip(app: &App, tab: RightTab, label: &str, badge: Option<usize>) -
         )
         .on_click(move |_| {
             click.bindings.right_tab.signal().set(tab);
-            if matches!(tab, RightTab::Saved | RightTab::Subagents) {
-                if let Some(info) = click.bindings.header.get() {
-                    match tab {
-                        RightTab::Saved => click.send(Command::LoadSavedPermissions {
-                            asid: info.asid.clone(),
-                        }),
-                        RightTab::Subagents => click.send(Command::LoadDescendants {
-                            asid: info.asid.clone(),
-                        }),
-                        _ => {}
+            if let Some(info) = click.bindings.header.get() {
+                match tab {
+                    RightTab::Saved => click.send(Command::LoadSavedPermissions {
+                        asid: info.asid.clone(),
+                    }),
+                    RightTab::Subagents => click.send(Command::LoadDescendants {
+                        asid: info.asid.clone(),
+                    }),
+                    RightTab::Shells => click.send(Command::LoadShells {
+                        agent: info.agent_id.clone(),
+                        directory: info.directory.clone(),
+                    }),
+                    RightTab::Git => {
+                        if let Some(directory) = info.directory.clone() {
+                            click.send(Command::LoadWorktrees {
+                                agent: info.agent_id.clone(),
+                                directory,
+                            });
+                        }
                     }
+                    _ => {}
                 }
             }
         });
@@ -550,6 +560,8 @@ fn right_column(app: &App, height: f32, width: State<f32>, window: f32, side: f3
     let dirs = app.bindings.dirs.clone();
     let descendants = app.bindings.descendants.clone();
     let saved_permissions = app.bindings.saved_permissions.clone();
+    let shells = app.bindings.shells.clone();
+    let worktrees = app.bindings.worktrees.clone();
     let cmp_inbox = composer::state::Cmp::get().inbox.clone();
     let app = app.clone();
     let handle_app = app.clone();
@@ -564,6 +576,8 @@ fn right_column(app: &App, height: f32, width: State<f32>, window: f32, side: f3
             dirs.signal_id(),
             descendants.signal_id(),
             saved_permissions.signal_id(),
+            shells.signal_id(),
+            worktrees.signal_id(),
             cmp_inbox.signal_id(),
             width.signal_id(),
         ])
@@ -572,6 +586,7 @@ fn right_column(app: &App, height: f32, width: State<f32>, window: f32, side: f3
             let queued = cmp_inbox.get().len();
             let subagents = descendants.get().len();
             let saved = saved_permissions.get().len();
+            let shell_n = shells.get().len();
             let current = tab.get();
             let head = div()
                 .class("mq-right-head")
@@ -608,6 +623,12 @@ fn right_column(app: &App, height: f32, width: State<f32>, window: f32, side: f3
                             RightTab::Saved,
                             app.strings.saved_tab(),
                             Some(saved),
+                        ))
+                        .child(right_tab_chip(
+                            &app,
+                            RightTab::Shells,
+                            app.strings.shells_tab(),
+                            Some(shell_n),
                         )),
                 )
                 .child(ghost_icon(Glyph::Close).on_click(move |_| close_right(&close)));
@@ -617,6 +638,7 @@ fn right_column(app: &App, height: f32, width: State<f32>, window: f32, side: f3
                 RightTab::Git => git_tab_body(&app),
                 RightTab::Subagents => subagents_tab_body(&app),
                 RightTab::Saved => saved_tab_body(&app),
+                RightTab::Shells => shells_tab_body(&app),
             };
             div()
                 .class("mq-right-body")
@@ -655,6 +677,95 @@ fn queue_tab_body(app: &App) -> Div {
         .w_full()
         .h_full()
         .child(scroll().w_full().h_full().child(list))
+}
+
+/// Background shells for the open session's agent/folder.
+fn shells_tab_body(app: &App) -> Div {
+    let items = app.bindings.shells.get();
+    let header = app.bindings.header.get();
+    let agent = header
+        .as_ref()
+        .map(|h| h.agent_id.clone())
+        .unwrap_or_default();
+    let directory = header.as_ref().and_then(|h| h.directory.clone());
+    let asid = header.as_ref().map(|h| h.asid.clone());
+
+    let mut col = div().class("mq-right-git").w_full().h_full().flex_col();
+    if let Some(asid) = asid {
+        let bg = app.clone();
+        col = col.child(div().class("mq-right-section").w_full().child(
+            crate::ui::parts::link_button(app.strings.shells_background(), move |_| {
+                bg.send(Command::BackgroundSession { asid: asid.clone() });
+            }),
+        ));
+    }
+    if items.is_empty() {
+        return col.child(
+            div().class("mq-right-empty").w_full().flex_1().child(
+                ui_text(app.strings.shells_empty())
+                    .size(12.0)
+                    .no_wrap()
+                    .no_cursor(),
+            ),
+        );
+    }
+    let mut list = div().class("mq-diff-panel-list").flex_col().w_full();
+    for item in items.iter() {
+        let label = if item.command.is_empty() {
+            item.id.clone()
+        } else {
+            item.command.lines().next().unwrap_or(&item.id).to_string()
+        };
+        let status = item.status.clone();
+        let kill = app.clone();
+        let agent = agent.clone();
+        let directory = directory.clone();
+        let id = item.id.clone();
+        list = list.child(
+            div()
+                .class("mq-diff-panel-row")
+                .w_full()
+                .flex_row()
+                .items_center()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(0.0)
+                        .overflow_clip()
+                        .child(ui_text(label).size(12.0).no_wrap().no_cursor()),
+                )
+                .child(
+                    div()
+                        .class("mq-menu-dim")
+                        .child(ui_text(status).size(11.0).no_wrap().no_cursor()),
+                )
+                .child(
+                    div()
+                        .class("mq-diff-open")
+                        .cursor_pointer()
+                        .child(
+                            ui_text(app.strings.shells_kill())
+                                .size(11.0)
+                                .no_wrap()
+                                .no_cursor(),
+                        )
+                        .on_click(move |_| {
+                            kill.send(Command::KillShell {
+                                agent: agent.clone(),
+                                id: id.clone(),
+                                directory: directory.clone(),
+                            });
+                        }),
+                ),
+        );
+    }
+    col.child(
+        div()
+            .w_full()
+            .flex_1()
+            .min_h(0.0)
+            .child(scroll().w_full().h_full().child(list)),
+    )
 }
 
 /// Remembered "always allow" rules for the open session's project.
@@ -822,26 +933,27 @@ fn git_tab_body(app: &App) -> Div {
         );
 
     let Some(stat) = stat else {
-        return col.child(
-            div()
-                .class("mq-right-empty")
-                .w_full()
-                .flex_1()
-                .child(
-                    ui_text(app.strings.changed_files())
-                        .size(12.0)
-                        .no_wrap()
-                        .no_cursor(),
-                )
-                .child(
-                    div().class("mq-menu-dim").child(
-                        ui_text(app.strings.diff_no_preview())
+        return col
+            .child(
+                div()
+                    .class("mq-right-empty")
+                    .w_full()
+                    .child(
+                        ui_text(app.strings.changed_files())
                             .size(12.0)
                             .no_wrap()
                             .no_cursor(),
+                    )
+                    .child(
+                        div().class("mq-menu-dim").child(
+                            ui_text(app.strings.diff_no_preview())
+                                .size(12.0)
+                                .no_wrap()
+                                .no_cursor(),
+                        ),
                     ),
-                ),
-        );
+            )
+            .child(worktrees_section(app));
     };
 
     let mut list = div().class("mq-diff-panel-list").flex_col().w_full();
@@ -940,6 +1052,110 @@ fn git_tab_body(app: &App) -> Div {
             .min_h(0.0)
             .child(scroll().w_full().h_full().child(list)),
     )
+    .child(worktrees_section(app))
+}
+
+/// Linked worktrees for the open session's project (gateway inventory).
+fn worktrees_section(app: &App) -> Div {
+    let header = app.bindings.header.get();
+    let items = app.bindings.worktrees.get();
+    let agent = header
+        .as_ref()
+        .map(|h| h.agent_id.clone())
+        .unwrap_or_default();
+    let project = header.as_ref().and_then(|h| h.directory.clone());
+
+    let mut head = div()
+        .class("mq-right-section")
+        .w_full()
+        .flex_row()
+        .items_center()
+        .child(
+            div().flex_1().child(
+                ui_text(app.strings.worktrees_heading())
+                    .size(11.0)
+                    .semibold()
+                    .no_wrap()
+                    .no_cursor(),
+            ),
+        );
+    if let Some(directory) = project.clone() {
+        let refresh = app.clone();
+        let agent = agent.clone();
+        head = head.child(crate::ui::parts::link_button(
+            app.strings.worktrees_refresh(),
+            move |_| {
+                refresh.send(Command::RefreshWorktrees {
+                    agent: agent.clone(),
+                    directory: directory.clone(),
+                });
+            },
+        ));
+    }
+
+    let mut section = div().w_full().flex_col().child(head);
+    if items.is_empty() {
+        return section.child(
+            div().class("mq-menu-dim").child(
+                ui_text(app.strings.worktrees_empty())
+                    .size(12.0)
+                    .no_wrap()
+                    .no_cursor(),
+            ),
+        );
+    }
+    for item in items.iter() {
+        let name = item
+            .directory
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(item.directory.as_str())
+            .to_string();
+        let label = if item.is_root() {
+            format!("{} ({})", name, app.strings.worktrees_root())
+        } else {
+            name
+        };
+        let mut row = div()
+            .class("mq-diff-panel-row")
+            .w_full()
+            .flex_row()
+            .items_center()
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(0.0)
+                    .overflow_clip()
+                    .child(mono_text(label).size(12.0).no_wrap().no_cursor()),
+            );
+        if !item.is_root() {
+            if let Some(project) = project.clone() {
+                let remove = app.clone();
+                let agent = agent.clone();
+                let worktree = item.directory.clone();
+                row = row.child(
+                    div()
+                        .class("mq-diff-open")
+                        .cursor_pointer()
+                        .child(
+                            ui_text(app.strings.worktrees_remove())
+                                .size(11.0)
+                                .no_wrap()
+                                .no_cursor(),
+                        )
+                        .on_click(move |_| {
+                            remove.send(Command::RemoveWorktree {
+                                agent: agent.clone(),
+                                project: project.clone(),
+                                worktree: worktree.clone(),
+                            });
+                        }),
+                );
+            }
+        }
+        section = section.child(row);
+    }
+    section
 }
 
 const DIFF_PANEL_PREVIEW_LINES: usize = 28;

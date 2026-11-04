@@ -22,8 +22,8 @@ use muqun_gateway::platform::StoredUpload;
 use tokio::sync::broadcast;
 
 use super::{
-    CatalogView, HubError, HubFuture, HubMode, PeerMention, SavedPermission, SessionHub,
-    TaskDefaults, TaskRow, TimelineCatchUp,
+    CatalogView, HubError, HubFuture, HubMode, PeerMention, SavedPermission, SessionHub, ShellRow,
+    TaskDefaults, TaskRow, TimelineCatchUp, WorktreeRow,
 };
 
 /// How deep `descendants` walks below the session asked about, and how many
@@ -642,6 +642,84 @@ impl SessionHub for LocalHub {
                 )));
             }
             Ok(agent.delete_saved_permission(id).await?)
+        })
+    }
+
+    fn list_shells<'a>(
+        &'a self,
+        agent: &'a str,
+        directory: Option<&'a str>,
+    ) -> HubFuture<'a, Vec<ShellRow>> {
+        Box::pin(async move {
+            let manager = self.manager_for_agent(agent).await?;
+            match manager.agent().list_shells(directory).await {
+                Ok(items) => Ok(items
+                    .into_iter()
+                    .filter_map(|v| serde_json::from_value::<ShellRow>(v).ok())
+                    .filter(|s| !s.id.is_empty())
+                    .collect()),
+                Err(AgentError::Unsupported(_)) => Ok(Vec::new()),
+                Err(err) => Err(err.into()),
+            }
+        })
+    }
+
+    fn kill_shell<'a>(&'a self, agent: &'a str, id: &'a str) -> HubFuture<'a, ()> {
+        Box::pin(async move {
+            let manager = self.manager_for_agent(agent).await?;
+            manager.agent().kill_shell(id).await?;
+            Ok(())
+        })
+    }
+
+    fn background_session<'a>(&'a self, asid: &'a AgentSessionId) -> HubFuture<'a, ()> {
+        Box::pin(async move {
+            let manager = self.manager_for_session(asid).await?;
+            manager.agent().background_session(&asid.0).await?;
+            manager.mirror().mark_running_tools_backgrounded(asid).await;
+            Ok(())
+        })
+    }
+
+    fn list_worktrees<'a>(
+        &'a self,
+        agent: &'a str,
+        directory: &'a str,
+    ) -> HubFuture<'a, Vec<WorktreeRow>> {
+        Box::pin(async move {
+            let manager = self.manager_for_agent(agent).await?;
+            match manager.agent().list_worktrees(Some(directory)).await {
+                Ok(items) => Ok(items
+                    .into_iter()
+                    .filter_map(|v| serde_json::from_value::<WorktreeRow>(v).ok())
+                    .filter(|w| !w.directory.is_empty())
+                    .collect()),
+                Err(AgentError::Unsupported(_)) => Ok(Vec::new()),
+                Err(err) => Err(err.into()),
+            }
+        })
+    }
+
+    fn remove_worktree<'a>(
+        &'a self,
+        agent: &'a str,
+        project: &'a str,
+        worktree: &'a str,
+        force: bool,
+    ) -> HubFuture<'a, ()> {
+        Box::pin(async move {
+            let manager = self.manager_for_agent(agent).await?;
+            Ok(manager
+                .agent()
+                .remove_worktree(Some(project), worktree, Some(force))
+                .await?)
+        })
+    }
+
+    fn refresh_worktrees<'a>(&'a self, agent: &'a str, directory: &'a str) -> HubFuture<'a, ()> {
+        Box::pin(async move {
+            let manager = self.manager_for_agent(agent).await?;
+            Ok(manager.agent().refresh_worktrees(Some(directory)).await?)
         })
     }
 

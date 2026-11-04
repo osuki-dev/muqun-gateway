@@ -132,6 +132,15 @@ strings! {
     saved_empty => "No always-allowed rules", "没有始终允许的规则";
     saved_forget => "Forget", "忘记";
     saved_open => "Always allowed…", "始终允许…";
+    shells_tab => "Shells", "Shell";
+    shells_empty => "No background shells", "没有后台 Shell";
+    shells_kill => "Kill", "结束";
+    shells_background => "Run in background", "放到后台";
+    worktrees_heading => "Worktrees", "Worktree";
+    worktrees_empty => "No linked worktrees", "没有关联的 worktree";
+    worktrees_refresh => "Refresh", "刷新";
+    worktrees_remove => "Remove", "删除";
+    worktrees_root => "Project root", "项目根目录";
     queue_empty => "Nothing queued", "没有排队的消息";
     attach_title => "Attach files", "添加附件";
     attachments_uploading => "Files are still uploading", "文件还在上传";

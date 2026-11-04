@@ -266,6 +266,8 @@ impl Drain {
                         .saved_permissions
                         .signal()
                         .set(Arc::new(Vec::new()));
+                    bindings.shells.signal().set(Arc::new(Vec::new()));
+                    bindings.worktrees.signal().set(Arc::new(Vec::new()));
                     if let Some(header) = header {
                         bindings.header.signal().set(header);
                     }
@@ -306,6 +308,8 @@ impl Drain {
                         .saved_permissions
                         .signal()
                         .set(Arc::new(Vec::new()));
+                    bindings.shells.signal().set(Arc::new(Vec::new()));
+                    bindings.worktrees.signal().set(Arc::new(Vec::new()));
                     bindings.header.signal().set(None);
                     bindings.order.signal().set(Arc::new(Default::default()));
                 }
@@ -676,6 +680,8 @@ fn batch_kinds(batch: &[Update]) -> String {
             Update::Tasks { .. } => "tasks",
             Update::Descendants { .. } => "descendants",
             Update::SavedPermissions { .. } => "saved",
+            Update::Shells(_) => "shells",
+            Update::Worktrees(_) => "worktrees",
             Update::HubMode(_) => "hub_mode",
         };
         match counts.iter_mut().find(|(k, _)| *k == kind) {
@@ -723,6 +729,8 @@ struct Rest {
     task_cwd: Option<Option<String>>,
     descendants: Option<Arc<Vec<muqun_gateway::agents::AgentSessionInfo>>>,
     saved_permissions: Option<Arc<Vec<crate::hub::SavedPermission>>>,
+    shells: Option<Arc<Vec<crate::hub::ShellRow>>>,
+    worktrees: Option<Arc<Vec<crate::hub::WorktreeRow>>>,
 }
 
 impl Rest {
@@ -750,6 +758,8 @@ impl Rest {
             saved_permissions: c
                 .saved_permissions
                 .then(|| Arc::new(view.saved_permissions.clone())),
+            shells: c.shells.then(|| Arc::new(view.shells.clone())),
+            worktrees: c.worktrees.then(|| Arc::new(view.worktrees.clone())),
         }
     }
 }
@@ -853,6 +863,12 @@ impl Planned {
         }
         if let Some(saved) = rest.saved_permissions {
             b.saved_permissions.signal().set(saved);
+        }
+        if let Some(shells) = rest.shells {
+            b.shells.signal().set(shells);
+        }
+        if let Some(worktrees) = rest.worktrees {
+            b.worktrees.signal().set(worktrees);
         }
         if let Some(cwd) = rest.task_cwd {
             if b.task_cwd.get() != cwd {

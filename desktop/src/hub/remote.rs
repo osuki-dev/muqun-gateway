@@ -26,8 +26,8 @@ use tokio::sync::broadcast;
 
 use super::local::enrich_local_media;
 use super::{
-    CatalogView, HubError, HubFuture, HubMode, PeerMention, SavedPermission, SessionHub,
-    TaskDefaults, TaskHubEvent, TaskRow, TimelineCatchUp,
+    CatalogView, HubError, HubFuture, HubMode, PeerMention, SavedPermission, SessionHub, ShellRow,
+    TaskDefaults, TaskHubEvent, TaskRow, TimelineCatchUp, WorktreeRow,
 };
 
 const EVENT_CAPACITY: usize = 4096;
@@ -992,6 +992,105 @@ impl SessionHub for RemoteHub {
                     &["permissions", "saved", id],
                     &[],
                     None,
+                )
+                .await,
+            )
+        })
+    }
+
+    fn list_shells<'a>(
+        &'a self,
+        _agent: &'a str,
+        directory: Option<&'a str>,
+    ) -> HubFuture<'a, Vec<ShellRow>> {
+        Box::pin(async move {
+            let mut pairs = Vec::new();
+            if let Some(directory) = directory {
+                pairs.push(("directory", directory));
+            }
+            let json = self
+                .call(Method::GET, &["api", "agent-shells"], &pairs, None)
+                .await?;
+            let data = json
+                .get("data")
+                .cloned()
+                .unwrap_or(Value::Array(Vec::new()));
+            decode(data)
+        })
+    }
+
+    fn kill_shell<'a>(&'a self, _agent: &'a str, id: &'a str) -> HubFuture<'a, ()> {
+        Box::pin(async move {
+            Self::unit(
+                self.call(Method::DELETE, &["api", "agent-shells", id], &[], None)
+                    .await,
+            )
+        })
+    }
+
+    fn background_session<'a>(&'a self, asid: &'a AgentSessionId) -> HubFuture<'a, ()> {
+        Box::pin(async move {
+            Self::unit(
+                self.session_call(Method::POST, asid, &["background"], &[], None)
+                    .await,
+            )
+        })
+    }
+
+    fn list_worktrees<'a>(
+        &'a self,
+        _agent: &'a str,
+        directory: &'a str,
+    ) -> HubFuture<'a, Vec<WorktreeRow>> {
+        Box::pin(async move {
+            let json = self
+                .call(
+                    Method::GET,
+                    &["api", "agent-worktrees"],
+                    &[("directory", directory)],
+                    None,
+                )
+                .await?;
+            let items = json
+                .pointer("/data/items")
+                .cloned()
+                .unwrap_or(Value::Array(Vec::new()));
+            decode(items)
+        })
+    }
+
+    fn remove_worktree<'a>(
+        &'a self,
+        _agent: &'a str,
+        project: &'a str,
+        worktree: &'a str,
+        force: bool,
+    ) -> HubFuture<'a, ()> {
+        Box::pin(async move {
+            Self::unit(
+                self.call(
+                    Method::DELETE,
+                    &["api", "agent-worktrees"],
+                    &[],
+                    Some(json!({
+                        "directory": project,
+                        "worktree": worktree,
+                        "force": force,
+                    })),
+                )
+                .await,
+            )
+        })
+    }
+
+    fn refresh_worktrees<'a>(&'a self, _agent: &'a str, directory: &'a str) -> HubFuture<'a, ()> {
+        Box::pin(async move {
+            Self::unit(
+                self.call(
+                    Method::POST,
+                    &["api", "agent-worktrees", "refresh"],
+                    &[],
+                    Some(json!({ "directory": directory })),
                 )
                 .await,
             )

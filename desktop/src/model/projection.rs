@@ -436,6 +436,43 @@ impl Core {
                     Err(err) => self.fail(err),
                 }
             }
+            Command::LoadShells { agent, directory } => {
+                self.load_shells(agent, directory).await;
+            }
+            Command::KillShell {
+                agent,
+                id,
+                directory,
+            } => match self.hub.kill_shell(&agent, &id).await {
+                Ok(()) => self.load_shells(agent, directory).await,
+                Err(err) => self.fail(err),
+            },
+            Command::BackgroundSession { asid } => {
+                if let Err(err) = self.hub.background_session(&asid).await {
+                    self.fail(err);
+                }
+            }
+            Command::LoadWorktrees { agent, directory } => {
+                self.load_worktrees(agent, directory).await;
+            }
+            Command::RemoveWorktree {
+                agent,
+                project,
+                worktree,
+            } => match self
+                .hub
+                .remove_worktree(&agent, &project, &worktree, false)
+                .await
+            {
+                Ok(()) => self.load_worktrees(agent, project).await,
+                Err(err) => self.fail(err),
+            },
+            Command::RefreshWorktrees { agent, directory } => {
+                match self.hub.refresh_worktrees(&agent, &directory).await {
+                    Ok(()) => self.load_worktrees(agent, directory).await,
+                    Err(err) => self.fail(err),
+                }
+            }
             Command::RefreshTasks => self.refresh_tasks().await,
             Command::CreateTask { goal, agent, cwd } => {
                 let goal = goal.trim().to_string();
@@ -630,6 +667,28 @@ impl Core {
                 tracing::debug!(asid = %asid.0, %err, "saved permissions unavailable")
             }
             Err(_) => tracing::debug!(asid = %asid.0, "saved permissions timed out"),
+        }
+    }
+
+    async fn load_shells(self: Arc<Self>, agent: String, directory: Option<String>) {
+        match tokio::time::timeout(
+            LIST_TIMEOUT,
+            self.hub.list_shells(&agent, directory.as_deref()),
+        )
+        .await
+        {
+            Ok(Ok(items)) => self.inbox.push(Update::Shells(items)),
+            Ok(Err(err)) => tracing::debug!(%agent, %err, "shells unavailable"),
+            Err(_) => tracing::debug!(%agent, "shells timed out"),
+        }
+    }
+
+    async fn load_worktrees(self: Arc<Self>, agent: String, directory: String) {
+        match tokio::time::timeout(LIST_TIMEOUT, self.hub.list_worktrees(&agent, &directory)).await
+        {
+            Ok(Ok(items)) => self.inbox.push(Update::Worktrees(items)),
+            Ok(Err(err)) => tracing::debug!(%agent, %err, "worktrees unavailable"),
+            Err(_) => tracing::debug!(%agent, "worktrees timed out"),
         }
     }
 

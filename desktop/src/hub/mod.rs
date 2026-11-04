@@ -141,6 +141,35 @@ pub struct SavedPermission {
     pub resource: String,
 }
 
+/// One background shell (`GET /api/agent-shells`).
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Deserialize)]
+pub struct ShellRow {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub command: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub pid: Option<u32>,
+}
+
+/// One entry from `GET /api/agent-worktrees` (`Worktree.Directory`).
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Deserialize)]
+pub struct WorktreeRow {
+    #[serde(default)]
+    pub directory: String,
+    /// Absent on the project's own root (not removable).
+    #[serde(default)]
+    pub strategy: Option<String>,
+}
+
+impl WorktreeRow {
+    pub fn is_root(&self) -> bool {
+        self.strategy.as_deref().is_none_or(|s| s.is_empty())
+    }
+}
+
 /// A task's direct children by state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
 pub struct TaskChildren {
@@ -367,6 +396,34 @@ pub trait SessionHub: Send + Sync {
         asid: &'a AgentSessionId,
         id: &'a str,
     ) -> HubFuture<'a, ()>;
+    /// Background shells for `agent` in `directory` (`GET /api/agent-shells`).
+    /// Empty when the agent has none.
+    fn list_shells<'a>(
+        &'a self,
+        agent: &'a str,
+        directory: Option<&'a str>,
+    ) -> HubFuture<'a, Vec<ShellRow>>;
+    /// Stop one background shell (`DELETE /api/agent-shells/{id}`).
+    fn kill_shell<'a>(&'a self, agent: &'a str, id: &'a str) -> HubFuture<'a, ()>;
+    /// Park the session's current turn in the background
+    /// (`POST …/background`).
+    fn background_session<'a>(&'a self, asid: &'a AgentSessionId) -> HubFuture<'a, ()>;
+    /// Worktrees under the project folder (`GET /api/agent-worktrees`).
+    fn list_worktrees<'a>(
+        &'a self,
+        agent: &'a str,
+        directory: &'a str,
+    ) -> HubFuture<'a, Vec<WorktreeRow>>;
+    /// Forget one linked worktree (`DELETE /api/agent-worktrees`).
+    fn remove_worktree<'a>(
+        &'a self,
+        agent: &'a str,
+        project: &'a str,
+        worktree: &'a str,
+        force: bool,
+    ) -> HubFuture<'a, ()>;
+    /// Rediscover worktrees (`POST /api/agent-worktrees/refresh`).
+    fn refresh_worktrees<'a>(&'a self, agent: &'a str, directory: &'a str) -> HubFuture<'a, ()>;
     /// Timeline rows with a sequence above `after`, from the mirror.
     fn timeline_after<'a>(
         &'a self,

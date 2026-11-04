@@ -514,6 +514,10 @@ pub struct ViewState {
     pub descendants: Vec<AgentSessionInfo>,
     /// Remembered "always allow" decisions for the open session's project.
     pub saved_permissions: Vec<crate::hub::SavedPermission>,
+    /// Background shells for the open session's agent/folder.
+    pub shells: Vec<crate::hub::ShellRow>,
+    /// Worktrees under the open session's project folder.
+    pub worktrees: Vec<crate::hub::WorktreeRow>,
 }
 
 /// What one batch moved.
@@ -544,6 +548,8 @@ pub struct Changes {
     pub tasks: bool,
     pub descendants: bool,
     pub saved_permissions: bool,
+    pub shells: bool,
+    pub worktrees: bool,
     /// A different session (or a fresh snapshot) is now shown.
     pub opened: bool,
     pub actions: Vec<UiAction>,
@@ -571,6 +577,8 @@ impl Changes {
             ("tasks", self.tasks),
             ("descendants", self.descendants),
             ("saved", self.saved_permissions),
+            ("shells", self.shells),
+            ("worktrees", self.worktrees),
             ("opened", self.opened),
         ];
         let mut out: Vec<String> = flags
@@ -604,6 +612,8 @@ impl ViewState {
         self.diff = None;
         self.descendants.clear();
         self.saved_permissions.clear();
+        self.shells.clear();
+        self.worktrees.clear();
         // Prefer a recently shown timeline (instant, like the web App), else
         // a chrome-only placeholder until the snapshot arrives.
         if self.active.as_ref().is_none_or(|a| a.info.asid.0 != asid) {
@@ -888,6 +898,18 @@ impl ViewState {
                     changes.saved_permissions = true;
                 }
             }
+            Update::Shells(items) => {
+                if self.shells != items {
+                    self.shells = items;
+                    changes.shells = true;
+                }
+            }
+            Update::Worktrees(items) => {
+                if self.worktrees != items {
+                    self.worktrees = items;
+                    changes.worktrees = true;
+                }
+            }
             Update::Tasks { rows, default_cwd } => {
                 if self.tasks != rows || self.task_cwd != default_cwd {
                     self.tasks = rows;
@@ -942,6 +964,8 @@ impl ViewState {
         self.diff = None;
         self.descendants.clear();
         self.saved_permissions.clear();
+        self.shells.clear();
+        self.worktrees.clear();
         self.selected.take().is_some()
     }
 
@@ -1219,6 +1243,8 @@ pub enum RightTab {
     Subagents,
     /// Remembered "always allow" decisions for the open session's project.
     Saved,
+    /// Background shells for the open session's agent/folder.
+    Shells,
 }
 
 /// The keyed Blinc state the views depend on. Created once, on the main
@@ -1258,6 +1284,10 @@ pub struct Bindings {
     pub descendants: State<Arc<Vec<AgentSessionInfo>>>,
     /// Remembered "always allow" decisions (the Saved tab).
     pub saved_permissions: State<Arc<Vec<crate::hub::SavedPermission>>>,
+    /// Background shells (the Shells tab).
+    pub shells: State<Arc<Vec<crate::hub::ShellRow>>>,
+    /// Worktrees listed under the Git tab.
+    pub worktrees: State<Arc<Vec<crate::hub::WorktreeRow>>>,
     pub selected: State<Option<String>>,
     pub header: State<Option<Arc<AgentSessionInfo>>>,
     pub order: State<Arc<TimelineOrder>>,
@@ -1306,6 +1336,8 @@ impl Bindings {
             task_cwd: ctx.use_state_keyed("mq.task_cwd", || None),
             descendants: ctx.use_state_keyed("mq.descendants", || Arc::new(Vec::new())),
             saved_permissions: ctx.use_state_keyed("mq.saved_permissions", || Arc::new(Vec::new())),
+            shells: ctx.use_state_keyed("mq.shells", || Arc::new(Vec::new())),
+            worktrees: ctx.use_state_keyed("mq.worktrees", || Arc::new(Vec::new())),
             selected: ctx.use_state_keyed("mq.selected", || None),
             header: ctx.use_state_keyed("mq.header", || None),
             order: ctx.use_state_keyed("mq.order", || Arc::new(TimelineOrder::default())),
