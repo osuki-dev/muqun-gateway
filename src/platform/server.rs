@@ -640,8 +640,12 @@ fn slot_key(device_id: &str, peer: Option<&SocketAddr>) -> String {
 }
 
 fn body_slot(plaintext_limit: usize, device_id: &str, peer: Option<&SocketAddr>) -> String {
+    // A chunk is read one at a time, in turn, by a device that may be
+    // sending a prompt meanwhile: it gets a slot of its own, like an upload.
     let class = if plaintext_limit > 25 * 1024 * 1024 {
         "upload"
+    } else if plaintext_limit == super::chunked_uploads::CHUNK_BYTES {
+        "chunk"
     } else {
         "message"
     };
@@ -858,7 +862,7 @@ pub(crate) fn body_read_timed_out(error: &(dyn std::error::Error + 'static)) -> 
     error_has::<BodyReadTimeout>(error)
 }
 
-fn body_read_error(error: axum::Error) -> (StatusCode, Json<serde_json::Value>) {
+pub(crate) fn body_read_error(error: axum::Error) -> (StatusCode, Json<serde_json::Value>) {
     if body_read_timed_out(&error) {
         api_error(
             StatusCode::REQUEST_TIMEOUT,
@@ -883,6 +887,8 @@ fn body_read_error(error: axum::Error) -> (StatusCode, Json<serde_json::Value>) 
 pub(crate) fn plaintext_body_limit(path: &str) -> usize {
     if path == UPLOADS_PATH {
         super::uploads::MAX_UPLOAD_BODY_BYTES
+    } else if super::chunked_uploads::is_chunk_path(path) {
+        super::chunked_uploads::CHUNK_BYTES
     } else if crate::platform::config::takes_large_body(path) {
         crate::MAX_PROMPT_BODY_BYTES
     } else {

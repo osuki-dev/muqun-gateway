@@ -820,6 +820,11 @@ pub fn openapi_spec() -> Value {
         "parameters": [path_param("kind")],
         "responses": ok_response()
     }});
+    if let Some(paths) = chunked_upload_paths().as_object() {
+        for (path, item) in paths {
+            spec["paths"][path.as_str()] = item.clone();
+        }
+    }
     spec["paths"]["/api/history/storage"] = json!({ "get": {
         "summary": "Which captured-history storage this Gateway runs with (memory or sqlite, from config.json at startup), whether it captures at all, and, for sqlite with capture on, what it holds, from counters the write loop keeps. Requires the admin token or a device",
         "responses": json_ok("The storage", json!({
@@ -1832,6 +1837,49 @@ fn resource_endpoint(summary: &str, resource_param: &str) -> Value {
         "summary": summary,
         "parameters": [path_param("sessionId"), path_param(resource_param)],
         "responses": ok_response()
+    })
+}
+
+/// The chunked upload routes, kept out of the big literal above so it stays
+/// under the macro recursion limit.
+fn chunked_upload_paths() -> Value {
+    json!({
+            "/api/uploads/chunked": {
+                "post": {
+                    "summary": "Open a chunked upload for a file too big for one request",
+                    "description": "JSON `{name, size, mime?}`; answers `{uploadId, chunkBytes}`. Refused with 413 when `size` is over the ceiling of its claimed kind (a video, by `mime` or file extension: 1 GiB; anything else 25 MiB). A device may have `uploads.chunked.maxConcurrentPerDevice` uploads open; past it 429. Then `PUT` each chunk, `POST …/complete`.",
+                    "requestBody": json_body(object_schema(&[("name", "string"), ("size", "integer"), ("mime", "string")], &["name", "size"])),
+                    "responses": ok_response()
+                }
+            },
+            "/api/uploads/chunked/{uploadId}": {
+                "delete": {
+                    "summary": "Abort a chunked upload and delete its partial file",
+                    "description": "Idle uploads are also dropped after 30 minutes. Another device's upload is a 404.",
+                    "parameters": [path_param("uploadId")],
+                    "responses": ok_response()
+                }
+            },
+            "/api/uploads/chunked/{uploadId}/{index}": {
+                "put": {
+                    "summary": "Send one chunk of a chunked upload",
+                    "description": "Raw bytes (`application/octet-stream`), at most `chunkBytes` (8 MiB), `index` from 0, in order. Re-sending the last chunk with the same bytes is answered again; any other out-of-order index is 409 `chunk_out_of_order`; more bytes than the upload declared is 413. Answers `{uploadId, index, received, size}`.",
+                    "parameters": [path_param("uploadId"), path_param("index")],
+                    "requestBody": {
+                        "required": true,
+                        "content": { "application/octet-stream": { "schema": { "type": "string", "format": "binary" } } }
+                    },
+                    "responses": ok_response()
+                }
+            },
+            "/api/uploads/chunked/{uploadId}/complete": {
+                "post": {
+                    "summary": "Finish a chunked upload: sniff the content and store it",
+                    "description": "The same content rules and the same answer as `POST /api/uploads`. 409 `upload_incomplete` until every declared byte has arrived; 415 for an executable or unsupported type (the partial is deleted); calling it again returns the same answer.",
+                    "parameters": [path_param("uploadId")],
+                    "responses": upload_responses()
+                }
+            }
     })
 }
 
