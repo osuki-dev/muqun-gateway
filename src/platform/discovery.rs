@@ -566,6 +566,14 @@ pub async fn build_discovery(state: &AppState, _sealed: bool, authenticated: boo
             "timeoutMs": 180_000,
             "idleTimeoutMs": 60_000,
             "maxConcurrentPerDevice": 1,
+            // Larger files, sent as many small requests: `POST
+            // /api/uploads/chunked`. The fields above are unchanged.
+            "chunked": {
+                "chunkBytes": crate::platform::chunked_uploads::CHUNK_BYTES,
+                "maxBytes": crate::platform::uploads::MAX_UPLOAD_BYTES,
+                "maxVideoBytes": crate::platform::chunked_uploads::MAX_CHUNKED_VIDEO_BYTES,
+                "maxConcurrentPerDevice": crate::platform::chunked_uploads::MAX_CHUNKED_PER_DEVICE,
+            },
         },
         "fileRanges": { "maxBytes": crate::platform::file_ranges::MAX_FILE_RANGE_BYTES, "validator": "x-muqun-file-version" },
         "terminalInput": { "maxTextBytes": crate::MAX_SEND_TEXT_BYTES, "maxKeys": crate::MAX_SEND_KEYS },

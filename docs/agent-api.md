@@ -1439,6 +1439,49 @@ The two references are for two different readers, and both are always present:
 `name` is the client's own filename, sanitised, for the label only. Uploads are
 deleted 48 hours after they are written.
 
+### Chunked uploads (`/api/uploads/chunked`)
+
+`POST /api/uploads` buffers its whole body, and a sealed body cannot be
+streamed, so it stops at 64 MiB. Larger files (videos up to 1 GiB) travel as
+many ordinary requests, each sealed like any other, and the gateway holds at
+most one chunk in memory. `GET /api/discovery` advertises it, and leaves the
+fields above unchanged for older apps:
+
+```json
+"uploads": { "maxBytes": 26214400, "maxVideoBytes": 67108864, "…": "…",
+  "chunked": { "chunkBytes": 8388608, "maxBytes": 26214400,
+               "maxVideoBytes": 1073741824, "maxConcurrentPerDevice": 2 } }
+```
+
+1. `POST /api/uploads/chunked`, JSON `{ "name", "size", "mime"? }` →
+   `{ "uploadId", "chunkBytes" }`. A video (by `mime` or file extension) may be
+   up to `chunked.maxVideoBytes`, anything else `chunked.maxBytes`; over that
+   is `413 upload_too_large`, `size` 0 is `400 empty_file`. A device with
+   `maxConcurrentPerDevice` uploads open gets `429 too_many_uploads` (its own
+   uploads idle for a minute are reclaimed first).
+2. `PUT /api/uploads/chunked/{uploadId}/{index}`, body = the raw bytes
+   (`content-type: application/octet-stream`; in a sealed request the bytes are
+   base64'd in the envelope's `body` exactly like the multipart body of
+   `POST /api/uploads`). `index` counts from 0 and must be the next one
+   (`409 chunk_out_of_order` otherwise); a chunk is at most `chunkBytes`
+   (`413 chunk_too_large`) and the total at most `size` (`413`). Re-sending the
+   last chunk with identical bytes is answered again, so a lost response is
+   safe to retry; a chunk that failed midway leaves nothing behind and can be
+   sent again. Answers `{ uploadId, index, received, size }`.
+3. `POST /api/uploads/chunked/{uploadId}/complete` (no body). `409
+   upload_incomplete` until `received == size`. Then the content is sniffed
+   with the rules of `POST /api/uploads` (415 for an executable or unsupported
+   type, deleting the partial; 413 over the ceiling of the sniffed kind) and
+   the answer is the single-shot one: `{ path, url, name, size, mime }`.
+   Calling it again returns the same answer.
+4. `DELETE /api/uploads/chunked/{uploadId}` aborts and deletes the partial.
+
+An upload belongs to the device that opened it; any other caller gets `404
+upload_not_found`. Partial files live in `uploads/.partial/`; an upload with no
+chunk for 30 minutes is dropped, and partials left by a previous run are
+removed at startup. A finished upload is a normal upload: 48-hour retention,
+read back with `GET /api/uploads/{file_name}`.
+
 ### `GET /api/uploads/{file_name}`
 
 Streams one stored upload back. `file_name` is the last segment of `url` — the
