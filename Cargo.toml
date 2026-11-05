@@ -48,6 +48,7 @@ tokio-stream = "0.1.18"
 # there indistinguishable from an idle stream.
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", default-features = false, features = ["ansi", "env-filter", "fmt", "smallvec", "std", "tracing-log"] }
+unicode-segmentation = "1.13.3"
 uuid = { version = "1.29.0", features = ["v4"] }
 argon2 = { version = "0.6.0", default-features = false, features = ["alloc"] }
 # `rustls-tls-webpki-roots`: a linked peer at an `https://` URL is followed

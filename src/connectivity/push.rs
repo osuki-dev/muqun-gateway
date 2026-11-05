@@ -173,6 +173,10 @@ pub(crate) struct AgentPushNotice {
     pub(crate) server_label: String,
     /// The agent's own name. `None` renders as the reader's word for an agent.
     pub(crate) agent_name: Option<String>,
+    /// The agent session's title, already cleaned by [`push_session_title`];
+    /// `None` when the session has no real title. When set it is the push's
+    /// title, so the owner sees which conversation it is about.
+    pub(crate) session_title: Option<String>,
     pub(crate) data: serde_json::Map<String, Value>,
     /// Only an approval has these, and only ever as indices and decisions.
     pub(crate) choices: Vec<approvals::PushChoice>,
@@ -230,6 +234,56 @@ impl PushDetail {
     }
 }
 
+/// Visible characters of a session title a push shows.
+const MAX_PUSH_TITLE_CHARS: usize = 40;
+
+/// A session's title as a push title, or `None` when it has no real one: empty,
+/// the session id, the agent's own name, a stock "new session" label or a path.
+/// Whitespace runs become one space, control characters are dropped, and the
+/// result is cut at [`MAX_PUSH_TITLE_CHARS`] grapheme clusters with "…".
+pub(crate) fn push_session_title(raw: &str, asid: &str, agent_id: &str) -> Option<String> {
+    use unicode_segmentation::UnicodeSegmentation;
+    let mut clean = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        if ch.is_whitespace() {
+            if !clean.is_empty() && !clean.ends_with(' ') {
+                clean.push(' ');
+            }
+        } else if !ch.is_control() {
+            clean.push(ch);
+        }
+    }
+    let clean = clean.trim_end();
+    let lower = clean.to_lowercase();
+    let is_id = clean == asid
+        || (clean.len() > 4
+            && clean.starts_with("ses_")
+            && clean[4..].chars().all(|c| c.is_ascii_alphanumeric()));
+    let is_path = clean.starts_with(['/', '~', '\\'])
+        || clean
+            .get(1..3)
+            .is_some_and(|rest| rest == ":\\" || rest == ":/");
+    let is_stock = matches!(
+        lower.as_str(),
+        "new session"
+            | "new chat"
+            | "new conversation"
+            | "untitled"
+            | "untitled session"
+            | "session"
+    ) || crate::agents::runtime::agent_display_name(agent_id)
+        .is_some_and(|name| name.to_lowercase() == lower);
+    if clean.is_empty() || is_id || is_path || is_stock {
+        return None;
+    }
+    let mut graphemes = clean.graphemes(true);
+    let mut title: String = graphemes.by_ref().take(MAX_PUSH_TITLE_CHARS).collect();
+    if graphemes.next().is_some() {
+        title.push('…');
+    }
+    Some(title)
+}
+
 impl AgentPushNotice {
     pub(crate) fn render(&self, locale: Locale) -> AgentPushNotification {
         let (heading, body) = match self.notice {
@@ -245,7 +299,9 @@ impl AgentPushNotice {
         // label (which the user set) and the agent name -- never terminal
         // output or prompts.
         let heading = i18n::t(locale, heading);
-        let title = if self.server_label.is_empty() {
+        let title = if let Some(session_title) = &self.session_title {
+            session_title.clone()
+        } else if self.server_label.is_empty() {
             heading.to_owned()
         } else {
             format!("{heading} · {}", truncate(&self.server_label, 32))
@@ -283,6 +339,61 @@ impl AgentPushNotice {
 mod tests {
     use super::*;
     use crate::*;
+
+    /// What a native agent push titles itself with: the session's title when
+    /// it is a real one, cleaned and cut by characters; today's heading when
+    /// not.
+    #[test]
+    fn a_push_is_titled_with_the_session_when_it_has_a_real_title() {
+        let long_cjk =
+            "修复登录页面在深色模式下按钮对比度不足的问题并补充对应的测试用例以及文档说明并且同步更新所有相关的设计稿和发布说明";
+        let long_cjk_cut = format!("{}…", long_cjk.chars().take(40).collect::<String>());
+        let long_ascii = "a".repeat(60);
+        let long_ascii_cut = format!("{}…", "a".repeat(40));
+        let family = "👨‍👩‍👧‍👦".repeat(41);
+        let family_cut = format!("{}…", "👨‍👩‍👧‍👦".repeat(40));
+        let cases: [(&str, Option<&str>); 14] = [
+            ("Fix the login bug", Some("Fix the login bug")),
+            (
+                "  Fix\n the\t\tlogin \r\n bug \u{7} ",
+                Some("Fix the login bug"),
+            ),
+            (long_cjk, Some(long_cjk_cut.as_str())),
+            (long_ascii.as_str(), Some(long_ascii_cut.as_str())),
+            (family.as_str(), Some(family_cut.as_str())),
+            ("", None),
+            (" \n\t ", None),
+            ("New session", None),
+            ("codex", None),
+            ("Codex", None),
+            ("ses_abc123", None),
+            ("ses_1", None),
+            ("/home/someone/project", None),
+            ("C:\\work\\project", None),
+        ];
+        for (raw, want) in cases {
+            assert_eq!(
+                push_session_title(raw, "ses_1", "codex").as_deref(),
+                want,
+                "{raw:?}"
+            );
+        }
+        let notice = |session_title: Option<String>| AgentPushNotice {
+            notice: AgentNotice::ApprovalPending,
+            server_label: "home".into(),
+            agent_name: Some("Codex".into()),
+            session_title,
+            data: Default::default(),
+            choices: vec![],
+            detail: None,
+        };
+        let titled = notice(Some("Fix the login bug".into())).render(Locale::En);
+        assert_eq!(titled.title, "Fix the login bug");
+        assert_eq!(titled.body, "Codex is waiting for your approval.");
+        let plain = notice(None).render(Locale::En);
+        assert_eq!(plain.title, "Approval needed · home");
+        assert_eq!(plain.body, titled.body);
+    }
 
     fn registration(token: &str, owner: Option<&str>) -> PushTokenRecord {
         PushTokenRecord {
@@ -436,6 +547,7 @@ mod tests {
                 notice: AgentNotice::AgentCompleted,
                 server_label: "test".into(),
                 agent_name: None,
+                session_title: None,
                 data: Default::default(),
                 choices: vec![],
                 detail: None,

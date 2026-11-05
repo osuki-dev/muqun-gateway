@@ -1004,6 +1004,7 @@ pub(crate) fn approval_notification(
     AgentPushNotice {
         notice: AgentNotice::ApprovalPending,
         server_label: server_label.trim().to_owned(),
+        session_title: None,
         agent_name: (!agent.trim().is_empty()).then(|| agent.trim().to_owned()),
         data,
         // The answers travel as indices and decisions, and are worded at
@@ -1420,26 +1421,22 @@ fn agent_form_push_data(
     data
 }
 
-/// The push a pending question sends, before it is put into words: "{name}
-/// needs your input", where the name is the session's title when there is one
-/// and the agent's otherwise. The form's own title is the body only when the
-/// owner turned `rich_agent_pushes` on.
+/// The push a pending question sends, before it is put into words: "{agent}
+/// needs your input", titled with the session's title when it has a real one.
+/// The form's own title is the body only when the owner turned
+/// `rich_agent_pushes` on.
 fn form_notification(
     state: &AppState,
     agent_id: &str,
-    session_title: Option<&str>,
+    session_title: Option<String>,
     asid: &str,
     request: &agents::FormRequest,
 ) -> AgentPushNotice {
-    let agent_name = session_title
-        .map(str::trim)
-        .filter(|title| !title.is_empty())
-        .or_else(|| agents::runtime::agent_display_name(agent_id))
-        .map(str::to_owned);
     AgentPushNotice {
         notice: AgentNotice::AgentBlocked,
         server_label: current_server_label(&state.config.label).trim().to_owned(),
-        agent_name,
+        session_title,
+        agent_name: agents::runtime::agent_display_name(agent_id).map(str::to_owned),
         data: agent_form_push_data(&state.config.server_id, agent_id, asid, &request.id),
         choices: Vec::new(),
         detail: state
@@ -1457,11 +1454,13 @@ fn permission_notification(
     state: &AppState,
     agent_id: &str,
     asid: &str,
+    session_title: Option<String>,
     request: &agents::PermissionRequest,
 ) -> AgentPushNotice {
     AgentPushNotice {
         notice: AgentNotice::ApprovalPending,
         server_label: current_server_label(&state.config.label).trim().to_owned(),
+        session_title,
         agent_name: agents::runtime::agent_display_name(agent_id).map(str::to_owned),
         data: agent_permission_push_data(&state.config.server_id, agent_id, asid, &request.id),
         choices: Vec::new(),
@@ -1473,45 +1472,51 @@ fn permission_notification(
     }
 }
 
+/// How long a push waits for the session's title before it goes without one.
+const PUSH_TITLE_WAIT: Duration = Duration::from_secs(1);
+
+/// The agent kind and the push-ready title of a session; the title is `None`
+/// when the agent does not answer in time or the session has no real one.
+async fn agent_and_push_title(state: &AppState, asid: &str) -> (String, Option<String>) {
+    let Some(manager) = state.agent_runtime.manager_for_session(asid).await else {
+        return (String::new(), None);
+    };
+    let agent_id = manager.agent().kind().to_owned();
+    let title = tokio::time::timeout(PUSH_TITLE_WAIT, manager.sessions().get_session(asid))
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .and_then(|info| {
+            crate::connectivity::push::push_session_title(&info.title, asid, &agent_id)
+        });
+    (agent_id, title)
+}
+
 async fn deliver_agent_approval_notice(
     state: &AppState,
     asid: &str,
     request: &agents::PermissionRequest,
 ) {
-    let agent_id = match state.agent_runtime.manager_for_session(asid).await {
-        Some(manager) => manager.agent().kind().to_owned(),
-        None => String::new(),
-    };
-    let notice = permission_notification(state, &agent_id, asid, request);
+    let (agent_id, title) = agent_and_push_title(state, asid).await;
+    let notice = permission_notification(state, &agent_id, asid, title, request);
     deliver_agent_notification(state, notice).await;
 }
 
 async fn deliver_agent_form_notice(state: &AppState, asid: &str, request: &agents::FormRequest) {
-    let (agent_id, title) = match state.agent_runtime.manager_for_session(asid).await {
-        Some(manager) => {
-            let title =
-                tokio::time::timeout(Duration::from_secs(3), manager.sessions().get_session(asid))
-                    .await
-                    .ok()
-                    .and_then(Result::ok)
-                    .map(|info| info.title);
-            (manager.agent().kind().to_owned(), title)
-        }
-        None => (String::new(), None),
-    };
-    let notice = form_notification(state, &agent_id, title.as_deref(), asid, request);
+    let (agent_id, title) = agent_and_push_title(state, asid).await;
+    let notice = form_notification(state, &agent_id, title, asid, request);
     deliver_agent_notification(state, notice).await;
 }
 
 /// The push a native session's finished turn sends: the pane completion's
 /// words ("{agent} finished running."), routed to the agent session by
-/// `asid` and `agent_id`. Nothing the agent wrote, and not the session's title
-/// either: some agents write that themselves.
+/// `asid` and `agent_id`, titled with the session's title when it has one.
 fn completion_notification(
     server_id: &str,
     server_label: &str,
     agent_id: &str,
     asid: &str,
+    session_title: Option<String>,
 ) -> AgentPushNotice {
     let mut data = serde_json::Map::new();
     data.insert("type".into(), json!("agent.completed"));
@@ -1521,6 +1526,7 @@ fn completion_notification(
     AgentPushNotice {
         notice: AgentNotice::AgentCompleted,
         server_label: server_label.trim().to_owned(),
+        session_title,
         agent_name: agents::runtime::agent_display_name(agent_id).map(str::to_owned),
         data,
         choices: Vec::new(),
@@ -1539,16 +1545,21 @@ async fn deliver_agent_completion(state: &AppState, asid: &str) {
         .await
         .ok()
         .and_then(Result::ok);
-    if info.is_some_and(|info| info.parent_id.is_some())
+    if info.as_ref().is_some_and(|info| info.parent_id.is_some())
         || state.tasks.is_subtask_session(asid).await
     {
         return;
     }
+    let agent_id = manager.agent().kind();
+    let title = info.and_then(|info| {
+        crate::connectivity::push::push_session_title(&info.title, asid, agent_id)
+    });
     let notice = completion_notification(
         &state.config.server_id,
         &current_server_label(&state.config.label),
-        manager.agent().kind(),
+        agent_id,
         asid,
+        title,
     );
     deliver_agent_notification(state, notice).await;
 }
@@ -1922,6 +1933,7 @@ fn native_input_notification(
     Some(AgentPushNotice {
         notice: AgentNotice::AgentInputRequired,
         server_label: server_label.to_owned(),
+        session_title: None,
         agent_name: ["display_agent", "agent"].into_iter().find_map(|key| {
             agent
                 .get(key)
@@ -2116,6 +2128,7 @@ pub(crate) fn notification_for_transition(
     Some(AgentPushNotice {
         notice,
         server_label: server_label.trim().to_owned(),
+        session_title: None,
         agent_name,
         data: notification_data,
         choices: Vec::new(),
@@ -4093,8 +4106,8 @@ mod tests {
                 "options": [],
             }))
             .unwrap();
-            let approval = super::permission_notification(&state, agent, &asid, &request);
-            let completion = super::completion_notification("server-1", &label, agent, &asid);
+            let approval = super::permission_notification(&state, agent, &asid, None, &request);
+            let completion = super::completion_notification("server-1", &label, agent, &asid, None);
             for (notice, english) in [
                 (&approval, format!("{name} is waiting for your approval.")),
                 (&completion, format!("{name} finished running.")),
@@ -4274,6 +4287,7 @@ mod tests {
                     notice,
                     server_label: String::new(),
                     agent_name: None,
+                    session_title: None,
                     data: [("pane_id".to_owned(), json!("w1:p1"))]
                         .into_iter()
                         .collect(),
@@ -4287,31 +4301,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    /// The question push says "{name} needs your input", naming the session
-    /// when it has a title and the agent when it does not.
-    #[test]
-    fn a_form_push_names_the_session_else_the_agent() {
-        use crate::agents::{AgentSessionId, FormRequest};
-        let state = test_state("admin", Vec::new());
-        let request = FormRequest {
-            nonblocking: false,
-            id: "form_1".into(),
-            asid: AgentSessionId("ses_1".into()),
-            title: "Which branch?".into(),
-            fields: Vec::new(),
-        };
-        let titled = super::form_notification(&state, "t3", Some("Fix login"), "ses_1", &request);
-        assert_eq!(titled.notice, AgentNotice::AgentBlocked);
-        assert_eq!(titled.agent_name.as_deref(), Some("Fix login"));
-        assert_eq!(titled.detail, None);
-        let rendered = titled.render(Locale::default());
-        assert_eq!(rendered.body, "Fix login needs your input.");
-        assert_eq!(rendered.data["form_id"], "form_1");
-
-        let untitled = super::form_notification(&state, "deepseek", Some("  "), "ses_1", &request);
-        assert_eq!(untitled.agent_name.as_deref(), Some("DeepSeek"));
     }
 
     /// The defect this hub exists for: `activity_stream()` used to be built
