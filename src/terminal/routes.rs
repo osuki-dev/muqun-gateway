@@ -1748,35 +1748,56 @@ pub(crate) fn observe_agent_notification(
     completions.observe(pane_id, &status, notice, Instant::now())
 }
 
-/// Send a push a terminal pane raised, unless the native agent session the
-/// pane's agent drives already pushes for the same event
-/// ([`crate::tasks::TaskService::pane_mirror`]): a Codex delegation's TUI
-/// asks its approvals, questions and turn ends through that session, whose
-/// pushes route to the conversation. One event, one push.
+/// Send a push a terminal pane raised, unless something else already says it.
 ///
-/// A blocked or input push whose pane shows a permission menu is not sent
-/// either: the approval watcher pushes `approval.pending` for that menu.
+/// A delegated task's native session ([`crate::tasks::TaskService::pane_mirror`])
+/// asks its approvals, questions and turn ends itself, and so does the
+/// approval watcher for a pane showing a permission menu: one event, one push.
+///
+/// A pane whose agent is a conversation the gateway holds (the runtime's
+/// terminal link) is the conversation, not "a terminal": a session driven
+/// natively pushes for itself, so the pane stays quiet; a session observed
+/// through its pane raises no native push, so the pane's notice goes out
+/// naming the conversation, and a tap opens it.
 pub(crate) async fn deliver_pane_notification(
     state: &AppState,
     session: &SessionConfig,
     notice: AgentPushNotice,
 ) {
-    if !pane_push_covered(state, session, &notice).await {
-        deliver_agent_notification(state, notice).await;
+    match pane_push_route(state, session, &notice).await {
+        PanePushRoute::Covered => {}
+        PanePushRoute::Terminal => deliver_agent_notification(state, notice).await,
+        PanePushRoute::Conversation(link) => {
+            deliver_agent_notification(state, conversation_notice(state, notice, &link)).await;
+        }
     }
 }
 
-async fn pane_push_covered(
+#[derive(Debug, PartialEq)]
+enum PanePushRoute {
+    Covered,
+    Terminal,
+    Conversation(PaneConversation),
+}
+
+#[derive(Debug, PartialEq)]
+struct PaneConversation {
+    asid: String,
+    agent_id: String,
+    title: String,
+}
+
+async fn pane_push_route(
     state: &AppState,
     session: &SessionConfig,
     notice: &AgentPushNotice,
-) -> bool {
+) -> PanePushRoute {
     let Some(pane_id) = notice.data.get("pane_id").and_then(Value::as_str) else {
-        return false;
+        return PanePushRoute::Terminal;
     };
     if let Some(asid) = state.tasks.pane_mirror(&session.id, pane_id).await {
         tracing::debug!(pane = pane_id, asid, "pane push left to its agent session");
-        return true;
+        return PanePushRoute::Covered;
     }
     // Saying the agent wants something, without saying it is a menu, is what
     // the menu's `approval.pending` already said.
@@ -1788,9 +1809,108 @@ async fn pane_push_covered(
         .is_ok_and(|screen| approvals::detect(&screen).is_some())
     {
         tracing::debug!(pane = pane_id, "pane push left to its approval push");
-        return true;
+        return PanePushRoute::Covered;
     }
-    false
+    match linked_conversation(state, session, pane_id).await {
+        Some((link, true)) => {
+            tracing::debug!(
+                pane = pane_id,
+                asid = link.asid,
+                "pane push left to its session"
+            );
+            PanePushRoute::Covered
+        }
+        Some((link, false)) => PanePushRoute::Conversation(link),
+        None => PanePushRoute::Terminal,
+    }
+}
+
+/// The conversation a pane's agent is linked to by the runtime's terminal
+/// link, and whether that session pushes for itself (it is driven natively,
+/// not observed through its pane). The link must name the pane's current
+/// agent incarnation where both sides report one.
+async fn linked_conversation(
+    state: &AppState,
+    session: &SessionConfig,
+    pane_id: &str,
+) -> Option<(PaneConversation, bool)> {
+    let query = crate::agents::domain::SessionQuery {
+        parent_id: Some("null".into()),
+        limit: Some(200),
+        order: Some("desc".into()),
+        ..Default::default()
+    };
+    let current_instance = backend_agents(session)
+        .await
+        .ok()?
+        .into_iter()
+        .find(|agent| agent.pane_id.as_str() == pane_id)
+        .and_then(|agent| agent.instance_id);
+    for manager in state.agent_runtime.all_managers().await {
+        let rows = tokio::time::timeout(
+            Duration::from_secs(3),
+            manager.sessions().list_sessions(&query),
+        )
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_default();
+        for row in rows.into_iter().filter(|row| !row.deleted) {
+            let Some(runtime) = &row.runtime else {
+                continue;
+            };
+            let Some(link) = &runtime.terminal else {
+                continue;
+            };
+            if link.session_id != session.id
+                || link.pane_id.as_str() != pane_id
+                || current_instance
+                    .as_deref()
+                    .is_some_and(|now| now != link.instance_id.as_str())
+            {
+                continue;
+            }
+            let agent_id = manager.agent().kind().to_owned();
+            let title =
+                crate::connectivity::push::push_session_title(&row.title, &row.asid.0, &agent_id)
+                    .unwrap_or_default();
+            let observed_through_pane =
+                runtime.source == crate::agents::domain::RuntimeSource::Terminal;
+            return Some((
+                PaneConversation {
+                    asid: row.asid.0.clone(),
+                    agent_id,
+                    title,
+                },
+                !observed_through_pane,
+            ));
+        }
+    }
+    None
+}
+
+/// The pane's notice as the conversation's: the data a native push carries,
+/// so a tap opens the session instead of the terminal.
+fn conversation_notice(
+    state: &AppState,
+    mut notice: AgentPushNotice,
+    link: &PaneConversation,
+) -> AgentPushNotice {
+    let event_type = notice.data.get("type").cloned();
+    notice.data.clear();
+    if let Some(event_type) = event_type {
+        notice.data.insert("type".into(), event_type);
+    }
+    notice
+        .data
+        .insert("server_id".into(), json!(state.config.server_id));
+    notice.data.insert("agent_id".into(), json!(link.agent_id));
+    notice.data.insert("asid".into(), json!(link.asid));
+    notice.session_title = (!link.title.is_empty()).then(|| link.title.clone());
+    if let Some(name) = agents::runtime::agent_display_name(&link.agent_id) {
+        notice.agent_name = Some(name.to_owned());
+    }
+    notice
 }
 
 /// Send one notice to every registered device, each in its own language.
@@ -4295,10 +4415,85 @@ mod tests {
                     detail: None,
                 };
                 assert_eq!(
-                    super::pane_push_covered(&state, &session, &push).await,
+                    super::pane_push_route(&state, &session, &push).await
+                        == super::PanePushRoute::Covered,
                     has_menu && asks,
                     "{notice:?}, menu on screen: {has_menu}"
                 );
+            }
+        }
+    }
+
+    /// A pane whose agent is a conversation the gateway holds is not "a
+    /// terminal": a natively driven session pushes for itself, one observed
+    /// through its pane has its notice sent as the conversation's; a pane no
+    /// session links to keeps the terminal push.
+    #[tokio::test]
+    async fn a_pane_linked_to_a_session_pushes_as_the_conversation() {
+        use crate::agents::domain::{
+            RuntimeInteraction, RuntimeSource, RuntimeTerminal, SessionRuntime,
+        };
+        let linked = |pane: &str, source: RuntimeSource, title: &str| {
+            let mut session = crate::test_support::fake_session("ses_linked", 1);
+            session.title = title.into();
+            session.runtime = Some(SessionRuntime {
+                transcript: None,
+                source,
+                interaction: RuntimeInteraction::Terminal,
+                status: None,
+                terminal: Some(RuntimeTerminal {
+                    session_id: "herdr".into(),
+                    pane_id: pane.into(),
+                    instance_id: "inst".into(),
+                }),
+                reason: None,
+            });
+            session
+        };
+        let herdr = crate::test_support::FakeHerdr::start(vec!["› ready"], None);
+        let session = herdr.session();
+        let cases = [
+            ("w1:p1", RuntimeSource::Terminal, true),
+            ("w1:p1", RuntimeSource::Native, false),
+            ("w1:p2", RuntimeSource::Terminal, false),
+        ];
+        for (link_pane, source, rerouted) in cases {
+            let state = test_state("admin", Vec::new());
+            let mut agent = crate::test_support::FakeAgent::new("codex");
+            agent.sessions = vec![linked(link_pane, source, "Fix the login bug")];
+            state.agent_runtime.attach_for_test(agent.manager()).await;
+            let mut session = session.clone();
+            session.id = "herdr".into();
+            let push = AgentPushNotice {
+                notice: AgentNotice::AgentCompleted,
+                server_label: String::new(),
+                agent_name: None,
+                session_title: None,
+                data: [
+                    ("type".to_owned(), json!("agent.completed")),
+                    ("pane_id".to_owned(), json!("w1:p1")),
+                ]
+                .into_iter()
+                .collect(),
+                choices: Vec::new(),
+                detail: None,
+            };
+            let route = super::pane_push_route(&state, &session, &push).await;
+            let expected = match (link_pane, rerouted, source) {
+                ("w1:p1", true, _) => super::PanePushRoute::Conversation(super::PaneConversation {
+                    asid: "ses_linked".into(),
+                    agent_id: "codex".into(),
+                    title: "Fix the login bug".into(),
+                }),
+                ("w1:p1", false, _) => super::PanePushRoute::Covered,
+                _ => super::PanePushRoute::Terminal,
+            };
+            assert_eq!(route, expected, "{link_pane} {source:?}");
+            if let super::PanePushRoute::Conversation(link) = route {
+                let out = super::conversation_notice(&state, push, &link);
+                assert_eq!(out.data.get("asid"), Some(&json!("ses_linked")));
+                assert!(out.data.get("pane_id").is_none());
+                assert_eq!(out.session_title.as_deref(), Some("Fix the login bug"));
             }
         }
     }
