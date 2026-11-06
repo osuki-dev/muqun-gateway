@@ -541,19 +541,30 @@ impl CodexDriver {
         }
     }
 
+    /// A thread this Gateway has joined on the shared daemon is driven
+    /// natively. A pane whose Codex reports the same thread is still linked, so
+    /// clients can open it and the pane's own push is known to be covered.
+    fn subscribed_runtime(&self, terminal: Option<RuntimeTerminal>) -> SessionRuntime {
+        SessionRuntime {
+            transcript: Some(TranscriptSource::Live),
+            source: RuntimeSource::Native,
+            interaction: RuntimeInteraction::Native,
+            status: None,
+            terminal,
+            reason: None,
+        }
+    }
+
     pub(crate) async fn runtime(&self, id: &str, fresh: bool) -> Option<SessionRuntime> {
         // Same-server accepted rejoin is stronger than a terminal observation:
         // both clients control this one runtime. Private writers keep the old
         // conservative terminal precedence.
         if self.client.is_shared() && self.client.is_subscribed(id) {
-            return Some(SessionRuntime {
-                transcript: Some(TranscriptSource::Live),
-                source: RuntimeSource::Native,
-                interaction: RuntimeInteraction::Native,
-                status: None,
-                terminal: None,
-                reason: None,
-            });
+            let terminal = match &self.terminal_runtime {
+                Some(observer) => observer.observe(id, false, fresh).await.terminal,
+                None => None,
+            };
+            return Some(self.subscribed_runtime(terminal));
         }
         let observer = self.terminal_runtime.as_ref()?;
         let native = self.loaded.lock().await.contains(id) && !self.client.is_shared();
@@ -574,14 +585,11 @@ impl CodexDriver {
     /// Local metadata only. Native event processing must not await Herdr I/O.
     pub(crate) async fn cached_runtime(&self, id: &str) -> Option<SessionRuntime> {
         if self.client.is_shared() && self.client.is_subscribed(id) {
-            return Some(SessionRuntime {
-                transcript: Some(TranscriptSource::Live),
-                source: RuntimeSource::Native,
-                interaction: RuntimeInteraction::Native,
-                status: None,
-                terminal: None,
-                reason: None,
-            });
+            let terminal = self
+                .terminal_runtime
+                .as_ref()
+                .and_then(|observer| observer.cached(id, false).terminal);
+            return Some(self.subscribed_runtime(terminal));
         }
         let observer = self.terminal_runtime.as_ref()?;
         let native = self.loaded.lock().await.contains(id) && !self.client.is_shared();
