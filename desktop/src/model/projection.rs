@@ -305,6 +305,7 @@ impl Core {
             Command::LoadEarlier(asid) => match self.hub.earlier(&asid).await {
                 Ok(items) => {
                     let exhausted = items.is_empty();
+                    tracing::debug!(asid = %asid.0, rows = items.len(), "older history page");
                     self.inbox.push(Update::Earlier {
                         asid: asid.0,
                         items,

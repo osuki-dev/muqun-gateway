@@ -51,24 +51,31 @@ fn acp_diffs(call: &ToolCall) -> Vec<(String, String, String)> {
         .collect()
 }
 
-type BuildFiles = Box<dyn FnOnce() -> Vec<FileDiff>>;
+pub type BuildFiles = Box<dyn FnOnce() -> Vec<FileDiff>>;
 
-/// The change an item carries, as a source string (to tell when it changed)
+fn hash_of(parts: &[&str]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    parts.hash(&mut h);
+    h.finish()
+}
+
+/// The change an item carries, as a hash of its source (to tell when it changed)
 /// and a builder for the parsed files. App order: `metadata.files` (what the
 /// tool did), ACP diff content, the edit's old/new strings, then
 /// `apply_patch`'s own sections.
-pub fn diff_source(item: &TimelineItem) -> Option<(String, BuildFiles)> {
+pub fn diff_source(item: &TimelineItem) -> Option<(u64, BuildFiles)> {
     match &item.part {
         AgentPart::Diff { file, diff } if !diff.trim().is_empty() => {
             let patch = with_headers(file, diff);
-            Some((patch.clone(), Box::new(move || parse(&patch))))
+            Some((hash_of(&[&patch]), Box::new(move || parse(&patch))))
         }
         AgentPart::Tool(call) => call_diff_source(call),
         _ => None,
     }
 }
 
-fn call_diff_source(call: &ToolCall) -> Option<(String, BuildFiles)> {
+fn call_diff_source(call: &ToolCall) -> Option<(u64, BuildFiles)> {
     let files = tv::call_diff_files(call);
     if !files.is_empty() {
         let patch = files
@@ -76,15 +83,15 @@ fn call_diff_source(call: &ToolCall) -> Option<(String, BuildFiles)> {
             .map(|f| with_headers(&f.path, &f.patch))
             .collect::<Vec<_>>()
             .join("\n");
-        return Some((patch.clone(), Box::new(move || parse(&patch))));
+        return Some((hash_of(&[&patch]), Box::new(move || parse(&patch))));
     }
     let acp = acp_diffs(call);
     if !acp.is_empty() {
-        let source = acp
+        let parts: Vec<&str> = acp
             .iter()
-            .map(|(p, o, n)| format!("{p}\0{o}\0{n}"))
-            .collect::<Vec<_>>()
-            .join("\0\0");
+            .flat_map(|(p, o, n)| [p.as_str(), o.as_str(), n.as_str()])
+            .collect();
+        let source = hash_of(&parts);
         return Some((
             source,
             Box::new(move || {
@@ -99,7 +106,7 @@ fn call_diff_source(call: &ToolCall) -> Option<(String, BuildFiles)> {
     if kind == ToolKind::Edit || call.name.eq_ignore_ascii_case("edit") {
         if let Some((old, new)) = tv::edit_strings(rec.as_ref()) {
             let path = tv::target(ToolKind::Edit, rec.as_ref());
-            let source = format!("{path}\0{old}\0{new}");
+            let source = hash_of(&[&path, &old, &new]);
             return Some((
                 source,
                 Box::new(move || vec![FileDiff::from_texts(path.as_str(), &old, &new)]),
@@ -119,7 +126,7 @@ fn call_diff_source(call: &ToolCall) -> Option<(String, BuildFiles)> {
             .collect::<Vec<_>>()
             .join("\n");
         if !patch.is_empty() {
-            return Some((patch.clone(), Box::new(move || parse(&patch))));
+            return Some((hash_of(&[&patch]), Box::new(move || parse(&patch))));
         }
     }
     None
@@ -127,8 +134,7 @@ fn call_diff_source(call: &ToolCall) -> Option<(String, BuildFiles)> {
 
 /// Lines and file headers a parsed diff draws, for the inline box's height.
 fn diff_rows(cx: &Tcx, id: &str) -> Option<(usize, usize, usize)> {
-    let (_, state) = cx.tl()?.diffs.get(id)?;
-    let files = state.files();
+    let files = cx.tl()?.diffs.get(id)?.files();
     if files.is_empty() {
         return None;
     }
@@ -155,8 +161,7 @@ pub fn diff_chips(cx: &Tcx, added: usize, removed: usize) -> Vec<El> {
 
 /// Item `id`'s parsed diff, as rows inside its card.
 pub fn inline_diff(cx: &Tcx, id: &str) -> Option<El> {
-    let (_, state) = cx.tl()?.diffs.get(id)?;
-    let files = state.files();
+    let files = cx.tl()?.diffs.get(id)?.files();
     (!files.is_empty()).then(|| super::diff_rows::rows(cx, id, files))
 }
 

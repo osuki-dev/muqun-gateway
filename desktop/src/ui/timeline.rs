@@ -18,13 +18,14 @@
 //! Cards are drawn by `ui::parts`, one module per part kind.
 
 use std::borrow::Cow;
+use std::cell::{OnceCell, RefCell};
 use std::collections::{HashMap, HashSet};
 
 use muqun_gateway::agents::{
     AgentPart, AgentSessionId, AgentSessionStatus, TimelineItem, TimelineRole,
 };
 use rune::{col, row, text, El, GrowthSpec, ScrollSpec};
-use rune_kit::diff::{DiffState, DiffView};
+use rune_kit::diff::{DiffState, DiffView, FileDiff};
 use rune_kit::{Badge, BadgeVariant, Button, ButtonVariant, ControlSize, Kit, ScrollBar, Spinner};
 
 use super::copy::tr_ref;
@@ -56,12 +57,32 @@ const ROW_ESTIMATE: f32 = 64.0;
 /// Readable line length on a wide window; tiles are narrower anyway.
 const FEED_MAX_W: f32 = 860.0;
 
+/// An item's change, parsed the first time a card draws it: a long session
+/// of whole-file edits would otherwise diff every one of them on open.
+pub struct LazyDiff {
+    source: u64,
+    build: RefCell<Option<parts::files::BuildFiles>>,
+    files: OnceCell<Vec<FileDiff>>,
+}
+
+impl LazyDiff {
+    pub fn files(&self) -> &[FileDiff] {
+        self.files.get_or_init(|| {
+            self.build
+                .borrow_mut()
+                .take()
+                .map(|build| build())
+                .unwrap_or_default()
+        })
+    }
+}
+
 /// One session's timeline as the UI holds it.
 #[derive(Default)]
 pub struct SessionTimeline {
     pub items: Vec<TimelineItem>,
     /// Diffs drawn inline, by item id, with the source they were built from.
-    pub diffs: HashMap<String, (String, DiffState)>,
+    pub diffs: HashMap<String, LazyDiff>,
     /// Cards the reader flipped from their default (open ↔ closed), by id.
     pub flipped: HashSet<String>,
     /// No older history to page in.
@@ -131,14 +152,16 @@ impl SessionTimeline {
             None => {
                 self.diffs.remove(&item.id);
             }
-            Some((source, files)) => {
-                if self
-                    .diffs
-                    .get(&item.id)
-                    .is_none_or(|(old, _)| *old != source)
-                {
-                    self.diffs
-                        .insert(item.id.clone(), (source, DiffState::new(files())));
+            Some((source, build)) => {
+                if self.diffs.get(&item.id).is_none_or(|d| d.source != source) {
+                    self.diffs.insert(
+                        item.id.clone(),
+                        LazyDiff {
+                            source,
+                            build: RefCell::new(Some(build)),
+                            files: OnceCell::new(),
+                        },
+                    );
                 }
             }
         }
@@ -281,7 +304,19 @@ fn row_count(s: &UiState, asid: &str) -> usize {
 pub fn session_view(s: &UiState, k: &Kit, asid: &str) -> El {
     let key = format!("feed-{asid}");
     let Some(tl) = s.timelines.get(asid) else {
-        return empty(s, k, &key);
+        // Opened, its history not read yet.
+        let language = s.cfg.general.language;
+        return col().key(key).w_full().grow(1.0).min_h(0.0).center().child(
+            row()
+                .gap(8.0)
+                .center_y()
+                .child(Spinner::new().size(14.0).build(k))
+                .child(
+                    text(tr_ref(language, "Opening the session…", "正在打开会话…"))
+                        .font(k.ty.ui)
+                        .color(k.c.text_muted),
+                ),
+        );
     };
     if tl.items.is_empty() && tl.earlier_exhausted {
         return empty(s, k, &key);
@@ -584,5 +619,61 @@ mod tests {
         tl.flip("c");
         tl.replace(vec![text_item("c")]);
         assert!(tl.is_open("c", false));
+    }
+
+    #[test]
+    fn live_rows_reach_the_focused_session_and_a_parked_tile() {
+        use crate::model::inbox::Update;
+        use muqun_gateway::agents::{AgentDomainEvent, AgentSessionId};
+        let (tx, _rx) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        s.splash = None;
+        let info = |asid: &str| -> muqun_gateway::agents::AgentSessionInfo {
+            serde_json::from_value(serde_json::json!({
+                "asid": asid, "agent_id": "codex", "title": "", "status": "busy",
+                "updated_ms": 1u64,
+            }))
+            .unwrap()
+        };
+        let snapshot = |asid: &str| {
+            Update::Snapshot(Box::new(
+                muqun_gateway::agents::ports::AgentSessionSnapshot {
+                    info: info(asid),
+                    timeline: vec![text_item(&format!("{asid}-1"))],
+                    permissions: vec![],
+                    forms: vec![],
+                    inbox: vec![],
+                    seq: 1,
+                },
+            ))
+        };
+        s.open_session("a");
+        s.open_in_tile("b");
+        s.apply_updates(vec![snapshot("a"), snapshot("b")]);
+        let upsert = |asid: &str, id: &str, seq| {
+            Update::event(AgentDomainEvent::TimelineUpsert {
+                asid: AgentSessionId(asid.into()),
+                items: vec![text_item(id)],
+                seq,
+            })
+        };
+        s.apply_updates(vec![
+            upsert("a", "a-2", 2),
+            upsert("b", "b-2", 2),
+            upsert("z", "z-1", 2),
+        ]);
+        let ids = |asid: &str| -> Vec<String> {
+            s.timelines[asid]
+                .items
+                .iter()
+                .map(|i| i.id.clone())
+                .collect()
+        };
+        assert_eq!(ids("a"), ["a-1", "a-2"]);
+        assert_eq!(ids("b"), ["b-1", "b-2"]);
+        assert!(
+            !s.timelines.contains_key("z"),
+            "a session not on screen keeps no rows"
+        );
     }
 }
