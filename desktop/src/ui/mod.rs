@@ -6,6 +6,7 @@
 
 mod agent_marks;
 mod agents;
+mod art;
 mod composer;
 mod home;
 mod inbox;
@@ -28,7 +29,9 @@ use muqun_gateway::agents::{
     AgentSessionStatus, FormRequest, ModelRef, PermissionRequest, TimelineItem,
 };
 use muqun_gateway::platform::discovery::AgentDiscoveryInfo;
-use rune::{Cx, El, KeyEvent, TextEdit, Tx};
+use std::time::{Duration, Instant};
+
+use rune::{Cx, El, ImageCache, KeyEvent, TextEdit, Tx};
 use rune_kit::diff::{parse, DiffState};
 use rune_kit::shell::{is_sidebar_toggle, PaneState};
 use rune_kit::{Kit, ToastRegion};
@@ -86,6 +89,9 @@ const MAX_TOASTS: usize = 3;
 
 /// How many gallery themes the Themes tab lists before "Show more".
 const GALLERY_PAGE: usize = 8;
+/// Launch vignette hold before it finishes fading out.
+const SPLASH_HOLD: Duration = Duration::from_millis(1600);
+const SPLASH_FADE: Duration = Duration::from_millis(550);
 
 /// A pane's grip or toggle was touched: the width may have changed and
 /// [`UiState::persist_layout`] should look (set from the pane access
@@ -223,6 +229,10 @@ pub struct UiState {
     pub gallery_limit: usize,
     pub toasts: Vec<ToastItem>,
     toast_seq: u64,
+    /// Theme / cover decode cache (wakes the app when an image is ready).
+    pub images: Option<ImageCache>,
+    /// While set, the launch vignette covers the window and fades out.
+    pub splash_until: Option<Instant>,
     /// A screenshot scene is showing: live core updates are ignored.
     pub demo: bool,
 }
@@ -247,7 +257,7 @@ impl UiState {
                 .map(|p| p.display().to_string())
                 .unwrap_or_default(),
         );
-        Self {
+        let mut s = Self {
             commands,
             dark,
             mode: Mode::Home,
@@ -323,9 +333,39 @@ impl UiState {
             gallery_limit: GALLERY_PAGE,
             toasts: Vec::new(),
             toast_seq: 0,
+            images: None,
+            splash_until: None,
             demo: false,
             cfg,
+        };
+        s.arm_splash();
+        s
+    }
+
+    /// How long the launch vignette stays up after open / theme switch.
+    pub fn arm_splash(&mut self) {
+        if self.cfg.appearance.reduced_motion || self.cfg.appearance.reduced_transparency {
+            self.splash_until = None;
+            return;
         }
+        self.splash_until = Some(Instant::now() + SPLASH_HOLD);
+    }
+
+    /// Install the image cache once the window can wake it.
+    pub fn install_images(&mut self, waker: rune::Waker) {
+        self.images = Some(ImageCache::new(waker));
+    }
+
+    /// Keep the window waking while the splash is fading.
+    pub fn poll_splash(&mut self, _: f64, _: &mut Tx) -> bool {
+        let Some(until) = self.splash_until else {
+            return false;
+        };
+        if Instant::now() >= until {
+            self.splash_until = None;
+            return false;
+        }
+        true
     }
 
     // ---- helpers the pages share -------------------------------------------------
@@ -682,6 +722,7 @@ impl UiState {
                         self.cfg.appearance.scheme = scheme;
                         self.dark = !matches!(scheme, Scheme::Light);
                         self.status = format!("Theme: {id}");
+                        self.arm_splash();
                     }
                     Err(err) => self.toast("Could not apply theme", Some(format!("{err:#}"))),
                 }
@@ -1028,6 +1069,19 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>) -> El {
     let k = crate::theme::apply::palette(scheme).map_or_else(|| Kit::neutral(dark), |p| p.kit());
     let mut layer: Vec<El> = Vec::new();
     let body = shell::view(s, cx, &k, &mut layer);
+    if let (Some(until), Some(images)) = (s.splash_until, s.images.as_ref()) {
+        let left = until.saturating_duration_since(Instant::now());
+        let opacity = if left > SPLASH_FADE {
+            1.0
+        } else {
+            (left.as_secs_f32() / SPLASH_FADE.as_secs_f32()).clamp(0.0, 1.0)
+        };
+        if opacity > 0.02 {
+            if let Some(splash) = art::splash(images, &k, scheme, opacity) {
+                layer.push(splash);
+            }
+        }
+    }
     if !s.toasts.is_empty() {
         let mut region = ToastRegion::new();
         for t in &s.toasts {

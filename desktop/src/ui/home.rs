@@ -361,28 +361,73 @@ fn recent(s: &UiState, k: &Kit) -> Option<El> {
     Some(list)
 }
 
+fn first_run(s: &UiState) -> bool {
+    !s.agents.is_empty()
+        && s.sessions.is_empty()
+        && s.cfg.general.last_agent.is_none()
+        && s.cfg.general.last_cwd.is_empty()
+}
+
+fn greeting(s: &UiState) -> (String, Option<String>) {
+    let zh = s.cfg.general.language == crate::config::Language::ZhCn;
+    if first_run(s) {
+        let n = s
+            .agents
+            .iter()
+            .filter(|a| {
+                !matches!(
+                    super::agents::Standing::of(a),
+                    super::agents::Standing::NotInstalled | super::agents::Standing::Disabled
+                )
+            })
+            .count();
+        let title = if zh {
+            "欢迎使用 Muqun".into()
+        } else {
+            "Welcome to Muqun".into()
+        };
+        let sub = if zh {
+            format!("已检测到 {n} 个 agent")
+        } else {
+            format!("{n} agent(s) detected")
+        };
+        (title, Some(sub))
+    } else if zh {
+        ("今天想做什么？".into(), None)
+    } else {
+        ("What should we work on?".into(), None)
+    }
+}
+
 pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
-    let mut page = col()
-        .key("home")
+    let (title, subtitle) = greeting(s);
+    let title_font = rune::TextStyle {
+        size: 34.0,
+        line_height: 42.0,
+        ..k.ty.ui_medium
+    };
+    let mut card = col()
+        .key("home-card")
         .w_full()
-        .max_w(720.0)
-        .gap(16.0)
-        .px(24.0)
-        .py(32.0)
-        .child(
-            text("What should we work on?")
-                .font(k.ty.ui_medium)
-                .color(k.c.text_base),
-        )
+        .max_w(680.0)
+        .gap(14.0)
+        .px(28.0)
+        .py(28.0)
+        .radius(k.radius.xl)
+        .fill(k.c.surface_raised_base.alpha(0.92))
         .child(agents(s, k))
         .child(folder(s, k));
     if let Some(pills) = start_pills(s, k, layer) {
-        page = page.child(pills);
+        card = card.child(pills);
     }
-    page = page
+    card = card
         .child(
             TextArea::new(&s.start_draft)
-                .placeholder("Describe the task…")
+                .placeholder(if s.cfg.general.language == crate::config::Language::ZhCn {
+                    "描述任务…"
+                } else {
+                    "Describe the task…"
+                })
                 .label("First prompt")
                 .width(None)
                 .auto_grow(4, 12)
@@ -399,29 +444,77 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
                 .gap(8.0)
                 .center_y()
                 .child(
-                    Button::new("Start")
-                        .variant(ButtonVariant::Submit)
-                        .control_size(ControlSize::Large)
-                        .disabled(s.pending_submit.is_some())
-                        .on_press(submit_start)
-                        .build(k)
-                        .key("start"),
+                    Button::new(if s.cfg.general.language == crate::config::Language::ZhCn {
+                        "开始"
+                    } else {
+                        "Start"
+                    })
+                    .variant(ButtonVariant::Submit)
+                    .control_size(ControlSize::Large)
+                    .disabled(s.pending_submit.is_some())
+                    .on_press(submit_start)
+                    .build(k)
+                    .key("start"),
                 )
                 .child(muted(
                     k,
                     format!("{} to start", crate::platform::keys::label("Primary+Enter")),
                 )),
         );
-    if let Some(recent) = recent(s, k) {
-        page = page.child(recent);
-    }
-    col()
-        .key("home-scroll")
+
+    let mut column = col()
+        .key("home")
         .w_full()
-        .items_center()
-        .child(page)
-        .scroll(ScrollSpec {
-            stick_bottom: false,
-        })
-        .scroll_bar(k)
+        .max_w(720.0)
+        .gap(20.0)
+        .px(32.0)
+        .pt(48.0)
+        .pb(28.0)
+        .child(
+            text(title)
+                .font(title_font)
+                .color(k.c.text_base)
+                .key("home-title"),
+        );
+    if let Some(sub) = subtitle {
+        column = column.child(
+            text(sub)
+                .font(k.ty.body)
+                .color(k.c.text_muted)
+                .key("home-subtitle"),
+        );
+    }
+    if let Some(recent) = recent(s, k) {
+        column = column.child(recent);
+    }
+    column = column.child(card);
+
+    let mut stage = rune::el().key("home-stage").w_full().h_full().min_h(0.0);
+    if !s.cfg.appearance.reduced_transparency {
+        if let Some(images) = s.images.as_ref() {
+            let scheme = if s.dark {
+                crate::theme::color_scheme::ColorScheme::Dark
+            } else {
+                crate::theme::color_scheme::ColorScheme::Light
+            };
+            if let Some(wall) = super::art::wallpaper(images, scheme, s.dark) {
+                stage = stage.child(wall);
+            }
+            if let Some(figure) = super::art::figure(images, scheme, s.dark) {
+                stage = stage.child(figure);
+            }
+        }
+    }
+    stage.child(
+        col()
+            .key("home-scroll")
+            .w_full()
+            .h_full()
+            .items_center()
+            .child(column)
+            .scroll(ScrollSpec {
+                stick_bottom: false,
+            })
+            .scroll_bar(k),
+    )
 }

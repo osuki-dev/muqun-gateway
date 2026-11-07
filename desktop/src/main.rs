@@ -69,6 +69,8 @@ fn main() -> anyhow::Result<()> {
     let app = App::new(AppSpec::<UiState> {
         scenes: ui::scenes::scenes(),
         on_key: Some(ui::on_key),
+        setup: Some(|s, waker| s.install_images(waker)),
+        poll: Some(UiState::poll_splash),
         ..AppSpec::new(
             title,
             (geometry.w.max(640) as f32, geometry.h.max(480) as f32),

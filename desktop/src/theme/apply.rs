@@ -23,8 +23,12 @@ use crate::config::Scheme;
 pub struct AppliedTheme {
     pub manifest: Arc<Manifest>,
     pub scheme: Scheme,
-    pub cover_light: Option<Arc<[u8]>>,
-    pub cover_dark: Option<Arc<[u8]>>,
+    pub wallpaper_light: Option<Arc<[u8]>>,
+    pub wallpaper_dark: Option<Arc<[u8]>>,
+    pub artwork_light: Option<Arc<[u8]>>,
+    pub artwork_dark: Option<Arc<[u8]>>,
+    pub launch_light: Option<Arc<[u8]>>,
+    pub launch_dark: Option<Arc<[u8]>>,
     /// When the owner asked, for the end-to-end timing.
     pub requested: Instant,
 }
@@ -43,13 +47,25 @@ struct Current {
     scheme: Scheme,
     light: ThemePalette,
     dark: ThemePalette,
-    cover_light: Option<Arc<[u8]>>,
-    cover_dark: Option<Arc<[u8]>>,
+    wallpaper_light: Option<Arc<[u8]>>,
+    wallpaper_dark: Option<Arc<[u8]>>,
+    artwork_light: Option<Arc<[u8]>>,
+    artwork_dark: Option<Arc<[u8]>>,
+    launch_light: Option<Arc<[u8]>>,
+    launch_dark: Option<Arc<[u8]>>,
 }
 
 fn current() -> &'static RwLock<Option<Current>> {
     static CURRENT: OnceLock<RwLock<Option<Current>>> = OnceLock::new();
     CURRENT.get_or_init(|| RwLock::new(None))
+}
+
+fn pick(dark: bool, a: &Option<Arc<[u8]>>, b: &Option<Arc<[u8]>>) -> Option<Arc<[u8]>> {
+    if dark {
+        a.clone().or_else(|| b.clone())
+    } else {
+        b.clone().or_else(|| a.clone())
+    }
 }
 
 /// The current theme's id.
@@ -78,17 +94,62 @@ pub fn palette(scheme: ColorScheme) -> Option<ThemePalette> {
     })
 }
 
-/// The current theme's Home hero image for the scheme on screen
-/// ([`Manifest::cover_asset`]: artwork, else wallpaper, else preview).
-/// Encoded image bytes (WebP/PNG/JPEG).
-#[allow(dead_code)]
-pub fn current_cover(scheme: ColorScheme) -> Option<Arc<[u8]>> {
+/// Soft Home backdrop (`home.wallpaper`).
+pub fn current_wallpaper(scheme: ColorScheme) -> Option<Arc<[u8]>> {
     let guard = current().read().unwrap();
     let c = guard.as_ref()?;
-    match scheme {
-        ColorScheme::Dark => c.cover_dark.clone().or_else(|| c.cover_light.clone()),
-        ColorScheme::Light => c.cover_light.clone().or_else(|| c.cover_dark.clone()),
-    }
+    pick(
+        scheme == ColorScheme::Dark,
+        &c.wallpaper_dark,
+        &c.wallpaper_light,
+    )
+}
+
+/// Home figure (`home.artwork`).
+pub fn current_artwork(scheme: ColorScheme) -> Option<Arc<[u8]>> {
+    let guard = current().read().unwrap();
+    let c = guard.as_ref()?;
+    pick(
+        scheme == ColorScheme::Dark,
+        &c.artwork_dark,
+        &c.artwork_light,
+    )
+}
+
+/// Startup vignette (`launch.artwork`), else the Home figure/cover.
+pub fn current_launch(scheme: ColorScheme) -> Option<Arc<[u8]>> {
+    let guard = current().read().unwrap();
+    let c = guard.as_ref()?;
+    pick(scheme == ColorScheme::Dark, &c.launch_dark, &c.launch_light)
+        .or_else(|| {
+            pick(
+                scheme == ColorScheme::Dark,
+                &c.artwork_dark,
+                &c.artwork_light,
+            )
+        })
+        .or_else(|| current_cover_from(c, scheme))
+}
+
+/// The Home hero image for the scheme on screen (artwork, else wallpaper).
+pub fn current_cover(scheme: ColorScheme) -> Option<Arc<[u8]>> {
+    let guard = current().read().unwrap();
+    current_cover_from(guard.as_ref()?, scheme)
+}
+
+fn current_cover_from(c: &Current, scheme: ColorScheme) -> Option<Arc<[u8]>> {
+    pick(
+        scheme == ColorScheme::Dark,
+        &c.artwork_dark,
+        &c.artwork_light,
+    )
+    .or_else(|| {
+        pick(
+            scheme == ColorScheme::Dark,
+            &c.wallpaper_dark,
+            &c.wallpaper_light,
+        )
+    })
 }
 
 /// Install `applied` now. Main thread. Returns how long the swap took.
@@ -101,8 +162,12 @@ pub fn activate(applied: AppliedTheme) -> anyhow::Result<std::time::Duration> {
         scheme: applied.scheme,
         light,
         dark,
-        cover_light: applied.cover_light,
-        cover_dark: applied.cover_dark,
+        wallpaper_light: applied.wallpaper_light,
+        wallpaper_dark: applied.wallpaper_dark,
+        artwork_light: applied.artwork_light,
+        artwork_dark: applied.artwork_dark,
+        launch_light: applied.launch_light,
+        launch_dark: applied.launch_dark,
     });
     let took = started.elapsed();
     tracing::info!(
@@ -125,8 +190,12 @@ mod tests {
         let applied = AppliedTheme {
             manifest: Arc::new(pack.manifest.clone()),
             scheme: Scheme::Dark,
-            cover_light: None,
-            cover_dark: None,
+            wallpaper_light: None,
+            wallpaper_dark: None,
+            artwork_light: None,
+            artwork_dark: None,
+            launch_light: None,
+            launch_dark: None,
             requested: Instant::now(),
         };
         activate(applied).unwrap();

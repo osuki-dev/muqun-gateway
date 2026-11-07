@@ -6,9 +6,10 @@
 Each pack is a regular `.muqun-theme` (stored ZIP: `theme.json` + `assets/*`,
 the layout `muqun-theme pack` writes), trimmed for the desktop binary:
 
-* only the images the desktop draws are kept -- the gallery `preview` and the
-  Home `home.artwork` / `home.wallpaper` slots -- downscaled to at most
-  `MAX_EDGE` px and re-encoded as WebP (`magick`, quality `QUALITY`);
+* only the images the desktop draws are kept -- the gallery `preview`, the
+  Home `home.artwork` / `home.wallpaper` slots, and `launch.artwork` --
+  downscaled to at most `MAX_EDGE` px and re-encoded as WebP (`magick`,
+  quality `QUALITY`);
 * every other slot, the icon set and a custom `homeIdentity.logo` are dropped,
   and each kept asset's `sha256` is rewritten to the new bytes.
 
@@ -33,7 +34,7 @@ THEMES = [
     "vanguard-drifter",
     "scene-voyager",
 ]
-KEPT_SLOTS = ("home.artwork", "home.wallpaper")
+KEPT_SLOTS = ("home.artwork", "home.wallpaper", "launch.artwork")
 MAX_EDGE = 1280
 PREVIEW_SIZE = "768x480"
 QUALITY = 78

@@ -175,6 +175,17 @@ impl Loaded {
         }
     }
 
+    /// Encoded bytes for decoration `slot` in `scheme`, when the pack has them.
+    pub fn slot(&self, slot: &str, scheme: ColorScheme) -> Option<Arc<[u8]>> {
+        let id = self
+            .manifest()
+            .slot_asset(slot, scheme == ColorScheme::Dark)?;
+        self.asset(id)
+            .inspect_err(|err| tracing::warn!(id, slot, "theme slot unreadable: {err:#}"))
+            .ok()
+            .flatten()
+    }
+
     /// The Home hero image for `scheme` ([`Manifest::cover_asset`]).
     pub fn cover(&self, scheme: ColorScheme) -> Option<Arc<[u8]>> {
         let id = self.manifest().cover_asset(scheme == ColorScheme::Dark)?;

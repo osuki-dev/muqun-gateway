@@ -629,8 +629,16 @@ pub fn load_applied(
     Ok(AppliedTheme {
         manifest: Arc::new(loaded.manifest().clone()),
         scheme,
-        cover_light: loaded.cover(ColorScheme::Light),
-        cover_dark: loaded.cover(ColorScheme::Dark),
+        wallpaper_light: loaded.slot("home.wallpaper", ColorScheme::Light),
+        wallpaper_dark: loaded.slot("home.wallpaper", ColorScheme::Dark),
+        artwork_light: loaded.slot("home.artwork", ColorScheme::Light),
+        artwork_dark: loaded.slot("home.artwork", ColorScheme::Dark),
+        launch_light: loaded
+            .slot("launch.artwork", ColorScheme::Light)
+            .or_else(|| loaded.slot("home.artwork", ColorScheme::Light)),
+        launch_dark: loaded
+            .slot("launch.artwork", ColorScheme::Dark)
+            .or_else(|| loaded.slot("home.artwork", ColorScheme::Dark)),
         requested,
     })
 }
