@@ -182,6 +182,9 @@ pub struct UiState {
     pub branches: HashMap<String, BranchInfo>,
     /// Computers `@` may name.
     pub peers: Vec<PeerMention>,
+    /// Esc dismissed a composer popup at this query start; forgotten when the
+    /// trigger leaves the draft (App `dismissedAt`).
+    pub popup_dismissed_at: Option<usize>,
     pub auto_approve: HashMap<String, bool>,
     pub next_token: u64,
     pub pending_submit: Option<(u64, Slot)>,
@@ -301,6 +304,7 @@ impl UiState {
             catalog: None,
             branches: HashMap::new(),
             peers: Vec::new(),
+            popup_dismissed_at: None,
             auto_approve: HashMap::new(),
             next_token: 1,
             pending_submit: None,

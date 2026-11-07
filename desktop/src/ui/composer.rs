@@ -21,10 +21,13 @@ use crate::model::compose::{ComposeCommand, Deliver, Source, Target};
 const CHIP_THUMB_W: f32 = 56.0;
 const CHIP_THUMB_H: f32 = 40.0;
 
-/// The most file hits the `@` popup lists.
+/// The most file hits the `@` popup lists (App `FILE_MENTION_LIMIT` page is 20;
+/// the panel shows a short head like the App's visible rows).
 const MAX_FILE_ROWS: usize = 8;
-/// The most commands and skills the `/` popup lists.
+/// The most `/` command rows.
 const MAX_SLASH_ROWS: usize = 12;
+/// The most `$` skill rows.
+const MAX_SKILL_ROWS: usize = 12;
 
 fn fresh(text: String) -> TextEdit {
     let mut edit = TextEdit::new(text);
@@ -78,35 +81,35 @@ pub fn take_paste(s: &mut UiState, content: &rune::ClipboardContent) -> bool {
     false
 }
 
-/// What `text` delivers: a host command or skill when it starts with a
-/// `/name` the agent's catalogue knows, else a prompt.
+/// What `text` delivers — App `readSlashCommand` / `readSkillInvocation`.
+/// `/` is host commands (and slash-marked skills); `$` is every catalog skill.
 fn deliver_of(s: &UiState, text: &str) -> Deliver {
-    let Some(rest) = text.strip_prefix('/') else {
-        return Deliver::Prompt(text.to_string());
-    };
-    let (name, args) = match rest.split_once(char::is_whitespace) {
-        Some((name, args)) => (name, args.trim().to_string()),
-        None => (rest, String::new()),
-    };
+    use crate::model::composer_popup::{read_skill_invocation, read_slash_command, SlashCommand};
     let Some(view) = s.catalog.as_ref() else {
         return Deliver::Prompt(text.to_string());
     };
-    if view.catalog.commands.iter().any(|c| c.name == name) {
-        return Deliver::Command {
-            name: name.to_string(),
-            args,
-        };
-    }
-    if let Some(skill) = view
+    let command_names: Vec<&str> = view
+        .catalog
+        .commands
+        .iter()
+        .map(|c| c.name.as_str())
+        .collect();
+    let slash_skills: Vec<&str> = view
         .catalog
         .skills
         .iter()
-        .find(|k| k.slash && (k.id == name || k.name == name))
-    {
-        return Deliver::Skill {
-            name: skill.id.clone(),
-            args,
+        .filter(|k| k.slash)
+        .map(|k| k.id.as_str())
+        .collect();
+    if let Some(cmd) = read_slash_command(text, &command_names, &slash_skills) {
+        return match cmd {
+            SlashCommand::Server { name, args } => Deliver::Command { name, args },
+            SlashCommand::Skill { name, args } => Deliver::Skill { name, args },
         };
+    }
+    let all_skills: Vec<&str> = view.catalog.skills.iter().map(|k| k.id.as_str()).collect();
+    if let Some((name, args)) = read_skill_invocation(text, &all_skills) {
+        return Deliver::Skill { name, args };
     }
     Deliver::Prompt(text.to_string())
 }
@@ -134,21 +137,36 @@ pub fn submit_session(s: &mut UiState) {
     }));
 }
 
-/// The `@word` the caret ends on, if any.
-fn mention(text: &str) -> Option<&str> {
-    let word = text.rsplit(char::is_whitespace).next()?;
-    word.strip_prefix('@')
-}
-
-/// The `/word` the draft is, when it is only that.
-fn slash(text: &str) -> Option<&str> {
-    text.strip_prefix('/')
-        .filter(|q| !q.contains(char::is_whitespace))
+fn draft_caret(edit: &TextEdit) -> usize {
+    edit.range().1
 }
 
 fn on_draft_change(s: &mut UiState, _: &mut Tx) {
     s.persist_draft(Slot::Session);
-    let Some(query) = mention(&s.draft.text).map(str::to_string) else {
+    // Forget an Esc dismissal once the trigger it belonged to is gone.
+    if let Some(at) = s.popup_dismissed_at {
+        use crate::model::composer_popup::{scan_query, TriggerAnchor};
+        let caret = draft_caret(&s.draft);
+        let still = ['/', '$', '@'].iter().any(|&ch| {
+            let anchor = if ch == '@' {
+                TriggerAnchor::Word
+            } else {
+                TriggerAnchor::Start
+            };
+            scan_query(&s.draft.text, caret, ch, anchor).is_some_and(|q| q.start == at)
+        });
+        if !still {
+            s.popup_dismissed_at = None;
+        }
+    }
+    let caret = draft_caret(&s.draft);
+    let Some(query) = crate::model::composer_popup::scan_query(
+        &s.draft.text,
+        caret,
+        '@',
+        crate::model::composer_popup::TriggerAnchor::Word,
+    )
+    .map(|q| q.term) else {
         s.file_hits.clear();
         return;
     };
@@ -167,12 +185,20 @@ fn on_draft_change(s: &mut UiState, _: &mut Tx) {
     }));
 }
 
-/// Replace the `@word` at the end of the draft with `insert` and a space.
-fn insert_mention(s: &mut UiState, insert: &str) {
-    let text = &s.draft.text;
-    let head = text.rfind('@').map_or(text.as_str(), |at| &text[..at]);
-    s.draft = fresh(format!("{head}{insert} "));
+/// Apply a popup pick into the draft (App `insertComposerPick`).
+fn apply_pick(s: &mut UiState, query: &crate::model::composer_popup::PopupQuery, insert: &str) {
+    use crate::model::composer_popup::{insert_pick, PopupRow};
+    let row = PopupRow {
+        id: insert.to_string(),
+        label: insert.to_string(),
+        description: String::new(),
+        insert: insert.to_string(),
+    };
+    let (text, caret) = insert_pick(&s.draft.text, query, &row);
+    s.draft = fresh(text);
+    s.draft.set_caret(caret);
     s.file_hits.clear();
+    s.popup_dismissed_at = None;
     s.persist_draft(Slot::Session);
 }
 
@@ -387,20 +413,97 @@ fn chips(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Option<El> {
 
 // ---- popups -------------------------------------------------------------------------
 
-/// Computers first (this one, reachable, offline), then files; ids say which.
-fn mention_items(s: &UiState, query: &str) -> Vec<PopupItem> {
-    let wanted = query.trim().to_lowercase();
-    let mut peers: Vec<_> = s
-        .peers
-        .iter()
-        .filter(|p| wanted.is_empty() || p.name.to_lowercase().starts_with(&wanted))
-        .collect();
+use crate::model::composer_popup::{
+    read_popup, PopupRow, PopupState, Trigger, TriggerAnchor, TriggerItem,
+};
+
+fn slash_trigger(s: &UiState) -> Trigger {
+    // `/` is host commands only. Skills live under `$` (App agent-composer).
+    let items = s
+        .catalog
+        .as_ref()
+        .map(|view| {
+            view.catalog
+                .commands
+                .iter()
+                .map(|c| {
+                    let name = if c.name.starts_with('/') {
+                        c.name.clone()
+                    } else {
+                        format!("/{}", c.name)
+                    };
+                    let description = c.description.clone().unwrap_or_default();
+                    TriggerItem {
+                        search: vec![name.clone(), description.clone()],
+                        row: PopupRow {
+                            id: format!("c:{}", c.name),
+                            label: name.clone(),
+                            description,
+                            insert: name,
+                        },
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Trigger {
+        char: '/',
+        anchor: TriggerAnchor::Start,
+        items,
+        limit: Some(MAX_SLASH_ROWS),
+    }
+}
+
+fn skill_trigger(s: &UiState) -> Trigger {
+    // Every catalog skill, including ones the slash menu hides.
+    let items = s
+        .catalog
+        .as_ref()
+        .map(|view| {
+            view.catalog
+                .skills
+                .iter()
+                .map(|k| {
+                    let label = format!("${}", k.id);
+                    let description = if !k.name.is_empty()
+                        && !k.description.is_empty()
+                        && !k.name.eq_ignore_ascii_case(&k.id)
+                    {
+                        format!("{} · {}", k.name, k.description)
+                    } else if !k.description.is_empty() {
+                        k.description.clone()
+                    } else {
+                        k.name.clone()
+                    };
+                    TriggerItem {
+                        search: vec![k.id.clone(), k.name.clone(), k.description.clone()],
+                        row: PopupRow {
+                            id: format!("s:{}", k.id),
+                            label,
+                            description,
+                            insert: format!("${}", k.id),
+                        },
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Trigger {
+        char: '$',
+        anchor: TriggerAnchor::Start,
+        items,
+        limit: Some(MAX_SKILL_ROWS),
+    }
+}
+
+fn mention_trigger(s: &UiState) -> Trigger {
+    let mut peers: Vec<_> = s.peers.iter().collect();
     peers.sort_by_key(|p| match (p.current, p.reachable) {
         (true, _) => 0,
         (false, true) => 1,
         (false, false) => 2,
     });
-    let mut items: Vec<PopupItem> = peers
+    let mut items: Vec<TriggerItem> = peers
         .into_iter()
         .map(|p| {
             let detail = if p.current {
@@ -410,82 +513,110 @@ fn mention_items(s: &UiState, query: &str) -> Vec<PopupItem> {
             } else {
                 "Offline"
             };
-            PopupItem::new(format!("p:{}", p.name), format!("@{}", p.name)).description(detail)
+            let insert = format!("@{}", p.name);
+            TriggerItem {
+                search: vec![p.name.clone(), detail.to_string()],
+                row: PopupRow {
+                    id: format!("p:{}", p.name),
+                    label: insert.clone(),
+                    description: detail.into(),
+                    insert,
+                },
+            }
         })
         .collect();
-    items.extend(s.file_hits.iter().take(MAX_FILE_ROWS).map(|h| {
-        PopupItem::new(format!("f:{}", h.path), h.name.clone()).description(h.path.clone())
+    items.extend(s.file_hits.iter().take(MAX_FILE_ROWS).map(|h| TriggerItem {
+        search: vec![h.name.clone(), h.path.clone()],
+        row: PopupRow {
+            id: format!("f:{}", h.path),
+            label: h.name.clone(),
+            description: h.path.clone(),
+            insert: h.path.clone(),
+        },
     }));
-    items
+    Trigger {
+        char: '@',
+        anchor: TriggerAnchor::Word,
+        items,
+        limit: Some(MAX_FILE_ROWS + 8),
+    }
 }
 
-/// Commands, then skills the agent offers as slash entries, narrowed by `query`.
-fn slash_items(s: &UiState, query: &str) -> Vec<PopupItem> {
-    let Some(view) = s.catalog.as_ref() else {
-        return Vec::new();
-    };
-    let wanted = query.to_lowercase();
-    let fits = |name: &str| {
-        wanted.is_empty() || {
-            let name = name.to_lowercase();
-            name.starts_with(&wanted) || name.contains(&wanted)
-        }
-    };
-    let commands = view
-        .catalog
-        .commands
+fn popup_rows(state: &PopupState) -> Vec<PopupItem> {
+    state
+        .rows()
         .iter()
-        .filter(|c| fits(&c.name))
-        .map(|c| {
-            PopupItem::new(format!("c:{}", c.name), format!("/{}", c.name))
-                .description(c.description.clone().unwrap_or_default())
-        });
-    let skills = view
-        .catalog
-        .skills
-        .iter()
-        .filter(|k| k.slash && fits(&k.id))
-        .map(|k| {
-            PopupItem::new(format!("s:{}", k.id), format!("/{}", k.id))
-                .description(k.description.clone())
-        });
-    commands.chain(skills).take(MAX_SLASH_ROWS).collect()
+        .map(|r| PopupItem::new(r.id.clone(), r.label.clone()).description(r.description.clone()))
+        .collect()
+}
+
+fn mount_popup(k: &Kit, layer: &mut Vec<El>, key: &str, label: &str, state: PopupState) {
+    if !state.open() {
+        return;
+    }
+    let items = popup_rows(&state);
+    if items.is_empty() {
+        return;
+    }
+    let query = state.query().cloned();
+    PopupList::<UiState>::new(key, "composer")
+        .width(360.0)
+        .label(label)
+        .items(items)
+        .on_choose(move |s: &mut UiState, id: &str, _: &mut Tx| {
+            let Some(query) = query.as_ref() else {
+                return;
+            };
+            let insert = match id.split_once(':') {
+                Some(("c", name)) => {
+                    if name.starts_with('/') {
+                        name.to_string()
+                    } else {
+                        format!("/{name}")
+                    }
+                }
+                Some(("s", id)) => format!("${id}"),
+                Some(("p", name)) => format!("@{name}"),
+                Some(("f", path)) => path.to_string(),
+                _ => return,
+            };
+            apply_pick(s, query, &insert);
+        })
+        .on_close(|s: &mut UiState| {
+            let caret = draft_caret(&s.draft);
+            for (ch, anchor) in [
+                ('/', TriggerAnchor::Start),
+                ('$', TriggerAnchor::Start),
+                ('@', TriggerAnchor::Word),
+            ] {
+                if let Some(q) =
+                    crate::model::composer_popup::scan_query(&s.draft.text, caret, ch, anchor)
+                {
+                    s.popup_dismissed_at = Some(q.start);
+                    return;
+                }
+            }
+        })
+        .build(k, layer);
 }
 
 /// Mount whichever popup the draft calls for, above the composer.
 fn popup(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
-    if let Some(query) = slash(&s.draft.text) {
-        let items = slash_items(s, query);
-        if !items.is_empty() {
-            PopupList::<UiState>::new("slash-popup", "composer")
-                .width(360.0)
-                .label("Commands")
-                .items(items)
-                .on_choose(|s: &mut UiState, id: &str, _: &mut Tx| {
-                    let name = id.split_once(':').map_or(id, |(_, n)| n);
-                    s.draft = fresh(format!("/{name} "));
-                    s.persist_draft(Slot::Session);
-                })
-                .build(k, layer);
-        }
+    let caret = Some(draft_caret(&s.draft));
+    let dismissed = s.popup_dismissed_at;
+    let slash = read_popup(&s.draft.text, caret, &slash_trigger(s), dismissed, true);
+    if slash.open() {
+        mount_popup(k, layer, "slash-popup", "Commands", slash);
         return;
     }
-    if let Some(query) = mention(&s.draft.text) {
-        let items = mention_items(s, query);
-        if !items.is_empty() {
-            PopupList::<UiState>::new("mention-popup", "composer")
-                .width(360.0)
-                .label("Mentions")
-                .items(items)
-                .on_choose(
-                    |s: &mut UiState, id: &str, _: &mut Tx| match id.split_once(':') {
-                        Some(("p", name)) => insert_mention(s, &format!("@{name}")),
-                        Some(("f", path)) => insert_mention(s, path),
-                        _ => {}
-                    },
-                )
-                .build(k, layer);
-        }
+    let skills = read_popup(&s.draft.text, caret, &skill_trigger(s), dismissed, true);
+    if skills.open() {
+        mount_popup(k, layer, "skill-popup", "Skills", skills);
+        return;
+    }
+    let mentions = read_popup(&s.draft.text, caret, &mention_trigger(s), dismissed, true);
+    if mentions.open() {
+        mount_popup(k, layer, "mention-popup", "Mentions", mentions);
     }
 }
 
@@ -949,7 +1080,7 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         .child(
             TextArea::new(&s.draft)
                 .placeholder(if s.selected.is_some() {
-                    "Message…  (@ to mention, / for commands)"
+                    "Message…  (/ commands, $ skills, @ files)"
                 } else {
                     "Pick a session first"
                 })

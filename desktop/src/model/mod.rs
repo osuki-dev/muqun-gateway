@@ -4,6 +4,7 @@
 
 pub mod commands;
 pub mod compose;
+pub mod composer_popup;
 pub mod inbox;
 pub mod projection;
 pub mod projects;
