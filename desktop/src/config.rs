@@ -31,6 +31,69 @@ pub struct DesktopConfig {
     pub ui: UiPrefs,
     pub window: WindowGeometry,
     pub notifications: Notifications,
+    /// Dictation's speech service (the API key lives in the keyring).
+    pub voice: VoiceConfig,
+}
+
+/// How dictation transcribes (the App's Settings → Voice).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VoiceMode {
+    /// The whole recording to an OpenAI-compatible `/v1/audio/transcriptions`.
+    #[default]
+    File,
+    /// Streamed to an OpenAI-Realtime-compatible WebSocket, words as you speak.
+    Realtime,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VoiceConfig {
+    pub mode: VoiceMode,
+    /// The service's endpoint: `https://…` after recording, `wss://…` realtime.
+    pub url: String,
+    /// Empty: the service's own default.
+    pub model: String,
+    /// `auto`, or a language tag (`en`, `zh-CN`, …).
+    pub language: String,
+}
+
+impl Default for VoiceConfig {
+    fn default() -> Self {
+        Self {
+            mode: VoiceMode::File,
+            url: String::new(),
+            model: String::new(),
+            language: "auto".into(),
+        }
+    }
+}
+
+impl VoiceConfig {
+    /// The App's presets, shown as placeholders and followed when the mode
+    /// changes while the URL is still the preset.
+    pub fn preset(mode: VoiceMode) -> (&'static str, &'static str) {
+        match mode {
+            VoiceMode::File => (
+                "https://api.openai.com/v1/audio/transcriptions",
+                "gpt-4o-mini-transcribe",
+            ),
+            VoiceMode::Realtime => (
+                "wss://api.openai.com/v1/realtime?intent=transcription",
+                "gpt-live-transcribe",
+            ),
+        }
+    }
+
+    /// The URL is one this mode can use (`https` / `wss`, no credentials).
+    pub fn usable(&self) -> bool {
+        let url = self.url.trim();
+        let scheme = match self.mode {
+            VoiceMode::File => "https://",
+            VoiceMode::Realtime => "wss://",
+        };
+        url.starts_with(scheme) && url.len() > scheme.len() && !url[scheme.len()..].contains('@')
+    }
 }
 
 /// System notifications for sessions that are not on screen.
@@ -407,6 +470,7 @@ pub enum ConfigEdit {
     ReducedMotion(bool),
     ReducedTransparency(bool),
     Notifications(bool),
+    Voice(VoiceConfig),
     EditorCommand(Option<String>),
     /// Where "New session" starts for an agent with no remembered folder.
     DefaultCwd(Option<PathBuf>),
@@ -465,6 +529,7 @@ impl DesktopConfig {
             ConfigEdit::ReducedMotion(on) => self.appearance.reduced_motion = on,
             ConfigEdit::ReducedTransparency(on) => self.appearance.reduced_transparency = on,
             ConfigEdit::Notifications(on) => self.notifications.enabled = on,
+            ConfigEdit::Voice(voice) => self.voice = voice,
             ConfigEdit::EditorCommand(command) => {
                 self.general.editor_command = command.filter(|c| !c.trim().is_empty());
             }
