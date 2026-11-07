@@ -888,6 +888,30 @@ pub fn scenes() -> &'static [Scene] {
         ("timeline-long", timeline_long),
         ("timeline-zh", timeline_zh),
         ("terminals", terminals_scene),
+        ("terminals-tw", |s| {
+            terminals_scene(s);
+            s.cfg.general.language = crate::config::Language::ZhTw;
+        }),
+        ("voice-settings-tw", |s| {
+            voice_settings_scene(s);
+            s.cfg.general.language = crate::config::Language::ZhTw;
+        }),
+        ("voice-tw", |s| {
+            voice_scene(s);
+            s.cfg.general.language = crate::config::Language::ZhTw;
+        }),
+        ("palette-tw", |s| {
+            palette_scene(s);
+            s.cfg.general.language = crate::config::Language::ZhTw;
+        }),
+        ("viewer-tw", |s| {
+            viewer_code(s);
+            s.cfg.general.language = crate::config::Language::ZhTw;
+        }),
+        ("viewer-video-tw", |s| {
+            viewer_video(s);
+            s.cfg.general.language = crate::config::Language::ZhTw;
+        }),
         ("voice", voice_scene),
         ("voice-realtime", voice_realtime_scene),
         ("voice-settings", voice_settings_scene),

@@ -541,7 +541,16 @@ pub fn settings(s: &UiState, k: &Kit) -> Vec<El> {
         .iter()
         .position(|(code, _)| *code == voice.language)
         .unwrap_or(0);
-    let labels: Vec<&str> = LANGUAGES.iter().map(|(_, l)| *l).collect();
+    let labels: Vec<&str> = LANGUAGES
+        .iter()
+        .map(|(id, l)| {
+            if *id == "auto" {
+                tr_ref(language, "Auto", "自动")
+            } else {
+                *l
+            }
+        })
+        .collect();
     let lang = SegmentedControl::new(&labels, Some(lang_at))
         .fit()
         .label(tr_ref(language, "Language", "语言"))
