@@ -37,6 +37,7 @@ pub fn tr_ref(language: Language, en: &'static str, zh: &'static str) -> &'stati
 /// the views; the right side is the final Traditional form.
 const WORDS: &[(&str, &str)] = &[
     ("文件系统", "檔案系統"),
+    ("会话", "工作階段"),
     ("文件夹", "資料夾"),
     ("收件箱", "收件匣"),
     ("快捷键", "快速鍵"),
@@ -168,7 +169,7 @@ mod tests {
 
     #[test]
     fn taiwan_words_win_over_character_conversion() {
-        assert_eq!(zh_tw("搜索会话"), "搜尋會話");
+        assert_eq!(zh_tw("搜索会话"), "搜尋工作階段");
         assert_eq!(zh_tw("默认文件夹"), "預設資料夾");
         assert_eq!(zh_tw("设置"), "設定");
         assert_eq!(

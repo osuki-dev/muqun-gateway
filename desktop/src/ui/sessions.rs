@@ -59,11 +59,11 @@ fn projects(s: &UiState) -> Vec<Project> {
     })
 }
 
-fn project_label(p: &Project) -> String {
+fn project_label(language: crate::config::Language, p: &Project) -> String {
     if p.is_no_folder() {
-        "No folder".into()
+        super::copy::tr(language, "No folder", "无文件夹")
     } else if p.is_other() {
-        "Other".into()
+        super::copy::tr(language, "Other", "其他")
     } else {
         format!("{}{}", p.display.0, p.display.1)
     }
@@ -90,13 +90,14 @@ fn tree(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Vec<El> {
             TreeRow::Gap => el().key(format!("gap-{i}")).h(8.0).w_full(),
             TreeRow::Project { id, open } => {
                 let project = by_id.get(id.as_str());
-                let label = project.map_or_else(|| id.clone(), |p| project_label(p));
+                let label = project
+                    .map_or_else(|| id.clone(), |p| project_label(s.cfg.general.language, p));
                 let mut row = SidebarRow::new(label)
                     .icon(if open { &FOLDER_OPEN } else { &FOLDER })
                     .select_only();
                 if let Some(p) = project {
                     if let Some(branch) = &p.branch {
-                        row = row.detail(branch.clone());
+                        row = row.detail(super::timeline::clip(branch, 18));
                     }
                 }
                 let key = format!("project-{id}");
@@ -129,14 +130,21 @@ fn tree(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Vec<El> {
             TreeRow::Session { asid, .. } => session_row(s, k, layer, &asid),
             TreeRow::More { project, hidden } => {
                 let key = format!("more-{project}");
-                SidebarRow::new(format!("More ({hidden})"))
-                    .depth(1)
-                    .select_only()
-                    .on_select(move |s: &mut UiState, _: &mut Tx| {
-                        s.full_projects.insert(project.clone());
-                    })
-                    .build(k)
-                    .key(key)
+                SidebarRow::new(super::copy::localize(
+                    s.cfg.general.language,
+                    super::copy::tr(
+                        s.cfg.general.language,
+                        &format!("More ({hidden})"),
+                        &format!("更多（{hidden}）"),
+                    ),
+                ))
+                .depth(1)
+                .select_only()
+                .on_select(move |s: &mut UiState, _: &mut Tx| {
+                    s.full_projects.insert(project.clone());
+                })
+                .build(k)
+                .key(key)
             }
         });
     }
@@ -172,11 +180,13 @@ fn project_menu(s: &UiState, k: &Kit, layer: &mut Vec<El>, p: &Project) -> El {
     let id = p.id.clone();
     let name = prefs.name.clone().unwrap_or_else(|| p.display.1.clone());
     let (pin_id, hide_id, reset_id) = (id.clone(), id.clone(), id.clone());
+    let language = s.cfg.general.language;
+    let t = |en: &'static str, zh: &'static str| super::copy::tr_ref(language, en, zh);
     let mut menu = Menu::new(format!("pmenu-{id}"))
         .trigger(menu_button(
             k,
             &format!("pbtn-{id}"),
-            "Project actions",
+            t("Project actions", "项目操作"),
             open,
             {
                 let id = id.clone();
@@ -187,29 +197,31 @@ fn project_menu(s: &UiState, k: &Kit, layer: &mut Vec<El>, p: &Project) -> El {
         .on_close(|s: &mut UiState| s.menu = None)
         .item(
             MenuItem::new(if prefs.pinned {
-                "Unpin project"
+                t("Unpin project", "取消置顶项目")
             } else {
-                "Pin project"
+                t("Pin project", "置顶项目")
             })
             .on_select(move |s: &mut UiState| set_prefs(s, &pin_id, |p| p.pinned = !p.pinned)),
         )
         .item(
             MenuItem::new(if prefs.hidden {
-                "Show project"
+                t("Show project", "显示项目")
             } else {
-                "Hide project"
+                t("Hide project", "隐藏项目")
             })
             .on_select(move |s: &mut UiState| set_prefs(s, &hide_id, |p| p.hidden = !p.hidden)),
         )
-        .item(MenuItem::new("Rename…").on_select(move |s: &mut UiState| {
-            s.menu = None;
-            s.rename_project = Some(id.clone());
-            s.project_edit = TextEdit::new(name.clone());
-            s.project_edit.focused = true;
-        }));
+        .item(
+            MenuItem::new(t("Rename…", "重命名…")).on_select(move |s: &mut UiState| {
+                s.menu = None;
+                s.rename_project = Some(id.clone());
+                s.project_edit = TextEdit::new(name.clone());
+                s.project_edit.focused = true;
+            }),
+        );
     if prefs.name.is_some() {
         menu = menu.item(
-            MenuItem::new("Reset name")
+            MenuItem::new(t("Reset name", "恢复名称"))
                 .on_select(move |s: &mut UiState| set_prefs(s, &reset_id, |p| p.name = None)),
         );
     }
@@ -271,53 +283,60 @@ fn session_menu(s: &UiState, k: &Kit, layer: &mut Vec<El>, asid: &str) -> El {
     let id = asid.to_string();
     let (rename_id, pin_id, fork_id, delete_id) = (id.clone(), id.clone(), id.clone(), id.clone());
     let split_id = id.clone();
-    let trigger = Menu::new(format!("smenu-{id}"))
-        .trigger(menu_button(
-            k,
-            &format!("sbtn-{id}"),
-            "Session actions",
-            open,
-            {
-                let id = id.clone();
-                move |s: &mut UiState| s.menu = (!open).then(|| OpenMenu::Session(id.clone()))
-            },
-        ))
-        .open(open)
-        .on_close(|s: &mut UiState| s.menu = None)
-        .item(
-            MenuItem::new("Rename…").on_select(move |s: &mut UiState| start_rename(s, &rename_id)),
-        )
-        .item(
-            MenuItem::new(if pinned { "Unpin" } else { "Pin" }).on_select(
-                move |s: &mut UiState| {
-                    s.menu = None;
-                    s.edit(ConfigEdit::TogglePin(pin_id.clone()));
+    let language = s.cfg.general.language;
+    let t = |en: &'static str, zh: &'static str| super::copy::tr_ref(language, en, zh);
+    let trigger =
+        Menu::new(format!("smenu-{id}"))
+            .trigger(menu_button(
+                k,
+                &format!("sbtn-{id}"),
+                t("Session actions", "会话操作"),
+                open,
+                {
+                    let id = id.clone();
+                    move |s: &mut UiState| s.menu = (!open).then(|| OpenMenu::Session(id.clone()))
                 },
-            ),
-        )
-        .item(
-            MenuItem::new("Open in split").on_select(move |s: &mut UiState| {
-                s.menu = None;
-                s.open_in_tile(&split_id);
-            }),
-        )
-        .item(MenuItem::new("Fork").on_select(move |s: &mut UiState| {
-            s.menu = None;
-            s.send(Command::ForkSession {
-                asid: AgentSessionId(fork_id.clone()),
-                message_id: None,
-            });
-        }))
-        .separator()
-        .item(
-            MenuItem::new("Delete")
-                .danger(true)
+            ))
+            .open(open)
+            .on_close(|s: &mut UiState| s.menu = None)
+            .item(
+                MenuItem::new(t("Rename…", "重命名…"))
+                    .on_select(move |s: &mut UiState| start_rename(s, &rename_id)),
+            )
+            .item(
+                MenuItem::new(if pinned {
+                    t("Unpin", "取消置顶")
+                } else {
+                    t("Pin", "置顶")
+                })
                 .on_select(move |s: &mut UiState| {
                     s.menu = None;
-                    s.send(Command::DeleteSession(AgentSessionId(delete_id.clone())));
+                    s.edit(ConfigEdit::TogglePin(pin_id.clone()));
                 }),
-        )
-        .build(k, layer);
+            )
+            .item(MenuItem::new(t("Open in split", "在分屏中打开")).on_select(
+                move |s: &mut UiState| {
+                    s.menu = None;
+                    s.open_in_tile(&split_id);
+                },
+            ))
+            .item(
+                MenuItem::new(t("Fork", "分叉")).on_select(move |s: &mut UiState| {
+                    s.menu = None;
+                    s.send(Command::ForkSession {
+                        asid: AgentSessionId(fork_id.clone()),
+                        message_id: None,
+                    });
+                }),
+            )
+            .separator()
+            .item(MenuItem::new(t("Delete", "删除")).danger(true).on_select(
+                move |s: &mut UiState| {
+                    s.menu = None;
+                    s.send(Command::DeleteSession(AgentSessionId(delete_id.clone())));
+                },
+            ))
+            .build(k, layer);
     if open {
         trigger
     } else {

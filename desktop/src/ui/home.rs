@@ -150,6 +150,7 @@ fn agents(s: &UiState, k: &Kit) -> El {
 }
 
 fn folder(s: &UiState, k: &Kit) -> El {
+    let language = s.cfg.general.language;
     let start = {
         let typed = s.start_cwd.text.trim();
         (!typed.is_empty()).then(|| PathBuf::from(typed))
@@ -162,8 +163,8 @@ fn folder(s: &UiState, k: &Kit) -> El {
             .center_y()
             .child(
                 TextInput::new(&s.start_cwd)
-                    .placeholder("Project folder")
-                    .label("Project folder")
+                    .placeholder(tr_ref(language, "Project folder", "项目文件夹"))
+                    .label(tr_ref(language, "Project folder", "项目文件夹"))
                     .on_edit(|s: &mut UiState| &mut s.start_cwd)
                     .on_change(|s: &mut UiState, _: &mut Tx| {
                         let prefix = s.start_cwd.text.clone();
@@ -174,7 +175,7 @@ fn folder(s: &UiState, k: &Kit) -> El {
                     .grow(1.0),
             )
             .child(
-                Button::new("Choose folder…")
+                Button::new(tr_ref(language, "Choose folder…", "选择文件夹…"))
                     .variant(ButtonVariant::Outline)
                     .control_size(ControlSize::Regular)
                     .on_press(move |_: &mut UiState| {
@@ -219,7 +220,11 @@ fn folder(s: &UiState, k: &Kit) -> El {
     block = block.child(chips);
     block.child(
         Switch::new(s.start_worktree)
-            .label("Start in a new git worktree")
+            .label(tr_ref(
+                language,
+                "Start in a new git worktree",
+                "在新的 git worktree 中开始",
+            ))
             .on_toggle(|s: &mut UiState| s.start_worktree = !s.start_worktree)
             .build(k)
             .key("worktree"),
@@ -228,6 +233,7 @@ fn folder(s: &UiState, k: &Kit) -> El {
 
 /// Model, mode and branch for the session about to start.
 fn start_pills(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Option<El> {
+    let language = s.cfg.general.language;
     let view = s.start_catalog.as_deref();
     let models = view.map(catalog_models).unwrap_or_default();
     let defaults = view.map(|v| &v.catalog.defaults);
@@ -253,9 +259,9 @@ fn start_pills(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Option<El> {
                                 == super::labels::bare_catalog_id(&m.model_id))
                     })
                     .map(|(_, _, n)| n.as_str());
-                super::labels::format_model_name(m, "Model", catalog)
+                super::labels::format_model_name(m, tr_ref(language, "Model", "模型"), catalog)
             })
-            .unwrap_or_else(|| "Model".into());
+            .unwrap_or_else(|| tr(language, "Model", "模型"));
         line = line.child(model_menu(
             k,
             layer,
@@ -306,7 +312,7 @@ fn start_pills(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Option<El> {
             line = line.child(
                 SegmentedControl::new(&labels, at)
                     .fit()
-                    .label("Mode")
+                    .label(tr_ref(language, "Mode", "模式"))
                     .on_pick(move |s: &mut UiState, i, _: &mut Tx| {
                         s.start_mode = Some(ids[i].clone());
                     })
@@ -315,7 +321,7 @@ fn start_pills(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Option<El> {
             );
         } else {
             let open = s.menu == Some(OpenMenu::StartMode);
-            let label = at.map_or_else(|| "Mode".to_string(), |i| modes[i].1.clone());
+            let label = at.map_or_else(|| tr(language, "Mode", "模式"), |i| modes[i].1.clone());
             let mut menu = rune_kit::Menu::new("start-mode")
                 .trigger(super::composer::pill(
                     k,
@@ -780,7 +786,7 @@ fn quick_start(s: &UiState, k: &Kit, look: &Look, layer: &mut Vec<El>) -> El {
         .child(
             TextArea::new(&s.start_draft)
                 .placeholder(placeholder)
-                .label("First prompt")
+                .label(tr_ref(language, "First prompt", "第一条消息"))
                 .width(None)
                 .auto_grow(3, 12)
                 .pill_style(move |id| {
@@ -941,17 +947,24 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
                 let figure = if cover { figure } else { figure.mr(28.0) };
                 stage = stage.child(figure);
             }
-            // The band settles into the page: a scrim from nothing to the page colour.
-            stage = stage.child(
-                el().key("home-scrim")
-                    .pin(Some(0.0), Some(HERO_H * 0.45), Some(0.0), None)
-                    .h(HERO_H * 0.55 + 24.0)
-                    .gradient(
-                        k.c.bg_base.alpha(0.0),
-                        k.c.bg_base.alpha(if cover { 0.96 } else { 0.7 }),
-                    )
-                    .a11y_hidden(),
-            );
+            // The band settles into the page: a scrim from nothing to the page
+            // colour over the hero, then that colour down to the bottom, so a
+            // full-bleed wallpaper never shows a hard edge under the cover.
+            let dim = if cover { 0.96 } else { 0.7 };
+            stage = stage
+                .child(
+                    el().key("home-scrim")
+                        .pin(Some(0.0), Some(HERO_H * 0.45), Some(0.0), None)
+                        .h(HERO_H * 0.55 + 24.0)
+                        .gradient(k.c.bg_base.alpha(0.0), k.c.bg_base.alpha(dim))
+                        .a11y_hidden(),
+                )
+                .child(
+                    el().key("home-scrim-tail")
+                        .pin(Some(0.0), Some(HERO_H + 24.0), Some(0.0), Some(0.0))
+                        .fill(k.c.bg_base.alpha(dim))
+                        .a11y_hidden(),
+                );
         }
     }
     stage.child(
