@@ -46,7 +46,7 @@ impl<'a> Tcx<'a> {
     }
 
     pub fn zh(&self) -> bool {
-        self.lang == Language::ZhCn
+        self.lang.is_zh()
     }
 
     pub fn tl(&self) -> Option<&'a SessionTimeline> {

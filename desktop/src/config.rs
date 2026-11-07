@@ -116,6 +116,8 @@ pub struct General {
     /// Placeholder: closing the window will hide it to the tray instead of
     /// quitting. Stored, not acted on yet (there is no tray in P0).
     pub close_to_tray: bool,
+    /// The first-run welcome was seen (or skipped).
+    pub welcomed: bool,
 }
 
 /// The draft key of the start page.
@@ -147,6 +149,10 @@ impl General {
 pub enum Language {
     #[serde(rename = "zh-CN")]
     ZhCn,
+    /// Traditional Chinese, Taiwan usage; derived from the zh-CN copy
+    /// (`ui/copy.rs`).
+    #[serde(rename = "zh-TW")]
+    ZhTw,
     #[serde(rename = "en")]
     En,
 }
@@ -158,7 +164,13 @@ impl Default for Language {
 }
 
 impl Language {
-    /// Simplified Chinese when the session's locale says Chinese, else English.
+    /// Chinese is Chinese: `zh` and the rest of the UI copy.
+    pub fn is_zh(self) -> bool {
+        matches!(self, Self::ZhCn | Self::ZhTw)
+    }
+
+    /// Chinese when the session's locale says Chinese (Traditional for
+    /// Taiwan, Hong Kong, Macau and `Hant`), else English.
     pub fn from_environment() -> Self {
         let lang = ["LC_ALL", "LC_MESSAGES", "LANG"]
             .iter()
@@ -168,10 +180,17 @@ impl Language {
     }
 
     fn from_locale_tag(tag: &str) -> Self {
-        if tag.to_ascii_lowercase().starts_with("zh") {
-            Self::ZhCn
+        let tag = tag.to_ascii_lowercase().replace('_', "-");
+        if !tag.starts_with("zh") {
+            return Self::En;
+        }
+        let traditional = ["zh-tw", "zh-hk", "zh-mo", "zh-hant"]
+            .iter()
+            .any(|t| tag.starts_with(t));
+        if traditional {
+            Self::ZhTw
         } else {
-            Self::En
+            Self::ZhCn
         }
     }
 
@@ -181,6 +200,9 @@ impl Language {
         use muqun_gateway::platform::i18n::Locale;
         match self {
             Self::ZhCn => Locale::from_code("zh-CN").unwrap_or_default(),
+            Self::ZhTw => Locale::from_code("zh-TW")
+                .or_else(|| Locale::from_code("zh-CN"))
+                .unwrap_or_default(),
             Self::En => Locale::default(),
         }
     }
@@ -197,6 +219,45 @@ pub struct Appearance {
     /// "Reduce transparency" (§6.1d): glass surfaces fall back to solid.
     pub reduced_transparency: bool,
     pub density: Density,
+    /// Text size, 0.85..=1.3 of the kit's own sizes (1 is the kit's).
+    pub text_scale: f32,
+    /// Corner profile of panels, cards and controls.
+    pub shape: Shape,
+}
+
+/// How rounded the surfaces are.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Shape {
+    Sharp,
+    #[default]
+    Soft,
+    Round,
+}
+
+impl Shape {
+    /// What the kit's radii are multiplied by.
+    pub fn factor(self) -> f32 {
+        match self {
+            Shape::Sharp => 0.5,
+            Shape::Soft => 1.0,
+            Shape::Round => 1.5,
+        }
+    }
+}
+
+impl Appearance {
+    pub const TEXT_SCALES: [f32; 4] = [0.9, 1.0, 1.1, 1.2];
+
+    /// The stored text scale, forced into range (a hand-edited value never
+    /// yields unreadable text).
+    pub fn text_scale(&self) -> f32 {
+        if self.text_scale.is_finite() {
+            self.text_scale.clamp(0.85, 1.3)
+        } else {
+            1.0
+        }
+    }
 }
 
 impl Default for Appearance {
@@ -207,6 +268,8 @@ impl Default for Appearance {
             reduced_motion: false,
             reduced_transparency: false,
             density: Density::Comfortable,
+            text_scale: 1.0,
+            shape: Shape::Soft,
         }
     }
 }
@@ -337,6 +400,10 @@ pub enum ConfigEdit {
     Scheme(Scheme),
     Language(Language),
     Density(Density),
+    TextScale(f32),
+    Shape(Shape),
+    /// The first-run welcome was dismissed.
+    Welcomed,
     ReducedMotion(bool),
     ReducedTransparency(bool),
     Notifications(bool),
@@ -392,6 +459,9 @@ impl DesktopConfig {
             ConfigEdit::Scheme(scheme) => self.appearance.scheme = scheme,
             ConfigEdit::Language(language) => self.general.language = language,
             ConfigEdit::Density(density) => self.appearance.density = density,
+            ConfigEdit::TextScale(scale) => self.appearance.text_scale = scale,
+            ConfigEdit::Shape(shape) => self.appearance.shape = shape,
+            ConfigEdit::Welcomed => self.general.welcomed = true,
             ConfigEdit::ReducedMotion(on) => self.appearance.reduced_motion = on,
             ConfigEdit::ReducedTransparency(on) => self.appearance.reduced_transparency = on,
             ConfigEdit::Notifications(on) => self.notifications.enabled = on,
@@ -693,6 +763,8 @@ mod tests {
     fn chinese_locales_pick_simplified_chinese() {
         assert_eq!(Language::from_locale_tag("zh_CN.UTF-8"), Language::ZhCn);
         assert_eq!(Language::from_locale_tag("en_US.UTF-8"), Language::En);
+        assert_eq!(Language::from_locale_tag("zh_TW.UTF-8"), Language::ZhTw);
+        assert_eq!(Language::from_locale_tag("zh-Hant-HK"), Language::ZhTw);
         assert_eq!(Language::from_locale_tag(""), Language::En);
     }
 

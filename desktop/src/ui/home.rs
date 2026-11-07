@@ -15,7 +15,7 @@ use super::copy::{tr, tr_ref};
 use super::{
     activity_pill, ago, muted, now_ms, timeline, title_of, Activity, Mode, OpenMenu, Slot, UiState,
 };
-use crate::config::{ConfigEdit, Language};
+use crate::config::ConfigEdit;
 use crate::model::commands::Command;
 use crate::model::compose::{ComposeCommand, Target};
 use crate::theme::look::{Look, CARD_RADIUS, PANEL_RADIUS};
@@ -378,7 +378,7 @@ fn needing(s: &UiState) -> Vec<&AgentSessionInfo> {
 /// The greeting and its one-line summary of what is going on.
 fn greeting(s: &UiState) -> (String, String) {
     let language = s.cfg.general.language;
-    let zh = language == Language::ZhCn;
+    let zh = language.is_zh();
     let ready = s
         .agents
         .iter()
@@ -397,7 +397,7 @@ fn greeting(s: &UiState) -> (String, String) {
                 if ready == 1 { "" } else { "s" }
             )
         };
-        return (title, sub);
+        return (title, super::copy::localize(language, sub));
     }
     let title = if waiting > 0 {
         if zh {
@@ -439,7 +439,10 @@ fn greeting(s: &UiState) -> (String, String) {
             ));
         }
     }
-    (title, parts.join(" · "))
+    (
+        super::copy::localize(language, title),
+        super::copy::localize(language, parts.join(" · ")),
+    )
 }
 
 /// A section's heading: a word, a count, and room for an action.

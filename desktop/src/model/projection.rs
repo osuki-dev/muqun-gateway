@@ -498,6 +498,21 @@ impl Core {
                 }
             }
             Command::RefreshTasks => self.refresh_tasks().await,
+            Command::ScanStorage => {
+                if let Ok(report) = tokio::task::spawn_blocking(super::storage::scan).await {
+                    self.inbox.push(Update::Storage(report));
+                }
+            }
+            Command::ClearStorage => {
+                let cleared = tokio::task::spawn_blocking(|| {
+                    super::storage::clear_caches();
+                    super::storage::scan()
+                })
+                .await;
+                if let Ok(report) = cleared {
+                    self.inbox.push(Update::Storage(report));
+                }
+            }
             Command::CreateTask { goal, agent, cwd } => {
                 let goal = goal.trim().to_string();
                 if goal.is_empty() {

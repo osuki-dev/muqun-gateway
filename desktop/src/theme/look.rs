@@ -30,6 +30,48 @@ pub const ARRIVE: Spring = Spring::new(0.42, 0.18);
 /// A tight spring for things that move between places.
 pub const MOVE: Spring = Spring::new(0.36, 0.1);
 
+/// Apply the owner's text size, density and corner profile to a kit: every
+/// type token scales, compact density tightens line heights, and the radii
+/// follow the shape. Shape and size are the owner's choices, never a theme's.
+pub fn tune_kit(k: &mut Kit, appearance: &Appearance) {
+    let scale = appearance.text_scale();
+    let lines = if appearance.density == crate::config::Density::Compact {
+        0.92
+    } else {
+        1.0
+    };
+    let style = |t: &mut rune::TextStyle| {
+        t.size *= scale;
+        if t.line_height > 0.0 {
+            t.line_height *= scale * lines;
+        }
+    };
+    let ty = &mut k.ty;
+    for t in [
+        &mut ty.ui,
+        &mut ty.ui_medium,
+        &mut ty.ui_compact,
+        &mut ty.small,
+        &mut ty.small_medium,
+        &mut ty.body,
+        &mut ty.body_medium,
+        &mut ty.text_small,
+        &mut ty.text_small_medium,
+        &mut ty.text_xsmall,
+        &mut ty.text_xsmall_medium,
+        &mut ty.mono,
+    ] {
+        style(t);
+    }
+    let f = appearance.shape.factor();
+    let r = &mut k.radius;
+    r.xs *= f;
+    r.sm *= f;
+    r.md *= f;
+    r.lg *= f;
+    r.xl *= f;
+}
+
 impl Look {
     pub fn of(appearance: &Appearance, dark: bool) -> Self {
         Self {

@@ -132,6 +132,7 @@ fn base(s: &mut UiState) {
     s.hub_label = "standalone".into();
     s.agents_seen = true;
     s.splash = None;
+    s.cfg.general.welcomed = true;
     s.status = "Demo".into();
     s.agents = vec![
         agent("codex", "Codex", true),
@@ -604,6 +605,51 @@ pub fn scenes() -> &'static [Scene] {
         ("split2-zh", |s| {
             split2(s);
             s.cfg.general.language = crate::config::Language::ZhCn;
+        }),
+        ("welcome", |s| {
+            home_first(s);
+            s.cfg.general.welcomed = false;
+        }),
+        ("settings-appearance", |s| {
+            settings(s);
+            s.settings_tab = SettingsTab::Appearance;
+        }),
+        ("settings-general", |s| {
+            settings(s);
+            s.settings_tab = SettingsTab::General;
+            s.storage = Some(crate::model::storage::StorageReport {
+                previews: 9_500_000,
+                gallery: 88_000,
+                uploads: 20_000_000,
+                other: 1_200_000,
+                state_dir: Some("/home/demo/.local/share/muqun-desktop".into()),
+            });
+        }),
+        ("settings-shortcuts", |s| {
+            settings(s);
+            s.settings_tab = SettingsTab::Shortcuts;
+        }),
+        ("settings-about", |s| {
+            settings(s);
+            s.settings_tab = SettingsTab::About;
+        }),
+        ("home-big", |s| {
+            home_busy(s);
+            s.cfg.appearance.text_scale = 1.2;
+            s.cfg.appearance.shape = crate::config::Shape::Round;
+        }),
+        ("home-tw", |s| {
+            home_busy(s);
+            s.cfg.general.language = crate::config::Language::ZhTw;
+        }),
+        ("session-tw", |s| {
+            session_scene(s);
+            s.cfg.general.language = crate::config::Language::ZhTw;
+        }),
+        ("settings-tw", |s| {
+            settings(s);
+            s.settings_tab = SettingsTab::General;
+            s.cfg.general.language = crate::config::Language::ZhTw;
         }),
         ("home-akiba", |s| {
             with_pack(s, "akiba-overdrive");

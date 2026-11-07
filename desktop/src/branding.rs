@@ -11,6 +11,9 @@ pub const APP_NAME: &str = "Muqun";
 /// compositor, the launcher and notifications all find the same entry.
 pub const APP_ID: &str = "muqun-desktop";
 
+/// The Rune revision the desktop is built against (short), for About.
+pub const RUNE_REV: &str = "a1fe735";
+
 /// Compact mark for the sidebar title bar (and similar chrome).
 pub const APP_MARK_PNG: &[u8] = include_bytes!("../assets/icons/app-mark-64.png");
 

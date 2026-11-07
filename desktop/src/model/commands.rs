@@ -158,6 +158,10 @@ pub enum Command {
     },
     /// Re-read the delegated task list (and the default folder).
     RefreshTasks,
+    /// Measure what the desktop keeps on disk (Settings → Storage).
+    ScanStorage,
+    /// Delete the rebuildable caches (theme previews, gallery index), then measure again.
+    ClearStorage,
     /// Delegate `goal` as a task (`agent` / `cwd` default on the gateway).
     CreateTask {
         goal: String,

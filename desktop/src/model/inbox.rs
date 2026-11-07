@@ -124,6 +124,8 @@ pub enum Update {
     },
     /// The open session's working-tree change count.
     Diff(super::types::DiffStat),
+    /// What the desktop keeps on disk, by folder (`Command::ScanStorage`).
+    Storage(crate::model::storage::StorageReport),
     /// The delegated task list, replacing the last, with the folder a new
     /// task would run in.
     Tasks {

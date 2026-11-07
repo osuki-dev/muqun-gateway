@@ -8,7 +8,7 @@ mod agent_marks;
 mod agents;
 mod art;
 mod composer;
-mod copy;
+pub mod copy;
 pub mod fx;
 mod home;
 mod icons;
@@ -25,6 +25,7 @@ mod tasks;
 mod tiles;
 mod timeline;
 mod viewer;
+mod welcome;
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -286,6 +287,8 @@ pub struct UiState {
     pub agents_seen: bool,
     /// A screenshot scene is showing: live core updates are ignored.
     pub demo: bool,
+    /// What the desktop keeps on disk (Settings → Storage), once scanned.
+    pub storage: Option<crate::model::storage::StorageReport>,
     /// The file viewer overlay ([`UiState::open_file`]).
     pub viewer: Option<viewer::Viewer>,
     /// Sessions open side by side (empty when one session fills the pane).
@@ -405,6 +408,7 @@ impl UiState {
             splash: None,
             agents_seen: false,
             demo: false,
+            storage: None,
             viewer: None,
             tiles: Vec::new(),
             focus: 0,
@@ -590,7 +594,10 @@ impl UiState {
                     crate::model::compose::ComposeCommand::ListPeers,
                 ));
             }
-            Mode::Settings => self.send(Command::ThemeRefresh),
+            Mode::Settings => {
+                self.send(Command::ThemeRefresh);
+                self.send(Command::ScanStorage);
+            }
             _ => {}
         }
     }
@@ -1062,6 +1069,7 @@ impl UiState {
                         slot.diff_stat = stat;
                     }
                 }
+                Update::Storage(report) => self.storage = Some(report),
                 Update::Tasks { rows, default_cwd } => {
                     self.tasks = rows;
                     self.task_cwd = default_cwd;
@@ -1724,7 +1732,9 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>) -> El {
     } else {
         ColorScheme::Light
     };
-    let k = crate::theme::apply::palette(scheme).map_or_else(|| Kit::neutral(dark), |p| p.kit());
+    let mut k =
+        crate::theme::apply::palette(scheme).map_or_else(|| Kit::neutral(dark), |p| p.kit());
+    crate::theme::look::tune_kit(&mut k, &s.cfg.appearance);
     if s.cfg.appearance.reduced_motion {
         cx.reduced_motion(true);
     }
@@ -1733,6 +1743,7 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>) -> El {
     if let Some(zoom) = timeline::overlay(s, &k) {
         layer.push(zoom);
     }
+    welcome::mount(s, &k, &mut layer);
     if let (Some(splash), Some(images)) = (s.splash.as_ref(), s.images.as_ref()) {
         let hub_ready = !s.hub_label.is_empty();
         let loading = match splash.kind {
