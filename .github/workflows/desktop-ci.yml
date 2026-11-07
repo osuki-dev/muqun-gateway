@@ -91,9 +91,9 @@ jobs:
           path: out/*
           if-no-files-found: error
 
-  # Smoke: start the release binary, wait 5 s, SIGTERM it. A first frame is
-  # logged as `build_ui` at debug level (see desktop/src/main.rs), so the run
-  # enables that target. Success is judged by the log, not the exit code.
+  # Smoke: start the release binary, wait for the first UI frame (`build_ui` at
+  # debug from ui::view), then SIGTERM. Lavapipe on GHA can take >5 s to the
+  # first frame, so the budget is 25 s. Success is judged by the log.
   smoke-x11:
     name: Smoke (Linux, X11/xvfb)
     needs: [build]
@@ -107,14 +107,14 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y xvfb mesa-vulkan-drivers libvulkan1 libxkbcommon-x11-0 libgtk-3-0 fonts-dejavu-core
           sudo apt-get install -y libasound2t64 || sudo apt-get install -y libasound2
-      - name: Run 5 s
+      - name: Run until first frame
         run: |
           chmod +x muqun-desktop
           export HOME="$RUNNER_TEMP/home" && mkdir -p "$HOME"
           set +e
           RUST_LOG=info,muqun_desktop=debug WINIT_UNIX_BACKEND=x11 \
             xvfb-run -a -s "-screen 0 1280x800x24" \
-            timeout -s TERM 5 ./muqun-desktop > smoke.log 2>&1
+            timeout -s TERM 25 ./muqun-desktop > smoke.log 2>&1
           code=$?
           set -e
           cat smoke.log
@@ -140,7 +140,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y weston mesa-vulkan-drivers libvulkan1 libwayland-client0 libxkbcommon0 libgtk-3-0 fonts-dejavu-core
           sudo apt-get install -y libasound2t64 || sudo apt-get install -y libasound2
-      - name: Run 5 s
+      - name: Run until first frame
         run: |
           chmod +x muqun-desktop
           export HOME="$RUNNER_TEMP/home" && mkdir -p "$HOME"
@@ -150,7 +150,7 @@ jobs:
           for _ in $(seq 1 20); do [ -S "$XDG_RUNTIME_DIR/wl-ci" ] && break; sleep 0.5; done
           set +e
           RUST_LOG=info,muqun_desktop=debug WAYLAND_DISPLAY=wl-ci WINIT_UNIX_BACKEND=wayland \
-            env -u DISPLAY timeout -s TERM 5 ./muqun-desktop > smoke.log 2>&1
+            env -u DISPLAY timeout -s TERM 25 ./muqun-desktop > smoke.log 2>&1
           code=$?
           set -e
           kill "$wpid" || true

@@ -1153,6 +1153,11 @@ pub fn on_key(s: &mut UiState, ev: &KeyEvent, _tx: &mut Tx) -> bool {
 }
 
 pub fn view(s: &UiState, cx: &mut Cx<UiState>) -> El {
+    // Desktop CI smoke greps this once the first frame builds (xvfb / lavapipe).
+    static FIRST_FRAME: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+    if FIRST_FRAME.swap(false, std::sync::atomic::Ordering::Relaxed) {
+        tracing::debug!("build_ui");
+    }
     let dark = s.is_dark(cx.system_dark());
     let scheme = if dark {
         ColorScheme::Dark
