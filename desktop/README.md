@@ -1,79 +1,100 @@
 # Muqun Desktop
 
-A native desktop client (Rust, [Blinc](https://github.com/project-blinc/Blinc) UI) for the coding
-agents on this computer. It runs the gateway's agents plane in-process — no HTTP, no server, no
-Chromium — and shows every agent's sessions in one window.
+A native desktop client for the coding agents on this computer, written in Rust on
+[Rune](https://github.com/ryuhzk/rune) (our fork; GPU-drawn UI, no webview, no Chromium). Every
+agent's sessions in one window: Codex, OpenCode, Claude Code, Cursor, Qoder, Pi, FX, Antigravity,
+DeepSeek and T3.
 
-This is the **P0 slice**: it is not part of the current gateway release and is not published.
+When a Muqun gateway service runs on this computer the desktop attaches to it (the token in its
+`local-client.json`), so the phone and the desktop see the same sessions. Without one it runs the
+gateway's agents plane in-process — no HTTP server, nothing listening.
+
+## Install (Linux)
+
+```sh
+desktop/scripts/install-local.sh          # builds --release, installs for this user (no sudo)
+desktop/scripts/uninstall-local.sh        # removes it again; settings and state stay
+```
+
+`install-local.sh` puts the binary at `~/.local/bin/muqun-desktop`, the launcher entry at
+`~/.local/share/applications/muqun-desktop.desktop` and the icons under
+`~/.local/share/icons/hicolor/<size>/apps/muqun-desktop.png`. It is idempotent: run it again to
+update (a running Muqun keeps its old binary until it is reopened). `--no-build` installs
+`target/release` as it is; `PREFIX=/some/dir` installs somewhere else (`$PREFIX/bin`,
+`$PREFIX/share`). It also removes the `muqun.desktop` entry an older version of the script wrote.
+
+The launcher entry and icons come from `desktop/packaging/linux/`. The icons are generated from
+`assets/icons/app-icon.png` by `scripts/gen-linux-icons.sh` (ImageMagick) and committed, so
+installing needs no tools beyond `cargo`. The app id — Wayland `app_id`, X11 class, desktop file
+and icon name — is `muqun-desktop` everywhere (`src/branding.rs`).
+
+macOS and Windows build and run (`cargo run -p muqun-desktop --release`) but have no installer or
+bundle yet.
+
+Linux needs a GPU stack wgpu can use (Vulkan, or GL through Mesa) and a session D-Bus for
+notifications, file dialogs and "Reveal in folder". For the fonts the UI looks for — Noto Sans CJK
+and JetBrains Mono Nerd Font (`src/platform/fonts.rs`) — missing ones fall back to the system's.
 
 ## Run
 
 ```sh
-cargo run -p muqun-desktop --release      # release builds are the ones to look at
+muqun-desktop                 # or Muqun from the app launcher
+muqun-desktop path/to/file    # open a file in the viewer
+cargo run -p muqun-desktop --release
 RUST_LOG=muqun_desktop=debug cargo run -p muqun-desktop --release
 ```
 
-Debug builds work but are slow with a few hundred sessions listed; judge speed on `--release`.
+**One instance.** A second launch hands its request to the running window — focus it (with the
+launcher's activation token, which a Wayland compositor needs before it lets a window take focus)
+and open the file it was given — and exits before it starts any agent. Instances are keyed by
+window title, so `MUQUN_WINDOW_TITLE` builds from different worktrees still run side by side, and
+Rune's tooling flags (`--scene`, `--snap`, …) always run on their own. Unix only; on Windows every
+launch is its own (`src/platform/instance.rs`).
 
-`SIGTERM` / `SIGINT` close the window cleanly and exit with status 0 (the last window size is
-saved first). The first `build_ui` logs `first frame` at info level.
+`SIGTERM` / `SIGINT` close the window cleanly and exit 0 after saving the config.
 
-Linux needs a GPU stack wgpu can use (Vulkan) and, for the fonts the UI looks for, Noto Sans CJK
-and JetBrains Mono Nerd Font (see `src/platform/fonts.rs`; missing fonts fall back to the system
-default).
+## What it does
 
-## Daily development
+* **Home** — start a session: agent, folder (recent projects, folders under what you type,
+  Browse…, a typed path as typed), model, mode, worktree, then the first prompt. Recent and
+  pinned sessions.
+* **Sidebar** — every session, searchable, grouped by time, agent or folder, with agent filter
+  chips; pin, rename, fork, delete, move to background; projects can be pinned, hidden and named.
+* **Session** — a streaming timeline (Markdown with highlighted code, tool calls, inline diffs,
+  todos, images), approvals and questions answered in place, Stop. The composer sends with Enter
+  (Shift+Enter for a newline), takes attachments (pick, paste an image, drop files; images and
+  videos are shrunk to what the agent accepts), `@` files and computers, `/` commands and skills,
+  and switches model, effort, mode and branch. Queued prompts wait above it.
+* **Inspector** — the open session's queue, git and worktrees, subagents, saved permissions and
+  background shells. The working-tree diff, with staged revert.
+* **Inbox** — every waiting approval and question across sessions. **Tasks** — delegated tasks,
+  new ones, cancel and complete.
+* **File viewer** — highlighted text and code with line numbers, rendered Markdown (source a
+  click away), images fit to the window or zoomed; video, audio, PDF and anything else show their
+  metadata and **Open with system app**. **Save as…** and **Reveal in folder** for every file.
+* **Notifications** — an approval, a question or a finished turn in a session you are not looking
+  at raises a system notification titled with the session; clicking it brings the window up on
+  that session. Rules and words are the gateway's native agent pushes (one per request; a turn
+  counts as finished after 30 s idle, at most once per 2 min; never for a subagent's turn).
+  Settings → General → Notifications turns them off. Linux (freedesktop notifications) only for
+  now; macOS and Windows build with a no-op.
+* **Settings** — Agents (enable, every config field, T3 pairing, sign-in hints), Appearance
+  (light / dark / system, density, reduce motion, reduce transparency), General (language
+  English / 简体中文, default folder, editor for "Open in", notifications), Themes (installed,
+  gallery, import a `.muqun-theme` file or link; applied live), About.
+* **Themes** — the App's theme packs: colours, materials and artwork follow the active pack in
+  light and dark. Six are built in (`assets/themes/README.md`).
 
-Everything lives in the gateway repository; the desktop is the `desktop/`
-workspace member on branch `feat/desktop-blinc` (not part of the current
-release train — no PRs against `main` until that changes).
+Keys: Ctrl/Cmd+Shift+B toggles the sidebar, Ctrl/Cmd+, opens Settings, Escape closes the viewer and
+popups.
 
-```sh
-cd gateway-desktop                       # the worktree on feat/desktop-blinc
-git switch -c desktop/<topic>            # one branch per topic; merge back via the integration branch
+### Opening a file from code
 
-cargo run --release -p muqun-desktop     # run (release: the debug build is slow with 300+ sessions)
-cargo build -p muqun-desktop             # type-check fast
-cargo test -p muqun-desktop              # desktop tests only (~130)
-
-# before every commit (CI runs the same):
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace --locked          # gateway must stay 2193 passed / 55 ignored, 16, 1
-desktop/scripts/lint-theme-tokens.sh     # no colour literals outside theme/{tokens,agents,pack}.rs
-grep -rn 'cfg(target_os' desktop/src | grep -v 'desktop/src/platform/'   # must be empty
-```
-
-Blinc comes from our fork through `[patch.crates-io]` in the root
-`Cargo.toml`, pointing at the `blinc-ime` worktree (pinned to a commit;
-see `PATCHES.md` in the fork). To try a fork change: commit it on a fork
-branch, `git -C ../blinc-ime checkout --detach <rev>`, rebuild.
-
-Where things go:
-
-| You want to… | Edit |
-|---|---|
-| render a timeline part differently | `src/ui/parts/<part>.rs` |
-| add a command the UI sends to the core | `model/commands.rs` → handle in `model/projection.rs` |
-| react to a new gateway event | `model/projection.rs` (filter) → `model/view.rs` (state) → `model/drain.rs` (publish) |
-| talk to the gateway | `hub/local.rs` (via `SessionHub` only — never `AgentRuntime` from the UI) |
-| platform-specific behaviour | `src/platform/*.rs` (the only place `cfg(target_os)` is allowed) |
-| colours / fonts / sizes | theme tokens + the `--mq-*` scale variables in `ui/styles.css`; never literals in UI code |
-| a new icon | `assets/glyphs/` via `scripts/sync-glyphs.sh` (App is the source) |
-| strings | `ui/strings.rs` (zh-CN / en for now) |
-
-Rules that CI enforces: UI builders never run on the tokio thread (the
-inbox → `request_redraw` → main-thread drain path in `model/`), one window
-title per worktree when testing (`MUQUN_WINDOW_TITLE`), kill every instance
-you start, and anything shown to a person is a release build.
-
-## Environment
-
-* `MUQUN_WINDOW_TITLE` -- the window's title, so builds from several worktrees can run side by
-  side and input scripts or compositor rules can pick one (also what the QA harness uses to keep
-  its window from taking focus).
-* `MUQUN_QA_*` -- the timeline QA harness (`src/ui/timeline/qa.rs`), off unless set.
-* `MUQUN_DEBUG_LIST=1` -- show the timeline list's window and offset.
+`UiState::open_file(target)` (`src/ui/viewer.rs`) is the one entry point. `target` is a
+`PathBuf` (`~` is expanded) or a `model::viewer::FileRef::Asset { asset, directory }` for a file
+the gateway presented (`files.present`, a timeline image or file link) with the session's folder.
+It resolves the file on this computer, reads text off the UI thread, and says so plainly when the
+file is on another computer.
 
 ## Files
 
@@ -83,90 +104,86 @@ you start, and anything shown to a person is a release build.
 | State (store, uploads) | `~/.local/share/muqun-desktop/` | same as config | `%LOCALAPPDATA%\muqun-desktop\` |
 
 These are deliberately **not** the gateway's directories: a gateway service owns its state
-directory through a lock, and a second owner would push it off the phones it serves.
-Settings → About shows both paths and opens the config folder.
+directory through a lock, and a second owner would push it off the phones it serves. Settings →
+About shows both paths.
 
-`config.json` is written atomically (temporary file, flush, rename), 500 ms after the last
-change and once more at exit. Agent blocks use the gateway's own `*Config` types and key names.
-Besides agents it remembers: window size, sidebar width, the agent filter, the sidebar grouping
-(time / agent / folder), the language, the colour scheme, and the last folder per agent
-(`general.last_cwd`).
+`config.json` is written atomically (temporary file, flush, rename), 500 ms after the last change
+and once more at exit. Agent blocks use the gateway's own `*Config` types and key names. Besides
+agents it remembers the window size, pane widths, sidebar grouping and filters, project choices,
+pinned sessions, unsent drafts, the last folder / model / mode per agent, language, appearance,
+theme and the notification switch.
 
 ## OpenCode ownership rule
 
 There is one OpenCode service per user. When a Muqun gateway service is running on this computer
 (its `gateway.lock` is held) the desktop only **adopts** a running OpenCode and never starts one;
-with no gateway it follows `opencode.autostart`. DeepSeek is only ever adopted (`autostart` is
-forced off). Codex joins the shared daemon; the ACP agents (Pi, FX, Qoder, Claude, Antigravity,
-Cursor) use private child processes; T3 needs pairing in the desktop (Settings → Agents → T3).
+with no gateway it follows `opencode.autostart`. DeepSeek is only ever adopted. Codex joins the
+shared daemon; the ACP agents (Pi, FX, Qoder, Claude, Antigravity, Cursor) use private child
+processes; T3 needs pairing in the desktop (Settings → Agents → T3).
 
-## What P0 has — and only P0 has
+## Daily development
 
-* Home, a session list grouped by time / agent / folder with agent filter chips, the Agents panel.
-* New session (Ctrl/Cmd+N): agent, then folder through a combobox — the agent's known projects
-  ("Recent"; a folder that no longer exists is greyed and says so), the folders under whatever is
-  typed (listed by the core after a 150 ms pause, never on the UI thread), "Browse…" for the
-  system picker, a typed path used as typed. `~` is expanded when the session is created. Enter
-  creates with the defaults; with text typed, Enter first commits that text.
-* A session: a windowed, streaming timeline (Markdown with highlighted code, tool calls, diffs,
-  todos, approvals, forms; long replies are cut into several list rows), composer (Enter sends, Shift+Enter newline),
-  approval cards (Approve / Deny), Stop button, **Esc stops a running turn**.
-* Settings (⚙ or Ctrl/Cmd+,): **Agents** (enable switch and config fields per agent, T3 pairing,
-  sign-in hints in the gateway CLI's wording), **Appearance** (Light / Dark / System, live), **General** (language zh-CN / en, live; default folder; editor command
-  for later; "close to tray" placeholder, off and disabled), **About**.
-  Agent changes are saved at once and take effect when the desktop next starts — the page says so.
-* Themes: **Ctrl/Cmd+Shift+T** opens the themes panel (installed, gallery, import a
-  `.muqun-theme`; applied live and remembered). Six themes are built in
-  (`assets/themes/README.md`).
-* Not here yet: search, rename/delete/fork, model/mode
-  switching, attachments, `@file`, `/commands`, tray, notifications, command palette.
+The desktop is the `desktop/` member of the gateway workspace.
 
-## Baseline (Linux, 2026-11-02)
+```sh
+cargo build -p muqun-desktop             # type-check fast
+cargo run --release -p muqun-desktop     # judge speed on release; debug is slow with 300+ sessions
+cargo test -p muqun-desktop
 
-Release build, Hyprland (Wayland), 5120×2880 @2×, window 1266×1396 logical, this machine's real
-agent data (8 usable agents, ~320 listed sessions), `muqun-gateway` not running.
+# before every commit (Desktop CI runs the same):
+cargo fmt --all -- --check
+cargo clippy -p muqun-desktop --all-targets -- -D warnings
+cargo test -p muqun-desktop --locked
+desktop/scripts/lint-theme-tokens.sh     # no colour literals outside theme/{tokens,agents,pack}.rs
+grep -rn 'cfg(target_os' desktop/src | grep -v 'desktop/src/platform/'   # must be empty
+```
 
-| Measure | Value |
+**Look at it without a screen.** Named demo states live in `src/ui/scenes.rs` (the only place
+demo data may live); Rune renders one headless:
+
+```sh
+./target/debug/muqun-desktop --scene session --snap out.png --size 1440x900 --scale 1 --frames 30
+./target/debug/muqun-desktop --list-scenes
+```
+
+`--theme light|dark`, `--script` for scripted input and `--tree` (dump the element tree) are
+Rune's; see its README. Add a scene for every new state you build.
+
+**Rune** comes from our fork, pinned by git rev in `desktop/Cargo.toml` (`patches/rune/` lists
+what the fork adds over upstream). To iterate on Rune itself, override the pin with a local
+checkout: see the comment at the end of the root `Cargo.toml`.
+
+Where things go:
+
+| You want to… | Edit |
 |---|---|
-| Cold start → first `build_ui` (`first frame`, process start to first build; 5 runs) | 163, 169, 169, 171, 171 ms |
-| Binary size (release, stripped, thin LTO) | 47.5 MB (45.3 MiB) |
-| RSS after 30 s idle | 256 MB |
-| Idle frames/s, 10 s, nothing touched, no text field focused | 3.2/s at t+31…41 s (agent session events from this machine's live sessions still arriving); 1/s by t+130 s; **0** in quiet 10 s windows (t+220…240 s) |
-| Frames/s, composer focused (caret blink), 10 s | 2.8/s |
+| change how a page looks | `src/ui/<page>.rs` (`home`, `sessions`, `timeline`, `composer`, `inspector`, `inbox`, `tasks`, `settings`, `viewer`) |
+| add a command the UI sends to the core | `model/commands.rs` → handle in `model/projection.rs` |
+| react to a new gateway event | `model/projection.rs` (filter) → `ui/mod.rs` `apply_updates` |
+| talk to the gateway | `hub/` (via `SessionHub` only: `local.rs` in-process, `remote.rs` the local service) |
+| platform-specific behaviour | `src/platform/*.rs` (the only place `cfg(target_os)` is allowed) |
+| colours, materials, artwork | theme tokens and pack slots (`src/theme/`); never literals in UI code |
+| a new icon | `assets/glyphs/` via `scripts/sync-glyphs.sh` (the App is the source) |
+| strings | `ui::copy::tr(language, en, zh)` |
+| the launcher entry or icons | `packaging/linux/`, `scripts/gen-linux-icons.sh` |
 
-Frames are `wl_surface.commit` calls counted from `WAYLAND_DEBUG=1`. The architecture's gates are
-<1 s cold start (met), <150 MB idle RSS (**not met**: 256 MB, mostly wgpu and the session lists),
-<40 MB package (not met as a bare binary). Debug builds with this many sessions keep the UI
-thread busy for ~30 s while the first lists are built; release does not.
+The UI never runs on the tokio thread: the core pushes `Update`s into the inbox
+(`model/inbox.rs`), and the main thread folds a batch per frame. Kill every instance you start.
 
-## Colours
+## Environment
 
-No colour literals outside `src/theme/tokens.rs` (the `.muqun-theme` → Blinc token mapping) and
-`src/theme/agents.rs` (the ten agent brand colours, exported as `--agent-<id>` with lightness
-adapting to the scheme, hue never); views and `styles.css` use `var(--token)`.
-`desktop/scripts/lint-theme-tokens.sh` enforces it (exit 1 on a hit).
+* `MUQUN_WINDOW_TITLE` — the window's title, so builds from several worktrees can run side by
+  side (it also keys the single-instance socket).
+* `MUQUN_LOCAL_GATEWAY` — the gateway credential file to attach with (default: the gateway
+  service's own `local-client.json`).
+* `MUQUN_GATEWAY_STATE_DIR` — where to look for a running gateway's lock.
+* `MUQUN_THEME_GALLERY` — another theme gallery (an `https://` base ending in `/`), for testing.
+* `MUQUN_QA_*` — composer and session-switch QA harnesses, off unless set.
 
-## Known limits (Blinc 0.5.1 fork)
+## Known limits
 
-* **Window position and maximized state are not saved.** `WindowedContext` exposes neither (the
-  `Moved` event is not forwarded to the app, and there is no maximized query). Size is saved and
-  restored; `window.x`, `window.y`, `window.maximized` in `config.json` are honoured when present.
-  Wayland never reports position to clients anyway. Needs a small fork patch.
-* The combobox list's text is painted outside the list box when its rows overflow it (text is not
-  clipped in the foreground layer), so the chooser offers at most 8 rows and shortens long paths.
-
-## Later
-
-Packaging and signing (dmg / msi / AppImage),
-tray and close-to-tray, notifications, command palette,
-session fork on agents that refuse it, the theme editor and theme art on Home beyond Cover
-Courier's, hot-apply of agent settings (restart button exists), saving window position and
-maximized state (fork patch), three-platform CI runs.
-
-## Icons
-
-The App's glyphs (`app/assets/glyphs`) are the single icon source. After they
-change, run `desktop/scripts/sync-glyphs.sh` (set `MUQUN_APP_DIR` if the App is
-not the sibling `app/` checkout). It refreshes `assets/glyphs/`, adds
-`brand-opencode.svg`, and regenerates `src/ui/glyphs.rs`. Use
-`ui::glyphs::icon(Glyph::X, size).tint(color)`, and `agent_mark(kind)` for brands.
+* Window position and maximized state are not restored (Wayland never reports position to
+  clients; size is saved).
+* System notifications are Linux-only so far (macOS and Windows build with a no-op), and single
+  instance is Unix-only (on Windows every launch is its own).
+* No tray or close-to-tray, no installer for macOS or Windows, no code signing.
