@@ -4,13 +4,11 @@
 
 use muqun_gateway::agents::{AgentPart, TimelineItem, ToolCall};
 use rune::{col, El};
-use rune_kit::diff::{parse, DiffView, FileDiff};
+use rune_kit::diff::{parse, FileDiff};
 use serde_json::Value;
 
 use super::{chip, glyphs, Tcx, ToolCard};
 use crate::model::tool_view::{self as tv, ToolKind};
-use crate::ui::timeline::empty_diff;
-use crate::ui::UiState;
 
 /// Lines a read or write shows before "N more lines".
 pub const CODE_LINES: usize = 400;
@@ -155,45 +153,11 @@ pub fn diff_chips(cx: &Tcx, added: usize, removed: usize) -> Vec<El> {
     chips
 }
 
-/// Item `id`'s parsed diff, drawn by rune-kit's diff view at its own
-/// height (up to a cap; longer diffs scroll inside).
+/// Item `id`'s parsed diff, as rows inside its card.
 pub fn inline_diff(cx: &Tcx, id: &str) -> Option<El> {
-    let (lines, _, _) = diff_rows(cx, id)?;
-    let height = (lines as f32 * 20.0 + 12.0).clamp(64.0, 420.0);
-    let (get_asid, get_id) = (cx.asid.to_string(), id.to_string());
-    let (set_asid, set_id) = (cx.asid.to_string(), id.to_string());
-    let view = DiffView::new(
-        move |s: &UiState| match s
-            .timelines
-            .get(&get_asid)
-            .and_then(|t| t.diffs.get(&get_id))
-        {
-            Some((_, d)) => d,
-            None => empty_diff(),
-        },
-        move |s: &mut UiState| {
-            &mut s
-                .timelines
-                .entry(set_asid.clone())
-                .or_default()
-                .diffs
-                .entry(set_id.clone())
-                .or_default()
-                .1
-        },
-    )
-    .key(format!("diff-{id}"))
-    .build(cx.s, cx.k);
-    Some(
-        col()
-            .key(format!("diffbox-{id}"))
-            .w_full()
-            .h(height)
-            .radius(cx.k.radius.sm)
-            .clip_rounded(cx.k.radius.sm)
-            .border(1.0, cx.k.c.border_weak)
-            .child(view),
-    )
+    let (_, state) = cx.tl()?.diffs.get(id)?;
+    let files = state.files();
+    (!files.is_empty()).then(|| super::diff_rows::rows(cx, id, files))
 }
 
 /// A `Diff` part: the file and its change.
