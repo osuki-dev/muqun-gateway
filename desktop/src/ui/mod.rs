@@ -4,6 +4,8 @@
 //! every core update into it, each page sends [`Command`]s back, and [`view`] lays the
 //! shell out from it.
 
+mod agent_marks;
+mod agents;
 mod composer;
 mod home;
 mod inbox;
@@ -354,10 +356,7 @@ impl UiState {
     }
 
     pub fn agent_name(&self, id: &str) -> String {
-        self.agents
-            .iter()
-            .find(|a| a.id == id)
-            .map_or_else(|| id.to_string(), |a| a.name.clone())
+        agents::name(id, &self.agents)
     }
 
     pub fn toast(&mut self, title: impl Into<String>, detail: Option<String>) {

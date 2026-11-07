@@ -505,7 +505,10 @@ pub fn catalog_models(view: &crate::hub::CatalogView) -> Vec<(String, String, St
 }
 
 fn mode_label(id: &str, catalog_name: Option<&str>) -> String {
-    if let Some(name) = catalog_name.map(str::trim).filter(|s| !s.is_empty() && *s != id) {
+    if let Some(name) = catalog_name
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != id)
+    {
         return name.to_string();
     }
     super::labels::readable_catalog_id(id)
@@ -522,13 +525,7 @@ fn effort_menu(
         .map(super::labels::readable_catalog_id)
         .unwrap_or_else(|| "Default".into());
     let mut menu = Menu::new("effort")
-        .trigger(pill(
-            k,
-            "effort-pill",
-            label,
-            open,
-            OpenMenu::Effort,
-        ))
+        .trigger(pill(k, "effort-pill", label, open, OpenMenu::Effort))
         .open(open)
         .min_width(160.0)
         .on_close(|s: &mut UiState| s.menu = None);
@@ -561,6 +558,20 @@ fn pills(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         .model
         .as_ref()
         .and_then(|m| super::labels::catalog_model_info(&model_infos, m, default_model));
+
+    let agent_name = s.agent_name(&info.agent_id);
+    line = line.child(
+        row()
+            .key("agent")
+            .gap(6.0)
+            .center_y()
+            .px(8.0)
+            .h(24.0)
+            .radius(k.radius.sm)
+            .fill(k.c.layer_03)
+            .child(super::agents::mark(&info.agent_id, 12.0, s.dark))
+            .child(rune::text(agent_name).font(k.ty.small).color(k.c.text_base)),
+    );
 
     if let Some(model) = &info.model {
         let name = super::labels::format_model_name(

@@ -190,21 +190,20 @@ fn agents(s: &UiState, k: &Kit) -> Vec<El> {
     if s.agents.is_empty() {
         return vec![muted(k, "No agents discovered yet.")];
     }
-    s.agents
-        .iter()
-        .map(|a| {
+    let language = s.cfg.general.language;
+    super::agents::by_standing(&s.agents)
+        .into_iter()
+        .map(|(a, standing)| {
             let enabled = s.cfg.agents.enabled(&a.id);
             let id = a.id.clone();
+            let brand = super::agents::color(&a.id, s.dark);
+            let title = super::agents::name(&a.id, &s.agents);
+            let standing_word = standing.word(language);
             let mut card = Card::new()
-                .accent(if enabled {
-                    k.c.success.icon
-                } else {
-                    k.c.icon_faint
-                })
-                .title(a.name.clone(), None)
+                .accent(if enabled { brand } else { k.c.icon_faint })
+                .title(title, Some(super::agents::mark_icon(&a.id)))
                 .description(format!(
-                    "{:?}{}",
-                    a.status,
+                    "{standing_word}{}",
                     a.version
                         .as_ref()
                         .map(|v| format!(" · {v}"))

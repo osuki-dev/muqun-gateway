@@ -333,6 +333,9 @@ fn session_row(s: &UiState, k: &Kit, layer: &mut Vec<El>, asid: &str) -> El {
         title_of(info)
     ))
     .depth(1)
+    .height(45.0)
+    .avatar(super::agents::mark(&info.agent_id, 14.0, s.dark))
+    .subtitle(s.agent_name(&info.agent_id))
     .selected(s.mode == Mode::Session && s.selected.as_deref() == Some(asid));
     if waiting {
         row = row.status(RowStatus::Attention);

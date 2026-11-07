@@ -83,24 +83,50 @@ fn pick_folder_path(s: &mut UiState, path: String) {
 }
 
 fn agents(s: &UiState, k: &Kit) -> El {
-    let usable: Vec<(&str, &str)> = s
-        .agents
+    let ranked = super::agents::by_standing(&s.agents);
+    let usable: Vec<&muqun_gateway::platform::discovery::AgentDiscoveryInfo> = ranked
         .iter()
-        .filter(|a| a.enabled)
-        .map(|a| (a.id.as_str(), a.name.as_str()))
+        .filter(|(_, st)| *st == super::agents::Standing::Usable)
+        .map(|(a, _)| a)
         .collect();
     if usable.is_empty() {
         return muted(k, "No agent is enabled. Turn one on in Settings → Agents.");
     }
-    let labels: Vec<&str> = usable.iter().map(|(_, n)| *n).collect();
-    let ids: Vec<String> = usable.iter().map(|(id, _)| id.to_string()).collect();
-    let at = usable.iter().position(|(id, _)| *id == s.start_agent);
-    SegmentedControl::new(&labels, at)
-        .fit()
-        .label("Agent")
-        .on_pick(move |s: &mut UiState, i, _: &mut Tx| pick_agent(s, ids[i].clone()))
-        .build(k)
-        .key("agents")
+    let dark = s.dark;
+    let mut line = row().key("agents").w_full().gap(6.0).wrap().center_y();
+    for a in usable {
+        let selected = a.id == s.start_agent;
+        let id = a.id.clone();
+        let label = super::agents::name(&a.id, &s.agents);
+        line = line.child(
+            Button::new(label.clone())
+                .variant(if selected {
+                    ButtonVariant::Outline
+                } else {
+                    ButtonVariant::GhostMuted
+                })
+                .control_size(ControlSize::Small)
+                .label_with({
+                    let id = id.clone();
+                    let label = label.clone();
+                    move |font, ink| {
+                        row()
+                            .gap(6.0)
+                            .center_y()
+                            .child(if selected {
+                                super::agents::mark(&id, 14.0, dark)
+                            } else {
+                                super::agents::mark_idle(&id, 14.0, ink)
+                            })
+                            .child(text(label).font(font).color(ink))
+                    }
+                })
+                .on_press(move |s: &mut UiState| pick_agent(s, id.clone()))
+                .build(k)
+                .key(format!("agent-{}", a.id)),
+        );
+    }
+    line
 }
 
 fn folder(s: &UiState, k: &Kit) -> El {
@@ -326,6 +352,7 @@ fn recent(s: &UiState, k: &Kit) -> Option<El> {
             SidebarRow::new(format!("{pin}{}", title_of(info)))
                 .subtitle(s.agent_name(&info.agent_id))
                 .height(45.0)
+                .avatar(super::agents::mark(&info.agent_id, 14.0, s.dark))
                 .on_select(move |s: &mut UiState, _: &mut Tx| s.open_session(&asid))
                 .build(k)
                 .key(format!("recent-{}", info.asid.0)),
