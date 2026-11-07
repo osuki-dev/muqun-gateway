@@ -13,3 +13,4 @@ pub mod projects;
 pub mod stream;
 pub mod turn;
 pub mod types;
+pub mod viewer;

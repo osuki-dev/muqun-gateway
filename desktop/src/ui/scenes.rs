@@ -283,6 +283,112 @@ fn inbox(s: &mut UiState) {
     s.demo = true;
 }
 
+const VIEWER_CODE: &str = r#"//! Retry a flaky request with capped exponential backoff.
+
+use std::time::Duration;
+
+/// How long to wait before attempt `n` (0-based): 200 ms, doubling, at most 5 s.
+pub fn backoff(n: u32) -> Duration {
+    let ms = 200u64.saturating_mul(1 << n.min(16));
+    Duration::from_millis(ms.min(5_000))
+}
+
+pub async fn with_retry<T, E, F, Fut>(mut attempt: F, tries: u32) -> Result<T, E>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, E>>,
+{
+    let mut n = 0;
+    loop {
+        match attempt().await {
+            Ok(value) => return Ok(value),
+            Err(err) if n + 1 >= tries => return Err(err),
+            Err(_) => {
+                tokio::time::sleep(backoff(n)).await;
+                n += 1;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn backoff_is_capped() {
+        assert_eq!(super::backoff(0).as_millis(), 200);
+        assert_eq!(super::backoff(10).as_millis(), 5_000);
+    }
+}
+"#;
+
+const VIEWER_MARKDOWN: &str = "# Release checklist
+
+Before tagging **v0.4.0**, walk this list top to bottom.
+
+## Build
+
+- [x] `cargo build --release` on Linux, macOS and Windows
+- [x] Installer smoke test in a clean container
+- [ ] Notarize the macOS bundle
+
+## Notes
+
+| Area | Owner | State |
+|---|---|---|
+| Desktop | platform | ready |
+| Gateway | core | review |
+
+```sh
+desktop/scripts/install-local.sh
+```
+
+> Ship nothing that has not run on a real machine.
+";
+
+fn viewer_with(s: &mut UiState, name: &str, kind: crate::model::viewer::FileKind, body: &str) {
+    use super::viewer::{text_body, Viewer};
+    session_scene(s);
+    s.viewer = Some(Viewer {
+        path: Some(format!("/home/demo/gateway/{name}").into()),
+        name: name.rsplit('/').next().unwrap_or(name).to_string(),
+        kind,
+        meta: crate::model::viewer::Meta {
+            size: Some(body.len() as u64),
+            modified: Some(std::time::SystemTime::now() - std::time::Duration::from_secs(720)),
+        },
+        body: text_body(body.into(), false),
+        zoom: None,
+        source: false,
+    });
+}
+
+fn viewer_code(s: &mut UiState) {
+    use crate::model::viewer::FileKind;
+    viewer_with(s, "src/retry.rs", FileKind::Text(Some("rust")), VIEWER_CODE);
+}
+
+fn viewer_markdown(s: &mut UiState) {
+    use crate::model::viewer::FileKind;
+    viewer_with(s, "docs/RELEASE.md", FileKind::Markdown, VIEWER_MARKDOWN);
+}
+
+fn viewer_image(s: &mut UiState) {
+    session_scene(s);
+    s.open_file(std::path::PathBuf::from(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/assets/icons/app-icon.png"
+    )));
+}
+
+fn viewer_video(s: &mut UiState) {
+    use crate::model::viewer::FileKind;
+    viewer_with(s, "recordings/demo-run.mp4", FileKind::Video, "");
+    if let Some(v) = s.viewer.as_mut() {
+        v.body = super::viewer::Body::External;
+        v.meta.size = Some(48_734_112);
+    }
+}
+
 /// A scene name and the state it applies.
 pub type Scene = (&'static str, fn(&mut UiState));
 
@@ -294,6 +400,10 @@ pub fn scenes() -> &'static [Scene] {
         ("tasks", tasks),
         ("inbox", inbox),
         ("diff", diff),
+        ("viewer", viewer_code),
+        ("viewer-markdown", viewer_markdown),
+        ("viewer-image", viewer_image),
+        ("viewer-video", viewer_video),
     ]
 }
 

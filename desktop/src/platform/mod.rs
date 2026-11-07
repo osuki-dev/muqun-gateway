@@ -6,6 +6,7 @@ pub mod dialogs;
 pub mod editors;
 pub mod filesearch;
 pub mod fonts;
+pub mod instance;
 pub mod keys;
 pub mod media;
 pub mod notify;

@@ -21,6 +21,7 @@ mod shell;
 mod splash;
 mod tasks;
 mod timeline;
+mod viewer;
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -247,6 +248,8 @@ pub struct UiState {
     pub agents_seen: bool,
     /// A screenshot scene is showing: live core updates are ignored.
     pub demo: bool,
+    /// The file viewer overlay ([`UiState::open_file`]).
+    pub viewer: Option<viewer::Viewer>,
 }
 
 impl UiState {
@@ -354,6 +357,7 @@ impl UiState {
             splash: None,
             agents_seen: false,
             demo: false,
+            viewer: None,
             cfg,
         };
         s.arm_splash(splash::SplashKind::Boot);
@@ -1044,6 +1048,8 @@ impl UiState {
                 }
             }
             UiAction::ThemeFilePicked(path) => self.send(Command::ThemeImportFile(path)),
+            UiAction::ViewerLoaded { path, loaded } => self.viewer_loaded(&path, *loaded),
+            UiAction::FileSaved(result) => self.file_saved(result),
             UiAction::SubmitComposer => composer::submit_session(self),
             UiAction::ComposerEdited
             | UiAction::ComposerKey { .. }
@@ -1212,6 +1218,7 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>) -> El {
             layer.push(stage);
         }
     }
+    viewer::mount(s, &k, cx.env().scale, &mut layer);
     if !s.toasts.is_empty() {
         let mut region = ToastRegion::new();
         for t in &s.toasts {

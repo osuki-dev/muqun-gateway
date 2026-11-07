@@ -67,6 +67,13 @@ pub enum UiAction {
     Open(String),
     /// Toggle the top-bar working-tree file list.
     ToggleDiffPanel,
+    /// The viewer's reader finished (`model/viewer.rs`).
+    ViewerLoaded {
+        path: std::path::PathBuf,
+        loaded: Box<super::viewer::Loaded>,
+    },
+    /// The viewer's Save as… copied the file (or could not).
+    FileSaved(Result<std::path::PathBuf, String>),
     /// Open one changed file in the preferred editor.
     OpenDiffFile {
         asid: String,
