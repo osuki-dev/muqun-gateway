@@ -132,11 +132,13 @@ pub fn read_popup(
 }
 
 /// Remember the query start when Esc dismisses an open popup.
+#[allow(dead_code)]
 pub fn dismiss(state: &PopupState) -> Option<usize> {
     state.query().map(|q| q.start)
 }
 
 /// Put the picked row into the draft in place of the query.
+#[allow(dead_code)]
 pub fn insert_pick(draft: &str, query: &PopupQuery, row: &PopupRow) -> (String, usize) {
     let head = &draft[..query.start];
     let tail = &draft[query.end..];

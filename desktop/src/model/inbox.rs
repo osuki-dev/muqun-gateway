@@ -35,6 +35,7 @@ pub struct UiError {
 /// Work that originates on the UI thread but must run after the current
 /// input has been fully dispatched (see `ui/composer.rs`).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // Several arms wait on platform hooks not yet re-wired on Rune.
 pub enum UiAction {
     SubmitComposer,
     /// The composer's text or caret may have changed (posted from its key
@@ -207,6 +208,7 @@ impl Inbox {
         std::mem::take(&mut state.pending)
     }
 
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.state.lock().unwrap().pending.is_empty()
     }

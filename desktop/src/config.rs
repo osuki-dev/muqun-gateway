@@ -160,6 +160,7 @@ impl Language {
     }
 
     /// The gateway's i18n locale for the same language.
+    #[allow(dead_code)]
     pub fn locale(self) -> muqun_gateway::platform::i18n::Locale {
         use muqun_gateway::platform::i18n::Locale;
         match self {
@@ -236,6 +237,7 @@ impl UiPrefs {
     pub const RIGHT_MIN: f32 = 240.0;
     pub const RIGHT_MAX: f32 = 720.0;
     /// Main column must keep at least this much (timeline + composer).
+    #[allow(dead_code)]
     pub const MAIN_MIN: f32 = 420.0;
 
     fn right_default() -> f32 {
@@ -278,6 +280,7 @@ impl Default for UiPrefs {
 /// plain function ([`DesktopConfig::apply`]) with tests.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConfigEdit {
+    #[allow(dead_code)]
     Window(WindowGeometry),
     SidebarWidth(f32),
     RightWidth(f32),

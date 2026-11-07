@@ -4,6 +4,9 @@
 //! allowed to live (architecture §10). Bundling a subset is a later task; a
 //! missing file only costs the fallback chain's choice of face.
 
+// Available to the UI; wired as those surfaces land.
+#![allow(dead_code)]
+
 /// The families the app draws with (`ui/text.rs` names them).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FontRole {

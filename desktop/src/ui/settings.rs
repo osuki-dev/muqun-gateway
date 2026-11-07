@@ -657,18 +657,19 @@ fn thumb_from_path(k: &Kit, images: Option<&ImageCache>, path: Option<&Path>, ke
         .fill(k.c.layer_02)
 }
 
-fn theme_tile(
-    k: &Kit,
-    key: &str,
-    name: &str,
-    about: &str,
+struct ThemeTile {
+    key: String,
+    name: String,
+    about: String,
     thumb: El,
     palette: Option<El>,
     status: Option<El>,
     actions: Vec<El>,
     current: bool,
-) -> El {
-    let border = if current {
+}
+
+fn theme_tile(k: &Kit, tile: ThemeTile) -> El {
+    let border = if tile.current {
         k.c.border_focus
     } else {
         k.c.border_weak
@@ -681,28 +682,34 @@ fn theme_tile(
         .pt(10.0)
         .pb(12.0)
         .child(
-            text(name.to_string())
+            text(tile.name)
                 .font(k.ty.body_medium)
                 .color(k.c.text_base)
                 .truncate(),
         )
         .child(
-            text(about.to_string())
+            text(tile.about)
                 .font(k.ty.small)
                 .color(k.c.text_muted)
                 .truncate(),
         );
-    if let Some(palette) = palette {
+    if let Some(palette) = tile.palette {
         body = body.child(palette);
     }
-    if let Some(status) = status {
+    if let Some(status) = tile.status {
         body = body.child(status);
     }
-    if !actions.is_empty() {
-        body = body.child(row().key("actions").gap(8.0).center_y().children(actions));
+    if !tile.actions.is_empty() {
+        body = body.child(
+            row()
+                .key("actions")
+                .gap(8.0)
+                .center_y()
+                .children(tile.actions),
+        );
     }
     col()
-        .key(key.to_string())
+        .key(tile.key)
         .w(TILE_W)
         .radius(k.radius.md)
         .fill(k.c.bg_base)
@@ -713,7 +720,7 @@ fn theme_tile(
                 .combined(Transition::offset(0.0, 10.0))
                 .combined(Transition::scale(0.98)),
         )
-        .child(thumb)
+        .child(tile.thumb)
         .child(body)
 }
 
@@ -759,18 +766,20 @@ fn library_tile(s: &UiState, k: &Kit, images: Option<&ImageCache>, entry: &Theme
     let fallback = Some(swatches(k, &entry.id, &entry.light, &entry.dark));
     theme_tile(
         k,
-        &format!("theme-{}", entry.id),
-        &entry.name,
-        &about.join(" · "),
-        thumb,
-        fallback,
-        entry
-            .description
-            .as_ref()
-            .filter(|d| !d.is_empty())
-            .map(|d| muted(k, d.clone())),
-        actions,
-        current,
+        ThemeTile {
+            key: format!("theme-{}", entry.id),
+            name: entry.name.clone(),
+            about: about.join(" · "),
+            thumb,
+            palette: fallback,
+            status: entry
+                .description
+                .as_ref()
+                .filter(|d| !d.is_empty())
+                .map(|d| muted(k, d.clone())),
+            actions,
+            current,
+        },
     )
 }
 
@@ -808,20 +817,22 @@ fn gallery_tile(s: &UiState, k: &Kit, images: Option<&ImageCache>, entry: &Index
     let status = job.map(|job| muted(k, job_label(language, job)));
     theme_tile(
         k,
-        &format!("gallery-{}", entry.id),
-        &entry.name,
-        &about.join(" · "),
-        thumb,
-        None,
-        status.or_else(|| {
-            entry
-                .description
-                .as_ref()
-                .filter(|d| !d.is_empty())
-                .map(|d| muted(k, d.clone()))
-        }),
-        actions,
-        false,
+        ThemeTile {
+            key: format!("gallery-{}", entry.id),
+            name: entry.name.clone(),
+            about: about.join(" · "),
+            thumb,
+            palette: None,
+            status: status.or_else(|| {
+                entry
+                    .description
+                    .as_ref()
+                    .filter(|d| !d.is_empty())
+                    .map(|d| muted(k, d.clone()))
+            }),
+            actions,
+            current: false,
+        },
     )
 }
 

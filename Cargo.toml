@@ -90,8 +90,6 @@ lto = "thin"
 codegen-units = 1
 strip = true
 
-# Local rune checkout (same rev as desktop/Cargo.toml) so TextArea can expose
-# on_input_paste for Ctrl+V file / image attachments.
-[patch."https://github.com/anomalyco/rune"]
-rune = { path = "../rune/crates/rune" }
-rune-kit = { path = "../rune/crates/rune-kit" }
+# Optional local override (not required for CI): point at a sibling checkout
+# with `cargo --config 'patch."https://github.com/ryuhzk/rune".rune.path="../rune/crates/rune"'`
+# (and the matching rune-kit path) while iterating on Rune itself.

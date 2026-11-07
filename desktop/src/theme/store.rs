@@ -187,6 +187,7 @@ impl Loaded {
     }
 
     /// The Home hero image for `scheme` ([`Manifest::cover_asset`]).
+    #[allow(dead_code)]
     pub fn cover(&self, scheme: ColorScheme) -> Option<Arc<[u8]>> {
         let id = self.manifest().cover_asset(scheme == ColorScheme::Dark)?;
         self.asset(id)

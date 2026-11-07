@@ -75,6 +75,7 @@ pub struct Notice {
     pub message: String,
     pub error: bool,
     /// What a Retry button re-sends, if anything.
+    #[allow(dead_code)]
     pub retry: Option<Command>,
 }
 

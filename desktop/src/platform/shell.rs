@@ -1,5 +1,8 @@
 //! Small per-OS behaviours the UI needs but must not branch on itself.
 
+// Available to the UI; wired as those surfaces land.
+#![allow(dead_code)]
+
 use std::path::Path;
 
 /// Whether a native file dialog must be opened from the main (UI) thread.

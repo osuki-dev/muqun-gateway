@@ -212,6 +212,7 @@ pub struct HomeIdentity {
     #[serde(default)]
     pub logo: Option<Mode>,
     #[serde(default)]
+    #[allow(dead_code)]
     pub artwork: Option<Mode>,
 }
 
@@ -589,6 +590,7 @@ impl Manifest {
     /// The Home hero for `scheme`: the pack's `home.artwork` (unless its
     /// author turned it off with `homeIdentity.artwork: hidden`), else its
     /// `home.wallpaper`, else its gallery preview.
+    #[allow(dead_code)]
     pub fn cover_asset(&self, dark: bool) -> Option<&str> {
         let artwork_hidden = self
             .home_identity

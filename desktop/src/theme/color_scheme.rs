@@ -7,6 +7,7 @@ pub enum ColorScheme {
 }
 
 impl ColorScheme {
+    #[allow(dead_code)]
     pub fn is_dark(self) -> bool {
         matches!(self, Self::Dark)
     }

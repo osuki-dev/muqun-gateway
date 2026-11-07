@@ -16,10 +16,12 @@ pub enum Command {
     OpenSession(AgentSessionId),
     /// Start a session for `agent` in `cwd`, remember `cwd`, open it. (The
     /// composer starts sessions through `Compose`; the QA harness uses this.)
+    #[allow(dead_code)]
     CreateSession {
         agent: String,
         cwd: PathBuf,
     },
+    #[allow(dead_code)]
     SendPrompt {
         asid: AgentSessionId,
         text: String,

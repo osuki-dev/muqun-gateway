@@ -1,6 +1,9 @@
 //! "Open in …" (architecture §6.0‴ A): a project folder in an editor, a
 //! terminal or the file manager, the way each platform starts them.
 
+// Available to the UI; wired as those surfaces land.
+#![allow(dead_code)]
+
 use std::path::Path;
 use std::process::{Command, Stdio};
 

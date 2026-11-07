@@ -2,6 +2,9 @@
 //! manager, `systemd` or a CI smoke test sees the process end with status 0
 //! instead of being killed mid-frame.
 
+// Available to the UI; wired as those surfaces land.
+#![allow(dead_code)]
+
 use std::time::Duration;
 
 /// How long the window gets to close before the process leaves anyway

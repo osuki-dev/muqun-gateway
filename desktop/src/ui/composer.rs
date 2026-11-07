@@ -273,7 +273,7 @@ pub(super) fn on_draft_change(s: &mut UiState, slot: Slot) {
     // App atomic backspace for typed mentions that are not yet pills.
     if !prev.is_empty() {
         let ranges = mention_ranges(&prev, &mention_tokens(s));
-        if let Some((text, at)) = delete_mention_atomically(&prev, &next, &ranges, prev_caret) {
+        if let Some((_text, at)) = delete_mention_atomically(&prev, &next, &ranges, prev_caret) {
             let draft = draft_of_mut(s, slot);
             let end = draft_caret(draft).max(at);
             draft.set_selection(at, end);

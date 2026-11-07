@@ -76,6 +76,7 @@ pub struct InboxItem {
 }
 
 impl InboxItem {
+    #[allow(dead_code)]
     pub fn attachments(&self) -> usize {
         self.files.len()
     }
@@ -288,6 +289,7 @@ pub enum ComposeCommand {
         asid: Option<AgentSessionId>,
     },
     Stage {
+        #[allow(dead_code)]
         id: u64,
         name: String,
         source: Source,
@@ -357,6 +359,7 @@ pub enum ComposerUpdate {
         view: Arc<CatalogView>,
     },
     Staged {
+        #[allow(dead_code)]
         id: u64,
         result: Result<StagedFile, String>,
     },

@@ -51,6 +51,7 @@ impl ConfigStore {
         })
     }
 
+    #[allow(dead_code)]
     pub fn path(&self) -> &std::path::Path {
         &self.path
     }

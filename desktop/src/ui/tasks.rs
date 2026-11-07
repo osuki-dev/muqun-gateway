@@ -1,6 +1,6 @@
 //! The tasks page: delegate a goal, watch, cancel or confirm tasks.
 
-use rune::{col, row, text, El, ScrollSpec, TextEdit, Tx};
+use rune::{col, row, El, ScrollSpec, TextEdit, Tx};
 use rune_kit::{
     Badge, BadgeVariant, Button, ButtonVariant, Card, ControlSize, Kit, ScrollBar, TextInput,
 };

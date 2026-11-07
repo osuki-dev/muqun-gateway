@@ -12,6 +12,9 @@
 //! streaming (a loose list restarts per segment; a reference link defined
 //! later resolves late). The finished part is parsed again as a whole.
 
+// Covered by unit tests; timeline UI wiring lands next.
+#![allow(dead_code)]
+
 use std::time::{Duration, Instant};
 
 /// At most this often the tail is replaced: 30 Hz.

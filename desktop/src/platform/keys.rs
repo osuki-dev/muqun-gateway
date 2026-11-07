@@ -7,9 +7,11 @@
 
 /// The shortcuts the window answers to (`ui/mod.rs` `on_key`). The whole
 /// table is the contract; a view names its entry when it shows the hint.
+#[allow(dead_code)]
 pub const SEARCH: &str = "Primary+K";
 #[allow(dead_code)]
 pub const NEW_SESSION: &str = "Primary+N";
+#[allow(dead_code)]
 pub const SETTINGS: &str = "Primary+,";
 #[allow(dead_code)]
 pub const STOP: &str = "Primary+.";

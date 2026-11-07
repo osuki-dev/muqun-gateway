@@ -8,6 +8,9 @@
 //! `WaitingApproval`, and the summary bar appears only once the turn is
 //! `Done` or `Failed`.
 
+// Covered by unit tests; timeline UI wiring lands next.
+#![allow(dead_code)]
+
 use std::ops::Range;
 use std::sync::Arc;
 
