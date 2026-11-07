@@ -2486,6 +2486,47 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn a_joined_shared_thread_keeps_native_control_and_links_its_herdr_pane() {
+        const HELD: &str = "00000000-0000-4000-8000-000000000041";
+        const OTHER: &str = "00000000-0000-4000-8000-000000000042";
+        let herdr = crate::test_support::FakeHerdr::start(vec![], None);
+        herdr.set_agents(json!([{"pane_id":"w1:p1","terminal_id":"fixture-terminal","agent":"codex","agent_status":"idle","agent_session":{"kind":"id","agent":"codex","value":HELD}}]));
+        let fixture = Fixture::new(|request| {
+            let id = request["params"]["threadId"].as_str().unwrap_or(HELD);
+            let thread = json!({"id":id,"historyMode":"paginated","status":{"type":"idle"}});
+            match request["method"].as_str().unwrap() {
+                "thread/read" | "thread/resume" => json!({"thread":thread}),
+                "thread/items/list" | "thread/turns/list" => json!({"data":[],"nextCursor":null}),
+                other => panic!("unexpected RPC {other}"),
+            }
+        })
+        .await;
+        let mut driver = CodexDriver::new(fixture.client.clone());
+        driver.observe_terminals(Some(crate::agents::terminal_runtime::TerminalRuntime::new(
+            &[herdr.session()],
+        )));
+        for (id, linked_pane) in [(HELD, Some("w1:p1")), (OTHER, None)] {
+            driver.get_timeline(id, 10).await.unwrap();
+            assert!(fixture.client.is_subscribed(id));
+            for fresh in [true, false] {
+                let runtime = driver.runtime(id, fresh).await.unwrap();
+                assert_eq!(
+                    runtime.interaction,
+                    crate::agents::domain::RuntimeInteraction::Native
+                );
+                assert_eq!(runtime.source, RuntimeSource::Native);
+                assert_eq!(
+                    runtime.terminal.as_ref().map(|t| t.pane_id.as_str()),
+                    linked_pane
+                );
+            }
+            // The event pump reads the cache the fresh read above filled.
+            let cached = driver.cached_runtime(id).await.unwrap();
+            assert_eq!(cached.terminal.is_some(), linked_pane.is_some());
+        }
+    }
+
+    #[tokio::test]
     async fn shared_rejoin_initial_status_replaces_unknown_and_completion_wins() {
         use crate::agents::domain::{AgentDomainEvent, AgentSessionId, AgentSessionStatus};
         use crate::agents::manager::AgentManager;

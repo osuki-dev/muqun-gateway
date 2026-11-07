@@ -2,6 +2,20 @@
 
 ## Changes and fixes
 
+- **Large videos can be uploaded in chunks, up to 1 GiB, without the Gateway
+  buffering the file.** `POST /api/uploads` reads its whole body into memory
+  (and a sealed body cannot be streamed), which is why it stops at 64 MiB.
+  The new `POST /api/uploads/chunked` opens an upload, `PUT
+  /api/uploads/chunked/{uploadId}/{index}` sends it in 8 MiB chunks that are
+  appended to a partial file on disk, and `POST …/complete` sniffs the finished
+  file with the same rules and answers with the same `{path, url, name, size,
+  mime}`; `DELETE …/{uploadId}` aborts. Memory per request is one chunk.
+  Uploads belong to the device that opened them, a device may have two open,
+  and abandoned partials are removed after 30 minutes. Discovery adds
+  `uploads.chunked` (`chunkBytes`, `maxBytes`, `maxVideoBytes`,
+  `maxConcurrentPerDevice`); the existing `uploads` fields and
+  `POST /api/uploads` are unchanged, so older Apps behave as before.
+
 - **The App's "Auto-approve supported requests" switch now answers an ACP
   agent's file, search and fetch permissions, and T3's file changes.** The
   App auto-approves only requests whose `action` is one of the OpenCode

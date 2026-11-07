@@ -1,7 +1,8 @@
 //! Platform infrastructure domain: discovery, git porcelain, i18n, service management, and state locks.
 
-pub(crate) mod assets;
-pub(crate) mod config;
+pub mod assets;
+pub(crate) mod chunked_uploads;
+pub mod config;
 pub mod discovery;
 pub(crate) mod file_ranges;
 pub(crate) mod git;

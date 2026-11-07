@@ -349,6 +349,13 @@ pub(crate) fn safe_upload_component(raw: &str) -> Option<String> {
 /// gateway earned from the content at upload time, never took from the client
 /// -- picks the flavour.
 pub(crate) fn sniff_stored_upload(path: &FsPath, stored_name: &str) -> Option<UploadKind> {
+    sniff_upload_file(path, stored_name)
+}
+
+/// [`sniff_stored_upload`] with the display name the extension flavour of a
+/// text file is read from: a stored upload passes its generated name, a
+/// chunked upload that is still being finished passes the client's.
+pub(crate) fn sniff_upload_file(path: &FsPath, name: &str) -> Option<UploadKind> {
     let head = read_asset_head(path);
     if head.is_empty() {
         return None;
@@ -370,7 +377,7 @@ pub(crate) fn sniff_stored_upload(path: &FsPath, stored_name: &str) -> Option<Up
             return Some(kind);
         }
     }
-    sniff_document_upload_kind(&head, stored_name)
+    sniff_document_upload_kind(&head, name)
 }
 
 /// The body limit is enforced by the framework while the body streams, so an
@@ -785,12 +792,14 @@ pub(crate) fn write_upload_file(path: &FsPath, bytes: &[u8]) -> anyhow::Result<(
     }
 }
 
-/// Sweep old uploads at startup and every hour after that. A phone that
+/// Sweep old uploads at startup and every hour after that, and the chunked
+/// uploads nobody finished with them. A phone that
 /// uploads a screenshot and loses interest should not leave it on the host.
 pub(crate) fn spawn_upload_gc() {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(UPLOAD_GC_INTERVAL);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut startup = true;
         loop {
             // The first tick completes immediately, which is the startup sweep.
             ticker.tick().await;
@@ -800,6 +809,8 @@ pub(crate) fn spawn_upload_gc() {
             if let Err(err) = purge_expired_uploads(&dir, SystemTime::now()) {
                 tracing::warn!("failed to sweep old uploads: {err:#}");
             }
+            super::chunked_uploads::sweep(&dir, startup);
+            startup = false;
         }
     });
 }
@@ -843,7 +854,7 @@ pub(crate) fn upload_expired(modified: SystemTime, now: SystemTime) -> bool {
 
 /// The two upload routes: accepting a file, and reading one back.
 pub(crate) fn mount(router: Router<AppState>) -> Router<AppState> {
-    router
+    let router = router
         // A route-level limit is applied inside the router-wide one, so uploads
         // get their own ceiling while every JSON route keeps the small one.
         .route(
@@ -853,7 +864,8 @@ pub(crate) fn mount(router: Router<AppState>) -> Router<AppState> {
         // Reading one back. The app needs this to draw the user's own
         // attachment in the transcript: the timeline item carries the host
         // path, which a phone cannot open.
-        .route("/api/uploads/{file_name}", get(upload_content))
+        .route("/api/uploads/{file_name}", get(upload_content));
+    super::chunked_uploads::mount(router)
 }
 
 #[cfg(test)]
