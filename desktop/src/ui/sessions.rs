@@ -6,13 +6,14 @@ use std::path::PathBuf;
 use muqun_gateway::agents::{AgentProject, AgentSessionId, AgentSessionStatus};
 use rune::El;
 use rune::{el, TextEdit, Tx};
-use rune_kit::glyphs::{CHECK, FOLDER, FOLDER_OPEN, KEYBOARD, SEARCH, SPARKLE, TRIANGLE_DOWN};
+use rune_kit::glyphs::{FOLDER, FOLDER_OPEN, SEARCH, TRIANGLE_DOWN};
 use rune_kit::shell::{RowStatus, Sidebar, SidebarRow};
 use rune_kit::{
     Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, Kit, Menu, MenuItem,
     TextInput,
 };
 
+use super::icons::{HOME, INBOX, SETTINGS, TASK};
 use super::{title_of, Mode, OpenMenu, UiState};
 use crate::config::ConfigEdit;
 use crate::model::commands::Command;
@@ -378,35 +379,7 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
                 .on_edit(|s: &mut UiState| &mut s.search)
                 .build(k)
                 .key("search"),
-        )
-        .child(nav(
-            s,
-            k,
-            super::copy::tr_ref(language, "Home", "首页"),
-            &SPARKLE,
-            Mode::Home,
-        ))
-        .child(nav(
-            s,
-            k,
-            super::copy::tr_ref(language, "Inbox", "收件箱"),
-            &CHECK,
-            Mode::Inbox,
-        ))
-        .child(nav(
-            s,
-            k,
-            super::copy::tr_ref(language, "Tasks", "任务"),
-            &KEYBOARD,
-            Mode::Tasks,
-        ))
-        .child(nav(
-            s,
-            k,
-            super::copy::tr_ref(language, "Settings", "设置"),
-            &FOLDER,
-            Mode::Settings,
-        ));
+        );
     if s.sessions.is_empty() {
         sidebar = sidebar.child(
             rune::text(super::copy::tr_ref(
@@ -425,6 +398,34 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         sidebar = sidebar.child(row);
     }
     sidebar
+        .footer(nav(
+            s,
+            k,
+            super::copy::tr_ref(language, "Home", "首页"),
+            &HOME,
+            Mode::Home,
+        ))
+        .footer(nav(
+            s,
+            k,
+            super::copy::tr_ref(language, "Inbox", "收件箱"),
+            &INBOX,
+            Mode::Inbox,
+        ))
+        .footer(nav(
+            s,
+            k,
+            super::copy::tr_ref(language, "Tasks", "任务"),
+            &TASK,
+            Mode::Tasks,
+        ))
+        .footer(nav(
+            s,
+            k,
+            super::copy::tr_ref(language, "Settings", "设置"),
+            &SETTINGS,
+            Mode::Settings,
+        ))
         .footer(
             Button::new(super::copy::tr_ref(language, "Refresh", "刷新"))
                 .control_size(ControlSize::Large)

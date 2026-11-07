@@ -10,6 +10,7 @@ mod art;
 mod composer;
 mod copy;
 mod home;
+mod icons;
 mod inbox;
 mod inspector;
 mod labels;

@@ -7,6 +7,11 @@
   entrance plays; the shell reveals once discovery is ready (or after a short
   timeout), so the first frame after the fade is usable instead of empty.
 
+- **Sidebar Home / Inbox / Tasks / Settings sit at the bottom again, with the
+  App glyph set.** The nav block was floating above the session tree with
+  mismatched kit placeholders; it now pins under the tree and uses the synced
+  `home` / `inbox` / `task` / `settings` icons.
+
 - **Large videos can be uploaded in chunks, up to 1 GiB, without the Gateway
   buffering the file.** `POST /api/uploads` reads its whole body into memory
   (and a sealed body cannot be streamed), which is why it stops at 64 MiB.
