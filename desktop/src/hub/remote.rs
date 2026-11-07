@@ -457,6 +457,18 @@ impl SessionHub for RemoteHub {
         Box::pin(async move { self.read_snapshot(asid).await })
     }
 
+    fn account_limits<'a>(&'a self, agent: &'a str) -> HubFuture<'a, Value> {
+        Box::pin(async move {
+            self.call(
+                Method::GET,
+                &["api", "agents", agent, "account-limits"],
+                &[],
+                None,
+            )
+            .await
+        })
+    }
+
     fn earlier<'a>(&'a self, asid: &'a AgentSessionId) -> HubFuture<'a, Vec<TimelineItem>> {
         Box::pin(async move {
             let cursor = self.cursors.lock().unwrap().get(&asid.0).cloned();
@@ -1197,6 +1209,50 @@ impl SessionHub for RemoteHub {
                 .call(Method::GET, &["api", "tasks", "defaults"], &[], None)
                 .await?;
             decode(json)
+        })
+    }
+
+    fn terminal<'a>(&'a self, call: super::TerminalCall<'a>) -> HubFuture<'a, Value> {
+        use super::TerminalCall as T;
+        Box::pin(async move {
+            match call {
+                T::Sessions => {
+                    self.call(Method::GET, &["api", "sessions"], &[], None)
+                        .await
+                }
+                T::Snapshot { session } => {
+                    let path = ["api", "sessions", session, "snapshot"];
+                    self.call(Method::GET, &path, &[], None).await
+                }
+                T::Screen {
+                    session,
+                    pane,
+                    lines,
+                } => {
+                    let path = ["api", "sessions", session, "panes", pane, "output"];
+                    let lines = lines.to_string();
+                    let query = [("source", "visible"), ("format", "ansi"), ("lines", &lines)];
+                    self.call(Method::GET, &path, &query, None).await
+                }
+                T::SendText {
+                    session,
+                    pane,
+                    text,
+                } => {
+                    let path = ["api", "sessions", session, "panes", pane, "send-text"];
+                    let body = serde_json::json!({ "text": text });
+                    self.call(Method::POST, &path, &[], Some(body)).await
+                }
+                T::SendKeys {
+                    session,
+                    pane,
+                    keys,
+                } => {
+                    let path = ["api", "sessions", session, "panes", pane, "send-keys"];
+                    let body = serde_json::json!({ "keys": keys });
+                    self.call(Method::POST, &path, &[], Some(body)).await
+                }
+            }
         })
     }
 

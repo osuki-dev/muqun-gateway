@@ -260,6 +260,26 @@ impl Core {
                 *self.active.lock().unwrap() = Some(asid.clone());
                 self.open(&asid).await;
             }
+            Command::ReadDetail(asid) => {
+                let read = match self.hub.peek(&asid).await {
+                    Ok(Some(snapshot)) => Ok(snapshot),
+                    _ => self.hub.snapshot(&asid).await,
+                };
+                self.inbox.push(Update::Detail {
+                    asid: asid.0,
+                    result: read.map(Box::new).map_err(|err| err.to_string()),
+                });
+            }
+            Command::LoadAccountLimits { agent } => {
+                let limits = match self.hub.account_limits(&agent).await {
+                    Ok(limits) => Some(limits),
+                    Err(err) => {
+                        tracing::debug!(%agent, %err, "account limits unavailable");
+                        None
+                    }
+                };
+                self.inbox.push(Update::AccountLimits { agent, limits });
+            }
             Command::OpenTile(asid) => {
                 {
                     let mut watched = self.watched.lock().unwrap();
@@ -305,6 +325,7 @@ impl Core {
             Command::LoadEarlier(asid) => match self.hub.earlier(&asid).await {
                 Ok(items) => {
                     let exhausted = items.is_empty();
+                    tracing::debug!(asid = %asid.0, rows = items.len(), "older history page");
                     self.inbox.push(Update::Earlier {
                         asid: asid.0,
                         items,
@@ -512,6 +533,9 @@ impl Core {
                 if let Ok(report) = cleared {
                     self.inbox.push(Update::Storage(report));
                 }
+            }
+            Command::Terminals(command) => {
+                super::terminals::run(self.hub.clone(), self.inbox.clone(), command).await
             }
             Command::CreateTask { goal, agent, cwd } => {
                 let goal = goal.trim().to_string();

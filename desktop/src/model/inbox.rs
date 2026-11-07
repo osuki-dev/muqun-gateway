@@ -104,6 +104,18 @@ pub enum Update {
         entries: Vec<DirectoryEntry>,
     },
     Ui(UiAction),
+    /// A read-only snapshot for a detail sheet (`Command::ReadDetail`), or
+    /// why it could not be read.
+    Detail {
+        asid: String,
+        result: Result<Box<AgentSessionSnapshot>, String>,
+    },
+    /// An agent's account rate windows as the gateway words them (`None`:
+    /// the agent has none to show).
+    AccountLimits {
+        agent: String,
+        limits: Option<serde_json::Value>,
+    },
     /// An older page of a session's history, oldest first. `exhausted`:
     /// the agent has nothing older.
     Earlier {
@@ -151,6 +163,8 @@ pub enum Update {
     /// A session wants the owner, or finished (`model/notify.rs`): the UI
     /// raises a system notification unless that session is on screen.
     Attention(super::notify::Attention),
+    /// The Terminals page's list, a pane's screen, or a failure.
+    Terminals(Box<super::terminals::TerminalUpdate>),
 }
 
 impl Update {

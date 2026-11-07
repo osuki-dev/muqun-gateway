@@ -12,6 +12,7 @@ pub mod projection;
 pub mod projects;
 pub mod storage;
 pub mod stream;
+pub mod terminals;
 pub mod tool_view;
 pub mod turn;
 pub mod types;

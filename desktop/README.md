@@ -67,6 +67,11 @@ launch is its own (`src/platform/instance.rs`).
   and switches model, effort, mode and branch. Queued prompts wait above it.
 * **Inspector** — the open session's queue, git and worktrees, subagents, saved permissions and
   background shells. The working-tree diff, with staged revert.
+* **Terminals** — the Herdr (and tmux) workspaces of the gateway this desktop is attached to:
+  every tab and pane with its agent and status, a live view of a pane's screen (colours follow
+  the theme), a key row (Esc, Tab, arrows, Ctrl+C, Backspace, Enter) and a field that types into
+  the pane, as the App's terminal workspace does. It never focuses, closes or rearranges a pane.
+  Needs the gateway service (the in-process hub has no terminal plane).
 * **Inbox** — every waiting approval and question across sessions. **Tasks** — delegated tasks,
   new ones, cancel and complete.
 * **File viewer** — highlighted text and code with line numbers, rendered Markdown (source a

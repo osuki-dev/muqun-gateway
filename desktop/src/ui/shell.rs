@@ -31,6 +31,7 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
         Mode::Session => session(s, k, &look, layer),
         Mode::Inbox => inbox::view(s, k),
         Mode::Tasks => tasks::view(s, k),
+        Mode::Terminals => super::terminals::view(s, k),
         Mode::Settings => settings::view(s, k),
     };
     let mut main = col().key("main").w_full().h_full().min_h(0.0);
@@ -116,6 +117,7 @@ fn page_title(s: &UiState) -> String {
         Mode::Home => tr(language, "New session", "新建会话"),
         Mode::Inbox => tr(language, "Inbox", "收件箱"),
         Mode::Tasks => tr(language, "Tasks", "任务"),
+        Mode::Terminals => tr(language, "Terminals", "终端"),
         Mode::Settings => tr(language, "Settings", "设置"),
         Mode::Session => s
             .current()
@@ -306,6 +308,9 @@ fn toolbar(s: &UiState, k: &Kit, look: &Look, layer: &mut Vec<El>) -> Toolbar {
             bar = bar.leading(session_identity(s, k, look));
             let asid = s.selected.clone().unwrap_or_default();
             let busy = s.busy();
+            if let Some(meter) = timeline::context_meter(s, k, &asid) {
+                bar = bar.trailing(meter);
+            }
             if s.diff_stat.files > 0 {
                 let label = format!("+{} −{}", s.diff_stat.added, s.diff_stat.removed);
                 bar = bar.trailing(

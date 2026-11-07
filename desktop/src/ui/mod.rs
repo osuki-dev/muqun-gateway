@@ -22,6 +22,7 @@ mod settings;
 mod shell;
 mod splash;
 mod tasks;
+mod terminals;
 mod tiles;
 mod timeline;
 mod viewer;
@@ -65,6 +66,7 @@ pub enum Mode {
     Session,
     Inbox,
     Tasks,
+    Terminals,
     Settings,
 }
 
@@ -203,6 +205,12 @@ pub struct UiState {
     pub timelines: HashMap<String, timeline::SessionTimeline>,
     /// A timeline picture opened full size (`timeline::overlay`).
     pub zoom: Option<PathBuf>,
+    /// A subagent's session shown read-only over its parent (`timeline::overlay`).
+    pub detail: Option<timeline::DetailSheet>,
+    /// The session whose context sheet is open (`timeline::context_meter`).
+    pub context_open: Option<String>,
+    /// Account rate windows by agent, once asked for (`None`: it has none).
+    pub account_limits: HashMap<String, Option<serde_json::Value>>,
     pub status: String,
     pub hub_label: String,
     pub error: Option<UiError>,
@@ -289,6 +297,8 @@ pub struct UiState {
     pub demo: bool,
     /// What the desktop keeps on disk (Settings → Storage), once scanned.
     pub storage: Option<crate::model::storage::StorageReport>,
+    /// The Terminals page (`ui/terminals.rs`).
+    pub terms: terminals::TermState,
     /// The file viewer overlay ([`UiState::open_file`]).
     pub viewer: Option<viewer::Viewer>,
     /// Sessions open side by side (empty when one session fills the pane).
@@ -347,6 +357,9 @@ impl UiState {
             selected: None,
             timelines: HashMap::new(),
             zoom: None,
+            detail: None,
+            context_open: None,
+            account_limits: HashMap::new(),
             status: "Starting…".into(),
             hub_label: String::new(),
             error: None,
@@ -410,6 +423,7 @@ impl UiState {
             demo: false,
             storage: None,
             viewer: None,
+            terms: terminals::TermState::default(),
             tiles: Vec::new(),
             focus: 0,
             tile_split: cfg.ui.tile_split(),
@@ -585,6 +599,7 @@ impl UiState {
         self.mode = mode;
         match mode {
             Mode::Tasks => self.send(Command::RefreshTasks),
+            Mode::Terminals => self.watch_terminals(),
             Mode::Home => {
                 self.send(Command::LoadProjects {
                     agent: self.start_agent.clone(),
@@ -1037,6 +1052,10 @@ impl UiState {
                     }
                 }
                 Update::Ui(action) => self.on_action(action),
+                Update::Detail { asid, result } => self.on_detail(asid, result),
+                Update::AccountLimits { agent, limits } => {
+                    self.account_limits.insert(agent, limits);
+                }
                 Update::Earlier {
                     asid,
                     items,
@@ -1092,6 +1111,7 @@ impl UiState {
                 Update::Worktrees(rows) => self.worktrees = rows,
                 Update::HubMode(mode) => self.hub_label = mode.to_string(),
                 Update::Attention(attention) => self.on_attention(&attention),
+                Update::Terminals(update) => self.on_terminals(*update),
             }
         }
         if LAYOUT_DIRTY.swap(false, Ordering::AcqRel) {
@@ -1763,6 +1783,7 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>) -> El {
             layer.push(stage);
         }
     }
+    terminals::page_visible(s.mode);
     viewer::mount(s, &k, cx.env().scale, &mut layer);
     if !s.toasts.is_empty() {
         let mut region = ToastRegion::new();
