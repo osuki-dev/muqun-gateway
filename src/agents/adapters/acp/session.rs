@@ -716,6 +716,17 @@ fn protocol(message: &str) -> AgentError {
     AgentError::Protocol(message.into())
 }
 
+/// Host paths from a prepared prompt's inbox file entries (`file://…`).
+fn attachment_paths(files: &[Value]) -> Option<Vec<String>> {
+    let paths: Vec<String> = files
+        .iter()
+        .filter_map(|file| file.get("uri").and_then(Value::as_str))
+        .map(|uri| uri.strip_prefix("file://").unwrap_or(uri).to_owned())
+        .filter(|path| !path.is_empty())
+        .collect();
+    (!paths.is_empty()).then_some(paths)
+}
+
 pub(crate) async fn read_metadata_output(
     binary: &str,
     arguments: &[&str],
@@ -3695,7 +3706,10 @@ impl<P: AcpProvider> AcpDriver<P> {
                         },
                     );
                 }
-                let row = state.projection.submitted(&prepared.transcript);
+                let attachments = attachment_paths(&prepared.files);
+                let row = state
+                    .projection
+                    .submitted(&prepared.transcript, attachments);
                 let event = mirror
                     .record_timeline_upsert(&state.info.asid, vec![row])
                     .await;
@@ -3751,7 +3765,8 @@ impl<P: AcpProvider> AcpDriver<P> {
                 let mut state = session.state.lock().await;
                 state.hidden_command = false;
                 state.last_activity = tokio::time::Instant::now();
-                let row = state.projection.steered(&prepared.transcript);
+                let attachments = attachment_paths(&prepared.files);
+                let row = state.projection.steered(&prepared.transcript, attachments);
                 let event = self
                     .mirror
                     .record_timeline_upsert(&state.info.asid, vec![row])

@@ -216,6 +216,62 @@ pub fn enrich_timeline(asid: &str, directory: Option<&str>, items: &mut [Timelin
         return;
     };
     images.attach(&root, items);
+    // Codex (and others) put user photos in `attachments` with `[Image #N]` in
+    // the text — the HTTP path runs originals::attach; Desktop only has this.
+    attach_local_attachments(&root, items);
+}
+
+/// Resolve bare `attachments` paths into `image_assets` for in-process clients.
+fn attach_local_attachments(root: &Path, items: &mut [TimelineItem]) {
+    for item in items {
+        let Some(sources) = item.attachments.clone() else {
+            continue;
+        };
+        let assets = item.image_assets.get_or_insert_with(Vec::new);
+        for src in sources {
+            if assets
+                .iter()
+                .any(|a| a.src == src || a.url == src || a.src.ends_with(&src))
+            {
+                continue;
+            }
+            let Some((path, _)) = hosted_file(&src, root).or_else(|| {
+                let raw = src.strip_prefix("file://").unwrap_or(&src);
+                let path = Path::new(raw);
+                path.is_absolute()
+                    .then(|| std::fs::canonicalize(path).ok())
+                    .flatten()
+                    .filter(|p| p.is_file())
+                    .map(|p| (p, root.to_path_buf()))
+            }) else {
+                continue;
+            };
+            let head = read_asset_head(&path);
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| src.clone());
+            let kind = sniff_asset_type(&head, &name);
+            if kind.kind != AssetKind::Image {
+                continue;
+            }
+            let (width, height) = image_dimensions(&head).unzip();
+            assets.push(MessageImageAsset {
+                src: src.clone(),
+                asset_id: String::new(),
+                url: path.to_string_lossy().into_owned(),
+                mime: kind.mime.to_owned(),
+                width,
+                height,
+                thumbnail_url: None,
+                preview_url: None,
+                download_url: None,
+                version_url: None,
+                size: std::fs::metadata(&path).ok().map(|m| m.len()),
+                unavailable_reason: None,
+            });
+        }
+    }
 }
 
 /// Resolve a media `src` (markdown destination, attachment path, or gateway

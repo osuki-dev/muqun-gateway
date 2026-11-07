@@ -168,6 +168,29 @@ pub fn split_attachment_paths(text: &str) -> (&str, Vec<&str>) {
     (body, paths)
 }
 
+/// Drop Codex/Cursor-style `[Image #N]` labels that agents put in front of
+/// the user's typed prose when photos were attached.
+pub fn strip_image_labels(text: &str) -> &str {
+    let mut rest = text.trim_start();
+    while let Some(after) = rest.strip_prefix("[Image #") {
+        let Some((number, suffix)) = after.split_once(']') else {
+            break;
+        };
+        if number.is_empty() || !number.bytes().all(|byte| byte.is_ascii_digit()) {
+            break;
+        }
+        rest = suffix.trim_start();
+    }
+    rest
+}
+
+/// Prose used to reconcile a live user echo with the Gateway's submitted
+/// transcript: attachment path blocks and `[Image #N]` labels are ignored.
+pub fn prompt_display_body(text: &str) -> &str {
+    let (body, _) = split_attachment_paths(text);
+    strip_image_labels(body).trim_end()
+}
+
 pub trait AgentPort: Send + Sync {
     /// Agent identifier (e.g. "opencode", "claude")
     fn kind(&self) -> &'static str;

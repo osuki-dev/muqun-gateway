@@ -39,12 +39,7 @@ sha2 = "0.11.1"
 hex = "0.4"
 # Native file / folder dialogs (`platform/dialogs.rs`).
 rfd = "0.17.2"
-# Pasting an image into the composer (`platform/clipboard.rs`).
-arboard = { version = "3", default-features = false, features = ["image-data"] }
 
-# Without this feature arboard talks X11 only and loses copies on Wayland.
-[target.'cfg(target_os = "linux")'.dependencies]
-arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }
 
 [dev-dependencies]
 tokio = { version = "1.53.3", features = ["test-util"] }

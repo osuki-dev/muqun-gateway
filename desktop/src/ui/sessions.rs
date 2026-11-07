@@ -8,10 +8,7 @@ use rune::El;
 use rune::{el, TextEdit, Tx};
 use rune_kit::glyphs::{FOLDER, FOLDER_OPEN, SEARCH, TRIANGLE_DOWN};
 use rune_kit::shell::{RowStatus, Sidebar, SidebarRow};
-use rune_kit::{
-    Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, Kit, Menu, MenuItem,
-    TextInput,
-};
+use rune_kit::{ControlSize, IconButton, IconButtonVariant, Kit, Menu, MenuItem, TextInput};
 
 use super::icons::{INBOX, SETTINGS, TASK};
 use super::{title_of, Mode, OpenMenu, UiState};
@@ -419,17 +416,5 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
             &SETTINGS,
             Mode::Settings,
         ))
-        .footer(
-            Button::new(super::copy::tr_ref(language, "Refresh", "刷新"))
-                .control_size(ControlSize::Large)
-                .variant(ButtonVariant::Outline)
-                .on_press(|s: &mut UiState| {
-                    s.status = "Refreshing…".into();
-                    s.send(Command::Refresh);
-                })
-                .build(k)
-                .key("refresh")
-                .w_full(),
-        )
         .build(k)
 }

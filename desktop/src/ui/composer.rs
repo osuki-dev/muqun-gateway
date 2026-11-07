@@ -1268,19 +1268,6 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
                 })
                 .build(k)
                 .key("attach"),
-        )
-        .child(
-            Button::new("Paste image")
-                .variant(ButtonVariant::Ghost)
-                .control_size(ControlSize::Large)
-                .on_press(
-                    |s: &mut UiState| match crate::platform::clipboard::read_image_png() {
-                        Some(png) => stage_png(s, png),
-                        None => s.toast("Clipboard has no image", None),
-                    },
-                )
-                .build(k)
-                .key("paste-image"),
         );
     if busy {
         if let Some(asid) = s.selected.clone() {

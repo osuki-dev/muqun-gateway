@@ -29,41 +29,51 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
         main = main.child(alert);
     }
     let main = main.child(page.grow(1.0).min_h(0.0));
+    // Home is full-bleed artwork; a toolbar strip would sit as a white band
+    // over the hero. Settings / hub live in the sidebar footer there.
     let mut split = SplitView::new(main)
         .sidebar(&s.sidebar, super::sidebar_pane, sessions::view(s, k, layer))
-        .sidebar_leading(home_brand(s, k))
-        .toolbar(toolbar(s, k));
+        .sidebar_leading(home_brand(s, k));
+    if s.mode != Mode::Home {
+        split = split.toolbar(toolbar(s, k));
+    }
     if s.right_open && s.mode == Mode::Session {
         split = split.inspector(&s.right, super::right_pane, inspector::view(s, k));
     }
-    split
+    let mut split = split
         .titlebar_inset(cx.titlebar_inset())
         .frame_inset(8.0)
-        .toolbar_in_panel()
-        .sidebar_toggle(SidebarToggle::new().size(ControlSize::Large).in_header())
-        .build(k)
+        .sidebar_toggle(SidebarToggle::new().size(ControlSize::Large).in_header());
+    if s.mode != Mode::Home {
+        split = split.toolbar_in_panel();
+    }
+    split.build(k)
 }
 
 /// Mark + name in the sidebar title bar; press returns to Home.
 fn home_brand(s: &UiState, k: &Kit) -> El {
     let language = s.cfg.general.language;
+    // Keep a fixed cross-size: the titlebar row stretches children to its full
+    // height, and a stretched text run top-aligns while the mark stays centred.
+    const MARK: f32 = 20.0;
     let mark = match s.images.as_ref() {
-        Some(images) => art::picture(images, Arc::<[u8]>::from(APP_MARK_PNG), SurfaceFit::Fit)
+        Some(images) => art::picture(images, Arc::<[u8]>::from(APP_MARK_PNG), SurfaceFit::Fill)
             .key("home-mark")
-            .w(22.0)
-            .h(22.0)
+            .w(MARK)
+            .h(MARK)
             .radius(5.0)
             .clip_rounded(5.0),
         None => el()
             .key("home-mark")
-            .w(22.0)
-            .h(22.0)
+            .w(MARK)
+            .h(MARK)
             .radius(5.0)
             .fill(k.c.bg_accent),
     };
     row()
         .key("home-brand")
         .gap(8.0)
+        .h(MARK)
         .center_y()
         .role("button")
         .label(tr_ref(language, "Home", "首页"))
@@ -71,7 +81,7 @@ fn home_brand(s: &UiState, k: &Kit) -> El {
         .child(
             text(APP_NAME)
                 .key("home-name")
-                .font(k.ty.ui_medium)
+                .font(k.ty.ui_medium.lh(MARK))
                 .color(k.c.text_base),
         )
         .on_press(|s: &mut UiState| s.go(Mode::Home))

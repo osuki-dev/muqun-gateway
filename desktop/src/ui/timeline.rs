@@ -1,10 +1,15 @@
 //! The session timeline: one block per [`TimelineItem`], by [`AgentPart`].
 
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use muqun_gateway::agents::message_images::resolve_host_media;
+use muqun_gateway::agents::ports::agent::{prompt_display_body, split_attachment_paths};
 use muqun_gateway::agents::{
     AgentPart, AgentSessionId, FormField, FormRequest, PermissionDecision, PermissionRequest,
     TimelineItem, TimelineRole, ToolCall, ToolCallStatus,
 };
-use rune::{col, row, text, El, ScrollSpec, TextEdit};
+use rune::{col, el, row, text, El, ImageCache, ScrollSpec, SurfaceFit, TextEdit};
 use rune_kit::diff::{DiffState, DiffView};
 use rune_kit::{
     Badge, BadgeVariant, Button, ButtonVariant, Card, Collapsible, ControlSize, Kit, Markdown,
@@ -12,11 +17,13 @@ use rune_kit::{
 };
 use serde_json::{json, Value};
 
-use super::{muted, UiState};
+use super::{art, muted, UiState};
 use crate::model::commands::Command;
 
 const OUTPUT_CHARS: usize = 600;
 const SUMMARY_CHARS: usize = 240;
+const TIMELINE_IMG_W: f32 = 320.0;
+const TIMELINE_IMG_H: f32 = 240.0;
 
 thread_local! {
     static EMPTY: &'static DiffState = Box::leak(Box::new(DiffState::default()));
@@ -79,19 +86,31 @@ fn tool_input(call: &ToolCall) -> String {
     let pick = [
         "command",
         "cmd",
+        "CommandLine",
         "file_path",
         "filePath",
+        "TargetFile",
         "path",
         "pattern",
         "query",
         "url",
+        "uri",
     ];
-    if let Some(obj) = call.input.as_object() {
+    let root = call
+        .input
+        .get("arguments")
+        .and_then(Value::as_object)
+        .or_else(|| call.input.as_object());
+    if let Some(obj) = root {
         if let Some(v) = pick
             .iter()
             .find_map(|k| obj.get(*k).and_then(Value::as_str))
         {
             return clip(v, SUMMARY_CHARS);
+        }
+        // MCP / structured tools: show a compact JSON of the args we have.
+        if !obj.is_empty() {
+            return clip(&Value::Object(obj.clone()).to_string(), SUMMARY_CHARS);
         }
     }
     match &call.input {
@@ -116,6 +135,176 @@ fn rich(k: &Kit, id: &str, body: &str) -> El {
     } else {
         Markdown::new(body).build(k).key(format!("md-{id}"))
     }
+}
+
+/// Drop Codex-style `[Image #N]` tokens once the real pictures are shown.
+fn strip_image_placeholders(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find("[Image #") {
+        out.push_str(&rest[..at]);
+        let after = &rest[at + "[Image #".len()..];
+        match after.find(']') {
+            Some(end) => {
+                rest = after[end + 1..].trim_start();
+            }
+            None => {
+                out.push_str(&rest[at..at + 1]);
+                rest = &rest[at + 1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out.trim().to_string()
+}
+
+fn image_ext(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .as_deref(),
+        Some("png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "tif" | "tiff")
+    )
+}
+
+fn session_directory(s: &UiState) -> Option<&str> {
+    s.current().and_then(|i| i.directory.as_deref())
+}
+
+fn push_resolved(out: &mut Vec<PathBuf>, src: &str, directory: Option<&str>) {
+    let Some(path) = resolve_host_media(src, directory) else {
+        return;
+    };
+    if !image_ext(&path) && !path.is_file() {
+        return;
+    }
+    if path.is_file() && !out.iter().any(|p| p == &path) {
+        out.push(path);
+    }
+}
+
+fn item_image_paths(s: &UiState, item: &TimelineItem) -> Vec<PathBuf> {
+    let directory = session_directory(s);
+    let mut paths = Vec::new();
+    if let Some(assets) = &item.image_assets {
+        for asset in assets {
+            if asset.unavailable_reason.is_some() {
+                continue;
+            }
+            if !asset.mime.is_empty()
+                && !asset.mime.starts_with("image/")
+                && asset.mime != "application/octet-stream"
+            {
+                continue;
+            }
+            for src in [
+                asset.thumbnail_url.as_deref(),
+                asset.preview_url.as_deref(),
+                (!asset.url.is_empty()).then_some(asset.url.as_str()),
+                (!asset.src.is_empty()).then_some(asset.src.as_str()),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                push_resolved(&mut paths, src, directory);
+                if paths.len() >= 8 {
+                    return paths;
+                }
+            }
+        }
+    }
+    if let Some(attachments) = &item.attachments {
+        for src in attachments {
+            push_resolved(&mut paths, src, directory);
+            if paths.len() >= 8 {
+                return paths;
+            }
+        }
+    }
+    // Composer/ACP transcripts list uploads under the host-files marker.
+    if let AgentPart::Text { text } = &item.part {
+        let (_, embedded) = split_attachment_paths(text);
+        for src in embedded {
+            push_resolved(&mut paths, src, directory);
+            if paths.len() >= 8 {
+                break;
+            }
+        }
+    }
+    paths
+}
+
+fn tool_image_paths(s: &UiState, call: &ToolCall) -> Vec<PathBuf> {
+    let directory = session_directory(s);
+    let mut paths = Vec::new();
+    let Some(Value::Array(content)) = &call.content else {
+        return paths;
+    };
+    for part in content {
+        // ACP nests media under `content`; Codex/OpenCode use top-level uri.
+        let media = part
+            .get("content")
+            .filter(|inner| inner.is_object())
+            .unwrap_or(part);
+        let uri = media
+            .get("uri")
+            .and_then(Value::as_str)
+            .or_else(|| media.get("url").and_then(Value::as_str))
+            .or_else(|| media.get("path").and_then(Value::as_str));
+        let Some(uri) = uri else {
+            continue;
+        };
+        let is_image = media
+            .get("mime")
+            .or_else(|| media.get("mimeType"))
+            .or_else(|| media.get("mediaType"))
+            .and_then(Value::as_str)
+            .is_some_and(|m| m.starts_with("image/"))
+            || media.get("type").and_then(Value::as_str) == Some("image")
+            || part.get("type").and_then(Value::as_str) == Some("image")
+            || image_ext(Path::new(uri));
+        if is_image || media.get("type").and_then(Value::as_str) == Some("file") {
+            push_resolved(&mut paths, uri, directory);
+        }
+        if paths.len() >= 8 {
+            break;
+        }
+    }
+    paths
+}
+
+fn timeline_picture(k: &Kit, images: &ImageCache, path: &Path, key: &str) -> El {
+    match std::fs::read(path) {
+        Ok(bytes) => art::picture(images, Arc::<[u8]>::from(bytes), SurfaceFit::Fit)
+            .key(key.to_string())
+            .w(TIMELINE_IMG_W)
+            .h(TIMELINE_IMG_H)
+            .radius(k.radius.md)
+            .clip_rounded(k.radius.md),
+        Err(_) => el()
+            .key(key.to_string())
+            .w(TIMELINE_IMG_W)
+            .h(96.0)
+            .radius(k.radius.md)
+            .fill(k.c.layer_02),
+    }
+}
+
+fn image_gallery(s: &UiState, k: &Kit, id: &str, paths: &[PathBuf]) -> Option<El> {
+    let images = s.images.as_ref()?;
+    if paths.is_empty() {
+        return None;
+    }
+    let mut gallery = row()
+        .key(format!("imgs-{id}"))
+        .gap(8.0)
+        .flex_wrap()
+        .w_full();
+    for (i, path) in paths.iter().enumerate() {
+        gallery = gallery.child(timeline_picture(k, images, path, &format!("img-{id}-{i}")));
+    }
+    Some(gallery)
 }
 
 fn mono(k: &Kit, body: String) -> El {
@@ -198,31 +387,53 @@ fn tool(s: &UiState, k: &Kit, item: &TimelineItem, call: &ToolCall) -> El {
         .clone()
         .filter(|t| !t.is_empty())
         .unwrap_or_else(|| call.name.clone());
+    let running = matches!(
+        call.state,
+        ToolCallStatus::Running | ToolCallStatus::Streaming | ToolCallStatus::Pending
+    );
     let mut card = Card::new()
         .accent(accent)
         .title(format!("{title} · {}", status_label(call.state)), None);
+    if running {
+        card = card.child(
+            row()
+                .key(format!("run-{}", item.id))
+                .gap(8.0)
+                .center_y()
+                .child(Spinner::new().build(k).key(format!("spin-{}", item.id)))
+                .child(muted(k, "Working…")),
+        );
+    }
     let input = tool_input(call);
     if !input.is_empty() {
         card = card.child(mono(k, input));
+    }
+    if let Some(gallery) = image_gallery(
+        s,
+        k,
+        &format!("tool-{}", item.id),
+        &tool_image_paths(s, call),
+    ) {
+        card = card.child(gallery);
     }
     if let Some(inline) = inline_diff(s, k, &item.id) {
         card = card.child(inline);
     } else {
         let output = tool_output(call);
         if !output.is_empty() {
-            let id = format!("out-{}", item.id);
-            let label = if call.truncated {
-                "Output (truncated)"
+            let clipped = clip(&output, OUTPUT_CHARS);
+            // Short results stay visible; long logs fold so the feed stays scannable.
+            if clipped.chars().count() <= SUMMARY_CHARS && !call.truncated {
+                card = card.child(mono(k, clipped));
             } else {
-                "Output"
-            };
-            card = card.child(collapsible(
-                s,
-                k,
-                &id,
-                label.into(),
-                mono(k, clip(&output, OUTPUT_CHARS)),
-            ));
+                let id = format!("out-{}", item.id);
+                let label = if call.truncated {
+                    "Output (truncated)"
+                } else {
+                    "Output"
+                };
+                card = card.child(collapsible(s, k, &id, label.into(), mono(k, clipped)));
+            }
         }
     }
     if let Some(err) = &call.error {
@@ -633,7 +844,31 @@ fn shell_card(s: &UiState, k: &Kit, item: &TimelineItem, part: &AgentPart) -> El
 fn part(s: &UiState, k: &Kit, item: &TimelineItem) -> El {
     let id = item.id.as_str();
     match &item.part {
-        AgentPart::Text { text } => rich(k, id, text),
+        AgentPart::Text { text } => {
+            let paths = item_image_paths(s, item);
+            let body = {
+                let prose = prompt_display_body(text);
+                if paths.is_empty() {
+                    // Keep wire text when we could not resolve pictures, so the
+                    // reader still sees where files were referenced.
+                    if split_attachment_paths(text).1.is_empty() {
+                        text.clone()
+                    } else {
+                        prose.to_string()
+                    }
+                } else {
+                    strip_image_placeholders(prose)
+                }
+            };
+            let mut block = col().key(format!("text-{id}")).gap(8.0).w_full();
+            if let Some(gallery) = image_gallery(s, k, id, &paths) {
+                block = block.child(gallery);
+            }
+            if !body.is_empty() {
+                block = block.child(rich(k, id, &body));
+            }
+            block
+        }
         AgentPart::Reasoning { text, duration_ms } => {
             let title = match duration_ms {
                 Some(ms) => format!("Thinking · {:.1}s", *ms as f32 / 1000.0),

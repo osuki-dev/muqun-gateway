@@ -6,7 +6,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use serde_json::Value;
 
 use crate::agents::domain::*;
-use crate::agents::ports::agent::AgentError;
+use crate::agents::ports::agent::{prompt_display_body, AgentError};
 
 pub(crate) fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -754,7 +754,7 @@ impl Projection {
 
     /// The ordinary live ACP stream omits user echoes. This row records only
     /// the Gateway's flushed submission, and is replaced by native history on load.
-    pub fn submitted(&mut self, text: &str) -> TimelineItem {
+    pub fn submitted(&mut self, text: &str, attachments: Option<Vec<String>>) -> TimelineItem {
         self.begin_turn();
         if !self.require_message_id {
             self.submission_echo = Some((text.into(), String::new()));
@@ -766,12 +766,13 @@ impl Projection {
             group,
             TimelineRole::User,
             AgentPart::Text { text: text.into() },
+            attachments.filter(|paths| !paths.is_empty()),
         )
     }
 
     /// A prompt steered into the running turn: a user row after the turn's
     /// output so far. The turn, its permissions and its tools go on.
-    pub fn steered(&mut self, text: &str) -> TimelineItem {
+    pub fn steered(&mut self, text: &str, attachments: Option<Vec<String>>) -> TimelineItem {
         self.current = None;
         self.thought = None;
         self.anonymous = None;
@@ -782,6 +783,7 @@ impl Projection {
             group,
             TimelineRole::User,
             AgentPart::Text { text: text.into() },
+            attachments.filter(|paths| !paths.is_empty()),
         )
     }
 
@@ -880,6 +882,7 @@ impl Projection {
             group,
             TimelineRole::Assistant,
             AgentPart::Todo { items },
+            None,
         )))
     }
 
@@ -899,6 +902,7 @@ impl Projection {
         group: String,
         role: TimelineRole,
         part: AgentPart,
+        attachments: Option<Vec<String>>,
     ) -> TimelineItem {
         let ordinal = match self.rows.get(&id) {
             Some(row) => {
@@ -912,6 +916,10 @@ impl Projection {
                 self.next_row
             }
         };
+        // Keep attachments already bound to this row when a later chunk only
+        // refreshes the text (Cursor may rewrite photos as `[Image #N]`).
+        let attachments =
+            attachments.or_else(|| self.rows.get(&id).and_then(|row| row.attachments.clone()));
         self.retained_bytes += row_bytes(&part);
         let row = TimelineItem {
             id: id.clone(),
@@ -921,7 +929,7 @@ impl Projection {
             seq: ordinal,
             updated_ms: now_ms(),
             ordinal,
-            attachments: None,
+            attachments,
             image_assets: None,
             generation: None,
             origin: None,
@@ -988,6 +996,7 @@ impl Projection {
                         text: format!("{severity}: {text}"),
                         description: Some("ACP session notice".into()),
                     },
+                    None,
                 )))
             }
             "agent_message_chunk" | "user_message_chunk" | "agent_thought_chunk" => {
@@ -1019,9 +1028,22 @@ impl Projection {
                     (id, group)
                 } else {
                     if user && !self.require_message_id {
-                        if let Some((expected, seen)) = &mut self.submission_echo {
+                        if let Some((expected, mut seen)) = self.submission_echo.take() {
                             seen.push_str(text);
-                            if expected.starts_with(seen.as_str()) {
+                            let matched = if expected.starts_with(seen.as_str()) {
+                                true
+                            } else {
+                                // Cursor (and similar) rewrite photos as `[Image #N]`
+                                // while keeping the typed prose; treat that as the
+                                // same flushed submission so attachments stay put.
+                                let expected_body = prompt_display_body(&expected);
+                                let seen_body = prompt_display_body(&seen);
+                                !expected_body.is_empty()
+                                    && (expected_body == seen_body
+                                        || expected_body.starts_with(seen_body))
+                            };
+                            self.submission_echo = Some((expected, seen));
+                            if matched {
                                 return Ok(None);
                             }
                             return Err(AgentError::Protocol("ACP user echo differs from the submitted prompt; refresh before sending again".into()));
@@ -1086,6 +1108,7 @@ impl Projection {
                         TimelineRole::Assistant
                     },
                     part,
+                    None,
                 )))
             }
             "tool_call" | "tool_call_update" => {
@@ -1217,6 +1240,7 @@ impl Projection {
                     group,
                     TimelineRole::Assistant,
                     AgentPart::Tool(call),
+                    None,
                 )))
             }
             _ => Ok(None),
@@ -1388,7 +1412,7 @@ mod tests {
     #[test]
     fn idless_stream_merges_chunks_but_splits_at_tools_and_turns() {
         let mut projection = Projection::new(false);
-        projection.submitted("question");
+        projection.submitted("question", None);
         for update in [
             json!({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"One"}}),
             json!({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":" two"}}),
@@ -1398,7 +1422,7 @@ mod tests {
         ] {
             projection.update(&update).unwrap();
         }
-        projection.submitted("follow up");
+        projection.submitted("follow up", None);
         projection.update(&json!({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Four"}})).unwrap();
         let rows = projection.timeline();
         assert_eq!(rows.len(), 6);
@@ -1414,7 +1438,7 @@ mod tests {
     #[test]
     fn a_tool_update_without_a_name_keeps_the_call_name() {
         let mut projection = Projection::new(false);
-        projection.submitted("question");
+        projection.submitted("question", None);
         // claude-agent-acp 0.99.1: the call names the tool; the refinement
         // and result repeat only `kind`.
         for update in [
@@ -1433,7 +1457,7 @@ mod tests {
     #[test]
     fn live_user_echo_reconciles_one_flushed_submission_without_duplicate_rows() {
         let mut projection = Projection::new(false);
-        let submitted = projection.submitted("hello world");
+        let submitted = projection.submitted("hello world", None);
         for text in ["hello", " world"] {
             assert!(projection.update(&json!({"sessionUpdate":"user_message_chunk","content":{"type":"text","text":text}})).unwrap().is_none());
         }
@@ -1442,6 +1466,29 @@ mod tests {
         assert_eq!(rows[0].id, submitted.id);
         assert!(matches!(&rows[0].part, AgentPart::Text{text} if text == "hello world"));
         assert!(projection.update(&json!({"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"unexpected"}})).is_err());
+    }
+
+    #[test]
+    fn image_label_echo_keeps_submission_attachments() {
+        use crate::agents::ports::agent::ATTACHED_FILES_MARKER;
+        let path = "/tmp/muqun-upload.png";
+        let transcript = format!("inspect icon{ATTACHED_FILES_MARKER}\n- {path}");
+        let mut projection = Projection::new(false);
+        let submitted = projection.submitted(&transcript, Some(vec![path.to_owned()]));
+        assert!(projection
+            .update(&json!({
+                "sessionUpdate": "user_message_chunk",
+                "content": { "type": "text", "text": "[Image #1] inspect icon" },
+            }))
+            .unwrap()
+            .is_none());
+        let rows = projection.timeline();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, submitted.id);
+        assert_eq!(
+            rows[0].attachments.as_deref(),
+            Some([path.to_owned()].as_slice())
+        );
     }
 
     #[test]
@@ -1648,7 +1695,7 @@ mod tests {
         assert!(projection
             .permission(json!(1), &shell_permission(None), PERMISSION_FIELDS)
             .is_err());
-        projection.submitted("start");
+        projection.submitted("start", None);
         projection.update(&update).unwrap();
         assert_eq!(
             projection
@@ -1677,13 +1724,13 @@ mod tests {
             .is_err());
 
         let mut projection = Projection::new(false);
-        projection.submitted("one");
+        projection.submitted("one", None);
         projection.update(&update).unwrap();
         projection.end_turn();
         assert!(projection
             .permission(json!(1), &shell_permission(None), PERMISSION_FIELDS)
             .is_err());
-        projection.submitted("two");
+        projection.submitted("two", None);
         assert!(projection
             .permission(json!(1), &shell_permission(None), PERMISSION_FIELDS)
             .is_err());

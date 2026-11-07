@@ -2,6 +2,18 @@
 
 ## Changes and fixes
 
+- **Timeline shows real photos instead of `[Image #N]` placeholders.** User
+  attachments (and ACP host-file lists) resolve to local thumbs; Codex/Cursor
+  image-label echoes keep those attachments. Tool cards show a running
+  spinner, short outputs inline, and any image content they return.
+
+- **Home no longer draws an empty white toolbar strip.** Session / Inbox /
+  Tasks / Settings keep the toolbar; Home stays full-bleed. The sidebar brand
+  mark stays vertically centred. The always-on sidebar Refresh control is
+  gone (live events already update the tree; unreachable errors still offer
+  Retry). The redundant composer **Paste image** button is removed — Ctrl/Cmd+V
+  still stages clipboard files and images.
+
 - **Desktop launch splash loads the workspace behind a cooler Rune motion
   stage.** Agents, themes and tasks start refreshing while the kick/bloom
   entrance plays; the shell reveals once discovery is ready (or after a short
