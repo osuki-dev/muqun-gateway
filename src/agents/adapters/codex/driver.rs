@@ -25,6 +25,35 @@ const ITEM_POSITION_STEP: u64 = 1 << 32;
 
 type ItemOrder = HashMap<(String, String, String), u64>;
 
+const MAX_ORDERED_ITEMS: usize = 8192;
+
+/// Live items never stop arriving, so a full index sheds instead of refusing
+/// them -- refusing froze every Codex timeline until a restart. Other turns
+/// keep only their last entry, which is all a later live item needs to sort
+/// after; if that is still too many, the oldest turns go (turn ids are
+/// UUIDv7, so they sort by time). A history page re-anchors what it reads.
+fn compact_item_order(order: &mut ItemOrder, thread: &str, turn: &str) {
+    let target = MAX_ORDERED_ITEMS * 3 / 4;
+    let active = |t: &str, u: &str| t == thread && u == turn;
+    let mut tails: HashMap<(String, String), u64> = HashMap::new();
+    for ((t, u, _), position) in order.iter() {
+        if !active(t, u) {
+            let tail = tails.entry((t.clone(), u.clone())).or_insert(*position);
+            *tail = (*tail).max(*position);
+        }
+    }
+    order.retain(|(t, u, _), position| {
+        active(t, u) || tails.get(&(t.clone(), u.clone())) == Some(position)
+    });
+    let mut turns: Vec<_> = tails.into_keys().collect();
+    turns.sort_by(|a, b| a.1.cmp(&b.1));
+    let mut turns = turns.into_iter();
+    while order.len() >= target {
+        let Some((t, u)) = turns.next() else { break };
+        order.retain(|(a, b, _), _| a != &t || b != &u);
+    }
+}
+
 #[derive(Debug)]
 enum OrderError {
     RebaseRequired,
@@ -861,10 +890,8 @@ impl CodexDriver {
     ) -> Result<u64, AgentError> {
         let mut order = self.order.lock().unwrap_or_else(|p| p.into_inner());
         let key = (thread.to_string(), turn.to_string(), item.to_string());
-        if order.len() >= 8192 && !order.contains_key(&key) {
-            return Err(AgentError::NotAvailable(
-                "Codex item-order capacity exhausted; resync required".into(),
-            ));
+        if order.len() >= MAX_ORDERED_ITEMS && !order.contains_key(&key) {
+            compact_item_order(&mut order, thread, turn);
         }
         let position = match order.get(&key).copied() {
             Some(position) => position,
@@ -4935,6 +4962,24 @@ mod history_tests {
             fixture.client.is_ready(),
             "history cache exhaustion must not stop the primary"
         );
+    }
+
+    /// A long-running gateway outgrows the live order index; new items keep
+    /// arriving and sort after what other turns already showed.
+    #[tokio::test]
+    async fn codex_live_order_sheds_old_turns_instead_of_refusing_items() {
+        let mut fixture = Fixture::new(|_| panic!("order tests never make RPCs")).await;
+        fixture.ready().await;
+        let driver = CodexDriver::new(fixture.client.clone());
+        let mut last = 0;
+        for n in 0..MAX_ORDERED_ITEMS {
+            last = driver
+                .item_position("other", "01-old", &n.to_string())
+                .unwrap();
+        }
+        driver.item_position("thread", "02-live", "a").unwrap();
+        assert!(driver.order.lock().unwrap().len() < MAX_ORDERED_ITEMS);
+        assert!(driver.item_position("other", "01-old", "new").unwrap() > last);
     }
 
     /// The retention budget is shared: a session is never refused a page

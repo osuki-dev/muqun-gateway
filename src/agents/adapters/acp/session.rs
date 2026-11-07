@@ -540,10 +540,13 @@ impl Session {
         self.inbox.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    /// A turn the agent has accepted and not yet ended.
+    /// A turn the agent has accepted and not yet ended -- or one admitted and
+    /// still starting (`busy` is taken before the status says Busy), so a
+    /// prompt sent then queues instead of failing as a second turn.
     async fn in_turn(&self) -> bool {
         self.connected.load(Ordering::Acquire)
-            && self.state.lock().await.info.status == AgentSessionStatus::Busy
+            && (self.busy.load(Ordering::Acquire)
+                || self.state.lock().await.info.status == AgentSessionStatus::Busy)
     }
 }
 
@@ -3499,6 +3502,13 @@ impl<P: AcpProvider> AcpDriver<P> {
                 AgentError::InvalidRequest("delivery must be steer or queue".into())
             })?),
         };
+        // Prompts left queued by a turn that did not end normally (stopped,
+        // failed) still go first: a new one waits behind them.
+        let queued = queued.or_else(|| {
+            self.retained(id)
+                .is_some_and(|session| session.queue().next(id).is_some())
+                .then_some(Delivery::Queue)
+        });
         if let Some(delivery) = queued {
             if self
                 .enqueue(id, text, attachments, native_command, delivery)
@@ -3559,8 +3569,9 @@ impl<P: AcpProvider> AcpDriver<P> {
             return Ok(false);
         };
         let prompt = Self::prepare(&session, text, attachments, native_command).await?;
-        let _gate = session.turn_gate.lock().await;
-        if !session.in_turn().await {
+        let gate = session.turn_gate.lock().await;
+        let running = session.in_turn().await;
+        if !running && session.queue().next(id).is_none() {
             return Ok(false);
         }
         session.queue().push(
@@ -3575,7 +3586,41 @@ impl<P: AcpProvider> AcpDriver<P> {
             },
         )?;
         Self::publish_inbox(&session, &self.mirror, &self.tx).await;
+        drop(gate);
+        // The prompt is queued either way; a turn that started meanwhile
+        // drains it when it ends.
+        if !running {
+            if let Err(error) = self.send_queue_head(id).await {
+                tracing::warn!(session = id, %error, "Queued ACP prompts not started");
+            }
+        }
         Ok(true)
+    }
+
+    /// Start the oldest queued prompt when no turn will: the queue only
+    /// drains itself when a turn ends normally.
+    async fn send_queue_head(&self, id: &str) -> Result<(), AgentError> {
+        let session = self.activate(id, false, true).await?;
+        let mut admission = Admission {
+            busy: &session.busy,
+            handed_off: false,
+        };
+        let Some(item) = session.queue().next(id).cloned() else {
+            return Ok(());
+        };
+        let result = Self::start_turn(
+            &session,
+            &self.mirror,
+            &self.tx,
+            &self.binary,
+            &self.inspection,
+            &self.stop,
+            &item.input,
+        )
+        .await;
+        admission.handed_off = result.is_ok();
+        Self::settle_queued(&session, &self.mirror, &self.tx, &item.id, &result).await;
+        result
     }
 
     async fn publish_inbox(
@@ -6023,16 +6068,17 @@ mod inbox_tests {
         .unwrap_or_else(|_| panic!("{what}"));
     }
 
-    /// The prompts the mock agent received for `id`, in order.
+    /// The prompts the mock agent received for `id`, in order. Empty while
+    /// the mock is rewriting its store: callers poll until it settles.
     fn received(fixture: &Fixture, id: &str) -> Vec<String> {
-        let store: Value = serde_json::from_slice(
-            &std::fs::read(fixture.directory.join("sessions.json")).unwrap(),
-        )
-        .unwrap();
+        let store: Value = std::fs::read(fixture.directory.join("sessions.json"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default();
         store[id]
             .as_array()
-            .unwrap()
-            .iter()
+            .into_iter()
+            .flatten()
             .filter(|entry| entry[2] == true)
             .map(|entry| entry[1].as_str().unwrap().to_owned())
             .collect()
@@ -6047,7 +6093,8 @@ mod inbox_tests {
 
     /// Prompts sent during a turn wait in the inbox (driver and mirror
     /// alike), "steer" first, and follow only a normal end: an interrupted
-    /// turn keeps them for the user, an ended process drops them.
+    /// turn keeps them for the user until the next prompt, an ended process
+    /// drops them.
     #[tokio::test]
     async fn prompts_sent_during_a_turn_follow_only_its_normal_end() {
         #[derive(Debug)]
@@ -6118,6 +6165,18 @@ mod inbox_tests {
             .await;
             assert_eq!(received(&fixture, id), sent, "{end:?}");
             assert_eq!(texts(&driver.get_inbox(id).await.unwrap()), kept, "{end:?}");
+            if let End::Interrupted = end {
+                // Kept, not stuck: the next prompt starts them and waits its turn.
+                driver.send_prompt(id, "after", &[], None).await.unwrap();
+                until("kept prompts sent", async || {
+                    received(&fixture, id).len() == 5 && driver.mirror.inbox(asid).await.is_empty()
+                })
+                .await;
+                assert_eq!(
+                    received(&fixture, id),
+                    ["approval", "next", "first", "second", "after"]
+                );
+            }
             driver.shutdown().await;
         }
     }
