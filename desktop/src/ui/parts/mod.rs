@@ -14,7 +14,7 @@ pub mod tool;
 
 use muqun_gateway::agents::{AgentPart, TimelineItem};
 use rune::{col, icon, row, text, Color, Cursor, El, Icon};
-use rune_kit::{Kit, Markdown, Spinner};
+use rune_kit::{Kit, Markdown, MarkdownStyle, Spinner};
 
 use super::copy::tr_ref;
 use super::timeline::SessionTimeline;
@@ -133,7 +133,16 @@ pub fn code(cx: &Tcx, key: &str, body: &str, language: Option<&str>, max_lines: 
         .key(key.to_string())
         .w_full()
         .gap(4.0)
-        .child(Markdown::new(&src).selectable(true).build(cx.k));
+        .child(
+            // The card's body is the surface; the code draws no box of its own.
+            Markdown::new(&src)
+                .selectable(true)
+                .style(MarkdownStyle::from_kit(cx.k).code_block(
+                    cx.k.alpha(cx.k.c.layer_01, 0.0),
+                    cx.k.alpha(cx.k.c.layer_01, 0.0),
+                ))
+                .build(cx.k),
+        );
     if hidden > 0 {
         block = block.child(more_lines(cx, hidden));
     }
