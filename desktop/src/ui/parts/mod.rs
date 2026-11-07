@@ -4,6 +4,8 @@
 //! tool call is drawn in.
 
 pub mod approval;
+pub mod context;
+pub mod detail;
 pub mod diff_rows;
 pub mod files;
 pub mod glyphs;
@@ -288,9 +290,21 @@ impl<'a> ToolCard<'a> {
                     .single_line(),
             );
         }
-        if !self.title.is_empty() {
+        // One line: a multi-line command or title shows its first line.
+        let mut lines = self.title.lines().map(str::trim).filter(|l| !l.is_empty());
+        let mut title = lines.next().unwrap_or("").to_string();
+        if lines.next().is_some() {
+            title.push_str(" …");
+        }
+        // A long title takes the row; its folder would only be an ellipsis.
+        let caption_text = if title.chars().count() > 56 {
+            String::new()
+        } else {
+            self.caption.lines().next().unwrap_or("").to_string()
+        };
+        if !title.is_empty() {
             header = header.child(
-                text(self.title)
+                text(title)
                     .key("title")
                     .font(k.ty.ui_compact)
                     .color(k.c.text_base)
@@ -299,19 +313,19 @@ impl<'a> ToolCard<'a> {
                     .shrink(),
             );
         }
-        let caption = if self.caption.is_empty() {
-            text("")
+        // An empty caption is a spacer, never an ellipsis.
+        header = header.child(if caption_text.is_empty() {
+            col().key("caption").grow(1.0)
         } else {
-            text(self.caption).font(k.ty.small).color(k.c.text_faint)
-        };
-        header = header.child(
-            caption
+            text(caption_text)
                 .key("caption")
+                .font(k.ty.small)
+                .color(k.c.text_faint)
                 .single_line()
                 .truncate_head()
                 .shrink()
-                .grow(1.0),
-        );
+                .grow(1.0)
+        });
         for (i, c) in self.chips.into_iter().enumerate() {
             header = header.child(c.key(format!("chip-{i}")));
         }
