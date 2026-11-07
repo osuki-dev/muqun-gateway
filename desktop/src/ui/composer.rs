@@ -1278,6 +1278,7 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         .gap(8.0)
         .center_y()
         .child(pills(s, k, layer).grow(1.0).shrink().min_w(0.0))
+        .child(super::voice::mic_button(s, k))
         .child(
             Button::new(if zh { "附件" } else { "Attach" })
                 .variant(ButtonVariant::Ghost)
@@ -1358,6 +1359,9 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     };
     let accent = k.c.bg_accent;
     let info = k.c.info.icon;
+    if let Some(dictation) = super::voice::strip(s, k) {
+        card = card.child(dictation);
+    }
     card = card
         .child(
             TextArea::new(&s.draft)

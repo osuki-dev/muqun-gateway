@@ -27,11 +27,12 @@ pub enum SettingsTab {
     Agents,
     Appearance,
     General,
+    Voice,
     Themes,
     About,
 }
 
-fn tabs(language: Language) -> [(&'static str, SettingsTab); 5] {
+fn tabs(language: Language) -> [(&'static str, SettingsTab); 6] {
     [
         (tr_ref(language, "Agents", "Agents"), SettingsTab::Agents),
         (
@@ -39,6 +40,7 @@ fn tabs(language: Language) -> [(&'static str, SettingsTab); 5] {
             SettingsTab::Appearance,
         ),
         (tr_ref(language, "General", "通用"), SettingsTab::General),
+        (tr_ref(language, "Voice", "语音"), SettingsTab::Voice),
         (tr_ref(language, "Themes", "主题"), SettingsTab::Themes),
         (tr_ref(language, "About", "关于"), SettingsTab::About),
     ]
@@ -1272,6 +1274,7 @@ pub fn view(s: &UiState, k: &Kit) -> El {
         SettingsTab::Agents => agents(s, k),
         SettingsTab::Appearance => appearance(s, k),
         SettingsTab::General => general(s, k),
+        SettingsTab::Voice => super::voice::settings(s, k),
         SettingsTab::Themes => themes(s, k, images),
         SettingsTab::About => about(s, k),
     };
@@ -1291,6 +1294,7 @@ pub fn view(s: &UiState, k: &Kit) -> El {
             "Language, default folder, editor and notifications.",
             "语言、默认文件夹、编辑器与通知。",
         ),
+        SettingsTab::Voice => super::voice::subtitle(language),
         SettingsTab::Themes => tr_ref(
             language,
             "Library, import, and gallery with preview cards.",

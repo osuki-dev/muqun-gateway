@@ -74,6 +74,8 @@ pub enum UiAction {
     },
     /// The viewer's Save as… copied the file (or could not).
     FileSaved(Result<std::path::PathBuf, String>),
+    /// Where the voice service's key is saved, after a lookup or a save.
+    VoiceKey(Option<crate::platform::secrets::Store>),
     /// Open one changed file in the preferred editor.
     OpenDiffFile {
         asid: String,
@@ -151,6 +153,8 @@ pub enum Update {
     Attention(super::notify::Attention),
     /// The Terminals page's list, a pane's screen, or a failure.
     Terminals(Box<super::terminals::TerminalUpdate>),
+    /// Dictation's progress (`model/voice.rs`).
+    Voice(super::voice::VoiceEvent),
 }
 
 impl Update {

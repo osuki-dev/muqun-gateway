@@ -16,3 +16,4 @@ pub mod tool_view;
 pub mod turn;
 pub mod types;
 pub mod viewer;
+pub mod voice;

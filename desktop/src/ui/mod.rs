@@ -26,6 +26,7 @@ mod terminals;
 mod tiles;
 mod timeline;
 mod viewer;
+mod voice;
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -290,6 +291,10 @@ pub struct UiState {
     pub demo: bool,
     /// The Terminals page (`ui/terminals.rs`).
     pub terms: terminals::TermState,
+    /// Dictation in progress (`ui/voice.rs`).
+    pub voice: Option<voice::Dictation>,
+    /// Settings → Voice's fields.
+    pub voice_form: voice::VoiceForm,
     /// The file viewer overlay ([`UiState::open_file`]).
     pub viewer: Option<viewer::Viewer>,
     /// Sessions open side by side (empty when one session fills the pane).
@@ -410,6 +415,8 @@ impl UiState {
             agents_seen: false,
             demo: false,
             viewer: None,
+            voice: None,
+            voice_form: voice::VoiceForm::new(&cfg.voice),
             terms: terminals::TermState::default(),
             tiles: Vec::new(),
             focus: 0,
@@ -420,6 +427,7 @@ impl UiState {
             cfg,
         };
         s.arm_splash(splash::SplashKind::Boot);
+        s.check_voice_key();
         s
     }
 
@@ -465,6 +473,12 @@ impl UiState {
     }
 
     /// Keep the window waking while the splash is animating.
+    /// Every frame Rune asks: the splash and a recording's waveform animate.
+    pub fn poll_frame(&mut self, t: f64, tx: &mut Tx) -> bool {
+        let voice = self.poll_voice();
+        self.poll_splash(t, tx) | voice
+    }
+
     pub fn poll_splash(&mut self, _: f64, _: &mut Tx) -> bool {
         let Some(splash) = self.splash.as_mut() else {
             return false;
@@ -1091,6 +1105,7 @@ impl UiState {
                 Update::HubMode(mode) => self.hub_label = mode.to_string(),
                 Update::Attention(attention) => self.on_attention(&attention),
                 Update::Terminals(update) => self.on_terminals(*update),
+                Update::Voice(event) => self.on_voice(event),
             }
         }
         if LAYOUT_DIRTY.swap(false, Ordering::AcqRel) {
@@ -1398,6 +1413,7 @@ impl UiState {
             UiAction::ThemeFilePicked(path) => self.send(Command::ThemeImportFile(path)),
             UiAction::ViewerLoaded { path, loaded } => self.viewer_loaded(&path, *loaded),
             UiAction::FileSaved(result) => self.file_saved(result),
+            UiAction::VoiceKey(store) => self.voice_form.key_saved = store,
             UiAction::SubmitComposer => composer::submit_session(self),
             UiAction::ComposerEdited
             | UiAction::ComposerKey { .. }
@@ -1688,7 +1704,13 @@ pub fn activity_pill(
 use copy::tr;
 
 pub fn on_key(s: &mut UiState, ev: &KeyEvent, _tx: &mut Tx) -> bool {
-    if is_sidebar_toggle(ev) {
+    if ev.is_command(' ') && ev.mods.shift && !ev.mods.alt && s.mode == Mode::Session {
+        s.toggle_voice();
+        return true;
+    } else if s.voice.is_some() && ev.key == rune::Key::Escape {
+        s.cancel_voice();
+        return true;
+    } else if is_sidebar_toggle(ev) {
         s.sidebar.toggle();
         return true;
     }
