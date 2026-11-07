@@ -4,8 +4,7 @@
 //! allowed to live (architecture §10). Bundling a subset is a later task; a
 //! missing file only costs the fallback chain's choice of face.
 
-// Available to the UI; wired as those surfaces land.
-#![allow(dead_code)]
+use std::sync::OnceLock;
 
 /// The families the app draws with (`ui/text.rs` names them).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -15,6 +14,7 @@ pub enum FontRole {
     /// Code, paths, tool names.
     Mono,
     /// Serif with CJK coverage, for editorial headlines (Home's greeting).
+    #[allow(dead_code)]
     Display,
 }
 
@@ -44,4 +44,43 @@ pub fn candidates(role: FontRole) -> &'static [&'static str] {
         let _ = role;
         &[]
     }
+}
+
+/// The family list a slot asks for by `role`, CSS style: the embedded face
+/// first, then what the platform resolves when it is missing.
+pub fn family(role: FontRole) -> &'static str {
+    match role {
+        // Inter (Rune's embedded face) for Latin, the system's CJK face for
+        // the glyphs it lacks, so Latin keeps its rhythm and CJK still shows.
+        FontRole::Ui => "Inter, Noto Sans CJK SC, Noto Sans CJK JP",
+        FontRole::Mono => "JetBrainsMono Nerd Font, JetBrainsMono NF, ui-monospace",
+        FontRole::Display => "Noto Serif CJK SC, Inter",
+    }
+}
+
+/// The first file of `candidates(role)` that reads, kept for the process
+/// (Rune takes font bytes for its lifetime). `None` leaves the platform
+/// fallback in charge.
+pub fn load(role: FontRole) -> Option<&'static [u8]> {
+    for path in candidates(role) {
+        if let Ok(bytes) = std::fs::read(path) {
+            tracing::debug!(?role, path, "font loaded");
+            return Some(Box::leak(bytes.into_boxed_slice()));
+        }
+    }
+    None
+}
+
+/// Every face the UI embeds at launch (`AppSpec::fonts`): the mono face, so
+/// code, commands and diffs share one width wherever the system's monospace
+/// differs. The UI face comes from the family list (Rune's Inter, the
+/// system's CJK face by glyph); its multi-megabyte TTC is never read here.
+pub fn embedded() -> &'static [&'static [u8]] {
+    static FONTS: OnceLock<Vec<&'static [u8]>> = OnceLock::new();
+    FONTS.get_or_init(|| [FontRole::Mono].into_iter().filter_map(load).collect())
+}
+
+/// The two slot families (`AppSpec::families`): the UI face and the mono face.
+pub fn families() -> (&'static str, &'static str) {
+    (family(FontRole::Ui), family(FontRole::Mono))
 }

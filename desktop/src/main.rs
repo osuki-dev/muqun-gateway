@@ -16,7 +16,7 @@ use std::time::Instant;
 use muqun_gateway::agents::compose::{
     attach_store, build_runtime, RuntimeSettings, StoreEncryption,
 };
-use rune::AppSpec;
+use rune::{App, AppSpec};
 
 use crate::config::{DesktopConfig, CONFIG_FILE};
 use crate::model::commands::{self, Command, CommandReceiver, CommandSender};
@@ -93,6 +93,8 @@ fn main() -> anyhow::Result<()> {
         on_key: Some(ui::on_key),
         setup: Some(|s, waker| s.install_images(waker)),
         poll: Some(UiState::poll_splash),
+        fonts: platform::fonts::embedded(),
+        families: platform::fonts::families(),
         ..AppSpec::new(
             title,
             (geometry.w.max(640) as f32, geometry.h.max(480) as f32),

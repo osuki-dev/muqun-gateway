@@ -224,18 +224,19 @@ pub fn mount(s: &UiState, k: &Kit, scale: f32, layer: &mut Vec<El>) {
     }
     layer.push(scrim);
 
-    let mut panel = col()
+    let look = s.look();
+    let panel = col()
         .key("viewer-panel")
         .role("dialog")
         .label(v.name.clone())
         .w_full()
         .h_full()
         .max_w(1180.0)
-        .max_h(900.0)
-        .radius(k.radius.xl)
-        .fill(k.c.layer_01)
-        .border(1.0, k.c.border_base)
-        .clip_rounded(k.radius.xl)
+        .max_h(900.0);
+    // The sheet: frosted over the blurred window, a top-lit rim; solid under
+    // reduce transparency.
+    let mut panel = look
+        .panel(k, panel, k.radius.xl)
         .child(header(v, k, language))
         .child(
             el().key("viewer-rule")

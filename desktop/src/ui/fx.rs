@@ -76,7 +76,7 @@ pub fn metal(key: &str, size: f32, radius: f32, color: rune::Color, flow: f32) -
         .a11y_hidden()
 }
 
-fn rgb(d: [f32; 4]) -> Rgb {
+fn to_rgb(d: [f32; 4]) -> Rgb {
     Rgb([
         d[0].clamp(0.0, 1.0),
         d[1].clamp(0.0, 1.0),
@@ -88,8 +88,8 @@ fn layer(kind: u32, d: [f32; 4], shape: Shape, t: f32, reduced: bool) -> Option<
     let fx = match kind {
         GLOW => rune_fx::Fx::glow(GlowParams {
             style: GlowStyle::Soft,
-            color: rgb(d),
-            core: rgb(d),
+            color: to_rgb(d),
+            core: to_rgb(d),
             intensity: d[3].clamp(0.0, 2.0),
             radius: 26.0,
             reach: 3.0,
@@ -98,7 +98,7 @@ fn layer(kind: u32, d: [f32; 4], shape: Shape, t: f32, reduced: bool) -> Option<
         }),
         RIM => rune_fx::Fx::glow(GlowParams {
             style: GlowStyle::Neon,
-            color: rgb(d),
+            color: to_rgb(d),
             core: Rgb([
                 (d[0] + 0.6).min(1.0),
                 (d[1] + 0.6).min(1.0),
@@ -112,7 +112,7 @@ fn layer(kind: u32, d: [f32; 4], shape: Shape, t: f32, reduced: bool) -> Option<
             ..Default::default()
         }),
         METAL => {
-            let tint = rgb(d);
+            let tint = to_rgb(d);
             // Chrome lit through the theme's accent: a cool studio, a warm tint.
             let light = Rgb([
                 0.55 + 0.45 * tint.0[0],
