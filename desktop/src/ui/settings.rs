@@ -783,6 +783,8 @@ fn shortcuts(s: &UiState, k: &Kit) -> Vec<El> {
                     ),
                     (key("Primary+,"), "Settings", "设置"),
                     (key("Shift+Primary+T"), "Themes", "主题"),
+                    (key("Primary+N"), "New session (Home)", "新建会话（首页）"),
+                    (key("Primary+F"), "Search sessions", "搜索会话"),
                     (
                         key("Escape"),
                         "Close the file viewer or a menu",
@@ -809,6 +811,11 @@ fn shortcuts(s: &UiState, k: &Kit) -> Vec<El> {
                         key("Primary+V"),
                         "Paste files or an image into the message",
                         "粘贴文件或图片到消息",
+                    ),
+                    (
+                        key("Shift+Primary+Space"),
+                        "Start or finish dictation",
+                        "开始 / 结束语音输入",
                     ),
                 ],
             ),

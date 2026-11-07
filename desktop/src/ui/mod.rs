@@ -842,6 +842,8 @@ impl UiState {
             self.focus_tile(i);
             return;
         }
+        self.right_open = false;
+        self.right.set_open(false);
         if self.tiles.is_empty() {
             let Some(current) = self.selected.clone() else {
                 self.open_session(asid);
@@ -889,6 +891,9 @@ impl UiState {
         if self.tiles.len() >= MAX_TILES {
             return;
         }
+        // The inspector describes one session; tiles need the width.
+        self.right_open = false;
+        self.right.set_open(false);
         if self.tiles.is_empty() {
             let Some(current) = self.selected.clone() else {
                 return;
@@ -1735,11 +1740,26 @@ pub fn on_key(s: &mut UiState, ev: &KeyEvent, _tx: &mut Tx) -> bool {
         s.sidebar.toggle();
         return true;
     }
+    if ev.is_command('t') && ev.mods.shift && !ev.mods.alt {
+        s.settings_tab = SettingsTab::Themes;
+        s.go(Mode::Settings);
+        return true;
+    }
     if ev.mods.shift || ev.mods.alt {
         return false;
     }
     if ev.is_command(',') {
         s.go(Mode::Settings);
+        return true;
+    }
+    if ev.is_command('n') {
+        s.go(Mode::Home);
+        s.start_draft.focused = true;
+        return true;
+    }
+    if ev.is_command('f') {
+        s.sidebar.set_open(true);
+        s.search.focused = true;
         return true;
     }
     if ev.is_command('\\') {
@@ -1777,6 +1797,7 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>) -> El {
     let mut k =
         crate::theme::apply::palette(scheme).map_or_else(|| Kit::neutral(dark), |p| p.kit());
     crate::theme::look::tune_kit(&mut k, &s.cfg.appearance);
+    cx.focus_ring(2.0, 1.5, k.c.border_focus);
     if s.cfg.appearance.reduced_motion {
         cx.reduced_motion(true);
     }

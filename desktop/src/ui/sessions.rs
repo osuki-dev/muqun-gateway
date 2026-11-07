@@ -542,6 +542,19 @@ fn hub_line(s: &UiState, k: &Kit) -> El {
         .center_y()
         .role("status")
         .label(word.clone())
+        .help(match s.hub_label.as_str() {
+            "local gateway" => super::copy::tr(
+                language,
+                "Sessions come from the Muqun gateway running on this computer; phones see the same ones.",
+                "会话来自这台电脑上运行的 Muqun Gateway，手机看到的是同一批。",
+            ),
+            "standalone" => super::copy::tr(
+                language,
+                "No gateway is running; this window talks to the agents directly.",
+                "没有运行中的 Gateway，此窗口直接连接各 Agent。",
+            ),
+            _ => super::copy::tr(language, "Looking for a local gateway…", "正在查找本机 Gateway…"),
+        })
         .child(dot.a11y_hidden())
         .child(
             rune::text(word)

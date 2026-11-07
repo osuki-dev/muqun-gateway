@@ -773,6 +773,12 @@ pub fn scenes() -> &'static [Scene] {
             split2(s);
             s.cfg.general.language = crate::config::Language::ZhCn;
         }),
+        ("home-noagent", |s| {
+            home_first(s);
+            for a in &mut s.agents {
+                a.enabled = false;
+            }
+        }),
         ("welcome", |s| {
             home_first(s);
             s.cfg.general.welcomed = false;

@@ -23,7 +23,7 @@ fn create(s: &mut UiState) {
 
 fn state_badge(k: &Kit, language: crate::config::Language, state: &str) -> El {
     let variant = match state {
-        "working" | "dispatching" => BadgeVariant::Accent,
+        "working" | "dispatching" => BadgeVariant::Neutral,
         "done" => BadgeVariant::Neutral,
         _ => BadgeVariant::Subtle,
     };

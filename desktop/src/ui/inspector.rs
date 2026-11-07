@@ -15,7 +15,7 @@ use crate::model::compose::ComposeCommand;
 const TABS: [(&str, InspectorTab); 5] = [
     ("Queue", InspectorTab::Queue),
     ("Git", InspectorTab::Git),
-    ("Agents", InspectorTab::Subagents),
+    ("Sub-agents", InspectorTab::Subagents),
     ("Saved", InspectorTab::Saved),
     ("Shells", InspectorTab::Shells),
 ];
@@ -39,7 +39,7 @@ fn tab_label(language: Language, en: &'static str) -> &'static str {
     match en {
         "Queue" => tr_ref(language, "Queue", "队列"),
         "Git" => "Git",
-        "Agents" => tr_ref(language, "Agents", "子 Agent"),
+        "Sub-agents" => tr_ref(language, "Sub-agents", "子 Agent"),
         "Saved" => tr_ref(language, "Saved", "已保存"),
         "Shells" => tr_ref(language, "Shells", "后台命令"),
         other => other,
