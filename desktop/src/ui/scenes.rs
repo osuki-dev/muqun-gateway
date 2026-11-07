@@ -471,6 +471,19 @@ pub fn scenes() -> &'static [Scene] {
         ("home-busy", home_busy),
         ("home-first", home_first),
         ("splash", splash_scene),
+        ("home-plain", |s| {
+            home_busy(s);
+            s.cfg.appearance.reduced_motion = true;
+            s.cfg.appearance.reduced_transparency = true;
+        }),
+        ("home-zh", |s| {
+            home_busy(s);
+            s.cfg.general.language = crate::config::Language::ZhCn;
+        }),
+        ("split2-zh", |s| {
+            split2(s);
+            s.cfg.general.language = crate::config::Language::ZhCn;
+        }),
         ("home-akiba", |s| {
             with_pack(s, "akiba-overdrive");
             home_busy(s);

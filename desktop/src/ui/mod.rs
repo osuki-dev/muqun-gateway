@@ -953,6 +953,10 @@ impl UiState {
         if self.tiles_restored || self.demo {
             return;
         }
+        if self.cfg.ui.tiles.len() < 2 {
+            self.tiles_restored = true;
+            return;
+        }
         let saved: Vec<String> = self
             .cfg
             .ui
@@ -962,9 +966,6 @@ impl UiState {
             .cloned()
             .collect();
         if saved.len() < 2 {
-            if !self.cfg.ui.tiles.is_empty() && self.sessions.len() >= SESSION_LIST_LIMIT.min(8) {
-                self.tiles_restored = true;
-            }
             return;
         }
         self.tiles_restored = true;
