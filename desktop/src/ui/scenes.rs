@@ -644,6 +644,8 @@ pub fn scenes() -> &'static [Scene] {
         ("timeline-narrow", timeline_narrow),
         ("timeline-long", timeline_long),
         ("timeline-zh", timeline_zh),
+        ("timeline-subagent", timeline_subagent),
+        ("timeline-context", timeline_context),
         ("viewer", viewer_code),
         ("viewer-markdown", viewer_markdown),
         ("viewer-image", viewer_image),

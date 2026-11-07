@@ -743,6 +743,14 @@ fn subagent(
     }
     card.body = Some(body);
     if let Some(child_id) = call.child_session_id.clone() {
+        let view = child_id.clone();
+        card.actions.push(
+            Button::new(cx.t("Details", "详情"))
+                .variant(ButtonVariant::Ghost)
+                .control_size(ControlSize::Small)
+                .on_press(move |s: &mut UiState| s.open_detail(&view))
+                .build(k),
+        );
         card.actions.push(
             Button::new(cx.t("Open session", "打开会话"))
                 .variant(ButtonVariant::Ghost)

@@ -4,6 +4,8 @@
 //! tool call is drawn in.
 
 pub mod approval;
+pub mod context;
+pub mod detail;
 pub mod diff_rows;
 pub mod files;
 pub mod glyphs;

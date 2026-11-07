@@ -34,6 +34,7 @@ use super::{muted, UiState};
 use crate::model::commands::Command;
 
 pub use super::parts::approval::permission_card;
+pub use super::parts::detail::DetailSheet;
 pub use super::parts::question::form_card;
 
 thread_local! {
@@ -183,9 +184,10 @@ impl UiState {
     /// Drop the timelines no longer on screen.
     pub(super) fn retain_timelines(&mut self) {
         let selected = self.selected.clone();
-        let tiles: Vec<String> = self.tiles.iter().filter_map(|t| t.asid.clone()).collect();
+        let mut keep: Vec<String> = self.tiles.iter().filter_map(|t| t.asid.clone()).collect();
+        keep.extend(self.detail_asids());
         self.timelines
-            .retain(|asid, _| selected.as_deref() == Some(asid.as_str()) || tiles.contains(asid));
+            .retain(|asid, _| selected.as_deref() == Some(asid.as_str()) || keep.contains(asid));
     }
 
     /// Open a file a timeline card names (a presented file, a glob or grep
@@ -507,9 +509,19 @@ fn item_row(cx: &Tcx, it: &TimelineItem) -> El {
     wrap
 }
 
-/// The image zoom over the window, when a picture is open.
+/// What the timeline draws over the window: an opened picture, else a
+/// subagent's detail sheet, else the context sheet.
 pub fn overlay(s: &UiState, k: &Kit) -> Option<El> {
     parts::images::zoom_overlay(s, k)
+        .or_else(|| parts::detail::sheet(s, k))
+        .or_else(|| parts::context::sheet(s, k))
+}
+
+/// The session header's context meter (how full the model's context is);
+/// a click opens the context and account-limits sheet. `None` when the
+/// session reports no usage.
+pub fn context_meter(s: &UiState, k: &Kit, asid: &str) -> Option<El> {
+    parts::context::meter(s, k, asid)
 }
 
 /// The session's working-tree changes, full height.

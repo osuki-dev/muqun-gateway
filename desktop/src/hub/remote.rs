@@ -457,6 +457,18 @@ impl SessionHub for RemoteHub {
         Box::pin(async move { self.read_snapshot(asid).await })
     }
 
+    fn account_limits<'a>(&'a self, agent: &'a str) -> HubFuture<'a, Value> {
+        Box::pin(async move {
+            self.call(
+                Method::GET,
+                &["api", "agents", agent, "account-limits"],
+                &[],
+                None,
+            )
+            .await
+        })
+    }
+
     fn earlier<'a>(&'a self, asid: &'a AgentSessionId) -> HubFuture<'a, Vec<TimelineItem>> {
         Box::pin(async move {
             let cursor = self.cursors.lock().unwrap().get(&asid.0).cloned();

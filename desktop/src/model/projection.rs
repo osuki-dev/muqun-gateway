@@ -260,6 +260,26 @@ impl Core {
                 *self.active.lock().unwrap() = Some(asid.clone());
                 self.open(&asid).await;
             }
+            Command::ReadDetail(asid) => {
+                let read = match self.hub.peek(&asid).await {
+                    Ok(Some(snapshot)) => Ok(snapshot),
+                    _ => self.hub.snapshot(&asid).await,
+                };
+                self.inbox.push(Update::Detail {
+                    asid: asid.0,
+                    result: read.map(Box::new).map_err(|err| err.to_string()),
+                });
+            }
+            Command::LoadAccountLimits { agent } => {
+                let limits = match self.hub.account_limits(&agent).await {
+                    Ok(limits) => Some(limits),
+                    Err(err) => {
+                        tracing::debug!(%agent, %err, "account limits unavailable");
+                        None
+                    }
+                };
+                self.inbox.push(Update::AccountLimits { agent, limits });
+            }
             Command::OpenTile(asid) => {
                 {
                     let mut watched = self.watched.lock().unwrap();

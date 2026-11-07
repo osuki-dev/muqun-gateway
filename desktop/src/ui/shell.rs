@@ -306,6 +306,9 @@ fn toolbar(s: &UiState, k: &Kit, look: &Look, layer: &mut Vec<El>) -> Toolbar {
             bar = bar.leading(session_identity(s, k, look));
             let asid = s.selected.clone().unwrap_or_default();
             let busy = s.busy();
+            if let Some(meter) = timeline::context_meter(s, k, &asid) {
+                bar = bar.trailing(meter);
+            }
             if s.diff_stat.files > 0 {
                 let label = format!("+{} −{}", s.diff_stat.added, s.diff_stat.removed);
                 bar = bar.trailing(
