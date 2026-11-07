@@ -1,25 +1,34 @@
-//! The window: sidebar, main pane, inspector and toolbar in one `SplitView`.
+//! The window: sidebar, main pane, inspector and the title band in one
+//! `SplitView`. The band is the session's header: its mark, title and state
+//! on the leading side, its actions trailing, so nothing overlaps however
+//! long the title gets.
 
 use std::sync::Arc;
 
 use rune::{col, el, row, text, Cx, El, SurfaceFit};
+use rune_kit::glyphs::TRIANGLE_DOWN;
 use rune_kit::shell::{SidebarToggle, SplitView, Toolbar, INSPECTOR};
 use rune_kit::{
     Badge, BadgeVariant, Button, ButtonVariant, Card, ControlSize, IconButton, IconButtonVariant,
-    Kit,
+    Kit, Menu, MenuItem,
 };
 
 use super::copy::{tr, tr_ref};
-use super::{art, composer, home, inbox, inspector, sessions, settings, tasks, timeline};
+use super::{
+    activity_pill, art, composer, home, inbox, inspector, sessions, settings, tasks, tiles,
+    timeline, title_of, Activity, OpenMenu,
+};
 use super::{Mode, UiState};
 use crate::branding::{APP_MARK_PNG, APP_NAME};
-use crate::config::Language;
 use crate::model::commands::Command;
+use crate::theme::look::Look;
 
 pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> El {
+    let look = s.look();
     let page = match s.mode {
         Mode::Home => home::view(s, k, layer),
-        Mode::Session => session(s, k, layer),
+        Mode::Session if s.in_split() => tiles::view(s, k, layer),
+        Mode::Session => session(s, k, &look, layer),
         Mode::Inbox => inbox::view(s, k),
         Mode::Tasks => tasks::view(s, k),
         Mode::Settings => settings::view(s, k),
@@ -28,14 +37,16 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
     if let Some(alert) = alert(s, k) {
         main = main.child(alert);
     }
+    // Pages cross-fade and lift a little as the mode changes.
+    let page = look.arrive(page.key(format!("page-{:?}", s.mode)), 0);
     let main = main.child(page.grow(1.0).min_h(0.0));
-    // Home is full-bleed artwork; a toolbar strip would sit as a white band
-    // over the hero. Settings / hub live in the sidebar footer there.
+    // Home is full-bleed artwork; a toolbar strip would sit as a band over
+    // the hero. Settings / hub live in the sidebar footer there.
     let mut split = SplitView::new(main)
         .sidebar(&s.sidebar, super::sidebar_pane, sessions::view(s, k, layer))
-        .sidebar_leading(home_brand(s, k));
+        .sidebar_leading(home_brand(s, k, &look));
     if s.mode != Mode::Home {
-        split = split.toolbar(toolbar(s, k));
+        split = split.toolbar(toolbar(s, k, &look, layer));
     }
     if s.right_open && s.mode == Mode::Session {
         split = split.inspector(&s.right, super::right_pane, inspector::view(s, k));
@@ -43,15 +54,22 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
     let mut split = split
         .titlebar_inset(cx.titlebar_inset())
         .frame_inset(8.0)
-        .sidebar_toggle(SidebarToggle::new().size(ControlSize::Large).in_header());
+        .reduced_motion(!look.motion || cx.is_reduced_motion())
+        .sidebar_toggle(
+            SidebarToggle::new()
+                .size(ControlSize::Large)
+                .in_header()
+                .unread(s.waiting_count() > 0),
+        );
     if s.mode != Mode::Home {
         split = split.toolbar_in_panel();
     }
     split.build(k)
 }
 
-/// Mark + name in the sidebar title bar; press returns to Home.
-fn home_brand(s: &UiState, k: &Kit) -> El {
+/// Mark + name in the sidebar title bar; press returns to Home. The mark
+/// carries a soft accent glow: the one lit thing in the chrome.
+fn home_brand(s: &UiState, k: &Kit, look: &Look) -> El {
     let language = s.cfg.general.language;
     // Keep a fixed cross-size: the titlebar row stretches children to its full
     // height, and a stretched text run top-aligns while the mark stays centred.
@@ -70,6 +88,7 @@ fn home_brand(s: &UiState, k: &Kit) -> El {
             .radius(5.0)
             .fill(k.c.bg_accent),
     };
+    let mark = look.glow(mark, k.c.bg_accent, 0.35);
     row()
         .key("home-brand")
         .gap(8.0)
@@ -82,12 +101,16 @@ fn home_brand(s: &UiState, k: &Kit) -> El {
             text(APP_NAME)
                 .key("home-name")
                 .font(k.ty.ui_medium.lh(MARK))
-                .color(k.c.text_base),
+                .color(if s.mode == Mode::Home {
+                    k.c.text_base
+                } else {
+                    k.c.text_muted
+                }),
         )
         .on_press(|s: &mut UiState| s.go(Mode::Home))
 }
 
-fn title(s: &UiState) -> String {
+fn page_title(s: &UiState) -> String {
     let language = s.cfg.general.language;
     match s.mode {
         Mode::Home => tr(language, "New session", "新建会话"),
@@ -100,65 +123,247 @@ fn title(s: &UiState) -> String {
     }
 }
 
-fn hub_badge_label(language: Language, raw: &str) -> String {
-    match raw {
-        "" => tr(language, "Connecting…", "连接中…"),
-        "local gateway" => tr(language, "Local gateway", "本机 Gateway"),
-        "standalone" => tr(language, "Standalone", "独立运行"),
-        other => other.to_string(),
-    }
-}
-
 fn status_interesting(status: &str) -> bool {
     let s = status.trim();
     !(s.is_empty()
         || s == "Starting…"
         || s == "Sent"
+        || s == "Demo"
         || s.starts_with("Opening ")
+        || s.starts_with("Theme: ")
         || s.ends_with(" messages")
         || s.ends_with(" agent(s) discovered"))
 }
 
-fn toolbar(s: &UiState, k: &Kit) -> Toolbar {
+/// The session's identity on the band's leading side: mark, title, agent
+/// and model, branch, and what it is doing.
+fn session_identity(s: &UiState, k: &Kit, look: &Look) -> El {
     let language = s.cfg.general.language;
-    let hub = hub_badge_label(language, &s.hub_label);
-    let mut bar = Toolbar::new().title(title(s));
-    if status_interesting(&s.status) {
-        bar = bar.trailing(
-            Badge::new(s.status.clone())
-                .variant(BadgeVariant::Subtle)
-                .build(k)
-                .key("status"),
+    let mut line = row()
+        .key("session-identity")
+        .gap(10.0)
+        .center_y()
+        .shrink()
+        .min_w(0.0);
+    let Some(info) = s.current() else {
+        return line.child(
+            text(s.status.clone())
+                .font(k.ty.ui_medium)
+                .color(k.c.text_muted)
+                .truncate(),
         );
+    };
+    let activity = s.activity(info);
+    let mut meta = vec![s.agent_name(&info.agent_id)];
+    if let Some(m) = &info.model {
+        let name = super::labels::format_model_name(m, "", None);
+        if !name.is_empty() {
+            meta.push(name);
+        }
+    }
+    if let Some(branch) = s.branch_of(info) {
+        meta.push(branch);
+    } else if let Some(folder) = UiState::folder_name(info) {
+        meta.push(folder);
+    }
+    line = line
+        .child(
+            look.glow(
+                el().key("session-mark")
+                    .size(26.0, 26.0)
+                    .radius(7.0)
+                    .fill(super::agents::color(&info.agent_id, s.dark).alpha(0.14))
+                    .center()
+                    .child(super::agents::mark(&info.agent_id, 16.0, s.dark)),
+                super::agents::color(&info.agent_id, s.dark),
+                if activity == Activity::Working {
+                    0.45
+                } else {
+                    0.0
+                },
+            )
+            .a11y_hidden(),
+        )
+        .child(
+            col()
+                .key("session-words")
+                .gap(0.0)
+                .shrink()
+                .min_w(0.0)
+                .child(
+                    text(title_of(info))
+                        .key("session-title")
+                        .font(k.ty.ui_medium.lh(17.0))
+                        .color(k.c.text_base)
+                        .truncate(),
+                )
+                .child(
+                    text(meta.join(" · "))
+                        .key("session-meta")
+                        .font(k.ty.caption().lh(14.0))
+                        .color(k.c.text_faint)
+                        .truncate(),
+                ),
+        );
+    if activity != Activity::Idle {
+        line = line.child(activity_pill(k, look, activity, language));
+    }
+    line
+}
+
+/// Fork, Compact, Rename, Pin and Delete: the session header's overflow.
+fn session_more(s: &UiState, k: &Kit, layer: &mut Vec<El>, asid: &str, busy: bool) -> El {
+    let language = s.cfg.general.language;
+    let open = s.menu == Some(OpenMenu::SessionMore);
+    let (rename_id, delete_id, pin_id) = (asid.to_string(), asid.to_string(), asid.to_string());
+    let (fork_id, compact_id) = (asid.to_string(), asid.to_string());
+    let pinned = s.cfg.general.pinned.iter().any(|p| p == asid);
+    Menu::new("session-more")
+        .trigger(
+            IconButton::new(&TRIANGLE_DOWN)
+                .variant(IconButtonVariant::GhostMuted)
+                .control_size(ControlSize::Small)
+                .label(tr_ref(language, "More", "更多"))
+                .expanded(open)
+                .on_press(move |s: &mut UiState| {
+                    s.menu = (!open).then_some(OpenMenu::SessionMore);
+                })
+                .build(k)
+                .key("session-more-btn"),
+        )
+        .open(open)
+        .on_close(|s: &mut UiState| s.menu = None)
+        .item(
+            MenuItem::new(tr(language, "Fork session", "分叉会话")).on_select(
+                move |s: &mut UiState| {
+                    s.menu = None;
+                    s.send(Command::ForkSession {
+                        asid: muqun_gateway::agents::AgentSessionId(fork_id.clone()),
+                        message_id: None,
+                    });
+                },
+            ),
+        )
+        .item(
+            MenuItem::new(tr(language, "Compact history", "压缩历史"))
+                .disabled(busy)
+                .on_select(move |s: &mut UiState| {
+                    s.menu = None;
+                    s.send(Command::CompactSession {
+                        asid: muqun_gateway::agents::AgentSessionId(compact_id.clone()),
+                    });
+                }),
+        )
+        .separator()
+        .item(MenuItem::new(tr(language, "Rename…", "重命名…")).on_select(
+            move |s: &mut UiState| {
+                s.menu = None;
+                let title = s
+                    .session_by_id(&rename_id)
+                    .map(title_of)
+                    .unwrap_or_default();
+                s.rename_asid = Some(rename_id.clone());
+                s.rename_edit = rune::TextEdit::new(title);
+                s.rename_edit.focused = true;
+            },
+        ))
+        .item(
+            MenuItem::new(if pinned {
+                tr(language, "Unpin", "取消置顶")
+            } else {
+                tr(language, "Pin", "置顶")
+            })
+            .on_select(move |s: &mut UiState| {
+                s.menu = None;
+                s.edit(crate::config::ConfigEdit::TogglePin(pin_id.clone()));
+            }),
+        )
+        .separator()
+        .item(
+            MenuItem::new(tr(language, "Delete session", "删除会话"))
+                .danger(true)
+                .on_select(move |s: &mut UiState| {
+                    s.menu = None;
+                    s.send(Command::DeleteSession(
+                        muqun_gateway::agents::AgentSessionId(delete_id.clone()),
+                    ));
+                }),
+        )
+        .build(k, layer)
+}
+
+fn toolbar(s: &UiState, k: &Kit, look: &Look, layer: &mut Vec<El>) -> Toolbar {
+    let language = s.cfg.general.language;
+    let mut bar = Toolbar::new();
+    match s.mode {
+        Mode::Session if s.in_split() => {
+            bar = bar.leading(tiles::toolbar_title(s, k));
+            for action in tiles::toolbar_actions(s, k) {
+                bar = bar.trailing(action);
+            }
+        }
+        Mode::Session => {
+            bar = bar.leading(session_identity(s, k, look));
+            let asid = s.selected.clone().unwrap_or_default();
+            let busy = s.busy();
+            if s.diff_stat.files > 0 {
+                let label = format!("+{} −{}", s.diff_stat.added, s.diff_stat.removed);
+                bar = bar.trailing(
+                    Button::new(label)
+                        .variant(if s.show_diff {
+                            ButtonVariant::Contrast
+                        } else {
+                            ButtonVariant::Ghost
+                        })
+                        .control_size(ControlSize::Small)
+                        .help(format!(
+                            "{} {}",
+                            s.diff_stat.files,
+                            tr_ref(language, "changed file(s)", "个文件有改动")
+                        ))
+                        .on_press(|s: &mut UiState| match s.selected.clone() {
+                            Some(asid) => s.send(Command::OpenDiff {
+                                asid: muqun_gateway::agents::AgentSessionId(asid),
+                                file: None,
+                            }),
+                            None => s.show_diff = !s.show_diff,
+                        })
+                        .build(k)
+                        .key("changes"),
+                );
+            }
+            bar = bar.trailing(
+                Button::new(tr_ref(language, "Split", "分屏"))
+                    .variant(ButtonVariant::Ghost)
+                    .control_size(ControlSize::Small)
+                    .disabled(asid.is_empty())
+                    .help(tr_ref(
+                        language,
+                        "Open another session beside this one",
+                        "在旁边打开另一个会话",
+                    ))
+                    .shortcut("Primary+\\")
+                    .on_press(|s: &mut UiState| s.split())
+                    .build(k)
+                    .key("split"),
+            );
+            if !asid.is_empty() {
+                bar = bar.trailing(session_more(s, k, layer, &asid, busy));
+            }
+        }
+        _ => {
+            bar = bar.title(page_title(s));
+            if status_interesting(&s.status) {
+                bar = bar.trailing(
+                    Badge::new(s.status.clone())
+                        .variant(BadgeVariant::Subtle)
+                        .build(k)
+                        .key("status"),
+                );
+            }
+        }
     }
     if s.mode == Mode::Session {
-        if s.diff_stat.files > 0 {
-            let label = format!(
-                "{} {} +{} −{}",
-                tr_ref(language, "Changes", "变更"),
-                s.diff_stat.files,
-                s.diff_stat.added,
-                s.diff_stat.removed
-            );
-            bar = bar.trailing(
-                Button::new(label)
-                    .variant(if s.show_diff {
-                        ButtonVariant::Contrast
-                    } else {
-                        ButtonVariant::Ghost
-                    })
-                    .control_size(ControlSize::Small)
-                    .on_press(|s: &mut UiState| match s.selected.clone() {
-                        Some(asid) => s.send(Command::OpenDiff {
-                            asid: muqun_gateway::agents::AgentSessionId(asid),
-                            file: None,
-                        }),
-                        None => s.show_diff = !s.show_diff,
-                    })
-                    .build(k)
-                    .key("changes"),
-            );
-        }
         bar = bar.trailing(
             IconButton::new(&INSPECTOR)
                 .variant(if s.right_open {
@@ -172,22 +377,7 @@ fn toolbar(s: &UiState, k: &Kit) -> Toolbar {
                 .key("inspector-toggle"),
         );
     }
-    if s.mode != Mode::Settings {
-        bar = bar.trailing(
-            Button::new(tr_ref(language, "Settings", "设置"))
-                .variant(ButtonVariant::Ghost)
-                .control_size(ControlSize::Small)
-                .on_press(|s: &mut UiState| s.go(Mode::Settings))
-                .build(k)
-                .key("goto-settings"),
-        );
-    }
-    bar.trailing(
-        Badge::new(hub)
-            .variant(BadgeVariant::Subtle)
-            .build(k)
-            .key("hub"),
-    )
+    bar
 }
 
 /// An error from the core: the message, what to check, and a way to dismiss it.
@@ -228,21 +418,41 @@ fn alert(s: &UiState, k: &Kit) -> Option<El> {
     )
 }
 
-fn session(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
+/// A hairline of light under the title band, in the session agent's colour.
+pub fn light_rule(k: &Kit, color: rune::Color, strength: f32) -> El {
+    el().key("light-rule")
+        .w_full()
+        .h(1.0)
+        .fill(k.c.border_muted)
+        .linear_gradient(
+            std::f32::consts::FRAC_PI_2,
+            [
+                (0.0, color.alpha(0.0)),
+                (0.25, color.alpha(0.75 * strength)),
+                (0.75, color.alpha(0.75 * strength)),
+                (1.0, color.alpha(0.0)),
+            ],
+        )
+        .a11y_hidden()
+}
+
+fn session(s: &UiState, k: &Kit, look: &Look, layer: &mut Vec<El>) -> El {
     let body = if s.show_diff {
         timeline::changes(s, k)
     } else {
         timeline::view(s, k)
     };
     let mut page = col().key("session").w_full().min_h(0.0);
+    if let Some(info) = s.current() {
+        let working = s.activity(info) == Activity::Working;
+        let color = super::agents::color(&info.agent_id, s.dark);
+        let rule = light_rule(k, color, if working { 1.0 } else { 0.45 });
+        page = page.child(if working { look.pulse(rule) } else { rule });
+    }
     if s.revert_staged {
         page = page.child(revert_banner(s, k));
     }
-    page = page
-        .child(session_actions(s, k))
-        .child(body)
-        .child(composer::view(s, k, layer));
-    page
+    page.child(body).child(composer::view(s, k, layer))
 }
 
 fn revert_banner(s: &UiState, k: &Kit) -> El {
@@ -287,76 +497,4 @@ fn revert_banner(s: &UiState, k: &Kit) -> El {
         .key("revert-banner")
         .mx(16.0)
         .mt(8.0)
-}
-
-fn session_actions(s: &UiState, k: &Kit) -> El {
-    let language = s.cfg.general.language;
-    let asid = s.selected.clone().unwrap_or_default();
-    let busy = s.busy();
-    row()
-        .key("session-actions")
-        .w_full()
-        .px(16.0)
-        .pt(8.0)
-        .gap(8.0)
-        .center_y()
-        .child(
-            Button::new(tr_ref(language, "Fork", "分叉"))
-                .variant(ButtonVariant::Ghost)
-                .control_size(ControlSize::Small)
-                .disabled(asid.is_empty())
-                .on_press({
-                    let asid = asid.clone();
-                    move |s: &mut UiState| {
-                        s.send(Command::ForkSession {
-                            asid: muqun_gateway::agents::AgentSessionId(asid.clone()),
-                            message_id: None,
-                        });
-                    }
-                })
-                .build(k)
-                .key("fork"),
-        )
-        .child(
-            Button::new(tr_ref(language, "Compact", "压缩"))
-                .variant(ButtonVariant::Ghost)
-                .control_size(ControlSize::Small)
-                .disabled(asid.is_empty() || busy)
-                .on_press({
-                    let asid = asid.clone();
-                    move |s: &mut UiState| {
-                        s.send(Command::CompactSession {
-                            asid: muqun_gateway::agents::AgentSessionId(asid.clone()),
-                        });
-                    }
-                })
-                .build(k)
-                .key("compact"),
-        )
-        .child(
-            Button::new(tr_ref(language, "Delete", "删除"))
-                .variant(ButtonVariant::Danger)
-                .control_size(ControlSize::Small)
-                .disabled(asid.is_empty())
-                .on_press({
-                    let asid = asid.clone();
-                    move |s: &mut UiState| {
-                        s.send(Command::DeleteSession(
-                            muqun_gateway::agents::AgentSessionId(asid.clone()),
-                        ));
-                    }
-                })
-                .build(k)
-                .key("delete"),
-        )
-        .child(
-            text(if busy {
-                tr(language, "Agent is working…", "Agent 正在工作…")
-            } else {
-                String::new()
-            })
-            .font(k.ty.small)
-            .color(k.c.text_muted)
-            .key("session-busy"),
-        )
 }

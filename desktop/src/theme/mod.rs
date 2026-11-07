@@ -16,6 +16,7 @@ pub mod agents;
 pub mod apply;
 pub mod color_scheme;
 pub mod gallery;
+pub mod look;
 pub mod muqun_theme;
 pub mod pack;
 pub mod service;

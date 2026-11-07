@@ -20,6 +20,7 @@ mod settings;
 mod shell;
 mod splash;
 mod tasks;
+mod tiles;
 mod timeline;
 mod viewer;
 
@@ -37,7 +38,7 @@ use muqun_gateway::platform::discovery::AgentDiscoveryInfo;
 use rune::{Cx, El, ImageCache, KeyEvent, TextEdit, Tx};
 use rune_kit::diff::{parse, DiffState};
 use rune_kit::shell::{is_sidebar_toggle, PaneState};
-use rune_kit::{Kit, ToastRegion};
+use rune_kit::{Kit, ScrollBar, ToastRegion};
 
 use crate::config::{ConfigEdit, DesktopConfig, Scheme};
 use crate::hub::CatalogView;
@@ -48,6 +49,7 @@ use crate::model::inbox::{Inbox, UiAction, UiError, Update};
 use crate::model::projects::DirInfo;
 use crate::model::types::{DiffStat, SESSION_LIST_LIMIT};
 use crate::theme::color_scheme::ColorScheme;
+use crate::theme::look::Look;
 use crate::theme::service::{GalleryView, Job, ThemeUpdate};
 use crate::theme::store::ThemeEntry;
 
@@ -125,7 +127,41 @@ pub enum OpenMenu {
     Project(String),
     /// A queued prompt chip above the composer (by inbox item id).
     Queued(String),
+    /// The session header's overflow (rename, delete …).
+    SessionMore,
+    /// A split tile's menu (by tile index).
+    Tile(usize),
 }
+
+/// The view state of one open session: what the timeline and composer read.
+/// The focused session's slot lives in [`UiState`]'s own fields (so the
+/// timeline and composer keep reading `s.timeline`, `s.draft` …); every other
+/// open tile keeps its own here and swaps in when it takes focus.
+#[derive(Default)]
+pub struct SessionSlot {
+    pub timeline: Vec<TimelineItem>,
+    pub earlier_exhausted: bool,
+    pub draft: TextEdit,
+    pub queue: Vec<InboxItem>,
+    pub staged: Vec<StagedFile>,
+    pub diff_stat: DiffStat,
+    pub diff: Option<DiffState>,
+    pub show_diff: bool,
+    pub revert_staged: bool,
+    pub catalog: Option<Arc<CatalogView>>,
+    pub descendants: Vec<AgentSessionInfo>,
+    pub saved_permissions: Vec<SavedPermission>,
+}
+
+/// One pane of the split session view. `asid` is `None` while the tile
+/// waits for a session to be picked into it.
+pub struct Tile {
+    pub asid: Option<String>,
+    pub slot: SessionSlot,
+}
+
+/// How many sessions may be open side by side.
+pub const MAX_TILES: usize = 4;
 
 static INITIAL_CONFIG: OnceLock<DesktopConfig> = OnceLock::new();
 
@@ -250,6 +286,18 @@ pub struct UiState {
     pub demo: bool,
     /// The file viewer overlay ([`UiState::open_file`]).
     pub viewer: Option<viewer::Viewer>,
+    /// Sessions open side by side (empty when one session fills the pane).
+    pub tiles: Vec<Tile>,
+    /// The tile the keyboard and the composer belong to.
+    pub focus: usize,
+    /// Where the first column ends, as a fraction of the split's width.
+    pub tile_split: f32,
+    /// An empty tile waiting for the next opened session.
+    pub pending_tile: Option<usize>,
+    /// The split's width on screen, for the grip's drag.
+    pub tile_grid_w: f32,
+    /// The saved split was put back once sessions were listed.
+    tiles_restored: bool,
 }
 
 impl UiState {
@@ -358,6 +406,12 @@ impl UiState {
             agents_seen: false,
             demo: false,
             viewer: None,
+            tiles: Vec::new(),
+            focus: 0,
+            tile_split: cfg.ui.tile_split(),
+            pending_tile: None,
+            tile_grid_w: 0.0,
+            tiles_restored: false,
             cfg,
         };
         s.arm_splash(splash::SplashKind::Boot);
@@ -492,16 +546,30 @@ impl UiState {
     }
 
     pub fn open_session(&mut self, asid: &str) {
+        crate::platform::notify::withdraw(asid);
+        if let Some(i) = self.tile_of(asid) {
+            if i != self.focus {
+                self.focus_tile(i);
+                return;
+            }
+        }
         let changed = self.selected.as_deref() != Some(asid);
         self.selected = Some(asid.to_string());
         self.mode = Mode::Session;
         self.show_diff = false;
         if changed {
+            if let Some(tile) = self.tiles.get_mut(self.focus) {
+                tile.asid = Some(asid.to_string());
+                self.persist_tiles();
+                self.sync_watch();
+            }
             self.load_draft(asid);
             self.menu = None;
             self.peers.clear();
             self.timeline.clear();
-            self.inline_diffs.clear();
+            if self.tiles.is_empty() {
+                self.inline_diffs.clear();
+            }
             self.queue.clear();
             self.staged.clear();
             self.diff_stat = DiffStat::default();
@@ -509,7 +577,6 @@ impl UiState {
             self.earlier_exhausted = false;
         }
         self.status = format!("Opening {asid}");
-        crate::platform::notify::withdraw(asid);
         self.send(Command::OpenSession(AgentSessionId(asid.to_string())));
     }
 
@@ -657,6 +724,269 @@ impl UiState {
         }
     }
 
+    // ---- split tiles ---------------------------------------------------------------
+
+    /// Several sessions share the pane.
+    pub fn in_split(&self) -> bool {
+        self.tiles.len() >= 2
+    }
+
+    pub fn tile_of(&self, asid: &str) -> Option<usize> {
+        self.tiles
+            .iter()
+            .position(|t| t.asid.as_deref() == Some(asid))
+    }
+
+    /// Move the focused session's view state out of the top-level fields.
+    fn take_slot(&mut self) -> SessionSlot {
+        SessionSlot {
+            timeline: std::mem::take(&mut self.timeline),
+            earlier_exhausted: std::mem::replace(&mut self.earlier_exhausted, false),
+            draft: std::mem::replace(&mut self.draft, TextEdit::new("")),
+            queue: std::mem::take(&mut self.queue),
+            staged: std::mem::take(&mut self.staged),
+            diff_stat: std::mem::take(&mut self.diff_stat),
+            diff: self.diff.take(),
+            show_diff: std::mem::replace(&mut self.show_diff, false),
+            revert_staged: std::mem::replace(&mut self.revert_staged, false),
+            catalog: self.catalog.take(),
+            descendants: std::mem::take(&mut self.descendants),
+            saved_permissions: std::mem::take(&mut self.saved_permissions),
+        }
+    }
+
+    fn put_slot(&mut self, slot: SessionSlot) {
+        self.timeline = slot.timeline;
+        self.earlier_exhausted = slot.earlier_exhausted;
+        self.draft = slot.draft;
+        self.draft.focused = true;
+        self.queue = slot.queue;
+        self.staged = slot.staged;
+        self.diff_stat = slot.diff_stat;
+        self.diff = slot.diff;
+        self.show_diff = slot.show_diff;
+        self.revert_staged = slot.revert_staged;
+        self.catalog = slot.catalog;
+        self.descendants = slot.descendants;
+        self.saved_permissions = slot.saved_permissions;
+    }
+
+    /// Give tile `i` the keyboard: its session becomes the one the top-level
+    /// fields describe, the old focused tile keeps its state in its slot.
+    pub fn focus_tile(&mut self, i: usize) {
+        if i >= self.tiles.len() || i == self.focus {
+            self.mode = Mode::Session;
+            return;
+        }
+        let old = self.take_slot();
+        self.tiles[self.focus].slot = old;
+        let new = std::mem::take(&mut self.tiles[i].slot);
+        self.put_slot(new);
+        self.focus = i;
+        self.selected = self.tiles[i].asid.clone();
+        self.menu = None;
+        self.mode = Mode::Session;
+        self.sync_watch();
+        if self.catalog.is_none() {
+            if let Some(info) = self.current().cloned() {
+                self.session_opened(&info);
+            }
+        }
+    }
+
+    /// Tell the core which sessions besides the focused one are on screen.
+    fn sync_watch(&self) {
+        let watched: Vec<AgentSessionId> = self
+            .tiles
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != self.focus)
+            .filter_map(|(_, t)| t.asid.clone().map(AgentSessionId))
+            .collect();
+        self.send(Command::WatchSessions(watched));
+    }
+
+    /// Open `asid` beside the current session(s). A session already open in
+    /// a tile takes focus instead; a full split replaces the last tile.
+    pub fn open_in_tile(&mut self, asid: &str) {
+        if let Some(i) = self.tile_of(asid) {
+            self.focus_tile(i);
+            return;
+        }
+        if self.tiles.is_empty() {
+            let Some(current) = self.selected.clone() else {
+                self.open_session(asid);
+                return;
+            };
+            self.tiles.push(Tile {
+                asid: Some(current),
+                slot: SessionSlot::default(),
+            });
+            self.focus = 0;
+        }
+        let slot = SessionSlot {
+            draft: TextEdit::new(
+                self.cfg
+                    .general
+                    .drafts
+                    .get(asid)
+                    .cloned()
+                    .unwrap_or_default(),
+            ),
+            ..SessionSlot::default()
+        };
+        if let Some(empty) = self.tiles.iter().position(|t| t.asid.is_none()) {
+            self.tiles[empty].asid = Some(asid.to_string());
+            self.tiles[empty].slot = slot;
+        } else if self.tiles.len() < MAX_TILES {
+            self.tiles.push(Tile {
+                asid: Some(asid.to_string()),
+                slot,
+            });
+        } else {
+            let last = self.tiles.len() - 1;
+            let victim = if last == self.focus { last - 1 } else { last };
+            self.tiles[victim].asid = Some(asid.to_string());
+            self.tiles[victim].slot = slot;
+        }
+        self.mode = Mode::Session;
+        self.send(Command::OpenTile(AgentSessionId(asid.to_string())));
+        self.sync_watch();
+        self.persist_tiles();
+    }
+
+    /// Add an empty tile that offers a session to pick (the Split action).
+    pub fn split(&mut self) {
+        if self.tiles.len() >= MAX_TILES {
+            return;
+        }
+        if self.tiles.is_empty() {
+            let Some(current) = self.selected.clone() else {
+                return;
+            };
+            self.tiles.push(Tile {
+                asid: Some(current),
+                slot: SessionSlot::default(),
+            });
+            self.focus = 0;
+        }
+        self.tiles.push(Tile {
+            asid: None,
+            slot: SessionSlot::default(),
+        });
+        self.mode = Mode::Session;
+    }
+
+    /// Close tile `i`; one tile left means the pane goes back to one session.
+    pub fn close_tile(&mut self, i: usize) {
+        if i >= self.tiles.len() {
+            return;
+        }
+        if i == self.focus {
+            // Hand focus to a neighbour first so its state comes to the top.
+            let next = if i + 1 < self.tiles.len() {
+                i + 1
+            } else {
+                i.saturating_sub(1)
+            };
+            if next != i {
+                self.focus_tile(next);
+            }
+        }
+        let gone = self.tiles.remove(i);
+        if self.focus > i {
+            self.focus -= 1;
+        }
+        for item in &gone.slot.timeline {
+            self.inline_diffs.remove(&item.id);
+        }
+        if let Some(asid) = gone.asid {
+            let text = gone.slot.draft.text.clone();
+            let stored = self
+                .cfg
+                .general
+                .drafts
+                .get(&asid)
+                .map_or("", String::as_str);
+            if stored != text {
+                self.edit(ConfigEdit::Draft { key: asid, text });
+            }
+        }
+        if self.tiles.len() <= 1 {
+            self.tiles.clear();
+            self.focus = 0;
+            if self.selected.is_none() {
+                self.mode = Mode::Home;
+            }
+        }
+        self.pending_tile = None;
+        self.menu = None;
+        self.sync_watch();
+        self.persist_tiles();
+    }
+
+    /// Swap tiles `i` and `j` (their places, not their focus).
+    pub fn swap_tiles(&mut self, i: usize, j: usize) {
+        if i >= self.tiles.len() || j >= self.tiles.len() || i == j {
+            return;
+        }
+        self.tiles.swap(i, j);
+        if self.focus == i {
+            self.focus = j;
+        } else if self.focus == j {
+            self.focus = i;
+        }
+        self.menu = None;
+        self.persist_tiles();
+    }
+
+    /// Remember the split for the next launch.
+    pub fn persist_tiles(&mut self) {
+        let asids: Vec<String> = self.tiles.iter().filter_map(|t| t.asid.clone()).collect();
+        let split = self.tile_split;
+        if asids != self.cfg.ui.tiles || (split - self.cfg.ui.tile_split).abs() > 0.001 {
+            self.edit(ConfigEdit::Tiles { asids, split });
+        }
+    }
+
+    pub fn set_tile_split(&mut self, split: f32) {
+        self.tile_split = split.clamp(0.25, 0.75);
+    }
+
+    /// Put the saved split back once the listed sessions include it.
+    fn restore_tiles(&mut self) {
+        if self.tiles_restored || self.demo {
+            return;
+        }
+        if self.cfg.ui.tiles.len() < 2 {
+            self.tiles_restored = true;
+            return;
+        }
+        let saved: Vec<String> = self
+            .cfg
+            .ui
+            .tiles
+            .iter()
+            .filter(|a| self.session_by_id(a).is_some())
+            .cloned()
+            .collect();
+        if saved.len() < 2 {
+            return;
+        }
+        self.tiles_restored = true;
+        self.open_session(&saved[0]);
+        for asid in &saved[1..] {
+            self.open_in_tile(asid);
+        }
+        self.focus_tile(0);
+    }
+
+    /// The slot of `asid`'s tile when it is open but not focused.
+    fn parked_slot(&mut self, asid: &str) -> Option<&mut SessionSlot> {
+        let i = self.tile_of(asid)?;
+        (i != self.focus || self.selected.as_deref() != Some(asid)).then(|| &mut self.tiles[i].slot)
+    }
+
     // ---- core → UI ---------------------------------------------------------------
 
     pub fn apply_updates(&mut self, updates: Vec<Update>) {
@@ -672,12 +1002,18 @@ impl UiState {
                     if self.error.as_ref().is_some_and(|e| e.unreachable) {
                         self.error = None;
                     }
+                    self.restore_tiles();
                 }
                 Update::SessionCreated(info) => self.merge_sessions(vec![*info]),
                 Update::SessionGone(asid) => {
                     self.sessions.retain(|s| s.asid.0 != asid);
                     self.waiting_perms.remove(&asid);
                     self.waiting_forms.remove(&asid);
+                    if let Some(i) = self.tile_of(&asid) {
+                        if self.in_split() {
+                            self.close_tile(i);
+                        }
+                    }
                     if self.selected.as_deref() == Some(asid.as_str()) {
                         self.selected = None;
                         self.timeline.clear();
@@ -705,15 +1041,19 @@ impl UiState {
                     items,
                     exhausted,
                 } => {
+                    let mut older = Vec::new();
+                    for item in items {
+                        self.ingest(&item);
+                        older.push(item);
+                    }
                     if self.selected.as_deref() == Some(asid.as_str()) {
-                        let mut older = Vec::new();
-                        for item in items {
-                            self.ingest(&item);
-                            older.push(item);
-                        }
                         older.append(&mut self.timeline);
                         self.timeline = older;
                         self.earlier_exhausted = exhausted;
+                    } else if let Some(slot) = self.parked_slot(&asid) {
+                        older.append(&mut slot.timeline);
+                        slot.timeline = older;
+                        slot.earlier_exhausted = exhausted;
                     }
                 }
                 Update::Composer(update) => self.on_composer(*update),
@@ -723,16 +1063,20 @@ impl UiState {
                     self.known_projects.insert(agent, projects);
                 }
                 Update::Diff(stat) => {
+                    let patch: String = stat
+                        .paths
+                        .iter()
+                        .map(|f| f.patch.as_str())
+                        .filter(|p| !p.is_empty())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    let diff = (!patch.is_empty()).then(|| DiffState::new(parse(&patch)));
                     if self.selected.as_deref() == Some(stat.asid.as_str()) {
-                        let patch: String = stat
-                            .paths
-                            .iter()
-                            .map(|f| f.patch.as_str())
-                            .filter(|p| !p.is_empty())
-                            .collect::<Vec<_>>()
-                            .join("\n");
-                        self.diff = (!patch.is_empty()).then(|| DiffState::new(parse(&patch)));
+                        self.diff = diff;
                         self.diff_stat = stat;
+                    } else if let Some(slot) = self.parked_slot(&stat.asid.clone()) {
+                        slot.diff = diff;
+                        slot.diff_stat = stat;
                     }
                 }
                 Update::Tasks { rows, default_cwd } => {
@@ -742,11 +1086,15 @@ impl UiState {
                 Update::Descendants { asid, sessions } => {
                     if self.selected.as_deref() == Some(asid.as_str()) {
                         self.descendants = sessions;
+                    } else if let Some(slot) = self.parked_slot(&asid) {
+                        slot.descendants = sessions;
                     }
                 }
                 Update::SavedPermissions { asid, items } => {
                     if self.selected.as_deref() == Some(asid.as_str()) {
                         self.saved_permissions = items;
+                    } else if let Some(slot) = self.parked_slot(&asid) {
+                        slot.saved_permissions = items;
                     }
                 }
                 Update::Shells(rows) => self.shells = rows,
@@ -763,9 +1111,11 @@ impl UiState {
     /// Raise a system notification unless the owner turned them off or is
     /// looking at that session (`model/notify.rs` has the rules and words).
     fn on_attention(&mut self, attention: &crate::model::notify::Attention) {
+        // On screen: the focused session, or any session in a split tile.
         let on_screen = crate::platform::notify::window_focused()
             && self.mode == Mode::Session
-            && self.selected.as_deref() == Some(attention.asid.as_str());
+            && (self.selected.as_deref() == Some(attention.asid.as_str())
+                || self.tile_of(&attention.asid).is_some());
         if !self.cfg.notifications.enabled || on_screen {
             return;
         }
@@ -857,11 +1207,44 @@ impl UiState {
 
     fn on_snapshot(&mut self, snapshot: muqun_gateway::agents::ports::AgentSessionSnapshot) {
         let asid = snapshot.info.asid.0.clone();
+        // A session opened into a tile that is not focused fills that tile.
+        if let Some(i) = self.tile_of(&asid) {
+            if i != self.focus {
+                self.merge_sessions(vec![snapshot.info.clone()]);
+                for item in &snapshot.timeline {
+                    self.ingest(item);
+                }
+                self.waiting_perms
+                    .insert(asid.clone(), snapshot.permissions);
+                self.waiting_forms.insert(asid.clone(), snapshot.forms);
+                let queue = InboxItem::list(&snapshot.inbox);
+                let slot = &mut self.tiles[i].slot;
+                slot.timeline = snapshot.timeline;
+                slot.queue = queue;
+                slot.earlier_exhausted = false;
+                return;
+            }
+        }
+        // A session started from an empty tile lands in it.
+        if let Some(i) = self.pending_tile.take() {
+            if self.tiles.get(i).is_some_and(|t| t.asid.is_none()) {
+                self.focus_tile(i);
+                self.tiles[i].asid = Some(asid.clone());
+                self.sync_watch();
+            }
+        }
         let fresh = self.selected.as_deref() != Some(asid.as_str());
-        if fresh {
+        if fresh && self.tiles.is_empty() {
             self.inline_diffs.clear();
         }
         self.selected = Some(asid.clone());
+        if let Some(tile) = self.tiles.get_mut(self.focus) {
+            if tile.asid.as_deref() != Some(asid.as_str()) {
+                tile.asid = Some(asid.clone());
+                self.sync_watch();
+                self.persist_tiles();
+            }
+        }
         if self.mode == Mode::Home {
             self.mode = Mode::Session;
         }
@@ -894,6 +1277,30 @@ impl UiState {
                 asid, mut items, ..
             } => {
                 if !current(self, &asid) {
+                    let directory = self
+                        .sessions
+                        .iter()
+                        .find(|s| s.asid == asid)
+                        .and_then(|s| s.directory.clone());
+                    if self.tile_of(&asid.0).is_none() {
+                        return;
+                    }
+                    muqun_gateway::agents::message_images::enrich_timeline(
+                        &asid.0,
+                        directory.as_deref(),
+                        &mut items,
+                    );
+                    for item in &items {
+                        self.ingest(item);
+                    }
+                    if let Some(slot) = self.parked_slot(&asid.0) {
+                        for item in items {
+                            match slot.timeline.iter_mut().find(|t| t.id == item.id) {
+                                Some(place) => *place = item,
+                                None => slot.timeline.push(item),
+                            }
+                        }
+                    }
                     return;
                 }
                 // Same egress step the App gets over HTTP/SSE (`attach_to_event`):
@@ -917,9 +1324,13 @@ impl UiState {
             AgentDomainEvent::TimelineRemoved { asid, ids, .. } => {
                 if current(self, &asid) {
                     self.timeline.retain(|t| !ids.contains(&t.id));
-                    for id in &ids {
-                        self.inline_diffs.remove(id);
-                    }
+                } else if let Some(slot) = self.parked_slot(&asid.0) {
+                    slot.timeline.retain(|t| !ids.contains(&t.id));
+                } else {
+                    return;
+                }
+                for id in &ids {
+                    self.inline_diffs.remove(id);
                 }
             }
             AgentDomainEvent::SessionUpdated { info, .. } => self.merge_sessions(vec![*info]),
@@ -974,11 +1385,15 @@ impl UiState {
             AgentDomainEvent::RevertChanged { asid, revert, .. } => {
                 if current(self, &asid) {
                     self.revert_staged = revert.is_some();
+                } else if let Some(slot) = self.parked_slot(&asid.0) {
+                    slot.revert_staged = revert.is_some();
                 }
             }
             AgentDomainEvent::InboxChanged { asid, items, .. } => {
                 if current(self, &asid) {
                     self.queue = InboxItem::list(&items);
+                } else if let Some(slot) = self.parked_slot(&asid.0) {
+                    slot.queue = InboxItem::list(&items);
                 }
             }
             AgentDomainEvent::WorktreeChanged { .. } => {
@@ -1109,6 +1524,8 @@ impl UiState {
             ComposerUpdate::Inbox { asid, items } => {
                 if self.selected.as_deref() == Some(asid.as_str()) {
                     self.queue = items;
+                } else if let Some(slot) = self.parked_slot(&asid) {
+                    slot.queue = items;
                 }
             }
             ComposerUpdate::Branch { cwd, info } => {
@@ -1142,11 +1559,25 @@ pub fn page_frame(k: &Kit, key: &str, title: &str, subtitle: Option<&str>) -> El
 /// Like [`page_frame`], with an explicit content width (Themes uses a wider rail).
 pub fn page_frame_w(k: &Kit, key: &str, title: &str, subtitle: Option<&str>, max_w: f32) -> El {
     let title_font = rune::TextStyle {
-        size: 22.0,
-        line_height: 28.0,
+        size: 26.0,
+        line_height: 32.0,
         ..k.ty.ui_medium
     };
-    let mut page = rune::col()
+    let mut head = rune::col().key("page-head").w_full().gap(4.0).child(
+        rune::text(title.to_string())
+            .font(title_font)
+            .color(k.c.text_base)
+            .key("page-title"),
+    );
+    if let Some(sub) = subtitle.filter(|s| !s.is_empty()) {
+        head = head.child(
+            rune::text(sub.to_string())
+                .font(k.ty.body)
+                .color(k.c.text_muted)
+                .key("page-subtitle"),
+        );
+    }
+    rune::col()
         .key(key.to_string())
         .w_full()
         .max_w(max_w)
@@ -1154,21 +1585,38 @@ pub fn page_frame_w(k: &Kit, key: &str, title: &str, subtitle: Option<&str>, max
         .px(28.0)
         .pt(28.0)
         .pb(40.0)
-        .child(
-            rune::text(title.to_string())
-                .font(title_font)
-                .color(k.c.text_base)
-                .key("page-title"),
-        );
-    if let Some(sub) = subtitle.filter(|s| !s.is_empty()) {
-        page = page.child(
-            rune::text(sub.to_string())
-                .font(k.ty.body)
-                .color(k.c.text_muted)
-                .key("page-subtitle"),
-        );
+        .child(head)
+}
+
+/// A page's stage: the scroll column centred over a soft accent light, so
+/// Inbox, Tasks and Settings share Home's atmosphere.
+pub fn page_stage(s: &UiState, k: &Kit, key: &str, page: El) -> El {
+    let look = s.look();
+    let mut stage = rune::el()
+        .key(format!("{key}-stage"))
+        .w_full()
+        .h_full()
+        .min_h(0.0);
+    if look.glass {
+        stage = stage.child(look.light(
+            &format!("{key}-light"),
+            [0.5, -0.1],
+            [700.0, 360.0],
+            k.c.bg_accent,
+        ));
     }
-    page
+    stage.child(
+        rune::col()
+            .key(format!("{key}-scroll"))
+            .w_full()
+            .h_full()
+            .items_center()
+            .child(page)
+            .scroll(rune::ScrollSpec {
+                stick_bottom: false,
+            })
+            .scroll_bar(k),
+    )
 }
 
 pub fn title_of(info: &AgentSessionInfo) -> String {
@@ -1179,16 +1627,163 @@ pub fn title_of(info: &AgentSessionInfo) -> String {
     }
 }
 
+/// What a session is doing, as the shell shows it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Activity {
+    Working,
+    NeedsYou,
+    Failed,
+    Idle,
+}
+
+impl UiState {
+    pub fn look(&self) -> Look {
+        Look::of(&self.cfg.appearance, self.dark)
+    }
+
+    pub fn scheme(&self) -> ColorScheme {
+        if self.dark {
+            ColorScheme::Dark
+        } else {
+            ColorScheme::Light
+        }
+    }
+
+    /// Whether a session has a permission or form waiting on the owner.
+    pub fn session_waiting(&self, asid: &str) -> bool {
+        self.waiting_perms.get(asid).is_some_and(|p| !p.is_empty())
+            || self.waiting_forms.get(asid).is_some_and(|f| !f.is_empty())
+    }
+
+    pub fn activity(&self, info: &AgentSessionInfo) -> Activity {
+        if self.session_waiting(&info.asid.0) {
+            Activity::NeedsYou
+        } else {
+            match info.status {
+                AgentSessionStatus::Busy | AgentSessionStatus::Retry => Activity::Working,
+                AgentSessionStatus::Failed => Activity::Failed,
+                _ => Activity::Idle,
+            }
+        }
+    }
+
+    /// Sessions working right now, newest first.
+    pub fn running(&self) -> Vec<&AgentSessionInfo> {
+        self.sessions
+            .iter()
+            .filter(|i| self.activity(i) == Activity::Working)
+            .collect()
+    }
+
+    /// The folder's short name for a session (`gateway` for `/home/me/gateway`).
+    pub fn folder_name(info: &AgentSessionInfo) -> Option<String> {
+        let dir = info.directory.as_deref()?.trim_end_matches('/');
+        let name = dir.rsplit('/').next().unwrap_or(dir);
+        (!name.is_empty()).then(|| name.to_string())
+    }
+
+    /// The checkout's branch for a session's folder, when the core resolved it.
+    pub fn branch_of(&self, info: &AgentSessionInfo) -> Option<String> {
+        let dir = info.directory.as_deref()?;
+        self.directories.get(dir).and_then(|d| d.branch.clone())
+    }
+}
+
+/// Milliseconds since the epoch, now.
+pub fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
+}
+
+/// `updated_ms` as a short relative time ("now", "4m", "3h", "2d").
+pub fn ago(updated_ms: u64, now: u64, language: crate::config::Language) -> String {
+    let zh = language == crate::config::Language::ZhCn;
+    if updated_ms == 0 {
+        return String::new();
+    }
+    let secs = now.saturating_sub(updated_ms) / 1000;
+    match secs {
+        0..=59 => tr(language, "now", "刚刚"),
+        60..=3599 => format!("{}{}", secs / 60, if zh { " 分钟前" } else { "m" }),
+        3600..=86_399 => format!("{}{}", secs / 3600, if zh { " 小时前" } else { "h" }),
+        _ => format!("{}{}", secs / 86_400, if zh { " 天前" } else { "d" }),
+    }
+}
+
+/// A small status pill: a dot (or spinner) and a word, in the state's colour.
+pub fn activity_pill(
+    k: &Kit,
+    look: &Look,
+    activity: Activity,
+    language: crate::config::Language,
+) -> El {
+    let (color, word) = match activity {
+        Activity::Working => (k.c.text_accent, tr(language, "Working", "工作中")),
+        Activity::NeedsYou => (k.c.warning.icon, tr(language, "Needs you", "等你处理")),
+        Activity::Failed => (k.c.danger.icon, tr(language, "Failed", "失败")),
+        Activity::Idle => (k.c.text_faint, tr(language, "Idle", "空闲")),
+    };
+    let mark = match activity {
+        Activity::Working => rune_kit::Spinner::new().size(10.0).color(color).build(k),
+        Activity::NeedsYou => look.pulse(rune::el().size(7.0, 7.0).radius(3.5).fill(color)),
+        _ => rune::el().size(7.0, 7.0).radius(3.5).fill(color),
+    };
+    rune::row()
+        .key("activity")
+        .h(20.0)
+        .px(8.0)
+        .gap(6.0)
+        .center_y()
+        .radius(10.0)
+        .fill(color.alpha(if activity == Activity::Idle {
+            0.08
+        } else {
+            0.14
+        }))
+        .role("status")
+        .label(word.clone())
+        .child(mark.a11y_hidden())
+        .child(
+            rune::text(word)
+                .font(k.ty.small_medium)
+                .color(color)
+                .a11y_hidden(),
+        )
+}
+
+use copy::tr;
+
 pub fn on_key(s: &mut UiState, ev: &KeyEvent, _tx: &mut Tx) -> bool {
     if is_sidebar_toggle(ev) {
         s.sidebar.toggle();
-        true
-    } else if ev.is_command(',') && !ev.mods.shift && !ev.mods.alt {
-        s.go(Mode::Settings);
-        true
-    } else {
-        false
+        return true;
     }
+    if ev.mods.shift || ev.mods.alt {
+        return false;
+    }
+    if ev.is_command(',') {
+        s.go(Mode::Settings);
+        return true;
+    }
+    if ev.is_command('\\') {
+        s.split();
+        return true;
+    }
+    if ev.is_command('w') && s.in_split() {
+        s.close_tile(s.focus);
+        return true;
+    }
+    for (n, c) in ['1', '2', '3', '4'].into_iter().enumerate() {
+        if ev.is_command(c) {
+            if s.in_split() && n < s.tiles.len() {
+                s.focus_tile(n);
+                return true;
+            }
+            return false;
+        }
+    }
+    false
 }
 
 pub fn view(s: &UiState, cx: &mut Cx<UiState>) -> El {
@@ -1214,7 +1809,14 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>) -> El {
             }
             splash::SplashKind::Theme => false,
         };
-        if let Some(stage) = splash.view(images, &k, scheme, s.cfg.general.language, loading) {
+        if let Some(stage) = splash.view(
+            images,
+            &k,
+            &s.look(),
+            scheme,
+            s.cfg.general.language,
+            loading,
+        ) {
             layer.push(stage);
         }
     }

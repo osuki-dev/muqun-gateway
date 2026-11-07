@@ -182,15 +182,65 @@ pub struct Asset {
     pub sha256: Option<String>,
 }
 
-/// A decoration slot: the image and its per-width replacements. Only the
-/// asset references are read; fit, opacity, outset … belong to the App.
+/// A decoration slot: the image, its per-width replacements, and how the
+/// author wants it shown (`fit`, `opacity`, `focalPoint`; outset and the
+/// rest belong to the App).
 #[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Slot {
     pub asset: String,
     #[serde(default)]
     pub compact: Option<ImageRef>,
     #[serde(default)]
     pub regular: Option<ImageRef>,
+    /// `cover` or `contain` (the default).
+    #[serde(default)]
+    pub fit: Option<String>,
+    /// 0..=1; absent means 1.
+    #[serde(default)]
+    pub opacity: Option<f32>,
+    #[serde(default)]
+    pub focal_point: Option<FocalPoint>,
+}
+
+/// Where the image's subject sits, in 0..=1 of its width and height.
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub struct FocalPoint {
+    pub x: f32,
+    pub y: f32,
+}
+
+/// How a slot's image is placed, as the manifest asks for it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SlotLook {
+    pub cover: bool,
+    pub opacity: f32,
+    pub focal: [f32; 2],
+}
+
+impl Default for SlotLook {
+    fn default() -> Self {
+        Self {
+            cover: false,
+            opacity: 1.0,
+            focal: [0.5, 0.5],
+        }
+    }
+}
+
+impl Slot {
+    pub fn look(&self) -> SlotLook {
+        SlotLook {
+            cover: self.fit.as_deref() == Some("cover"),
+            opacity: self
+                .opacity
+                .filter(|o| o.is_finite())
+                .map_or(1.0, |o| o.clamp(0.0, 1.0)),
+            focal: self
+                .focal_point
+                .map_or([0.5, 0.5], |f| [f.x.clamp(0.0, 1.0), f.y.clamp(0.0, 1.0)]),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -584,6 +634,25 @@ impl Manifest {
                 .get(slot)
                 .and_then(|s| s.as_ref())
                 .map(|s| s.asset.as_str()),
+        }
+    }
+
+    /// How the slot's image is shown in `scheme` (fit, opacity, focal point),
+    /// from the scheme's own decoration, else the shared one.
+    pub fn slot_look(&self, slot: &str, dark: bool) -> Option<SlotLook> {
+        let own = if dark {
+            &self.variant_decorations.dark
+        } else {
+            &self.variant_decorations.light
+        };
+        match own.get(slot) {
+            Some(Some(s)) => Some(s.look()),
+            Some(None) => None,
+            None => self
+                .decoration
+                .get(slot)
+                .and_then(|s| s.as_ref())
+                .map(Slot::look),
         }
     }
 

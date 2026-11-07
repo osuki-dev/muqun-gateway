@@ -44,6 +44,7 @@ impl std::fmt::Debug for AppliedTheme {
 
 struct Current {
     id: String,
+    manifest: Arc<Manifest>,
     scheme: Scheme,
     light: ThemePalette,
     dark: ThemePalette,
@@ -92,6 +93,17 @@ pub fn palette(scheme: ColorScheme) -> Option<ThemePalette> {
         ColorScheme::Light => c.light,
         ColorScheme::Dark => c.dark,
     })
+}
+
+/// How the theme wants a slot's image shown (`home.wallpaper`,
+/// `home.artwork`, `launch.artwork`): the manifest's fit, opacity and
+/// focal point, or the defaults when the slot is unset.
+pub fn slot_look(slot: &str, scheme: ColorScheme) -> super::pack::SlotLook {
+    let guard = current().read().unwrap();
+    guard
+        .as_ref()
+        .and_then(|c| c.manifest.slot_look(slot, scheme == ColorScheme::Dark))
+        .unwrap_or_default()
 }
 
 /// Soft Home backdrop (`home.wallpaper`).
@@ -159,6 +171,7 @@ pub fn activate(applied: AppliedTheme) -> anyhow::Result<std::time::Duration> {
     let dark = applied.manifest.palette(ColorScheme::Dark)?;
     *current().write().unwrap() = Some(Current {
         id: applied.manifest.id.clone(),
+        manifest: applied.manifest.clone(),
         scheme: applied.scheme,
         light,
         dark,
