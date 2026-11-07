@@ -1,9 +1,7 @@
 //! The tasks page: delegate a goal, watch, cancel or confirm tasks.
 
-use rune::{col, row, El, ScrollSpec, TextEdit, Tx};
-use rune_kit::{
-    Badge, BadgeVariant, Button, ButtonVariant, Card, ControlSize, Kit, ScrollBar, TextInput,
-};
+use rune::{row, El, TextEdit, Tx};
+use rune_kit::{Badge, BadgeVariant, Button, ButtonVariant, Card, ControlSize, Kit, TextInput};
 
 use super::copy::{tr, tr_ref};
 use super::{muted, page_frame, UiState};
@@ -123,7 +121,13 @@ fn card(s: &UiState, k: &Kit, t: &TaskRow) -> El {
                 .key(format!("task-cancel-{}", t.id)),
         );
     }
-    card.build(k).key(format!("task-{}", t.id))
+    let look = s.look();
+    look.row_card(
+        k,
+        card.build(k).px(6.0).py(4.0),
+        crate::theme::look::CARD_RADIUS,
+    )
+    .key(format!("task-{}", t.id))
 }
 
 pub fn view(s: &UiState, k: &Kit) -> El {
@@ -201,14 +205,5 @@ pub fn view(s: &UiState, k: &Kit) -> El {
     for t in &s.tasks {
         page = page.child(card(s, k, t));
     }
-    col()
-        .key("tasks-scroll")
-        .w_full()
-        .h_full()
-        .items_center()
-        .child(page)
-        .scroll(ScrollSpec {
-            stick_bottom: false,
-        })
-        .scroll_bar(k)
+    super::page_stage(s, k, "tasks", page)
 }

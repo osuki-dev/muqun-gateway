@@ -979,8 +979,8 @@ fn part(s: &UiState, k: &Kit, item: &TimelineItem) -> El {
 }
 
 /// Rollback and Fork from here, under a message's text.
-fn message_actions(s: &UiState, k: &Kit, it: &TimelineItem) -> Option<El> {
-    let asid = AgentSessionId(s.selected.clone()?);
+fn message_actions(k: &Kit, it: &TimelineItem, asid: Option<&str>) -> Option<El> {
+    let asid = AgentSessionId(asid?.to_string());
     let (rollback_asid, rollback_id) = (asid.clone(), it.message_id.clone());
     let fork_id = it.message_id.clone();
     Some(
@@ -1017,7 +1017,7 @@ fn message_actions(s: &UiState, k: &Kit, it: &TimelineItem) -> Option<El> {
     )
 }
 
-fn item(s: &UiState, k: &Kit, it: &TimelineItem) -> El {
+fn item(s: &UiState, k: &Kit, it: &TimelineItem, asid: Option<&str>) -> El {
     let body = part(s, k, it);
     let mut wrap = col().key(format!("item-{}", it.id)).w_full().gap(2.0);
     let is_text = matches!(it.part, AgentPart::Text { .. });
@@ -1037,7 +1037,7 @@ fn item(s: &UiState, k: &Kit, it: &TimelineItem) -> El {
         wrap.child(body)
     };
     if is_text && matches!(it.role, TimelineRole::User | TimelineRole::Assistant) {
-        if let Some(actions) = message_actions(s, k, it) {
+        if let Some(actions) = message_actions(k, it, asid) {
             wrap = wrap.child(actions);
         }
     }
@@ -1045,9 +1045,29 @@ fn item(s: &UiState, k: &Kit, it: &TimelineItem) -> El {
 }
 
 pub fn view(s: &UiState, k: &Kit) -> El {
+    view_items(
+        s,
+        k,
+        s.selected.as_deref(),
+        &s.timeline,
+        s.earlier_exhausted,
+        s.busy(),
+    )
+}
+
+/// The feed of `items` for session `asid` (a split tile's own timeline; the
+/// focused session passes the top-level fields through [`view`]).
+pub fn view_items(
+    s: &UiState,
+    k: &Kit,
+    asid: Option<&str>,
+    items: &[TimelineItem],
+    earlier_exhausted: bool,
+    busy: bool,
+) -> El {
     let mut feed = col().key("feed").gap(12.0).w_full().px(24.0).py(24.0);
-    if s.timeline.is_empty() {
-        let line = if s.selected.is_some() {
+    if items.is_empty() {
+        let line = if asid.is_some() {
             "No messages yet."
         } else {
             "Select a session or start a new one."
@@ -1058,8 +1078,8 @@ pub fn view(s: &UiState, k: &Kit) -> El {
                 .font(k.ty.ui)
                 .color(k.c.text_muted),
         );
-    } else if !s.earlier_exhausted {
-        if let Some(asid) = s.selected.clone() {
+    } else if !earlier_exhausted {
+        if let Some(asid) = asid.map(str::to_string) {
             feed = feed.child(
                 Button::new("Load earlier")
                     .variant(ButtonVariant::Ghost)
@@ -1074,10 +1094,10 @@ pub fn view(s: &UiState, k: &Kit) -> El {
             );
         }
     }
-    for it in &s.timeline {
-        feed = feed.child(item(s, k, it));
+    for it in items {
+        feed = feed.child(item(s, k, it, asid));
     }
-    if s.busy() {
+    if busy {
         feed = feed.child(
             row()
                 .key("working")

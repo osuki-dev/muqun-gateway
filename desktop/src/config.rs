@@ -227,6 +227,13 @@ pub struct UiPrefs {
     /// (`model/projects.rs`). Only projects with a choice are kept.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub projects: BTreeMap<String, ProjectPrefs>,
+    /// Sessions open side by side when the window closed, in tile order
+    /// (`ui/tiles.rs`); empty when one session filled the pane.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tiles: Vec<String>,
+    /// Where the split's first column ends, 0.25..=0.75 of its width.
+    #[serde(default = "UiPrefs::tile_split_default")]
+    pub tile_split: f32,
 }
 
 impl UiPrefs {
@@ -242,6 +249,19 @@ impl UiPrefs {
 
     fn right_default() -> f32 {
         Self::RIGHT_DEFAULT
+    }
+
+    fn tile_split_default() -> f32 {
+        0.5
+    }
+
+    /// The stored split, forced into range.
+    pub fn tile_split(&self) -> f32 {
+        if self.tile_split.is_finite() {
+            self.tile_split.clamp(0.25, 0.75)
+        } else {
+            0.5
+        }
     }
 
     /// The stored width, forced into the range the layout allows (a hand
@@ -271,6 +291,8 @@ impl Default for UiPrefs {
             sidebar_width: Self::SIDEBAR_DEFAULT,
             right_width: Self::RIGHT_DEFAULT,
             projects: BTreeMap::new(),
+            tiles: Vec::new(),
+            tile_split: 0.5,
         }
     }
 }
@@ -284,6 +306,11 @@ pub enum ConfigEdit {
     Window(WindowGeometry),
     SidebarWidth(f32),
     RightWidth(f32),
+    /// The sessions open side by side and where the split sits.
+    Tiles {
+        asids: Vec<String>,
+        split: f32,
+    },
     /// What the owner chose for one project (pin, hide, name), by root.
     Project {
         root: String,
@@ -333,6 +360,10 @@ impl DesktopConfig {
             ConfigEdit::Window(geometry) => self.window = geometry,
             ConfigEdit::SidebarWidth(width) => self.ui.sidebar_width = width,
             ConfigEdit::RightWidth(width) => self.ui.right_width = width,
+            ConfigEdit::Tiles { asids, split } => {
+                self.ui.tiles = asids;
+                self.ui.tile_split = split;
+            }
             ConfigEdit::Project { root, prefs } => {
                 if prefs.is_default() {
                     self.ui.projects.remove(&root);

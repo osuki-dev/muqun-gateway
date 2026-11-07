@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use muqun_gateway::agents::{AgentProject, AgentSessionId, AgentSessionStatus};
+use muqun_gateway::agents::{AgentProject, AgentSessionId};
 use rune::El;
 use rune::{el, TextEdit, Tx};
 use rune_kit::glyphs::{FOLDER, FOLDER_OPEN, SEARCH, TRIANGLE_DOWN};
@@ -11,7 +11,7 @@ use rune_kit::shell::{RowStatus, Sidebar, SidebarRow};
 use rune_kit::{ControlSize, IconButton, IconButtonVariant, Kit, Menu, MenuItem, TextInput};
 
 use super::icons::{INBOX, SETTINGS, TASK};
-use super::{title_of, Mode, OpenMenu, UiState};
+use super::{ago, now_ms, title_of, Activity, Mode, OpenMenu, UiState};
 use crate::config::ConfigEdit;
 use crate::model::commands::Command;
 use crate::model::projects::{
@@ -270,6 +270,7 @@ fn session_menu(s: &UiState, k: &Kit, layer: &mut Vec<El>, asid: &str) -> El {
     let pinned = s.cfg.general.pinned.iter().any(|p| p == asid);
     let id = asid.to_string();
     let (rename_id, pin_id, fork_id, delete_id) = (id.clone(), id.clone(), id.clone(), id.clone());
+    let split_id = id.clone();
     let trigger = Menu::new(format!("smenu-{id}"))
         .trigger(menu_button(
             k,
@@ -293,6 +294,12 @@ fn session_menu(s: &UiState, k: &Kit, layer: &mut Vec<El>, asid: &str) -> El {
                     s.edit(ConfigEdit::TogglePin(pin_id.clone()));
                 },
             ),
+        )
+        .item(
+            MenuItem::new("Open in split").on_select(move |s: &mut UiState| {
+                s.menu = None;
+                s.open_in_tile(&split_id);
+            }),
         )
         .item(MenuItem::new("Fork").on_select(move |s: &mut UiState| {
             s.menu = None;
@@ -322,9 +329,16 @@ fn session_row(s: &UiState, k: &Kit, layer: &mut Vec<El>, asid: &str) -> El {
     let Some(info) = s.session_by_id(asid) else {
         return el().key(format!("session-{asid}")).h(0.0);
     };
-    let waiting = s.waiting_perms.get(asid).is_some_and(|p| !p.is_empty())
-        || s.waiting_forms.get(asid).is_some_and(|f| !f.is_empty());
+    let look = s.look();
+    let activity = s.activity(info);
     let pinned = s.cfg.general.pinned.iter().any(|p| p == asid);
+    let in_tile = s.in_split() && s.tile_of(asid).is_some();
+    let when = ago(info.updated_ms, now_ms(), s.cfg.general.language);
+    let subtitle = if when.is_empty() {
+        s.agent_name(&info.agent_id)
+    } else {
+        format!("{} · {when}", s.agent_name(&info.agent_id))
+    };
     let mut row = SidebarRow::new(format!(
         "{}{}",
         if pinned { "★ " } else { "" },
@@ -333,15 +347,31 @@ fn session_row(s: &UiState, k: &Kit, layer: &mut Vec<El>, asid: &str) -> El {
     .depth(1)
     .height(45.0)
     .avatar(super::agents::mark(&info.agent_id, 14.0, s.dark))
-    .subtitle(s.agent_name(&info.agent_id))
+    .subtitle(subtitle)
     .selected(s.mode == Mode::Session && s.selected.as_deref() == Some(asid));
-    if waiting {
-        row = row.status(RowStatus::Attention);
-    } else if matches!(
-        info.status,
-        AgentSessionStatus::Busy | AgentSessionStatus::Retry
-    ) {
-        row = row.status(RowStatus::Busy);
+    if in_tile {
+        row = row.detail(super::copy::tr(s.cfg.general.language, "split", "分屏"));
+    }
+    match activity {
+        // A breathing dot in the agent's colour: the row is alive.
+        Activity::Working => {
+            let c = super::agents::color(&info.agent_id, s.dark);
+            row = row.status(RowStatus::Other(
+                look.pulse(look.spark(el().size(7.0, 7.0).radius(3.5).fill(c), c)),
+            ));
+        }
+        Activity::NeedsYou => {
+            let c = k.c.warning.icon;
+            row = row.status(RowStatus::Other(
+                look.pulse(look.spark(el().size(7.0, 7.0).radius(3.5).fill(c), c)),
+            ));
+        }
+        Activity::Failed => {
+            row = row.status(RowStatus::Other(
+                el().size(7.0, 7.0).radius(3.5).fill(k.c.danger.icon),
+            ));
+        }
+        Activity::Idle => {}
     }
     let id = asid.to_string();
     if s.rename_asid.as_deref() == Some(asid) {
@@ -355,13 +385,21 @@ fn session_row(s: &UiState, k: &Kit, layer: &mut Vec<El>, asid: &str) -> El {
         row = row.trailing(session_menu(s, k, layer, asid));
     }
     let (menu_id, rename_id) = (id.clone(), id.clone());
-    row.on_select(move |s: &mut UiState, _: &mut Tx| s.open_session(&id))
-        .on_double_click(move |s: &mut UiState, _: &mut Tx| start_rename(s, &rename_id))
-        .build(k)
-        .key(format!("session-{asid}"))
-        .on_secondary_press(move |s: &mut UiState, _, _: &mut Tx| {
-            s.menu = Some(OpenMenu::Session(menu_id.clone()));
-        })
+    // Alt- or Shift-click opens the session beside the current one.
+    row.on_select(move |s: &mut UiState, tx: &mut Tx| {
+        let mods = tx.mods();
+        if mods.alt || mods.shift {
+            s.open_in_tile(&id);
+        } else {
+            s.open_session(&id);
+        }
+    })
+    .on_double_click(move |s: &mut UiState, _: &mut Tx| start_rename(s, &rename_id))
+    .build(k)
+    .key(format!("session-{asid}"))
+    .on_secondary_press(move |s: &mut UiState, _, _: &mut Tx| {
+        s.menu = Some(OpenMenu::Session(menu_id.clone()));
+    })
 }
 
 pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
@@ -416,5 +454,42 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
             &SETTINGS,
             Mode::Settings,
         ))
+        .footer(hub_line(s, k))
         .build(k)
+}
+
+/// Where the sessions come from, as a quiet caption under the navigation.
+fn hub_line(s: &UiState, k: &Kit) -> El {
+    let language = s.cfg.general.language;
+    let (word, live) = match s.hub_label.as_str() {
+        "" => (super::copy::tr(language, "Connecting…", "连接中…"), false),
+        "local gateway" => (
+            super::copy::tr(language, "Local gateway", "本机 Gateway"),
+            true,
+        ),
+        "standalone" => (super::copy::tr(language, "Standalone", "独立运行"), true),
+        other => (other.to_string(), true),
+    };
+    let dot = el().size(6.0, 6.0).radius(3.0).fill(if live {
+        k.c.success.icon
+    } else {
+        k.c.text_faint
+    });
+    rune::row()
+        .key("hub-line")
+        .w_full()
+        .h(24.0)
+        .px(12.0)
+        .gap(6.0)
+        .center_y()
+        .role("status")
+        .label(word.clone())
+        .child(dot.a11y_hidden())
+        .child(
+            rune::text(word)
+                .font(k.ty.caption())
+                .color(k.c.text_faint)
+                .truncate()
+                .a11y_hidden(),
+        )
 }

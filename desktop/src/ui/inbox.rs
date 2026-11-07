@@ -1,7 +1,7 @@
 //! The inbox page: every permission and form waiting on the owner, by session.
 
-use rune::{col, row, text, El, ScrollSpec};
-use rune_kit::{Button, ButtonVariant, Card, ControlSize, Kit, ScrollBar};
+use rune::{col, row, text, El};
+use rune_kit::{Button, ButtonVariant, Card, ControlSize, Kit};
 
 use super::copy::{tr, tr_ref};
 use super::{muted, page_frame, timeline, title_of, UiState};
@@ -40,18 +40,47 @@ pub fn view(s: &UiState, k: &Kit) -> El {
             .session_by_id(asid)
             .map_or_else(|| (*asid).clone(), title_of);
         let id = (*asid).clone();
-        let mut block = col().key(format!("wait-{asid}")).w_full().gap(8.0).child(
-            row()
-                .gap(8.0)
-                .center_y()
+        let look = s.look();
+        let warn = k.c.warning.icon;
+        let agent = s.session_by_id(asid).map(|i| i.agent_id.clone());
+        let mut head = row()
+            .gap(8.0)
+            .center_y()
+            .child(look.pulse(look.spark(rune::el().size(8.0, 8.0).radius(4.0).fill(warn), warn)));
+        if let Some(agent) = &agent {
+            head = head
+                .child(super::agents::mark(agent, 14.0, s.dark).a11y_hidden())
                 .child(
-                    text(title)
+                    text(title.clone())
                         .font(k.ty.ui_medium)
                         .color(k.c.text_base)
-                        .grow(1.0)
-                        .truncate(),
+                        .truncate()
+                        .shrink()
+                        .min_w(0.0),
                 )
                 .child(
+                    text(s.agent_name(agent))
+                        .font(k.ty.small)
+                        .color(k.c.text_faint),
+                )
+                .child(rune::el().grow(1.0));
+        } else {
+            head = head.child(
+                text(title)
+                    .font(k.ty.ui_medium)
+                    .color(k.c.text_base)
+                    .grow(1.0)
+                    .truncate(),
+            );
+        }
+        let mut block = col()
+            .key(format!("wait-{asid}"))
+            .w_full()
+            .gap(8.0)
+            .px(14.0)
+            .py(12.0)
+            .child(
+                head.child(
                     Button::new(tr_ref(language, "Open session", "打开会话"))
                         .variant(ButtonVariant::Ghost)
                         .control_size(ControlSize::Small)
@@ -59,14 +88,18 @@ pub fn view(s: &UiState, k: &Kit) -> El {
                         .build(k)
                         .key(format!("open-{asid}")),
                 ),
-        );
+            );
         for p in s.waiting_perms.get(*asid).into_iter().flatten() {
             block = block.child(timeline::permission_card(s, k, p).key(format!("p-{}", p.id)));
         }
         for f in s.waiting_forms.get(*asid).into_iter().flatten() {
             block = block.child(timeline::form_card(s, k, f).key(format!("f-{}", f.id)));
         }
-        page = page.child(block);
+        page = page.child(look.glow(
+            look.card(k, block, crate::theme::look::CARD_RADIUS),
+            warn,
+            0.2,
+        ));
     }
     for t in s.tasks.iter().filter(|t| t.state == "waiting") {
         let mut line = row()
@@ -132,14 +165,5 @@ pub fn view(s: &UiState, k: &Kit) -> El {
                 .key("inbox-empty"),
         );
     }
-    col()
-        .key("inbox-scroll")
-        .w_full()
-        .h_full()
-        .items_center()
-        .child(page)
-        .scroll(ScrollSpec {
-            stick_bottom: false,
-        })
-        .scroll_bar(k)
+    super::page_stage(s, k, "inbox", page)
 }
