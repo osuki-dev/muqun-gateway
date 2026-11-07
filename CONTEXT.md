@@ -10,9 +10,22 @@ The retired `herdr.gateway` identifier remains only for migration compatibility.
 
 ## Shape of the codebase
 
-- `src/main.rs`: composition root only -- module declarations, the legacy
-  crate-root re-exports, `AppState`, and `fn main`. Domain code lives in the
-  module tree below.
+- `src/lib.rs`: the `muqun_gateway` library and composition root -- module
+  declarations, the legacy crate-root re-exports, `AppState`, and `run_main`.
+  `src/main.rs` is a thin binary that calls `muqun_gateway::run_main`. Domain
+  code lives in the module tree below. The root `Cargo.toml` is also a
+  (single-member) workspace. The only public surface is `agents`
+  (`AgentRuntime`, the adapter config types, `domain`, `use_cases`, `manager`,
+  `ports`, `compose`), `platform::discovery`, `platform::i18n` and
+  `set_directories`; everything else is `pub(crate)`, so a host crate can embed
+  the agents plane without the HTTP server.
+- `src/agents/compose.rs`: the one place that builds the `AgentRuntime` from
+  settings (`RuntimeSettings`, `build_runtime`) and opens/attaches the shared
+  store (`open_store`, `attach_store`); the server, the `agent` command and an
+  embedding host all go through it.
+- `set_directories` (`platform/store.rs`): pins the config and state
+  directories once per process, ahead of `MUQUN_GATEWAY_*_DIR` and the
+  platform defaults, for hosts that own where their files live.
 - `src/cli/`: CLI arguments, subcommands, and dispatch.
 - `src/test_support.rs`: shared test fixtures and fakes, compiled only for
   test builds.

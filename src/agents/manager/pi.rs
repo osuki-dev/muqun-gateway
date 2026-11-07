@@ -258,6 +258,7 @@ mod tests {
             attachments: None,
             image_assets: None,
             generation: None,
+            origin: None,
         };
         apply_change(&asid, LiveChange::Upsert(vec![row]), &ctx).await;
         let AgentDomainEvent::TimelineUpsert { items, seq, .. } = events.recv().await.unwrap()

@@ -560,6 +560,7 @@ mod tests {
             attachments: None,
             image_assets: None,
             generation: None,
+            origin: None,
         }]
     }
 

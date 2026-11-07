@@ -165,6 +165,36 @@ fn recovery_evidence_is_one_entry_per_prompt_with_the_last_reply() {
 }
 
 #[test]
+fn store_photos_become_timeline_attachments() {
+    let root = scratch();
+    // 1×1 PNG; Cursor persists images as hex Uint8Array blobs beside the query.
+    const PNG: &str = "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000a49444154789a63000100000500010d0a2db40000000049454e44ae426082";
+    let messages = [json!({
+        "role": "user",
+        "content": [
+            {"type": "image", "image": {"__type": "Uint8Array", "hex": PNG}},
+            {"type": "text", "text": "<timestamp>now</timestamp>\n<user_query>\n[Image #1] look\n</user_query>"}
+        ]
+    })];
+    write_store(&root.0.join("photo-1"), "photo-1", &messages);
+    let stop = CancellationToken::new();
+    let snapshot = store::snapshot_at(&root.0, "photo-1", &stop).unwrap();
+    let attachments = snapshot.entries[0]["attachments"].as_array().unwrap();
+    assert_eq!(attachments.len(), 1);
+    let path = attachments[0].as_str().unwrap();
+    assert!(
+        std::path::Path::new(path).is_file(),
+        "materialized photo missing: {path}"
+    );
+    let rows = store::timeline_of(&snapshot);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].attachments.as_deref(),
+        Some([path.to_owned()].as_slice())
+    );
+}
+
+#[test]
 fn a_terminal_chat_is_listed_by_its_first_prompt_and_read_as_a_timeline() {
     let chats = scratch();
     let folder = chats.0.join("0123abcd");

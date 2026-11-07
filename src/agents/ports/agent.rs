@@ -133,18 +133,155 @@ pub struct PreparedTerminalLaunch {
     pub arguments: Vec<String>,
 }
 
+/// Marker the gateway appends for agents that read host paths themselves.
+pub const ATTACHED_FILES_MARKER: &str = "\n\nAttached files (on this host):";
+
 /// `text` followed by a block listing `paths` for an agent that reads files
 /// itself. Unchanged when there are no paths.
 pub fn append_attachment_paths(text: &str, paths: &[String]) -> String {
     if paths.is_empty() {
         return text.to_string();
     }
-    let mut out = format!("{text}\n\nAttached files (on this host):");
+    let mut out = format!("{text}{ATTACHED_FILES_MARKER}");
     for path in paths {
         out.push_str("\n- ");
         out.push_str(path);
     }
     out
+}
+
+/// Inverse of [`append_attachment_paths`]: prose for the reader, and the
+/// host paths listed under the marker (for thumbs). Wire text stays as-is;
+/// clients strip this only when painting a user row.
+pub fn split_attachment_paths(text: &str) -> (&str, Vec<&str>) {
+    let Some(at) = text.find(ATTACHED_FILES_MARKER) else {
+        return (text, Vec::new());
+    };
+    let body = text[..at].trim_end();
+    let paths = text[at + ATTACHED_FILES_MARKER.len()..]
+        .lines()
+        .filter_map(|line| {
+            let path = line.strip_prefix("- ").unwrap_or(line).trim();
+            (!path.is_empty()).then_some(path)
+        })
+        .collect();
+    (body, paths)
+}
+
+/// Same rules as the App's `gatewayUploadName`: only UUID files under the
+/// gateway uploads folder count as recovered attachments.
+pub fn gateway_upload_name(path: &str) -> Option<&str> {
+    let absolute = path.strip_prefix("file://").unwrap_or(path);
+    if !absolute.starts_with('/')
+        || absolute
+            .bytes()
+            .any(|b| matches!(b, b'\\' | b'%' | b'?' | b'#' | 0..=0x1f | 0x7f))
+    {
+        return None;
+    }
+    let name = absolute.rsplit('/').next()?;
+    let (stem, ext) = name.rsplit_once('.')?;
+    if ext.is_empty() || ext.len() > 10 || !ext.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        return None;
+    }
+    // 8-4-4-4-12 uuid
+    let mut parts = stem.split('-');
+    let expected = [8usize, 4, 4, 4, 12];
+    for len in expected {
+        let part = parts.next()?;
+        if part.len() != len || !part.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+    }
+    if parts.next().is_some() {
+        return None;
+    }
+    if !absolute.contains("/muqun-gateway/uploads/") {
+        return None;
+    }
+    // Refuse nested folders (`…/uploads/cursor-store/…`); App only accepts the
+    // direct uploads file.
+    let after = absolute.split("/muqun-gateway/uploads/").nth(1)?;
+    (after == name).then_some(name)
+}
+
+/// App `splitUploadedAttachmentSuffix`: recover ByPath handoff paths and the
+/// prose above them. Fence-aware; only gateway upload UUID paths qualify.
+pub fn split_uploaded_attachment_suffix(text: &str) -> (&str, Vec<&str>) {
+    let Some(start) = text.rfind(ATTACHED_FILES_MARKER) else {
+        return (text, Vec::new());
+    };
+    // Examples inside a code fence are prose, not a transport attachment envelope.
+    let mut fence: Option<(char, usize)> = None;
+    for line in text[..start].split('\n') {
+        let indent = line.bytes().take_while(|b| *b == b' ').count().min(3);
+        let body = &line[indent..];
+        let marker = match body.as_bytes().first() {
+            Some(b'`') => '`',
+            Some(b'~') => '~',
+            _ => continue,
+        };
+        let count = body.chars().take_while(|c| *c == marker).count();
+        if count < 3 {
+            continue;
+        }
+        let rest = &body[count..];
+        match fence {
+            None => fence = Some((marker, count)),
+            Some((open, open_count))
+                if marker == open && count >= open_count && rest.trim().is_empty() =>
+            {
+                fence = None;
+            }
+            _ => {}
+        }
+    }
+    if fence.is_some() {
+        return (text, Vec::new());
+    }
+    let mut lines = text[start + ATTACHED_FILES_MARKER.len()..]
+        .trim_end_matches('\n')
+        .split('\n');
+    if lines.next() != Some("") {
+        return (text, Vec::new());
+    }
+    let mut attachments = Vec::new();
+    for line in lines {
+        let Some(path) = line.strip_prefix("- ") else {
+            return (text, Vec::new());
+        };
+        if gateway_upload_name(path).is_none() {
+            return (text, Vec::new());
+        }
+        attachments.push(path);
+    }
+    if attachments.is_empty() {
+        return (text, Vec::new());
+    }
+    (text[..start].trim_end(), attachments)
+}
+
+/// Drop Codex/Cursor-style `[Image #N]` labels that agents put in front of
+/// the user's typed prose when photos were attached.
+pub fn strip_image_labels(text: &str) -> &str {
+    let mut rest = text.trim_start();
+    while let Some(after) = rest.strip_prefix("[Image #") {
+        let Some((number, suffix)) = after.split_once(']') else {
+            break;
+        };
+        if number.is_empty() || !number.bytes().all(|byte| byte.is_ascii_digit()) {
+            break;
+        }
+        rest = suffix.trim_start();
+    }
+    rest
+}
+
+/// Prose used to reconcile a live user echo with the Gateway's submitted
+/// transcript: attachment path blocks and `[Image #N]` labels are ignored.
+pub fn prompt_display_body(text: &str) -> &str {
+    let (body, _) = split_attachment_paths(text);
+    strip_image_labels(body).trim_end()
 }
 
 pub trait AgentPort: Send + Sync {
@@ -727,5 +864,37 @@ pub trait AgentPort: Send + Sync {
 
     fn delete_saved_permission<'a>(&'a self, _id: &'a str) -> AgentFuture<'a, ()> {
         Box::pin(async { Err(AgentError::Unsupported("delete_saved_permission".into())) })
+    }
+}
+
+#[cfg(test)]
+mod uploaded_suffix_tests {
+    use super::*;
+
+    #[test]
+    fn gateway_upload_name_matches_the_app() {
+        let ok =
+            "/home/ryu/.local/share/muqun-gateway/uploads/fc263af9-df7b-4438-a079-861883eee43f.jpg";
+        assert_eq!(
+            gateway_upload_name(ok),
+            Some("fc263af9-df7b-4438-a079-861883eee43f.jpg")
+        );
+        assert!(gateway_upload_name(
+            "/home/ryu/.local/share/muqun-gateway/uploads/cursor-store/s/a.jpg"
+        )
+        .is_none());
+        assert!(gateway_upload_name("/tmp/photo.jpg").is_none());
+    }
+
+    #[test]
+    fn split_uploaded_attachment_suffix_matches_the_app() {
+        let path =
+            "/home/ryu/.local/share/muqun-gateway/uploads/fc263af9-df7b-4438-a079-861883eee43f.jpg";
+        let text = format!("look{ATTACHED_FILES_MARKER}\n- {path}");
+        let (body, attachments) = split_uploaded_attachment_suffix(&text);
+        assert_eq!(body, "look");
+        assert_eq!(attachments, vec![path]);
+        let fenced = format!("```\n{ATTACHED_FILES_MARKER}\n- {path}\n```");
+        assert!(split_uploaded_attachment_suffix(&fenced).1.is_empty());
     }
 }

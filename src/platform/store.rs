@@ -43,9 +43,32 @@ pub(crate) fn load_config(config_path: Option<String>) -> anyhow::Result<Config>
 /// with a stripped environment.
 static CONFIG_DIR_OVERRIDE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
+/// A state directory a host process named explicitly, outranking the
+/// environment. See [`set_directories`].
+static STATE_DIR_OVERRIDE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
 /// Make [`config_dir`] answer `dir` for the rest of this process.
 pub(crate) fn override_config_dir(dir: PathBuf) {
     let _ = CONFIG_DIR_OVERRIDE.set(dir);
+}
+
+/// Pin the config and state directories for the rest of this process, ahead
+/// of the environment variables and platform defaults.
+///
+/// For a host that embeds the agents plane and owns where its files live. It
+/// can be called once, before anything resolves either directory; a second
+/// call, or one after the config directory was already overridden, is an
+/// error and changes nothing.
+pub fn set_directories(config_dir: PathBuf, state_dir: PathBuf) -> anyhow::Result<()> {
+    if CONFIG_DIR_OVERRIDE.get().is_some() || STATE_DIR_OVERRIDE.get().is_some() {
+        anyhow::bail!("the config and state directories are already set");
+    }
+    CONFIG_DIR_OVERRIDE
+        .set(config_dir)
+        .map_err(|_| anyhow::anyhow!("the config directory is already set"))?;
+    STATE_DIR_OVERRIDE
+        .set(state_dir)
+        .map_err(|_| anyhow::anyhow!("the state directory is already set"))
 }
 
 /// The test binary's config directory, beside its state directory: the
@@ -124,6 +147,9 @@ pub(crate) fn short_test_socket(prefix: &str) -> std::path::PathBuf {
 
 #[cfg(not(test))]
 pub(crate) fn state_dir() -> anyhow::Result<std::path::PathBuf> {
+    if let Some(path) = STATE_DIR_OVERRIDE.get() {
+        return Ok(path.clone());
+    }
     if let Some(path) = std::env::var_os("MUQUN_GATEWAY_STATE_DIR") {
         return Ok(path.into());
     }

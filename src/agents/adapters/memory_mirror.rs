@@ -7,8 +7,8 @@ use tokio::sync::RwLock;
 
 use crate::agents::domain::{
     tool_item_id, AgentDomainEvent, AgentErrorInfo, AgentPart, AgentSessionId, AgentSessionInfo,
-    AgentSessionStatus, FormRequest, FormResolutionReason, PermissionRequest, RevertState,
-    SessionRevertInfo, TimelineItem, TimelineRole, ToolCall, ToolCallStatus, ToolTime,
+    AgentSessionStatus, FormRequest, FormResolutionReason, MessageOrigin, PermissionRequest,
+    RevertState, SessionRevertInfo, TimelineItem, TimelineRole, ToolCall, ToolCallStatus, ToolTime,
 };
 use crate::agents::ports::mirror::{AgentSessionSnapshot, MirrorFuture, SessionMirrorPort};
 
@@ -30,6 +30,26 @@ const MAX_TOOL_OUTPUT_BYTES: usize = 64 * 1024;
 /// Sessions held in memory at once, and how long an untouched one survives.
 const MAX_SESSIONS: usize = 200;
 const SESSION_IDLE_EVICTION_MS: u64 = 6 * 60 * 60 * 1000;
+/// How long a presented prompt waits for the agent to echo it back, and how
+/// many unechoed prompts one session remembers.
+const PENDING_ORIGIN_TTL_MS: u64 = 60 * 1000;
+const MAX_PENDING_ORIGINS: usize = 8;
+/// An echo that beat `present_user_prompt` is at most this old when it is
+/// found already stored.
+const ECHO_BEFORE_PRESENT_MS: u64 = 5 * 1000;
+
+/// A user prompt sent through the Gateway whose echo has not come back yet.
+struct PendingOrigin {
+    origin: MessageOrigin,
+    text_digest: String,
+    presented_id: String,
+    at: u64,
+}
+
+fn prompt_digest(text: &str) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(text.trim().as_bytes()))
+}
 
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -161,6 +181,8 @@ struct SessionState {
     history_gate: Arc<tokio::sync::Mutex<()>>,
     timeline_commit_gate: Arc<tokio::sync::Mutex<()>>,
     history_removal_generation: u64,
+    /// Prompts presented to the timeline whose agent echo is still awaited.
+    pending_origins: Vec<PendingOrigin>,
 }
 
 impl SessionState {
@@ -185,7 +207,33 @@ impl SessionState {
             history_gate: Arc::new(tokio::sync::Mutex::new(())),
             timeline_commit_gate: Arc::new(tokio::sync::Mutex::new(())),
             history_removal_generation: 0,
+            pending_origins: Vec::new(),
         }
+    }
+
+    /// Give an echoed user prompt the origin of the presented row it repeats.
+    /// The presented row is replaced by the echo, which carries the agent's
+    /// own id and ordering; its id is returned so the caller can retract it.
+    fn claim_presented_origin(&mut self, item: &mut TimelineItem, now: u64) -> Option<String> {
+        self.pending_origins
+            .retain(|pending| now.saturating_sub(pending.at) < PENDING_ORIGIN_TTL_MS);
+        if item.role != TimelineRole::User || self.pending_origins.is_empty() {
+            return None;
+        }
+        let AgentPart::Text { text } = &item.part else {
+            return None;
+        };
+        let digest = prompt_digest(text);
+        let at = self
+            .pending_origins
+            .iter()
+            .position(|pending| pending.text_digest == digest && pending.presented_id != item.id)?;
+        let pending = self.pending_origins.remove(at);
+        if item.origin.is_none() {
+            item.origin = Some(pending.origin);
+        }
+        (item.id != pending.presented_id && self.timeline.remove(&pending.presented_id).is_some())
+            .then_some(pending.presented_id)
     }
 
     fn apply_history_order(
@@ -400,9 +448,28 @@ impl MemoryMirror {
             asid,
             AgentSessionStatus::Idle,
         );
+        let now = now_ms();
+        let mut retracted = Vec::new();
+        let mut claimed = Vec::new();
+        for mut item in items {
+            retracted.extend(state.claim_presented_origin(&mut item, now));
+            claimed.push(item);
+        }
+        if !retracted.is_empty() {
+            state.invalidate_history_reads();
+            let seq = state.next_seq();
+            self.history_event(
+                state,
+                AgentDomainEvent::TimelineRemoved {
+                    asid: asid.clone(),
+                    ids: retracted,
+                    seq,
+                },
+            );
+        }
         let seq = state.next_seq();
         let mut updated_items = Vec::new();
-        for mut item in items {
+        for mut item in claimed {
             item.seq = seq;
             if let AgentPart::Tool(ref mut call) = item.part {
                 truncate_tool_output(call);
@@ -417,6 +484,87 @@ impl MemoryMirror {
         };
         state.push_event(event.clone());
         event
+    }
+
+    /// Show a prompt a paired device sent through the Gateway, labelled with
+    /// that device, without waiting for the agent to echo it. The echo, when it
+    /// arrives, replaces this row and keeps the label. `text` is what the user
+    /// typed, not the context-expanded text the agent received.
+    pub(crate) async fn present_user_prompt(
+        &self,
+        asid: &AgentSessionId,
+        text: &str,
+        origin: MessageOrigin,
+    ) -> AgentDomainEvent {
+        let now = now_ms();
+        let digest = prompt_digest(text);
+        // The agent can echo before the send call returns: label that row
+        // rather than presenting a second one.
+        let echoed = {
+            let sessions = self.sessions.read().await;
+            sessions.get(asid).and_then(|state| {
+                state
+                    .timeline
+                    .ordered()
+                    .rev()
+                    .find(|row| row.role == TimelineRole::User)
+                    .filter(|row| {
+                        row.origin.is_none()
+                            && now.saturating_sub(row.updated_ms) < ECHO_BEFORE_PRESENT_MS
+                            && matches!(&row.part, AgentPart::Text { text } if prompt_digest(text) == digest)
+                    })
+                    .cloned()
+            })
+        };
+        if let Some(mut row) = echoed {
+            row.origin = Some(origin);
+            let event = self.record_timeline_upsert(asid, vec![row]).await;
+            self.publish_presented(&event);
+            return event;
+        }
+        let id = format!("presented:{}", uuid::Uuid::new_v4());
+        let item = TimelineItem {
+            id: id.clone(),
+            message_id: id.clone(),
+            role: TimelineRole::User,
+            part: AgentPart::Text { text: text.into() },
+            seq: 0,
+            updated_ms: now,
+            ordinal: 0,
+            attachments: None,
+            image_assets: None,
+            generation: None,
+            origin: Some(origin.clone()),
+        };
+        {
+            // Registered before the row is stored, so an echo racing this call
+            // cannot slip between the two.
+            let mut sessions = self.sessions.write().await;
+            let state = Self::entry(
+                &self.agent_id,
+                &mut sessions,
+                asid,
+                AgentSessionStatus::Idle,
+            );
+            state.pending_origins.push(PendingOrigin {
+                origin,
+                text_digest: digest,
+                presented_id: id,
+                at: now,
+            });
+            if state.pending_origins.len() > MAX_PENDING_ORIGINS {
+                state.pending_origins.remove(0);
+            }
+        }
+        let event = self.record_timeline_upsert(asid, vec![item]).await;
+        self.publish_presented(&event);
+        event
+    }
+
+    fn publish_presented(&self, event: &AgentDomainEvent) {
+        if let Some(events) = self.history_events.get() {
+            let _ = events.send(event.clone());
+        }
     }
 
     /// Preserve resolution semantics in the replay ring as well as live SSE.
@@ -1361,6 +1509,7 @@ impl MemoryMirror {
                 attachments: None,
                 image_assets: None,
                 generation: None,
+                origin: None,
             };
             state.insert_item(item.clone());
             item
@@ -1446,6 +1595,7 @@ impl MemoryMirror {
                     attachments: None,
                     image_assets: None,
                     generation: None,
+                    origin: None,
                 };
                 state.insert_item(item.clone());
                 item
@@ -2592,6 +2742,7 @@ mod tests {
             attachments: None,
             image_assets: None,
             generation: None,
+            origin: None,
         }
     }
 
@@ -3360,5 +3511,90 @@ mod tests {
             mirror.update_session(info(&asid, "many")).await;
         }
         assert!(mirror.session_count().await <= MAX_SESSIONS);
+    }
+
+    fn pixel() -> MessageOrigin {
+        MessageOrigin {
+            device_id: "dev-1".into(),
+            name: "Pixel".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_echoed_presented_prompt_is_one_row_with_the_origin() {
+        let mirror = MemoryMirror::new();
+        let asid = AgentSessionId("ses-origin".to_string());
+        mirror.update_session(info(&asid, "Origin")).await;
+
+        let AgentDomainEvent::TimelineUpsert { items, .. } = mirror
+            .present_user_prompt(&asid, "run the tests", pixel())
+            .await
+        else {
+            panic!("expected timeline event")
+        };
+        let presented = items[0].clone();
+        assert!(presented.id.starts_with("presented:"));
+        assert_eq!(presented.message_id, presented.id);
+        assert_eq!(presented.origin, Some(pixel()));
+
+        // The agent repeats the text under its own id, a little differently
+        // spaced; it replaces the presented row and keeps the label.
+        mirror
+            .record_timeline_upsert(
+                &asid,
+                vec![text_item("msg-1:t0", "msg-1", " run the tests\n")],
+            )
+            .await;
+        let snapshot = mirror.get_snapshot(&asid).await.unwrap();
+        assert_eq!(snapshot.timeline.len(), 1);
+        assert_eq!(snapshot.timeline[0].id, "msg-1:t0");
+        assert_eq!(snapshot.timeline[0].origin, Some(pixel()));
+
+        // The claim is spent: the same text typed at the terminal is not ours.
+        mirror
+            .record_timeline_upsert(&asid, vec![text_item("msg-2:t0", "msg-2", "run the tests")])
+            .await;
+        let snapshot = mirror.get_snapshot(&asid).await.unwrap();
+        assert_eq!(snapshot.timeline.len(), 2);
+        assert_eq!(snapshot.timeline[1].origin, None);
+    }
+
+    #[tokio::test]
+    async fn an_echo_with_other_text_leaves_the_presented_row_alone() {
+        let mirror = MemoryMirror::new();
+        let asid = AgentSessionId("ses-origin-other".to_string());
+        mirror.update_session(info(&asid, "Origin")).await;
+        mirror
+            .present_user_prompt(&asid, "from the phone", pixel())
+            .await;
+        mirror
+            .record_timeline_upsert(&asid, vec![text_item("msg-1:t0", "msg-1", "from the pane")])
+            .await;
+        let snapshot = mirror.get_snapshot(&asid).await.unwrap();
+        assert_eq!(snapshot.timeline.len(), 2);
+        assert_eq!(
+            snapshot
+                .timeline
+                .iter()
+                .filter(|row| row.origin.is_some())
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn an_echo_that_arrived_first_is_labelled_not_duplicated() {
+        let mirror = MemoryMirror::new();
+        let asid = AgentSessionId("ses-origin-early".to_string());
+        mirror.update_session(info(&asid, "Origin")).await;
+        let mut echo = text_item("msg-1:t0", "msg-1", "hello");
+        echo.updated_ms = now_ms();
+        mirror.record_timeline_upsert(&asid, vec![echo]).await;
+
+        mirror.present_user_prompt(&asid, "hello", pixel()).await;
+        let snapshot = mirror.get_snapshot(&asid).await.unwrap();
+        assert_eq!(snapshot.timeline.len(), 1);
+        assert_eq!(snapshot.timeline[0].id, "msg-1:t0");
+        assert_eq!(snapshot.timeline[0].origin, Some(pixel()));
     }
 }

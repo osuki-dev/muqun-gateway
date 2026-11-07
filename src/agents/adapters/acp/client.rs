@@ -861,7 +861,12 @@ async fn dispatch(
                 return Err(state.disconnected());
             };
             // Form questions reach only clients that advertised them.
-            if !matches!(method, "session/request_permission" | "elicitation/create") {
+            // `cursor/update_todos` is Cursor's checklist extension (request or
+            // notification); the session layer answers and projects it.
+            if !matches!(
+                method,
+                "session/request_permission" | "elicitation/create" | "cursor/update_todos"
+            ) {
                 return send_packet(state, outgoing, json!({"jsonrpc":"2.0","id":id,"error":{"code":-32601,"message":"Method not supported by Muqun Gateway"}})).await;
             }
             {

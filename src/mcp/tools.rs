@@ -1158,6 +1158,7 @@ mod tests {
             attachments: None,
             image_assets: None,
             generation: None,
+            origin: None,
         }
     }
 
@@ -1864,6 +1865,7 @@ mod tests {
                 attachments: None,
                 image_assets: None,
                 generation: None,
+                origin: None,
             }],
         );
         state.agent_runtime.attach_for_test(agent.manager()).await;

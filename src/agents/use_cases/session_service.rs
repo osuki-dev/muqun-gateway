@@ -6,6 +6,14 @@ use crate::agents::domain::{
 use crate::agents::ports::agent::{AgentError, AgentPort, FileDiffItem};
 use crate::agents::ports::mirror::{AgentSessionSnapshot, SessionMirrorPort};
 
+/// Newest timeline items a snapshot / refresh opens with. Older pages come
+/// from [`Self::load_earlier_timeline`] (scroll-to-top or "Load earlier").
+/// Shared by every client: the desktop shows fewer rows on open by trimming
+/// client-side, not by shrinking what the gateway reads.
+const INITIAL_TIMELINE_LIMIT: usize = 100;
+/// Items per older-history page.
+const EARLIER_TIMELINE_LIMIT: usize = 80;
+
 pub struct SessionService {
     agent: Arc<dyn AgentPort>,
     mirror: Arc<dyn SessionMirrorPort>,
@@ -190,7 +198,7 @@ impl SessionService {
         // history read, as it was when these ran one after another.
         let (info, prepared, permissions, forms) = tokio::join!(
             self.agent.get_session(&asid.0),
-            self.agent.prepare_timeline(&asid.0, 100),
+            self.agent.prepare_timeline(&asid.0, INITIAL_TIMELINE_LIMIT),
             self.agent.get_pending_permissions(&asid.0),
             self.agent.get_pending_forms(&asid.0),
         );
@@ -290,7 +298,10 @@ impl SessionService {
             .ok_or_else(|| AgentError::Unsupported("explicit session refresh".into()))?;
         let (expected, incarnation) = memory.snapshot_read_revision(asid).await;
         let info = self.get_session(&asid.0).await?;
-        let prepared = self.agent.prepare_timeline(&asid.0, 100).await?;
+        let prepared = self
+            .agent
+            .prepare_timeline(&asid.0, INITIAL_TIMELINE_LIMIT)
+            .await?;
         let timeline = prepared.items;
         let permissions = self.agent.get_pending_permissions(&asid.0).await?;
         let forms = self.agent.get_pending_forms(&asid.0).await?;
@@ -335,6 +346,30 @@ impl SessionService {
         Ok(window)
     }
 
+    /// The newest window of what the mirror already holds, or `None` when it
+    /// holds no read history for the session. Never reads or wakes the agent.
+    pub(crate) async fn retained_window(
+        &self,
+        asid: &AgentSessionId,
+        cursor: Option<&str>,
+    ) -> Result<
+        Option<crate::agents::adapters::memory_mirror::history_window::HistoryWindow>,
+        AgentError,
+    > {
+        let Some(memory) = self.memory.as_ref() else {
+            return Ok(None);
+        };
+        if !memory.history_initialized(asid).await {
+            return Ok(None);
+        }
+        match memory.history_window(asid, cursor).await {
+            Ok(window) => Ok(Some(window)),
+            // Evicted between the check and the read.
+            Err(AgentError::HistoryCursorLost) if cursor.is_none() => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     pub(crate) async fn history_page(
         &self,
         asid: &AgentSessionId,
@@ -361,7 +396,10 @@ impl SessionService {
                 .history_read_revision(asid)
                 .await
                 .ok_or(AgentError::HistoryCursorLost)?;
-            let prepared = self.agent.prepare_earlier_timeline(&asid.0, 80).await?;
+            let prepared = self
+                .agent
+                .prepare_earlier_timeline(&asid.0, EARLIER_TIMELINE_LIMIT)
+                .await?;
             let exhausted = prepared.items.is_empty();
             let source_ids: std::collections::HashSet<_> =
                 prepared.items.iter().map(|row| row.id.clone()).collect();
@@ -399,12 +437,18 @@ impl SessionService {
                 .history_read_revision(asid)
                 .await
                 .ok_or(AgentError::HistoryCursorLost)?;
-            let prepared = self.agent.prepare_earlier_timeline(&asid.0, 80).await?;
+            let prepared = self
+                .agent
+                .prepare_earlier_timeline(&asid.0, EARLIER_TIMELINE_LIMIT)
+                .await?;
             return memory
                 .accept_earlier_history(asid, &gate, revision, prepared.items, prepared.commit)
                 .await;
         }
-        let prepared = self.agent.prepare_earlier_timeline(&asid.0, 80).await?;
+        let prepared = self
+            .agent
+            .prepare_earlier_timeline(&asid.0, EARLIER_TIMELINE_LIMIT)
+            .await?;
         if prepared.commit.is_some() {
             return Err(AgentError::Unsupported(
                 "stateful history requires atomic mirror acceptance".into(),
@@ -486,7 +530,7 @@ impl SessionService {
         self.agent.revert_session(&asid.0, message_id).await?;
         let timeline = self
             .agent
-            .get_timeline(&asid.0, 100)
+            .get_timeline(&asid.0, INITIAL_TIMELINE_LIMIT)
             .await
             .unwrap_or_default();
         if !timeline.is_empty() {

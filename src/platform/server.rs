@@ -139,51 +139,21 @@ pub(crate) async fn run(config_path: Option<String>) -> anyhow::Result<()> {
     // One background attempt per opted-in backend; no restart/logging loop.
     backend_startup::spawn(&config);
 
-    let agent_runtime = if config.agent_runtime.enabled {
-        agents::AgentRuntime::with_local_configs(
-            config.opencode.clone(),
-            config.deepseek.clone(),
-            config.t3.clone(),
-            crate::agents::runtime::LocalAgentConfigs {
-                codex: config.codex.clone(),
-                fx: config.fx.clone(),
-                qoder: config.qoder.clone(),
-                antigravity: config.antigravity.clone(),
-                cursor: config.cursor.clone(),
-                pi: config.pi.clone(),
-                claude: config.claude.clone(),
-            },
-            Some(state_dir()?),
-        )
-    } else {
-        agents::AgentRuntime::disabled()
-    };
+    let state_directory = state_dir()?;
+    let agent_runtime = agents::compose::build_runtime(
+        agents::compose::RuntimeSettings::from_config(&config),
+        config.agent_runtime.enabled,
+        Some(state_directory.clone()),
+    );
 
     agent_runtime.observe_terminal_sessions(&config.sessions);
 
     let scrollback = Arc::new(Mutex::new(scrollback::ScrollbackStore::new(
         config.history.capture,
     )));
-    let state_directory = state_dir()?;
-    let key = platform::store::db_key::key_for(&config.store, &state_directory)?;
-    let db = platform::store::sqlite::SqliteStore::open(
-        &platform::store::store_db_path(&state_directory),
-        key,
-        platform::store::sqlite::ALL_MIGRATIONS,
-    )
-    .map_err(|err| match config.store.encryption {
-        // One sentence that names both files, so the owner knows what to restore.
-        crate::platform::config::StoreEncryption::File => anyhow::anyhow!(
-            "{err} (key file: {})",
-            platform::store::db_key::key_file(&state_directory).display()
-        ),
-        crate::platform::config::StoreEncryption::Off => err,
-    })?;
-    if config.store.encryption == crate::platform::config::StoreEncryption::File {
-        agent_runtime.persist_t3_credentials(db.clone());
-    }
-    agent_runtime.restore_native_codex_sessions(db.clone());
-    agent_runtime.persist_session_routes(db.clone()).await;
+    let encryption = agents::compose::StoreEncryption::from(config.store.encryption);
+    let db = agents::compose::open_store(&state_directory, encryption)?;
+    agents::compose::attach_opened_store(&agent_runtime, &db, encryption).await;
     let task_events = tokio::sync::broadcast::channel(crate::tasks::events::TASK_EVENT_CAPACITY).0;
     let presence = Arc::new(crate::fleet::peers::PeerPresence::default());
     let tasks = Arc::new(crate::tasks::service::TaskService::new(

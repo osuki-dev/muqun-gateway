@@ -592,6 +592,7 @@ mod tests {
             attachments: None,
             image_assets: None,
             generation: None,
+            origin: None,
         };
         let mut agent = FakeAgent::new("opencode").with_timeline(vec![reply]);
         agent.sessions = vec![idle, busy, fake_session("ses_quiet", 1)];

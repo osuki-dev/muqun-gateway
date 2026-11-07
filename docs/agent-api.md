@@ -718,6 +718,15 @@ range, including its oldest boundary. Omit it when reopening at the latest page.
 Providers without older paging retain their existing full snapshot and omit the
 cursor, so cached history does not become inaccessible.
 
+`GET .../timeline/window?retained=true` is a non-waking peek: it answers only from
+history the Gateway's mirror already holds, never prepares, reads or starts the
+agent, and returns `404 not_retained` when there is none (open the session
+normally then). A user `TimelineItem` sent through `POST .../prompt` by a paired
+device carries optional `origin: { device_id, name }`; the Gateway shows it at
+once as a `presented:<uuid>` row, and the agent's own echo replaces that row
+(an `agent.timeline.removed` for the presented id precedes the echo's upsert) and keeps
+the `origin`. Prompts typed in the agent itself have no `origin`.
+
 Cursors are scoped to the session incarnation and removal generation. Invalid,
 evicted or obsolete boundaries return `409 history_cursor_lost`, not exhaustion.
 Recover with a new window; do not silently jump to another reader's provider
@@ -983,7 +992,7 @@ which `GET` reads without changing anything.
 | Codex | the next `turn/start` carries `approvalPolicy: "never"` with `sandboxPolicy: {type: "dangerFullAccess"}` (no asking and no sandbox, as `--dangerously-bypass-approvals-and-sandbox` at the terminal), which Codex keeps for the turns after it; off sends back the last policy the thread was seen asking under, else the configuration's `approval_policy`/`sandbox_mode`, never with a sandbox wider than the thread was last observed in. `enabled` reads true only for `never` with a sandbox that can write | session |
 | OpenCode | a session permission rule `{action: "*", resource: "*", effect: "allow"}` appended last; off removes it | session |
 | T3 Code | `thread.runtime-mode.set` `full-access`; off returns to `runtime_mode` (or `approval-required` when that is `full-access`) | session |
-| Antigravity, Cursor, FX | a launch flag or environment (`agy acp --dangerously-skip-permissions`, `agent --force acp`, `FX_PERMISSION_MODE=full-access`): `POST` relaunches that session's agent process with or without it and loads the same session again; an agent that is working refuses (502, "switch YOLO when it is idle"); the flag lasts until the Gateway restarts | session |
+| Antigravity, Cursor, FX | a launch flag or environment (`agy acp --dangerously-skip-permissions`, `agent --force acp`, `FX_PERMISSION_MODE=full-access`): `POST` relaunches that session's agent process with or without it and loads the same session again; a brand-new empty session (not yet saved by Cursor/FX) is replaced through `session/new` under the same App-facing asid instead, because `session/load` would answer -32602; an agent that is working refuses (502, "switch YOLO when it is idle"); the flag lasts until the Gateway restarts | session |
 | Pi | environment only (`MUQUN_PI_APPROVALS=never`): `POST` answers 501 | launch |
 | DeepSeek | per-request approvals only: `POST` answers 501, `enabled` is null | none |
 
