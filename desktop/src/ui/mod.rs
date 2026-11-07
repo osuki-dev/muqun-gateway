@@ -23,6 +23,7 @@ mod tasks;
 mod timeline;
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
@@ -222,6 +223,8 @@ pub struct UiState {
     /// Themes: the library, the gallery, running installs, the link field.
     pub theme_library: Arc<Vec<ThemeEntry>>,
     pub theme_gallery: Arc<GalleryView>,
+    /// Gallery card pictures keyed by theme id (`ThemeUpdate::Preview`).
+    pub theme_previews: HashMap<String, PathBuf>,
     pub theme_jobs: HashMap<String, Job>,
     pub theme_url: TextEdit,
     pub gallery_limit: usize,
@@ -328,6 +331,7 @@ impl UiState {
             cwd_input,
             theme_library: Arc::new(Vec::new()),
             theme_gallery: Arc::new(GalleryView::default()),
+            theme_previews: HashMap::new(),
             theme_jobs: HashMap::new(),
             theme_url: TextEdit::new(""),
             gallery_limit: GALLERY_PAGE,
@@ -738,8 +742,9 @@ impl UiState {
         match update {
             ThemeUpdate::Library(list) => self.theme_library = list,
             ThemeUpdate::Gallery(view) => self.theme_gallery = view,
-            // Cards draw swatches; a downloaded picture needs nothing here.
-            ThemeUpdate::Preview { .. } => {}
+            ThemeUpdate::Preview { id, path } => {
+                self.theme_previews.insert(id, path);
+            }
             ThemeUpdate::Job { id, job } => {
                 self.theme_jobs.insert(id, job);
             }
@@ -1076,6 +1081,11 @@ pub fn heading(k: &Kit, s: impl Into<String>) -> El {
 
 /// Shared page chrome: centered column, title, optional subtitle.
 pub fn page_frame(k: &Kit, key: &str, title: &str, subtitle: Option<&str>) -> El {
+    page_frame_w(k, key, title, subtitle, 760.0)
+}
+
+/// Like [`page_frame`], with an explicit content width (Themes uses a wider rail).
+pub fn page_frame_w(k: &Kit, key: &str, title: &str, subtitle: Option<&str>, max_w: f32) -> El {
     let title_font = rune::TextStyle {
         size: 22.0,
         line_height: 28.0,
@@ -1084,11 +1094,11 @@ pub fn page_frame(k: &Kit, key: &str, title: &str, subtitle: Option<&str>) -> El
     let mut page = rune::col()
         .key(key.to_string())
         .w_full()
-        .max_w(760.0)
-        .gap(16.0)
+        .max_w(max_w)
+        .gap(18.0)
         .px(28.0)
         .pt(28.0)
-        .pb(36.0)
+        .pb(40.0)
         .child(
             rune::text(title.to_string())
                 .font(title_font)

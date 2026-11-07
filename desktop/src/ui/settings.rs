@@ -1,16 +1,18 @@
 //! Settings: Agents, Appearance, General, Themes, About.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use rune::{col, row, text, El, ScrollSpec, TextEdit, Tx};
+use rune::{col, el, row, text, El, ImageCache, ScrollSpec, SurfaceFit, TextEdit, Transition, Tx};
 use rune_kit::{
     Badge, BadgeVariant, Button, ButtonVariant, Card, ControlSize, Kit, ScrollBar,
     SegmentedControl, Switch, TextInput,
 };
 
 use super::agents::Standing;
+use super::art;
 use super::copy::{tr, tr_ref};
-use super::{heading, muted, page_frame, UiState};
+use super::{heading, muted, page_frame_w, UiState};
 use crate::agent_fields::{fields, Field, Kind};
 use crate::branding::APP_NAME;
 use crate::config::{AgentConfigs, ConfigEdit, Density, Language, Scheme};
@@ -228,14 +230,31 @@ fn agents(s: &UiState, k: &Kit) -> Vec<El> {
             ),
         )];
     }
-    let mut out = vec![muted(
-        k,
-        tr(
-            language,
-            "Enable the agents you use. Changes take effect after Refresh.",
-            "打开要用的 Agents。更改在刷新后生效。",
+    let mut out = vec![
+        section(
+            k,
+            "agents-intro",
+            tr_ref(language, "Installed agents", "已安装的 Agents"),
+            vec![
+                muted(
+                    k,
+                    tr(
+                        language,
+                        "Enable the agents you use. Field changes save as you type; toggles take effect after Refresh.",
+                        "打开要用的 Agents。字段随输入保存，开关在刷新后生效。",
+                    ),
+                ),
+                row().key("agents-toolbar").w_full().gap(8.0).child(
+                    Button::new(tr_ref(language, "Rediscover agents", "重新发现"))
+                        .variant(ButtonVariant::Outline)
+                        .control_size(ControlSize::Regular)
+                        .on_press(|s: &mut UiState| s.send(Command::Refresh))
+                        .build(k)
+                        .key("agents-refresh"),
+                ),
+            ],
         ),
-    )];
+    ];
     out.extend(
         super::agents::by_standing(&s.agents)
             .into_iter()
@@ -287,16 +306,10 @@ fn agents(s: &UiState, k: &Kit) -> Vec<El> {
                 for field in fields(&a.id) {
                     card = card.child(agent_field(s, k, &a.id, *field));
                 }
-                card.build(k).key(format!("agent-{}", a.id))
+                card.build(k)
+                    .key(format!("agent-{}", a.id))
+                    .transition(Transition::opacity().combined(Transition::offset(0.0, 6.0)))
             }),
-    );
-    out.push(
-        Button::new(tr_ref(language, "Rediscover agents", "重新发现"))
-            .variant(ButtonVariant::Outline)
-            .control_size(ControlSize::Regular)
-            .on_press(|s: &mut UiState| s.send(Command::Refresh))
-            .build(k)
-            .key("agents-refresh"),
     );
     out
 }
@@ -313,90 +326,127 @@ fn appearance(s: &UiState, k: &Kit) -> Vec<El> {
     };
     let density = usize::from(ap.density == Density::Compact);
     let (motion, glass) = (ap.reduced_motion, ap.reduced_transparency);
-    vec![section(
-        k,
-        "appearance-card",
-        tr_ref(language, "Look & feel", "外观与动效"),
-        vec![
-            setting(
+    vec![
+        section(
+            k,
+            "appearance-theme",
+            tr_ref(language, "Theme", "主题"),
+            vec![setting(
                 k,
-                "scheme",
-                tr_ref(language, "Color scheme", "配色"),
+                "theme-jump",
+                tr_ref(language, "Active theme", "当前主题"),
                 tr_ref(
                     language,
-                    "Follow the system or pin light or dark.",
-                    "跟随系统，或固定浅色 / 深色。",
+                    "Open the Themes tab for previews, install and import.",
+                    "在「主题」页查看预览、安装与导入。",
                 ),
-                choice(
+                row()
+                    .key("theme-jump-row")
+                    .gap(8.0)
+                    .center_y()
+                    .child(
+                        Badge::new(ap.theme_id.clone())
+                            .variant(BadgeVariant::Subtle)
+                            .build(k),
+                    )
+                    .child(
+                        Button::new(tr_ref(language, "Browse themes", "浏览主题"))
+                            .variant(ButtonVariant::Outline)
+                            .control_size(ControlSize::Small)
+                            .on_press(|s: &mut UiState| {
+                                s.settings_tab = SettingsTab::Themes;
+                                s.send(Command::ThemeRefresh);
+                            })
+                            .build(k)
+                            .key("goto-themes"),
+                    ),
+            )],
+        ),
+        section(
+            k,
+            "appearance-card",
+            tr_ref(language, "Look & feel", "外观与动效"),
+            vec![
+                setting(
                     k,
                     "scheme",
-                    [
-                        tr_ref(language, "Light", "浅色"),
-                        tr_ref(language, "Dark", "深色"),
-                        tr_ref(language, "System", "系统"),
-                    ],
-                    scheme,
-                    |s, i| {
-                        s.set_scheme([Scheme::Light, Scheme::Dark, Scheme::System][i]);
-                    },
+                    tr_ref(language, "Color scheme", "配色"),
+                    tr_ref(
+                        language,
+                        "Follow the system or pin light or dark.",
+                        "跟随系统，或固定浅色 / 深色。",
+                    ),
+                    choice(
+                        k,
+                        "scheme",
+                        [
+                            tr_ref(language, "Light", "浅色"),
+                            tr_ref(language, "Dark", "深色"),
+                            tr_ref(language, "System", "系统"),
+                        ],
+                        scheme,
+                        |s, i| {
+                            s.set_scheme([Scheme::Light, Scheme::Dark, Scheme::System][i]);
+                        },
+                    ),
                 ),
-            ),
-            setting(
-                k,
-                "density",
-                tr_ref(language, "Density", "密度"),
-                tr_ref(language, "Row heights and spacing.", "行高与间距。"),
-                choice(
+                setting(
                     k,
                     "density",
-                    [
-                        tr_ref(language, "Comfortable", "舒适"),
-                        tr_ref(language, "Compact", "紧凑"),
-                    ],
-                    density,
-                    |s, i| {
-                        s.edit(ConfigEdit::Density(
-                            [Density::Comfortable, Density::Compact][i],
-                        ));
-                    },
+                    tr_ref(language, "Density", "密度"),
+                    tr_ref(language, "Row heights and spacing.", "行高与间距。"),
+                    choice(
+                        k,
+                        "density",
+                        [
+                            tr_ref(language, "Comfortable", "舒适"),
+                            tr_ref(language, "Compact", "紧凑"),
+                        ],
+                        density,
+                        |s, i| {
+                            s.edit(ConfigEdit::Density(
+                                [Density::Comfortable, Density::Compact][i],
+                            ));
+                        },
+                    ),
                 ),
-            ),
-            setting(
-                k,
-                "motion",
-                tr_ref(language, "Reduce motion", "减少动态"),
-                tr_ref(
-                    language,
-                    "Large movements become short fades.",
-                    "大幅动画改为短淡入淡出。",
-                ),
-                flag(
+                setting(
                     k,
                     "motion",
-                    motion,
                     tr_ref(language, "Reduce motion", "减少动态"),
-                    move |s| s.edit(ConfigEdit::ReducedMotion(!motion)),
+                    tr_ref(
+                        language,
+                        "Large movements become short fades.",
+                        "大幅动画改为短淡入淡出。",
+                    ),
+                    flag(
+                        k,
+                        "motion",
+                        motion,
+                        tr_ref(language, "Reduce motion", "减少动态"),
+                        move |s| s.edit(ConfigEdit::ReducedMotion(!motion)),
+                    ),
                 ),
-            ),
-            setting(
-                k,
-                "glass",
-                tr_ref(language, "Reduce transparency", "减少透明"),
-                tr_ref(
-                    language,
-                    "Glass surfaces and cover art become solid.",
-                    "玻璃表面与封面插图改为不透明。",
-                ),
-                flag(
+                setting(
                     k,
                     "glass",
-                    glass,
                     tr_ref(language, "Reduce transparency", "减少透明"),
-                    move |s| s.edit(ConfigEdit::ReducedTransparency(!glass)),
+                    tr_ref(
+                        language,
+                        "Glass surfaces and cover art become solid.",
+                        "玻璃表面与封面插图改为不透明。",
+                    ),
+                    flag(
+                        k,
+                        "glass",
+                        glass,
+                        tr_ref(language, "Reduce transparency", "减少透明"),
+                        move |s| s.edit(ConfigEdit::ReducedTransparency(!glass)),
+                    ),
                 ),
-            ),
-        ],
-    )]
+            ],
+        ),
+    ]
 }
 
 // ---- General -----------------------------------------------------------------------
@@ -526,23 +576,46 @@ fn general(s: &UiState, k: &Kit) -> Vec<El> {
 
 // ---- Themes ------------------------------------------------------------------------
 
+/// Card picture size (8×5, matching gallery thumbnails).
+const TILE_W: f32 = 236.0;
+const TILE_H: f32 = 148.0;
+
 fn swatch(k: &Kit, key: &str, hex: &str) -> El {
     let color = rune::color::hex(hex).unwrap_or(k.c.layer_02);
-    row()
-        .key(key.to_string())
-        .size(18.0, 18.0)
+    el().key(key.to_string())
+        .size(14.0, 14.0)
         .radius(k.radius.sm)
         .fill(color)
 }
 
-fn swatches(k: &Kit, id: &str, s: &crate::theme::store::Swatch, tag: &str) -> El {
+fn swatches(
+    k: &Kit,
+    id: &str,
+    light: &crate::theme::store::Swatch,
+    dark: &crate::theme::store::Swatch,
+) -> El {
     row()
-        .key(format!("sw-{id}-{tag}"))
-        .gap(3.0)
-        .child(swatch(k, "bg", &s.background))
-        .child(swatch(k, "surface", &s.surface))
-        .child(swatch(k, "primary", &s.primary))
-        .child(swatch(k, "text", &s.text))
+        .key(format!("sw-{id}"))
+        .gap(6.0)
+        .center_y()
+        .child(
+            row()
+                .key("light")
+                .gap(2.0)
+                .child(swatch(k, "l-bg", &light.background))
+                .child(swatch(k, "l-sf", &light.surface))
+                .child(swatch(k, "l-pr", &light.primary))
+                .child(swatch(k, "l-tx", &light.text)),
+        )
+        .child(
+            row()
+                .key("dark")
+                .gap(2.0)
+                .child(swatch(k, "d-bg", &dark.background))
+                .child(swatch(k, "d-sf", &dark.surface))
+                .child(swatch(k, "d-pr", &dark.primary))
+                .child(swatch(k, "d-tx", &dark.text)),
+        )
 }
 
 fn job_label(language: Language, job: &Job) -> String {
@@ -569,32 +642,89 @@ fn job_label(language: Language, job: &Job) -> String {
     }
 }
 
-fn library_card(s: &UiState, k: &Kit, entry: &ThemeEntry) -> El {
+fn thumb_from_path(k: &Kit, images: Option<&ImageCache>, path: Option<&Path>, key: &str) -> El {
+    if let (Some(images), Some(path)) = (images, path) {
+        if let Ok(bytes) = std::fs::read(path) {
+            return art::picture(images, Arc::<[u8]>::from(bytes), SurfaceFit::Fill)
+                .key(key.to_string())
+                .w(TILE_W)
+                .h(TILE_H);
+        }
+    }
+    el().key(key.to_string())
+        .w(TILE_W)
+        .h(TILE_H)
+        .fill(k.c.layer_02)
+}
+
+fn theme_tile(
+    k: &Kit,
+    key: &str,
+    name: &str,
+    about: &str,
+    thumb: El,
+    palette: Option<El>,
+    status: Option<El>,
+    actions: Vec<El>,
+    current: bool,
+) -> El {
+    let border = if current {
+        k.c.border_focus
+    } else {
+        k.c.border_weak
+    };
+    let mut body = col()
+        .key("meta")
+        .w_full()
+        .gap(6.0)
+        .px(12.0)
+        .pt(10.0)
+        .pb(12.0)
+        .child(
+            text(name.to_string())
+                .font(k.ty.body_medium)
+                .color(k.c.text_base)
+                .truncate(),
+        )
+        .child(
+            text(about.to_string())
+                .font(k.ty.small)
+                .color(k.c.text_muted)
+                .truncate(),
+        );
+    if let Some(palette) = palette {
+        body = body.child(palette);
+    }
+    if let Some(status) = status {
+        body = body.child(status);
+    }
+    if !actions.is_empty() {
+        body = body.child(row().key("actions").gap(8.0).center_y().children(actions));
+    }
+    col()
+        .key(key.to_string())
+        .w(TILE_W)
+        .radius(k.radius.md)
+        .fill(k.c.bg_base)
+        .border(1.0, border)
+        .clip_rounded(k.radius.md)
+        .transition(
+            Transition::opacity()
+                .combined(Transition::offset(0.0, 10.0))
+                .combined(Transition::scale(0.98)),
+        )
+        .child(thumb)
+        .child(body)
+}
+
+fn library_tile(s: &UiState, k: &Kit, images: Option<&ImageCache>, entry: &ThemeEntry) -> El {
     let language = s.cfg.general.language;
     let current = entry.id == s.cfg.appearance.theme_id;
     let mut about = vec![format!("v{}", entry.version)];
     about.extend(entry.author.clone());
-    let mut card = Card::new()
-        .accent(if current {
-            k.c.success.icon
-        } else {
-            k.c.icon_faint
-        })
-        .title(entry.name.clone(), None)
-        .description(about.join(" · "))
-        .child(
-            row()
-                .key(format!("sw-{}", entry.id))
-                .gap(12.0)
-                .child(swatches(k, &entry.id, &entry.light, "light"))
-                .child(swatches(k, &entry.id, &entry.dark, "dark")),
-        );
-    if let Some(d) = entry.description.as_ref().filter(|d| !d.is_empty()) {
-        card = card.child(muted(k, d.clone()));
-    }
     let scheme = s.cfg.appearance.scheme;
     let (apply_id, remove_id) = (entry.id.clone(), entry.id.clone());
-    card = card.action(if current {
+    let mut actions = vec![if current {
         Badge::new(tr_ref(language, "Current", "当前"))
             .variant(BadgeVariant::Accent)
             .build(k)
@@ -607,9 +737,9 @@ fn library_card(s: &UiState, k: &Kit, entry: &ThemeEntry) -> El {
             })
             .build(k)
             .key(format!("apply-{}", entry.id))
-    });
+    }];
     if entry.origin.removable() {
-        card = card.action(
+        actions.push(
             Button::new(tr_ref(language, "Remove", "移除"))
                 .variant(ButtonVariant::Danger)
                 .control_size(ControlSize::Small)
@@ -620,10 +750,31 @@ fn library_card(s: &UiState, k: &Kit, entry: &ThemeEntry) -> El {
                 .key(format!("remove-{}", entry.id)),
         );
     }
-    card.build(k).key(format!("theme-{}", entry.id))
+    let thumb = thumb_from_path(
+        k,
+        images,
+        entry.thumbnail.as_deref(),
+        &format!("thumb-lib-{}", entry.id),
+    );
+    let fallback = Some(swatches(k, &entry.id, &entry.light, &entry.dark));
+    theme_tile(
+        k,
+        &format!("theme-{}", entry.id),
+        &entry.name,
+        &about.join(" · "),
+        thumb,
+        fallback,
+        entry
+            .description
+            .as_ref()
+            .filter(|d| !d.is_empty())
+            .map(|d| muted(k, d.clone())),
+        actions,
+        current,
+    )
 }
 
-fn gallery_card(s: &UiState, k: &Kit, entry: &IndexEntry) -> El {
+fn gallery_tile(s: &UiState, k: &Kit, images: Option<&ImageCache>, entry: &IndexEntry) -> El {
     let language = s.cfg.general.language;
     let installed = s.theme_library.iter().any(|t| t.id == entry.id);
     let job = s.theme_jobs.get(&entry.id);
@@ -636,69 +787,221 @@ fn gallery_card(s: &UiState, k: &Kit, entry: &IndexEntry) -> El {
     let mut about = vec![format!("v{}", entry.version)];
     about.extend(entry.author.clone());
     about.push(format!("{} KB", entry.bytes / 1024));
-    let mut card = Card::new()
-        .accent(k.c.icon_accent)
-        .title(entry.name.clone(), None)
-        .description(about.join(" · "));
-    if let Some(d) = entry.description.as_ref().filter(|d| !d.is_empty()) {
-        card = card.child(muted(k, d.clone()));
-    }
-    if let Some(job) = job {
-        card = card.child(muted(k, job_label(language, job)));
-    }
+    let preview = s.theme_previews.get(&entry.id).map(PathBuf::as_path);
+    let thumb = thumb_from_path(k, images, preview, &format!("thumb-gal-{}", entry.id));
     let id = entry.id.clone();
-    card.action(
-        Button::new(if installed {
-            tr_ref(language, "Reinstall", "重新安装")
-        } else {
-            tr_ref(language, "Install", "安装")
-        })
-        .variant(if installed {
-            ButtonVariant::Outline
-        } else {
-            ButtonVariant::Submit
-        })
-        .control_size(ControlSize::Small)
-        .disabled(running)
-        .on_press(move |s: &mut UiState| s.send(Command::ThemeInstall(id.clone())))
-        .build(k)
-        .key(format!("install-{}", entry.id)),
-    )
+    let actions = vec![Button::new(if installed {
+        tr_ref(language, "Reinstall", "重新安装")
+    } else {
+        tr_ref(language, "Install", "安装")
+    })
+    .variant(if installed {
+        ButtonVariant::Outline
+    } else {
+        ButtonVariant::Submit
+    })
+    .control_size(ControlSize::Small)
+    .disabled(running)
+    .on_press(move |s: &mut UiState| s.send(Command::ThemeInstall(id.clone())))
     .build(k)
-    .key(format!("gallery-{}", entry.id))
+    .key(format!("install-{}", entry.id))];
+    let status = job.map(|job| muted(k, job_label(language, job)));
+    theme_tile(
+        k,
+        &format!("gallery-{}", entry.id),
+        &entry.name,
+        &about.join(" · "),
+        thumb,
+        None,
+        status.or_else(|| {
+            entry
+                .description
+                .as_ref()
+                .filter(|d| !d.is_empty())
+                .map(|d| muted(k, d.clone()))
+        }),
+        actions,
+        false,
+    )
 }
 
-fn themes(s: &UiState, k: &Kit) -> Vec<El> {
+fn theme_grid(key: &str, tiles: Vec<El>) -> El {
+    row()
+        .key(key.to_string())
+        .w_full()
+        .gap(14.0)
+        .flex_wrap()
+        .children(tiles)
+}
+
+fn section_head(k: &Kit, title: &str, detail: &str, trailing: Option<El>) -> El {
+    let mut copy = col()
+        .grow(1.0)
+        .shrink()
+        .gap(2.0)
+        .child(heading(k, title.to_string()));
+    if !detail.is_empty() {
+        copy = copy.child(muted(k, detail));
+    }
+    let mut row = row()
+        .key(format!("head-{title}"))
+        .w_full()
+        .gap(12.0)
+        .center_y()
+        .pt(4.0)
+        .child(copy);
+    if let Some(t) = trailing {
+        row = row.child(t);
+    }
+    row
+}
+
+fn current_theme_hero(s: &UiState, k: &Kit, images: Option<&ImageCache>) -> El {
     let language = s.cfg.general.language;
-    let mut out = vec![
-        setting(
+    let id = &s.cfg.appearance.theme_id;
+    let entry = s.theme_library.iter().find(|t| t.id == *id);
+    let name = entry.map(|t| t.name.as_str()).unwrap_or(id.as_str());
+    let about = entry
+        .map(|t| {
+            let mut bits = vec![format!("v{}", t.version)];
+            bits.extend(t.author.clone());
+            bits.join(" · ")
+        })
+        .unwrap_or_default();
+    let thumb_path = entry.and_then(|t| t.thumbnail.as_deref());
+    let thumb = if let (Some(images), Some(path)) = (images, thumb_path) {
+        if let Ok(bytes) = std::fs::read(path) {
+            art::picture(images, Arc::<[u8]>::from(bytes), SurfaceFit::Fill)
+                .key("current-thumb")
+                .w(320.0)
+                .h(200.0)
+                .radius(k.radius.md)
+                .clip_rounded(k.radius.md)
+        } else {
+            el().key("current-thumb")
+                .w(320.0)
+                .h(200.0)
+                .radius(k.radius.md)
+                .fill(k.c.layer_02)
+        }
+    } else {
+        el().key("current-thumb")
+            .w(320.0)
+            .h(200.0)
+            .radius(k.radius.md)
+            .fill(k.c.layer_02)
+    };
+    let mut meta = col()
+        .key("current-meta")
+        .grow(1.0)
+        .gap(8.0)
+        .child(
+            Badge::new(tr_ref(language, "Current theme", "当前主题"))
+                .variant(BadgeVariant::Accent)
+                .build(k),
+        )
+        .child(
+            text(name.to_string())
+                .font(k.ty.ui_medium)
+                .color(k.c.text_base),
+        );
+    if !about.is_empty() {
+        meta = meta.child(muted(k, about));
+    }
+    if let Some(entry) = entry {
+        meta = meta.child(swatches(k, &entry.id, &entry.light, &entry.dark));
+        if let Some(d) = entry.description.as_ref().filter(|d| !d.is_empty()) {
+            meta = meta.child(muted(k, d.clone()));
+        }
+    } else {
+        meta = meta.child(muted(
             k,
-            "theme",
-            tr_ref(language, "Current theme", "当前主题"),
-            tr_ref(
+            tr(
                 language,
                 "Applies to the light and dark variants alike.",
                 "浅色与深色变体共用同一主题。",
             ),
-            Badge::new(s.cfg.appearance.theme_id.clone())
-                .variant(BadgeVariant::Subtle)
-                .build(k),
+        ));
+    }
+    row()
+        .key("theme-current")
+        .w_full()
+        .gap(20.0)
+        .items_center()
+        .px(14.0)
+        .py(14.0)
+        .radius(k.radius.md)
+        .fill(k.c.bg_base)
+        .border(1.0, k.c.border_weak)
+        .child(thumb)
+        .child(meta)
+        .transition(Transition::opacity().combined(Transition::offset(0.0, 8.0)))
+}
+
+fn themes(s: &UiState, k: &Kit, images: Option<&ImageCache>) -> Vec<El> {
+    let language = s.cfg.general.language;
+    let mut out = vec![
+        current_theme_hero(s, k, images),
+        section_head(
+            k,
+            tr_ref(language, "Library", "已安装"),
+            tr_ref(
+                language,
+                "Themes on this computer. Apply one to restyle the window.",
+                "本机已有主题。应用后立即更换窗口外观。",
+            ),
+            Some(
+                Button::new(tr_ref(language, "Refresh", "刷新"))
+                    .variant(ButtonVariant::Ghost)
+                    .control_size(ControlSize::Small)
+                    .on_press(|s: &mut UiState| s.send(Command::ThemeRefresh))
+                    .build(k)
+                    .key("theme-refresh"),
+            ),
         ),
-        heading(k, tr_ref(language, "Library", "已安装")),
     ];
     if s.theme_library.is_empty() {
-        out.push(muted(k, tr_ref(language, "No themes yet.", "还没有主题。")));
+        out.push(empty_note(
+            k,
+            tr_ref(language, "No themes yet", "还没有主题"),
+            tr_ref(
+                language,
+                "Import a package or install one from the gallery below.",
+                "导入主题包，或从下方图库安装。",
+            ),
+        ));
+    } else {
+        out.push(theme_grid(
+            "library-grid",
+            s.theme_library
+                .iter()
+                .map(|t| library_tile(s, k, images, t))
+                .collect(),
+        ));
     }
-    out.extend(s.theme_library.iter().map(|t| library_card(s, k, t)));
 
-    out.push(heading(k, tr_ref(language, "Import", "导入")));
+    out.push(section_head(
+        k,
+        tr_ref(language, "Import", "导入"),
+        tr_ref(
+            language,
+            "Paste a .muqun-theme link or open a package from disk.",
+            "粘贴 .muqun-theme 链接，或从磁盘打开主题包。",
+        ),
+        None,
+    ));
     out.push(
         row()
             .key("theme-import")
             .w_full()
             .gap(8.0)
             .center_y()
-            .wrap()
+            .flex_wrap()
+            .px(12.0)
+            .py(12.0)
+            .radius(k.radius.md)
+            .fill(k.c.bg_base)
+            .border(1.0, k.c.border_weak)
             .child(
                 TextInput::new(&s.theme_url)
                     .label(tr_ref(language, "Theme link", "主题链接"))
@@ -708,7 +1011,7 @@ fn themes(s: &UiState, k: &Kit) -> Vec<El> {
                     .build(k)
                     .key("theme-url")
                     .grow(1.0)
-                    .min_w(220.0),
+                    .min_w(240.0),
             )
             .child(
                 Button::new(tr_ref(language, "Import link", "导入链接"))
@@ -729,7 +1032,16 @@ fn themes(s: &UiState, k: &Kit) -> Vec<El> {
             ),
     );
 
-    out.push(heading(k, tr_ref(language, "Gallery", "图库")));
+    out.push(section_head(
+        k,
+        tr_ref(language, "Gallery", "图库"),
+        tr_ref(
+            language,
+            "Published themes from muqun.dev, with preview cards.",
+            "来自 muqun.dev 的主题，带预览图。",
+        ),
+        None,
+    ));
     let gallery = &s.theme_gallery;
     if gallery.loading && gallery.entries.is_empty() {
         out.push(muted(
@@ -765,13 +1077,17 @@ fn themes(s: &UiState, k: &Kit) -> Vec<El> {
             ),
         ));
     }
-    out.extend(
-        gallery
-            .entries
-            .iter()
-            .take(s.gallery_limit)
-            .map(|e| gallery_card(s, k, e)),
-    );
+    if !gallery.entries.is_empty() {
+        out.push(theme_grid(
+            "gallery-grid",
+            gallery
+                .entries
+                .iter()
+                .take(s.gallery_limit)
+                .map(|e| gallery_tile(s, k, images, e))
+                .collect(),
+        ));
+    }
     if gallery.entries.len() > s.gallery_limit {
         out.push(
             Button::new(tr_ref(language, "Show more", "显示更多"))
@@ -782,16 +1098,6 @@ fn themes(s: &UiState, k: &Kit) -> Vec<El> {
                 .key("gallery-more"),
         );
     }
-    out.push(
-        row().key("theme-actions").gap(8.0).child(
-            Button::new(tr_ref(language, "Refresh themes", "刷新主题"))
-                .variant(ButtonVariant::Outline)
-                .control_size(ControlSize::Regular)
-                .on_press(|s: &mut UiState| s.send(Command::ThemeRefresh))
-                .build(k)
-                .key("theme-refresh"),
-        ),
-    );
     out
 }
 
@@ -911,22 +1217,48 @@ pub fn view(s: &UiState, k: &Kit) -> El {
     let tab_defs = tabs(language);
     let labels: Vec<&str> = tab_defs.iter().map(|(l, _)| *l).collect();
     let at = tab_defs.iter().position(|(_, t)| *t == s.settings_tab);
+    let images = s.images.as_ref();
+    let wide = s.settings_tab == SettingsTab::Themes;
     let body = match s.settings_tab {
         SettingsTab::Agents => agents(s, k),
         SettingsTab::Appearance => appearance(s, k),
         SettingsTab::General => general(s, k),
-        SettingsTab::Themes => themes(s, k),
+        SettingsTab::Themes => themes(s, k, images),
         SettingsTab::About => about(s, k),
     };
-    let mut page = page_frame(
+    let subtitle = match s.settings_tab {
+        SettingsTab::Agents => tr_ref(
+            language,
+            "Discovery, enablement, and agent-specific fields.",
+            "发现、启用与各 Agent 专属字段。",
+        ),
+        SettingsTab::Appearance => tr_ref(
+            language,
+            "Color scheme, density, and motion preferences.",
+            "配色、密度与动效偏好。",
+        ),
+        SettingsTab::General => tr_ref(
+            language,
+            "Language, default folder, and editor.",
+            "语言、默认文件夹与编辑器。",
+        ),
+        SettingsTab::Themes => tr_ref(
+            language,
+            "Library, import, and gallery with preview cards.",
+            "已安装、导入与带预览的图库。",
+        ),
+        SettingsTab::About => tr_ref(
+            language,
+            "Version, hub mode, and data locations.",
+            "版本、连接方式与数据位置。",
+        ),
+    };
+    let mut page = page_frame_w(
         k,
         "settings",
         tr_ref(language, "Settings", "设置"),
-        Some(tr_ref(
-            language,
-            "Agents, look, workspace, themes.",
-            "Agents、外观、工作区与主题。",
-        )),
+        Some(subtitle),
+        if wide { 920.0 } else { 760.0 },
     )
     .child(
         SegmentedControl::new(&labels, at)

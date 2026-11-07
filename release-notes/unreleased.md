@@ -12,6 +12,11 @@
   mismatched kit placeholders; it now pins under the tree and uses the synced
   `home` / `inbox` / `task` / `settings` icons.
 
+- **Settings Themes is a full gallery with preview cards.** Library and
+  catalogue themes show 8×5 thumbnails (plus palette swatches), the current
+  theme gets a hero strip, and Agents / Appearance / General / About use
+  clearer section intros; Appearance links into Themes.
+
 - **Large videos can be uploaded in chunks, up to 1 GiB, without the Gateway
   buffering the file.** `POST /api/uploads` reads its whole body into memory
   (and a sealed body cannot be streamed), which is why it stops at 64 MiB.
