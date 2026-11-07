@@ -413,7 +413,9 @@ fn entry(turn: Turn) -> Value {
 }
 
 /// Cursor stores pasted photos as `content` parts `{type:"image", image:{hex}}`.
-/// Write them beside gateway uploads so the desktop can paint them.
+/// Materialize them under the gateway uploads tree as ordinary attachment
+/// paths so `attach_to_items` / desktop `enrich_timeline` can mint the same
+/// `image_assets` map the App already consumes over HTTP.
 fn materialize_user_images(session_id: &str, content: &Value) -> Vec<String> {
     let Some(parts) = content.as_array() else {
         return Vec::new();

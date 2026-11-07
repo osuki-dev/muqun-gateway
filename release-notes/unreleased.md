@@ -2,13 +2,13 @@
 
 ## Changes and fixes
 
-- **Timeline shows real photos instead of `[Image #N]` placeholders.** User
-  attachments (and ACP host-file lists) resolve to local thumbs; Codex/Cursor
-  image-label echoes keep those attachments. Cursor's session store keeps
-  photos as binary `image` parts — those are materialized back into host files
-  when the timeline is read, so historical `[Image #N]` rows show the picture
-  again. Tool cards show a running spinner, short outputs inline, and any
-  image content they return.
+- **Timeline shows real photos the same way the App does — via gateway
+  `image_assets`.** Live upserts and snapshots run the in-process enrich that
+  mirrors HTTP `attach_to_event` / `attach_to_items`, so text parts carry the
+  asset map the App already paints. Cursor store history that only had
+  `[Image #N]` text plus binary `image` parts now restores those as attachments
+  first, then the same enrich mints `image_assets`. Tool cards show a running
+  spinner, short outputs inline, and any image content they return.
 
 - **Home no longer draws an empty white toolbar strip.** Session / Inbox /
   Tasks / Settings keep the toolbar; Home stays full-bleed. The sidebar brand

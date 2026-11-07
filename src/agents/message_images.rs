@@ -200,29 +200,31 @@ fn local_images() -> &'static MessageImages {
     IMAGES.get_or_init(Default::default)
 }
 
-/// Attach `image_assets` for markdown/file URIs inside `directory`, for a
-/// desktop (or other in-process) client that does not go through `/api`.
+/// Attach `image_assets` the way the HTTP egress does for the App
+/// (`attach_to_items` / `originals::attach`), for an in-process desktop that
+/// never hits `/api`. Same fields the App reads on each text part.
 pub fn enrich_timeline(asid: &str, directory: Option<&str>, items: &mut [TimelineItem]) {
     // Tool `content` media is resolved at paint time; only text embeds and
     // attachments need the host map (and must not run on every tool delta).
     if !items.iter().any(may_embed_image) && !items.iter().any(|item| item.attachments.is_some()) {
         return;
     }
-    let Some(directory) = directory.filter(|d| !d.is_empty()) else {
-        return;
-    };
     let images = local_images();
-    let Some(root) = images.remember_root(asid, Some(directory)) else {
-        return;
-    };
-    images.attach(&root, items);
-    // Codex (and others) put user photos in `attachments` with `[Image #N]` in
-    // the text — the HTTP path runs originals::attach; Desktop only has this.
-    attach_local_attachments(&root, items);
+    let root = directory
+        .filter(|d| !d.is_empty())
+        .and_then(|d| images.remember_root(asid, Some(d)));
+    if let Some(root) = root.as_ref() {
+        images.attach(root, items);
+    }
+    // Codex / Cursor put user photos in `attachments` (often absolute uploads)
+    // with `[Image #N]` in the text. The HTTP path runs `originals::attach`;
+    // Desktop gets the same `image_assets` shape here, including when the
+    // session directory is not known yet.
+    attach_local_attachments(root.as_deref(), items);
 }
 
 /// Resolve bare `attachments` paths into `image_assets` for in-process clients.
-fn attach_local_attachments(root: &Path, items: &mut [TimelineItem]) {
+fn attach_local_attachments(root: Option<&Path>, items: &mut [TimelineItem]) {
     for item in items {
         let Some(sources) = item.attachments.clone() else {
             continue;
@@ -235,15 +237,17 @@ fn attach_local_attachments(root: &Path, items: &mut [TimelineItem]) {
             {
                 continue;
             }
-            let Some((path, _)) = hosted_file(&src, root).or_else(|| {
-                let raw = src.strip_prefix("file://").unwrap_or(&src);
-                let path = Path::new(raw);
-                path.is_absolute()
-                    .then(|| std::fs::canonicalize(path).ok())
-                    .flatten()
-                    .filter(|p| p.is_file())
-                    .map(|p| (p, root.to_path_buf()))
-            }) else {
+            let Some(path) = root
+                .and_then(|root| hosted_file(&src, root).map(|(path, _)| path))
+                .or_else(|| {
+                    let raw = src.strip_prefix("file://").unwrap_or(&src);
+                    let path = Path::new(raw);
+                    path.is_absolute()
+                        .then(|| std::fs::canonicalize(path).ok())
+                        .flatten()
+                        .filter(|p| p.is_file())
+                })
+            else {
                 continue;
             };
             let head = read_asset_head(&path);
@@ -256,6 +260,8 @@ fn attach_local_attachments(root: &Path, items: &mut [TimelineItem]) {
                 continue;
             }
             let (width, height) = image_dimensions(&head).unzip();
+            // Same map the App consumes: src stays the wire source, url is what
+            // the client loads (here a host path; over HTTP it is /api/assets/…).
             assets.push(MessageImageAsset {
                 src: src.clone(),
                 asset_id: String::new(),

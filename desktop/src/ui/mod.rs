@@ -865,10 +865,22 @@ impl UiState {
         let current =
             |s: &Self, asid: &AgentSessionId| s.selected.as_deref() == Some(asid.0.as_str());
         match event {
-            AgentDomainEvent::TimelineUpsert { asid, items, .. } => {
+            AgentDomainEvent::TimelineUpsert {
+                asid, mut items, ..
+            } => {
                 if !current(self, &asid) {
                     return;
                 }
+                // Same egress step the App gets over HTTP/SSE (`attach_to_event`):
+                // fill `image_assets` before the timeline paints.
+                let directory = self
+                    .sessions
+                    .iter()
+                    .find(|s| s.asid == asid)
+                    .and_then(|s| s.directory.as_deref());
+                muqun_gateway::agents::message_images::enrich_timeline(
+                    &asid.0, directory, &mut items,
+                );
                 for item in items {
                     self.ingest(&item);
                     match self.timeline.iter_mut().find(|t| t.id == item.id) {
