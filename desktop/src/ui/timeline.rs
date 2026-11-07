@@ -68,6 +68,9 @@ pub struct SessionTimeline {
     pub earlier_exhausted: bool,
     /// A page of older history is on its way.
     pub loading_earlier: bool,
+    /// Bumped whenever rows are added, removed or reordered (the virtual
+    /// list's key version).
+    pub rev: u64,
 }
 
 impl SessionTimeline {
@@ -79,6 +82,7 @@ impl SessionTimeline {
             self.ingest(item);
         }
         self.items = items;
+        self.rev += 1;
     }
 
     /// Live rows: replace by id, else append.
@@ -88,13 +92,17 @@ impl SessionTimeline {
             // New and updated rows are nearly always at the tail.
             match self.items.iter().rposition(|t| t.id == item.id) {
                 Some(at) => self.items[at] = item,
-                None => self.items.push(item),
+                None => {
+                    self.items.push(item);
+                    self.rev += 1;
+                }
             }
         }
     }
 
     pub fn remove(&mut self, ids: &[String]) {
         self.items.retain(|t| !ids.contains(&t.id));
+        self.rev += 1;
         for id in ids {
             self.diffs.remove(id);
         }
@@ -114,6 +122,7 @@ impl SessionTimeline {
         }
         older.append(&mut self.items);
         self.items = older;
+        self.rev += 1;
     }
 
     /// Parse the item's change (a diff part, an edit's files) once, for drawing.
@@ -312,7 +321,7 @@ pub fn session_view(s: &UiState, k: &Kit, asid: &str) -> El {
                     .child(body.w_full().max_w(FEED_MAX_W))
             },
         )
-        .virtual_rows_version((tl.items.len(), tl.items.first().map(|i| i.id.clone())))
+        .virtual_rows_version((tl.rev, s.session_busy(asid)))
         .on_visible_rows(move |s: &mut UiState, range: std::ops::Range<usize>| {
             // Near the top with more history upstream: ask for the next page.
             if range.start > 2 {

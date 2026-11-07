@@ -8,7 +8,6 @@ use rune_kit::{Button, ButtonVariant, ControlSize, Kit, Switch, TextInput};
 use serde_json::{json, Map, Value};
 
 use super::{caption, glyphs, prose, Tcx, ToolCard};
-use crate::config::Language;
 use crate::model::commands::Command;
 use crate::model::tool_view::{self as tv, Output};
 use crate::ui::copy::tr_ref;
@@ -47,6 +46,7 @@ pub fn question_card(
     if tv::pending(call.state) && !cx.stopped() {
         if let Some(form) = unshown_form(cx) {
             card.preview = Some(form_fields(cx.s, cx.k, form, true));
+            card.attention = true;
             return;
         }
         card.open_default = true;
@@ -532,9 +532,4 @@ pub fn form_card(s: &UiState, k: &Kit, form: &FormRequest) -> El {
         card = card.child(form_fields(s, k, form, false));
     }
     card
-}
-
-#[allow(dead_code)]
-fn language_of(s: &UiState) -> Language {
-    s.cfg.general.language
 }

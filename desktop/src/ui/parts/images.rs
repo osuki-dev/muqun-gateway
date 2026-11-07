@@ -230,7 +230,9 @@ pub fn zoom_overlay(s: &UiState, k: &Kit) -> Option<El> {
     let images = s.images.as_ref()?;
     let language = s.cfg.general.language;
     let close = |s: &mut UiState| s.zoom = None;
-    let image = images.file(path, 2048.0, 2.0);
+    // Raster files decode whole whatever the size asked for, so the
+    // thumbnail's handle is already the full picture.
+    let image = images.file(path, THUMB_H, 2.0);
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -284,7 +286,7 @@ pub fn zoom_overlay(s: &UiState, k: &Kit) -> Option<El> {
         .px(40.0)
         .py(28.0)
         .gap(14.0)
-        .fill(k.alpha(k.c.black, 0.82))
+        .fill(k.alpha(k.c.black, 0.88))
         .on_press(close)
         .modal(true, close)
         .child(bar)

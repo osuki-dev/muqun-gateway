@@ -232,6 +232,8 @@ pub struct ToolCard<'a> {
     pub error: Option<String>,
     /// Tint the glyph (danger for a failed command, accent for an approval).
     pub accent: Option<Color>,
+    /// Waiting on the reader (a question to answer): the border says so.
+    pub attention: bool,
 }
 
 impl<'a> ToolCard<'a> {
@@ -250,6 +252,7 @@ impl<'a> ToolCard<'a> {
             actions: Vec::new(),
             error: None,
             accent: None,
+            attention: false,
         }
     }
 
@@ -331,7 +334,14 @@ impl<'a> ToolCard<'a> {
             .key(format!("card-{}", self.id))
             .w_full()
             .radius(k.radius.md)
-            .border(1.0, k.c.border_weak)
+            .border(
+                1.0,
+                if self.attention {
+                    k.alpha(k.c.icon_accent, 0.5)
+                } else {
+                    k.c.border_weak
+                },
+            )
             .fill(k.c.surface_raised_base)
             .clip_rounded(k.radius.md)
             .child(header);

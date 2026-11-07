@@ -178,7 +178,7 @@ pub fn inline_diff(cx: &Tcx, id: &str) -> Option<El> {
                 .or_default()
                 .diffs
                 .entry(set_id.clone())
-                .or_insert_with(Default::default)
+                .or_default()
                 .1
         },
     )
