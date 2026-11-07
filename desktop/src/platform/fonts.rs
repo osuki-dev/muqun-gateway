@@ -50,9 +50,10 @@ pub fn candidates(role: FontRole) -> &'static [&'static str] {
 /// first, then what the platform resolves when it is missing.
 pub fn family(role: FontRole) -> &'static str {
     match role {
-        // Inter (Rune's embedded face) for Latin, the system's CJK face for
-        // the glyphs it lacks, so Latin keeps its rhythm and CJK still shows.
-        FontRole::Ui => "Inter, Noto Sans CJK SC, Noto Sans CJK JP",
+        // Rune's default UI face; CJK comes through its script fallbacks, so
+        // the sans slot is left alone (naming a CJK family here would put
+        // its Latin in front of Inter's wherever Inter is not installed).
+        FontRole::Ui => "Inter",
         FontRole::Mono => "JetBrainsMono Nerd Font, JetBrainsMono NF, ui-monospace",
         FontRole::Display => "Noto Serif CJK SC, Inter",
     }
