@@ -529,6 +529,31 @@ impl Core {
                 }
             }
             Command::RefreshTasks => self.refresh_tasks().await,
+            Command::ScanStorage => {
+                if let Ok(report) = tokio::task::spawn_blocking(super::storage::scan).await {
+                    self.inbox.push(Update::Storage(report));
+                }
+            }
+            Command::ClearStorage => {
+                let cleared = tokio::task::spawn_blocking(|| {
+                    super::storage::clear_caches();
+                    super::storage::scan()
+                })
+                .await;
+                if let Ok(report) = cleared {
+                    self.inbox.push(Update::Storage(report));
+                }
+            }
+            Command::Voice(start) => {
+                if let Some(control) = start.control.lock().unwrap().take() {
+                    super::voice::spawn(
+                        start.config.clone(),
+                        start.meter.clone(),
+                        self.inbox.clone(),
+                        control,
+                    );
+                }
+            }
             Command::Terminals(command) => {
                 super::terminals::run(self.hub.clone(), self.inbox.clone(), command).await
             }

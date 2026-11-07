@@ -42,7 +42,7 @@ pub fn question_card(
 ) {
     let questions = rec.map(tv::parse_questions).unwrap_or_default();
     let answers = tv::question_answers(call);
-    card.accent = Some(cx.k.c.icon_accent);
+    card.accent = Some(cx.k.c.info.icon);
     if tv::pending(call.state) && !cx.stopped() {
         if let Some(form) = unshown_form(cx) {
             card.preview = Some(form_fields(cx.s, cx.k, form, true));
@@ -116,11 +116,7 @@ pub fn question_card(
 /// An option as a pill: its label, its description under it, and a mark
 /// when it is (or was) the answer.
 fn option_pill(k: &Kit, key: String, label: &str, description: Option<&str>, chosen: bool) -> El {
-    let ink = if chosen {
-        k.c.text_accent
-    } else {
-        k.c.text_base
-    };
+    let ink = if chosen { k.c.info.fg } else { k.c.text_base };
     let mut copy = col().gap(1.0).shrink().child(
         text(label.to_string())
             .font(if chosen {
@@ -156,8 +152,8 @@ fn option_pill(k: &Kit, key: String, label: &str, description: Option<&str>, cho
         .max_w(360.0);
     if chosen {
         pill = pill
-            .fill(k.alpha(k.c.icon_accent, 0.12))
-            .child(icon(&glyphs::DONE, 12.0).color(k.c.icon_accent).mt(2.0));
+            .fill(k.alpha(k.c.info.icon, 0.12))
+            .child(icon(&glyphs::DONE, 12.0).color(k.c.info.icon).mt(2.0));
     }
     pill.child(copy)
 }
@@ -480,7 +476,7 @@ pub fn form_card(s: &UiState, k: &Kit, form: &FormRequest) -> El {
     let language = s.cfg.general.language;
     let pending = form_pending(s, form);
     let accent = if pending {
-        k.c.icon_accent
+        k.c.info.icon
     } else {
         k.c.icon_faint
     };
@@ -521,7 +517,7 @@ pub fn form_card(s: &UiState, k: &Kit, form: &FormRequest) -> El {
         .border(
             1.0,
             if pending {
-                k.alpha(k.c.icon_accent, 0.45)
+                k.alpha(k.c.info.icon, 0.45)
             } else {
                 k.c.border_weak
             },

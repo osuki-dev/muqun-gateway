@@ -8,8 +8,26 @@ use tokio::sync::mpsc;
 
 use crate::config::{ConfigEdit, Scheme};
 
+/// Start dictation (`model/voice.rs`): the service, the meter the waveform
+/// reads, and the control channel the composer's buttons drive.
+pub struct VoiceStart {
+    pub config: crate::config::VoiceConfig,
+    pub meter: std::sync::Arc<super::voice::Meter>,
+    pub control: std::sync::Mutex<Option<mpsc::UnboundedReceiver<super::voice::VoiceControl>>>,
+}
+
+impl std::fmt::Debug for VoiceStart {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VoiceStart")
+            .field("mode", &self.config.mode)
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Command {
+    /// Record and transcribe into the composer.
+    Voice(std::sync::Arc<VoiceStart>),
     /// Re-read agent status and the session list.
     Refresh,
     /// Make a session the active one and read its snapshot.
@@ -165,6 +183,10 @@ pub enum Command {
     },
     /// Re-read the delegated task list (and the default folder).
     RefreshTasks,
+    /// Measure what the desktop keeps on disk (Settings → Storage).
+    ScanStorage,
+    /// Delete the rebuildable caches (theme previews, gallery index), then measure again.
+    ClearStorage,
     /// The Terminals page (`model/terminals.rs`).
     Terminals(super::terminals::TerminalCommand),
     /// Delegate `goal` as a task (`agent` / `cwd` default on the gateway).

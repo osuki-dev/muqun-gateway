@@ -41,6 +41,9 @@ impl Standing {
     }
 
     pub fn word(self, language: Language) -> &'static str {
+        if language == Language::ZhTw {
+            return super::copy::zh_tw_ref(self.word(Language::ZhCn));
+        }
         match (language, self) {
             (Language::En, Self::Usable) => "Available",
             (Language::En, Self::NeedsSetup) => "Needs setup",
@@ -56,6 +59,7 @@ impl Standing {
             (Language::ZhCn, Self::NeedsUpdate) => "需要更新",
             (Language::ZhCn, Self::Disabled) => "已关闭",
             (Language::ZhCn, Self::Checking) => "检查中…",
+            (Language::ZhTw, _) => unreachable!("derived above"),
         }
     }
 }

@@ -12,6 +12,7 @@ use rune_kit::{
 };
 
 use super::art;
+use super::copy::tr_ref;
 use super::{muted, OpenMenu, Slot, UiState};
 use crate::config::ConfigEdit;
 use crate::model::commands::Command;
@@ -509,9 +510,14 @@ fn queued_chip(
 ) -> El {
     let id = item.id.clone();
     let open = s.menu == Some(OpenMenu::Queued(id.clone()));
+    let language = s.cfg.general.language;
     let label = format!(
         "{} {}",
-        if item.steer { "Steer:" } else { "Queued:" },
+        if item.steer {
+            tr_ref(language, "Steer:", "插队：")
+        } else {
+            tr_ref(language, "Queued:", "已排队：")
+        },
         super::timeline::clip(&item.text, 32)
     );
     let mut menu = Menu::new(format!("queued-{id}"))
@@ -535,23 +541,23 @@ fn queued_chip(
     if item.files.is_empty() {
         let (edit_id, text) = (id.clone(), item.text.clone());
         menu = menu.item(
-            MenuItem::new("Edit")
+            MenuItem::new(tr_ref(language, "Edit", "编辑"))
                 .on_select(move |s: &mut UiState| edit_queued(s, &edit_id, text.clone())),
         );
     }
     let (steer_id, next_steer) = (id.clone(), !item.steer);
     menu = menu.item(
         MenuItem::new(if item.steer {
-            "Keep queued"
+            tr_ref(language, "Keep queued", "保持排队")
         } else {
-            "Send next"
+            tr_ref(language, "Send next", "下一个发送")
         })
         .on_select(move |s: &mut UiState| toggle_queued_steer(s, &steer_id, next_steer)),
     );
     let cancel_id = id.clone();
     let pill = menu
         .item(
-            MenuItem::new("Cancel")
+            MenuItem::new(tr_ref(language, "Cancel", "取消"))
                 .danger(true)
                 .on_select(move |s: &mut UiState| cancel_queued(s, &cancel_id)),
         )
@@ -1221,7 +1227,7 @@ fn pills(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         line = line.child(
             SegmentedControl::new(&labels, at)
                 .fit()
-                .label("Mode")
+                .label(tr_ref(s.cfg.general.language, "Mode", "模式"))
                 .on_pick(move |s: &mut UiState, i, _: &mut Tx| switch_mode(s, ids[i].clone()))
                 .build(k)
                 .key("modes"),
@@ -1243,7 +1249,7 @@ fn pills(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     let asid = info.asid.clone();
     line.child(
         Switch::new(on)
-            .label("Auto-approve")
+            .label(tr_ref(s.cfg.general.language, "Auto-approve", "自动批准"))
             .on_toggle(move |s: &mut UiState| {
                 s.send(Command::Compose(ComposeCommand::SetAutoApprove {
                     asid: asid.clone(),
@@ -1258,7 +1264,6 @@ fn pills(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
 pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     let look = s.look();
     let language = s.cfg.general.language;
-    let zh = language == crate::config::Language::ZhCn;
     let busy = s.busy();
     let has_session = s.selected.is_some();
     let focused = s.draft.focused && has_session;
@@ -1278,18 +1283,15 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         .gap(8.0)
         .center_y()
         .child(pills(s, k, layer).grow(1.0).shrink().min_w(0.0))
+        .child(super::voice::mic_button(s, k))
         .child(
-            Button::new(if zh { "附件" } else { "Attach" })
+            Button::new(tr_ref(language, "Attach", "附件"))
                 .variant(ButtonVariant::Ghost)
                 .control_size(ControlSize::Regular)
                 .disabled(!has_session)
                 .help(format!(
                     "{} · {}",
-                    if zh {
-                        "添加文件或图片"
-                    } else {
-                        "Add files or an image"
-                    },
+                    tr_ref(language, "Add files or an image", "添加文件或图片"),
                     crate::platform::keys::label("Primary+V")
                 ))
                 .on_press(move |_: &mut UiState| {
@@ -1301,7 +1303,7 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     if busy {
         if let Some(asid) = s.selected.clone() {
             actions = actions.child(
-                Button::new(if zh { "停止" } else { "Stop" })
+                Button::new(tr_ref(language, "Stop", "停止"))
                     .variant(ButtonVariant::Danger)
                     .control_size(ControlSize::Regular)
                     .shortcut("Escape")
@@ -1313,11 +1315,10 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
             );
         }
     }
-    let send_label = match (busy, zh) {
-        (true, true) => "排队",
-        (true, false) => "Queue",
-        (false, true) => "发送",
-        (false, false) => "Send",
+    let send_label = if busy {
+        tr_ref(language, "Queue", "排队")
+    } else {
+        tr_ref(language, "Send", "发送")
     };
     let send = Button::new(send_label)
         .variant(ButtonVariant::Submit)
@@ -1346,23 +1347,24 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         card = card.child(chips);
     }
     let placeholder = if has_session {
-        if zh {
-            "发消息…（/ 命令，$ 技能，@ 文件）"
-        } else {
-            "Message…  (/ commands, $ skills, @ files)"
-        }
-    } else if zh {
-        "先选一个会话"
+        tr_ref(
+            language,
+            "Message…  (/ commands, $ skills, @ files)",
+            "发消息…（/ 命令，$ 技能，@ 文件）",
+        )
     } else {
-        "Pick a session first"
+        tr_ref(language, "Pick a session first", "先选一个会话")
     };
     let accent = k.c.bg_accent;
     let info = k.c.info.icon;
+    if let Some(dictation) = super::voice::strip(s, k) {
+        card = card.child(dictation);
+    }
     card = card
         .child(
             TextArea::new(&s.draft)
                 .placeholder(placeholder)
-                .label("Draft")
+                .label(tr_ref(language, "Draft", "草稿"))
                 .width(None)
                 .auto_grow(2, 8)
                 .pill_style(move |id| {
@@ -1416,11 +1418,11 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         hint = hint
             .child(rune_kit::Spinner::new().size(10.0).color(brand).build(k))
             .child(
-                rune::text(if zh {
-                    "Agent 正在工作，消息会排队"
-                } else {
-                    "Agent is working; messages queue"
-                })
+                rune::text(tr_ref(
+                    language,
+                    "Agent is working; messages queue",
+                    "Agent 正在工作，消息会排队",
+                ))
                 .font(k.ty.small)
                 .color(k.c.text_muted),
             )
@@ -1433,13 +1435,9 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         format!(
             "{} {} · {} {}",
             crate::platform::keys::label("Primary+Enter"),
-            if zh { "发送" } else { "to send" },
+            tr_ref(language, "to send", "发送"),
             crate::platform::keys::label("Primary+V"),
-            if zh {
-                "粘贴文件或图片"
-            } else {
-                "to paste files or an image"
-            },
+            tr_ref(language, "to paste files or an image", "粘贴文件或图片"),
         ),
     ));
 

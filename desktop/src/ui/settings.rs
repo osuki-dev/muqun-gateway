@@ -15,7 +15,7 @@ use super::copy::{tr, tr_ref};
 use super::{heading, muted, page_frame_w, UiState};
 use crate::agent_fields::{fields, Field, Kind};
 use crate::branding::APP_NAME;
-use crate::config::{AgentConfigs, ConfigEdit, Density, Language, Scheme};
+use crate::config::{AgentConfigs, Appearance, ConfigEdit, Density, Language, Scheme, Shape};
 use crate::model::commands::Command;
 use crate::platform::editors::Editor;
 use crate::theme::gallery::IndexEntry;
@@ -27,11 +27,13 @@ pub enum SettingsTab {
     Agents,
     Appearance,
     General,
+    Voice,
     Themes,
+    Shortcuts,
     About,
 }
 
-fn tabs(language: Language) -> [(&'static str, SettingsTab); 5] {
+pub(super) fn tabs(language: Language) -> [(&'static str, SettingsTab); 7] {
     [
         (tr_ref(language, "Agents", "Agents"), SettingsTab::Agents),
         (
@@ -39,7 +41,12 @@ fn tabs(language: Language) -> [(&'static str, SettingsTab); 5] {
             SettingsTab::Appearance,
         ),
         (tr_ref(language, "General", "通用"), SettingsTab::General),
+        (tr_ref(language, "Voice", "语音"), SettingsTab::Voice),
         (tr_ref(language, "Themes", "主题"), SettingsTab::Themes),
+        (
+            tr_ref(language, "Shortcuts", "快捷键"),
+            SettingsTab::Shortcuts,
+        ),
         (tr_ref(language, "About", "关于"), SettingsTab::About),
     ]
 }
@@ -423,6 +430,54 @@ fn appearance(s: &UiState, k: &Kit) -> Vec<El> {
                 ),
                 setting(
                     k,
+                    "text-size",
+                    tr_ref(language, "Text size", "文字大小"),
+                    tr_ref(
+                        language,
+                        "Every label, message and code block scales together.",
+                        "所有文案、消息与代码一起缩放。",
+                    ),
+                    choice(
+                        k,
+                        "text-size",
+                        ["90%", "100%", "110%", "120%"],
+                        Appearance::TEXT_SCALES
+                            .iter()
+                            .position(|v| (v - ap.text_scale()).abs() < 0.01)
+                            .unwrap_or(1),
+                        |s, i| s.edit(ConfigEdit::TextScale(Appearance::TEXT_SCALES[i])),
+                    ),
+                ),
+                setting(
+                    k,
+                    "shape",
+                    tr_ref(language, "Shape", "圆角"),
+                    tr_ref(
+                        language,
+                        "How rounded panels, cards and controls are.",
+                        "面板、卡片与控件的圆角程度。",
+                    ),
+                    choice(
+                        k,
+                        "shape",
+                        [
+                            tr_ref(language, "Sharp", "锐利"),
+                            tr_ref(language, "Soft", "柔和"),
+                            tr_ref(language, "Round", "圆润"),
+                        ],
+                        [Shape::Sharp, Shape::Soft, Shape::Round]
+                            .iter()
+                            .position(|v| *v == ap.shape)
+                            .unwrap_or(1),
+                        |s, i| {
+                            s.edit(ConfigEdit::Shape(
+                                [Shape::Sharp, Shape::Soft, Shape::Round][i],
+                            ))
+                        },
+                    ),
+                ),
+                setting(
+                    k,
                     "motion",
                     tr_ref(language, "Reduce motion", "减少动态"),
                     tr_ref(
@@ -464,7 +519,11 @@ fn appearance(s: &UiState, k: &Kit) -> Vec<El> {
 
 fn general(s: &UiState, k: &Kit) -> Vec<El> {
     let language = s.cfg.general.language;
-    let lang_at = usize::from(language == Language::ZhCn);
+    let lang_at = match language {
+        Language::En => 0,
+        Language::ZhCn => 1,
+        Language::ZhTw => 2,
+    };
     let editor = TextEdit::new(s.cfg.general.editor_command.clone().unwrap_or_default());
     vec![
         section(
@@ -483,10 +542,12 @@ fn general(s: &UiState, k: &Kit) -> Vec<El> {
                 choice(
                     k,
                     "language",
-                    ["English", "简体中文"],
+                    ["English", "简体中文", "繁體中文"],
                     lang_at,
                     |s, i| {
-                        s.edit(ConfigEdit::Language([Language::En, Language::ZhCn][i]));
+                        s.edit(ConfigEdit::Language(
+                            [Language::En, Language::ZhCn, Language::ZhTw][i],
+                        ));
                     },
                 ),
             )],
@@ -583,6 +644,208 @@ fn general(s: &UiState, k: &Kit) -> Vec<El> {
             ],
         ),
         notifications(s, k),
+        storage(s, k),
+    ]
+}
+
+/// What the desktop keeps on disk, and a button for the part it can rebuild.
+fn storage(s: &UiState, k: &Kit) -> El {
+    use crate::model::storage::human;
+    let language = s.cfg.general.language;
+    let report = s.storage.clone().unwrap_or_default();
+    let scanned = s.storage.is_some();
+    let size = |n: u64| {
+        if scanned {
+            human(n)
+        } else {
+            "…".to_string()
+        }
+    };
+    let line = |key: &str, title: &'static str, title_zh: &'static str, n: u64| {
+        setting(
+            k,
+            key,
+            tr_ref(language, title, title_zh),
+            "",
+            Badge::new(size(n)).variant(BadgeVariant::Subtle).build(k),
+        )
+    };
+    let state_dir = report
+        .state_dir
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    section(
+        k,
+        "general-storage",
+        tr_ref(language, "Storage", "存储"),
+        vec![
+            setting(
+                k,
+                "storage-cache",
+                tr_ref(language, "Cache", "缓存"),
+                tr_ref(
+                    language,
+                    "Theme previews and the gallery index. Rebuilt when needed.",
+                    "主题预览与图库索引，需要时会重新生成。",
+                ),
+                row()
+                    .key("storage-cache-row")
+                    .gap(8.0)
+                    .center_y()
+                    .child(
+                        Badge::new(size(report.cache()))
+                            .variant(BadgeVariant::Subtle)
+                            .build(k),
+                    )
+                    .child(
+                        Button::new(tr_ref(language, "Clear cache", "清除缓存"))
+                            .variant(ButtonVariant::Outline)
+                            .control_size(ControlSize::Small)
+                            .disabled(!scanned || report.cache() == 0)
+                            .on_press(|s: &mut UiState| {
+                                s.storage = None;
+                                s.send(Command::ClearStorage);
+                            })
+                            .build(k)
+                            .key("storage-clear"),
+                    ),
+            ),
+            line("storage-uploads", "Attachments", "附件副本", report.uploads),
+            line(
+                "storage-other",
+                "Sessions and settings",
+                "会话与设置",
+                report.other,
+            ),
+            setting(
+                k,
+                "storage-total",
+                tr_ref(language, "Total", "合计"),
+                &state_dir,
+                Badge::new(size(report.total()))
+                    .variant(BadgeVariant::Neutral)
+                    .build(k),
+            ),
+        ],
+    )
+}
+
+/// One shortcut row: what it does, and the keys.
+fn shortcut_row(k: &Kit, key: String, keys: String, what: String) -> El {
+    row()
+        .key(key)
+        .w_full()
+        .gap(12.0)
+        .center_y()
+        .py(5.0)
+        .child(text(what).font(k.ty.ui).color(k.c.text_base).grow(1.0))
+        .child(
+            rune_kit::Keybind::new(
+                &keys
+                    .split('+')
+                    .filter(|p| !p.is_empty())
+                    .collect::<Vec<_>>(),
+            )
+            .build(k),
+        )
+}
+
+/// Every keyboard shortcut the window answers to.
+fn shortcuts(s: &UiState, k: &Kit) -> Vec<El> {
+    let language = s.cfg.general.language;
+    let key = crate::platform::keys::label;
+    let rows = |id: &str, list: &[(String, &'static str, &'static str)]| -> Vec<El> {
+        list.iter()
+            .enumerate()
+            .map(|(i, (keys, en, zh))| {
+                shortcut_row(
+                    k,
+                    format!("sc-{id}-{i}"),
+                    keys.clone(),
+                    tr(language, en, zh),
+                )
+            })
+            .collect()
+    };
+    vec![
+        section(
+            k,
+            "shortcuts-window",
+            tr_ref(language, "Window", "窗口"),
+            rows(
+                "window",
+                &[
+                    (
+                        key("Shift+Primary+B"),
+                        "Show or hide the sidebar",
+                        "显示 / 隐藏侧边栏",
+                    ),
+                    (key("Primary+,"), "Settings", "设置"),
+                    (key("Shift+Primary+T"), "Themes", "主题"),
+                    (key("Primary+N"), "New session (Home)", "新建会话（首页）"),
+                    (key("Primary+F"), "Search sessions", "搜索会话"),
+                    (
+                        key("Escape"),
+                        "Close the file viewer or a menu",
+                        "关闭文件查看器或菜单",
+                    ),
+                ],
+            ),
+        ),
+        section(
+            k,
+            "shortcuts-session",
+            tr_ref(language, "Session", "会话"),
+            rows(
+                "session",
+                &[
+                    (
+                        key("Primary+Enter"),
+                        "Send (queue while the agent works)",
+                        "发送（Agent 工作时排队）",
+                    ),
+                    (key("Shift+Enter"), "New line in the message", "消息内换行"),
+                    (key("Escape"), "Stop the running turn", "停止当前回合"),
+                    (
+                        key("Primary+V"),
+                        "Paste files or an image into the message",
+                        "粘贴文件或图片到消息",
+                    ),
+                    (
+                        key("Shift+Primary+Space"),
+                        "Start or finish dictation",
+                        "开始 / 结束语音输入",
+                    ),
+                ],
+            ),
+        ),
+        section(
+            k,
+            "shortcuts-split",
+            tr_ref(language, "Split view", "分屏"),
+            rows(
+                "split",
+                &[
+                    (
+                        key("Primary+\\"),
+                        "Open another session beside this one",
+                        "在旁边打开另一个会话",
+                    ),
+                    (
+                        key("Primary+1"),
+                        "Focus tile 1 (… Primary+4)",
+                        "聚焦第 1 个分屏（… Primary+4）",
+                    ),
+                    (key("Primary+W"), "Close the focused tile", "关闭当前分屏"),
+                    (
+                        format!("{} / Shift", key("Alt")),
+                        "Click a session to open it in a split",
+                        "点击会话时按住即可在分屏中打开",
+                    ),
+                ],
+            ),
+        ),
     ]
 }
 
@@ -596,19 +859,38 @@ fn notifications(s: &UiState, k: &Kit) -> El {
         k,
         "general-notify",
         tr_ref(language, "Notifications", "通知"),
-        vec![setting(
-            k,
-            "notify",
-            title,
-            tr_ref(
-                language,
-                "Approvals, questions and finished turns in sessions you are not looking at.",
-                "不在眼前的会话需要审批、提问或完成时提醒你。",
+        vec![
+            setting(
+                k,
+                "notify",
+                title,
+                tr_ref(
+                    language,
+                    "Approvals, questions and finished turns in sessions you are not looking at.",
+                    "不在眼前的会话需要审批、提问或完成时提醒你。",
+                ),
+                flag(k, "notify", on, title, move |s| {
+                    s.edit(ConfigEdit::Notifications(!on))
+                }),
             ),
-            flag(k, "notify", on, title, move |s| {
-                s.edit(ConfigEdit::Notifications(!on))
-            }),
-        )],
+            {
+                let tray = s.cfg.general.close_to_tray;
+                let title = tr_ref(language, "Keep running in the tray", "关闭窗口后留在托盘");
+                setting(
+                k,
+                "tray",
+                title,
+                tr_ref(
+                    language,
+                    "Closing the window leaves Muqun in the system tray, still notifying. Quit from the tray's menu.",
+                    "关闭窗口后 Muqun 留在系统托盘并继续提醒；从托盘菜单退出。",
+                ),
+                flag(k, "tray", tray, title, move |s| {
+                    s.edit(ConfigEdit::CloseToTray(!tray))
+                }),
+            )
+            },
+        ],
     )
 }
 
@@ -1177,7 +1459,18 @@ fn about(s: &UiState, k: &Kit) -> Vec<El> {
             "about-app",
             APP_NAME,
             vec![
-                muted(k, format!("muqun-desktop {version}")),
+                muted(
+                    k,
+                    format!(
+                        "muqun-desktop {version} · {} · rune {}",
+                        option_env!("MUQUN_BUILD").unwrap_or(if cfg!(debug_assertions) {
+                            "debug build"
+                        } else {
+                            "release build"
+                        }),
+                        crate::branding::RUNE_REV
+                    ),
+                ),
                 muted(
                     k,
                     tr(
@@ -1210,6 +1503,97 @@ fn about(s: &UiState, k: &Kit) -> Vec<El> {
         ),
         section(
             k,
+            "about-links",
+            tr_ref(language, "Links", "链接"),
+            vec![row()
+                .key("about-link-row")
+                .w_full()
+                .gap(8.0)
+                .flex_wrap()
+                .child(link_button(
+                    k,
+                    "about-repo",
+                    tr_ref(language, "Source code", "源码"),
+                    env!("CARGO_PKG_REPOSITORY"),
+                ))
+                .child(link_button(
+                    k,
+                    "about-issues",
+                    tr_ref(language, "Report an issue", "反馈问题"),
+                    concat!(env!("CARGO_PKG_REPOSITORY"), "/issues"),
+                ))
+                .child(link_button(
+                    k,
+                    "about-site",
+                    "muqun.dev",
+                    "https://muqun.dev",
+                ))
+                .child(link_button(
+                    k,
+                    "about-themes",
+                    tr_ref(language, "Theme gallery", "主题图库"),
+                    "https://muqun.dev/themes",
+                ))],
+        ),
+        section(
+            k,
+            "about-licenses",
+            tr_ref(language, "Open source", "开源许可"),
+            vec![
+                license_row(
+                    k,
+                    "muqun-desktop",
+                    "Apache-2.0",
+                    tr_ref(
+                        language,
+                        "This app, and the gateway it embeds.",
+                        "本应用及其内嵌的 Gateway。",
+                    ),
+                ),
+                license_row(
+                    k,
+                    "Rune, rune-kit, rune-fx",
+                    "MIT",
+                    tr_ref(
+                        language,
+                        "The UI framework, components and GPU effects.",
+                        "UI 框架、组件与 GPU 特效。",
+                    ),
+                ),
+                license_row(
+                    k,
+                    "OpenCC data",
+                    "Apache-2.0",
+                    tr_ref(
+                        language,
+                        "The Simplified to Traditional Chinese table (assets/i18n).",
+                        "简繁转换字表（assets/i18n）。",
+                    ),
+                ),
+                license_row(
+                    k,
+                    "Built-in themes",
+                    "CC0-1.0",
+                    tr_ref(
+                        language,
+                        "Six theme packs and their artwork.",
+                        "六套内置主题及其插图。",
+                    ),
+                ),
+                license_row(
+                    k,
+                    "JetBrains Mono, Noto Sans CJK",
+                    "OFL-1.1",
+                    tr_ref(
+                        language,
+                        "Fonts the UI asks the system for; not bundled.",
+                        "UI 向系统请求的字体，未打包。",
+                    ),
+                ),
+            ],
+        ),
+        section(
+            k,
             "about-paths",
             tr_ref(language, "Files", "文件位置"),
             vec![
@@ -1228,6 +1612,28 @@ fn about(s: &UiState, k: &Kit) -> Vec<El> {
             ],
         ),
     ]
+}
+
+fn link_button(k: &Kit, key: &str, label: &str, url: &'static str) -> El {
+    Button::new(label)
+        .variant(ButtonVariant::Outline)
+        .control_size(ControlSize::Small)
+        .help(url)
+        .on_press_tx(move |_: &mut UiState, tx: &mut Tx| {
+            let _ = tx.open_url(url);
+        })
+        .build(k)
+        .key(key.to_string())
+}
+
+fn license_row(k: &Kit, name: &str, license: &str, detail: &str) -> El {
+    setting(
+        k,
+        &format!("lic-{}", name.replace([' ', ','], "-")),
+        name,
+        detail,
+        Badge::new(license).variant(BadgeVariant::Subtle).build(k),
+    )
 }
 
 fn path_row(k: &Kit, key: &str, title: &str, path: String) -> El {
@@ -1272,7 +1678,9 @@ pub fn view(s: &UiState, k: &Kit) -> El {
         SettingsTab::Agents => agents(s, k),
         SettingsTab::Appearance => appearance(s, k),
         SettingsTab::General => general(s, k),
+        SettingsTab::Voice => super::voice::settings(s, k),
         SettingsTab::Themes => themes(s, k, images),
+        SettingsTab::Shortcuts => shortcuts(s, k),
         SettingsTab::About => about(s, k),
     };
     let subtitle = match s.settings_tab {
@@ -1291,15 +1699,21 @@ pub fn view(s: &UiState, k: &Kit) -> El {
             "Language, default folder, editor and notifications.",
             "语言、默认文件夹、编辑器与通知。",
         ),
+        SettingsTab::Voice => super::voice::subtitle(language),
         SettingsTab::Themes => tr_ref(
             language,
             "Library, import, and gallery with preview cards.",
             "已安装、导入与带预览的图库。",
         ),
+        SettingsTab::Shortcuts => tr_ref(
+            language,
+            "Every key the window answers to.",
+            "窗口响应的所有按键。",
+        ),
         SettingsTab::About => tr_ref(
             language,
-            "Version, hub mode, and data locations.",
-            "版本、连接方式与数据位置。",
+            "Version, build, links and licenses.",
+            "版本、构建、链接与许可。",
         ),
     };
     let mut page = page_frame_w(

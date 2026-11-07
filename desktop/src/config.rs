@@ -31,6 +31,69 @@ pub struct DesktopConfig {
     pub ui: UiPrefs,
     pub window: WindowGeometry,
     pub notifications: Notifications,
+    /// Dictation's speech service (the API key lives in the keyring).
+    pub voice: VoiceConfig,
+}
+
+/// How dictation transcribes (the App's Settings → Voice).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VoiceMode {
+    /// The whole recording to an OpenAI-compatible `/v1/audio/transcriptions`.
+    #[default]
+    File,
+    /// Streamed to an OpenAI-Realtime-compatible WebSocket, words as you speak.
+    Realtime,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VoiceConfig {
+    pub mode: VoiceMode,
+    /// The service's endpoint: `https://…` after recording, `wss://…` realtime.
+    pub url: String,
+    /// Empty: the service's own default.
+    pub model: String,
+    /// `auto`, or a language tag (`en`, `zh-CN`, …).
+    pub language: String,
+}
+
+impl Default for VoiceConfig {
+    fn default() -> Self {
+        Self {
+            mode: VoiceMode::File,
+            url: String::new(),
+            model: String::new(),
+            language: "auto".into(),
+        }
+    }
+}
+
+impl VoiceConfig {
+    /// The App's presets, shown as placeholders and followed when the mode
+    /// changes while the URL is still the preset.
+    pub fn preset(mode: VoiceMode) -> (&'static str, &'static str) {
+        match mode {
+            VoiceMode::File => (
+                "https://api.openai.com/v1/audio/transcriptions",
+                "gpt-4o-mini-transcribe",
+            ),
+            VoiceMode::Realtime => (
+                "wss://api.openai.com/v1/realtime?intent=transcription",
+                "gpt-live-transcribe",
+            ),
+        }
+    }
+
+    /// The URL is one this mode can use (`https` / `wss`, no credentials).
+    pub fn usable(&self) -> bool {
+        let url = self.url.trim();
+        let scheme = match self.mode {
+            VoiceMode::File => "https://",
+            VoiceMode::Realtime => "wss://",
+        };
+        url.starts_with(scheme) && url.len() > scheme.len() && !url[scheme.len()..].contains('@')
+    }
 }
 
 /// System notifications for sessions that are not on screen.
@@ -113,9 +176,11 @@ pub struct General {
     pub editor_command: Option<String>,
     /// The top bar's "Open in …": the editor used last.
     pub editor: crate::platform::editors::Editor,
-    /// Placeholder: closing the window will hide it to the tray instead of
-    /// quitting. Stored, not acted on yet (there is no tray in P0).
+    /// Closing the window keeps Muqun running behind its status icon
+    /// (where there is one); off quits.
     pub close_to_tray: bool,
+    /// The first-run welcome was seen (or skipped).
+    pub welcomed: bool,
 }
 
 /// The draft key of the start page.
@@ -147,6 +212,10 @@ impl General {
 pub enum Language {
     #[serde(rename = "zh-CN")]
     ZhCn,
+    /// Traditional Chinese, Taiwan usage; derived from the zh-CN copy
+    /// (`ui/copy.rs`).
+    #[serde(rename = "zh-TW")]
+    ZhTw,
     #[serde(rename = "en")]
     En,
 }
@@ -158,7 +227,13 @@ impl Default for Language {
 }
 
 impl Language {
-    /// Simplified Chinese when the session's locale says Chinese, else English.
+    /// Chinese is Chinese: `zh` and the rest of the UI copy.
+    pub fn is_zh(self) -> bool {
+        matches!(self, Self::ZhCn | Self::ZhTw)
+    }
+
+    /// Chinese when the session's locale says Chinese (Traditional for
+    /// Taiwan, Hong Kong, Macau and `Hant`), else English.
     pub fn from_environment() -> Self {
         let lang = ["LC_ALL", "LC_MESSAGES", "LANG"]
             .iter()
@@ -168,10 +243,17 @@ impl Language {
     }
 
     fn from_locale_tag(tag: &str) -> Self {
-        if tag.to_ascii_lowercase().starts_with("zh") {
-            Self::ZhCn
+        let tag = tag.to_ascii_lowercase().replace('_', "-");
+        if !tag.starts_with("zh") {
+            return Self::En;
+        }
+        let traditional = ["zh-tw", "zh-hk", "zh-mo", "zh-hant"]
+            .iter()
+            .any(|t| tag.starts_with(t));
+        if traditional {
+            Self::ZhTw
         } else {
-            Self::En
+            Self::ZhCn
         }
     }
 
@@ -181,6 +263,9 @@ impl Language {
         use muqun_gateway::platform::i18n::Locale;
         match self {
             Self::ZhCn => Locale::from_code("zh-CN").unwrap_or_default(),
+            Self::ZhTw => Locale::from_code("zh-TW")
+                .or_else(|| Locale::from_code("zh-CN"))
+                .unwrap_or_default(),
             Self::En => Locale::default(),
         }
     }
@@ -197,6 +282,45 @@ pub struct Appearance {
     /// "Reduce transparency" (§6.1d): glass surfaces fall back to solid.
     pub reduced_transparency: bool,
     pub density: Density,
+    /// Text size, 0.85..=1.3 of the kit's own sizes (1 is the kit's).
+    pub text_scale: f32,
+    /// Corner profile of panels, cards and controls.
+    pub shape: Shape,
+}
+
+/// How rounded the surfaces are.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Shape {
+    Sharp,
+    #[default]
+    Soft,
+    Round,
+}
+
+impl Shape {
+    /// What the kit's radii are multiplied by.
+    pub fn factor(self) -> f32 {
+        match self {
+            Shape::Sharp => 0.5,
+            Shape::Soft => 1.0,
+            Shape::Round => 1.5,
+        }
+    }
+}
+
+impl Appearance {
+    pub const TEXT_SCALES: [f32; 4] = [0.9, 1.0, 1.1, 1.2];
+
+    /// The stored text scale, forced into range (a hand-edited value never
+    /// yields unreadable text).
+    pub fn text_scale(&self) -> f32 {
+        if self.text_scale.is_finite() {
+            self.text_scale.clamp(0.85, 1.3)
+        } else {
+            1.0
+        }
+    }
 }
 
 impl Default for Appearance {
@@ -207,6 +331,8 @@ impl Default for Appearance {
             reduced_motion: false,
             reduced_transparency: false,
             density: Density::Comfortable,
+            text_scale: 1.0,
+            shape: Shape::Soft,
         }
     }
 }
@@ -243,6 +369,9 @@ pub struct UiPrefs {
     /// (`model/projects.rs`). Only projects with a choice are kept.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub projects: BTreeMap<String, ProjectPrefs>,
+    /// The command palette's recent commands, newest first.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub recent_commands: Vec<String>,
     /// Sessions open side by side when the window closed, in tile order
     /// (`ui/tiles.rs`); empty when one session filled the pane.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -307,6 +436,7 @@ impl Default for UiPrefs {
             sidebar_width: Self::SIDEBAR_DEFAULT,
             right_width: Self::RIGHT_DEFAULT,
             projects: BTreeMap::new(),
+            recent_commands: Vec::new(),
             tiles: Vec::new(),
             tile_split: 0.5,
         }
@@ -337,9 +467,17 @@ pub enum ConfigEdit {
     Scheme(Scheme),
     Language(Language),
     Density(Density),
+    TextScale(f32),
+    Shape(Shape),
+    /// The first-run welcome was dismissed.
+    Welcomed,
     ReducedMotion(bool),
     ReducedTransparency(bool),
     Notifications(bool),
+    CloseToTray(bool),
+    /// The command palette's recent commands, newest first.
+    RecentCommands(Vec<String>),
+    Voice(VoiceConfig),
     EditorCommand(Option<String>),
     /// Where "New session" starts for an agent with no remembered folder.
     DefaultCwd(Option<PathBuf>),
@@ -392,9 +530,15 @@ impl DesktopConfig {
             ConfigEdit::Scheme(scheme) => self.appearance.scheme = scheme,
             ConfigEdit::Language(language) => self.general.language = language,
             ConfigEdit::Density(density) => self.appearance.density = density,
+            ConfigEdit::TextScale(scale) => self.appearance.text_scale = scale,
+            ConfigEdit::Shape(shape) => self.appearance.shape = shape,
+            ConfigEdit::Welcomed => self.general.welcomed = true,
             ConfigEdit::ReducedMotion(on) => self.appearance.reduced_motion = on,
             ConfigEdit::ReducedTransparency(on) => self.appearance.reduced_transparency = on,
             ConfigEdit::Notifications(on) => self.notifications.enabled = on,
+            ConfigEdit::CloseToTray(on) => self.general.close_to_tray = on,
+            ConfigEdit::RecentCommands(list) => self.ui.recent_commands = list,
+            ConfigEdit::Voice(voice) => self.voice = voice,
             ConfigEdit::EditorCommand(command) => {
                 self.general.editor_command = command.filter(|c| !c.trim().is_empty());
             }
@@ -693,6 +837,8 @@ mod tests {
     fn chinese_locales_pick_simplified_chinese() {
         assert_eq!(Language::from_locale_tag("zh_CN.UTF-8"), Language::ZhCn);
         assert_eq!(Language::from_locale_tag("en_US.UTF-8"), Language::En);
+        assert_eq!(Language::from_locale_tag("zh_TW.UTF-8"), Language::ZhTw);
+        assert_eq!(Language::from_locale_tag("zh-Hant-HK"), Language::ZhTw);
         assert_eq!(Language::from_locale_tag(""), Language::En);
     }
 

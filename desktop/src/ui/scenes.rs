@@ -132,6 +132,7 @@ fn base(s: &mut UiState) {
     s.hub_label = "standalone".into();
     s.agents_seen = true;
     s.splash = None;
+    s.cfg.general.welcomed = true;
     s.status = "Demo".into();
     s.agents = vec![
         agent("codex", "Codex", true),
@@ -702,6 +703,78 @@ test result: \u{1b}[32mok\u{1b}[0m. 131 passed; 0 failed; 0 ignored\r\n\r\n\
     s.demo = true;
 }
 
+fn voice_meter() -> std::sync::Arc<crate::model::voice::Meter> {
+    use crate::model::voice::Meter;
+    let started = std::time::Instant::now() - std::time::Duration::from_secs_f64(6.3);
+    let meter = Meter::since(started);
+    // A speech-like envelope: syllables riding on phrases, a pause mid-way.
+    let mut t = 0.0f64;
+    while t < 6.3 {
+        let phrase =
+            ((t * 0.9).sin() * 0.5 + 0.5) * if (2.6..3.2).contains(&t) { 0.1 } else { 1.0 };
+        let syllable = ((t * 11.0).sin() * 0.5 + 0.5).powf(0.7);
+        meter.push(t, (0.12 + 0.78 * phrase * syllable) as f32);
+        t += 0.02;
+    }
+    std::sync::Arc::new(meter)
+}
+
+fn voice_scene(s: &mut UiState) {
+    use crate::config::VoiceMode;
+    session_scene(s);
+    s.cfg.voice.mode = VoiceMode::File;
+    s.voice = Some(super::voice::Dictation::preview(
+        VoiceMode::File,
+        voice_meter(),
+        "",
+    ));
+}
+
+fn voice_realtime_scene(s: &mut UiState) {
+    use crate::config::VoiceMode;
+    session_scene(s);
+    s.cfg.voice.mode = VoiceMode::Realtime;
+    s.voice = Some(super::voice::Dictation::preview(
+        VoiceMode::Realtime,
+        voice_meter(),
+        "Rename the greet helper and 顺便把测试也更新一下, then run the checks",
+    ));
+}
+
+fn voice_settings_scene(s: &mut UiState) {
+    use crate::config::VoiceMode;
+    settings(s);
+    s.settings_tab = SettingsTab::Voice;
+    s.cfg.voice.mode = VoiceMode::Realtime;
+    s.cfg.voice.url = "wss://speech.example.com/v1/realtime".into();
+    s.voice_form = super::voice::VoiceForm::new(&s.cfg.voice);
+    s.voice_form.key_saved = Some(crate::platform::secrets::Store::Keyring);
+}
+
+fn palette_scene(s: &mut UiState) {
+    session_scene(s);
+    s.cfg.ui.recent_commands = vec!["go:Terminals".into(), "session:s2".into()];
+    s.palette = Some(super::palette::Palette::new());
+}
+
+fn palette_search_scene(s: &mut UiState) {
+    session_scene(s);
+    let mut palette = super::palette::Palette::new();
+    palette.query = TextEdit::new("new cod");
+    palette.query.focused = true;
+    palette.selected = 1;
+    s.cfg.general.last_cwd.clear();
+    s.cfg
+        .general
+        .last_cwd
+        .insert("codex".into(), "/home/demo/gateway".into());
+    s.cfg
+        .general
+        .last_cwd
+        .insert("opencode".into(), "/home/demo/rune".into());
+    s.palette = Some(palette);
+}
+
 /// A scene name and the state it applies.
 pub type Scene = (&'static str, fn(&mut UiState));
 
@@ -723,6 +796,57 @@ pub fn scenes() -> &'static [Scene] {
         ("split2-zh", |s| {
             split2(s);
             s.cfg.general.language = crate::config::Language::ZhCn;
+        }),
+        ("home-noagent", |s| {
+            home_first(s);
+            for a in &mut s.agents {
+                a.enabled = false;
+            }
+        }),
+        ("welcome", |s| {
+            home_first(s);
+            s.cfg.general.welcomed = false;
+        }),
+        ("settings-appearance", |s| {
+            settings(s);
+            s.settings_tab = SettingsTab::Appearance;
+        }),
+        ("settings-general", |s| {
+            settings(s);
+            s.settings_tab = SettingsTab::General;
+            s.storage = Some(crate::model::storage::StorageReport {
+                previews: 9_500_000,
+                gallery: 88_000,
+                uploads: 20_000_000,
+                other: 1_200_000,
+                state_dir: Some("/home/demo/.local/share/muqun-desktop".into()),
+            });
+        }),
+        ("settings-shortcuts", |s| {
+            settings(s);
+            s.settings_tab = SettingsTab::Shortcuts;
+        }),
+        ("settings-about", |s| {
+            settings(s);
+            s.settings_tab = SettingsTab::About;
+        }),
+        ("home-big", |s| {
+            home_busy(s);
+            s.cfg.appearance.text_scale = 1.2;
+            s.cfg.appearance.shape = crate::config::Shape::Round;
+        }),
+        ("home-tw", |s| {
+            home_busy(s);
+            s.cfg.general.language = crate::config::Language::ZhTw;
+        }),
+        ("session-tw", |s| {
+            session_scene(s);
+            s.cfg.general.language = crate::config::Language::ZhTw;
+        }),
+        ("settings-tw", |s| {
+            settings(s);
+            s.settings_tab = SettingsTab::General;
+            s.cfg.general.language = crate::config::Language::ZhTw;
         }),
         ("home-akiba", |s| {
             with_pack(s, "akiba-overdrive");
@@ -764,8 +888,37 @@ pub fn scenes() -> &'static [Scene] {
         ("timeline-long", timeline_long),
         ("timeline-zh", timeline_zh),
         ("terminals", terminals_scene),
+        ("terminals-tw", |s| {
+            terminals_scene(s);
+            s.cfg.general.language = crate::config::Language::ZhTw;
+        }),
+        ("voice-settings-tw", |s| {
+            voice_settings_scene(s);
+            s.cfg.general.language = crate::config::Language::ZhTw;
+        }),
+        ("voice-tw", |s| {
+            voice_scene(s);
+            s.cfg.general.language = crate::config::Language::ZhTw;
+        }),
+        ("palette-tw", |s| {
+            palette_scene(s);
+            s.cfg.general.language = crate::config::Language::ZhTw;
+        }),
+        ("viewer-tw", |s| {
+            viewer_code(s);
+            s.cfg.general.language = crate::config::Language::ZhTw;
+        }),
+        ("viewer-video-tw", |s| {
+            viewer_video(s);
+            s.cfg.general.language = crate::config::Language::ZhTw;
+        }),
+        ("voice", voice_scene),
+        ("voice-realtime", voice_realtime_scene),
+        ("voice-settings", voice_settings_scene),
         ("timeline-subagent", timeline_subagent),
         ("timeline-context", timeline_context),
+        ("palette", palette_scene),
+        ("palette-search", palette_search_scene),
         ("viewer", viewer_code),
         ("viewer-markdown", viewer_markdown),
         ("viewer-image", viewer_image),

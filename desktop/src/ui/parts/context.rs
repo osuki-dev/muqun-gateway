@@ -28,7 +28,7 @@ pub fn compact(n: u64) -> String {
 pub fn tokens_label(language: Language, n: u64) -> String {
     match language {
         Language::En => format!("{} tokens", compact(n)),
-        Language::ZhCn => format!("{} tokens", compact(n)),
+        Language::ZhCn | Language::ZhTw => format!("{} tokens", compact(n)),
     }
 }
 
@@ -119,13 +119,14 @@ pub fn meter(s: &UiState, k: &Kit, asid: &str) -> Option<El> {
                     compact(used),
                     compact(limit)
                 ),
-                Language::ZhCn => {
+                Language::ZhCn | Language::ZhTw => crate::ui::copy::localize(
+                    language,
                     format!(
                         "上下文：模型可容纳 {} 中的 {}",
                         compact(limit),
                         compact(used)
-                    )
-                }
+                    ),
+                ),
             }
         }
         None => {
@@ -191,13 +192,15 @@ fn until(language: Language, at_ms: u64) -> String {
         Language::En if d > 0 => format!("{d}d {h}h"),
         Language::En if h > 0 => format!("{h}h {m}m"),
         Language::En => format!("{m}m"),
-        Language::ZhCn if d > 0 => format!("{d} 天 {h} 小时"),
-        Language::ZhCn if h > 0 => format!("{h} 小时 {m} 分"),
-        Language::ZhCn => format!("{m} 分钟"),
+        Language::ZhCn | Language::ZhTw if d > 0 => format!("{d} 天 {h} 小时"),
+        Language::ZhCn | Language::ZhTw if h > 0 => format!("{h} 小时 {m} 分"),
+        Language::ZhCn | Language::ZhTw => format!("{m} 分钟"),
     };
     match language {
         Language::En => format!("Resets in {span}"),
-        Language::ZhCn => format!("{span}后重置"),
+        Language::ZhCn | Language::ZhTw => {
+            crate::ui::copy::localize(language, format!("{span}后重置"))
+        }
     }
 }
 
@@ -278,9 +281,13 @@ fn limits_section(s: &UiState, k: &Kit, agent: &str) -> Option<El> {
                         .and_then(Value::as_u64)
                         .map(|m| match (m >= 1440, language) {
                             (true, Language::En) => format!("{} day window", m / 1440),
-                            (true, Language::ZhCn) => format!("{} 天周期", m / 1440),
+                            (true, _) => {
+                                crate::ui::copy::localize(language, format!("{} 天周期", m / 1440))
+                            }
                             (false, Language::En) => format!("{} hour window", m / 60),
-                            (false, Language::ZhCn) => format!("{} 小时周期", m / 60),
+                            (false, _) => {
+                                crate::ui::copy::localize(language, format!("{} 小时周期", m / 60))
+                            }
                         })
                 })
                 .unwrap_or_else(|| t("Quota", "额度").to_string());
@@ -289,11 +296,11 @@ fn limits_section(s: &UiState, k: &Kit, agent: &str) -> Option<El> {
             let value = match (remaining, unit) {
                 (Some(r), "percent") => match language {
                     Language::En => format!("{r:.0}% left"),
-                    Language::ZhCn => format!("剩余 {r:.0}%"),
+                    _ => crate::ui::copy::localize(language, format!("剩余 {r:.0}%")),
                 },
                 (Some(r), unit) => match language {
                     Language::En => format!("{r} {unit} left"),
-                    Language::ZhCn => format!("剩余 {r} {unit}"),
+                    _ => crate::ui::copy::localize(language, format!("剩余 {r} {unit}")),
                 },
                 (None, _) => t("Remaining unknown", "剩余未知").to_string(),
             };
@@ -384,10 +391,13 @@ pub fn sheet(s: &UiState, k: &Kit) -> Option<El> {
                             compact(used),
                             compact(limit)
                         ),
-                        Language::ZhCn => format!(
-                            "模型可容纳 {} tokens，已用 {}",
-                            compact(limit),
-                            compact(used)
+                        _ => crate::ui::copy::localize(
+                            language,
+                            format!(
+                                "模型可容纳 {} tokens，已用 {}",
+                                compact(limit),
+                                compact(used)
+                            ),
                         ),
                     },
                 ));
@@ -402,9 +412,10 @@ pub fn sheet(s: &UiState, k: &Kit) -> Option<El> {
                             compact(used)
                         )
                     }
-                    Language::ZhCn => {
-                        format!("模型最近读取了 {} tokens；未报告上限", compact(used))
-                    }
+                    _ => crate::ui::copy::localize(
+                        language,
+                        format!("模型最近读取了 {} tokens；未报告上限", compact(used)),
+                    ),
                 },
             ));
         }

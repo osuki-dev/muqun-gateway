@@ -49,7 +49,7 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
     if s.mode != Mode::Home {
         split = split.toolbar(toolbar(s, k, &look, layer));
     }
-    if s.right_open && s.mode == Mode::Session {
+    if s.right_open && s.mode == Mode::Session && !s.in_split() {
         split = split.inspector(&s.right, super::right_pane, inspector::view(s, k));
     }
     let mut split = split
@@ -350,7 +350,7 @@ fn toolbar(s: &UiState, k: &Kit, look: &Look, layer: &mut Vec<El>) -> Toolbar {
                     .shortcut("Primary+\\")
                     .on_press(|s: &mut UiState| s.split())
                     .build(k)
-                    .key("split"),
+                    .key("split-session"),
             );
             if !asid.is_empty() {
                 bar = bar.trailing(session_more(s, k, layer, &asid, busy));
@@ -368,7 +368,7 @@ fn toolbar(s: &UiState, k: &Kit, look: &Look, layer: &mut Vec<El>) -> Toolbar {
             }
         }
     }
-    if s.mode == Mode::Session {
+    if s.mode == Mode::Session && !s.in_split() {
         bar = bar.trailing(
             IconButton::new(&INSPECTOR)
                 .variant(if s.right_open {

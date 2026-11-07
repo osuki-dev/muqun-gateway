@@ -9,9 +9,12 @@ pub mod fonts;
 pub mod instance;
 pub mod keys;
 pub mod media;
+pub mod mic;
 pub mod notify;
+pub mod secrets;
 pub mod shell;
 pub mod shutdown;
+pub mod tray;
 
 use std::path::PathBuf;
 

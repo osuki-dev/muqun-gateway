@@ -16,6 +16,7 @@ use rune::{
 use rune_kit::Kit;
 
 use super::art;
+use super::copy::tr_ref;
 use crate::branding::APP_NAME;
 use crate::config::Language;
 use crate::theme::color_scheme::ColorScheme;
@@ -183,15 +184,9 @@ fn stage(
     pose: Pose,
 ) -> El {
     let subtitle = if pose.loading {
-        match language {
-            Language::En => "Warming up agents…",
-            Language::ZhCn => "正在准备 Agents…",
-        }
+        tr_ref(language, "Warming up agents…", "正在准备 Agents…")
     } else {
-        match language {
-            Language::En => "Ready",
-            Language::ZhCn => "已就绪",
-        }
+        tr_ref(language, "Ready", "已就绪")
     };
     let title_font = TextStyle {
         size: 30.0,

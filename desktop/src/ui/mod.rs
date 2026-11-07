@@ -8,13 +8,14 @@ mod agent_marks;
 mod agents;
 mod art;
 mod composer;
-mod copy;
+pub mod copy;
 pub mod fx;
 mod home;
 mod icons;
 mod inbox;
 mod inspector;
 mod labels;
+mod palette;
 mod parts;
 pub mod scenes;
 mod sessions;
@@ -25,7 +26,10 @@ mod tasks;
 mod terminals;
 mod tiles;
 mod timeline;
+mod tray;
 mod viewer;
+mod voice;
+mod welcome;
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -57,6 +61,7 @@ use crate::theme::service::{GalleryView, Job, ThemeUpdate};
 use crate::theme::store::ThemeEntry;
 
 pub use settings::SettingsTab;
+pub use tray::words as tray_words;
 
 /// What the main pane shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -294,8 +299,18 @@ pub struct UiState {
     pub agents_seen: bool,
     /// A screenshot scene is showing: live core updates are ignored.
     pub demo: bool,
+    /// What the desktop keeps on disk (Settings → Storage), once scanned.
+    pub storage: Option<crate::model::storage::StorageReport>,
     /// The Terminals page (`ui/terminals.rs`).
     pub terms: terminals::TermState,
+    /// What the status icon last showed (`ui/tray.rs`).
+    tray_shown: Option<(crate::config::Language, Vec<(String, String)>)>,
+    /// The command palette (`ui/palette.rs`), when open.
+    pub palette: Option<palette::Palette>,
+    /// Dictation in progress (`ui/voice.rs`).
+    pub voice: Option<voice::Dictation>,
+    /// Settings → Voice's fields.
+    pub voice_form: voice::VoiceForm,
     /// The file viewer overlay ([`UiState::open_file`]).
     pub viewer: Option<viewer::Viewer>,
     /// Sessions open side by side (empty when one session fills the pane).
@@ -420,7 +435,12 @@ impl UiState {
             splash: None,
             agents_seen: false,
             demo: false,
+            storage: None,
             viewer: None,
+            voice: None,
+            palette: None,
+            tray_shown: None,
+            voice_form: voice::VoiceForm::new(&cfg.voice),
             terms: terminals::TermState::default(),
             tiles: Vec::new(),
             focus: 0,
@@ -432,6 +452,7 @@ impl UiState {
             cfg,
         };
         s.arm_splash(splash::SplashKind::Boot);
+        s.check_voice_key();
         s
     }
 
@@ -477,6 +498,12 @@ impl UiState {
     }
 
     /// Keep the window waking while the splash is animating.
+    /// Every frame Rune asks: the splash and a recording's waveform animate.
+    pub fn poll_frame(&mut self, t: f64, tx: &mut Tx) -> bool {
+        let voice = self.poll_voice();
+        self.poll_splash(t, tx) | voice
+    }
+
     pub fn poll_splash(&mut self, _: f64, _: &mut Tx) -> bool {
         let Some(splash) = self.splash.as_mut() else {
             return false;
@@ -608,7 +635,10 @@ impl UiState {
                     crate::model::compose::ComposeCommand::ListPeers,
                 ));
             }
-            Mode::Settings => self.send(Command::ThemeRefresh),
+            Mode::Settings => {
+                self.send(Command::ThemeRefresh);
+                self.send(Command::ScanStorage);
+            }
             _ => {}
         }
     }
@@ -824,6 +854,8 @@ impl UiState {
             self.focus_tile(i);
             return;
         }
+        self.right_open = false;
+        self.right.set_open(false);
         if self.tiles.is_empty() {
             let Some(current) = self.selected.clone() else {
                 self.open_session(asid);
@@ -871,6 +903,9 @@ impl UiState {
         if self.tiles.len() >= MAX_TILES {
             return;
         }
+        // The inspector describes one session; tiles need the width.
+        self.right_open = false;
+        self.right.set_open(false);
         if self.tiles.is_empty() {
             let Some(current) = self.selected.clone() else {
                 return;
@@ -1101,6 +1136,7 @@ impl UiState {
                         slot.diff_stat = stat;
                     }
                 }
+                Update::Storage(report) => self.storage = Some(report),
                 Update::Tasks { rows, default_cwd } => {
                     self.tasks = rows;
                     self.task_cwd = default_cwd;
@@ -1124,11 +1160,13 @@ impl UiState {
                 Update::HubMode(mode) => self.hub_label = mode.to_string(),
                 Update::Attention(attention) => self.on_attention(&attention),
                 Update::Terminals(update) => self.on_terminals(*update),
+                Update::Voice(event) => self.on_voice(event),
             }
         }
         if LAYOUT_DIRTY.swap(false, Ordering::AcqRel) {
             self.persist_layout();
         }
+        self.sync_tray();
     }
 
     /// Raise a system notification unless the owner turned them off or is
@@ -1431,6 +1469,7 @@ impl UiState {
             UiAction::ThemeFilePicked(path) => self.send(Command::ThemeImportFile(path)),
             UiAction::ViewerLoaded { path, loaded } => self.viewer_loaded(&path, *loaded),
             UiAction::FileSaved(result) => self.file_saved(result),
+            UiAction::VoiceKey(store) => self.voice_form.key_saved = store,
             UiAction::SubmitComposer => composer::submit_session(self),
             UiAction::ComposerEdited
             | UiAction::ComposerKey { .. }
@@ -1721,8 +1760,23 @@ pub fn activity_pill(
 use copy::tr;
 
 pub fn on_key(s: &mut UiState, ev: &KeyEvent, _tx: &mut Tx) -> bool {
-    if is_sidebar_toggle(ev) {
+    if ev.is_command('k') && !ev.mods.shift && !ev.mods.alt {
+        s.toggle_palette();
+        return true;
+    }
+    if ev.is_command(' ') && ev.mods.shift && !ev.mods.alt && s.mode == Mode::Session {
+        s.toggle_voice();
+        return true;
+    } else if s.voice.is_some() && ev.key == rune::Key::Escape {
+        s.cancel_voice();
+        return true;
+    } else if is_sidebar_toggle(ev) {
         s.sidebar.toggle();
+        return true;
+    }
+    if ev.is_command('t') && ev.mods.shift && !ev.mods.alt {
+        s.settings_tab = SettingsTab::Themes;
+        s.go(Mode::Settings);
         return true;
     }
     if ev.mods.shift || ev.mods.alt {
@@ -1730,6 +1784,16 @@ pub fn on_key(s: &mut UiState, ev: &KeyEvent, _tx: &mut Tx) -> bool {
     }
     if ev.is_command(',') {
         s.go(Mode::Settings);
+        return true;
+    }
+    if ev.is_command('n') {
+        s.go(Mode::Home);
+        s.start_draft.focused = true;
+        return true;
+    }
+    if ev.is_command('f') {
+        s.sidebar.set_open(true);
+        s.search.focused = true;
         return true;
     }
     if ev.is_command('\\') {
@@ -1764,7 +1828,10 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>) -> El {
     } else {
         ColorScheme::Light
     };
-    let k = crate::theme::apply::palette(scheme).map_or_else(|| Kit::neutral(dark), |p| p.kit());
+    let mut k =
+        crate::theme::apply::palette(scheme).map_or_else(|| Kit::neutral(dark), |p| p.kit());
+    crate::theme::look::tune_kit(&mut k, &s.cfg.appearance);
+    cx.focus_ring(2.0, 1.5, k.c.border_focus);
     if s.cfg.appearance.reduced_motion {
         cx.reduced_motion(true);
     }
@@ -1773,6 +1840,7 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>) -> El {
     if let Some(zoom) = timeline::overlay(s, &k) {
         layer.push(zoom);
     }
+    welcome::mount(s, &k, &mut layer);
     if let (Some(splash), Some(images)) = (s.splash.as_ref(), s.images.as_ref()) {
         let hub_ready = !s.hub_label.is_empty();
         let loading = match splash.kind {
@@ -1794,6 +1862,7 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>) -> El {
     }
     terminals::page_visible(s.mode);
     viewer::mount(s, &k, cx.env().scale, &mut layer);
+    palette::mount(s, &k, &mut layer);
     if !s.toasts.is_empty() {
         let mut region = ToastRegion::new();
         for t in &s.toasts {
