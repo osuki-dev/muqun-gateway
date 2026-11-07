@@ -106,7 +106,7 @@ fn agents(s: &UiState, k: &Kit) -> El {
         return muted(k, "No agent is enabled. Turn one on in Settings → Agents.");
     }
     let dark = s.dark;
-    let mut line = row().key("agents").w_full().gap(8.0).wrap().center_y();
+    let mut line = row().key("agents").w_full().gap(8.0).flex_wrap().center_y();
     for a in usable {
         let selected = a.id == s.start_agent;
         let id = a.id.clone();
@@ -184,7 +184,7 @@ fn folder(s: &UiState, k: &Kit) -> El {
                     .key("choose-folder"),
             ),
     );
-    let mut chips = row().key("folder-chips").w_full().gap(6.0).wrap();
+    let mut chips = row().key("folder-chips").w_full().gap(6.0).flex_wrap();
     for entry in s.completions.iter().take(5) {
         let path = entry.path.clone();
         chips = chips.child(
@@ -235,7 +235,12 @@ fn start_pills(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Option<El> {
         .start_model
         .as_ref()
         .or_else(|| defaults.and_then(|d| d.model.as_ref()));
-    let mut line = row().key("start-pills").w_full().gap(8.0).center_y().wrap();
+    let mut line = row()
+        .key("start-pills")
+        .w_full()
+        .gap(8.0)
+        .center_y()
+        .flex_wrap();
     let mut any = false;
     if !models.is_empty() {
         let label = picked
@@ -666,7 +671,7 @@ fn running(s: &UiState, k: &Kit, look: &Look) -> Option<El> {
         return None;
     }
     let now = now_ms();
-    let mut grid = row().key("running-grid").w_full().gap(10.0).wrap();
+    let mut grid = row().key("running-grid").w_full().gap(10.0).flex_wrap();
     for info in list.iter().take(4) {
         grid = grid.child(session_card(s, k, look, info, now).w(440.0).grow(1.0));
     }
@@ -704,7 +709,7 @@ fn recent(s: &UiState, k: &Kit, look: &Look) -> Option<El> {
     if sessions.is_empty() {
         return None;
     }
-    let mut grid = row().key("recent-grid").w_full().gap(10.0).wrap();
+    let mut grid = row().key("recent-grid").w_full().gap(10.0).flex_wrap();
     for info in sessions.into_iter().take(6) {
         grid = grid.child(session_card(s, k, look, info, now).w(440.0).grow(1.0));
     }
