@@ -147,7 +147,106 @@ fn insert_mention(s: &mut UiState, insert: &str) {
     s.persist_draft(Slot::Session);
 }
 
-fn chips(s: &UiState, k: &Kit) -> Option<El> {
+/// Pull a queued prompt back into the draft (App parity). Attachments cannot
+/// follow, so those items stay cancel-only.
+pub(super) fn edit_queued(s: &mut UiState, id: &str, text: String) {
+    s.menu = None;
+    let Some(asid) = s.selected.clone() else {
+        return;
+    };
+    s.queue.retain(|q| q.id != id);
+    s.send(Command::Compose(ComposeCommand::InboxCancel {
+        asid: AgentSessionId(asid),
+        item: id.to_string(),
+    }));
+    s.draft = fresh(text);
+    s.persist_draft(Slot::Session);
+}
+
+fn cancel_queued(s: &mut UiState, id: &str) {
+    s.menu = None;
+    let Some(asid) = s.selected.clone() else {
+        return;
+    };
+    s.queue.retain(|q| q.id != id);
+    s.send(Command::Compose(ComposeCommand::InboxCancel {
+        asid: AgentSessionId(asid),
+        item: id.to_string(),
+    }));
+}
+
+fn toggle_queued_steer(s: &mut UiState, id: &str, steer: bool) {
+    s.menu = None;
+    let Some(asid) = s.selected.clone() else {
+        return;
+    };
+    if let Some(item) = s.queue.iter_mut().find(|q| q.id == id) {
+        item.steer = steer;
+    }
+    s.send(Command::Compose(ComposeCommand::InboxDelivery {
+        asid: AgentSessionId(asid),
+        item: id.to_string(),
+        steer,
+    }));
+}
+
+fn queued_chip(
+    s: &UiState,
+    k: &Kit,
+    layer: &mut Vec<El>,
+    item: &crate::model::compose::InboxItem,
+) -> El {
+    let id = item.id.clone();
+    let open = s.menu == Some(OpenMenu::Queued(id.clone()));
+    let label = format!(
+        "{} {}",
+        if item.steer { "Steer:" } else { "Queued:" },
+        super::timeline::clip(&item.text, 32)
+    );
+    let mut menu = Menu::new(format!("queued-{id}"))
+        .trigger(
+            Button::new(label)
+                .variant(ButtonVariant::Outline)
+                .control_size(ControlSize::Small)
+                .expanded(open)
+                .on_press({
+                    let id = id.clone();
+                    move |s: &mut UiState| {
+                        s.menu = (!open).then(|| OpenMenu::Queued(id.clone()));
+                    }
+                })
+                .build(k)
+                .key(format!("queued-pill-{id}")),
+        )
+        .open(open)
+        .min_width(160.0)
+        .on_close(|s: &mut UiState| s.menu = None);
+    if item.attachments == 0 {
+        let (edit_id, text) = (id.clone(), item.text.clone());
+        menu = menu.item(
+            MenuItem::new("Edit")
+                .on_select(move |s: &mut UiState| edit_queued(s, &edit_id, text.clone())),
+        );
+    }
+    let (steer_id, next_steer) = (id.clone(), !item.steer);
+    menu = menu.item(
+        MenuItem::new(if item.steer {
+            "Keep queued"
+        } else {
+            "Send next"
+        })
+        .on_select(move |s: &mut UiState| toggle_queued_steer(s, &steer_id, next_steer)),
+    );
+    let cancel_id = id.clone();
+    menu.item(
+        MenuItem::new("Cancel")
+            .danger(true)
+            .on_select(move |s: &mut UiState| cancel_queued(s, &cancel_id)),
+    )
+    .build(k, layer)
+}
+
+fn chips(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Option<El> {
     if s.staged.is_empty() && s.queue.is_empty() {
         return None;
     }
@@ -167,28 +266,7 @@ fn chips(s: &UiState, k: &Kit) -> Option<El> {
         );
     }
     for item in &s.queue {
-        let (id, asid) = (item.id.clone(), s.selected.clone());
-        let label = format!(
-            "{} {}",
-            if item.steer { "Steer:" } else { "Queued:" },
-            super::timeline::clip(&item.text, 32)
-        );
-        line = line.child(
-            Button::new(format!("{label} ✕"))
-                .variant(ButtonVariant::Ghost)
-                .control_size(ControlSize::Small)
-                .on_press(move |s: &mut UiState| {
-                    if let Some(asid) = asid.clone() {
-                        s.queue.retain(|q| q.id != id);
-                        s.send(Command::Compose(ComposeCommand::InboxCancel {
-                            asid: AgentSessionId(asid),
-                            item: id.clone(),
-                        }));
-                    }
-                })
-                .build(k)
-                .key(format!("queued-{}", item.id)),
-        );
+        line = line.child(queued_chip(s, k, layer, item));
     }
     Some(line)
 }
@@ -750,7 +828,7 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     );
     popup(s, k, layer);
     let mut composer = col().key("composer").w_full().px(24.0).py(12.0).gap(8.0);
-    if let Some(chips) = chips(s, k) {
+    if let Some(chips) = chips(s, k, layer) {
         composer = composer.child(chips);
     }
     composer

@@ -101,14 +101,29 @@ fn queue(s: &UiState, k: &Kit) -> Vec<El> {
         let (id, a) = (q.id.clone(), AgentSessionId(asid.clone()));
         let steer = q.steer;
         let (id2, a2) = (id.clone(), a.clone());
-        let action = row()
-            .gap(4.0)
+        let mut action = row().gap(4.0);
+        if q.attachments == 0 {
+            let (edit_id, text) = (q.id.clone(), q.text.clone());
+            action = action.child(small(
+                k,
+                "Edit",
+                ButtonVariant::Ghost,
+                format!("ed-{edit_id}"),
+                move |s| {
+                    super::composer::edit_queued(s, &edit_id, text.clone());
+                },
+            ));
+        }
+        action = action
             .child(small(
                 k,
-                if steer { "Queue" } else { "Steer" },
+                if steer { "Keep queued" } else { "Send next" },
                 ButtonVariant::Ghost,
                 format!("dl-{id}"),
                 move |s| {
+                    if let Some(item) = s.queue.iter_mut().find(|x| x.id == id) {
+                        item.steer = !steer;
+                    }
                     s.send(Command::Compose(ComposeCommand::InboxDelivery {
                         asid: a.clone(),
                         item: id.clone(),

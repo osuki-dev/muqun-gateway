@@ -117,6 +117,8 @@ pub enum OpenMenu {
     Session(String),
     /// A project row's actions (by project id / root).
     Project(String),
+    /// A queued prompt chip above the composer (by inbox item id).
+    Queued(String),
 }
 
 static INITIAL_CONFIG: OnceLock<DesktopConfig> = OnceLock::new();
