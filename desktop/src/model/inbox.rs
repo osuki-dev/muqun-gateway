@@ -106,6 +106,18 @@ pub enum Update {
         entries: Vec<DirectoryEntry>,
     },
     Ui(UiAction),
+    /// A read-only snapshot for a detail sheet (`Command::ReadDetail`), or
+    /// why it could not be read.
+    Detail {
+        asid: String,
+        result: Result<Box<AgentSessionSnapshot>, String>,
+    },
+    /// An agent's account rate windows as the gateway words them (`None`:
+    /// the agent has none to show).
+    AccountLimits {
+        agent: String,
+        limits: Option<serde_json::Value>,
+    },
     /// An older page of a session's history, oldest first. `exhausted`:
     /// the agent has nothing older.
     Earlier {

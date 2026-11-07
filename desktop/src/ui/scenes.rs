@@ -815,6 +815,8 @@ pub fn scenes() -> &'static [Scene] {
         ("voice", voice_scene),
         ("voice-realtime", voice_realtime_scene),
         ("voice-settings", voice_settings_scene),
+        ("timeline-subagent", timeline_subagent),
+        ("timeline-context", timeline_context),
         ("viewer", viewer_code),
         ("viewer-markdown", viewer_markdown),
         ("viewer-image", viewer_image),

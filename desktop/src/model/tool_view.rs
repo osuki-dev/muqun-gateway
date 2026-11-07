@@ -39,22 +39,22 @@ pub enum ToolKind {
 pub fn classify(name: &str) -> ToolKind {
     let n = name.to_ascii_lowercase();
     match n.as_str() {
-        "shell" | "bash" | "terminal" | "run" | "exec_command" | "local_shell" | "bashoutput" => {
-            ToolKind::Shell
-        }
+        "shell" | "bash" | "terminal" | "run" | "exec_command" | "local_shell" | "bashoutput"
+        | "run_command" => ToolKind::Shell,
         "read" | "list" | "cat" | "ls" | "read_file" => ToolKind::Read,
-        "edit" | "multiedit" | "str_replace" | "str_replace_editor" | "notebookedit" => {
-            ToolKind::Edit
-        }
+        "edit" | "multiedit" | "str_replace" | "str_replace_editor" | "notebookedit"
+        | "edit_file" => ToolKind::Edit,
         "write" | "create" | "new_file" | "write_file" => ToolKind::Write,
         "patch" | "apply_patch" => ToolKind::Patch,
         "glob" | "find" => ToolKind::Glob,
         "grep" | "ripgrep" => ToolKind::Grep,
         "search" | "codesearch" => ToolKind::Search,
         "webfetch" | "fetch" | "websearch" | "web_search" => ToolKind::Web,
-        "subagent" | "task" | "spawn" | "agent" => ToolKind::Subagent,
+        "subagent" | "task" | "spawn" | "agent" | "invoke_subagent" => ToolKind::Subagent,
         "skill" | "load_skill" => ToolKind::Skill,
-        "todowrite" | "todoread" | "todo" | "tasks" => ToolKind::Todo,
+        "todowrite" | "todoread" | "todo" | "tasks" | "updatetodos" | "todo_write" => {
+            ToolKind::Todo
+        }
         "question" | "ask" | "askuserquestion" => ToolKind::Question,
         "execute" | "code" => ToolKind::Execute,
         "browser" => ToolKind::Browser,
@@ -70,7 +70,15 @@ fn pick<'a>(rec: &'a Map<String, Value>, keys: &[&str]) -> Option<&'a str> {
     })
 }
 
-const PATH_KEYS: &[&str] = &["path", "filePath", "file_path", "file", "TargetFile"];
+const PATH_KEYS: &[&str] = &[
+    "path",
+    "filePath",
+    "file_path",
+    "file",
+    "TargetFile",
+    "Path",
+    "AbsolutePath",
+];
 
 /// The call's input as an object: the parsed input, `arguments` inside it
 /// (MCP), or the string fields a still-streaming partial JSON has reached.
@@ -191,7 +199,16 @@ pub fn target(kind: ToolKind, rec: Option<&Map<String, Value>>) -> String {
             }
             s(&["command", "cmd", "CommandLine"])
         }
-        ToolKind::Read | ToolKind::Edit | ToolKind::Write => s(PATH_KEYS),
+        ToolKind::Read | ToolKind::Edit | ToolKind::Write => pick(rec, PATH_KEYS)
+            .or_else(|| {
+                // Codex names an edit's files as a list.
+                rec.get("paths")
+                    .and_then(Value::as_array)
+                    .and_then(|p| p.first())
+                    .and_then(Value::as_str)
+            })
+            .unwrap_or_default()
+            .to_string(),
         ToolKind::Patch => pick(rec, &["patchText", "patch_text", "patch", "input"])
             .and_then(|t| parse_patch_sections(t).into_iter().next())
             .map(|p| p.path)
@@ -410,7 +427,14 @@ fn parse_output_at(raw: &Value, depth: usize) -> Output {
         }
         Value::Object(rec) => {
             if let Some(stdout) = rec.get("stdout").and_then(Value::as_str) {
-                let (stdout, truncated) = cap(stdout);
+                // Cursor's `execute` answers `{stdout, stderr, exitCode}`.
+                let stderr = rec.get("stderr").and_then(Value::as_str).unwrap_or("");
+                let joined = match (stdout.trim().is_empty(), stderr.trim().is_empty()) {
+                    (_, true) => stdout.to_string(),
+                    (true, false) => stderr.to_string(),
+                    (false, false) => format!("{stdout}\n{stderr}"),
+                };
+                let (stdout, truncated) = cap(&joined);
                 let exit = rec
                     .get("exitCode")
                     .or_else(|| rec.get("exit"))
@@ -423,7 +447,14 @@ fn parse_output_at(raw: &Value, depth: usize) -> Output {
                 };
             }
             if let Some(output) = rec.get("output") {
-                return parse_output_at(output, depth + 1);
+                let mut out = parse_output_at(output, depth + 1);
+                // Antigravity's `{exit_code, output}`.
+                out.exit = out.exit.or_else(|| {
+                    rec.get("exit_code")
+                        .or_else(|| rec.get("exitCode"))
+                        .and_then(Value::as_i64)
+                });
+                return out;
             }
             if let Some(content @ (Value::Array(_) | Value::String(_))) = rec.get("content") {
                 return parse_output_at(content, depth + 1);
@@ -452,8 +483,13 @@ fn parse_output_at(raw: &Value, depth: usize) -> Output {
 pub fn output_text(call: &ToolCall) -> Output {
     let parsed = call.output.as_ref().map(parse_output).unwrap_or_default();
     if let Some(Value::Array(items)) = &call.content {
+        // `{type: "text", text}`, or ACP's `{type: "content", content: {type: "text", text}}`.
         let text = items
             .iter()
+            .map(|i| match i.get("content") {
+                Some(inner) if i.get("type").and_then(Value::as_str) == Some("content") => inner,
+                _ => i,
+            })
             .filter(|i| i.get("type").and_then(Value::as_str) == Some("text"))
             .filter_map(|i| i.get("text").and_then(Value::as_str))
             .collect::<Vec<_>>()
@@ -824,10 +860,70 @@ pub fn shell_timed_out(call: &ToolCall) -> bool {
 }
 
 pub fn result_count(call: &ToolCall) -> Option<u64> {
-    let m = metadata(call)?;
-    ["count", "matches", "results", "total"]
-        .iter()
-        .find_map(|k| m.get(*k).and_then(Value::as_u64))
+    let keys = ["count", "matches", "results", "total", "totalMatches"];
+    let find = |m: &Map<String, Value>| keys.iter().find_map(|k| m.get(*k).and_then(Value::as_u64));
+    // Cursor's search answers `{totalMatches, truncated}` with no text.
+    metadata(call).and_then(find).or_else(|| {
+        call.output
+            .as_ref()
+            .and_then(Value::as_object)
+            .and_then(find)
+    })
+}
+
+/// A shell command as a person reads it: Codex runs every command as
+/// `/usr/bin/bash -lc '<command>'`, and the wrapper is not the command.
+pub fn display_command(command: &str) -> String {
+    let t = command.trim();
+    for shell in ["bash", "zsh", "sh"] {
+        for flag in ["-lc", "-c"] {
+            let lead = [
+                format!("/usr/bin/{shell} {flag} "),
+                format!("/bin/{shell} {flag} "),
+                format!("{shell} {flag} "),
+            ];
+            if let Some(rest) = lead.iter().find_map(|l| t.strip_prefix(l.as_str())) {
+                let rest = rest.trim();
+                for q in ['\'', '"'] {
+                    if rest.len() >= 2 && rest.starts_with(q) && rest.ends_with(q) {
+                        return rest[1..rest.len() - 1].to_string();
+                    }
+                }
+                return rest.to_string();
+            }
+        }
+    }
+    t.to_string()
+}
+
+/// One web search hit (Codex's `web_search` answers a list of these).
+#[derive(Debug, Clone, PartialEq)]
+pub struct WebHit {
+    pub title: String,
+    pub url: String,
+    pub snippet: String,
+}
+
+pub fn web_hits(call: &ToolCall) -> Vec<WebHit> {
+    let list = call.output.as_ref().and_then(Value::as_array).or_else(|| {
+        metadata(call)
+            .and_then(|m| m.get("results"))
+            .and_then(Value::as_array)
+    });
+    list.into_iter()
+        .flatten()
+        .filter_map(Value::as_object)
+        .filter_map(|r| {
+            let url = pick(r, &["url", "link"])?.to_string();
+            Some(WebHit {
+                title: pick(r, &["title"]).unwrap_or(&url).to_string(),
+                snippet: pick(r, &["snippet", "description"])
+                    .unwrap_or_default()
+                    .to_string(),
+                url,
+            })
+        })
+        .collect()
 }
 
 pub fn meta_str<'a>(call: &'a ToolCall, keys: &[&str]) -> Option<&'a str> {
@@ -1039,7 +1135,14 @@ pub fn todo_items(rec: Option<&Map<String, Value>>) -> Vec<(String, bool)> {
             Value::String(s) => out.push((s.clone(), false)),
             Value::Object(o) => {
                 if let Some(text) = pick(o, &["content", "text"]) {
-                    let done = o.get("status").and_then(Value::as_str) == Some("completed")
+                    // `completed`, Cursor's `TODO_STATUS_COMPLETED`, `done`.
+                    let status = o
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_ascii_lowercase();
+                    let done = status.ends_with("completed")
+                        || status.ends_with("done")
                         || o.get("done") == Some(&Value::Bool(true));
                     out.push((text.into(), done));
                 }
@@ -1623,6 +1726,28 @@ mod tests {
         assert_eq!((shell.stdout.as_str(), shell.exit), ("ok", Some(2)));
         let nested = parse_output(&json!({"output": "{\"stdout\": \"hi\", \"exitCode\": 0}"}));
         assert_eq!((nested.stdout.as_str(), nested.exit), ("hi", Some(0)));
+    }
+
+    #[test]
+    fn real_engine_shapes_read_right() {
+        // Claude over ACP wraps text in `{type: "content", content: {…}}`.
+        let mut c = call("Bash", json!({"command": "ls"}), Value::Null);
+        c.content = Some(json!([{"type": "content", "content": {"type": "text", "text": "a.rs"}}]));
+        assert_eq!(output_text(&c).stdout, "a.rs");
+        // Cursor's execute, Antigravity's run_command.
+        let o = parse_output(&json!({"exitCode": 1, "stdout": "", "stderr": "boom"}));
+        assert_eq!((o.stdout.as_str(), o.exit), ("boom", Some(1)));
+        let o = parse_output(&json!({"exit_code": 2, "output": "x"}));
+        assert_eq!(o.exit, Some(2));
+        assert_eq!(
+            display_command("/usr/bin/bash -lc 'git status --short'"),
+            "git status --short"
+        );
+        assert_eq!(classify("updateTodos"), ToolKind::Todo);
+        assert_eq!(classify("run_command"), ToolKind::Shell);
+        let codex_edit = call("edit", json!({"paths": ["src/a.rs"]}), Value::Null);
+        let rec = input_record(&codex_edit);
+        assert_eq!(target(ToolKind::Edit, rec.as_ref()), "src/a.rs");
     }
 
     #[test]

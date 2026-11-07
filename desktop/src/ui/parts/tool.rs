@@ -118,7 +118,10 @@ pub fn card(cx: &Tcx, item: &TimelineItem, call: &ToolCall) -> El {
         kind = ToolKind::Shell;
     }
     let out = tv::output_text(call);
-    let target = tv::target(kind, rec.as_ref());
+    let mut target = tv::target(kind, rec.as_ref());
+    if kind == ToolKind::Shell {
+        target = tv::display_command(&target);
+    }
     let caption_line = tv::caption(kind, rec.as_ref());
     let id = item.id.as_str();
     let mut card = ToolCard::new(id, glyph(kind), verb(cx, kind, call));
@@ -149,6 +152,17 @@ pub fn card(cx: &Tcx, item: &TimelineItem, call: &ToolCall) -> El {
                 target.clone()
             };
             card.caption = caption_line.clone();
+            // Claude says what a command is for; that is the better second line.
+            if kind == ToolKind::Shell {
+                if let Some(d) = rec
+                    .as_ref()
+                    .and_then(|r| r.get("description"))
+                    .and_then(Value::as_str)
+                    .filter(|d| !d.trim().is_empty())
+                {
+                    card.caption = d.trim().to_string();
+                }
+            }
         }
     }
     if card.title.is_empty() {
@@ -251,7 +265,10 @@ pub fn card(cx: &Tcx, item: &TimelineItem, call: &ToolCall) -> El {
         }
         ToolKind::Search => {
             count_chip(cx, call, &mut card, 0);
-            card.body = output_body(cx, &out);
+            // A count alone (Cursor's `{totalMatches}`) is the chip, not a body.
+            if !call.output.as_ref().is_some_and(Value::is_object) {
+                card.body = output_body(cx, &out);
+            }
         }
         ToolKind::Web => {
             if let Some(t) = tv::meta_str(call, &["contentType", "content_type", "mime"]) {
@@ -262,7 +279,11 @@ pub fn card(cx: &Tcx, item: &TimelineItem, call: &ToolCall) -> El {
                 card.chips
                     .push(chip(cx.k, p.to_string(), cx.k.c.text_muted));
             }
-            if !out.stdout.trim().is_empty() {
+            let hits = tv::web_hits(call);
+            if !hits.is_empty() {
+                count_chip(cx, call, &mut card, hits.len());
+                card.body = Some(web_hits_body(cx, &hits));
+            } else if !out.stdout.trim().is_empty() {
                 let (shown, hidden) = super::cap_lines(&out.stdout, 80);
                 let mut body = col()
                     .key("web")
@@ -430,6 +451,20 @@ fn generic_body(cx: &Tcx, call: &ToolCall, out: &Output) -> Option<El> {
         Value::Array(a) if !a.is_empty() => Some(Value::Array(a.clone())),
         _ => None,
     };
+    // Cursor's `createPlan` (and the like) carry their document in `plan`.
+    if let Some(plan) = call
+        .input
+        .get("plan")
+        .and_then(Value::as_str)
+        .filter(|p| !p.trim().is_empty())
+    {
+        let (shown, hidden) = super::cap_lines(plan, 80);
+        body = body.child(prose(cx, "plan", &shown));
+        if hidden > 0 {
+            body = body.child(super::more_lines(cx, hidden));
+        }
+        return Some(body);
+    }
     if let Some(input) = input {
         let pretty = serde_json::to_string_pretty(&input).unwrap_or_default();
         body = body.child(caption(cx.k, cx.t("Input", "输入")));
@@ -455,6 +490,35 @@ fn generic_body(cx: &Tcx, call: &ToolCall, out: &Output) -> Option<El> {
         any = true;
     }
     any.then_some(body)
+}
+
+fn web_hits_body(cx: &Tcx, hits: &[tv::WebHit]) -> El {
+    let k = cx.k;
+    let mut body = col().key("hits").w_full().gap(8.0);
+    for (i, hit) in hits.iter().take(10).enumerate() {
+        let host = tv::split_url(&hit.url).map(|(h, _)| h).unwrap_or_default();
+        let mut block = col().key(format!("h{i}")).w_full().gap(1.0).child(
+            text(hit.title.clone())
+                .font(k.ty.small_medium)
+                .color(k.c.text_base)
+                .single_line()
+                .truncate(),
+        );
+        block = block.child(caption(k, host));
+        if !hit.snippet.is_empty() {
+            block = block.child(
+                text(hit.snippet.clone())
+                    .font(k.ty.small)
+                    .color(k.c.text_muted)
+                    .max_lines(2),
+            );
+        }
+        body = body.child(block);
+    }
+    if hits.len() > 10 {
+        body = body.child(more_count(cx, hits.len() - 10));
+    }
+    body
 }
 
 fn glob_body(cx: &Tcx, groups: &[tv::PathGroup]) -> El {
@@ -679,6 +743,14 @@ fn subagent(
     }
     card.body = Some(body);
     if let Some(child_id) = call.child_session_id.clone() {
+        let view = child_id.clone();
+        card.actions.push(
+            Button::new(cx.t("Details", "详情"))
+                .variant(ButtonVariant::Ghost)
+                .control_size(ControlSize::Small)
+                .on_press(move |s: &mut UiState| s.open_detail(&view))
+                .build(k),
+        );
         card.actions.push(
             Button::new(cx.t("Open session", "打开会话"))
                 .variant(ButtonVariant::Ghost)

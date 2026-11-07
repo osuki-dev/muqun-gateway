@@ -253,3 +253,51 @@ fn timeline_long(s: &mut UiState) {
     s.right.set_open(false);
     s.demo = true;
 }
+
+/// A subagent's session open in the detail sheet over its parent.
+fn timeline_subagent(s: &mut UiState) {
+    cards_state(s, false);
+    let child: Vec<TimelineItem> = every_card().into_iter().take(9).collect();
+    let mut tl = super::timeline::SessionTimeline::default();
+    tl.replace(child);
+    tl.earlier_exhausted = true;
+    s.timelines.insert("s2".into(), tl);
+    s.detail = Some(super::timeline::DetailSheet {
+        stack: vec!["s2".into()],
+        error: None,
+    });
+}
+
+/// The context meter's sheet, with a Codex-style account limits answer.
+fn timeline_context(s: &mut UiState) {
+    cards_state(s, false);
+    if let Some(info) = s.sessions.iter_mut().find(|i| i.asid.0 == "s1") {
+        info.context_usage = serde_json::from_value(json!({
+            "tokens": { "input": 820, "output": 1190, "cache_read": 174208, "cache_write": 0, "reasoning": 310 },
+            "total_tokens": 211_400, "limit": { "context": 258_400 },
+        }))
+        .ok();
+    }
+    if let Some(agent) = s.agents.iter_mut().find(|a| a.id == "codex") {
+        agent.features.extra.insert("accountLimits".into(), json!(true));
+    }
+    let soon = |mins: u64| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64 + mins * 60_000)
+            .unwrap_or(0)
+    };
+    s.account_limits.insert(
+        "codex".into(),
+        Some(json!({
+            "status": "available", "reason": null, "observed_at_ms": 0, "ordinary_usage_allowed": true,
+            "limits": [{ "id": "codex", "name": null, "windows": [
+                { "id": "primary", "label": null, "unit": "percent", "used": 62.0, "limit": 100.0,
+                  "remaining": 38.0, "window_duration_minutes": 300, "resets_at_ms": soon(134) },
+                { "id": "secondary", "label": null, "unit": "percent", "used": 21.0, "limit": 100.0,
+                  "remaining": 79.0, "window_duration_minutes": 10080, "resets_at_ms": soon(4 * 1440 + 200) },
+            ] }],
+        })),
+    );
+    s.context_open = Some("s1".into());
+}

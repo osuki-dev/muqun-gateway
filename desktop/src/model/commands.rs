@@ -32,6 +32,13 @@ pub enum Command {
     Refresh,
     /// Make a session the active one and read its snapshot.
     OpenSession(AgentSessionId),
+    /// Read a session's snapshot for a read-only look (a subagent's detail
+    /// sheet): never prepares it, never makes it the active one.
+    ReadDetail(AgentSessionId),
+    /// An agent's account rate windows (`Update::AccountLimits`).
+    LoadAccountLimits {
+        agent: String,
+    },
     /// Open a session into a split tile: read its snapshot and stream its
     /// events, without taking the active (focused) place.
     OpenTile(AgentSessionId),

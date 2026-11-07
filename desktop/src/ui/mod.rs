@@ -205,6 +205,12 @@ pub struct UiState {
     pub timelines: HashMap<String, timeline::SessionTimeline>,
     /// A timeline picture opened full size (`timeline::overlay`).
     pub zoom: Option<PathBuf>,
+    /// A subagent's session shown read-only over its parent (`timeline::overlay`).
+    pub detail: Option<timeline::DetailSheet>,
+    /// The session whose context sheet is open (`timeline::context_meter`).
+    pub context_open: Option<String>,
+    /// Account rate windows by agent, once asked for (`None`: it has none).
+    pub account_limits: HashMap<String, Option<serde_json::Value>>,
     pub status: String,
     pub hub_label: String,
     pub error: Option<UiError>,
@@ -353,6 +359,9 @@ impl UiState {
             selected: None,
             timelines: HashMap::new(),
             zoom: None,
+            detail: None,
+            context_open: None,
+            account_limits: HashMap::new(),
             status: "Starting…".into(),
             hub_label: String::new(),
             error: None,
@@ -1050,6 +1059,10 @@ impl UiState {
                     }
                 }
                 Update::Ui(action) => self.on_action(action),
+                Update::Detail { asid, result } => self.on_detail(asid, result),
+                Update::AccountLimits { agent, limits } => {
+                    self.account_limits.insert(agent, limits);
+                }
                 Update::Earlier {
                     asid,
                     items,
