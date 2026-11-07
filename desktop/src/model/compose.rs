@@ -584,7 +584,16 @@ async fn stage(hub: &dyn SessionHub, name: &str, source: Source) -> Result<Stage
                 .map_err(|err| err.to_string())?
         }
     };
-    match hub.store_attachment(name, bytes).await {
+    // ACP's image budget is ~3.75 MiB of file bytes; camera stills and
+    // screen recordings sit above it. Shrink on a worker the way the App
+    // does before the bytes ever hit `store_attachment`.
+    let name = name.to_string();
+    let (name, bytes) = tokio::task::spawn_blocking(move || {
+        crate::platform::media::prepare_attachment(&name, bytes)
+    })
+    .await
+    .map_err(|err| err.to_string())?;
+    match hub.store_attachment(&name, bytes).await {
         Ok(stored) => Ok(StagedFile {
             path: stored.path.to_string_lossy().into_owned(),
             name: stored.name,

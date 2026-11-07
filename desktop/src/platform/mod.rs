@@ -8,6 +8,7 @@ pub mod editors;
 pub mod filesearch;
 pub mod fonts;
 pub mod keys;
+pub mod media;
 pub mod shell;
 pub mod shutdown;
 

@@ -25,6 +25,12 @@
   the inspector Queue list draw a small preview for each image file instead of
   a bare name count.
 
+- **Desktop compresses images (and large videos) before staging.** Picked or
+  pasted photos are resized to a 2048px long edge and re-encoded as JPEG so
+  they stay under ACP's native 5 MiB encoded-image limit; GIFs are left alone.
+  Videos over 8 MiB are re-encoded with `ffmpeg` to ≤1080p H.264 when it is on
+  `PATH`. Compression failures keep the original file.
+
 - **Large videos can be uploaded in chunks, up to 1 GiB, without the Gateway
   buffering the file.** `POST /api/uploads` reads its whole body into memory
   (and a sealed body cannot be streamed), which is why it stops at 64 MiB.
