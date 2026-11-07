@@ -92,7 +92,7 @@ fn main() -> anyhow::Result<()> {
         scenes: ui::scenes::scenes(),
         on_key: Some(ui::on_key),
         setup: Some(|s, waker| s.install_images(waker)),
-        poll: Some(UiState::poll_splash),
+        poll: Some(UiState::poll_frame),
         families: platform::fonts::families(),
         ..AppSpec::new(
             title,

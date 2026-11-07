@@ -703,6 +703,54 @@ test result: \u{1b}[32mok\u{1b}[0m. 131 passed; 0 failed; 0 ignored\r\n\r\n\
     s.demo = true;
 }
 
+fn voice_meter() -> std::sync::Arc<crate::model::voice::Meter> {
+    use crate::model::voice::Meter;
+    let started = std::time::Instant::now() - std::time::Duration::from_secs_f64(6.3);
+    let meter = Meter::since(started);
+    // A speech-like envelope: syllables riding on phrases, a pause mid-way.
+    let mut t = 0.0f64;
+    while t < 6.3 {
+        let phrase =
+            ((t * 0.9).sin() * 0.5 + 0.5) * if (2.6..3.2).contains(&t) { 0.1 } else { 1.0 };
+        let syllable = ((t * 11.0).sin() * 0.5 + 0.5).powf(0.7);
+        meter.push(t, (0.12 + 0.78 * phrase * syllable) as f32);
+        t += 0.02;
+    }
+    std::sync::Arc::new(meter)
+}
+
+fn voice_scene(s: &mut UiState) {
+    use crate::config::VoiceMode;
+    session_scene(s);
+    s.cfg.voice.mode = VoiceMode::File;
+    s.voice = Some(super::voice::Dictation::preview(
+        VoiceMode::File,
+        voice_meter(),
+        "",
+    ));
+}
+
+fn voice_realtime_scene(s: &mut UiState) {
+    use crate::config::VoiceMode;
+    session_scene(s);
+    s.cfg.voice.mode = VoiceMode::Realtime;
+    s.voice = Some(super::voice::Dictation::preview(
+        VoiceMode::Realtime,
+        voice_meter(),
+        "Rename the greet helper and 顺便把测试也更新一下, then run the checks",
+    ));
+}
+
+fn voice_settings_scene(s: &mut UiState) {
+    use crate::config::VoiceMode;
+    settings(s);
+    s.settings_tab = SettingsTab::Voice;
+    s.cfg.voice.mode = VoiceMode::Realtime;
+    s.cfg.voice.url = "wss://speech.example.com/v1/realtime".into();
+    s.voice_form = super::voice::VoiceForm::new(&s.cfg.voice);
+    s.voice_form.key_saved = Some(crate::platform::secrets::Store::Keyring);
+}
+
 /// A scene name and the state it applies.
 pub type Scene = (&'static str, fn(&mut UiState));
 
@@ -810,6 +858,9 @@ pub fn scenes() -> &'static [Scene] {
         ("timeline-long", timeline_long),
         ("timeline-zh", timeline_zh),
         ("terminals", terminals_scene),
+        ("voice", voice_scene),
+        ("voice-realtime", voice_realtime_scene),
+        ("voice-settings", voice_settings_scene),
         ("timeline-subagent", timeline_subagent),
         ("timeline-context", timeline_context),
         ("viewer", viewer_code),

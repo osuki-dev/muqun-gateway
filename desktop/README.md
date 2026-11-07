@@ -65,6 +65,13 @@ launch is its own (`src/platform/instance.rs`).
   (Shift+Enter for a newline), takes attachments (pick, paste an image, drop files; images and
   videos are shrunk to what the agent accepts), `@` files and computers, `/` commands and skills,
   and switches model, effort, mode and branch. Queued prompts wait above it.
+* **Dictation** — the mic button (or Ctrl/Cmd+Shift+Space) records; a waveform scrolls while
+  you speak and, in realtime mode, the words fade in as the service hears them. Done
+  transcribes into the draft — never sent on its own; Escape cancels. Settings → Voice: after
+  recording (an OpenAI-compatible `/v1/audio/transcriptions`) or realtime (an
+  OpenAI-Realtime-compatible WebSocket, PCM16 mono 24 kHz), URL, model, language, and an API
+  key kept in the system keyring (Secret Service on Linux; a 0600 file when there is none).
+  Building on Linux needs the ALSA headers (`libasound2-dev`) for the microphone.
 * **Inspector** — the open session's queue, git and worktrees, subagents, saved permissions and
   background shells. The working-tree diff, with staged revert.
 * **Terminals** — the Herdr (and tmux) workspaces of the gateway this desktop is attached to:
