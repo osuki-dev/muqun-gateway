@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use muqun_gateway::agents::{AgentSessionId, ModelRef};
-use rune::{col, el, row, El, ImageCache, SurfaceFit, TextEdit, Tx};
+use rune::{col, el, row, El, ImageCache, PillStyle, SurfaceFit, TextEdit, Tx};
 use rune_kit::{
     Badge, BadgeVariant, Button, ButtonVariant, ControlSize, Kit, Menu, MenuItem, PopupItem,
     PopupList, SegmentedControl, Switch, TextArea,
@@ -217,20 +217,90 @@ fn mention_search_target(s: &UiState, slot: Slot) -> Option<(String, String)> {
     }
 }
 
-pub(super) fn on_draft_change(s: &mut UiState, slot: Slot) {
-    s.persist_draft(slot);
+fn mention_tokens(s: &UiState) -> Vec<crate::model::composer_mentions::MentionToken> {
+    use crate::model::composer_mentions::{MentionKind, MentionToken};
+    let mut tokens: Vec<_> = s
+        .peers
+        .iter()
+        .map(|p| MentionToken {
+            text: format!("@{}", p.name),
+            kind: MentionKind::Computer,
+        })
+        .collect();
+    tokens.extend(s.mention_file_tokens.iter().map(|path| MentionToken {
+        text: path.clone(),
+        kind: MentionKind::File,
+    }));
+    tokens
+}
+
+/// Turn standing `@name` / file-path tokens into pills so they highlight and
+/// backspace as one chip (Rune `Mark::Pill`).
+fn ensure_mention_pills(s: &mut UiState, slot: Slot) {
+    use crate::model::composer_mentions::{mention_ranges, MentionKind};
+    let tokens = mention_tokens(s);
     let draft = draft_of(s, slot);
+    let text = draft.text.clone();
+    let ranges = mention_ranges(&text, &tokens);
+    if ranges.is_empty() {
+        return;
+    }
+    let covered: Vec<(usize, usize)> = draft.pills().map(|(r, _)| (r.start, r.end)).collect();
+    // Right-to-left so earlier offsets stay valid.
+    for range in ranges.into_iter().rev() {
+        if covered
+            .iter()
+            .any(|&(a, b)| a <= range.start && range.end <= b)
+        {
+            continue;
+        }
+        let label = text[range.start..range.end].to_string();
+        let id = match range.kind {
+            MentionKind::Computer => format!("computer:{}", label.trim_start_matches('@')),
+            MentionKind::File => format!("file:{label}"),
+        };
+        draft_of_mut(s, slot).replace_with_pill(range.start..range.end, id, &label);
+    }
+}
+
+pub(super) fn on_draft_change(s: &mut UiState, slot: Slot) {
+    use crate::model::composer_mentions::{delete_mention_atomically, mention_ranges};
+
+    let prev = s.draft_snap.clone();
+    let prev_caret = s.draft_snap_caret;
+    let next = draft_of(s, slot).text.clone();
+
+    // App atomic backspace for typed mentions that are not yet pills.
+    if !prev.is_empty() {
+        let ranges = mention_ranges(&prev, &mention_tokens(s));
+        if let Some((text, at)) = delete_mention_atomically(&prev, &next, &ranges, prev_caret) {
+            let draft = draft_of_mut(s, slot);
+            let end = draft_caret(draft).max(at);
+            draft.set_selection(at, end);
+            draft.insert("");
+            draft.set_caret(at);
+        }
+    }
+
+    ensure_mention_pills(s, slot);
+    s.persist_draft(slot);
+
+    let snap_text = draft_of(s, slot).text.clone();
+    let snap_caret = draft_caret(draft_of(s, slot));
+    s.draft_snap = snap_text;
+    s.draft_snap_caret = snap_caret;
+
     // Forget an Esc dismissal once the trigger it belonged to is gone.
     if let Some(at) = s.popup_dismissed_at {
         use crate::model::composer_popup::{scan_query, TriggerAnchor};
-        let caret = draft_caret(draft);
+        let caret = draft_caret(draft_of(s, slot));
         let still = ['/', '$', '@'].iter().any(|&ch| {
             let anchor = if ch == '@' {
                 TriggerAnchor::Word
             } else {
                 TriggerAnchor::Start
             };
-            scan_query(&draft.text, caret, ch, anchor).is_some_and(|q| q.start == at)
+            scan_query(&draft_of(s, slot).text, caret, ch, anchor).is_some_and(|q| q.start == at)
         });
         if !still {
             s.popup_dismissed_at = None;
@@ -260,26 +330,56 @@ pub(super) fn on_draft_change(s: &mut UiState, slot: Slot) {
     }));
 }
 
+enum PickKind {
+    Plain,
+    Computer,
+    File,
+}
+
 /// Apply a popup pick into the draft (App `insertComposerPick`).
 fn apply_pick(
     s: &mut UiState,
     slot: Slot,
     query: &crate::model::composer_popup::PopupQuery,
     insert: &str,
+    kind: PickKind,
 ) {
-    use crate::model::composer_popup::{insert_pick, PopupRow};
-    let row = PopupRow {
-        id: insert.to_string(),
-        label: insert.to_string(),
-        description: String::new(),
-        insert: insert.to_string(),
-        disabled: false,
-    };
-    let (text, caret) = insert_pick(&draft_of(s, slot).text, query, &row);
-    *draft_of_mut(s, slot) = fresh(text);
-    draft_of_mut(s, slot).set_caret(caret);
+    let draft = draft_of_mut(s, slot);
+    let tail_space = draft
+        .text
+        .get(query.end..)
+        .is_some_and(|t| t.starts_with(' '));
+    draft.set_selection(query.start, query.end);
+    match kind {
+        PickKind::Computer => {
+            let name = insert.trim_start_matches('@');
+            draft.insert_pill(format!("computer:{name}"), insert);
+            if !tail_space {
+                draft.insert(" ");
+            }
+        }
+        PickKind::File => {
+            draft.insert_pill(format!("file:{insert}"), insert);
+            if !tail_space {
+                draft.insert(" ");
+            }
+            if !s.mention_file_tokens.iter().any(|p| p == insert) {
+                s.mention_file_tokens.push(insert.to_string());
+            }
+        }
+        PickKind::Plain => {
+            let text = if tail_space {
+                insert.to_string()
+            } else {
+                format!("{insert} ")
+            };
+            draft.insert(&text);
+        }
+    }
     s.file_hits.clear();
     s.popup_dismissed_at = None;
+    s.draft_snap = draft_of(s, slot).text.clone();
+    s.draft_snap_caret = draft_caret(draft_of(s, slot));
     s.persist_draft(slot);
 }
 
@@ -511,7 +611,15 @@ fn slash_trigger(s: &UiState, slot: Slot) -> Trigger {
                     } else {
                         format!("/{}", c.name)
                     };
-                    let description = c.description.clone().unwrap_or_default();
+                    let mut description = c.description.clone().unwrap_or_default();
+                    // App shows argsHint as a placeholder; template present → "…"
+                    if c.template.as_ref().is_some_and(|t| !t.is_empty()) {
+                        if description.is_empty() {
+                            description = "…".into();
+                        } else {
+                            description = format!("{description}  …");
+                        }
+                    }
                     TriggerItem {
                         search: vec![name.clone(), description.clone()],
                         row: PopupRow {
@@ -575,6 +683,19 @@ fn skill_trigger(s: &UiState, slot: Slot) -> Trigger {
     }
 }
 
+fn section_header(id: &str, label: &str) -> TriggerItem {
+    TriggerItem {
+        search: vec![],
+        row: PopupRow {
+            id: id.into(),
+            label: label.into(),
+            description: String::new(),
+            insert: String::new(),
+            disabled: true,
+        },
+    }
+}
+
 fn mention_trigger(s: &UiState) -> Trigger {
     let mut peers: Vec<_> = s.peers.iter().collect();
     peers.sort_by_key(|p| match (p.current, p.reachable) {
@@ -582,9 +703,10 @@ fn mention_trigger(s: &UiState) -> Trigger {
         (false, true) => 1,
         (false, false) => 2,
     });
-    let mut items: Vec<TriggerItem> = peers
-        .into_iter()
-        .map(|p| {
+    let mut items: Vec<TriggerItem> = Vec::new();
+    if !peers.is_empty() {
+        items.push(section_header("hdr:computers", "Computers"));
+        items.extend(peers.into_iter().map(|p| {
             let detail = if p.current {
                 "This computer"
             } else if p.reachable {
@@ -594,33 +716,38 @@ fn mention_trigger(s: &UiState) -> Trigger {
             };
             let insert = format!("@{}", p.name);
             TriggerItem {
+                // Empty search keeps headers out of fuzzy filter when term is set;
+                // peers still match on name.
                 search: vec![p.name.clone(), detail.to_string()],
                 row: PopupRow {
                     id: format!("p:{}", p.name),
                     label: insert.clone(),
                     description: detail.into(),
                     insert,
-                    // App: unreachable computers cannot be picked.
                     disabled: !p.reachable,
                 },
             }
-        })
-        .collect();
-    items.extend(s.file_hits.iter().take(MAX_FILE_ROWS).map(|h| TriggerItem {
-        search: vec![h.name.clone(), h.path.clone()],
-        row: PopupRow {
-            id: format!("f:{}", h.path),
-            label: h.name.clone(),
-            description: h.path.clone(),
-            insert: h.path.clone(),
-            disabled: false,
-        },
-    }));
+        }));
+    }
+    let files: Vec<_> = s.file_hits.iter().take(MAX_FILE_ROWS).collect();
+    if !files.is_empty() {
+        items.push(section_header("hdr:files", "Files"));
+        items.extend(files.into_iter().map(|h| TriggerItem {
+            search: vec![h.name.clone(), h.path.clone()],
+            row: PopupRow {
+                id: format!("f:{}", h.path),
+                label: h.name.clone(),
+                description: h.path.clone(),
+                insert: h.path.clone(),
+                disabled: false,
+            },
+        }));
+    }
     Trigger {
         char: '@',
         anchor: TriggerAnchor::Word,
         items,
-        limit: Some(MAX_FILE_ROWS + 8),
+        limit: Some(MAX_FILE_ROWS + 16),
     }
 }
 
@@ -663,26 +790,27 @@ fn mount_popup(
         .label(label)
         .items(items)
         .on_choose(move |s: &mut UiState, id: &str, _: &mut Tx| {
-            if disabled.contains(id) {
+            if disabled.contains(id) || id.starts_with("hdr:") {
                 return;
             }
             let Some(query) = query.as_ref() else {
                 return;
             };
-            let insert = match id.split_once(':') {
+            let (insert, kind) = match id.split_once(':') {
                 Some(("c", name)) => {
-                    if name.starts_with('/') {
+                    let insert = if name.starts_with('/') {
                         name.to_string()
                     } else {
                         format!("/{name}")
-                    }
+                    };
+                    (insert, PickKind::Plain)
                 }
-                Some(("s", id)) => format!("${id}"),
-                Some(("p", name)) => format!("@{name}"),
-                Some(("f", path)) => path.to_string(),
+                Some(("s", id)) => (format!("${id}"), PickKind::Plain),
+                Some(("p", name)) => (format!("@{name}"), PickKind::Computer),
+                Some(("f", path)) => (path.to_string(), PickKind::File),
                 _ => return,
             };
-            apply_pick(s, slot, query, &insert);
+            apply_pick(s, slot, query, &insert, kind);
         })
         .on_close(move |s: &mut UiState| {
             let caret = draft_caret(draft_of(s, slot));
@@ -1182,17 +1310,36 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     if let Some(chips) = chips(s, k, layer) {
         composer = composer.child(chips);
     }
+    let zh = s.cfg.general.language == crate::config::Language::ZhCn;
+    let placeholder = if s.selected.is_some() {
+        if zh {
+            "发消息…（/ 命令，$ 技能，@ 文件）"
+        } else {
+            "Message…  (/ commands, $ skills, @ files)"
+        }
+    } else if zh {
+        "先选一个会话"
+    } else {
+        "Pick a session first"
+    };
+    let accent = k.c.bg_accent;
+    let info = k.c.info.icon;
     composer
         .child(
             TextArea::new(&s.draft)
-                .placeholder(if s.selected.is_some() {
-                    "Message…  (/ commands, $ skills, @ files)"
-                } else {
-                    "Pick a session first"
-                })
+                .placeholder(placeholder)
                 .label("Draft")
                 .width(None)
                 .auto_grow(2, 8)
+                .pill_style(move |id| {
+                    if id.starts_with("computer:") {
+                        PillStyle::default().bg(accent.alpha(0.22)).fg(accent)
+                    } else if id.starts_with("file:") {
+                        PillStyle::default().bg(info.alpha(0.18)).fg(info)
+                    } else {
+                        PillStyle::default()
+                    }
+                })
                 .on_edit(|s: &mut UiState| &mut s.draft)
                 .on_change(|s: &mut UiState, _: &mut Tx| on_draft_change(s, Slot::Session))
                 .on_submit(|s: &mut UiState, _: &mut Tx| submit_session(s))

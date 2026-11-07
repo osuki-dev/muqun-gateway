@@ -429,6 +429,8 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     } else {
         "Describe the task…  (/ commands, $ skills, @ files)"
     };
+    let accent = k.c.bg_accent;
+    let info = k.c.info.icon;
     card = card
         .child(
             TextArea::new(&s.start_draft)
@@ -436,6 +438,15 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
                 .label("First prompt")
                 .width(None)
                 .auto_grow(4, 12)
+                .pill_style(move |id| {
+                    if id.starts_with("computer:") {
+                        rune::PillStyle::default().bg(accent.alpha(0.22)).fg(accent)
+                    } else if id.starts_with("file:") {
+                        rune::PillStyle::default().bg(info.alpha(0.18)).fg(info)
+                    } else {
+                        rune::PillStyle::default()
+                    }
+                })
                 .on_edit(|s: &mut UiState| &mut s.start_draft)
                 .on_change(|s: &mut UiState, _: &mut Tx| composer::on_draft_change(s, Slot::Start))
                 .on_submit(|s: &mut UiState, _: &mut Tx| submit_start(s))

@@ -40,7 +40,10 @@
   follows the App: unknown `/` stays a prompt; `$name` runs a skill. Home's
   first prompt uses the same popups and routing. Attachments skip slash/skill
   parse; unreachable `@` computers stay listed but cannot be picked; typed
-  skill arguments are announced and not sent on the wire.
+  skill arguments are announced and not sent on the wire. Mentions render as
+  pills (computers vs files), backspace removes a whole mention, the `@` list
+  groups Computers / Files, commands show an args hint when they have a
+  template, and placeholders follow the UI language.
 
 - **Large videos can be uploaded in chunks, up to 1 GiB, without the Gateway
   buffering the file.** `POST /api/uploads` reads its whole body into memory

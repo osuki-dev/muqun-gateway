@@ -257,9 +257,7 @@ pub fn scan_query(
         }
         start -= prev.len_utf8();
     }
-    let Some(ch) = draft[start..].chars().next() else {
-        return None;
-    };
+    let ch = draft[start..].chars().next()?;
     if ch != trigger {
         return None;
     }
