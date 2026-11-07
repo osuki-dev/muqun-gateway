@@ -17,6 +17,7 @@ pub mod scenes;
 mod sessions;
 mod settings;
 mod shell;
+mod splash;
 mod tasks;
 mod timeline;
 
@@ -30,8 +31,6 @@ use muqun_gateway::agents::{
     AgentSessionStatus, FormRequest, ModelRef, PermissionRequest, TimelineItem,
 };
 use muqun_gateway::platform::discovery::AgentDiscoveryInfo;
-use std::time::{Duration, Instant};
-
 use rune::{Cx, El, ImageCache, KeyEvent, TextEdit, Tx};
 use rune_kit::diff::{parse, DiffState};
 use rune_kit::shell::{is_sidebar_toggle, PaneState};
@@ -90,9 +89,6 @@ const MAX_TOASTS: usize = 3;
 
 /// How many gallery themes the Themes tab lists before "Show more".
 const GALLERY_PAGE: usize = 8;
-/// Launch vignette hold before it finishes fading out.
-const SPLASH_HOLD: Duration = Duration::from_millis(1600);
-const SPLASH_FADE: Duration = Duration::from_millis(550);
 
 /// A pane's grip or toggle was touched: the width may have changed and
 /// [`UiState::persist_layout`] should look (set from the pane access
@@ -232,8 +228,10 @@ pub struct UiState {
     toast_seq: u64,
     /// Theme / cover decode cache (wakes the app when an image is ready).
     pub images: Option<ImageCache>,
-    /// While set, the launch vignette covers the window and fades out.
-    pub splash_until: Option<Instant>,
+    /// Launch / theme-switch splash while the core warms up.
+    pub splash: Option<splash::Splash>,
+    /// First agents discovery finished (empty list still counts).
+    pub agents_seen: bool,
     /// A screenshot scene is showing: live core updates are ignored.
     pub demo: bool,
 }
@@ -335,35 +333,64 @@ impl UiState {
             toasts: Vec::new(),
             toast_seq: 0,
             images: None,
-            splash_until: None,
+            splash: None,
+            agents_seen: false,
             demo: false,
             cfg,
         };
-        s.arm_splash();
+        s.arm_splash(splash::SplashKind::Boot);
         s
     }
 
-    /// How long the launch vignette stays up after open / theme switch.
-    pub fn arm_splash(&mut self) {
+    /// Cover the shell with the launch stage; boot also kicks background loads.
+    pub fn arm_splash(&mut self, kind: splash::SplashKind) {
+        if kind == splash::SplashKind::Boot {
+            self.kick_boot_preload();
+        }
         if self.cfg.appearance.reduced_motion || self.cfg.appearance.reduced_transparency {
-            self.splash_until = None;
+            self.splash = None;
             return;
         }
-        self.splash_until = Some(Instant::now() + SPLASH_HOLD);
+        self.splash = Some(splash::Splash::start(kind));
+    }
+
+    /// Agents, themes, and tasks load while the splash is up.
+    fn kick_boot_preload(&mut self) {
+        self.send(Command::Refresh);
+        self.send(Command::ThemeRefresh);
+        self.send(Command::RefreshTasks);
     }
 
     /// Install the image cache once the window can wake it.
     pub fn install_images(&mut self, waker: rune::Waker) {
-        self.images = Some(ImageCache::new(waker));
+        let cache = ImageCache::new(waker);
+        let scheme = if self.dark {
+            ColorScheme::Dark
+        } else {
+            ColorScheme::Light
+        };
+        if let Some(bytes) = crate::theme::apply::current_launch(scheme) {
+            let _ = cache.load(bytes);
+        }
+        if let Some(bytes) = crate::theme::apply::current_wallpaper(scheme) {
+            let _ = cache.load(bytes);
+        }
+        if let Some(bytes) = crate::theme::apply::current_artwork(scheme)
+            .or_else(|| crate::theme::apply::current_cover(scheme))
+        {
+            let _ = cache.load(bytes);
+        }
+        self.images = Some(cache);
     }
 
-    /// Keep the window waking while the splash is fading.
+    /// Keep the window waking while the splash is animating.
     pub fn poll_splash(&mut self, _: f64, _: &mut Tx) -> bool {
-        let Some(until) = self.splash_until else {
+        let Some(splash) = self.splash.as_mut() else {
             return false;
         };
-        if Instant::now() >= until {
-            self.splash_until = None;
+        let hub_ready = !self.hub_label.is_empty();
+        if !splash.tick(self.agents_seen, hub_ready) {
+            self.splash = None;
             return false;
         }
         true
@@ -723,7 +750,7 @@ impl UiState {
                         self.cfg.appearance.scheme = scheme;
                         self.dark = !matches!(scheme, Scheme::Light);
                         self.status = format!("Theme: {id}");
-                        self.arm_splash();
+                        self.arm_splash(splash::SplashKind::Theme);
                     }
                     Err(err) => self.toast("Could not apply theme", Some(format!("{err:#}"))),
                 }
@@ -750,7 +777,8 @@ impl UiState {
                 .map(|a| a.id.clone())
                 .unwrap_or_default();
         }
-        let first = self.agents.is_empty();
+        let first = !self.agents_seen;
+        self.agents_seen = true;
         self.agents = agents;
         if first && self.start_cwd.text.is_empty() {
             let cwd = self.cfg.general.initial_cwd(&self.start_agent);
@@ -760,6 +788,11 @@ impl UiState {
                     agent: self.start_agent.clone(),
                 });
             }
+        } else if first && !self.start_agent.is_empty() {
+            self.send(Command::LoadProjects {
+                agent: self.start_agent.clone(),
+            });
+            self.refresh_start_catalog();
         }
     }
 
@@ -1102,17 +1135,16 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>) -> El {
     let k = crate::theme::apply::palette(scheme).map_or_else(|| Kit::neutral(dark), |p| p.kit());
     let mut layer: Vec<El> = Vec::new();
     let body = shell::view(s, cx, &k, &mut layer);
-    if let (Some(until), Some(images)) = (s.splash_until, s.images.as_ref()) {
-        let left = until.saturating_duration_since(Instant::now());
-        let opacity = if left > SPLASH_FADE {
-            1.0
-        } else {
-            (left.as_secs_f32() / SPLASH_FADE.as_secs_f32()).clamp(0.0, 1.0)
-        };
-        if opacity > 0.02 {
-            if let Some(splash) = art::splash(images, &k, scheme, opacity) {
-                layer.push(splash);
+    if let (Some(splash), Some(images)) = (s.splash.as_ref(), s.images.as_ref()) {
+        let hub_ready = !s.hub_label.is_empty();
+        let loading = match splash.kind {
+            splash::SplashKind::Boot => {
+                !splash::Splash::data_ready(splash.kind, s.agents_seen, hub_ready)
             }
+            splash::SplashKind::Theme => false,
+        };
+        if let Some(stage) = splash.view(images, &k, scheme, s.cfg.general.language, loading) {
+            layer.push(stage);
         }
     }
     if !s.toasts.is_empty() {

@@ -92,6 +92,8 @@ fn item(id: &str, role: TimelineRole, part: AgentPart) -> TimelineItem {
 
 fn base(s: &mut UiState) {
     s.hub_label = "standalone".into();
+    s.agents_seen = true;
+    s.splash = None;
     s.status = "Demo".into();
     s.agents = vec![
         agent("codex", "Codex", true),

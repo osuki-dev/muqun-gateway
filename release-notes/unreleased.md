@@ -2,6 +2,11 @@
 
 ## Changes and fixes
 
+- **Desktop launch splash loads the workspace behind a cooler Rune motion
+  stage.** Agents, themes and tasks start refreshing while the kick/bloom
+  entrance plays; the shell reveals once discovery is ready (or after a short
+  timeout), so the first frame after the fade is usable instead of empty.
+
 - **Large videos can be uploaded in chunks, up to 1 GiB, without the Gateway
   buffering the file.** `POST /api/uploads` reads its whole body into memory
   (and a sealed body cannot be streamed), which is why it stops at 64 MiB.

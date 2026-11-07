@@ -1,7 +1,6 @@
 //! Theme artwork drawn through Rune's [`ImageCache`].
 
 use rune::{el, El, ImageCache, SurfaceFit};
-use rune_kit::Kit;
 
 use crate::theme::apply;
 use crate::theme::color_scheme::ColorScheme;
@@ -36,24 +35,6 @@ pub fn figure(images: &ImageCache, scheme: ColorScheme, dark: bool) -> Option<El
             .w(460.0)
             .h(520.0)
             .opacity(opacity)
-            .a11y_hidden(),
-    )
-}
-
-/// Startup vignette: centered launch art over a dim scrim.
-pub fn splash(images: &ImageCache, k: &Kit, scheme: ColorScheme, opacity: f32) -> Option<El> {
-    let bytes = apply::current_launch(scheme)?;
-    let art = picture(images, bytes, SurfaceFit::Fit)
-        .key("splash-art")
-        .w(360.0)
-        .h(420.0)
-        .opacity(opacity);
-    Some(
-        el().key("theme-splash")
-            .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
-            .fill(k.c.bg_base.alpha(0.72 * opacity))
-            .center()
-            .child(art)
             .a11y_hidden(),
     )
 }
