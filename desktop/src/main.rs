@@ -66,6 +66,7 @@ fn main() -> anyhow::Result<()> {
         _ => branding::APP_NAME,
     };
 
+    rune::set_app_id(branding::APP_ID);
     let app = App::new(AppSpec::<UiState> {
         scenes: ui::scenes::scenes(),
         on_key: Some(ui::on_key),
@@ -77,9 +78,22 @@ fn main() -> anyhow::Result<()> {
             || UiState::new(COMMANDS.get().expect("commands").clone()),
             ui::view,
         )
-    });
+    })
+    .on_focus(|_, focused, _| platform::notify::set_window_focused(focused));
 
     let handle = app.handle();
+    platform::notify::install({
+        let handle = handle.clone();
+        move |asid, token| {
+            // A click on a notification: bring the window up (with the
+            // compositor's token on Wayland) and open that session.
+            match token {
+                Some(token) => handle.activate(token),
+                None => handle.open(),
+            }
+            handle.update(move |s, _| s.open_session(&asid));
+        }
+    });
     ui::spawn_inbox_pump(inbox, handle);
 
     tracing::info!(

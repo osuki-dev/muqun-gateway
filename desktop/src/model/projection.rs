@@ -212,6 +212,7 @@ pub fn spawn(
     });
     core.inbox.push(Update::HubMode(core.hub.mode()));
     tokio::spawn(core.clone().events());
+    tokio::spawn(super::notify::watch(core.hub.clone(), core.inbox.clone()));
     if let Some(tasks) = core.hub.task_events() {
         tokio::spawn(core.clone().task_events(tasks));
     }

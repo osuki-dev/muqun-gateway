@@ -139,6 +139,9 @@ pub enum Update {
     Worktrees(Vec<crate::hub::WorktreeRow>),
     /// Where this desktop's sessions run, applied by the drain to a binding.
     HubMode(crate::hub::HubMode),
+    /// A session wants the owner, or finished (`model/notify.rs`): the UI
+    /// raises a system notification unless that session is on screen.
+    Attention(super::notify::Attention),
 }
 
 impl Update {

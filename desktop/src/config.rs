@@ -30,6 +30,22 @@ pub struct DesktopConfig {
     pub appearance: Appearance,
     pub ui: UiPrefs,
     pub window: WindowGeometry,
+    pub notifications: Notifications,
+}
+
+/// System notifications for sessions that are not on screen.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Notifications {
+    /// An approval, a question or a finished turn raises a system
+    /// notification (the App's "Gateway notifications"). On by default.
+    pub enabled: bool,
+}
+
+impl Default for Notifications {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
 }
 
 /// Every agent the gateway drives, under the names its `config.json` uses.
@@ -296,6 +312,7 @@ pub enum ConfigEdit {
     Density(Density),
     ReducedMotion(bool),
     ReducedTransparency(bool),
+    Notifications(bool),
     EditorCommand(Option<String>),
     /// Where "New session" starts for an agent with no remembered folder.
     DefaultCwd(Option<PathBuf>),
@@ -346,6 +363,7 @@ impl DesktopConfig {
             ConfigEdit::Density(density) => self.appearance.density = density,
             ConfigEdit::ReducedMotion(on) => self.appearance.reduced_motion = on,
             ConfigEdit::ReducedTransparency(on) => self.appearance.reduced_transparency = on,
+            ConfigEdit::Notifications(on) => self.notifications.enabled = on,
             ConfigEdit::EditorCommand(command) => {
                 self.general.editor_command = command.filter(|c| !c.trim().is_empty());
             }
@@ -511,6 +529,10 @@ mod tests {
         assert!(!config.appearance.reduced_motion && !config.appearance.reduced_transparency);
         assert_eq!(config.appearance.density, Density::Comfortable);
         assert_eq!(config.window, WindowGeometry::default());
+        assert!(
+            config.notifications.enabled,
+            "notifications are on until turned off"
+        );
     }
 
     #[test]

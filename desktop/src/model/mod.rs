@@ -7,6 +7,7 @@ pub mod compose;
 pub mod composer_mentions;
 pub mod composer_popup;
 pub mod inbox;
+pub mod notify;
 pub mod projection;
 pub mod projects;
 pub mod stream;

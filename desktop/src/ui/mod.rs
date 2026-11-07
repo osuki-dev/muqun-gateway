@@ -505,6 +505,7 @@ impl UiState {
             self.earlier_exhausted = false;
         }
         self.status = format!("Opening {asid}");
+        crate::platform::notify::withdraw(asid);
         self.send(Command::OpenSession(AgentSessionId(asid.to_string())));
     }
 
@@ -747,10 +748,30 @@ impl UiState {
                 Update::Shells(rows) => self.shells = rows,
                 Update::Worktrees(rows) => self.worktrees = rows,
                 Update::HubMode(mode) => self.hub_label = mode.to_string(),
+                Update::Attention(attention) => self.on_attention(&attention),
             }
         }
         if LAYOUT_DIRTY.swap(false, Ordering::AcqRel) {
             self.persist_layout();
+        }
+    }
+
+    /// Raise a system notification unless the owner turned them off or is
+    /// looking at that session (`model/notify.rs` has the rules and words).
+    fn on_attention(&mut self, attention: &crate::model::notify::Attention) {
+        let on_screen = crate::platform::notify::window_focused()
+            && self.mode == Mode::Session
+            && self.selected.as_deref() == Some(attention.asid.as_str());
+        if !self.cfg.notifications.enabled || on_screen {
+            return;
+        }
+        let info = self.session_by_id(&attention.asid);
+        let agent = info.map(|i| self.agent_name(&i.agent_id));
+        let language = self.cfg.general.language;
+        if let Some(notice) =
+            crate::model::notify::compose(attention, info, agent.as_deref(), language)
+        {
+            crate::platform::notify::show(notice);
         }
     }
 

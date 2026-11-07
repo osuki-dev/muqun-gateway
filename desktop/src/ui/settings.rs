@@ -571,7 +571,34 @@ fn general(s: &UiState, k: &Kit) -> Vec<El> {
                     )),
             ],
         ),
+        notifications(s, k),
     ]
+}
+
+/// The App's "Gateway notifications": an approval, a question or a finished
+/// turn in a session that is not on screen raises a system notification.
+fn notifications(s: &UiState, k: &Kit) -> El {
+    let language = s.cfg.general.language;
+    let on = s.cfg.notifications.enabled;
+    let title = tr_ref(language, "System notifications", "系统通知");
+    section(
+        k,
+        "general-notify",
+        tr_ref(language, "Notifications", "通知"),
+        vec![setting(
+            k,
+            "notify",
+            title,
+            tr_ref(
+                language,
+                "Approvals, questions and finished turns in sessions you are not looking at.",
+                "不在眼前的会话需要审批、提问或完成时提醒你。",
+            ),
+            flag(k, "notify", on, title, move |s| {
+                s.edit(ConfigEdit::Notifications(!on))
+            }),
+        )],
+    )
 }
 
 // ---- Themes ------------------------------------------------------------------------
