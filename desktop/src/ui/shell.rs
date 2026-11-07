@@ -1,6 +1,8 @@
 //! The window: sidebar, main pane, inspector and toolbar in one `SplitView`.
 
-use rune::{col, row, text, Cx, El};
+use std::sync::Arc;
+
+use rune::{col, el, row, text, Cx, El, SurfaceFit};
 use rune_kit::shell::{SidebarToggle, SplitView, Toolbar, INSPECTOR};
 use rune_kit::{
     Badge, BadgeVariant, Button, ButtonVariant, Card, ControlSize, IconButton, IconButtonVariant,
@@ -8,8 +10,9 @@ use rune_kit::{
 };
 
 use super::copy::{tr, tr_ref};
-use super::{composer, home, inbox, inspector, sessions, settings, tasks, timeline};
+use super::{art, composer, home, inbox, inspector, sessions, settings, tasks, timeline};
 use super::{Mode, UiState};
+use crate::branding::{APP_MARK_PNG, APP_NAME};
 use crate::config::Language;
 use crate::model::commands::Command;
 
@@ -28,6 +31,7 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
     let main = main.child(page.grow(1.0).min_h(0.0));
     let mut split = SplitView::new(main)
         .sidebar(&s.sidebar, super::sidebar_pane, sessions::view(s, k, layer))
+        .sidebar_leading(home_brand(s, k))
         .toolbar(toolbar(s, k));
     if s.right_open && s.mode == Mode::Session {
         split = split.inspector(&s.right, super::right_pane, inspector::view(s, k));
@@ -38,6 +42,39 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
         .toolbar_in_panel()
         .sidebar_toggle(SidebarToggle::new().size(ControlSize::Large).in_header())
         .build(k)
+}
+
+/// Mark + name in the sidebar title bar; press returns to Home.
+fn home_brand(s: &UiState, k: &Kit) -> El {
+    let language = s.cfg.general.language;
+    let mark = match s.images.as_ref() {
+        Some(images) => art::picture(images, Arc::<[u8]>::from(APP_MARK_PNG), SurfaceFit::Fit)
+            .key("home-mark")
+            .w(22.0)
+            .h(22.0)
+            .radius(5.0)
+            .clip_rounded(5.0),
+        None => el()
+            .key("home-mark")
+            .w(22.0)
+            .h(22.0)
+            .radius(5.0)
+            .fill(k.c.bg_accent),
+    };
+    row()
+        .key("home-brand")
+        .gap(8.0)
+        .center_y()
+        .role("button")
+        .label(tr_ref(language, "Home", "首页"))
+        .child(mark)
+        .child(
+            text(APP_NAME)
+                .key("home-name")
+                .font(k.ty.ui_medium)
+                .color(k.c.text_base),
+        )
+        .on_press(|s: &mut UiState| s.go(Mode::Home))
 }
 
 fn title(s: &UiState) -> String {

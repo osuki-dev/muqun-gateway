@@ -6,6 +6,9 @@
 
 pub const APP_NAME: &str = "Muqun";
 
+/// Compact mark for the sidebar title bar (and similar chrome).
+pub const APP_MARK_PNG: &[u8] = include_bytes!("../assets/icons/app-mark-64.png");
+
 /// The full-size icon, 1024×1024, for packaging.
 #[cfg(test)]
 pub const APP_ICON_PNG: &[u8] = include_bytes!("../assets/icons/app-icon.png");
@@ -17,5 +20,10 @@ mod tests {
     #[test]
     fn the_icon_is_a_png() {
         assert_eq!(&APP_ICON_PNG[..8], b"\x89PNG\r\n\x1a\n");
+    }
+
+    #[test]
+    fn the_mark_is_a_png() {
+        assert_eq!(&APP_MARK_PNG[..8], b"\x89PNG\r\n\x1a\n");
     }
 }

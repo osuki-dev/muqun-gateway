@@ -13,7 +13,7 @@ use rune_kit::{
     TextInput,
 };
 
-use super::icons::{HOME, INBOX, SETTINGS, TASK};
+use super::icons::{INBOX, SETTINGS, TASK};
 use super::{title_of, Mode, OpenMenu, UiState};
 use crate::config::ConfigEdit;
 use crate::model::commands::Command;
@@ -398,13 +398,6 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         sidebar = sidebar.child(row);
     }
     sidebar
-        .footer(nav(
-            s,
-            k,
-            super::copy::tr_ref(language, "Home", "首页"),
-            &HOME,
-            Mode::Home,
-        ))
         .footer(nav(
             s,
             k,

@@ -6,15 +6,6 @@
 
 use rune::Icon;
 
-pub static HOME: Icon = Icon {
-    name: "home",
-    view: 24.0,
-    body: concat!(
-        r#"<path d="m3 10 9-7 9 7M5 9v12h5v-7h4v7h5V9""#,
-        r#" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>"#,
-    ),
-};
-
 pub static INBOX: Icon = Icon {
     name: "inbox",
     view: 24.0,

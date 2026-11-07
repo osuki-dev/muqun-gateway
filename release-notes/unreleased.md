@@ -31,6 +31,9 @@
   Videos over 8 MiB are re-encoded with `ffmpeg` to ≤1080p H.264 when it is on
   `PATH`. Compression failures keep the original file.
 
+- **Sidebar title bar shows the Muqun mark; click it for Home.** The footer
+  Home row is gone — the brand in the empty title-bar slot is the way back.
+
 - **Large videos can be uploaded in chunks, up to 1 GiB, without the Gateway
   buffering the file.** `POST /api/uploads` reads its whole body into memory
   (and a sealed body cannot be streamed), which is why it stops at 64 MiB.
