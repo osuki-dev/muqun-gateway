@@ -65,6 +65,13 @@ launch is its own (`src/platform/instance.rs`).
   (Shift+Enter for a newline), takes attachments (pick, paste an image, drop files; images and
   videos are shrunk to what the agent accepts), `@` files and computers, `/` commands and skills,
   and switches model, effort, mode and branch. Queued prompts wait above it.
+* **Command palette** — Ctrl/Cmd+K: a frosted launcher that fuzzy-matches every session (title,
+  agent, folder; most recent first) and action — new session by agent and folder, split,
+  inspector, every page and Settings tab, theme packs, light/dark, dictation — with ↑/↓, Enter,
+  matched letters lit and your recent commands first.
+* **Status icon** — Linux (StatusNotifierItem) and Windows: the tooltip and menu list the sessions
+  that need you; Open Muqun, a session, or Quit. Settings → General → Keep running in the tray
+  makes closing the window leave Muqun running there (off by default).
 * **Dictation** — the mic button (or Ctrl/Cmd+Shift+Space) records; a waveform scrolls while
   you speak and, in realtime mode, the words fade in as the service hears them. Done
   transcribes into the draft — never sent on its own; Escape cancels. Settings → Voice: after
@@ -97,7 +104,7 @@ launch is its own (`src/platform/instance.rs`).
 * **Themes** — the App's theme packs: colours, materials and artwork follow the active pack in
   light and dark. Six are built in (`assets/themes/README.md`).
 
-Keys: Ctrl/Cmd+Shift+B toggles the sidebar, Ctrl/Cmd+, opens Settings, Escape closes the viewer and
+Keys: Ctrl/Cmd+K opens the command palette, Ctrl/Cmd+Shift+B toggles the sidebar, Ctrl/Cmd+, opens Settings, Escape closes the viewer and
 popups.
 
 ### Opening a file from code
@@ -198,4 +205,4 @@ The UI never runs on the tokio thread: the core pushes `Update`s into the inbox
   clients; size is saved).
 * System notifications are Linux-only so far (macOS and Windows build with a no-op), and single
   instance is Unix-only (on Windows every launch is its own).
-* No tray or close-to-tray, no installer for macOS or Windows, no code signing.
+* No status icon on macOS yet; no installer for macOS or Windows, no code signing.

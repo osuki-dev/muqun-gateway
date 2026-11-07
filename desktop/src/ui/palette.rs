@@ -1,0 +1,683 @@
+//! The command palette (Ctrl/Cmd+K): one frosted field over the window that
+//! jumps to any session and runs any action -- new sessions by agent and
+//! folder, the split, the inspector, every page and Settings tab, theme packs,
+//! light/dark, dictation. Fuzzy matching with the matched letters lit,
+//! ↑/↓ and Enter, recent commands first. It opens on a spring and settles
+//! without one under reduce motion.
+
+use std::path::PathBuf;
+
+use rune::{col, el, rich, row, text, El, Span, Spring, TextEdit, Transition, Tx};
+use rune_kit::{Kit, TextInput};
+
+use super::copy::{tr, tr_ref};
+use super::{Mode, UiState};
+use crate::config::{ConfigEdit, Scheme};
+use crate::model::commands::Command;
+
+/// Rows shown at once; the rest scroll.
+const SHOWN: usize = 9;
+/// Recent commands remembered.
+pub const RECENT: usize = 8;
+
+/// The open palette.
+pub struct Palette {
+    pub query: TextEdit,
+    pub selected: usize,
+}
+
+impl Palette {
+    pub fn new() -> Self {
+        let mut query = TextEdit::new("");
+        query.focused = true;
+        Self { query, selected: 0 }
+    }
+}
+
+/// What a row does when chosen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Act {
+    Session(String),
+    NewSession {
+        agent: Option<String>,
+        cwd: Option<PathBuf>,
+    },
+    Go(Mode),
+    Settings(super::SettingsTab),
+    Split,
+    Inspector,
+    Theme(String),
+    ToggleScheme,
+    Dictation,
+}
+
+impl Act {
+    /// A stable id for "recent commands" (sessions by id, actions by kind).
+    fn id(&self) -> String {
+        match self {
+            Self::Session(asid) => format!("session:{asid}"),
+            Self::NewSession { agent, cwd } => format!(
+                "new:{}:{}",
+                agent.as_deref().unwrap_or(""),
+                cwd.as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default()
+            ),
+            Self::Go(mode) => format!("go:{mode:?}"),
+            Self::Settings(tab) => format!("settings:{tab:?}"),
+            Self::Split => "split".into(),
+            Self::Inspector => "inspector".into(),
+            Self::Theme(id) => format!("theme:{id}"),
+            Self::ToggleScheme => "scheme".into(),
+            Self::Dictation => "dictation".into(),
+        }
+    }
+}
+
+/// One row: what it says, what it does.
+#[derive(Debug, Clone)]
+pub struct Entry {
+    pub label: String,
+    pub detail: String,
+    /// A word on the right: "Session", "Action", a shortcut.
+    pub hint: String,
+    pub act: Act,
+    /// Agent mark to draw, for sessions and new sessions.
+    pub agent: Option<String>,
+}
+
+/// A fuzzy match: letters of `query` in order in `text`, case-insensitive.
+/// Scores consecutive runs and word starts; returns the matched char indices.
+pub fn fuzzy(query: &str, text: &str) -> Option<(i32, Vec<usize>)> {
+    let q: Vec<char> = query
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .flat_map(char::to_lowercase)
+        .collect();
+    if q.is_empty() {
+        return Some((0, Vec::new()));
+    }
+    let t: Vec<char> = text.chars().collect();
+    let lower: Vec<char> = t
+        .iter()
+        .map(|c| c.to_lowercase().next().unwrap_or(*c))
+        .collect();
+    let mut hits = Vec::with_capacity(q.len());
+    let mut score = 0i32;
+    let mut qi = 0;
+    let mut last: Option<usize> = None;
+    for (i, c) in lower.iter().enumerate() {
+        if qi < q.len() && *c == q[qi] {
+            let start = i == 0
+                || !t[i - 1].is_alphanumeric()
+                || (t[i].is_uppercase() && t[i - 1].is_lowercase());
+            score += 1;
+            if last == Some(i.wrapping_sub(1)) {
+                score += 5;
+            }
+            if start {
+                score += 8;
+            }
+            if i == 0 {
+                score += 4;
+            }
+            hits.push(i);
+            last = Some(i);
+            qi += 1;
+        }
+    }
+    if qi < q.len() {
+        return None;
+    }
+    // Tighter matches rank above scattered ones.
+    let span = hits.last().unwrap_or(&0) - hits.first().unwrap_or(&0);
+    score -= (span as i32 - q.len() as i32).max(0) / 3;
+    Some((score, hits))
+}
+
+fn folder_name(path: &str) -> String {
+    let trimmed = path.trim_end_matches('/');
+    let name = trimmed.rsplit('/').next().unwrap_or(trimmed);
+    if name.is_empty() {
+        path.to_string()
+    } else {
+        name.to_string()
+    }
+}
+
+/// Everything the palette can do right now.
+pub fn entries(s: &UiState) -> Vec<Entry> {
+    let language = s.cfg.general.language;
+    let mut out = Vec::new();
+    let action = |label: String, hint: &str, act: Act| Entry {
+        label,
+        detail: String::new(),
+        hint: hint.to_string(),
+        act,
+        agent: None,
+    };
+    // Sessions, most recent first (the list is kept in that order).
+    for info in &s.sessions {
+        let folder = info
+            .directory
+            .as_deref()
+            .map(folder_name)
+            .unwrap_or_default();
+        out.push(Entry {
+            label: super::title_of(info),
+            detail: [s.agent_name(&info.agent_id), folder]
+                .into_iter()
+                .filter(|p| !p.is_empty())
+                .collect::<Vec<_>>()
+                .join(" · "),
+            hint: tr(language, "Session", "会话"),
+            act: Act::Session(info.asid.0.clone()),
+            agent: Some(info.agent_id.clone()),
+        });
+    }
+    let new = tr(language, "New session", "新建会话");
+    out.push(action(
+        new.clone(),
+        &crate::platform::keys::label("Primary+N"),
+        Act::NewSession {
+            agent: None,
+            cwd: None,
+        },
+    ));
+    let usable: Vec<_> = s.agents.iter().filter(|a| a.enabled).collect();
+    let mut folders: Vec<PathBuf> = s.cfg.general.last_cwd.values().cloned().collect();
+    folders.sort();
+    folders.dedup();
+    for agent in &usable {
+        let name = s.agent_name(&agent.id);
+        out.push(Entry {
+            label: tr(
+                language,
+                &format!("New {name} session"),
+                &format!("新建 {name} 会话"),
+            ),
+            detail: String::new(),
+            hint: tr(language, "Action", "操作"),
+            act: Act::NewSession {
+                agent: Some(agent.id.clone()),
+                cwd: None,
+            },
+            agent: Some(agent.id.clone()),
+        });
+        for folder in folders.iter().take(6) {
+            let shown = folder_name(&folder.display().to_string());
+            out.push(Entry {
+                label: tr(
+                    language,
+                    &format!("New {name} session in {shown}"),
+                    &format!("在 {shown} 新建 {name} 会话"),
+                ),
+                detail: folder.display().to_string(),
+                hint: tr(language, "Action", "操作"),
+                act: Act::NewSession {
+                    agent: Some(agent.id.clone()),
+                    cwd: Some(folder.clone()),
+                },
+                agent: Some(agent.id.clone()),
+            });
+        }
+    }
+    let act = tr(language, "Action", "操作");
+    if s.mode == Mode::Session && s.selected.is_some() {
+        out.push(action(
+            tr(language, "Open split", "打开分屏"),
+            &crate::platform::keys::label("Primary+\\"),
+            Act::Split,
+        ));
+        out.push(action(
+            tr(language, "Toggle inspector", "显示或隐藏检查器"),
+            &act,
+            Act::Inspector,
+        ));
+        let dictating = s.voice.is_some();
+        out.push(action(
+            if dictating {
+                tr(language, "Stop dictation", "停止听写")
+            } else {
+                tr(language, "Start dictation", "开始听写")
+            },
+            &crate::platform::keys::label("Primary+Shift+Space"),
+            Act::Dictation,
+        ));
+    }
+    for (label, mode) in [
+        (tr_ref(language, "Home", "首页"), Mode::Home),
+        (tr_ref(language, "Inbox", "收件箱"), Mode::Inbox),
+        (tr_ref(language, "Tasks", "任务"), Mode::Tasks),
+        (tr_ref(language, "Terminals", "终端"), Mode::Terminals),
+    ] {
+        out.push(action(
+            tr(language, &format!("Go to {label}"), &format!("前往{label}")),
+            &act,
+            Act::Go(mode),
+        ));
+    }
+    for (label, tab) in super::settings::tabs(language) {
+        out.push(action(
+            tr(
+                language,
+                &format!("Settings: {label}"),
+                &format!("设置：{label}"),
+            ),
+            &act,
+            Act::Settings(tab),
+        ));
+    }
+    out.push(action(
+        if s.dark {
+            tr(language, "Switch to light appearance", "切换到浅色外观")
+        } else {
+            tr(language, "Switch to dark appearance", "切换到深色外观")
+        },
+        &act,
+        Act::ToggleScheme,
+    ));
+    for theme in s.theme_library.iter() {
+        out.push(Entry {
+            label: tr(
+                language,
+                &format!("Theme: {}", theme.name),
+                &format!("主题：{}", theme.name),
+            ),
+            detail: theme.author.clone().unwrap_or_default(),
+            hint: if theme.id == s.cfg.appearance.theme_id {
+                tr(language, "Current", "当前")
+            } else {
+                tr(language, "Theme", "主题")
+            },
+            act: Act::Theme(theme.id.clone()),
+            agent: None,
+        });
+    }
+    out
+}
+
+/// What the palette lists for `query`: recent commands first when empty,
+/// else the best matches; each with its label's matched char indices.
+pub fn results(s: &UiState, query: &str) -> Vec<(Entry, Vec<usize>)> {
+    let all = entries(s);
+    let query = query.trim();
+    if query.is_empty() {
+        let recent = &s.cfg.ui.recent_commands;
+        let mut out: Vec<(Entry, Vec<usize>)> = recent
+            .iter()
+            .filter_map(|id| all.iter().find(|e| e.act.id() == *id).cloned())
+            .map(|e| (e, Vec::new()))
+            .collect();
+        // Then recent sessions, then the actions without a target.
+        for e in all.iter().filter(|e| {
+            !recent.contains(&e.act.id()) && !matches!(&e.act, Act::NewSession { cwd: Some(_), .. })
+        }) {
+            out.push((e.clone(), Vec::new()));
+            if out.len() >= 60 {
+                break;
+            }
+        }
+        return out;
+    }
+    let mut scored: Vec<(i32, usize, Entry, Vec<usize>)> = Vec::new();
+    for (order, e) in all.into_iter().enumerate() {
+        let on_label = fuzzy(query, &e.label);
+        let on_detail = fuzzy(query, &format!("{} {}", e.label, e.detail));
+        let (score, hits) = match (on_label, on_detail) {
+            (Some((a, hits)), _) => (a + 10, hits),
+            (None, Some((b, _))) => (b, Vec::new()),
+            (None, None) => continue,
+        };
+        let recent_bonus = if s.cfg.ui.recent_commands.contains(&e.act.id()) {
+            6
+        } else {
+            0
+        };
+        scored.push((score + recent_bonus, order, e, hits));
+    }
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    scored.truncate(60);
+    scored.into_iter().map(|(_, _, e, h)| (e, h)).collect()
+}
+
+impl UiState {
+    pub fn toggle_palette(&mut self) {
+        self.palette = match self.palette {
+            Some(_) => None,
+            None => Some(Palette::new()),
+        };
+    }
+
+    fn palette_move(&mut self, by: i32) {
+        let query = match &self.palette {
+            Some(p) => p.query.text.clone(),
+            None => return,
+        };
+        let n = results(self, &query).len();
+        if let Some(p) = self.palette.as_mut() {
+            if n == 0 {
+                p.selected = 0;
+            } else {
+                p.selected = (p.selected as i32 + by).rem_euclid(n as i32) as usize;
+            }
+        }
+    }
+
+    fn palette_run_selected(&mut self) {
+        let Some(p) = self.palette.as_ref() else {
+            return;
+        };
+        let (query, at) = (p.query.text.clone(), p.selected);
+        if let Some((entry, _)) = results(self, &query).into_iter().nth(at) {
+            self.run_act(entry.act);
+        }
+    }
+
+    pub fn run_act(&mut self, act: Act) {
+        self.palette = None;
+        let id = act.id();
+        let mut recent = self.cfg.ui.recent_commands.clone();
+        recent.retain(|r| *r != id);
+        recent.insert(0, id);
+        recent.truncate(RECENT);
+        self.edit(ConfigEdit::RecentCommands(recent));
+        match act {
+            Act::Session(asid) => self.open_session(&asid),
+            Act::NewSession { agent, cwd } => {
+                if let Some(agent) = agent {
+                    self.start_agent = agent;
+                }
+                if let Some(cwd) = cwd {
+                    self.start_cwd = TextEdit::new(cwd.display().to_string());
+                    self.completions.clear();
+                }
+                self.go(Mode::Home);
+            }
+            Act::Go(mode) => self.go(mode),
+            Act::Settings(tab) => {
+                self.go(Mode::Settings);
+                self.settings_tab = tab;
+            }
+            Act::Split => self.split(),
+            Act::Inspector => self.toggle_inspector(),
+            Act::Theme(id) => self.send(Command::ThemeApply(id, self.cfg.appearance.scheme)),
+            Act::ToggleScheme => self.set_scheme(if self.dark {
+                Scheme::Light
+            } else {
+                Scheme::Dark
+            }),
+            Act::Dictation => self.toggle_voice(),
+        }
+    }
+}
+
+fn label_spans(k: &Kit, label: &str, hits: &[usize]) -> Vec<Span> {
+    let mut spans = Vec::new();
+    for (i, (at, c)) in label.char_indices().enumerate() {
+        if hits.contains(&i) {
+            spans.push(
+                Span::new(at, at + c.len_utf8())
+                    .color(k.c.text_accent)
+                    .weight(650.0),
+            );
+        }
+    }
+    spans
+}
+
+/// Mount the palette above the window when it is open.
+pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
+    let Some(p) = s.palette.as_ref() else {
+        return;
+    };
+    let language = s.cfg.general.language;
+    let look = s.look();
+    let results = results(s, &p.query.text);
+    let selected = p.selected.min(results.len().saturating_sub(1));
+
+    let field = TextInput::new(&p.query)
+        .placeholder(tr_ref(
+            language,
+            "Jump to a session or run a command…",
+            "跳转到会话或执行命令…",
+        ))
+        .label(tr_ref(language, "Command palette", "命令面板"))
+        .plain()
+        .large()
+        .on_edit(|s: &mut UiState| &mut s.palette.as_mut().expect("palette open").query)
+        .on_change(|s: &mut UiState, _: &mut Tx| {
+            if let Some(p) = s.palette.as_mut() {
+                p.selected = 0;
+            }
+        })
+        .on_key(
+            |s: &mut UiState, ev: &rune::KeyEvent, _: &mut Tx| match ev.key {
+                rune::Key::Down => {
+                    s.palette_move(1);
+                    true
+                }
+                rune::Key::Up => {
+                    s.palette_move(-1);
+                    true
+                }
+                rune::Key::Enter => {
+                    s.palette_run_selected();
+                    true
+                }
+                _ => false,
+            },
+        )
+        .build(k)
+        .key("palette-input")
+        .w_full();
+
+    let mut list = col().key("palette-list").w_full().gap(2.0).px(8.0).py(8.0);
+    if results.is_empty() {
+        list = list.child(
+            text(tr(language, "Nothing matches", "没有匹配项"))
+                .font(k.ty.ui)
+                .color(k.c.text_faint)
+                .px(12.0)
+                .py(10.0),
+        );
+    }
+    let first = selected.saturating_sub(SHOWN - 1);
+    let recents = p.query.text.trim().is_empty() && !s.cfg.ui.recent_commands.is_empty();
+    // `results` puts the recent commands that still exist first.
+    let recent_count = if recents {
+        results
+            .iter()
+            .take_while(|(e, _)| s.cfg.ui.recent_commands.contains(&e.act.id()))
+            .count()
+    } else {
+        0
+    };
+    for (i, (entry, hits)) in results.iter().enumerate().skip(first).take(SHOWN) {
+        if recents && i == 0 {
+            list = list.child(section(k, tr(language, "Recent", "最近")));
+        }
+        if recents && i == recent_count && i > 0 {
+            list = list.child(section(
+                k,
+                tr(language, "Sessions and actions", "会话与操作"),
+            ));
+        }
+        let on = i == selected;
+        let mark = match &entry.agent {
+            Some(agent) => super::agents::mark(agent, 16.0, s.dark),
+            None => rune::icon(glyph(&entry.act), 16.0).color(k.c.icon_muted),
+        };
+        let mut words = col().grow(1.0).shrink().min_w(0.0).gap(1.0).child(
+            rich(entry.label.clone(), label_spans(k, &entry.label, hits))
+                .font(k.ty.ui)
+                .color(if on { k.c.text_strong } else { k.c.text_base })
+                .truncate(),
+        );
+        if !entry.detail.is_empty() {
+            words = words.child(
+                text(entry.detail.clone())
+                    .font(k.ty.small)
+                    .color(k.c.text_faint)
+                    .truncate(),
+            );
+        }
+        let act = entry.act.clone();
+        let mut line = row()
+            .key(format!("pal-{}", entry.act.id()))
+            .w_full()
+            .gap(10.0)
+            .center_y()
+            .px(12.0)
+            .py(7.0)
+            .radius(k.radius.md)
+            .child(mark)
+            .child(words)
+            .child(
+                text(entry.hint.clone())
+                    .font(k.ty.small)
+                    .color(k.c.text_faint),
+            )
+            .hover(k.c.hover)
+            .role("option")
+            .label(entry.label.clone())
+            .on_press(move |s: &mut UiState| s.run_act(act.clone()));
+        if on {
+            line = line.fill(k.c.surface_hover);
+            line = look.accent_rim(k, line, k.c.bg_accent);
+        }
+        list = list.child(line);
+    }
+
+    let foot = row()
+        .key("palette-foot")
+        .w_full()
+        .gap(16.0)
+        .px(18.0)
+        .py(8.0)
+        .child(hint(k, "↑ ↓", tr(language, "move", "移动")))
+        .child(hint(k, "↵", tr(language, "run", "执行")))
+        .child(hint(k, "Esc", tr(language, "close", "关闭")))
+        .child(el().grow(1.0))
+        .child(
+            text(format!(
+                "{} {}",
+                results.len(),
+                tr(language, "results", "项结果")
+            ))
+            .font(k.ty.small)
+            .color(k.c.text_faint),
+        );
+
+    let panel = col()
+        .key("palette")
+        .role("dialog")
+        .label(tr(language, "Command palette", "命令面板"))
+        .w_full()
+        .max_w(640.0)
+        .child(
+            row()
+                .key("palette-field")
+                .w_full()
+                .px(16.0)
+                .py(10.0)
+                .child(field),
+        )
+        .child(el().w_full().h(1.0).fill(k.c.border_muted))
+        .child(list)
+        .child(el().w_full().h(1.0).fill(k.c.border_muted))
+        .child(foot);
+    let mut panel = look.panel(k, panel, crate::theme::look::PANEL_RADIUS);
+    for shadow in k.shadow_layers(&k.elevation.overlay) {
+        panel = panel.box_shadow(shadow);
+    }
+    // A spring drop-in from just above; a plain fade under reduce motion.
+    let panel = if s.cfg.appearance.reduced_motion {
+        panel.transition(Transition::opacity())
+    } else {
+        panel
+            .transition(
+                Transition::opacity()
+                    .combined(Transition::offset(0.0, -12.0))
+                    .combined(Transition::scale(0.97)),
+            )
+            .motion(Spring::new(0.32, 0.16))
+    }
+    .modal(true, |s: &mut UiState| s.palette = None);
+
+    layer.push(
+        el().key("palette-scrim")
+            .absolute(0.0, 0.0)
+            .w_full()
+            .h_full()
+            // The kit's scrim is faint in some packs; the palette wants the
+            // window to recede a little more.
+            .fill(k.c.black.alpha(if s.dark { 0.38 } else { 0.18 }))
+            .token_motion(k.motion.overlay)
+            .a11y_hidden(),
+    );
+    layer.push(
+        col()
+            .key("palette-layer")
+            .absolute(0.0, 0.0)
+            .w_full()
+            .h_full()
+            .items_center()
+            .pt(96.0)
+            .px(24.0)
+            .child(panel),
+    );
+}
+
+fn glyph(act: &Act) -> &'static rune::Icon {
+    match act {
+        Act::Go(Mode::Inbox) => &super::icons::INBOX,
+        Act::Go(Mode::Tasks) => &super::icons::TASK,
+        Act::Go(Mode::Terminals) => &super::terminals::TERMINAL,
+        Act::Dictation => &super::voice::MIC,
+        Act::Settings(_) | Act::Inspector | Act::Split => &super::icons::SETTINGS,
+        Act::Theme(_) | Act::ToggleScheme => &rune_kit::glyphs::SPARKLE,
+        _ => &rune_kit::glyphs::ARROW_RIGHT,
+    }
+}
+
+fn section(k: &Kit, label: String) -> El {
+    text(label)
+        .font(k.ty.small_medium)
+        .color(k.c.text_faint)
+        .px(12.0)
+        .pt(4.0)
+        .pb(2.0)
+}
+
+fn hint(k: &Kit, key: &str, what: String) -> El {
+    row()
+        .gap(6.0)
+        .center_y()
+        .child(
+            text(key.to_string())
+                .font(k.ty.small_medium)
+                .color(k.c.text_muted)
+                .px(5.0)
+                .py(1.0)
+                .radius(4.0)
+                .fill(k.c.layer_02),
+        )
+        .child(text(what).font(k.ty.small).color(k.c.text_faint))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fuzzy_matches_in_order_and_prefers_word_starts() {
+        assert!(fuzzy("xyz", "Go to Tasks").is_none());
+        let (_, hits) = fuzzy("gtt", "Go to Tasks").unwrap();
+        assert_eq!(hits, vec![0, 3, 6]);
+        let starts = fuzzy("ns", "New session").unwrap().0;
+        let middle = fuzzy("ns", "Insights").unwrap().0;
+        assert!(starts > middle);
+        assert_eq!(fuzzy("", "anything"), Some((0, Vec::new())));
+    }
+}

@@ -176,8 +176,8 @@ pub struct General {
     pub editor_command: Option<String>,
     /// The top bar's "Open in …": the editor used last.
     pub editor: crate::platform::editors::Editor,
-    /// Placeholder: closing the window will hide it to the tray instead of
-    /// quitting. Stored, not acted on yet (there is no tray in P0).
+    /// Closing the window keeps Muqun running behind its status icon
+    /// (where there is one); off quits.
     pub close_to_tray: bool,
     /// The first-run welcome was seen (or skipped).
     pub welcomed: bool,
@@ -369,6 +369,9 @@ pub struct UiPrefs {
     /// (`model/projects.rs`). Only projects with a choice are kept.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub projects: BTreeMap<String, ProjectPrefs>,
+    /// The command palette's recent commands, newest first.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub recent_commands: Vec<String>,
     /// Sessions open side by side when the window closed, in tile order
     /// (`ui/tiles.rs`); empty when one session filled the pane.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -433,6 +436,7 @@ impl Default for UiPrefs {
             sidebar_width: Self::SIDEBAR_DEFAULT,
             right_width: Self::RIGHT_DEFAULT,
             projects: BTreeMap::new(),
+            recent_commands: Vec::new(),
             tiles: Vec::new(),
             tile_split: 0.5,
         }
@@ -470,6 +474,9 @@ pub enum ConfigEdit {
     ReducedMotion(bool),
     ReducedTransparency(bool),
     Notifications(bool),
+    CloseToTray(bool),
+    /// The command palette's recent commands, newest first.
+    RecentCommands(Vec<String>),
     Voice(VoiceConfig),
     EditorCommand(Option<String>),
     /// Where "New session" starts for an agent with no remembered folder.
@@ -529,6 +536,8 @@ impl DesktopConfig {
             ConfigEdit::ReducedMotion(on) => self.appearance.reduced_motion = on,
             ConfigEdit::ReducedTransparency(on) => self.appearance.reduced_transparency = on,
             ConfigEdit::Notifications(on) => self.notifications.enabled = on,
+            ConfigEdit::CloseToTray(on) => self.general.close_to_tray = on,
+            ConfigEdit::RecentCommands(list) => self.ui.recent_commands = list,
             ConfigEdit::Voice(voice) => self.voice = voice,
             ConfigEdit::EditorCommand(command) => {
                 self.general.editor_command = command.filter(|c| !c.trim().is_empty());

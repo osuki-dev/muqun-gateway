@@ -102,7 +102,15 @@ fn main() -> anyhow::Result<()> {
         )
     })
     .compositor(ui::fx::Fx::default())
-    .on_focus(|_, focused, _| platform::notify::set_window_focused(focused));
+    .on_focus(|_, focused, _| platform::notify::set_window_focused(focused))
+    // Closing keeps the app only when the owner asked for the tray and an
+    // icon is up to come back through; otherwise it quits as before.
+    .keep_running()
+    .on_close(|s, tx| {
+        if !(s.cfg.general.close_to_tray && platform::tray::active()) {
+            tx.quit();
+        }
+    });
 
     let handle = app.handle();
     platform::notify::install({
@@ -131,6 +139,21 @@ fn main() -> anyhow::Result<()> {
     }
     if let Some(path) = open {
         handle.update(move |s, _| s.open_file(path));
+    }
+    if !std::env::args().skip(1).any(|a| a.starts_with("--")) {
+        let words = ui::tray_words(config.general.language, 0);
+        let tray_handle = handle.clone();
+        platform::tray::start(&words, move |request| match request {
+            platform::tray::TrayRequest::Open(token) => match token {
+                Some(token) => tray_handle.activate(token),
+                None => tray_handle.open(),
+            },
+            platform::tray::TrayRequest::Session(asid) => {
+                tray_handle.open();
+                tray_handle.update(move |s, _| s.open_session(&asid));
+            }
+            platform::tray::TrayRequest::Quit => tray_handle.quit(),
+        });
     }
     ui::spawn_inbox_pump(inbox, handle);
 
