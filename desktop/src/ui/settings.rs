@@ -12,6 +12,10 @@ use super::{heading, muted, UiState};
 use crate::agent_fields::{fields, Field, Kind};
 use crate::config::{AgentConfigs, ConfigEdit, Density, Language, Scheme};
 use crate::model::commands::Command;
+use crate::platform::editors::Editor;
+use crate::theme::gallery::IndexEntry;
+use crate::theme::service::Job;
+use crate::theme::store::ThemeEntry;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsTab {
@@ -326,6 +330,22 @@ fn general(s: &UiState, k: &Kit) -> Vec<El> {
                 k,
                 "Where New session starts when an agent has no remembered folder.",
             )),
+        setting(
+            k,
+            "open-in",
+            "Open in",
+            "Where Open in editor sends a project folder.",
+            choice(
+                k,
+                "open-in",
+                ["VS Code", "Zed", "Cursor", "Terminal", "Files"],
+                Editor::ALL
+                    .iter()
+                    .position(|e| *e == s.cfg.general.editor)
+                    .unwrap_or(0),
+                |s, i| s.edit(ConfigEdit::Editor(Editor::ALL[i])),
+            ),
+        ),
         col()
             .key("set-editor")
             .w_full()
@@ -359,17 +379,213 @@ fn general(s: &UiState, k: &Kit) -> Vec<El> {
 
 // ---- Themes ------------------------------------------------------------------------
 
+fn swatch(k: &Kit, key: &str, hex: &str) -> El {
+    let color = rune::color::hex(hex).unwrap_or(k.c.layer_02);
+    row()
+        .key(key.to_string())
+        .size(18.0, 18.0)
+        .radius(k.radius.sm)
+        .fill(color)
+}
+
+fn swatches(k: &Kit, id: &str, s: &crate::theme::store::Swatch, tag: &str) -> El {
+    row()
+        .key(format!("sw-{id}-{tag}"))
+        .gap(3.0)
+        .child(swatch(k, "bg", &s.background))
+        .child(swatch(k, "surface", &s.surface))
+        .child(swatch(k, "primary", &s.primary))
+        .child(swatch(k, "text", &s.text))
+}
+
+fn job_label(job: &Job) -> String {
+    match job {
+        Job::Downloading { read, total } if *total > 0 => {
+            format!("Downloading {}%", read * 100 / total)
+        }
+        Job::Downloading { .. } => "Downloading…".into(),
+        Job::Verifying => "Verifying…".into(),
+        Job::Installing => "Installing…".into(),
+        Job::Done { verified: true } => "Installed (checksum verified)".into(),
+        Job::Done { verified: false } => "Installed".into(),
+        Job::Failed { message } => format!("Failed: {message}"),
+    }
+}
+
+fn library_card(s: &UiState, k: &Kit, entry: &ThemeEntry) -> El {
+    let current = entry.id == s.cfg.appearance.theme_id;
+    let mut about = vec![format!("v{}", entry.version)];
+    about.extend(entry.author.clone());
+    let mut card = Card::new()
+        .accent(if current {
+            k.c.success.icon
+        } else {
+            k.c.icon_faint
+        })
+        .title(entry.name.clone(), None)
+        .description(about.join(" · "))
+        .child(
+            row()
+                .key(format!("sw-{}", entry.id))
+                .gap(12.0)
+                .child(swatches(k, &entry.id, &entry.light, "light"))
+                .child(swatches(k, &entry.id, &entry.dark, "dark")),
+        );
+    if let Some(d) = entry.description.as_ref().filter(|d| !d.is_empty()) {
+        card = card.child(muted(k, d.clone()));
+    }
+    let scheme = s.cfg.appearance.scheme;
+    let (apply_id, remove_id) = (entry.id.clone(), entry.id.clone());
+    card = card.action(if current {
+        Badge::new("Current").variant(BadgeVariant::Subtle).build(k)
+    } else {
+        Button::new("Apply")
+            .variant(ButtonVariant::Submit)
+            .control_size(ControlSize::Small)
+            .on_press(move |s: &mut UiState| {
+                s.send(Command::ThemeApply(apply_id.clone(), scheme));
+            })
+            .build(k)
+            .key(format!("apply-{}", entry.id))
+    });
+    if entry.origin.removable() {
+        card = card.action(
+            Button::new("Remove")
+                .variant(ButtonVariant::Danger)
+                .control_size(ControlSize::Small)
+                .on_press(move |s: &mut UiState| {
+                    s.send(Command::ThemeRemove(remove_id.clone()));
+                })
+                .build(k)
+                .key(format!("remove-{}", entry.id)),
+        );
+    }
+    card.build(k).key(format!("theme-{}", entry.id))
+}
+
+fn gallery_card(s: &UiState, k: &Kit, entry: &IndexEntry) -> El {
+    let installed = s.theme_library.iter().any(|t| t.id == entry.id);
+    let job = s.theme_jobs.get(&entry.id);
+    let running = job.is_some_and(|j| {
+        matches!(
+            j,
+            Job::Downloading { .. } | Job::Verifying | Job::Installing
+        )
+    });
+    let mut about = vec![format!("v{}", entry.version)];
+    about.extend(entry.author.clone());
+    about.push(format!("{} KB", entry.bytes / 1024));
+    let mut card = Card::new()
+        .accent(k.c.icon_accent)
+        .title(entry.name.clone(), None)
+        .description(about.join(" · "));
+    if let Some(d) = entry.description.as_ref().filter(|d| !d.is_empty()) {
+        card = card.child(muted(k, d.clone()));
+    }
+    if let Some(job) = job {
+        card = card.child(muted(k, job_label(job)));
+    }
+    let id = entry.id.clone();
+    card.action(
+        Button::new(if installed { "Reinstall" } else { "Install" })
+            .variant(if installed {
+                ButtonVariant::Outline
+            } else {
+                ButtonVariant::Submit
+            })
+            .control_size(ControlSize::Small)
+            .disabled(running)
+            .on_press(move |s: &mut UiState| s.send(Command::ThemeInstall(id.clone())))
+            .build(k)
+            .key(format!("install-{}", entry.id)),
+    )
+    .build(k)
+    .key(format!("gallery-{}", entry.id))
+}
+
 fn themes(s: &UiState, k: &Kit) -> Vec<El> {
-    vec![
+    let mut out = vec![
         setting(
             k,
             "theme",
             "Current theme",
-            "The theme library is not available in this build yet; the neutral kit theme is used.",
+            "Applies to the light and dark variants alike.",
             Badge::new(s.cfg.appearance.theme_id.clone())
                 .variant(BadgeVariant::Subtle)
                 .build(k),
         ),
+        heading(k, "Library"),
+    ];
+    if s.theme_library.is_empty() {
+        out.push(muted(k, "No themes yet."));
+    }
+    out.extend(s.theme_library.iter().map(|t| library_card(s, k, t)));
+
+    out.push(heading(k, "Import"));
+    out.push(
+        row()
+            .key("theme-import")
+            .w_full()
+            .gap(8.0)
+            .center_y()
+            .child(
+                TextInput::new(&s.theme_url)
+                    .label("Theme link")
+                    .placeholder("https://… .muqun-theme")
+                    .on_edit(|s: &mut UiState| &mut s.theme_url)
+                    .on_submit(import_url)
+                    .build(k)
+                    .key("theme-url")
+                    .grow(1.0),
+            )
+            .child(
+                Button::new("Import link")
+                    .variant(ButtonVariant::Outline)
+                    .control_size(ControlSize::Regular)
+                    .disabled(s.theme_url.text.trim().is_empty())
+                    .on_press(|s: &mut UiState| import_url(s, &mut Tx::default()))
+                    .build(k)
+                    .key("theme-import-url"),
+            )
+            .child(
+                Button::new("Import file…")
+                    .variant(ButtonVariant::Outline)
+                    .control_size(ControlSize::Regular)
+                    .on_press(|_: &mut UiState| crate::platform::dialogs::import_theme_file())
+                    .build(k)
+                    .key("theme-import-file"),
+            ),
+    );
+
+    out.push(heading(k, "Gallery"));
+    let gallery = &s.theme_gallery;
+    if gallery.loading && gallery.entries.is_empty() {
+        out.push(muted(k, "Loading the gallery…"));
+    }
+    if let Some(err) = &gallery.error {
+        out.push(muted(k, err.clone()));
+    }
+    if let Some(why) = &gallery.stale {
+        out.push(muted(k, format!("Showing the saved list: {why}")));
+    }
+    out.extend(
+        gallery
+            .entries
+            .iter()
+            .take(s.gallery_limit)
+            .map(|e| gallery_card(s, k, e)),
+    );
+    if gallery.entries.len() > s.gallery_limit {
+        out.push(
+            Button::new("Show more")
+                .variant(ButtonVariant::Ghost)
+                .control_size(ControlSize::Regular)
+                .on_press(|s: &mut UiState| s.gallery_limit += 8)
+                .build(k)
+                .key("gallery-more"),
+        );
+    }
+    out.push(
         row().key("theme-actions").gap(8.0).child(
             Button::new("Refresh themes")
                 .variant(ButtonVariant::Outline)
@@ -378,7 +594,17 @@ fn themes(s: &UiState, k: &Kit) -> Vec<El> {
                 .build(k)
                 .key("theme-refresh"),
         ),
-    ]
+    );
+    out
+}
+
+fn import_url(s: &mut UiState, _: &mut Tx) {
+    let url = s.theme_url.text.trim().to_string();
+    if url.is_empty() {
+        return;
+    }
+    s.theme_url = TextEdit::new("");
+    s.send(Command::ThemeImportUrl(url));
 }
 
 pub fn view(s: &UiState, k: &Kit) -> El {

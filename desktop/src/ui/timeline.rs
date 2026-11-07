@@ -1,8 +1,8 @@
 //! The session timeline: one block per [`TimelineItem`], by [`AgentPart`].
 
 use muqun_gateway::agents::{
-    AgentPart, FormField, FormRequest, PermissionDecision, PermissionRequest, TimelineItem,
-    TimelineRole, ToolCall, ToolCallStatus,
+    AgentPart, AgentSessionId, FormField, FormRequest, PermissionDecision, PermissionRequest,
+    TimelineItem, TimelineRole, ToolCall, ToolCallStatus,
 };
 use rune::{col, row, text, El, ScrollSpec, TextEdit};
 use rune_kit::diff::{DiffState, DiffView};
@@ -702,11 +702,51 @@ fn part(s: &UiState, k: &Kit, item: &TimelineItem) -> El {
     }
 }
 
+/// Rollback and Fork from here, under a message's text.
+fn message_actions(s: &UiState, k: &Kit, it: &TimelineItem) -> Option<El> {
+    let asid = AgentSessionId(s.selected.clone()?);
+    let (rollback_asid, rollback_id) = (asid.clone(), it.message_id.clone());
+    let fork_id = it.message_id.clone();
+    Some(
+        row()
+            .key(format!("actions-{}", it.id))
+            .gap(4.0)
+            .center_y()
+            .child(
+                Button::new("Rollback")
+                    .variant(ButtonVariant::Ghost)
+                    .control_size(ControlSize::Small)
+                    .on_press(move |s: &mut UiState| {
+                        s.send(Command::StageRevert {
+                            asid: rollback_asid.clone(),
+                            message_id: rollback_id.clone(),
+                        })
+                    })
+                    .build(k)
+                    .key(format!("rollback-{}", it.id)),
+            )
+            .child(
+                Button::new("Fork from here")
+                    .variant(ButtonVariant::Ghost)
+                    .control_size(ControlSize::Small)
+                    .on_press(move |s: &mut UiState| {
+                        s.send(Command::ForkSession {
+                            asid: asid.clone(),
+                            message_id: Some(fork_id.clone()),
+                        })
+                    })
+                    .build(k)
+                    .key(format!("fork-{}", it.id)),
+            ),
+    )
+}
+
 fn item(s: &UiState, k: &Kit, it: &TimelineItem) -> El {
     let body = part(s, k, it);
-    let wrap = col().key(format!("item-{}", it.id)).w_full();
-    let user_text = it.role == TimelineRole::User && matches!(it.part, AgentPart::Text { .. });
-    if user_text {
+    let mut wrap = col().key(format!("item-{}", it.id)).w_full().gap(2.0);
+    let is_text = matches!(it.part, AgentPart::Text { .. });
+    let user_text = it.role == TimelineRole::User && is_text;
+    wrap = if user_text {
         wrap.child(
             col()
                 .key("user")
@@ -719,7 +759,13 @@ fn item(s: &UiState, k: &Kit, it: &TimelineItem) -> El {
         )
     } else {
         wrap.child(body)
+    };
+    if is_text && matches!(it.role, TimelineRole::User | TimelineRole::Assistant) {
+        if let Some(actions) = message_actions(s, k, it) {
+            wrap = wrap.child(actions);
+        }
     }
+    wrap
 }
 
 pub fn view(s: &UiState, k: &Kit) -> El {
@@ -788,14 +834,26 @@ pub fn changes(s: &UiState, k: &Kit) -> El {
             ),
         ));
         for f in &s.diff_stat.paths {
+            let (asid, path) = (s.selected.clone(), f.path.clone());
             list = list.child(
                 row()
                     .key(format!("chg-{}", f.path))
                     .gap(8.0)
+                    .center_y()
                     .child(
-                        text(f.path.clone())
-                            .font(k.ty.mono)
-                            .color(k.c.text_base)
+                        Button::new(f.path.clone())
+                            .variant(ButtonVariant::Ghost)
+                            .control_size(ControlSize::Small)
+                            .on_press(move |s: &mut UiState| {
+                                if let Some(asid) = asid.clone() {
+                                    s.send(Command::OpenDiff {
+                                        asid: AgentSessionId(asid),
+                                        file: Some(path.clone()),
+                                    });
+                                }
+                            })
+                            .build(k)
+                            .key(format!("chg-open-{}", f.path))
                             .grow(1.0),
                     )
                     .child(badge(k, format!("+{} −{}", f.added, f.removed))),

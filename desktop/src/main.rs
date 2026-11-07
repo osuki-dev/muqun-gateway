@@ -44,6 +44,7 @@ fn main() -> anyhow::Result<()> {
     let settings = runtime_settings(&config);
 
     let inbox = Arc::new(Inbox::new());
+    platform::dialogs::install(inbox.clone());
     let (tx, rx) = commands::channel();
     COMMANDS
         .set(tx.clone())
@@ -65,7 +66,7 @@ fn main() -> anyhow::Result<()> {
         _ => branding::APP_NAME,
     };
 
-    let mut app = App::new(AppSpec::<UiState> {
+    let app = App::new(AppSpec::<UiState> {
         scenes: ui::scenes::scenes(),
         on_key: Some(ui::on_key),
         ..AppSpec::new(

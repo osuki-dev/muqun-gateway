@@ -54,6 +54,8 @@ pub enum UiAction {
     QaStep(String),
     /// A PNG came off the clipboard (read on its own thread).
     ImagePasted(Vec<u8>),
+    /// A `.muqun-theme` file came back from Settings → Themes → Import file.
+    ThemeFilePicked(std::path::PathBuf),
     /// Files came back from the attach dialog.
     FilesPicked(Vec<std::path::PathBuf>),
     /// Folders were dropped on the window: their paths go into the draft.

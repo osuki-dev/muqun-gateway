@@ -30,6 +30,13 @@ futures = { version = "0.3.32", default-features = false, features = ["std"] }
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "webp"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", default-features = false, features = ["ansi", "env-filter", "fmt", "std"] }
+# Theme packs (`theme/pack.rs`, `theme/gallery.rs`): ZIP inflate, CRC, SHA-256.
+flate2 = { version = "1.1.10", default-features = false, features = ["rust_backend"] }
+crc32fast = "1.5.3"
+sha2 = "0.11.1"
+hex = "0.4"
+# Native file / folder dialogs (`platform/dialogs.rs`).
+rfd = "0.17.2"
 # Pasting an image into the composer (`platform/clipboard.rs`).
 arboard = { version = "3", default-features = false, features = ["image-data"] }
 

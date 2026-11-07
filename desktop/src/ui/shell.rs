@@ -11,10 +11,10 @@ use super::{composer, home, inbox, inspector, sessions, settings, tasks, timelin
 use super::{Mode, UiState};
 use crate::model::commands::Command;
 
-pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit) -> El {
+pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> El {
     let page = match s.mode {
-        Mode::Home => home::view(s, k),
-        Mode::Session => session(s, k),
+        Mode::Home => home::view(s, k, layer),
+        Mode::Session => session(s, k, layer),
         Mode::Inbox => inbox::view(s, k),
         Mode::Tasks => tasks::view(s, k),
         Mode::Settings => settings::view(s, k),
@@ -25,18 +25,10 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit) -> El {
     }
     let main = main.child(page.grow(1.0).min_h(0.0));
     let mut split = SplitView::new(main)
-        .sidebar(
-            &s.sidebar,
-            |s: &mut UiState| &mut s.sidebar,
-            sessions::view(s, k),
-        )
+        .sidebar(&s.sidebar, super::sidebar_pane, sessions::view(s, k, layer))
         .toolbar(toolbar(s, k));
     if s.right_open && s.mode == Mode::Session {
-        split = split.inspector(
-            &s.right,
-            |s: &mut UiState| &mut s.right,
-            inspector::view(s, k),
-        );
+        split = split.inspector(&s.right, super::right_pane, inspector::view(s, k));
     }
     split
         .titlebar_inset(cx.titlebar_inset())
@@ -79,7 +71,14 @@ fn toolbar(s: &UiState, k: &Kit) -> Toolbar {
                         ButtonVariant::Ghost
                     })
                     .control_size(ControlSize::Small)
-                    .on_press(|s: &mut UiState| s.show_diff = !s.show_diff)
+                    .on_press(|s: &mut UiState| match s.selected.clone() {
+                        // The core answers with the toggle (`UiAction::ToggleDiffPanel`).
+                        Some(asid) => s.send(Command::OpenDiff {
+                            asid: muqun_gateway::agents::AgentSessionId(asid),
+                            file: None,
+                        }),
+                        None => s.show_diff = !s.show_diff,
+                    })
                     .build(k)
                     .key("changes"),
             );
@@ -142,7 +141,7 @@ fn alert(s: &UiState, k: &Kit) -> Option<El> {
     )
 }
 
-fn session(s: &UiState, k: &Kit) -> El {
+fn session(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     let body = if s.show_diff {
         timeline::changes(s, k)
     } else {
@@ -152,7 +151,10 @@ fn session(s: &UiState, k: &Kit) -> El {
     if s.revert_staged {
         page = page.child(revert_banner(s, k));
     }
-    page = page.child(session_actions(s, k)).child(body).child(composer::view(s, k));
+    page = page
+        .child(session_actions(s, k))
+        .child(body)
+        .child(composer::view(s, k, layer));
     page
 }
 

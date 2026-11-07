@@ -16,12 +16,13 @@ mod tasks;
 mod timeline;
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use muqun_gateway::agents::directories::DirectoryEntry;
 use muqun_gateway::agents::{
     AgentDomainEvent, AgentPart, AgentProject, AgentSessionId, AgentSessionInfo,
-    AgentSessionStatus, FormRequest, PermissionRequest, TimelineItem,
+    AgentSessionStatus, FormRequest, ModelRef, PermissionRequest, TimelineItem,
 };
 use muqun_gateway::platform::discovery::AgentDiscoveryInfo;
 use rune::{Cx, El, KeyEvent, TextEdit, Tx};
@@ -31,12 +32,15 @@ use rune_kit::{Kit, ToastRegion};
 
 use crate::config::{ConfigEdit, DesktopConfig, Scheme};
 use crate::hub::CatalogView;
-use crate::hub::{SavedPermission, ShellRow, TaskRow, WorktreeRow};
+use crate::hub::{PeerMention, SavedPermission, ShellRow, TaskRow, WorktreeRow};
 use crate::model::commands::{self, Command, CommandSender};
 use crate::model::compose::{BranchInfo, ComposerUpdate, FileHit, InboxItem, StagedFile};
 use crate::model::inbox::{Inbox, UiAction, UiError, Update};
 use crate::model::projects::DirInfo;
 use crate::model::types::{DiffStat, SESSION_LIST_LIMIT};
+use crate::theme::color_scheme::ColorScheme;
+use crate::theme::service::{GalleryView, Job, ThemeUpdate};
+use crate::theme::store::ThemeEntry;
 
 pub use settings::SettingsTab;
 
@@ -77,6 +81,40 @@ pub struct ToastItem {
 
 const MAX_TOASTS: usize = 3;
 
+/// How many gallery themes the Themes tab lists before "Show more".
+const GALLERY_PAGE: usize = 8;
+
+/// A pane's grip or toggle was touched: the width may have changed and
+/// [`UiState::persist_layout`] should look (set from the pane access
+/// functions, read by the inbox pump).
+static LAYOUT_DIRTY: AtomicBool = AtomicBool::new(false);
+
+fn sidebar_pane(s: &mut UiState) -> &mut PaneState {
+    LAYOUT_DIRTY.store(true, Ordering::Release);
+    &mut s.sidebar
+}
+
+fn right_pane(s: &mut UiState) -> &mut PaneState {
+    LAYOUT_DIRTY.store(true, Ordering::Release);
+    &mut s.right
+}
+
+/// The one open dropdown (or row menu), if any.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OpenMenu {
+    /// The session composer's model, branch menus.
+    Model,
+    Branch,
+    /// The start page's model, mode and branch menus.
+    StartModel,
+    StartMode,
+    StartBranch,
+    /// A session row's actions (by asid).
+    Session(String),
+    /// A project row's actions (by project id / root).
+    Project(String),
+}
+
 static INITIAL_CONFIG: OnceLock<DesktopConfig> = OnceLock::new();
 
 /// Hand the loaded config to the UI before the window opens.
@@ -97,6 +135,8 @@ pub struct UiState {
     pub right: PaneState,
     pub right_open: bool,
     pub inspector_tab: InspectorTab,
+    /// The open dropdown or row menu.
+    pub menu: Option<OpenMenu>,
 
     pub sessions: Vec<AgentSessionInfo>,
     pub directories: HashMap<String, DirInfo>,
@@ -119,12 +159,18 @@ pub struct UiState {
     pub start_agent: String,
     pub start_cwd: TextEdit,
     pub start_worktree: bool,
+    /// The start page's model and mode picks; `None` leaves the agent's own.
+    pub start_model: Option<ModelRef>,
+    pub start_mode: Option<String>,
+    pub start_catalog: Option<Arc<CatalogView>>,
     pub completions: Vec<DirectoryEntry>,
     pub staged: Vec<StagedFile>,
     pub queue: Vec<InboxItem>,
     pub file_hits: Vec<FileHit>,
     pub catalog: Option<Arc<CatalogView>>,
     pub branches: HashMap<String, BranchInfo>,
+    /// Computers `@` may name.
+    pub peers: Vec<PeerMention>,
     pub auto_approve: HashMap<String, bool>,
     pub next_token: u64,
     pub pending_submit: Option<(u64, Slot)>,
@@ -143,6 +189,12 @@ pub struct UiState {
     pub worktrees: Vec<WorktreeRow>,
 
     pub search: TextEdit,
+    /// Inline rename of a session row (its asid) and the text being typed.
+    pub rename_asid: Option<String>,
+    pub rename_edit: TextEdit,
+    /// Inline rename of a project row (its id) and the text being typed.
+    pub rename_project: Option<String>,
+    pub project_edit: TextEdit,
     pub open_projects: HashMap<String, bool>,
     pub full_projects: HashSet<String>,
     /// Collapsibles the owner opened, by item id.
@@ -157,6 +209,12 @@ pub struct UiState {
     pub agent_inputs: HashMap<String, TextEdit>,
     pub agent_errors: HashMap<String, String>,
     pub cwd_input: TextEdit,
+    /// Themes: the library, the gallery, running installs, the link field.
+    pub theme_library: Arc<Vec<ThemeEntry>>,
+    pub theme_gallery: Arc<GalleryView>,
+    pub theme_jobs: HashMap<String, Job>,
+    pub theme_url: TextEdit,
+    pub gallery_limit: usize,
     pub toasts: Vec<ToastItem>,
     toast_seq: u64,
     /// A screenshot scene is showing: live core updates are ignored.
@@ -169,6 +227,13 @@ impl UiState {
         let dark = !matches!(cfg.appearance.scheme, Scheme::Light);
         let mut draft = TextEdit::new("");
         draft.focused = true;
+        let start_draft = TextEdit::new(
+            cfg.general
+                .drafts
+                .get(crate::config::START_DRAFT)
+                .cloned()
+                .unwrap_or_default(),
+        );
         let cwd_input = TextEdit::new(
             cfg.general
                 .default_cwd
@@ -181,10 +246,15 @@ impl UiState {
             dark,
             mode: Mode::Home,
             settings_tab: SettingsTab::Agents,
-            sidebar: PaneState::new(260.0).range(180.0, 420.0),
-            right: PaneState::new(320.0).range(240.0, 520.0),
+            sidebar: PaneState::new(260.0)
+                .range(180.0, 420.0)
+                .with_width(cfg.ui.sidebar()),
+            right: PaneState::new(320.0)
+                .range(240.0, 520.0)
+                .with_width(cfg.ui.right()),
             right_open: false,
             inspector_tab: InspectorTab::Queue,
+            menu: None,
             sessions: Vec::new(),
             directories: HashMap::new(),
             known_projects: HashMap::new(),
@@ -198,16 +268,20 @@ impl UiState {
             hub_label: String::new(),
             error: None,
             draft,
-            start_draft: TextEdit::new(""),
+            start_draft,
             start_agent: cfg.general.last_agent.clone().unwrap_or_default(),
             start_cwd: TextEdit::new(""),
             start_worktree: false,
+            start_model: None,
+            start_mode: None,
+            start_catalog: None,
             completions: Vec::new(),
             staged: Vec::new(),
             queue: Vec::new(),
             file_hits: Vec::new(),
             catalog: None,
             branches: HashMap::new(),
+            peers: Vec::new(),
             auto_approve: HashMap::new(),
             next_token: 1,
             pending_submit: None,
@@ -223,6 +297,10 @@ impl UiState {
             shells: Vec::new(),
             worktrees: Vec::new(),
             search: TextEdit::new(""),
+            rename_asid: None,
+            rename_edit: TextEdit::new(""),
+            rename_project: None,
+            project_edit: TextEdit::new(""),
             open_projects: HashMap::new(),
             full_projects: HashSet::new(),
             open_items: HashSet::new(),
@@ -232,6 +310,11 @@ impl UiState {
             agent_inputs: HashMap::new(),
             agent_errors: HashMap::new(),
             cwd_input,
+            theme_library: Arc::new(Vec::new()),
+            theme_gallery: Arc::new(GalleryView::default()),
+            theme_jobs: HashMap::new(),
+            theme_url: TextEdit::new(""),
+            gallery_limit: GALLERY_PAGE,
             toasts: Vec::new(),
             toast_seq: 0,
             demo: false,
@@ -321,6 +404,9 @@ impl UiState {
         self.mode = Mode::Session;
         self.show_diff = false;
         if changed {
+            self.load_draft(asid);
+            self.menu = None;
+            self.peers.clear();
             self.timeline.clear();
             self.inline_diffs.clear();
             self.queue.clear();
@@ -337,11 +423,87 @@ impl UiState {
         self.mode = mode;
         match mode {
             Mode::Tasks => self.send(Command::RefreshTasks),
-            Mode::Home => self.send(Command::LoadProjects {
-                agent: self.start_agent.clone(),
-            }),
+            Mode::Home => {
+                self.send(Command::LoadProjects {
+                    agent: self.start_agent.clone(),
+                });
+                self.refresh_start_catalog();
+            }
             Mode::Settings => self.send(Command::ThemeRefresh),
             _ => {}
+        }
+    }
+
+    /// Ask for the start page's catalogue (models, modes) and branch list
+    /// for the chosen agent and folder. Called when either is picked, not on
+    /// every keystroke of the folder field.
+    pub fn refresh_start_catalog(&mut self) {
+        use crate::model::compose::ComposeCommand as C;
+        if self.start_agent.is_empty() {
+            return;
+        }
+        let cwd = self.start_cwd.text.trim().to_string();
+        let directory = (!cwd.is_empty()).then(|| cwd.clone());
+        self.send(Command::Compose(C::Catalog {
+            agent: self.start_agent.clone(),
+            directory,
+            asid: None,
+        }));
+        if !cwd.is_empty() {
+            self.send(Command::Compose(C::Branch { cwd }));
+        }
+    }
+
+    /// The draft key of the composer being typed in.
+    pub fn draft_key(&self, slot: Slot) -> Option<String> {
+        match slot {
+            Slot::Start => Some(crate::config::START_DRAFT.to_string()),
+            Slot::Session => self.selected.clone(),
+        }
+    }
+
+    /// Remember the unsent text of a composer (the config store writes it
+    /// out after a quiet moment). Does nothing when it has not changed.
+    pub fn persist_draft(&mut self, slot: Slot) {
+        let Some(key) = self.draft_key(slot) else {
+            return;
+        };
+        let text = match slot {
+            Slot::Start => self.start_draft.text.clone(),
+            Slot::Session => self.draft.text.clone(),
+        };
+        let stored = self.cfg.general.drafts.get(&key).map_or("", String::as_str);
+        if stored != text {
+            self.edit(ConfigEdit::Draft { key, text });
+        }
+    }
+
+    /// Put the remembered draft of `asid` in the session composer.
+    fn load_draft(&mut self, asid: &str) {
+        let text = self
+            .cfg
+            .general
+            .drafts
+            .get(asid)
+            .cloned()
+            .unwrap_or_default();
+        self.draft = TextEdit::new(text);
+        self.draft.focused = true;
+    }
+
+    /// Save the panes' widths when they changed (a drag, a double-click
+    /// reset). Waits for a drag in progress to end.
+    pub fn persist_layout(&mut self) {
+        if self.sidebar.is_resizing() || self.right.is_resizing() {
+            LAYOUT_DIRTY.store(true, Ordering::Release);
+            return;
+        }
+        let (sidebar, right) = (self.sidebar.width(), self.right.width());
+        if (sidebar - self.cfg.ui.sidebar_width).abs() >= 1.0 {
+            self.edit(ConfigEdit::SidebarWidth(sidebar));
+        }
+        if (right - self.cfg.ui.right_width).abs() >= 1.0 {
+            self.edit(ConfigEdit::RightWidth(right));
         }
     }
 
@@ -392,6 +554,7 @@ impl UiState {
         if let Some(cwd) = info.directory.clone() {
             self.send(Command::Compose(C::Branch { cwd }));
         }
+        self.send(Command::Compose(C::ListPeers));
         if self.right_open {
             self.refresh_inspector();
         }
@@ -457,11 +620,7 @@ impl UiState {
                     }
                 }
                 Update::Composer(update) => self.on_composer(*update),
-                Update::Theme(update) => {
-                    let crate::theme::service::ThemeUpdate::Notice(notice) = *update;
-                    self.status = notice.message.clone();
-                    self.toast(notice.message, notice.detail);
-                }
+                Update::Theme(update) => self.on_theme(*update),
                 Update::Directories(found) => self.directories.extend(found),
                 Update::KnownProjects { agent, projects } => {
                     self.known_projects.insert(agent, projects);
@@ -496,6 +655,40 @@ impl UiState {
                 Update::Shells(rows) => self.shells = rows,
                 Update::Worktrees(rows) => self.worktrees = rows,
                 Update::HubMode(mode) => self.hub_label = mode.to_string(),
+            }
+        }
+        if LAYOUT_DIRTY.swap(false, Ordering::AcqRel) {
+            self.persist_layout();
+        }
+    }
+
+    fn on_theme(&mut self, update: ThemeUpdate) {
+        match update {
+            ThemeUpdate::Library(list) => self.theme_library = list,
+            ThemeUpdate::Gallery(view) => self.theme_gallery = view,
+            // Cards draw swatches; a downloaded picture needs nothing here.
+            ThemeUpdate::Preview { .. } => {}
+            ThemeUpdate::Job { id, job } => {
+                self.theme_jobs.insert(id, job);
+            }
+            ThemeUpdate::Applied(applied) => {
+                let (id, scheme) = (applied.manifest.id.clone(), applied.scheme);
+                match crate::theme::apply::activate(applied) {
+                    Ok(_) => {
+                        self.cfg.appearance.theme_id = id.clone();
+                        self.cfg.appearance.scheme = scheme;
+                        self.dark = !matches!(scheme, Scheme::Light);
+                        self.status = format!("Theme: {id}");
+                    }
+                    Err(err) => self.toast("Could not apply theme", Some(format!("{err:#}"))),
+                }
+            }
+            ThemeUpdate::Notice(notice) => {
+                self.status = notice.message.clone();
+                let detail = notice
+                    .error
+                    .then(|| "Try again from Settings → Themes".to_string());
+                self.toast(notice.message, detail);
             }
         }
     }
@@ -563,6 +756,7 @@ impl UiState {
         }
         if fresh {
             self.earlier_exhausted = false;
+            self.load_draft(&asid);
             self.session_opened(&snapshot.info);
         }
     }
@@ -695,6 +889,10 @@ impl UiState {
             }
             UiAction::ProjectPicked(path) => {
                 self.start_cwd = TextEdit::new(path.display().to_string());
+                self.completions.clear();
+                self.start_model = None;
+                self.start_mode = None;
+                self.refresh_start_catalog();
             }
             UiAction::FoldersDropped(paths) => {
                 let mut text = self.draft.text.clone();
@@ -712,6 +910,7 @@ impl UiState {
                     composer::stage_path(self, path);
                 }
             }
+            UiAction::ThemeFilePicked(path) => self.send(Command::ThemeImportFile(path)),
             UiAction::SubmitComposer => composer::submit_session(self),
             UiAction::ComposerEdited
             | UiAction::ComposerKey { .. }
@@ -723,7 +922,24 @@ impl UiState {
     fn on_composer(&mut self, update: ComposerUpdate) {
         match update {
             ComposerUpdate::Files { hits } => self.file_hits = hits,
-            ComposerUpdate::Catalog { view, .. } => self.catalog = Some(view),
+            ComposerUpdate::Catalog {
+                agent,
+                directory,
+                view,
+            } => {
+                let session = self
+                    .current()
+                    .is_some_and(|i| i.agent_id == agent && i.directory == directory);
+                let typed = self.start_cwd.text.trim();
+                let start =
+                    agent == self.start_agent && directory.as_deref().unwrap_or("") == typed;
+                if start {
+                    self.start_catalog = Some(view.clone());
+                }
+                if session || !start {
+                    self.catalog = Some(view);
+                }
+            }
             ComposerUpdate::Staged { result, .. } => match result {
                 Ok(file) => self.staged.push(file),
                 Err(err) => self.toast("Attachment failed", Some(err)),
@@ -744,6 +960,7 @@ impl UiState {
                         }
                         Slot::Start => self.start_draft = TextEdit::new(""),
                     }
+                    self.persist_draft(slot);
                     self.staged.clear();
                     self.status = "Sent".into();
                 } else {
@@ -758,7 +975,7 @@ impl UiState {
             ComposerUpdate::Branch { cwd, info } => {
                 self.branches.insert(cwd, info);
             }
-            ComposerUpdate::Peers { .. } => {}
+            ComposerUpdate::Peers { peers } => self.peers = peers,
             ComposerUpdate::AutoApprove { asid, enabled } => {
                 if let Some(on) = enabled {
                     self.auto_approve.insert(asid, on);
@@ -799,8 +1016,15 @@ pub fn on_key(s: &mut UiState, ev: &KeyEvent, _tx: &mut Tx) -> bool {
 }
 
 pub fn view(s: &UiState, cx: &mut Cx<UiState>) -> El {
-    let k = Kit::neutral(s.is_dark(cx.system_dark()));
+    let dark = s.is_dark(cx.system_dark());
+    let scheme = if dark {
+        ColorScheme::Dark
+    } else {
+        ColorScheme::Light
+    };
+    let k = crate::theme::apply::palette(scheme).map_or_else(|| Kit::neutral(dark), |p| p.kit());
     let mut layer: Vec<El> = Vec::new();
+    let body = shell::view(s, cx, &k, &mut layer);
     if !s.toasts.is_empty() {
         let mut region = ToastRegion::new();
         for t in &s.toasts {
@@ -814,7 +1038,6 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>) -> El {
         }
         layer.push(region.build(&k));
     }
-    let body = shell::view(s, cx, &k);
     rune_kit::root(body, layer)
 }
 
@@ -830,6 +1053,11 @@ pub fn spawn_inbox_pump(inbox: Arc<Inbox>, handle: rune::AppHandle<UiState>) {
             std::thread::sleep(std::time::Duration::from_millis(16));
             let batch = inbox.take();
             if batch.is_empty() {
+                // A pane grip was touched: look at the widths once the
+                // quiet frame arrives (a drag in progress re-arms the flag).
+                if LAYOUT_DIRTY.swap(false, Ordering::AcqRel) {
+                    handle.update(|s, _| s.persist_layout());
+                }
                 continue;
             }
             handle.update(move |s, _| s.apply_updates(batch));
