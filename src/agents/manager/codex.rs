@@ -560,11 +560,16 @@ impl Context {
                     return;
                 };
                 let mut items = mapper::turn_update(thread, turn, method, params);
-                let Ok(position) =
-                    self.driver
-                        .item_position(thread, turn, &format!(":event:{method}"))
-                else {
-                    return;
+                let position = match self.driver.item_position(
+                    thread,
+                    turn,
+                    &format!(":event:{method}"),
+                ) {
+                    Ok(position) => position,
+                    Err(error) => {
+                        tracing::warn!(thread, %error, "Codex turn update not ordered; dropped");
+                        return;
+                    }
                 };
                 for item in &mut items {
                     item.message_id = mapper::order_group(thread, turn, position);
@@ -723,6 +728,7 @@ impl Context {
                         .or_else(|| params["completedAtMs"].as_u64())
                         .unwrap_or(0),
                 ) else {
+                    tracing::warn!(thread, "Codex item not ordered; dropped");
                     return;
                 };
                 for item in &mut items {
@@ -777,6 +783,7 @@ impl Context {
                     text_item_id(&message, ordinal)
                 };
                 let Ok(position) = self.driver.item_position(thread, turn, item) else {
+                    tracing::warn!(thread, "Codex text delta not ordered; dropped");
                     return;
                 };
                 let order_group = mapper::order_group(thread, turn, position);
