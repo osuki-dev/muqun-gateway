@@ -25,11 +25,8 @@ pub fn compact(n: u64) -> String {
     }
 }
 
-pub fn tokens_label(language: Language, n: u64) -> String {
-    match language {
-        Language::En => format!("{} tokens", compact(n)),
-        Language::ZhCn | Language::ZhTw => format!("{} tokens", compact(n)),
-    }
+pub fn tokens_label(_language: Language, n: u64) -> String {
+    format!("{} tokens", compact(n))
 }
 
 /// What the model holds now and the most it can: (used, limit).
@@ -119,7 +116,7 @@ pub fn meter(s: &UiState, k: &Kit, asid: &str) -> Option<El> {
                     compact(used),
                     compact(limit)
                 ),
-                Language::ZhCn | Language::ZhTw => crate::ui::copy::localize(
+                _ => crate::ui::copy::localize(
                     language,
                     format!(
                         "上下文：模型可容纳 {} 中的 {}",
@@ -192,15 +189,13 @@ fn until(language: Language, at_ms: u64) -> String {
         Language::En if d > 0 => format!("{d}d {h}h"),
         Language::En if h > 0 => format!("{h}h {m}m"),
         Language::En => format!("{m}m"),
-        Language::ZhCn | Language::ZhTw if d > 0 => format!("{d} 天 {h} 小时"),
-        Language::ZhCn | Language::ZhTw if h > 0 => format!("{h} 小时 {m} 分"),
-        Language::ZhCn | Language::ZhTw => format!("{m} 分钟"),
+        _ if d > 0 => format!("{d} 天 {h} 小时"),
+        _ if h > 0 => format!("{h} 小时 {m} 分"),
+        _ => format!("{m} 分钟"),
     };
     match language {
         Language::En => format!("Resets in {span}"),
-        Language::ZhCn | Language::ZhTw => {
-            crate::ui::copy::localize(language, format!("{span}后重置"))
-        }
+        _ => crate::ui::copy::localize(language, format!("{span}后重置")),
     }
 }
 

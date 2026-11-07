@@ -558,7 +558,7 @@ pub fn changes(s: &UiState, k: &Kit) -> El {
                     "{} changed file(s); the agent gave no patch.",
                     s.diff_stat.files
                 ),
-                crate::config::Language::ZhCn | crate::config::Language::ZhTw => super::copy::tr(
+                _ => super::copy::tr(
                     language,
                     "",
                     &format!("{} 个文件有改动；agent 没有给出补丁。", s.diff_stat.files),

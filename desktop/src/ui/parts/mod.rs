@@ -158,7 +158,7 @@ pub fn prose(cx: &Tcx, key: &str, body: &str) -> El {
 
 pub fn more_lines(cx: &Tcx, hidden: usize) -> El {
     text(if cx.zh() {
-        format!("还有 {hidden} 行")
+        crate::ui::copy::localize(cx.lang, format!("还有 {hidden} 行"))
     } else if hidden == 1 {
         "1 more line".to_string()
     } else {

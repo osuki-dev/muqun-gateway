@@ -411,7 +411,7 @@ fn count_chip(cx: &Tcx, call: &ToolCall, card: &mut ToolCard, counted: usize) {
         return;
     }
     let label = if cx.zh() {
-        format!("{n} 个结果")
+        crate::ui::copy::localize(cx.lang, format!("{n} 个结果"))
     } else if n == 1 {
         "1 result".to_string()
     } else {
@@ -767,7 +767,7 @@ pub fn todo_card(cx: &Tcx, id: &str, items: &[(String, bool)]) -> El {
     let done = items.iter().filter(|(_, d)| *d).count();
     let mut card = ToolCard::new(id, &glyphs::TASK_LIST, cx.t("Tasks", "任务"));
     card.title = if cx.zh() {
-        format!("已完成 {done}/{}", items.len())
+        crate::ui::copy::localize(cx.lang, format!("已完成 {done}/{}", items.len()))
     } else {
         format!("{done} of {} done", items.len())
     };

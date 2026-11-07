@@ -200,7 +200,7 @@ pub fn rows(cx: &Tcx, id: &str, files: &[FileDiff]) -> El {
         let label = if show_all {
             cx.t("Show less", "收起").to_string()
         } else if cx.zh() {
-            format!("显示全部 {total} 行")
+            crate::ui::copy::localize(cx.lang, format!("显示全部 {total} 行"))
         } else {
             format!("Show all {total} lines")
         };
