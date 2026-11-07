@@ -63,7 +63,8 @@ pub fn question_card(
         let picked = answers.get(qi).cloned().unwrap_or_default();
         let mut block = col().key(format!("q{qi}")).w_full().gap(6.0);
         let mut head = row().key("h").gap(8.0).center_y();
-        if !q.header.is_empty() {
+        let titled = questions.len() == 1 && q.header == card.title;
+        if !q.header.is_empty() && !titled {
             head = head.child(
                 text(q.header.clone())
                     .font(k.ty.small_medium)
@@ -149,7 +150,7 @@ fn option_pill(k: &Kit, key: String, label: &str, description: Option<&str>, cho
             if chosen {
                 k.c.border_focus
             } else {
-                k.c.border_weak
+                k.c.border_base
             },
         )
         .max_w(360.0);
@@ -369,21 +370,21 @@ fn field_input(s: &UiState, k: &Kit, form: &FormRequest, field: &FormField) -> E
             for option in options {
                 let on = chosen.contains(&option.value.as_str());
                 line = line.child(
-                    k.interactive(option_pill(
-                        k,
-                        format!("opt-{slot}-{}", option.value),
-                        &option.label,
-                        option.description.as_deref(),
-                        on,
-                    ))
+                    k.interactive(
+                        row()
+                            .key(format!("opt-{slot}-{}", option.value))
+                            .radius(k.radius.md)
+                            .child(option_pill(
+                                k,
+                                "pill".into(),
+                                &option.label,
+                                option.description.as_deref(),
+                                on,
+                            )),
+                    )
                     .cursor(Cursor::Pointer)
                     .label(option.label.clone())
-                    .on_press(pick(
-                        &form.id,
-                        key,
-                        option.value.clone(),
-                        multi,
-                    )),
+                    .on_press(pick(&form.id, key, option.value.clone(), multi)),
                 );
             }
             list = list.child(line);

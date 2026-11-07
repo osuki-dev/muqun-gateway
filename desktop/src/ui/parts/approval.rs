@@ -76,7 +76,7 @@ fn option_label(language: Language, option: &PermissionOption) -> String {
             t("Always allow", "始终允许")
         }
         PermissionDecision::Deny if label.is_empty() || lower == "deny" => t("Deny", "拒绝"),
-        _ => label.to_string(),
+        _ => label.replace('`', ""),
     }
 }
 

@@ -285,6 +285,8 @@ fn inbox(s: &mut UiState) {
     s.demo = true;
 }
 
+include!("scenes_timeline.rs");
+
 /// A scene name and the state it applies.
 pub type Scene = (&'static str, fn(&mut UiState));
 
@@ -296,6 +298,9 @@ pub fn scenes() -> &'static [Scene] {
         ("tasks", tasks),
         ("inbox", inbox),
         ("diff", diff),
+        ("timeline-cards", timeline_cards),
+        ("timeline-narrow", timeline_narrow),
+        ("timeline-long", timeline_long),
     ]
 }
 

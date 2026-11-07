@@ -154,6 +154,11 @@ pub fn card(cx: &Tcx, item: &TimelineItem, call: &ToolCall) -> El {
     if card.title.is_empty() {
         card.title = call.title.clone().unwrap_or_default();
     }
+    // A path as a title reads as its file name, over its folder.
+    if (card.title.starts_with('/') || card.title.starts_with("~/")) && card.caption.is_empty() {
+        card.caption = tv::dirname(&card.title).to_string();
+        card.title = tv::basename(&card.title).to_string();
+    }
 
     if let Some(ms) = tv::sleep_ms(call, rec.as_ref()) {
         card.glyph = &glyphs::TIME;
