@@ -362,7 +362,7 @@ fn tile(s: &UiState, k: &Kit, look: &Look, i: usize, layer: &mut Vec<El>) -> El 
         .key(id.clone())
         .matched(id.clone())
         .grow(1.0)
-        .min_w(0.0)
+        .min_w(320.0)
         .min_h(0.0)
         .radius(PANEL_RADIUS)
         .clip_rounded(PANEL_RADIUS)

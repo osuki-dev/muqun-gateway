@@ -103,7 +103,32 @@ fn agents(s: &UiState, k: &Kit) -> El {
         .map(|(a, _)| a)
         .collect();
     if usable.is_empty() {
-        return muted(k, "No agent is enabled. Turn one on in Settings → Agents.");
+        let language = s.cfg.general.language;
+        return row()
+            .key("agents-none")
+            .w_full()
+            .gap(10.0)
+            .center_y()
+            .flex_wrap()
+            .child(muted(
+                k,
+                tr(
+                    language,
+                    "No agent is ready. Turn one on, or install one.",
+                    "还没有可用的 Agent。启用一个，或先安装。",
+                ),
+            ))
+            .child(
+                Button::new(tr_ref(language, "Open Agents settings", "打开 Agents 设置"))
+                    .variant(ButtonVariant::Outline)
+                    .control_size(ControlSize::Small)
+                    .on_press(|s: &mut UiState| {
+                        s.settings_tab = super::SettingsTab::Agents;
+                        s.go(Mode::Settings);
+                    })
+                    .build(k)
+                    .key("agents-settings"),
+            );
     }
     let dark = s.dark;
     let mut line = row().key("agents").w_full().gap(8.0).flex_wrap().center_y();
@@ -395,6 +420,16 @@ fn greeting(s: &UiState) -> (String, String) {
     let tasks = s.tasks.iter().filter(|t| t.state == "working").count();
     if first_run(s) {
         let title = tr(language, "Welcome to Muqun", "欢迎使用 Muqun");
+        if ready == 0 {
+            return (
+                title,
+                tr(
+                    language,
+                    "No agent is ready yet. Turn one on in Settings → Agents.",
+                    "还没有可用的 Agent。在「设置 → Agents」中启用一个。",
+                ),
+            );
+        }
         let sub = if zh {
             format!("已检测到 {ready} 个 agent，选一个开始。")
         } else {
@@ -736,8 +771,8 @@ fn recent(s: &UiState, k: &Kit, look: &Look) -> Option<El> {
                     k,
                     tr(
                         language,
-                        "Shift-click opens beside the current session",
-                        "Shift 点击在当前会话旁打开",
+                        "Shift-click opens in a split",
+                        "Shift 点击在分屏中打开",
                     ),
                 )),
             ))
