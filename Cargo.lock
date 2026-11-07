@@ -2596,6 +2596,7 @@ dependencies = [
  "reqwest",
  "rfd",
  "rune",
+ "rune-fx",
  "rune-kit",
  "serde",
  "serde_json",
@@ -2604,6 +2605,7 @@ dependencies = [
  "tokio-tungstenite 0.30.0",
  "tracing",
  "tracing-subscriber",
+ "wgpu",
 ]
 
 [[package]]
@@ -4106,6 +4108,17 @@ dependencies = [
  "xkbcommon",
  "zbus 6.2.1",
  "zeroize",
+]
+
+[[package]]
+name = "rune-fx"
+version = "0.0.1"
+source = "git+https://github.com/ryuhzk/rune?rev=a1fe7354ed53396558e4ab40385bfccb9bb617d3#a1fe7354ed53396558e4ab40385bfccb9bb617d3"
+dependencies = [
+ "bytemuck",
+ "rune-motion",
+ "rune-staging",
+ "wgpu",
 ]
 
 [[package]]
