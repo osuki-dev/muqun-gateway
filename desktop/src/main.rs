@@ -48,10 +48,17 @@ fn main() -> anyhow::Result<()> {
     COMMANDS
         .set(tx.clone())
         .map_err(|_| anyhow::anyhow!("commands already installed"))?;
-    start_core(settings, state_dir.clone(), inbox.clone(), store.clone(), rx)?;
+    start_core(
+        settings,
+        state_dir.clone(),
+        inbox.clone(),
+        store.clone(),
+        rx,
+    )?;
     commands::send(&tx, Command::Refresh);
     let _ = theme::install(&config_dir, &state_dir, &config.appearance);
 
+    ui::seed_config(config.clone());
     let geometry = config.window.clamped();
     let title = match std::env::var("MUQUN_WINDOW_TITLE") {
         Ok(t) if !t.is_empty() => Box::leak(t.into_boxed_str()) as &'static str,
@@ -59,7 +66,7 @@ fn main() -> anyhow::Result<()> {
     };
 
     let mut app = App::new(AppSpec::<UiState> {
-        scenes: &[("empty", |_| {})],
+        scenes: ui::scenes::scenes(),
         on_key: Some(ui::on_key),
         ..AppSpec::new(
             title,
