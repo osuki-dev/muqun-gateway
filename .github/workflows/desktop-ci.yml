@@ -41,7 +41,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        # Gateway release matrix is macOS + Linux only; Windows desktop needs a
+        # separate OpenSSL/sqlcipher story (vendored openssl-sys fails on GHA).
+        os: [ubuntu-latest, macos-latest]
     defaults:
       run:
         shell: bash
