@@ -181,7 +181,9 @@ fn timeline(s: &mut UiState) {
             seq: 1,
         },
     ))]);
-    s.open_items.insert("r1".into());
+    if let Some(tl) = s.timelines.get_mut("s1") {
+        tl.flip("r1");
+    }
     s.mode = Mode::Session;
 }
 

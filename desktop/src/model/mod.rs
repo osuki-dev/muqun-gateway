@@ -10,5 +10,6 @@ pub mod inbox;
 pub mod projection;
 pub mod projects;
 pub mod stream;
+pub mod tool_view;
 pub mod turn;
 pub mod types;

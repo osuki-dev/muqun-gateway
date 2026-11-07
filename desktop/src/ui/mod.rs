@@ -14,6 +14,7 @@ mod icons;
 mod inbox;
 mod inspector;
 mod labels;
+mod parts;
 pub mod scenes;
 mod sessions;
 mod settings;
@@ -29,8 +30,8 @@ use std::sync::{Arc, OnceLock};
 
 use muqun_gateway::agents::directories::DirectoryEntry;
 use muqun_gateway::agents::{
-    AgentDomainEvent, AgentPart, AgentProject, AgentSessionId, AgentSessionInfo,
-    AgentSessionStatus, FormRequest, ModelRef, PermissionRequest, TimelineItem,
+    AgentDomainEvent, AgentProject, AgentSessionId, AgentSessionInfo, AgentSessionStatus,
+    FormRequest, ModelRef, PermissionRequest,
 };
 use muqun_gateway::platform::discovery::AgentDiscoveryInfo;
 use rune::{Cx, El, ImageCache, KeyEvent, TextEdit, Tx};
@@ -157,10 +158,13 @@ pub struct UiState {
     pub agents: Vec<AgentDiscoveryInfo>,
 
     pub selected: Option<String>,
-    pub timeline: Vec<TimelineItem>,
-    /// Diffs drawn inline in the timeline, by item id, with the patch they came from.
-    pub inline_diffs: HashMap<String, (String, DiffState)>,
-    pub earlier_exhausted: bool,
+    /// Timelines on screen, by asid: the selected session's and any tile's
+    /// (`timeline::SessionTimeline`; drawn by `timeline::session_view`).
+    pub timelines: HashMap<String, timeline::SessionTimeline>,
+    /// Other sessions shown beside the selected one (`UiState::set_tiles`).
+    pub tiles: Vec<String>,
+    /// A timeline picture opened full size (`timeline::overlay`).
+    pub zoom: Option<PathBuf>,
     pub status: String,
     pub hub_label: String,
     pub error: Option<UiError>,
@@ -217,8 +221,6 @@ pub struct UiState {
     pub project_edit: TextEdit,
     pub open_projects: HashMap<String, bool>,
     pub full_projects: HashSet<String>,
-    /// Collapsibles the owner opened, by item id.
-    pub open_items: HashSet<String>,
 
     /// Pending prompts per session, from snapshots and events.
     pub waiting_perms: HashMap<String, Vec<PermissionRequest>>,
@@ -289,9 +291,9 @@ impl UiState {
             agent_projects: HashMap::new(),
             agents: Vec::new(),
             selected: None,
-            timeline: Vec::new(),
-            inline_diffs: HashMap::new(),
-            earlier_exhausted: false,
+            timelines: HashMap::new(),
+            tiles: Vec::new(),
+            zoom: None,
             status: "Starting…".into(),
             hub_label: String::new(),
             error: None,
@@ -335,7 +337,6 @@ impl UiState {
             project_edit: TextEdit::new(""),
             open_projects: HashMap::new(),
             full_projects: HashSet::new(),
-            open_items: HashSet::new(),
             waiting_perms: HashMap::new(),
             waiting_forms: HashMap::new(),
             form_inputs: HashMap::new(),
@@ -496,13 +497,12 @@ impl UiState {
             self.load_draft(asid);
             self.menu = None;
             self.peers.clear();
-            self.timeline.clear();
-            self.inline_diffs.clear();
+            self.timelines.remove(asid);
+            self.retain_timelines();
             self.queue.clear();
             self.staged.clear();
             self.diff_stat = DiffStat::default();
             self.diff = None;
-            self.earlier_exhausted = false;
         }
         self.status = format!("Opening {asid}");
         self.send(Command::OpenSession(AgentSessionId(asid.to_string())));
@@ -673,10 +673,10 @@ impl UiState {
                     self.sessions.retain(|s| s.asid.0 != asid);
                     self.waiting_perms.remove(&asid);
                     self.waiting_forms.remove(&asid);
+                    self.timelines.remove(&asid);
+                    self.tiles.retain(|t| *t != asid);
                     if self.selected.as_deref() == Some(asid.as_str()) {
                         self.selected = None;
-                        self.timeline.clear();
-                        self.inline_diffs.clear();
                         self.mode = Mode::Home;
                     }
                 }
@@ -700,15 +700,8 @@ impl UiState {
                     items,
                     exhausted,
                 } => {
-                    if self.selected.as_deref() == Some(asid.as_str()) {
-                        let mut older = Vec::new();
-                        for item in items {
-                            self.ingest(&item);
-                            older.push(item);
-                        }
-                        older.append(&mut self.timeline);
-                        self.timeline = older;
-                        self.earlier_exhausted = exhausted;
+                    if let Some(tl) = self.timelines.get_mut(&asid) {
+                        tl.prepend(items, exhausted);
                     }
                 }
                 Update::Composer(update) => self.on_composer(*update),
@@ -833,29 +826,40 @@ impl UiState {
     fn on_snapshot(&mut self, snapshot: muqun_gateway::agents::ports::AgentSessionSnapshot) {
         let asid = snapshot.info.asid.0.clone();
         let fresh = self.selected.as_deref() != Some(asid.as_str());
-        if fresh {
-            self.inline_diffs.clear();
+        // A tile beside the selected session: keep its timeline, select nothing.
+        if fresh && self.tiles.contains(&asid) {
+            self.merge_sessions(vec![snapshot.info.clone()]);
+            self.timelines
+                .entry(asid.clone())
+                .or_default()
+                .replace(snapshot.timeline);
+            self.waiting_perms
+                .insert(asid.clone(), snapshot.permissions);
+            self.waiting_forms.insert(asid, snapshot.forms);
+            return;
         }
         self.selected = Some(asid.clone());
         if self.mode == Mode::Home {
             self.mode = Mode::Session;
         }
         self.merge_sessions(vec![snapshot.info.clone()]);
-        self.timeline.clear();
-        for item in &snapshot.timeline {
-            self.ingest(item);
+        let count = snapshot.timeline.len();
+        self.timelines
+            .entry(asid.clone())
+            .or_default()
+            .replace(snapshot.timeline);
+        if fresh {
+            self.retain_timelines();
         }
-        self.timeline = snapshot.timeline;
         self.waiting_perms
             .insert(asid.clone(), snapshot.permissions);
         self.waiting_forms.insert(asid.clone(), snapshot.forms);
         self.queue = InboxItem::list(&snapshot.inbox);
-        self.status = format!("{} messages", self.timeline.len());
+        self.status = format!("{count} messages");
         if self.error.as_ref().is_some_and(|e| e.unreachable) {
             self.error = None;
         }
         if fresh {
-            self.earlier_exhausted = false;
             self.load_draft(&asid);
             self.session_opened(&snapshot.info);
         }
@@ -864,11 +868,12 @@ impl UiState {
     fn apply_event(&mut self, event: AgentDomainEvent) {
         let current =
             |s: &Self, asid: &AgentSessionId| s.selected.as_deref() == Some(asid.0.as_str());
+        let shown = |s: &Self, asid: &AgentSessionId| s.timelines.contains_key(&asid.0);
         match event {
             AgentDomainEvent::TimelineUpsert {
                 asid, mut items, ..
             } => {
-                if !current(self, &asid) {
+                if !shown(self, &asid) {
                     return;
                 }
                 // Same egress step the App gets over HTTP/SSE (`attach_to_event`):
@@ -881,20 +886,13 @@ impl UiState {
                 muqun_gateway::agents::message_images::enrich_timeline(
                     &asid.0, directory, &mut items,
                 );
-                for item in items {
-                    self.ingest(&item);
-                    match self.timeline.iter_mut().find(|t| t.id == item.id) {
-                        Some(slot) => *slot = item,
-                        None => self.timeline.push(item),
-                    }
+                if let Some(tl) = self.timelines.get_mut(&asid.0) {
+                    tl.upsert(items);
                 }
             }
             AgentDomainEvent::TimelineRemoved { asid, ids, .. } => {
-                if current(self, &asid) {
-                    self.timeline.retain(|t| !ids.contains(&t.id));
-                    for id in &ids {
-                        self.inline_diffs.remove(id);
-                    }
+                if let Some(tl) = self.timelines.get_mut(&asid.0) {
+                    tl.remove(&ids);
                 }
             }
             AgentDomainEvent::SessionUpdated { info, .. } => self.merge_sessions(vec![*info]),
@@ -967,25 +965,6 @@ impl UiState {
                     self.send(Command::OpenSession(AgentSessionId(open)));
                 }
             }
-        }
-    }
-
-    /// Parse the item's diff (a diff part or an edit tool's files) for inline drawing.
-    fn ingest(&mut self, item: &TimelineItem) {
-        let patch = match &item.part {
-            AgentPart::Diff { diff, .. } => diff.clone(),
-            AgentPart::Tool(call) => timeline::tool_patch(call),
-            _ => return,
-        };
-        if patch.trim().is_empty() {
-            self.inline_diffs.remove(&item.id);
-        } else if self
-            .inline_diffs
-            .get(&item.id)
-            .is_none_or(|(old, _)| *old != patch)
-        {
-            let state = DiffState::new(parse(&patch));
-            self.inline_diffs.insert(item.id.clone(), (patch, state));
         }
     }
 
@@ -1177,8 +1156,14 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>) -> El {
         ColorScheme::Light
     };
     let k = crate::theme::apply::palette(scheme).map_or_else(|| Kit::neutral(dark), |p| p.kit());
+    if s.cfg.appearance.reduced_motion {
+        cx.reduced_motion(true);
+    }
     let mut layer: Vec<El> = Vec::new();
     let body = shell::view(s, cx, &k, &mut layer);
+    if let Some(zoom) = timeline::overlay(s, &k) {
+        layer.push(zoom);
+    }
     if let (Some(splash), Some(images)) = (s.splash.as_ref(), s.images.as_ref()) {
         let hub_ready = !s.hub_label.is_empty();
         let loading = match splash.kind {

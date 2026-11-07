@@ -113,7 +113,11 @@ async fn mark_missing(projects: &mut [muqun_gateway::agents::AgentProject]) {
 /// listed row shows (title, status, order, a pending approval) always goes
 /// through; the rest only for the open session -- its snapshot, read after it
 /// became the active one, covers anything dropped before.
-fn wanted(event: &AgentDomainEvent, active: Option<&AgentSessionId>) -> bool {
+fn wanted(
+    event: &AgentDomainEvent,
+    active: Option<&AgentSessionId>,
+    watched: &std::collections::HashSet<AgentSessionId>,
+) -> bool {
     match event {
         AgentDomainEvent::SessionUpdated { .. }
         | AgentDomainEvent::StatusChanged { .. }
@@ -123,7 +127,9 @@ fn wanted(event: &AgentDomainEvent, active: Option<&AgentSessionId>) -> bool {
         | AgentDomainEvent::FormPending { .. }
         | AgentDomainEvent::FormResolved { .. }
         | AgentDomainEvent::Resync { .. } => true,
-        other => active.is_some_and(|active| active == other.asid()),
+        other => {
+            active.is_some_and(|active| active == other.asid()) || watched.contains(other.asid())
+        }
     }
 }
 
@@ -168,6 +174,8 @@ struct Core {
     config: Arc<ConfigStore>,
     /// The session the user is looking at, for resyncs.
     active: Mutex<Option<AgentSessionId>>,
+    /// Sessions shown beside the active one, followed live as well.
+    watched: Mutex<std::collections::HashSet<AgentSessionId>>,
     /// Re-reads of the active session's snapshot, after a resync.
     reread: Coalesce,
     /// Re-reads of every agent's list, after a resync.
@@ -201,6 +209,7 @@ pub fn spawn(
         inbox,
         config,
         active: Mutex::new(None),
+        watched: Mutex::new(Default::default()),
         reread: Coalesce::default(),
         relist: Coalesce::default(),
         retask: Coalesce::default(),
@@ -249,6 +258,7 @@ impl Core {
                 *self.active.lock().unwrap() = Some(asid.clone());
                 self.open(&asid).await;
             }
+            Command::WatchSessions(asids) => self.watch(asids).await,
             Command::CreateSession { agent, cwd } => match self.hub.create(&agent, &cwd).await {
                 Ok(info) => {
                     let asid = info.asid.clone();
@@ -848,6 +858,34 @@ impl Core {
         }
     }
 
+    /// Follow `asids` beside the active session: read each one not followed
+    /// before (peeked when the mirror holds it), then let its events through.
+    async fn watch(self: &Arc<Self>, asids: Vec<AgentSessionId>) {
+        let fresh: Vec<AgentSessionId> = {
+            let mut watched = self.watched.lock().unwrap();
+            let fresh = asids
+                .iter()
+                .filter(|a| !watched.contains(*a))
+                .cloned()
+                .collect();
+            *watched = asids.into_iter().collect();
+            fresh
+        };
+        for asid in fresh {
+            let snapshot = match self.hub.peek(&asid).await {
+                Ok(Some(snapshot)) => Ok(snapshot),
+                _ => self.hub.snapshot(&asid).await,
+            };
+            match snapshot {
+                Ok(snapshot) if self.watched.lock().unwrap().contains(&asid) => {
+                    self.push_snapshot(snapshot)
+                }
+                Ok(_) => {}
+                Err(err) => tracing::debug!(asid = %asid.0, %err, "reading a tile failed"),
+            }
+        }
+    }
+
     /// Mark the session read now, and again every [`VIEW_HEARTBEAT`] while it
     /// stays the open one. A newer call ends the heartbeat of an older one.
     fn watch_viewed(self: &Arc<Self>, asid: &AgentSessionId) {
@@ -1049,7 +1087,8 @@ impl Core {
                         }
                         _ => {}
                     }
-                    if wanted(&event, active.as_ref()) {
+                    let watched = self.watched.lock().unwrap().clone();
+                    if wanted(&event, active.as_ref(), &watched) {
                         if event.seq() != 0 {
                             self.last_seq
                                 .lock()
@@ -1243,28 +1282,37 @@ mod tests {
 
     #[test]
     fn only_the_open_session_streams_its_timeline_to_the_ui() {
+        let none = std::collections::HashSet::new();
         let upsert = |asid: &str| AgentDomainEvent::TimelineUpsert {
             asid: id(asid),
             items: vec![],
             seq: 1,
         };
-        assert!(wanted(&upsert("open"), Some(&id("open"))));
-        assert!(!wanted(&upsert("other"), Some(&id("open"))));
-        assert!(!wanted(&upsert("other"), None));
+        assert!(wanted(&upsert("open"), Some(&id("open")), &none));
+        assert!(!wanted(&upsert("other"), Some(&id("open")), &none));
+        assert!(!wanted(&upsert("other"), None, &none));
+        let tiles: std::collections::HashSet<_> = [id("other")].into_iter().collect();
+        assert!(
+            wanted(&upsert("other"), Some(&id("open")), &tiles),
+            "a tile streams too"
+        );
         let status = AgentDomainEvent::StatusChanged {
             asid: id("other"),
             status: AgentSessionStatus::Busy,
             error: None,
             seq: 1,
         };
-        assert!(wanted(&status, Some(&id("open"))), "a row shows status");
+        assert!(
+            wanted(&status, Some(&id("open")), &none),
+            "a row shows status"
+        );
         let removed = |asid: &str| AgentDomainEvent::TimelineRemoved {
             asid: id(asid),
             ids: vec!["x".into()],
             seq: 2,
         };
-        assert!(wanted(&removed("open"), Some(&id("open"))));
-        assert!(!wanted(&removed("other"), Some(&id("open"))));
+        assert!(wanted(&removed("open"), Some(&id("open")), &none));
+        assert!(!wanted(&removed("other"), Some(&id("open")), &none));
         let resolved = AgentDomainEvent::FormResolved {
             asid: id("open"),
             form_id: "f".into(),
@@ -1272,7 +1320,7 @@ mod tests {
             seq: 3,
         };
         assert!(
-            wanted(&resolved, Some(&id("open"))),
+            wanted(&resolved, Some(&id("open")), &none),
             "the open session's forms"
         );
     }

@@ -14,6 +14,9 @@ pub enum Command {
     Refresh,
     /// Make a session the active one and read its snapshot.
     OpenSession(AgentSessionId),
+    /// Also follow these sessions (tiles shown beside the active one): read
+    /// each new one's snapshot and pass their timeline events through.
+    WatchSessions(Vec<AgentSessionId>),
     /// Start a session for `agent` in `cwd`, remember `cwd`, open it. (The
     /// composer starts sessions through `Compose`; the QA harness uses this.)
     #[allow(dead_code)]
