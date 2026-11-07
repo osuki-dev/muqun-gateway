@@ -158,6 +158,8 @@ pub enum Command {
     },
     /// Re-read the delegated task list (and the default folder).
     RefreshTasks,
+    /// The Terminals page (`model/terminals.rs`).
+    Terminals(super::terminals::TerminalCommand),
     /// Delegate `goal` as a task (`agent` / `cwd` default on the gateway).
     CreateTask {
         goal: String,
