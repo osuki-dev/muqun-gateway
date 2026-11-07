@@ -3,10 +3,10 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use rune::{col, el, row, text, El, ImageCache, ScrollSpec, SurfaceFit, TextEdit, Transition, Tx};
+use rune::{col, el, row, text, El, ImageCache, SurfaceFit, TextEdit, Transition, Tx};
 use rune_kit::{
-    Badge, BadgeVariant, Button, ButtonVariant, Card, ControlSize, Kit, ScrollBar,
-    SegmentedControl, Switch, TextInput,
+    Badge, BadgeVariant, Button, ButtonVariant, Card, ControlSize, Kit, SegmentedControl, Switch,
+    TextInput,
 };
 
 use super::agents::Standing;
@@ -69,7 +69,18 @@ fn section(k: &Kit, key: &str, title: &str, children: Vec<El>) -> El {
     for child in children {
         card = card.child(child);
     }
-    card.build(k).key(key.to_string())
+    surface(k, card.build(k)).key(key.to_string())
+}
+
+/// A card on its own surface: a translucent sheet with a hairline rim, as
+/// Home's cards. (Pages read the kit only; the sheet is a layer colour at a
+/// fixed alpha, so it keeps reading well under reduce transparency.)
+fn surface(k: &Kit, card: El) -> El {
+    card.px(6.0)
+        .py(4.0)
+        .radius(crate::theme::look::CARD_RADIUS)
+        .fill(k.c.layer_01.alpha(0.6))
+        .border(1.0, k.c.border_muted)
 }
 
 fn choice<const N: usize>(
@@ -306,7 +317,7 @@ fn agents(s: &UiState, k: &Kit) -> Vec<El> {
                 for field in fields(&a.id) {
                     card = card.child(agent_field(s, k, &a.id, *field));
                 }
-                card.build(k)
+                surface(k, card.build(k))
                     .key(format!("agent-{}", a.id))
                     .transition(Transition::opacity().combined(Transition::offset(0.0, 6.0)))
             }),
@@ -1287,14 +1298,5 @@ pub fn view(s: &UiState, k: &Kit) -> El {
     for child in body {
         page = page.child(child);
     }
-    col()
-        .key("settings-scroll")
-        .w_full()
-        .h_full()
-        .items_center()
-        .child(page)
-        .scroll(ScrollSpec {
-            stick_bottom: false,
-        })
-        .scroll_bar(k)
+    super::page_stage(s, k, "settings", page)
 }

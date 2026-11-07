@@ -14,8 +14,11 @@ pub enum Command {
     Refresh,
     /// Make a session the active one and read its snapshot.
     OpenSession(AgentSessionId),
-    /// Also follow these sessions (tiles shown beside the active one): read
-    /// each new one's snapshot and pass their timeline events through.
+    /// Open a session into a split tile: read its snapshot and stream its
+    /// events, without taking the active (focused) place.
+    OpenTile(AgentSessionId),
+    /// The sessions on screen besides the active one (split tiles). Their
+    /// events stream like the active session's; the rest are filtered.
     WatchSessions(Vec<AgentSessionId>),
     /// Start a session for `agent` in `cwd`, remember `cwd`, open it. (The
     /// composer starts sessions through `Compose`; the QA harness uses this.)

@@ -116,7 +116,7 @@ async fn mark_missing(projects: &mut [muqun_gateway::agents::AgentProject]) {
 fn wanted(
     event: &AgentDomainEvent,
     active: Option<&AgentSessionId>,
-    watched: &std::collections::HashSet<AgentSessionId>,
+    watched: &[AgentSessionId],
 ) -> bool {
     match event {
         AgentDomainEvent::SessionUpdated { .. }
@@ -174,8 +174,9 @@ struct Core {
     config: Arc<ConfigStore>,
     /// The session the user is looking at, for resyncs.
     active: Mutex<Option<AgentSessionId>>,
-    /// Sessions shown beside the active one, followed live as well.
-    watched: Mutex<std::collections::HashSet<AgentSessionId>>,
+    /// Sessions open in split tiles beside the active one: their events
+    /// stream too (`Command::WatchSessions`).
+    watched: Mutex<Vec<AgentSessionId>>,
     /// Re-reads of the active session's snapshot, after a resync.
     reread: Coalesce,
     /// Re-reads of every agent's list, after a resync.
@@ -209,7 +210,7 @@ pub fn spawn(
         inbox,
         config,
         active: Mutex::new(None),
-        watched: Mutex::new(Default::default()),
+        watched: Mutex::new(Vec::new()),
         reread: Coalesce::default(),
         relist: Coalesce::default(),
         retask: Coalesce::default(),
@@ -258,7 +259,18 @@ impl Core {
                 *self.active.lock().unwrap() = Some(asid.clone());
                 self.open(&asid).await;
             }
-            Command::WatchSessions(asids) => self.watch(asids).await,
+            Command::OpenTile(asid) => {
+                {
+                    let mut watched = self.watched.lock().unwrap();
+                    if !watched.contains(&asid) {
+                        watched.push(asid.clone());
+                    }
+                }
+                self.open(&asid).await;
+            }
+            Command::WatchSessions(asids) => {
+                *self.watched.lock().unwrap() = asids;
+            }
             Command::CreateSession { agent, cwd } => match self.hub.create(&agent, &cwd).await {
                 Ok(info) => {
                     let asid = info.asid.clone();
@@ -833,7 +845,7 @@ impl Core {
             }
             Ok(None) => match self.hub.open(asid).await {
                 Ok(snapshot) => {
-                    if self.active.lock().unwrap().as_ref() != Some(asid) {
+                    if !self.is_open(asid) {
                         return;
                     }
                     self.resolve_dirs(snapshot.info.directory.iter().cloned().collect(), false);
@@ -849,7 +861,7 @@ impl Core {
                     tokio::spawn(self.clone().descendants(asid.clone()));
                 }
                 Err(err) => {
-                    if self.active.lock().unwrap().as_ref() == Some(asid) {
+                    if self.is_open(asid) {
                         self.fail(err);
                     }
                 }
@@ -858,32 +870,10 @@ impl Core {
         }
     }
 
-    /// Follow `asids` beside the active session: read each one not followed
-    /// before (peeked when the mirror holds it), then let its events through.
-    async fn watch(self: &Arc<Self>, asids: Vec<AgentSessionId>) {
-        let fresh: Vec<AgentSessionId> = {
-            let mut watched = self.watched.lock().unwrap();
-            let fresh = asids
-                .iter()
-                .filter(|a| !watched.contains(*a))
-                .cloned()
-                .collect();
-            *watched = asids.into_iter().collect();
-            fresh
-        };
-        for asid in fresh {
-            let snapshot = match self.hub.peek(&asid).await {
-                Ok(Some(snapshot)) => Ok(snapshot),
-                _ => self.hub.snapshot(&asid).await,
-            };
-            match snapshot {
-                Ok(snapshot) if self.watched.lock().unwrap().contains(&asid) => {
-                    self.push_snapshot(snapshot)
-                }
-                Ok(_) => {}
-                Err(err) => tracing::debug!(asid = %asid.0, %err, "reading a tile failed"),
-            }
-        }
+    /// The session is on screen: the active one or a split tile.
+    fn is_open(&self, asid: &AgentSessionId) -> bool {
+        self.active.lock().unwrap().as_ref() == Some(asid)
+            || self.watched.lock().unwrap().contains(asid)
     }
 
     /// Mark the session read now, and again every [`VIEW_HEARTBEAT`] while it
@@ -894,7 +884,7 @@ impl Core {
         let asid = asid.clone();
         tokio::spawn(async move {
             loop {
-                let open = core.active.lock().unwrap().as_ref() == Some(&asid);
+                let open = core.is_open(&asid);
                 if !open || core.beat.load(Ordering::SeqCst) != beat {
                     return;
                 }
@@ -1066,20 +1056,20 @@ impl Core {
                     self.resync(Some(&asid)).await;
                 }
                 Ok(AgentDomainEvent::InboxChanged { asid, items, .. }) => {
-                    let active = self.active.lock().unwrap().clone();
-                    if active.as_ref() == Some(&asid) {
+                    if self.is_open(&asid) {
                         super::compose::push_inbox(&self.inbox, &asid.0, &items);
                     }
                 }
                 Ok(event) => {
                     let active = self.active.lock().unwrap().clone();
+                    let watched = self.watched.lock().unwrap().clone();
                     match &event {
                         AgentDomainEvent::SessionUpdated { info, .. } => {
                             self.resolve_dirs(info.directory.iter().cloned().collect(), false);
                         }
                         // A turn ended in the open session: its changes moved.
                         AgentDomainEvent::StatusChanged { asid, status, .. }
-                            if active.as_ref() == Some(asid)
+                            if (active.as_ref() == Some(asid) || watched.contains(asid))
                                 && *status == muqun_gateway::agents::AgentSessionStatus::Idle =>
                         {
                             tokio::spawn(self.clone().diff(asid.clone()));
@@ -1087,7 +1077,6 @@ impl Core {
                         }
                         _ => {}
                     }
-                    let watched = self.watched.lock().unwrap().clone();
                     if wanted(&event, active.as_ref(), &watched) {
                         if event.seq() != 0 {
                             self.last_seq
@@ -1282,19 +1271,17 @@ mod tests {
 
     #[test]
     fn only_the_open_session_streams_its_timeline_to_the_ui() {
-        let none = std::collections::HashSet::new();
         let upsert = |asid: &str| AgentDomainEvent::TimelineUpsert {
             asid: id(asid),
             items: vec![],
             seq: 1,
         };
-        assert!(wanted(&upsert("open"), Some(&id("open")), &none));
-        assert!(!wanted(&upsert("other"), Some(&id("open")), &none));
-        assert!(!wanted(&upsert("other"), None, &none));
-        let tiles: std::collections::HashSet<_> = [id("other")].into_iter().collect();
+        assert!(wanted(&upsert("open"), Some(&id("open")), &[]));
+        assert!(!wanted(&upsert("other"), Some(&id("open")), &[]));
+        assert!(!wanted(&upsert("other"), None, &[]));
         assert!(
-            wanted(&upsert("other"), Some(&id("open")), &tiles),
-            "a tile streams too"
+            wanted(&upsert("other"), Some(&id("open")), &[id("other")]),
+            "a split tile's session streams too"
         );
         let status = AgentDomainEvent::StatusChanged {
             asid: id("other"),
@@ -1303,7 +1290,7 @@ mod tests {
             seq: 1,
         };
         assert!(
-            wanted(&status, Some(&id("open")), &none),
+            wanted(&status, Some(&id("open")), &[]),
             "a row shows status"
         );
         let removed = |asid: &str| AgentDomainEvent::TimelineRemoved {
@@ -1311,8 +1298,8 @@ mod tests {
             ids: vec!["x".into()],
             seq: 2,
         };
-        assert!(wanted(&removed("open"), Some(&id("open")), &none));
-        assert!(!wanted(&removed("other"), Some(&id("open")), &none));
+        assert!(wanted(&removed("open"), Some(&id("open")), &[]));
+        assert!(!wanted(&removed("other"), Some(&id("open")), &[]));
         let resolved = AgentDomainEvent::FormResolved {
             asid: id("open"),
             form_id: "f".into(),
@@ -1320,7 +1307,7 @@ mod tests {
             seq: 3,
         };
         assert!(
-            wanted(&resolved, Some(&id("open")), &none),
+            wanted(&resolved, Some(&id("open")), &[]),
             "the open session's forms"
         );
     }

@@ -9,8 +9,8 @@
 //! - [`view`]`(s, k)`: the selected session's, for the single-session page.
 //! - [`overlay`]`(s, k)`: the image zoom, when one is open; push it onto the
 //!   root layer.
-//! - [`UiState::set_tiles`]: the other sessions on screen beside the
-//!   selected one; their timelines are kept and followed live.
+//! - Split tiles (`ui::tiles`) open sessions beside the focused one; every
+//!   open session's timeline is kept in `UiState::timelines`.
 //!
 //! Each session's [`SessionTimeline`] (items, parsed diffs, expanded cards,
 //! loaded-history state) lives in `UiState::timelines`; the scroll anchor is
@@ -157,28 +157,10 @@ impl SessionTimeline {
 }
 
 impl UiState {
-    /// The other sessions shown beside the selected one (multi-session
-    /// tiles). Their timelines are kept, and the core follows them live.
-    #[allow(dead_code)] // the shell's multi-session mode calls it
-    pub fn set_tiles(&mut self, tiles: Vec<String>) {
-        if tiles == self.tiles {
-            return;
-        }
-        self.tiles = tiles;
-        self.retain_timelines();
-        self.send(Command::WatchSessions(
-            self.tiles
-                .iter()
-                .filter(|a| self.selected.as_deref() != Some(a.as_str()))
-                .map(|a| AgentSessionId(a.clone()))
-                .collect(),
-        ));
-    }
-
     /// Drop the timelines no longer on screen.
     pub(super) fn retain_timelines(&mut self) {
         let selected = self.selected.clone();
-        let tiles = &self.tiles;
+        let tiles: Vec<String> = self.tiles.iter().filter_map(|t| t.asid.clone()).collect();
         self.timelines
             .retain(|asid, _| selected.as_deref() == Some(asid.as_str()) || tiles.contains(asid));
     }
@@ -218,6 +200,23 @@ impl UiState {
                 AgentSessionStatus::Busy | AgentSessionStatus::Retry
             )
         })
+    }
+}
+
+/// A split tile's timeline (the tiles call this). The rows come from the
+/// session's own [`SessionTimeline`], whatever the tile hands in.
+#[allow(dead_code)] // kept for callers that hand in their own rows
+pub fn view_items(
+    s: &UiState,
+    k: &Kit,
+    asid: Option<&str>,
+    _items: &[TimelineItem],
+    _earlier_exhausted: bool,
+    _busy: bool,
+) -> El {
+    match asid {
+        Some(asid) => session_view(s, k, asid),
+        None => empty(s, k, "feed"),
     }
 }
 

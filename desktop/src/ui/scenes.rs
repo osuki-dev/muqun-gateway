@@ -8,7 +8,7 @@ use rune::TextEdit;
 use rune_kit::diff::{parse, DiffState};
 use serde_json::json;
 
-use super::{InspectorTab, Mode, SettingsTab, UiState};
+use super::{InspectorTab, Mode, SessionSlot, SettingsTab, Tile, UiState};
 use crate::hub::TaskRow;
 use crate::model::compose::InboxItem;
 use crate::model::types::{DiffFile, DiffStat};
@@ -88,6 +88,44 @@ fn item(id: &str, role: TimelineRole, part: AgentPart) -> TimelineItem {
         generation: None,
         origin: None,
     }
+}
+
+/// Make a built-in theme pack current, so a scene renders in it.
+fn with_pack(s: &mut UiState, id: &str) {
+    let Some(pack) = crate::theme::store::builtin(id) else {
+        return;
+    };
+    let slot = |slot: &str, dark: bool| {
+        pack.manifest
+            .slot_asset(slot, dark)
+            .and_then(|asset| pack.asset(asset))
+    };
+    let applied = crate::theme::apply::AppliedTheme {
+        manifest: std::sync::Arc::new(pack.manifest.clone()),
+        scheme: crate::config::Scheme::System,
+        wallpaper_light: slot("home.wallpaper", false),
+        wallpaper_dark: slot("home.wallpaper", true),
+        artwork_light: slot("home.artwork", false),
+        artwork_dark: slot("home.artwork", true),
+        launch_light: slot("launch.artwork", false).or_else(|| slot("home.artwork", false)),
+        launch_dark: slot("launch.artwork", true).or_else(|| slot("home.artwork", true)),
+        requested: std::time::Instant::now(),
+    };
+    if crate::theme::apply::activate(applied).is_ok() {
+        s.cfg.appearance.theme_id = id.to_string();
+    }
+}
+
+/// The launch splash, caught mid-hold.
+fn splash_scene(s: &mut UiState) {
+    base(s);
+    s.mode = Mode::Home;
+    s.selected = None;
+    let mut splash = super::splash::Splash::start(super::splash::SplashKind::Boot);
+    splash.started = std::time::Instant::now() - std::time::Duration::from_millis(1000);
+    s.hub_label.clear();
+    s.splash = Some(splash);
+    s.demo = true;
 }
 
 fn base(s: &mut UiState) {
@@ -211,6 +249,43 @@ fn home(s: &mut UiState) {
     s.demo = true;
 }
 
+/// Home while agents work: one approval waiting, one session running, a task.
+fn home_busy(s: &mut UiState) {
+    base(s);
+    s.sessions.push(session(
+        "s4",
+        "Migrate the config loader",
+        "opencode",
+        "busy",
+        "/home/demo/rune",
+        5_000,
+    ));
+    s.waiting_perms.insert("s1".into(), vec![permission()]);
+    s.tasks = vec![TaskRow {
+        id: "k1".into(),
+        state: "working".into(),
+        title: "Audit the release workflow".into(),
+        progress: Some("3 of 5 steps".into()),
+        agent_id: Some("codex".into()),
+        asid: Some("s1".into()),
+        ..TaskRow::default()
+    }];
+    s.selected = None;
+    s.mode = Mode::Home;
+    s.demo = true;
+}
+
+/// Home before the first session: the welcome.
+fn home_first(s: &mut UiState) {
+    base(s);
+    s.sessions.clear();
+    s.cfg.general.last_agent = None;
+    s.cfg.general.last_cwd.clear();
+    s.selected = None;
+    s.mode = Mode::Home;
+    s.demo = true;
+}
+
 fn session_scene(s: &mut UiState) {
     base(s);
     timeline(s);
@@ -235,6 +310,122 @@ fn diff(s: &mut UiState) {
     s.show_diff = true;
     s.right_open = true;
     s.inspector_tab = InspectorTab::Git;
+    s.demo = true;
+}
+
+/// A parked tile's own short timeline.
+fn parked_items(prefix: &str, ask: &str, reply: &str) -> Vec<TimelineItem> {
+    use TimelineRole::{Assistant, User};
+    vec![
+        item(
+            &format!("{prefix}-u1"),
+            User,
+            AgentPart::Text { text: ask.into() },
+        ),
+        item(
+            &format!("{prefix}-a1"),
+            Assistant,
+            AgentPart::Text { text: reply.into() },
+        ),
+    ]
+}
+
+/// Two sessions side by side: the greeting fix (focused) and the release
+/// notes review streaming beside it.
+fn split2(s: &mut UiState) {
+    base(s);
+    timeline(s);
+    diff_stat(s);
+    s.tiles = vec![
+        Tile {
+            asid: Some("s1".into()),
+            slot: SessionSlot::default(),
+        },
+        Tile {
+            asid: Some("s2".into()),
+            slot: SessionSlot {
+                draft: TextEdit::new("Also check the Chinese copy"),
+                ..SessionSlot::default()
+            },
+        },
+    ];
+    s.timelines.insert(
+        "s2".into(),
+        {
+            let mut tl = super::timeline::SessionTimeline::default();
+            tl.replace(parked_items(
+                "s2",
+                    "Review the release notes for 3.1.0 and tighten the wording.",
+                    "Reading `release-notes/unreleased.md`…\n\n- The **Pad layout** entry needs the keyboard shortcut.\n- Two entries repeat the PR number.",
+            ));
+            tl.earlier_exhausted = true;
+            tl
+        },
+    );
+    s.focus = 0;
+    s.draft = TextEdit::new("");
+    s.demo = true;
+}
+
+/// Four tiles: two working, one waiting on an approval, one empty picker.
+fn split4(s: &mut UiState) {
+    base(s);
+    s.sessions.push(session(
+        "s4",
+        "Migrate the config loader",
+        "opencode",
+        "busy",
+        "/home/demo/rune",
+        5_000,
+    ));
+    timeline(s);
+    s.tiles = vec![
+        Tile {
+            asid: Some("s1".into()),
+            slot: SessionSlot::default(),
+        },
+        Tile {
+            asid: Some("s2".into()),
+            slot: SessionSlot {
+                ..SessionSlot::default()
+            },
+        },
+        Tile {
+            asid: Some("s4".into()),
+            slot: SessionSlot {
+                ..SessionSlot::default()
+            },
+        },
+        Tile {
+            asid: None,
+            slot: SessionSlot::default(),
+        },
+    ];
+    s.timelines.insert("s2".into(), {
+        let mut tl = super::timeline::SessionTimeline::default();
+        tl.replace(parked_items(
+            "s2",
+            "Review the release notes for 3.1.0.",
+            "Two entries repeat the PR number; fixing.",
+        ));
+        tl.earlier_exhausted = true;
+        tl
+    });
+    s.timelines.insert("s4".into(), {
+        let mut tl = super::timeline::SessionTimeline::default();
+        tl.replace(parked_items(
+            "s4",
+            "Move the config loader onto serde defaults.",
+            "Working through `config.rs`: 3 of 7 structs done.",
+        ));
+        tl.earlier_exhausted = true;
+        tl
+    });
+    s.focus = 1;
+    // Tile 1 is focused: its state lives in the top-level fields.
+    s.tiles[1].slot = SessionSlot::default();
+    s.selected = Some("s2".into());
+    s.draft = TextEdit::new("");
     s.demo = true;
 }
 
@@ -293,7 +484,53 @@ pub type Scene = (&'static str, fn(&mut UiState));
 pub fn scenes() -> &'static [Scene] {
     &[
         ("home", home),
+        ("home-busy", home_busy),
+        ("home-first", home_first),
+        ("splash", splash_scene),
+        ("home-plain", |s| {
+            home_busy(s);
+            s.cfg.appearance.reduced_motion = true;
+            s.cfg.appearance.reduced_transparency = true;
+        }),
+        ("home-zh", |s| {
+            home_busy(s);
+            s.cfg.general.language = crate::config::Language::ZhCn;
+        }),
+        ("split2-zh", |s| {
+            split2(s);
+            s.cfg.general.language = crate::config::Language::ZhCn;
+        }),
+        ("home-akiba", |s| {
+            with_pack(s, "akiba-overdrive");
+            home_busy(s);
+        }),
+        ("home-jade", |s| {
+            with_pack(s, "jade-tempest");
+            home_busy(s);
+        }),
+        ("home-voyager", |s| {
+            with_pack(s, "scene-voyager");
+            home(s);
+        }),
+        ("home-eclipse", |s| {
+            with_pack(s, "eclipse-archivist");
+            home(s);
+        }),
+        ("home-vanguard", |s| {
+            with_pack(s, "vanguard-drifter");
+            home_busy(s);
+        }),
+        ("split2-akiba", |s| {
+            with_pack(s, "akiba-overdrive");
+            split2(s);
+        }),
+        ("splash-jade", |s| {
+            with_pack(s, "jade-tempest");
+            splash_scene(s);
+        }),
         ("session", session_scene),
+        ("split2", split2),
+        ("split4", split4),
         ("settings", settings),
         ("tasks", tasks),
         ("inbox", inbox),

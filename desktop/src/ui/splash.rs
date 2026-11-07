@@ -1,10 +1,17 @@
-//! Launch splash: cool Rune motion while the core loads behind it.
+//! Launch splash: the theme's launch art lit from behind, with the brand,
+//! while the core warms up. Also the short beat after a theme switch.
+//!
+//! Timing is the app's (`tick`): a minimum hold so the entrance finishes, a
+//! maximum so discovery never keeps the window dark, and a dissolve out. The
+//! pictures move on Rune springs and loops, so reduce motion holds them still
+//! (and `arm_splash` skips the splash altogether under reduce motion or
+//! reduce transparency).
 
 use std::f32::consts::TAU;
 use std::time::{Duration, Instant};
 
 use rune::{
-    col, el, text, El, ImageCache, MotionIntent, Spring, SurfaceFit, TextStyle, Transition,
+    col, el, row, text, El, ImageCache, LoopSpec, MotionIntent, Spring, TextStyle, Transition,
 };
 use rune_kit::Kit;
 
@@ -12,6 +19,7 @@ use super::art;
 use crate::branding::APP_NAME;
 use crate::config::Language;
 use crate::theme::color_scheme::ColorScheme;
+use crate::theme::look::Look;
 
 /// Minimum time the boot splash stays up so the entrance can finish.
 pub const BOOT_MIN: Duration = Duration::from_millis(1400);
@@ -23,7 +31,7 @@ pub const THEME_MAX: Duration = Duration::from_millis(1800);
 /// Exit dissolve length.
 pub const EXIT: Duration = Duration::from_millis(620);
 /// Entrance settle before we treat "hold" as started.
-const ENTER: Duration = Duration::from_millis(520);
+const ENTER: Duration = Duration::from_millis(560);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SplashKind {
@@ -87,67 +95,94 @@ impl Splash {
         &self,
         images: &ImageCache,
         k: &Kit,
+        look: &Look,
         scheme: ColorScheme,
         language: Language,
         loading: bool,
     ) -> Option<El> {
         let now = Instant::now();
         let elapsed = now.saturating_duration_since(self.started).as_secs_f32();
-        let (opacity, scale, lift, blur, pulse) = if let Some(exit) = self.exit_at {
+        let pose = if let Some(exit) = self.exit_at {
             let t = (now.saturating_duration_since(exit).as_secs_f32() / EXIT.as_secs_f32())
                 .clamp(0.0, 1.0);
             let ease = t * t * (3.0 - 2.0 * t);
-            (1.0 - ease, 1.0 + 0.12 * ease, -42.0 * ease, 4.0 * ease, 1.0)
+            Pose {
+                opacity: 1.0 - ease,
+                scale: 1.0 + 0.10 * ease,
+                lift: -36.0 * ease,
+                blur: 5.0 * ease,
+                settled: 1.0,
+                loading,
+            }
         } else {
             let enter = (elapsed / ENTER.as_secs_f32()).clamp(0.0, 1.0);
             let ease = 1.0 - (1.0 - enter).powi(3);
             // Soft breathing after the kick settles.
             let scale = if enter < 1.0 {
-                0.84 + 0.24 * ease
+                0.86 + 0.14 * ease
             } else {
-                1.0 + 0.022 * (elapsed * TAU * 0.32).sin()
+                1.0 + 0.016 * (elapsed * TAU * 0.28).sin()
             };
-            (ease.clamp(0.0, 1.0), scale, 32.0 * (1.0 - ease), 0.0, enter)
+            Pose {
+                opacity: ease,
+                scale,
+                lift: 28.0 * (1.0 - ease),
+                blur: 0.0,
+                settled: enter,
+                loading,
+            }
         };
-        if opacity < 0.02 {
+        if pose.opacity < 0.02 {
             return None;
         }
-        stage(
-            images,
-            k,
-            scheme,
-            language,
-            SplashLook {
-                opacity,
-                scale,
-                lift,
-                blur,
-                pulse,
-                loading,
-            },
-        )
+        Some(stage(images, k, look, scheme, language, pose))
     }
 }
 
-struct SplashLook {
+struct Pose {
     opacity: f32,
     scale: f32,
     lift: f32,
     blur: f32,
-    pulse: f32,
+    /// 0..1 through the entrance, 1 after.
+    settled: f32,
     loading: bool,
 }
 
-/// Elevated launch art with spring kick, brand, and a soft accent bloom.
+/// One layer of the hero stack, centred over the whole stage.
+fn layer(key: &str, e: El) -> El {
+    el().key(key.to_string())
+        .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
+        .center()
+        .child(e)
+        .a11y_hidden()
+}
+
+/// A ring of light that turns slowly while the core loads.
+fn orbit(k: &Kit, look: &Look, size: f32, alpha: f32, period: f64, dash: (f32, f32)) -> El {
+    let ring = el()
+        .size(size, size)
+        .radius(size / 2.0)
+        .border(1.2, k.c.bg_accent.alpha(alpha))
+        .border_dash(dash.0, dash.1)
+        .a11y_hidden();
+    if look.motion {
+        ring.looping(LoopSpec::rotation(period))
+    } else {
+        ring
+    }
+}
+
+/// The launch art on a bloom of accent light, the brand under it.
 fn stage(
     images: &ImageCache,
     k: &Kit,
+    look: &Look,
     scheme: ColorScheme,
     language: Language,
-    look: SplashLook,
-) -> Option<El> {
-    let bytes = crate::theme::apply::current_launch(scheme)?;
-    let subtitle = if look.loading {
+    pose: Pose,
+) -> El {
+    let subtitle = if pose.loading {
         match language {
             Language::En => "Warming up agents…",
             Language::ZhCn => "正在准备 Agents…",
@@ -159,96 +194,153 @@ fn stage(
         }
     };
     let title_font = TextStyle {
-        size: 28.0,
-        line_height: 34.0,
+        size: 30.0,
+        line_height: 36.0,
         ..k.ty.ui_medium
     };
-    let art = art::picture(images, bytes, SurfaceFit::Fit)
-        .key("splash-art")
-        .w(320.0)
-        .h(380.0)
-        .opacity(look.opacity)
-        .blur(look.blur)
-        .scale(look.scale)
-        .scale_motion(Spring::new(0.42, 0.28))
+    let accent = k.c.bg_accent;
+
+    // The picture: the pack's launch art, else the app mark on a disc.
+    let hero: El = match art::launch(images, scheme) {
+        Some((picture, slot)) => picture
+            .key("splash-art")
+            .w(300.0)
+            .h(360.0)
+            .radius(if slot.cover { 24.0 } else { 0.0 })
+            .clip_rounded(if slot.cover { 24.0 } else { 0.0 })
+            .opacity(pose.opacity * slot.opacity),
+        None => look
+            .glow(
+                el().key("splash-art")
+                    .size(120.0, 120.0)
+                    .radius(32.0)
+                    .fill(k.c.layer_02)
+                    .center()
+                    .child(
+                        art::picture(
+                            images,
+                            std::sync::Arc::<[u8]>::from(crate::branding::APP_MARK_PNG),
+                            rune::SurfaceFit::Fill,
+                        )
+                        .size(72.0, 72.0)
+                        .radius(18.0)
+                        .clip_rounded(18.0),
+                    ),
+                accent,
+                0.9,
+            )
+            .opacity(pose.opacity),
+    };
+    let hero = hero
+        .blur(pose.blur)
+        .scale(pose.scale)
+        .scale_motion(Spring::new(0.46, 0.26))
         .motion_intent(MotionIntent::KICK)
-        .offset(0.0, look.lift)
-        .offset_motion(Spring::new(0.36, 0.18))
+        .offset(0.0, pose.lift)
+        .offset_motion(Spring::new(0.38, 0.16))
         .raise()
         .transition(
-            Transition::scale(0.88)
-                .combined(Transition::offset(0.0, 36.0))
+            Transition::scale(0.9)
+                .combined(Transition::offset(0.0, 30.0))
                 .combined(Transition::opacity())
                 .combined(Transition::blur(6.0)),
         );
 
-    let glow = el()
-        .key("splash-glow")
-        .size(360.0, 360.0)
-        .radius(180.0)
-        .fill(
-            k.c.bg_accent
-                .alpha(0.12 * look.opacity * (0.55 + 0.45 * look.pulse)),
+    // Light from behind: a wide bloom and a tighter core, breathing.
+    let bloom = el()
+        .key("splash-bloom")
+        .size(520.0, 520.0)
+        .radius(260.0)
+        .radial_gradient(
+            [0.5, 0.5],
+            260.0,
+            [
+                (0.0, accent.alpha(0.42 * pose.opacity)),
+                (0.45, accent.alpha(0.16 * pose.opacity)),
+                (1.0, accent.alpha(0.0)),
+            ],
         )
-        .blur(6.0)
-        .scale(0.90 + 0.10 * look.scale)
-        .scale_motion(Spring::new(0.55, 0.22))
-        .motion_intent(MotionIntent::PULSE | MotionIntent::OVERSHOOT)
+        .scale(0.92 + 0.08 * pose.scale)
+        .scale_motion(Spring::new(0.6, 0.2))
         .a11y_hidden();
+    let bloom = if look.motion {
+        bloom.looping(LoopSpec::opacity(3.2, 0.0, 0.7, 1.0))
+    } else {
+        bloom
+    };
 
-    let ring = el()
-        .key("splash-ring")
-        .size(300.0, 300.0)
-        .radius(150.0)
-        .border(
-            1.2,
-            k.c.bg_accent
-                .alpha(0.28 * look.opacity * look.pulse.max(0.2)),
-        )
-        .scale(look.scale)
-        .scale_motion(Spring::new(0.48, 0.20))
-        .opacity(look.opacity * 0.85)
+    let rings = el()
+        .key("splash-rings")
+        .size(440.0, 440.0)
+        .center()
+        .opacity(pose.opacity * (0.35 + 0.65 * pose.settled))
+        .child(orbit(k, look, 440.0, 0.22, 26.0, (46.0, 22.0)))
+        .child(orbit(k, look, 380.0, 0.30, 19.0, (18.0, 14.0)).absolute(30.0, 30.0))
         .a11y_hidden();
 
     let copy = col()
         .key("splash-copy")
         .gap(6.0)
         .items_center()
-        .opacity(look.opacity * look.pulse.max(0.25))
-        .offset(0.0, look.lift * 0.35)
-        .offset_motion(Spring::new(0.40, 0.12))
+        .opacity(pose.opacity * pose.settled.max(0.2))
+        .offset(0.0, pose.lift * 0.4)
+        .offset_motion(Spring::new(0.4, 0.12))
         .transition(Transition::offset(0.0, 16.0).combined(Transition::opacity()))
         .child(
             text(APP_NAME.to_string())
                 .font(title_font)
-                .color(k.c.text_base.alpha(look.opacity)),
+                .color(k.c.text_base.alpha(pose.opacity)),
         )
         .child(
-            text(subtitle.to_string())
-                .font(k.ty.small)
-                .color(k.c.text_muted.alpha(look.opacity * 0.95)),
+            row()
+                .gap(8.0)
+                .center_y()
+                .child(if pose.loading {
+                    rune_kit::Spinner::new()
+                        .size(12.0)
+                        .color(k.c.text_muted)
+                        .build(k)
+                } else {
+                    el().size(7.0, 7.0).radius(3.5).fill(k.c.success.icon)
+                })
+                .child(
+                    text(subtitle.to_string())
+                        .font(k.ty.small)
+                        .color(k.c.text_muted.alpha(pose.opacity * 0.95)),
+                ),
         );
 
-    Some(
-        el().key("theme-splash")
-            .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
-            .fill(k.c.bg_deep.alpha(0.90 * look.opacity.max(0.30)))
-            .center()
-            .child(
-                col()
-                    .key("splash-stack")
-                    .gap(20.0)
-                    .items_center()
-                    .child(
-                        el().key("splash-hero")
-                            .size(360.0, 400.0)
-                            .center()
-                            .child(glow)
-                            .child(ring)
-                            .child(art),
-                    )
-                    .child(copy),
-            )
-            .a11y_hidden(),
-    )
+    let backdrop = el()
+        .key("splash-backdrop")
+        .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
+        .fill(k.c.bg_deep.alpha(0.94 * pose.opacity.max(0.3)))
+        .radial_gradient(
+            [0.5, 0.42],
+            [760.0, 620.0],
+            [
+                (0.0, accent.alpha(0.10 * pose.opacity)),
+                (1.0, accent.alpha(0.0)),
+            ],
+        )
+        .a11y_hidden();
+
+    el().key("theme-splash")
+        .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
+        .center()
+        .child(backdrop)
+        .child(
+            col()
+                .key("splash-stack")
+                .gap(22.0)
+                .items_center()
+                .child(
+                    el().key("splash-hero")
+                        .size(520.0, 420.0)
+                        .child(layer("splash-bloom-layer", bloom))
+                        .child(layer("splash-rings-layer", rings))
+                        .child(layer("splash-art-layer", hero)),
+                )
+                .child(copy),
+        )
+        .a11y_hidden()
 }
