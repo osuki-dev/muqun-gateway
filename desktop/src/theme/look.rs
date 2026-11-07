@@ -16,9 +16,22 @@ use crate::config::Appearance;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Look {
     pub glass: bool,
+    /// Backdrop blur is allowed: glass, and the window is small enough that
+    /// Rune's blur textures stay within [`BLUR_PIXEL_BUDGET`].
+    pub blur: bool,
     pub motion: bool,
     pub dark: bool,
 }
+
+/// The most device pixels a window may have before frosted panels fall back
+/// to a translucent fill. While any element blurs its backdrop Rune keeps a
+/// window-sized copy of the frame per target format (4 or 8 bytes a pixel)
+/// plus a half-resolution float pyramid, never freed for the rest of the run,
+/// and each new resource class commits another allocator block (64 MiB on
+/// NVIDIA). A large window therefore pays ~130 MiB for the frost; a small one
+/// shares blocks the frame already holds. 3 Mpx is a 1600×1200 window at 1×
+/// or a 1200×800 one at 2×; the owner's full-width 2542×1396 stays above it.
+pub const BLUR_PIXEL_BUDGET: f32 = 3_000_000.0;
 
 /// Corner radius of panels and tiles.
 pub const PANEL_RADIUS: f32 = 14.0;
@@ -73,9 +86,16 @@ pub fn tune_kit(k: &mut Kit, appearance: &Appearance) {
 }
 
 impl Look {
+    /// Decides whether backdrop blur fits the budget from the window's device
+    /// pixels (`ui::fx::viewport_pixels`, 0 before the first frame). Glass goes
+    /// solid once the GPU refused an allocation, so the window keeps drawing.
     pub fn of(appearance: &Appearance, dark: bool) -> Self {
+        let lost = crate::ui::fx::gpu_lost();
+        let pixels = crate::ui::fx::viewport_pixels();
+        let glass = !appearance.reduced_transparency && !lost;
         Self {
-            glass: !appearance.reduced_transparency,
+            glass,
+            blur: glass && pixels > 0.0 && pixels <= BLUR_PIXEL_BUDGET,
             motion: !appearance.reduced_motion,
             dark,
         }
@@ -90,17 +110,24 @@ impl Look {
         }
     }
 
-    /// A translucent panel that blurs what is behind it (a frosted sheet over
-    /// the theme's artwork), with a top-lit rim. Solid under reduce
-    /// transparency. At most four blurred panels per frame read their
-    /// backdrop; use [`Look::card`] for the rest.
+    /// A translucent panel over the page (a frosted sheet over the theme's
+    /// artwork when the window is within the blur budget, a translucent fill
+    /// otherwise), with a top-lit rim. Solid under reduce transparency. At
+    /// most four blurred panels per frame read their backdrop; use
+    /// [`Look::card`] for the rest.
     pub fn panel(&self, k: &Kit, e: El, radius: f32) -> El {
         let (top, bottom) = self.rim(k);
         let e = e.radius(radius).clip_rounded(radius);
         if self.glass {
-            let tint = if self.dark { 0.62 } else { 0.70 };
-            e.backdrop_blur(18.0)
-                .fill(k.c.surface_raised_base.alpha(tint))
+            // Without the blur the fill carries the frost, so it is denser.
+            let tint = match (self.blur, self.dark) {
+                (true, true) => 0.62,
+                (true, false) => 0.70,
+                (false, true) => 0.86,
+                (false, false) => 0.90,
+            };
+            let e = if self.blur { e.backdrop_blur(18.0) } else { e };
+            e.fill(k.c.surface_raised_base.alpha(tint))
                 .border_gradient(1.0, top, bottom)
         } else {
             e.fill(k.c.surface_raised_base).border(1.0, k.c.border_base)

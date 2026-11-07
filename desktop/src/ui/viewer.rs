@@ -219,7 +219,7 @@ pub fn mount(s: &UiState, k: &Kit, scale: f32, layer: &mut Vec<El>) {
         .fill(k.c.scrim)
         .token_motion(k.motion.overlay)
         .a11y_hidden();
-    if !s.cfg.appearance.reduced_transparency {
+    if s.look().blur {
         scrim = scrim.backdrop_blur(14.0);
     }
     layer.push(scrim);

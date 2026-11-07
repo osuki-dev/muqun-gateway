@@ -46,7 +46,7 @@ pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
         .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
         .fill(k.c.scrim)
         .a11y_hidden();
-    if look.glass {
+    if look.blur {
         scrim = scrim.backdrop_blur(12.0);
     }
     layer.push(scrim);

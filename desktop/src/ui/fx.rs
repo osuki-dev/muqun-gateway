@@ -8,6 +8,9 @@
 //! a drawn layer moves on its own (the splash's liquid metal, a working
 //! composer's breathing rim), so an idle window stays idle.
 
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::Arc;
+
 use rune::compose::{Compositor, Frame};
 use rune::render::{EffectPhase, EffectSite, KIND_EFFECT};
 use rune::El;
@@ -32,8 +35,58 @@ pub const GLOW_BLEED: f32 = 48.0;
 impl UiState {
     /// Whether views may emit effect slots this frame.
     pub fn fx_on(&self) -> bool {
-        !self.cfg.appearance.reduced_motion && !self.cfg.appearance.reduced_transparency
+        !self.cfg.appearance.reduced_motion
+            && !self.cfg.appearance.reduced_transparency
+            && fx_enabled()
     }
+}
+
+/// GPU effects stay on unless `MUQUN_FX=0` (a diagnostic switch) or the
+/// GPU refused an allocation ([`gpu_lost`]).
+pub fn fx_enabled() -> bool {
+    static ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENV.get_or_init(|| std::env::var("MUQUN_FX").map_or(true, |v| v != "0")) && !gpu_lost()
+}
+
+/// Set once the GPU reported an error (out of memory, most likely): effects
+/// and glass go dark and stay dark for the process, so the window keeps
+/// drawing with less instead of panicking.
+static GPU_LOST: AtomicBool = AtomicBool::new(false);
+static GPU_ERRORS: AtomicU32 = AtomicU32::new(0);
+
+pub fn gpu_lost() -> bool {
+    GPU_LOST.load(Ordering::Relaxed)
+}
+
+/// The window's target size in device pixels, as the last frame saw it
+/// (0 before the first frame). The materials size their budget by it.
+static VIEWPORT: [AtomicU32; 2] = [AtomicU32::new(0), AtomicU32::new(0)];
+
+pub fn viewport_pixels() -> f32 {
+    VIEWPORT[0].load(Ordering::Relaxed) as f32 * VIEWPORT[1].load(Ordering::Relaxed) as f32
+}
+
+/// wgpu's default uncaptured-error handler panics ("Handling wgpu errors as
+/// fatal by default"). Installed once per device: an error is logged (the
+/// first few in full, then one line per hundred) and downgrades the look.
+fn install_error_handler(device: &wgpu::Device) {
+    device.on_uncaptured_error(Arc::new(|error: wgpu::Error| {
+        let n = GPU_ERRORS.fetch_add(1, Ordering::Relaxed);
+        let first = !GPU_LOST.swap(true, Ordering::Relaxed);
+        let kind = match &error {
+            wgpu::Error::OutOfMemory { .. } => "out of memory",
+            wgpu::Error::Validation { .. } => "validation",
+            wgpu::Error::Internal { .. } => "internal",
+        };
+        if first {
+            tracing::error!(
+                %error,
+                "GPU {kind} error; effects and glass are off for this run"
+            );
+        } else if n < 5 || n.is_multiple_of(100) {
+            tracing::warn!(n, "GPU {kind} error (continuing): {error}");
+        }
+    }));
 }
 
 /// Pack a kit colour and a parameter into a slot's payload.
@@ -149,7 +202,10 @@ fn layer(kind: u32, d: [f32; 4], shape: Shape, t: f32, reduced: bool) -> Option<
 #[derive(Default)]
 pub struct Fx {
     renderer: Option<(rune::compose::DeviceKey, FxRenderer)>,
+    /// The device whose errors are routed through [`install_error_handler`].
+    guarded: Option<rune::compose::DeviceKey>,
     animating: bool,
+    frames: u64,
 }
 
 impl Compositor<UiState> for Fx {
@@ -158,8 +214,38 @@ impl Compositor<UiState> for Fx {
     }
 
     fn render(&mut self, f: &mut Frame<'_, UiState>) {
+        let key = f.device_key();
+        if self.guarded != Some(key) {
+            install_error_handler(f.device);
+            self.guarded = Some(key);
+        }
+        VIEWPORT[0].store(f.size.0, Ordering::Relaxed);
+        VIEWPORT[1].store(f.size.1, Ordering::Relaxed);
         let t = f.rt.t as f32;
         let reduced = f.rt.reduced_motion;
+        // GPU memory telemetry for `RUST_LOG=muqun_desktop=debug`: Rune's
+        // isolated-layer targets and image atlas pages, every ~5 s.
+        self.frames += 1;
+        if self.frames % 300 == 1 && tracing::enabled!(tracing::Level::DEBUG) {
+            let stats = f.ui.layer_stats();
+            let pages: Vec<(u32, u32)> =
+                f.rt.images
+                    .pages
+                    .iter()
+                    .map(|p| (p.width, p.height))
+                    .collect();
+            let look = f.rt.state.look();
+            tracing::debug!(
+                viewport = ?f.size,
+                blur = look.blur,
+                glass = look.glass,
+                layer_targets = stats.targets,
+                layer_mib = stats.bytes / (1024 * 1024),
+                layer_allocations = stats.allocations,
+                ?pages,
+                "gpu memory"
+            );
+        }
         let mut at: Vec<u32> = Vec::new();
         let mut layers: Vec<FxLayer> = Vec::new();
         let mut slots: Vec<FxSlot> = Vec::new();
@@ -183,7 +269,6 @@ impl Compositor<UiState> for Fx {
             f.draw_ui();
             return;
         }
-        let key = f.device_key();
         let (device, queue, size, format) = (f.device, f.queue, f.size, f.format);
         if self.renderer.as_ref().is_none_or(|(k, _)| *k != key) {
             let mut fx = FxRenderer::new(device, format, FxOptions { dither: true });
