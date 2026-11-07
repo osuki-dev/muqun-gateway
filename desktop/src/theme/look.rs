@@ -167,9 +167,13 @@ impl Look {
     /// A panel's rim with a hint of `color` along its top edge: lit, not
     /// outlined (an outline in the accent reads as a warning in light themes).
     pub fn accent_rim(&self, k: &Kit, e: El, color: rune::Color) -> El {
-        let (_, bottom) = self.rim(k);
-        let top = if self.dark { 0.55 } else { 0.4 };
-        e.border_gradient(1.0, color.alpha(top), bottom)
+        let (light_top, bottom) = self.rim(k);
+        if self.dark {
+            e.border_gradient(1.0, color.alpha(0.55), bottom)
+        } else {
+            // A hint of the accent mixed into the light rim, not a coloured outline.
+            e.border_gradient(1.0, light_top.mix(color, 0.18).alpha(0.8), bottom)
+        }
     }
 
     /// A small lit mark (a status dot): a tight glow sized for it.

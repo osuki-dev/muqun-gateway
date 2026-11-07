@@ -510,9 +510,14 @@ fn queued_chip(
 ) -> El {
     let id = item.id.clone();
     let open = s.menu == Some(OpenMenu::Queued(id.clone()));
+    let language = s.cfg.general.language;
     let label = format!(
         "{} {}",
-        if item.steer { "Steer:" } else { "Queued:" },
+        if item.steer {
+            tr_ref(language, "Steer:", "插队：")
+        } else {
+            tr_ref(language, "Queued:", "已排队：")
+        },
         super::timeline::clip(&item.text, 32)
     );
     let mut menu = Menu::new(format!("queued-{id}"))
@@ -536,23 +541,23 @@ fn queued_chip(
     if item.files.is_empty() {
         let (edit_id, text) = (id.clone(), item.text.clone());
         menu = menu.item(
-            MenuItem::new("Edit")
+            MenuItem::new(tr_ref(language, "Edit", "编辑"))
                 .on_select(move |s: &mut UiState| edit_queued(s, &edit_id, text.clone())),
         );
     }
     let (steer_id, next_steer) = (id.clone(), !item.steer);
     menu = menu.item(
         MenuItem::new(if item.steer {
-            "Keep queued"
+            tr_ref(language, "Keep queued", "保持排队")
         } else {
-            "Send next"
+            tr_ref(language, "Send next", "下一个发送")
         })
         .on_select(move |s: &mut UiState| toggle_queued_steer(s, &steer_id, next_steer)),
     );
     let cancel_id = id.clone();
     let pill = menu
         .item(
-            MenuItem::new("Cancel")
+            MenuItem::new(tr_ref(language, "Cancel", "取消"))
                 .danger(true)
                 .on_select(move |s: &mut UiState| cancel_queued(s, &cancel_id)),
         )
@@ -1222,7 +1227,7 @@ fn pills(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         line = line.child(
             SegmentedControl::new(&labels, at)
                 .fit()
-                .label("Mode")
+                .label(tr_ref(s.cfg.general.language, "Mode", "模式"))
                 .on_pick(move |s: &mut UiState, i, _: &mut Tx| switch_mode(s, ids[i].clone()))
                 .build(k)
                 .key("modes"),
@@ -1244,7 +1249,7 @@ fn pills(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     let asid = info.asid.clone();
     line.child(
         Switch::new(on)
-            .label("Auto-approve")
+            .label(tr_ref(s.cfg.general.language, "Auto-approve", "自动批准"))
             .on_toggle(move |s: &mut UiState| {
                 s.send(Command::Compose(ComposeCommand::SetAutoApprove {
                     asid: asid.clone(),
@@ -1355,7 +1360,7 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         .child(
             TextArea::new(&s.draft)
                 .placeholder(placeholder)
-                .label("Draft")
+                .label(tr_ref(language, "Draft", "草稿"))
                 .width(None)
                 .auto_grow(2, 8)
                 .pill_style(move |id| {
