@@ -113,7 +113,7 @@ pub enum Update {
         projects: Vec<AgentProject>,
     },
     /// The open session's working-tree change count.
-    Diff(super::view::DiffStat),
+    Diff(super::types::DiffStat),
     /// The delegated task list, replacing the last, with the folder a new
     /// task would run in.
     Tasks {

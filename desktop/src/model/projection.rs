@@ -16,7 +16,7 @@ use tokio::sync::{broadcast, watch};
 use super::commands::{Command, CommandReceiver};
 use super::compose::{self, ComposeCommand, ComposerUpdate, Deliver, Target};
 use super::inbox::{Inbox, UiError, Update};
-use super::view::{DiffStat, SESSION_LIST_LIMIT};
+use super::types::{DiffStat, SESSION_LIST_LIMIT};
 use crate::config::{ConfigEdit, DesktopConfig};
 use crate::hub::{HubError, SessionHub, TaskHubEvent, OPENCODE};
 
@@ -919,7 +919,7 @@ impl Core {
                 paths: files
                     .into_iter()
                     .take(48)
-                    .map(|f| super::view::DiffFile {
+                    .map(|f| super::types::DiffFile {
                         path: f.path,
                         added: f.additions,
                         removed: f.deletions,

@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use muqun_gateway::agents::AgentProject;
 use serde::{Deserialize, Serialize};
 
-use super::view::ListedSession;
+use super::types::ListedSession;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProjectKind {
