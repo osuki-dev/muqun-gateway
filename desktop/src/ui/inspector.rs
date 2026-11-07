@@ -102,7 +102,7 @@ fn queue(s: &UiState, k: &Kit) -> Vec<El> {
         let steer = q.steer;
         let (id2, a2) = (id.clone(), a.clone());
         let mut action = row().gap(4.0);
-        if q.attachments == 0 {
+        if q.files.is_empty() {
             let (edit_id, text) = (q.id.clone(), q.text.clone());
             action = action.child(small(
                 k,
@@ -144,22 +144,40 @@ fn queue(s: &UiState, k: &Kit) -> Vec<El> {
                     }));
                 },
             ));
+        let images = q.files.iter().filter(|f| f.image).count();
         let detail = format!(
             "{}{}",
             if q.steer { "steer" } else { "queue" },
-            if q.attachments > 0 {
-                format!(" · {} file(s)", q.attachments)
-            } else {
+            if q.files.is_empty() {
                 String::new()
+            } else if images > 0 {
+                format!(" · {} image(s)", images)
+            } else {
+                format!(" · {} file(s)", q.files.len())
             }
         );
-        out.push(item(
+        let mut card = item(
             k,
             format!("q-{}", q.id),
             timeline::clip(&q.text, 80),
             detail,
             Some(action),
-        ));
+        );
+        let thumbs: Vec<&str> = q
+            .files
+            .iter()
+            .filter(|f| f.image)
+            .map(|f| f.path.as_str())
+            .collect();
+        if let Some(row) = super::composer::queue_thumbs(s, k, &q.id, &thumbs) {
+            card = col()
+                .key(format!("q-wrap-{}", q.id))
+                .w_full()
+                .gap(6.0)
+                .child(row)
+                .child(card);
+        }
+        out.push(card);
     }
     out
 }

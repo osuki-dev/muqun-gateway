@@ -1,19 +1,25 @@
 //! The session composer: draft, attachments, queue, model / mode / branch
 //! pills, and the `@` and `/` popups.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use muqun_gateway::agents::{AgentSessionId, ModelRef};
-use rune::{col, row, El, TextEdit, Tx};
+use rune::{col, el, row, El, ImageCache, SurfaceFit, TextEdit, Tx};
 use rune_kit::{
     Badge, BadgeVariant, Button, ButtonVariant, ControlSize, Kit, Menu, MenuItem, PopupItem,
     PopupList, SegmentedControl, Switch, TextArea,
 };
 
+use super::art;
 use super::{muted, OpenMenu, Slot, UiState};
 use crate::config::ConfigEdit;
 use crate::model::commands::Command;
 use crate::model::compose::{ComposeCommand, Deliver, Source, Target};
+
+/// Chip thumbnail size (wide enough to read the picture, short for the row).
+const CHIP_THUMB_W: f32 = 56.0;
+const CHIP_THUMB_H: f32 = 40.0;
 
 /// The most file hits the `@` popup lists.
 const MAX_FILE_ROWS: usize = 8;
@@ -213,6 +219,81 @@ fn toggle_queued_steer(s: &mut UiState, id: &str, steer: bool) {
     }));
 }
 
+fn chip_thumb(k: &Kit, images: Option<&ImageCache>, path: &str, key: &str) -> El {
+    if let Some(images) = images {
+        if let Ok(bytes) = std::fs::read(path) {
+            return art::picture(images, Arc::<[u8]>::from(bytes), SurfaceFit::Fill)
+                .key(key.to_string())
+                .w(CHIP_THUMB_W)
+                .h(CHIP_THUMB_H)
+                .radius(k.radius.sm)
+                .clip_rounded(k.radius.sm);
+        }
+    }
+    el().key(key.to_string())
+        .w(CHIP_THUMB_W)
+        .h(CHIP_THUMB_H)
+        .radius(k.radius.sm)
+        .fill(k.c.layer_02)
+}
+
+/// Thumbnails for queued image attachments (composer chips and the inspector).
+pub(super) fn queue_thumbs(s: &UiState, k: &Kit, prefix: &str, paths: &[&str]) -> Option<El> {
+    image_thumbs(k, s.images.as_ref(), prefix, paths)
+}
+
+fn image_thumbs(k: &Kit, images: Option<&ImageCache>, prefix: &str, paths: &[&str]) -> Option<El> {
+    if paths.is_empty() {
+        return None;
+    }
+    let mut row = row().key(format!("{prefix}-thumbs")).gap(4.0).center_y();
+    for (i, path) in paths.iter().take(4).enumerate() {
+        row = row.child(chip_thumb(k, images, path, &format!("{prefix}-thumb-{i}")));
+    }
+    if paths.len() > 4 {
+        row = row.child(
+            Badge::new(format!("+{}", paths.len() - 4))
+                .variant(BadgeVariant::Subtle)
+                .build(k),
+        );
+    }
+    Some(row)
+}
+
+fn staged_chip(s: &UiState, k: &Kit, i: usize, file: &crate::model::compose::StagedFile) -> El {
+    let images = s.images.as_ref();
+    let remove = Button::new(format!("{} ✕", file.name))
+        .variant(ButtonVariant::Outline)
+        .control_size(ControlSize::Small)
+        .on_press(move |s: &mut UiState| {
+            if i < s.staged.len() {
+                s.staged.remove(i);
+            }
+        })
+        .build(k)
+        .key(format!("staged-btn-{i}"));
+    if file.image && Path::new(&file.path).is_file() {
+        row()
+            .key(format!("staged-{i}"))
+            .gap(6.0)
+            .center_y()
+            .px(4.0)
+            .py(2.0)
+            .radius(k.radius.md)
+            .fill(k.c.bg_base)
+            .border(1.0, k.c.border_weak)
+            .child(chip_thumb(
+                k,
+                images,
+                &file.path,
+                &format!("staged-thumb-{i}"),
+            ))
+            .child(remove)
+    } else {
+        remove.key(format!("staged-{i}"))
+    }
+}
+
 fn queued_chip(
     s: &UiState,
     k: &Kit,
@@ -244,7 +325,7 @@ fn queued_chip(
         .open(open)
         .min_width(160.0)
         .on_close(|s: &mut UiState| s.menu = None);
-    if item.attachments == 0 {
+    if item.files.is_empty() {
         let (edit_id, text) = (id.clone(), item.text.clone());
         menu = menu.item(
             MenuItem::new("Edit")
@@ -261,12 +342,33 @@ fn queued_chip(
         .on_select(move |s: &mut UiState| toggle_queued_steer(s, &steer_id, next_steer)),
     );
     let cancel_id = id.clone();
-    menu.item(
-        MenuItem::new("Cancel")
-            .danger(true)
-            .on_select(move |s: &mut UiState| cancel_queued(s, &cancel_id)),
-    )
-    .build(k, layer)
+    let pill = menu
+        .item(
+            MenuItem::new("Cancel")
+                .danger(true)
+                .on_select(move |s: &mut UiState| cancel_queued(s, &cancel_id)),
+        )
+        .build(k, layer);
+    let thumbs: Vec<&str> = item
+        .files
+        .iter()
+        .filter(|f| f.image)
+        .map(|f| f.path.as_str())
+        .collect();
+    match queue_thumbs(s, k, &format!("q-{id}"), &thumbs) {
+        Some(thumbs) => row()
+            .key(format!("queued-row-{id}"))
+            .gap(6.0)
+            .center_y()
+            .px(4.0)
+            .py(2.0)
+            .radius(k.radius.md)
+            .fill(k.c.bg_base)
+            .border(1.0, k.c.border_weak)
+            .child(thumbs)
+            .child(pill),
+        None => pill,
+    }
 }
 
 fn chips(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Option<El> {
@@ -275,18 +377,7 @@ fn chips(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Option<El> {
     }
     let mut line = row().key("chips").w_full().gap(6.0).wrap().center_y();
     for (i, file) in s.staged.iter().enumerate() {
-        line = line.child(
-            Button::new(format!("{} ✕", file.name))
-                .variant(ButtonVariant::Outline)
-                .control_size(ControlSize::Small)
-                .on_press(move |s: &mut UiState| {
-                    if i < s.staged.len() {
-                        s.staged.remove(i);
-                    }
-                })
-                .build(k)
-                .key(format!("staged-{i}")),
-        );
+        line = line.child(staged_chip(s, k, i, file));
     }
     for item in &s.queue {
         line = line.child(queued_chip(s, k, layer, item));

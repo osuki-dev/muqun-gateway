@@ -56,6 +56,15 @@ impl FileHit {
     }
 }
 
+/// One file a queued prompt carries (path for a local thumb, when it is an image).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueuedFile {
+    /// Host path (`file://` stripped) or the original URI when that is all we have.
+    pub path: String,
+    pub name: String,
+    pub image: bool,
+}
+
 /// One queued or steered prompt waiting for the agent (`Session.Inbox.Info`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InboxItem {
@@ -63,10 +72,14 @@ pub struct InboxItem {
     pub text: String,
     /// Runs at the next step boundary rather than in line.
     pub steer: bool,
-    pub attachments: usize,
+    pub files: Vec<QueuedFile>,
 }
 
 impl InboxItem {
+    pub fn attachments(&self) -> usize {
+        self.files.len()
+    }
+
     pub fn from_value(value: &Value) -> Option<Self> {
         let id = value
             .get("id")?
@@ -94,16 +107,120 @@ impl InboxItem {
             id,
             text,
             steer: value.get("delivery").and_then(Value::as_str) != Some("queue"),
-            attachments: value
-                .get("attachments")
-                .and_then(Value::as_array)
-                .map_or(0, Vec::len),
+            files: queued_files(value),
         })
     }
 
     pub fn list(values: &[Value]) -> Vec<Self> {
         values.iter().filter_map(Self::from_value).collect()
     }
+}
+
+fn image_name(name: &str) -> bool {
+    matches!(
+        PathBuf::from(name)
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .as_deref(),
+        Some("png" | "jpg" | "jpeg" | "gif" | "webp" | "heic" | "heif" | "bmp")
+    )
+}
+
+fn host_path(raw: &str) -> String {
+    if let Ok(url) = reqwest::Url::parse(raw) {
+        if url.scheme() == "file" {
+            if let Ok(path) = url.to_file_path() {
+                return path.display().to_string();
+            }
+        }
+    }
+    raw.strip_prefix("file://")
+        .map(|rest| rest.strip_prefix("localhost").unwrap_or(rest).to_string())
+        .unwrap_or_else(|| raw.to_string())
+}
+
+fn queued_file(path: String, name: Option<String>, mime: Option<&str>) -> QueuedFile {
+    let name = name.unwrap_or_else(|| {
+        PathBuf::from(&path)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "attachment".into())
+    });
+    let image = mime
+        .map(|m| m.starts_with("image/"))
+        .unwrap_or_else(|| image_name(&name) || image_name(&path));
+    QueuedFile { path, name, image }
+}
+
+fn queued_files(value: &Value) -> Vec<QueuedFile> {
+    let payload_files = value
+        .get("payload")
+        .and_then(|p| p.get("files"))
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|entry| {
+                    let obj = entry.as_object()?;
+                    let source = obj.get("source").and_then(Value::as_object);
+                    let raw = ["uri", "url", "path"]
+                        .iter()
+                        .find_map(|k| obj.get(*k).and_then(Value::as_str))
+                        .or_else(|| source?.get("uri")?.as_str())?;
+                    let name = obj.get("name").and_then(Value::as_str).map(str::to_string);
+                    let mime = obj.get("mime").and_then(Value::as_str);
+                    Some(queued_file(host_path(raw), name, mime))
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let top = value
+        .get("attachments")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .enumerate()
+                .filter_map(|(i, entry)| match entry {
+                    Value::String(uri) => {
+                        let hint = payload_files.get(i);
+                        Some(queued_file(
+                            host_path(uri),
+                            hint.map(|f| f.name.clone()),
+                            None,
+                        ))
+                    }
+                    Value::Object(obj) => {
+                        let raw = ["uri", "url", "path"]
+                            .iter()
+                            .find_map(|k| obj.get(*k).and_then(Value::as_str))?;
+                        let name = obj.get("name").and_then(Value::as_str).map(str::to_string);
+                        let mime = obj.get("mime").and_then(Value::as_str);
+                        Some(queued_file(host_path(raw), name, mime))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if !top.is_empty() {
+        return top
+            .into_iter()
+            .enumerate()
+            .map(|(i, mut file)| {
+                if let Some(hint) = payload_files.get(i) {
+                    if !hint.image && file.image {
+                        // keep image flag from name/path
+                    }
+                    if file.name == "attachment" {
+                        file.name = hint.name.clone();
+                    }
+                    file.image = file.image || hint.image;
+                }
+                file
+            })
+            .collect();
+    }
+    payload_files
 }
 
 /// Where an attachment's bytes come from.
@@ -707,8 +824,26 @@ mod tests {
         assert_eq!(items.len(), 3);
         assert_eq!(items[0].text, "first");
         assert!(!items[0].steer, "queue is not steer");
-        assert!(items[1].steer && items[1].attachments == 1);
+        assert!(items[1].steer && items[1].attachments() == 1);
+        assert_eq!(items[1].files[0].path, "x");
         assert_eq!(items[2].text, "third");
+    }
+
+    #[test]
+    fn inbox_files_keep_image_paths_for_thumbs() {
+        let items = InboxItem::list(&[json!({
+            "id": "pic",
+            "delivery": "queue",
+            "payload": {
+                "text": "see this",
+                "files": [{"uri": "file:///tmp/shot.png", "name": "shot.png", "mime": "image/png"}]
+            },
+            "attachments": ["file:///tmp/shot.png"]
+        })]);
+        assert_eq!(items.len(), 1);
+        assert!(items[0].files[0].image);
+        assert!(items[0].files[0].path.ends_with("shot.png"));
+        assert_eq!(items[0].files[0].name, "shot.png");
     }
 
     #[test]

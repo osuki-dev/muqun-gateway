@@ -21,6 +21,10 @@
   Finder/Nautilus files and screenshots stage as attachments on the Home and
   session drafts; plain text still pastes into the field as before.
 
+- **Queued and staged image attachments show thumbnails.** Composer chips and
+  the inspector Queue list draw a small preview for each image file instead of
+  a bare name count.
+
 - **Large videos can be uploaded in chunks, up to 1 GiB, without the Gateway
   buffering the file.** `POST /api/uploads` reads its whole body into memory
   (and a sealed body cannot be streamed), which is why it stops at 64 MiB.

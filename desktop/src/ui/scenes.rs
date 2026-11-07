@@ -217,7 +217,7 @@ fn session_scene(s: &mut UiState) {
         id: "q1".into(),
         text: "Then update the changelog".into(),
         steer: false,
-        attachments: 0,
+        files: Vec::new(),
     }];
     s.right_open = true;
     s.right.set_open(true);
