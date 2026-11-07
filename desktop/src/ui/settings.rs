@@ -1277,8 +1277,8 @@ pub fn view(s: &UiState, k: &Kit) -> El {
         ),
         SettingsTab::General => tr_ref(
             language,
-            "Language, default folder, and editor.",
-            "语言、默认文件夹与编辑器。",
+            "Language, default folder, editor and notifications.",
+            "语言、默认文件夹、编辑器与通知。",
         ),
         SettingsTab::Themes => tr_ref(
             language,
