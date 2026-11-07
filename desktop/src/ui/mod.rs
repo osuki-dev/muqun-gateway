@@ -1,12 +1,17 @@
-//! Rune UI shell for Muqun Desktop (replaces Blinc).
+//! Muqun Desktop UI — assembled from rune-kit shell + controls.
 
 use std::sync::Arc;
 
 use muqun_gateway::agents::{AgentDomainEvent, AgentSessionId, AgentSessionInfo, TimelineItem};
-use rune::tok::{self, radius, space, type_};
-use rune::{col, el, row, text, text_input, Cx, El, ScrollSpec, TextEdit, Tx};
-use rune_kit::markdown::Markdown;
-use rune_kit::Kit;
+use rune::{col, row, text, Cx, El, KeyEvent, ScrollSpec, TextEdit, Tx};
+use rune_kit::shell::{
+    is_sidebar_toggle, PaneState, Sidebar, SidebarRow, SidebarSection, SidebarToggle, SplitView,
+    Toolbar,
+};
+use rune_kit::{
+    Badge, BadgeVariant, Button, ButtonVariant, ControlSize, Kit, Markdown, Note, ScrollBar,
+    TextArea,
+};
 
 use crate::model::commands::{self, Command, CommandSender};
 use crate::model::inbox::{Inbox, Update};
@@ -29,7 +34,7 @@ pub struct UiState {
     pub hub_label: String,
     pub commands: CommandSender,
     pub dark: bool,
-    kit: Kit,
+    pub sidebar: PaneState,
 }
 
 impl UiState {
@@ -45,7 +50,7 @@ impl UiState {
             hub_label: String::new(),
             commands,
             dark: true,
-            kit: Kit::neutral(true),
+            sidebar: PaneState::new(260.0).range(180.0, 420.0),
         }
     }
 
@@ -87,7 +92,8 @@ impl UiState {
                     self.hub_label = mode.to_string();
                 }
                 Update::Earlier { items, .. } => {
-                    let mut earlier: Vec<_> = items.into_iter().filter_map(bubble_from_item).collect();
+                    let mut earlier: Vec<_> =
+                        items.into_iter().filter_map(bubble_from_item).collect();
                     earlier.append(&mut self.bubbles);
                     self.bubbles = earlier;
                 }
@@ -110,7 +116,8 @@ impl UiState {
         }
         self.sessions
             .sort_by(|a, b| b.updated_ms.cmp(&a.updated_ms));
-        self.sessions.truncate(crate::model::types::SESSION_LIST_LIMIT);
+        self.sessions
+            .truncate(crate::model::types::SESSION_LIST_LIMIT);
     }
 
     fn apply_event(&mut self, event: AgentDomainEvent) {
@@ -157,80 +164,57 @@ fn bubble_from_item(item: TimelineItem) -> Option<Bubble> {
     })
 }
 
-pub fn view(s: &UiState, cx: &mut Cx<UiState>) -> El {
-    let t = tok::theme(s.dark || cx.system_dark());
-    let sidebar = session_list(s, t);
-    let main = col()
-        .key("main")
-        .grow(1.0)
-        .min_w(0.0)
-        .h_full()
-        .fill(t.bg)
-        .child(timeline(s, t))
-        .child(composer(s, t));
-    col()
-        .key("root")
-        .w_full()
-        .h_full()
-        .fill(t.bg)
-        .child(
-            row()
-                .key("chrome")
-                .w_full()
-                .h(36.0)
-                .px(space::S6)
-                .center_y()
-                .gap(space::S3)
-                .fill(t.card)
-                .border(1.0, t.card_border)
-                .child(
-                    text("Muqun")
-                        .key("brand")
-                        .font(type_::TITLE)
-                        .color(t.text),
-                )
-                .child(
-                    text(s.status.clone())
-                        .key("status")
-                        .font(type_::LABEL)
-                        .color(t.text_secondary)
-                        .grow(1.0),
-                )
-                .child(
-                    text(if s.hub_label.is_empty() {
-                        "hub…".into()
-                    } else {
-                        s.hub_label.clone()
-                    })
-                    .key("hub")
-                    .font(type_::LABEL)
-                    .color(t.text_secondary),
-                ),
-        )
-        .child(
-            row()
-                .key("body")
-                .w_full()
-                .grow(1.0)
-                .min_h(0.0)
-                .child(sidebar)
-                .child(main),
-        )
+pub fn on_key(s: &mut UiState, ev: &KeyEvent, _tx: &mut Tx) -> bool {
+    if is_sidebar_toggle(ev) {
+        s.sidebar.toggle();
+        true
+    } else {
+        false
+    }
 }
 
-fn session_list(s: &UiState, t: tok::Theme) -> El {
-    let mut list = col().key("sessions").gap(2.0).w_full();
-    if s.sessions.is_empty() {
-        list = list.child(
-            text("No sessions yet")
-                .key("empty-sessions")
-                .font(type_::LABEL)
-                .color(t.text_secondary)
-                .px(space::S3)
-                .py(space::S2),
-        );
-    }
-    for (i, session) in s.sessions.iter().enumerate() {
+pub fn view(s: &UiState, cx: &mut Cx<UiState>) -> El {
+    let k = Kit::neutral(s.dark || cx.system_dark());
+    let sidebar = sessions_sidebar(s, &k);
+    let main = col()
+        .key("main")
+        .w_full()
+        .h_full()
+        .min_h(0.0)
+        .child(timeline(s, &k))
+        .child(composer(s, &k));
+
+    let hub = if s.hub_label.is_empty() {
+        "hub…".to_string()
+    } else {
+        s.hub_label.clone()
+    };
+
+    SplitView::new(main)
+        .sidebar(&s.sidebar, |s: &mut UiState| &mut s.sidebar, sidebar)
+        .toolbar(
+            Toolbar::new()
+                .title(s.status.clone())
+                .trailing(
+                    Badge::new(hub)
+                        .variant(BadgeVariant::Subtle)
+                        .build(&k)
+                        .key("hub"),
+                ),
+        )
+        .titlebar_inset(cx.titlebar_inset())
+        .frame_inset(8.0)
+        .toolbar_in_panel()
+        .sidebar_toggle(
+            SidebarToggle::new()
+                .size(ControlSize::Large)
+                .in_header(),
+        )
+        .build(&k)
+}
+
+fn sessions_sidebar(s: &UiState, k: &Kit) -> El {
+    let rows = s.sessions.iter().enumerate().map(|(i, session)| {
         let asid = session.asid.0.clone();
         let selected = s.selected.as_deref() == Some(asid.as_str());
         let title = if session.title.is_empty() {
@@ -238,101 +222,87 @@ fn session_list(s: &UiState, t: tok::Theme) -> El {
         } else {
             session.title.clone()
         };
-        let agent = session.agent_id.clone();
-        list = list.child(
-            col()
-                .key(format!("session-{i}"))
-                .w_full()
-                .px(space::S3)
-                .py(space::S2)
-                .gap(2.0)
-                .radius(radius::MD)
-                .fill(if selected { t.control_off } else { t.card })
-                .hover(t.hover)
-                .on_press({
-                    let asid = asid.clone();
-                    move |s: &mut UiState| {
-                        s.selected = Some(asid.clone());
-                        s.status = format!("Opening {asid}");
-                        commands::send(
-                            &s.commands,
-                            Command::OpenSession(AgentSessionId(asid.clone())),
-                        );
-                    }
-                })
-                .child(text(title).font(type_::BODY).color(t.text))
-                .child(text(agent).font(type_::LABEL).color(t.text_secondary)),
+        SidebarRow::new(title)
+            .subtitle(session.agent_id.clone())
+            .selected(selected)
+            .on_select(move |s: &mut UiState, _| {
+                s.selected = Some(asid.clone());
+                s.status = format!("Opening {asid}");
+                commands::send(
+                    &s.commands,
+                    Command::OpenSession(AgentSessionId(asid.clone())),
+                );
+            })
+            .build(k)
+            .key(format!("session-{i}-{}", session.asid.0))
+    });
+
+    let mut sidebar = Sidebar::new().label("Sessions");
+    if s.sessions.is_empty() {
+        sidebar = sidebar.child(
+            text("No sessions yet")
+                .key("empty-sessions")
+                .font(k.ty.small)
+                .color(k.c.text_faint)
+                .px(12.0)
+                .py(8.0),
+        );
+    } else {
+        sidebar = sidebar.section(
+            SidebarSection::new("Sessions")
+                .count(s.sessions.len())
+                .rows(rows),
         );
     }
-    col()
-        .key("sidebar")
-        .w(260.0)
-        .h_full()
-        .fill(t.card)
-        .border(1.0, t.card_border)
-        .child(
-            text("Sessions")
-                .key("sidebar-title")
-                .font(type_::LABEL)
-                .color(t.text_secondary)
-                .px(space::S3)
-                .py(space::S3),
-        )
-        .child(
-            list.scroll(ScrollSpec {
-                stick_bottom: false,
-            })
-            .grow(1.0)
-            .min_h(0.0),
-        )
-        .child(
-            row()
-                .key("refresh")
-                .role("button")
-                .label("Refresh")
-                .h(32.0)
-                .mx(space::S3)
-                .mb(space::S3)
-                .center()
-                .radius(radius::MD)
-                .fill(t.control_off)
-                .hover(t.hover)
+
+    sidebar
+        .footer(
+            Button::new("Refresh")
+                .control_size(ControlSize::Large)
+                .variant(ButtonVariant::Outline)
                 .on_press(|s: &mut UiState| {
                     s.status = "Refreshing…".into();
                     commands::send(&s.commands, Command::Refresh);
                 })
-                .child(text("Refresh").font(type_::LABEL).color(t.text)),
+                .build(k)
+                .key("refresh")
+                .w_full(),
         )
+        .build(k)
 }
 
-fn timeline(s: &UiState, t: tok::Theme) -> El {
-    let mut feed = col().key("feed").gap(space::S3).w_full().px(space::S6).py(space::S6);
+fn timeline(s: &UiState, k: &Kit) -> El {
+    let mut feed = col()
+        .key("feed")
+        .gap(12.0)
+        .w_full()
+        .px(24.0)
+        .py(24.0);
     if s.bubbles.is_empty() {
         feed = feed.child(
             text("Select a session or wait for messages.")
                 .key("empty-feed")
-                .font(type_::BODY)
-                .color(t.text_secondary),
+                .font(k.ty.ui)
+                .color(k.c.text_muted),
         );
     }
-    for (i, bubble) in s.bubbles.iter().enumerate() {
-        let md = Markdown::new(&bubble.body).build(&s.kit);
+    for bubble in &s.bubbles {
+        let body = if looks_like_note(&bubble.body) {
+            Note::new(&bubble.body).key(&bubble.id).build(k)
+        } else {
+            Markdown::new(&bubble.body).build(k).key(format!("md-{}", bubble.id))
+        };
         feed = feed.child(
             col()
-                .key(format!("bubble-{i}-{}", bubble.id))
+                .key(format!("bubble-{}", bubble.id))
                 .w_full()
-                .gap(space::S1)
-                .px(space::S3)
-                .py(space::S3)
-                .radius(radius::MD)
-                .fill(t.card)
-                .border(1.0, t.card_border)
+                .gap(6.0)
                 .child(
-                    text(bubble.role.clone())
-                        .font(type_::LABEL)
-                        .color(t.text_secondary),
+                    Badge::new(bubble.role.clone())
+                        .variant(BadgeVariant::Subtle)
+                        .build(k),
                 )
-                .child(md.key(format!("md-{}", bubble.id)).w_full()),
+                .child(body),
         );
     }
     feed.scroll(ScrollSpec {
@@ -340,63 +310,58 @@ fn timeline(s: &UiState, t: tok::Theme) -> El {
     })
     .grow(1.0)
     .min_h(0.0)
+    .scroll_bar(k)
 }
 
-fn composer(s: &UiState, t: tok::Theme) -> El {
+fn composer(s: &UiState, k: &Kit) -> El {
     col()
         .key("composer")
         .w_full()
-        .px(space::S6)
-        .py(space::S3)
-        .gap(space::S2)
-        .border(1.0, t.card_border)
-        .fill(t.card)
+        .px(24.0)
+        .py(12.0)
+        .gap(8.0)
         .child(
-            el()
-                .key("draft-box")
-                .w_full()
-                .h(72.0)
-                .px(space::S3)
-                .py(space::S2)
-                .radius(radius::MD)
-                .fill(t.bg)
-                .border(1.0, t.card_border)
-                .child(
-                    text_input(&s.draft, type_::BODY)
-                        .key("draft")
-                        .w_full()
-                        .h_full()
-                        .color(t.text)
-                        .on_edit(|s: &mut UiState| &mut s.draft)
-                        .on_submit(|s: &mut UiState, tx: &mut Tx| {
-                            submit_draft(s);
-                            tx.blur();
-                        }),
-                ),
+            TextArea::new(&s.draft)
+                .placeholder("Message…")
+                .label("Draft")
+                .width(None)
+                .auto_grow(2, 8)
+                .on_edit(|s: &mut UiState| &mut s.draft)
+                .on_submit(|s: &mut UiState, tx: &mut Tx| {
+                    submit_draft(s);
+                    tx.blur();
+                })
+                .build(k)
+                .key("draft")
+                .w_full(),
         )
         .child(
             row()
                 .key("composer-actions")
-                .gap(space::S2)
+                .gap(8.0)
+                .center_y()
                 .child(
-                    row()
-                        .key("send")
-                        .role("button")
-                        .label("Send")
-                        .h(32.0)
-                        .px(space::S6)
-                        .center()
-                        .radius(radius::MD)
-                        .fill(tok::accent(0, s.dark))
+                    Button::new("Send")
+                        .variant(ButtonVariant::Submit)
+                        .control_size(ControlSize::Large)
                         .on_press(|s: &mut UiState| submit_draft(s))
-                        .child(text("Send").font(type_::LABEL).color(tok::theme(false).bg)),
+                        .build(k)
+                        .key("send"),
                 )
                 .child(
-                    text("Enter to send")
-                        .font(type_::LABEL)
-                        .color(t.text_secondary),
+                    text("⌘/Ctrl+Enter to send")
+                        .font(k.ty.small)
+                        .color(k.c.text_faint),
                 ),
         )
+}
+
+fn looks_like_note(body: &str) -> bool {
+    body.contains("```facts")
+        || body.contains("```steps")
+        || body.contains("```callout")
+        || body.contains(":::facts")
+        || body.contains(":::steps")
 }
 
 fn submit_draft(s: &mut UiState) {

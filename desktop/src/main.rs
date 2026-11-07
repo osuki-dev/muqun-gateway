@@ -60,6 +60,7 @@ fn main() -> anyhow::Result<()> {
 
     let mut app = App::new(AppSpec::<UiState> {
         scenes: &[("empty", |_| {})],
+        on_key: Some(ui::on_key),
         ..AppSpec::new(
             title,
             (geometry.w.max(640) as f32, geometry.h.max(480) as f32),
