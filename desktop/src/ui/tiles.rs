@@ -399,22 +399,8 @@ fn tile(s: &UiState, k: &Kit, look: &Look, i: usize, layer: &mut Vec<El>) -> El 
             body = body.child(feed).child(composer::view(s, k, layer));
         }
         (Some(asid), false) => {
-            let busy = info.is_some_and(|i| {
-                matches!(
-                    i.status,
-                    muqun_gateway::agents::AgentSessionStatus::Busy
-                        | muqun_gateway::agents::AgentSessionStatus::Retry
-                )
-            });
             body = body
-                .child(timeline::view_items(
-                    s,
-                    k,
-                    Some(asid),
-                    &t.slot.timeline,
-                    t.slot.earlier_exhausted,
-                    busy,
-                ))
+                .child(timeline::session_view(s, k, asid))
                 .child(parked_composer(s, k, look, i));
         }
     }

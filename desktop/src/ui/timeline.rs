@@ -1,29 +1,39 @@
-//! The session timeline: one block per [`TimelineItem`], by [`AgentPart`].
+//! The session timeline: per-session state and the virtualised list.
+//!
+//! Public entry points, all a function of an explicit session so a window can
+//! show several timelines at once:
+//!
+//! - [`session_view`]`(s, k, asid)`: one session's timeline, filling the
+//!   space it is given (any width; tiles down to ~480 pt). Call it once per
+//!   visible session.
+//! - [`view`]`(s, k)`: the selected session's, for the single-session page.
+//! - [`overlay`]`(s, k)`: the image zoom, when one is open; push it onto the
+//!   root layer.
+//! - Split tiles (`ui::tiles`) open sessions beside the focused one; every
+//!   open session's timeline is kept in `UiState::timelines`.
+//!
+//! Each session's [`SessionTimeline`] (items, parsed diffs, expanded cards,
+//! loaded-history state) lives in `UiState::timelines`; the scroll anchor is
+//! the list's own (Rune keeps the reader's row when rows are prepended).
+//! Cards are drawn by `ui::parts`, one module per part kind.
 
-use std::path::{Path, PathBuf};
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
 
-use muqun_gateway::agents::message_images::resolve_host_media;
-use muqun_gateway::agents::ports::agent::prompt_display_body;
-use muqun_gateway::agents::MessageImageAsset;
 use muqun_gateway::agents::{
-    AgentPart, AgentSessionId, FormField, FormRequest, PermissionDecision, PermissionRequest,
-    TimelineItem, TimelineRole, ToolCall, ToolCallStatus,
+    AgentPart, AgentSessionId, AgentSessionStatus, TimelineItem, TimelineRole,
 };
-use rune::{col, el, row, text, El, ImageCache, ScrollSpec, SurfaceFit, TextEdit};
+use rune::{col, row, text, El, GrowthSpec, ScrollSpec};
 use rune_kit::diff::{DiffState, DiffView};
-use rune_kit::{
-    Badge, BadgeVariant, Button, ButtonVariant, Card, Collapsible, ControlSize, Kit, Markdown,
-    Note, ScrollBar, Spinner, Switch, TextInput,
-};
-use serde_json::{json, Value};
+use rune_kit::{Badge, BadgeVariant, Button, ButtonVariant, ControlSize, Kit, ScrollBar, Spinner};
 
+use super::copy::tr_ref;
+use super::parts::{self, Tcx};
 use super::{muted, UiState};
 use crate::model::commands::Command;
 
-const OUTPUT_CHARS: usize = 600;
-const SUMMARY_CHARS: usize = 240;
-const TIMELINE_IMG_W: f32 = 320.0;
-const TIMELINE_IMG_H: f32 = 240.0;
+pub use super::parts::approval::permission_card;
+pub use super::parts::question::form_card;
 
 thread_local! {
     static EMPTY: &'static DiffState = Box::leak(Box::new(DiffState::default()));
@@ -41,1080 +51,435 @@ pub fn clip(text: &str, max: usize) -> String {
     }
 }
 
-/// The unified patch of an edit tool's `metadata.files`, joined.
-pub fn tool_patch(call: &ToolCall) -> String {
-    let files = call
-        .metadata
-        .as_ref()
-        .and_then(|m| m.get("files"))
-        .and_then(Value::as_array);
-    files
-        .into_iter()
-        .flatten()
-        .filter_map(|f| {
-            f.get("patch")
-                .or_else(|| f.get("diff"))
-                .and_then(Value::as_str)
-        })
-        .filter(|p| !p.trim().is_empty())
-        .collect::<Vec<_>>()
-        .join("\n")
+/// Rows a list estimates before it has measured them.
+const ROW_ESTIMATE: f32 = 64.0;
+/// Readable line length on a wide window; tiles are narrower anyway.
+const FEED_MAX_W: f32 = 860.0;
+
+/// One session's timeline as the UI holds it.
+#[derive(Default)]
+pub struct SessionTimeline {
+    pub items: Vec<TimelineItem>,
+    /// Diffs drawn inline, by item id, with the source they were built from.
+    pub diffs: HashMap<String, (String, DiffState)>,
+    /// Cards the reader flipped from their default (open ↔ closed), by id.
+    pub flipped: HashSet<String>,
+    /// No older history to page in.
+    pub earlier_exhausted: bool,
+    /// A page of older history is on its way.
+    pub loading_earlier: bool,
+    /// Bumped whenever rows are added, removed or reordered (the virtual
+    /// list's key version).
+    pub rev: u64,
 }
 
-fn tool_output(call: &ToolCall) -> String {
-    if let Some(output) = &call.output {
-        return match output {
-            Value::String(s) => s.clone(),
-            Value::Null => String::new(),
-            other => other.to_string(),
-        };
-    }
-    call.content
-        .as_ref()
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|i| i.get("text").and_then(Value::as_str))
-                .collect::<Vec<_>>()
-                .join("\n")
-        })
-        .unwrap_or_default()
-}
-
-fn tool_input(call: &ToolCall) -> String {
-    let pick = [
-        "command",
-        "cmd",
-        "CommandLine",
-        "file_path",
-        "filePath",
-        "TargetFile",
-        "path",
-        "pattern",
-        "query",
-        "url",
-        "uri",
-    ];
-    let root = call
-        .input
-        .get("arguments")
-        .and_then(Value::as_object)
-        .or_else(|| call.input.as_object());
-    if let Some(obj) = root {
-        if let Some(v) = pick
-            .iter()
-            .find_map(|k| obj.get(*k).and_then(Value::as_str))
-        {
-            return clip(v, SUMMARY_CHARS);
+impl SessionTimeline {
+    /// A snapshot: the whole list, as of now. Reader state stays.
+    pub fn replace(&mut self, items: Vec<TimelineItem>) {
+        let keep: HashSet<&str> = items.iter().map(|i| i.id.as_str()).collect();
+        self.diffs.retain(|id, _| keep.contains(id.as_str()));
+        for item in &items {
+            self.ingest(item);
         }
-        // MCP / structured tools: show a compact JSON of the args we have.
-        if !obj.is_empty() {
-            return clip(&Value::Object(obj.clone()).to_string(), SUMMARY_CHARS);
-        }
+        self.items = items;
+        self.rev += 1;
     }
-    match &call.input {
-        Value::Null => call
-            .input_partial
-            .clone()
-            .map(|p| clip(&p, SUMMARY_CHARS))
-            .unwrap_or_default(),
-        other => clip(&other.to_string(), SUMMARY_CHARS),
-    }
-}
 
-fn looks_like_note(body: &str) -> bool {
-    ["```facts", "```steps", "```callout", ":::facts", ":::steps"]
-        .iter()
-        .any(|m| body.contains(m))
-}
-
-fn rich(k: &Kit, id: &str, body: &str) -> El {
-    if looks_like_note(body) {
-        Note::new(body).key(id).build(k)
-    } else {
-        Markdown::new(body).build(k).key(format!("md-{id}"))
-    }
-}
-
-/// Drop Codex-style `[Image #N]` tokens once the real pictures are shown.
-fn strip_image_placeholders(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(at) = rest.find("[Image #") {
-        out.push_str(&rest[..at]);
-        let after = &rest[at + "[Image #".len()..];
-        match after.find(']') {
-            Some(end) => {
-                rest = after[end + 1..].trim_start();
+    /// Live rows: replace by id, else append.
+    pub fn upsert(&mut self, items: Vec<TimelineItem>) {
+        for item in items {
+            self.ingest(&item);
+            // New and updated rows are nearly always at the tail.
+            match self.items.iter().rposition(|t| t.id == item.id) {
+                Some(at) => self.items[at] = item,
+                None => {
+                    self.items.push(item);
+                    self.rev += 1;
+                }
             }
+        }
+    }
+
+    pub fn remove(&mut self, ids: &[String]) {
+        self.items.retain(|t| !ids.contains(&t.id));
+        self.rev += 1;
+        for id in ids {
+            self.diffs.remove(id);
+        }
+    }
+
+    /// An older page, above what is loaded.
+    pub fn prepend(&mut self, older: Vec<TimelineItem>, exhausted: bool) {
+        self.loading_earlier = false;
+        self.earlier_exhausted = exhausted;
+        let have: HashSet<String> = self.items.iter().map(|i| i.id.clone()).collect();
+        let mut older: Vec<TimelineItem> = older
+            .into_iter()
+            .filter(|i| !have.contains(&i.id))
+            .collect();
+        for item in &older {
+            self.ingest(item);
+        }
+        older.append(&mut self.items);
+        self.items = older;
+        self.rev += 1;
+    }
+
+    /// Parse the item's change (a diff part, an edit's files) once, for drawing.
+    fn ingest(&mut self, item: &TimelineItem) {
+        match parts::files::diff_source(item) {
             None => {
-                out.push_str(&rest[at..at + 1]);
-                rest = &rest[at + 1..];
+                self.diffs.remove(&item.id);
+            }
+            Some((source, files)) => {
+                if self
+                    .diffs
+                    .get(&item.id)
+                    .is_none_or(|(old, _)| *old != source)
+                {
+                    self.diffs
+                        .insert(item.id.clone(), (source, DiffState::new(files())));
+                }
             }
         }
     }
-    out.push_str(rest);
-    out.trim().to_string()
-}
 
-fn image_ext(path: &Path) -> bool {
-    matches!(
-        path.extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.to_ascii_lowercase())
-            .as_deref(),
-        Some("png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "tif" | "tiff")
-    )
-}
-
-fn session_directory(s: &UiState) -> Option<&str> {
-    s.current().and_then(|i| i.directory.as_deref())
-}
-
-fn push_resolved(out: &mut Vec<PathBuf>, src: &str, directory: Option<&str>) {
-    let Some(path) = resolve_host_media(src, directory) else {
-        return;
-    };
-    if !image_ext(&path) && !path.is_file() {
-        return;
+    /// Whether card `id` is open, given whether it opens by default.
+    pub fn is_open(&self, id: &str, default: bool) -> bool {
+        default != self.flipped.contains(id)
     }
-    if path.is_file() && !out.iter().any(|p| p == &path) {
-        out.push(path);
+
+    pub fn flip(&mut self, id: &str) {
+        if !self.flipped.remove(id) {
+            self.flipped.insert(id.to_string());
+        }
     }
 }
 
-/// App `messageImageForSource`: exact `src` match, image mime, not unavailable.
-fn message_image_for_source<'a>(
-    assets: Option<&'a [MessageImageAsset]>,
-    src: &str,
-) -> Option<&'a MessageImageAsset> {
-    assets?.iter().find(|asset| {
-        asset.src == src
-            && asset.unavailable_reason.is_none()
-            && asset.mime.starts_with("image/")
-            && asset.mime[6..]
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'+' | b'-'))
-    })
+impl UiState {
+    /// Drop the timelines no longer on screen.
+    pub(super) fn retain_timelines(&mut self) {
+        let selected = self.selected.clone();
+        let tiles: Vec<String> = self.tiles.iter().filter_map(|t| t.asid.clone()).collect();
+        self.timelines
+            .retain(|asid, _| selected.as_deref() == Some(asid.as_str()) || tiles.contains(asid));
+    }
+
+    /// Open a file a timeline card names (a presented file, a glob or grep
+    /// hit) in the viewer. Relative paths are the selected session's; `~/` is
+    /// home.
+    pub fn open_timeline_file(&mut self, path: &str) {
+        let path = path.trim();
+        let resolved = if let Some(rest) = path.strip_prefix("~/") {
+            dirs::home_dir().map(|h| h.join(rest))
+        } else if std::path::Path::new(path).is_absolute() {
+            Some(std::path::PathBuf::from(path))
+        } else {
+            self.current()
+                .and_then(|i| i.directory.as_deref())
+                .map(|d| std::path::Path::new(d).join(path))
+        };
+        match resolved.filter(|p| p.exists()) {
+            Some(p) => self.open_file(p),
+            None => {
+                let title = super::copy::tr(
+                    self.cfg.general.language,
+                    "File not found on this computer",
+                    "这台电脑上找不到该文件",
+                );
+                self.toast(title, Some(path.to_string()));
+            }
+        }
+    }
+
+    pub fn session_busy(&self, asid: &str) -> bool {
+        self.session_by_id(asid).is_some_and(|s| {
+            matches!(
+                s.status,
+                AgentSessionStatus::Busy | AgentSessionStatus::Retry
+            )
+        })
+    }
 }
 
-fn looks_like_image_uri(uri: &str) -> bool {
-    uri.starts_with("data:image/")
-        || matches!(
-            Path::new(uri.split('?').next().unwrap_or(uri))
-                .extension()
-                .and_then(|e| e.to_str())
-                .map(|e| e.to_ascii_lowercase())
-                .as_deref(),
-            Some("png" | "jpg" | "jpeg" | "gif" | "webp")
+/// A split tile's timeline (the tiles call this). The rows come from the
+/// session's own [`SessionTimeline`], whatever the tile hands in.
+#[allow(dead_code)] // kept for callers that hand in their own rows
+pub fn view_items(
+    s: &UiState,
+    k: &Kit,
+    asid: Option<&str>,
+    _items: &[TimelineItem],
+    _earlier_exhausted: bool,
+    _busy: bool,
+) -> El {
+    match asid {
+        Some(asid) => session_view(s, k, asid),
+        None => empty(s, k, "feed"),
+    }
+}
+
+/// The selected session's timeline.
+pub fn view(s: &UiState, k: &Kit) -> El {
+    match s.selected.clone() {
+        Some(asid) => session_view(s, k, &asid),
+        None => empty(s, k, "feed"),
+    }
+}
+
+fn empty(s: &UiState, k: &Kit, key: &str) -> El {
+    let language = s.cfg.general.language;
+    col()
+        .key(key.to_string())
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .center()
+        .child(
+            text(if s.selected.is_some() {
+                tr_ref(language, "No messages yet.", "还没有消息。")
+            } else {
+                tr_ref(
+                    language,
+                    "Select a session or start a new one.",
+                    "选择一个会话，或开始新会话。",
+                )
+            })
+            .key("empty-feed")
+            .font(k.ty.ui)
+            .color(k.c.text_muted),
         )
 }
 
-/// App `MessageAttachments`: walk `attachments`, resolve each through
-/// `image_assets`, else treat a clear image URI as a local file.
-fn item_image_paths(s: &UiState, item: &TimelineItem) -> Vec<PathBuf> {
-    let directory = session_directory(s);
-    let mut paths = Vec::new();
-    let assets = item.image_assets.as_deref();
-    if let Some(attachments) = &item.attachments {
-        for src in attachments {
-            if let Some(asset) = message_image_for_source(assets, src) {
-                let before = paths.len();
-                for candidate in [
-                    asset.thumbnail_url.as_deref(),
-                    asset.preview_url.as_deref(),
-                    (!asset.url.is_empty()).then_some(asset.url.as_str()),
-                ]
-                .into_iter()
-                .flatten()
-                {
-                    push_resolved(&mut paths, candidate, directory);
-                    if paths.len() > before {
-                        break;
-                    }
-                }
-                if paths.len() >= 8 {
-                    return paths;
-                }
-                continue;
-            }
-            if looks_like_image_uri(src) {
-                push_resolved(&mut paths, src, directory);
-                if paths.len() >= 8 {
-                    return paths;
-                }
-            }
-        }
-    }
-    // Assistant markdown embeds: App rewrites sources via `image_assets` with
-    // no `attachments` list; Desktop draws those assets as a gallery.
-    if paths.is_empty() {
-        if let Some(assets) = assets {
-            for asset in assets {
-                if asset.unavailable_reason.is_some() || !asset.mime.starts_with("image/") {
-                    continue;
-                }
-                let before = paths.len();
-                for candidate in [
-                    asset.thumbnail_url.as_deref(),
-                    asset.preview_url.as_deref(),
-                    (!asset.url.is_empty()).then_some(asset.url.as_str()),
-                    (!asset.src.is_empty()).then_some(asset.src.as_str()),
-                ]
-                .into_iter()
-                .flatten()
-                {
-                    push_resolved(&mut paths, candidate, directory);
-                    if paths.len() > before {
-                        break;
-                    }
-                }
-                if paths.len() >= 8 {
-                    return paths;
-                }
-            }
-        }
-    }
-    paths
+/// What row `i` of a session's list is.
+enum Row<'a> {
+    Top,
+    Item(&'a TimelineItem),
+    Working,
 }
 
-fn tool_image_paths(s: &UiState, call: &ToolCall) -> Vec<PathBuf> {
-    let directory = session_directory(s);
-    let mut paths = Vec::new();
-    let Some(Value::Array(content)) = &call.content else {
-        return paths;
+fn row_at<'a>(s: &'a UiState, asid: &str, i: usize) -> Option<Row<'a>> {
+    let tl = s.timelines.get(asid)?;
+    if i == 0 {
+        return Some(Row::Top);
+    }
+    match tl.items.get(i - 1) {
+        Some(item) => Some(Row::Item(item)),
+        None => Some(Row::Working),
+    }
+}
+
+fn row_count(s: &UiState, asid: &str) -> usize {
+    let n = s.timelines.get(asid).map_or(0, |t| t.items.len());
+    1 + n + usize::from(s.session_busy(asid))
+}
+
+/// One session's timeline: a virtualised list that only builds the rows
+/// near the viewport, follows the bottom while the agent writes, keeps the
+/// reader's row when older history lands above it, and pages that history
+/// in as the reader nears the top.
+pub fn session_view(s: &UiState, k: &Kit, asid: &str) -> El {
+    let key = format!("feed-{asid}");
+    let Some(tl) = s.timelines.get(asid) else {
+        return empty(s, k, &key);
     };
-    for part in content {
-        // ACP nests media under `content`; Codex/OpenCode use top-level uri.
-        let media = part
-            .get("content")
-            .filter(|inner| inner.is_object())
-            .unwrap_or(part);
-        let uri = media
-            .get("uri")
-            .and_then(Value::as_str)
-            .or_else(|| media.get("url").and_then(Value::as_str))
-            .or_else(|| media.get("path").and_then(Value::as_str));
-        let Some(uri) = uri else {
-            continue;
-        };
-        let is_image = media
-            .get("mime")
-            .or_else(|| media.get("mimeType"))
-            .or_else(|| media.get("mediaType"))
-            .and_then(Value::as_str)
-            .is_some_and(|m| m.starts_with("image/"))
-            || media.get("type").and_then(Value::as_str) == Some("image")
-            || part.get("type").and_then(Value::as_str) == Some("image")
-            || image_ext(Path::new(uri));
-        if is_image || media.get("type").and_then(Value::as_str) == Some("file") {
-            push_resolved(&mut paths, uri, directory);
-        }
-        if paths.len() >= 8 {
-            break;
-        }
+    if tl.items.is_empty() && tl.earlier_exhausted {
+        return empty(s, k, &key);
     }
-    paths
-}
-
-fn timeline_picture(k: &Kit, images: &ImageCache, path: &Path, key: &str) -> El {
-    if !path.is_file() {
-        return el()
-            .key(key.to_string())
-            .w(TIMELINE_IMG_W)
-            .h(96.0)
-            .radius(k.radius.md)
-            .fill(k.c.layer_02);
-    }
-    // `ImageCache::file` keeps a strong handle via Pixels::keep while drawn.
-    let image = images.file(path, TIMELINE_IMG_H, 2.0);
-    el().key(key.to_string())
-        .pixels_fit(image.pixels(), SurfaceFit::Fit)
-        .w(TIMELINE_IMG_W)
-        .h(TIMELINE_IMG_H)
-        .radius(k.radius.md)
-        .clip_rounded(k.radius.md)
-}
-
-fn image_gallery(s: &UiState, k: &Kit, id: &str, paths: &[PathBuf]) -> Option<El> {
-    let images = s.images.as_ref()?;
-    if paths.is_empty() {
-        return None;
-    }
-    let mut gallery = row()
-        .key(format!("imgs-{id}"))
-        .gap(8.0)
-        .flex_wrap()
-        .w_full();
-    for (i, path) in paths.iter().enumerate() {
-        gallery = gallery.child(timeline_picture(k, images, path, &format!("img-{id}-{i}")));
-    }
-    Some(gallery)
-}
-
-fn mono(k: &Kit, body: String) -> El {
-    text(body)
-        .font(k.ty.mono)
-        .color(k.c.text_muted)
-        .wrap()
+    let count = row_count(s, asid);
+    let (key_asid, build_asid, edge_asid) = (asid.to_string(), asid.to_string(), asid.to_string());
+    let kit = k.clone();
+    let rows = col()
+        .key(format!("rows-{asid}"))
         .w_full()
-}
-
-fn badge(k: &Kit, label: impl Into<String>) -> El {
-    Badge::new(label).variant(BadgeVariant::Subtle).build(k)
-}
-
-fn toggle(s: &mut UiState, id: &str) {
-    if !s.open_items.remove(id) {
-        s.open_items.insert(id.to_string());
-    }
-}
-
-fn collapsible(s: &UiState, k: &Kit, id: &str, title: String, body: El) -> El {
-    let open = s.open_items.contains(id);
-    let key = id.to_string();
-    Collapsible::new(title, open)
-        .child(body)
-        .on_toggle(move |s: &mut UiState| toggle(s, &key))
-        .build(k)
-        .key(format!("fold-{id}"))
-}
-
-fn inline_diff(s: &UiState, k: &Kit, id: &str) -> Option<El> {
-    let (patch, _) = s.inline_diffs.get(id)?;
-    let height = (patch.lines().count() as f32 * 20.0 + 44.0).clamp(88.0, 360.0);
-    let (get_id, set_id) = (id.to_string(), id.to_string());
-    let view = DiffView::new(
-        move |s: &UiState| match s.inline_diffs.get(&get_id) {
-            Some((_, d)) => d,
-            None => empty_diff(),
-        },
-        move |s: &mut UiState| {
-            &mut s
-                .inline_diffs
-                .entry(set_id.clone())
-                .or_insert_with(|| (String::new(), DiffState::default()))
-                .1
-        },
-    )
-    .key(format!("diff-{id}"))
-    .build(s, k);
-    Some(
-        col()
-            .key(format!("diffbox-{id}"))
-            .w_full()
-            .h(height)
-            .radius(k.radius.md)
-            .clip_rounded(k.radius.md)
-            .child(view),
-    )
-}
-
-fn status_label(status: ToolCallStatus) -> &'static str {
-    match status {
-        ToolCallStatus::Pending => "pending",
-        ToolCallStatus::Streaming => "streaming",
-        ToolCallStatus::Running => "running",
-        ToolCallStatus::Completed => "done",
-        ToolCallStatus::Failed => "failed",
-    }
-}
-
-fn tool(s: &UiState, k: &Kit, item: &TimelineItem, call: &ToolCall) -> El {
-    let accent = match call.state {
-        ToolCallStatus::Completed => k.c.success.icon,
-        ToolCallStatus::Failed => k.c.danger.icon,
-        ToolCallStatus::Running | ToolCallStatus::Streaming => k.c.info.icon,
-        ToolCallStatus::Pending => k.c.icon_faint,
-    };
-    let title = call
-        .title
-        .clone()
-        .filter(|t| !t.is_empty())
-        .unwrap_or_else(|| call.name.clone());
-    let running = matches!(
-        call.state,
-        ToolCallStatus::Running | ToolCallStatus::Streaming | ToolCallStatus::Pending
-    );
-    let mut card = Card::new()
-        .accent(accent)
-        .title(format!("{title} · {}", status_label(call.state)), None);
-    if running {
-        card = card.child(
-            row()
-                .key(format!("run-{}", item.id))
-                .gap(8.0)
-                .center_y()
-                .child(Spinner::new().build(k).key(format!("spin-{}", item.id)))
-                .child(muted(k, "Working…")),
-        );
-    }
-    let input = tool_input(call);
-    if !input.is_empty() {
-        card = card.child(mono(k, input));
-    }
-    if let Some(gallery) = image_gallery(
-        s,
-        k,
-        &format!("tool-{}", item.id),
-        &tool_image_paths(s, call),
-    ) {
-        card = card.child(gallery);
-    }
-    if let Some(inline) = inline_diff(s, k, &item.id) {
-        card = card.child(inline);
-    } else {
-        let output = tool_output(call);
-        if !output.is_empty() {
-            let clipped = clip(&output, OUTPUT_CHARS);
-            // Short results stay visible; long logs fold so the feed stays scannable.
-            if clipped.chars().count() <= SUMMARY_CHARS && !call.truncated {
-                card = card.child(mono(k, clipped));
-            } else {
-                let id = format!("out-{}", item.id);
-                let label = if call.truncated {
-                    "Output (truncated)"
-                } else {
-                    "Output"
+        .growth(GrowthSpec::default())
+        .virtual_rows(
+            count,
+            ROW_ESTIMATE,
+            move |s: &UiState, i| -> Cow<'_, str> {
+                match row_at(s, &key_asid, i) {
+                    Some(Row::Item(item)) => Cow::Borrowed(item.id.as_str()),
+                    Some(Row::Top) => Cow::Borrowed("tl-top"),
+                    _ => Cow::Borrowed("tl-working"),
+                }
+            },
+            move |s: &UiState, i| {
+                let cx = Tcx::new(s, &kit, &build_asid);
+                let mut tail = false;
+                let body = match row_at(s, &build_asid, i) {
+                    Some(Row::Top) => top_row(&cx),
+                    Some(Row::Item(item)) => {
+                        // The answer being written: Rune eases its growth.
+                        tail = s.session_busy(&build_asid)
+                            && matches!(item.part, AgentPart::Text { .. })
+                            && cx.tl().and_then(|t| t.items.last()).map(|l| &l.id)
+                                == Some(&item.id);
+                        item_row(&cx, item)
+                    }
+                    Some(Row::Working) | None => working_row(&cx),
                 };
-                card = card.child(collapsible(s, k, &id, label.into(), mono(k, clipped)));
+                // Rows space themselves with padding: virtual rows take no gaps.
+                col()
+                    .w_full()
+                    .items_center()
+                    .px(16.0)
+                    .py(5.0)
+                    .streaming(tail)
+                    .child(body.w_full().max_w(FEED_MAX_W))
+            },
+        )
+        .virtual_rows_version((tl.rev, s.session_busy(asid)))
+        .on_visible_rows(move |s: &mut UiState, range: std::ops::Range<usize>| {
+            // Near the top with more history upstream: ask for the next page.
+            if range.start > 2 {
+                return false;
             }
-        }
+            let Some(tl) = s.timelines.get_mut(&edge_asid) else {
+                return false;
+            };
+            if tl.earlier_exhausted || tl.loading_earlier || tl.items.is_empty() {
+                return false;
+            }
+            tl.loading_earlier = true;
+            s.send(Command::LoadEarlier(AgentSessionId(edge_asid.clone())));
+            true
+        });
+    col()
+        .key(key)
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .child(rows)
+        .scroll(ScrollSpec { stick_bottom: true })
+        .scroll_bar(k)
+}
+
+/// Row 0: the start of the conversation, or older history arriving.
+fn top_row(cx: &Tcx) -> El {
+    let tl = cx.tl();
+    let exhausted = tl.is_none_or(|t| t.earlier_exhausted);
+    if exhausted {
+        return col().key("tl-top").h(8.0);
     }
-    if let Some(err) = &call.error {
-        card = card.description(err.message.clone());
-    }
-    if let Some(child) = &call.child_session_id {
-        let id = child.clone();
-        card = card.action(
-            Button::new("Open sub-agent")
+    let loading = tl.is_some_and(|t| t.loading_earlier);
+    let mut line = row().key("tl-top").gap(8.0).center().py(6.0);
+    if loading {
+        line = line
+            .child(Spinner::new().size(12.0).build(cx.k).key("top-spin"))
+            .child(
+                text(cx.t("Loading earlier messages…", "正在载入更早的消息…"))
+                    .font(cx.k.ty.small)
+                    .color(cx.k.c.text_faint),
+            );
+    } else {
+        let asid = cx.asid.to_string();
+        line = line.child(
+            Button::new(cx.t("Load earlier messages", "载入更早的消息"))
                 .variant(ButtonVariant::Ghost)
                 .control_size(ControlSize::Small)
-                .on_press(move |s: &mut UiState| s.open_session(&id))
-                .build(k)
-                .key(format!("sub-{}", item.id)),
-        );
-    }
-    card.build(k)
-}
-
-fn reply(
-    request: &PermissionRequest,
-    decision: PermissionDecision,
-) -> impl Fn(&mut UiState) + 'static {
-    let (asid, id) = (request.asid.clone(), request.id.clone());
-    move |s: &mut UiState| {
-        if let Some(list) = s.waiting_perms.get_mut(&asid.0) {
-            list.retain(|p| p.id != id);
-        }
-        s.send(Command::ReplyPermission {
-            asid: asid.clone(),
-            id: id.clone(),
-            decision,
-        });
-    }
-}
-
-pub fn pending_permission(s: &UiState, request: &PermissionRequest) -> bool {
-    s.waiting_perms
-        .get(&request.asid.0)
-        .is_some_and(|l| l.iter().any(|p| p.id == request.id))
-}
-
-/// A permission as a card with its answers (or "resolved" once answered).
-pub fn permission_card(s: &UiState, k: &Kit, request: &PermissionRequest) -> El {
-    let mut card = Card::new()
-        .accent(k.c.warning.icon)
-        .title(format!("Permission: {}", request.action), None)
-        .description(if request.prompt.is_empty() {
-            request.action.clone()
-        } else {
-            request.prompt.clone()
-        });
-    if !request.resources.is_empty() {
-        card = card.child(mono(k, clip(&request.resources.join("\n"), SUMMARY_CHARS)));
-    }
-    let key = |n: &str| format!("perm-{}-{n}", request.id);
-    if pending_permission(s, request) {
-        let button = |label: &str, variant, decision| {
-            Button::new(label)
-                .variant(variant)
-                .control_size(ControlSize::Small)
-                .on_press(reply(request, decision))
-                .build(k)
-                .key(key(label))
-        };
-        card = card
-            .action(button(
-                "Allow",
-                ButtonVariant::Submit,
-                PermissionDecision::Allow,
-            ))
-            .action(button(
-                "Deny",
-                ButtonVariant::Danger,
-                PermissionDecision::Deny,
-            ));
-        if !request.save.is_empty()
-            || request
-                .options
-                .iter()
-                .any(|o| o.decision == PermissionDecision::AllowAlways)
-        {
-            card = card.action(button(
-                "Always",
-                ButtonVariant::Outline,
-                PermissionDecision::AllowAlways,
-            ));
-        }
-    } else {
-        card = card.child(badge(k, "resolved"));
-    }
-    card.build(k)
-}
-
-fn form_key(form: &str, field: &str) -> String {
-    format!("{form}/{field}")
-}
-
-fn form_value(s: &UiState, form: &str, field: &FormField) -> String {
-    let (key, default) = field_meta(field);
-    s.form_inputs
-        .get(&form_key(form, key))
-        .map_or(default, |e| e.text.clone())
-}
-
-/// A field's key and its default as text.
-fn field_meta(field: &FormField) -> (&str, String) {
-    match field {
-        FormField::String { key, default, .. } => (key, default.clone().unwrap_or_default()),
-        FormField::Number { key, default, .. } => {
-            (key, default.map(|d| d.to_string()).unwrap_or_default())
-        }
-        FormField::Boolean { key, default, .. } => (key, default.unwrap_or(false).to_string()),
-        FormField::Multiselect { key, default, .. } => (key, default.join(",")),
-        FormField::External { key, .. } | FormField::Unknown { key, .. } => (key, String::new()),
-    }
-}
-
-fn field_when(field: &FormField) -> &[muqun_gateway::agents::FormWhen] {
-    match field {
-        FormField::String { when, .. }
-        | FormField::Number { when, .. }
-        | FormField::Boolean { when, .. }
-        | FormField::Multiselect { when, .. }
-        | FormField::External { when, .. }
-        | FormField::Unknown { when, .. } => when,
-    }
-}
-
-fn visible(s: &UiState, form: &FormRequest, field: &FormField) -> bool {
-    field_when(field).iter().all(|w| {
-        let current = form
-            .fields
-            .iter()
-            .find(|f| field_meta(f).0 == w.key)
-            .map(|f| form_value(s, &form.id, f))
-            .unwrap_or_default();
-        let wanted = match &w.value {
-            Value::String(v) => v.clone(),
-            other => other.to_string(),
-        };
-        (current == wanted) == (w.op != "neq")
-    })
-}
-
-fn form_answers(s: &UiState, form: &FormRequest) -> Value {
-    let mut answers = serde_json::Map::new();
-    for field in form.fields.iter().filter(|f| visible(s, form, f)) {
-        let value = form_value(s, &form.id, field);
-        let (key, _) = field_meta(field);
-        let json = match field {
-            FormField::Number { .. } => value
-                .trim()
-                .parse::<f64>()
-                .map_or(Value::Null, |n| json!(n)),
-            FormField::Boolean { .. } => json!(value == "true"),
-            FormField::Multiselect { .. } => json!(value
-                .split(',')
-                .filter(|v| !v.is_empty())
-                .collect::<Vec<_>>()),
-            FormField::External { .. } | FormField::Unknown { .. } => continue,
-            FormField::String { .. } => json!(value),
-        };
-        answers.insert(key.to_string(), json);
-    }
-    Value::Object(answers)
-}
-
-fn pick(form: &str, key: &str, value: String, multi: bool) -> impl Fn(&mut UiState) + 'static {
-    let slot = form_key(form, key);
-    move |s: &mut UiState| {
-        let next = if multi {
-            let mut chosen: Vec<String> = s
-                .form_inputs
-                .get(&slot)
-                .map(|e| {
-                    e.text
-                        .split(',')
-                        .filter(|v| !v.is_empty())
-                        .map(str::to_string)
-                        .collect()
-                })
-                .unwrap_or_default();
-            match chosen.iter().position(|c| *c == value) {
-                Some(at) => {
-                    chosen.remove(at);
-                }
-                None => chosen.push(value.clone()),
-            }
-            chosen.join(",")
-        } else {
-            value.clone()
-        };
-        s.form_inputs.insert(slot.clone(), TextEdit::new(next));
-    }
-}
-
-fn field_input(s: &UiState, k: &Kit, form: &FormRequest, field: &FormField) -> El {
-    let (key, _) = field_meta(field);
-    let slot = form_key(&form.id, key);
-    let current = form_value(s, &form.id, field);
-    let (title, description, options, multi): (
-        &str,
-        Option<&String>,
-        &[muqun_gateway::agents::FormOption],
-        bool,
-    ) = match field {
-        FormField::String {
-            title,
-            description,
-            options,
-            ..
-        } => (title, description.as_ref(), options, false),
-        FormField::Number {
-            title, description, ..
-        }
-        | FormField::Boolean {
-            title, description, ..
-        } => (title, description.as_ref(), &[], false),
-        FormField::Multiselect {
-            title,
-            description,
-            options,
-            ..
-        } => (title, description.as_ref(), options, true),
-        FormField::External {
-            title, description, ..
-        } => (title, description.as_ref(), &[], false),
-        FormField::Unknown { title, .. } => (title, None, &[], false),
-    };
-    let control = match field {
-        FormField::Boolean { .. } => Switch::new(current == "true")
-            .label(title)
-            .on_toggle({
-                let slot = slot.clone();
-                move |s: &mut UiState| {
-                    let on = s.form_inputs.get(&slot).is_some_and(|e| e.text == "true");
-                    s.form_inputs
-                        .insert(slot.clone(), TextEdit::new((!on).to_string()));
-                }
-            })
-            .build(k),
-        FormField::External { url, .. } => muted(k, url.clone()),
-        FormField::Unknown { raw_type, .. } => {
-            muted(k, format!("Unsupported field type: {raw_type}"))
-        }
-        _ if !options.is_empty() => {
-            let chosen: Vec<&str> = current.split(',').collect();
-            let mut line = row().key(format!("opts-{slot}")).gap(6.0).wrap();
-            for option in options {
-                let on = chosen.contains(&option.value.as_str());
-                line = line.child(
-                    Button::new(option.label.clone())
-                        .variant(if on {
-                            ButtonVariant::Contrast
-                        } else {
-                            ButtonVariant::Outline
-                        })
-                        .control_size(ControlSize::Small)
-                        .on_press(pick(&form.id, key, option.value.clone(), multi))
-                        .build(k)
-                        .key(format!("opt-{slot}-{}", option.value)),
-                );
-            }
-            line
-        }
-        _ => {
-            let edit = s
-                .form_inputs
-                .get(&slot)
-                .cloned()
-                .unwrap_or_else(|| TextEdit::new(current.clone()));
-            let target = slot.clone();
-            TextInput::new(&edit)
-                .placeholder(title)
-                .label(title)
-                .on_edit(move |s: &mut UiState| {
-                    s.form_inputs
-                        .entry(target.clone())
-                        .or_insert_with(|| TextEdit::new(current.clone()))
-                })
-                .build(k)
-                .key(format!("in-{slot}"))
-        }
-    };
-    let mut block = col().key(format!("field-{slot}")).w_full().gap(4.0);
-    if !matches!(field, FormField::Boolean { .. }) {
-        block = block.child(
-            text(title.to_string())
-                .font(k.ty.small_medium)
-                .color(k.c.text_base),
-        );
-    }
-    if let Some(d) = description {
-        block = block.child(muted(k, d.clone()));
-    }
-    block.child(control)
-}
-
-pub fn form_card(s: &UiState, k: &Kit, form: &FormRequest) -> El {
-    let pending = s
-        .waiting_forms
-        .get(&form.asid.0)
-        .is_some_and(|l| l.iter().any(|f| f.id == form.id));
-    let mut card = Card::new()
-        .accent(k.c.info.icon)
-        .title(form.title.clone(), None);
-    if !pending {
-        return card.child(badge(k, "answered")).build(k);
-    }
-    for field in form.fields.iter().filter(|f| visible(s, form, f)) {
-        card = card.child(field_input(s, k, form, field));
-    }
-    let (asid, id) = (form.asid.clone(), form.id.clone());
-    card.action(
-        Button::new("Submit")
-            .variant(ButtonVariant::Submit)
-            .control_size(ControlSize::Small)
-            .on_press({
-                let form = form.clone();
-                move |s: &mut UiState| {
-                    let answers = form_answers(s, &form);
-                    if let Some(list) = s.waiting_forms.get_mut(&asid.0) {
-                        list.retain(|f| f.id != id);
+                .on_press(move |s: &mut UiState| {
+                    if let Some(tl) = s.timelines.get_mut(&asid) {
+                        tl.loading_earlier = true;
                     }
-                    s.send(Command::ReplyForm {
-                        asid: asid.clone(),
-                        id: id.clone(),
-                        answers,
-                    });
-                }
-            })
-            .build(k)
-            .key(format!("form-submit-{}", form.id)),
-    )
-    .build(k)
-}
-
-fn todo(k: &Kit, items: &[muqun_gateway::agents::TodoItem]) -> El {
-    let mut list = col().gap(4.0).w_full();
-    for (i, item) in items.iter().enumerate() {
-        let mark = if item.done { "✓" } else { "○" };
-        list = list.child(
-            row()
-                .key(format!("todo-{i}"))
-                .gap(8.0)
-                .child(text(mark).font(k.ty.ui).color(if item.done {
-                    k.c.success.icon
-                } else {
-                    k.c.text_faint
-                }))
-                .child(
-                    text(item.text.clone())
-                        .font(k.ty.ui)
-                        .color(k.c.text_base)
-                        .wrap()
-                        .grow(1.0),
-                ),
+                    s.send(Command::LoadEarlier(AgentSessionId(asid.clone())));
+                })
+                .build(cx.k)
+                .key("load-earlier"),
         );
     }
-    Card::new()
-        .accent(k.c.icon_accent)
-        .title("Todo", None)
-        .child(list)
-        .build(k)
+    line
 }
 
-fn shell_card(s: &UiState, k: &Kit, item: &TimelineItem, part: &AgentPart) -> El {
-    let AgentPart::Shell {
-        command,
-        status,
-        exit,
-        output,
-        truncated,
-        ..
-    } = part
-    else {
-        return col();
-    };
-    let mut card = Card::new()
-        .accent(if exit.is_some_and(|e| e != 0.0) {
-            k.c.danger.icon
-        } else {
-            k.c.icon_base
-        })
-        .title(format!("$ {}", clip(command, 120)), None)
-        .description(match exit {
-            Some(code) => format!("{status} · exit {code}"),
-            None => status.clone(),
-        });
-    if let Some(out) = output.as_ref().filter(|o| !o.is_empty()) {
-        let label = if *truncated {
-            "Output (truncated)"
-        } else {
-            "Output"
-        };
-        card = card.child(collapsible(
-            s,
-            k,
-            &format!("sh-{}", item.id),
-            label.into(),
-            mono(k, clip(out, OUTPUT_CHARS)),
-        ));
-    }
-    card.build(k)
+fn working_row(cx: &Tcx) -> El {
+    row()
+        .key("tl-working")
+        .gap(8.0)
+        .center_y()
+        .py(4.0)
+        .child(Spinner::new().size(12.0).build(cx.k).key("work-spin"))
+        .child(
+            text(cx.t("Working…", "正在工作…"))
+                .font(cx.k.ty.small)
+                .color(cx.k.c.text_muted),
+        )
 }
 
-fn part(s: &UiState, k: &Kit, item: &TimelineItem) -> El {
-    let id = item.id.as_str();
-    match &item.part {
-        AgentPart::Text { text } => {
-            let paths = item_image_paths(s, item);
-            // App shows prose first, then MessageAttachments underneath.
-            let body = {
-                let prose = prompt_display_body(text);
-                if paths.is_empty() {
-                    text.clone()
-                } else {
-                    strip_image_placeholders(prose)
-                }
-            };
-            let mut block = col().key(format!("text-{id}")).gap(8.0).w_full();
-            if !body.is_empty() {
-                block = block.child(rich(k, id, &body));
-            }
-            if let Some(gallery) = image_gallery(s, k, id, &paths) {
-                block = block.child(gallery);
-            }
-            block
-        }
-        AgentPart::Reasoning { text, duration_ms } => {
-            let title = match duration_ms {
-                Some(ms) => format!("Thinking · {:.1}s", *ms as f32 / 1000.0),
-                None => "Thinking".into(),
-            };
-            collapsible(s, k, id, title, rich(k, id, text))
-        }
-        AgentPart::Tool(call) => tool(s, k, item, call),
-        AgentPart::Diff { file, .. } => {
-            let mut card = Card::new()
-                .accent(k.c.icon_accent)
-                .title(file.clone(), None);
-            if let Some(diff) = inline_diff(s, k, id) {
-                card = card.child(diff);
-            }
-            card.build(k)
-        }
-        AgentPart::Todo { items } => todo(k, items),
-        AgentPart::Approval { request } => permission_card(s, k, request),
-        AgentPart::Form { request } => form_card(s, k, request),
-        AgentPart::Status { text } => badge(k, text.clone()),
-        AgentPart::Compaction {
-            status,
-            reason,
-            summary,
-            ..
-        } => {
-            let mut card = Card::new()
-                .accent(k.c.icon_muted)
-                .title(format!("Compaction · {status:?}").to_lowercase(), None);
-            if let Some(reason) = reason {
-                card = card.description(reason.clone());
-            }
-            if let Some(summary) = summary.as_ref().filter(|t| !t.is_empty()) {
-                card = card.child(collapsible(
-                    s,
-                    k,
-                    &format!("cmp-{id}"),
-                    "Summary".into(),
-                    rich(k, id, summary),
-                ));
-            }
-            card.build(k)
-        }
-        AgentPart::Skill { skill, name, text } => col()
-            .gap(6.0)
-            .child(badge(
-                k,
-                format!("Skill · {}", if name.is_empty() { skill } else { name }),
-            ))
-            .child(rich(k, id, text)),
-        AgentPart::Shell { .. } => shell_card(s, k, item, &item.part),
-        AgentPart::ModelSwitched { model, .. } => badge(
-            k,
-            format!("Model → {}/{}", model.provider_id, model.model_id),
-        ),
-        AgentPart::AgentSwitched { mode, .. } => badge(k, format!("Mode → {mode}")),
-        AgentPart::LocationSwitched { directory, .. } => badge(k, format!("Moved to {directory}")),
-        AgentPart::Synthetic { text, description } | AgentPart::System { text, description } => {
-            let mut block = col().gap(6.0);
-            if let Some(d) = description.as_ref().filter(|d| !d.is_empty()) {
-                block = block.child(badge(k, d.clone()));
-            }
-            block.child(rich(k, id, text))
-        }
-    }
-}
-
-/// Rollback and Fork from here, under a message's text.
-fn message_actions(k: &Kit, it: &TimelineItem, asid: Option<&str>) -> Option<El> {
-    let asid = AgentSessionId(asid?.to_string());
+/// Rollback and Fork from here, under a message's text, shown on hover.
+fn message_actions(cx: &Tcx, it: &TimelineItem) -> El {
+    let asid = AgentSessionId(cx.asid.to_string());
     let (rollback_asid, rollback_id) = (asid.clone(), it.message_id.clone());
     let fork_id = it.message_id.clone();
-    Some(
-        row()
-            .key(format!("actions-{}", it.id))
-            .gap(4.0)
-            .center_y()
-            .child(
-                Button::new("Rollback")
-                    .variant(ButtonVariant::Ghost)
-                    .control_size(ControlSize::Small)
-                    .on_press(move |s: &mut UiState| {
-                        s.send(Command::StageRevert {
-                            asid: rollback_asid.clone(),
-                            message_id: rollback_id.clone(),
-                        })
-                    })
-                    .build(k)
-                    .key(format!("rollback-{}", it.id)),
-            )
-            .child(
-                Button::new("Fork from here")
-                    .variant(ButtonVariant::Ghost)
-                    .control_size(ControlSize::Small)
-                    .on_press(move |s: &mut UiState| {
-                        s.send(Command::ForkSession {
-                            asid: asid.clone(),
-                            message_id: Some(fork_id.clone()),
-                        })
-                    })
-                    .build(k)
-                    .key(format!("fork-{}", it.id)),
-            ),
+    let user = it.role == TimelineRole::User;
+    let mut line = row()
+        .key(format!("actions-{}", it.id))
+        .gap(2.0)
+        .center_y()
+        .group_opacity(0.0, 1.0);
+    if user {
+        line = line.self_end();
+    }
+    line.child(
+        Button::new(cx.t("Roll back to here", "回滚到这里"))
+            .variant(ButtonVariant::Ghost)
+            .control_size(ControlSize::Small)
+            .on_press(move |s: &mut UiState| {
+                s.send(Command::StageRevert {
+                    asid: rollback_asid.clone(),
+                    message_id: rollback_id.clone(),
+                })
+            })
+            .build(cx.k)
+            .key(format!("rollback-{}", it.id)),
+    )
+    .child(
+        Button::new(cx.t("Fork from here", "从这里分叉"))
+            .variant(ButtonVariant::Ghost)
+            .control_size(ControlSize::Small)
+            .on_press(move |s: &mut UiState| {
+                s.send(Command::ForkSession {
+                    asid: asid.clone(),
+                    message_id: Some(fork_id.clone()),
+                })
+            })
+            .build(cx.k)
+            .key(format!("fork-{}", it.id)),
     )
 }
 
-fn item(s: &UiState, k: &Kit, it: &TimelineItem, asid: Option<&str>) -> El {
-    let body = part(s, k, it);
-    let mut wrap = col().key(format!("item-{}", it.id)).w_full().gap(2.0);
+fn item_row(cx: &Tcx, it: &TimelineItem) -> El {
+    let body = parts::part(cx, it);
     let is_text = matches!(it.part, AgentPart::Text { .. });
     let user_text = it.role == TimelineRole::User && is_text;
+    let mut wrap = col().key(format!("item-{}", it.id)).w_full().gap(2.0);
     wrap = if user_text {
         wrap.child(
             col()
                 .key("user")
-                .w_full()
-                .px(12.0)
-                .py(8.0)
-                .radius(k.radius.lg)
-                .fill(k.c.layer_02)
+                .self_end()
+                .max_w(620.0)
+                .px(14.0)
+                .py(9.0)
+                .radius(cx.k.radius.lg)
+                .fill(cx.k.c.layer_02)
                 .child(body),
         )
     } else {
         wrap.child(body)
     };
     if is_text && matches!(it.role, TimelineRole::User | TimelineRole::Assistant) {
-        if let Some(actions) = message_actions(k, it, asid) {
-            wrap = wrap.child(actions);
-        }
+        wrap = wrap.hover_group().child(message_actions(cx, it));
     }
     wrap
 }
 
-pub fn view(s: &UiState, k: &Kit) -> El {
-    view_items(
-        s,
-        k,
-        s.selected.as_deref(),
-        &s.timeline,
-        s.earlier_exhausted,
-        s.busy(),
-    )
-}
-
-/// The feed of `items` for session `asid` (a split tile's own timeline; the
-/// focused session passes the top-level fields through [`view`]).
-pub fn view_items(
-    s: &UiState,
-    k: &Kit,
-    asid: Option<&str>,
-    items: &[TimelineItem],
-    earlier_exhausted: bool,
-    busy: bool,
-) -> El {
-    let mut feed = col().key("feed").gap(12.0).w_full().px(24.0).py(24.0);
-    if items.is_empty() {
-        let line = if asid.is_some() {
-            "No messages yet."
-        } else {
-            "Select a session or start a new one."
-        };
-        feed = feed.child(
-            text(line)
-                .key("empty-feed")
-                .font(k.ty.ui)
-                .color(k.c.text_muted),
-        );
-    } else if !earlier_exhausted {
-        if let Some(asid) = asid.map(str::to_string) {
-            feed = feed.child(
-                Button::new("Load earlier")
-                    .variant(ButtonVariant::Ghost)
-                    .control_size(ControlSize::Small)
-                    .on_press(move |s: &mut UiState| {
-                        s.send(Command::LoadEarlier(muqun_gateway::agents::AgentSessionId(
-                            asid.clone(),
-                        )));
-                    })
-                    .build(k)
-                    .key("load-earlier"),
-            );
-        }
-    }
-    for it in items {
-        feed = feed.child(item(s, k, it, asid));
-    }
-    if busy {
-        feed = feed.child(
-            row()
-                .key("working")
-                .gap(8.0)
-                .center_y()
-                .child(Spinner::new().build(k))
-                .child(text("Working…").font(k.ty.small).color(k.c.text_muted)),
-        );
-    }
-    feed.scroll(ScrollSpec { stick_bottom: true })
-        .grow(1.0)
-        .min_h(0.0)
-        .scroll_bar(k)
+/// The image zoom over the window, when a picture is open.
+pub fn overlay(s: &UiState, k: &Kit) -> Option<El> {
+    parts::images::zoom_overlay(s, k)
 }
 
 /// The session's working-tree changes, full height.
 pub fn changes(s: &UiState, k: &Kit) -> El {
+    let language = s.cfg.general.language;
     if s.diff.is_none() {
         let mut list = col()
             .key("changes-list")
@@ -1124,10 +489,15 @@ pub fn changes(s: &UiState, k: &Kit) -> El {
             .py(24.0);
         list = list.child(muted(
             k,
-            format!(
-                "{} changed file(s); the agent gave no patch.",
-                s.diff_stat.files
-            ),
+            match language {
+                crate::config::Language::En => format!(
+                    "{} changed file(s); the agent gave no patch.",
+                    s.diff_stat.files
+                ),
+                crate::config::Language::ZhCn => {
+                    format!("{} 个文件有改动；agent 没有给出补丁。", s.diff_stat.files)
+                }
+            },
         ));
         for f in &s.diff_stat.paths {
             let (asid, path) = (s.selected.clone(), f.path.clone());
@@ -1152,7 +522,11 @@ pub fn changes(s: &UiState, k: &Kit) -> El {
                             .key(format!("chg-open-{}", f.path))
                             .grow(1.0),
                     )
-                    .child(badge(k, format!("+{} −{}", f.added, f.removed))),
+                    .child(
+                        Badge::new(format!("+{} −{}", f.added, f.removed))
+                            .variant(BadgeVariant::Subtle)
+                            .build(k),
+                    ),
             );
         }
         return list
@@ -1171,4 +545,44 @@ pub fn changes(s: &UiState, k: &Kit) -> El {
         .key("changes-diff")
         .build(s, k),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use muqun_gateway::agents::TimelineRole;
+
+    fn text_item(id: &str) -> TimelineItem {
+        TimelineItem {
+            id: id.into(),
+            message_id: format!("m-{id}"),
+            role: TimelineRole::Assistant,
+            part: AgentPart::Text { text: id.into() },
+            seq: 0,
+            updated_ms: 0,
+            ordinal: 0,
+            attachments: None,
+            image_assets: None,
+            generation: None,
+            origin: None,
+        }
+    }
+
+    #[test]
+    fn pages_and_live_rows_keep_one_ordered_list() {
+        let mut tl = SessionTimeline::default();
+        tl.replace(vec![text_item("c"), text_item("d")]);
+        // A live update replaces in place; a new row appends.
+        tl.upsert(vec![text_item("d"), text_item("e")]);
+        // An older page goes above, without the rows already held.
+        tl.loading_earlier = true;
+        tl.prepend(vec![text_item("a"), text_item("b"), text_item("c")], false);
+        let ids: Vec<&str> = tl.items.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(ids, ["a", "b", "c", "d", "e"]);
+        assert!(!tl.loading_earlier && !tl.earlier_exhausted);
+        // A reader's choice survives a snapshot that still has the row.
+        tl.flip("c");
+        tl.replace(vec![text_item("c")]);
+        assert!(tl.is_open("c", false));
+    }
 }

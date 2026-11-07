@@ -42,6 +42,12 @@ sha2 = "0.11.1"
 hex = "0.4"
 # Native file / folder dialogs (`platform/dialogs.rs`).
 rfd = "0.17.2"
+unicode-segmentation = "1.13"
+
+# System notifications (`platform/notify.rs`): the freedesktop notification
+# server over the session bus. Same zbus as Rune's own D-Bus services.
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = { version = "6.2.1", default-features = false, features = ["tokio", "proxy"] }
 
 
 [dev-dependencies]

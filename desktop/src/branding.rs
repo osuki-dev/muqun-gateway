@@ -6,6 +6,11 @@
 
 pub const APP_NAME: &str = "Muqun";
 
+/// The application id: the Wayland `app_id` / X11 class, the `.desktop`
+/// file's name (`muqun-desktop.desktop`) and the icon name, so the
+/// compositor, the launcher and notifications all find the same entry.
+pub const APP_ID: &str = "muqun-desktop";
+
 /// Compact mark for the sidebar title bar (and similar chrome).
 pub const APP_MARK_PNG: &[u8] = include_bytes!("../assets/icons/app-mark-64.png");
 
