@@ -70,10 +70,12 @@ jobs:
 
       - name: fmt
         run: cargo fmt --all -- --check
+      # Workspace clippy still typechecks the gateway; full gateway tests stay
+      # in ci.yml (tmux + its own flakes). Desktop CI owns desktop only.
       - name: clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - name: test
-        run: cargo test --workspace --locked
+      - name: test desktop
+        run: cargo test -p muqun-desktop --locked
       - name: build release
         run: cargo build --release --locked -p muqun-desktop
 
