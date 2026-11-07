@@ -151,6 +151,7 @@ impl RemoteHub {
         let text = answer.text().await.unwrap_or_default();
         let json: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
         if status.is_success() {
+            drop(text);
             return Ok(json);
         }
         let asid = match segments {
@@ -196,10 +197,11 @@ impl RemoteHub {
         asid: &AgentSessionId,
         query: &[(&str, &str)],
     ) -> Result<AgentSessionSnapshot, HubError> {
-        let json = self
+        let mut json = self
             .session_call(Method::GET, asid, &["timeline", "window"], query, None)
             .await?;
-        let data = json.get("data").cloned().unwrap_or(Value::Null);
+        // Taken, not cloned: a long session's window is tens of megabytes.
+        let data = json.get_mut("data").map(Value::take).unwrap_or(Value::Null);
         {
             let mut cursors = self.cursors.lock().unwrap();
             match data.get("history_cursor").and_then(Value::as_str) {
@@ -441,6 +443,14 @@ impl SessionHub for RemoteHub {
         })
     }
 
+    fn wake<'a>(&'a self, asid: &'a AgentSessionId) -> HubFuture<'a, ()> {
+        Box::pin(async move {
+            self.session_call(Method::POST, asid, &["prepare"], &[], None)
+                .await
+                .map(|_| ())
+        })
+    }
+
     /// What the gateway already retains, read without preparing the session
     /// (`retained=true`). `None` when it holds nothing: the open is cold.
     fn peek<'a>(&'a self, asid: &'a AgentSessionId) -> HubFuture<'a, Option<AgentSessionSnapshot>> {
@@ -490,7 +500,8 @@ impl SessionHub for RemoteHub {
                     false,
                 ),
             };
-            let data = json.get("data").cloned().unwrap_or(Value::Null);
+            let mut json = json;
+            let mut data = json.get_mut("data").map(Value::take).unwrap_or(Value::Null);
             if paged {
                 let mut cursors = self.cursors.lock().unwrap();
                 match data.get("history_cursor").and_then(Value::as_str) {
@@ -498,8 +509,11 @@ impl SessionHub for RemoteHub {
                     None => cursors.remove(&asid.0),
                 };
             }
-            let mut items: Vec<TimelineItem> =
-                decode(data.get("items").cloned().unwrap_or(Value::Null))?;
+            let mut items: Vec<TimelineItem> = decode(
+                data.get_mut("items")
+                    .map(Value::take)
+                    .unwrap_or(Value::Null),
+            )?;
             let directory = self.snapshot_directory(asid).await;
             muqun_gateway::agents::message_images::enrich_timeline(
                 &asid.0,

@@ -53,6 +53,9 @@ pub fn clip(text: &str, max: usize) -> String {
     }
 }
 
+/// The least time between two older pages asked for by scrolling.
+const PAGE_PAUSE: std::time::Duration = std::time::Duration::from_millis(700);
+
 /// Rows a list estimates before it has measured them.
 const ROW_ESTIMATE: f32 = 64.0;
 /// Readable line length on a wide window; tiles are narrower anyway.
@@ -90,6 +93,10 @@ pub struct SessionTimeline {
     pub earlier_exhausted: bool,
     /// A page of older history is on its way.
     pub loading_earlier: bool,
+    /// When the last older page landed. While a fling holds the list at its
+    /// top, each page would ask for the next at once and pull the whole
+    /// history in; the next one waits until the reader moves again.
+    pub paged_at: Option<std::time::Instant>,
     /// Bumped whenever rows are added, removed or reordered (the virtual
     /// list's key version).
     pub rev: u64,
@@ -98,6 +105,7 @@ pub struct SessionTimeline {
 impl SessionTimeline {
     /// A snapshot: the whole list, as of now. Reader state stays.
     pub fn replace(&mut self, items: Vec<TimelineItem>) {
+        let started = std::time::Instant::now();
         let keep: HashSet<&str> = items.iter().map(|i| i.id.as_str()).collect();
         self.diffs.retain(|id, _| keep.contains(id.as_str()));
         for item in &items {
@@ -105,6 +113,11 @@ impl SessionTimeline {
         }
         self.items = items;
         self.rev += 1;
+        tracing::debug!(
+            rows = self.items.len(),
+            us = started.elapsed().as_micros() as u64,
+            "timeline replaced"
+        );
     }
 
     /// Live rows: replace by id, else append.
@@ -133,6 +146,7 @@ impl SessionTimeline {
     /// An older page, above what is loaded.
     pub fn prepend(&mut self, older: Vec<TimelineItem>, exhausted: bool) {
         self.loading_earlier = false;
+        self.paged_at = Some(std::time::Instant::now());
         self.earlier_exhausted = exhausted;
         let have: HashSet<String> = self.items.iter().map(|i| i.id.clone()).collect();
         let mut older: Vec<TimelineItem> = older
@@ -375,6 +389,9 @@ pub fn session_view(s: &UiState, k: &Kit, asid: &str) -> El {
                 return false;
             };
             if tl.earlier_exhausted || tl.loading_earlier || tl.items.is_empty() {
+                return false;
+            }
+            if tl.paged_at.is_some_and(|at| at.elapsed() < PAGE_PAUSE) {
                 return false;
             }
             tl.loading_earlier = true;

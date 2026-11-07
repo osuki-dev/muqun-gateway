@@ -50,7 +50,7 @@ use crate::model::commands::{self, Command, CommandSender};
 use crate::model::compose::{BranchInfo, ComposerUpdate, FileHit, InboxItem, StagedFile};
 use crate::model::inbox::{Inbox, UiAction, UiError, Update};
 use crate::model::projects::DirInfo;
-use crate::model::types::{DiffStat, SESSION_LIST_LIMIT};
+use crate::model::types::{DiffStat, SESSIONS_KEPT};
 use crate::theme::color_scheme::ColorScheme;
 use crate::theme::look::Look;
 use crate::theme::service::{GalleryView, Job, ThemeUpdate};
@@ -310,6 +310,8 @@ pub struct UiState {
     pub tile_grid_w: f32,
     /// The saved split was put back once sessions were listed.
     tiles_restored: bool,
+    /// Agents whose session list has arrived (split restore waits for them).
+    listed_agents: HashSet<String>,
 }
 
 impl UiState {
@@ -425,6 +427,7 @@ impl UiState {
             tile_split: cfg.ui.tile_split(),
             pending_tile: None,
             tile_grid_w: 0.0,
+            listed_agents: HashSet::new(),
             tiles_restored: false,
             cfg,
         };
@@ -980,7 +983,20 @@ impl UiState {
             .filter(|a| self.session_by_id(a).is_some())
             .cloned()
             .collect();
-        if saved.len() < 2 {
+        // Lists arrive agent by agent: wait for every saved tile, or for
+        // every agent, before restoring fewer than were saved.
+        let all_listed = !self.agents.is_empty()
+            && self
+                .agents
+                .iter()
+                .filter(|a| {
+                    a.enabled && {
+                        use muqun_gateway::platform::discovery::AgentAvailability as A;
+                        matches!(a.status, A::Connected | A::Reachable | A::Unknown)
+                    }
+                })
+                .all(|a| self.listed_agents.contains(&a.id));
+        if saved.len() < 2 || (saved.len() < self.cfg.ui.tiles.len() && !all_listed) {
             return;
         }
         self.tiles_restored = true;
@@ -1005,8 +1021,12 @@ impl UiState {
         }
         for update in updates {
             match update {
-                Update::Agents(agents) => self.on_agents(agents),
+                Update::Agents(agents) => {
+                    self.on_agents(agents);
+                    self.restore_tiles();
+                }
                 Update::AgentSessions { agent, sessions } => {
+                    self.listed_agents.insert(agent.clone());
                     self.sessions.retain(|s| s.agent_id != agent);
                     self.merge_sessions(sessions);
                     if self.error.as_ref().is_some_and(|e| e.unreachable) {
@@ -1205,7 +1225,7 @@ impl UiState {
         }
         self.sessions
             .sort_by_key(|s| std::cmp::Reverse(s.updated_ms));
-        self.sessions.truncate(SESSION_LIST_LIMIT);
+        self.sessions.truncate(SESSIONS_KEPT);
     }
 
     fn on_snapshot(&mut self, snapshot: muqun_gateway::agents::ports::AgentSessionSnapshot) {

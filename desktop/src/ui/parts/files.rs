@@ -34,6 +34,22 @@ fn with_headers(path: &str, patch: &str) -> String {
     format!("--- a/{path}\n+++ b/{path}\n{body}")
 }
 
+/// ACP diff items the core slimmed to their patch (`model::compact`).
+fn acp_patches(call: &ToolCall) -> Vec<(String, String)> {
+    call.content
+        .as_ref()
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|c| c.get("type").and_then(Value::as_str) == Some("diff"))
+        .filter_map(|c| {
+            let patch = c.get("patch").and_then(Value::as_str)?;
+            let path = c.get("path").and_then(Value::as_str).unwrap_or("");
+            Some((path.to_string(), patch.to_string()))
+        })
+        .collect()
+}
+
 /// ACP's `{type: "diff", path, oldText, newText}` content items.
 fn acp_diffs(call: &ToolCall) -> Vec<(String, String, String)> {
     call.content
@@ -83,6 +99,19 @@ fn call_diff_source(call: &ToolCall) -> Option<(u64, BuildFiles)> {
             .map(|f| with_headers(&f.path, &f.patch))
             .collect::<Vec<_>>()
             .join("\n");
+        return Some((hash_of(&[&patch]), Box::new(move || parse(&patch))));
+    }
+    let patches = acp_patches(call);
+    if !patches.is_empty() {
+        let patch = patches
+            .iter()
+            .filter(|(_, p)| p.contains("\n@@ "))
+            .map(|(_, p)| p.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if patch.is_empty() {
+            return None;
+        }
         return Some((hash_of(&[&patch]), Box::new(move || parse(&patch))));
     }
     let acp = acp_diffs(call);

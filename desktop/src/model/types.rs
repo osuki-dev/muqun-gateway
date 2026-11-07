@@ -2,6 +2,11 @@
 
 /// How many sessions the sidebar lists. P0 has no paging.
 pub const SESSION_LIST_LIMIT: usize = 100;
+/// Sessions the UI keeps across all agents (each lists up to
+/// [`SESSION_LIST_LIMIT`]). Cutting the merged list to 100 hid most of a
+/// busy computer's sessions, and the split view could not restore tiles
+/// whose sessions fell outside it.
+pub const SESSIONS_KEPT: usize = 1000;
 
 /// A listed session's id and folder, for resolving projects.
 #[derive(Debug, Clone, PartialEq, Eq)]

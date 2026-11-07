@@ -27,7 +27,26 @@ use crate::ui::UiState;
 
 static COMMANDS: OnceLock<CommandSender> = OnceLock::new();
 
+/// glibc keeps a heap arena per thread and returns little of it: a long
+/// session's window (tens of megabytes of JSON) parsed on a runtime worker
+/// left its pages resident, and browsing four long sessions held ~1 GB.
+/// Two arenas, prompt trimming and big blocks in their own mappings give
+/// that memory back (measured: ~1 GB → ~330 MB on the same browse).
+#[cfg(target_env = "gnu")]
+fn tune_allocator() {
+    // SAFETY: plain allocator tuning calls, made before any other thread.
+    unsafe {
+        libc::mallopt(libc::M_ARENA_MAX, 2);
+        libc::mallopt(libc::M_TRIM_THRESHOLD, 128 * 1024);
+        libc::mallopt(libc::M_MMAP_THRESHOLD, 256 * 1024);
+    }
+}
+
+#[cfg(not(target_env = "gnu"))]
+fn tune_allocator() {}
+
 fn main() -> anyhow::Result<()> {
+    tune_allocator();
     let started = Instant::now();
     let (config_dir, state_dir) = platform::directories()?;
     muqun_gateway::set_directories(config_dir.clone(), state_dir.clone())?;

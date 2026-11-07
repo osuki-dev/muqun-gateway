@@ -106,6 +106,9 @@ async fn mark_missing(projects: &mut [muqun_gateway::agents::AgentProject]) {
     let _ = tokio::time::timeout(EXISTS_BUDGET, check).await;
 }
 
+/// Refreshes asked for within this of the last are folded into it.
+const REFRESH_DEDUPE: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Whether the UI can show anything of `event`, with `active` the session
 /// that is open. Every agent's sessions stream through one channel, and an
 /// agent working in a session nobody is looking at sends its timeline many
@@ -193,6 +196,10 @@ struct Core {
     last_seq: Mutex<HashMap<String, u64>>,
     /// Which view-heartbeat task is current; older ones end at their next tick.
     beat: AtomicU64,
+    /// When the last full refresh started: boot asks from main and from the
+    /// window, and a second ask this soon is answered by the first.
+    refreshed_at: Mutex<Option<std::time::Instant>>,
+    tasks_reading: std::sync::atomic::AtomicBool,
 }
 
 /// Start the core side. Returns at once; the tasks live as long as the
@@ -219,6 +226,8 @@ pub fn spawn(
         resolved: Mutex::new(Default::default()),
         last_seq: Mutex::new(HashMap::new()),
         beat: AtomicU64::new(0),
+        refreshed_at: Mutex::new(None),
+        tasks_reading: Default::default(),
     });
     core.inbox.push(Update::HubMode(core.hub.mode()));
     tokio::spawn(core.clone().events());
@@ -323,7 +332,8 @@ impl Core {
                 }
             }
             Command::LoadEarlier(asid) => match self.hub.earlier(&asid).await {
-                Ok(items) => {
+                Ok(mut items) => {
+                    super::compact::slim(&mut items);
                     let exhausted = items.is_empty();
                     tracing::debug!(asid = %asid.0, rows = items.len(), "older history page");
                     self.inbox.push(Update::Earlier {
@@ -663,6 +673,13 @@ impl Core {
     /// others back. Starts are staggered so ten agents listing at once do
     /// not spike the first second of startup.
     async fn refresh(self: Arc<Self>) {
+        {
+            let mut at = self.refreshed_at.lock().unwrap();
+            if at.is_some_and(|t| t.elapsed() < REFRESH_DEDUPE) {
+                return;
+            }
+            *at = Some(std::time::Instant::now());
+        }
         tokio::spawn(self.clone().refresh_tasks());
         if let Ok(agents) = self.hub.agents().await {
             self.inbox.push(Update::Agents(agents));
@@ -674,6 +691,14 @@ impl Core {
     /// The delegated task list and the default folder. A gateway without
     /// task routes (or an unreachable one) leaves the list as it was.
     async fn refresh_tasks(self: Arc<Self>) {
+        if self.tasks_reading.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.clone().read_tasks().await;
+        self.tasks_reading.store(false, Ordering::Release);
+    }
+
+    async fn read_tasks(self: Arc<Self>) {
         let list = tokio::time::timeout(LIST_TIMEOUT, self.hub.list_tasks(None, None));
         match list.await {
             Ok(Ok(rows)) => {
@@ -796,7 +821,13 @@ impl Core {
                 .filter(|a| !listed.contains(a))
                 .cloned()
                 .collect();
-            if !fresh.is_empty() {
+            // A refresh that just started lists these already (boot).
+            let refreshing = self
+                .refreshed_at
+                .lock()
+                .unwrap()
+                .is_some_and(|t| t.elapsed() < REFRESH_DEDUPE);
+            if !fresh.is_empty() && !refreshing {
                 self.spawn_lists(fresh).await;
             }
             listed = attached;
@@ -833,7 +864,8 @@ impl Core {
 
     /// A session's snapshot to the view, and its waiting prompts to the
     /// composer (the view keeps no inbox).
-    fn push_snapshot(&self, snapshot: muqun_gateway::agents::ports::AgentSessionSnapshot) {
+    fn push_snapshot(&self, mut snapshot: muqun_gateway::agents::ports::AgentSessionSnapshot) {
+        super::compact::slim(&mut snapshot.timeline);
         self.last_seq
             .lock()
             .unwrap()
@@ -861,7 +893,7 @@ impl Core {
                 let hub = Arc::clone(&self.hub);
                 let wake = asid.clone();
                 tokio::spawn(async move {
-                    if let Err(err) = hub.open(&wake).await {
+                    if let Err(err) = hub.wake(&wake).await {
                         tracing::debug!(asid = %wake.0, %err, "background wake after peek failed");
                     }
                 });
@@ -936,7 +968,8 @@ impl Core {
             return false;
         }
         match self.hub.timeline_after(asid, after).await {
-            Ok(found) if !found.resync => {
+            Ok(mut found) if !found.resync => {
+                super::compact::slim(&mut found.items);
                 if !found.items.is_empty() {
                     self.last_seq
                         .lock()
@@ -1110,6 +1143,10 @@ impl Core {
                                 .entry(event.asid().0.clone())
                                 .and_modify(|seq| *seq = (*seq).max(event.seq()))
                                 .or_insert(event.seq());
+                        }
+                        let mut event = event;
+                        if let AgentDomainEvent::TimelineUpsert { items, .. } = &mut event {
+                            super::compact::slim(items);
                         }
                         self.inbox.push(Update::event(event));
                     }

@@ -3,6 +3,7 @@
 //! thread folds them into its state (`ui::bridge`).
 
 pub mod commands;
+pub mod compact;
 pub mod compose;
 pub mod composer_mentions;
 pub mod composer_popup;

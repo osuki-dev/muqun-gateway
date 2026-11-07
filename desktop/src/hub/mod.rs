@@ -256,6 +256,11 @@ pub trait SessionHub: Send + Sync {
     /// preparing it as the App's `/prepare` does (which may restore a dormant
     /// runtime or start following a terminal). For an explicit selection.
     fn open<'a>(&'a self, asid: &'a AgentSessionId) -> HubFuture<'a, AgentSessionSnapshot>;
+    /// Prepare the session as `open` does, without reading its history back
+    /// (the warm path already painted it from `peek`).
+    fn wake<'a>(&'a self, asid: &'a AgentSessionId) -> HubFuture<'a, ()> {
+        Box::pin(async move { self.open(asid).await.map(|_| ()) })
+    }
     /// Retained history only — never wakes an agent. `None` means a cold open.
     fn peek<'a>(&'a self, asid: &'a AgentSessionId) -> HubFuture<'a, Option<AgentSessionSnapshot>>;
     /// The same snapshot, read without preparing anything where the hub can
