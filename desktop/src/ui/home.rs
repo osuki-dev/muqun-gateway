@@ -434,6 +434,9 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
                 .on_edit(|s: &mut UiState| &mut s.start_draft)
                 .on_change(|s: &mut UiState, _: &mut Tx| s.persist_draft(Slot::Start))
                 .on_submit(|s: &mut UiState, _: &mut Tx| submit_start(s))
+                .on_input_paste(|s: &mut UiState, content, _: &mut Tx| {
+                    super::composer::take_paste(s, content)
+                })
                 .build(k)
                 .key("start-draft")
                 .w_full(),

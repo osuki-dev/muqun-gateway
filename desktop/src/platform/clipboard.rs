@@ -1,6 +1,5 @@
-//! The system clipboard's image, for pasting a screenshot into the composer.
-//! Text goes through Blinc's own `clipboard_read` (the text area handles it);
-//! Blinc has no image path, so this asks the same crate Blinc uses.
+//! The system clipboard's image, for the composer's "Paste image" button.
+//! Ctrl/Cmd+V file and image pastes go through Rune's `on_input_paste` instead.
 
 /// The clipboard's image as PNG bytes, or `None` when it holds none (or the
 /// clipboard cannot be opened). PNG because the gateway's upload route

@@ -17,6 +17,10 @@
   theme gets a hero strip, and Agents / Appearance / General / About use
   clearer section intros; Appearance links into Themes.
 
+- **Ctrl/Cmd+V pastes files or a clipboard image into the prompt.** Copied
+  Finder/Nautilus files and screenshots stage as attachments on the Home and
+  session drafts; plain text still pastes into the field as before.
+
 - **Large videos can be uploaded in chunks, up to 1 GiB, without the Gateway
   buffering the file.** `POST /api/uploads` reads its whole body into memory
   (and a sealed body cannot be streamed), which is why it stops at 64 MiB.

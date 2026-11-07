@@ -89,3 +89,9 @@ tokio = { version = "1.53.3", features = ["test-util"] }
 lto = "thin"
 codegen-units = 1
 strip = true
+
+# Local rune checkout (same rev as desktop/Cargo.toml) so TextArea can expose
+# on_input_paste for Ctrl+V file / image attachments.
+[patch."https://github.com/anomalyco/rune"]
+rune = { path = "../rune/crates/rune" }
+rune-kit = { path = "../rune/crates/rune-kit" }

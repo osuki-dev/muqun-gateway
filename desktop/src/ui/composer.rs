@@ -49,6 +49,29 @@ pub fn stage_path(s: &mut UiState, path: PathBuf) {
     }));
 }
 
+/// Ctrl/Cmd+V into the draft: stage copied files or a clipboard image; leave
+/// plain text to the editor. Returns true when the paste was consumed.
+pub fn take_paste(s: &mut UiState, content: &rune::ClipboardContent) -> bool {
+    let files = content.files();
+    if !files.is_empty() {
+        for path in files {
+            stage_path(s, path.clone());
+        }
+        s.status = if files.len() == 1 {
+            "Attached file".into()
+        } else {
+            format!("Attached {} files", files.len())
+        };
+        return true;
+    }
+    if let Some(image) = content.image() {
+        stage_png(s, image.png().to_vec());
+        s.status = "Attached image".into();
+        return true;
+    }
+    false
+}
+
 /// What `text` delivers: a host command or skill when it starts with a
 /// `/name` the agent's catalogue knows, else a prompt.
 fn deliver_of(s: &UiState, text: &str) -> Deliver {
@@ -845,6 +868,7 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
                 .on_edit(|s: &mut UiState| &mut s.draft)
                 .on_change(on_draft_change)
                 .on_submit(|s: &mut UiState, _: &mut Tx| submit_session(s))
+                .on_input_paste(|s: &mut UiState, content, _: &mut Tx| take_paste(s, content))
                 .build(k)
                 .key("draft")
                 .w_full(),
@@ -852,6 +876,10 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         .child(actions)
         .child(muted(
             k,
-            format!("{} to send", crate::platform::keys::label("Primary+Enter")),
+            format!(
+                "{} to send · {} to paste files or an image",
+                crate::platform::keys::label("Primary+Enter"),
+                crate::platform::keys::label("Primary+V"),
+            ),
         ))
 }
