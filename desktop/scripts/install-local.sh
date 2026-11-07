@@ -43,7 +43,8 @@ if [[ "$BUILD" == 1 ]]; then
   echo "building muqun-desktop (release)…"
   cargo build --manifest-path "$ROOT/Cargo.toml" -p muqun-desktop --release --locked
 fi
-BIN_SRC="$ROOT/target/release/muqun-desktop"
+# cargo puts the build where CARGO_TARGET_DIR says, when it is set.
+BIN_SRC="${CARGO_TARGET_DIR:-$ROOT/target}/release/muqun-desktop"
 if [[ ! -x "$BIN_SRC" ]]; then
   echo "missing release binary: $BIN_SRC (run without --no-build)" >&2
   exit 1

@@ -74,13 +74,22 @@ fn main() -> anyhow::Result<()> {
     COMMANDS
         .set(tx.clone())
         .map_err(|_| anyhow::anyhow!("commands already installed"))?;
-    start_core(
-        settings,
-        state_dir.clone(),
-        inbox.clone(),
-        store.clone(),
-        rx,
-    )?;
+    // A screenshot scene (`--scene`) shows demo data and ignores the core:
+    // starting it would launch agents (and their daemons) for nothing.
+    if std::env::args().any(|a| a == "--scene" || a.starts_with("--scene=")) {
+        std::thread::spawn(move || {
+            let mut rx = rx;
+            while rx.blocking_recv().is_some() {}
+        });
+    } else {
+        start_core(
+            settings,
+            state_dir.clone(),
+            inbox.clone(),
+            store.clone(),
+            rx,
+        )?;
+    }
     commands::send(&tx, Command::Refresh);
     let _ = theme::install(&config_dir, &state_dir, &config.appearance);
 
