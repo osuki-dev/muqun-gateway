@@ -583,6 +583,125 @@ fn viewer_video(s: &mut UiState) {
     }
 }
 
+fn terminals_scene(s: &mut UiState) {
+    use crate::model::terminals::{
+        parse_screen, Pane, PaneRef, SessionView, Tab, TerminalsView, Workspace,
+    };
+    use std::sync::Arc;
+    base(s);
+    s.mode = Mode::Terminals;
+    let pane = |id: &str, agent: Option<&str>, status: &str, cmd: &str, cwd: &str| Pane {
+        id: id.into(),
+        agent: agent.map(Into::into),
+        status: status.into(),
+        command: Some(cmd.into()),
+        cwd: Some(cwd.into()),
+        title: None,
+        focused: false,
+    };
+    let tab = |id: &str, label: &str, panes: Vec<Pane>| Tab {
+        id: id.into(),
+        label: label.into(),
+        panes,
+    };
+    let ws = |id: &str, n: u64, label: &str, status: &str, tabs: Vec<Tab>| Workspace {
+        id: id.into(),
+        label: label.into(),
+        number: Some(n),
+        focused: false,
+        status: status.into(),
+        tabs,
+    };
+    s.terms.view = Arc::new(TerminalsView {
+        sessions: vec![SessionView {
+            id: "herdr".into(),
+            label: "Herdr".into(),
+            connected: true,
+            error: None,
+            workspaces: vec![
+                ws(
+                    "w1",
+                    1,
+                    "gateway",
+                    "working",
+                    vec![tab(
+                        "w1:t1",
+                        "1",
+                        vec![
+                            pane(
+                                "w1:p1",
+                                Some("claude"),
+                                "working",
+                                "claude",
+                                "/home/demo/gateway",
+                            ),
+                            pane("w1:p2", None, "unknown", "bash", "/home/demo/gateway"),
+                        ],
+                    )],
+                ),
+                ws(
+                    "w2",
+                    2,
+                    "app",
+                    "blocked",
+                    vec![
+                        tab(
+                            "w2:t1",
+                            "agent",
+                            vec![pane(
+                                "w2:p1",
+                                Some("codex"),
+                                "blocked",
+                                "codex",
+                                "/home/demo/app",
+                            )],
+                        ),
+                        tab(
+                            "w2:t2",
+                            "logs",
+                            vec![pane("w2:p2", None, "unknown", "tail", "/home/demo/app")],
+                        ),
+                    ],
+                ),
+                ws(
+                    "w3",
+                    3,
+                    "notes",
+                    "idle",
+                    vec![tab(
+                        "w3:t1",
+                        "1",
+                        vec![pane("w3:p1", None, "unknown", "nvim", "/home/demo/notes")],
+                    )],
+                ),
+            ],
+        }],
+        error: None,
+    });
+    s.terms.loaded = true;
+    let at = PaneRef {
+        session: "herdr".into(),
+        pane: "w1:p2".into(),
+    };
+    let raw =
+        "\u{1b}[1;36m~/gateway\u{1b}[0m \u{1b}[1;36m❯\u{1b}[0m cargo test -p muqun-desktop\r\n\
+\u{1b}[1;32m   Compiling\u{1b}[0m muqun-desktop v0.1.0\r\n\
+\u{1b}[1;32m    Finished\u{1b}[0m `test` profile [unoptimized + debuginfo] in 14.2s\r\n\
+\u{1b}[1;32m     Running\u{1b}[0m unittests src/main.rs\r\n\r\n\
+running 131 tests\r\n\
+test model::terminals::tests::a_screen_keeps_its_colours ... \u{1b}[32mok\u{1b}[0m\r\n\
+test model::notify::tests::titles_follow_the_gateway_push_rule ... \u{1b}[32mok\u{1b}[0m\r\n\
+test ui::viewer::tests::the_gutter_numbers_every_line_once ... \u{1b}[32mok\u{1b}[0m\r\n\r\n\
+test result: \u{1b}[32mok\u{1b}[0m. 131 passed; 0 failed; 0 ignored\r\n\r\n\
+\u{1b}[1;36m~/gateway\u{1b}[0m \u{1b}[1;36m❯\u{1b}[0m git status --short\r\n\
+\u{1b}[31m M\u{1b}[0m desktop/src/ui/terminals.rs\r\n\
+\u{1b}[32m??\u{1b}[0m desktop/src/model/terminals.rs\r\n\r\n\
+\u{1b}[1;36m~/gateway\u{1b}[0m \u{1b}[1;36m❯\u{1b}[0m \r\n";
+    s.terms.screen = Some((at.clone(), Arc::new(parse_screen(raw))));
+    s.terms.selected = Some(at);
+    s.demo = true;
+}
+
 /// A scene name and the state it applies.
 pub type Scene = (&'static str, fn(&mut UiState));
 
@@ -644,6 +763,7 @@ pub fn scenes() -> &'static [Scene] {
         ("timeline-narrow", timeline_narrow),
         ("timeline-long", timeline_long),
         ("timeline-zh", timeline_zh),
+        ("terminals", terminals_scene),
         ("viewer", viewer_code),
         ("viewer-markdown", viewer_markdown),
         ("viewer-image", viewer_image),

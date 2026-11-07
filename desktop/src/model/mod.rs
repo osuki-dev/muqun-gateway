@@ -11,6 +11,7 @@ pub mod notify;
 pub mod projection;
 pub mod projects;
 pub mod stream;
+pub mod terminals;
 pub mod tool_view;
 pub mod turn;
 pub mod types;

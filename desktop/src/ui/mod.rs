@@ -22,6 +22,7 @@ mod settings;
 mod shell;
 mod splash;
 mod tasks;
+mod terminals;
 mod tiles;
 mod timeline;
 mod viewer;
@@ -64,6 +65,7 @@ pub enum Mode {
     Session,
     Inbox,
     Tasks,
+    Terminals,
     Settings,
 }
 
@@ -286,6 +288,8 @@ pub struct UiState {
     pub agents_seen: bool,
     /// A screenshot scene is showing: live core updates are ignored.
     pub demo: bool,
+    /// The Terminals page (`ui/terminals.rs`).
+    pub terms: terminals::TermState,
     /// The file viewer overlay ([`UiState::open_file`]).
     pub viewer: Option<viewer::Viewer>,
     /// Sessions open side by side (empty when one session fills the pane).
@@ -406,6 +410,7 @@ impl UiState {
             agents_seen: false,
             demo: false,
             viewer: None,
+            terms: terminals::TermState::default(),
             tiles: Vec::new(),
             focus: 0,
             tile_split: cfg.ui.tile_split(),
@@ -581,6 +586,7 @@ impl UiState {
         self.mode = mode;
         match mode {
             Mode::Tasks => self.send(Command::RefreshTasks),
+            Mode::Terminals => self.watch_terminals(),
             Mode::Home => {
                 self.send(Command::LoadProjects {
                     agent: self.start_agent.clone(),
@@ -1084,6 +1090,7 @@ impl UiState {
                 Update::Worktrees(rows) => self.worktrees = rows,
                 Update::HubMode(mode) => self.hub_label = mode.to_string(),
                 Update::Attention(attention) => self.on_attention(&attention),
+                Update::Terminals(update) => self.on_terminals(*update),
             }
         }
         if LAYOUT_DIRTY.swap(false, Ordering::AcqRel) {
@@ -1752,6 +1759,7 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>) -> El {
             layer.push(stage);
         }
     }
+    terminals::page_visible(s.mode);
     viewer::mount(s, &k, cx.env().scale, &mut layer);
     if !s.toasts.is_empty() {
         let mut region = ToastRegion::new();

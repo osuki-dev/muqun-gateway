@@ -31,6 +31,7 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
         Mode::Session => session(s, k, &look, layer),
         Mode::Inbox => inbox::view(s, k),
         Mode::Tasks => tasks::view(s, k),
+        Mode::Terminals => super::terminals::view(s, k),
         Mode::Settings => settings::view(s, k),
     };
     let mut main = col().key("main").w_full().h_full().min_h(0.0);
@@ -116,6 +117,7 @@ fn page_title(s: &UiState) -> String {
         Mode::Home => tr(language, "New session", "新建会话"),
         Mode::Inbox => tr(language, "Inbox", "收件箱"),
         Mode::Tasks => tr(language, "Tasks", "任务"),
+        Mode::Terminals => tr(language, "Terminals", "终端"),
         Mode::Settings => tr(language, "Settings", "设置"),
         Mode::Session => s
             .current()

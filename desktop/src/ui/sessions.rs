@@ -482,6 +482,13 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         .footer(nav(
             s,
             k,
+            super::copy::tr_ref(language, "Terminals", "终端"),
+            &super::terminals::TERMINAL,
+            Mode::Terminals,
+        ))
+        .footer(nav(
+            s,
+            k,
             super::copy::tr_ref(language, "Settings", "设置"),
             &SETTINGS,
             Mode::Settings,
