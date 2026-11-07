@@ -996,7 +996,11 @@ impl Projection {
                     });
                 // An update without a name keeps the call's (Claude Code
                 // repeats only `kind`); `kind` names a call that has none.
+                // Cursor sends no name and a category `kind` ("other"); its
+                // tool's own name is `rawInput._toolName` (`task` = subagent).
                 if let Some(name) = update["name"].as_str() {
+                    call.name = name.into();
+                } else if let Some(name) = update["rawInput"]["_toolName"].as_str() {
                     call.name = name.into();
                 } else if let Some(kind) = update["kind"].as_str().filter(|_| call.name.is_empty())
                 {
@@ -1285,6 +1289,10 @@ mod tests {
         // A call that never names its tool is still named by `kind`.
         let row = projection.update(&json!({"sessionUpdate":"tool_call","toolCallId":"t2","kind":"read","status":"pending"})).unwrap().unwrap();
         assert!(matches!(&row.part, AgentPart::Tool(tool) if tool.name == "read"));
+        // Cursor's category `kind` is "other"; the tool names itself in its
+        // input, and `task` is how it starts a subagent.
+        let row = projection.update(&json!({"sessionUpdate":"tool_call","toolCallId":"t3","kind":"other","status":"pending","rawInput":{"_toolName":"task","description":"Audit","prompt":"Read the files"}})).unwrap().unwrap();
+        assert!(matches!(&row.part, AgentPart::Tool(tool) if tool.name == "task"));
     }
 
     #[test]
