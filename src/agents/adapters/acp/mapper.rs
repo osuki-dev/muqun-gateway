@@ -752,6 +752,27 @@ impl Projection {
             .map(|(_, text)| text)
     }
 
+    /// Bind host file paths onto the newest user text row (Cursor store photos
+    /// arrive as separate content parts beside the `[Image #N]` prompt text).
+    pub fn bind_latest_user_attachments(&mut self, paths: Vec<String>) {
+        if paths.is_empty() {
+            return;
+        }
+        let Some(id) = self
+            .rows
+            .values()
+            .filter(|row| row.role == TimelineRole::User)
+            .filter(|row| matches!(row.part, AgentPart::Text { .. }))
+            .max_by_key(|row| row.ordinal)
+            .map(|row| row.id.clone())
+        else {
+            return;
+        };
+        if let Some(row) = self.rows.get_mut(&id) {
+            row.attachments = Some(paths);
+        }
+    }
+
     /// The ordinary live ACP stream omits user echoes. This row records only
     /// the Gateway's flushed submission, and is replaced by native history on load.
     pub fn submitted(&mut self, text: &str, attachments: Option<Vec<String>>) -> TimelineItem {

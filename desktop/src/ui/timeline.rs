@@ -1,7 +1,6 @@
 //! The session timeline: one block per [`TimelineItem`], by [`AgentPart`].
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use muqun_gateway::agents::message_images::resolve_host_media;
 use muqun_gateway::agents::ports::agent::{prompt_display_body, split_attachment_paths};
@@ -17,7 +16,7 @@ use rune_kit::{
 };
 use serde_json::{json, Value};
 
-use super::{art, muted, UiState};
+use super::{muted, UiState};
 use crate::model::commands::Command;
 
 const OUTPUT_CHARS: usize = 600;
@@ -275,20 +274,22 @@ fn tool_image_paths(s: &UiState, call: &ToolCall) -> Vec<PathBuf> {
 }
 
 fn timeline_picture(k: &Kit, images: &ImageCache, path: &Path, key: &str) -> El {
-    match std::fs::read(path) {
-        Ok(bytes) => art::picture(images, Arc::<[u8]>::from(bytes), SurfaceFit::Fit)
-            .key(key.to_string())
-            .w(TIMELINE_IMG_W)
-            .h(TIMELINE_IMG_H)
-            .radius(k.radius.md)
-            .clip_rounded(k.radius.md),
-        Err(_) => el()
+    if !path.is_file() {
+        return el()
             .key(key.to_string())
             .w(TIMELINE_IMG_W)
             .h(96.0)
             .radius(k.radius.md)
-            .fill(k.c.layer_02),
+            .fill(k.c.layer_02);
     }
+    // `ImageCache::file` keeps a strong handle via Pixels::keep while drawn.
+    let image = images.file(path, TIMELINE_IMG_H, 2.0);
+    el().key(key.to_string())
+        .pixels_fit(image.pixels(), SurfaceFit::Fit)
+        .w(TIMELINE_IMG_W)
+        .h(TIMELINE_IMG_H)
+        .radius(k.radius.md)
+        .clip_rounded(k.radius.md)
 }
 
 fn image_gallery(s: &UiState, k: &Kit, id: &str, paths: &[PathBuf]) -> Option<El> {
