@@ -301,6 +301,7 @@ pub fn scenes() -> &'static [Scene] {
         ("timeline-cards", timeline_cards),
         ("timeline-narrow", timeline_narrow),
         ("timeline-long", timeline_long),
+        ("timeline-zh", timeline_zh),
     ]
 }
 

@@ -307,9 +307,17 @@ pub fn session_view(s: &UiState, k: &Kit, asid: &str) -> El {
             },
             move |s: &UiState, i| {
                 let cx = Tcx::new(s, &kit, &build_asid);
+                let mut tail = false;
                 let body = match row_at(s, &build_asid, i) {
                     Some(Row::Top) => top_row(&cx),
-                    Some(Row::Item(item)) => item_row(&cx, item),
+                    Some(Row::Item(item)) => {
+                        // The answer being written: Rune eases its growth.
+                        tail = s.session_busy(&build_asid)
+                            && matches!(item.part, AgentPart::Text { .. })
+                            && cx.tl().and_then(|t| t.items.last()).map(|l| &l.id)
+                                == Some(&item.id);
+                        item_row(&cx, item)
+                    }
                     Some(Row::Working) | None => working_row(&cx),
                 };
                 // Rows space themselves with padding: virtual rows take no gaps.
@@ -318,6 +326,7 @@ pub fn session_view(s: &UiState, k: &Kit, asid: &str) -> El {
                     .items_center()
                     .px(16.0)
                     .py(5.0)
+                    .streaming(tail)
                     .child(body.w_full().max_w(FEED_MAX_W))
             },
         )
@@ -538,4 +547,44 @@ pub fn changes(s: &UiState, k: &Kit) -> El {
         .key("changes-diff")
         .build(s, k),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use muqun_gateway::agents::TimelineRole;
+
+    fn text_item(id: &str) -> TimelineItem {
+        TimelineItem {
+            id: id.into(),
+            message_id: format!("m-{id}"),
+            role: TimelineRole::Assistant,
+            part: AgentPart::Text { text: id.into() },
+            seq: 0,
+            updated_ms: 0,
+            ordinal: 0,
+            attachments: None,
+            image_assets: None,
+            generation: None,
+            origin: None,
+        }
+    }
+
+    #[test]
+    fn pages_and_live_rows_keep_one_ordered_list() {
+        let mut tl = SessionTimeline::default();
+        tl.replace(vec![text_item("c"), text_item("d")]);
+        // A live update replaces in place; a new row appends.
+        tl.upsert(vec![text_item("d"), text_item("e")]);
+        // An older page goes above, without the rows already held.
+        tl.loading_earlier = true;
+        tl.prepend(vec![text_item("a"), text_item("b"), text_item("c")], false);
+        let ids: Vec<&str> = tl.items.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(ids, ["a", "b", "c", "d", "e"]);
+        assert!(!tl.loading_earlier && !tl.earlier_exhausted);
+        // A reader's choice survives a snapshot that still has the row.
+        tl.flip("c");
+        tl.replace(vec![text_item("c")]);
+        assert!(tl.is_open("c", false));
+    }
 }
