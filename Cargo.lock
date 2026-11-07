@@ -2604,6 +2604,8 @@ dependencies = [
  "tokio-tungstenite 0.30.0",
  "tracing",
  "tracing-subscriber",
+ "unicode-segmentation",
+ "zbus 6.2.1",
 ]
 
 [[package]]

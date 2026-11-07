@@ -500,7 +500,7 @@ fn glob_body(cx: &Tcx, groups: &[tv::PathGroup]) -> El {
                         ),
                 )
                 .cursor(Cursor::Pointer)
-                .on_press(move |s: &mut UiState| s.open_file(&path)),
+                .on_press(move |s: &mut UiState| s.open_timeline_file(&path)),
             );
         }
         if group.files.len() > 12 {
@@ -529,7 +529,7 @@ fn grep_body(cx: &Tcx, groups: &[tv::GrepFile]) -> El {
                     .w_full(),
             )
             .cursor(Cursor::Pointer)
-            .on_press(move |s: &mut UiState| s.open_file(&path)),
+            .on_press(move |s: &mut UiState| s.open_timeline_file(&path)),
         );
         for (li, (n, line)) in group.lines.iter().take(8).enumerate() {
             block = block.child(

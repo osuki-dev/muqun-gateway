@@ -67,6 +67,13 @@ pub enum UiAction {
     Open(String),
     /// Toggle the top-bar working-tree file list.
     ToggleDiffPanel,
+    /// The viewer's reader finished (`model/viewer.rs`).
+    ViewerLoaded {
+        path: std::path::PathBuf,
+        loaded: Box<super::viewer::Loaded>,
+    },
+    /// The viewer's Save as… copied the file (or could not).
+    FileSaved(Result<std::path::PathBuf, String>),
     /// Open one changed file in the preferred editor.
     OpenDiffFile {
         asid: String,
@@ -139,6 +146,9 @@ pub enum Update {
     Worktrees(Vec<crate::hub::WorktreeRow>),
     /// Where this desktop's sessions run, applied by the drain to a binding.
     HubMode(crate::hub::HubMode),
+    /// A session wants the owner, or finished (`model/notify.rs`): the UI
+    /// raises a system notification unless that session is on screen.
+    Attention(super::notify::Attention),
 }
 
 impl Update {

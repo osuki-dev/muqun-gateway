@@ -166,10 +166,9 @@ impl UiState {
     }
 
     /// Open a file a timeline card names (a presented file, a glob or grep
-    /// hit). The one hook for the file viewer: route it there when it lands;
-    /// until then the system opens it. Relative paths are the selected
-    /// session's; `~/` is home.
-    pub fn open_file(&mut self, path: &str) {
+    /// hit) in the viewer. Relative paths are the selected session's; `~/` is
+    /// home.
+    pub fn open_timeline_file(&mut self, path: &str) {
         let path = path.trim();
         let resolved = if let Some(rest) = path.strip_prefix("~/") {
             dirs::home_dir().map(|h| h.join(rest))
@@ -181,7 +180,7 @@ impl UiState {
                 .map(|d| std::path::Path::new(d).join(path))
         };
         match resolved.filter(|p| p.exists()) {
-            Some(p) => crate::platform::shell::open_path(&p),
+            Some(p) => self.open_file(p),
             None => {
                 let title = super::copy::tr(
                     self.cfg.general.language,

@@ -109,7 +109,7 @@ fn file_row(cx: &Tcx, i: usize, file: &tv::PresentedFile) -> El {
     .cursor(Cursor::Pointer)
     .label(file.name.clone())
     .help(file.path.clone())
-    .on_press(move |s: &mut UiState| s.open_file(&path))
+    .on_press(move |s: &mut UiState| s.open_timeline_file(&path))
 }
 
 pub fn card(cx: &Tcx, item: &TimelineItem, call: &ToolCall, m: &Muqun) -> El {

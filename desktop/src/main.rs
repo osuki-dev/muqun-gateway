@@ -22,7 +22,7 @@ use crate::config::{DesktopConfig, CONFIG_FILE};
 use crate::model::commands::{self, Command, CommandReceiver, CommandSender};
 use crate::model::inbox::Inbox;
 use crate::model::projection::{self, ConfigStore};
-use crate::platform::coexist;
+use crate::platform::{coexist, instance};
 use crate::ui::UiState;
 
 static COMMANDS: OnceLock<CommandSender> = OnceLock::new();
@@ -37,6 +37,31 @@ fn main() -> anyhow::Result<()> {
         state = %state_dir.display(),
         "muqun-desktop starting (rune)"
     );
+
+    let title = match std::env::var("MUQUN_WINDOW_TITLE") {
+        Ok(t) if !t.is_empty() => Box::leak(t.into_boxed_str()) as &'static str,
+        _ => branding::APP_NAME,
+    };
+    // `muqun-desktop <file>` opens the file in the viewer.
+    let open = rune::extra_args()
+        .iter()
+        .find(|a| !a.starts_with('-'))
+        .map(|a| std::path::absolute(a).unwrap_or_else(|_| PathBuf::from(a)));
+    // A second launch focuses the first (and hands it the file), before
+    // this one starts any agent. Rune's tooling flags (--scene, --snap, …)
+    // always run on their own.
+    let tooling = std::env::args().skip(1).any(|a| a.starts_with("--"));
+    let instance = if tooling {
+        None
+    } else {
+        match instance::claim(title, &instance::Request::here(open.clone())) {
+            instance::Claim::Forwarded => {
+                tracing::info!("handed to the running Muqun");
+                return Ok(());
+            }
+            instance::Claim::Primary(primary) => Some(primary),
+        }
+    };
 
     let config_path = config_dir.join(CONFIG_FILE);
     let config = load_config(&config_path);
@@ -61,11 +86,8 @@ fn main() -> anyhow::Result<()> {
 
     ui::seed_config(config.clone());
     let geometry = config.window.clamped();
-    let title = match std::env::var("MUQUN_WINDOW_TITLE") {
-        Ok(t) if !t.is_empty() => Box::leak(t.into_boxed_str()) as &'static str,
-        _ => branding::APP_NAME,
-    };
 
+    rune::set_app_id(branding::APP_ID);
     let app = App::new(AppSpec::<UiState> {
         scenes: ui::scenes::scenes(),
         on_key: Some(ui::on_key),
@@ -77,9 +99,37 @@ fn main() -> anyhow::Result<()> {
             || UiState::new(COMMANDS.get().expect("commands").clone()),
             ui::view,
         )
-    });
+    })
+    .on_focus(|_, focused, _| platform::notify::set_window_focused(focused));
 
     let handle = app.handle();
+    platform::notify::install({
+        let handle = handle.clone();
+        move |asid, token| {
+            // A click on a notification: bring the window up (with the
+            // compositor's token on Wayland) and open that session.
+            match token {
+                Some(token) => handle.activate(token),
+                None => handle.open(),
+            }
+            handle.update(move |s, _| s.open_session(&asid));
+        }
+    });
+    if let Some(primary) = instance {
+        let handle = handle.clone();
+        primary.serve(move |request| {
+            match request.token {
+                Some(token) => handle.activate(token),
+                None => handle.open(),
+            }
+            if let Some(path) = request.open {
+                handle.update(move |s, _| s.open_file(path));
+            }
+        });
+    }
+    if let Some(path) = open {
+        handle.update(move |s, _| s.open_file(path));
+    }
     ui::spawn_inbox_pump(inbox, handle);
 
     tracing::info!(
@@ -87,6 +137,7 @@ fn main() -> anyhow::Result<()> {
         "opening rune window"
     );
     app.run();
+    instance::release();
     store.flush();
     Ok(())
 }
@@ -153,6 +204,7 @@ fn start_core(
 async fn stop_on_signal(store: Arc<ConfigStore>) {
     let signal = platform::shutdown::requested().await;
     tracing::info!(signal, "stop requested");
+    instance::release();
     store.flush();
     std::process::exit(0);
 }

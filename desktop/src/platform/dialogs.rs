@@ -119,3 +119,33 @@ pub fn import_theme_file() {
         |file| post(UiAction::ThemeFilePicked(file)),
     );
 }
+
+/// The viewer's Save as…: ask where, then copy `source` there. The outcome
+/// comes back as [`UiAction::FileSaved`].
+pub fn save_copy(source: PathBuf) {
+    let name = source
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let dialog = rfd::FileDialog::new()
+        .set_title("Save a copy")
+        .set_file_name(name)
+        .set_directory(
+            dirs::download_dir()
+                .or_else(dirs::home_dir)
+                .unwrap_or_else(|| PathBuf::from("/")),
+        );
+    run(move || {
+        let Some(target) = dialog.save_file() else {
+            return;
+        };
+        let result = if target == source {
+            Ok(target)
+        } else {
+            std::fs::copy(&source, &target)
+                .map(|_| target)
+                .map_err(|err| err.to_string())
+        };
+        post(UiAction::FileSaved(result));
+    });
+}

@@ -23,6 +23,7 @@ mod splash;
 mod tasks;
 mod tiles;
 mod timeline;
+mod viewer;
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -284,6 +285,8 @@ pub struct UiState {
     pub agents_seen: bool,
     /// A screenshot scene is showing: live core updates are ignored.
     pub demo: bool,
+    /// The file viewer overlay ([`UiState::open_file`]).
+    pub viewer: Option<viewer::Viewer>,
     /// Sessions open side by side (empty when one session fills the pane).
     pub tiles: Vec<Tile>,
     /// The tile the keyboard and the composer belong to.
@@ -401,6 +404,7 @@ impl UiState {
             splash: None,
             agents_seen: false,
             demo: false,
+            viewer: None,
             tiles: Vec::new(),
             focus: 0,
             tile_split: cfg.ui.tile_split(),
@@ -541,6 +545,7 @@ impl UiState {
     }
 
     pub fn open_session(&mut self, asid: &str) {
+        crate::platform::notify::withdraw(asid);
         if let Some(i) = self.tile_of(asid) {
             if i != self.focus {
                 self.focus_tile(i);
@@ -1077,10 +1082,32 @@ impl UiState {
                 Update::Shells(rows) => self.shells = rows,
                 Update::Worktrees(rows) => self.worktrees = rows,
                 Update::HubMode(mode) => self.hub_label = mode.to_string(),
+                Update::Attention(attention) => self.on_attention(&attention),
             }
         }
         if LAYOUT_DIRTY.swap(false, Ordering::AcqRel) {
             self.persist_layout();
+        }
+    }
+
+    /// Raise a system notification unless the owner turned them off or is
+    /// looking at that session (`model/notify.rs` has the rules and words).
+    fn on_attention(&mut self, attention: &crate::model::notify::Attention) {
+        // On screen: the focused session, or any session in a split tile.
+        let on_screen = crate::platform::notify::window_focused()
+            && self.mode == Mode::Session
+            && (self.selected.as_deref() == Some(attention.asid.as_str())
+                || self.tile_of(&attention.asid).is_some());
+        if !self.cfg.notifications.enabled || on_screen {
+            return;
+        }
+        let info = self.session_by_id(&attention.asid);
+        let agent = info.map(|i| self.agent_name(&i.agent_id));
+        let language = self.cfg.general.language;
+        if let Some(notice) =
+            crate::model::notify::compose(attention, info, agent.as_deref(), language)
+        {
+            crate::platform::notify::show(notice);
         }
     }
 
@@ -1361,6 +1388,8 @@ impl UiState {
                 }
             }
             UiAction::ThemeFilePicked(path) => self.send(Command::ThemeImportFile(path)),
+            UiAction::ViewerLoaded { path, loaded } => self.viewer_loaded(&path, *loaded),
+            UiAction::FileSaved(result) => self.file_saved(result),
             UiAction::SubmitComposer => composer::submit_session(self),
             UiAction::ComposerEdited
             | UiAction::ComposerKey { .. }
@@ -1722,6 +1751,7 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>) -> El {
             layer.push(stage);
         }
     }
+    viewer::mount(s, &k, cx.env().scale, &mut layer);
     if !s.toasts.is_empty() {
         let mut region = ToastRegion::new();
         for t in &s.toasts {
