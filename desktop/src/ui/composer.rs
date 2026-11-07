@@ -321,10 +321,44 @@ fn switch_model(s: &mut UiState, provider_id: String, model_id: String) {
     let Some(asid) = s.selected.clone() else {
         return;
     };
+    let keep_variant = s
+        .sessions
+        .iter()
+        .find(|i| i.asid.0 == asid)
+        .and_then(|i| i.model.as_ref())
+        .and_then(|m| m.variant.clone());
     let model = ModelRef {
         provider_id,
         model_id,
-        variant: None,
+        variant: keep_variant,
+    };
+    if let Some(info) = s.sessions.iter_mut().find(|i| i.asid.0 == asid) {
+        info.model = Some(model.clone());
+    }
+    s.send(Command::Compose(ComposeCommand::SwitchModel {
+        asid: AgentSessionId(asid),
+        model,
+    }));
+    remember(s);
+}
+
+fn switch_effort(s: &mut UiState, variant: Option<String>) {
+    s.menu = None;
+    let Some(asid) = s.selected.clone() else {
+        return;
+    };
+    let Some(current) = s
+        .sessions
+        .iter()
+        .find(|i| i.asid.0 == asid)
+        .and_then(|i| i.model.clone())
+    else {
+        return;
+    };
+    let model = ModelRef {
+        provider_id: current.provider_id,
+        model_id: current.model_id,
+        variant,
     };
     if let Some(info) = s.sessions.iter_mut().find(|i| i.asid.0 == asid) {
         info.model = Some(model.clone());
@@ -451,19 +485,90 @@ pub fn catalog_models(view: &crate::hub::CatalogView) -> Vec<(String, String, St
         .models
         .iter()
         .filter(|m| m.enabled)
-        .map(|m| (m.provider_id.clone(), m.id.clone(), m.name.clone()))
+        .map(|m| {
+            let name = if m.name.trim().is_empty() || m.name == m.id {
+                super::labels::format_model_name(
+                    &ModelRef {
+                        provider_id: m.provider_id.clone(),
+                        model_id: m.id.clone(),
+                        variant: None,
+                    },
+                    &m.id,
+                    None,
+                )
+            } else {
+                m.name.clone()
+            };
+            (m.provider_id.clone(), m.id.clone(), name)
+        })
         .collect()
+}
+
+fn mode_label(id: &str, catalog_name: Option<&str>) -> String {
+    if let Some(name) = catalog_name.map(str::trim).filter(|s| !s.is_empty() && *s != id) {
+        return name.to_string();
+    }
+    super::labels::readable_catalog_id(id)
+}
+
+fn effort_menu(
+    k: &Kit,
+    layer: &mut Vec<El>,
+    open: bool,
+    current: Option<&str>,
+    variants: &[String],
+) -> El {
+    let label = current
+        .map(super::labels::readable_catalog_id)
+        .unwrap_or_else(|| "Default".into());
+    let mut menu = Menu::new("effort")
+        .trigger(pill(
+            k,
+            "effort-pill",
+            label,
+            open,
+            OpenMenu::Effort,
+        ))
+        .open(open)
+        .min_width(160.0)
+        .on_close(|s: &mut UiState| s.menu = None);
+    menu = menu.item(
+        MenuItem::new("Default")
+            .checked(current.is_none())
+            .on_select(|s: &mut UiState| switch_effort(s, None)),
+    );
+    for variant in variants {
+        let name = variant.clone();
+        menu = menu.item(
+            MenuItem::new(super::labels::readable_catalog_id(variant))
+                .checked(current == Some(variant.as_str()))
+                .on_select(move |s: &mut UiState| switch_effort(s, Some(name.clone()))),
+        );
+    }
+    menu.build(k, layer)
 }
 
 fn pills(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     let mut line = row().key("pills").gap(8.0).center_y().wrap();
     let Some(info) = s.current() else { return line };
-    let models = s.catalog.as_deref().map(catalog_models).unwrap_or_default();
+    let catalog = s.catalog.as_ref();
+    let model_infos: Vec<&muqun_gateway::agents::ModelInfo> = catalog
+        .map(|c| c.catalog.models.iter().filter(|m| m.enabled).collect())
+        .unwrap_or_default();
+    let models = catalog.map(|c| catalog_models(c)).unwrap_or_default();
+    let default_model = catalog.and_then(|c| c.catalog.defaults.model.as_ref());
+    let selected_info = info
+        .model
+        .as_ref()
+        .and_then(|m| super::labels::catalog_model_info(&model_infos, m, default_model));
+
     if let Some(model) = &info.model {
-        let name = models
-            .iter()
-            .find(|(p, id, _)| *p == model.provider_id && *id == model.model_id)
-            .map_or_else(|| model.model_id.clone(), |(_, _, n)| n.clone());
+        let name = super::labels::format_model_name(
+            model,
+            "Model",
+            selected_info.map(|m| m.name.as_str()),
+        );
+        let current = Some((model.provider_id.as_str(), model.model_id.as_str()));
         line = line.child(if models.is_empty() {
             Badge::new(name)
                 .variant(BadgeVariant::Subtle)
@@ -477,10 +582,22 @@ fn pills(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
                 s.menu == Some(OpenMenu::Model),
                 name,
                 &models,
-                Some((model.provider_id.as_str(), model.model_id.as_str())),
+                current,
                 switch_model,
             )
         });
+        if let Some(info) = selected_info {
+            if let Some(variants) = info.variants.as_ref().filter(|v| !v.is_empty()) {
+                let ids: Vec<String> = variants.iter().map(|v| v.id.clone()).collect();
+                line = line.child(effort_menu(
+                    k,
+                    layer,
+                    s.menu == Some(OpenMenu::Effort),
+                    model.variant.as_deref(),
+                    &ids,
+                ));
+            }
+        }
     } else if !models.is_empty() {
         line = line.child(model_menu(
             k,
@@ -507,24 +624,23 @@ fn pills(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
             line = line.child(branch);
         }
     }
-    let modes: Vec<(String, String)> = s
-        .catalog
-        .as_ref()
+    let modes: Vec<(String, String)> = catalog
         .map(|c| {
             c.catalog
                 .modes
                 .iter()
                 .filter(|m| !m.hidden)
-                .map(|m| (m.id.clone(), m.name.clone()))
+                .map(|m| (m.id.clone(), mode_label(&m.id, Some(m.name.as_str()))))
                 .collect()
         })
         .unwrap_or_default();
     if (2..=4).contains(&modes.len()) {
         let labels: Vec<&str> = modes.iter().map(|(_, n)| n.as_str()).collect();
-        let at = info
-            .mode
-            .as_ref()
-            .and_then(|m| modes.iter().position(|(id, _)| id == m));
+        let at = info.mode.as_ref().and_then(|m| {
+            modes
+                .iter()
+                .position(|(id, _)| id == m || super::labels::bare_catalog_id(id) == m.as_str())
+        });
         let ids: Vec<String> = modes.iter().map(|(id, _)| id.clone()).collect();
         line = line.child(
             SegmentedControl::new(&labels, at)
@@ -535,8 +651,13 @@ fn pills(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
                 .key("modes"),
         );
     } else if let Some(mode) = &info.mode {
+        let label = modes
+            .iter()
+            .find(|(id, _)| id == mode)
+            .map(|(_, n)| n.clone())
+            .unwrap_or_else(|| mode_label(mode, None));
         line = line.child(
-            Badge::new(mode.clone())
+            Badge::new(label)
                 .variant(BadgeVariant::Neutral)
                 .build(k)
                 .key("mode"),

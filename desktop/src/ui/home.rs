@@ -193,11 +193,16 @@ fn start_pills(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Option<El> {
     let mut any = false;
     if !models.is_empty() {
         let label = picked
-            .and_then(|m| {
-                models
+            .map(|m| {
+                let catalog = models
                     .iter()
-                    .find(|(p, id, _)| *p == m.provider_id && *id == m.model_id)
-                    .map(|(_, _, n)| n.clone())
+                    .find(|(p, id, _)| {
+                        (*p == m.provider_id && *id == m.model_id)
+                            || (super::labels::bare_catalog_id(id)
+                                == super::labels::bare_catalog_id(&m.model_id))
+                    })
+                    .map(|(_, _, n)| n.as_str());
+                super::labels::format_model_name(m, "Model", catalog)
             })
             .unwrap_or_else(|| "Model".into());
         line = line.child(model_menu(
@@ -225,7 +230,14 @@ fn start_pills(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Option<El> {
                 .modes
                 .iter()
                 .filter(|m| !m.hidden)
-                .map(|m| (m.id.clone(), m.name.clone()))
+                .map(|m| {
+                    let name = if m.name.trim().is_empty() || m.name == m.id {
+                        super::labels::readable_catalog_id(&m.id)
+                    } else {
+                        m.name.clone()
+                    };
+                    (m.id.clone(), name)
+                })
                 .collect()
         })
         .unwrap_or_default();

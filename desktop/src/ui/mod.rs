@@ -8,6 +8,7 @@ mod composer;
 mod home;
 mod inbox;
 mod inspector;
+mod labels;
 pub mod scenes;
 mod sessions;
 mod settings;
@@ -102,8 +103,9 @@ fn right_pane(s: &mut UiState) -> &mut PaneState {
 /// The one open dropdown (or row menu), if any.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OpenMenu {
-    /// The session composer's model, branch menus.
+    /// The session composer's model, effort, branch menus.
     Model,
+    Effort,
     Branch,
     /// The start page's model, mode and branch menus.
     StartModel,
