@@ -232,8 +232,6 @@ fn parked_composer(s: &UiState, k: &Kit, look: &Look, i: usize) -> El {
         .key("tile-composer")
         .w_full()
         .h(44.0)
-        .mx(12.0)
-        .mb(12.0)
         .px(12.0)
         .gap(8.0)
         .center_y()
@@ -257,7 +255,12 @@ fn parked_composer(s: &UiState, k: &Kit, look: &Look, i: usize) -> El {
                 .build(k),
         );
     }
-    look.row_card(k, strip, 10.0)
+    col()
+        .key("tile-composer-pad")
+        .w_full()
+        .px(12.0)
+        .pb(12.0)
+        .child(look.row_card(k, strip, 10.0))
 }
 
 /// An empty tile: pick a recent session or start a new one into it.
@@ -417,7 +420,15 @@ fn tile(s: &UiState, k: &Kit, look: &Look, i: usize, layer: &mut Vec<El>) -> El 
     }
     // The edge: focused tiles are lit in the accent; a tile that needs the
     // owner pulses in the warning colour; the rest keep a hairline.
-    body = if focused {
+    body = if focused && s.fx_on() {
+        look.lit_edge(body, k.c.bg_accent)
+            .child(super::fx::glow_slot(
+                "tile-glow",
+                k.c.bg_accent,
+                0.8,
+                PANEL_RADIUS,
+            ))
+    } else if focused {
         look.glow(look.lit_edge(body, k.c.bg_accent), k.c.bg_accent, 0.55)
     } else {
         body.border(1.0, k.c.border_muted)

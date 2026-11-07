@@ -16,7 +16,7 @@ use std::time::Instant;
 use muqun_gateway::agents::compose::{
     attach_store, build_runtime, RuntimeSettings, StoreEncryption,
 };
-use rune::{App, AppSpec};
+use rune::AppSpec;
 
 use crate::config::{DesktopConfig, CONFIG_FILE};
 use crate::model::commands::{self, Command, CommandReceiver, CommandSender};
@@ -66,7 +66,7 @@ fn main() -> anyhow::Result<()> {
         _ => branding::APP_NAME,
     };
 
-    let app = App::new(AppSpec::<UiState> {
+    let app = rune::App::new(AppSpec::<UiState> {
         scenes: ui::scenes::scenes(),
         on_key: Some(ui::on_key),
         setup: Some(|s, waker| s.install_images(waker)),
@@ -77,7 +77,8 @@ fn main() -> anyhow::Result<()> {
             || UiState::new(COMMANDS.get().expect("commands").clone()),
             ui::view,
         )
-    });
+    })
+    .compositor(ui::fx::Fx::default());
 
     let handle = app.handle();
     ui::spawn_inbox_pump(inbox, handle);

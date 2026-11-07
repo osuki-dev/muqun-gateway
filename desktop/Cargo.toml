@@ -18,6 +18,9 @@ path = "src/main.rs"
 muqun-gateway = { path = ".." }
 rune = { git = "https://github.com/ryuhzk/rune", rev = "a1fe7354ed53396558e4ab40385bfccb9bb617d3" }
 rune-kit = { git = "https://github.com/ryuhzk/rune", rev = "a1fe7354ed53396558e4ab40385bfccb9bb617d3", features = ["markdown"] }
+# GPU effect layers (`ui/fx.rs`): glow and liquid metal at effect slots.
+rune-fx = { git = "https://github.com/ryuhzk/rune", rev = "a1fe7354ed53396558e4ab40385bfccb9bb617d3" }
+wgpu = { version = "30", default-features = false, features = ["std", "parking_lot", "wgsl"] }
 anyhow = "1.0.103"
 base64 = "0.23.1"
 dirs = "7.0.0"

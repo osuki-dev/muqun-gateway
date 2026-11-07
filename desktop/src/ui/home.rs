@@ -843,13 +843,45 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         line_height: 44.0,
         ..k.ty.ui_medium
     };
-    let hero = col()
+    let mut hero = col()
         .key("home-hero")
         .w_full()
         .min_h(HERO_H - 24.0)
         .justify_end()
         .gap(6.0)
-        .pb(6.0)
+        .pb(6.0);
+    if s.fx_on() {
+        if let Some(images) = s.images.as_ref() {
+            hero = hero.child(
+                look.glow(
+                    el().key("home-badge")
+                        .size(44.0, 44.0)
+                        .radius(13.0)
+                        .center()
+                        .mb(10.0)
+                        .fill(k.c.layer_02)
+                        .child(
+                            super::fx::metal("home-metal", 44.0, 13.0, k.c.bg_accent, 0.0)
+                                .absolute(0.0, 0.0),
+                        )
+                        .child(
+                            super::art::picture(
+                                images,
+                                std::sync::Arc::<[u8]>::from(crate::branding::APP_MARK_PNG),
+                                rune::SurfaceFit::Fill,
+                            )
+                            .size(26.0, 26.0)
+                            .radius(7.0)
+                            .clip_rounded(7.0),
+                        )
+                        .a11y_hidden(),
+                    k.c.bg_accent,
+                    0.5,
+                ),
+            );
+        }
+    }
+    let hero = hero
         .child(
             text(title)
                 .font(title_font)

@@ -1,8 +1,10 @@
 //! The right-hand inspector: Queue, Git (with worktrees), Subagents, Saved, Shells.
 
 use muqun_gateway::agents::AgentSessionId;
-use rune::{col, row, text, El, ScrollSpec};
-use rune_kit::{Badge, BadgeVariant, Button, ButtonVariant, ControlSize, Kit, ScrollBar};
+use rune::{col, el, row, text, El, ScrollSpec, Tx};
+use rune_kit::{
+    Badge, BadgeVariant, Button, ButtonVariant, ControlSize, Kit, ScrollBar, SegmentedControl,
+};
 
 use super::{muted, timeline, title_of, InspectorTab, Mode, UiState};
 use crate::model::commands::Command;
@@ -31,6 +33,26 @@ fn small(
         .key(key)
 }
 
+/// A quiet empty state: a word and a line under it, on its own sheet.
+fn empty(k: &Kit, key: &str, title: &str, detail: &str) -> El {
+    col()
+        .key(format!("empty-{key}"))
+        .w_full()
+        .gap(2.0)
+        .px(12.0)
+        .py(12.0)
+        .radius(crate::theme::look::CARD_RADIUS)
+        .fill(k.c.layer_01.alpha(0.5))
+        .border(1.0, k.c.border_muted)
+        .border_dash(4.0, 4.0)
+        .child(
+            text(title.to_string())
+                .font(k.ty.ui_medium)
+                .color(k.c.text_muted),
+        )
+        .child(muted(k, detail))
+}
+
 /// One list row: a title, a muted second line, and an optional action.
 fn item(k: &Kit, key: String, title: String, detail: String, action: Option<El>) -> El {
     let mut copy = col()
@@ -52,7 +74,11 @@ fn item(k: &Kit, key: String, title: String, detail: String, action: Option<El>)
         .w_full()
         .gap(8.0)
         .center_y()
-        .py(4.0)
+        .px(10.0)
+        .py(6.0)
+        .radius(crate::theme::look::CARD_RADIUS)
+        .fill(k.c.layer_01.alpha(0.5))
+        .border(1.0, k.c.border_muted)
         .child(copy);
     if let Some(action) = action {
         line = line.child(action);
@@ -60,11 +86,20 @@ fn item(k: &Kit, key: String, title: String, detail: String, action: Option<El>)
     line
 }
 
+/// A section heading with a hairline running on from it.
 fn heading(k: &Kit, label: &str) -> El {
-    text(label.to_string())
-        .font(k.ty.small_medium)
-        .color(k.c.text_faint)
+    row()
         .key(format!("h-{label}"))
+        .w_full()
+        .gap(8.0)
+        .center_y()
+        .mt(6.0)
+        .child(
+            text(label.to_string())
+                .font(k.ty.small_medium)
+                .color(k.c.text_faint),
+        )
+        .child(el().grow(1.0).h(1.0).fill(k.c.border_muted).a11y_hidden())
 }
 
 fn queue(s: &UiState, k: &Kit) -> Vec<El> {
@@ -95,7 +130,12 @@ fn queue(s: &UiState, k: &Kit) -> Vec<El> {
     }
     out.push(heading(k, "Queued prompts"));
     if s.queue.is_empty() {
-        out.push(muted(k, "Nothing is waiting for the agent."));
+        out.push(empty(
+            k,
+            "queue",
+            "Nothing queued",
+            "Messages sent while the agent works line up here.",
+        ));
     }
     for q in &s.queue {
         let (id, a) = (q.id.clone(), AgentSessionId(asid.clone()));
@@ -197,11 +237,21 @@ fn git(s: &UiState, k: &Kit) -> Vec<El> {
                 out.push(muted(k, format!("{} local branch(es)", b.local.len())));
             }
         }
-        None => out.push(muted(k, "No repository information.")),
+        None => out.push(empty(
+            k,
+            "branch",
+            "No repository",
+            "This folder is not a git checkout.",
+        )),
     }
     out.push(heading(k, "Changes"));
     if s.diff_stat.files == 0 {
-        out.push(muted(k, "Working tree is clean."));
+        out.push(empty(
+            k,
+            "changes",
+            "Working tree is clean",
+            "Edits the agent makes show up here.",
+        ));
     } else {
         out.push(muted(
             k,
@@ -232,7 +282,12 @@ fn git(s: &UiState, k: &Kit) -> Vec<El> {
     }
     out.push(heading(k, "Worktrees"));
     if s.worktrees.is_empty() {
-        out.push(muted(k, "No linked worktrees."));
+        out.push(empty(
+            k,
+            "worktrees",
+            "No linked worktrees",
+            "Start a session in a new worktree from Home.",
+        ));
     }
     let (agent, dir) = info
         .map(|i| (i.agent_id.clone(), i.directory.clone().unwrap_or_default()))
@@ -283,7 +338,12 @@ fn git(s: &UiState, k: &Kit) -> Vec<El> {
 
 fn subagents(s: &UiState, k: &Kit) -> Vec<El> {
     if s.descendants.is_empty() {
-        return vec![muted(k, "This session has no sub-agents.")];
+        return vec![empty(
+            k,
+            "subagents",
+            "No sub-agents",
+            "Sessions this one delegates to appear here.",
+        )];
     }
     s.descendants
         .iter()
@@ -309,7 +369,12 @@ fn subagents(s: &UiState, k: &Kit) -> Vec<El> {
 
 fn saved(s: &UiState, k: &Kit) -> Vec<El> {
     if s.saved_permissions.is_empty() {
-        return vec![muted(k, "No remembered \"always allow\" decisions.")];
+        return vec![empty(
+            k,
+            "saved",
+            "Nothing remembered",
+            "\"Always allow\" answers for this project are kept here.",
+        )];
     }
     let asid = s.selected.clone().unwrap_or_default();
     s.saved_permissions
@@ -347,7 +412,12 @@ fn shells(s: &UiState, k: &Kit) -> Vec<El> {
         .unwrap_or_default();
     let mut out: Vec<El> = Vec::new();
     if s.shells.is_empty() {
-        out.push(muted(k, "No background shells."));
+        out.push(empty(
+            k,
+            "shells",
+            "No background shells",
+            "Long commands the agent parks keep running here.",
+        ));
     }
     for sh in &s.shells {
         let (agent, id, dir) = (agent.clone(), sh.id.clone(), dir.clone());
@@ -393,18 +463,31 @@ fn shells(s: &UiState, k: &Kit) -> Vec<El> {
 }
 
 pub fn view(s: &UiState, k: &Kit) -> El {
-    let mut tabs = row().key("inspector-tabs").w_full().gap(4.0).wrap();
-    for (label, tab) in TABS {
-        let variant = if s.inspector_tab == tab {
-            ButtonVariant::Contrast
-        } else {
-            ButtonVariant::Ghost
-        };
-        tabs = tabs.child(small(k, label, variant, format!("tab-{label}"), move |s| {
-            s.inspector_tab = tab;
+    let asid = s.selected.clone().unwrap_or_default();
+    let waiting = s.waiting_perms.get(&asid).map_or(0, Vec::len)
+        + s.waiting_forms.get(&asid).map_or(0, Vec::len)
+        + s.queue.len();
+    let labels: Vec<String> = TABS
+        .iter()
+        .map(|(label, tab)| match tab {
+            InspectorTab::Queue if waiting > 0 => format!("{label} {waiting}"),
+            InspectorTab::Git if s.diff_stat.files > 0 => {
+                format!("{label} {}", s.diff_stat.files)
+            }
+            InspectorTab::Shells if !s.shells.is_empty() => format!("{label} {}", s.shells.len()),
+            _ => (*label).to_string(),
+        })
+        .collect();
+    let at = TABS.iter().position(|(_, t)| *t == s.inspector_tab);
+    let tabs = SegmentedControl::new(&labels, at)
+        .width(None)
+        .label("Inspector")
+        .on_pick(move |s: &mut UiState, i, _: &mut Tx| {
+            s.inspector_tab = TABS[i].1;
             s.refresh_inspector();
-        }));
-    }
+        })
+        .build(k)
+        .key("inspector-tabs");
     let body = match s.inspector_tab {
         InspectorTab::Queue => queue(s, k),
         InspectorTab::Git => git(s, k),

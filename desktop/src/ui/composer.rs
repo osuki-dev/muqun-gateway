@@ -582,7 +582,7 @@ fn chips(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Option<El> {
     if s.staged.is_empty() && s.queue.is_empty() {
         return None;
     }
-    let mut line = row().key("chips").w_full().gap(6.0).wrap().center_y();
+    let mut line = row().key("chips").w_full().gap(6.0).flex_wrap().center_y();
     for (i, file) in s.staged.iter().enumerate() {
         line = line.child(staged_chip(s, k, i, file));
     }
@@ -1103,7 +1103,7 @@ fn effort_menu(
 }
 
 fn pills(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
-    let mut line = row().key("pills").gap(8.0).center_y().wrap();
+    let mut line = row().key("pills").gap(6.0).center_y().flex_wrap();
     let Some(info) = s.current() else { return line };
     let catalog = s.catalog.as_ref();
     let model_infos: Vec<&muqun_gateway::agents::ModelInfo> = catalog
@@ -1124,10 +1124,18 @@ fn pills(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
             .center_y()
             .px(8.0)
             .h(24.0)
-            .radius(k.radius.sm)
-            .fill(k.c.layer_03)
+            .radius(12.0)
+            .fill(super::agents::color(&info.agent_id, s.dark).alpha(0.14))
+            .border(
+                1.0,
+                super::agents::color(&info.agent_id, s.dark).alpha(0.35),
+            )
             .child(super::agents::mark(&info.agent_id, 12.0, s.dark))
-            .child(rune::text(agent_name).font(k.ty.small).color(k.c.text_base)),
+            .child(
+                rune::text(agent_name)
+                    .font(k.ty.small_medium)
+                    .color(k.c.text_base),
+            ),
     );
 
     if let Some(model) = &info.model {
@@ -1248,21 +1256,42 @@ fn pills(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
 }
 
 pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
+    let look = s.look();
+    let language = s.cfg.general.language;
+    let zh = language == crate::config::Language::ZhCn;
     let busy = s.busy();
+    let has_session = s.selected.is_some();
+    let focused = s.draft.focused && has_session;
+    let brand = s
+        .current()
+        .map(|i| super::agents::color(&i.agent_id, s.dark))
+        .unwrap_or(k.c.bg_accent);
     let start = s
         .current()
         .and_then(|i| i.directory.clone().map(PathBuf::from));
+    let has_text = !s.draft.text.trim().is_empty() || !s.staged.is_empty();
+
+    // The row under the field: chips on the left, actions on the right.
     let mut actions = row()
         .key("composer-actions")
         .w_full()
         .gap(8.0)
         .center_y()
-        .child(pills(s, k, layer).grow(1.0))
+        .child(pills(s, k, layer).grow(1.0).shrink().min_w(0.0))
         .child(
-            Button::new("Attach")
+            Button::new(if zh { "附件" } else { "Attach" })
                 .variant(ButtonVariant::Ghost)
-                .control_size(ControlSize::Large)
-                .disabled(s.selected.is_none())
+                .control_size(ControlSize::Regular)
+                .disabled(!has_session)
+                .help(format!(
+                    "{} · {}",
+                    if zh {
+                        "添加文件或图片"
+                    } else {
+                        "Add files or an image"
+                    },
+                    crate::platform::keys::label("Primary+V")
+                ))
                 .on_press(move |_: &mut UiState| {
                     crate::platform::dialogs::attach_files(start.clone());
                 })
@@ -1272,9 +1301,10 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     if busy {
         if let Some(asid) = s.selected.clone() {
             actions = actions.child(
-                Button::new("Stop")
+                Button::new(if zh { "停止" } else { "Stop" })
                     .variant(ButtonVariant::Danger)
-                    .control_size(ControlSize::Large)
+                    .control_size(ControlSize::Regular)
+                    .shortcut("Escape")
                     .on_press(move |s: &mut UiState| {
                         s.send(Command::Interrupt(AgentSessionId(asid.clone())))
                     })
@@ -1283,22 +1313,39 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
             );
         }
     }
-    actions = actions.child(
-        Button::new(if busy { "Queue" } else { "Send" })
-            .variant(ButtonVariant::Submit)
-            .control_size(ControlSize::Large)
-            .disabled(s.selected.is_none() || s.pending_submit.is_some())
-            .on_press(submit_session)
-            .build(k)
-            .key("send"),
-    );
+    let send_label = match (busy, zh) {
+        (true, true) => "排队",
+        (true, false) => "Queue",
+        (false, true) => "发送",
+        (false, false) => "Send",
+    };
+    let send = Button::new(send_label)
+        .variant(ButtonVariant::Submit)
+        .control_size(ControlSize::Regular)
+        .disabled(!has_session || s.pending_submit.is_some())
+        .shortcut("Primary+Enter")
+        .on_press(submit_session)
+        .build(k)
+        .key("send");
+    // The send button lights up once there is something to send.
+    actions = actions.child(look.glow(
+        send,
+        k.c.bg_accent,
+        if has_text && has_session { 0.6 } else { 0.0 },
+    ));
+
     popup(s, k, layer, Slot::Session);
-    let mut composer = col().key("composer").w_full().px(24.0).py(12.0).gap(8.0);
+    let mut card = col()
+        .key("composer-card")
+        .w_full()
+        .gap(8.0)
+        .px(12.0)
+        .pt(10.0)
+        .pb(10.0);
     if let Some(chips) = chips(s, k, layer) {
-        composer = composer.child(chips);
+        card = card.child(chips);
     }
-    let zh = s.cfg.general.language == crate::config::Language::ZhCn;
-    let placeholder = if s.selected.is_some() {
+    let placeholder = if has_session {
         if zh {
             "发消息…（/ 命令，$ 技能，@ 文件）"
         } else {
@@ -1311,7 +1358,7 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     };
     let accent = k.c.bg_accent;
     let info = k.c.info.icon;
-    composer
+    card = card
         .child(
             TextArea::new(&s.draft)
                 .placeholder(placeholder)
@@ -1335,13 +1382,74 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
                 .key("draft")
                 .w_full(),
         )
-        .child(actions)
-        .child(muted(
-            k,
-            format!(
-                "{} to send · {} to paste files or an image",
-                crate::platform::keys::label("Primary+Enter"),
-                crate::platform::keys::label("Primary+V"),
-            ),
-        ))
+        .child(actions);
+
+    // The card: glass over the pane, lit in the accent while the field has
+    // focus, breathing in the agent's colour while it works.
+    let radius = crate::theme::look::PANEL_RADIUS;
+    let mut card = look.panel(k, card, radius).motion(k.motion.control);
+    if busy && s.fx_on() {
+        // A breathing neon rim in the agent's colour (GPU); the field stays still.
+        card = card.child(super::fx::rim_slot("composer-rim", brand, 0.9, radius));
+    } else if busy {
+        card = look.glow(card, brand, 0.35).child(
+            look.pulse(
+                el().key("composer-working-rim")
+                    .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
+                    .radius(radius)
+                    .border_gradient(1.5, brand.alpha(0.9), brand.alpha(0.3)),
+            )
+            .a11y_hidden(),
+        );
+    } else if focused {
+        card = look.glow(look.accent_rim(k, card, k.c.bg_accent), k.c.bg_accent, 0.35);
+    }
+
+    // The status line: what the keys do, and a word while the agent works.
+    let mut hint = row()
+        .key("composer-hint")
+        .w_full()
+        .gap(8.0)
+        .center_y()
+        .px(4.0);
+    if busy {
+        hint = hint
+            .child(rune_kit::Spinner::new().size(10.0).color(brand).build(k))
+            .child(
+                rune::text(if zh {
+                    "Agent 正在工作，消息会排队"
+                } else {
+                    "Agent is working; messages queue"
+                })
+                .font(k.ty.small)
+                .color(k.c.text_muted),
+            )
+            .child(el().grow(1.0));
+    } else {
+        hint = hint.child(el().grow(1.0));
+    }
+    hint = hint.child(muted(
+        k,
+        format!(
+            "{} {} · {} {}",
+            crate::platform::keys::label("Primary+Enter"),
+            if zh { "发送" } else { "to send" },
+            crate::platform::keys::label("Primary+V"),
+            if zh {
+                "粘贴文件或图片"
+            } else {
+                "to paste files or an image"
+            },
+        ),
+    ));
+
+    col()
+        .key("composer")
+        .w_full()
+        .px(16.0)
+        .pt(8.0)
+        .pb(10.0)
+        .gap(6.0)
+        .child(card)
+        .child(hint)
 }

@@ -9,6 +9,7 @@ mod agents;
 mod art;
 mod composer;
 mod copy;
+pub mod fx;
 mod home;
 mod icons;
 mod inbox;

@@ -7,7 +7,7 @@ use muqun_gateway::agents::{AgentProject, AgentSessionId};
 use rune::El;
 use rune::{el, TextEdit, Tx};
 use rune_kit::glyphs::{FOLDER, FOLDER_OPEN, SEARCH, TRIANGLE_DOWN};
-use rune_kit::shell::{RowStatus, Sidebar, SidebarRow};
+use rune_kit::shell::{Sidebar, SidebarRow};
 use rune_kit::{ControlSize, IconButton, IconButtonVariant, Kit, Menu, MenuItem, TextInput};
 
 use super::icons::{INBOX, SETTINGS, TASK};
@@ -325,6 +325,43 @@ fn session_menu(s: &UiState, k: &Kit, layer: &mut Vec<El>, asid: &str) -> El {
     }
 }
 
+/// The agent's mark with a small lit dot at its corner: breathing in the
+/// agent's colour while it works, the warning colour while it waits on the
+/// owner, the danger colour when it failed.
+fn avatar_with_state(
+    s: &UiState,
+    k: &Kit,
+    look: &crate::theme::look::Look,
+    info: &muqun_gateway::agents::AgentSessionInfo,
+    activity: Activity,
+) -> El {
+    let mark = super::agents::mark(&info.agent_id, 14.0, s.dark);
+    let dot = |c: rune::Color| {
+        el().size(7.0, 7.0)
+            .radius(3.5)
+            .fill(c)
+            .border(1.5, k.c.bg_deep)
+            .absolute(10.0, 10.0)
+    };
+    let badge = match activity {
+        Activity::Working => {
+            let c = super::agents::color(&info.agent_id, s.dark);
+            Some(look.pulse(look.spark(dot(c), c)))
+        }
+        Activity::NeedsYou => {
+            let c = k.c.warning.icon;
+            Some(look.pulse(look.spark(dot(c), c)))
+        }
+        Activity::Failed => Some(dot(k.c.danger.icon)),
+        Activity::Idle => None,
+    };
+    let mut avatar = el().size(16.0, 16.0).center().child(mark);
+    if let Some(b) = badge {
+        avatar = avatar.child(b.a11y_hidden());
+    }
+    avatar
+}
+
 fn session_row(s: &UiState, k: &Kit, layer: &mut Vec<El>, asid: &str) -> El {
     let Some(info) = s.session_by_id(asid) else {
         return el().key(format!("session-{asid}")).h(0.0);
@@ -334,11 +371,27 @@ fn session_row(s: &UiState, k: &Kit, layer: &mut Vec<El>, asid: &str) -> El {
     let pinned = s.cfg.general.pinned.iter().any(|p| p == asid);
     let in_tile = s.in_split() && s.tile_of(asid).is_some();
     let when = ago(info.updated_ms, now_ms(), s.cfg.general.language);
-    let subtitle = if when.is_empty() {
+    let mut subtitle = if when.is_empty() {
         s.agent_name(&info.agent_id)
     } else {
         format!("{} · {when}", s.agent_name(&info.agent_id))
     };
+    // The state in words too, so the row says it without the mark.
+    match activity {
+        Activity::Working => {
+            subtitle = format!(
+                "{} · {subtitle}",
+                super::copy::tr(s.cfg.general.language, "Working", "工作中")
+            );
+        }
+        Activity::NeedsYou => {
+            subtitle = format!(
+                "{} · {subtitle}",
+                super::copy::tr(s.cfg.general.language, "Needs you", "等你处理")
+            );
+        }
+        _ => {}
+    }
     let mut row = SidebarRow::new(format!(
         "{}{}",
         if pinned { "★ " } else { "" },
@@ -346,32 +399,11 @@ fn session_row(s: &UiState, k: &Kit, layer: &mut Vec<El>, asid: &str) -> El {
     ))
     .depth(1)
     .height(45.0)
-    .avatar(super::agents::mark(&info.agent_id, 14.0, s.dark))
+    .avatar(avatar_with_state(s, k, &look, info, activity))
     .subtitle(subtitle)
     .selected(s.mode == Mode::Session && s.selected.as_deref() == Some(asid));
     if in_tile {
         row = row.detail(super::copy::tr(s.cfg.general.language, "split", "分屏"));
-    }
-    match activity {
-        // A breathing dot in the agent's colour: the row is alive.
-        Activity::Working => {
-            let c = super::agents::color(&info.agent_id, s.dark);
-            row = row.status(RowStatus::Other(
-                look.pulse(look.spark(el().size(7.0, 7.0).radius(3.5).fill(c), c)),
-            ));
-        }
-        Activity::NeedsYou => {
-            let c = k.c.warning.icon;
-            row = row.status(RowStatus::Other(
-                look.pulse(look.spark(el().size(7.0, 7.0).radius(3.5).fill(c), c)),
-            ));
-        }
-        Activity::Failed => {
-            row = row.status(RowStatus::Other(
-                el().size(7.0, 7.0).radius(3.5).fill(k.c.danger.icon),
-            ));
-        }
-        Activity::Idle => {}
     }
     let id = asid.to_string();
     if s.rename_asid.as_deref() == Some(asid) {

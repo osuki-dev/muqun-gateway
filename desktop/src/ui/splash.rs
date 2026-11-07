@@ -200,7 +200,37 @@ fn stage(
     };
     let accent = k.c.bg_accent;
 
-    // The picture: the pack's launch art, else the app mark on a disc.
+    // The brand badge: a liquid-metal slab in the accent with the mark on it.
+    let fx_on = look.glass && look.motion;
+    let badge = |key: &str| {
+        let mut slab = el()
+            .key(key.to_string())
+            .size(92.0, 92.0)
+            .radius(26.0)
+            .center()
+            .fill(k.c.layer_02);
+        if fx_on {
+            slab = slab.child(
+                super::fx::metal(&format!("{key}-metal"), 92.0, 26.0, accent, 0.5)
+                    .absolute(0.0, 0.0),
+            );
+        }
+        look.glow(
+            slab.child(
+                art::picture(
+                    images,
+                    std::sync::Arc::<[u8]>::from(crate::branding::APP_MARK_PNG),
+                    rune::SurfaceFit::Fill,
+                )
+                .size(52.0, 52.0)
+                .radius(14.0)
+                .clip_rounded(14.0),
+            ),
+            accent,
+            0.9,
+        )
+    };
+    // The picture: the pack's launch art, else the badge alone.
     let hero: El = match art::launch(images, scheme) {
         Some((picture, slot)) => picture
             .key("splash-art")
@@ -209,28 +239,14 @@ fn stage(
             .radius(if slot.cover { 24.0 } else { 0.0 })
             .clip_rounded(if slot.cover { 24.0 } else { 0.0 })
             .opacity(pose.opacity * slot.opacity),
-        None => look
-            .glow(
-                el().key("splash-art")
-                    .size(120.0, 120.0)
-                    .radius(32.0)
-                    .fill(k.c.layer_02)
-                    .center()
-                    .child(
-                        art::picture(
-                            images,
-                            std::sync::Arc::<[u8]>::from(crate::branding::APP_MARK_PNG),
-                            rune::SurfaceFit::Fill,
-                        )
-                        .size(72.0, 72.0)
-                        .radius(18.0)
-                        .clip_rounded(18.0),
-                    ),
-                accent,
-                0.9,
-            )
+        None => el()
+            .key("splash-art")
+            .size(300.0, 360.0)
+            .center()
+            .child(badge("splash-badge-solo").scale(1.3))
             .opacity(pose.opacity),
     };
+    let has_art = art::launch(images, scheme).is_some();
     let hero = hero
         .blur(pose.blur)
         .scale(pose.scale)
@@ -278,14 +294,22 @@ fn stage(
         .child(orbit(k, look, 380.0, 0.30, 19.0, (18.0, 14.0)).absolute(30.0, 30.0))
         .a11y_hidden();
 
-    let copy = col()
+    let mut copy = col()
         .key("splash-copy")
-        .gap(6.0)
+        .gap(8.0)
         .items_center()
         .opacity(pose.opacity * pose.settled.max(0.2))
         .offset(0.0, pose.lift * 0.4)
         .offset_motion(Spring::new(0.4, 0.12))
-        .transition(Transition::offset(0.0, 16.0).combined(Transition::opacity()))
+        .transition(Transition::offset(0.0, 16.0).combined(Transition::opacity()));
+    if has_art {
+        copy = copy.child(
+            el().size(50.0, 50.0)
+                .center()
+                .child(badge("splash-badge").scale(0.5)),
+        );
+    }
+    let copy = copy
         .child(
             text(APP_NAME.to_string())
                 .font(title_font)
