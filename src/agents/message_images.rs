@@ -26,7 +26,10 @@ use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
-use crate::agents::domain::{AgentDomainEvent, AgentPart, MessageImageAsset, TimelineItem};
+use crate::agents::domain::{
+    AgentDomainEvent, AgentPart, MessageImageAsset, TimelineItem, TimelineRole,
+};
+use crate::agents::ports::agent::split_uploaded_attachment_suffix;
 use crate::{
     api_error, asset_id, asset_json, content_envelope, read_asset_head, require_device,
     sniff_asset_type, ApiResult, AppState, AssetEntry, AssetKind,
@@ -200,10 +203,40 @@ fn local_images() -> &'static MessageImages {
     IMAGES.get_or_init(Default::default)
 }
 
+/// Promote the App's ByPath "Attached files (on this host)" suffix into
+/// `attachments` and strip it from the visible text — same as the App's
+/// `parseTimelineItem` / `splitUploadedAttachmentSuffix`.
+fn promote_uploaded_attachment_suffix(items: &mut [TimelineItem]) {
+    for item in items {
+        if item.role != TimelineRole::User {
+            continue;
+        }
+        let AgentPart::Text { text } = &item.part else {
+            continue;
+        };
+        let (body, paths) = split_uploaded_attachment_suffix(text);
+        if paths.is_empty() {
+            continue;
+        }
+        let body = body.to_owned();
+        let paths: Vec<String> = paths.into_iter().map(str::to_owned).collect();
+        let attachments = item.attachments.get_or_insert_with(Vec::new);
+        for path in paths {
+            if !attachments.iter().any(|existing| existing == &path) {
+                attachments.push(path);
+            }
+        }
+        if let AgentPart::Text { text } = &mut item.part {
+            *text = body;
+        }
+    }
+}
+
 /// Attach `image_assets` the way the HTTP egress does for the App
 /// (`attach_to_items` / `originals::attach`), for an in-process desktop that
 /// never hits `/api`. Same fields the App reads on each text part.
 pub fn enrich_timeline(asid: &str, directory: Option<&str>, items: &mut [TimelineItem]) {
+    promote_uploaded_attachment_suffix(items);
     // Tool `content` media is resolved at paint time; only text embeds and
     // attachments need the host map (and must not run on every tool delta).
     if !items.iter().any(may_embed_image) && !items.iter().any(|item| item.attachments.is_some()) {
@@ -528,6 +561,9 @@ pub(crate) async fn attach_to_items(
     directory: Option<&str>,
     items: &mut [TimelineItem],
 ) {
+    // Same client-side recovery the App runs in `parseTimelineItem`, so HTTP
+    // and Desktop both attach originals for ByPath handoffs.
+    promote_uploaded_attachment_suffix(items);
     let needs_files = items.iter().any(|item| {
         item.attachments.is_some()
             || matches!(&item.part, AgentPart::Tool(call) if call.content.is_some())

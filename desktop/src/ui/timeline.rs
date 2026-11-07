@@ -3,7 +3,8 @@
 use std::path::{Path, PathBuf};
 
 use muqun_gateway::agents::message_images::resolve_host_media;
-use muqun_gateway::agents::ports::agent::{prompt_display_body, split_attachment_paths};
+use muqun_gateway::agents::ports::agent::prompt_display_body;
+use muqun_gateway::agents::MessageImageAsset;
 use muqun_gateway::agents::{
     AgentPart, AgentSessionId, FormField, FormRequest, PermissionDecision, PermissionRequest,
     TimelineItem, TimelineRole, ToolCall, ToolCallStatus,
@@ -183,29 +184,62 @@ fn push_resolved(out: &mut Vec<PathBuf>, src: &str, directory: Option<&str>) {
     }
 }
 
+/// App `messageImageForSource`: exact `src` match, image mime, not unavailable.
+fn message_image_for_source<'a>(
+    assets: Option<&'a [MessageImageAsset]>,
+    src: &str,
+) -> Option<&'a MessageImageAsset> {
+    assets?.iter().find(|asset| {
+        asset.src == src
+            && asset.unavailable_reason.is_none()
+            && asset.mime.starts_with("image/")
+            && asset.mime[6..]
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'+' | b'-'))
+    })
+}
+
+fn looks_like_image_uri(uri: &str) -> bool {
+    uri.starts_with("data:image/")
+        || matches!(
+            Path::new(uri.split('?').next().unwrap_or(uri))
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_ascii_lowercase())
+                .as_deref(),
+            Some("png" | "jpg" | "jpeg" | "gif" | "webp")
+        )
+}
+
+/// App `MessageAttachments`: walk `attachments`, resolve each through
+/// `image_assets`, else treat a clear image URI as a local file.
 fn item_image_paths(s: &UiState, item: &TimelineItem) -> Vec<PathBuf> {
     let directory = session_directory(s);
     let mut paths = Vec::new();
-    if let Some(assets) = &item.image_assets {
-        for asset in assets {
-            if asset.unavailable_reason.is_some() {
+    let assets = item.image_assets.as_deref();
+    if let Some(attachments) = &item.attachments {
+        for src in attachments {
+            if let Some(asset) = message_image_for_source(assets, src) {
+                let before = paths.len();
+                for candidate in [
+                    asset.thumbnail_url.as_deref(),
+                    asset.preview_url.as_deref(),
+                    (!asset.url.is_empty()).then_some(asset.url.as_str()),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    push_resolved(&mut paths, candidate, directory);
+                    if paths.len() > before {
+                        break;
+                    }
+                }
+                if paths.len() >= 8 {
+                    return paths;
+                }
                 continue;
             }
-            if !asset.mime.is_empty()
-                && !asset.mime.starts_with("image/")
-                && asset.mime != "application/octet-stream"
-            {
-                continue;
-            }
-            for src in [
-                asset.thumbnail_url.as_deref(),
-                asset.preview_url.as_deref(),
-                (!asset.url.is_empty()).then_some(asset.url.as_str()),
-                (!asset.src.is_empty()).then_some(asset.src.as_str()),
-            ]
-            .into_iter()
-            .flatten()
-            {
+            if looks_like_image_uri(src) {
                 push_resolved(&mut paths, src, directory);
                 if paths.len() >= 8 {
                     return paths;
@@ -213,21 +247,32 @@ fn item_image_paths(s: &UiState, item: &TimelineItem) -> Vec<PathBuf> {
             }
         }
     }
-    if let Some(attachments) = &item.attachments {
-        for src in attachments {
-            push_resolved(&mut paths, src, directory);
-            if paths.len() >= 8 {
-                return paths;
-            }
-        }
-    }
-    // Composer/ACP transcripts list uploads under the host-files marker.
-    if let AgentPart::Text { text } = &item.part {
-        let (_, embedded) = split_attachment_paths(text);
-        for src in embedded {
-            push_resolved(&mut paths, src, directory);
-            if paths.len() >= 8 {
-                break;
+    // Assistant markdown embeds: App rewrites sources via `image_assets` with
+    // no `attachments` list; Desktop draws those assets as a gallery.
+    if paths.is_empty() {
+        if let Some(assets) = assets {
+            for asset in assets {
+                if asset.unavailable_reason.is_some() || !asset.mime.starts_with("image/") {
+                    continue;
+                }
+                let before = paths.len();
+                for candidate in [
+                    asset.thumbnail_url.as_deref(),
+                    asset.preview_url.as_deref(),
+                    (!asset.url.is_empty()).then_some(asset.url.as_str()),
+                    (!asset.src.is_empty()).then_some(asset.src.as_str()),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    push_resolved(&mut paths, candidate, directory);
+                    if paths.len() > before {
+                        break;
+                    }
+                }
+                if paths.len() >= 8 {
+                    return paths;
+                }
             }
         }
     }
@@ -847,26 +892,21 @@ fn part(s: &UiState, k: &Kit, item: &TimelineItem) -> El {
     match &item.part {
         AgentPart::Text { text } => {
             let paths = item_image_paths(s, item);
+            // App shows prose first, then MessageAttachments underneath.
             let body = {
                 let prose = prompt_display_body(text);
                 if paths.is_empty() {
-                    // Keep wire text when we could not resolve pictures, so the
-                    // reader still sees where files were referenced.
-                    if split_attachment_paths(text).1.is_empty() {
-                        text.clone()
-                    } else {
-                        prose.to_string()
-                    }
+                    text.clone()
                 } else {
                     strip_image_placeholders(prose)
                 }
             };
             let mut block = col().key(format!("text-{id}")).gap(8.0).w_full();
-            if let Some(gallery) = image_gallery(s, k, id, &paths) {
-                block = block.child(gallery);
-            }
             if !body.is_empty() {
                 block = block.child(rich(k, id, &body));
+            }
+            if let Some(gallery) = image_gallery(s, k, id, &paths) {
+                block = block.child(gallery);
             }
             block
         }
