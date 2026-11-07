@@ -4,7 +4,8 @@
 //! allowed to live (architecture §10). Bundling a subset is a later task; a
 //! missing file only costs the fallback chain's choice of face.
 
-use std::sync::OnceLock;
+// `candidates` stays for a bundled subset later; the slots resolve by name.
+#![allow(dead_code)]
 
 /// The families the app draws with (`ui/text.rs` names them).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,29 +60,12 @@ pub fn family(role: FontRole) -> &'static str {
     }
 }
 
-/// The first file of `candidates(role)` that reads, kept for the process
-/// (Rune takes font bytes for its lifetime). `None` leaves the platform
-/// fallback in charge.
-pub fn load(role: FontRole) -> Option<&'static [u8]> {
-    for path in candidates(role) {
-        if let Ok(bytes) = std::fs::read(path) {
-            tracing::debug!(?role, path, "font loaded");
-            return Some(Box::leak(bytes.into_boxed_slice()));
-        }
-    }
-    None
-}
-
-/// Every face the UI embeds at launch (`AppSpec::fonts`): the mono face, so
-/// code, commands and diffs share one width wherever the system's monospace
-/// differs. The UI face comes from the family list (Rune's Inter, the
-/// system's CJK face by glyph); its multi-megabyte TTC is never read here.
-pub fn embedded() -> &'static [&'static [u8]] {
-    static FONTS: OnceLock<Vec<&'static [u8]>> = OnceLock::new();
-    FONTS.get_or_init(|| [FontRole::Mono].into_iter().filter_map(load).collect())
-}
-
-/// The two slot families (`AppSpec::families`): the UI face and the mono face.
+/// The two slot families (`AppSpec::families`): the UI face and the mono
+/// face. Names, not bytes: a face registered through `AppSpec::fonts` joins
+/// the glyph fallback chain of every text, which put the mono face's
+/// punctuation into UI labels; fontconfig resolves the names instead and
+/// `ui-monospace` is the platform's own monospace where the Nerd Font is
+/// not installed.
 pub fn families() -> (&'static str, &'static str) {
     (family(FontRole::Ui), family(FontRole::Mono))
 }
