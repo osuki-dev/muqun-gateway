@@ -15,6 +15,7 @@ mod icons;
 mod inbox;
 mod inspector;
 mod labels;
+mod palette;
 mod parts;
 pub mod scenes;
 mod sessions;
@@ -25,6 +26,7 @@ mod tasks;
 mod terminals;
 mod tiles;
 mod timeline;
+mod tray;
 mod viewer;
 mod voice;
 mod welcome;
@@ -59,6 +61,7 @@ use crate::theme::service::{GalleryView, Job, ThemeUpdate};
 use crate::theme::store::ThemeEntry;
 
 pub use settings::SettingsTab;
+pub use tray::words as tray_words;
 
 /// What the main pane shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -300,6 +303,10 @@ pub struct UiState {
     pub storage: Option<crate::model::storage::StorageReport>,
     /// The Terminals page (`ui/terminals.rs`).
     pub terms: terminals::TermState,
+    /// What the status icon last showed (`ui/tray.rs`).
+    tray_shown: Option<(crate::config::Language, Vec<(String, String)>)>,
+    /// The command palette (`ui/palette.rs`), when open.
+    pub palette: Option<palette::Palette>,
     /// Dictation in progress (`ui/voice.rs`).
     pub voice: Option<voice::Dictation>,
     /// Settings → Voice's fields.
@@ -429,6 +436,8 @@ impl UiState {
             storage: None,
             viewer: None,
             voice: None,
+            palette: None,
+            tray_shown: None,
             voice_form: voice::VoiceForm::new(&cfg.voice),
             terms: terminals::TermState::default(),
             tiles: Vec::new(),
@@ -1137,6 +1146,7 @@ impl UiState {
         if LAYOUT_DIRTY.swap(false, Ordering::AcqRel) {
             self.persist_layout();
         }
+        self.sync_tray();
     }
 
     /// Raise a system notification unless the owner turned them off or is
@@ -1730,6 +1740,10 @@ pub fn activity_pill(
 use copy::tr;
 
 pub fn on_key(s: &mut UiState, ev: &KeyEvent, _tx: &mut Tx) -> bool {
+    if ev.is_command('k') && !ev.mods.shift && !ev.mods.alt {
+        s.toggle_palette();
+        return true;
+    }
     if ev.is_command(' ') && ev.mods.shift && !ev.mods.alt && s.mode == Mode::Session {
         s.toggle_voice();
         return true;
@@ -1828,6 +1842,7 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>) -> El {
     }
     terminals::page_visible(s.mode);
     viewer::mount(s, &k, cx.env().scale, &mut layer);
+    palette::mount(s, &k, &mut layer);
     if !s.toasts.is_empty() {
         let mut region = ToastRegion::new();
         for t in &s.toasts {

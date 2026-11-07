@@ -33,7 +33,7 @@ pub enum SettingsTab {
     About,
 }
 
-fn tabs(language: Language) -> [(&'static str, SettingsTab); 7] {
+pub(super) fn tabs(language: Language) -> [(&'static str, SettingsTab); 7] {
     [
         (tr_ref(language, "Agents", "Agents"), SettingsTab::Agents),
         (
@@ -859,19 +859,38 @@ fn notifications(s: &UiState, k: &Kit) -> El {
         k,
         "general-notify",
         tr_ref(language, "Notifications", "通知"),
-        vec![setting(
-            k,
-            "notify",
-            title,
-            tr_ref(
-                language,
-                "Approvals, questions and finished turns in sessions you are not looking at.",
-                "不在眼前的会话需要审批、提问或完成时提醒你。",
+        vec![
+            setting(
+                k,
+                "notify",
+                title,
+                tr_ref(
+                    language,
+                    "Approvals, questions and finished turns in sessions you are not looking at.",
+                    "不在眼前的会话需要审批、提问或完成时提醒你。",
+                ),
+                flag(k, "notify", on, title, move |s| {
+                    s.edit(ConfigEdit::Notifications(!on))
+                }),
             ),
-            flag(k, "notify", on, title, move |s| {
-                s.edit(ConfigEdit::Notifications(!on))
-            }),
-        )],
+            {
+                let tray = s.cfg.general.close_to_tray;
+                let title = tr_ref(language, "Keep running in the tray", "关闭窗口后留在托盘");
+                setting(
+                k,
+                "tray",
+                title,
+                tr_ref(
+                    language,
+                    "Closing the window leaves Muqun in the system tray, still notifying. Quit from the tray's menu.",
+                    "关闭窗口后 Muqun 留在系统托盘并继续提醒；从托盘菜单退出。",
+                ),
+                flag(k, "tray", tray, title, move |s| {
+                    s.edit(ConfigEdit::CloseToTray(!tray))
+                }),
+            )
+            },
+        ],
     )
 }
 

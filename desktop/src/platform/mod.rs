@@ -14,6 +14,7 @@ pub mod notify;
 pub mod secrets;
 pub mod shell;
 pub mod shutdown;
+pub mod tray;
 
 use std::path::PathBuf;
 

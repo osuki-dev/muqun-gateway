@@ -751,6 +751,30 @@ fn voice_settings_scene(s: &mut UiState) {
     s.voice_form.key_saved = Some(crate::platform::secrets::Store::Keyring);
 }
 
+fn palette_scene(s: &mut UiState) {
+    session_scene(s);
+    s.cfg.ui.recent_commands = vec!["go:Terminals".into(), "session:s2".into()];
+    s.palette = Some(super::palette::Palette::new());
+}
+
+fn palette_search_scene(s: &mut UiState) {
+    session_scene(s);
+    let mut palette = super::palette::Palette::new();
+    palette.query = TextEdit::new("new cod");
+    palette.query.focused = true;
+    palette.selected = 1;
+    s.cfg.general.last_cwd.clear();
+    s.cfg
+        .general
+        .last_cwd
+        .insert("codex".into(), "/home/demo/gateway".into());
+    s.cfg
+        .general
+        .last_cwd
+        .insert("opencode".into(), "/home/demo/rune".into());
+    s.palette = Some(palette);
+}
+
 /// A scene name and the state it applies.
 pub type Scene = (&'static str, fn(&mut UiState));
 
@@ -869,6 +893,8 @@ pub fn scenes() -> &'static [Scene] {
         ("voice-settings", voice_settings_scene),
         ("timeline-subagent", timeline_subagent),
         ("timeline-context", timeline_context),
+        ("palette", palette_scene),
+        ("palette-search", palette_search_scene),
         ("viewer", viewer_code),
         ("viewer-markdown", viewer_markdown),
         ("viewer-image", viewer_image),
