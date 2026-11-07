@@ -5,7 +5,8 @@ use rune_kit::{
     Badge, BadgeVariant, Button, ButtonVariant, Card, ControlSize, Kit, ScrollBar, TextInput,
 };
 
-use super::{muted, UiState};
+use super::copy::{tr, tr_ref};
+use super::{muted, page_frame, UiState};
 use crate::hub::TaskRow;
 use crate::model::commands::Command;
 
@@ -22,18 +23,30 @@ fn create(s: &mut UiState) {
     });
 }
 
-fn state_badge(k: &Kit, state: &str) -> El {
+fn state_badge(k: &Kit, language: crate::config::Language, state: &str) -> El {
     let variant = match state {
         "working" | "dispatching" => BadgeVariant::Accent,
         "done" => BadgeVariant::Neutral,
         _ => BadgeVariant::Subtle,
     };
-    Badge::new(state.replace('_', " "))
+    let label = match state {
+        "working" => tr_ref(language, "working", "进行中"),
+        "dispatching" => tr_ref(language, "dispatching", "派发中"),
+        "queued" => tr_ref(language, "queued", "排队中"),
+        "waiting" => tr_ref(language, "waiting", "等待中"),
+        "done" => tr_ref(language, "done", "完成"),
+        "failed" => tr_ref(language, "failed", "失败"),
+        "cancelled" => tr_ref(language, "cancelled", "已取消"),
+        "idle_unconfirmed" => tr_ref(language, "idle", "待确认"),
+        other => other,
+    };
+    Badge::new(label.replace('_', " "))
         .variant(variant)
         .build(k)
 }
 
-fn card(k: &Kit, t: &TaskRow) -> El {
+fn card(s: &UiState, k: &Kit, t: &TaskRow) -> El {
+    let language = s.cfg.general.language;
     let accent = match t.state.as_str() {
         "done" => k.c.success.icon,
         "failed" => k.c.danger.icon,
@@ -50,10 +63,13 @@ fn card(k: &Kit, t: &TaskRow) -> El {
     if !note.is_empty() {
         card = card.description(note);
     }
-    let mut meta = row().gap(6.0).center_y().child(state_badge(k, &t.state));
+    let mut meta = row()
+        .gap(6.0)
+        .center_y()
+        .child(state_badge(k, language, &t.state));
     if let Some(agent) = &t.agent_id {
         meta = meta.child(
-            Badge::new(agent.clone())
+            Badge::new(s.agent_name(agent))
                 .variant(BadgeVariant::Neutral)
                 .build(k),
         );
@@ -61,16 +77,23 @@ fn card(k: &Kit, t: &TaskRow) -> El {
     if t.children.total > 0 {
         meta = meta.child(muted(
             k,
-            format!(
-                "{} sub-task(s), {} active",
-                t.children.total, t.children.active
+            tr(
+                language,
+                &format!(
+                    "{} sub-task(s), {} active",
+                    t.children.total, t.children.active
+                ),
+                &format!(
+                    "{} 个子任务，{} 个进行中",
+                    t.children.total, t.children.active
+                ),
             ),
         ));
     }
     card = card.child(meta);
     if let Some(asid) = t.asid.clone() {
         card = card.action(
-            Button::new("Open session")
+            Button::new(tr_ref(language, "Open session", "打开会话"))
                 .variant(ButtonVariant::Ghost)
                 .control_size(ControlSize::Small)
                 .on_press(move |s: &mut UiState| s.open_session(&asid))
@@ -81,7 +104,7 @@ fn card(k: &Kit, t: &TaskRow) -> El {
     if t.completable {
         let id = t.id.clone();
         card = card.action(
-            Button::new("Mark done")
+            Button::new(tr_ref(language, "Mark done", "标记完成"))
                 .variant(ButtonVariant::Outline)
                 .control_size(ControlSize::Small)
                 .on_press(move |s: &mut UiState| s.send(Command::CompleteTask { id: id.clone() }))
@@ -92,7 +115,7 @@ fn card(k: &Kit, t: &TaskRow) -> El {
     if !t.is_ended() {
         let id = t.id.clone();
         card = card.action(
-            Button::new("Cancel")
+            Button::new(tr_ref(language, "Cancel", "取消"))
                 .variant(ButtonVariant::Danger)
                 .control_size(ControlSize::Small)
                 .on_press(move |s: &mut UiState| s.send(Command::CancelTask { id: id.clone() }))
@@ -104,58 +127,88 @@ fn card(k: &Kit, t: &TaskRow) -> El {
 }
 
 pub fn view(s: &UiState, k: &Kit) -> El {
+    let language = s.cfg.general.language;
     let hint = match &s.task_cwd {
-        Some(cwd) => format!("Runs in {cwd} unless the goal says otherwise."),
-        None => "Runs in the gateway's default folder.".into(),
+        Some(cwd) => tr(
+            language,
+            &format!("Runs in {cwd} unless the goal says otherwise."),
+            &format!("默认在 {cwd} 运行，除非目标另有说明。"),
+        ),
+        None => tr(
+            language,
+            "Runs in the gateway's default folder.",
+            "在 Gateway 默认文件夹中运行。",
+        ),
     };
-    let mut page = col()
-        .key("tasks")
-        .w_full()
-        .gap(12.0)
-        .px(24.0)
-        .py(24.0)
-        .child(
-            row()
-                .key("task-new")
-                .w_full()
-                .gap(8.0)
-                .center_y()
-                .child(
-                    TextInput::new(&s.task_goal)
-                        .placeholder("Delegate a goal…")
-                        .label("Task goal")
-                        .on_edit(|s: &mut UiState| &mut s.task_goal)
-                        .on_submit(|s: &mut UiState, _: &mut Tx| create(s))
-                        .build(k)
-                        .key("task-goal")
-                        .grow(1.0),
-                )
-                .child(
-                    Button::new("Delegate")
-                        .variant(ButtonVariant::Submit)
-                        .control_size(ControlSize::Large)
-                        .on_press(create)
-                        .build(k)
-                        .key("task-create"),
-                )
-                .child(
-                    Button::new("Refresh")
-                        .variant(ButtonVariant::Outline)
-                        .control_size(ControlSize::Large)
-                        .on_press(|s: &mut UiState| s.send(Command::RefreshTasks))
-                        .build(k)
-                        .key("task-refresh"),
-                ),
-        )
-        .child(muted(k, hint));
+    let mut page = page_frame(
+        k,
+        "tasks",
+        tr_ref(language, "Tasks", "任务"),
+        Some(tr_ref(
+            language,
+            "Delegate a goal and watch it run.",
+            "委派一个目标并跟踪进度。",
+        )),
+    )
+    .child(
+        row()
+            .key("task-new")
+            .w_full()
+            .gap(8.0)
+            .center_y()
+            .child(
+                TextInput::new(&s.task_goal)
+                    .placeholder(tr_ref(language, "Delegate a goal…", "委派一个目标…"))
+                    .label(tr_ref(language, "Task goal", "任务目标"))
+                    .on_edit(|s: &mut UiState| &mut s.task_goal)
+                    .on_submit(|s: &mut UiState, _: &mut Tx| create(s))
+                    .build(k)
+                    .key("task-goal")
+                    .grow(1.0),
+            )
+            .child(
+                Button::new(tr_ref(language, "Delegate", "委派"))
+                    .variant(ButtonVariant::Submit)
+                    .control_size(ControlSize::Large)
+                    .on_press(create)
+                    .build(k)
+                    .key("task-create"),
+            )
+            .child(
+                Button::new(tr_ref(language, "Refresh", "刷新"))
+                    .variant(ButtonVariant::Outline)
+                    .control_size(ControlSize::Large)
+                    .on_press(|s: &mut UiState| s.send(Command::RefreshTasks))
+                    .build(k)
+                    .key("task-refresh"),
+            ),
+    )
+    .child(muted(k, hint));
     if s.tasks.is_empty() {
-        page = page.child(text("No tasks yet.").font(k.ty.ui).color(k.c.text_muted));
+        page = page.child(
+            Card::new()
+                .accent(k.c.icon_faint)
+                .title(tr_ref(language, "No tasks yet", "还没有任务"), None)
+                .description(tr(
+                    language,
+                    "Describe a goal above to start one.",
+                    "在上方描述目标即可开始。",
+                ))
+                .build(k)
+                .key("tasks-empty"),
+        );
     }
     for t in &s.tasks {
-        page = page.child(card(k, t));
+        page = page.child(card(s, k, t));
     }
-    page.scroll(ScrollSpec {
-        stick_bottom: false,
-    })
-    .scroll_bar(k)
+    col()
+        .key("tasks-scroll")
+        .w_full()
+        .h_full()
+        .items_center()
+        .child(page)
+        .scroll(ScrollSpec {
+            stick_bottom: false,
+        })
+        .scroll_bar(k)
 }

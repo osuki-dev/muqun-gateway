@@ -8,6 +8,7 @@ mod agent_marks;
 mod agents;
 mod art;
 mod composer;
+mod copy;
 mod home;
 mod inbox;
 mod inspector;
@@ -1037,6 +1038,38 @@ pub fn muted(k: &Kit, s: impl Into<String>) -> El {
 
 pub fn heading(k: &Kit, s: impl Into<String>) -> El {
     rune::text(s).font(k.ty.ui_medium).color(k.c.text_base)
+}
+
+/// Shared page chrome: centered column, title, optional subtitle.
+pub fn page_frame(k: &Kit, key: &str, title: &str, subtitle: Option<&str>) -> El {
+    let title_font = rune::TextStyle {
+        size: 22.0,
+        line_height: 28.0,
+        ..k.ty.ui_medium
+    };
+    let mut page = rune::col()
+        .key(key.to_string())
+        .w_full()
+        .max_w(760.0)
+        .gap(16.0)
+        .px(28.0)
+        .pt(28.0)
+        .pb(36.0)
+        .child(
+            rune::text(title.to_string())
+                .font(title_font)
+                .color(k.c.text_base)
+                .key("page-title"),
+        );
+    if let Some(sub) = subtitle.filter(|s| !s.is_empty()) {
+        page = page.child(
+            rune::text(sub.to_string())
+                .font(k.ty.body)
+                .color(k.c.text_muted)
+                .key("page-subtitle"),
+        );
+    }
+    page
 }
 
 pub fn title_of(info: &AgentSessionInfo) -> String {

@@ -1,14 +1,16 @@
 //! The window: sidebar, main pane, inspector and toolbar in one `SplitView`.
 
-use rune::{col, Cx, El};
+use rune::{col, row, text, Cx, El};
 use rune_kit::shell::{SidebarToggle, SplitView, Toolbar, INSPECTOR};
 use rune_kit::{
     Badge, BadgeVariant, Button, ButtonVariant, Card, ControlSize, IconButton, IconButtonVariant,
     Kit,
 };
 
+use super::copy::{tr, tr_ref};
 use super::{composer, home, inbox, inspector, sessions, settings, tasks, timeline};
 use super::{Mode, UiState};
+use crate::config::Language;
 use crate::model::commands::Command;
 
 pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> El {
@@ -39,29 +41,57 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
 }
 
 fn title(s: &UiState) -> String {
+    let language = s.cfg.general.language;
     match s.mode {
-        Mode::Home => "New session".into(),
-        Mode::Inbox => "Inbox".into(),
-        Mode::Tasks => "Tasks".into(),
-        Mode::Settings => "Settings".into(),
+        Mode::Home => tr(language, "New session", "新建会话"),
+        Mode::Inbox => tr(language, "Inbox", "收件箱"),
+        Mode::Tasks => tr(language, "Tasks", "任务"),
+        Mode::Settings => tr(language, "Settings", "设置"),
         Mode::Session => s
             .current()
             .map_or_else(|| s.status.clone(), super::title_of),
     }
 }
 
+fn hub_badge_label(language: Language, raw: &str) -> String {
+    match raw {
+        "" => tr(language, "Connecting…", "连接中…"),
+        "local gateway" => tr(language, "Local gateway", "本机 Gateway"),
+        "standalone" => tr(language, "Standalone", "独立运行"),
+        other => other.to_string(),
+    }
+}
+
+fn status_interesting(status: &str) -> bool {
+    let s = status.trim();
+    !(s.is_empty()
+        || s == "Starting…"
+        || s == "Sent"
+        || s.starts_with("Opening ")
+        || s.ends_with(" messages")
+        || s.ends_with(" agent(s) discovered"))
+}
+
 fn toolbar(s: &UiState, k: &Kit) -> Toolbar {
-    let hub = if s.hub_label.is_empty() {
-        "hub…".to_string()
-    } else {
-        s.hub_label.clone()
-    };
+    let language = s.cfg.general.language;
+    let hub = hub_badge_label(language, &s.hub_label);
     let mut bar = Toolbar::new().title(title(s));
+    if status_interesting(&s.status) {
+        bar = bar.trailing(
+            Badge::new(s.status.clone())
+                .variant(BadgeVariant::Subtle)
+                .build(k)
+                .key("status"),
+        );
+    }
     if s.mode == Mode::Session {
         if s.diff_stat.files > 0 {
             let label = format!(
-                "Changes {} +{} −{}",
-                s.diff_stat.files, s.diff_stat.added, s.diff_stat.removed
+                "{} {} +{} −{}",
+                tr_ref(language, "Changes", "变更"),
+                s.diff_stat.files,
+                s.diff_stat.added,
+                s.diff_stat.removed
             );
             bar = bar.trailing(
                 Button::new(label)
@@ -72,7 +102,6 @@ fn toolbar(s: &UiState, k: &Kit) -> Toolbar {
                     })
                     .control_size(ControlSize::Small)
                     .on_press(|s: &mut UiState| match s.selected.clone() {
-                        // The core answers with the toggle (`UiAction::ToggleDiffPanel`).
                         Some(asid) => s.send(Command::OpenDiff {
                             asid: muqun_gateway::agents::AgentSessionId(asid),
                             file: None,
@@ -90,10 +119,20 @@ fn toolbar(s: &UiState, k: &Kit) -> Toolbar {
                 } else {
                     IconButtonVariant::Ghost
                 })
-                .label("Inspector")
+                .label(tr_ref(language, "Inspector", "检查器"))
                 .on_press(|s: &mut UiState| s.toggle_inspector())
                 .build(k)
                 .key("inspector-toggle"),
+        );
+    }
+    if s.mode != Mode::Settings {
+        bar = bar.trailing(
+            Button::new(tr_ref(language, "Settings", "设置"))
+                .variant(ButtonVariant::Ghost)
+                .control_size(ControlSize::Small)
+                .on_press(|s: &mut UiState| s.go(Mode::Settings))
+                .build(k)
+                .key("goto-settings"),
         );
     }
     bar.trailing(
@@ -106,12 +145,13 @@ fn toolbar(s: &UiState, k: &Kit) -> Toolbar {
 
 /// An error from the core: the message, what to check, and a way to dismiss it.
 fn alert(s: &UiState, k: &Kit) -> Option<El> {
+    let language = s.cfg.general.language;
     let err = s.error.as_ref()?;
     let mut card = Card::new()
         .accent(k.c.danger.icon)
         .title(err.message.clone(), None)
         .action(
-            Button::new("Dismiss")
+            Button::new(tr_ref(language, "Dismiss", "关闭"))
                 .variant(ButtonVariant::Ghost)
                 .control_size(ControlSize::Small)
                 .on_press(|s: &mut UiState| s.error = None)
@@ -123,7 +163,7 @@ fn alert(s: &UiState, k: &Kit) -> Option<El> {
     }
     if err.unreachable {
         card = card.action(
-            Button::new("Retry")
+            Button::new(tr_ref(language, "Retry", "重试"))
                 .variant(ButtonVariant::Outline)
                 .control_size(ControlSize::Small)
                 .on_press(|s: &mut UiState| s.send(Command::Refresh))
@@ -159,13 +199,17 @@ fn session(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
 }
 
 fn revert_banner(s: &UiState, k: &Kit) -> El {
-    let _ = s;
+    let language = s.cfg.general.language;
     Card::new()
         .accent(k.c.warning.icon)
-        .title("Rollback staged", None)
-        .description("Confirm to restore files to the marked message, or cancel.")
+        .title(tr_ref(language, "Rollback staged", "已暂存回滚"), None)
+        .description(tr(
+            language,
+            "Confirm to restore files to the marked message, or cancel.",
+            "确认后会把文件恢复到标记的消息，或取消。",
+        ))
         .action(
-            Button::new("Confirm")
+            Button::new(tr_ref(language, "Confirm", "确认"))
                 .variant(ButtonVariant::Submit)
                 .control_size(ControlSize::Small)
                 .on_press(|s: &mut UiState| {
@@ -179,7 +223,7 @@ fn revert_banner(s: &UiState, k: &Kit) -> El {
                 .key("revert-commit"),
         )
         .action(
-            Button::new("Cancel")
+            Button::new(tr_ref(language, "Cancel", "取消"))
                 .variant(ButtonVariant::Ghost)
                 .control_size(ControlSize::Small)
                 .on_press(|s: &mut UiState| {
@@ -199,17 +243,21 @@ fn revert_banner(s: &UiState, k: &Kit) -> El {
 }
 
 fn session_actions(s: &UiState, k: &Kit) -> El {
+    let language = s.cfg.general.language;
     let asid = s.selected.clone().unwrap_or_default();
-    rune::row()
+    let busy = s.busy();
+    row()
         .key("session-actions")
         .w_full()
         .px(16.0)
         .pt(8.0)
         .gap(8.0)
+        .center_y()
         .child(
-            Button::new("Fork")
+            Button::new(tr_ref(language, "Fork", "分叉"))
                 .variant(ButtonVariant::Ghost)
                 .control_size(ControlSize::Small)
+                .disabled(asid.is_empty())
                 .on_press({
                     let asid = asid.clone();
                     move |s: &mut UiState| {
@@ -223,9 +271,10 @@ fn session_actions(s: &UiState, k: &Kit) -> El {
                 .key("fork"),
         )
         .child(
-            Button::new("Compact")
+            Button::new(tr_ref(language, "Compact", "压缩"))
                 .variant(ButtonVariant::Ghost)
                 .control_size(ControlSize::Small)
+                .disabled(asid.is_empty() || busy)
                 .on_press({
                     let asid = asid.clone();
                     move |s: &mut UiState| {
@@ -238,9 +287,10 @@ fn session_actions(s: &UiState, k: &Kit) -> El {
                 .key("compact"),
         )
         .child(
-            Button::new("Delete")
+            Button::new(tr_ref(language, "Delete", "删除"))
                 .variant(ButtonVariant::Danger)
                 .control_size(ControlSize::Small)
+                .disabled(asid.is_empty())
                 .on_press({
                     let asid = asid.clone();
                     move |s: &mut UiState| {
@@ -251,5 +301,15 @@ fn session_actions(s: &UiState, k: &Kit) -> El {
                 })
                 .build(k)
                 .key("delete"),
+        )
+        .child(
+            text(if busy {
+                tr(language, "Agent is working…", "Agent 正在工作…")
+            } else {
+                String::new()
+            })
+            .font(k.ty.small)
+            .color(k.c.text_muted)
+            .key("session-busy"),
         )
 }

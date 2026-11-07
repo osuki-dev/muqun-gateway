@@ -367,29 +367,58 @@ fn session_row(s: &UiState, k: &Kit, layer: &mut Vec<El>, asid: &str) -> El {
 }
 
 pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
+    let language = s.cfg.general.language;
     let mut sidebar = Sidebar::new()
-        .label("Sessions")
+        .label(super::copy::tr_ref(language, "Sessions", "会话"))
         .header(
             TextInput::new(&s.search)
-                .placeholder("Search sessions")
+                .placeholder(super::copy::tr_ref(language, "Search sessions", "搜索会话"))
                 .leading_icon(&SEARCH)
                 .clear_button()
                 .on_edit(|s: &mut UiState| &mut s.search)
                 .build(k)
                 .key("search"),
         )
-        .child(nav(s, k, "Home", &SPARKLE, Mode::Home))
-        .child(nav(s, k, "Inbox", &CHECK, Mode::Inbox))
-        .child(nav(s, k, "Tasks", &KEYBOARD, Mode::Tasks))
-        .child(nav(s, k, "Settings", &FOLDER, Mode::Settings));
+        .child(nav(
+            s,
+            k,
+            super::copy::tr_ref(language, "Home", "首页"),
+            &SPARKLE,
+            Mode::Home,
+        ))
+        .child(nav(
+            s,
+            k,
+            super::copy::tr_ref(language, "Inbox", "收件箱"),
+            &CHECK,
+            Mode::Inbox,
+        ))
+        .child(nav(
+            s,
+            k,
+            super::copy::tr_ref(language, "Tasks", "任务"),
+            &KEYBOARD,
+            Mode::Tasks,
+        ))
+        .child(nav(
+            s,
+            k,
+            super::copy::tr_ref(language, "Settings", "设置"),
+            &FOLDER,
+            Mode::Settings,
+        ));
     if s.sessions.is_empty() {
         sidebar = sidebar.child(
-            rune::text("No sessions yet")
-                .key("empty-sessions")
-                .font(k.ty.small)
-                .color(k.c.text_faint)
-                .px(12.0)
-                .py(8.0),
+            rune::text(super::copy::tr_ref(
+                language,
+                "No sessions yet",
+                "还没有会话",
+            ))
+            .key("empty-sessions")
+            .font(k.ty.small)
+            .color(k.c.text_faint)
+            .px(12.0)
+            .py(8.0),
         );
     }
     for row in tree(s, k, layer) {
@@ -397,7 +426,7 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     }
     sidebar
         .footer(
-            Button::new("Refresh")
+            Button::new(super::copy::tr_ref(language, "Refresh", "刷新"))
                 .control_size(ControlSize::Large)
                 .variant(ButtonVariant::Outline)
                 .on_press(|s: &mut UiState| {

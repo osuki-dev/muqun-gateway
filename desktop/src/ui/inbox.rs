@@ -1,12 +1,14 @@
 //! The inbox page: every permission and form waiting on the owner, by session.
 
 use rune::{col, row, text, El, ScrollSpec};
-use rune_kit::{Button, ButtonVariant, ControlSize, Kit, ScrollBar};
+use rune_kit::{Button, ButtonVariant, Card, ControlSize, Kit, ScrollBar};
 
-use super::{muted, timeline, title_of, UiState};
+use super::copy::{tr, tr_ref};
+use super::{muted, page_frame, timeline, title_of, UiState};
 use crate::model::commands::Command;
 
 pub fn view(s: &UiState, k: &Kit) -> El {
+    let language = s.cfg.general.language;
     let mut asids: Vec<&String> = s
         .waiting_perms
         .iter()
@@ -21,10 +23,23 @@ pub fn view(s: &UiState, k: &Kit) -> El {
         .collect();
     asids.sort();
     asids.dedup();
-    let mut page = col().key("inbox").w_full().gap(16.0).px(24.0).py(24.0);
-    for asid in asids {
-        let title = s.session_by_id(asid).map_or_else(|| asid.clone(), title_of);
-        let id = asid.clone();
+
+    let mut page = page_frame(
+        k,
+        "inbox",
+        tr_ref(language, "Inbox", "收件箱"),
+        Some(tr_ref(
+            language,
+            "Approvals and forms waiting on you.",
+            "等待你处理的审批与表单。",
+        )),
+    );
+
+    for asid in &asids {
+        let title = s
+            .session_by_id(asid)
+            .map_or_else(|| (*asid).clone(), title_of);
+        let id = (*asid).clone();
         let mut block = col().key(format!("wait-{asid}")).w_full().gap(8.0).child(
             row()
                 .gap(8.0)
@@ -37,7 +52,7 @@ pub fn view(s: &UiState, k: &Kit) -> El {
                         .truncate(),
                 )
                 .child(
-                    Button::new("Open session")
+                    Button::new(tr_ref(language, "Open session", "打开会话"))
                         .variant(ButtonVariant::Ghost)
                         .control_size(ControlSize::Small)
                         .on_press(move |s: &mut UiState| s.open_session(&id))
@@ -45,10 +60,10 @@ pub fn view(s: &UiState, k: &Kit) -> El {
                         .key(format!("open-{asid}")),
                 ),
         );
-        for p in s.waiting_perms.get(asid).into_iter().flatten() {
+        for p in s.waiting_perms.get(*asid).into_iter().flatten() {
             block = block.child(timeline::permission_card(s, k, p).key(format!("p-{}", p.id)));
         }
-        for f in s.waiting_forms.get(asid).into_iter().flatten() {
+        for f in s.waiting_forms.get(*asid).into_iter().flatten() {
             block = block.child(timeline::form_card(s, k, f).key(format!("f-{}", f.id)));
         }
         page = page.child(block);
@@ -71,12 +86,16 @@ pub fn view(s: &UiState, k: &Kit) -> El {
                     )
                     .child(muted(
                         k,
-                        format!("Task waiting · {}", t.progress.clone().unwrap_or_default()),
+                        tr(
+                            language,
+                            &format!("Task waiting · {}", t.progress.clone().unwrap_or_default()),
+                            &format!("任务等待中 · {}", t.progress.clone().unwrap_or_default()),
+                        ),
                     )),
             );
         if let Some(asid) = t.asid.clone() {
             line = line.child(
-                Button::new("Open")
+                Button::new(tr_ref(language, "Open", "打开"))
                     .variant(ButtonVariant::Ghost)
                     .control_size(ControlSize::Small)
                     .on_press(move |s: &mut UiState| s.open_session(&asid))
@@ -87,7 +106,7 @@ pub fn view(s: &UiState, k: &Kit) -> El {
         if t.completable {
             let id = t.id.clone();
             line = line.child(
-                Button::new("Mark done")
+                Button::new(tr_ref(language, "Mark done", "标记完成"))
                     .variant(ButtonVariant::Outline)
                     .control_size(ControlSize::Small)
                     .on_press(move |s: &mut UiState| {
@@ -99,11 +118,28 @@ pub fn view(s: &UiState, k: &Kit) -> El {
         }
         page = page.child(line);
     }
-    if s.waiting_count() == 0 {
-        page = page.child(muted(k, "Nothing is waiting for you."));
+    if s.waiting_count() == 0 && !s.tasks.iter().any(|t| t.state == "waiting") {
+        page = page.child(
+            Card::new()
+                .accent(k.c.success.icon)
+                .title(tr_ref(language, "All clear", "全部处理完毕"), None)
+                .description(tr(
+                    language,
+                    "Nothing is waiting for you right now.",
+                    "现在没有需要你处理的事项。",
+                ))
+                .build(k)
+                .key("inbox-empty"),
+        );
     }
-    page.scroll(ScrollSpec {
-        stick_bottom: false,
-    })
-    .scroll_bar(k)
+    col()
+        .key("inbox-scroll")
+        .w_full()
+        .h_full()
+        .items_center()
+        .child(page)
+        .scroll(ScrollSpec {
+            stick_bottom: false,
+        })
+        .scroll_bar(k)
 }
