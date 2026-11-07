@@ -137,6 +137,7 @@ fn main() -> anyhow::Result<()> {
         "opening rune window"
     );
     app.run();
+    instance::release();
     store.flush();
     Ok(())
 }
@@ -203,6 +204,7 @@ fn start_core(
 async fn stop_on_signal(store: Arc<ConfigStore>) {
     let signal = platform::shutdown::requested().await;
     tracing::info!(signal, "stop requested");
+    instance::release();
     store.flush();
     std::process::exit(0);
 }

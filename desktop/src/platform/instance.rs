@@ -53,6 +53,19 @@ pub fn claim(name: &str, request: &Request) -> Claim {
     imp::claim(name, request)
 }
 
+/// The socket this process listens on, removed by [`release`].
+#[cfg_attr(not(unix), allow(dead_code))]
+static SOCKET: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Stop being the instance: remove the socket, so the next launch starts
+/// without first trying a dead one. Called on the way out (a crash leaves
+/// it, and the next launch replaces it).
+pub fn release() {
+    if let Some(path) = SOCKET.get() {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 impl Primary {
     /// Answer later launches: `on_request` runs on a thread of its own for
     /// each one.
@@ -135,7 +148,7 @@ mod imp {
         let spawned = std::thread::Builder::new()
             .name("muqun-instance".into())
             .spawn(move || {
-                let _cleanup = Cleanup(path);
+                let _ = super::SOCKET.set(path);
                 for stream in listener.incoming() {
                     let Ok(mut stream) = stream else { continue };
                     let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
@@ -154,16 +167,6 @@ mod imp {
             });
         if let Err(err) = spawned {
             tracing::warn!("could not listen for other launches: {err}");
-        }
-    }
-
-    /// Remove the socket when the listener goes (it lives as long as the
-    /// process; a crash leaves it, and the next launch replaces it).
-    struct Cleanup(std::path::PathBuf);
-
-    impl Drop for Cleanup {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
         }
     }
 }
