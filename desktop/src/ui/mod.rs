@@ -508,6 +508,9 @@ impl UiState {
                     agent: self.start_agent.clone(),
                 });
                 self.refresh_start_catalog();
+                self.send(Command::Compose(
+                    crate::model::compose::ComposeCommand::ListPeers,
+                ));
             }
             Mode::Settings => self.send(Command::ThemeRefresh),
             _ => {}

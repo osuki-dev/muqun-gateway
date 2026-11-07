@@ -10,11 +10,11 @@ use rune_kit::{
     TextInput,
 };
 
-use super::composer::{branch_menu, catalog_models, model_menu};
+use super::composer::{self, branch_menu, catalog_models, model_menu};
 use super::{muted, title_of, OpenMenu, Slot, UiState};
 use crate::config::ConfigEdit;
 use crate::model::commands::Command;
-use crate::model::compose::{ComposeCommand, Deliver, Target};
+use crate::model::compose::{ComposeCommand, Target};
 
 pub fn submit_start(s: &mut UiState) {
     let prompt = s.start_draft.text.trim().to_string();
@@ -43,7 +43,10 @@ pub fn submit_start(s: &mut UiState) {
             mode: mode.clone(),
         });
     }
-    let attachments = s.staged.iter().map(|f| f.path.clone()).collect();
+    let attachments: Vec<String> = s.staged.iter().map(|f| f.path.clone()).collect();
+    let deliver =
+        composer::deliver_of(s.start_catalog.as_deref(), &prompt, !attachments.is_empty());
+    composer::note_skill_args(s, &deliver);
     let token = s.token(Slot::Start);
     s.status = "Starting…".into();
     s.send(Command::Compose(ComposeCommand::Submit {
@@ -55,7 +58,7 @@ pub fn submit_start(s: &mut UiState) {
             mode,
             worktree,
         },
-        deliver: Deliver::Prompt(prompt),
+        deliver,
         attachments,
         delivery: None,
     }));
@@ -420,22 +423,24 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     if let Some(pills) = start_pills(s, k, layer) {
         card = card.child(pills);
     }
+    composer::popup(s, k, layer, Slot::Start);
+    let placeholder = if s.cfg.general.language == crate::config::Language::ZhCn {
+        "描述任务…（/ 命令，$ 技能，@ 文件）"
+    } else {
+        "Describe the task…  (/ commands, $ skills, @ files)"
+    };
     card = card
         .child(
             TextArea::new(&s.start_draft)
-                .placeholder(if s.cfg.general.language == crate::config::Language::ZhCn {
-                    "描述任务…"
-                } else {
-                    "Describe the task…"
-                })
+                .placeholder(placeholder)
                 .label("First prompt")
                 .width(None)
                 .auto_grow(4, 12)
                 .on_edit(|s: &mut UiState| &mut s.start_draft)
-                .on_change(|s: &mut UiState, _: &mut Tx| s.persist_draft(Slot::Start))
+                .on_change(|s: &mut UiState, _: &mut Tx| composer::on_draft_change(s, Slot::Start))
                 .on_submit(|s: &mut UiState, _: &mut Tx| submit_start(s))
                 .on_input_paste(|s: &mut UiState, content, _: &mut Tx| {
-                    super::composer::take_paste(s, content)
+                    composer::take_paste(s, content)
                 })
                 .build(k)
                 .key("start-draft")

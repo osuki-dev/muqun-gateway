@@ -418,6 +418,8 @@ pub async fn deliver(
             .run_command(asid, name, args, delivery)
             .await
             .map(|_| ()),
+        // Agent-session skills take no wire arguments (App `invokeAgentSkill`);
+        // typed args are said in the UI, not dropped silently.
         Deliver::Skill { name, .. } => hub.activate_skill(asid, name).await,
     }
 }

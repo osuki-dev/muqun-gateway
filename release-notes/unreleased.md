@@ -37,7 +37,10 @@
 - **Composer `@` / `$` / `/` match the App.** `/` lists host commands at draft
   start; `$` lists every catalog skill; `@` is a word-boundary mention of
   computers and workspace files (caret-aware, fuzzy-ranked). Send routing
-  follows the App: unknown `/` stays a prompt; `$name` runs a skill.
+  follows the App: unknown `/` stays a prompt; `$name` runs a skill. Home's
+  first prompt uses the same popups and routing. Attachments skip slash/skill
+  parse; unreachable `@` computers stay listed but cannot be picked; typed
+  skill arguments are announced and not sent on the wire.
 
 - **Large videos can be uploaded in chunks, up to 1 GiB, without the Gateway
   buffering the file.** `POST /api/uploads` reads its whole body into memory

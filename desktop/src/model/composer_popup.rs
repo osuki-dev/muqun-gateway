@@ -21,6 +21,8 @@ pub struct PopupRow {
     pub label: String,
     pub description: String,
     pub insert: String,
+    /// Unreachable computers stay listed but cannot be picked (App parity).
+    pub disabled: bool,
 }
 
 /// The trigger character and everything typed after it, located in the draft.
@@ -367,6 +369,7 @@ mod tests {
             label: insert.into(),
             description: String::new(),
             insert: insert.into(),
+            disabled: false,
         }
     }
 
