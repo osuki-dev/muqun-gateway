@@ -18,7 +18,7 @@ use std::path::PathBuf;
 
 use rune::{col, el, memo, row, text, text_input, Color, El, KeyEvent, TextEdit, TextStyle, Tx};
 use rune_kit::shell::PaneState;
-use rune_kit::{Badge, BadgeVariant, ControlSize, IconButton, IconButtonVariant, Kit};
+use rune_kit::{Badge, BadgeVariant, ControlSize, IconButton, IconButtonVariant, Kit, MenuItem};
 
 use super::copy::tr_ref;
 use super::UiState;
@@ -47,7 +47,12 @@ static RESTART: rune::Icon = rune::Icon {
 const FONT_SIZE: f32 = 13.0;
 const LINE: f32 = 17.0;
 /// Inside the grid's card, around the cells.
-const INSET: f32 = 8.0;
+const INSET: f32 = 6.0;
+/// The title strip's height: one dense desktop line.
+const HEAD: f32 = 34.0;
+/// Copy and paste while the terminal has the keyboard (`term/input.rs`).
+const COPY: &str = "Primary+Shift+C";
+const PASTE: &str = "Primary+Shift+V";
 
 fn style() -> TextStyle {
     TextStyle::new(FONT_SIZE, 400.0).mono().lh(LINE)
@@ -88,6 +93,8 @@ pub struct TermPanel {
     pub want: Cell<Option<Colors>>,
     sent: Option<Colors>,
     wheel: f32,
+    /// Where the context menu opened, while it is open.
+    pub menu_at: Option<rune::PointerPress>,
     /// What the panel sent the shell, for the routing test.
     #[cfg(test)]
     pub sent_log: std::cell::RefCell<Vec<String>>,
@@ -111,6 +118,7 @@ impl TermPanel {
             want: Cell::new(None),
             sent: None,
             wheel: 0.0,
+            menu_at: None,
             #[cfg(test)]
             sent_log: Default::default(),
         }
@@ -401,7 +409,7 @@ impl UiState {
 }
 
 /// The panel.
-pub fn view(s: &UiState, k: &Kit, scheme: ColorScheme, scale: f32) -> El {
+pub fn view(s: &UiState, k: &Kit, scheme: ColorScheme, scale: f32, layer: &mut Vec<El>) -> El {
     let language = s.cfg.general.language;
     let colors = colors(k, scheme);
     s.term.want.set(Some(colors));
@@ -422,20 +430,23 @@ pub fn view(s: &UiState, k: &Kit, scheme: ColorScheme, scale: f32) -> El {
                 .unwrap_or_else(|| s.terminal_cwd());
             short_path(&cwd)
         });
+    // A desktop pane's title strip: one dense line, then the grid edge to edge.
     let mut header = row()
         .key("terminal-head")
         .w_full()
+        .h(HEAD)
+        .px(10.0)
         .gap(6.0)
         .center_y()
         .child(
-            rune::icon(&TERMINAL_WINDOW, 15.0)
+            rune::icon(&TERMINAL_WINDOW, 14.0)
                 .color(k.c.icon_muted)
                 .a11y_hidden(),
         )
         .child(
             text(title)
                 .key("terminal-title")
-                .font(k.ty.ui_medium)
+                .font(k.ty.caption())
                 .color(k.c.text_base)
                 .truncate()
                 .shrink()
@@ -470,20 +481,17 @@ pub fn view(s: &UiState, k: &Kit, scheme: ColorScheme, scale: f32) -> El {
                 .key("terminal-close"),
         );
 
-    let grid = grid(s, k, frame, m, bg, scale);
-    let mut card = col()
-        .key("terminal-card")
+    let grid = context_menu(s, k, grid(s, k, frame, m, bg, scale), layer);
+    let mut body = col()
+        .key("terminal-body")
         .w_full()
         .grow(1.0)
         .min_h(0.0)
         .padding(INSET)
-        .radius(crate::theme::look::CARD_RADIUS)
         .fill(bg)
-        .border(1.0, k.c.border_muted)
-        .clip_rounded(crate::theme::look::CARD_RADIUS)
         .child(grid);
     if let Some(err) = &s.term.error {
-        card = card.child(
+        body = body.child(
             text(err.clone())
                 .key("terminal-error")
                 .font(k.ty.body)
@@ -491,7 +499,7 @@ pub fn view(s: &UiState, k: &Kit, scheme: ColorScheme, scale: f32) -> El {
                 .wrap(),
         );
     } else if exited {
-        card = card.child(
+        body = body.child(
             text(tr_ref(
                 language,
                 "The shell ended. Press Return for a new one.",
@@ -507,12 +515,74 @@ pub fn view(s: &UiState, k: &Kit, scheme: ColorScheme, scale: f32) -> El {
         .w_full()
         .h_full()
         .min_h(0.0)
-        .gap(8.0)
-        .px(10.0)
-        .pt(10.0)
-        .pb(10.0)
         .child(header)
-        .child(card)
+        .child(
+            el().key("terminal-rule")
+                .w_full()
+                .h(1.0)
+                .fill(k.c.border_muted),
+        )
+        .child(body)
+}
+
+/// Right-click: what a desktop terminal offers there.
+fn context_menu(s: &UiState, k: &Kit, grid: El, layer: &mut Vec<El>) -> El {
+    let language = s.cfg.general.language;
+    let has_selection = s.term.frame.as_ref().is_some_and(|f| f.selection.is_some());
+    let shortcut = |chord: &str| crate::platform::keys::label(chord);
+    let grid = grid.on_secondary_press(|s: &mut UiState, at, _: &mut Tx| {
+        s.term.menu_at = Some(at);
+        s.term.sink.focused = true;
+    });
+    rune_kit::context_menu("terminal-menu", grid, s.term.menu_at)
+        .min_width(220.0)
+        .on_close(|s: &mut UiState| s.term.menu_at = None)
+        .item(
+            MenuItem::new(tr_ref(language, "Copy", "复制"))
+                .shortcut(shortcut(COPY))
+                .disabled(!has_selection)
+                .on_select_tx(|s: &mut UiState, tx: &mut Tx| {
+                    s.term.menu_at = None;
+                    if let Some(text) = s.term.frame.as_ref().and_then(|f| f.selection.clone()) {
+                        tx.copy(text);
+                    }
+                }),
+        )
+        .item(
+            MenuItem::new(tr_ref(language, "Paste", "粘贴"))
+                .shortcut(shortcut(PASTE))
+                .on_select_tx(|s: &mut UiState, tx: &mut Tx| {
+                    s.term.menu_at = None;
+                    tx.request_paste();
+                }),
+        )
+        .item(
+            MenuItem::new(tr_ref(language, "Clear", "清屏")).on_select(|s: &mut UiState| {
+                s.term.menu_at = None;
+                s.term.send(Msg::Clear);
+            }),
+        )
+        .separator()
+        .item(
+            MenuItem::new(tr_ref(language, "New shell", "新的 Shell")).on_select(
+                |s: &mut UiState| {
+                    s.term.menu_at = None;
+                    s.restart_terminal();
+                },
+            ),
+        )
+        .item(
+            MenuItem::new(tr_ref(language, "Hide terminal", "隐藏终端"))
+                .shortcut("Ctrl+`")
+                .on_select(|s: &mut UiState| {
+                    s.term.menu_at = None;
+                    s.close_terminal();
+                }),
+        )
+        .build(k, layer)
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
 }
 
 /// `~/…` for paths under home.

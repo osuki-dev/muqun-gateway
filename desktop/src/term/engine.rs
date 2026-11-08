@@ -278,6 +278,24 @@ impl Engine {
         Ok(())
     }
 
+    /// Forget the scrollback and the screen, then ask the shell for a fresh
+    /// prompt with Ctrl+L, as a terminal's Clear does.
+    pub fn clear(&mut self) -> Result<()> {
+        self.term.vt_write(b"\x1b[H\x1b[2J\x1b[3J");
+        self.follow_output();
+        self.force = true;
+        self.key(&KeyInput {
+            key: key::Key::L,
+            mods: Mods {
+                ctrl: true,
+                ..Mods::default()
+            },
+            text: None,
+            unshifted: 'l',
+            repeat: false,
+        })
+    }
+
     /// Text an input method composed: sent as typed.
     pub fn text(&mut self, text: &str) {
         self.follow_output();

@@ -38,6 +38,8 @@ pub enum Msg {
     Resize(Size),
     Colors(Colors),
     Bytes(Vec<u8>),
+    /// Drop the history and have the shell redraw its prompt (Ctrl+L).
+    Clear,
     Eof,
     /// The panel closed: hang the shell up and stop.
     Shutdown,
@@ -167,6 +169,7 @@ impl Session {
                                     }
                                 }
                                 Msg::Colors(c) => log(engine.set_colors(c)),
+                                Msg::Clear => log(engine.clear()),
                                 Msg::Eof => {
                                     exited.store(true, Ordering::Release);
                                 }

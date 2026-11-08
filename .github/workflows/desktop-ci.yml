@@ -66,6 +66,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      # The terminal panel's emulator (libghostty-vt-sys) builds Ghostty's
+      # libghostty-vt from source: it clones Ghostty and runs `zig build`.
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
       - uses: Swatinem/rust-cache@v2
 
       - name: fmt

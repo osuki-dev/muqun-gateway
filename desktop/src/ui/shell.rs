@@ -59,7 +59,7 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
         split = split.inspector(
             &s.term.pane,
             super::terminal_pane,
-            super::terminal_panel::view(s, k, scheme, cx.env().scale),
+            super::terminal_panel::view(s, k, scheme, cx.env().scale, layer),
         );
     } else if inspector_here {
         split = split.inspector(&s.right, super::right_pane, inspector::view(s, k));

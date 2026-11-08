@@ -891,6 +891,13 @@ pub fn scenes() -> &'static [Scene] {
         ("terminals", terminals_scene),
         ("terminal", |s| terminal_scene(s, shell_fixture)),
         ("terminal-vim", |s| terminal_scene(s, vim_fixture)),
+        ("terminal-menu", |s| {
+            terminal_scene(s, shell_fixture);
+            s.term.menu_at = Some(rune::PointerPress {
+                x: 1180.0,
+                y: 300.0,
+            });
+        }),
         ("terminal-ime", |s| {
             terminal_scene(s, shell_fixture);
             s.term.sink.preedit = Some(("ni hao".into(), Some((6, 6))));

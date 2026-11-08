@@ -90,6 +90,13 @@ lto = "thin"
 codegen-units = 1
 strip = true
 
+# The desktop terminal's emulator is Zig code built by libghostty-vt-sys; in a
+# dev build without this it compiles in Zig's Debug mode, several times slower
+# at parsing a flood of output. Release-fast it, debug builds stay debuggable.
+[profile.dev.package.libghostty-vt-sys]
+debug = false
+opt-level = 3
+
 # Optional local override (not required for CI): point at a sibling checkout
 # with `cargo --config 'patch."https://github.com/ryuhzk/rune".rune.path="../rune/crates/rune"'`
 # (and the matching rune-kit path) while iterating on Rune itself.

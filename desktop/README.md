@@ -144,6 +144,10 @@ processes; T3 needs pairing in the desktop (Settings → Agents → T3).
 
 The desktop is the `desktop/` member of the gateway workspace.
 
+The terminal panel's emulator (`libghostty-vt`) is Zig built from source: its build script clones
+Ghostty and needs **Zig 0.15.2** on `PATH` (with mise: `mise exec zig@0.15.2 -- cargo build …`;
+the first build also needs network for the clone).
+
 ```sh
 cargo build -p muqun-desktop             # type-check fast
 cargo run --release -p muqun-desktop     # judge speed on release; debug is slow with 300+ sessions
