@@ -9,13 +9,41 @@
 //! Agent brand colours are not theme tokens ([`super::agents`]), so no theme
 //! can change their hue (architecture §6.1b).
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Instant;
 
 use super::color_scheme::ColorScheme;
-use super::pack::Manifest;
+use super::pack::{Manifest, SlotLook};
 use super::tokens::ThemePalette;
 use crate::config::Scheme;
+
+/// The decoration slots this host draws; their images are read with the
+/// theme so a switch never waits on the disk.
+pub const DRAWN_SLOTS: &[&str] = &[
+    "home.artwork",
+    "home.wallpaper",
+    "shell.wallpaper",
+    "home.composer.background",
+    "empty.artwork",
+    "launch.artwork",
+];
+
+/// The chrome glyphs this host replaces.
+pub const DRAWN_ICONS: &[&str] = &["chrome.settings", "home.arrow"];
+
+/// A replacement glyph, decoded: straight RGBA, `template` when its alpha is
+/// the shape and the theme supplies the colour.
+#[derive(Clone)]
+pub struct Glyph {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Arc<[u8]>,
+    pub template: bool,
+    /// Which way it points as drawn, radians clockwise from right, when the
+    /// pack says (`iconDirections`).
+    pub direction: Option<f32>,
+}
 
 /// Everything the main thread needs to switch: read and checked on the
 /// tokio side.
@@ -23,12 +51,14 @@ use crate::config::Scheme;
 pub struct AppliedTheme {
     pub manifest: Arc<Manifest>,
     pub scheme: Scheme,
-    pub wallpaper_light: Option<Arc<[u8]>>,
-    pub wallpaper_dark: Option<Arc<[u8]>>,
-    pub artwork_light: Option<Arc<[u8]>>,
-    pub artwork_dark: Option<Arc<[u8]>>,
-    pub launch_light: Option<Arc<[u8]>>,
-    pub launch_dark: Option<Arc<[u8]>>,
+    /// Encoded bytes by asset id, for every asset a drawn slot or the custom
+    /// logo names (one copy however many slots share it).
+    pub images: BTreeMap<String, Arc<[u8]>>,
+    /// Each image's size in pixels (read from its header), so art can be
+    /// composed before it has decoded.
+    pub sizes: BTreeMap<String, [u32; 2]>,
+    /// Decoded glyphs by icon name ([`DRAWN_ICONS`]).
+    pub glyphs: BTreeMap<String, Glyph>,
     /// When the owner asked, for the end-to-end timing.
     pub requested: Instant,
 }
@@ -48,12 +78,9 @@ struct Current {
     scheme: Scheme,
     light: ThemePalette,
     dark: ThemePalette,
-    wallpaper_light: Option<Arc<[u8]>>,
-    wallpaper_dark: Option<Arc<[u8]>>,
-    artwork_light: Option<Arc<[u8]>>,
-    artwork_dark: Option<Arc<[u8]>>,
-    launch_light: Option<Arc<[u8]>>,
-    launch_dark: Option<Arc<[u8]>>,
+    images: BTreeMap<String, Arc<[u8]>>,
+    sizes: BTreeMap<String, [u32; 2]>,
+    glyphs: BTreeMap<String, Glyph>,
 }
 
 fn current() -> &'static RwLock<Option<Current>> {
@@ -61,12 +88,42 @@ fn current() -> &'static RwLock<Option<Current>> {
     CURRENT.get_or_init(|| RwLock::new(None))
 }
 
-fn pick(dark: bool, a: &Option<Arc<[u8]>>, b: &Option<Arc<[u8]>>) -> Option<Arc<[u8]>> {
-    if dark {
-        a.clone().or_else(|| b.clone())
-    } else {
-        b.clone().or_else(|| a.clone())
+/// A slot's picture and how the pack wants it shown.
+#[derive(Clone)]
+pub struct Art {
+    pub bytes: Arc<[u8]>,
+    pub look: SlotLook,
+    /// Width and height in pixels.
+    pub size: [f32; 2],
+}
+
+impl Current {
+    fn art(&self, slot: &str, scheme: ColorScheme) -> Option<Art> {
+        let dark = scheme == ColorScheme::Dark;
+        let asset = self.manifest.slot_asset(slot, dark)?;
+        let [w, h] = *self.sizes.get(asset)?;
+        Some(Art {
+            bytes: self.images.get(asset)?.clone(),
+            look: self.manifest.slot_look(slot, dark).unwrap_or_default(),
+            size: [w as f32, h as f32],
+        })
     }
+
+    fn home_artwork(&self, scheme: ColorScheme) -> Option<Art> {
+        let hidden = self
+            .manifest
+            .home_identity
+            .as_ref()
+            .and_then(|h| h.artwork.as_ref())
+            .is_some_and(|m| m.mode == "hidden");
+        (!hidden)
+            .then(|| self.art("home.artwork", scheme))
+            .flatten()
+    }
+}
+
+fn read<T>(f: impl FnOnce(&Current) -> Option<T>) -> Option<T> {
+    current().read().unwrap().as_ref().and_then(f)
 }
 
 /// The current theme's id.
@@ -95,73 +152,97 @@ pub fn palette(scheme: ColorScheme) -> Option<ThemePalette> {
     })
 }
 
-/// How the theme wants a slot's image shown (`home.wallpaper`,
-/// `home.artwork`, `launch.artwork`): the manifest's fit, opacity and
-/// focal point, or the defaults when the slot is unset.
-pub fn slot_look(slot: &str, scheme: ColorScheme) -> super::pack::SlotLook {
-    let guard = current().read().unwrap();
-    guard
-        .as_ref()
-        .and_then(|c| c.manifest.slot_look(slot, scheme == ColorScheme::Dark))
-        .unwrap_or_default()
+/// Decoration `slot`'s picture in `scheme` (`home.composer.background`,
+/// `empty.artwork` …), when the pack has one.
+pub fn art(slot: &str, scheme: ColorScheme) -> Option<Art> {
+    read(|c| c.art(slot, scheme))
 }
 
-/// Soft Home backdrop (`home.wallpaper`).
-pub fn current_wallpaper(scheme: ColorScheme) -> Option<Arc<[u8]>> {
-    let guard = current().read().unwrap();
-    let c = guard.as_ref()?;
-    pick(
-        scheme == ColorScheme::Dark,
-        &c.wallpaper_dark,
-        &c.wallpaper_light,
-    )
+/// The Home foreground (`home.artwork`), unless the pack turned it off
+/// (`homeIdentity.artwork: hidden`).
+pub fn home_artwork(scheme: ColorScheme) -> Option<Art> {
+    read(|c| c.home_artwork(scheme))
 }
 
-/// Home figure (`home.artwork`).
-pub fn current_artwork(scheme: ColorScheme) -> Option<Arc<[u8]>> {
-    let guard = current().read().unwrap();
-    let c = guard.as_ref()?;
-    pick(
-        scheme == ColorScheme::Dark,
-        &c.artwork_dark,
-        &c.artwork_light,
-    )
-}
-
-/// Startup vignette (`launch.artwork`), else the Home figure/cover.
-pub fn current_launch(scheme: ColorScheme) -> Option<Arc<[u8]>> {
-    let guard = current().read().unwrap();
-    let c = guard.as_ref()?;
-    pick(scheme == ColorScheme::Dark, &c.launch_dark, &c.launch_light)
-        .or_else(|| {
-            pick(
-                scheme == ColorScheme::Dark,
-                &c.artwork_dark,
-                &c.artwork_light,
-            )
-        })
-        .or_else(|| current_cover_from(c, scheme))
-}
-
-/// The Home hero image for the scheme on screen (artwork, else wallpaper).
-pub fn current_cover(scheme: ColorScheme) -> Option<Arc<[u8]>> {
-    let guard = current().read().unwrap();
-    current_cover_from(guard.as_ref()?, scheme)
-}
-
-fn current_cover_from(c: &Current, scheme: ColorScheme) -> Option<Arc<[u8]>> {
-    pick(
-        scheme == ColorScheme::Dark,
-        &c.artwork_dark,
-        &c.artwork_light,
-    )
-    .or_else(|| {
-        pick(
-            scheme == ColorScheme::Dark,
-            &c.wallpaper_dark,
-            &c.wallpaper_light,
-        )
+/// The wallpaper behind the window: on Home `home.wallpaper`, else the
+/// shared `shell.wallpaper`; elsewhere only `shell.wallpaper` (the App's
+/// rule: Home's own wallpaper never spills onto the other screens).
+pub fn backdrop(scheme: ColorScheme, home: bool) -> Option<Art> {
+    read(|c| {
+        home.then(|| c.art("home.wallpaper", scheme))
+            .flatten()
+            .or_else(|| c.art("shell.wallpaper", scheme))
     })
+}
+
+/// Startup art: `launch.artwork`, else the Home foreground.
+pub fn launch(scheme: ColorScheme) -> Option<Art> {
+    read(|c| {
+        c.art("launch.artwork", scheme)
+            .or_else(|| c.home_artwork(scheme))
+    })
+}
+
+/// How the pack presents Home's brand block.
+#[derive(Clone, Default)]
+pub struct Identity {
+    /// The Muqun mark shows (no theme, or `logo` default).
+    pub mark: bool,
+    /// The pack's own logo (`logo: custom`).
+    pub logo: Option<Arc<[u8]>>,
+    /// The pack's own name for Home (`name: custom`).
+    pub name: Option<String>,
+    /// Home uses a tall cover band (`homePresentation.header: cover`).
+    pub cover_header: bool,
+}
+
+/// The current pack's Home identity; Muqun's own when no theme is active.
+/// As in the App, a custom theme that says nothing about the logo hides it.
+pub fn identity() -> Identity {
+    read(|c| {
+        let m = &c.manifest;
+        let id = m.home_identity.as_ref();
+        let mode = |f: fn(&super::pack::HomeIdentity) -> Option<&super::pack::Mode>| {
+            id.and_then(f).map(|m| m.mode.as_str())
+        };
+        let builtin_default = c.id == super::DEFAULT_THEME_ID;
+        let logo_mode = mode(|h| h.logo.as_ref());
+        Some(Identity {
+            mark: logo_mode == Some("default") || (logo_mode.is_none() && builtin_default),
+            logo: (logo_mode == Some("custom"))
+                .then(|| id?.logo.as_ref()?.asset.as_ref())
+                .flatten()
+                .and_then(|a| c.images.get(a).cloned()),
+            name: (mode(|h| h.name.as_ref()) == Some("custom"))
+                .then(|| id?.name.as_ref()?.text.clone())
+                .flatten(),
+            cover_header: m
+                .home_presentation
+                .as_ref()
+                .is_none_or(|p| p.header != "standard"),
+        })
+    })
+    .unwrap_or(Identity {
+        mark: true,
+        cover_header: true,
+        ..Identity::default()
+    })
+}
+
+/// The current pack's name and its one-line description (else author).
+pub fn current_title() -> Option<(String, Option<String>)> {
+    read(|c| {
+        let m = &c.manifest;
+        Some((
+            m.name.clone(),
+            m.description.clone().or_else(|| m.author.clone()),
+        ))
+    })
+}
+
+/// The pack's replacement for chrome glyph `name`.
+pub fn glyph(name: &str) -> Option<Glyph> {
+    read(|c| c.glyphs.get(name).cloned())
 }
 
 /// Install `applied` now. Main thread. Returns how long the swap took.
@@ -175,12 +256,9 @@ pub fn activate(applied: AppliedTheme) -> anyhow::Result<std::time::Duration> {
         scheme: applied.scheme,
         light,
         dark,
-        wallpaper_light: applied.wallpaper_light,
-        wallpaper_dark: applied.wallpaper_dark,
-        artwork_light: applied.artwork_light,
-        artwork_dark: applied.artwork_dark,
-        launch_light: applied.launch_light,
-        launch_dark: applied.launch_dark,
+        images: applied.images,
+        sizes: applied.sizes,
+        glyphs: applied.glyphs,
     });
     let took = started.elapsed();
     tracing::info!(
@@ -203,12 +281,9 @@ mod tests {
         let applied = AppliedTheme {
             manifest: Arc::new(pack.manifest.clone()),
             scheme: Scheme::Dark,
-            wallpaper_light: None,
-            wallpaper_dark: None,
-            artwork_light: None,
-            artwork_dark: None,
-            launch_light: None,
-            launch_dark: None,
+            images: BTreeMap::new(),
+            sizes: BTreeMap::new(),
+            glyphs: BTreeMap::new(),
             requested: Instant::now(),
         };
         activate(applied).unwrap();

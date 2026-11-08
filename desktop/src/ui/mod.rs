@@ -483,16 +483,16 @@ impl UiState {
         } else {
             ColorScheme::Light
         };
-        if let Some(bytes) = crate::theme::apply::current_launch(scheme) {
-            let _ = cache.load(bytes);
-        }
-        if let Some(bytes) = crate::theme::apply::current_wallpaper(scheme) {
-            let _ = cache.load(bytes);
-        }
-        if let Some(bytes) = crate::theme::apply::current_artwork(scheme)
-            .or_else(|| crate::theme::apply::current_cover(scheme))
+        // Start decoding what the first frames draw.
+        for art in [
+            crate::theme::apply::launch(scheme),
+            crate::theme::apply::backdrop(scheme, true),
+            crate::theme::apply::home_artwork(scheme),
+        ]
+        .into_iter()
+        .flatten()
         {
-            let _ = cache.load(bytes);
+            let _ = cache.load(art.bytes);
         }
         self.images = Some(cache);
     }

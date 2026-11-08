@@ -85,6 +85,58 @@ pub fn tune_kit(k: &mut Kit, appearance: &Appearance) {
     r.xl *= f;
 }
 
+/// The most opacity a picture of unknown content may have over `base` while
+/// every `(ink, minimum ratio)` keeps its contrast (the App's
+/// `safeArtworkOpacity`): composited art lies anywhere between `base` dimmed
+/// toward black and toward white, and the worst case is the luminance closest
+/// to the ink. At most `requested`.
+pub fn safe_art_opacity(base: rune::Color, inks: &[(rune::Color, f32)], requested: f32) -> f32 {
+    if requested.is_nan() || requested <= 0.0 {
+        return 0.0;
+    }
+    let lum = |r: f32, g: f32, b: f32| 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    let safe = |o: f32| {
+        let low = lum(base.r * (1.0 - o), base.g * (1.0 - o), base.b * (1.0 - o));
+        let high = lum(
+            base.r * (1.0 - o) + o,
+            base.g * (1.0 - o) + o,
+            base.b * (1.0 - o) + o,
+        );
+        inks.iter().all(|(ink, minimum)| {
+            let v = ink.luminance();
+            let closest = v.clamp(low, high);
+            (v.max(closest) + 0.05) / (v.min(closest) + 0.05) >= *minimum
+        })
+    };
+    let requested = requested.min(1.0);
+    if !safe(0.0) {
+        return 0.0;
+    }
+    if safe(requested) {
+        return requested;
+    }
+    let (mut lo, mut hi) = (0.0, requested);
+    for _ in 0..24 {
+        let mid = (lo + hi) / 2.0;
+        if safe(mid) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
+}
+
+/// How much of `base` to lay over a picture shown at `opacity` so the inks
+/// keep their contrast over it: 0 when it already does, up to 1.
+pub fn wash_for(base: rune::Color, inks: &[(rune::Color, f32)], opacity: f32) -> f32 {
+    if opacity <= 0.0 {
+        return 0.0;
+    }
+    let safe = safe_art_opacity(base, inks, opacity);
+    (1.0 - safe / opacity).clamp(0.0, 1.0)
+}
+
 impl Look {
     /// Decides whether backdrop blur fits the budget from the window's device
     /// pixels (`ui::fx::viewport_pixels`, 0 before the first frame). Glass goes
@@ -265,5 +317,34 @@ impl Look {
         } else {
             e
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rune::Color;
+
+    /// Composited art lies between `base` dimmed toward black and toward
+    /// white; at the opacity returned, every ink keeps its ratio against both.
+    #[test]
+    fn art_opacity_keeps_text_contrast_over_any_picture() {
+        let lum = |c: Color| c.luminance();
+        let ratio = |a: f32, b: f32| (a.max(b) + 0.05) / (a.min(b) + 0.05);
+        let white = Color::WHITE;
+        let ink = Color::BLACK.mix(white, 0.18);
+        for requested in [0.2, 0.6, 1.0] {
+            let o = safe_art_opacity(white, &[(ink, 4.5)], requested);
+            assert!(o <= requested);
+            let darkest = lum(white) * (1.0 - o);
+            assert!(ratio(lum(ink), darkest) >= 4.5 - 1e-3, "{requested}: {o}");
+        }
+        // Light art cannot hurt dark text on white much; a full black picture can.
+        assert!(safe_art_opacity(white, &[(ink, 4.5)], 1.0) < 1.0);
+        assert_eq!(safe_art_opacity(white, &[(ink, 4.5)], 0.0), 0.0);
+        // The wash makes up exactly the difference.
+        let w = wash_for(white, &[(ink, 4.5)], 1.0);
+        let o = safe_art_opacity(white, &[(ink, 4.5)], 1.0);
+        assert!((1.0 - w - o).abs() < 1e-4);
     }
 }
