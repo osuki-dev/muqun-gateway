@@ -226,14 +226,27 @@ fn stage(
         )
     };
     // The picture: the pack's launch art, else the badge alone.
-    let hero: El = match art::launch(images, scheme) {
-        Some((picture, slot)) => picture
-            .key("splash-art")
-            .w(300.0)
-            .h(360.0)
-            .radius(if slot.cover { 24.0 } else { 0.0 })
-            .clip_rounded(if slot.cover { 24.0 } else { 0.0 })
-            .opacity(pose.opacity * slot.opacity),
+    let launch = crate::theme::apply::launch(scheme);
+    let has_art = launch.is_some();
+    let hero: El = match launch {
+        // A cover fills a rounded card; a contained picture stands whole,
+        // its edges dissolving (a cut-out's own transparency is untouched,
+        // a painting never ends on a line).
+        Some(launch) if launch.look.cover => {
+            art::cover(images, &launch, "splash-art", 300.0, 360.0)
+                .radius(24.0)
+                .clip_rounded(24.0)
+                .opacity(pose.opacity * launch.look.opacity)
+        }
+        Some(launch) => {
+            let (pic, [w, h]) = art::contained(images, &launch, 420.0, 360.0);
+            let fade = w.min(h) * 0.12;
+            el().key("splash-art")
+                .size(420.0, 360.0)
+                .center()
+                .child(pic.clip_fade(fade, fade, fade, fade))
+                .opacity(pose.opacity * launch.look.opacity)
+        }
         None => el()
             .key("splash-art")
             .size(300.0, 360.0)
@@ -241,7 +254,6 @@ fn stage(
             .child(badge("splash-badge-solo").scale(1.3))
             .opacity(pose.opacity),
     };
-    let has_art = art::launch(images, scheme).is_some();
     let hero = hero
         .blur(pose.blur)
         .scale(pose.scale)

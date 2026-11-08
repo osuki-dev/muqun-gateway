@@ -625,21 +625,101 @@ pub fn load_applied(
     requested: Instant,
 ) -> anyhow::Result<AppliedTheme> {
     let loaded = store.load(id)?;
-    loaded.manifest().palette(ColorScheme::Light)?;
-    loaded.manifest().palette(ColorScheme::Dark)?;
+    applied_from(&loaded, scheme, requested)
+}
+
+/// [`AppliedTheme`] for a theme already read: its palettes checked and the
+/// images its slots draw.
+pub fn applied_from(
+    loaded: &super::store::Loaded,
+    scheme: Scheme,
+    requested: Instant,
+) -> anyhow::Result<AppliedTheme> {
+    let manifest = loaded.manifest();
+    manifest.palette(ColorScheme::Light)?;
+    manifest.palette(ColorScheme::Dark)?;
+    let mut wanted: Vec<&str> = super::apply::DRAWN_SLOTS
+        .iter()
+        .flat_map(|slot| [false, true].map(|dark| manifest.slot_asset(slot, dark)))
+        .flatten()
+        .collect();
+    if let Some(logo) = manifest
+        .home_identity
+        .as_ref()
+        .and_then(|h| h.logo.as_ref())
+        .filter(|l| l.mode == "custom")
+        .and_then(|l| l.asset.as_deref())
+    {
+        wanted.push(logo);
+    }
+    let mut images = std::collections::BTreeMap::new();
+    let mut sizes = std::collections::BTreeMap::new();
+    for id in wanted {
+        if images.contains_key(id) {
+            continue;
+        }
+        match loaded.asset(id) {
+            Ok(Some(bytes)) => {
+                // Checked at unpack, so the header reads; a size of nothing
+                // keeps the image out rather than mis-placed.
+                let size = image::ImageReader::new(std::io::Cursor::new(&bytes[..]))
+                    .with_guessed_format()
+                    .ok()
+                    .and_then(|r| r.into_dimensions().ok());
+                if let Some((w, h)) = size.filter(|(w, h)| *w > 0 && *h > 0) {
+                    sizes.insert(id.to_string(), [w, h]);
+                    images.insert(id.to_string(), bytes);
+                }
+            }
+            Ok(None) => {}
+            Err(err) => tracing::warn!(id, "theme image unreadable: {err:#}"),
+        }
+    }
+    let mut glyphs = std::collections::BTreeMap::new();
+    let icons = manifest.icons.as_ref();
+    for name in super::apply::DRAWN_ICONS {
+        let Some(icon) = icons.and_then(|i| i.get(*name)).and_then(|i| i.as_ref()) else {
+            continue;
+        };
+        let decoded = loaded
+            .asset(&icon.asset)
+            .and_then(|b| b.ok_or_else(|| anyhow::anyhow!("not in the pack")))
+            .and_then(|bytes| {
+                // A glyph draws at ~20 pt: 256 px covers it at any scale.
+                let img = image::load_from_memory(&bytes)?;
+                Ok(if img.width() > 256 || img.height() > 256 {
+                    img.thumbnail(256, 256)
+                } else {
+                    img
+                }
+                .into_rgba8())
+            });
+        match decoded {
+            Ok(rgba) => {
+                glyphs.insert(
+                    name.to_string(),
+                    super::apply::Glyph {
+                        width: rgba.width(),
+                        height: rgba.height(),
+                        rgba: rgba.into_raw().into(),
+                        template: icon.template(),
+                        direction: manifest
+                            .icon_directions
+                            .as_ref()
+                            .and_then(|d| d.get(*name))
+                            .and_then(|w| super::pack::direction_angle(w)),
+                    },
+                );
+            }
+            Err(err) => tracing::warn!(name, "theme icon unreadable: {err:#}"),
+        }
+    }
     Ok(AppliedTheme {
-        manifest: Arc::new(loaded.manifest().clone()),
+        manifest: Arc::new(manifest.clone()),
         scheme,
-        wallpaper_light: loaded.slot("home.wallpaper", ColorScheme::Light),
-        wallpaper_dark: loaded.slot("home.wallpaper", ColorScheme::Dark),
-        artwork_light: loaded.slot("home.artwork", ColorScheme::Light),
-        artwork_dark: loaded.slot("home.artwork", ColorScheme::Dark),
-        launch_light: loaded
-            .slot("launch.artwork", ColorScheme::Light)
-            .or_else(|| loaded.slot("home.artwork", ColorScheme::Light)),
-        launch_dark: loaded
-            .slot("launch.artwork", ColorScheme::Dark)
-            .or_else(|| loaded.slot("home.artwork", ColorScheme::Dark)),
+        images,
+        sizes,
+        glyphs,
         requested,
     })
 }

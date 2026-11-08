@@ -124,6 +124,15 @@ pub struct Manifest {
     pub variant_decorations: VariantDecorations,
     #[serde(default)]
     pub home_identity: Option<HomeIdentity>,
+    #[serde(default, deserialize_with = "lenient")]
+    pub home_presentation: Option<HomePresentation>,
+    /// Chrome glyphs the pack replaces (`chrome.settings`, `home.arrow` …);
+    /// a malformed entry is dropped, never fatal, as in the App.
+    #[serde(default, deserialize_with = "lenient")]
+    pub icons: Option<BTreeMap<String, Option<IconRef>>>,
+    /// Which way a directional glyph (`home.arrow`) points as drawn.
+    #[serde(default, deserialize_with = "lenient")]
+    pub icon_directions: Option<BTreeMap<String, String>>,
     /// Architecture §5, `schemaVersion` 2. Read leniently: a value this build
     /// does not understand is dropped, never fatal. Parsed and checked now;
     /// chrome, density and typography consume it as those settings land.
@@ -229,23 +238,44 @@ impl Default for SlotLook {
 }
 
 impl Slot {
+    /// The image a wide window shows: the `regular` replacement when the
+    /// author made one (a desktop window is the App's regular width class).
+    pub fn asset(&self) -> &str {
+        self.regular.as_ref().map_or(&self.asset, |r| &r.asset)
+    }
+
+    /// How the wide window shows it: the `regular` replacement's own fit,
+    /// opacity and focal point, each falling back to the slot's.
     pub fn look(&self) -> SlotLook {
+        let r = self.regular.as_ref();
+        let fit = r.and_then(|r| r.fit.as_deref()).or(self.fit.as_deref());
         SlotLook {
-            cover: self.fit.as_deref() == Some("cover"),
-            opacity: self
-                .opacity
+            cover: fit == Some("cover"),
+            opacity: r
+                .and_then(|r| r.opacity)
+                .or(self.opacity)
                 .filter(|o| o.is_finite())
                 .map_or(1.0, |o| o.clamp(0.0, 1.0)),
-            focal: self
-                .focal_point
+            focal: r
+                .and_then(|r| r.focal_point)
+                .or(self.focal_point)
                 .map_or([0.5, 0.5], |f| [f.x.clamp(0.0, 1.0), f.y.clamp(0.0, 1.0)]),
         }
     }
 }
 
+/// A slot's per-width replacement: its own image, and optionally its own
+/// placement.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ImageRef {
     pub asset: String,
+    #[serde(default)]
+    pub fit: Option<String>,
+    #[serde(default)]
+    pub opacity: Option<f32>,
+    #[serde(default)]
+    pub focal_point: Option<FocalPoint>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -260,17 +290,69 @@ pub struct VariantDecorations {
 #[derive(Debug, Clone, Deserialize)]
 pub struct HomeIdentity {
     #[serde(default)]
+    pub name: Option<Mode>,
+    #[serde(default)]
     pub logo: Option<Mode>,
     #[serde(default)]
-    #[allow(dead_code)]
     pub artwork: Option<Mode>,
 }
 
+/// `{ mode: default | hidden | custom }`, with the custom `asset` (a logo)
+/// or `text` (a name).
 #[derive(Debug, Clone, Deserialize)]
 pub struct Mode {
     pub mode: String,
     #[serde(default)]
     pub asset: Option<String>,
+    #[serde(default)]
+    pub text: Option<String>,
+}
+
+/// How Home presents the artwork: `cover` (a tall band the greeting sits
+/// in) or `standard` (a compact header).
+#[derive(Debug, Clone, Deserialize)]
+pub struct HomePresentation {
+    pub header: String,
+}
+
+/// A replacement glyph: an asset drawn as a mask in the theme's colour
+/// (`template`, the default) or as it is (`original`).
+#[derive(Debug, Clone, Deserialize)]
+pub struct IconRef {
+    pub asset: String,
+    #[serde(default)]
+    pub render: Option<String>,
+}
+
+/// A direction word (`up`, `up-right` … `up-left`) as radians clockwise
+/// from pointing right, the way screen rotation turns.
+pub fn direction_angle(word: &str) -> Option<f32> {
+    let steps = match word {
+        "right" => 0.0,
+        "down-right" => 1.0,
+        "down" => 2.0,
+        "down-left" => 3.0,
+        "left" => 4.0,
+        "up-left" => 5.0,
+        "up" => 6.0,
+        "up-right" => 7.0,
+        _ => return None,
+    };
+    Some(steps * std::f32::consts::FRAC_PI_4)
+}
+
+impl IconRef {
+    pub fn template(&self) -> bool {
+        self.render.as_deref() != Some("original")
+    }
+}
+
+/// Reads an optional App-only block, dropping it when it does not parse.
+fn lenient<'de, D: Deserializer<'de>, T: serde::de::DeserializeOwned>(
+    d: D,
+) -> Result<Option<T>, D::Error> {
+    let value = serde_json::Value::deserialize(d)?;
+    Ok(serde_json::from_value(value).ok())
 }
 
 /// The optional desktop block (architecture §5). Every field is optional;
@@ -627,13 +709,13 @@ impl Manifest {
             &self.variant_decorations.light
         };
         match own.get(slot) {
-            Some(Some(s)) => Some(s.asset.as_str()),
+            Some(Some(s)) => Some(s.asset()),
             Some(None) => None,
             None => self
                 .decoration
                 .get(slot)
                 .and_then(|s| s.as_ref())
-                .map(|s| s.asset.as_str()),
+                .map(Slot::asset),
         }
     }
 
@@ -1383,5 +1465,45 @@ pub(crate) mod tests {
         value.as_object_mut().unwrap().remove("variantDecorations");
         let bare = parse_manifest(&serde_json::to_vec(&value).unwrap()).unwrap();
         assert_eq!(bare.cover_asset(true), Some("preview"));
+    }
+
+    #[test]
+    fn a_wide_window_shows_the_regular_replacement_with_its_own_placement() {
+        let mut value: serde_json::Value =
+            serde_json::from_str(crate::theme::COVER_COURIER_JSON).unwrap();
+        value["decoration"]["home.wallpaper"] = serde_json::json!({
+            "asset": "paper-light", "fit": "cover", "opacity": 0.4,
+            "focalPoint": { "x": 0.5, "y": 0.0 },
+            "regular": { "asset": "paper-dark", "fit": "contain", "focalPoint": { "x": 0.2, "y": 0.8 } }
+        });
+        value["variantDecorations"]["light"]
+            .as_object_mut()
+            .unwrap()
+            .remove("home.wallpaper");
+        let m = parse_manifest(&serde_json::to_vec(&value).unwrap()).unwrap();
+        assert_eq!(m.slot_asset("home.wallpaper", false), Some("paper-dark"));
+        let look = m.slot_look("home.wallpaper", false).unwrap();
+        // Its own fit and focal point; the opacity it leaves out is the slot's.
+        assert!(!look.cover);
+        assert_eq!(look.focal, [0.2, 0.8]);
+        assert_eq!(look.opacity, 0.4);
+    }
+
+    #[test]
+    fn app_only_blocks_that_do_not_read_are_dropped_not_fatal() {
+        let mut value: serde_json::Value =
+            serde_json::from_str(crate::theme::COVER_COURIER_JSON).unwrap();
+        value["icons"] = serde_json::json!({ "chrome.settings": { "asset": 3 } });
+        value["homePresentation"] = serde_json::json!("tall");
+        value["iconDirections"] = serde_json::json!({ "home.arrow": "up-right" });
+        let m = parse_manifest(&serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(m.icons.is_none() && m.home_presentation.is_none());
+        assert_eq!(
+            m.icon_directions
+                .unwrap()
+                .get("home.arrow")
+                .map(String::as_str),
+            Some("up-right")
+        );
     }
 }

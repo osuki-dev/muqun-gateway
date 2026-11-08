@@ -95,24 +95,53 @@ fn with_pack(s: &mut UiState, id: &str) {
     let Some(pack) = crate::theme::store::builtin(id) else {
         return;
     };
-    let slot = |slot: &str, dark: bool| {
-        pack.manifest
-            .slot_asset(slot, dark)
-            .and_then(|asset| pack.asset(asset))
+    activate(s, &crate::theme::store::Loaded::Builtin(pack));
+}
+
+fn activate(s: &mut UiState, loaded: &crate::theme::store::Loaded) {
+    let applied = crate::theme::service::applied_from(
+        loaded,
+        crate::config::Scheme::System,
+        std::time::Instant::now(),
+    );
+    match applied.and_then(crate::theme::apply::activate) {
+        Ok(_) => s.cfg.appearance.theme_id = loaded.manifest().id.clone(),
+        Err(err) => tracing::error!("scene theme: {err:#}"),
+    }
+}
+
+/// `MUQUN_SCENE_THEME` renders any scene in another pack: a built-in id, a
+/// `.muqun-theme` package, or a directory holding `theme.json` (a source in
+/// the themes repository) or `manifest.json` (an installed theme) beside
+/// `assets/`. Pair it with Rune's `--theme light|dark`.
+fn scene_pack(s: &mut UiState) {
+    let Ok(spec) = std::env::var("MUQUN_SCENE_THEME") else {
+        return;
     };
-    let applied = crate::theme::apply::AppliedTheme {
-        manifest: std::sync::Arc::new(pack.manifest.clone()),
-        scheme: crate::config::Scheme::System,
-        wallpaper_light: slot("home.wallpaper", false),
-        wallpaper_dark: slot("home.wallpaper", true),
-        artwork_light: slot("home.artwork", false),
-        artwork_dark: slot("home.artwork", true),
-        launch_light: slot("launch.artwork", false).or_else(|| slot("home.artwork", false)),
-        launch_dark: slot("launch.artwork", true).or_else(|| slot("home.artwork", true)),
-        requested: std::time::Instant::now(),
+    let path = std::path::Path::new(&spec);
+    let loaded = if let Some(pack) = crate::theme::store::builtin(&spec) {
+        Ok(crate::theme::store::Loaded::Builtin(pack))
+    } else if path.is_dir() {
+        ["theme.json", "manifest.json"]
+            .iter()
+            .map(|name| path.join(name))
+            .find(|p| p.is_file())
+            .ok_or_else(|| anyhow::anyhow!("{spec}: no theme.json or manifest.json"))
+            .and_then(|p| Ok(std::fs::read(p)?))
+            .and_then(|bytes| crate::theme::pack::parse_manifest(&bytes))
+            .map(|manifest| crate::theme::store::Loaded::Installed {
+                manifest: std::sync::Arc::new(manifest),
+                dir: path.to_path_buf(),
+            })
+    } else {
+        std::fs::read(path)
+            .map_err(anyhow::Error::from)
+            .and_then(|bytes| crate::theme::pack::unpack(&bytes))
+            .map(|pack| crate::theme::store::Loaded::Builtin(std::sync::Arc::new(pack)))
     };
-    if crate::theme::apply::activate(applied).is_ok() {
-        s.cfg.appearance.theme_id = id.to_string();
+    match loaded {
+        Ok(loaded) => activate(s, &loaded),
+        Err(err) => tracing::error!("MUQUN_SCENE_THEME: {err:#}"),
     }
 }
 
@@ -129,6 +158,7 @@ fn splash_scene(s: &mut UiState) {
 }
 
 fn base(s: &mut UiState) {
+    scene_pack(s);
     s.hub_label = "standalone".into();
     s.agents_seen = true;
     s.splash = None;

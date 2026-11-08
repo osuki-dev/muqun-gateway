@@ -26,7 +26,14 @@ use crate::theme::look::Look;
 pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> El {
     let look = s.look();
     let page = match s.mode {
-        Mode::Home => home::view(s, k, layer),
+        // Composed for the card's size: the first frame guesses, the
+        // layout read re-runs the view once the card is laid out.
+        Mode::Home => home::view(
+            s,
+            k,
+            cx.layout_size("main-pane").unwrap_or([1080.0, 860.0]),
+            layer,
+        ),
         Mode::Session if s.in_split() => tiles::view(s, k, layer),
         Mode::Session => session(s, k, &look, layer),
         Mode::Inbox => inbox::view(s, k),
@@ -84,7 +91,80 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
     if s.mode != Mode::Home {
         split = split.toolbar_in_panel();
     }
-    split.build(k)
+    match backdrop(s, k, &look, cx.layout_size("shell")) {
+        Some((backdrop, wash)) => {
+            // The sidebar's lists (and outside Home the inspector's) read
+            // over a calmer patch of the wallpaper; Home's band keeps it whole.
+            let wash_el = el()
+                .key("window-wash")
+                .fill(k.c.bg_deep.alpha(wash))
+                .motion(crate::theme::look::MOVE)
+                .a11y_hidden();
+            // The chrome sits on the theme's world: the window floor turns
+            // clear over the wallpaper, and the main card lets a breath of
+            // it through (Home draws its own stage over a clear card).
+            let mut chrome = k.clone();
+            chrome.c.bg_deep = k.c.bg_deep.alpha(0.0);
+            chrome.c.bg_base = k.c.bg_base.alpha(if s.mode == Mode::Home {
+                0.0
+            } else {
+                CARD_ALPHA
+            });
+            el().key("window-stage")
+                .w_full()
+                .h_full()
+                .fill(k.c.bg_deep)
+                .child(backdrop)
+                .child(if s.mode == Mode::Home {
+                    wash_el
+                        .pin(Some(0.0), Some(0.0), None, Some(0.0))
+                        .w(s.sidebar.shown_width())
+                } else {
+                    wash_el.pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
+                })
+                .child(split.build(&chrome))
+        }
+        None => split.build(k),
+    }
+}
+
+/// The least of the window floor that returns under the sidebar's lists,
+/// so a picture there is felt rather than read (light, dark): a picture
+/// over a light floor reads louder.
+const SIDEBAR_WASH: [f32; 2] = [0.62, 0.4];
+
+/// The main card's opacity over the window's wallpaper outside Home.
+const CARD_ALPHA: f32 = 0.9;
+
+/// The theme's wallpaper across the whole window, behind sidebar and card:
+/// `home.wallpaper` on Home, `shell.wallpaper` elsewhere, placed as the pack
+/// asks at its opacity. With it, how much of the floor to lay back over the
+/// sidebar so its text keeps its contrast over any picture. None under
+/// reduce transparency: the chrome stays solid.
+fn backdrop(s: &UiState, k: &Kit, look: &Look, window: Option<[f32; 2]>) -> Option<(El, f32)> {
+    if !look.glass {
+        return None;
+    }
+    let images = s.images.as_ref()?;
+    let art = crate::theme::apply::backdrop(s.scheme(), s.mode == Mode::Home)?;
+    let [w, h] = window?;
+    let opacity = art.look.opacity;
+    if opacity <= 0.01 {
+        return None;
+    }
+    let wash = crate::theme::look::wash_for(
+        k.c.bg_deep,
+        &[(k.c.text_base, 4.5), (k.c.text_muted, 4.5)],
+        opacity,
+    )
+    .max(SIDEBAR_WASH[usize::from(look.dark)]);
+    Some((
+        art::place(images, &art, "window-backdrop", w, h)
+            .absolute(0.0, 0.0)
+            .opacity(opacity)
+            .opacity_motion(crate::theme::look::MOVE),
+        wash,
+    ))
 }
 
 /// Mark + name in the sidebar title bar; press returns to Home. The mark

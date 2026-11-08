@@ -22,7 +22,7 @@ use crate::theme::look::{Look, CARD_RADIUS, PANEL_RADIUS};
 
 /// The widest the content column gets.
 const COLUMN: f32 = 980.0;
-/// The cover band's height: the theme's figure lives here, the greeting sits
+/// The least height of the Home band: the theme's art lives here, the greeting sits
 /// on its lower edge and the page starts under it.
 const HERO_H: f32 = 250.0;
 
@@ -517,26 +517,41 @@ fn heading(k: &Kit, key: &str, title: String, count: Option<usize>, action: Opti
     line
 }
 
-/// A small "open beside" button for a session card.
+/// A small "open beside" button for a session card: the theme's arrow when
+/// its pack draws one, turned to point right.
 fn split_button(s: &UiState, k: &Kit, asid: &str) -> El {
     let id = asid.to_string();
-    IconButton::new(&ARROW_RIGHT)
-        .variant(IconButtonVariant::GhostMuted)
-        .control_size(ControlSize::Small)
-        .label(tr_ref(
-            s.cfg.general.language,
-            "Open in split",
-            "在分屏中打开",
-        ))
-        .help(tr_ref(
-            s.cfg.general.language,
-            "Open beside the current session",
-            "在当前会话旁打开",
-        ))
-        .on_press(move |s: &mut UiState| s.open_in_tile(&id))
-        .build(k)
-        .key(format!("split-{asid}"))
-        .group_opacity(0.0, 1.0)
+    let language = s.cfg.general.language;
+    let label = tr_ref(language, "Open in split", "在分屏中打开");
+    let help = tr_ref(
+        language,
+        "Open beside the current session",
+        "在当前会话旁打开",
+    );
+    let themed = s.images.as_ref().and_then(|images| {
+        super::art::glyph_toward(images, "home.arrow", 14.0, k.c.text_muted, Some(0.0))
+    });
+    let button = match themed {
+        Some(glyph) => k
+            .interactive(
+                el().size(24.0, 24.0)
+                    .center()
+                    .radius(k.radius.sm)
+                    .role("button")
+                    .label(label)
+                    .help(help)
+                    .child(glyph),
+            )
+            .on_press(move |s: &mut UiState| s.open_in_tile(&id)),
+        None => IconButton::new(&ARROW_RIGHT)
+            .variant(IconButtonVariant::GhostMuted)
+            .control_size(ControlSize::Small)
+            .label(label)
+            .help(help)
+            .on_press(move |s: &mut UiState| s.open_in_tile(&id))
+            .build(k),
+    };
+    button.key(format!("split-{asid}")).group_opacity(0.0, 1.0)
 }
 
 /// The cards for every permission and form waiting on the owner, with the
@@ -789,6 +804,7 @@ fn quick_start(s: &UiState, k: &Kit, look: &Look, layer: &mut Vec<El>) -> El {
         .gap(14.0)
         .px(22.0)
         .py(20.0)
+        .children(composer_art(s))
         .child(heading(
             k,
             "start",
@@ -881,52 +897,212 @@ fn quick_start(s: &UiState, k: &Kit, look: &Look, layer: &mut Vec<El>) -> El {
     look.accent_rim(k, look.panel(k, card, PANEL_RADIUS), k.c.bg_accent)
 }
 
-pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
-    let look = s.look();
+/// The Home hero's height for a card `h` points tall: a tall band when the
+/// pack presents Home as a cover, a compact header otherwise.
+fn hero_height(card_h: f32, cover_header: bool) -> f32 {
+    if cover_header {
+        (card_h * 0.42).clamp(HERO_H, 600.0)
+    } else {
+        (card_h * 0.3).clamp(HERO_H - 30.0, 420.0)
+    }
+}
+
+/// The brand block over the greeting: the Muqun mark (or the pack's logo)
+/// and the pack's own name, as its `homeIdentity` asks.
+fn identity(s: &UiState, k: &Kit, look: &Look) -> Option<El> {
+    let id = crate::theme::apply::identity();
+    let images = s.images.as_ref()?;
+    let mark = if let Some(logo) = id.logo.clone() {
+        Some(
+            super::art::picture(images, logo, rune::SurfaceFit::Fit)
+                .key("home-logo")
+                .size(56.0, 56.0)
+                .a11y_hidden(),
+        )
+    } else if id.mark && s.fx_on() {
+        Some(
+            look.glow(
+                el().key("home-badge")
+                    .size(44.0, 44.0)
+                    .radius(13.0)
+                    .center()
+                    .fill(k.c.layer_02)
+                    .child(
+                        super::fx::metal("home-metal", 44.0, 13.0, k.c.bg_accent, 0.0)
+                            .absolute(0.0, 0.0),
+                    )
+                    .child(
+                        super::art::picture(
+                            images,
+                            std::sync::Arc::<[u8]>::from(crate::branding::APP_MARK_PNG),
+                            rune::SurfaceFit::Fill,
+                        )
+                        .size(26.0, 26.0)
+                        .radius(7.0)
+                        .clip_rounded(7.0),
+                    )
+                    .a11y_hidden(),
+                k.c.bg_accent,
+                0.5,
+            ),
+        )
+    } else {
+        None
+    };
+    let name = id.name.map(|name| {
+        text(name.to_uppercase())
+            .key("home-theme-name")
+            .font(rune::TextStyle {
+                tracking: 1.6,
+                ..k.ty.small_medium
+            })
+            .color(k.c.text_accent)
+    });
+    if mark.is_none() && name.is_none() {
+        return None;
+    }
+    Some(
+        col()
+            .key("home-identity")
+            .gap(10.0)
+            .mb(4.0)
+            .children(mark)
+            .children(name),
+    )
+}
+
+/// The theme's world on Home, composed for the card `w`×`hero` band: a
+/// cut-out figure stands whole on the right, its inner edges melting into
+/// the page; a painting fills the band's far side and dissolves toward the
+/// greeting, so its subject is never under text. Behind it all, a scrim on
+/// the greeting's side keeps the window's wallpaper from fighting the title.
+fn hero_art(s: &UiState, k: &Kit, look: &Look, w: f32, hero: f32) -> Vec<El> {
+    let mut layers = Vec::new();
     let scheme = s.scheme();
+    if look.glass {
+        if let Some(wall) = crate::theme::apply::backdrop(scheme, true) {
+            let wash = crate::theme::look::wash_for(
+                k.c.bg_base,
+                &[(k.c.text_base, 4.5), (k.c.text_muted, 4.5)],
+                wall.look.opacity,
+            );
+            if wash > 0.0 {
+                layers.push(
+                    el().key("home-title-scrim")
+                        .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
+                        .linear_gradient(
+                            std::f32::consts::FRAC_PI_2,
+                            [
+                                (0.0, k.c.bg_base.alpha(wash)),
+                                (0.42, k.c.bg_base.alpha(wash * 0.85)),
+                                (0.75, k.c.bg_base.alpha(0.0)),
+                            ],
+                        )
+                        .a11y_hidden(),
+                );
+            }
+        }
+    }
+    let (Some(images), Some(art)) = (s.images.as_ref(), crate::theme::apply::home_artwork(scheme))
+    else {
+        return layers;
+    };
+    if art.look.cover {
+        // A painting: the far 62% of the band and a little below, its near
+        // edge and foot dissolving, cropped around its focal point.
+        let bw = (w * 0.62).max(w - 560.0).min(w);
+        let bh = hero + 60.0;
+        layers.push(
+            super::art::cover(images, &art, "home-figure", bw, bh)
+                .clip_fade(bw * 0.4, 0.0, 0.0, bh * 0.4)
+                .pin(None, Some(0.0), Some(0.0), None)
+                .opacity(art.look.opacity),
+        );
+        return layers;
+    }
+    // A cut-out: whole, as large as the band allows, on the side away from
+    // the greeting. Its own transparency shapes it; only the edges that face
+    // the page fade, so a square-cut figure never ends on a line.
+    let room_w = (w * 0.52).min(hero * 1.9);
+    let (figure, [fw, fh]) = super::art::contained(images, &art, room_w, hero - 16.0);
+    let right = (w * 0.04).clamp(16.0, 72.0);
+    // The light reaches past the band, so its falloff never meets an edge.
+    let reach = hero * 1.6;
+    let cx = (w - right - fw * 0.5) / w;
+    let cy = (hero - fh * 0.55) / reach;
+    layers.push(
+        look.light(
+            "home-light",
+            [cx, cy],
+            [fw * 0.75, fh * 0.75],
+            k.c.bg_accent,
+        )
+        .pin(Some(0.0), Some(0.0), Some(0.0), None)
+        .h(reach),
+    );
+    layers.push(
+        figure
+            .key("home-figure")
+            .clip_fade(fw * 0.08, 0.0, 0.0, fh * 0.16)
+            .pin(None, None, Some(right), Some(0.0))
+            .opacity(art.look.opacity),
+    );
+    layers
+}
+
+/// The pack's composer artwork inside the start card, at its opacity and
+/// anchored where its focal point says (most hang from the top edge).
+fn composer_art(s: &UiState) -> Option<El> {
+    let images = s.images.as_ref()?;
+    let art = crate::theme::apply::art("home.composer.background", s.scheme())?;
+    let fit = if art.look.cover {
+        rune::SurfaceFit::Fill
+    } else {
+        rune::SurfaceFit::Fit
+    };
+    let image = super::art::image(images, &art.bytes);
+    let pic = el()
+        .key("home-card-art")
+        .pixels_fit(image.pixels(), fit)
+        .opacity(art.look.opacity)
+        .a11y_hidden();
+    // A contain picture keeps its aspect: hang it from the focal edge.
+    let pic = if art.look.cover {
+        pic.pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
+    } else if art.look.focal[1] > 0.66 {
+        pic.pin(Some(0.0), None, Some(0.0), Some(0.0)).w_full()
+    } else {
+        pic.pin(Some(0.0), Some(0.0), Some(0.0), None).w_full()
+    };
+    Some(pic)
+}
+
+/// Home, composed for a main card `card` points wide and tall.
+pub fn view(s: &UiState, k: &Kit, card: [f32; 2], layer: &mut Vec<El>) -> El {
+    let look = s.look();
     let (title, subtitle) = greeting(s);
+    let [card_w, card_h] = card;
+    // The greeting grows a little with a large window, to hold its band.
+    let size = (card_w / 34.0).clamp(36.0, 46.0);
     let title_font = rune::TextStyle {
-        size: 36.0,
-        line_height: 44.0,
+        size,
+        line_height: size * 1.22,
         ..k.ty.ui_medium
     };
+    let id = crate::theme::apply::identity();
+    let hero_h = hero_height(card_h, id.cover_header);
+
     let mut hero = col()
         .key("home-hero")
         .w_full()
-        .min_h(HERO_H - 24.0)
+        .max_w(COLUMN)
+        .px(40.0)
+        .h(hero_h)
         .justify_end()
         .gap(6.0)
         .pb(6.0);
-    if s.fx_on() {
-        if let Some(images) = s.images.as_ref() {
-            hero = hero.child(
-                look.glow(
-                    el().key("home-badge")
-                        .size(44.0, 44.0)
-                        .radius(13.0)
-                        .center()
-                        .mb(10.0)
-                        .fill(k.c.layer_02)
-                        .child(
-                            super::fx::metal("home-metal", 44.0, 13.0, k.c.bg_accent, 0.0)
-                                .absolute(0.0, 0.0),
-                        )
-                        .child(
-                            super::art::picture(
-                                images,
-                                std::sync::Arc::<[u8]>::from(crate::branding::APP_MARK_PNG),
-                                rune::SurfaceFit::Fill,
-                            )
-                            .size(26.0, 26.0)
-                            .radius(7.0)
-                            .clip_rounded(7.0),
-                        )
-                        .a11y_hidden(),
-                    k.c.bg_accent,
-                    0.5,
-                ),
-            );
-        }
+    if let Some(identity) = identity(s, k, &look) {
+        hero = hero.child(identity);
     }
     let hero = hero
         .child(
@@ -941,6 +1117,14 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
                 .color(k.c.text_muted)
                 .key("home-subtitle"),
         );
+    // The band: the theme's world behind the greeting, scrolling with it.
+    let band = col()
+        .key("home-band")
+        .w_full()
+        .h(hero_h)
+        .items_center()
+        .children(hero_art(s, k, &look, card_w, hero_h))
+        .child(look.arrive(hero, 0));
 
     let mut column = col()
         .key("home")
@@ -948,8 +1132,8 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         .max_w(COLUMN)
         .gap(26.0)
         .px(40.0)
-        .pb(40.0)
-        .child(look.arrive(hero, 0));
+        .pt(26.0)
+        .pb(40.0);
     let mut step = 1;
     if let Some(needs) = needs_you(s, k, &look) {
         column = column.child(look.arrive(needs, step));
@@ -965,52 +1149,37 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         column = column.child(look.arrive(recent, step));
     }
 
-    let mut stage = el()
-        .key("home-stage")
-        .w_full()
-        .h_full()
-        .min_h(0.0)
-        .fill(k.c.bg_base);
-    if look.glass {
-        if let Some(images) = s.images.as_ref() {
-            if let Some(wall) = super::art::wallpaper(images, scheme, 0.6) {
-                stage = stage.child(wall);
-            }
-        }
-        // Light from behind the figure, in the theme's accent.
-        stage = stage.child(look.light("home-light", [0.82, 0.18], [620.0, 520.0], k.c.bg_accent));
-        if let Some(images) = s.images.as_ref() {
-            let cover = super::art::figure_covers(scheme);
-            if let Some(figure) = super::art::figure(images, scheme, 340.0, HERO_H) {
-                let figure = if cover { figure } else { figure.mr(28.0) };
-                stage = stage.child(figure);
-            }
-            // The band settles into the page: a scrim from nothing to the page
-            // colour over the hero, then that colour down to the bottom, so a
-            // full-bleed wallpaper never shows a hard edge under the cover.
-            let dim = if cover { 0.96 } else { 0.7 };
-            stage = stage
-                .child(
-                    el().key("home-scrim")
-                        .pin(Some(0.0), Some(HERO_H * 0.45), Some(0.0), None)
-                        .h(HERO_H * 0.55 + 24.0)
-                        .gradient(k.c.bg_base.alpha(0.0), k.c.bg_base.alpha(dim))
-                        .a11y_hidden(),
-                )
-                .child(
-                    el().key("home-scrim-tail")
-                        .pin(Some(0.0), Some(HERO_H + 24.0), Some(0.0), Some(0.0))
-                        .fill(k.c.bg_base.alpha(dim))
-                        .a11y_hidden(),
-                );
-        }
-    }
+    // The floor: clear under the band, so the window's wallpaper and the
+    // figure read as one scene, then the page colour under the sections so
+    // their headings stay readable. On a solid card it is the card itself.
+    let floor = if look.glass { 0.84 } else { 1.0 };
+    let stage = el().key("home-stage").w_full().h_full().min_h(0.0).child(
+        el().key("home-floor")
+            .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
+            .linear_gradient(
+                std::f32::consts::PI,
+                [
+                    (0.0, k.c.bg_base.alpha(0.0)),
+                    (
+                        ((hero_h * 0.55) / card_h.max(1.0)).min(0.9),
+                        k.c.bg_base.alpha(floor * 0.25),
+                    ),
+                    (
+                        ((hero_h + 40.0) / card_h.max(1.0)).min(0.95),
+                        k.c.bg_base.alpha(floor),
+                    ),
+                    (1.0, k.c.bg_base.alpha(floor)),
+                ],
+            )
+            .a11y_hidden(),
+    );
     stage.child(
         col()
             .key("home-scroll")
             .w_full()
             .h_full()
             .items_center()
+            .child(band)
             .child(column)
             .scroll(ScrollSpec {
                 stick_bottom: false,

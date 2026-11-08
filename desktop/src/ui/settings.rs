@@ -334,6 +334,97 @@ fn agents(s: &UiState, k: &Kit) -> Vec<El> {
 
 // ---- Appearance --------------------------------------------------------------------
 
+/// The current theme as a picture: its Home art (else its wallpaper) across
+/// a banner, its name and line over the scrim on the near side, and the way
+/// to the gallery. A theme without art shows its colours.
+fn theme_banner(s: &UiState, k: &Kit) -> El {
+    let language = s.cfg.general.language;
+    let scheme = s.scheme();
+    let (name, line) = crate::theme::apply::current_title()
+        .unwrap_or_else(|| (s.cfg.appearance.theme_id.clone(), None));
+    let line = line.unwrap_or_default();
+    const H: f32 = 168.0;
+    const BANNER_ART_W: f32 = 480.0;
+    let art = crate::theme::apply::home_artwork(scheme)
+        .or_else(|| crate::theme::apply::backdrop(scheme, true));
+    let mut banner = el()
+        .key("theme-banner")
+        .w_full()
+        .h(H)
+        .radius(crate::theme::look::CARD_RADIUS)
+        .clip_rounded(crate::theme::look::CARD_RADIUS)
+        .fill(k.c.layer_02)
+        .border(1.0, k.c.border_muted);
+    if let (Some(images), Some(art)) = (s.images.as_ref(), art) {
+        // A painting fills the far side, dissolving under the name; a
+        // cut-out stands whole beside it.
+        banner = banner.child(if art.look.cover {
+            super::art::cover(images, &art, "theme-banner-art", BANNER_ART_W, H)
+                .clip_fade(BANNER_ART_W * 0.35, 0.0, 0.0, 0.0)
+                .pin(None, Some(0.0), Some(0.0), None)
+        } else {
+            let (pic, _) = super::art::contained(images, &art, H * 1.7, H - 8.0);
+            pic.key("theme-banner-art")
+                .pin(None, None, Some(16.0), Some(0.0))
+        });
+    }
+    let copy = col()
+        .key("theme-banner-copy")
+        .h_full()
+        .w_full()
+        .justify_end()
+        .gap(4.0)
+        .px(18.0)
+        .py(16.0)
+        .linear_gradient(
+            std::f32::consts::FRAC_PI_2,
+            [
+                (0.0, k.c.bg_base.alpha(0.92)),
+                (0.45, k.c.bg_base.alpha(0.7)),
+                (0.7, k.c.bg_base.alpha(0.0)),
+            ],
+        )
+        .child(
+            text(tr(language, "Current theme", "当前主题").to_uppercase())
+                .font(rune::TextStyle {
+                    tracking: 1.4,
+                    ..k.ty.small_medium
+                })
+                .color(k.c.text_accent),
+        )
+        .child(
+            text(name)
+                .key("theme-banner-name")
+                .font(rune::TextStyle {
+                    size: 22.0,
+                    line_height: 28.0,
+                    ..k.ty.ui_medium
+                })
+                .color(k.c.text_base),
+        )
+        .children((!line.is_empty()).then(|| {
+            text(line)
+                .font(k.ty.small)
+                .color(k.c.text_muted)
+                .max_w(380.0)
+                .max_lines(2)
+        }))
+        .child(
+            row().pt(8.0).child(
+                Button::new(tr_ref(language, "Browse themes", "浏览主题"))
+                    .variant(ButtonVariant::Outline)
+                    .control_size(ControlSize::Small)
+                    .on_press(|s: &mut UiState| {
+                        s.settings_tab = SettingsTab::Themes;
+                        s.send(Command::ThemeRefresh);
+                    })
+                    .build(k)
+                    .key("goto-themes"),
+            ),
+        );
+    banner.child(copy.pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0)))
+}
+
 fn appearance(s: &UiState, k: &Kit) -> Vec<El> {
     let language = s.cfg.general.language;
     let ap = &s.cfg.appearance;
@@ -345,41 +436,7 @@ fn appearance(s: &UiState, k: &Kit) -> Vec<El> {
     let density = usize::from(ap.density == Density::Compact);
     let (motion, glass) = (ap.reduced_motion, ap.reduced_transparency);
     vec![
-        section(
-            k,
-            "appearance-theme",
-            tr_ref(language, "Theme", "主题"),
-            vec![setting(
-                k,
-                "theme-jump",
-                tr_ref(language, "Active theme", "当前主题"),
-                tr_ref(
-                    language,
-                    "Open the Themes tab for previews, install and import.",
-                    "在「主题」页查看预览、安装与导入。",
-                ),
-                row()
-                    .key("theme-jump-row")
-                    .gap(8.0)
-                    .center_y()
-                    .child(
-                        Badge::new(ap.theme_id.clone())
-                            .variant(BadgeVariant::Subtle)
-                            .build(k),
-                    )
-                    .child(
-                        Button::new(tr_ref(language, "Browse themes", "浏览主题"))
-                            .variant(ButtonVariant::Outline)
-                            .control_size(ControlSize::Small)
-                            .on_press(|s: &mut UiState| {
-                                s.settings_tab = SettingsTab::Themes;
-                                s.send(Command::ThemeRefresh);
-                            })
-                            .build(k)
-                            .key("goto-themes"),
-                    ),
-            )],
-        ),
+        theme_banner(s, k),
         section(
             k,
             "appearance-card",
