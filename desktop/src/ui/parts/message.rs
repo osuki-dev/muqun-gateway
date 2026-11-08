@@ -360,3 +360,26 @@ pub fn part(cx: &Tcx, item: &TimelineItem) -> El {
         | AgentPart::Shell { .. } => col(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{strip_image_placeholders, strip_markdown_images};
+
+    #[test]
+    fn picture_tokens_give_way_to_the_thumbnails() {
+        for (given, want) in [
+            ("[Image #1] what is this", "what is this"),
+            ("before [Image #2] after", "before after"),
+            ("![](<file:///tmp/a b.png>)", ""),
+            ("see ![chart](out/flow.png) here", "see  here"),
+            ("[link](x.png) stays", "[link](x.png) stays"),
+            ("unclosed ![alt", "unclosed ![alt"),
+        ] {
+            assert_eq!(
+                strip_markdown_images(&strip_image_placeholders(given)),
+                want,
+                "{given}"
+            );
+        }
+    }
+}
