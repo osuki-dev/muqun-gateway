@@ -504,6 +504,8 @@ fn popup_session_slash(s: &mut UiState) {
     turn_state(s, false);
     s.catalog = Some(scene_catalog());
     s.draft = typed("/");
+    // The keyboard moved down one row.
+    s.popup_active = Some((0, String::new(), 1));
 }
 
 /// The session composer's `$` skills, filtered.

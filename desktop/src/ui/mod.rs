@@ -251,6 +251,8 @@ pub struct UiState {
     /// Esc dismissed a composer popup at this query start; forgotten when the
     /// trigger leaves the draft (App `dismissedAt`).
     pub popup_dismissed_at: Option<usize>,
+    /// The composer popup's keyboard row: (query start, term, row).
+    pub popup_active: Option<(usize, String, usize)>,
     /// File paths inserted as `@` mentions (App `fileTokens`), for highlight /
     /// atomic delete of typed paths still standing in the draft.
     pub mention_file_tokens: Vec<String>,
@@ -408,6 +410,7 @@ impl UiState {
             branches: HashMap::new(),
             peers: Vec::new(),
             popup_dismissed_at: None,
+            popup_active: None,
             mention_file_tokens: Vec::new(),
             draft_snap: String::new(),
             draft_snap_caret: 0,
