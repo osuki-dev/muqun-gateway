@@ -249,6 +249,11 @@ for line in sys.stdin:
             data=read();data[active].append(['assistant-'+str(turn),'AB',False])
             with open(store,'w') as f:json.dump(data,f)
             reply(message['id'],{'stopReason':'end_turn','usage':{'inputTokens':17,'outputTokens':7,'cacheReadTokens':5,'cacheWriteTokens':2,'reasoningTokens':3}})
+    elif method=='_session/steering':
+        if pending is None:reply(message['id'],{'outcome':'promptRequired'});continue
+        data=read(); data[active].append(['steer-'+str(turn),params['prompt'][0]['text'],True])
+        with open(store,'w') as f:json.dump(data,f)
+        reply(message['id'],{'outcome':'injected'})
     elif method=='session/cancel':
         if pending is not None:reply(pending,{'stopReason':'cancelled'});pending=None
     elif method is None and message.get('id')=='permission-opaque':
