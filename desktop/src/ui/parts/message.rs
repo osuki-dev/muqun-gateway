@@ -41,6 +41,37 @@ pub fn strip_image_placeholders(text: &str) -> String {
     out.trim().to_string()
 }
 
+/// Drop markdown images (`![alt](src)`, `![alt](<src>)`) once the message's
+/// pictures are drawn as thumbnails: Markdown would only show their alt text.
+pub fn strip_markdown_images(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find("![") {
+        out.push_str(&rest[..at]);
+        let after = &rest[at + 2..];
+        let Some(close) = after.find("](") else {
+            out.push_str(&rest[at..]);
+            rest = "";
+            break;
+        };
+        let dest = &after[close + 2..];
+        let end = if let Some(inner) = dest.strip_prefix('<') {
+            inner.find(">)").map(|e| e + 3)
+        } else {
+            dest.find(')').map(|e| e + 1)
+        };
+        match end {
+            Some(end) if !after[..close].contains('\n') => rest = &dest[end..],
+            _ => {
+                out.push_str("![");
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out.trim().to_string()
+}
+
 /// A centred one-line marker between turns (a status, a switch).
 fn marker(cx: &Tcx, key: String, label: String) -> El {
     row()
@@ -64,84 +95,74 @@ fn marker(cx: &Tcx, key: String, label: String) -> El {
 fn reasoning(cx: &Tcx, item: &TimelineItem, body: &str, duration_ms: Option<u64>) -> El {
     let k = cx.k;
     let id = item.id.as_str();
-    let open = cx.is_open(id, false);
     let label = match duration_ms {
         Some(ms) => format!("{} · {:.1}s", cx.t("Thought", "思考"), ms as f32 / 1000.0),
         None => cx.t("Thought", "思考过程").to_string(),
     };
-    let turn = if open {
-        0.0
-    } else {
-        -std::f32::consts::FRAC_PI_2
-    };
-    let mut head = row()
-        .key("head")
-        .gap(6.0)
+    if cx.pane {
+        return col()
+            .key(format!("think-{id}"))
+            .w_full()
+            .gap(12.0)
+            .child(
+                row()
+                    .key("head")
+                    .gap(8.0)
+                    .center_y()
+                    .child(icon(&glyphs::REASONING, 15.0).color(k.c.icon_muted))
+                    .child(text(label).font(k.ty.ui_medium).color(k.c.text_base)),
+            )
+            .child(rich(cx, id, body));
+    }
+    // One dense line: what it thought, in a phrase; the pane has the rest.
+    let first = body
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("")
+        .trim_start_matches(['#', '*', '_', ' '])
+        .trim_end_matches(['*', '_'])
+        .to_string();
+    let mut line = row()
+        .key("line")
+        .w_full()
+        .h(super::ROW_H)
+        .px(6.0)
+        .gap(8.0)
         .center_y()
-        .py(2.0)
+        .radius(k.radius.sm)
         .child(
             icon(&glyphs::REASONING, 13.0)
                 .color(k.c.icon_faint)
                 .a11y_hidden(),
         )
-        .child(text(label).font(k.ty.small_medium).color(k.c.text_muted));
-    if !open {
-        // One line of what it thought, so a closed block still says something.
-        let first = body
-            .lines()
-            .map(str::trim)
-            .find(|l| !l.is_empty())
-            .unwrap_or("")
-            .trim_start_matches(['#', '*', '_', ' ']);
-        head = head.child(
-            text(first.to_string())
+        .child(
+            text(label)
+                .font(k.ty.small_medium)
+                .color(k.c.text_muted)
+                .single_line(),
+        )
+        .child(
+            text(first)
                 .font(k.ty.small)
                 .color(k.c.text_faint)
                 .single_line()
                 .truncate()
-                .shrink(),
+                .shrink()
+                .grow(1.0),
         );
+    if cx.selected(id) {
+        line = line.fill(k.c.surface_raised_hover);
     }
-    head = head.child(
-        icon(&glyphs::CHEVRON, 11.0)
-            .key("chevron")
-            .color(k.c.icon_faint)
-            .rotate(turn)
-            .a11y_hidden(),
-    );
-    let mut block = col().key(format!("think-{id}")).w_full().gap(4.0).child(
-        k.interactive(head.radius(k.radius.sm).px(4.0))
-            .cursor(Cursor::Pointer)
-            .expanded(open)
-            .on_press(flip(cx.asid, id)),
-    );
-    if open {
-        let mut inner = col()
-            .key("body")
-            .w_full()
-            .pl(12.0)
-            .border(0.0, k.c.border_weak)
-            .child(rich(cx, id, body));
-        if !cx.reduced_motion() {
-            inner = inner.transition(rune::Transition::opacity());
-        }
-        block = block.child(
-            row()
-                .key("rail")
-                .w_full()
-                .gap(0.0)
-                .child(
-                    col()
-                        .w(2.0)
-                        .h_full()
-                        .radius(1.0)
-                        .fill(k.c.border_weak)
-                        .ml(9.0),
-                )
-                .child(inner.shrink().grow(1.0)),
-        );
-    }
-    block
+    let (asid, open) = (cx.asid.to_string(), id.to_string());
+    let has_body = !body.trim().is_empty();
+    k.interactive(line)
+        .key(format!("think-{id}"))
+        .cursor(Cursor::Pointer)
+        .role("button")
+        .on_press_tx(move |s: &mut crate::ui::UiState, tx: &mut rune::Tx| {
+            s.press_row(&asid, &open, has_body, tx)
+        })
 }
 
 fn compaction(
@@ -205,24 +226,45 @@ fn compaction(
     block
 }
 
+/// A text item's words as they should read and its pictures. Codex writes
+/// `[Image #1]` where a picture was pasted, and an image an agent made
+/// arrives as `![](file)`: the thumbnails stand for both.
+pub fn text_parts(cx: &Tcx, item: &TimelineItem) -> (String, Option<El>) {
+    let AgentPart::Text { text: body } = &item.part else {
+        return (String::new(), None);
+    };
+    let user = item.role == muqun_gateway::agents::TimelineRole::User;
+    if !images::carries_images(item) {
+        return (body.clone(), None);
+    }
+    let paths = images::item_image_paths(cx.s, cx.asid, item);
+    let pending = images::pending_images(item, paths.len());
+    let body = strip_markdown_images(&strip_image_placeholders(prompt_display_body(body)));
+    let height = if user { 150.0 } else { 240.0 };
+    (
+        body,
+        images::gallery_sized(cx, &item.id, &paths, pending, height),
+    )
+}
+
+/// Rendered text with the rich-note check, for callers outside this module.
+pub fn rich_text(cx: &Tcx, id: &str, body: &str) -> El {
+    rich(cx, id, body)
+}
+
 pub fn part(cx: &Tcx, item: &TimelineItem) -> El {
     let id = item.id.as_str();
     let k = cx.k;
     match &item.part {
-        AgentPart::Text { text: body } => {
-            let paths = images::item_image_paths(cx.s, cx.asid, item);
-            // App shows prose first, then MessageAttachments underneath.
-            let body = if paths.is_empty() {
-                body.clone()
-            } else {
-                strip_image_placeholders(prompt_display_body(body))
-            };
+        AgentPart::Text { .. } => {
+            // An agent's picture follows its words (App MessageAttachments).
+            let (body, gallery) = text_parts(cx, item);
             let mut block = col().key(format!("text-{id}")).gap(8.0).w_full();
             if !body.is_empty() {
                 block = block.child(rich(cx, id, &body));
             }
-            if let Some(gallery) = images::gallery(cx, id, &paths) {
-                block = block.child(gallery);
+            if let Some(g) = gallery {
+                block = block.child(g);
             }
             block
         }

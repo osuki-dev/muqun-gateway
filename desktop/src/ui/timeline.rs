@@ -31,6 +31,7 @@ use rune_kit::{Badge, BadgeVariant, Button, ButtonVariant, ControlSize, Kit, Scr
 use super::copy::tr_ref;
 use super::parts::{self, Tcx};
 use super::{muted, UiState};
+use crate::model::activity::{self, Block};
 use crate::model::commands::Command;
 
 pub use super::parts::approval::permission_card;
@@ -100,6 +101,15 @@ pub struct SessionTimeline {
     /// Bumped whenever rows are added, removed or reordered (the virtual
     /// list's key version).
     pub rev: u64,
+    /// The list's rows: items, and runs of tool activity folded together.
+    pub blocks: Vec<Block>,
+    /// The row the keyboard is on (an item id, or a group's key).
+    pub selected: Option<String>,
+}
+
+/// A folded group's key: its first item's.
+pub fn group_key(first: &TimelineItem) -> String {
+    format!("grp-{}", first.id)
 }
 
 impl SessionTimeline {
@@ -112,7 +122,7 @@ impl SessionTimeline {
             self.ingest(item);
         }
         self.items = items;
-        self.rev += 1;
+        self.regroup();
         tracing::debug!(
             rows = self.items.len(),
             us = started.elapsed().as_micros() as u64,
@@ -122,22 +132,40 @@ impl SessionTimeline {
 
     /// Live rows: replace by id, else append.
     pub fn upsert(&mut self, items: Vec<TimelineItem>) {
+        let mut regroup = false;
         for item in items {
             self.ingest(&item);
             // New and updated rows are nearly always at the tail.
             match self.items.iter().rposition(|t| t.id == item.id) {
-                Some(at) => self.items[at] = item,
+                Some(at) => {
+                    // Streaming words never change the folding; anything
+                    // else (a call's picture, a blank turning into words) may.
+                    let words = |t: &TimelineItem| {
+                        matches!(t.part, AgentPart::Text { .. }) && !activity::invisible(t)
+                    };
+                    regroup |= !(words(&self.items[at]) && words(&item));
+                    self.items[at] = item;
+                }
                 None => {
                     self.items.push(item);
-                    self.rev += 1;
+                    regroup = true;
                 }
             }
         }
+        if regroup {
+            self.regroup();
+        }
+    }
+
+    /// Fold the rows again, after the list changed.
+    fn regroup(&mut self) {
+        self.blocks = activity::blocks(&self.items);
+        self.rev += 1;
     }
 
     pub fn remove(&mut self, ids: &[String]) {
         self.items.retain(|t| !ids.contains(&t.id));
-        self.rev += 1;
+        self.regroup();
         for id in ids {
             self.diffs.remove(id);
         }
@@ -158,7 +186,7 @@ impl SessionTimeline {
         }
         older.append(&mut self.items);
         self.items = older;
-        self.rev += 1;
+        self.regroup();
     }
 
     /// Parse the item's change (a diff part, an edit's files) once, for drawing.
@@ -294,6 +322,7 @@ fn empty(s: &UiState, k: &Kit, key: &str) -> El {
 enum Row<'a> {
     Top,
     Item(&'a TimelineItem),
+    Group(&'a [TimelineItem]),
     Working,
 }
 
@@ -302,14 +331,15 @@ fn row_at<'a>(s: &'a UiState, asid: &str, i: usize) -> Option<Row<'a>> {
     if i == 0 {
         return Some(Row::Top);
     }
-    match tl.items.get(i - 1) {
-        Some(item) => Some(Row::Item(item)),
+    match tl.blocks.get(i - 1) {
+        Some(Block::Item(at)) => tl.items.get(*at).map(Row::Item),
+        Some(Block::Group { start, end }) => tl.items.get(*start..*end).map(Row::Group),
         None => Some(Row::Working),
     }
 }
 
 fn row_count(s: &UiState, asid: &str) -> usize {
-    let n = s.timelines.get(asid).map_or(0, |t| t.items.len());
+    let n = s.timelines.get(asid).map_or(0, |t| t.blocks.len());
     1 + n + usize::from(s.session_busy(asid))
 }
 
@@ -350,6 +380,7 @@ pub fn session_view(s: &UiState, k: &Kit, asid: &str) -> El {
             move |s: &UiState, i| -> Cow<'_, str> {
                 match row_at(s, &key_asid, i) {
                     Some(Row::Item(item)) => Cow::Borrowed(item.id.as_str()),
+                    Some(Row::Group(items)) => Cow::Owned(group_key(&items[0])),
                     Some(Row::Top) => Cow::Borrowed("tl-top"),
                     _ => Cow::Borrowed("tl-working"),
                 }
@@ -367,6 +398,7 @@ pub fn session_view(s: &UiState, k: &Kit, asid: &str) -> El {
                                 == Some(&item.id);
                         item_row(&cx, item)
                     }
+                    Some(Row::Group(items)) => parts::group::view(&cx, items),
                     Some(Row::Working) | None => working_row(&cx),
                 };
                 // Rows space themselves with padding: virtual rows take no gaps.
@@ -374,7 +406,7 @@ pub fn session_view(s: &UiState, k: &Kit, asid: &str) -> El {
                     .w_full()
                     .items_center()
                     .px(16.0)
-                    .py(5.0)
+                    .py(3.0)
                     .streaming(tail)
                     .child(body.w_full().max_w(FEED_MAX_W))
             },
@@ -464,14 +496,19 @@ fn message_actions(cx: &Tcx, it: &TimelineItem) -> El {
     let (rollback_asid, rollback_id) = (asid.clone(), it.message_id.clone());
     let fork_id = it.message_id.clone();
     let user = it.role == TimelineRole::User;
-    let mut line = row()
+    // A small floating bar over the message's top corner on hover: it
+    // takes no room when the reader is not pointing at it.
+    let line = row()
         .key(format!("actions-{}", it.id))
         .gap(2.0)
+        .px(2.0)
+        .py(2.0)
         .center_y()
+        .radius(cx.k.radius.md)
+        .fill(cx.k.c.surface_float)
+        .border(1.0, cx.k.c.border_weak)
         .group_opacity(0.0, 1.0);
-    if user {
-        line = line.self_end();
-    }
+    let line = line.pin(None, Some(if user { -4.0 } else { -6.0 }), Some(0.0), None);
     line.child(
         Button::new(cx.t("Roll back to here", "回滚到这里"))
             .variant(ButtonVariant::Ghost)
@@ -501,25 +538,36 @@ fn message_actions(cx: &Tcx, it: &TimelineItem) -> El {
 }
 
 fn item_row(cx: &Tcx, it: &TimelineItem) -> El {
-    let body = parts::part(cx, it);
     let is_text = matches!(it.part, AgentPart::Text { .. });
     let user_text = it.role == TimelineRole::User && is_text;
-    let mut wrap = col().key(format!("item-{}", it.id)).w_full().gap(2.0);
-    wrap = if user_text {
-        wrap.child(
-            col()
-                .key("user")
-                .self_end()
-                .max_w(620.0)
-                .px(14.0)
-                .py(9.0)
-                .radius(cx.k.radius.lg)
-                .fill(cx.k.c.layer_02)
-                .child(body),
-        )
+    let mut wrap = col().key(format!("item-{}", it.id)).w_full().gap(4.0);
+    if user_text {
+        // The owner's words: a quiet bubble on the trailing side, any
+        // pasted pictures above it, a little air before the answer.
+        let (body, gallery) = parts::message::text_parts(cx, it);
+        wrap = wrap.pt(10.0).pb(4.0);
+        if let Some(g) = gallery {
+            wrap = wrap.child(g.justify_end().key("user-imgs"));
+        }
+        if !body.is_empty() {
+            wrap = wrap.child(
+                col()
+                    .key("user")
+                    .self_end()
+                    .max_w(620.0)
+                    .px(14.0)
+                    .py(8.0)
+                    .radius(cx.k.radius.lg)
+                    .fill(cx.k.c.layer_02)
+                    .child(parts::message::rich_text(cx, &it.id, &body)),
+            );
+        }
     } else {
-        wrap.child(body)
-    };
+        if is_text {
+            wrap = wrap.py(4.0);
+        }
+        wrap = wrap.child(parts::part(cx, it));
+    }
     if is_text && matches!(it.role, TimelineRole::User | TimelineRole::Assistant) {
         wrap = wrap.hover_group().child(message_actions(cx, it));
     }
@@ -532,6 +580,11 @@ pub fn overlay(s: &UiState, k: &Kit) -> Option<El> {
     parts::images::zoom_overlay(s, k)
         .or_else(|| parts::detail::sheet(s, k))
         .or_else(|| parts::context::sheet(s, k))
+}
+
+/// The right-hand detail pane, while a row is open in it.
+pub fn detail_pane(s: &UiState, k: &Kit) -> Option<El> {
+    parts::pane::view(s, k)
 }
 
 /// The session header's context meter (how full the model's context is);

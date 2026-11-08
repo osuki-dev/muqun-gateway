@@ -114,6 +114,12 @@ fn sidebar_pane(s: &mut UiState) -> &mut PaneState {
     &mut s.sidebar
 }
 
+fn inspect_pane(s: &mut UiState) -> &mut PaneState {
+    &mut s.inspect_pane
+}
+
+pub use parts::pane::{Inspect, RowMenu};
+
 fn right_pane(s: &mut UiState) -> &mut PaneState {
     LAYOUT_DIRTY.store(true, Ordering::Release);
     &mut s.right
@@ -211,6 +217,12 @@ pub struct UiState {
     pub zoom: Option<PathBuf>,
     /// A subagent's session shown read-only over its parent (`timeline::overlay`).
     pub detail: Option<timeline::DetailSheet>,
+    /// The timeline row open in the right-hand detail pane (`parts::pane`).
+    pub inspect: Option<Inspect>,
+    /// The detail pane's width.
+    pub inspect_pane: PaneState,
+    /// A timeline row's context menu, where it was asked for.
+    pub row_menu: Option<RowMenu>,
     /// The session whose context sheet is open (`timeline::context_meter`).
     pub context_open: Option<String>,
     /// Account rate windows by agent, once asked for (`None`: it has none).
@@ -372,6 +384,9 @@ impl UiState {
             timelines: HashMap::new(),
             zoom: None,
             detail: None,
+            inspect: None,
+            inspect_pane: PaneState::new(440.0).range(320.0, 760.0),
+            row_menu: None,
             context_open: None,
             account_limits: HashMap::new(),
             status: "Starting…".into(),
@@ -1137,6 +1152,12 @@ impl UiState {
                     }
                 }
                 Update::Storage(report) => self.storage = Some(report),
+                Update::MediaReady => {
+                    // Placeholders become pictures: rows measure again.
+                    for tl in self.timelines.values_mut() {
+                        tl.rev += 1;
+                    }
+                }
                 Update::Tasks { rows, default_cwd } => {
                     self.tasks = rows;
                     self.task_cwd = default_cwd;
@@ -1759,7 +1780,7 @@ pub fn activity_pill(
 
 use copy::tr;
 
-pub fn on_key(s: &mut UiState, ev: &KeyEvent, _tx: &mut Tx) -> bool {
+pub fn on_key(s: &mut UiState, ev: &KeyEvent, tx: &mut Tx) -> bool {
     if ev.is_command('k') && !ev.mods.shift && !ev.mods.alt {
         s.toggle_palette();
         return true;
@@ -1772,6 +1793,9 @@ pub fn on_key(s: &mut UiState, ev: &KeyEvent, _tx: &mut Tx) -> bool {
         return true;
     } else if is_sidebar_toggle(ev) {
         s.sidebar.toggle();
+        return true;
+    }
+    if s.timeline_key(ev, tx) {
         return true;
     }
     if ev.is_command('t') && ev.mods.shift && !ev.mods.alt {
@@ -1840,6 +1864,7 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>) -> El {
     if let Some(zoom) = timeline::overlay(s, &k) {
         layer.push(zoom);
     }
+    parts::pane::row_menu(s, &k, &mut layer);
     welcome::mount(s, &k, &mut layer);
     if let (Some(splash), Some(images)) = (s.splash.as_ref(), s.images.as_ref()) {
         let hub_ready = !s.hub_label.is_empty();

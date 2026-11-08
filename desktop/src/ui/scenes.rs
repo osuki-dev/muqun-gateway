@@ -887,6 +887,14 @@ pub fn scenes() -> &'static [Scene] {
         ("timeline-narrow", timeline_narrow),
         ("timeline-long", timeline_long),
         ("timeline-zh", timeline_zh),
+        ("timeline-grouped", timeline_grouped),
+        ("timeline-expanded", timeline_expanded),
+        ("timeline-running", timeline_running),
+        ("timeline-detail", timeline_detail),
+        ("timeline-detail-zh", |s| {
+            timeline_detail(s);
+            s.cfg.general.language = crate::config::Language::ZhCn;
+        }),
         ("terminals", terminals_scene),
         ("terminals-tw", |s| {
             terminals_scene(s);

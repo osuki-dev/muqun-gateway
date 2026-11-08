@@ -2,12 +2,14 @@
 //! channel, updates come core → UI through the [`inbox::Inbox`], and the UI
 //! thread folds them into its state (`ui::bridge`).
 
+pub mod activity;
 pub mod commands;
 pub mod compact;
 pub mod compose;
 pub mod composer_mentions;
 pub mod composer_popup;
 pub mod inbox;
+pub mod media;
 pub mod notify;
 pub mod projection;
 pub mod projects;

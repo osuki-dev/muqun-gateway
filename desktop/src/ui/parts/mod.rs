@@ -9,9 +9,11 @@ pub mod detail;
 pub mod diff_rows;
 pub mod files;
 pub mod glyphs;
+pub mod group;
 pub mod images;
 pub mod message;
 pub mod muqun;
+pub mod pane;
 pub mod question;
 pub mod tool;
 
@@ -30,6 +32,9 @@ pub struct Tcx<'a> {
     pub k: &'a Kit,
     pub asid: &'a str,
     pub lang: Language,
+    /// Drawing into the detail pane (everything a call has), not the
+    /// timeline's dense rows.
+    pub pane: bool,
 }
 
 impl<'a> Tcx<'a> {
@@ -39,7 +44,26 @@ impl<'a> Tcx<'a> {
             k,
             asid,
             lang: s.cfg.general.language,
+            pane: false,
         }
+    }
+
+    /// The same, for the detail pane.
+    pub fn for_pane(s: &'a UiState, k: &'a Kit, asid: &'a str) -> Self {
+        Self {
+            pane: true,
+            ..Self::new(s, k, asid)
+        }
+    }
+
+    /// Row `id` is the reader's: selected with the keyboard or open in the pane.
+    pub fn selected(&self, id: &str) -> bool {
+        self.tl().and_then(|t| t.selected.as_deref()) == Some(id)
+            || self
+                .s
+                .inspect
+                .as_ref()
+                .is_some_and(|i| i.asid == self.asid && i.id == id)
     }
 
     /// English or 简体中文, by the owner's language.
@@ -98,21 +122,33 @@ pub fn part(cx: &Tcx, item: &TimelineItem) -> El {
 
 // ---- shared pieces ----------------------------------------------------------
 
-/// A small coloured label beside a card's title (`+3`, `exit 1`).
+/// A small coloured label beside a row's title (`+3`, `exit 1`): plain
+/// text, no pill, so a row of them stays quiet.
 pub fn chip(k: &Kit, label: impl Into<String>, color: Color) -> El {
     text(label.into())
         .font(k.ty.small_medium)
         .color(color)
-        .px(6.0)
-        .py(1.0)
-        .radius(k.radius.sm)
-        .fill(k.alpha(color, 0.12))
+        .single_line()
 }
 
 /// Monospace text, capped to `max_lines`, with a note of what is held back.
 pub fn mono(cx: &Tcx, key: &str, body: &str, max_lines: usize) -> El {
+    // The pane has the room: it shows the whole output, on a well.
+    let max_lines = if cx.pane {
+        max_lines.max(4000)
+    } else {
+        max_lines
+    };
     let (shown, hidden) = cap_lines(body, max_lines);
-    let mut block = col().key(key.to_string()).w_full().gap(4.0).child(
+    let mut block = col().key(key.to_string()).w_full().gap(4.0);
+    if cx.pane {
+        block = block
+            .px(10.0)
+            .py(8.0)
+            .radius(cx.k.radius.md)
+            .fill(cx.k.c.layer_01);
+    }
+    let mut block = block.child(
         text(shown)
             .font(cx.k.ty.mono)
             .color(cx.k.c.text_muted)
@@ -129,6 +165,11 @@ pub fn mono(cx: &Tcx, key: &str, body: &str, max_lines: usize) -> El {
 
 /// Syntax-coloured code (a Markdown fence: Rune's highlighter), capped.
 pub fn code(cx: &Tcx, key: &str, body: &str, language: Option<&str>, max_lines: usize) -> El {
+    let max_lines = if cx.pane {
+        max_lines.max(4000)
+    } else {
+        max_lines
+    };
     let (shown, hidden) = cap_lines(body, max_lines);
     let fence = if shown.contains("```") { "~~~~" } else { "```" };
     let src = format!("{fence}{}\n{shown}\n{fence}", language.unwrap_or(""));
@@ -242,6 +283,10 @@ pub struct ToolCard<'a> {
     pub accent: Option<Color>,
     /// Waiting on the reader (a question to answer): the border says so.
     pub attention: bool,
+    /// What the row's Copy puts on the clipboard (the command, the path).
+    pub copy: Option<String>,
+    /// A file the row's Open shows in the viewer.
+    pub open: Option<String>,
 }
 
 impl<'a> ToolCard<'a> {
@@ -261,10 +306,255 @@ impl<'a> ToolCard<'a> {
             error: None,
             accent: None,
             attention: false,
+            copy: None,
+            open: None,
         }
     }
 
+    /// The call as the timeline shows it: a dense row (anything waiting on
+    /// the reader stays a full card), or everything it has in the pane.
     pub fn build(self, cx: &Tcx) -> El {
+        if cx.pane {
+            self.build_pane(cx)
+        } else if self.attention {
+            self.build_card(cx)
+        } else {
+            self.build_row(cx)
+        }
+    }
+
+    /// The one-line title: a multi-line command shows its first line.
+    fn one_line(title: &str) -> String {
+        let mut lines = title.lines().map(str::trim).filter(|l| !l.is_empty());
+        let mut first = lines.next().unwrap_or("").to_string();
+        if lines.next().is_some() {
+            first.push_str(" …");
+        }
+        first
+    }
+
+    /// One dense line: glyph, verb, target (monospace; its folder or what it
+    /// is for, muted), meta on the right, and on hover Copy / Open and the
+    /// call's own actions. A click opens the call in the detail pane.
+    fn build_row(self, cx: &Tcx) -> El {
+        let k = cx.k;
+        let id = self.id.to_string();
+        let has_detail = self.body.is_some() || self.error.is_some() || !self.actions.is_empty();
+        let failed = self.state == CardState::Failed;
+        let glyph_color = if failed {
+            k.c.danger.icon
+        } else {
+            self.accent.unwrap_or(k.c.icon_faint)
+        };
+        let selected = cx.selected(&id);
+        let mut line = row()
+            .key("line")
+            .w_full()
+            .h(ROW_H)
+            .px(6.0)
+            .gap(8.0)
+            .center_y()
+            .radius(k.radius.sm)
+            .child(icon(self.glyph, 13.0).color(glyph_color).a11y_hidden());
+        if !self.verb.is_empty() {
+            line = line.child(
+                text(self.verb)
+                    .key("verb")
+                    .font(k.ty.small_medium)
+                    .color(if failed {
+                        k.c.danger.fg
+                    } else {
+                        k.c.text_muted
+                    })
+                    .single_line(),
+            );
+        }
+        let title = Self::one_line(&self.title);
+        if !title.is_empty() {
+            line = line.child(
+                text(title)
+                    .key("title")
+                    .font(k.ty.mono)
+                    .color(k.c.text_base)
+                    .single_line()
+                    .truncate()
+                    .shrink(),
+            );
+        }
+        let caption_text = self.caption.lines().next().unwrap_or("").to_string();
+        line = line.child(if caption_text.is_empty() {
+            col().key("caption").grow(1.0)
+        } else {
+            text(caption_text)
+                .key("caption")
+                .font(k.ty.small)
+                .color(k.c.text_faint)
+                .single_line()
+                .truncate_head()
+                .shrink()
+                .grow(1.0)
+        });
+        // The tray: what a hover offers, over the meta's leading edge.
+        let mut tray = row()
+            .key("tray")
+            .gap(2.0)
+            .center_y()
+            .group_opacity(0.0, 1.0);
+        for (i, a) in self.actions.into_iter().enumerate() {
+            tray = tray.child(a.key(format!("act-{i}")));
+        }
+        if let Some(path) = self.open.clone().filter(|p| !p.is_empty()) {
+            tray = tray.child(tray_button(
+                cx,
+                "open",
+                &glyphs::OPEN,
+                cx.t("Open file", "打开文件"),
+                move |s: &mut UiState, _tx: &mut rune::Tx| s.open_timeline_file(&path),
+            ));
+        }
+        if let Some(copy) = self.copy.clone().filter(|c| !c.is_empty()) {
+            tray = tray.child(tray_button(
+                cx,
+                "copy",
+                &rune_kit::glyphs::COPY,
+                cx.t("Copy", "复制"),
+                move |_: &mut UiState, tx: &mut rune::Tx| tx.copy(copy.clone()),
+            ));
+        }
+        line = line.child(tray);
+        for (i, c) in self.chips.into_iter().enumerate() {
+            line = line.child(c.key(format!("chip-{i}")));
+        }
+        line = line.child(state_mark(cx, self.state));
+        if selected {
+            line = line.fill(k.c.surface_raised_hover);
+        }
+        let (asid, open_id) = (cx.asid.to_string(), id.clone());
+        let line = k
+            .interactive(line)
+            .cursor(Cursor::Pointer)
+            .hover_group()
+            .role("button")
+            .on_press_tx(move |s: &mut UiState, tx: &mut rune::Tx| {
+                s.press_row(&asid, &open_id, has_detail, tx)
+            });
+        let asid = cx.asid.to_string();
+        let menu_id = id.clone();
+        let line = line.on_secondary_press(move |s: &mut UiState, press, _tx: &mut rune::Tx| {
+            s.row_menu = Some(crate::ui::RowMenu {
+                asid: asid.clone(),
+                id: menu_id.clone(),
+                point: press,
+            });
+        });
+        let mut block = col()
+            .key(format!("call-{id}"))
+            .w_full()
+            .gap(4.0)
+            .child(line);
+        // A picture, a presented file or a checklist is the point: in view.
+        if let Some(preview) = self.preview {
+            block = block.child(
+                col()
+                    .key("preview")
+                    .w_full()
+                    .pl(27.0)
+                    .pb(4.0)
+                    .child(preview),
+            );
+        }
+        if self.open_default {
+            if let Some(body) = self.body {
+                block = block.child(col().key("body").w_full().pl(27.0).pb(4.0).child(body));
+            }
+        }
+        block
+    }
+
+    /// Everything the call has, for the detail pane: the full title and
+    /// caption, meta, error, pictures, the body and its actions.
+    fn build_pane(self, cx: &Tcx) -> El {
+        let k = cx.k;
+        let failed = self.state == CardState::Failed;
+        let mut head = row().key("head").w_full().gap(8.0).center_y().child(
+            icon(self.glyph, 15.0)
+                .color(if failed {
+                    k.c.danger.icon
+                } else {
+                    self.accent.unwrap_or(k.c.icon_muted)
+                })
+                .a11y_hidden(),
+        );
+        if !self.verb.is_empty() {
+            head = head.child(
+                text(self.verb)
+                    .font(k.ty.ui_medium)
+                    .color(k.c.text_base)
+                    .single_line(),
+            );
+        }
+        head = head.child(col().grow(1.0));
+        for (i, c) in self.chips.into_iter().enumerate() {
+            head = head.child(c.key(format!("chip-{i}")));
+        }
+        head = head.child(state_mark(cx, self.state));
+        let mut pane = col()
+            .key(format!("detail-{}", self.id))
+            .w_full()
+            .gap(12.0)
+            .child(head);
+        if !self.title.trim().is_empty() {
+            pane = pane.child(
+                text(self.title.trim().to_string())
+                    .key("title")
+                    .font(k.ty.mono)
+                    .color(k.c.text_base)
+                    .wrap_anywhere()
+                    .selectable(true)
+                    .selection_color(k.selection())
+                    .w_full(),
+            );
+        }
+        if !self.caption.trim().is_empty() {
+            pane = pane.child(
+                text(self.caption.trim().to_string())
+                    .key("caption")
+                    .font(k.ty.small)
+                    .color(k.c.text_muted)
+                    .wrap_anywhere()
+                    .selectable(true)
+                    .w_full(),
+            );
+        }
+        if let Some(err) = self.error {
+            pane = pane.child(
+                text(err)
+                    .key("error")
+                    .font(k.ty.small)
+                    .color(k.c.danger.fg)
+                    .wrap()
+                    .selectable(true)
+                    .w_full(),
+            );
+        }
+        if let Some(preview) = self.preview {
+            pane = pane.child(col().key("preview").w_full().child(preview));
+        }
+        if let Some(body) = self.body {
+            pane = pane.child(col().key("body").w_full().child(body));
+        }
+        if !self.actions.is_empty() {
+            let mut line = row().key("actions").w_full().gap(6.0).wrap();
+            for (i, a) in self.actions.into_iter().enumerate() {
+                line = line.child(a.key(format!("act-{i}")));
+            }
+            pane = pane.child(line);
+        }
+        pane
+    }
+
+    /// The bordered card, for a call waiting on the reader.
+    fn build_card(self, cx: &Tcx) -> El {
         let k = cx.k;
         let has_body = self.body.is_some() || self.error.is_some();
         let open = has_body && cx.is_open(self.id, self.open_default);
@@ -437,6 +727,32 @@ fn state_mark(cx: &Tcx, state: CardState) -> El {
             .single_line(),
         CardState::Done => col().key("state"),
     }
+}
+
+/// A dense row's height.
+pub const ROW_H: f32 = 24.0;
+
+/// A small icon button for a row's hover tray.
+pub fn tray_button(
+    cx: &Tcx,
+    key: &str,
+    glyph: &'static Icon,
+    label: &str,
+    f: impl Fn(&mut UiState, &mut rune::Tx) + 'static,
+) -> El {
+    cx.k.interactive(
+        row()
+            .key(format!("tray-{key}"))
+            .size(20.0, 20.0)
+            .center()
+            .radius(cx.k.radius.sm)
+            .child(icon(glyph, 12.0).color(cx.k.c.icon_muted).a11y_hidden()),
+    )
+    .cursor(Cursor::Pointer)
+    .role("button")
+    .label(label.to_string())
+    .help(label.to_string())
+    .on_press_tx(f)
 }
 
 /// A plain block with the card look, for parts that are not tool calls.

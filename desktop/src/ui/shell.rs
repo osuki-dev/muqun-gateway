@@ -49,7 +49,13 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
     if s.mode != Mode::Home {
         split = split.toolbar(toolbar(s, k, &look, layer));
     }
-    if s.right_open && s.mode == Mode::Session && !s.in_split() {
+    // A row's details take the right-hand slot while they are open.
+    let details = (s.mode == Mode::Session)
+        .then(|| timeline::detail_pane(s, k))
+        .flatten();
+    if let Some(pane) = details {
+        split = split.inspector(&s.inspect_pane, super::inspect_pane, pane);
+    } else if s.right_open && s.mode == Mode::Session && !s.in_split() {
         split = split.inspector(&s.right, super::right_pane, inspector::view(s, k));
     }
     let mut split = split

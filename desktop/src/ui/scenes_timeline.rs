@@ -301,3 +301,149 @@ fn timeline_context(s: &mut UiState) {
     );
     s.context_open = Some("s1".into());
 }
+
+// ---- desktop timeline: folded activity, the detail pane, pictures ----------
+
+/// A picture asset as the gateway attaches it to a row.
+fn scene_asset(src: &str) -> muqun_gateway::agents::MessageImageAsset {
+    serde_json::from_value(json!({
+        "asset_id": "demo", "src": src, "url": src, "mime": "image/png",
+        "width": 1024, "height": 1024,
+    }))
+    .expect("demo asset")
+}
+
+/// One realistic turn: a pasted screenshot (Codex's `[Image #1]`), a run of
+/// reads and searches, words with code, edits and a failed check, and a
+/// picture the agent made.
+fn turn_items(running: bool) -> Vec<TimelineItem> {
+    use TimelineRole::{Assistant, User};
+    let sh = |id: &str, cmd: &str, out: &str, exit: i64, ms: u64| {
+        tool_item(id, "exec_command", if exit == 0 { "completed" } else { "failed" }, json!({
+            "input": { "command": cmd, "workdir": "/home/demo/gateway" },
+            "output": out,
+            "metadata": { "exit": exit },
+            "time": { "ran": 1000, "completed": 1000 + ms },
+        }))
+    };
+    let read = |id: &str, path: &str| {
+        tool_item(id, "Read", "completed", json!({
+            "input": { "file_path": path },
+            "content": [{ "type": "text", "text": READ_OUT }],
+        }))
+    };
+    let mut pasted = item("u1", User, AgentPart::Text {
+        text: "[Image #1] The order tabs should show a count badge for each state.".into(),
+    });
+    pasted.attachments = Some(vec![SCENE_PICTURE.into()]);
+    pasted.image_assets = Some(vec![scene_asset(SCENE_PICTURE)]);
+    let mut made = item("a3img", Assistant, AgentPart::Text {
+        text: format!("![](<file://{SCENE_PICTURE}>)"),
+    });
+    made.image_assets = Some(vec![scene_asset(SCENE_PICTURE)]);
+    let mut items = vec![
+        pasted,
+        item("a0", Assistant, AgentPart::Text {
+            text: "I'll find where the tabs are built and where the counts come from.".into(),
+        }),
+        item("r1", Assistant, AgentPart::Reasoning {
+            text: "**Locating the tab bar**\n\nThe tabs live in the orders page; counts need a query per state.".into(),
+            duration_ms: Some(3100),
+        }),
+        read("rd1", "/home/demo/shop/src/pages/orders/index.tsx"),
+        read("rd2", "/home/demo/shop/src/pages/orders/tabs.tsx"),
+        tool_item("gr1", "grep", "completed", json!({
+            "input": { "pattern": "orderStatus", "path": "src" },
+            "output": "Found 2 matches\n/home/demo/shop/src/api/orders.ts:\n  Line 12: export function orderStatus(\n/home/demo/shop/src/pages/orders/tabs.tsx:\n  Line 4: import { orderStatus } from '../../api/orders';",
+        })),
+        read("rd3", "/home/demo/shop/src/api/orders.ts"),
+        sh("sh1", "rg -n \"status\" src/api | head -40", "src/api/orders.ts:12: export function orderStatus(\nsrc/api/orders.ts:31:   status: OrderState,", 0, 220),
+        read("rd4", "/home/demo/shop/src/components/Badge.tsx"),
+        item("a1", Assistant, AgentPart::Text {
+            text: "The tabs render from a static list, so I'll add a `counts` query and show a badge only when a count is above zero:\n\n```tsx\nconst counts = useOrderCounts();\n<Tab label={t.label} badge={counts[t.state] || undefined} />\n```".into(),
+        }),
+        tool_item("ed1", "apply_patch", "completed", json!({
+            "input": { "patchText": "*** Begin Patch\n*** Update File: src/pages/orders/tabs.tsx\n@@\n-  <Tab label={t.label} />\n+  <Tab label={t.label} badge={counts[t.state] || undefined} />\n*** End Patch" },
+        })),
+        tool_item("ed2", "edit", "completed", json!({
+            "input": { "file_path": "src/api/orders.ts" },
+            "metadata": { "files": [{ "file": "src/api/orders.ts", "patch": PATCH }] },
+        })),
+        sh("sh2", "pnpm tsc --noEmit", "src/pages/orders/tabs.tsx(18,7): error TS2322: Type 'number | undefined' is not assignable to type 'string'.\n", 2, 6400),
+        tool_item("ed3", "edit", "completed", json!({
+            "input": { "file_path": "src/components/Badge.tsx" },
+            "metadata": { "files": [{ "file": "src/components/Badge.tsx", "patch": PATCH }] },
+        })),
+        sh("sh3", "pnpm tsc --noEmit", "", 0, 5900),
+        sh("sh4", "pnpm test --run orders", "✓ orders/tabs.test.tsx (4 tests) 41ms\n\nTest Files  1 passed (1)\n     Tests  4 passed (4)", 0, 3200),
+        item("a2", Assistant, AgentPart::Text {
+            text: "Each tab now shows how many orders are in that state; the badge hides at zero. Here is a mock of the result:".into(),
+        }),
+        made,
+    ];
+    if running {
+        items.truncate(items.len() - 2);
+        items.push(tool_item("sh5", "exec_command", "running", json!({
+            "input": { "command": "pnpm test --run orders --coverage" },
+            "output": " RUN  v2.1.3 /home/demo/shop",
+        })));
+    }
+    items
+}
+
+fn turn_state(s: &mut UiState, running: bool) {
+    base(s);
+    if let Some(info) = s.sessions.iter_mut().find(|i| i.asid.0 == "s1") {
+        info.status = if running {
+            muqun_gateway::agents::AgentSessionStatus::Busy
+        } else {
+            muqun_gateway::agents::AgentSessionStatus::Idle
+        };
+    }
+    s.apply_updates(vec![crate::model::inbox::Update::Snapshot(Box::new(
+        muqun_gateway::agents::ports::AgentSessionSnapshot {
+            info: s.sessions[0].clone(),
+            timeline: turn_items(running),
+            permissions: vec![],
+            forms: vec![],
+            inbox: vec![],
+            seq: 1,
+        },
+    ))]);
+    if let Some(tl) = s.timelines.get_mut("s1") {
+        tl.earlier_exhausted = true;
+    }
+    s.mode = Mode::Session;
+    s.right_open = false;
+    s.right.set_open(false);
+    s.demo = true;
+}
+
+/// Activity folded under its summary lines.
+fn timeline_grouped(s: &mut UiState) {
+    turn_state(s, false);
+}
+
+/// The second group open, a row selected.
+fn timeline_expanded(s: &mut UiState) {
+    turn_state(s, false);
+    if let Some(tl) = s.timelines.get_mut("s1") {
+        tl.flip("grp-ed1");
+        tl.selected = Some("sh2".into());
+    }
+}
+
+/// The agent at work: the running group names its step.
+fn timeline_running(s: &mut UiState) {
+    turn_state(s, true);
+}
+
+/// The failed check open in the detail pane.
+fn timeline_detail(s: &mut UiState) {
+    timeline_expanded(s);
+    s.inspect = Some(super::Inspect {
+        asid: "s1".into(),
+        id: "sh2".into(),
+    });
+    s.inspect_pane.set_open(true);
+}
