@@ -59,24 +59,16 @@ pub enum MousePhase {
     Up,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MouseButton {
-    Left,
-    Middle,
-    Right,
-}
-
 /// A pointer event over the grid, in pixels from the grid's top-left.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MouseInput {
     pub phase: MousePhase,
-    pub button: MouseButton,
     pub x: f32,
     pub y: f32,
     pub mods: Mods,
 }
 
-fn rgb(c: RgbColor) -> Rgb {
+fn from_ghostty(c: RgbColor) -> Rgb {
     Rgb(c.r, c.g, c.b)
 }
 
@@ -123,7 +115,6 @@ pub struct Engine {
     selecting: bool,
     selection: Option<String>,
     clock: Instant,
-    generation: u64,
     title: String,
 }
 
@@ -200,7 +191,6 @@ impl Engine {
             selecting: false,
             selection: None,
             clock: Instant::now(),
-            generation: 0,
             title: String::new(),
         };
         engine.set_colors(colors)?;
@@ -282,7 +272,7 @@ impl Engine {
             }
         }
         if !out.is_empty() {
-            self.to_bottom();
+            self.follow_output();
             self.out.borrow_mut().extend_from_slice(&out);
         }
         Ok(())
@@ -290,7 +280,7 @@ impl Engine {
 
     /// Text an input method composed: sent as typed.
     pub fn text(&mut self, text: &str) {
-        self.to_bottom();
+        self.follow_output();
         self.out.borrow_mut().extend_from_slice(text.as_bytes());
     }
 
@@ -308,12 +298,12 @@ impl Engine {
             }
             Err(e) => return Err(e),
         };
-        self.to_bottom();
+        self.follow_output();
         self.out.borrow_mut().extend_from_slice(&buf[..n]);
         Ok(())
     }
 
-    fn to_bottom(&mut self) {
+    fn follow_output(&mut self) {
         if self.scroll().in_history() {
             self.term.scroll_viewport(ScrollViewport::Bottom);
             self.force = true;
@@ -416,11 +406,7 @@ impl Engine {
         let tracking = self.term.is_mouse_tracking()?;
         let report = tracking && !input.mods.shift && !self.selecting;
         if report {
-            let button = match input.button {
-                MouseButton::Left => mouse::Button::Left,
-                MouseButton::Middle => mouse::Button::Middle,
-                MouseButton::Right => mouse::Button::Right,
-            };
+            let button = mouse::Button::Left;
             self.prepare_mouse(input.phase == MousePhase::Move);
             self.mouse_ev
                 .set_mods(mods(input.mods))
@@ -437,9 +423,6 @@ impl Engine {
             let mut out = Vec::new();
             self.mouse_enc.encode_to_vec(&self.mouse_ev, &mut out)?;
             self.out.borrow_mut().extend_from_slice(&out);
-            return Ok(());
-        }
-        if input.button != MouseButton::Left {
             return Ok(());
         }
         let point = self.point(input.x, input.y);
@@ -488,11 +471,6 @@ impl Engine {
         Ok(())
     }
 
-    /// The selection's text, if any.
-    pub fn selection(&self) -> Option<&str> {
-        self.selection.as_deref()
-    }
-
     /// The picture to draw, when anything changed since the last one.
     pub fn frame(&mut self) -> Result<Option<Frame>> {
         let force = std::mem::take(&mut self.force);
@@ -506,7 +484,10 @@ impl Engine {
         }
         self.title = title;
         let colors = snapshot.colors()?;
-        let (fg, bg) = (rgb(colors.foreground), rgb(colors.background));
+        let (fg, bg) = (
+            from_ghostty(colors.foreground),
+            from_ghostty(colors.background),
+        );
         let rows = usize::from(snapshot.rows()?);
         let cols = snapshot.cols()?;
         let all = force || dirty == Dirty::Full || self.grid.len() != rows;
@@ -539,8 +520,8 @@ impl Engine {
                         CellWide::SpacerTail => 0,
                         _ => 1,
                     };
-                    let mut cfg = cell.fg_color()?.map_or(fg, rgb);
-                    let mut cbg = cell.bg_color()?.map(rgb);
+                    let mut cfg = cell.fg_color()?.map_or(fg, from_ghostty);
+                    let mut cbg = cell.bg_color()?.map(from_ghostty);
                     let mut attrs = Attrs::default();
                     let mut invisible = false;
                     if cell.has_styling()? {
@@ -599,22 +580,19 @@ impl Engine {
         } else {
             None
         };
-        let cursor_color = colors.cursor.map_or(self.colors.cursor, rgb);
+        let cursor_color = colors.cursor.map_or(self.colors.cursor, from_ghostty);
         snapshot.set_dirty(Dirty::Clean)?;
-        self.generation += 1;
         Ok(Some(Frame {
             cols,
             rows: rows as u16,
             grid: self.grid.clone(),
             cursor,
-            fg,
             bg,
             cursor_color,
             title: self.title.clone(),
             scroll,
             mouse_tracking,
             selection: self.selection.clone(),
-            generation: self.generation,
         }))
     }
 }

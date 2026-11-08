@@ -49,7 +49,19 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
     if s.mode != Mode::Home {
         split = split.toolbar(toolbar(s, k, &look, layer));
     }
-    if s.right_open && s.mode == Mode::Session && !s.in_split() {
+    let inspector_here = s.right_open && s.mode == Mode::Session && !s.in_split();
+    if s.term.mounted() && (s.term.open || !inspector_here) {
+        let scheme = if k.dark {
+            crate::theme::color_scheme::ColorScheme::Dark
+        } else {
+            crate::theme::color_scheme::ColorScheme::Light
+        };
+        split = split.inspector(
+            &s.term.pane,
+            super::terminal_pane,
+            super::terminal_panel::view(s, k, scheme, cx.env().scale),
+        );
+    } else if inspector_here {
         split = split.inspector(&s.right, super::right_pane, inspector::view(s, k));
     }
     let mut split = split
@@ -368,10 +380,31 @@ fn toolbar(s: &UiState, k: &Kit, look: &Look, layer: &mut Vec<El>) -> Toolbar {
             }
         }
     }
+    if s.mode != Mode::Home {
+        bar = bar.trailing(
+            IconButton::new(&super::terminal_panel::TERMINAL_WINDOW)
+                .variant(if s.term.open {
+                    IconButtonVariant::Contrast
+                } else {
+                    IconButtonVariant::Ghost
+                })
+                .label(tr_ref(language, "Terminal", "终端"))
+                .help(tr_ref(language, "Terminal (Ctrl+`)", "终端 (Ctrl+`)"))
+                .on_press(|s: &mut UiState| {
+                    if s.term.open {
+                        s.close_terminal();
+                    } else {
+                        s.open_terminal();
+                    }
+                })
+                .build(k)
+                .key("terminal-toggle"),
+        );
+    }
     if s.mode == Mode::Session && !s.in_split() {
         bar = bar.trailing(
             IconButton::new(&INSPECTOR)
-                .variant(if s.right_open {
+                .variant(if s.right_open && !s.term.open {
                     IconButtonVariant::Contrast
                 } else {
                     IconButtonVariant::Ghost

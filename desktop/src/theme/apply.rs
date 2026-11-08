@@ -95,6 +95,17 @@ pub fn palette(scheme: ColorScheme) -> Option<ThemePalette> {
     })
 }
 
+/// The current theme's terminal palette for `scheme` (`variants.<scheme>.terminal`),
+/// or `None` before a theme was activated.
+pub fn terminal(scheme: ColorScheme) -> Option<super::pack::Terminal> {
+    let guard = current().read().unwrap();
+    let v = &guard.as_ref()?.manifest.variants;
+    Some(match scheme {
+        ColorScheme::Light => v.light.terminal.clone(),
+        ColorScheme::Dark => v.dark.terminal.clone(),
+    })
+}
+
 /// How the theme wants a slot's image shown (`home.wallpaper`,
 /// `home.artwork`, `launch.artwork`): the manifest's fit, opacity and
 /// focal point, or the defaults when the slot is unset.

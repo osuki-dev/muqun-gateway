@@ -365,6 +365,9 @@ pub struct UiPrefs {
     /// at layout time so the left column and main stay usable.
     #[serde(default = "UiPrefs::right_default")]
     pub right_width: f32,
+    /// The terminal panel's width (`ui/terminal_panel.rs`).
+    #[serde(default = "UiPrefs::terminal_default")]
+    pub terminal_width: f32,
     /// Pins, hidden projects and names given to projects, by project root
     /// (`model/projects.rs`). Only projects with a choice are kept.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
@@ -394,6 +397,21 @@ impl UiPrefs {
 
     fn right_default() -> f32 {
         Self::RIGHT_DEFAULT
+    }
+
+    pub const TERMINAL_DEFAULT: f32 = 560.0;
+
+    fn terminal_default() -> f32 {
+        Self::TERMINAL_DEFAULT
+    }
+
+    /// The stored terminal width, forced into the panel's range.
+    pub fn terminal(&self) -> f32 {
+        if self.terminal_width.is_finite() {
+            self.terminal_width.clamp(360.0, 1200.0)
+        } else {
+            Self::TERMINAL_DEFAULT
+        }
     }
 
     fn tile_split_default() -> f32 {
@@ -435,6 +453,7 @@ impl Default for UiPrefs {
         Self {
             sidebar_width: Self::SIDEBAR_DEFAULT,
             right_width: Self::RIGHT_DEFAULT,
+            terminal_width: Self::TERMINAL_DEFAULT,
             projects: BTreeMap::new(),
             recent_commands: Vec::new(),
             tiles: Vec::new(),
@@ -452,6 +471,7 @@ pub enum ConfigEdit {
     Window(WindowGeometry),
     SidebarWidth(f32),
     RightWidth(f32),
+    TerminalWidth(f32),
     /// The sessions open side by side and where the split sits.
     Tiles {
         asids: Vec<String>,
@@ -515,6 +535,7 @@ impl DesktopConfig {
             ConfigEdit::Window(geometry) => self.window = geometry,
             ConfigEdit::SidebarWidth(width) => self.ui.sidebar_width = width,
             ConfigEdit::RightWidth(width) => self.ui.right_width = width,
+            ConfigEdit::TerminalWidth(width) => self.ui.terminal_width = width,
             ConfigEdit::Tiles { asids, split } => {
                 self.ui.tiles = asids;
                 self.ui.tile_split = split;

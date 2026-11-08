@@ -23,6 +23,7 @@ mod settings;
 mod shell;
 mod splash;
 mod tasks;
+mod terminal_panel;
 mod terminals;
 mod tiles;
 mod timeline;
@@ -117,6 +118,11 @@ fn sidebar_pane(s: &mut UiState) -> &mut PaneState {
 fn right_pane(s: &mut UiState) -> &mut PaneState {
     LAYOUT_DIRTY.store(true, Ordering::Release);
     &mut s.right
+}
+
+fn terminal_pane(s: &mut UiState) -> &mut PaneState {
+    LAYOUT_DIRTY.store(true, Ordering::Release);
+    &mut s.term.pane
 }
 
 /// The one open dropdown (or row menu), if any.
@@ -303,6 +309,8 @@ pub struct UiState {
     pub storage: Option<crate::model::storage::StorageReport>,
     /// The Terminals page (`ui/terminals.rs`).
     pub terms: terminals::TermState,
+    /// The terminal panel on the right (`ui/terminal_panel.rs`).
+    pub term: terminal_panel::TermPanel,
     /// What the status icon last showed (`ui/tray.rs`).
     tray_shown: Option<(crate::config::Language, Vec<(String, String)>)>,
     /// The command palette (`ui/palette.rs`), when open.
@@ -442,6 +450,7 @@ impl UiState {
             tray_shown: None,
             voice_form: voice::VoiceForm::new(&cfg.voice),
             terms: terminals::TermState::default(),
+            term: terminal_panel::TermPanel::new(cfg.ui.terminal()),
             tiles: Vec::new(),
             focus: 0,
             tile_split: cfg.ui.tile_split(),
@@ -477,6 +486,7 @@ impl UiState {
 
     /// Install the image cache once the window can wake it.
     pub fn install_images(&mut self, waker: rune::Waker) {
+        self.term.waker = Some(waker.clone());
         let cache = ImageCache::new(waker);
         let scheme = if self.dark {
             ColorScheme::Dark
@@ -501,7 +511,8 @@ impl UiState {
     /// Every frame Rune asks: the splash and a recording's waveform animate.
     pub fn poll_frame(&mut self, t: f64, tx: &mut Tx) -> bool {
         let voice = self.poll_voice();
-        self.poll_splash(t, tx) | voice
+        let term = self.poll_terminal();
+        self.poll_splash(t, tx) | voice | term
     }
 
     pub fn poll_splash(&mut self, _: f64, _: &mut Tx) -> bool {
@@ -703,7 +714,7 @@ impl UiState {
     /// Save the panes' widths when they changed (a drag, a double-click
     /// reset). Waits for a drag in progress to end.
     pub fn persist_layout(&mut self) {
-        if self.sidebar.is_resizing() || self.right.is_resizing() {
+        if self.sidebar.is_resizing() || self.right.is_resizing() || self.term.pane.is_resizing() {
             LAYOUT_DIRTY.store(true, Ordering::Release);
             return;
         }
@@ -713,6 +724,10 @@ impl UiState {
         }
         if (right - self.cfg.ui.right_width).abs() >= 1.0 {
             self.edit(ConfigEdit::RightWidth(right));
+        }
+        let terminal = self.term.pane.width();
+        if (terminal - self.cfg.ui.terminal_width).abs() >= 1.0 {
+            self.edit(ConfigEdit::TerminalWidth(terminal));
         }
     }
 
@@ -742,6 +757,11 @@ impl UiState {
     }
 
     pub fn toggle_inspector(&mut self) {
+        if self.term.open {
+            // One panel on the right at a time: the inspector takes it back.
+            self.close_terminal();
+            self.right_open = false;
+        }
         self.right_open = !self.right_open;
         self.right.set_open(self.right_open);
         if self.right_open {
@@ -1759,7 +1779,11 @@ pub fn activity_pill(
 
 use copy::tr;
 
-pub fn on_key(s: &mut UiState, ev: &KeyEvent, _tx: &mut Tx) -> bool {
+pub fn on_key(s: &mut UiState, ev: &KeyEvent, tx: &mut Tx) -> bool {
+    if crate::term::input::is_toggle(ev, tx.physical_key()) {
+        s.toggle_terminal();
+        return true;
+    }
     if ev.is_command('k') && !ev.mods.shift && !ev.mods.alt {
         s.toggle_palette();
         return true;

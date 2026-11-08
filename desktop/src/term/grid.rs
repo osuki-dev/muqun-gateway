@@ -212,7 +212,6 @@ pub struct Frame {
     pub rows: u16,
     pub grid: Vec<Arc<Row>>,
     pub cursor: Option<Cursor>,
-    pub fg: Rgb,
     pub bg: Rgb,
     pub cursor_color: Rgb,
     pub title: String,
@@ -221,8 +220,6 @@ pub struct Frame {
     pub mouse_tracking: bool,
     /// The selection's text, when there is one.
     pub selection: Option<String>,
-    /// Bumps with every frame the emulator publishes.
-    pub generation: u64,
 }
 
 #[cfg(test)]

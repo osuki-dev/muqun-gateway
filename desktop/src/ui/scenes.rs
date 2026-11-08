@@ -478,6 +478,7 @@ fn inbox(s: &mut UiState) {
 }
 
 include!("scenes_timeline.rs");
+include!("scenes_terminal.rs");
 const VIEWER_CODE: &str = r#"//! Retry a flaky request with capped exponential backoff.
 
 use std::time::Duration;
@@ -888,6 +889,12 @@ pub fn scenes() -> &'static [Scene] {
         ("timeline-long", timeline_long),
         ("timeline-zh", timeline_zh),
         ("terminals", terminals_scene),
+        ("terminal", |s| terminal_scene(s, shell_fixture)),
+        ("terminal-vim", |s| terminal_scene(s, vim_fixture)),
+        ("terminal-jade", |s| {
+            with_pack(s, "jade-tempest");
+            terminal_scene(s, shell_fixture);
+        }),
         ("terminals-tw", |s| {
             terminals_scene(s);
             s.cfg.general.language = crate::config::Language::ZhTw;
