@@ -65,20 +65,48 @@ fn slim_block(block: &mut Value) {
         });
         return;
     }
+    let mime = ["mimeType", "mime", "media_type", "mediaType"]
+        .iter()
+        .find_map(|k| rec.get(*k).and_then(Value::as_str))
+        .unwrap_or("")
+        .to_string();
     for key in ["data", "base64"] {
-        if rec
+        let Some(data) = rec
             .get(key)
             .and_then(Value::as_str)
-            .is_some_and(|d| d.len() > INLINE_IMAGE_BYTES)
-        {
-            rec.insert(key.into(), Value::String(String::new()));
-            rec.insert("omitted".into(), Value::Bool(true));
+            .filter(|d| d.len() > INLINE_IMAGE_BYTES)
+        else {
+            continue;
+        };
+        // The picture is kept as a file the row points at.
+        if !rec.contains_key("uri") {
+            if let Some(path) = super::media::store_inline(data, &mime) {
+                rec.insert(
+                    "uri".into(),
+                    Value::String(path.to_string_lossy().into_owned()),
+                );
+            }
         }
+        rec.insert(key.into(), Value::String(String::new()));
+        rec.insert("omitted".into(), Value::Bool(true));
     }
-    // Anthropic's `{type: "image", source: {data}}`.
-    if let Some(source) = rec.get_mut("source") {
+    // Anthropic's `{type: "image", source: {data}}`: the file goes on the block.
+    let stored = rec.get_mut("source").and_then(|source| {
         slim_block(source);
+        source.get("uri").cloned().map(|uri| (uri, mime_of(source)))
+    });
+    if let Some((uri, mime)) = stored {
+        rec.entry("uri").or_insert(uri);
+        rec.entry("mimeType").or_insert(Value::String(mime));
     }
+}
+
+fn mime_of(source: &Value) -> String {
+    ["media_type", "mimeType", "mime"]
+        .iter()
+        .find_map(|k| source.get(*k).and_then(Value::as_str))
+        .unwrap_or("image/png")
+        .to_string()
 }
 
 fn slim_list(value: &mut Value) {

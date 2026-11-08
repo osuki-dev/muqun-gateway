@@ -841,6 +841,35 @@ impl SessionHub for RemoteHub {
         })
     }
 
+    fn media<'a>(&'a self, path: &'a str) -> HubFuture<'a, Vec<u8>> {
+        Box::pin(async move {
+            // Only the gateway's own media routes: never a URL a row names.
+            let path = path.split('?').next().unwrap_or(path);
+            let segments: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+            if !matches!(segments.as_slice(), ["api", "agent-images" | "assets", ..]) {
+                return Err(HubError::Agent(AgentError::Unsupported("media".into())));
+            }
+            let answer = self
+                .http
+                .get(self.url(&segments, &[]))
+                .bearer_auth(&self.token)
+                .send()
+                .await
+                .map_err(|err| HubError::Agent(AgentError::Network(err.to_string())))?;
+            if !answer.status().is_success() {
+                return Err(HubError::Agent(AgentError::Network(format!(
+                    "media answered {}",
+                    answer.status()
+                ))));
+            }
+            answer
+                .bytes()
+                .await
+                .map(|b| b.to_vec())
+                .map_err(|err| HubError::Agent(AgentError::Network(err.to_string())))
+        })
+    }
+
     fn store_attachment<'a>(
         &'a self,
         name: &'a str,
