@@ -112,7 +112,7 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
 /// The least of the window floor that returns under the sidebar's lists,
 /// so a picture there is felt rather than read (light, dark): a picture
 /// over a light floor reads louder.
-const SIDEBAR_WASH: [f32; 2] = [0.5, 0.4];
+const SIDEBAR_WASH: [f32; 2] = [0.62, 0.4];
 
 /// The main card's opacity over the window's wallpaper outside Home.
 const CARD_ALPHA: f32 = 0.9;
