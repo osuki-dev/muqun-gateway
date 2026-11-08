@@ -6,6 +6,7 @@ mod config;
 mod hub;
 mod model;
 mod platform;
+mod term;
 mod theme;
 mod ui;
 

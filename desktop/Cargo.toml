@@ -43,6 +43,9 @@ hex = "0.4"
 # Native file / folder dialogs (`platform/dialogs.rs`).
 rfd = "0.17.2"
 unicode-segmentation = "1.13"
+# The terminal panel's emulator (`term/`). Its -sys crate builds Ghostty's
+# libghostty-vt from source with Zig 0.15.2 (`mise exec zig@0.15.2 -- cargo …`).
+libghostty-vt = "0.2.2"
 # Dictation's microphone (`platform/mic.rs`): ALSA, Core Audio, WASAPI.
 cpal = "0.17.3"
 
