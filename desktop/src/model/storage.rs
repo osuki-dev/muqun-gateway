@@ -6,7 +6,8 @@ use std::path::{Path, PathBuf};
 /// Bytes per folder of the state directory.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StorageReport {
-    /// Theme gallery card pictures and the library's thumbnails (rebuilt on demand).
+    /// Theme gallery card pictures, the library's thumbnails and timeline
+    /// pictures fetched from the gateway (rebuilt on demand).
     pub previews: u64,
     /// The gallery index cache (refetched when stale).
     pub gallery: u64,
@@ -69,7 +70,7 @@ pub fn scan() -> StorageReport {
     let Ok((_, state)) = crate::platform::directories() else {
         return StorageReport::default();
     };
-    let previews = dir_size(&state.join(PREVIEWS));
+    let previews = dir_size(&state.join(PREVIEWS)) + dir_size(&state.join(super::media::DIR));
     let gallery = dir_size(&state.join(GALLERY));
     let uploads = dir_size(&state.join(UPLOADS));
     let total = dir_size(&state);
@@ -87,7 +88,7 @@ pub fn clear_caches() {
     let Ok((_, state)) = crate::platform::directories() else {
         return;
     };
-    for name in [PREVIEWS, GALLERY] {
+    for name in [PREVIEWS, GALLERY, super::media::DIR] {
         let dir = state.join(name);
         if let Ok(entries) = std::fs::read_dir(&dir) {
             for entry in entries.flatten() {

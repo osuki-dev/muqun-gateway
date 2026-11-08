@@ -22,13 +22,9 @@ use crate::model::compose::{ComposeCommand, Deliver, Source, Target};
 const CHIP_THUMB_W: f32 = 56.0;
 const CHIP_THUMB_H: f32 = 40.0;
 
-/// The most file hits the `@` popup lists (App `FILE_MENTION_LIMIT` page is 20;
-/// the panel shows a short head like the App's visible rows).
-const MAX_FILE_ROWS: usize = 8;
-/// The most `/` command rows.
-const MAX_SLASH_ROWS: usize = 12;
-/// The most `$` skill rows.
-const MAX_SKILL_ROWS: usize = 12;
+/// The most file hits the `@` popup lists (App `FILE_MENTION_LIMIT`); the
+/// list scrolls, as `/` and `$` (uncapped, as the App) do.
+const MAX_FILE_ROWS: usize = 20;
 
 fn fresh(text: String) -> TextEdit {
     let mut edit = TextEdit::new(text);
@@ -319,6 +315,8 @@ pub(super) fn on_draft_change(s: &mut UiState, slot: Slot) {
         return;
     };
     let Some((agent, directory)) = mention_search_target(s, slot) else {
+        // No folder to search: no stale hits from another one.
+        s.file_hits.clear();
         return;
     };
     let generation = s.next_token;
@@ -644,7 +642,7 @@ fn slash_trigger(s: &UiState, slot: Slot) -> Trigger {
         char: '/',
         anchor: TriggerAnchor::Start,
         items,
-        limit: Some(MAX_SLASH_ROWS),
+        limit: None,
     }
 }
 
@@ -685,7 +683,7 @@ fn skill_trigger(s: &UiState, slot: Slot) -> Trigger {
         char: '$',
         anchor: TriggerAnchor::Start,
         items,
-        limit: Some(MAX_SKILL_ROWS),
+        limit: None,
     }
 }
 
@@ -702,58 +700,192 @@ fn section_header(id: &str, label: &str) -> TriggerItem {
     }
 }
 
-fn mention_trigger(s: &UiState) -> Trigger {
-    let mut peers: Vec<_> = s.peers.iter().collect();
+/// The `@` popup (App `file-mention-panel`): computers whose name starts
+/// with the term (this one, then reachable, then offline, which cannot be
+/// picked) under their heading, then the gateway's file matches as it
+/// ranked them, headed only before anything is typed.
+fn mention_popup(s: &UiState, slot: Slot) -> PopupState {
+    use crate::model::composer_popup::{scan_query, ClosedReason};
+    let draft = draft_of(s, slot);
+    let caret = draft_caret(draft);
+    let Some(query) = scan_query(&draft.text, caret, '@', TriggerAnchor::Word) else {
+        return PopupState::Closed {
+            reason: ClosedReason::NoQuery,
+        };
+    };
+    if s.popup_dismissed_at == Some(query.start) || query.term.chars().count() > 96 {
+        return PopupState::Closed {
+            reason: ClosedReason::Dismissed,
+        };
+    }
+    let language = s.cfg.general.language;
+    let term = query.term.to_lowercase();
+    let mut peers: Vec<_> = s
+        .peers
+        .iter()
+        .filter(|p| p.name.to_lowercase().starts_with(&term))
+        .collect();
     peers.sort_by_key(|p| match (p.current, p.reachable) {
         (true, _) => 0,
         (false, true) => 1,
         (false, false) => 2,
     });
-    let mut items: Vec<TriggerItem> = Vec::new();
+    let mut rows: Vec<PopupRow> = Vec::new();
     if !peers.is_empty() {
-        items.push(section_header("hdr:computers", "Computers"));
-        items.extend(peers.into_iter().map(|p| {
+        rows.push(section_header("hdr:computers", tr_ref(language, "Computers", "电脑")).row);
+        rows.extend(peers.into_iter().map(|p| {
             let detail = if p.current {
-                "This computer"
+                tr_ref(language, "This computer", "本机")
             } else if p.reachable {
-                "Computer"
+                ""
             } else {
-                "Offline"
+                tr_ref(language, "Offline", "离线")
             };
-            let insert = format!("@{}", p.name);
-            TriggerItem {
-                // Empty search keeps headers out of fuzzy filter when term is set;
-                // peers still match on name.
-                search: vec![p.name.clone(), detail.to_string()],
-                row: PopupRow {
-                    id: format!("p:{}", p.name),
-                    label: insert.clone(),
-                    description: detail.into(),
-                    insert,
-                    disabled: !p.reachable,
-                },
+            PopupRow {
+                id: format!("p:{}", p.name),
+                label: format!("@{}", p.name),
+                description: detail.into(),
+                insert: format!("@{}", p.name),
+                disabled: !p.reachable,
             }
         }));
     }
-    let files: Vec<_> = s.file_hits.iter().take(MAX_FILE_ROWS).collect();
-    if !files.is_empty() {
-        items.push(section_header("hdr:files", "Files"));
-        items.extend(files.into_iter().map(|h| TriggerItem {
-            search: vec![h.name.clone(), h.path.clone()],
-            row: PopupRow {
-                id: format!("f:{}", h.path),
-                label: h.name.clone(),
-                description: h.path.clone(),
-                insert: h.path.clone(),
-                disabled: false,
-            },
-        }));
+    let files = s.file_hits.iter().take(MAX_FILE_ROWS);
+    if !s.file_hits.is_empty() && term.is_empty() {
+        rows.push(
+            section_header(
+                "hdr:files",
+                tr_ref(language, "Files in this project", "此项目中的文件"),
+            )
+            .row,
+        );
     }
-    Trigger {
-        char: '@',
-        anchor: TriggerAnchor::Word,
-        items,
-        limit: Some(MAX_FILE_ROWS + 16),
+    rows.extend(files.map(|h| PopupRow {
+        id: format!("f:{}", h.path),
+        label: h.name.clone(),
+        description: h.path.clone(),
+        insert: h.path.clone(),
+        disabled: false,
+    }));
+    if rows.is_empty() {
+        return PopupState::Closed {
+            reason: ClosedReason::NoMatch,
+        };
+    }
+    PopupState::Open { query, rows }
+}
+
+/// The popup the draft calls for now: `/` commands, `$` skills or `@`
+/// mentions (one at a time), with its key and label.
+fn current_popup(s: &UiState, slot: Slot) -> Option<(&'static str, &'static str, PopupState)> {
+    let draft = draft_of(s, slot);
+    let caret = Some(draft_caret(draft));
+    let dismissed = s.popup_dismissed_at;
+    let language = s.cfg.general.language;
+    let slash = read_popup(&draft.text, caret, &slash_trigger(s, slot), dismissed, true);
+    if slash.open() {
+        return Some(("slash-popup", tr_ref(language, "Commands", "命令"), slash));
+    }
+    let skills = read_popup(&draft.text, caret, &skill_trigger(s, slot), dismissed, true);
+    if skills.open() {
+        return Some(("skill-popup", tr_ref(language, "Skills", "技能"), skills));
+    }
+    let mentions = mention_popup(s, slot);
+    mentions.open().then(|| {
+        (
+            "mention-popup",
+            tr_ref(language, "Mentions", "提及"),
+            mentions,
+        )
+    })
+}
+
+fn pickable(row: &PopupRow) -> bool {
+    !row.disabled && !row.id.starts_with("hdr:")
+}
+
+/// The keyboard's row in an open popup: the one it moved to while the
+/// query stays the same, else the first that can be picked.
+fn active_row(s: &UiState, state: &PopupState) -> Option<usize> {
+    let PopupState::Open { query, rows } = state else {
+        return None;
+    };
+    s.popup_active
+        .as_ref()
+        .filter(|(start, term, at)| {
+            *start == query.start && *term == query.term && rows.get(*at).is_some_and(pickable)
+        })
+        .map(|(_, _, at)| *at)
+        .or_else(|| rows.iter().position(pickable))
+}
+
+/// Pick row `id` of the open popup into the draft.
+fn choose(s: &mut UiState, slot: Slot, query: &crate::model::composer_popup::PopupQuery, id: &str) {
+    if id.starts_with("hdr:") {
+        return;
+    }
+    let (insert, kind) = match id.split_once(':') {
+        Some(("c", name)) => {
+            let insert = if name.starts_with('/') {
+                name.to_string()
+            } else {
+                format!("/{name}")
+            };
+            (insert, PickKind::Plain)
+        }
+        Some(("s", id)) => (format!("${id}"), PickKind::Plain),
+        Some(("p", name)) => (format!("@{name}"), PickKind::Computer),
+        Some(("f", path)) => (path.to_string(), PickKind::File),
+        _ => return,
+    };
+    s.popup_active = None;
+    apply_pick(s, slot, query, &insert, kind);
+}
+
+/// The draft field's keys while a popup is open: ↑ ↓ move (wrapping, over
+/// headers and offline computers), Tab or Return pick, Esc dismisses.
+pub(super) fn popup_key(s: &mut UiState, slot: Slot, ev: &rune::KeyEvent) -> bool {
+    if ev.mods.cmd || ev.mods.ctrl || ev.mods.alt {
+        return false;
+    }
+    let Some((_, _, state)) = current_popup(s, slot) else {
+        return false;
+    };
+    let PopupState::Open { query, rows } = &state else {
+        return false;
+    };
+    let picks: Vec<usize> = (0..rows.len()).filter(|i| pickable(&rows[*i])).collect();
+    let at = active_row(s, &state);
+    match ev.key {
+        rune::Key::Up | rune::Key::Down => {
+            if picks.is_empty() {
+                return true;
+            }
+            let here = at
+                .and_then(|a| picks.iter().position(|p| *p == a))
+                .unwrap_or(0);
+            let next = if ev.key == rune::Key::Down {
+                (here + 1) % picks.len()
+            } else {
+                (here + picks.len() - 1) % picks.len()
+            };
+            s.popup_active = Some((query.start, query.term.clone(), picks[next]));
+            true
+        }
+        rune::Key::Tab | rune::Key::Enter if !ev.mods.shift => {
+            let Some(at) = at else {
+                return false;
+            };
+            let (query, id) = (query.clone(), rows[at].id.clone());
+            choose(s, slot, &query, &id);
+            true
+        }
+        rune::Key::Escape => {
+            s.popup_dismissed_at = Some(query.start);
+            s.popup_active = None;
+            true
+        }
+        _ => false,
     }
 }
 
@@ -770,6 +902,7 @@ fn popup_rows(state: &PopupState) -> Vec<PopupItem> {
 }
 
 fn mount_popup(
+    s: &UiState,
     k: &Kit,
     layer: &mut Vec<El>,
     key: &str,
@@ -784,79 +917,45 @@ fn mount_popup(
     if items.is_empty() {
         return;
     }
+    let active = active_row(s, &state);
     let query = state.query().cloned();
-    let disabled: std::collections::HashSet<String> = state
-        .rows()
-        .iter()
-        .filter(|r| r.disabled)
-        .map(|r| r.id.clone())
-        .collect();
-    PopupList::<UiState>::new(key, "composer")
-        .width(360.0)
+    let hover_query = query.clone();
+    // Over the field the draft is typed in (below it when the window has
+    // no room above), never the window's corner: Home's field is not the
+    // session composer.
+    let anchor = match slot {
+        Slot::Session => "draft",
+        Slot::Start => "start-draft",
+    };
+    PopupList::<UiState>::new(key, anchor)
+        .anchored(anchor, rune::Side::Top, rune::Align::Start, 6.0)
+        .width(380.0)
+        .max_height(300.0)
         .label(label)
         .items(items)
-        .on_choose(move |s: &mut UiState, id: &str, _: &mut Tx| {
-            if disabled.contains(id) || id.starts_with("hdr:") {
-                return;
+        .active(active)
+        .on_active(move |s: &mut UiState, at: usize| {
+            if let Some(q) = hover_query.as_ref() {
+                s.popup_active = Some((q.start, q.term.clone(), at));
             }
-            let Some(query) = query.as_ref() else {
-                return;
-            };
-            let (insert, kind) = match id.split_once(':') {
-                Some(("c", name)) => {
-                    let insert = if name.starts_with('/') {
-                        name.to_string()
-                    } else {
-                        format!("/{name}")
-                    };
-                    (insert, PickKind::Plain)
-                }
-                Some(("s", id)) => (format!("${id}"), PickKind::Plain),
-                Some(("p", name)) => (format!("@{name}"), PickKind::Computer),
-                Some(("f", path)) => (path.to_string(), PickKind::File),
-                _ => return,
-            };
-            apply_pick(s, slot, query, &insert, kind);
+        })
+        .on_choose(move |s: &mut UiState, id: &str, _: &mut Tx| {
+            if let Some(query) = query.as_ref() {
+                choose(s, slot, query, id);
+            }
         })
         .on_close(move |s: &mut UiState| {
-            let caret = draft_caret(draft_of(s, slot));
-            for (ch, anchor) in [
-                ('/', TriggerAnchor::Start),
-                ('$', TriggerAnchor::Start),
-                ('@', TriggerAnchor::Word),
-            ] {
-                if let Some(q) = crate::model::composer_popup::scan_query(
-                    &draft_of(s, slot).text,
-                    caret,
-                    ch,
-                    anchor,
-                ) {
-                    s.popup_dismissed_at = Some(q.start);
-                    return;
-                }
+            if let Some((_, _, PopupState::Open { query, .. })) = current_popup(s, slot) {
+                s.popup_dismissed_at = Some(query.start);
             }
         })
         .build(k, layer);
 }
 
-/// Mount whichever popup the draft calls for, above the composer.
+/// Mount whichever popup the draft calls for, at its field.
 pub(super) fn popup(s: &UiState, k: &Kit, layer: &mut Vec<El>, slot: Slot) {
-    let draft = draft_of(s, slot);
-    let caret = Some(draft_caret(draft));
-    let dismissed = s.popup_dismissed_at;
-    let slash = read_popup(&draft.text, caret, &slash_trigger(s, slot), dismissed, true);
-    if slash.open() {
-        mount_popup(k, layer, "slash-popup", "Commands", slot, slash);
-        return;
-    }
-    let skills = read_popup(&draft.text, caret, &skill_trigger(s, slot), dismissed, true);
-    if skills.open() {
-        mount_popup(k, layer, "skill-popup", "Skills", slot, skills);
-        return;
-    }
-    let mentions = read_popup(&draft.text, caret, &mention_trigger(s), dismissed, true);
-    if mentions.open() {
-        mount_popup(k, layer, "mention-popup", "Mentions", slot, mentions);
+    if let Some((key, label, state)) = current_popup(s, slot) {
+        mount_popup(s, k, layer, key, label, slot, state);
     }
 }
 
@@ -1276,30 +1375,48 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         .and_then(|i| i.directory.clone().map(PathBuf::from));
     let has_text = !s.draft.text.trim().is_empty() || !s.staged.is_empty();
 
-    // The row under the field: chips on the left, actions on the right.
-    let mut actions = row()
-        .key("composer-actions")
-        .w_full()
-        .gap(8.0)
-        .center_y()
-        .child(pills(s, k, layer).grow(1.0).shrink().min_w(0.0))
-        .child(super::voice::mic_button(s, k))
-        .child(
-            Button::new(tr_ref(language, "Attach", "附件"))
-                .variant(ButtonVariant::Ghost)
-                .control_size(ControlSize::Regular)
-                .disabled(!has_session)
-                .help(format!(
-                    "{} · {}",
-                    tr_ref(language, "Add files or an image", "添加文件或图片"),
-                    crate::platform::keys::label("Primary+V")
-                ))
-                .on_press(move |_: &mut UiState| {
-                    crate::platform::dialogs::attach_files(start.clone());
-                })
-                .build(k)
-                .key("attach"),
-        );
+    // The row under the field: chips on the left, actions on the right. A
+    // narrow column gives the chips their own line, and Attach its icon.
+    let fit = super::Fit::of("composer");
+    let attach_help = format!(
+        "{} · {}",
+        tr_ref(language, "Add files or an image", "添加文件或图片"),
+        crate::platform::keys::label("Primary+V")
+    );
+    let attach_press = move |_: &mut UiState| {
+        crate::platform::dialogs::attach_files(start.clone());
+    };
+    let attach = if fit == super::Fit::Wide {
+        Button::new(tr_ref(language, "Attach", "附件"))
+            .variant(ButtonVariant::Ghost)
+            .control_size(ControlSize::Regular)
+            .disabled(!has_session)
+            .help(attach_help)
+            .on_press(attach_press)
+            .build(k)
+            .key("attach")
+    } else {
+        rune_kit::IconButton::new(&super::parts::glyphs::ATTACH)
+            .variant(rune_kit::IconButtonVariant::Ghost)
+            .label(tr_ref(language, "Attach", "附件"))
+            .help(attach_help)
+            .disabled(!has_session)
+            .on_press(attach_press)
+            .build(k)
+            .key("attach")
+    };
+    let pill_row = pills(s, k, layer);
+    let mut actions = row().key("composer-actions").w_full().gap(8.0).center_y();
+    let pill_line = if fit == super::Fit::Wide {
+        actions = actions.child(pill_row.grow(1.0).shrink().min_w(0.0));
+        None
+    } else {
+        Some(pill_row.w_full())
+    };
+    actions = actions.child(super::voice::mic_button(s, k)).child(attach);
+    if pill_line.is_some() {
+        actions = actions.child(el().grow(1.0));
+    }
     if busy {
         if let Some(asid) = s.selected.clone() {
             actions = actions.child(
@@ -1360,31 +1477,33 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     if let Some(dictation) = super::voice::strip(s, k) {
         card = card.child(dictation);
     }
-    card = card
-        .child(
-            TextArea::new(&s.draft)
-                .placeholder(placeholder)
-                .label(tr_ref(language, "Draft", "草稿"))
-                .width(None)
-                .auto_grow(2, 8)
-                .pill_style(move |id| {
-                    if id.starts_with("computer:") {
-                        PillStyle::default().bg(accent.alpha(0.22)).fg(accent)
-                    } else if id.starts_with("file:") {
-                        PillStyle::default().bg(info.alpha(0.18)).fg(info)
-                    } else {
-                        PillStyle::default()
-                    }
-                })
-                .on_edit(|s: &mut UiState| &mut s.draft)
-                .on_change(|s: &mut UiState, _: &mut Tx| on_draft_change(s, Slot::Session))
-                .on_submit(|s: &mut UiState, _: &mut Tx| submit_session(s))
-                .on_input_paste(|s: &mut UiState, content, _: &mut Tx| take_paste(s, content))
-                .build(k)
-                .key("draft")
-                .w_full(),
-        )
-        .child(actions);
+    card = card.child(
+        TextArea::new(&s.draft)
+            .placeholder(placeholder)
+            .label(tr_ref(language, "Draft", "草稿"))
+            .width(None)
+            .auto_grow(2, 8)
+            .pill_style(move |id| {
+                if id.starts_with("computer:") {
+                    PillStyle::default().bg(accent.alpha(0.22)).fg(accent)
+                } else if id.starts_with("file:") {
+                    PillStyle::default().bg(info.alpha(0.18)).fg(info)
+                } else {
+                    PillStyle::default()
+                }
+            })
+            .on_edit(|s: &mut UiState| &mut s.draft)
+            .on_change(|s: &mut UiState, _: &mut Tx| on_draft_change(s, Slot::Session))
+            .on_submit(|s: &mut UiState, _: &mut Tx| submit_session(s))
+            .on_input_paste(|s: &mut UiState, content, _: &mut Tx| take_paste(s, content))
+            .build(k)
+            .key("draft")
+            .w_full(),
+    );
+    if let Some(line) = pill_line {
+        card = card.child(line);
+    }
+    card = card.child(actions);
 
     // The card: glass over the pane, lit in the accent while the field has
     // focus, breathing in the agent's colour while it works.
@@ -1430,16 +1549,19 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     } else {
         hint = hint.child(el().grow(1.0));
     }
-    hint = hint.child(muted(
-        k,
-        format!(
-            "{} {} · {} {}",
-            crate::platform::keys::label("Primary+Enter"),
-            tr_ref(language, "to send", "发送"),
-            crate::platform::keys::label("Primary+V"),
-            tr_ref(language, "to paste files or an image", "粘贴文件或图片"),
-        ),
-    ));
+    // The keys are a wide column's footnote; a narrow one keeps the room.
+    if fit == super::Fit::Wide {
+        hint = hint.child(muted(
+            k,
+            format!(
+                "{} {} · {} {}",
+                crate::platform::keys::label("Primary+Enter"),
+                tr_ref(language, "to send", "发送"),
+                crate::platform::keys::label("Primary+V"),
+                tr_ref(language, "to paste files or an image", "粘贴文件或图片"),
+            ),
+        ));
+    }
 
     col()
         .key("composer")

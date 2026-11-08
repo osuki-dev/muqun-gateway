@@ -115,6 +115,12 @@ fn sidebar_pane(s: &mut UiState) -> &mut PaneState {
     &mut s.sidebar
 }
 
+fn inspect_pane(s: &mut UiState) -> &mut PaneState {
+    &mut s.inspect_pane
+}
+
+pub use parts::pane::{Inspect, RowMenu};
+
 fn right_pane(s: &mut UiState) -> &mut PaneState {
     LAYOUT_DIRTY.store(true, Ordering::Release);
     &mut s.right
@@ -217,6 +223,12 @@ pub struct UiState {
     pub zoom: Option<PathBuf>,
     /// A subagent's session shown read-only over its parent (`timeline::overlay`).
     pub detail: Option<timeline::DetailSheet>,
+    /// The timeline row open in the right-hand detail pane (`parts::pane`).
+    pub inspect: Option<Inspect>,
+    /// The detail pane's width.
+    pub inspect_pane: PaneState,
+    /// A timeline row's context menu, where it was asked for.
+    pub row_menu: Option<RowMenu>,
     /// The session whose context sheet is open (`timeline::context_meter`).
     pub context_open: Option<String>,
     /// Account rate windows by agent, once asked for (`None`: it has none).
@@ -245,6 +257,8 @@ pub struct UiState {
     /// Esc dismissed a composer popup at this query start; forgotten when the
     /// trigger leaves the draft (App `dismissedAt`).
     pub popup_dismissed_at: Option<usize>,
+    /// The composer popup's keyboard row: (query start, term, row).
+    pub popup_active: Option<(usize, String, usize)>,
     /// File paths inserted as `@` mentions (App `fileTokens`), for highlight /
     /// atomic delete of typed paths still standing in the draft.
     pub mention_file_tokens: Vec<String>,
@@ -380,6 +394,9 @@ impl UiState {
             timelines: HashMap::new(),
             zoom: None,
             detail: None,
+            inspect: None,
+            inspect_pane: PaneState::new(440.0).range(320.0, 760.0),
+            row_menu: None,
             context_open: None,
             account_limits: HashMap::new(),
             status: "Starting…".into(),
@@ -401,6 +418,7 @@ impl UiState {
             branches: HashMap::new(),
             peers: Vec::new(),
             popup_dismissed_at: None,
+            popup_active: None,
             mention_file_tokens: Vec::new(),
             draft_snap: String::new(),
             draft_snap_caret: 0,
@@ -1157,6 +1175,12 @@ impl UiState {
                     }
                 }
                 Update::Storage(report) => self.storage = Some(report),
+                Update::MediaReady => {
+                    // Placeholders become pictures: rows measure again.
+                    for tl in self.timelines.values_mut() {
+                        tl.rev += 1;
+                    }
+                }
                 Update::Tasks { rows, default_cwd } => {
                     self.tasks = rows;
                     self.task_cwd = default_cwd;
@@ -1737,11 +1761,52 @@ pub fn ago(updated_ms: u64, now: u64, language: crate::config::Language) -> Stri
 }
 
 /// A small status pill: a dot (or spinner) and a word, in the state's colour.
+/// How much room a column has, read from its last layout: chrome drops
+/// its secondary pieces as a right-hand panel squeezes the session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Fit {
+    /// Under ~400 pt: one thing per line, icons for words.
+    Tight,
+    /// Under ~640 pt: secondary pieces fold away.
+    Narrow,
+    Wide,
+}
+
+impl Fit {
+    pub fn of_width(width: f32) -> Fit {
+        if width < 400.0 {
+            Fit::Tight
+        } else if width < 640.0 {
+            Fit::Narrow
+        } else {
+            Fit::Wide
+        }
+    }
+
+    /// The fit of the element keyed `key`, as it was last laid out (wide
+    /// before its first layout).
+    pub fn of(key: &str) -> Fit {
+        rune::memo::layout_with(key, |r| Fit::of_width(r[2])).unwrap_or(Fit::Wide)
+    }
+}
+
 pub fn activity_pill(
     k: &Kit,
     look: &Look,
     activity: Activity,
     language: crate::config::Language,
+) -> El {
+    activity_mark(k, look, activity, language, true)
+}
+
+/// The activity pill, or with `word` false only its mark (a narrow
+/// header), the word kept as its label and tooltip.
+pub fn activity_mark(
+    k: &Kit,
+    look: &Look,
+    activity: Activity,
+    language: crate::config::Language,
+    word_shown: bool,
 ) -> El {
     let (color, word) = match activity {
         Activity::Working => (k.c.text_accent, tr(language, "Working", "工作中")),
@@ -1754,7 +1819,7 @@ pub fn activity_pill(
         Activity::NeedsYou => look.pulse(rune::el().size(7.0, 7.0).radius(3.5).fill(color)),
         _ => rune::el().size(7.0, 7.0).radius(3.5).fill(color),
     };
-    rune::row()
+    let pill = rune::row()
         .key("activity")
         .h(20.0)
         .px(8.0)
@@ -1768,13 +1833,17 @@ pub fn activity_pill(
         }))
         .role("status")
         .label(word.clone())
-        .child(mark.a11y_hidden())
-        .child(
-            rune::text(word)
-                .font(k.ty.small_medium)
-                .color(color)
-                .a11y_hidden(),
-        )
+        .help(word.clone())
+        .child(mark.a11y_hidden());
+    if !word_shown {
+        return pill.px(6.0);
+    }
+    pill.child(
+        rune::text(word)
+            .font(k.ty.small_medium)
+            .color(color)
+            .a11y_hidden(),
+    )
 }
 
 use copy::tr;
@@ -1796,6 +1865,9 @@ pub fn on_key(s: &mut UiState, ev: &KeyEvent, tx: &mut Tx) -> bool {
         return true;
     } else if is_sidebar_toggle(ev) {
         s.sidebar.toggle();
+        return true;
+    }
+    if s.timeline_key(ev, tx) {
         return true;
     }
     if ev.is_command('t') && ev.mods.shift && !ev.mods.alt {
@@ -1864,6 +1936,7 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>) -> El {
     if let Some(zoom) = timeline::overlay(s, &k) {
         layer.push(zoom);
     }
+    parts::pane::row_menu(s, &k, &mut layer);
     welcome::mount(s, &k, &mut layer);
     if let (Some(splash), Some(images)) = (s.splash.as_ref(), s.images.as_ref()) {
         let hub_ready = !s.hub_label.is_empty();

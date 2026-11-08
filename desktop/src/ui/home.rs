@@ -834,6 +834,9 @@ fn quick_start(s: &UiState, k: &Kit, look: &Look, layer: &mut Vec<El>) -> El {
                     }
                 })
                 .on_edit(|s: &mut UiState| &mut s.start_draft)
+                .on_key(|s: &mut UiState, ev: &rune::KeyEvent, _: &mut Tx| {
+                    composer::popup_key(s, Slot::Start, ev)
+                })
                 .on_change(|s: &mut UiState, _: &mut Tx| composer::on_draft_change(s, Slot::Start))
                 .on_submit(|s: &mut UiState, _: &mut Tx| submit_start(s))
                 .on_input_paste(|s: &mut UiState, content, _: &mut Tx| {

@@ -200,6 +200,8 @@ struct Core {
     /// window, and a second ask this soon is answered by the first.
     refreshed_at: Mutex<Option<std::time::Instant>>,
     tasks_reading: std::sync::atomic::AtomicBool,
+    /// Gateway pictures being fetched into the media cache.
+    fetching: Arc<Mutex<std::collections::HashSet<String>>>,
 }
 
 /// Start the core side. Returns at once; the tasks live as long as the
@@ -228,6 +230,7 @@ pub fn spawn(
         beat: AtomicU64::new(0),
         refreshed_at: Mutex::new(None),
         tasks_reading: Default::default(),
+        fetching: Default::default(),
     });
     core.inbox.push(Update::HubMode(core.hub.mode()));
     tokio::spawn(core.clone().events());
@@ -333,7 +336,7 @@ impl Core {
             }
             Command::LoadEarlier(asid) => match self.hub.earlier(&asid).await {
                 Ok(mut items) => {
-                    super::compact::slim(&mut items);
+                    self.ready_rows(&mut items);
                     let exhausted = items.is_empty();
                     tracing::debug!(asid = %asid.0, rows = items.len(), "older history page");
                     self.inbox.push(Update::Earlier {
@@ -887,10 +890,45 @@ impl Core {
         }
     }
 
+    /// Rows on their way to the UI: slimmed, and any picture only the
+    /// gateway holds fetched into the media cache (the UI redraws when it
+    /// lands).
+    fn ready_rows(&self, items: &mut [muqun_gateway::agents::TimelineItem]) {
+        super::compact::slim(items);
+        let urls = super::media::missing(items);
+        if urls.is_empty() {
+            return;
+        }
+        for url in urls {
+            if !self.fetching.lock().unwrap().insert(url.clone()) {
+                continue;
+            }
+            let (hub, inbox, fetching) = (
+                Arc::clone(&self.hub),
+                Arc::clone(&self.inbox),
+                Arc::clone(&self.fetching),
+            );
+            tokio::spawn(async move {
+                let landed = match hub.media(&url).await {
+                    Ok(bytes) => super::media::target(&url)
+                        .is_some_and(|path| super::media::write(&path, &bytes)),
+                    Err(err) => {
+                        tracing::debug!(%url, %err, "timeline picture unavailable");
+                        false
+                    }
+                };
+                fetching.lock().unwrap().remove(&url);
+                if landed {
+                    inbox.push(Update::MediaReady);
+                }
+            });
+        }
+    }
+
     /// A session's snapshot to the view, and its waiting prompts to the
     /// composer (the view keeps no inbox).
     fn push_snapshot(&self, mut snapshot: muqun_gateway::agents::ports::AgentSessionSnapshot) {
-        super::compact::slim(&mut snapshot.timeline);
+        self.ready_rows(&mut snapshot.timeline);
         self.last_seq
             .lock()
             .unwrap()
@@ -994,7 +1032,7 @@ impl Core {
         }
         match self.hub.timeline_after(asid, after).await {
             Ok(mut found) if !found.resync => {
-                super::compact::slim(&mut found.items);
+                self.ready_rows(&mut found.items);
                 if !found.items.is_empty() {
                     self.last_seq
                         .lock()
@@ -1171,7 +1209,7 @@ impl Core {
                         }
                         let mut event = event;
                         if let AgentDomainEvent::TimelineUpsert { items, .. } = &mut event {
-                            super::compact::slim(items);
+                            self.ready_rows(items);
                         }
                         self.inbox.push(Update::event(event));
                     }

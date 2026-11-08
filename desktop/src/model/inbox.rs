@@ -120,6 +120,8 @@ pub enum Update {
     },
     /// An older page of a session's history, oldest first. `exhausted`:
     /// the agent has nothing older.
+    /// A gateway picture landed in the media cache: draw it.
+    MediaReady,
     Earlier {
         asid: String,
         items: Vec<muqun_gateway::agents::TimelineItem>,

@@ -16,6 +16,11 @@ use crate::ui::UiState;
 /// Lines of output a card shows before "N more lines".
 const OUTPUT_LINES: usize = 24;
 
+/// The verb a row leads with for a call of `kind`.
+pub fn verb_of(cx: &Tcx, kind: ToolKind, call: &ToolCall) -> String {
+    verb(cx, kind, call)
+}
+
 fn verb(cx: &Tcx, kind: ToolKind, call: &ToolCall) -> String {
     let w = |en, zh| cx.t(en, zh).to_string();
     match kind {
@@ -112,11 +117,8 @@ pub fn card(cx: &Tcx, item: &TimelineItem, call: &ToolCall) -> El {
         return super::muqun::card(cx, item, call, &m);
     }
     let rec = tv::input_record(call);
-    let mut kind = tv::classify(&call.name);
     // ACP names a shell call by its category, `execute`.
-    if kind == ToolKind::Execute && rec.as_ref().is_some_and(|r| r.contains_key("command")) {
-        kind = ToolKind::Shell;
-    }
+    let kind = crate::model::activity::tool_kind(call);
     let out = tv::output_text(call);
     let mut target = tv::target(kind, rec.as_ref());
     if kind == ToolKind::Shell {
@@ -126,6 +128,17 @@ pub fn card(cx: &Tcx, item: &TimelineItem, call: &ToolCall) -> El {
     let id = item.id.as_str();
     let mut card = ToolCard::new(id, glyph(kind), verb(cx, kind, call));
     card.error = error_line(cx, call);
+    if !target.is_empty() {
+        card.copy = Some(target.clone());
+    }
+    if matches!(
+        kind,
+        ToolKind::Read | ToolKind::Edit | ToolKind::Write | ToolKind::Patch
+    ) && !target.is_empty()
+        && !target.contains('\n')
+    {
+        card.open = Some(target.clone());
+    }
     let mut failed = false;
 
     // Header title and caption (App `headerTitle` / `headerCaption`).
@@ -187,13 +200,10 @@ pub fn card(cx: &Tcx, item: &TimelineItem, call: &ToolCall) -> El {
         ToolKind::Shell => {
             let exit = tv::shell_exit(call, &out);
             let timed_out = tv::shell_timed_out(call);
-            if let Some(code) = exit {
-                let color = if code == 0 {
-                    cx.k.c.success.fg
-                } else {
-                    cx.k.c.danger.fg
-                };
-                card.chips.push(chip(cx.k, format!("exit {code}"), color));
+            // An exit code is news only when it is not 0.
+            if let Some(code) = exit.filter(|c| *c != 0) {
+                card.chips
+                    .push(chip(cx.k, format!("exit {code}"), cx.k.c.danger.fg));
             }
             if timed_out {
                 card.chips
@@ -201,7 +211,8 @@ pub fn card(cx: &Tcx, item: &TimelineItem, call: &ToolCall) -> El {
             }
             failed = exit.is_some_and(|c| c != 0) || timed_out;
             let mut body = col().key("shell").w_full().gap(8.0);
-            if !target.is_empty() {
+            // The pane's title is the command already.
+            if !target.is_empty() && !cx.pane {
                 body = body.child(command_line(cx, &target));
             }
             if !out.stdout.trim().is_empty() {
@@ -380,11 +391,13 @@ pub fn card(cx: &Tcx, item: &TimelineItem, call: &ToolCall) -> El {
             );
         }
     }
-    if let Some(gallery) = images::gallery(
-        cx,
-        &format!("tool-{id}"),
-        &images::tool_image_paths(cx.s, cx.asid, call),
-    ) {
+    // What the tool returned, else the pictures the gateway attached to
+    // the row (a read of an image on a computer that is not this one).
+    let mut pictures = images::tool_image_paths(cx.s, cx.asid, call);
+    if pictures.is_empty() && item.image_assets.is_some() {
+        pictures = images::item_image_paths(cx.s, cx.asid, item);
+    }
+    if let Some(gallery) = images::gallery(cx, &format!("tool-{id}"), &pictures) {
         card.preview = Some(gallery);
     }
     if let Some(ms) = tv::duration_ms(call).filter(|ms| *ms >= 1000) {
@@ -836,14 +849,11 @@ pub fn shell_part(cx: &Tcx, item: &TimelineItem) -> El {
     let k = cx.k;
     let mut card = ToolCard::new(&item.id, &glyphs::TERMINAL, cx.t("Shell", "终端"));
     card.title = command.clone();
-    if let Some(code) = exit {
-        let color = if *code == 0.0 {
-            k.c.success.fg
-        } else {
-            k.c.danger.fg
-        };
-        card.chips.push(chip(k, format!("exit {code}"), color));
+    if let Some(code) = exit.filter(|c| *c != 0.0) {
+        card.chips
+            .push(chip(k, format!("exit {code}"), k.c.danger.fg));
     }
+    card.copy = Some(command.clone());
     if *truncated {
         card.chips
             .push(chip(k, cx.t("Truncated", "已截断"), k.c.warning.fg));

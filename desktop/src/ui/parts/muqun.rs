@@ -147,7 +147,22 @@ pub fn card(cx: &Tcx, item: &TimelineItem, call: &ToolCall, m: &Muqun) -> El {
         for (i, f) in m.files.iter().enumerate() {
             list = list.child(file_row(cx, i, f));
         }
-        card.preview = Some(list);
+        // Presented pictures show themselves, above their rows.
+        let pictures: Vec<std::path::PathBuf> = m
+            .files
+            .iter()
+            .map(|f| std::path::PathBuf::from(&f.path))
+            .filter(|p| super::images::image_ext(p) && p.is_file())
+            .collect();
+        card.preview = Some(match super::images::gallery(cx, &item.id, &pictures) {
+            Some(g) => col()
+                .key("presented")
+                .w_full()
+                .gap(8.0)
+                .child(g)
+                .child(list),
+            None => list,
+        });
     }
     let mut body = col().key("muqun").w_full().gap(8.0);
     let mut any = false;

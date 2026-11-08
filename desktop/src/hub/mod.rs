@@ -275,6 +275,12 @@ pub trait SessionHub: Send + Sync {
             )))
         })
     }
+    /// The bytes of a picture the gateway serves (`/api/agent-images/…`,
+    /// `/api/assets/…`): a pasted image only the gateway holds. Unsupported
+    /// where the hub is in-process and resolves those itself.
+    fn media<'a>(&'a self, _path: &'a str) -> HubFuture<'a, Vec<u8>> {
+        Box::pin(async { Err(HubError::Agent(AgentError::Unsupported("media".into()))) })
+    }
     /// The next older page of the session's history, kept in the mirror;
     /// empty when there is nothing older.
     fn earlier<'a>(&'a self, asid: &'a AgentSessionId) -> HubFuture<'a, Vec<TimelineItem>>;
