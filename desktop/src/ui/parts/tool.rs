@@ -391,11 +391,13 @@ pub fn card(cx: &Tcx, item: &TimelineItem, call: &ToolCall) -> El {
             );
         }
     }
-    if let Some(gallery) = images::gallery(
-        cx,
-        &format!("tool-{id}"),
-        &images::tool_image_paths(cx.s, cx.asid, call),
-    ) {
+    // What the tool returned, else the pictures the gateway attached to
+    // the row (a read of an image on a computer that is not this one).
+    let mut pictures = images::tool_image_paths(cx.s, cx.asid, call);
+    if pictures.is_empty() && item.image_assets.is_some() {
+        pictures = images::item_image_paths(cx.s, cx.asid, item);
+    }
+    if let Some(gallery) = images::gallery(cx, &format!("tool-{id}"), &pictures) {
         card.preview = Some(gallery);
     }
     if let Some(ms) = tv::duration_ms(call).filter(|ms| *ms >= 1000) {

@@ -69,7 +69,9 @@ pub fn family(item: &TimelineItem) -> Option<Family> {
             if matches!(kind, ToolKind::Question | ToolKind::Todo) {
                 return None;
             }
-            if !super::media::tool_image_refs(call).is_empty() {
+            if !super::media::tool_image_refs(call).is_empty()
+                || item.image_assets.as_ref().is_some_and(|a| !a.is_empty())
+            {
                 return None;
             }
             Some(family_of(kind))
