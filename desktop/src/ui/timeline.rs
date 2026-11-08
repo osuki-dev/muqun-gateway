@@ -370,6 +370,7 @@ pub fn session_view(s: &UiState, k: &Kit, asid: &str) -> El {
     let count = row_count(s, asid);
     let (key_asid, build_asid, edge_asid) = (asid.to_string(), asid.to_string(), asid.to_string());
     let kit = k.clone();
+    let narrow = super::Fit::of(&format!("feed-{asid}")) == super::Fit::Tight;
     let rows = col()
         .key(format!("rows-{asid}"))
         .w_full()
@@ -386,7 +387,8 @@ pub fn session_view(s: &UiState, k: &Kit, asid: &str) -> El {
                 }
             },
             move |s: &UiState, i| {
-                let cx = Tcx::new(s, &kit, &build_asid);
+                let mut cx = Tcx::new(s, &kit, &build_asid);
+                cx.narrow = narrow;
                 let mut tail = false;
                 let body = match row_at(s, &build_asid, i) {
                     Some(Row::Top) => top_row(&cx),

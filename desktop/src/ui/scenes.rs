@@ -891,6 +891,20 @@ pub fn scenes() -> &'static [Scene] {
         ("timeline-expanded", timeline_expanded),
         ("timeline-running", timeline_running),
         ("timeline-detail", timeline_detail),
+        ("session-narrow", |s| {
+            // A wide right-hand pane squeezes the session column to ~360 pt
+            // at 1440 (and ~240 pt at 1320).
+            timeline_detail(s);
+            s.sessions[0].status = muqun_gateway::agents::AgentSessionStatus::Busy;
+            s.inspect_pane.set_width(700.0);
+            s.diff_stat.files = 3;
+            s.diff_stat.added = 3;
+            s.diff_stat.removed = 1;
+        }),
+        ("popup-home-mention", popup_home_mention),
+        ("popup-home-slash", popup_home_slash),
+        ("popup-session-slash", popup_session_slash),
+        ("popup-session-skill", popup_session_skill),
         ("timeline-detail-zh", |s| {
             timeline_detail(s);
             s.cfg.general.language = crate::config::Language::ZhCn;

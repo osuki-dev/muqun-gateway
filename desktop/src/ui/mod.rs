@@ -1738,11 +1738,52 @@ pub fn ago(updated_ms: u64, now: u64, language: crate::config::Language) -> Stri
 }
 
 /// A small status pill: a dot (or spinner) and a word, in the state's colour.
+/// How much room a column has, read from its last layout: chrome drops
+/// its secondary pieces as a right-hand panel squeezes the session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Fit {
+    /// Under ~400 pt: one thing per line, icons for words.
+    Tight,
+    /// Under ~640 pt: secondary pieces fold away.
+    Narrow,
+    Wide,
+}
+
+impl Fit {
+    pub fn of_width(width: f32) -> Fit {
+        if width < 400.0 {
+            Fit::Tight
+        } else if width < 640.0 {
+            Fit::Narrow
+        } else {
+            Fit::Wide
+        }
+    }
+
+    /// The fit of the element keyed `key`, as it was last laid out (wide
+    /// before its first layout).
+    pub fn of(key: &str) -> Fit {
+        rune::memo::layout_with(key, |r| Fit::of_width(r[2])).unwrap_or(Fit::Wide)
+    }
+}
+
 pub fn activity_pill(
     k: &Kit,
     look: &Look,
     activity: Activity,
     language: crate::config::Language,
+) -> El {
+    activity_mark(k, look, activity, language, true)
+}
+
+/// The activity pill, or with `word` false only its mark (a narrow
+/// header), the word kept as its label and tooltip.
+pub fn activity_mark(
+    k: &Kit,
+    look: &Look,
+    activity: Activity,
+    language: crate::config::Language,
+    word_shown: bool,
 ) -> El {
     let (color, word) = match activity {
         Activity::Working => (k.c.text_accent, tr(language, "Working", "工作中")),
@@ -1755,7 +1796,7 @@ pub fn activity_pill(
         Activity::NeedsYou => look.pulse(rune::el().size(7.0, 7.0).radius(3.5).fill(color)),
         _ => rune::el().size(7.0, 7.0).radius(3.5).fill(color),
     };
-    rune::row()
+    let pill = rune::row()
         .key("activity")
         .h(20.0)
         .px(8.0)
@@ -1769,13 +1810,17 @@ pub fn activity_pill(
         }))
         .role("status")
         .label(word.clone())
-        .child(mark.a11y_hidden())
-        .child(
-            rune::text(word)
-                .font(k.ty.small_medium)
-                .color(color)
-                .a11y_hidden(),
-        )
+        .help(word.clone())
+        .child(mark.a11y_hidden());
+    if !word_shown {
+        return pill.px(6.0);
+    }
+    pill.child(
+        rune::text(word)
+            .font(k.ty.small_medium)
+            .color(color)
+            .a11y_hidden(),
+    )
 }
 
 use copy::tr;

@@ -791,8 +791,17 @@ fn mount_popup(
         .filter(|r| r.disabled)
         .map(|r| r.id.clone())
         .collect();
-    PopupList::<UiState>::new(key, "composer")
+    // Over the field the draft is typed in (below it when the window has
+    // no room above), never the window's corner: Home's field is not the
+    // session composer.
+    let anchor = match slot {
+        Slot::Session => "draft",
+        Slot::Start => "start-draft",
+    };
+    PopupList::<UiState>::new(key, anchor)
+        .anchored(anchor, rune::Side::Top, rune::Align::Start, 6.0)
         .width(360.0)
+        .max_height(300.0)
         .label(label)
         .items(items)
         .on_choose(move |s: &mut UiState, id: &str, _: &mut Tx| {
@@ -1276,30 +1285,48 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         .and_then(|i| i.directory.clone().map(PathBuf::from));
     let has_text = !s.draft.text.trim().is_empty() || !s.staged.is_empty();
 
-    // The row under the field: chips on the left, actions on the right.
-    let mut actions = row()
-        .key("composer-actions")
-        .w_full()
-        .gap(8.0)
-        .center_y()
-        .child(pills(s, k, layer).grow(1.0).shrink().min_w(0.0))
-        .child(super::voice::mic_button(s, k))
-        .child(
-            Button::new(tr_ref(language, "Attach", "附件"))
-                .variant(ButtonVariant::Ghost)
-                .control_size(ControlSize::Regular)
-                .disabled(!has_session)
-                .help(format!(
-                    "{} · {}",
-                    tr_ref(language, "Add files or an image", "添加文件或图片"),
-                    crate::platform::keys::label("Primary+V")
-                ))
-                .on_press(move |_: &mut UiState| {
-                    crate::platform::dialogs::attach_files(start.clone());
-                })
-                .build(k)
-                .key("attach"),
-        );
+    // The row under the field: chips on the left, actions on the right. A
+    // narrow column gives the chips their own line, and Attach its icon.
+    let fit = super::Fit::of("composer");
+    let attach_help = format!(
+        "{} · {}",
+        tr_ref(language, "Add files or an image", "添加文件或图片"),
+        crate::platform::keys::label("Primary+V")
+    );
+    let attach_press = move |_: &mut UiState| {
+        crate::platform::dialogs::attach_files(start.clone());
+    };
+    let attach = if fit == super::Fit::Wide {
+        Button::new(tr_ref(language, "Attach", "附件"))
+            .variant(ButtonVariant::Ghost)
+            .control_size(ControlSize::Regular)
+            .disabled(!has_session)
+            .help(attach_help)
+            .on_press(attach_press)
+            .build(k)
+            .key("attach")
+    } else {
+        rune_kit::IconButton::new(&super::parts::glyphs::ATTACH)
+            .variant(rune_kit::IconButtonVariant::Ghost)
+            .label(tr_ref(language, "Attach", "附件"))
+            .help(attach_help)
+            .disabled(!has_session)
+            .on_press(attach_press)
+            .build(k)
+            .key("attach")
+    };
+    let pill_row = pills(s, k, layer);
+    let mut actions = row().key("composer-actions").w_full().gap(8.0).center_y();
+    let pill_line = if fit == super::Fit::Wide {
+        actions = actions.child(pill_row.grow(1.0).shrink().min_w(0.0));
+        None
+    } else {
+        Some(pill_row.w_full())
+    };
+    actions = actions.child(super::voice::mic_button(s, k)).child(attach);
+    if pill_line.is_some() {
+        actions = actions.child(el().grow(1.0));
+    }
     if busy {
         if let Some(asid) = s.selected.clone() {
             actions = actions.child(
@@ -1360,31 +1387,33 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     if let Some(dictation) = super::voice::strip(s, k) {
         card = card.child(dictation);
     }
-    card = card
-        .child(
-            TextArea::new(&s.draft)
-                .placeholder(placeholder)
-                .label(tr_ref(language, "Draft", "草稿"))
-                .width(None)
-                .auto_grow(2, 8)
-                .pill_style(move |id| {
-                    if id.starts_with("computer:") {
-                        PillStyle::default().bg(accent.alpha(0.22)).fg(accent)
-                    } else if id.starts_with("file:") {
-                        PillStyle::default().bg(info.alpha(0.18)).fg(info)
-                    } else {
-                        PillStyle::default()
-                    }
-                })
-                .on_edit(|s: &mut UiState| &mut s.draft)
-                .on_change(|s: &mut UiState, _: &mut Tx| on_draft_change(s, Slot::Session))
-                .on_submit(|s: &mut UiState, _: &mut Tx| submit_session(s))
-                .on_input_paste(|s: &mut UiState, content, _: &mut Tx| take_paste(s, content))
-                .build(k)
-                .key("draft")
-                .w_full(),
-        )
-        .child(actions);
+    card = card.child(
+        TextArea::new(&s.draft)
+            .placeholder(placeholder)
+            .label(tr_ref(language, "Draft", "草稿"))
+            .width(None)
+            .auto_grow(2, 8)
+            .pill_style(move |id| {
+                if id.starts_with("computer:") {
+                    PillStyle::default().bg(accent.alpha(0.22)).fg(accent)
+                } else if id.starts_with("file:") {
+                    PillStyle::default().bg(info.alpha(0.18)).fg(info)
+                } else {
+                    PillStyle::default()
+                }
+            })
+            .on_edit(|s: &mut UiState| &mut s.draft)
+            .on_change(|s: &mut UiState, _: &mut Tx| on_draft_change(s, Slot::Session))
+            .on_submit(|s: &mut UiState, _: &mut Tx| submit_session(s))
+            .on_input_paste(|s: &mut UiState, content, _: &mut Tx| take_paste(s, content))
+            .build(k)
+            .key("draft")
+            .w_full(),
+    );
+    if let Some(line) = pill_line {
+        card = card.child(line);
+    }
+    card = card.child(actions);
 
     // The card: glass over the pane, lit in the accent while the field has
     // focus, breathing in the agent's colour while it works.
@@ -1430,16 +1459,19 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     } else {
         hint = hint.child(el().grow(1.0));
     }
-    hint = hint.child(muted(
-        k,
-        format!(
-            "{} {} · {} {}",
-            crate::platform::keys::label("Primary+Enter"),
-            tr_ref(language, "to send", "发送"),
-            crate::platform::keys::label("Primary+V"),
-            tr_ref(language, "to paste files or an image", "粘贴文件或图片"),
-        ),
-    ));
+    // The keys are a wide column's footnote; a narrow one keeps the room.
+    if fit == super::Fit::Wide {
+        hint = hint.child(muted(
+            k,
+            format!(
+                "{} {} · {} {}",
+                crate::platform::keys::label("Primary+Enter"),
+                tr_ref(language, "to send", "发送"),
+                crate::platform::keys::label("Primary+V"),
+                tr_ref(language, "to paste files or an image", "粘贴文件或图片"),
+            ),
+        ));
+    }
 
     col()
         .key("composer")

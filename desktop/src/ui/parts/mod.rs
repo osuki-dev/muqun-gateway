@@ -35,6 +35,8 @@ pub struct Tcx<'a> {
     /// Drawing into the detail pane (everything a call has), not the
     /// timeline's dense rows.
     pub pane: bool,
+    /// The timeline is a narrow column: rows drop their secondary words.
+    pub narrow: bool,
 }
 
 impl<'a> Tcx<'a> {
@@ -45,6 +47,7 @@ impl<'a> Tcx<'a> {
             asid,
             lang: s.cfg.general.language,
             pane: false,
+            narrow: false,
         }
     }
 
@@ -381,7 +384,11 @@ impl<'a> ToolCard<'a> {
                     .shrink(),
             );
         }
-        let caption_text = self.caption.lines().next().unwrap_or("").to_string();
+        let caption_text = if cx.narrow {
+            String::new()
+        } else {
+            self.caption.lines().next().unwrap_or("").to_string()
+        };
         line = line.child(if caption_text.is_empty() {
             col().key("caption").grow(1.0)
         } else {

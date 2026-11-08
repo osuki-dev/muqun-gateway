@@ -15,8 +15,8 @@ use rune_kit::{
 
 use super::copy::{tr, tr_ref};
 use super::{
-    activity_pill, art, composer, home, inbox, inspector, sessions, settings, tasks, tiles,
-    timeline, title_of, Activity, OpenMenu,
+    art, composer, home, inbox, inspector, sessions, settings, tasks, tiles, timeline, title_of,
+    Activity, OpenMenu,
 };
 use super::{Mode, UiState};
 use crate::branding::{APP_MARK_PNG, APP_NAME};
@@ -214,7 +214,8 @@ fn session_identity(s: &UiState, k: &Kit, look: &Look) -> El {
                 ),
         );
     if activity != Activity::Idle {
-        line = line.child(activity_pill(k, look, activity, language));
+        let word = super::Fit::of("main") == super::Fit::Wide;
+        line = line.child(super::activity_mark(k, look, activity, language, word));
     }
     line
 }
@@ -314,10 +315,13 @@ fn toolbar(s: &UiState, k: &Kit, look: &Look, layer: &mut Vec<El>) -> Toolbar {
             bar = bar.leading(session_identity(s, k, look));
             let asid = s.selected.clone().unwrap_or_default();
             let busy = s.busy();
+            // A squeezed column keeps the title readable: Split folds away
+            // (Ctrl+\\ still splits), then the change count.
+            let fit = super::Fit::of("main");
             if let Some(meter) = timeline::context_meter(s, k, &asid) {
                 bar = bar.trailing(meter);
             }
-            if s.diff_stat.files > 0 {
+            if s.diff_stat.files > 0 && fit > super::Fit::Tight {
                 let label = format!("+{} −{}", s.diff_stat.added, s.diff_stat.removed);
                 bar = bar.trailing(
                     Button::new(label)
@@ -343,21 +347,23 @@ fn toolbar(s: &UiState, k: &Kit, look: &Look, layer: &mut Vec<El>) -> Toolbar {
                         .key("changes"),
                 );
             }
-            bar = bar.trailing(
-                Button::new(tr_ref(language, "Split", "分屏"))
-                    .variant(ButtonVariant::Ghost)
-                    .control_size(ControlSize::Small)
-                    .disabled(asid.is_empty())
-                    .help(tr_ref(
-                        language,
-                        "Open another session beside this one",
-                        "在旁边打开另一个会话",
-                    ))
-                    .shortcut("Primary+\\")
-                    .on_press(|s: &mut UiState| s.split())
-                    .build(k)
-                    .key("split-session"),
-            );
+            if fit == super::Fit::Wide {
+                bar = bar.trailing(
+                    Button::new(tr_ref(language, "Split", "分屏"))
+                        .variant(ButtonVariant::Ghost)
+                        .control_size(ControlSize::Small)
+                        .disabled(asid.is_empty())
+                        .help(tr_ref(
+                            language,
+                            "Open another session beside this one",
+                            "在旁边打开另一个会话",
+                        ))
+                        .shortcut("Primary+\\")
+                        .on_press(|s: &mut UiState| s.split())
+                        .build(k)
+                        .key("split-session"),
+                );
+            }
             if !asid.is_empty() {
                 bar = bar.trailing(session_more(s, k, layer, &asid, busy));
             }

@@ -447,3 +447,75 @@ fn timeline_detail(s: &mut UiState) {
     });
     s.inspect_pane.set_open(true);
 }
+
+// ---- composer popups --------------------------------------------------------
+
+fn scene_catalog() -> std::sync::Arc<crate::hub::CatalogView> {
+    std::sync::Arc::new(crate::hub::CatalogView {
+        catalog: serde_json::from_value(json!({
+            "models": [], "modes": [], "mcp": [],
+            "commands": [
+                { "name": "review", "description": "Review the working tree" },
+                { "name": "compact", "description": "Summarise the conversation so far" },
+                { "name": "init", "description": "Write an AGENTS.md for this project" },
+                { "name": "model", "description": "Switch the model" },
+            ],
+            "skills": [
+                { "id": "release-notes", "name": "Release notes", "description": "Write notes from merged PRs" },
+                { "id": "imagegen", "name": "Image generation", "description": "Make or edit a picture" },
+                { "id": "frontend-design", "name": "Frontend design", "description": "Distinctive UI, not a template" },
+            ],
+        }))
+        .expect("demo catalog"),
+    })
+}
+
+fn scene_mentions(s: &mut UiState) {
+    s.peers = vec![
+        crate::hub::PeerMention { server_id: "local".into(), name: "studio".into(), reachable: true, current: true },
+        crate::hub::PeerMention { server_id: "m2".into(), name: "mini".into(), reachable: true, current: false },
+        crate::hub::PeerMention { server_id: "m3".into(), name: "build-box".into(), reachable: false, current: false },
+    ];
+    s.file_hits = ["src/main.rs", "src/ui/composer.rs", "src/ui/timeline.rs", "README.md"]
+        .iter()
+        .map(|p| crate::model::compose::FileHit {
+            path: (*p).into(),
+            name: p.rsplit('/').next().unwrap_or(p).into(),
+            kind: "file".into(),
+        })
+        .collect();
+}
+
+fn typed(text: &str) -> TextEdit {
+    let mut edit = TextEdit::new(text);
+    edit.focused = true;
+    edit
+}
+
+/// Home's composer with `@` typed: computers, then files, at the field.
+fn popup_home_mention(s: &mut UiState) {
+    home(s);
+    scene_mentions(s);
+    s.start_draft = typed("Compare the disk use on @");
+}
+
+/// The session composer's `/` commands.
+fn popup_session_slash(s: &mut UiState) {
+    turn_state(s, false);
+    s.catalog = Some(scene_catalog());
+    s.draft = typed("/");
+}
+
+/// The session composer's `$` skills, filtered.
+fn popup_session_skill(s: &mut UiState) {
+    turn_state(s, false);
+    s.catalog = Some(scene_catalog());
+    s.draft = typed("$re");
+}
+
+/// Home's `/` commands.
+fn popup_home_slash(s: &mut UiState) {
+    home(s);
+    s.start_catalog = Some(scene_catalog());
+    s.start_draft = typed("/");
+}

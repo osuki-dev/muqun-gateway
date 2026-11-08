@@ -140,3 +140,9 @@ pub static WARNING: Icon = Icon {
     view: 24.0,
     body: r#"<path d="M10 4a2.3 2.3 0 0 1 4 0l8 14a2 2 0 0 1-2 3H4a2 2 0 0 1-2-3l8-14Zm2 5v4m0 4h.01" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>"#,
 };
+
+pub static ATTACH: Icon = Icon {
+    name: "tl-attach",
+    view: 24.0,
+    body: r#"<path d="m9 13 6-6a2.5 2.5 0 0 1 3.5 3.5l-8 8a4 4 0 0 1-5.7-5.7l8.5-8.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>"#,
+};
