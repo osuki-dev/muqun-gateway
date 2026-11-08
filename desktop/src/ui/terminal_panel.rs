@@ -88,6 +88,9 @@ pub struct TermPanel {
     pub want: Cell<Option<Colors>>,
     sent: Option<Colors>,
     wheel: f32,
+    /// What the panel sent the shell, for the routing test.
+    #[cfg(test)]
+    pub sent_log: std::cell::RefCell<Vec<String>>,
 }
 
 impl TermPanel {
@@ -95,7 +98,7 @@ impl TermPanel {
         Self {
             open: false,
             pane: PaneState::new(560.0)
-                .range(360.0, 1200.0)
+                .range(360.0, 760.0)
                 .with_width(width)
                 .collapsed(),
             session: None,
@@ -108,6 +111,8 @@ impl TermPanel {
             want: Cell::new(None),
             sent: None,
             wheel: 0.0,
+            #[cfg(test)]
+            sent_log: Default::default(),
         }
     }
 
@@ -118,6 +123,13 @@ impl TermPanel {
     }
 
     fn send(&self, msg: Msg) {
+        #[cfg(test)]
+        self.sent_log.borrow_mut().push(match &msg {
+            Msg::Key(k) => format!("key {:?} ctrl={}", k.key, k.mods.ctrl),
+            Msg::Text(t) => format!("text {t}"),
+            Msg::Paste(t) => format!("paste {t}"),
+            _ => "other".into(),
+        });
         if let Some(session) = &self.session {
             session.send(msg);
         }
@@ -725,4 +737,66 @@ fn sink(s: &UiState, k: &Kit, m: Metrics, col: u16, row: u16, bg: Color) -> El {
         field = field.fill(bg);
     }
     field
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::commands;
+    use rune::{Env, Ime, Key, Mods, Runtime};
+
+    fn key(key: Key, ctrl: bool, shift: bool) -> KeyEvent {
+        KeyEvent {
+            key,
+            mods: Mods {
+                shift,
+                cmd: ctrl,
+                alt: false,
+                ctrl,
+                logo: false,
+            },
+        }
+    }
+
+    #[test]
+    fn a_focused_terminal_takes_every_key_but_lends_ctrl_shift_to_the_app() {
+        let (tx, _rx) = commands::channel();
+        let mut state = UiState::new(tx);
+        state.open_terminal();
+        let mut rt = Runtime::new(
+            state,
+            super::super::view,
+            (1440.0, 900.0),
+            Env::new(true, 1.0),
+        );
+        rt.frame(0.0);
+        rt.frame(1.0 / 60.0);
+        for ev in [
+            key(Key::Escape, false, false),
+            key(Key::Tab, false, false),
+            key(Key::Command('c'), true, false),
+            key(Key::Text("x".into()), false, false),
+        ] {
+            rt.key(ev);
+            rt.frame(1.0 / 60.0);
+        }
+        // An input method's commit goes to the shell as typed.
+        rt.ime(Ime::Commit("中文".into()));
+        rt.frame(1.0 / 60.0);
+        rt.key(key(Key::Command('k'), true, true));
+        rt.frame(1.0 / 60.0);
+        let s = &rt.state;
+        assert_eq!(
+            *s.term.sent_log.borrow(),
+            [
+                "key Escape ctrl=false",
+                "key Tab ctrl=false",
+                "key C ctrl=true",
+                "key X ctrl=false",
+                "text 中文",
+            ]
+        );
+        // Ctrl+Shift+K reached the app's Ctrl+K: the palette.
+        assert!(s.palette.is_some());
+    }
 }

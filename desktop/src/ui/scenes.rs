@@ -891,6 +891,10 @@ pub fn scenes() -> &'static [Scene] {
         ("terminals", terminals_scene),
         ("terminal", |s| terminal_scene(s, shell_fixture)),
         ("terminal-vim", |s| terminal_scene(s, vim_fixture)),
+        ("terminal-ime", |s| {
+            terminal_scene(s, shell_fixture);
+            s.term.sink.preedit = Some(("ni hao".into(), Some((6, 6))));
+        }),
         ("terminal-jade", |s| {
             with_pack(s, "jade-tempest");
             terminal_scene(s, shell_fixture);

@@ -408,7 +408,7 @@ impl UiPrefs {
     /// The stored terminal width, forced into the panel's range.
     pub fn terminal(&self) -> f32 {
         if self.terminal_width.is_finite() {
-            self.terminal_width.clamp(360.0, 1200.0)
+            self.terminal_width.clamp(360.0, 760.0)
         } else {
             Self::TERMINAL_DEFAULT
         }
