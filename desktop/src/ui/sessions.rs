@@ -23,10 +23,26 @@ const DEFAULT_OPEN: usize = 3;
 const PER_PROJECT: usize = 8;
 
 fn nav(s: &UiState, k: &Kit, label: &str, icon: &'static rune::Icon, mode: Mode) -> El {
-    let mut row = SidebarRow::new(label)
-        .icon(icon)
-        .selected(s.mode == mode)
-        .on_select(move |s: &mut UiState, _: &mut Tx| s.go(mode));
+    // The theme's own glyph for the row, when its pack draws one.
+    let themed = match mode {
+        Mode::Settings => Some("chrome.settings"),
+        _ => None,
+    }
+    .and_then(|name| {
+        let color = if s.mode == mode {
+            k.c.text_base
+        } else {
+            k.c.text_muted
+        };
+        super::art::glyph(s.images.as_ref()?, name, 16.0, color)
+    });
+    let row = SidebarRow::new(label);
+    let mut row = match themed {
+        Some(glyph) => row.avatar(glyph),
+        None => row.icon(icon),
+    }
+    .selected(s.mode == mode)
+    .on_select(move |s: &mut UiState, _: &mut Tx| s.go(mode));
     if mode == Mode::Inbox {
         let waiting = s.waiting_count();
         if waiting > 0 {
