@@ -3282,7 +3282,9 @@ impl<P: AcpProvider> AcpDriver<P> {
                     let prepared =
                         operations::prompt_parts(text, attachments, session.prompt_capabilities)
                             .await?;
-                    if self.steer(&session, id, &prepared).await? {
+                    if self.steer_queued(&session, id).await?
+                        && self.steer(&session, id, &prepared).await?
+                    {
                         return Ok(());
                     }
                 }
@@ -3565,6 +3567,32 @@ impl<P: AcpProvider> AcpDriver<P> {
                     "{error}; prompt delivery may have occurred; do not retry automatically"
                 )))
             }
+        }
+    }
+
+    /// Before a prompt is steered into the running turn, steer in the prompts
+    /// queued ahead of it, oldest first: once the agent takes input, an older
+    /// prompt must not be overtaken and left for the turn's end. Claude Code
+    /// keeps a turn open while its background subagents run, so that end can
+    /// be hours after the answer. `Ok(false)`: the turn ended meanwhile, and
+    /// what is left waits in the queue.
+    async fn steer_queued(&self, session: &Session, id: &str) -> Result<bool, AgentError> {
+        let _gate = session.turn_gate.lock().await;
+        loop {
+            let Some(item) = session.queue().next(id).cloned() else {
+                return Ok(true);
+            };
+            // A native command is never steered; it waits for the turn's end.
+            if item.input.command {
+                return Ok(true);
+            }
+            let result = self.steer(session, id, &item.input.prepared).await;
+            if matches!(result, Ok(false)) {
+                return Ok(false);
+            }
+            let result = result.map(drop);
+            Self::settle_queued(session, &self.mirror, &self.tx, &item.id, &result).await;
+            result?;
         }
     }
 
@@ -5959,6 +5987,63 @@ mod inbox_tests {
             }
             driver.shutdown().await;
         }
+    }
+
+    struct SteeringProvider;
+    impl AcpProvider for SteeringProvider {
+        const KIND: &'static str = "fx";
+        const LABEL: &'static str = "Steering";
+        const ARGS: &'static [&'static str] = &["acp"];
+        const REQUIRE_MESSAGE_ID: bool = true;
+        const MODEL_SELECTION: bool = true;
+        const STEERING: bool = true;
+        fn recovery_snapshot<'a>(
+            binary: &'a str,
+            directory: &'a str,
+            id: &'a str,
+            stop: &'a CancellationToken,
+        ) -> AgentFuture<'a, NativeSnapshot> {
+            crate::agents::adapters::fx::driver::FxProvider::recovery_snapshot(
+                binary, directory, id, stop,
+            )
+        }
+    }
+
+    /// A turn the agent holds open (Claude Code waiting on background
+    /// subagents) does not strand a queued prompt behind a later steer: the
+    /// queued one is steered in first.
+    #[tokio::test]
+    async fn a_steer_takes_the_prompts_queued_before_it_into_the_turn() {
+        let fixture = Fixture::new().await;
+        let (tx, _) = broadcast::channel(256);
+        let mirror = Arc::new(MemoryMirror::for_agent("fx"));
+        let driver = AcpDriver::<SteeringProvider>::new(
+            fixture
+                .directory
+                .join("mock-fx")
+                .to_string_lossy()
+                .into_owned(),
+            fixture.directory.to_string_lossy().into_owned(),
+            mirror.clone(),
+            tx,
+        );
+        driver.set_session_store(|| None);
+        let info = driver.create_session(None, None, None).await.unwrap();
+        let (id, asid) = (info.asid.0.as_str(), &info.asid);
+        driver.send_prompt(id, "hold", &[], None).await.unwrap();
+        driver
+            .send_prompt(id, "queued", &[], Some("queue"))
+            .await
+            .unwrap();
+        assert_eq!(texts(&driver.get_inbox(id).await.unwrap()), ["queued"]);
+        driver
+            .send_prompt(id, "steered", &[], Some("steer"))
+            .await
+            .unwrap();
+        assert_eq!(received(&fixture, id), ["hold", "queued", "steered"]);
+        assert!(driver.get_inbox(id).await.unwrap().is_empty());
+        assert!(mirror.inbox(asid).await.is_empty());
+        driver.shutdown().await;
     }
 
     /// A mode switch publishes only the mode: a turn whose end was published
