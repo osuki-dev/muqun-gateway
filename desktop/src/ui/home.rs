@@ -1057,7 +1057,7 @@ fn composer_art(s: &UiState) -> Option<El> {
     } else {
         rune::SurfaceFit::Fit
     };
-    let image = images.load(art.bytes.clone());
+    let image = super::art::image(images, &art.bytes);
     let pic = el()
         .key("home-card-art")
         .pixels_fit(image.pixels(), fit)

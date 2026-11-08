@@ -18,12 +18,33 @@ pub fn picture(images: &ImageCache, bytes: impl Into<Arc<[u8]>>, fit: SurfaceFit
     el().pixels_fit(image.pixels(), fit)
 }
 
+/// The decoded handle for a theme picture. Looking a picture up in the
+/// cache hashes all its bytes, megabytes for a wallpaper, and the view runs
+/// on every keystroke; this remembers the handle per picture instead. A
+/// picture the current theme no longer holds is let go on the next miss.
+pub fn image(images: &ImageCache, bytes: &Arc<[u8]>) -> rune::Image {
+    type Handles = HashMap<usize, (Arc<[u8]>, rune::Image)>;
+    thread_local! {
+        static HANDLES: std::cell::RefCell<Handles> = Default::default();
+    }
+    let key = Arc::as_ptr(bytes) as *const u8 as usize;
+    HANDLES.with_borrow_mut(|handles| {
+        if let Some((_, image)) = handles.get(&key) {
+            return image.clone();
+        }
+        handles.retain(|_, (held, _)| Arc::strong_count(held) > 1);
+        let image = images.load(bytes.clone());
+        handles.insert(key, (bytes.clone(), image.clone()));
+        image
+    })
+}
+
 /// `art` placed in a `w`×`h` box as the pack asks: covering it (cropped)
 /// or contained (whole), either way positioned by the focal point, so the
 /// subject stays in view (CSS `object-fit` with `object-position` at the
 /// focal point). Clipped hard; a caller softens any edge with `clip_fade`.
 pub fn place(images: &ImageCache, art: &Art, key: &str, w: f32, h: f32) -> El {
-    let image = images.load(art.bytes.clone());
+    let image = image(images, &art.bytes);
     let [iw, ih] = art.size;
     let scale = if art.look.cover {
         (w / iw).max(h / ih)
@@ -70,7 +91,7 @@ pub fn contained(images: &ImageCache, art: &Art, w: f32, h: f32) -> (El, [f32; 2
     let [iw, ih] = art.size;
     let scale = (w / iw).min(h / ih);
     let (dw, dh) = (iw * scale, ih * scale);
-    let image = images.load(art.bytes.clone());
+    let image = image(images, &art.bytes);
     (
         el().w(dw).h(dh).a11y_hidden().child(
             el().w(dw)
