@@ -146,6 +146,12 @@ fn main() -> anyhow::Result<()> {
     });
 
     let handle = app.handle();
+    // SIGTERM / SIGINT quit through the event loop, as the tray's Quit does,
+    // so the window and its GPU device go away on this thread.
+    platform::shutdown::on_request({
+        let handle = handle.clone();
+        move || handle.quit()
+    });
     platform::notify::install({
         let handle = handle.clone();
         move |asid, token| {
@@ -194,10 +200,23 @@ fn main() -> anyhow::Result<()> {
         ms = started.elapsed().as_millis() as u64,
         "opening rune window"
     );
-    app.run();
+    // A failed start or a panic leaves through the same door: unwinding out
+    // of `main` would run the libraries' exit handlers under the core's
+    // threads (OpenSSL's cleanup under a SQLite open crashed that way).
+    let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| app.try_run()));
+    platform::shutdown::deadline();
     instance::release();
     store.flush();
-    Ok(())
+    let code = match ran {
+        Ok(Ok(())) => 0,
+        Ok(Err(err)) => {
+            tracing::error!("{err}");
+            1
+        }
+        Err(_) => 101,
+    };
+    tracing::info!(code, "muqun-desktop stopped");
+    platform::shutdown::leave(code)
 }
 
 fn init_tracing() {
@@ -241,7 +260,6 @@ fn start_core(
     store: Arc<ConfigStore>,
     commands: CommandReceiver,
 ) -> anyhow::Result<()> {
-    let shutdown_store = store.clone();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_name("muqun-core")
@@ -251,20 +269,11 @@ fn start_core(
         .spawn(move || {
             runtime.block_on(async move {
                 let hub = select_hub(settings, &state_dir).await;
-                tokio::spawn(stop_on_signal(shutdown_store));
                 projection::spawn(hub, inbox, store, commands);
                 std::future::pending::<()>().await;
             });
         })?;
     Ok(())
-}
-
-async fn stop_on_signal(store: Arc<ConfigStore>) {
-    let signal = platform::shutdown::requested().await;
-    tracing::info!(signal, "stop requested");
-    instance::release();
-    store.flush();
-    std::process::exit(0);
 }
 
 async fn select_hub(
