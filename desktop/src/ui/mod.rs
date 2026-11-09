@@ -8,6 +8,7 @@ mod agent_marks;
 mod agents;
 mod art;
 mod composer;
+mod composer_row;
 pub mod copy;
 pub mod fx;
 mod home;
@@ -141,6 +142,10 @@ pub enum OpenMenu {
     Model,
     Effort,
     Branch,
+    /// The session composer's permission mode menu, and its overflow
+    /// (what a narrow composer folds away).
+    Mode,
+    ComposerMore,
     /// The start page's model, mode and branch menus.
     StartModel,
     StartMode,

@@ -8,7 +8,7 @@ use muqun_gateway::agents::{AgentSessionId, ModelRef};
 use rune::{col, el, row, El, ImageCache, PillStyle, SurfaceFit, TextEdit, Tx};
 use rune_kit::{
     Badge, BadgeVariant, Button, ButtonVariant, ControlSize, Kit, Menu, MenuItem, PopupItem,
-    PopupList, SegmentedControl, Switch, TextArea,
+    PopupList, TextArea,
 };
 
 use super::art;
@@ -1046,7 +1046,7 @@ fn remember(s: &mut UiState) {
     });
 }
 
-fn switch_model(s: &mut UiState, provider_id: String, model_id: String) {
+pub(super) fn switch_model(s: &mut UiState, provider_id: String, model_id: String) {
     s.menu = None;
     let Some(asid) = s.selected.clone() else {
         return;
@@ -1072,7 +1072,7 @@ fn switch_model(s: &mut UiState, provider_id: String, model_id: String) {
     remember(s);
 }
 
-fn switch_effort(s: &mut UiState, variant: Option<String>) {
+pub(super) fn switch_effort(s: &mut UiState, variant: Option<String>) {
     s.menu = None;
     let Some(asid) = s.selected.clone() else {
         return;
@@ -1100,7 +1100,7 @@ fn switch_effort(s: &mut UiState, variant: Option<String>) {
     remember(s);
 }
 
-fn switch_mode(s: &mut UiState, mode: String) {
+pub(super) fn switch_mode(s: &mut UiState, mode: String) {
     s.menu = None;
     let Some(asid) = s.selected.clone() else {
         return;
@@ -1190,16 +1190,25 @@ pub fn branch_menu(
                 .key(key),
         );
     }
-    let mut menu = Menu::new(key)
+    let menu = Menu::new(key)
         .placement(rune_kit::Placement::TopStart)
         .trigger(pill(k, &format!("{key}-pill"), label, open, kind))
         .open(open)
         .on_close(|s: &mut UiState| s.menu = None);
+    Some(branch_items(menu, cwd, info).build(k, layer))
+}
+
+/// The folder's local branches as menu items, the checked-out one ticked.
+pub(super) fn branch_items(
+    mut menu: Menu,
+    cwd: &str,
+    info: &crate::model::compose::BranchInfo,
+) -> Menu {
     for branch in &info.local {
         let (cwd, name) = (cwd.to_string(), branch.clone());
         menu = menu.item(
             MenuItem::new(branch.clone())
-                .checked(*branch == current)
+                .checked(info.current.as_ref() == Some(branch))
                 .on_select(move |s: &mut UiState| {
                     s.menu = None;
                     s.send(Command::Compose(ComposeCommand::Checkout {
@@ -1209,7 +1218,7 @@ pub fn branch_menu(
                 }),
         );
     }
-    Some(menu.build(k, layer))
+    menu
 }
 
 /// Catalogue models as `(provider, id, name)`, enabled ones only.
@@ -1237,7 +1246,7 @@ pub fn catalog_models(view: &crate::hub::CatalogView) -> Vec<(String, String, St
         .collect()
 }
 
-fn mode_label(id: &str, catalog_name: Option<&str>) -> String {
+pub(super) fn mode_label(id: &str, catalog_name: Option<&str>) -> String {
     if let Some(name) = catalog_name
         .map(str::trim)
         .filter(|s| !s.is_empty() && *s != id)
@@ -1247,7 +1256,7 @@ fn mode_label(id: &str, catalog_name: Option<&str>) -> String {
     super::labels::readable_catalog_id(id)
 }
 
-fn effort_menu(
+pub(super) fn effort_menu(
     k: &Kit,
     layer: &mut Vec<El>,
     open: bool,
@@ -1278,153 +1287,6 @@ fn effort_menu(
     menu.build(k, layer)
 }
 
-fn pills(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
-    let mut line = row().key("pills").gap(2.0).center_y().flex_wrap();
-    let Some(info) = s.current() else { return line };
-    let catalog = s.catalog.as_ref();
-    let model_infos: Vec<&muqun_gateway::agents::ModelInfo> = catalog
-        .map(|c| c.catalog.models.iter().filter(|m| m.enabled).collect())
-        .unwrap_or_default();
-    let models = catalog.map(|c| catalog_models(c)).unwrap_or_default();
-    let default_model = catalog.and_then(|c| c.catalog.defaults.model.as_ref());
-    let selected_info = info
-        .model
-        .as_ref()
-        .and_then(|m| super::labels::catalog_model_info(&model_infos, m, default_model));
-
-    let agent_name = s.agent_name(&info.agent_id);
-    line = line.child(
-        row()
-            .key("agent")
-            .gap(6.0)
-            .center_y()
-            .px(8.0)
-            .h(24.0)
-            .child(super::agents::mark(&info.agent_id, 12.0, s.dark))
-            .child(
-                rune::text(agent_name)
-                    .font(k.ty.small_medium)
-                    .color(k.c.text_muted),
-            ),
-    );
-
-    if let Some(model) = &info.model {
-        let name = super::labels::format_model_name(
-            model,
-            "Model",
-            selected_info.map(|m| m.name.as_str()),
-        );
-        let current = Some((model.provider_id.as_str(), model.model_id.as_str()));
-        line = line.child(if models.is_empty() {
-            Badge::new(name)
-                .variant(BadgeVariant::Subtle)
-                .build(k)
-                .key("model")
-        } else {
-            model_menu(
-                k,
-                layer,
-                OpenMenu::Model,
-                s.menu == Some(OpenMenu::Model),
-                name,
-                &models,
-                current,
-                switch_model,
-            )
-        });
-        if let Some(info) = selected_info {
-            if let Some(variants) = info.variants.as_ref().filter(|v| !v.is_empty()) {
-                let ids: Vec<String> = variants.iter().map(|v| v.id.clone()).collect();
-                line = line.child(effort_menu(
-                    k,
-                    layer,
-                    s.menu == Some(OpenMenu::Effort),
-                    model.variant.as_deref(),
-                    &ids,
-                ));
-            }
-        }
-    } else if !models.is_empty() {
-        line = line.child(model_menu(
-            k,
-            layer,
-            OpenMenu::Model,
-            s.menu == Some(OpenMenu::Model),
-            "Model".into(),
-            &models,
-            None,
-            switch_model,
-        ));
-    }
-    if let Some(cwd) = &info.directory {
-        if let Some(branch) = s.branches.get(cwd).and_then(|b| {
-            branch_menu(
-                k,
-                layer,
-                OpenMenu::Branch,
-                s.menu == Some(OpenMenu::Branch),
-                cwd,
-                b,
-            )
-        }) {
-            line = line.child(branch);
-        }
-    }
-    let modes: Vec<(String, String)> = catalog
-        .map(|c| {
-            c.catalog
-                .modes
-                .iter()
-                .filter(|m| !m.hidden)
-                .map(|m| (m.id.clone(), mode_label(&m.id, Some(m.name.as_str()))))
-                .collect()
-        })
-        .unwrap_or_default();
-    if (2..=4).contains(&modes.len()) {
-        let labels: Vec<&str> = modes.iter().map(|(_, n)| n.as_str()).collect();
-        let at = info.mode.as_ref().and_then(|m| {
-            modes
-                .iter()
-                .position(|(id, _)| id == m || super::labels::bare_catalog_id(id) == m.as_str())
-        });
-        let ids: Vec<String> = modes.iter().map(|(id, _)| id.clone()).collect();
-        line = line.child(
-            SegmentedControl::new(&labels, at)
-                .fit()
-                .label(tr_ref(s.cfg.general.language, "Mode", "模式"))
-                .on_pick(move |s: &mut UiState, i, _: &mut Tx| switch_mode(s, ids[i].clone()))
-                .build(k)
-                .key("modes"),
-        );
-    } else if let Some(mode) = &info.mode {
-        let label = modes
-            .iter()
-            .find(|(id, _)| id == mode)
-            .map(|(_, n)| n.clone())
-            .unwrap_or_else(|| mode_label(mode, None));
-        line = line.child(
-            Badge::new(label)
-                .variant(BadgeVariant::Neutral)
-                .build(k)
-                .key("mode"),
-        );
-    }
-    let on = s.auto_approve.get(&info.asid.0).copied().unwrap_or(false);
-    let asid = info.asid.clone();
-    line.child(
-        Switch::new(on)
-            .label(tr_ref(s.cfg.general.language, "Auto-approve", "自动批准"))
-            .on_toggle(move |s: &mut UiState| {
-                s.send(Command::Compose(ComposeCommand::SetAutoApprove {
-                    asid: asid.clone(),
-                    enabled: !on,
-                }));
-            })
-            .build(k)
-            .key("auto-approve"),
-    )
-}
-
 pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     let look = s.look();
     let language = s.cfg.general.language;
@@ -1440,8 +1302,8 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         .and_then(|i| i.directory.clone().map(PathBuf::from));
     let has_text = !s.draft.text.trim().is_empty() || !s.staged.is_empty();
 
-    // The row under the field: chips on the left, actions on the right. A
-    // narrow column gives the chips their own line, and Attach its icon.
+    // The row under the field: the session's controls on the left (see
+    // `composer_row`), the actions on the right.
     let fit = super::Fit::of("composer");
     let attach_help = format!(
         "{} · {}",
@@ -1459,22 +1321,75 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         .on_press(attach_press)
         .build(k)
         .key("attach");
-    let pill_row = pills(s, k, layer);
-    let mut actions = row().key("composer-actions").w_full().gap(8.0).center_y();
-    let pill_line = if fit == super::Fit::Wide {
-        actions = actions.child(pill_row.grow(1.0).shrink().min_w(0.0));
-        None
+    let stop_label = tr_ref(language, "Stop", "停止");
+    let send_label = if busy {
+        tr_ref(language, "Steer", "插话")
     } else {
-        Some(pill_row.w_full())
+        tr_ref(language, "Send", "发送")
     };
-    actions = actions.child(super::voice::mic_button(s, k)).child(attach);
-    if pill_line.is_some() {
+
+    // The controls fold to fit beside the buttons, measured on the card
+    // itself (a split pane is narrower than the window); only when even
+    // their narrowest fold does not fit do they take a line of their own.
+    use super::composer_row::{self as controls_row, ACTION_GAP, CARD_PAD};
+    let inner = rune::memo::layout_with("composer-card", |r| r[2].round())
+        .map_or(f32::INFINITY, |w| w - CARD_PAD);
+    let button_w = |label: &str| rune::text::measure(label, &[], k.ty.ui_medium, None).0 + 24.0;
+    // Mic and Attach (24 pt each), Send, Stop while working, the gaps.
+    let mut buttons = 24.0 + 24.0 + button_w(send_label) + 3.0 * ACTION_GAP;
+    if busy {
+        buttons += button_w(stop_label) + ACTION_GAP;
+    }
+    // Narrower still, Mic and Attach join the controls' line so Stop and
+    // Send keep their words.
+    let squeezed = inner < buttons;
+    let mut tools = Some(
+        row()
+            .gap(ACTION_GAP)
+            .center_y()
+            .child(super::voice::mic_button(s, k))
+            .child(attach),
+    );
+    let tools_w = 48.0 + 2.0 * ACTION_GAP;
+    let controls = controls_row::Controls::read(s);
+    let beside = controls
+        .as_ref()
+        .and_then(|c| controls_row::beside(s, c, k, layer, inner - buttons));
+    let mut own_line = None;
+    if beside.is_none() {
+        let mut line = row()
+            .key("composer-controls")
+            .w_full()
+            .gap(ACTION_GAP)
+            .center_y();
+        let mut room = inner;
+        if squeezed {
+            line = line.children(tools.take());
+            room -= tools_w;
+        }
+        if let Some(c) = &controls {
+            line = line.child(controls_row::own_line(s, c, k, layer, room));
+        }
+        own_line = Some(line);
+    }
+    let mut actions = row()
+        .key("composer-actions")
+        .w_full()
+        .gap(ACTION_GAP)
+        .center_y();
+    if let Some(r) = beside {
+        actions = actions.child(r.shrink().min_w(0.0)).child(el().grow(1.0));
+    }
+    if let Some(tools) = tools {
+        actions = actions.child(tools);
+    }
+    if own_line.is_some() {
         actions = actions.child(el().grow(1.0));
     }
     if busy {
         if let Some(asid) = s.selected.clone() {
             actions = actions.child(
-                Button::new(tr_ref(language, "Stop", "停止"))
+                Button::new(stop_label)
                     .variant(ButtonVariant::Danger)
                     .control_size(ControlSize::Regular)
                     .shortcut(super::keymap::label(super::keymap::Action::Stop))
@@ -1486,11 +1401,6 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
             );
         }
     }
-    let send_label = if busy {
-        tr_ref(language, "Steer", "插话")
-    } else {
-        tr_ref(language, "Send", "发送")
-    };
     let send = Button::new(send_label)
         .variant(ButtonVariant::Submit)
         .control_size(ControlSize::Regular)
@@ -1528,11 +1438,17 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         card = card.child(chips);
     }
     let placeholder = if has_session {
-        tr_ref(
+        let full = tr_ref(
             language,
             "Message…  (/ commands, $ skills, @ files)",
             "发消息…（/ 命令，$ 技能，@ 文件）",
-        )
+        );
+        // A narrow card keeps the hint to one line.
+        if rune::text::measure(full, &[], k.ty.ui, None).0 + 24.0 <= inner {
+            full
+        } else {
+            tr_ref(language, "Message…  (/ $ @)", "发消息…（/ $ @）")
+        }
     } else {
         tr_ref(language, "Pick a session first", "先选一个会话")
     };
@@ -1575,7 +1491,7 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
             .key("draft")
             .w_full(),
     );
-    if let Some(line) = pill_line {
+    if let Some(line) = own_line {
         card = card.child(line);
     }
     card = card.child(actions);
@@ -1595,21 +1511,36 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         .center_y()
         .px(4.0);
     if busy {
+        // The whole sentence while it fits, then its gist; cut short last.
+        let room = inner + CARD_PAD - 8.0 - 18.0;
+        let queue_key = crate::platform::keys::label("Alt+Enter");
+        let long = format!(
+            "{} · {queue_key} {}",
+            tr_ref(
+                language,
+                "Agent is working; messages steer it",
+                "Agent 正在工作，消息会插话",
+            ),
+            tr_ref(language, "to queue", "排队"),
+        );
+        let line = if rune::text::measure(&long, &[], k.ty.small, None).0 <= room {
+            long
+        } else {
+            format!(
+                "{} · {queue_key} {}",
+                tr_ref(language, "Working", "工作中"),
+                tr_ref(language, "queues", "排队"),
+            )
+        };
         hint = hint
             .child(rune_kit::Spinner::new().size(10.0).color(brand).build(k))
             .child(
-                rune::text(format!(
-                    "{} · {} {}",
-                    tr_ref(
-                        language,
-                        "Agent is working; messages steer it",
-                        "Agent 正在工作，消息会插话",
-                    ),
-                    crate::platform::keys::label("Alt+Enter"),
-                    tr_ref(language, "to queue", "排队"),
-                ))
-                .font(k.ty.small)
-                .color(k.c.text_muted),
+                rune::text(line)
+                    .font(k.ty.small)
+                    .color(k.c.text_muted)
+                    .truncate()
+                    .shrink()
+                    .min_w(0.0),
             )
             .child(el().grow(1.0));
     } else {
