@@ -9,3 +9,5 @@ pub use mapper::PermissionFields;
 pub(crate) mod operations;
 
 pub(crate) mod recovery;
+
+pub(crate) mod skills;

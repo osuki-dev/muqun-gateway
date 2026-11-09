@@ -210,6 +210,7 @@ pub(crate) fn test_state(admin_token: &str, devices: Vec<DeviceRecord>) -> AppSt
         tasks,
         task_events,
         home_overview: Default::default(),
+        search: Arc::new(crate::search::SearchService::disabled()),
         db,
     }
 }

@@ -257,7 +257,12 @@ pub(crate) async fn with_reminder(state: &AppState, mut answer: Value, child: &T
         } => (peer_server_id.as_str(), peer_name.as_str()),
         _ => (state.config.server_id.as_str(), state.config.label.as_str()),
     };
-    super::files::attach_output(&mut answer, source, machine);
+    super::files::attach_output(
+        &mut answer,
+        source,
+        machine,
+        source == state.config.server_id,
+    );
     if !REPORTED_STATES.contains(&task.state) {
         return answer;
     }
@@ -659,7 +664,7 @@ impl MuqunMcp {
         let run = self.state.tasks.run(&self.state, by, request).await;
         reply(run.map(|handle| {
             let mut result = command_result(handle);
-            super::files::attach_output(&mut result, &config.server_id, &config.label);
+            super::files::attach_output(&mut result, &config.server_id, &config.label, true);
             result
         }))
     }
@@ -723,7 +728,7 @@ impl MuqunMcp {
             "task_id": run.task.task_id, "state":run.task.state,
             "exit_code":run.exit_code, "stdout_tail":run.stdout_tail, "machine":machine,
         });
-        super::files::attach_output(&mut result, server_id, &machine);
+        super::files::attach_output(&mut result, server_id, &machine, false);
         Ok(ok(result))
     }
 

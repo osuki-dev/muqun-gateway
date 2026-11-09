@@ -171,6 +171,7 @@ impl CursorState {
                     &mut info.features,
                     &driver.observed_capabilities(),
                     driver.slash_commands_listed(),
+                    driver.skills_listed(),
                 );
             }
             return info;

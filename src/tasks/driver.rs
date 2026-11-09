@@ -5,7 +5,9 @@
 //!
 //! - A command whose pane is gone fails ("pane closed"); one whose pane is
 //!   there gets one marker read, which completes it (and closes an exit-0
-//!   tab) if it has exited.
+//!   tab) if it has exited. One open a minute whose pane's shell is back in
+//!   front with no marker to read has ended unseen: it fails, its exit
+//!   unknown ("never dispatched" while still `queued`).
 //! - A delegation whose session the agent no longer has fails ("session
 //!   gone"); one whose session failed fails with the error line as its
 //!   summary; one whose session went idle after the task was created is
@@ -13,7 +15,14 @@
 //!   `waiting` when it carries the blocked marker, and `idle_unconfirmed`
 //!   (the last message's line as a hint) otherwise -- except a blocked task,
 //!   which stays `waiting`; a paused one whose session runs again is
-//!   working (a blocked one, on a turn after the one that said so).
+//!   working (a blocked one, on a turn after the one that said so). A
+//!   working one whose session has sat idle a minute, with no idle time and
+//!   never seen busy here (an ACP session whose process a restart stopped),
+//!   is settled the same way; one reopened without a new prompt after the
+//!   agent's own `tasks.complete` goes back to the end it was reopened from.
+//! - A finished delegation is reopened by a new user turn only when its
+//!   session has run one since (running, or idle since): a row's own time
+//!   is no evidence, as a loaded ACP session replays its history stamped now.
 //!
 //! - A terminal agent's delegation (bound to a pane, with `agent_id`) gets
 //!   its pane follower started if none runs (after a restart, say), which
@@ -42,12 +51,14 @@ use std::time::Duration;
 
 use super::domain::one_line;
 use super::domain::{now_ms, Task, TaskBinding, TaskChange, TaskFilter, TaskKind, TaskState};
+use super::run_command::{self, NEVER_DISPATCHED};
 use super::service::{
-    finished_since, is_running, session_failure, sourced, turn_end, turn_timeline, OPEN_STATES,
-    SUMMARY_CHARS,
+    finished_since, is_running, session_failure, sourced, summary_timeline, turn_end,
+    turn_timeline, OPEN_STATES, SUMMARY_CHARS,
 };
 use super::{pane_agent, same_pane};
-use crate::agents::domain::AgentSessionStatus;
+use crate::agents::domain::{AgentPart, AgentSessionStatus, TimelineRole, ToolCallStatus};
+use crate::agents::manager::AgentManager;
 use crate::agents::ports::agent::AgentError;
 use crate::backend::Pane;
 use crate::{terminal_backend, AppState};
@@ -56,7 +67,10 @@ const INTERVAL: Duration = Duration::from_secs(60);
 /// How long a task may stay bound to nothing before it is given up on;
 /// dispatching takes seconds.
 const NEVER_DISPATCHED_AFTER: Duration = Duration::from_secs(10 * 60);
-const NEVER_DISPATCHED: &str = "never dispatched";
+/// How long a working delegation's session may sit idle, with no idle time
+/// to say when its turn ended and never seen busy here, before the turn is
+/// taken as over (see [`settle_delegation`]).
+const ENDED_UNSEEN_AFTER: Duration = Duration::from_secs(60);
 const SOURCE: &str = "task_driver";
 /// The store caps a page at 1000.
 const PAGE: usize = 1000;
@@ -224,7 +238,12 @@ pub(crate) async fn reconcile(state: &AppState) -> usize {
             }
             match &task.binding {
                 TaskBinding::AgentSession { agent_id, asid } => {
+                    // Only a session that ran a turn since is read: reading
+                    // one loads it, which for an ACP agent starts its process.
                     if let Some(manager) = state.agent_runtime.manager_for_agent(agent_id).await {
+                        if !state.tasks.ran_since(&manager, asid, task.updated_ms).await {
+                            continue;
+                        }
                         let items = manager
                             .agent()
                             .get_timeline(asid, super::service::SUMMARY_ITEMS)
@@ -256,7 +275,9 @@ pub(crate) async fn reconcile(state: &AppState) -> usize {
                     false
                 }
                 Some(false) => fail(state, &task, "pane closed").await,
-                Some(true) => poll_command(state, &task).await,
+                Some(true) => {
+                    poll_command(state, &task).await || ended_unreported(state, &task).await
+                }
                 None => false,
             },
             TaskBinding::AgentSession { agent_id, asid } => {
@@ -341,12 +362,30 @@ async fn settle_delegation(state: &AppState, task: &Task, agent_id: &str, asid: 
         return settled(state, task, change(TaskState::Working)).await;
     }
     if !finished_since(&session, task.reopened_ms.unwrap_or(task.created_ms)) {
-        // Left dispatching by a stop between binding the session and sending
-        // its prompt: the session never ran it, and nothing else will move it.
-        let never_sent = task.state == TaskState::Dispatching
-            && !is_running(session.status)
-            && older_than(task.updated_ms, NEVER_DISPATCHED_AFTER);
-        return never_sent && fail(state, task, NEVER_DISPATCHED).await;
+        // A turn that ended where this gateway could not see it go idle: the
+        // agent keeps no idle time (an ACP session, whose process a gateway
+        // restart stops) and this gateway never saw the session busy. A
+        // working task whose session sits idle that long is not working. A
+        // session not loaded since the restart says `unknown` rather than
+        // idle (a native listing proves no idle state): it runs no turn either.
+        let ended_unseen = task.state == TaskState::Working
+            && matches!(
+                session.status,
+                AgentSessionStatus::Idle | AgentSessionStatus::Unknown
+            )
+            && !state.tasks.is_busy(asid)
+            && older_than(task.updated_ms, ENDED_UNSEEN_AFTER);
+        if !ended_unseen {
+            // Left dispatching by a stop between binding the session and sending
+            // its prompt: the session never ran it, and nothing else will move it.
+            let never_sent = task.state == TaskState::Dispatching
+                && !is_running(session.status)
+                && older_than(task.updated_ms, NEVER_DISPATCHED_AFTER);
+            return never_sent && fail(state, task, NEVER_DISPATCHED).await;
+        }
+        if let Some(ended) = unproven_reopen(state, &manager, asid, task).await {
+            return moved(state, task, ended).await;
+        }
     }
     // Marker first: a turn that ended while the gateway was down is done
     // only if the agent said so.
@@ -355,6 +394,46 @@ async fn settle_delegation(state: &AppState, task: &Task, agent_id: &str, asid: 
         return false;
     }
     settled(state, task, sourced(ended, SOURCE)).await
+}
+
+/// A reopened task whose session shows no prompt after the agent's own
+/// `tasks.complete` was never reopened by a new turn (an older gateway took
+/// a replayed history for one): it goes back to the end it was reopened
+/// from. `None` for any other task.
+async fn unproven_reopen(
+    state: &AppState,
+    manager: &AgentManager,
+    asid: &str,
+    task: &Task,
+) -> Option<TaskChange> {
+    task.reopened_ms?;
+    let ended = state.tasks.reopened_from(&task.id).await?;
+    let items = summary_timeline(manager, asid, task.created_ms).await;
+    let prompt = items
+        .iter()
+        .rposition(|item| item.role == TimelineRole::User);
+    let completed = items.iter().rposition(|item| {
+        matches!(&item.part, AgentPart::Tool(call)
+            if call.status == ToolCallStatus::Completed
+                && (call.name.ends_with("tasks_complete") || call.name.ends_with("tasks.complete")))
+    })?;
+    prompt
+        .is_none_or(|prompt| prompt < completed)
+        .then(|| TaskChange {
+            note: Some("no new turn followed tasks.complete".into()),
+            ..change(ended)
+        })
+}
+
+/// A command left open a while whose pane's shell is back at its prompt:
+/// settled by its marker, else failed with its exit unknown
+/// ([`run_command::settle_unreported`]).
+async fn ended_unreported(state: &AppState, task: &Task) -> bool {
+    if !older_than(task.updated_ms, ENDED_UNSEEN_AFTER) {
+        return false;
+    }
+    let front = run_command::shell_in_front(state, task).await;
+    run_command::settle_unreported(state, task, front).await
 }
 
 /// [`moved`] for a session delegation, which a blocked task may refuse.
@@ -651,6 +730,129 @@ mod tests {
         ] {
             assert_eq!(session_gone(&error), gone, "{error:?}");
         }
+    }
+
+    /// Make `id` look last moved `ago_ms` ago.
+    async fn age(state: &AppState, id: &TaskId, ago_ms: u64) {
+        let (id, at) = (id.0.clone(), (now_ms() - ago_ms) as i64);
+        state
+            .db
+            .call(move |db| {
+                db.execute(
+                    "UPDATE tasks SET updated_ms = ?2 WHERE id = ?1",
+                    rusqlite::params![id, at],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    /// After a gateway restart an ACP session is idle with no idle time, and
+    /// loading it replays its history stamped now. Nothing stays working
+    /// for that, and nothing is reopened by it.
+    #[tokio::test]
+    async fn after_a_restart_a_delegation_s_quiet_session_settles_it() {
+        use crate::agents::domain::{AgentPart, TimelineItem, TimelineRole};
+        let row = |id: &str, role: TimelineRole, part: AgentPart| TimelineItem {
+            id: id.into(),
+            message_id: id.into(),
+            role,
+            part,
+            seq: 0,
+            // Replayed: every row stamped with the load's time.
+            updated_ms: now_ms(),
+            ordinal: 0,
+            attachments: None,
+            image_assets: None,
+            generation: None,
+            origin: None,
+        };
+        let text = |text: &str| AgentPart::Text { text: text.into() };
+        let complete = AgentPart::Tool(crate::agents::adapters::opencode::mapper::map_tool_call(
+            &json!({ "type": "tool", "id": "c", "name": "mcp__muqun__tasks_complete",
+                "state": { "status": "completed", "input": { "summary": "fixture done" } } }),
+        ));
+        let goal = row("u1", TimelineRole::User, text("run the fixture"));
+        let answer = row("a1", TimelineRole::Assistant, text("I ran the 25 ticks."));
+        let call = row("t1", TimelineRole::Assistant, complete);
+        let again = row("u2", TimelineRole::User, text("and once more"));
+        let mut agent = FakeAgent::new("opencode");
+        agent.sessions = [
+            "ses_cut",
+            "ses_replayed",
+            "ses_asked",
+            "ses_fresh",
+            "ses_done",
+        ]
+        .map(|asid| fake_session(asid, 1))
+        .into();
+        // Never loaded again since the restart: an ACP native listing says
+        // `unknown`, not idle, until something opens the session.
+        agent.sessions[1].status = crate::agents::domain::AgentSessionStatus::Unknown;
+        agent.session_timelines = [
+            ("ses_cut", vec![goal.clone(), answer.clone()]),
+            (
+                "ses_replayed",
+                vec![goal.clone(), call.clone(), answer.clone()],
+            ),
+            (
+                "ses_asked",
+                vec![goal.clone(), call.clone(), again, answer.clone()],
+            ),
+            ("ses_done", vec![goal, call, answer]),
+        ]
+        .into_iter()
+        .map(|(asid, items)| (asid.to_owned(), items))
+        .collect();
+        let state = test_state("admin", Vec::new());
+        state.agent_runtime.attach_for_test(agent.manager()).await;
+        let done = |summary: &str| TaskChange {
+            to: TaskState::Done,
+            summary: Some(summary.into()),
+            ..Default::default()
+        };
+        // Working two minutes; `reopened` as an older gateway did on the replay.
+        let stale = |asid: &'static str, reopened: bool| {
+            let state = state.clone();
+            async move {
+                let id = working(&state, delegation(asid)).await;
+                if reopened {
+                    let ended = state
+                        .tasks
+                        .move_to(&id, done("fixture done"))
+                        .await
+                        .unwrap();
+                    state.tasks.reopen(&ended, now_ms()).await.unwrap();
+                }
+                age(&state, &id, 2 * 60 * 1000).await;
+                id
+            }
+        };
+        // Stopped mid-turn by the restart: paused, its last message the hint.
+        let cut = stale("ses_cut", false).await;
+        // Reopened by the replay alone, its session dormant since: done
+        // again, as the agent said.
+        let replayed = stale("ses_replayed", true).await;
+        // Reopened by a real prompt after the agent's tasks.complete: paused.
+        let asked = stale("ses_asked", true).await;
+        // Dispatched a moment ago: its session may not be busy yet.
+        let fresh = working(&state, delegation("ses_fresh")).await;
+        // Ended, its session idle since before: neither reopened nor read.
+        let finished = working(&state, delegation("ses_done")).await;
+        state.tasks.move_to(&finished, done("ok")).await.unwrap();
+
+        assert_eq!(reconcile(&state).await, 3);
+        let paused = state_of(&state, &cut).await;
+        assert_eq!(paused.state, TaskState::IdleUnconfirmed);
+        assert_eq!(paused.summary.as_deref(), Some("I ran the 25 ticks."));
+        let restored = state_of(&state, &replayed).await;
+        assert_eq!(restored.state, TaskState::Done);
+        assert_eq!(restored.summary.as_deref(), Some("fixture done"));
+        let asked = state_of(&state, &asked).await.state;
+        assert_eq!(asked, TaskState::IdleUnconfirmed);
+        assert_eq!(state_of(&state, &fresh).await.state, TaskState::Working);
+        assert_eq!(state_of(&state, &finished).await.state, TaskState::Done);
     }
 
     #[tokio::test]

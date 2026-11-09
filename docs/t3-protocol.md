@@ -60,9 +60,10 @@ The default is `start_immediately` when no root work is active, otherwise
 A concurrent rejection is returned, not retried under another mode.
 Explicit `queue` uses the same queued/start decision; explicit `steer` uses
 `steer_active` with `targetRunId` after checking the active root's matching live
-provider session and `supportsActiveSteering`. Queueing during a run requires
-`supportsQueuedMessages`. A provider advertising only interrupt/restart steering
-is refused. Interrupt targets the
+provider session and `supportsActiveSteering`; a provider without active
+steering (including one advertising only interrupt/restart steering) takes
+the prompt as `queue_after_active` instead, never a restart. Queueing during a
+run requires `supportsQueuedMessages`. Interrupt targets the
 current authoritative **root run ID**, not a V1 turn or provider subrun.
 Rename uses `thread.metadata.update`; model changes use
 `thread.model-selection.set`. Pinned upstream planning explicitly performs

@@ -35,6 +35,10 @@ const SOURCE: &str = "run_command";
 pub(crate) const NO_TERMINAL: &str = "no reachable terminal session";
 /// The pane is missing, changed, or cannot provide its bound shell identity.
 const PANE_UNVERIFIED: &str = "the task's pane identity could not be verified";
+/// A command whose shell is back at its prompt with no exit marker to read.
+pub(crate) const ENDED_UNREPORTED: &str =
+    "the command ended without reporting its exit code (its shell is back at the prompt); exit unknown";
+pub(crate) const NEVER_DISPATCHED: &str = "never dispatched";
 
 pub(crate) struct RunRequest {
     pub cwd: PathBuf,
@@ -236,6 +240,72 @@ pub(crate) fn follow_peer_command(state: &AppState, task: &Task) {
         }
         state.tasks.release_follow(&id);
     });
+}
+
+/// Whether the shell of `task`'s pane is its terminal's foreground: nothing
+/// it started runs any more. `None` when that cannot be told (no such pane
+/// or shell, `ps` unanswered, a shell on no terminal).
+pub(crate) async fn shell_in_front(state: &AppState, task: &Task) -> Option<bool> {
+    let TaskBinding::Pane {
+        session_id,
+        pane_id,
+        ..
+    } = &task.binding
+    else {
+        return None;
+    };
+    let session = state.config.sessions.iter().find(|s| &s.id == session_id)?;
+    let pane = terminal_backend(session)
+        .get_pane(&PaneId::new(pane_id))
+        .await
+        .ok()?;
+    let out = tokio::process::Command::new("ps")
+        .args(["-o", "pgid=,tpgid=", "-p", &pane.shell_pid?.to_string()])
+        .kill_on_drop(true)
+        .output()
+        .await
+        .ok()?;
+    in_front(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// `ps -o pgid=,tpgid=` of a shell: in front when its terminal's foreground
+/// group is its own. A process on no terminal has no foreground (`-1` on
+/// Linux, `0` on macOS): `None`.
+fn in_front(row: &str) -> Option<bool> {
+    let mut fields = row.split_whitespace().map(str::parse::<i64>);
+    let (pgid, tpgid) = (fields.next()?.ok()?, fields.next()?.ok()?);
+    (tpgid > 0).then_some(tpgid == pgid)
+}
+
+/// A command task whose shell is back in front (`shell_in_front`) has
+/// ended: one more read of its pane for the marker, which settles it as
+/// ever; without one, its exit is unknown -- the pane was restored after a
+/// restart, say, without the output -- and the task fails saying so (or
+/// "never dispatched" when it was never typed). Whether the task moved.
+pub(crate) async fn settle_unreported(
+    state: &AppState,
+    task: &Task,
+    shell_in_front: Option<bool>,
+) -> bool {
+    if task.kind != TaskKind::Command || shell_in_front != Some(true) {
+        return false;
+    }
+    match state.tasks.poll_once(state, task).await {
+        Ok(handle) if handle.task.state != task.state => return true,
+        Ok(_) => {}
+        Err(_) => return false,
+    }
+    let why = if task.state == TaskState::Queued {
+        NEVER_DISPATCHED
+    } else {
+        ENDED_UNREPORTED
+    };
+    let failed = TaskChange {
+        summary: Some(why.to_owned()),
+        note: Some(why.to_owned()),
+        ..change(TaskState::Failed)
+    };
+    state.tasks.move_to(&task.id, failed).await.is_ok()
 }
 
 /// Close a tab nothing was typed into, so a failed start leaves none behind.
@@ -534,7 +604,7 @@ mod tests {
         assert_eq!(
             typed["text"],
             format!(
-                "sh -c 'sh -c \"$1\"; printf \"\\037muqun-exit:%s:%d\\037\\n\" \"$2\" \"$?\"' sh 'echo hi; exit 3' {ID}"
+                "sh -c 'PAGER=cat GIT_PAGER=cat sh -c \"$1\"; printf \"\\037muqun-exit:%s:%d\\037\\n\" \"$2\" \"$?\"' sh 'echo hi; exit 3' {ID}"
             )
         );
         assert_eq!(herdr.enters().len(), 1);
@@ -946,6 +1016,77 @@ mod tests {
         assert_eq!(methods(&herdr, "pane.read").len(), reads, "nothing read");
         let task = store.get(&TaskId(ID.into())).await.unwrap().unwrap();
         assert_eq!(task.state, TaskState::Working);
+    }
+
+    /// A command whose pane's shell is back at its prompt has ended: its
+    /// marker settles it, and without one it fails with its exit unknown
+    /// (a pane restored after a restart shows no output). While the shell
+    /// is not in front, or that cannot be told, it is left alone.
+    #[tokio::test]
+    async fn a_command_whose_shell_is_back_in_front_has_ended() {
+        use TaskState::{Done, Failed, Queued, Working};
+        let typed = format!("$ {}\n", command_line("sleep 60", ID));
+        let exited = format!("{typed}\u{1f}muqun-exit:{ID}:0\u{1f}\n$ ");
+        for (screen, from, front, to, summary) in [
+            (&*typed, Working, None, Working, None),
+            (&*typed, Working, Some(false), Working, None),
+            (&*typed, Working, Some(true), Failed, Some(ENDED_UNREPORTED)),
+            (&*exited, Working, Some(true), Done, Some("exit 0\n")),
+            ("$ ", Queued, Some(true), Failed, Some(NEVER_DISPATCHED)),
+        ] {
+            let herdr = FakeHerdr::start(vec![screen], None);
+            let state = output_state(&herdr);
+            let now = now_ms();
+            let task = Task {
+                id: TaskId(ID.into()),
+                kind: TaskKind::Command,
+                goal: "sleep 60".into(),
+                cwd: None,
+                binding: TaskBinding::Pane {
+                    session_id: state.config.sessions[0].id.clone(),
+                    pane_id: "w1:p9".into(),
+                    tab_id: None,
+                    shell_pid: None,
+                    agent_id: None,
+                    agent_job: None,
+                    model: None,
+                    variant: None,
+                    agent_session_id: None,
+                },
+                state: from,
+                summary: None,
+                exit_code: None,
+                created_by: principal().by,
+                created_ms: now,
+                updated_ms: now,
+                seq: 0,
+                parent: None,
+                origin: TaskOrigin::Peer,
+                label: None,
+                requester_name: None,
+                session_title: None,
+                mentions: Vec::new(),
+                client_ref: None,
+                requester_server_id: None,
+                reopened_ms: None,
+                reopen_count: 0,
+            };
+            state.tasks.insert_for_test(&task).await;
+            let moved = settle_unreported(&state, &task, front).await;
+            let now = state.tasks.get_for_test(&task.id).await;
+            assert_eq!((moved, now.state), (to != from, to), "{front:?} {screen:?}");
+            assert_eq!(now.summary.as_deref(), summary);
+        }
+        // `ps -o pgid=,tpgid=` of the shell.
+        for (row, front) in [
+            (" 300   300\n", Some(true)),
+            (" 300   412\n", Some(false)),
+            (" 300    -1\n", None),
+            (" 300     0\n", None),
+            ("", None),
+        ] {
+            assert_eq!(in_front(row), front, "{row:?}");
+        }
     }
 
     #[test]

@@ -23,6 +23,7 @@ use crate::agents::ports::agent::{
 };
 use crate::agents::ports::mirror::{AgentSessionSnapshot, SessionMirrorPort};
 use std::marker::PhantomData;
+use std::path::PathBuf;
 
 /// Native launch and verified differences; protocol lifecycle is shared.
 /// An agent whose bypass is a launch flag: the session's child is started
@@ -138,6 +139,11 @@ pub trait AcpProvider: Send + Sync + 'static {
     /// How long a successful global catalog is reused. Discovery asks on
     /// every refresh, and each lookup launches a native process.
     const CATALOG_TTL: Duration = Duration::from_secs(60);
+    /// Where the agent reads skills from on disk, so the skills among its
+    /// listed slash commands can be offered as skills too
+    /// ([`super::skills`]). `None` for an agent that lists no skills as
+    /// commands.
+    const SKILL_LAYOUT: Option<&'static super::skills::SkillLayout> = None;
     /// Cheap token that changes whenever the native saved-session store does.
     /// While it holds, a listing stays valid for `SESSION_STORE_MAX_AGE`, so
     /// periodic Home refreshes do not launch a process to learn nothing new.
@@ -285,6 +291,12 @@ const MAX_LIST_PAGES: usize = 64;
 const MAX_DEFERRED_REPLAY_BYTES: usize = 8 * 1024 * 1024;
 const MAX_DEFERRED_REPLAY_UPDATES: usize = 10_000;
 const SESSION_METADATA_TTL: Duration = Duration::from_secs(30);
+/// How long a workspace's skill names on disk are reused by the catalog.
+const SKILLS_TTL: Duration = Duration::from_secs(60);
+/// One workspace's skill names, and when they were read.
+type ScannedSkills = (tokio::time::Instant, Arc<HashSet<String>>);
+/// Workspaces whose skill names are kept.
+const MAX_SKILL_SCANS: usize = 64;
 const SESSION_LIST_TTL: Duration = SESSION_METADATA_TTL;
 const SESSION_STORE_MAX_AGE: Duration = Duration::from_secs(600);
 const MAX_LIST_SCOPES: usize = 4;
@@ -675,6 +687,11 @@ pub struct AcpDriver<P: AcpProvider> {
     metadata_revision: AtomicU64,
     native_capabilities: StdMutex<Value>,
     commands_observed: Arc<AtomicBool>,
+    /// The skill names on disk per workspace (`P::SKILL_LAYOUT`), reused for
+    /// `SKILLS_TTL` so catalog polling does not rescan the skill directories.
+    skill_names: StdMutex<HashMap<PathBuf, ScannedSkills>>,
+    /// Whether a catalog read has offered at least one skill.
+    skills_observed: AtomicBool,
     launch: StdMutex<Option<AcpLaunch>>,
     /// Sessions whose child is launched with the provider's bypass flag
     /// (`P::LAUNCH_BYPASS`). In memory: a restart of the Gateway forgets it.
@@ -820,6 +837,8 @@ impl<P: AcpProvider> AcpDriver<P> {
             metadata_revision: AtomicU64::new(0),
             native_capabilities: StdMutex::new(Value::Null),
             commands_observed: Arc::new(AtomicBool::new(false)),
+            skill_names: StdMutex::new(HashMap::new()),
+            skills_observed: AtomicBool::new(false),
             launch: StdMutex::new(None),
             launch_bypass: StdMutex::new(HashSet::new()),
             native_ids: StdMutex::new(HashMap::new()),
@@ -1440,6 +1459,15 @@ impl<P: AcpProvider> AcpDriver<P> {
         &self,
         directory: Option<&str>,
     ) -> Result<AgentCatalog, AgentError> {
+        let mut catalog = self.available_catalog_without_skills(directory).await?;
+        self.attach_skills(&mut catalog, directory).await;
+        Ok(catalog)
+    }
+
+    async fn available_catalog_without_skills(
+        &self,
+        directory: Option<&str>,
+    ) -> Result<AgentCatalog, AgentError> {
         let mut observed = self.observed_catalog().await;
         if !P::MODEL_SELECTION {
             observed.models.clear();
@@ -1508,6 +1536,52 @@ impl<P: AcpProvider> AcpDriver<P> {
             }
             Err(_) if !observed.commands.is_empty() => Ok(observed),
             Err(error) => Err(error),
+        }
+    }
+
+    /// The skills among `catalog.commands`, by the skill files on disk for
+    /// `directory` (else the default workspace), as `catalog.skills`. The
+    /// commands stay: `/name args` is how the agent runs a skill.
+    async fn attach_skills(&self, catalog: &mut AgentCatalog, directory: Option<&str>) {
+        let Some(layout) = P::SKILL_LAYOUT else {
+            return;
+        };
+        if catalog.commands.is_empty() {
+            return;
+        }
+        let cwd = PathBuf::from(directory.unwrap_or(&self.default_directory));
+        let cached = self
+            .skill_names
+            .lock()
+            .unwrap()
+            .get(&cwd)
+            .and_then(|(at, names)| (at.elapsed() < SKILLS_TTL).then(|| names.clone()));
+        let names = match cached {
+            Some(names) => names,
+            None => {
+                let scan = cwd.clone();
+                let Ok(names) = tokio::task::spawn_blocking(move || {
+                    let home = dirs::home_dir();
+                    super::skills::skill_names(layout, &scan, home.as_deref(), |key| {
+                        std::env::var_os(key)
+                    })
+                })
+                .await
+                else {
+                    return;
+                };
+                let names = Arc::new(names);
+                let mut cache = self.skill_names.lock().unwrap();
+                if cache.len() >= MAX_SKILL_SCANS && !cache.contains_key(&cwd) {
+                    cache.clear();
+                }
+                cache.insert(cwd, (tokio::time::Instant::now(), names.clone()));
+                names
+            }
+        };
+        catalog.skills = super::skills::split(&catalog.commands, &names);
+        if !catalog.skills.is_empty() {
+            self.skills_observed.store(true, Ordering::Release);
         }
     }
 
@@ -3479,25 +3553,45 @@ impl<P: AcpProvider> AcpDriver<P> {
         delivery: Option<&str>,
         native_command: bool,
     ) -> Result<(), AgentError> {
+        // A prompt with no stated delivery is the agent's own mid-turn input,
+        // the same as "steer": steered into the running turn where the agent
+        // does that, else the next prompt the turn's end sends.
         let queued = match delivery {
-            None | Some("auto") => None,
-            Some("steer") if P::STEERING && !native_command => {
-                let running = self.retained(id).filter(|session| {
+            None | Some("auto" | "steer") => {
+                let session = self.retained(id);
+                if let Some(session) = &session {
+                    // Idle retirement holds `busy` while it inspects the
+                    // session; that is not a turn. Wait for its decision, as
+                    // `activate` does: a retired generation queues nothing.
+                    drop(session.retirement.lock().await);
+                }
+                let running = session.filter(|session| {
                     session.connected.load(Ordering::Acquire)
                         && session.busy.load(Ordering::Acquire)
                 });
-                if let Some(session) = running {
-                    let prepared =
-                        operations::prompt_parts(text, attachments, session.prompt_capabilities)
-                            .await?;
-                    if self.steer(&session, id, &prepared).await? {
-                        return Ok(());
+                match running {
+                    Some(session) if P::STEERING && !native_command => {
+                        let prepared = operations::prompt_parts(
+                            text,
+                            attachments,
+                            session.prompt_capabilities,
+                        )
+                        .await?;
+                        if self.steer_queued(&session, id).await?
+                            && self.steer(&session, id, &prepared).await?
+                        {
+                            return Ok(());
+                        }
+                        // The turn ended meanwhile: an ordinary prompt.
+                        None
                     }
+                    // A native command, or an agent without steering: it goes
+                    // first when the turn ends (`enqueue` sends it now when
+                    // no turn runs).
+                    Some(_) => Some(Delivery::Steer),
+                    None => None,
                 }
-                // No turn is running (any more): an ordinary prompt.
-                None
             }
-            // Without steering, "steer" is the next prompt the turn's end sends.
             Some(mode) => Some(Delivery::parse(mode).ok_or_else(|| {
                 AgentError::InvalidRequest("delivery must be steer or queue".into())
             })?),
@@ -3776,6 +3870,32 @@ impl<P: AcpProvider> AcpDriver<P> {
                     "{error}; prompt delivery may have occurred; do not retry automatically"
                 )))
             }
+        }
+    }
+
+    /// Before a prompt is steered into the running turn, steer in the prompts
+    /// queued ahead of it, oldest first: once the agent takes input, an older
+    /// prompt must not be overtaken and left for the turn's end. Claude Code
+    /// keeps a turn open while its background subagents run, so that end can
+    /// be hours after the answer. `Ok(false)`: the turn ended meanwhile, and
+    /// what is left waits in the queue.
+    async fn steer_queued(&self, session: &Session, id: &str) -> Result<bool, AgentError> {
+        let _gate = session.turn_gate.lock().await;
+        loop {
+            let Some(item) = session.queue().next(id).cloned() else {
+                return Ok(true);
+            };
+            // A native command is never steered; it waits for the turn's end.
+            if item.input.command {
+                return Ok(true);
+            }
+            let result = self.steer(session, id, &item.input.prepared).await;
+            if matches!(result, Ok(false)) {
+                return Ok(false);
+            }
+            let result = result.map(drop);
+            Self::settle_queued(session, &self.mirror, &self.tx, &item.id, &result).await;
+            result?;
         }
     }
 
@@ -4428,6 +4548,36 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
     fn slash_commands_listed(&self) -> bool {
         self.commands_observed.load(Ordering::Acquire)
     }
+    fn skills_listed(&self) -> bool {
+        self.skills_observed.load(Ordering::Acquire)
+    }
+    /// A skill runs as its slash command, `/name`, without arguments (the
+    /// skill route carries none). Only a skill this session's catalog lists.
+    fn activate_skill<'a>(
+        &'a self,
+        id: &'a str,
+        name: &'a str,
+        resume: Option<bool>,
+    ) -> AgentFuture<'a, ()> {
+        Box::pin(async move {
+            if resume == Some(false) {
+                return Err(AgentError::Unsupported(
+                    "ACP skill activation without a turn".into(),
+                ));
+            }
+            // A dormant session's skills are read for its own workspace.
+            let directory = self.get_session(id).await?.directory;
+            let catalog = self
+                .get_catalog_for_session(Some(id), directory.as_deref())
+                .await?;
+            if !catalog.skills.iter().any(|skill| skill.id == name) {
+                return Err(AgentError::InvalidRequest(
+                    "that skill is not offered by this session".into(),
+                ));
+            }
+            self.run_command(id, name, "", None).await
+        })
+    }
     fn signin_failure(&self) -> Option<u64> {
         *self.signin_failure.lock().unwrap()
     }
@@ -4830,7 +4980,10 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
                         "ACP generation changed during catalog observation".into(),
                     )
                 })?;
-                let mut catalog = session.state.lock().await.catalog.clone();
+                let (mut catalog, session_directory) = {
+                    let state = session.state.lock().await;
+                    (state.catalog.clone(), state.info.directory.clone())
+                };
                 if !P::MODEL_SELECTION {
                     catalog.models.clear();
                     catalog.defaults.model = None;
@@ -4842,6 +4995,8 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
                     catalog.modes.clear();
                     catalog.defaults.mode = None;
                 }
+                self.attach_skills(&mut catalog, session_directory.as_deref().or(directory))
+                    .await;
                 Ok(catalog)
             } else {
                 self.get_catalog(directory).await
@@ -6068,8 +6223,7 @@ mod inbox_tests {
         .unwrap_or_else(|_| panic!("{what}"));
     }
 
-    /// The prompts the mock agent received for `id`, in order. Empty while
-    /// the mock is rewriting its store: callers poll until it settles.
+    /// The prompts the mock agent received for `id`, in order.
     fn received(fixture: &Fixture, id: &str) -> Vec<String> {
         let store: Value = std::fs::read(fixture.directory.join("sessions.json"))
             .ok()
@@ -6179,6 +6333,162 @@ mod inbox_tests {
             }
             driver.shutdown().await;
         }
+    }
+
+    struct SteeringProvider;
+    impl AcpProvider for SteeringProvider {
+        const KIND: &'static str = "fx";
+        const LABEL: &'static str = "Steering";
+        const ARGS: &'static [&'static str] = &["acp"];
+        const REQUIRE_MESSAGE_ID: bool = true;
+        const MODEL_SELECTION: bool = true;
+        const STEERING: bool = true;
+        fn recovery_snapshot<'a>(
+            binary: &'a str,
+            directory: &'a str,
+            id: &'a str,
+            stop: &'a CancellationToken,
+        ) -> AgentFuture<'a, NativeSnapshot> {
+            crate::agents::adapters::fx::driver::FxProvider::recovery_snapshot(
+                binary, directory, id, stop,
+            )
+        }
+    }
+
+    /// A turn the agent holds open (Claude Code waiting on background
+    /// subagents) does not strand a queued prompt behind a later steer: the
+    /// queued one is steered in first.
+    #[tokio::test]
+    async fn a_steer_takes_the_prompts_queued_before_it_into_the_turn() {
+        let fixture = Fixture::new().await;
+        let (tx, _) = broadcast::channel(256);
+        let mirror = Arc::new(MemoryMirror::for_agent("fx"));
+        let driver = AcpDriver::<SteeringProvider>::new(
+            fixture
+                .directory
+                .join("mock-fx")
+                .to_string_lossy()
+                .into_owned(),
+            fixture.directory.to_string_lossy().into_owned(),
+            mirror.clone(),
+            tx,
+        );
+        driver.set_session_store(|| None);
+        let info = driver.create_session(None, None, None).await.unwrap();
+        let (id, asid) = (info.asid.0.as_str(), &info.asid);
+        driver.send_prompt(id, "hold", &[], None).await.unwrap();
+        driver
+            .send_prompt(id, "queued", &[], Some("queue"))
+            .await
+            .unwrap();
+        assert_eq!(texts(&driver.get_inbox(id).await.unwrap()), ["queued"]);
+        driver
+            .send_prompt(id, "steered", &[], Some("steer"))
+            .await
+            .unwrap();
+        assert_eq!(received(&fixture, id), ["hold", "queued", "steered"]);
+        assert!(driver.get_inbox(id).await.unwrap().is_empty());
+        assert!(mirror.inbox(asid).await.is_empty());
+        driver.shutdown().await;
+    }
+
+    /// Idle, every delivery is an ordinary prompt. During a turn, a prompt
+    /// with no stated delivery is the agent's own mid-turn input, the same
+    /// as "steer": steered into the turn (after what was queued before it)
+    /// where the agent steers, else first when the turn ends; "queue" always
+    /// waits for the end. Nothing is refused, lost or reordered.
+    #[tokio::test]
+    async fn a_prompt_sent_during_a_turn_is_the_agents_own_mid_turn_input() {
+        async fn run<P: AcpProvider>(fixture: &Fixture, driver: &Arc<AcpDriver<P>>) {
+            let info = driver.create_session(None, None, None).await.unwrap();
+            let (id, asid) = (info.asid.0.as_str(), &info.asid);
+            let mut sent = Vec::new();
+            for (text, delivery) in [
+                ("idle-none", None),
+                ("idle-steer", Some("steer")),
+                ("idle-queue", Some("queue")),
+            ] {
+                driver.send_prompt(id, text, &[], delivery).await.unwrap();
+                sent.push(text);
+                until("idle prompt answered", async || {
+                    received(fixture, id) == sent
+                        && driver.get_session(id).await.unwrap().status == AgentSessionStatus::Idle
+                })
+                .await;
+            }
+            assert!(driver.get_inbox(id).await.unwrap().is_empty());
+            driver.send_prompt(id, "approval", &[], None).await.unwrap();
+            sent.push("approval");
+            until("permission asked", async || {
+                !driver.get_pending_permissions(id).await.unwrap().is_empty()
+            })
+            .await;
+            for (text, delivery) in [
+                ("queued", Some("queue")),
+                ("plain", None),
+                ("steered", Some("steer")),
+            ] {
+                driver.send_prompt(id, text, &[], delivery).await.unwrap();
+            }
+            let (now, inbox, end): (&[&str], &[(&str, &str)], &[&str]) = if P::STEERING {
+                (&["queued", "plain", "steered"], &[], &[])
+            } else {
+                (
+                    &[],
+                    &[
+                        ("queued", "queue"),
+                        ("plain", "steer"),
+                        ("steered", "steer"),
+                    ],
+                    &["plain", "steered", "queued"],
+                )
+            };
+            sent.extend(now);
+            assert_eq!(received(fixture, id), sent, "steering {}", P::STEERING);
+            let items = driver.get_inbox(id).await.unwrap();
+            assert_eq!(
+                items
+                    .iter()
+                    .map(|item| (
+                        item["payload"]["text"].as_str().unwrap(),
+                        item["delivery"].as_str().unwrap()
+                    ))
+                    .collect::<Vec<_>>(),
+                inbox,
+                "steering {}",
+                P::STEERING
+            );
+            assert_eq!(driver.mirror.inbox(asid).await, items);
+            let permission = driver.get_pending_permissions(id).await.unwrap();
+            driver
+                .reply_permission(id, &permission[0].id, PermissionDecision::Allow, None)
+                .await
+                .unwrap();
+            sent.extend(end);
+            until("turn ended and queue drained", async || {
+                received(fixture, id) == sent
+                    && driver.mirror.inbox(asid).await.is_empty()
+                    && driver.get_session(id).await.unwrap().status == AgentSessionStatus::Idle
+            })
+            .await;
+            assert!(driver.get_inbox(id).await.unwrap().is_empty());
+            driver.shutdown().await;
+        }
+        let fixture = Fixture::new().await;
+        run(&fixture, &fixture.driver.clone()).await;
+        let (tx, _) = broadcast::channel(256);
+        let steering = AcpDriver::<SteeringProvider>::new(
+            fixture
+                .directory
+                .join("mock-fx")
+                .to_string_lossy()
+                .into_owned(),
+            fixture.directory.to_string_lossy().into_owned(),
+            Arc::new(MemoryMirror::for_agent("fx")),
+            tx,
+        );
+        steering.set_session_store(|| None);
+        run(&fixture, &steering).await;
     }
 
     /// A mode switch publishes only the mode: a turn whose end was published

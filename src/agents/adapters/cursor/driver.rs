@@ -34,6 +34,10 @@ impl AcpProvider for CursorProvider {
     // is no separate effort option.
     const MODEL_SELECTION: bool = true;
     const IDLE_RETIREMENT: bool = true;
+    // Skills are listed among the slash commands; the files on disk tell
+    // which they are.
+    const SKILL_LAYOUT: Option<&'static crate::agents::adapters::acp::skills::SkillLayout> =
+        Some(&crate::agents::adapters::acp::skills::CURSOR);
     const PROVIDER_CONFIG: bool = false;
     // No system prompt in its ACP server, and MCP server instructions do not
     // reach the model.

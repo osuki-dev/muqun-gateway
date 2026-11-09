@@ -986,7 +986,7 @@ fn read_into(
 /// first: the directory itself and every parent up to its checkout root, the
 /// way Claude Code and Codex walk them. Outside a checkout, only `cwd`. Never
 /// the home directory, whose skills are the user's own.
-fn workspace_levels(cwd: &Path, home: Option<&Path>) -> Vec<PathBuf> {
+pub(crate) fn workspace_levels(cwd: &Path, home: Option<&Path>) -> Vec<PathBuf> {
     let Ok(cwd) = std::fs::canonicalize(cwd) else {
         return Vec::new();
     };

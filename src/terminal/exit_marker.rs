@@ -17,6 +17,8 @@ use super::shell_word::shell_word;
 
 pub(crate) const MARKER: char = '\u{1f}';
 const TAG: &str = "muqun-exit:";
+/// Pagers off for the command: its output is read, never paged through.
+const NO_PAGER: &str = "PAGER=cat GIT_PAGER=cat";
 /// The format string as the pane echoes the typed line. It never matches a
 /// marker, so its last occurrence is where the command line was typed.
 const ECHOED_FORMAT: &str = "muqun-exit:%s";
@@ -28,9 +30,13 @@ const ECHOED_FORMAT: &str = "muqun-exit:%s";
 /// single-quoted literals -- nothing like `$?` that fish spells differently --
 /// and an `exit N` in `command` ends the inner `sh` only, so the status is
 /// still printed. `job_id` is a task id: URL-safe, never quoted.
+///
+/// The command's output goes to the pane's terminal, so `git log`, `man`
+/// and the like would open a pager there and wait for a key nobody presses:
+/// the command would never end. It runs with [`NO_PAGER`].
 pub(crate) fn command_line(command: &str, job_id: &str) -> String {
     format!(
-        "sh -c 'sh -c \"$1\"; printf \"\\037{TAG}%s:%d\\037\\n\" \"$2\" \"$?\"' sh {} {job_id}",
+        "sh -c '{NO_PAGER} sh -c \"$1\"; printf \"\\037{TAG}%s:%d\\037\\n\" \"$2\" \"$?\"' sh {} {job_id}",
         shell_word(command)
     )
 }
@@ -198,7 +204,8 @@ mod tests {
 
     #[test]
     fn nothing_counts_while_the_typed_line_is_still_being_echoed() {
-        let partial = "$ sh -c 'sh -c \"$1\"; printf \"\\037muqun-exit:%s:%d";
+        let partial =
+            "$ sh -c 'PAGER=cat GIT_PAGER=cat sh -c \"$1\"; printf \"\\037muqun-exit:%s:%d";
         assert_eq!(find_exit_after_command(partial, "t_abc"), None);
         assert_eq!(output_after_command(partial, "t_abc"), "");
         assert_eq!(find_exit_after_command("$ ", "t_abc"), None);
@@ -296,7 +303,7 @@ mod tests {
         let line = command_line("echo 'hi there'; exit 3", "t_abc");
         assert_eq!(
             line,
-            "sh -c 'sh -c \"$1\"; printf \"\\037muqun-exit:%s:%d\\037\\n\" \"$2\" \"$?\"' sh 'echo '\\''hi there'\\''; exit 3' t_abc"
+            "sh -c 'PAGER=cat GIT_PAGER=cat sh -c \"$1\"; printf \"\\037muqun-exit:%s:%d\\037\\n\" \"$2\" \"$?\"' sh 'echo '\\''hi there'\\''; exit 3' t_abc"
         );
         assert!(line.contains(ECHOED_FORMAT));
         // What the interactive shell does with it: `exit 3` ends the inner
@@ -309,5 +316,14 @@ mod tests {
         let text = String::from_utf8(out.stdout).unwrap();
         assert_eq!(text, "hi there\n\u{1f}muqun-exit:t_abc:3\u{1f}\n");
         assert_eq!(find_exit(&text, "t_abc"), Some(3));
+        // No pager waits for a key in the pane: the command runs with them off.
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(command_line("echo \"$PAGER $GIT_PAGER\"", "t_abc"))
+            .output()
+            .unwrap();
+        assert!(String::from_utf8(out.stdout)
+            .unwrap()
+            .starts_with("cat cat\n"));
     }
 }

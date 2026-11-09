@@ -2709,6 +2709,7 @@ fn apply_acp_capabilities(
     features: &mut crate::discovery::AgentFeatures,
     capabilities: &serde_json::Value,
     commands_listed: bool,
+    skills_listed: bool,
 ) {
     features.attachments = capabilities
         .pointer("/promptCapabilities/image")
@@ -2720,6 +2721,7 @@ fn apply_acp_capabilities(
             == Some(true);
     features.attachments_by_path = false;
     features.slash_commands = commands_listed;
+    features.skills = skills_listed;
     // Before any process ran, the agent's own defaults stand.
     if capabilities.is_null() {
         return;
