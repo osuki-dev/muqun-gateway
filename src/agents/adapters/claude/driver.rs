@@ -37,6 +37,10 @@ impl AcpProvider for ClaudeProvider {
     // `session/delete` is the SDK's transcript delete, which finds a saved
     // session without loading it (adapter 0.99.1).
     const DELETE_LISTED: bool = true;
+    // Skills are listed among the slash commands; the files on disk tell
+    // which they are.
+    const SKILL_LAYOUT: Option<&'static crate::agents::adapters::acp::skills::SkillLayout> =
+        Some(&crate::agents::adapters::acp::skills::CLAUDE);
     fn recovery_snapshot<'a>(
         _binary: &'a str,
         directory: &'a str,
