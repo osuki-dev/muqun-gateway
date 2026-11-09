@@ -164,6 +164,13 @@ pub enum Update {
         rows: Vec<crate::hub::TaskRow>,
         default_cwd: Option<String>,
     },
+    /// The task list could not be read (why); the last list stays.
+    TasksFailed(String),
+    /// A task's state history (`Command::TaskHistory`).
+    TaskHistory {
+        id: String,
+        steps: Vec<crate::hub::TaskStep>,
+    },
     /// The sessions below `asid`, newest first, replacing the last read.
     Descendants {
         asid: String,

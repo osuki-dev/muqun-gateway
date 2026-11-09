@@ -69,12 +69,18 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
         ));
     // Home has no toolbar of its own; its card still starts on the
     // sidebar's top row, as every page's does.
-    // Settings has none either: its nav and page take the whole card.
-    split = split.toolbar(if matches!(s.mode, Mode::Home | Mode::Settings) {
-        Toolbar::new()
-    } else {
-        toolbar(s, k, &look, layer)
-    });
+    // Settings, Inbox and Tasks have none either: their panes take the
+    // whole card.
+    split = split.toolbar(
+        if matches!(
+            s.mode,
+            Mode::Home | Mode::Settings | Mode::Inbox | Mode::Tasks
+        ) {
+            Toolbar::new()
+        } else {
+            toolbar(s, k, &look, layer)
+        },
+    );
     let inspector_here = s.right_open && s.mode == Mode::Session && !s.in_split();
     // A row's details take the right-hand slot while they are open; an open
     // terminal takes it over both, and the inspector comes last.

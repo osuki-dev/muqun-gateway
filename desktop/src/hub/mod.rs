@@ -92,6 +92,9 @@ pub struct TaskRow {
     pub cwd: Option<String>,
     #[serde(default)]
     pub children: TaskChildren,
+    /// A command task's exit status, once it has one.
+    #[serde(default)]
+    pub exit_code: Option<i32>,
     /// When it started working: its last reopening, else its creation.
     #[serde(skip)]
     pub started_ms: u64,
@@ -196,6 +199,19 @@ pub struct TaskChildren {
     pub waiting: u32,
     #[serde(default)]
     pub failed: u32,
+}
+
+/// One state change in a task's history.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Deserialize)]
+pub struct TaskStep {
+    #[serde(default)]
+    pub at_ms: u64,
+    /// The state it moved to.
+    #[serde(default)]
+    pub to: String,
+    /// Why, when the ledger recorded a reason (a summary, an error).
+    #[serde(default)]
+    pub note: Option<String>,
 }
 
 /// `GET /api/tasks/defaults`: what a task opened without a folder runs in.
@@ -550,6 +566,11 @@ pub trait SessionHub: Send + Sync {
     fn complete_task<'a>(&'a self, id: &'a str) -> HubFuture<'a, ()>;
     /// What a task opened without a folder would run in.
     fn task_defaults(&self) -> HubFuture<'_, TaskDefaults>;
+    /// A task's state changes, oldest first (`GET /api/tasks/{id}`
+    /// `events`); empty where there is no task ledger.
+    fn task_history<'a>(&'a self, _id: &'a str) -> HubFuture<'a, Vec<TaskStep>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
     /// Computers `@` may name: this machine first, then linked fleet peers
     /// when the hub has them (App `GET /api/peers`).
     fn list_peers(&self) -> HubFuture<'_, Vec<PeerMention>>;

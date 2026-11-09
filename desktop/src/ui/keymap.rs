@@ -61,6 +61,11 @@ pub enum Action {
     PrevMessage,
     TermCopy,
     TermPaste,
+    Allow,
+    AllowAlways,
+    Deny,
+    MarkDone,
+    CancelTask,
 }
 
 /// Where a shortcut is listed.
@@ -72,14 +77,16 @@ pub enum Group {
     Timeline,
     Split,
     Terminal,
+    Lists,
 }
 
 impl Group {
-    pub const ALL: [Group; 6] = [
+    pub const ALL: [Group; 7] = [
         Group::Global,
         Group::Panels,
         Group::Session,
         Group::Timeline,
+        Group::Lists,
         Group::Split,
         Group::Terminal,
     ];
@@ -92,6 +99,7 @@ impl Group {
             Group::Timeline => ("Timeline", "时间线"),
             Group::Split => ("Split view", "分屏"),
             Group::Terminal => ("Terminal", "终端"),
+            Group::Lists => ("Inbox and Tasks", "收件箱与任务"),
         };
         tr(language, en, zh)
     }
@@ -326,6 +334,29 @@ pub static ENTRIES: &[Entry] = &[
         "Previous message",
         "上一条消息",
     ),
+    e(A::Allow, G::Lists, "a", "Allow", "允许"),
+    e(
+        A::AllowAlways,
+        G::Lists,
+        "shift+a",
+        "Always allow",
+        "始终允许",
+    ),
+    e(A::Deny, G::Lists, "d", "Deny", "拒绝"),
+    e(
+        A::MarkDone,
+        G::Lists,
+        "m",
+        "Mark the paused task done",
+        "将暂停的任务标记完成",
+    ),
+    e(
+        A::CancelTask,
+        G::Lists,
+        "x",
+        "Cancel the task (press twice)",
+        "取消任务（按两次）",
+    ),
     e(
         A::AddSplit,
         G::Split,
@@ -508,6 +539,18 @@ pub fn dispatch(s: &mut UiState, ev: &KeyEvent, tx: &mut Tx) -> bool {
         s.toggle_terminal();
         return true;
     }
+    // The arrows step the Inbox's and Tasks' lists as j and k do.
+    if matches!(s.mode, Mode::Inbox | Mode::Tasks)
+        && matches!(ev.key, rune::Key::Up | rune::Key::Down)
+        && !(ev.mods.shift || ev.mods.alt || ev.mods.ctrl || ev.mods.cmd)
+    {
+        let action = if ev.key == rune::Key::Down {
+            A::NextRow
+        } else {
+            A::PrevRow
+        };
+        return run(s, action, ev, tx);
+    }
     let Some(found) = ENTRIES
         .iter()
         .filter(|e| e.owner == Owner::Window)
@@ -615,6 +658,16 @@ pub fn run(s: &mut UiState, action: Action, ev: &KeyEvent, tx: &mut Tx) -> bool 
                 return false;
             };
             s.jump_to_latest(&asid, tx);
+        }
+        A::NextRow | A::PrevRow | A::OpenRow | A::Allow | A::AllowAlways | A::Deny
+            if s.mode == Mode::Inbox =>
+        {
+            return super::inbox::key(s, action)
+        }
+        A::NextRow | A::PrevRow | A::OpenRow | A::MarkDone | A::CancelTask
+            if s.mode == Mode::Tasks =>
+        {
+            return super::tasks::key(s, action)
         }
         A::NextRow | A::PrevRow | A::ToggleRow | A::OpenRow | A::NextMessage | A::PrevMessage => {
             return s.timeline_key(action, tx)

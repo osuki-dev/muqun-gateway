@@ -14,7 +14,7 @@ use crate::model::tool_view as tv;
 use crate::ui::copy::tr_ref;
 use crate::ui::UiState;
 
-fn reply(
+pub fn reply(
     request: &PermissionRequest,
     decision: PermissionDecision,
 ) -> impl Fn(&mut UiState) + 'static {
@@ -38,7 +38,7 @@ pub fn pending_permission(s: &UiState, request: &PermissionRequest) -> bool {
 }
 
 /// App `permissionActionPhrase`; an unknown key spelled out.
-fn action_phrase(language: Language, action: &str) -> String {
+pub fn action_phrase(language: Language, action: &str) -> String {
     let t = |en, zh| tr_ref(language, en, zh).to_string();
     match action {
         "external_directory" => t("Read outside the workspace", "读取工作区之外的内容"),
@@ -60,7 +60,7 @@ fn action_phrase(language: Language, action: &str) -> String {
 
 /// App `permissionOptionLabel`: known labels in the app's words, a
 /// provider's own scope as it wrote it.
-fn option_label(language: Language, option: &PermissionOption) -> String {
+pub fn option_label(language: Language, option: &PermissionOption) -> String {
     let label = option.label.trim();
     let lower = label.to_ascii_lowercase();
     let t = |en, zh| tr_ref(language, en, zh).to_string();
@@ -80,7 +80,7 @@ fn option_label(language: Language, option: &PermissionOption) -> String {
     }
 }
 
-fn danger_reason(language: Language, reason: &str) -> &'static str {
+pub fn danger_reason(language: Language, reason: &str) -> &'static str {
     let t = |en, zh| tr_ref(language, en, zh);
     match reason {
         "rm-system-root" => t(
@@ -110,7 +110,7 @@ fn danger_reason(language: Language, reason: &str) -> &'static str {
 
 /// The diff an edit permission carries, drawn read-only before it is
 /// approved (a tinted `diff` fence: the same rows, no state to keep).
-fn permission_diff(k: &Kit, request: &PermissionRequest) -> Option<El> {
+pub fn permission_diff(k: &Kit, request: &PermissionRequest) -> Option<El> {
     let files = tv::diff_files(request.metadata.as_ref().and_then(|m| m.as_object()));
     if files.is_empty() {
         return None;
@@ -230,75 +230,13 @@ pub fn permission_card(s: &UiState, k: &Kit, request: &PermissionRequest) -> El 
                 ),
         );
     }
-    let mut what = col()
-        .key("what")
-        .w_full()
-        .gap(6.0)
-        .px(10.0)
-        .py(8.0)
-        .radius(k.radius.md)
-        .fill(k.c.surface_base);
-    let mut any = false;
-    if !subject.is_empty() {
-        what = what.child(
-            text(subject.clone())
-                .font(k.ty.mono)
-                .color(k.c.text_base)
-                .wrap_anywhere()
-                .selectable(true)
-                .w_full(),
-        );
-        any = true;
-    }
-    for res in request
-        .resources
-        .iter()
-        .filter(|r| **r != subject && !request.save.contains(r))
-        .take(8)
-    {
-        what = what.child(
-            text(format!("• {res}"))
-                .font(k.ty.mono)
-                .color(k.c.text_muted)
-                .wrap_anywhere()
-                .w_full(),
-        );
-        any = true;
-    }
-    if let Some(message) = request.message.as_ref().filter(|m| !m.trim().is_empty()) {
-        what = what.child(Markdown::new(message).build(k));
-        any = true;
-    }
-    if any {
+    if let Some(what) = what_block(k, request, &subject) {
         card = card.child(what);
     }
     if let Some(diff) = permission_diff(k, request) {
         card = card.child(diff);
     }
-    // The engine's answers in its order; the three every permission has when
-    // it listed none. Allow leads.
-    let mut options: Vec<PermissionOption> = if request.options.is_empty() {
-        let mut base = vec![PermissionOption {
-            index: 0,
-            label: String::new(),
-            decision: PermissionDecision::Allow,
-        }];
-        if !request.save.is_empty() {
-            base.push(PermissionOption {
-                index: 1,
-                label: String::new(),
-                decision: PermissionDecision::AllowAlways,
-            });
-        }
-        base.push(PermissionOption {
-            index: 2,
-            label: String::new(),
-            decision: PermissionDecision::Deny,
-        });
-        base
-    } else {
-        request.options.clone()
-    };
+    let mut options = options(request);
     let stacked = options.len() > 3 || options.iter().any(|o| o.label.chars().count() > 24);
     if stacked {
         options.sort_by_key(|o| o.decision != PermissionDecision::Allow);
@@ -340,4 +278,75 @@ pub fn permission_card(s: &UiState, k: &Kit, request: &PermissionRequest) -> El 
         );
     }
     card
+}
+
+/// What the permission acts on, the other resources and the agent's note,
+/// in one quiet block; `None` when it names nothing.
+pub fn what_block(k: &Kit, request: &PermissionRequest, subject: &str) -> Option<El> {
+    let mut what = col()
+        .key("what")
+        .w_full()
+        .gap(6.0)
+        .px(10.0)
+        .py(8.0)
+        .radius(k.radius.md)
+        .fill(k.c.surface_base);
+    let mut any = false;
+    if !subject.is_empty() {
+        what = what.child(
+            text(subject.to_string())
+                .font(k.ty.mono)
+                .color(k.c.text_base)
+                .wrap_anywhere()
+                .selectable(true)
+                .w_full(),
+        );
+        any = true;
+    }
+    for res in request
+        .resources
+        .iter()
+        .filter(|r| **r != subject && !request.save.contains(r))
+        .take(8)
+    {
+        what = what.child(
+            text(format!("• {res}"))
+                .font(k.ty.mono)
+                .color(k.c.text_muted)
+                .wrap_anywhere()
+                .w_full(),
+        );
+        any = true;
+    }
+    if let Some(message) = request.message.as_ref().filter(|m| !m.trim().is_empty()) {
+        what = what.child(Markdown::new(message).build(k));
+        any = true;
+    }
+    any.then_some(what)
+}
+
+/// The engine's answers in its order; the three every permission has when
+/// it listed none (Always only when the engine offers something to save).
+pub fn options(request: &PermissionRequest) -> Vec<PermissionOption> {
+    if !request.options.is_empty() {
+        return request.options.clone();
+    }
+    let mut base = vec![PermissionOption {
+        index: 0,
+        label: String::new(),
+        decision: PermissionDecision::Allow,
+    }];
+    if !request.save.is_empty() {
+        base.push(PermissionOption {
+            index: 1,
+            label: String::new(),
+            decision: PermissionDecision::AllowAlways,
+        });
+    }
+    base.push(PermissionOption {
+        index: 2,
+        label: String::new(),
+        decision: PermissionDecision::Deny,
+    });
+    base
 }
