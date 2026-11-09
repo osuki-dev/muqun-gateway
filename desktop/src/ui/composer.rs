@@ -194,6 +194,11 @@ pub fn bare_field(k: &Kit) -> Kit {
     bare
 }
 
+/// No selection and the caret after the last character.
+pub fn caret_at_end(edit: &rune::TextEdit) -> bool {
+    edit.range() == (edit.text.len(), edit.text.len())
+}
+
 pub fn submit_session(s: &mut UiState) {
     send_session(s, false);
 }
@@ -1472,7 +1477,7 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
                 Button::new(tr_ref(language, "Stop", "停止"))
                     .variant(ButtonVariant::Danger)
                     .control_size(ControlSize::Regular)
-                    .shortcut("Escape")
+                    .shortcut(super::keymap::label(super::keymap::Action::Stop))
                     .on_press(move |s: &mut UiState| {
                         s.send(Command::Interrupt(AgentSessionId(asid.clone())))
                     })
@@ -1553,15 +1558,16 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
             })
             .on_edit(|s: &mut UiState| &mut s.draft)
             .on_change(|s: &mut UiState, _: &mut Tx| on_draft_change(s, Slot::Session))
-            .on_key(|s: &mut UiState, ev: &rune::KeyEvent, _: &mut Tx| {
+            .on_key(|s: &mut UiState, ev: &rune::KeyEvent, tx: &mut Tx| {
                 // Alt+Enter while the agent works: queue after this turn.
                 let alt_enter = ev.key == rune::Key::Enter && ev.mods.alt && !ev.mods.cmd;
                 if alt_enter && s.busy() {
                     queue_session(s);
                     return true;
                 }
-                // Split view's pane keys, ahead of the field's word moves.
-                super::tiles::arrow_key(s, ev)
+                // Sidebar and pane keys, ahead of the field's caret moves.
+                let at_end = caret_at_end(&s.draft);
+                super::keymap::field_key(s, ev, tx, at_end)
             })
             .on_submit(|s: &mut UiState, _: &mut Tx| submit_session(s))
             .on_input_paste(|s: &mut UiState, content, _: &mut Tx| take_paste(s, content))

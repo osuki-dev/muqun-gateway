@@ -85,12 +85,11 @@ fn project_label(language: crate::config::Language, p: &Project) -> String {
     }
 }
 
-fn tree(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Vec<El> {
-    let all = projects(s);
-    let by_id: HashMap<&str, &Project> = all.iter().map(|p| (p.id.as_str(), p)).collect();
+/// The sidebar's rows, as drawn (folded projects and the search applied).
+fn tree_rows(s: &UiState, all: &[Project]) -> Vec<TreeRow> {
     let query = s.search.text.trim().to_lowercase();
-    let rows = flatten(
-        &all,
+    flatten(
+        all,
         &TreeOptions {
             query: &query,
             open: &s.open_projects,
@@ -99,7 +98,24 @@ fn tree(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Vec<El> {
             per_project: PER_PROJECT,
         },
         |asid| s.session_by_id(asid).map(title_of),
-    );
+    )
+}
+
+/// The sessions the sidebar shows, top to bottom (Alt+↑ / Alt+↓ walk them).
+pub fn listed(s: &UiState) -> Vec<String> {
+    tree_rows(s, &projects(s))
+        .into_iter()
+        .filter_map(|row| match row {
+            TreeRow::Session { asid, .. } => Some(asid),
+            _ => None,
+        })
+        .collect()
+}
+
+fn tree(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Vec<El> {
+    let all = projects(s);
+    let by_id: HashMap<&str, &Project> = all.iter().map(|p| (p.id.as_str(), p)).collect();
+    let rows = tree_rows(s, &all);
     let mut out = Vec::with_capacity(rows.len());
     for (i, row) in rows.into_iter().enumerate() {
         out.push(match row {

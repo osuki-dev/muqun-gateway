@@ -5,23 +5,6 @@
 //! on macOS (`⌘K`, `⌘⇧T`), words joined by `+` elsewhere (`Ctrl+K`,
 //! `Ctrl+Shift+T`). `Primary` is ⌘ on macOS and Ctrl everywhere else.
 
-/// The shortcuts the window answers to (`ui/mod.rs` `on_key`). The whole
-/// table is the contract; a view names its entry when it shows the hint.
-#[allow(dead_code)]
-pub const SEARCH: &str = "Primary+K";
-#[allow(dead_code)]
-pub const NEW_SESSION: &str = "Primary+N";
-#[allow(dead_code)]
-pub const SETTINGS: &str = "Primary+,";
-#[allow(dead_code)]
-pub const STOP: &str = "Primary+.";
-#[allow(dead_code)]
-pub const HOME: &str = "Primary+0";
-#[allow(dead_code)]
-pub const THEMES: &str = "Primary+Shift+T";
-#[allow(dead_code)]
-pub const TOGGLE_SIDEBAR: &str = "Primary+B";
-
 /// Which convention to write a shortcut in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Style {
@@ -99,19 +82,15 @@ mod tests {
 
     #[test]
     fn macos_writes_symbols_and_everyone_else_words() {
-        assert_eq!(label_in(SEARCH, Style::Symbols), "⌘K");
-        assert_eq!(label_in(SEARCH, Style::Words), "Ctrl+K");
-        assert_eq!(label_in(STOP, Style::Symbols), "⌘.");
-        assert_eq!(label_in(STOP, Style::Words), "Ctrl+.");
-        assert_eq!(label_in(SETTINGS, Style::Words), "Ctrl+,");
-        assert_eq!(label_in(NEW_SESSION, Style::Symbols), "⌘N");
-        assert_eq!(label_in(HOME, Style::Words), "Ctrl+0");
-        assert_eq!(label_in(TOGGLE_SIDEBAR, Style::Words), "Ctrl+B");
+        assert_eq!(label_in("Primary+K", Style::Symbols), "⌘K");
+        assert_eq!(label_in("Primary+K", Style::Words), "Ctrl+K");
+        assert_eq!(label_in("Primary+.", Style::Symbols), "⌘.");
+        assert_eq!(label_in("Primary+,", Style::Words), "Ctrl+,");
     }
 
     #[test]
     fn modifiers_follow_each_platforms_order() {
-        assert_eq!(label_in(THEMES, Style::Symbols), "⇧⌘T");
+        assert_eq!(label_in("Primary+Shift+T", Style::Symbols), "⇧⌘T");
         assert_eq!(label_in("Shift+Primary+T", Style::Words), "Ctrl+Shift+T");
         assert_eq!(label_in("Primary+Alt+Shift+P", Style::Symbols), "⌥⇧⌘P");
         assert_eq!(label_in("Primary++", Style::Words), "Ctrl++");
@@ -125,6 +104,6 @@ mod tests {
         } else {
             "Ctrl+K"
         };
-        assert_eq!(label(SEARCH), expected);
+        assert_eq!(label("Primary+K"), expected);
     }
 }

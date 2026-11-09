@@ -1,9 +1,10 @@
 //! The command palette (Ctrl/Cmd+K): one frosted field over the window that
 //! jumps to any session and runs any action -- new sessions by agent and
 //! folder, the split, the inspector, every page and Settings tab, theme packs,
-//! light/dark, dictation. Fuzzy matching with the matched letters lit,
-//! ↑/↓ and Enter, recent commands first. It opens on a spring and settles
-//! without one under reduce motion.
+//! light/dark, dictation, and every keymap command with its chord on the
+//! right. Ctrl/Cmd+P opens it on sessions alone (quick open). Fuzzy matching
+//! with the matched letters lit, ↑/↓ and Enter, recent commands first. It
+//! opens on a spring and settles without one under reduce motion.
 
 use std::path::PathBuf;
 
@@ -11,6 +12,7 @@ use rune::{col, el, rich, row, text, El, Span, Spring, TextEdit, Transition, Tx}
 use rune_kit::{Kit, TextInput};
 
 use super::copy::{tr, tr_ref};
+use super::keymap::{self, Action};
 use super::{Mode, UiState};
 use crate::config::{ConfigEdit, Scheme};
 use crate::model::commands::Command;
@@ -24,13 +26,19 @@ pub const RECENT: usize = 8;
 pub struct Palette {
     pub query: TextEdit,
     pub selected: usize,
+    /// Quick open: sessions only, by title and folder.
+    pub sessions: bool,
 }
 
 impl Palette {
-    pub fn new() -> Self {
+    pub fn new(sessions: bool) -> Self {
         let mut query = TextEdit::new("");
         query.focused = true;
-        Self { query, selected: 0 }
+        Self {
+            query,
+            selected: 0,
+            sessions,
+        }
     }
 }
 
@@ -49,9 +57,29 @@ pub enum Act {
     Theme(String),
     ToggleScheme,
     Dictation,
+    /// A keymap command (`ui/keymap.rs`).
+    Key(Action),
 }
 
 impl Act {
+    /// The keymap command this row runs, whose chord it shows.
+    fn shortcut(&self) -> Option<Action> {
+        Some(match self {
+            Self::NewSession {
+                agent: None,
+                cwd: None,
+            } => Action::NewSession,
+            Self::Go(Mode::Home) => Action::Home,
+            Self::Go(Mode::Inbox) => Action::Inbox,
+            Self::Go(Mode::Tasks) => Action::Tasks,
+            Self::Split => Action::AddSplit,
+            Self::Inspector => Action::ToggleInspector,
+            Self::Dictation => Action::Dictation,
+            Self::Key(action) => *action,
+            _ => return None,
+        })
+    }
+
     /// A stable id for "recent commands" (sessions by id, actions by kind).
     fn id(&self) -> String {
         match self {
@@ -70,6 +98,7 @@ impl Act {
             Self::Theme(id) => format!("theme:{id}"),
             Self::ToggleScheme => "scheme".into(),
             Self::Dictation => "dictation".into(),
+            Self::Key(action) => format!("key:{action:?}"),
         }
     }
 }
@@ -175,10 +204,13 @@ pub fn entries(s: &UiState) -> Vec<Entry> {
             agent: Some(info.agent_id.clone()),
         });
     }
+    if s.palette.as_ref().is_some_and(|p| p.sessions) {
+        return out;
+    }
     let new = tr(language, "New session", "新建会话");
     out.push(action(
         new.clone(),
-        &crate::platform::keys::label("Primary+N"),
+        &keymap::label(Action::NewSession),
         Act::NewSession {
             agent: None,
             cwd: None,
@@ -226,12 +258,12 @@ pub fn entries(s: &UiState) -> Vec<Entry> {
     if s.mode == Mode::Session && s.selected.is_some() {
         out.push(action(
             tr(language, "Add to split view", "加入分屏"),
-            &crate::platform::keys::label("Primary+\\"),
+            &keymap::label(Action::AddSplit),
             Act::Split,
         ));
         out.push(action(
             tr(language, "Toggle inspector", "显示或隐藏检查器"),
-            &act,
+            &keymap::label(Action::ToggleInspector),
             Act::Inspector,
         ));
         let dictating = s.voice.is_some();
@@ -241,19 +273,59 @@ pub fn entries(s: &UiState) -> Vec<Entry> {
             } else {
                 tr(language, "Start dictation", "开始听写")
             },
-            &crate::platform::keys::label("Primary+Shift+Space"),
+            &keymap::label(Action::Dictation),
             Act::Dictation,
         ));
+        let mut here = vec![Action::FocusComposer, Action::JumpLatest];
+        if s.busy() {
+            here.push(Action::Stop);
+        }
+        if s.catalog.is_some() {
+            here.push(Action::ModelPicker);
+        }
+        if s.in_split() {
+            here.push(Action::RemoveSplit);
+        }
+        for a in here {
+            out.push(action(
+                keymap::entry(a).what(language),
+                &keymap::label(a),
+                Act::Key(a),
+            ));
+        }
     }
-    for (label, mode) in [
-        (tr_ref(language, "Home", "首页"), Mode::Home),
-        (tr_ref(language, "Inbox", "收件箱"), Mode::Inbox),
-        (tr_ref(language, "Tasks", "任务"), Mode::Tasks),
+    for (label, mode, key) in [
+        (tr_ref(language, "Home", "首页"), Mode::Home, Action::Home),
+        (
+            tr_ref(language, "Inbox", "收件箱"),
+            Mode::Inbox,
+            Action::Inbox,
+        ),
+        (
+            tr_ref(language, "Tasks", "任务"),
+            Mode::Tasks,
+            Action::Tasks,
+        ),
     ] {
         out.push(action(
             tr(language, &format!("Go to {label}"), &format!("前往{label}")),
-            &act,
+            &keymap::label(key),
             Act::Go(mode),
+        ));
+    }
+    for a in [
+        Action::Settings,
+        Action::Shortcuts,
+        Action::QuickOpen,
+        Action::ToggleSidebar,
+        Action::FocusSearch,
+        Action::ToggleTerminal,
+        Action::NewShell,
+    ] {
+        out.push(action(
+            keymap::entry(a).what(language),
+            &keymap::label(a),
+            Act::Key(a),
         ));
     }
     for (label, tab) in super::settings::tabs(language) {
@@ -341,10 +413,13 @@ pub fn results(s: &UiState, query: &str) -> Vec<(Entry, Vec<usize>)> {
 }
 
 impl UiState {
-    pub fn toggle_palette(&mut self) {
-        self.palette = match self.palette {
-            Some(_) => None,
-            None => Some(Palette::new()),
+    /// Ctrl+K (everything) or Ctrl+P (`sessions`): open, close, or switch
+    /// an open palette to the other list.
+    pub fn toggle_palette(&mut self, sessions: bool) {
+        self.keys_sheet = None;
+        self.palette = match &self.palette {
+            Some(p) if p.sessions == sessions => None,
+            _ => Some(Palette::new(sessions)),
         };
     }
 
@@ -363,17 +438,17 @@ impl UiState {
         }
     }
 
-    fn palette_run_selected(&mut self) {
+    fn palette_run_selected(&mut self, tx: &mut Tx) {
         let Some(p) = self.palette.as_ref() else {
             return;
         };
         let (query, at) = (p.query.text.clone(), p.selected);
         if let Some((entry, _)) = results(self, &query).into_iter().nth(at) {
-            self.run_act(entry.act);
+            self.run_act(entry.act, tx);
         }
     }
 
-    pub fn run_act(&mut self, act: Act) {
+    pub fn run_act(&mut self, act: Act, tx: &mut Tx) {
         self.palette = None;
         let id = act.id();
         let mut recent = self.cfg.ui.recent_commands.clone();
@@ -407,6 +482,9 @@ impl UiState {
                 Scheme::Dark
             }),
             Act::Dictation => self.toggle_voice(),
+            Act::Key(action) => {
+                keymap::run(self, action, &rune::Key::Escape.into(), tx);
+            }
         }
     }
 }
@@ -436,11 +514,19 @@ pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
     let selected = p.selected.min(results.len().saturating_sub(1));
 
     let field = TextInput::new(&p.query)
-        .placeholder(tr_ref(
-            language,
-            "Jump to a session or run a command…",
-            "跳转到会话或执行命令…",
-        ))
+        .placeholder(if p.sessions {
+            tr_ref(
+                language,
+                "Go to a session by title or folder…",
+                "按标题或文件夹跳转到会话…",
+            )
+        } else {
+            tr_ref(
+                language,
+                "Jump to a session or run a command…",
+                "跳转到会话或执行命令…",
+            )
+        })
         .label(tr_ref(language, "Command palette", "命令面板"))
         .plain()
         .large()
@@ -451,7 +537,7 @@ pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
             }
         })
         .on_key(
-            |s: &mut UiState, ev: &rune::KeyEvent, _: &mut Tx| match ev.key {
+            |s: &mut UiState, ev: &rune::KeyEvent, tx: &mut Tx| match ev.key {
                 rune::Key::Down => {
                     s.palette_move(1);
                     true
@@ -461,7 +547,7 @@ pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
                     true
                 }
                 rune::Key::Enter => {
-                    s.palette_run_selected();
+                    s.palette_run_selected(tx);
                     true
                 }
                 _ => false,
@@ -532,15 +618,20 @@ pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
             .radius(k.radius.md)
             .child(mark)
             .child(words)
-            .child(
-                text(entry.hint.clone())
+            .child(match entry.act.shortcut() {
+                // A command's chord, as keycaps; else what the row is.
+                Some(action) => rune_kit::Keybind::new(
+                    &keymap::entry(action).keycaps_on(rune::KeyPlatform::current())[0],
+                )
+                .build(k),
+                None => text(entry.hint.clone())
                     .font(k.ty.small)
                     .color(k.c.text_faint),
-            )
+            })
             .hover(k.c.hover)
             .role("option")
             .label(entry.label.clone())
-            .on_press(move |s: &mut UiState| s.run_act(act.clone()));
+            .on_press_tx(move |s: &mut UiState, tx: &mut Tx| s.run_act(act.clone(), tx));
         if on {
             line = line.fill(k.c.surface_hover);
             line = look.accent_rim(k, line, k.c.bg_accent);
@@ -633,7 +724,9 @@ fn glyph(act: &Act) -> &'static rune::Icon {
         Act::Go(Mode::Inbox) => &super::icons::INBOX,
         Act::Go(Mode::Tasks) => &super::icons::TASK,
         Act::Dictation => &super::voice::MIC,
-        Act::Settings(_) | Act::Inspector | Act::Split => &super::icons::SETTINGS,
+        Act::Settings(_) | Act::Inspector | Act::Split | Act::Key(Action::Settings) => {
+            &super::icons::SETTINGS
+        }
         Act::Theme(_) | Act::ToggleScheme => &rune_kit::glyphs::SPARKLE,
         _ => &rune_kit::glyphs::ARROW_RIGHT,
     }

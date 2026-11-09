@@ -788,136 +788,51 @@ fn storage(s: &UiState, k: &Kit) -> El {
     )
 }
 
-/// One shortcut row: what it does, and the keys.
-fn shortcut_row(k: &Kit, key: String, keys: String, what: String) -> El {
-    row()
-        .key(key)
-        .w_full()
-        .gap(12.0)
-        .center_y()
-        .py(5.0)
-        .child(text(what).font(k.ty.ui).color(k.c.text_base).grow(1.0))
-        .child(
-            rune_kit::Keybind::new(
-                &keys
-                    .split('+')
-                    .filter(|p| !p.is_empty())
-                    .collect::<Vec<_>>(),
-            )
-            .build(k),
-        )
-}
-
-/// Every keyboard shortcut the window answers to.
+/// Every keyboard shortcut the window answers to (`ui/keymap.rs`), read
+/// only, and what the keymap check finds.
 fn shortcuts(s: &UiState, k: &Kit) -> Vec<El> {
     let language = s.cfg.general.language;
-    let key = crate::platform::keys::label;
-    let rows = |id: &str, list: &[(String, &'static str, &'static str)]| -> Vec<El> {
-        list.iter()
-            .enumerate()
-            .map(|(i, (keys, en, zh))| {
-                shortcut_row(
-                    k,
-                    format!("sc-{id}-{i}"),
-                    keys.clone(),
-                    tr(language, en, zh),
-                )
-            })
-            .collect()
+    let line = |key: String, words: String, color| {
+        text(words)
+            .key(key)
+            .font(k.ty.small)
+            .color(color)
+            .w_full()
+            .py(3.0)
     };
-    vec![
-        section(
-            k,
-            "shortcuts-window",
-            tr_ref(language, "Window", "窗口"),
-            rows(
-                "window",
-                &[
-                    (
-                        key("Shift+Primary+B"),
-                        "Show or hide the sidebar",
-                        "显示 / 隐藏侧边栏",
-                    ),
-                    (key("Primary+,"), "Settings", "设置"),
-                    (key("Shift+Primary+T"), "Themes", "主题"),
-                    (key("Primary+N"), "New session (Home)", "新建会话（首页）"),
-                    (key("Primary+F"), "Search sessions", "搜索会话"),
-                    (
-                        key("Escape"),
-                        "Close the file viewer or a menu",
-                        "关闭文件查看器或菜单",
-                    ),
-                ],
+    let (clashes, shadows) = super::shortcuts::conflicts(language);
+    let mut check: Vec<El> = Vec::new();
+    if clashes.is_empty() {
+        check.push(line(
+            "sc-check-ok".into(),
+            tr(
+                language,
+                "No conflicts: every chord does one thing.",
+                "没有冲突：每个组合键只做一件事。",
             ),
-        ),
-        section(
-            k,
-            "shortcuts-session",
-            tr_ref(language, "Session", "会话"),
-            rows(
-                "session",
-                &[
-                    (
-                        key("Primary+Enter"),
-                        "Send (steer the turn while the agent works)",
-                        "发送（Agent 工作时插话）",
-                    ),
-                    (
-                        key("Alt+Enter"),
-                        "Queue after the running turn",
-                        "排到当前回合之后",
-                    ),
-                    (key("Shift+Enter"), "New line in the message", "消息内换行"),
-                    (key("Escape"), "Stop the running turn", "停止当前回合"),
-                    (
-                        key("Primary+V"),
-                        "Paste files or an image into the message",
-                        "粘贴文件或图片到消息",
-                    ),
-                    (
-                        key("Shift+Primary+Space"),
-                        "Start or finish dictation",
-                        "开始 / 结束语音输入",
-                    ),
-                ],
-            ),
-        ),
-        section(
-            k,
-            "shortcuts-split",
-            tr_ref(language, "Split view", "分屏"),
-            rows(
-                "split",
-                &[
-                    (
-                        key("Primary+\\"),
-                        "Add to split view: another session beside this one",
-                        "加入分屏：在旁边打开另一个会话",
-                    ),
-                    (
-                        key("Primary+1"),
-                        "Focus pane 1 (… Primary+4)",
-                        "聚焦第 1 个窗格（… Primary+4）",
-                    ),
-                    (
-                        format!("{} ← ↑ → ↓", key("Primary+Alt")),
-                        "Focus the pane that way",
-                        "聚焦该方向的窗格",
-                    ),
-                    (
-                        key("Primary+W"),
-                        "Remove the focused pane from split view",
-                        "把当前窗格移出分屏",
-                    ),
-                    (
-                        format!("{} / Shift", key("Alt")),
-                        "Click a session to add it to split view",
-                        "点击会话时按住即可加入分屏",
-                    ),
-                ],
-            ),
-        ),
-    ]
+            k.c.success.icon,
+        ));
+    }
+    for (i, words) in clashes.into_iter().enumerate() {
+        check.push(line(format!("sc-clash-{i}"), words, k.c.danger.icon));
+    }
+    for (i, words) in shadows
+        .into_iter()
+        .chain(super::shortcuts::field_notes(language))
+        .enumerate()
+    {
+        check.push(line(format!("sc-note-{i}"), words, k.c.text_muted));
+    }
+    let mut out = vec![section(
+        k,
+        "shortcuts-check",
+        tr_ref(language, "Conflict check", "冲突检查"),
+        check,
+    )];
+    for (group, title, rows) in super::shortcuts::groups(s, k, "", "sc") {
+        out.push(section(k, &format!("shortcuts-{group:?}"), &title, rows));
+    }
+    out
 }
 
 /// The App's "Gateway notifications": an approval, a question or a finished

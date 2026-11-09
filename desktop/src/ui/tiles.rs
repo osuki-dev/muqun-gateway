@@ -228,7 +228,11 @@ fn header(s: &UiState, k: &Kit, look: &Look, i: usize, layer: &mut Vec<El>) -> E
             .variant(IconButtonVariant::GhostMuted)
             .control_size(ControlSize::Small)
             .label(tr_ref(language, "Remove from split view", "移出分屏"))
-            .shortcut(if focused { "Primary+W" } else { "" })
+            .shortcut(if focused {
+                super::keymap::label(super::keymap::Action::RemoveSplit)
+            } else {
+                String::new()
+            })
             .on_press(move |s: &mut UiState| s.close_tile(i))
             .build(k)
             .key(format!("tile-close-{i}"))
@@ -574,7 +578,7 @@ pub fn toolbar_actions(s: &UiState, k: &Kit) -> Vec<El> {
                 .variant(ButtonVariant::Ghost)
                 .control_size(ControlSize::Small)
                 .icon(&ARROW_RIGHT)
-                .shortcut("Primary+\\")
+                .shortcut(super::keymap::label(super::keymap::Action::AddSplit))
                 .on_press(|s: &mut UiState| s.split())
                 .build(k)
                 .key("split-add"),

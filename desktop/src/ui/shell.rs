@@ -110,7 +110,8 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
             SidebarToggle::new()
                 .size(ControlSize::Large)
                 .in_header()
-                .unread(s.waiting_count() > 0),
+                .unread(s.waiting_count() > 0)
+                .shortcut(super::keymap::sidebar_label()),
         );
     split = split.toolbar_in_panel();
     // The window floor, the theme's world on it, the sidebar's panel, and
@@ -597,7 +598,7 @@ fn toolbar(s: &UiState, k: &Kit, look: &Look, layer: &mut Vec<El>) -> Toolbar {
                             "Open another session beside this one",
                             "在旁边打开另一个会话",
                         ))
-                        .shortcut("Primary+\\")
+                        .shortcut(super::keymap::label(super::keymap::Action::AddSplit))
                         .on_press(|s: &mut UiState| s.split())
                         .build(k)
                         .key("split-session"),
@@ -628,7 +629,10 @@ fn toolbar(s: &UiState, k: &Kit, look: &Look, layer: &mut Vec<El>) -> Toolbar {
                     IconButtonVariant::Ghost
                 })
                 .label(tr_ref(language, "Terminal", "终端"))
-                .help(tr_ref(language, "Terminal (Ctrl+`)", "终端 (Ctrl+`)"))
+                .help(super::keymap::tip(
+                    tr_ref(language, "Terminal", "终端"),
+                    super::keymap::Action::ToggleTerminal,
+                ))
                 .on_press(|s: &mut UiState| {
                     if s.term.open {
                         s.close_terminal();
@@ -649,6 +653,10 @@ fn toolbar(s: &UiState, k: &Kit, look: &Look, layer: &mut Vec<El>) -> Toolbar {
                     IconButtonVariant::Ghost
                 })
                 .label(tr_ref(language, "Inspector", "检查器"))
+                .help(super::keymap::tip(
+                    tr_ref(language, "Inspector", "检查器"),
+                    super::keymap::Action::ToggleInspector,
+                ))
                 .on_press(|s: &mut UiState| s.toggle_inspector())
                 .build(k)
                 .key("inspector-toggle"),

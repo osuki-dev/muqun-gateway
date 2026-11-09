@@ -711,8 +711,9 @@ fn quick_start(s: &UiState, k: &Kit, look: &Look, layer: &mut Vec<El>, size: [f3
                 }
             })
             .on_edit(|s: &mut UiState| &mut s.start_draft)
-            .on_key(|s: &mut UiState, ev: &rune::KeyEvent, _: &mut Tx| {
+            .on_key(|s: &mut UiState, ev: &rune::KeyEvent, tx: &mut Tx| {
                 composer::popup_key(s, Slot::Start, ev)
+                    || super::keymap::field_key(s, ev, tx, false)
             })
             .on_change(|s: &mut UiState, _: &mut Tx| composer::on_draft_change(s, Slot::Start))
             .on_submit(|s: &mut UiState, _: &mut Tx| submit_start(s))

@@ -50,9 +50,6 @@ const LINE: f32 = 17.0;
 const INSET: f32 = 6.0;
 /// The title strip's height: one dense desktop line.
 const HEAD: f32 = 34.0;
-/// Copy and paste while the terminal has the keyboard (`term/input.rs`).
-const COPY: &str = "Primary+Shift+C";
-const PASTE: &str = "Primary+Shift+V";
 
 fn style() -> TextStyle {
     TextStyle::new(FONT_SIZE, 400.0).mono().lh(LINE)
@@ -602,7 +599,7 @@ pub fn view(s: &UiState, k: &Kit, scheme: ColorScheme, scale: f32, layer: &mut V
 fn context_menu(s: &UiState, k: &Kit, grid: El, layer: &mut Vec<El>) -> El {
     let language = s.cfg.general.language;
     let has_selection = s.term.frame.as_ref().is_some_and(|f| f.selection.is_some());
-    let shortcut = |chord: &str| crate::platform::keys::label(chord);
+    use super::keymap::{label, Action};
     let grid = grid.on_secondary_press(|s: &mut UiState, at, _: &mut Tx| {
         s.term.menu_at = Some(at);
         s.term.sink.focused = true;
@@ -612,7 +609,7 @@ fn context_menu(s: &UiState, k: &Kit, grid: El, layer: &mut Vec<El>) -> El {
         .on_close(|s: &mut UiState| s.term.menu_at = None)
         .item(
             MenuItem::new(tr_ref(language, "Copy", "复制"))
-                .shortcut(shortcut(COPY))
+                .shortcut(label(Action::TermCopy))
                 .disabled(!has_selection)
                 .on_select_tx(|s: &mut UiState, tx: &mut Tx| {
                     s.term.menu_at = None;
@@ -623,7 +620,7 @@ fn context_menu(s: &UiState, k: &Kit, grid: El, layer: &mut Vec<El>) -> El {
         )
         .item(
             MenuItem::new(tr_ref(language, "Paste", "粘贴"))
-                .shortcut(shortcut(PASTE))
+                .shortcut(label(Action::TermPaste))
                 .on_select_tx(|s: &mut UiState, tx: &mut Tx| {
                     s.term.menu_at = None;
                     tx.request_paste();
@@ -637,16 +634,16 @@ fn context_menu(s: &UiState, k: &Kit, grid: El, layer: &mut Vec<El>) -> El {
         )
         .separator()
         .item(
-            MenuItem::new(tr_ref(language, "New shell", "新的 Shell")).on_select(
-                |s: &mut UiState| {
+            MenuItem::new(tr_ref(language, "New shell", "新的 Shell"))
+                .shortcut(label(Action::NewShell))
+                .on_select(|s: &mut UiState| {
                     s.term.menu_at = None;
                     s.restart_terminal();
-                },
-            ),
+                }),
         )
         .item(
             MenuItem::new(tr_ref(language, "Hide terminal", "隐藏终端"))
-                .shortcut("Ctrl+`")
+                .shortcut(label(Action::ToggleTerminal))
                 .on_select(|s: &mut UiState| {
                     s.term.menu_at = None;
                     s.close_terminal();
@@ -940,6 +937,7 @@ mod tests {
     fn a_focused_terminal_takes_every_key_but_lends_ctrl_shift_to_the_app() {
         let (tx, _rx) = commands::channel();
         let mut state = UiState::new(tx);
+        state.mode = super::super::Mode::Inbox;
         state.open_terminal();
         let mut rt = Runtime::new(
             state,
@@ -947,6 +945,7 @@ mod tests {
             (1440.0, 900.0),
             Env::new(true, 1.0),
         );
+        rt.on_key = Some(super::super::on_key);
         rt.frame(0.0);
         rt.frame(1.0 / 60.0);
         for ev in [
@@ -954,6 +953,8 @@ mod tests {
             key(Key::Tab, false, false),
             key(Key::Command('c'), true, false),
             key(Key::Text("x".into()), false, false),
+            // Readline's back-a-character, not the sidebar.
+            key(Key::Command('b'), true, false),
         ] {
             rt.key(ev);
             rt.frame(1.0 / 60.0);
@@ -971,10 +972,20 @@ mod tests {
                 "key Tab ctrl=false",
                 "key C ctrl=true",
                 "key X ctrl=false",
+                "key B ctrl=true",
                 "text 中文",
             ]
         );
         // Ctrl+Shift+K reached the app's Ctrl+K: the palette.
         assert!(s.palette.is_some());
+        // The window's own Ctrl+Shift+H (Home) arrives as it is.
+        for _ in 0..3 {
+            rt.frame(1.0 / 60.0);
+        }
+        rt.key(key(Key::Command('h'), true, true));
+        rt.frame(1.0 / 60.0);
+        let s = &rt.state;
+        assert_eq!(s.mode, super::super::Mode::Home);
+        assert!(s.palette.is_none(), "a command leaves the palette");
     }
 }

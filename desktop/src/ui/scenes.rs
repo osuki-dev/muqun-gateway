@@ -766,12 +766,12 @@ fn voice_settings_scene(s: &mut UiState) {
 fn palette_scene(s: &mut UiState) {
     session_scene(s);
     s.cfg.ui.recent_commands = vec!["go:Tasks".into(), "session:s2".into()];
-    s.palette = Some(super::palette::Palette::new());
+    s.palette = Some(super::palette::Palette::new(false));
 }
 
 fn palette_search_scene(s: &mut UiState) {
     session_scene(s);
-    let mut palette = super::palette::Palette::new();
+    let mut palette = super::palette::Palette::new(false);
     palette.query = TextEdit::new("new cod");
     palette.query.focused = true;
     palette.selected = 1;
@@ -785,6 +785,17 @@ fn palette_search_scene(s: &mut UiState) {
         .last_cwd
         .insert("opencode".into(), "/home/demo/rune".into());
     s.palette = Some(palette);
+}
+
+fn shortcuts_scene(s: &mut UiState) {
+    session_scene(s);
+    s.toggle_keys_sheet();
+}
+
+fn latest_scene(s: &mut UiState) {
+    session_scene(s);
+    s.right_open = false;
+    s.right.set_open(false);
 }
 
 /// A scene name and the state it applies.
@@ -1007,6 +1018,33 @@ pub fn scenes() -> &'static [Scene] {
         ("timeline-subagent", timeline_subagent),
         ("timeline-context", timeline_context),
         ("palette", palette_scene),
+        ("quick-open", |s| {
+            session_scene(s);
+            s.palette = Some(super::palette::Palette::new(true));
+        }),
+        // The shortcuts sheet (Ctrl+/).
+        ("shortcuts", shortcuts_scene),
+        ("shortcuts-zh", |s| {
+            shortcuts_scene(s);
+            s.cfg.general.language = crate::config::Language::ZhCn;
+        }),
+        ("shortcuts-search", |s| {
+            shortcuts_scene(s);
+            if let Some(sheet) = s.keys_sheet.as_mut() {
+                sheet.query = TextEdit::new("split");
+                sheet.query.focused = true;
+            }
+        }),
+        // The "Latest" pill shows once the reader scrolls up: run with
+        // `--script` and a `{"type": "wheel", "key": "feed-s1", "dy": 400}`
+        // step. `latest-new` has three messages waiting below.
+        ("latest", latest_scene),
+        ("latest-new", |s| {
+            latest_scene(s);
+            if let Some(tl) = s.timelines.get_mut("s1") {
+                tl.unseen = 3;
+            }
+        }),
         ("palette-search", palette_search_scene),
         ("viewer", viewer_code),
         ("viewer-markdown", viewer_markdown),

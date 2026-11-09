@@ -14,6 +14,7 @@ mod home;
 mod icons;
 mod inbox;
 mod inspector;
+pub mod keymap;
 mod labels;
 mod palette;
 mod panes;
@@ -23,6 +24,7 @@ pub mod scenes;
 mod sessions;
 mod settings;
 mod shell;
+mod shortcuts;
 mod splash;
 mod tasks;
 mod terminal_panel;
@@ -46,7 +48,7 @@ use muqun_gateway::agents::{
 use muqun_gateway::platform::discovery::AgentDiscoveryInfo;
 use rune::{Cx, El, ImageCache, KeyEvent, TextEdit, Tx};
 use rune_kit::diff::{parse, DiffState};
-use rune_kit::shell::{is_sidebar_toggle, PaneState};
+use rune_kit::shell::PaneState;
 use rune_kit::{Kit, ScrollBar, ToastRegion};
 
 use crate::config::{ConfigEdit, DesktopConfig, Scheme};
@@ -337,6 +339,8 @@ pub struct UiState {
     tray_shown: Option<(crate::config::Language, Vec<(String, String)>)>,
     /// The command palette (`ui/palette.rs`), when open.
     pub palette: Option<palette::Palette>,
+    /// The keyboard shortcuts sheet (`ui/shortcuts.rs`), when open.
+    pub keys_sheet: Option<shortcuts::Sheet>,
     /// Dictation in progress (`ui/voice.rs`).
     pub voice: Option<voice::Dictation>,
     /// Settings → Voice's fields.
@@ -476,6 +480,7 @@ impl UiState {
             viewer: None,
             voice: None,
             palette: None,
+            keys_sheet: None,
             tray_shown: None,
             voice_form: voice::VoiceForm::new(&cfg.voice),
             term: terminal_panel::TermPanel::new(cfg.ui.terminal()),
@@ -1908,25 +1913,7 @@ pub fn activity_mark(
 use copy::tr;
 
 pub fn on_key(s: &mut UiState, ev: &KeyEvent, tx: &mut Tx) -> bool {
-    if crate::term::input::is_toggle(ev, tx.physical_key()) {
-        s.toggle_terminal();
-        return true;
-    }
-    if ev.is_command('k') && !ev.mods.shift && !ev.mods.alt {
-        s.toggle_palette();
-        return true;
-    }
-    if ev.is_command(' ') && ev.mods.shift && !ev.mods.alt && s.mode == Mode::Session {
-        s.toggle_voice();
-        return true;
-    } else if s.voice.is_some() && ev.key == rune::Key::Escape {
-        s.cancel_voice();
-        return true;
-    } else if is_sidebar_toggle(ev) {
-        s.sidebar.toggle();
-        return true;
-    }
-    if s.timeline_key(ev, tx) || tiles::arrow_key(s, ev) {
+    if keymap::dispatch(s, ev, tx) {
         return true;
     }
     // Shift+Insert pastes and Ctrl+Insert copies in every field, as Ctrl+V
@@ -1941,45 +1928,6 @@ pub fn on_key(s: &mut UiState, ev: &KeyEvent, tx: &mut Tx) -> bool {
                 tx.copy(text);
                 return true;
             }
-        }
-    }
-    if ev.is_command('t') && ev.mods.shift && !ev.mods.alt {
-        s.settings_tab = SettingsTab::Themes;
-        s.go(Mode::Settings);
-        return true;
-    }
-    if ev.mods.shift || ev.mods.alt {
-        return false;
-    }
-    if ev.is_command(',') {
-        s.go(Mode::Settings);
-        return true;
-    }
-    if ev.is_command('n') {
-        s.go(Mode::Home);
-        s.start_draft.focused = true;
-        return true;
-    }
-    if ev.is_command('f') {
-        s.sidebar.set_open(true);
-        s.search.focused = true;
-        return true;
-    }
-    if ev.is_command('\\') {
-        s.split();
-        return true;
-    }
-    if ev.is_command('w') && s.in_split() {
-        s.close_tile(s.focus);
-        return true;
-    }
-    for (n, c) in ['1', '2', '3', '4'].into_iter().enumerate() {
-        if ev.is_command(c) {
-            if s.in_split() && n < s.tiles.len() {
-                s.focus_tile(n);
-                return true;
-            }
-            return false;
         }
     }
     false
@@ -2032,6 +1980,7 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>) -> El {
     }
     viewer::mount(s, &k, cx.env().scale, &mut layer);
     palette::mount(s, &k, &mut layer);
+    shortcuts::mount(s, &k, &mut layer);
     if !s.toasts.is_empty() {
         let mut region = ToastRegion::new();
         for t in &s.toasts {

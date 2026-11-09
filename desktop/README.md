@@ -104,8 +104,11 @@ launch is its own (`src/platform/instance.rs`).
 * **Themes** — the App's theme packs: colours, materials and artwork follow the active pack in
   light and dark. Six are built in (`assets/themes/README.md`).
 
-Keys: Ctrl/Cmd+K opens the command palette, Ctrl/Cmd+Shift+B toggles the sidebar, Ctrl/Cmd+, opens Settings, Escape closes the viewer and
-popups.
+Keys: one table, `src/ui/keymap.rs`, drives dispatch, the shortcuts sheet (Ctrl/Cmd+/, or `?`
+when not typing), the palette's hints, button tooltips and Settings → Shortcuts. Ctrl/Cmd+K
+opens the command palette, Ctrl/Cmd+P jumps to a session, Ctrl/Cmd+B toggles the sidebar.
+Escape closes the innermost popup, then leaves a page for the last session. In the terminal
+every key is the shell's; the app's Ctrl chords reach the window with Shift added.
 
 ### Opening a file from code
 

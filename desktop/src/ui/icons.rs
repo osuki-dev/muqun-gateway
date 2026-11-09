@@ -90,3 +90,25 @@ pub static BRANCH: Icon = Icon {
         r#" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>"#,
     ),
 };
+
+/// `move-down.svg`: the timeline's "jump to latest".
+pub static MOVE_DOWN: Icon = Icon {
+    name: "move-down",
+    view: 24.0,
+    body: concat!(
+        r#"<path d="M12 4v16m-6-6 6 6 6-6""#,
+        r#" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>"#,
+    ),
+};
+
+/// `keyboard.svg`: the shortcuts sheet.
+pub static KEYBOARD: Icon = Icon {
+    name: "keyboard",
+    view: 24.0,
+    body: concat!(
+        r#"<rect x="2" y="5" width="20" height="14" rx="3""#,
+        r#" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>"#,
+        r#"<path d="M6 9h.01M10 9h.01M14 9h.01M18 9h.01M6 12h.01M10 12h.01M14 12h.01M18 12h.01M7 16h10""#,
+        r#" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>"#,
+    ),
+};

@@ -109,6 +109,11 @@ pub struct SessionTimeline {
     pub blocks: Vec<Block>,
     /// The row the keyboard is on (an item id, or a group's key).
     pub selected: Option<String>,
+    /// The reader scrolled up off the bottom: the list stopped following it
+    /// and the "Latest" pill shows.
+    pub away: bool,
+    /// Messages that arrived while away, for the pill's "N new".
+    pub unseen: usize,
 }
 
 /// A folded group's key: its first item's.
@@ -151,6 +156,9 @@ impl SessionTimeline {
                     self.items[at] = item;
                 }
                 None => {
+                    if self.away && matches!(item.part, AgentPart::Text { .. }) {
+                        self.unseen += 1;
+                    }
                     self.items.push(item);
                     regroup = true;
                 }
@@ -159,6 +167,15 @@ impl SessionTimeline {
         if regroup {
             self.regroup();
         }
+    }
+
+    /// The list's viewport reached its bottom (`true`) or left it. Arriving
+    /// back is when the new messages count as seen.
+    pub fn at_bottom(&mut self, at: bool) {
+        if at && self.away {
+            self.unseen = 0;
+        }
+        self.away = !at;
     }
 
     /// Fold the rows again, after the list changed.
@@ -436,14 +453,109 @@ pub fn session_view(s: &UiState, k: &Kit, asid: &str) -> El {
             s.send(Command::LoadEarlier(AgentSessionId(edge_asid.clone())));
             true
         });
-    col()
+    let bottom_asid = asid.to_string();
+    let feed = col()
         .key(key)
         .w_full()
         .grow(1.0)
         .min_h(0.0)
         .child(rows)
         .scroll(ScrollSpec { stick_bottom: true })
-        .scroll_bar(k)
+        .on_at_bottom(move |s: &mut UiState, at| {
+            if let Some(tl) = s.timelines.get_mut(&bottom_asid) {
+                tl.at_bottom(at);
+            }
+        })
+        .scroll_bar(k);
+    let mut stage = col()
+        .key(format!("feed-stage-{asid}"))
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .child(feed);
+    if tl.away {
+        stage = stage.child(latest_pill(s, k, asid, tl.unseen));
+    }
+    stage
+}
+
+/// "↓ Latest" (or "↓ 3 new") over the timeline's bottom-right corner while
+/// the reader is scrolled up: a press glides back down and follows again.
+fn latest_pill(s: &UiState, k: &Kit, asid: &str, unseen: usize) -> El {
+    let language = s.cfg.general.language;
+    let words = if unseen == 0 {
+        tr_ref(language, "Latest", "最新").to_string()
+    } else {
+        super::copy::tr(
+            language,
+            &format!("{unseen} new"),
+            &format!("{unseen} 条新消息"),
+        )
+    };
+    let tip = super::keymap::tip(
+        &super::keymap::entry(super::keymap::Action::JumpLatest).what(language),
+        super::keymap::Action::JumpLatest,
+    );
+    let fresh = unseen > 0;
+    let (ink, fill) = if fresh {
+        (k.c.text_accent, k.c.bg_accent.alpha(0.16))
+    } else {
+        (k.c.text_muted, k.c.layer_02)
+    };
+    let target = asid.to_string();
+    let mut pill = row()
+        .key(format!("latest-{asid}"))
+        .h(28.0)
+        .px(12.0)
+        .gap(6.0)
+        .center_y()
+        .radius(14.0)
+        .fill(k.c.bg_base)
+        .border(1.0, k.c.border_muted)
+        .child(
+            row()
+                .absolute(0.0, 0.0)
+                .w_full()
+                .h_full()
+                .radius(14.0)
+                .fill(fill)
+                .a11y_hidden(),
+        )
+        .child(rune::icon(&super::icons::MOVE_DOWN, 13.0).color(ink))
+        .child(text(words.clone()).font(k.ty.small_medium).color(ink))
+        .hover(k.c.hover)
+        .role("button")
+        .label(words)
+        .help(tip)
+        .on_press_tx(move |s: &mut UiState, tx: &mut rune::Tx| s.jump_to_latest(&target, tx));
+    for shadow in k.shadow_layers(&k.elevation.overlay) {
+        pill = pill.box_shadow(shadow);
+    }
+    let pill = if s.cfg.appearance.reduced_motion {
+        pill.transition(rune::Transition::opacity())
+    } else {
+        pill.transition(
+            rune::Transition::opacity()
+                .combined(rune::Transition::offset(0.0, 8.0))
+                .combined(rune::Transition::scale(0.94)),
+        )
+        .motion(rune::Spring::new(0.3, 0.2))
+    };
+    // On the reading column's right edge, wherever the column sits.
+    row()
+        .key(format!("latest-band-{asid}"))
+        .pin(Some(0.0), None, Some(0.0), Some(12.0))
+        .justify_center()
+        .px(16.0)
+        .child(row().w_full().max_w(FEED_MAX_W).justify_end().child(pill))
+}
+
+impl UiState {
+    /// Glide `asid`'s timeline to its bottom; it follows the end again once
+    /// there (reduce motion jumps).
+    pub fn jump_to_latest(&mut self, asid: &str, tx: &mut rune::Tx) {
+        tx.scroll_to_bottom(format!("feed-{asid}"));
+    }
 }
 
 /// Row 0: the start of the conversation, or older history arriving.
@@ -723,6 +835,65 @@ mod tests {
         tl.flip("c");
         tl.replace(vec![text_item("c")]);
         assert!(tl.is_open("c", false));
+    }
+
+    #[test]
+    fn the_latest_pill_shows_off_the_bottom_counts_arrivals_and_jumps_back() {
+        let (tx, _rx) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        let (_, scene) = crate::ui::scenes::scenes()
+            .iter()
+            .find(|(name, _)| *name == "session")
+            .expect("the session scene");
+        scene(&mut s);
+        let asid = s.selected.clone().expect("a session");
+        let history: Vec<_> = (0..40).map(|i| text_item(&format!("h{i}"))).collect();
+        s.timelines
+            .get_mut(&asid)
+            .expect("its rows")
+            .upsert(history);
+        let (feed, pill) = (format!("feed-{asid}"), format!("latest-{asid}"));
+        let mut rt = rune::Runtime::new(
+            s,
+            crate::ui::view,
+            (1100.0, 560.0),
+            rune::Env::new(true, 1.0),
+        );
+        let mut now = 0.0;
+        let mut settle = |rt: &mut rune::Runtime<UiState>| {
+            for _ in 0..90 {
+                now += 1.0 / 60.0;
+                rt.frame(now);
+            }
+        };
+        settle(&mut rt);
+        assert!(rt.find(&pill).is_none(), "at the bottom: no pill");
+        // A wheel turn up leaves the bottom.
+        let (x, y) = rt.find(&feed).expect("the feed");
+        rt.wheel(x, y, 600.0);
+        settle(&mut rt);
+        assert!(rt.state.timelines[&asid].away);
+        assert!(rt.find(&pill).is_some(), "scrolled up: the pill");
+        // Three messages arrive (a fourth row only updates one in place).
+        let rows: Vec<_> = ["n1", "n2", "n3", "n1"]
+            .iter()
+            .map(|id| text_item(id))
+            .collect();
+        for row in rows {
+            rt.state.timelines.get_mut(&asid).unwrap().upsert(vec![row]);
+        }
+        assert_eq!(rt.state.timelines[&asid].unseen, 3);
+        // Reading on without reaching the end keeps them unseen.
+        rt.wheel(x, y, 100.0);
+        settle(&mut rt);
+        assert_eq!(rt.state.timelines[&asid].unseen, 3);
+        // The pill's jump glides down and follows again.
+        let target = asid.clone();
+        rt.update(move |s, tx| s.jump_to_latest(&target, tx));
+        settle(&mut rt);
+        let tl = &rt.state.timelines[&asid];
+        assert!(!tl.away && tl.unseen == 0);
+        assert!(rt.find(&pill).is_none());
     }
 
     #[test]

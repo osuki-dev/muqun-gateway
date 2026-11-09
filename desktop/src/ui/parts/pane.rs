@@ -264,39 +264,20 @@ impl UiState {
         }
     }
 
-    /// The timeline's keys, when no text field has them. `false` leaves the
-    /// key to whoever is next.
-    pub fn timeline_key(&mut self, ev: &rune::KeyEvent, tx: &mut Tx) -> bool {
-        if ev.key == rune::Key::Escape {
-            if self.row_menu.take().is_some() {
-                return true;
-            }
-            if self.inspect.is_some() {
-                self.close_inspect();
-                return true;
-            }
+    /// A timeline key from the keymap (`ui/keymap.rs`), when no text field
+    /// has it. `false` leaves the key to whoever is next.
+    pub fn timeline_key(&mut self, act: crate::ui::keymap::Action, tx: &mut Tx) -> bool {
+        use crate::ui::keymap::Action;
+        if self.mode != crate::ui::Mode::Session || self.zoom.is_some() || self.palette.is_some() {
             return false;
         }
-        if self.mode != crate::ui::Mode::Session
-            || ev.mods.ctrl
-            || ev.mods.alt
-            || ev.mods.cmd
-            || ev.mods.logo
-            || self.zoom.is_some()
-            || self.palette.is_some()
-        {
-            return false;
-        }
-        match &ev.key {
-            rune::Key::Enter => self.open_selected(tx),
-            rune::Key::Text(t) => match t.as_str() {
-                " " => self.toggle_selected_group(tx),
-                "j" => self.step_row(true, tx),
-                "k" => self.step_row(false, tx),
-                "]" => self.step_message(true, tx),
-                "[" => self.step_message(false, tx),
-                _ => false,
-            },
+        match act {
+            Action::OpenRow => self.open_selected(tx),
+            Action::ToggleRow => self.toggle_selected_group(tx),
+            Action::NextRow => self.step_row(true, tx),
+            Action::PrevRow => self.step_row(false, tx),
+            Action::NextMessage => self.step_message(true, tx),
+            Action::PrevMessage => self.step_message(false, tx),
             _ => false,
         }
     }
