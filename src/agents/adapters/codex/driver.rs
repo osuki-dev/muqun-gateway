@@ -2755,57 +2755,61 @@ impl CodexDriver {
             // Validate uploads before any rejoin/resume or prompt mutation.
             let prepared = super::input::prepare(text, attachments).await?;
             let input = super::presentation::PromptInput::presented(prepared.input, text, display)?;
-            // Compaction cannot consume steering yet. Publish the accepted
-            // prompt through the ordinary inbox instead of hiding it upstream.
-            if delivery == Some(Delivery::Queue) || self.client.is_compacting(id) {
-                self.prepare_shared_interaction(id).await?;
-                let _guard = self.mutations.lock().await;
-                self.require_native_interaction(id).await?;
-                if self.client.active_turn(id).is_none() {
-                    // Idle: nothing to wait for, so it starts now, as an idle
-                    // OpenCode session delivers a queued prompt at once.
-                    return self
-                        .start_turn_locked(id, input)
-                        .await
-                        .map_err(SendFailure::into_error);
-                }
-                if !self.loaded.lock().await.contains(id) {
-                    return unsupported("Codex queued delivery requires an owned live thread");
-                }
+            self.prepare_shared_interaction(id).await?;
+            let _guard = self.mutations.lock().await;
+            let Some(turn) = self.client.active_turn(id) else {
+                // Idle: nothing to wait for or steer, so every delivery
+                // starts now, as an idle OpenCode session delivers a queued
+                // prompt at once.
+                return self
+                    .start_turn_locked(id, input)
+                    .await
+                    .map_err(SendFailure::into_error);
+            };
+            if !self.loaded.lock().await.contains(id) {
+                return unsupported("Codex prompts during a turn require an owned live thread");
+            }
+            // No stated delivery is Codex's own mid-turn input, the same as
+            // "steer": `turn/steer` into the active turn. "queue" waits for
+            // its end. Compaction cannot consume steering yet: the prompt
+            // waits in the inbox as "steer" and is steered once it ends.
+            let delivery = delivery.unwrap_or(Delivery::Steer);
+            if delivery == Delivery::Queue
+                || self.client.is_compacting(id)
+                || !self.steer_queued_locked(id, &turn).await?
+            {
                 return self.enqueue_prompt(
                     id,
                     display.unwrap_or(text),
                     prepared.files,
                     input,
-                    delivery.unwrap_or(Delivery::Steer),
+                    delivery,
                 );
             }
-            if delivery == Some(Delivery::Steer) {
-                self.prepare_shared_interaction(id).await?;
-                let _guard = self.mutations.lock().await;
-                self.require_native_interaction(id).await?;
-                if !self.loaded.lock().await.contains(id) {
-                    return unsupported("Codex steering requires an owned live thread");
-                }
-                // Compaction may have begun while preparing the interaction.
-                if self.client.is_compacting(id) {
-                    return self.enqueue_prompt(
-                        id,
-                        display.unwrap_or(text),
-                        prepared.files,
-                        input,
-                        Delivery::Steer,
-                    );
-                }
-                let turn = self.client.active_turn(id).ok_or_else(|| {
-                    AgentError::InvalidRequest(
-                        "Codex active turn ended before steering; message was not resent".into(),
-                    )
-                })?;
-                return self.steer(id, &turn, input).await;
-            }
-            self.submit_turn(id, input).await
+            self.steer_locked(id, &turn, input)
+                .await
+                .map_err(SendFailure::into_error)
         })
+    }
+
+    /// Before a prompt is steered into `turn`, steer in the prompts queued
+    /// ahead of it, oldest first: once Codex takes input, an older prompt
+    /// must not be overtaken and left for the turn's end. Caller holds
+    /// `mutations`. `Ok(false)`: the turn ended (or compaction began)
+    /// meanwhile; what is left waits in the queue.
+    async fn steer_queued_locked(&self, thread: &str, turn: &str) -> Result<bool, AgentError> {
+        loop {
+            if self.client.is_compacting(thread)
+                || self.client.active_turn(thread).as_deref() != Some(turn)
+            {
+                return Ok(false);
+            }
+            let Some(item) = self.queue().next(thread).cloned() else {
+                return Ok(true);
+            };
+            let result = self.steer_locked(thread, turn, item.input).await;
+            self.settle(thread, &item.id, result)?;
+        }
     }
 }
 

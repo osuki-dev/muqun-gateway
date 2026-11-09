@@ -1454,14 +1454,16 @@ impl AgentPort for PiDriver {
             let child = self.child_for(session_id).await?;
             let running = self.live.with(session_id, |s| s.running()) == Some(true);
             // An idle session always gets `prompt`: a `follow_up` sent to an
-            // idle Pi waits for a run nobody starts.
-            if !running || delivery == Some("steer") {
+            // idle Pi waits for a run nobody starts. While a run goes, a
+            // prompt without a stated delivery is Pi's own mid-run input
+            // (Enter in its TUI): `steer`; only "queue" is a follow-up.
+            if !running || delivery != Some("queue") {
                 command
                     .as_object_mut()
                     .expect("Pi prompt is an object")
                     .remove("streamingBehavior");
             }
-            if running && delivery == Some("steer") {
+            if running && delivery != Some("queue") {
                 command["type"] = json!("steer");
             }
             self.ensure_open()?;
@@ -1633,10 +1635,10 @@ impl AgentPort for PiDriver {
             };
             let mut command = json!({"type":"prompt", "message":message});
             if self.live.with(session_id, |s| s.running()) == Some(true) {
-                command["streamingBehavior"] = json!(if delivery == Some("steer") {
-                    "steer"
-                } else {
+                command["streamingBehavior"] = json!(if delivery == Some("queue") {
                     "followUp"
+                } else {
+                    "steer"
                 });
             }
             // Extension commands are accepted only through prompt, including
@@ -2443,6 +2445,83 @@ for raw in sys.stdin.buffer:
         assert_eq!(submitted[0]["type"], "prompt");
         assert_eq!(submitted[0]["streamingBehavior"], "steer");
         assert!(!commands.iter().any(|c| c["message"] == "/settings"));
+        driver.host.shutdown_all().await;
+    }
+
+    /// Idle, every delivery is a plain `prompt`. While Pi runs, a prompt with
+    /// no stated delivery is Pi's own Enter: `steer`; only "queue" is a
+    /// follow-up. A slash command, which only `prompt` takes, carries the
+    /// same choice as `streamingBehavior`.
+    #[tokio::test]
+    async fn a_prompt_while_pi_runs_steers_unless_queued() {
+        let Some((driver, dir)) = fake_driver(Duration::from_secs(900)) else {
+            return;
+        };
+        let info = driver
+            .create_session(dir.to_str(), None, None)
+            .await
+            .unwrap();
+        let id = info.asid.0.as_str();
+        let deliveries = [
+            (None, "none"),
+            (Some("steer"), "steer"),
+            (Some("queue"), "queue"),
+        ];
+        for (delivery, name) in deliveries {
+            driver
+                .send_prompt(id, &format!("idle {name}"), &[], delivery)
+                .await
+                .unwrap();
+        }
+        driver
+            .live
+            .with(id, |s| s.status = AgentSessionStatus::Busy);
+        for (delivery, name) in deliveries {
+            driver
+                .send_prompt(id, &format!("busy {name}"), &[], delivery)
+                .await
+                .unwrap();
+            driver
+                .run_command(id, "example", name, delivery)
+                .await
+                .unwrap();
+        }
+        let sent = std::fs::read_to_string(dir.join("commands.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|c| c["type"] == "prompt" || c["type"] == "steer")
+            .map(|c| {
+                (
+                    c["type"].as_str().unwrap().to_owned(),
+                    c["message"].as_str().unwrap().to_owned(),
+                    c.get("streamingBehavior")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                )
+            })
+            .collect::<Vec<_>>();
+        let row = |kind: &str, message: &str, behavior: Option<&str>| {
+            (
+                kind.to_owned(),
+                message.to_owned(),
+                behavior.map(str::to_owned),
+            )
+        };
+        assert_eq!(
+            sent,
+            [
+                row("prompt", "idle none", None),
+                row("prompt", "idle steer", None),
+                row("prompt", "idle queue", None),
+                row("steer", "busy none", None),
+                row("prompt", "/example none", Some("steer")),
+                row("steer", "busy steer", None),
+                row("prompt", "/example steer", Some("steer")),
+                row("prompt", "busy queue", Some("followUp")),
+                row("prompt", "/example queue", Some("followUp")),
+            ]
+        );
         driver.host.shutdown_all().await;
     }
 

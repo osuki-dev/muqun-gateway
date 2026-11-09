@@ -1029,6 +1029,40 @@ mod tests {
         server.abort();
     }
 
+    /// A prompt with no stated delivery is DeepSeek's own mid-turn input,
+    /// `steer` (its `next-step` inbox); only "queue" is `next-turn`.
+    #[tokio::test]
+    async fn a_prompt_without_delivery_is_deepseeks_next_step_input() {
+        use axum::{routing::post, Json, Router};
+        use serde_json::json;
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let sent = seen.clone();
+        let app = Router::new().route(
+            "/api/session/prompt",
+            post(move |Json(body): Json<Value>| {
+                sent.lock().unwrap().push(body);
+                async move { Json(json!({"result":{"ok":true,"value":{}}})) }
+            }),
+        );
+        let (driver, server) = rpc_server(app).await;
+        for delivery in [None, Some("steer"), Some("queue")] {
+            driver.send_prompt("s", "hi", &[], delivery).await.unwrap();
+        }
+        let modes = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|body| {
+                body["payload"]["args"]["request"]["mode"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(modes, ["steer", "steer", "queue"]);
+        server.abort();
+    }
+
     #[tokio::test]
     async fn durable_inbox_mutations_use_native_identity_and_never_retry_failures() {
         use axum::{routing::post, Json, Router};

@@ -33,11 +33,34 @@ fn steering_requires_the_active_root_provider_and_its_native_capability() {
     );
     assert_eq!(inbox::items(p).unwrap()[0]["id"], "queued-run");
     assert_eq!(inbox::items(p).unwrap()[0]["payload"]["text"], "later");
+    // T3's own default during a run is its queue; it never silently steers.
+    assert_eq!(
+        inbox::dispatch_mode(p, None).unwrap()["type"],
+        "queue_after_active"
+    );
+    assert_eq!(
+        inbox::dispatch_mode(p, Some("queue")).unwrap()["type"],
+        "queue_after_active"
+    );
+    // Without active steering, "steer" is the next run, never a restart.
+    let mut no_steer = snapshot.clone();
+    no_steer["projection"]["providerSessions"][0]["capabilities"]["turns"]
+        ["supportsActiveSteering"] = json!(false);
+    assert_eq!(
+        inbox::dispatch_mode(&no_steer["projection"], Some("steer")).unwrap()["type"],
+        "queue_after_active"
+    );
     let mut no_queue = snapshot.clone();
     no_queue["projection"]["providerSessions"][0]["capabilities"]["turns"]
         ["supportsQueuedMessages"] = json!(false);
     assert!(matches!(
         inbox::dispatch_mode(&no_queue["projection"], Some("queue")),
+        Err(AgentError::Unsupported(_))
+    ));
+    no_queue["projection"]["providerSessions"][0]["capabilities"]["turns"]
+        ["supportsActiveSteering"] = json!(false);
+    assert!(matches!(
+        inbox::dispatch_mode(&no_queue["projection"], Some("steer")),
         Err(AgentError::Unsupported(_))
     ));
     let mut idle = snapshot.clone();

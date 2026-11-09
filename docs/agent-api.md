@@ -888,7 +888,12 @@ Marks the session read. Unread is `info.time_idle > info.time_viewed`.
 ```
 
 `delivery` is `steer` (run at the next step boundary) or `queue` (wait behind
-what is already queued). Returns `{"submitted": true}`.
+what is already queued). Omitted, a prompt sent while a turn runs is handled
+as the agent itself handles input typed mid-turn, which is `steer`: injected
+into the running turn where the agent can (Claude Code, Codex, Pi, DeepSeek,
+OpenCode), else taken first when the turn ends (ACP agents without steering,
+T3 providers without active steering, native slash commands). It is never
+refused for the turn being busy. Returns `{"submitted": true}`.
 
 `computer_ids` is optional and requires `agent_computer_context_v1`. It contains
 up to eight immutable machine IDs from this Gateway's linked-computer inventory,

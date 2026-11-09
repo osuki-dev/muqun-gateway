@@ -1829,8 +1829,6 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn shared_prompt_delivery_does_not_relock_mutations_and_keeps_turn_serialization() {
-        use crate::agents::ports::agent::AgentError;
-
         const ID: &str = "00000000-0000-4000-8000-000000000021";
         let turns = Arc::new(AtomicU64::new(0));
         let accepted = turns.clone();
@@ -1857,12 +1855,12 @@ pub(crate) mod tests {
                 .send_prompt(ID, "Steer the current turn", &[], Some("steer"))
                 .await
                 .unwrap();
-            assert!(matches!(
-                driver
-                    .send_prompt(ID, "Not a new turn while busy", &[], None)
-                    .await,
-                Err(AgentError::InvalidRequest(_))
-            ));
+            // No stated delivery while busy is Codex's own mid-turn input:
+            // steered, never a second turn.
+            driver
+                .send_prompt(ID, "Not a new turn while busy", &[], None)
+                .await
+                .unwrap();
             fixture
                 .send
                 .send(json!({"method":"turn/completed","params":{
@@ -1873,15 +1871,14 @@ pub(crate) mod tests {
             while fixture.client.active_turn(ID).is_some() {
                 tokio::task::yield_now().await;
             }
+            // Serialized under one lock: the first starts the turn, the
+            // second steers into it.
             let (left, right) = tokio::join!(
                 driver.send_prompt(ID, "Follow-up A", &[], None),
                 driver.send_prompt(ID, "Follow-up B", &[], None),
             );
-            assert!(matches!(
-                (&left, &right),
-                (Ok(()), Err(AgentError::InvalidRequest(_)))
-                    | (Err(AgentError::InvalidRequest(_)), Ok(()))
-            ));
+            left.unwrap();
+            right.unwrap();
         })
         .await
         .expect("prompt delivery must finish without acquiring its mutation lock twice");
@@ -1899,7 +1896,7 @@ pub(crate) mod tests {
                 .iter()
                 .filter(|r| r["method"] == "turn/steer")
                 .count(),
-            1
+            3
         );
         assert!(!requests.iter().any(|r| r["method"] == "thread/resume"));
     }
