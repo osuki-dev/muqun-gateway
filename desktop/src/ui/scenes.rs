@@ -669,6 +669,7 @@ include!("scenes_timeline.rs");
 include!("scenes_terminal.rs");
 include!("scenes_search.rs");
 include!("scenes_composer.rs");
+include!("scenes_lists.rs");
 const VIEWER_CODE: &str = r#"//! Retry a flaky request with capped exponential backoff.
 
 use std::time::Duration;
@@ -867,6 +868,7 @@ pub fn scenes() -> &'static [Scene] {
         let mut all = base_scenes().to_vec();
         all.extend(search_scenes());
         all.extend(composer_scenes());
+        all.extend(list_scenes());
         all
     })
 }

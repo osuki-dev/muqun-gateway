@@ -51,7 +51,7 @@ use muqun_gateway::platform::discovery::AgentDiscoveryInfo;
 use rune::{Cx, El, ImageCache, KeyEvent, TextEdit, Tx};
 use rune_kit::diff::{parse, DiffState};
 use rune_kit::shell::PaneState;
-use rune_kit::{Kit, ScrollBar, ToastRegion};
+use rune_kit::{Kit, ToastRegion};
 
 use crate::config::{ConfigEdit, DesktopConfig, Scheme};
 use crate::hub::CatalogView;
@@ -321,6 +321,10 @@ pub struct UiState {
     /// Pending prompts per session, from snapshots and events.
     pub waiting_perms: HashMap<String, Vec<PermissionRequest>>,
     pub waiting_forms: HashMap<String, Vec<FormRequest>>,
+    /// The Inbox page's selection and when each prompt first arrived.
+    pub inbox_view: inbox::InboxView,
+    /// The Tasks page's selection, filters and task histories.
+    pub tasks_view: tasks::TasksView,
     /// Form answers, by `form id / field key`.
     pub form_inputs: HashMap<String, TextEdit>,
 
@@ -479,6 +483,8 @@ impl UiState {
             full_projects: HashSet::new(),
             waiting_perms: HashMap::new(),
             waiting_forms: HashMap::new(),
+            inbox_view: Default::default(),
+            tasks_view: Default::default(),
             form_inputs: HashMap::new(),
             agent_inputs: HashMap::new(),
             agent_errors: HashMap::new(),
@@ -1236,6 +1242,11 @@ impl UiState {
                 Update::Tasks { rows, default_cwd } => {
                     self.tasks = rows;
                     self.task_cwd = default_cwd;
+                    tasks::listed(self);
+                }
+                Update::TasksFailed(why) => self.tasks_view.error = Some(why),
+                Update::TaskHistory { id, steps } => {
+                    self.tasks_view.history.insert(id, steps);
                 }
                 Update::Descendants { asid, sessions } => {
                     if self.selected.as_deref() == Some(asid.as_str()) {
@@ -1267,6 +1278,7 @@ impl UiState {
             self.persist_layout();
         }
         self.note_busy();
+        inbox::note_waiting(self);
         self.sync_tray();
     }
 
@@ -1653,72 +1665,34 @@ pub fn muted(k: &Kit, s: impl Into<String>) -> El {
     rune::text(s).font(k.ty.small).color(k.c.text_muted).wrap()
 }
 
-/// Shared page chrome: centered column, title, optional subtitle.
-pub fn page_frame(k: &Kit, key: &str, title: &str, subtitle: Option<&str>) -> El {
-    page_frame_w(k, key, title, subtitle, 760.0)
-}
-
-/// Like [`page_frame`], with an explicit content width (Themes uses a wider rail).
-pub fn page_frame_w(k: &Kit, key: &str, title: &str, subtitle: Option<&str>, max_w: f32) -> El {
-    let title_font = rune::TextStyle {
-        size: 26.0,
-        line_height: 32.0,
-        ..k.ty.ui_medium
-    };
-    let mut head = rune::col().key("page-head").w_full().gap(4.0).child(
-        rune::text(title.to_string())
-            .font(title_font)
-            .color(k.c.text_base)
-            .key("page-title"),
-    );
-    if let Some(sub) = subtitle.filter(|s| !s.is_empty()) {
-        head = head.child(
-            rune::text(sub.to_string())
-                .font(k.ty.body)
-                .color(k.c.text_muted)
-                .key("page-subtitle"),
-        );
-    }
-    rune::col()
-        .key(key.to_string())
-        .w_full()
-        .max_w(max_w)
-        .gap(18.0)
-        .px(28.0)
-        .pt(28.0)
-        .pb(40.0)
-        .child(head)
-}
-
-/// A page's stage: the scroll column centred over a soft accent light, so
-/// Inbox, Tasks and Settings share Home's atmosphere.
-pub fn page_stage(s: &UiState, k: &Kit, key: &str, page: El) -> El {
+/// A page that owns the whole card, with no toolbar over it (Inbox, Tasks):
+/// the stage rises under the card's empty toolbar row so its panes start at
+/// the card's top edge, over a soft accent light.
+pub fn card_stage(s: &UiState, k: &Kit, key: &str, panes: El) -> El {
     let look = s.look();
-    let mut stage = rune::el()
-        .key(format!("{key}-stage"))
-        .w_full()
-        .h_full()
-        .min_h(0.0);
+    let lift = rune_kit::shell::TOOLBAR_HEIGHT;
+    let mut stage = rune::col().key(format!("{key}-stage")).w_full();
+    // As tall as the whole card (not shrunk to the room under the row).
+    stage = match rune::memo::layout_with("main-pane", |r| r[3]) {
+        Some(h) => stage.h(h).min_h(h).offset(0.0, -lift),
+        None => stage.h_full(),
+    };
     if look.glass {
         stage = stage.child(look.light(
             &format!("{key}-light"),
-            [0.5, -0.1],
-            [700.0, 360.0],
+            [0.3, -0.1],
+            [720.0, 340.0],
             k.c.bg_accent,
         ));
     }
-    stage.child(
-        rune::col()
-            .key(format!("{key}-scroll"))
-            .w_full()
-            .h_full()
-            .items_center()
-            .child(page)
-            .scroll(rune::ScrollSpec {
-                stick_bottom: false,
-            })
-            .scroll_bar(k),
-    )
+    // The shell sizes a page to the room under the toolbar row; the stage
+    // inside keeps its own height past that.
+    rune::col()
+        .key(format!("{key}-page"))
+        .w_full()
+        .h_full()
+        .min_h(0.0)
+        .child(stage.child(panes.w_full().h_full().min_h(0.0)))
 }
 
 pub fn title_of(info: &AgentSessionInfo) -> String {

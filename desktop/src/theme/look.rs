@@ -197,21 +197,6 @@ impl Look {
         }
     }
 
-    /// A card: a translucent surface with a rim light, no blur.
-    pub fn card(&self, k: &Kit, e: El, radius: f32) -> El {
-        let (top, bottom) = self.rim(k);
-        let e = e.radius(radius);
-        if self.glass {
-            e.fill(
-                k.c.surface_raised_base
-                    .alpha(if self.dark { 0.72 } else { 0.78 }),
-            )
-            .border_gradient(1.0, top, bottom)
-        } else {
-            e.fill(k.c.surface_raised_base).border(1.0, k.c.border_base)
-        }
-    }
-
     /// A quieter card for list items: the layer colour, hairline border.
     pub fn row_card(&self, k: &Kit, e: El, radius: f32) -> El {
         let fill = if self.glass {

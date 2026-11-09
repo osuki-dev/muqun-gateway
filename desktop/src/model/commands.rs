@@ -207,6 +207,10 @@ pub enum Command {
     CompleteTask {
         id: String,
     },
+    /// Read a task's state history (`Update::TaskHistory`).
+    TaskHistory {
+        id: String,
+    },
 }
 
 pub type CommandSender = mpsc::UnboundedSender<Command>;

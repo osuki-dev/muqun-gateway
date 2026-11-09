@@ -623,6 +623,13 @@ impl Core {
                 Ok(()) => self.refresh_tasks().await,
                 Err(err) => self.fail(err),
             },
+            Command::TaskHistory { id } => {
+                match tokio::time::timeout(LIST_TIMEOUT, self.hub.task_history(&id)).await {
+                    Ok(Ok(steps)) => self.inbox.push(Update::TaskHistory { id, steps }),
+                    Ok(Err(err)) => tracing::debug!(task = %id, %err, "task history unavailable"),
+                    Err(_) => tracing::debug!(task = %id, "task history timed out"),
+                }
+            }
             Command::CompleteDirectory { .. } | Command::Edit(_) => {
                 unreachable!("handled in the command loop")
             }
@@ -777,8 +784,14 @@ impl Core {
                 };
                 self.inbox.push(Update::Tasks { rows, default_cwd });
             }
-            Ok(Err(err)) => tracing::warn!(%err, "task list unavailable"),
-            Err(_) => tracing::warn!("task list timed out"),
+            Ok(Err(err)) => {
+                tracing::warn!(%err, "task list unavailable");
+                self.inbox.push(Update::TasksFailed(err.to_string()));
+            }
+            Err(_) => {
+                tracing::warn!("task list timed out");
+                self.inbox.push(Update::TasksFailed("timed out".into()));
+            }
         }
     }
 

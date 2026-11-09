@@ -27,8 +27,8 @@ use tokio::sync::broadcast;
 use super::local::enrich_local_media;
 use super::{
     CatalogView, HubError, HubFuture, HubMode, PeerMention, SavedPermission, SearchPage,
-    SearchQuery, SessionHub, ShellRow, TaskDefaults, TaskHubEvent, TaskRow, TimelineCatchUp,
-    WorktreeRow,
+    SearchQuery, SessionHub, ShellRow, TaskDefaults, TaskHubEvent, TaskRow, TaskStep,
+    TimelineCatchUp, WorktreeRow,
 };
 
 const EVENT_CAPACITY: usize = 4096;
@@ -1298,6 +1298,24 @@ impl SessionHub for RemoteHub {
                 )
                 .await,
             )
+        })
+    }
+
+    fn task_history<'a>(&'a self, id: &'a str) -> HubFuture<'a, Vec<TaskStep>> {
+        Box::pin(async move {
+            let json = self
+                .call(Method::GET, &["api", "tasks", id], &[], None)
+                .await?;
+            Ok(json
+                .get("events")
+                .and_then(Value::as_array)
+                .map(|events| {
+                    events
+                        .iter()
+                        .filter_map(|e| serde_json::from_value(e.clone()).ok())
+                        .collect()
+                })
+                .unwrap_or_default())
         })
     }
 
