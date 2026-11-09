@@ -16,6 +16,28 @@ use serde::Deserialize;
 pub const SOFT_ALPHA: f32 = 0.12;
 /// Status borders.
 pub const BORDER_ALPHA: f32 = 0.40;
+/// The least contrast text on the primary fill may have (WCAG AA).
+pub const ON_PRIMARY_CONTRAST: f32 = 4.5;
+
+/// WCAG contrast ratio of two opaque colours.
+pub fn contrast(a: Color, b: Color) -> f32 {
+    let (a, b) = (a.luminance(), b.luminance());
+    (a.max(b) + 0.05) / (a.min(b) + 0.05)
+}
+
+/// `on` when it reads on `fill` (≥ 4.5:1), else whichever of white and
+/// black reads better: a pack's `onPrimary` wins wherever it works.
+pub fn readable_on(fill: Color, on: Color) -> Color {
+    if contrast(fill, on) >= ON_PRIMARY_CONTRAST {
+        return on;
+    }
+    let (white, black) = (Color::WHITE, Color::BLACK);
+    if contrast(fill, white) >= contrast(fill, black) {
+        white
+    } else {
+        black
+    }
+}
 
 /// `variants.<scheme>.colors` of a `.muqun-theme`, as hex strings.
 #[derive(Debug, Clone, Deserialize)]
@@ -129,6 +151,24 @@ impl ThemePalette {
         c.text_accent = self.primary;
         c.icon_accent = self.primary;
         c.bg_accent = self.primary;
+        // The primary action — rune-kit's Submit and Contrast buttons and
+        // icon buttons — is the pack's primary fill with its `onPrimary`
+        // ink, as in the App (the derived kit paints them in the text colour).
+        let on = readable_on(self.primary, self.on_primary);
+        c.bg_contrast = self.primary;
+        c.bg_icon_button_contrast = self.primary;
+        c.text_contrast = on;
+        c.icon_contrast = on;
+        c.submit_fg = on;
+        c.submit_icon = on;
+        c.contrast_hover = on.alpha(0.12);
+        c.contrast_pressed = on.alpha(0.20);
+        c.submit_hover = on.alpha(0.12);
+        // A switch's knob: the light surface on a light theme, the text
+        // colour on a dark one (the App's `Toggle`), never the ink.
+        let knob = if kit.dark { self.text } else { self.surface };
+        c.knob = knob;
+        c.knob_on = knob;
         let state = |role: Color, bg: Option<Color>| StateColors {
             bg: bg.unwrap_or_else(|| role.alpha(SOFT_ALPHA)),
             fg: role,
@@ -258,6 +298,35 @@ mod tests {
         assert!(close(k.c.danger.bg, light.danger_subtle));
         assert!(close(k.c.success.icon, light.success));
         assert!(dark.kit().dark, "a light-on-dark palette makes a dark kit");
+    }
+
+    #[test]
+    fn primary_actions_wear_the_pack_primary_with_readable_ink() {
+        use crate::theme::color_scheme::ColorScheme;
+        for b in crate::theme::store::BUILTIN {
+            let pack = crate::theme::store::builtin(b.id).unwrap();
+            for scheme in [ColorScheme::Light, ColorScheme::Dark] {
+                let p = pack.manifest.palette(scheme).unwrap();
+                let k = p.kit();
+                let c = &k.c;
+                assert!(close(c.bg_icon_button_contrast, p.primary), "{}", b.id);
+                assert!(close(c.bg_contrast, p.primary), "{}", b.id);
+                for ink in [c.submit_fg, c.text_contrast] {
+                    assert!(contrast(p.primary, ink) >= ON_PRIMARY_CONTRAST, "{}", b.id);
+                }
+                // The knob is never the ink colour on a light theme.
+                if !k.dark {
+                    assert!(close(c.knob, p.surface), "{}", b.id);
+                }
+            }
+        }
+        // An `onPrimary` that doesn't read gives way to white or black.
+        let yellow = hex("#F7D777");
+        assert!(close(readable_on(yellow, hex("#FFFFFF")), Color::BLACK));
+        assert!(close(
+            readable_on(hex("#151719"), hex("#FFF5DE")),
+            hex("#FFF5DE")
+        ));
     }
 
     #[test]
