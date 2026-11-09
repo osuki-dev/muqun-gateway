@@ -809,7 +809,7 @@ fn quick_start(s: &UiState, k: &Kit, look: &Look, layer: &mut Vec<El>, inner: f3
             .on_change(|s: &mut UiState, _: &mut Tx| composer::on_draft_change(s, Slot::Start))
             .on_submit(|s: &mut UiState, _: &mut Tx| submit_start(s))
             .on_input_paste(|s: &mut UiState, content, _: &mut Tx| composer::take_paste(s, content))
-            .build(k)
+            .build(&composer::bare_field(k))
             .key("start-draft")
             .w_full(),
     );
@@ -869,7 +869,8 @@ fn quick_start(s: &UiState, k: &Kit, look: &Look, layer: &mut Vec<El>, inner: f3
             ),
         );
     card = card.child(actions);
-    look.accent_rim(k, look.panel(k, card, PANEL_RADIUS), k.c.bg_accent)
+    let card = look.panel(k, card, PANEL_RADIUS).motion(k.motion.control);
+    composer::accent_state(k, look, card, PANEL_RADIUS, s.start_draft.focused, false)
 }
 
 /// The Home band's height for a card `h` points tall: enough for the
@@ -990,6 +991,9 @@ fn hero_art(s: &UiState, k: &Kit, look: &Look, stage: Stage) -> Vec<El> {
                                 (0.75, k.c.bg_base.alpha(0.0)),
                             ],
                         )
+                        // Eased in from the card's top, so no edge shows
+                        // under the empty toolbar row.
+                        .clip_fade(0.0, hero * 0.5, 0.0, 0.0)
                         .a11y_hidden(),
                 );
             }
@@ -1035,7 +1039,8 @@ fn hero_art(s: &UiState, k: &Kit, look: &Look, stage: Stage) -> Vec<El> {
             k.c.bg_accent,
         )
         .pin(Some(0.0), Some(0.0), Some(0.0), None)
-        .h(light_h),
+        .h(light_h)
+        .clip_fade(0.0, hero * 0.4, 0.0, 0.0),
     );
     layers.push(
         figure
@@ -1158,27 +1163,37 @@ pub fn view(s: &UiState, k: &Kit, card: [f32; 2], layer: &mut Vec<El>) -> El {
     // figure read as one scene, then the page colour under the sections so
     // their headings stay readable. On a solid card it is the card itself.
     let floor = if look.glass { 0.84 } else { 1.0 };
-    let stage = el().key("home-stage").w_full().h_full().min_h(0.0).child(
-        el().key("home-floor")
-            .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
-            .linear_gradient(
-                std::f32::consts::PI,
-                [
-                    (0.0, k.c.bg_base.alpha(0.0)),
-                    (
-                        ((hero_h * 0.55) / card_h.max(1.0)).min(0.9),
-                        k.c.bg_base.alpha(floor * 0.25),
-                    ),
-                    (
-                        ((hero_h + 40.0) / card_h.max(1.0)).min(0.95),
-                        k.c.bg_base.alpha(floor),
-                    ),
-                    (1.0, k.c.bg_base.alpha(floor)),
-                ],
-            )
-            .a11y_hidden(),
-    );
-    stage.child(
+    // Home has no toolbar: its stage rises under the card's empty toolbar
+    // row, so the art and the floor start at the card's top edge.
+    let lift = rune_kit::shell::TOOLBAR_HEIGHT;
+    let stage = el()
+        .key("home-stage")
+        .w_full()
+        .h(card_h)
+        .min_h(card_h)
+        .offset(0.0, -lift)
+        .offset_motion(rune::Anim::INSTANT)
+        .child(
+            el().key("home-floor")
+                .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
+                .linear_gradient(
+                    std::f32::consts::PI,
+                    [
+                        (0.0, k.c.bg_base.alpha(0.0)),
+                        (
+                            ((hero_h * 0.55) / card_h.max(1.0)).min(0.9),
+                            k.c.bg_base.alpha(floor * 0.25),
+                        ),
+                        (
+                            ((hero_h + 40.0) / card_h.max(1.0)).min(0.95),
+                            k.c.bg_base.alpha(floor),
+                        ),
+                        (1.0, k.c.bg_base.alpha(floor)),
+                    ],
+                )
+                .a11y_hidden(),
+        );
+    let stage = stage.child(
         col()
             .key("home-scroll")
             .w_full()
@@ -1190,7 +1205,8 @@ pub fn view(s: &UiState, k: &Kit, card: [f32; 2], layer: &mut Vec<El>) -> El {
                 stick_bottom: false,
             })
             .scroll_bar(k),
-    )
+    );
+    el().key("home-page").w_full().h_full().child(stage)
 }
 
 #[cfg(test)]

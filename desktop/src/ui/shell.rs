@@ -51,10 +51,19 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
     // the hero. Settings / hub live in the sidebar footer there.
     let mut split = SplitView::new(main)
         .sidebar(&s.sidebar, super::sidebar_pane, sessions::view(s, k, layer))
-        .sidebar_leading(home_brand(s, k, &look, cx.titlebar_inset()));
-    if s.mode != Mode::Home {
-        split = split.toolbar(toolbar(s, k, &look, layer));
-    }
+        .sidebar_leading(home_brand(
+            s,
+            k,
+            &look,
+            crate::platform::titlebar_inset(cx.titlebar_inset()),
+        ));
+    // Home has no toolbar of its own; its card still starts on the
+    // sidebar's top row, as every page's does.
+    split = split.toolbar(if s.mode == Mode::Home {
+        Toolbar::new()
+    } else {
+        toolbar(s, k, &look, layer)
+    });
     let inspector_here = s.right_open && s.mode == Mode::Session && !s.in_split();
     // A row's details take the right-hand slot while they are open; an open
     // terminal takes it over both, and the inspector comes last.
@@ -78,7 +87,7 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
         split = split.inspector(&s.right, super::right_pane, inspector::view(s, k));
     }
     let mut split = split
-        .titlebar_inset(cx.titlebar_inset())
+        .titlebar_inset(crate::platform::titlebar_inset(cx.titlebar_inset()))
         .frame_inset(8.0)
         .pane_motion(super::panes::motion())
         .reduced_motion(!look.motion || cx.is_reduced_motion())
@@ -88,9 +97,7 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
                 .in_header()
                 .unread(s.waiting_count() > 0),
         );
-    if s.mode != Mode::Home {
-        split = split.toolbar_in_panel();
-    }
+    split = split.toolbar_in_panel();
     let root = match backdrop(s, k, &look, cx.layout_size("shell")) {
         Some((backdrop, wash)) => {
             // The sidebar's lists (and outside Home the inspector's) read

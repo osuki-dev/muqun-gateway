@@ -5,8 +5,7 @@
 //! colour (linear RGB) and one parameter, so the compositor needs no app
 //! state. Views emit slots only through [`UiState::fx_on`]: nothing under
 //! reduce motion or reduce transparency. [`Fx::animating`] is true only while
-//! a drawn layer moves on its own (the splash's liquid metal, a working
-//! composer's breathing rim), so an idle window stays idle.
+//! a drawn layer moves on its own (the splash's liquid metal), so an idle window stays idle.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
@@ -23,8 +22,6 @@ use super::UiState;
 
 /// A soft bloom under the slot in `data[0..3]`, intensity `data[3]`.
 pub const GLOW: u32 = 1;
-/// A breathing neon rim on the slot's edge in `data[0..3]`, intensity `data[3]`.
-pub const RIM: u32 = 2;
 /// Liquid metal filling the slot, tinted toward `data[0..3]`; `data[3]` is
 /// the flow (0 holds a polished, still surface that costs no frames).
 pub const METAL: u32 = 3;
@@ -106,18 +103,6 @@ pub fn glow_slot(key: &str, color: rune::Color, intensity: f32, radius: f32) -> 
         .a11y_hidden()
 }
 
-/// A neon rim slot pinned over its parent's rect.
-pub fn rim_slot(key: &str, color: rune::Color, intensity: f32, radius: f32) -> El {
-    rune::el()
-        .key(key.to_string())
-        .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
-        .radius(radius)
-        .effect(RIM)
-        .effect_bleed(24.0)
-        .effect_data(data(color, intensity))
-        .a11y_hidden()
-}
-
 /// A liquid-metal slab of `size`, tinted toward `color`, flowing at `flow`.
 pub fn metal(key: &str, size: f32, radius: f32, color: rune::Color, flow: f32) -> El {
     rune::el()
@@ -147,21 +132,6 @@ fn layer(kind: u32, d: [f32; 4], shape: Shape, t: f32, reduced: bool) -> Option<
             radius: 26.0,
             reach: 3.0,
             occlusion: 0.1,
-            ..Default::default()
-        }),
-        RIM => rune_fx::Fx::glow(GlowParams {
-            style: GlowStyle::Neon,
-            color: to_rgb(d),
-            core: Rgb([
-                (d[0] + 0.6).min(1.0),
-                (d[1] + 0.6).min(1.0),
-                (d[2] + 0.6).min(1.0),
-            ]),
-            intensity: d[3].clamp(0.0, 2.0),
-            radius: 10.0,
-            rim_width: 0.8,
-            breathe: 0.45,
-            breathe_period: 2.4,
             ..Default::default()
         }),
         METAL => {

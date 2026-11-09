@@ -158,6 +158,53 @@ pub(super) fn note_skill_args(s: &mut UiState, deliver: &Deliver) {
 
 /// Send the draft. While the agent works it steers the running turn, as on
 /// the App; [`queue_session`] (Alt+Enter) waits for the turn to end instead.
+/// A composer card's state in the theme's accent: lit while focused, a
+/// slow breathing rim while the agent works (held still without motion).
+pub fn accent_state(
+    k: &Kit,
+    look: &crate::theme::look::Look,
+    card: El,
+    radius: f32,
+    focused: bool,
+    busy: bool,
+) -> El {
+    let accent = k.c.bg_accent;
+    let card = if focused || busy {
+        look.accent_rim(k, card, accent)
+    } else {
+        card
+    };
+    let card = if focused {
+        look.glow(card, accent, 0.22)
+    } else {
+        card
+    };
+    if !busy {
+        return card;
+    }
+    card.child(
+        look.pulse(
+            el().key("composer-working-rim")
+                .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
+                .radius(radius)
+                .border_gradient(1.0, accent.alpha(0.7), accent.alpha(0.15)),
+        )
+        .a11y_hidden(),
+    )
+}
+
+/// The kit a composer's text field is built with: the field draws no box of
+/// its own (fill, shadow, focus ring), so the composer card around it is the
+/// one surface and the one focus mark.
+pub fn bare_field(k: &Kit) -> Kit {
+    let mut bare = k.clone();
+    bare.c.bg_base = k.c.bg_base.alpha(0.0);
+    bare.c.hover = k.c.hover.alpha(0.0);
+    bare.c.border_focus = k.c.border_focus.alpha(0.0);
+    bare.elevation.button_neutral = Vec::new();
+    bare
+}
+
 pub fn submit_session(s: &mut UiState) {
     send_session(s, false);
 }
@@ -480,10 +527,27 @@ fn image_thumbs(k: &Kit, images: Option<&ImageCache>, prefix: &str, paths: &[&st
 }
 
 fn staged_chip(s: &UiState, k: &Kit, i: usize, file: &crate::model::compose::StagedFile) -> El {
-    let images = s.images.as_ref();
-    let remove = Button::new(format!("{} ✕", file.name))
-        .variant(ButtonVariant::Outline)
+    let language = s.cfg.general.language;
+    let lead = if file.image && Path::new(&file.path).is_file() {
+        chip_thumb(
+            k,
+            s.images.as_ref(),
+            &file.path,
+            &format!("staged-thumb-{i}"),
+        )
+    } else {
+        rune::icon(&rune_kit::glyphs::FILE, 14.0)
+            .color(k.c.icon_muted)
+            .ml(4.0)
+    };
+    let remove = rune_kit::IconButton::new(k.glyph.close)
+        .variant(rune_kit::IconButtonVariant::GhostMuted)
         .control_size(ControlSize::Small)
+        .label(format!(
+            "{} {}",
+            tr_ref(language, "Remove", "移除"),
+            file.name
+        ))
         .on_press(move |s: &mut UiState| {
             if i < s.staged.len() {
                 s.staged.remove(i);
@@ -491,26 +555,23 @@ fn staged_chip(s: &UiState, k: &Kit, i: usize, file: &crate::model::compose::Sta
         })
         .build(k)
         .key(format!("staged-btn-{i}"));
-    if file.image && Path::new(&file.path).is_file() {
-        row()
-            .key(format!("staged-{i}"))
-            .gap(6.0)
-            .center_y()
-            .px(4.0)
-            .py(2.0)
-            .radius(k.radius.md)
-            .fill(k.c.bg_base)
-            .border(1.0, k.c.border_weak)
-            .child(chip_thumb(
-                k,
-                images,
-                &file.path,
-                &format!("staged-thumb-{i}"),
-            ))
-            .child(remove)
-    } else {
-        remove.key(format!("staged-{i}"))
-    }
+    row()
+        .key(format!("staged-{i}"))
+        .h(32.0)
+        .pl(4.0)
+        .gap(6.0)
+        .center_y()
+        .radius(k.radius.md)
+        .fill(k.c.text_base.alpha(0.06))
+        .help(file.path.clone())
+        .child(lead.a11y_hidden())
+        .child(
+            rune::text(super::timeline::clip(&file.name, 32))
+                .font(k.ty.small)
+                .color(k.c.text_base)
+                .a11y_hidden(),
+        )
+        .child(remove)
 }
 
 fn queued_chip(
@@ -1063,7 +1124,7 @@ fn switch_mode(s: &mut UiState, mode: String) {
 /// A pill-sized button that opens `menu` (toggling it).
 pub fn pill(k: &Kit, key: &str, label: String, open: bool, menu: OpenMenu) -> El {
     Button::new(label)
-        .variant(ButtonVariant::Outline)
+        .variant(ButtonVariant::GhostMuted)
         .control_size(ControlSize::Small)
         .expanded(open)
         .on_press(move |s: &mut UiState| s.menu = (!open).then(|| menu.clone()))
@@ -1221,7 +1282,7 @@ fn effort_menu(
 }
 
 fn pills(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
-    let mut line = row().key("pills").gap(6.0).center_y().flex_wrap();
+    let mut line = row().key("pills").gap(2.0).center_y().flex_wrap();
     let Some(info) = s.current() else { return line };
     let catalog = s.catalog.as_ref();
     let model_infos: Vec<&muqun_gateway::agents::ModelInfo> = catalog
@@ -1242,17 +1303,11 @@ fn pills(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
             .center_y()
             .px(8.0)
             .h(24.0)
-            .radius(12.0)
-            .fill(super::agents::color(&info.agent_id, s.dark).alpha(0.14))
-            .border(
-                1.0,
-                super::agents::color(&info.agent_id, s.dark).alpha(0.35),
-            )
             .child(super::agents::mark(&info.agent_id, 12.0, s.dark))
             .child(
                 rune::text(agent_name)
                     .font(k.ty.small_medium)
-                    .color(k.c.text_base),
+                    .color(k.c.text_muted),
             ),
     );
 
@@ -1399,25 +1454,14 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     let attach_press = move |_: &mut UiState| {
         crate::platform::dialogs::attach_files(start.clone());
     };
-    let attach = if fit == super::Fit::Wide {
-        Button::new(tr_ref(language, "Attach", "附件"))
-            .variant(ButtonVariant::Ghost)
-            .control_size(ControlSize::Regular)
-            .disabled(!has_session)
-            .help(attach_help)
-            .on_press(attach_press)
-            .build(k)
-            .key("attach")
-    } else {
-        rune_kit::IconButton::new(&super::parts::glyphs::ATTACH)
-            .variant(rune_kit::IconButtonVariant::Ghost)
-            .label(tr_ref(language, "Attach", "附件"))
-            .help(attach_help)
-            .disabled(!has_session)
-            .on_press(attach_press)
-            .build(k)
-            .key("attach")
-    };
+    let attach = rune_kit::IconButton::new(&super::parts::glyphs::ATTACH)
+        .variant(rune_kit::IconButtonVariant::GhostMuted)
+        .label(tr_ref(language, "Attach", "附件"))
+        .help(attach_help)
+        .disabled(!has_session)
+        .on_press(attach_press)
+        .build(k)
+        .key("attach");
     let pill_row = pills(s, k, layer);
     let mut actions = row().key("composer-actions").w_full().gap(8.0).center_y();
     let pill_line = if fit == super::Fit::Wide {
@@ -1528,7 +1572,7 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
             })
             .on_submit(|s: &mut UiState, _: &mut Tx| submit_session(s))
             .on_input_paste(|s: &mut UiState, content, _: &mut Tx| take_paste(s, content))
-            .build(k)
+            .build(&bare_field(k))
             .key("draft")
             .w_full(),
     );
@@ -1537,26 +1581,12 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     }
     card = card.child(actions);
 
-    // The card: glass over the pane, lit in the accent while the field has
-    // focus, breathing in the agent's colour while it works.
+    // The card is the one surface: a quiet rim at rest, the theme's accent
+    // lit along it while the field has focus, and while the agent works a
+    // slow breath of the accent (still under reduce motion).
     let radius = crate::theme::look::PANEL_RADIUS;
-    let mut card = look.panel(k, card, radius).motion(k.motion.control);
-    if busy && s.fx_on() {
-        // A breathing neon rim in the agent's colour (GPU); the field stays still.
-        card = card.child(super::fx::rim_slot("composer-rim", brand, 0.9, radius));
-    } else if busy {
-        card = look.glow(card, brand, 0.35).child(
-            look.pulse(
-                el().key("composer-working-rim")
-                    .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
-                    .radius(radius)
-                    .border_gradient(1.5, brand.alpha(0.9), brand.alpha(0.3)),
-            )
-            .a11y_hidden(),
-        );
-    } else if focused {
-        card = look.glow(look.accent_rim(k, card, k.c.bg_accent), k.c.bg_accent, 0.35);
-    }
+    let card = look.panel(k, card, radius).motion(k.motion.control);
+    let card = accent_state(k, &look, card, radius, focused, busy);
 
     // The status line: what the keys do, and a word while the agent works.
     let mut hint = row()

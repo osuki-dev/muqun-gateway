@@ -38,3 +38,14 @@ pub fn directories() -> anyhow::Result<(PathBuf, PathBuf)> {
         .join(DIR_NAME);
     Ok((config, state))
 }
+
+/// What the window's own controls take at the titlebar's leading edge:
+/// macOS's traffic lights, as Rune reports them. Elsewhere nothing sits
+/// there (a headless render still reports the Mac's, so ignore it).
+pub fn titlebar_inset(reported: f32) -> f32 {
+    if cfg!(target_os = "macos") {
+        reported
+    } else {
+        0.0
+    }
+}

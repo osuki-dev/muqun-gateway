@@ -7,6 +7,7 @@
 //! |---|---|
 //! | Ctrl+` | toggles the panel (closing it hands the keyboard back) |
 //! | Ctrl+Shift+C / Ctrl+Shift+V | copy the selection / paste (bracketed) |
+//! | Ctrl+Insert / Shift+Insert | the same, as X11 and dictation tools send them |
 //! | any other Ctrl+Shift+key | the app: its own Ctrl+Shift shortcut, else its Ctrl+key one (Ctrl+Shift+K opens the palette) |
 //! | everything else, Esc, Tab and Ctrl+letters included | the shell |
 
@@ -40,6 +41,15 @@ pub fn route(ev: &KeyEvent, physical: Option<PhysicalKeyCode>, mac: bool) -> Rou
         return Route::Toggle;
     }
     let m = ev.mods;
+    // The old CUA pair, which clipboard tools (dictation pasting through
+    // Shift+Insert) still send, on every platform.
+    if ev.key == Key::Insert && !m.alt {
+        match (m.ctrl, m.shift) {
+            (true, false) => return Route::Copy,
+            (false, true) => return Route::Paste,
+            _ => {}
+        }
+    }
     let letter = |c: char| {
         matches!(&ev.key, Key::Command(k) if k.eq_ignore_ascii_case(&c))
             || physical == Some(letter_code(c))
@@ -350,6 +360,9 @@ mod tests {
                 Some(P::KeyK),
                 Route::App,
             ),
+            (ev(Key::Insert, false, true, false), None, Route::Paste),
+            (ev(Key::Insert, true, false, false), None, Route::Copy),
+            (ev(Key::Insert, false, false, false), None, Route::Terminal),
             (
                 ev(Key::Command('t'), true, true, false),
                 Some(P::KeyT),

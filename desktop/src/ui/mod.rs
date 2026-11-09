@@ -1742,6 +1742,27 @@ impl UiState {
         }
     }
 
+    /// The selected text of the focused field, when it has a selection.
+    fn focused_selection(&self) -> Option<String> {
+        [
+            &self.draft,
+            &self.start_draft,
+            &self.search,
+            &self.folder_query,
+            &self.task_goal,
+            &self.theme_url,
+            &self.cwd_input,
+            &self.rename_edit,
+            &self.project_edit,
+        ]
+        .into_iter()
+        .chain(self.form_inputs.values())
+        .chain(self.agent_inputs.values())
+        .find(|e| e.focused)
+        .map(|e| e.selected().to_string())
+        .filter(|t| !t.is_empty())
+    }
+
     /// Start the clock of every session that began working, stop the rest.
     fn note_busy(&mut self) {
         let now = now_ms();
@@ -1915,6 +1936,20 @@ pub fn on_key(s: &mut UiState, ev: &KeyEvent, tx: &mut Tx) -> bool {
     }
     if s.timeline_key(ev, tx) {
         return true;
+    }
+    // Shift+Insert pastes and Ctrl+Insert copies in every field, as Ctrl+V
+    // and Ctrl+C do: dictation and clipboard tools paste with Shift+Insert.
+    if ev.key == rune::Key::Insert && !ev.mods.alt {
+        if ev.mods.shift && !ev.mods.ctrl {
+            tx.request_paste();
+            return true;
+        }
+        if ev.mods.ctrl && !ev.mods.shift {
+            if let Some(text) = s.focused_selection() {
+                tx.copy(text);
+                return true;
+            }
+        }
     }
     if ev.is_command('t') && ev.mods.shift && !ev.mods.alt {
         s.settings_tab = SettingsTab::Themes;
