@@ -156,6 +156,19 @@ impl UiState {
         });
     }
 
+    /// Whether a search is showing in the sidebar (a query is typed).
+    pub fn searching(&self) -> bool {
+        !self.search.text.is_empty()
+    }
+
+    /// × or Esc: the query cleared, the field blurred and the sidebar back
+    /// to its session list.
+    pub fn close_search(&mut self) {
+        self.search = rune::TextEdit::new("");
+        self.content.only = false;
+        self.search_changed();
+    }
+
     /// Ctrl+F (`only == false`) and Ctrl+Shift+F: the field, focused.
     pub fn focus_search(&mut self, only: bool) {
         self.sidebar.set_open(true);
@@ -237,10 +250,18 @@ impl UiState {
         rows
     }
 
-    /// The search field's keys: ↑ / ↓ move through both groups, Enter opens.
+    /// The search field's keys: ↑ / ↓ move through both groups, Enter opens,
+    /// Esc closes the search (with nothing typed it only blurs the field).
     pub fn search_key(&mut self, ev: &rune::KeyEvent, tx: &mut Tx) -> bool {
         if ev.mods.alt || ev.mods.primary() {
             return false;
+        }
+        if ev.key == rune::Key::Escape {
+            if !self.searching() {
+                return false;
+            }
+            self.close_search();
+            return true;
         }
         let rows = self.search_rows();
         let at = self

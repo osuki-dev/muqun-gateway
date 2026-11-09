@@ -191,8 +191,8 @@ pub static ENTRIES: &[Entry] = &[
         A::Back,
         G::Global,
         "escape",
-        "Close the innermost popup, then back to the session",
-        "关闭最上层弹窗，再返回会话",
+        "Close the innermost popup or the search, then back to the session",
+        "关闭最上层弹窗或搜索，再返回会话",
     ),
     e(
         A::ToggleSidebar,
@@ -735,6 +735,8 @@ pub enum EscStep {
     Dialog,
     /// The timeline row's detail pane.
     Pane,
+    /// The sidebar's search: cleared, back to the session list.
+    Search,
     /// A page other than the session: back to the last session (or Home).
     Page,
 }
@@ -752,6 +754,9 @@ pub fn esc_step(s: &UiState) -> Option<EscStep> {
     }
     if s.inspect.is_some() {
         return Some(EscStep::Pane);
+    }
+    if s.searching() {
+        return Some(EscStep::Search);
     }
     let session = last_session(s).is_some();
     match s.mode {
@@ -795,6 +800,7 @@ pub fn escape(s: &mut UiState) -> bool {
             }
         }
         EscStep::Pane => s.close_inspect(),
+        EscStep::Search => s.close_search(),
         EscStep::Page => match last_session(s) {
             Some(_) if s.in_split() => s.mode = Mode::Session,
             Some(asid) => s.open_session(&asid),
@@ -906,6 +912,8 @@ mod tests {
         });
         s.menu = Some(OpenMenu::SessionMore);
         s.palette = Some(super::super::palette::Palette::new(false));
+        s.search = rune::TextEdit::new("greet");
+        s.search_changed();
         let mut steps = Vec::new();
         while let Some(step) = esc_step(&s) {
             steps.push(step);
@@ -913,8 +921,15 @@ mod tests {
         }
         assert_eq!(
             steps,
-            [EscStep::Sheet, EscStep::Popup, EscStep::Pane, EscStep::Page]
+            [
+                EscStep::Sheet,
+                EscStep::Popup,
+                EscStep::Pane,
+                EscStep::Search,
+                EscStep::Page
+            ]
         );
+        assert!(s.search.text.is_empty() && !s.search.focused);
         assert_eq!(s.mode, Mode::Session);
         assert_eq!(s.selected.as_deref(), Some(asid.as_str()));
         // On the session itself Esc has nothing left to do.

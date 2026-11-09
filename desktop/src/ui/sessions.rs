@@ -574,7 +574,9 @@ fn search(s: &UiState, k: &Kit) -> El {
         .on_change(|s: &mut UiState, _: &mut Tx| s.search_changed())
         .on_key(|s: &mut UiState, ev: &rune::KeyEvent, tx: &mut Tx| s.search_key(ev, tx));
     if !s.search.text.is_empty() {
-        field = field.clear_button();
+        field = field
+            .clear_button()
+            .on_action(|s: &mut UiState, _: &mut Tx| s.close_search());
     }
     let mut well = rune::row()
         .key("search")
