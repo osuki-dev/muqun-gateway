@@ -151,6 +151,10 @@ def read():
     try:
         with open(store) as f: return json.load(f)
     except FileNotFoundError: return {}
+def write(data):
+    temporary=store+'.'+str(os.getpid())
+    with open(temporary,'w') as f:json.dump(data,f)
+    os.replace(temporary,store)
 def send(value):
     print(json.dumps(value), flush=True)
 def reply(id, result): send({'jsonrpc':'2.0','id':id,'result':result})
@@ -192,7 +196,7 @@ for line in sys.stdin:
     elif method=='session/new':
         active='session-'+str(os.getpid())
         data=read();data[active]=[]
-        with open(store,'w') as f:json.dump(data,f)
+        write(data)
         reply(message['id'],dict(config,sessionId=active))
         if '--acp' in sys.argv:
             time.sleep(0.03)
@@ -208,13 +212,13 @@ for line in sys.stdin:
         data=read();source=params['sessionId']
         if not data.get(source):send({'jsonrpc':'2.0','id':message['id'],'error':{'code':500,'message':'No conversation to branch'}});continue
         cloned='fork-'+str(os.getpid());data[cloned]=data[source]
-        with open(store,'w') as f:json.dump(data,f)
+        write(data)
         reply(message['id'],dict(config,sessionId=cloned))
     elif method=='session/delete':
         if active!=params['sessionId']:
             send({'jsonrpc':'2.0','id':message['id'],'error':{'code':-32602,'message':'Deletion requires a bound native session'}});continue
         data=read();data.pop(params['sessionId'],None)
-        with open(store,'w') as f:json.dump(data,f)
+        write(data)
         reply(message['id'],{})
     elif method=='session/set_config_option':
         for option in config['configOptions']:
@@ -238,7 +242,7 @@ for line in sys.stdin:
             else:text(active,'notice-'+str(turn),diagnostic)
         if content=='disconnect':sys.exit(0)
         data=read(); data[active].append(['user-'+str(turn),content,True])
-        with open(store,'w') as f:json.dump(data,f)
+        write(data)
         if content in ('approval','hold'):
             pending=message['id']
             if content=='approval':
@@ -247,12 +251,12 @@ for line in sys.stdin:
         else:
             text(active,'assistant-'+str(turn),'A');text(active,'assistant-'+str(turn),'B')
             data=read();data[active].append(['assistant-'+str(turn),'AB',False])
-            with open(store,'w') as f:json.dump(data,f)
+            write(data)
             reply(message['id'],{'stopReason':'end_turn','usage':{'inputTokens':17,'outputTokens':7,'cacheReadTokens':5,'cacheWriteTokens':2,'reasoningTokens':3}})
     elif method=='_session/steering':
         if pending is None:reply(message['id'],{'outcome':'promptRequired'});continue
         data=read(); data[active].append(['steer-'+str(turn),params['prompt'][0]['text'],True])
-        with open(store,'w') as f:json.dump(data,f)
+        write(data)
         reply(message['id'],{'outcome':'injected'})
     elif method=='session/cancel':
         if pending is not None:reply(pending,{'stopReason':'cancelled'});pending=None
