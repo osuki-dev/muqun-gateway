@@ -86,8 +86,12 @@ pub struct TermPanel {
     /// into a fresh emulator instead of a live shell.
     pub fixture: Option<fn(u16, u16) -> Vec<u8>>,
     pub error: Option<String>,
-    /// The grid's size the last layout gave, in cells.
+    /// The grid's size the shell and emulator have, in cells.
     size: Option<Size>,
+    /// New sizes on their way to the shell (paced while the divider drags).
+    resize: Resizer,
+    /// The frame clock's seconds, as the last poll saw them.
+    now: f64,
     /// The theme's colours as the last view resolved them; [`poll`] hands
     /// them to the emulator when they changed.
     pub want: Cell<Option<Colors>>,
@@ -105,7 +109,7 @@ impl TermPanel {
         Self {
             open: false,
             pane: PaneState::new(560.0)
-                .range(360.0, 760.0)
+                .range(360.0, super::panes::UNBOUNDED)
                 .with_width(width)
                 .collapsed(),
             session: None,
@@ -115,6 +119,8 @@ impl TermPanel {
             fixture: None,
             error: None,
             size: None,
+            resize: Resizer::default(),
+            now: 0.0,
             want: Cell::new(None),
             sent: None,
             wheel: 0.0,
@@ -141,6 +147,57 @@ impl TermPanel {
         if let Some(session) = &self.session {
             session.send(msg);
         }
+    }
+}
+
+/// Seconds between the sizes a dragged divider sends the shell. Every size
+/// makes a full-screen program (nvim, lazygit) redraw the whole screen, so a
+/// drag sends a few and the last as it ends, never one a frame.
+const DRAG_EVERY: f64 = 0.12;
+
+/// When a new grid size reaches the shell: at once, except while the owner
+/// drags the divider, when at most every [`DRAG_EVERY`] seconds.
+#[derive(Debug, Default)]
+struct Resizer {
+    pending: Option<Size>,
+    /// When the last size went out.
+    at: Option<f64>,
+}
+
+impl Resizer {
+    /// `size` is wanted at `now`: it, if it goes out now.
+    fn want(&mut self, size: Size, now: f64, dragging: bool) -> Option<Size> {
+        self.pending = Some(size);
+        self.due(now, dragging)
+    }
+
+    /// The waiting size, once it may go out.
+    fn due(&mut self, now: f64, dragging: bool) -> Option<Size> {
+        let size = self.pending?;
+        if dragging && self.wait(now).is_some() {
+            return None;
+        }
+        self.pending = None;
+        self.at = Some(now);
+        Some(size)
+    }
+
+    /// Seconds until the waiting size may go out, while it must wait.
+    fn wait(&self, now: f64) -> Option<f64> {
+        let left = DRAG_EVERY - (now - self.at?);
+        (self.pending.is_some() && left > 0.0).then_some(left)
+    }
+}
+
+/// The grid's size in cells: across from the pane's settled width (the
+/// grid fills it, inside the body's inset), never its width mid-slide;
+/// down from the laid-out height.
+fn grid_size(pane_width: f32, height: f32, m: Metrics, scale: f32) -> Size {
+    Size {
+        cols: (((pane_width - 2.0 * INSET) / m.cw).floor() as u16).max(2),
+        rows: ((height / m.ch).floor() as u16).max(1),
+        cell_w: (m.cw * scale).round().max(1.0) as u32,
+        cell_h: (m.ch * scale).round().max(1.0) as u32,
     }
 }
 
@@ -300,23 +357,29 @@ impl UiState {
     }
 
     /// The grid was laid out at `[x, y, w, h]`: the shell's size follows.
+    /// Hidden, the shell keeps the size it had.
     fn terminal_layout(&mut self, rect: [f32; 4], scale: f32) {
         if !self.term.open || rect[2] < 40.0 || rect[3] < 20.0 {
             return;
         }
-        let m = metrics();
-        let size = Size {
-            cols: ((rect[2] / m.cw).floor() as u16).max(2),
-            rows: ((rect[3] / m.ch).floor() as u16).max(1),
-            cell_w: (m.cw * scale).round().max(1.0) as u32,
-            cell_h: (m.ch * scale).round().max(1.0) as u32,
-        };
+        let size = grid_size(self.term.pane.width(), rect[3], metrics(), scale);
         if self.term.size == Some(size)
             && (self.term.session.is_some() || self.term.frame.is_some())
         {
+            self.term.resize.pending = None;
             return;
         }
+        // A size held back waits for `poll_terminal`, which wakes for it.
+        let dragging = self.term.pane.is_resizing();
+        if let Some(size) = self.term.resize.want(size, self.term.now, dragging) {
+            self.resize_terminal(size);
+        }
+    }
+
+    /// Give the shell and emulator (or a scene's fixture) a new grid size.
+    fn resize_terminal(&mut self, size: Size) {
         self.term.size = Some(size);
+        tracing::debug!(target: "muqun_desktop::term_resize", cols = size.cols, rows = size.rows, "grid resize");
         if let Some(fixture) = self.term.fixture {
             if let Some(colors) = self.term.want.get() {
                 let bytes = fixture(size.cols, size.rows);
@@ -330,10 +393,20 @@ impl UiState {
         }
     }
 
-    /// Before each frame: take the emulator's newest picture, and pass on a
-    /// theme change.
-    pub fn poll_terminal(&mut self) -> bool {
+    /// Before each frame: send a size a drag held back, take the emulator's
+    /// newest picture, and pass on a theme change.
+    pub fn poll_terminal(&mut self, now: f64, tx: &mut Tx) -> bool {
+        self.term.now = now;
         let mut changed = false;
+        let dragging = self.term.pane.is_resizing();
+        if let Some(size) = self.term.resize.due(now, dragging) {
+            if self.term.size != Some(size) {
+                self.resize_terminal(size);
+                changed = true;
+            }
+        } else if let Some(left) = self.term.resize.wait(now) {
+            tx.wake_after(std::time::Duration::from_secs_f64(left));
+        }
         if let Some(want) = self.term.want.get() {
             if self.term.sent.is_some_and(|sent| sent != want) {
                 self.term.sent = Some(want);
@@ -814,6 +887,41 @@ mod tests {
     use super::*;
     use crate::model::commands;
     use rune::{Env, Ime, Key, Mods, Runtime};
+
+    #[test]
+    fn the_grid_takes_the_settled_pane_width_and_a_drag_paces_its_resizes() {
+        let m = Metrics { cw: 8.0, ch: 17.0 };
+        // 560 wide less the inset on each side: 68 columns, whatever the slide.
+        assert_eq!(grid_size(560.0, 850.0, m, 2.0).cols, 68);
+        assert_eq!(grid_size(560.0, 850.0, m, 2.0).rows, 50);
+
+        let size = |cols| Size {
+            cols,
+            rows: 50,
+            cell_w: 16,
+            cell_h: 34,
+        };
+        let mut r = Resizer::default();
+        // Not dragging: every size goes out at once.
+        assert_eq!(r.want(size(60), 0.0, false), Some(size(60)));
+        assert_eq!(r.want(size(61), 0.01, false), Some(size(61)));
+        // A drag a frame at a time for half a second: a few sizes, not 30.
+        let mut sent = 0;
+        for f in 1..=30 {
+            let now = 1.0 + f as f64 / 60.0;
+            if r.want(size(61 + f), now, true).is_some() {
+                sent += 1;
+            }
+        }
+        assert!(
+            (3..=5).contains(&sent),
+            "{sent} sizes in half a second of dragging"
+        );
+        // Held still, the last size waits its turn; released, it goes at once.
+        assert!(r.wait(1.5).is_some());
+        assert_eq!(r.due(1.5, false), Some(size(91)));
+        assert_eq!(r.due(1.6, false), None);
+    }
 
     fn key(key: Key, ctrl: bool, shift: bool) -> KeyEvent {
         KeyEvent {

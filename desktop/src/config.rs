@@ -390,7 +390,9 @@ impl UiPrefs {
     pub const SIDEBAR_MAX: f32 = 360.0;
     pub const RIGHT_DEFAULT: f32 = 320.0;
     pub const RIGHT_MIN: f32 = 240.0;
-    pub const RIGHT_MAX: f32 = 720.0;
+    /// Right-hand panes have no fixed ceiling: the window sets it at
+    /// layout time (`ui/panes.rs`). This only stops nonsense values.
+    pub const RIGHT_MAX: f32 = 4096.0;
     /// Main column must keep at least this much (timeline + composer).
     #[allow(dead_code)]
     pub const MAIN_MIN: f32 = 420.0;
@@ -405,10 +407,11 @@ impl UiPrefs {
         Self::TERMINAL_DEFAULT
     }
 
-    /// The stored terminal width, forced into the panel's range.
+    /// The stored terminal width, forced into the panel's range (the
+    /// window narrows it further at layout time).
     pub fn terminal(&self) -> f32 {
         if self.terminal_width.is_finite() {
-            self.terminal_width.clamp(360.0, 760.0)
+            self.terminal_width.clamp(360.0, Self::RIGHT_MAX)
         } else {
             Self::TERMINAL_DEFAULT
         }

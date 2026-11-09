@@ -16,6 +16,7 @@ mod inbox;
 mod inspector;
 mod labels;
 mod palette;
+mod panes;
 mod parts;
 pub mod scenes;
 mod sessions;
@@ -227,6 +228,8 @@ pub struct UiState {
     pub inspect: Option<Inspect>,
     /// The detail pane's width.
     pub inspect_pane: PaneState,
+    /// How wide the right-hand panes may be in this window (`panes.rs`).
+    pub fits: panes::Fits,
     /// A timeline row's context menu, where it was asked for.
     pub row_menu: Option<RowMenu>,
     /// The session whose context sheet is open (`timeline::context_meter`).
@@ -380,7 +383,7 @@ impl UiState {
                 .range(180.0, 420.0)
                 .with_width(cfg.ui.sidebar()),
             right: PaneState::new(320.0)
-                .range(240.0, 520.0)
+                .range(240.0, panes::UNBOUNDED)
                 .with_width(cfg.ui.right()),
             right_open: false,
             inspector_tab: InspectorTab::Queue,
@@ -395,7 +398,8 @@ impl UiState {
             zoom: None,
             detail: None,
             inspect: None,
-            inspect_pane: PaneState::new(440.0).range(320.0, 760.0),
+            inspect_pane: PaneState::new(440.0).range(320.0, panes::UNBOUNDED),
+            fits: panes::Fits::default(),
             row_menu: None,
             context_open: None,
             account_limits: HashMap::new(),
@@ -529,8 +533,9 @@ impl UiState {
     /// Every frame Rune asks: the splash and a recording's waveform animate.
     pub fn poll_frame(&mut self, t: f64, tx: &mut Tx) -> bool {
         let voice = self.poll_voice();
-        let term = self.poll_terminal();
-        self.poll_splash(t, tx) | voice | term
+        let fit = self.fit_panes();
+        let term = self.poll_terminal(t, tx);
+        self.poll_splash(t, tx) | voice | fit | term
     }
 
     pub fn poll_splash(&mut self, _: f64, _: &mut Tx) -> bool {
@@ -729,6 +734,21 @@ impl UiState {
         self.draft.focused = true;
     }
 
+    /// Keep the right-hand panes within the window beside the sidebar
+    /// (`panes.rs`). Whether a width changed.
+    fn fit_panes(&mut self) -> bool {
+        let window = self.fits.window;
+        if window <= 0.0 {
+            return false;
+        }
+        let max = panes::right_max(window, self.sidebar.shown_width());
+        let f = &mut self.fits;
+        let term = f.term.apply(&mut self.term.pane, max);
+        let inspect = f.inspect.apply(&mut self.inspect_pane, max);
+        let right = f.right.apply(&mut self.right, max);
+        term | inspect | right
+    }
+
     /// Save the panes' widths when they changed (a drag, a double-click
     /// reset). Waits for a drag in progress to end.
     pub fn persist_layout(&mut self) {
@@ -736,14 +756,15 @@ impl UiState {
             LAYOUT_DIRTY.store(true, Ordering::Release);
             return;
         }
-        let (sidebar, right) = (self.sidebar.width(), self.right.width());
+        let sidebar = self.sidebar.width();
+        let right = self.fits.right.chosen(&self.right);
         if (sidebar - self.cfg.ui.sidebar_width).abs() >= 1.0 {
             self.edit(ConfigEdit::SidebarWidth(sidebar));
         }
         if (right - self.cfg.ui.right_width).abs() >= 1.0 {
             self.edit(ConfigEdit::RightWidth(right));
         }
-        let terminal = self.term.pane.width();
+        let terminal = self.fits.term.chosen(&self.term.pane);
         if (terminal - self.cfg.ui.terminal_width).abs() >= 1.0 {
             self.edit(ConfigEdit::TerminalWidth(terminal));
         }

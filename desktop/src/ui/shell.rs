@@ -81,6 +81,7 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
     let mut split = split
         .titlebar_inset(cx.titlebar_inset())
         .frame_inset(8.0)
+        .pane_motion(super::panes::motion())
         .reduced_motion(!look.motion || cx.is_reduced_motion())
         .sidebar_toggle(
             SidebarToggle::new()
@@ -91,7 +92,7 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
     if s.mode != Mode::Home {
         split = split.toolbar_in_panel();
     }
-    match backdrop(s, k, &look, cx.layout_size("shell")) {
+    let root = match backdrop(s, k, &look, cx.layout_size("shell")) {
         Some((backdrop, wash)) => {
             // The sidebar's lists (and outside Home the inspector's) read
             // over a calmer patch of the wallpaper; Home's band keeps it whole.
@@ -125,7 +126,9 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
                 .child(split.build(&chrome))
         }
         None => split.build(k),
-    }
+    };
+    // The window's width bounds the right-hand panes (`UiState::fit_panes`).
+    root.on_layout(|s: &mut UiState, r| s.fits.window = r[2])
 }
 
 /// The least of the window floor that returns under the sidebar's lists,
