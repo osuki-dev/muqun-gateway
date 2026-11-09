@@ -124,8 +124,6 @@ pub struct Manifest {
     pub variant_decorations: VariantDecorations,
     #[serde(default)]
     pub home_identity: Option<HomeIdentity>,
-    #[serde(default, deserialize_with = "lenient")]
-    pub home_presentation: Option<HomePresentation>,
     /// Chrome glyphs the pack replaces (`chrome.settings`, `home.arrow` …);
     /// a malformed entry is dropped, never fatal, as in the App.
     #[serde(default, deserialize_with = "lenient")]
@@ -192,8 +190,8 @@ pub struct Asset {
 }
 
 /// A decoration slot: the image, its per-width replacements, and how the
-/// author wants it shown (`fit`, `opacity`, `focalPoint`; outset and the
-/// rest belong to the App).
+/// author wants it shown (`fit`, `opacity`, `focalPoint`, and for Home's
+/// composer the `outset` its frame may reach past the field).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Slot {
@@ -210,6 +208,38 @@ pub struct Slot {
     pub opacity: Option<f32>,
     #[serde(default)]
     pub focal_point: Option<FocalPoint>,
+    #[serde(default)]
+    pub outset: Option<Outset>,
+}
+
+/// How far `home.composer.background` may reach past the composer's left,
+/// right and bottom edges, in points (the App bounds it to 12, 12 and 8).
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+pub struct Outset {
+    #[serde(default)]
+    pub left: f32,
+    #[serde(default)]
+    pub right: f32,
+    #[serde(default)]
+    pub bottom: f32,
+}
+
+impl Outset {
+    /// Left, right and bottom, held within the App's bounds.
+    fn bounded(self) -> [f32; 3] {
+        let at = |v: f32, max: f32| {
+            if v.is_finite() {
+                v.clamp(0.0, max)
+            } else {
+                0.0
+            }
+        };
+        [
+            at(self.left, 12.0),
+            at(self.right, 12.0),
+            at(self.bottom, 8.0),
+        ]
+    }
 }
 
 /// Where the image's subject sits, in 0..=1 of its width and height.
@@ -225,6 +255,8 @@ pub struct SlotLook {
     pub cover: bool,
     pub opacity: f32,
     pub focal: [f32; 2],
+    /// Left, right, bottom: how far the picture may reach past its box.
+    pub outset: [f32; 3],
 }
 
 impl Default for SlotLook {
@@ -233,6 +265,7 @@ impl Default for SlotLook {
             cover: false,
             opacity: 1.0,
             focal: [0.5, 0.5],
+            outset: [0.0; 3],
         }
     }
 }
@@ -260,6 +293,10 @@ impl Slot {
                 .and_then(|r| r.focal_point)
                 .or(self.focal_point)
                 .map_or([0.5, 0.5], |f| [f.x.clamp(0.0, 1.0), f.y.clamp(0.0, 1.0)]),
+            outset: r
+                .and_then(|r| r.outset)
+                .or(self.outset)
+                .map_or([0.0; 3], Outset::bounded),
         }
     }
 }
@@ -276,6 +313,8 @@ pub struct ImageRef {
     pub opacity: Option<f32>,
     #[serde(default)]
     pub focal_point: Option<FocalPoint>,
+    #[serde(default)]
+    pub outset: Option<Outset>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -290,29 +329,17 @@ pub struct VariantDecorations {
 #[derive(Debug, Clone, Deserialize)]
 pub struct HomeIdentity {
     #[serde(default)]
-    pub name: Option<Mode>,
-    #[serde(default)]
     pub logo: Option<Mode>,
     #[serde(default)]
     pub artwork: Option<Mode>,
 }
 
-/// `{ mode: default | hidden | custom }`, with the custom `asset` (a logo)
-/// or `text` (a name).
+/// `{ mode: default | hidden | custom }`, with the custom `asset` (a logo).
 #[derive(Debug, Clone, Deserialize)]
 pub struct Mode {
     pub mode: String,
     #[serde(default)]
     pub asset: Option<String>,
-    #[serde(default)]
-    pub text: Option<String>,
-}
-
-/// How Home presents the artwork: `cover` (a tall band the greeting sits
-/// in) or `standard` (a compact header).
-#[derive(Debug, Clone, Deserialize)]
-pub struct HomePresentation {
-    pub header: String,
 }
 
 /// A replacement glyph: an asset drawn as a mask in the theme's colour
@@ -1497,7 +1524,7 @@ pub(crate) mod tests {
         value["homePresentation"] = serde_json::json!("tall");
         value["iconDirections"] = serde_json::json!({ "home.arrow": "up-right" });
         let m = parse_manifest(&serde_json::to_vec(&value).unwrap()).unwrap();
-        assert!(m.icons.is_none() && m.home_presentation.is_none());
+        assert!(m.icons.is_none());
         assert_eq!(
             m.icon_directions
                 .unwrap()

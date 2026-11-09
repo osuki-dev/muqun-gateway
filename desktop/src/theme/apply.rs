@@ -202,10 +202,6 @@ pub struct Identity {
     pub mark: bool,
     /// The pack's own logo (`logo: custom`).
     pub logo: Option<Arc<[u8]>>,
-    /// The pack's own name for Home (`name: custom`).
-    pub name: Option<String>,
-    /// Home uses a tall cover band (`homePresentation.header: cover`).
-    pub cover_header: bool,
 }
 
 /// The current pack's Home identity; Muqun's own when no theme is active.
@@ -225,18 +221,10 @@ pub fn identity() -> Identity {
                 .then(|| id?.logo.as_ref()?.asset.as_ref())
                 .flatten()
                 .and_then(|a| c.images.get(a).cloned()),
-            name: (mode(|h| h.name.as_ref()) == Some("custom"))
-                .then(|| id?.name.as_ref()?.text.clone())
-                .flatten(),
-            cover_header: m
-                .home_presentation
-                .as_ref()
-                .is_none_or(|p| p.header != "standard"),
         })
     })
     .unwrap_or(Identity {
         mark: true,
-        cover_header: true,
         ..Identity::default()
     })
 }

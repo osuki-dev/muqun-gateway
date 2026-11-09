@@ -62,8 +62,9 @@ const PAGE_PAUSE: std::time::Duration = std::time::Duration::from_millis(700);
 
 /// Rows a list estimates before it has measured them.
 const ROW_ESTIMATE: f32 = 64.0;
-/// Readable line length on a wide window; tiles are narrower anyway.
-const FEED_MAX_W: f32 = 860.0;
+/// Readable line length on a wide window; tiles are narrower anyway. The
+/// session composer shares it, so the two line up.
+pub const FEED_MAX_W: f32 = 860.0;
 
 /// An item's change, parsed the first time a card draws it: a long session
 /// of whole-file edits would otherwise diff every one of them on open.

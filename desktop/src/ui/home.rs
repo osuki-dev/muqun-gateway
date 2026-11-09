@@ -2,11 +2,9 @@
 
 use std::path::PathBuf;
 
-use muqun_gateway::agents::{AgentSessionInfo, ModelRef};
+use muqun_gateway::agents::ModelRef;
 use rune::{col, el, row, text, El, ScrollSpec, Tx};
-use rune_kit::{
-    Button, ButtonVariant, ControlSize, Kit, ScrollBar, SegmentedControl, TextArea, TextInput,
-};
+use rune_kit::{Button, ButtonVariant, ControlSize, Kit, SegmentedControl, TextArea, TextInput};
 
 use super::composer::{self, branch_menu, catalog_models, model_menu};
 use super::copy::{tr, tr_ref};
@@ -16,17 +14,20 @@ use crate::model::commands::Command;
 use crate::model::compose::{ComposeCommand, Target};
 use crate::theme::look::{Look, PANEL_RADIUS};
 
-/// The widest the content column gets, its side padding included.
-const COLUMN: f32 = 1160.0;
-/// The column's side padding.
-const SIDE: f32 = 40.0;
-/// The least height of the Home band: the theme's art lives here, the greeting sits
-/// on its lower edge and the page starts under it.
-const HERO_H: f32 = 196.0;
-/// The band's height with no art in it: room for the greeting and a breath above.
-const HERO_BARE_H: f32 = 150.0;
-/// The least room a cut-out figure is drawn in.
-const FIGURE_MIN_W: f32 = 120.0;
+/// The widest the composer gets, on a very wide window.
+const DOCK_MAX: f32 = 1180.0;
+/// The share of the main card the composer takes on a wide window, and the
+/// least it takes there; a narrower card gives it all but its gutters.
+const DOCK_SHARE: f32 = 0.75;
+const DOCK_MIN_WIDE: f32 = 960.0;
+/// The composer's height before it is laid out.
+const DOCK_GUESS: f32 = 190.0;
+/// The tallest the theme's art stands over the composer.
+const ART_MAX_H: f32 = 760.0;
+/// The least height a figure is worth drawing at.
+const ART_MIN_H: f32 = 140.0;
+/// How far below the card's top edge the art may rise.
+const ART_TOP: f32 = 20.0;
 /// The start card's padding.
 const START_PAD: f32 = 24.0;
 /// The folder picker's width.
@@ -248,6 +249,7 @@ fn agents(s: &UiState, k: &Kit, layer: &mut Vec<El>, room: f32) -> El {
     if !rest.is_empty() {
         let open = s.menu == Some(OpenMenu::StartAgents);
         let mut menu = rune_kit::Menu::new("start-agents")
+            .placement(rune_kit::Placement::TopStart)
             .trigger(
                 Button::new(more_label(rest.len()))
                     .variant(ButtonVariant::GhostMuted)
@@ -369,6 +371,7 @@ fn folder(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         .build(k)
         .key("start-folder");
     let mut pop = rune_kit::Popover::new("start-folders")
+        .placement(rune_kit::Placement::TopStart)
         .trigger(trigger)
         .open(open)
         .padding(6.0)
@@ -642,6 +645,7 @@ fn start_pills(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Option<El> {
             let open = s.menu == Some(OpenMenu::StartMode);
             let label = at.map_or_else(|| tr(language, "Mode", "模式"), |i| modes[i].1.clone());
             let mut menu = rune_kit::Menu::new("start-mode")
+                .placement(rune_kit::Placement::TopStart)
                 .trigger(super::composer::pill(
                     k,
                     "start-mode-pill",
@@ -671,104 +675,9 @@ fn start_pills(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Option<El> {
 
 // ---- the page ------------------------------------------------------------------------
 
-fn first_run(s: &UiState) -> bool {
-    !s.agents.is_empty()
-        && s.sessions.is_empty()
-        && s.cfg.general.last_agent.is_none()
-        && s.cfg.general.last_cwd.is_empty()
-}
-
-/// Every session with something waiting on the owner, newest first.
-fn needing(s: &UiState) -> Vec<&AgentSessionInfo> {
-    s.sessions
-        .iter()
-        .filter(|i| s.session_waiting(&i.asid.0))
-        .collect()
-}
-
-/// The greeting and its one-line summary of what is going on.
-fn greeting(s: &UiState) -> (String, String) {
-    let language = s.cfg.general.language;
-    let zh = language.is_zh();
-    let ready = s
-        .agents
-        .iter()
-        .filter(|a| super::agents::Standing::of(a) == super::agents::Standing::Usable)
-        .count();
-    let running = s.running().len();
-    let waiting = needing(s).len();
-    let tasks = s.tasks.iter().filter(|t| t.state == "working").count();
-    if first_run(s) {
-        let title = tr(language, "Welcome to Muqun", "欢迎使用 Muqun");
-        if ready == 0 {
-            return (
-                title,
-                tr(
-                    language,
-                    "No agent is ready yet. Turn one on in Settings → Agents.",
-                    "还没有可用的 Agent。在「设置 → Agents」中启用一个。",
-                ),
-            );
-        }
-        let sub = if zh {
-            format!("已检测到 {ready} 个 agent，选一个开始。")
-        } else {
-            format!(
-                "{ready} agent{} ready. Pick one and describe the task.",
-                if ready == 1 { "" } else { "s" }
-            )
-        };
-        return (title, super::copy::localize(language, sub));
-    }
-    let title = if waiting > 0 {
-        if zh {
-            format!("{waiting} 项等你处理")
-        } else if waiting == 1 {
-            "One thing needs you".to_string()
-        } else {
-            format!("{waiting} things need you")
-        }
-    } else if running > 0 {
-        tr(language, "Agents are working", "Agent 正在工作")
-    } else {
-        tr(language, "What should we work on?", "今天想做什么？")
-    };
-    let mut parts = Vec::new();
-    if zh {
-        parts.push(format!("{ready} 个 agent 就绪"));
-        if running > 0 {
-            parts.push(format!("{running} 个会话工作中"));
-        }
-        if tasks > 0 {
-            parts.push(format!("{tasks} 个任务运行中"));
-        }
-    } else {
-        parts.push(format!(
-            "{ready} agent{} ready",
-            if ready == 1 { "" } else { "s" }
-        ));
-        if running > 0 {
-            parts.push(format!(
-                "{running} session{} working",
-                if running == 1 { "" } else { "s" }
-            ));
-        }
-        if tasks > 0 {
-            parts.push(format!(
-                "{tasks} task{} running",
-                if tasks == 1 { "" } else { "s" }
-            ));
-        }
-    }
-    (
-        super::copy::localize(language, title),
-        super::copy::localize(language, parts.join(" · ")),
-    )
-}
-
 /// The start form: which agent, the first prompt, and under it one quiet
 /// row of choices (folder, branch, model, mode, worktree) beside Start.
-fn quick_start(s: &UiState, k: &Kit, look: &Look, layer: &mut Vec<El>, inner: f32) -> El {
+fn quick_start(s: &UiState, k: &Kit, look: &Look, layer: &mut Vec<El>, size: [f32; 2]) -> El {
     let language = s.cfg.general.language;
     let mut card = col()
         .key("home-card")
@@ -777,8 +686,7 @@ fn quick_start(s: &UiState, k: &Kit, look: &Look, layer: &mut Vec<El>, inner: f3
         .px(START_PAD)
         .pt(START_PAD - 4.0)
         .pb(START_PAD - 6.0)
-        .children(composer_art(s))
-        .child(agents(s, k, layer, inner - START_PAD * 2.0));
+        .child(agents(s, k, layer, size[0] - START_PAD * 2.0));
     composer::popup(s, k, layer, Slot::Start);
     let placeholder = tr_ref(
         language,
@@ -870,342 +778,249 @@ fn quick_start(s: &UiState, k: &Kit, look: &Look, layer: &mut Vec<El>, inner: f3
         );
     card = card.child(actions);
     let card = look.panel(k, card, PANEL_RADIUS).motion(k.motion.control);
-    composer::accent_state(k, look, card, PANEL_RADIUS, s.start_draft.focused, false)
+    let card = composer::accent_state(k, look, card, PANEL_RADIUS, s.start_draft.focused, false);
+    // A frame the pack drew to reach past the field sits over its edges.
+    el().key("home-dock")
+        .w_full()
+        .child(card)
+        .children(composer_frame(s, size))
 }
 
-/// The Home band's height for a card `h` points tall: enough for the
-/// theme's art beside the greeting, never a screenful of empty sky.
-fn hero_height(card_h: f32, cover_header: bool) -> f32 {
-    if cover_header {
-        (card_h * 0.22).clamp(HERO_H, 280.0)
-    } else {
-        (card_h * 0.18).clamp(HERO_H - 24.0, 230.0)
+/// Where the stage's parts sit in the main card, `w` × `h` points (the art
+/// may rise under the card's empty toolbar row): the composer `dock` wide
+/// and tall, its top edge at `dock_top`.
+struct Stage {
+    w: f32,
+    h: f32,
+    dock: [f32; 2],
+    dock_top: f32,
+}
+
+/// The theme's world standing behind the composer, as if on a stage whose
+/// front edge the composer is. A cut-out figure or scene stands whole above
+/// it, its foot going behind the composer and dissolving there, with light
+/// from behind; a painting fills the card's top and dissolves down into the
+/// page before the composer. With no art, the brand mark rests above it.
+fn stage_art(s: &UiState, k: &Kit, look: &Look, stage: Stage) -> Vec<El> {
+    let Stage {
+        w, dock, dock_top, ..
+    } = stage;
+    let mut layers = Vec::new();
+    let Some(images) = s.images.as_ref() else {
+        return layers;
+    };
+    let Some(art) = crate::theme::apply::home_artwork(s.scheme()) else {
+        layers.extend(mark(s, k, look, w, dock_top));
+        return layers;
+    };
+    if art.look.cover {
+        // A painting: edge to edge from the card's top, its foot going
+        // under the composer's top and dissolving well before it.
+        let ph = (dock_top + dock[1] * 0.3).max(0.0);
+        if ph < ART_MIN_H {
+            return layers;
+        }
+        layers.push(
+            super::art::place(images, &art, "home-figure", w, ph)
+                .clip_fade(0.0, 0.0, 0.0, ph * 0.45)
+                .absolute(0.0, 0.0)
+                .opacity(art.look.opacity),
+        );
+        return layers;
     }
+    // A cut-out: whole, as tall as the room over the composer allows, a
+    // little wider than the composer at most, centred on it.
+    let room_h = (dock_top - ART_TOP).max(0.0);
+    let overlap = (room_h * 0.1).clamp(24.0, 64.0);
+    let (figure, [fw, fh]) = super::art::contained(
+        images,
+        &art,
+        (w - 32.0).min(dock[0] + 280.0),
+        (room_h + overlap).min(ART_MAX_H.max(stage.h * 0.6)),
+    );
+    if fh < ART_MIN_H {
+        return layers;
+    }
+    let overlap = (fh * 0.1).clamp(24.0, 64.0).min(overlap);
+    let (x, y) = ((w - fw) * 0.5, dock_top + overlap - fh);
+    // Light from behind, reaching past the figure so its falloff never
+    // meets an edge.
+    layers.push(
+        look.light(
+            "home-light",
+            [0.5, 0.45],
+            [fw * 0.62, fh * 0.5],
+            k.c.bg_accent,
+        )
+        .absolute(x - fw, y - fh * 0.5)
+        .size(fw * 3.0, fh * 2.0),
+    );
+    // Its foot fades from above the composer's edge to under it, so neither
+    // a waist-cut figure nor a painted ground ends on a line, even through
+    // the composer's glass; a square-cut side melts a little too.
+    layers.push(
+        figure
+            .key("home-figure")
+            .clip_fade(fw * 0.04, 0.0, fw * 0.04, overlap + fh * 0.14)
+            .absolute(x, y)
+            .opacity(art.look.opacity),
+    );
+    layers
 }
 
-/// The brand block over the greeting: the Muqun mark (or the pack's logo)
-/// and the pack's own name, as its `homeIdentity` asks.
-fn identity(s: &UiState, k: &Kit, look: &Look) -> Option<El> {
+/// With no art: the Muqun mark (or the pack's logo) resting above the
+/// composer, lit from behind.
+fn mark(s: &UiState, k: &Kit, look: &Look, w: f32, dock_top: f32) -> Option<El> {
     let id = crate::theme::apply::identity();
     let images = s.images.as_ref()?;
-    let mark = if let Some(logo) = id.logo.clone() {
-        Some(
+    let (mark, size) = if let Some(logo) = id.logo.clone() {
+        (
             super::art::picture(images, logo, rune::SurfaceFit::Fit)
                 .key("home-logo")
-                .size(56.0, 56.0)
-                .a11y_hidden(),
+                .size(72.0, 72.0),
+            72.0,
         )
-    } else if id.mark && s.fx_on() {
-        Some(
+    } else if id.mark {
+        (
             look.glow(
                 el().key("home-badge")
-                    .size(44.0, 44.0)
-                    .radius(13.0)
+                    .size(56.0, 56.0)
+                    .radius(16.0)
                     .center()
                     .fill(k.c.layer_02)
-                    .child(
-                        super::fx::metal("home-metal", 44.0, 13.0, k.c.bg_accent, 0.0)
-                            .absolute(0.0, 0.0),
-                    )
+                    .children(s.fx_on().then(|| {
+                        super::fx::metal("home-metal", 56.0, 16.0, k.c.bg_accent, 0.0)
+                            .absolute(0.0, 0.0)
+                    }))
                     .child(
                         super::art::picture(
                             images,
                             std::sync::Arc::<[u8]>::from(crate::branding::APP_MARK_PNG),
                             rune::SurfaceFit::Fill,
                         )
-                        .size(26.0, 26.0)
-                        .radius(7.0)
-                        .clip_rounded(7.0),
-                    )
-                    .a11y_hidden(),
+                        .size(32.0, 32.0)
+                        .radius(8.0)
+                        .clip_rounded(8.0),
+                    ),
                 k.c.bg_accent,
                 0.5,
             ),
+            56.0,
         )
     } else {
-        None
-    };
-    let name = id.name.map(|name| {
-        text(name.to_uppercase())
-            .key("home-theme-name")
-            .font(rune::TextStyle {
-                tracking: 1.6,
-                ..k.ty.small_medium
-            })
-            .color(k.c.text_accent)
-    });
-    if mark.is_none() && name.is_none() {
         return None;
-    }
+    };
+    let y = (dock_top * 0.62 - size * 0.5).max(ART_TOP);
     Some(
-        col()
-            .key("home-identity")
-            .gap(10.0)
-            .mb(4.0)
-            .children(mark)
-            .children(name),
+        el().key("home-mark-stage")
+            .absolute(0.0, 0.0)
+            .size(w, dock_top)
+            .a11y_hidden()
+            .child(
+                look.light(
+                    "home-light",
+                    [0.5, (y + size * 0.5) / dock_top.max(1.0)],
+                    [size * 4.0, size * 3.0],
+                    k.c.bg_accent,
+                )
+                .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0)),
+            )
+            .child(mark.absolute((w - size) * 0.5, y)),
     )
 }
 
-/// Where the theme's art may sit in the Home band, `w` × `hero` points:
-/// right of `clear` (the greeting's far edge and a margin), and no further
-/// right than `reach` (a little past the content column, so on a very wide
-/// window the art stays with the greeting instead of drifting to the edge).
-struct Stage {
-    w: f32,
-    hero: f32,
-    clear: f32,
-    reach: f32,
-}
-
-/// The theme's world on Home: a cut-out figure stands whole beside the
-/// greeting, its inner edges melting into the page; a painting fills the
-/// band right of the greeting and dissolves toward it. Neither goes under
-/// the text. Behind it all, a scrim on the greeting's side keeps the
-/// window's wallpaper from fighting the title.
-fn hero_art(s: &UiState, k: &Kit, look: &Look, stage: Stage) -> Vec<El> {
-    let Stage {
-        w,
-        hero,
-        clear,
-        reach,
-    } = stage;
-    let mut layers = Vec::new();
-    let scheme = s.scheme();
-    if look.glass {
-        if let Some(wall) = crate::theme::apply::backdrop(scheme, true) {
-            let wash = crate::theme::look::wash_for(
-                k.c.bg_base,
-                &[(k.c.text_base, 4.5), (k.c.text_muted, 4.5)],
-                wall.look.opacity,
-            );
-            if wash > 0.0 {
-                layers.push(
-                    el().key("home-title-scrim")
-                        .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
-                        .linear_gradient(
-                            std::f32::consts::FRAC_PI_2,
-                            [
-                                (0.0, k.c.bg_base.alpha(wash)),
-                                (0.42, k.c.bg_base.alpha(wash * 0.85)),
-                                (0.75, k.c.bg_base.alpha(0.0)),
-                            ],
-                        )
-                        // Eased in from the card's top, so no edge shows
-                        // under the empty toolbar row.
-                        .clip_fade(0.0, hero * 0.5, 0.0, 0.0)
-                        .a11y_hidden(),
-                );
-            }
-        }
-    }
-    let (Some(images), Some(art)) = (s.images.as_ref(), crate::theme::apply::home_artwork(scheme))
-    else {
-        return layers;
-    };
-    if art.look.cover {
-        // A painting: from the greeting's edge to the band's far side and
-        // a little below, its near edge and foot dissolving.
-        let bw = (w - clear).max(w * 0.38).min(w);
-        let bh = hero + 48.0;
-        layers.push(
-            super::art::cover(images, &art, "home-figure", bw, bh)
-                .clip_fade(bw * 0.3, 0.0, 0.0, bh * 0.4)
-                .pin(None, Some(0.0), Some(0.0), None)
-                .opacity(art.look.opacity),
-        );
-        return layers;
-    }
-    // A cut-out: whole, as large as the room beside the greeting allows.
-    // Its own transparency shapes it; only the edges that face the page
-    // fade, so a square-cut figure never ends on a line.
-    let edge = (w * 0.03).clamp(16.0, 56.0);
-    let right_x = reach.min(w - edge);
-    let room_w = (right_x - clear).min(hero * 1.9).max(0.0);
-    if room_w < FIGURE_MIN_W {
-        return layers;
-    }
-    let (figure, [fw, fh]) = super::art::contained(images, &art, room_w, hero - 12.0);
-    let right = w - right_x;
-    // The light reaches past the band, so its falloff never meets an edge.
-    let light_h = hero * 1.6;
-    let cx = (right_x - fw * 0.5) / w;
-    let cy = (hero - fh * 0.55) / light_h;
-    layers.push(
-        look.light(
-            "home-light",
-            [cx, cy],
-            [fw * 0.75, fh * 0.75],
-            k.c.bg_accent,
-        )
-        .pin(Some(0.0), Some(0.0), Some(0.0), None)
-        .h(light_h)
-        .clip_fade(0.0, hero * 0.4, 0.0, 0.0),
-    );
-    layers.push(
-        figure
-            .key("home-figure")
-            .clip_fade(fw * 0.08, 0.0, 0.0, fh * 0.16)
-            .pin(None, None, Some(right), Some(0.0))
-            .opacity(art.look.opacity),
-    );
-    layers
-}
-
-/// The pack's composer artwork inside the start card, at its opacity and
-/// anchored where its focal point says (most hang from the top edge).
-fn composer_art(s: &UiState) -> Option<El> {
+/// The pack's composer frame (`home.composer.background` drawn to reach
+/// past the field, its `outset`) around a composer `size` points: over the
+/// field's edges, as wide as the frame, hung from its focal edge, so its
+/// rails and posts land on the field's edges as drawn. A picture meant to
+/// sit inside the field is left out: on Home the theme's art already stands
+/// right above the composer, and inside it a picture only muddies the
+/// controls.
+fn composer_frame(s: &UiState, size: [f32; 2]) -> Option<El> {
     let images = s.images.as_ref()?;
     let art = crate::theme::apply::art("home.composer.background", s.scheme())?;
-    let fit = if art.look.cover {
-        rune::SurfaceFit::Fill
-    } else {
-        rune::SurfaceFit::Fit
-    };
-    let image = super::art::image(images, &art.bytes);
-    let pic = el()
-        .key("home-card-art")
-        .pixels_fit(image.pixels(), fit)
-        .opacity(art.look.opacity)
-        .a11y_hidden();
-    // A contain picture keeps its aspect: hang it from the focal edge.
-    let pic = if art.look.cover {
-        pic.pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
-    } else if art.look.focal[1] > 0.66 {
-        pic.pin(Some(0.0), None, Some(0.0), Some(0.0)).w_full()
-    } else {
-        pic.pin(Some(0.0), Some(0.0), Some(0.0), None).w_full()
-    };
-    Some(pic)
+    let [l, r, b] = art.look.outset;
+    if l + r + b <= 0.0 {
+        return None;
+    }
+    let (w, h) = (size[0] + l + r, size[1] + b);
+    let mut art = art;
+    if !art.look.cover {
+        // Fitted to the frame's width rather than inside its height.
+        art.look.cover = art.size[0] / art.size[1] <= w / h;
+    }
+    Some(
+        super::art::place(images, &art, "home-card-art", w, h)
+            .absolute(-l, 0.0)
+            .opacity(art.look.opacity),
+    )
 }
 
-/// Home, composed for a main card `card` points wide and tall.
-pub fn view(s: &UiState, k: &Kit, card: [f32; 2], layer: &mut Vec<El>) -> El {
+/// Home, composed for a main card `card` points wide and tall, the
+/// composer `dock` (when laid out): the theme's art on a stage, and the
+/// composer at the stage's front edge, at the card's foot.
+pub fn view(
+    s: &UiState,
+    k: &Kit,
+    card: [f32; 2],
+    dock: Option<[f32; 2]>,
+    layer: &mut Vec<El>,
+) -> El {
     let look = s.look();
-    let (title, subtitle) = greeting(s);
-    let [card_w, card_h] = card;
-    // The greeting grows a little with a large window, to hold its band.
-    let size = (card_w / 40.0).clamp(32.0, 40.0);
-    let title_font = rune::TextStyle {
-        size,
-        line_height: size * 1.2,
-        ..k.ty.ui_medium
-    };
-    let id = crate::theme::apply::identity();
-    let column_w = card_w.min(COLUMN);
-    let inner = column_w - SIDE * 2.0;
-    let left = (card_w - column_w) * 0.5 + SIDE;
-    let words = rune::text::measure(&title, &[], title_font, None)
-        .0
-        .max(rune::text::measure(&subtitle, &[], k.ty.body, None).0);
-    let clear = left + words.min(inner) + 40.0;
-    let reach = left + inner + 160.0;
-    // With no art to show beside the greeting (none, or no room for a
-    // figure in a narrow window) the band is only as tall as its words.
-    let art_shown = crate::theme::apply::home_artwork(s.scheme())
-        .is_some_and(|art| art.look.cover || reach.min(card_w - 16.0) - clear >= FIGURE_MIN_W);
-    let hero_h = if art_shown {
-        hero_height(card_h, id.cover_header)
-    } else {
-        HERO_BARE_H
-    };
-    let stage = Stage {
-        w: card_w,
-        hero: hero_h,
-        clear,
-        reach,
-    };
-
-    let mut hero = col()
-        .key("home-hero")
-        .w_full()
-        .max_w(COLUMN)
-        .px(SIDE)
-        .h(hero_h)
-        .justify_end()
-        .gap(8.0);
-    if let Some(identity) = identity(s, k, &look) {
-        hero = hero.child(identity);
-    }
-    let hero = hero
-        .child(
-            text(title)
-                .font(title_font)
-                .color(k.c.text_base)
-                .key("home-title"),
-        )
-        .child(
-            text(subtitle)
-                .font(k.ty.body)
-                .color(k.c.text_muted)
-                .key("home-subtitle"),
-        );
-    // The band: the theme's world behind the greeting, scrolling with it.
-    let band = col()
-        .key("home-band")
-        .w_full()
-        .h(hero_h)
-        .items_center()
-        .children(hero_art(s, k, &look, stage))
-        .child(look.arrive(hero, 0));
-
-    let mut column = col()
-        .key("home")
-        .w_full()
-        .max_w(COLUMN)
-        .gap(32.0)
-        .px(SIDE)
-        .pt(28.0)
-        .pb(48.0);
-    column = column.child(look.arrive(quick_start(s, k, &look, layer, inner), 1));
-
-    // The floor: clear under the band, so the window's wallpaper and the
-    // figure read as one scene, then the page colour under the sections so
-    // their headings stay readable. On a solid card it is the card itself.
-    let floor = if look.glass { 0.84 } else { 1.0 };
+    let [w, h] = card;
+    let side = (w * 0.04).clamp(24.0, 56.0);
+    let gutters = (w - side * 2.0).max(0.0);
+    let dock_w = (w * DOCK_SHARE).clamp(DOCK_MIN_WIDE, DOCK_MAX).min(gutters);
+    let dock_h = dock.map_or(DOCK_GUESS, |d| d[1]);
+    let bottom = (h * 0.05).clamp(20.0, 48.0);
     // Home has no toolbar: its stage rises under the card's empty toolbar
-    // row, so the art and the floor start at the card's top edge.
+    // row, so the art starts at the card's top edge (`card` is the whole
+    // card, that row included).
     let lift = rune_kit::shell::TOOLBAR_HEIGHT;
+    let full_h = h;
+    let dock_top = full_h - bottom - dock_h;
+    let stage = Stage {
+        w,
+        h,
+        dock: [dock_w, dock_h],
+        dock_top,
+    };
+    let art = stage_art(s, k, &look, stage);
+    let composer = quick_start(s, k, &look, layer, [dock_w, dock_h]);
+    // The ground the composer stands on: the page colour rising behind it,
+    // so the window's wallpaper and the art's foot settle there. On a solid
+    // card it is the card itself.
+    let ground = look.glass.then(|| {
+        let from = ((dock_top - dock_h * 0.6) / full_h.max(1.0)).clamp(0.0, 0.95);
+        el().key("home-ground")
+            .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
+            .linear_gradient(
+                std::f32::consts::PI,
+                [
+                    (0.0, k.c.bg_base.alpha(0.0)),
+                    (from, k.c.bg_base.alpha(0.0)),
+                    (1.0, k.c.bg_base.alpha(0.6)),
+                ],
+            )
+            .a11y_hidden()
+    });
     let stage = el()
         .key("home-stage")
         .w_full()
-        .h(card_h)
-        .min_h(card_h)
+        .h(full_h)
         .offset(0.0, -lift)
         .offset_motion(rune::Anim::INSTANT)
+        .children(art.into_iter().map(|a| look.arrive(a.a11y_hidden(), 0)))
+        .children(ground)
         .child(
-            el().key("home-floor")
+            col()
+                .key("home-dock-row")
                 .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
-                .linear_gradient(
-                    std::f32::consts::PI,
-                    [
-                        (0.0, k.c.bg_base.alpha(0.0)),
-                        (
-                            ((hero_h * 0.55) / card_h.max(1.0)).min(0.9),
-                            k.c.bg_base.alpha(floor * 0.25),
-                        ),
-                        (
-                            ((hero_h + 40.0) / card_h.max(1.0)).min(0.95),
-                            k.c.bg_base.alpha(floor),
-                        ),
-                        (1.0, k.c.bg_base.alpha(floor)),
-                    ],
-                )
-                .a11y_hidden(),
+                .items_center()
+                .justify_end()
+                .pb(bottom)
+                .child(look.arrive(composer.w(dock_w), 1)),
         );
-    let stage = stage.child(
-        col()
-            .key("home-scroll")
-            .w_full()
-            .h_full()
-            .items_center()
-            .child(band)
-            .child(column)
-            .scroll(ScrollSpec {
-                stick_bottom: false,
-            })
-            .scroll_bar(k),
-    );
     el().key("home-page").w_full().h_full().child(stage)
 }
 

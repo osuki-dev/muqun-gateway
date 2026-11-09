@@ -1783,14 +1783,6 @@ impl UiState {
         }
     }
 
-    /// Sessions working right now, newest first.
-    pub fn running(&self) -> Vec<&AgentSessionInfo> {
-        self.sessions
-            .iter()
-            .filter(|i| self.activity(i) == Activity::Working)
-            .collect()
-    }
-
     /// The folder's short name for a session (`gateway` for `/home/me/gateway`).
     pub fn folder_name(info: &AgentSessionInfo) -> Option<String> {
         let dir = info.directory.as_deref()?.trim_end_matches('/');

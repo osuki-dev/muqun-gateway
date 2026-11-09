@@ -1149,7 +1149,9 @@ pub fn model_menu(
         OpenMenu::StartModel => "start-model",
         _ => "model",
     };
+    // Composers sit at the window's foot: their menus open upward.
     let mut menu = Menu::new(key)
+        .placement(rune_kit::Placement::TopStart)
         .trigger(pill(k, &format!("{key}-pill"), label, open, kind))
         .open(open)
         .min_width(220.0)
@@ -1195,6 +1197,7 @@ pub fn branch_menu(
         );
     }
     let mut menu = Menu::new(key)
+        .placement(rune_kit::Placement::TopStart)
         .trigger(pill(k, &format!("{key}-pill"), label, open, kind))
         .open(open)
         .on_close(|s: &mut UiState| s.menu = None);
@@ -1630,13 +1633,17 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         ));
     }
 
+    // The messages' reading column: as wide and as centred as they are on
+    // a wide window, the whole width on a narrow one.
+    let column = super::timeline::FEED_MAX_W;
     col()
         .key("composer")
         .w_full()
+        .items_center()
         .px(16.0)
         .pt(8.0)
         .pb(10.0)
         .gap(6.0)
-        .child(card)
-        .child(hint)
+        .child(card.w_full().max_w(column))
+        .child(hint.max_w(column))
 }

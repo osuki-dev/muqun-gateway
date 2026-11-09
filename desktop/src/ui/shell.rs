@@ -32,6 +32,7 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
             s,
             k,
             cx.layout_size("main-pane").unwrap_or([1080.0, 860.0]),
+            cx.layout_size("home-dock"),
             layer,
         ),
         Mode::Session if s.in_split() => tiles::view(s, k, layer),
@@ -49,8 +50,17 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
     let main = main.child(page.grow(1.0).min_h(0.0));
     // Home is full-bleed artwork; a toolbar strip would sit as a band over
     // the hero. Settings / hub live in the sidebar footer there.
+    let frame = super::panes::FRAME;
+    // The sidebar floats as a rounded panel inset from the window's edges,
+    // a frame's width from the main card: its contents keep clear of the
+    // panel's edges, its footer of the panel's foot.
+    let sidebar = col()
+        .key("sidebar-frame")
+        .pb(frame)
+        .child(sessions::view(s, k, layer).w_full().grow(1.0).min_h(0.0));
     let mut split = SplitView::new(main)
-        .sidebar(&s.sidebar, super::sidebar_pane, sessions::view(s, k, layer))
+        .sidebar(&s.sidebar, super::sidebar_pane, sidebar)
+        .sidebar_padding(frame, frame)
         .sidebar_leading(home_brand(
             s,
             k,
@@ -88,7 +98,7 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
     }
     let mut split = split
         .titlebar_inset(crate::platform::titlebar_inset(cx.titlebar_inset()))
-        .frame_inset(8.0)
+        .frame_inset(frame)
         .pane_motion(super::panes::motion())
         .reduced_motion(!look.motion || cx.is_reduced_motion())
         .sidebar_toggle(
@@ -98,41 +108,34 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
                 .unread(s.waiting_count() > 0),
         );
     split = split.toolbar_in_panel();
-    let root = match backdrop(s, k, &look, cx.layout_size("shell")) {
-        Some((backdrop, wash)) => {
-            // The sidebar's lists (and outside Home the inspector's) read
-            // over a calmer patch of the wallpaper; Home's band keeps it whole.
-            let wash_el = el()
-                .key("window-wash")
-                .fill(k.c.bg_deep.alpha(wash))
-                .motion(crate::theme::look::MOVE)
-                .a11y_hidden();
-            // The chrome sits on the theme's world: the window floor turns
-            // clear over the wallpaper, and the main card lets a breath of
-            // it through (Home draws its own stage over a clear card).
-            let mut chrome = k.clone();
-            chrome.c.bg_deep = k.c.bg_deep.alpha(0.0);
-            chrome.c.bg_base = k.c.bg_base.alpha(if s.mode == Mode::Home {
-                0.0
-            } else {
-                CARD_ALPHA
-            });
-            el().key("window-stage")
-                .w_full()
-                .h_full()
-                .fill(k.c.bg_deep)
-                .child(backdrop)
-                .child(if s.mode == Mode::Home {
-                    wash_el
-                        .pin(Some(0.0), Some(0.0), None, Some(0.0))
-                        .w(s.sidebar.shown_width())
-                } else {
-                    wash_el.pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
-                })
-                .child(split.build(&chrome))
+    // The window floor, the theme's world on it, the sidebar's panel, and
+    // the chrome over them: the shell itself lays no floor of its own.
+    let home = s.mode == Mode::Home;
+    let mut chrome = k.clone();
+    chrome.c.bg_deep = k.c.bg_deep.alpha(0.0);
+    let mut stage = el().key("window-stage").w_full().h_full().fill(k.c.bg_deep);
+    let mut panel_wash = 0.0;
+    if let Some((backdrop, wash)) = backdrop(s, k, &look, cx.layout_size("shell")) {
+        // The main card lets a breath of the wallpaper through (Home draws
+        // its own stage over a clear card).
+        chrome.c.bg_base = k.c.bg_base.alpha(if home { 0.0 } else { CARD_ALPHA });
+        stage = stage.child(backdrop);
+        if home {
+            // Home keeps the wallpaper whole; the sidebar's lists read over
+            // a calmer patch of it, inside their panel.
+            panel_wash = wash;
+        } else {
+            stage = stage.child(
+                el().key("window-wash")
+                    .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
+                    .fill(k.c.bg_deep.alpha(wash))
+                    .a11y_hidden(),
+            );
         }
-        None => split.build(k),
-    };
+    }
+    let root = stage
+        .child(sidebar_panel(s, k, panel_wash))
+        .child(split.build(&chrome));
     // The window's width bounds the right-hand panes (`UiState::fit_panes`).
     root.on_layout(|s: &mut UiState, r| s.fits.window = r[2])
 }
@@ -144,6 +147,43 @@ const SIDEBAR_WASH: [f32; 2] = [0.62, 0.4];
 
 /// The main card's opacity over the window's wallpaper outside Home.
 const CARD_ALPHA: f32 = 0.9;
+
+/// How much of the page colour the sidebar's panel lays over the window
+/// floor (light, dark): a half step between the floor and the main card,
+/// so the card stays the one surface that leads.
+const SIDEBAR_TINT: [f32; 2] = [0.62, 0.5];
+
+/// The sidebar's panel: a rounded surface behind its contents, inset from
+/// the window's edges and a frame's width from the main card, with the
+/// card's radius and hairline. `wash` lays the floor back first, over a
+/// wallpaper. It follows the pane open and shut on the panes' spring.
+fn sidebar_panel(s: &UiState, k: &Kit, wash: f32) -> El {
+    let frame = super::panes::FRAME;
+    let open = s.sidebar.is_open();
+    let motion = if s.sidebar.is_resizing() {
+        rune::Spring::NONE
+    } else {
+        super::panes::SPRING
+    };
+    let tint = SIDEBAR_TINT[usize::from(s.look().dark)];
+    let panel = el()
+        .key("sidebar-panel")
+        .pin(Some(frame), Some(frame), None, Some(frame))
+        .w((s.sidebar.width() - frame * 2.0).max(0.0))
+        .radius(k.radius.lg)
+        .fill(k.c.bg_deep.alpha(wash))
+        .border(1.0, k.c.border_muted)
+        .clip_rounded(k.radius.lg)
+        .opacity(if open { 1.0 } else { 0.0 })
+        .opacity_motion(super::panes::SPRING)
+        .motion(motion)
+        .a11y_hidden();
+    panel.child(
+        el().key("sidebar-panel-tint")
+            .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
+            .fill(k.c.bg_base.alpha(tint)),
+    )
+}
 
 /// The theme's wallpaper across the whole window, behind sidebar and card:
 /// `home.wallpaper` on Home, `shell.wallpaper` elsewhere, placed as the pack

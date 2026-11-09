@@ -7,8 +7,9 @@ use rune_kit::shell::{PaneMotion, PaneState};
 
 /// What the session column keeps beside a right-hand pane, in points.
 pub const MAIN_MIN: f32 = 360.0;
-/// The window's edge around the main card (`SplitView::frame_inset`).
-const FRAME: f32 = 8.0;
+/// The window's edge around the main card (`SplitView::frame_inset`), and
+/// around the floating sidebar.
+pub const FRAME: f32 = 8.0;
 /// A pane's ceiling before the window is known; [`Fit`] brings it down.
 pub const UNBOUNDED: f32 = 4096.0;
 
@@ -16,8 +17,11 @@ pub const UNBOUNDED: f32 = 4096.0;
 /// tail for the eye to follow. One spring moves both sides (`SplitView`), so
 /// the sidebar gets the same brisk slide.
 pub fn motion() -> PaneMotion {
-    PaneMotion::new().spring(Spring::new(0.15, 0.0))
+    PaneMotion::new().spring(SPRING)
 }
+
+/// The spring [`motion`] moves the panes on, for what moves with them.
+pub const SPRING: Spring = Spring::new(0.15, 0.0);
 
 /// The widest a right-hand pane may be in a window `window` points wide
 /// beside a sidebar `sidebar` points wide (0 when closed).
