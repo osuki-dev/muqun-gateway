@@ -377,6 +377,8 @@ pub struct UiState {
     pub keys_sheet: Option<shortcuts::Sheet>,
     /// Dictation in progress (`ui/voice.rs`).
     pub voice: Option<voice::Dictation>,
+    /// In-app self-update status.
+    pub update_state: crate::model::inbox::UpdateState,
     /// Settings → Voice's fields.
     pub voice_form: voice::VoiceForm,
     /// The file viewer overlay ([`UiState::open_file`]).
@@ -524,6 +526,7 @@ impl UiState {
             storage: None,
             viewer: None,
             voice: None,
+            update_state: crate::model::inbox::UpdateState::Idle,
             palette: None,
             keys_sheet: None,
             tray_shown: None,
@@ -1389,6 +1392,7 @@ impl UiState {
                 } => self.on_search(generation, outcome),
                 Update::Attention(attention) => self.on_attention(&attention),
                 Update::Voice(event) => self.on_voice(event),
+                Update::UpdateState(state) => self.update_state = state,
             }
         }
         if LAYOUT_DIRTY.swap(false, Ordering::AcqRel) {

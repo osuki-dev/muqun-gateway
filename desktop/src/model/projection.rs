@@ -15,7 +15,7 @@ use tokio::sync::{broadcast, watch};
 
 use super::commands::{Command, CommandReceiver};
 use super::compose::{self, ComposeCommand, ComposerUpdate, Deliver, Target};
-use super::inbox::{Inbox, SearchOutcome, UiError, Update};
+use super::inbox::{Inbox, SearchOutcome, UiError, Update, UpdateState};
 use super::types::{DiffStat, SESSION_LIST_LIMIT};
 use crate::config::{ConfigEdit, DesktopConfig};
 use crate::hub::{HubError, SessionHub, TaskHubEvent, OPENCODE};
@@ -638,6 +638,37 @@ impl Core {
                     Ok(Err(err)) => tracing::debug!(task = %id, %err, "task history unavailable"),
                     Err(_) => tracing::debug!(task = %id, "task history timed out"),
                 }
+            }
+            Command::CheckUpdate { include_preview } => {
+                let inbox = self.inbox.clone();
+                inbox.push(Update::UpdateState(UpdateState::Checking));
+                tokio::spawn(async move {
+                    match crate::platform::update::check_latest(include_preview).await {
+                        Ok(Some(info)) => {
+                            inbox.push(Update::UpdateState(UpdateState::Available(Box::new(info))));
+                        }
+                        Ok(None) => {
+                            inbox.push(Update::UpdateState(UpdateState::UpToDate));
+                        }
+                        Err(err) => {
+                            inbox.push(Update::UpdateState(UpdateState::Failed(err.to_string())));
+                        }
+                    }
+                });
+            }
+            Command::InstallUpdate(info) => {
+                let inbox = self.inbox.clone();
+                inbox.push(Update::UpdateState(UpdateState::Downloading));
+                tokio::spawn(async move {
+                    match crate::platform::update::download_and_install(&info).await {
+                        Ok(()) => {
+                            inbox.push(Update::UpdateState(UpdateState::ReadyToRestart));
+                        }
+                        Err(err) => {
+                            inbox.push(Update::UpdateState(UpdateState::Failed(err.to_string())));
+                        }
+                    }
+                });
             }
             Command::CompleteDirectory { .. } | Command::Edit(_) => {
                 unreachable!("handled in the command loop")

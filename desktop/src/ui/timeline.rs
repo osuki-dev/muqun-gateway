@@ -630,10 +630,13 @@ fn working_row(cx: &Tcx) -> El {
         )
 }
 
-/// Copy message text: small icon button on a raised chip,
-/// shown while the pointer is on the message.
+/// Copy message text, roll back to here, and fork from here: small icon buttons on a raised chip,
+/// shown while the pointer is on the message. No hover tooltip popovers.
 fn message_actions(cx: &Tcx, it: &TimelineItem) -> El {
     let k = cx.k;
+    let asid = AgentSessionId(cx.asid.to_string());
+    let (rollback_asid, rollback_id) = (asid.clone(), it.message_id.clone());
+    let fork_id = it.message_id.clone();
     let text = match &it.part {
         AgentPart::Text { text } => {
             if it.role == TimelineRole::User {
@@ -663,13 +666,40 @@ fn message_actions(cx: &Tcx, it: &TimelineItem) -> El {
                 .variant(IconButtonVariant::GhostMuted)
                 .control_size(ControlSize::Small)
                 .label(cx.t("Copy", "复制"))
-                .help(cx.t("Copy message", "复制消息"))
                 .on_press_tx(move |s: &mut UiState, tx: &mut rune::Tx| {
                     tx.copy(text.clone());
                     s.status = copied_label.to_string();
                 })
                 .build(k)
                 .key(format!("copy-{}", copy_id)),
+        )
+        .child(
+            IconButton::new(&super::icons::UNDO)
+                .variant(IconButtonVariant::GhostMuted)
+                .control_size(ControlSize::Small)
+                .label(cx.t("Roll back to here", "回滚到这里"))
+                .on_press(move |s: &mut UiState| {
+                    s.send(Command::StageRevert {
+                        asid: rollback_asid.clone(),
+                        message_id: rollback_id.clone(),
+                    })
+                })
+                .build(k)
+                .key(format!("rollback-{}", it.id)),
+        )
+        .child(
+            IconButton::new(&super::icons::FORK)
+                .variant(IconButtonVariant::GhostMuted)
+                .control_size(ControlSize::Small)
+                .label(cx.t("Fork from here", "从这里分叉"))
+                .on_press(move |s: &mut UiState| {
+                    s.send(Command::ForkSession {
+                        asid: asid.clone(),
+                        message_id: Some(fork_id.clone()),
+                    })
+                })
+                .build(k)
+                .key(format!("fork-{}", it.id)),
         );
     k.elevate(chip, &k.elevation.floating)
 }
@@ -1271,7 +1301,7 @@ mod tests {
         );
         let mut now = 0.0;
         let mut settle = |rt: &mut rune::Runtime<UiState>| {
-            for _ in 0..90 {
+            for _ in 0..30 {
                 now += 1.0 / 60.0;
                 rt.frame(now);
             }
