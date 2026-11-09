@@ -119,14 +119,22 @@ fn file_header(cx: &Tcx, fi: usize, file: &FileDiff) -> El {
     }
 
     let p = path.clone();
+    let asid_c = asid.clone();
     let diff_btn = Button::new(cx.t("Diff", "差异"))
         .variant(ButtonVariant::Ghost)
         .control_size(ControlSize::Small)
-        .on_press(move |s: &mut crate::ui::UiState| {
+        .on_press_tx(move |s: &mut crate::ui::UiState, tx: &mut rune::Tx| {
             s.send(Command::OpenDiff {
-                asid: AgentSessionId(asid.clone()),
+                asid: AgentSessionId(asid_c.clone()),
                 file: Some(p.clone()),
             });
+            s.show_diff = true;
+            if let Some(diff) = &mut s.diff {
+                if let Some(idx) = diff.file_index(&p) {
+                    s.diff_active_file = idx;
+                    diff.scroll_to_file(idx, tx);
+                }
+            }
         })
         .build(k)
         .key(format!("diff-btn-{fi}"));

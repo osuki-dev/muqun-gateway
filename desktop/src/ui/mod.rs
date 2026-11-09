@@ -185,6 +185,7 @@ pub struct SessionSlot {
     pub diff_stat: DiffStat,
     pub diff: Option<DiffState>,
     pub show_diff: bool,
+    pub diff_active_file: usize,
     pub revert_staged: bool,
     pub catalog: Option<Arc<CatalogView>>,
     pub descendants: Vec<AgentSessionInfo>,
@@ -298,6 +299,7 @@ pub struct UiState {
     pub diff_stat: DiffStat,
     pub diff: Option<DiffState>,
     pub show_diff: bool,
+    pub diff_active_file: usize,
     pub revert_staged: bool,
 
     pub tasks: Vec<TaskRow>,
@@ -475,6 +477,7 @@ impl UiState {
             diff_stat: DiffStat::default(),
             diff: None,
             show_diff: false,
+            diff_active_file: 0,
             revert_staged: false,
             tasks: Vec::new(),
             task_cwd: None,
@@ -717,6 +720,8 @@ impl UiState {
             self.staged.clear();
             self.diff_stat = DiffStat::default();
             self.diff = None;
+            self.diff_active_file = 0;
+            self.show_diff = false;
         }
         self.status = format!("Opening {asid}");
         self.send(Command::OpenSession(AgentSessionId(asid.to_string())));
@@ -916,6 +921,7 @@ impl UiState {
             diff_stat: std::mem::take(&mut self.diff_stat),
             diff: self.diff.take(),
             show_diff: std::mem::replace(&mut self.show_diff, false),
+            diff_active_file: std::mem::take(&mut self.diff_active_file),
             revert_staged: std::mem::replace(&mut self.revert_staged, false),
             catalog: self.catalog.take(),
             descendants: std::mem::take(&mut self.descendants),
@@ -931,6 +937,7 @@ impl UiState {
         self.diff_stat = slot.diff_stat;
         self.diff = slot.diff;
         self.show_diff = slot.show_diff;
+        self.diff_active_file = slot.diff_active_file;
         self.revert_staged = slot.revert_staged;
         self.catalog = slot.catalog;
         self.descendants = slot.descendants;
@@ -1662,6 +1669,11 @@ impl UiState {
             UiAction::OpenDiffFile { asid, path } => {
                 if self.selected.as_deref() == Some(asid.as_str()) {
                     self.show_diff = true;
+                    if let Some(diff) = &self.diff {
+                        if let Some(idx) = diff.file_index(&path) {
+                            self.diff_active_file = idx;
+                        }
+                    }
                     self.status = path;
                 }
             }

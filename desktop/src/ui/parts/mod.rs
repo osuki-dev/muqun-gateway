@@ -424,16 +424,24 @@ impl<'a> ToolCard<'a> {
         }
         if let Some(path) = self.diff.clone().filter(|p| !p.is_empty()) {
             let asid = cx.asid.to_string();
+            let p = path.clone();
             tray = tray.child(tray_button(
                 cx,
                 "diff",
                 &glyphs::DIFF,
                 cx.t("View in Diff", "查看差异"),
-                move |s: &mut UiState, _tx: &mut rune::Tx| {
+                move |s: &mut UiState, tx: &mut rune::Tx| {
                     s.send(crate::model::commands::Command::OpenDiff {
                         asid: muqun_gateway::agents::AgentSessionId(asid.clone()),
-                        file: Some(path.clone()),
+                        file: Some(p.clone()),
                     });
+                    s.show_diff = true;
+                    if let Some(diff) = &mut s.diff {
+                        if let Some(idx) = diff.file_index(&p) {
+                            s.diff_active_file = idx;
+                            diff.scroll_to_file(idx, tx);
+                        }
+                    }
                 },
             ));
         }
@@ -571,15 +579,23 @@ impl<'a> ToolCard<'a> {
         let mut actions = self.actions;
         if let Some(path) = self.diff.clone().filter(|p| !p.is_empty()) {
             let asid = cx.asid.to_string();
+            let p = path.clone();
             actions.push(
                 rune_kit::Button::new(cx.t("View in Diff", "查看差异"))
                     .variant(rune_kit::ButtonVariant::Ghost)
                     .control_size(rune_kit::ControlSize::Small)
-                    .on_press(move |s: &mut UiState| {
+                    .on_press_tx(move |s: &mut UiState, tx: &mut rune::Tx| {
                         s.send(crate::model::commands::Command::OpenDiff {
                             asid: muqun_gateway::agents::AgentSessionId(asid.clone()),
-                            file: Some(path.clone()),
+                            file: Some(p.clone()),
                         });
+                        s.show_diff = true;
+                        if let Some(diff) = &mut s.diff {
+                            if let Some(idx) = diff.file_index(&p) {
+                                s.diff_active_file = idx;
+                                diff.scroll_to_file(idx, tx);
+                            }
+                        }
                     })
                     .build(k),
             );

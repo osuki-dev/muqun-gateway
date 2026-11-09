@@ -435,6 +435,9 @@ impl Core {
                     .inbox
                     .push(Update::Ui(super::inbox::UiAction::ToggleDiffPanel)),
             },
+            Command::RefreshDiff(asid) => {
+                tokio::spawn(self.clone().diff(asid));
+            }
             Command::StageRevert { asid, message_id } => {
                 if let Err(err) = self.hub.stage_revert(&asid, &message_id, true).await {
                     self.fail(err);

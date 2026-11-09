@@ -68,6 +68,8 @@ pub enum Command {
         asid: AgentSessionId,
         file: Option<String>,
     },
+    /// Refresh the session's working tree diff from the gateway.
+    RefreshDiff(AgentSessionId),
     /// Stage a rollback to `message_id`, to be confirmed or cancelled
     /// (§6.1c item 9).
     StageRevert {
