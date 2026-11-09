@@ -176,6 +176,9 @@ const CARD_ALPHA: f32 = 0.9;
 /// over the (compositor-blurred) desktop before its own surface (light,
 /// dark): enough that its words read over any desktop.
 const SEE_THROUGH_FLOOR: [f32; 2] = [0.82, 0.78];
+/// The main card's floor there: denser, so the theme's world in it is the
+/// theme's and not the desktop's.
+const SEE_THROUGH_CARD: [f32; 2] = [0.93, 0.9];
 
 /// The main card's floor on a see-through window: the window floor, and the
 /// theme's wallpaper on it placed for the card, rounded as the card is.
@@ -201,7 +204,7 @@ fn card_floor(
         .pin(Some(left), Some(frame), Some(right), Some(frame))
         .radius(k.radius.lg)
         .clip_rounded(k.radius.lg)
-        .fill(k.c.bg_deep.alpha(SEE_THROUGH_FLOOR[usize::from(look.dark)]))
+        .fill(k.c.bg_deep.alpha(SEE_THROUGH_CARD[usize::from(look.dark)]))
         .motion(super::panes::SPRING)
         .a11y_hidden();
     let wall = s.images.as_ref().and_then(|images| {
