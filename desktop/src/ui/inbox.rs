@@ -299,7 +299,7 @@ pub fn view(s: &UiState, k: &Kit) -> El {
                 None => el(),
             })
     };
-    super::card_stage(s, k, "inbox", panes)
+    super::card_stage("inbox", panes)
 }
 
 fn page_head(k: &Kit, language: Language, count: usize) -> El {

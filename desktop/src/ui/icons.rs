@@ -191,3 +191,11 @@ pub static DELETE: Icon = Icon {
     view: 24.0,
     body: r#"<path d="M4 6h16M9 6V3h6v3M6 6l1 15h10l1-15M10 10v7m4-7v7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>"#,
 };
+
+/// A plain plus in the kit's close-button weight: "Add to split view" beside
+/// a pane's ×.
+pub static PLUS: Icon = Icon {
+    name: "plus",
+    view: 16.0,
+    body: r#"<path d="M8 3.75V12.25M3.75 8H12.25" stroke="currentColor"/>"#,
+};

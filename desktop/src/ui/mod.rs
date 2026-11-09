@@ -10,6 +10,7 @@ mod art;
 mod composer;
 mod composer_row;
 pub mod copy;
+mod dwindle;
 pub mod fx;
 mod home;
 mod icons;
@@ -371,12 +372,12 @@ pub struct UiState {
     pub tiles: Vec<Tile>,
     /// The tile the keyboard and the composer belong to.
     pub focus: usize,
-    /// Where the first column ends, as a fraction of the split's width.
-    pub tile_split: f32,
+    /// How the tiles sit (`dwindle.rs`); [`UiState::tile_layout`] reads it.
+    pub tile_tree: crate::config::TileNode,
     /// An empty tile waiting for the next opened session.
     pub pending_tile: Option<usize>,
-    /// The split's width on screen, for the grip's drag.
-    pub tile_grid_w: f32,
+    /// The split's size on screen, for splitting and the gaps' drags.
+    pub tile_grid: [f32; 2],
     /// The saved split was put back once sessions were listed.
     tiles_restored: bool,
     /// Agents whose session list has arrived (split restore waits for them).
@@ -512,9 +513,9 @@ impl UiState {
             term: terminal_panel::TermPanel::new(cfg.ui.terminal()),
             tiles: Vec::new(),
             focus: 0,
-            tile_split: cfg.ui.tile_split(),
+            tile_tree: crate::config::TileNode::Leaf(0),
             pending_tile: None,
-            tile_grid_w: 0.0,
+            tile_grid: [0.0; 2],
             listed_agents: HashSet::new(),
             tiles_restored: false,
             cfg,
@@ -661,7 +662,20 @@ impl UiState {
         perms + forms + tasks
     }
 
+    /// Show session `asid`. In split view it joins as a new pane (or takes
+    /// focus where it already is); otherwise it fills the main card.
     pub fn open_session(&mut self, asid: &str) {
+        if self.in_split() && self.tile_of(asid).is_none() {
+            crate::platform::notify::withdraw(asid);
+            self.open_in_tile(asid);
+            return;
+        }
+        self.open_here(asid);
+    }
+
+    /// Show session `asid` in the focused pane (the main card outside split
+    /// view), in place of what it showed.
+    fn open_here(&mut self, asid: &str) {
         crate::platform::notify::withdraw(asid);
         if let Some(i) = self.tile_of(asid) {
             if i != self.focus {
@@ -943,8 +957,10 @@ impl UiState {
         self.send(Command::WatchSessions(watched));
     }
 
-    /// Open `asid` beside the current session(s). A session already open in
-    /// a tile takes focus instead; a full split replaces the last tile.
+    /// Open `asid` beside the current session(s): it fills an empty pane,
+    /// or splits the focused pane (Hyprland's dwindle), or at the most
+    /// panes takes the focused pane's place. The pane it lands in takes
+    /// focus; a session already in a pane just takes focus.
     pub fn open_in_tile(&mut self, asid: &str) {
         if let Some(i) = self.tile_of(asid) {
             self.focus_tile(i);
@@ -954,7 +970,7 @@ impl UiState {
         self.right.set_open(false);
         if self.tiles.is_empty() {
             let Some(current) = self.selected.clone() else {
-                self.open_session(asid);
+                self.open_here(asid);
                 return;
             };
             self.tiles.push(Tile {
@@ -962,8 +978,18 @@ impl UiState {
                 slot: SessionSlot::default(),
             });
             self.focus = 0;
+            self.tile_tree = crate::config::TileNode::Leaf(0);
         }
-        let slot = SessionSlot {
+        let at = match self.tiles.iter().position(|t| t.asid.is_none()) {
+            Some(empty) => empty,
+            None if self.tiles.len() < MAX_TILES => self.add_tile(),
+            None => {
+                self.open_here(asid);
+                return;
+            }
+        };
+        self.tiles[at].asid = Some(asid.to_string());
+        self.tiles[at].slot = SessionSlot {
             draft: TextEdit::new(
                 self.cfg
                     .general
@@ -974,27 +1000,48 @@ impl UiState {
             ),
             ..SessionSlot::default()
         };
-        if let Some(empty) = self.tiles.iter().position(|t| t.asid.is_none()) {
-            self.tiles[empty].asid = Some(asid.to_string());
-            self.tiles[empty].slot = slot;
-        } else if self.tiles.len() < MAX_TILES {
-            self.tiles.push(Tile {
-                asid: Some(asid.to_string()),
-                slot,
-            });
-        } else {
-            let last = self.tiles.len() - 1;
-            let victim = if last == self.focus { last - 1 } else { last };
-            self.tiles[victim].asid = Some(asid.to_string());
-            self.tiles[victim].slot = slot;
-        }
         self.mode = Mode::Session;
         self.send(Command::OpenTile(AgentSessionId(asid.to_string())));
+        self.focus_tile(at);
         self.sync_watch();
         self.persist_tiles();
     }
 
-    /// Add an empty tile that offers a session to pick (the Split action).
+    /// An empty tile splitting the focused one; its index.
+    fn add_tile(&mut self) -> usize {
+        let mut tree = self.tile_layout();
+        let new = self.tiles.len();
+        dwindle::insert(&mut tree, self.focus, new, self.tile_grid);
+        self.tile_tree = tree;
+        self.tiles.push(Tile {
+            asid: None,
+            slot: SessionSlot::default(),
+        });
+        new
+    }
+
+    /// How the tiles sit: the kept tree, or (when it no longer matches the
+    /// tiles, as a hand-set demo's) the dwindle spiral of as many.
+    pub fn tile_layout(&self) -> crate::config::TileNode {
+        let n = self.tiles.len().max(1);
+        if self.tile_tree.fits(n) {
+            self.tile_tree.clone()
+        } else {
+            dwindle::build(n, self.tile_grid)
+        }
+    }
+
+    /// Set the share of the split at `path` (dragging the gap in it).
+    pub fn set_tile_ratio(&mut self, path: &[bool], ratio: f32) {
+        let mut tree = self.tile_layout();
+        if let Some(crate::config::TileNode::Split { ratio: r, .. }) = tree.at_mut(path) {
+            *r = ratio.clamp(dwindle::MIN_RATIO, 1.0 - dwindle::MIN_RATIO);
+        }
+        self.tile_tree = tree;
+    }
+
+    /// Add an empty pane splitting the focused one, offering a session to
+    /// pick (the Split action), and focus it.
     pub fn split(&mut self) {
         if self.tiles.len() >= MAX_TILES {
             return;
@@ -1011,12 +1058,22 @@ impl UiState {
                 slot: SessionSlot::default(),
             });
             self.focus = 0;
+            self.tile_tree = crate::config::TileNode::Leaf(0);
         }
-        self.tiles.push(Tile {
-            asid: None,
-            slot: SessionSlot::default(),
-        });
+        let new = self.add_tile();
         self.mode = Mode::Session;
+        self.focus_tile(new);
+    }
+
+    /// Leave split view: keep the focused pane's session, close the others.
+    pub fn unsplit(&mut self) {
+        let mut j = self.tiles.len();
+        while j > 0 {
+            j -= 1;
+            if j != self.focus && self.tiles.len() > 1 {
+                self.close_tile(j);
+            }
+        }
     }
 
     /// Close tile `i`; one tile left means the pane goes back to one session.
@@ -1036,6 +1093,8 @@ impl UiState {
             }
         }
         let gone = self.tiles.remove(i);
+        self.tile_tree = dwindle::remove(self.tile_layout_of(self.tiles.len() + 1), i)
+            .unwrap_or(crate::config::TileNode::Leaf(0));
         if self.focus > i {
             self.focus -= 1;
         }
@@ -1058,6 +1117,7 @@ impl UiState {
         }
         if self.tiles.len() <= 1 {
             self.tiles.clear();
+            self.tile_tree = crate::config::TileNode::Leaf(0);
             self.focus = 0;
             if self.selected.is_none() {
                 self.mode = Mode::Home;
@@ -1069,7 +1129,17 @@ impl UiState {
         self.persist_tiles();
     }
 
-    /// Swap tiles `i` and `j` (their places, not their focus).
+    /// The kept tree if it tiles `n` panes, else the spiral of `n`.
+    fn tile_layout_of(&self, n: usize) -> crate::config::TileNode {
+        if self.tile_tree.fits(n) {
+            self.tile_tree.clone()
+        } else {
+            dwindle::build(n, self.tile_grid)
+        }
+    }
+
+    /// Swap tiles `i` and `j`: their sessions trade places (focus follows
+    /// its session).
     pub fn swap_tiles(&mut self, i: usize, j: usize) {
         if i >= self.tiles.len() || j >= self.tiles.len() || i == j {
             return;
@@ -1084,17 +1154,20 @@ impl UiState {
         self.persist_tiles();
     }
 
-    /// Remember the split for the next launch.
+    /// Remember the split for the next launch: its sessions and their
+    /// tiling, empty panes left out.
     pub fn persist_tiles(&mut self) {
         let asids: Vec<String> = self.tiles.iter().filter_map(|t| t.asid.clone()).collect();
-        let split = self.tile_split;
-        if asids != self.cfg.ui.tiles || (split - self.cfg.ui.tile_split).abs() > 0.001 {
-            self.edit(ConfigEdit::Tiles { asids, split });
+        let mut layout = (self.tiles.len() >= 2).then(|| self.tile_layout());
+        for (i, t) in self.tiles.iter().enumerate().rev() {
+            if t.asid.is_none() {
+                layout = layout.and_then(|l| dwindle::remove(l, i));
+            }
         }
-    }
-
-    pub fn set_tile_split(&mut self, split: f32) {
-        self.tile_split = split.clamp(0.25, 0.75);
+        let layout = layout.filter(|l| asids.len() >= 2 && l.fits(asids.len()));
+        if asids != self.cfg.ui.tiles || layout != self.cfg.ui.tile_layout {
+            self.edit(ConfigEdit::Tiles { asids, layout });
+        }
     }
 
     /// Put the saved split back once the listed sessions include it.
@@ -1135,7 +1208,14 @@ impl UiState {
         for asid in &saved[1..] {
             self.open_in_tile(asid);
         }
+        // The saved tiling, when every saved pane came back.
+        if let Some(layout) = self.cfg.ui.tile_layout.clone() {
+            if saved.len() == self.cfg.ui.tiles.len() && layout.fits(self.tiles.len()) {
+                self.tile_tree = layout;
+            }
+        }
         self.focus_tile(0);
+        self.persist_tiles();
     }
 
     /// The slot of `asid`'s tile when it is open but not focused.
@@ -1405,6 +1485,12 @@ impl UiState {
                 self.sync_watch();
             }
         }
+        // A session started while split view is up joins it in a new pane
+        // (at the most panes, it takes the focused one's place below).
+        if self.in_split() && self.tile_of(&asid).is_none() && self.tiles.len() < MAX_TILES {
+            let at = self.add_tile();
+            self.focus_tile(at);
+        }
         let fresh = self.selected.as_deref() != Some(asid.as_str());
         self.selected = Some(asid.clone());
         if let Some(tile) = self.tiles.get_mut(self.focus) {
@@ -1667,9 +1753,8 @@ pub fn muted(k: &Kit, s: impl Into<String>) -> El {
 
 /// A page that owns the whole card, with no toolbar over it (Inbox, Tasks):
 /// the stage rises under the card's empty toolbar row so its panes start at
-/// the card's top edge, over a soft accent light.
-pub fn card_stage(s: &UiState, k: &Kit, key: &str, panes: El) -> El {
-    let look = s.look();
+/// the card's top edge.
+pub fn card_stage(key: &str, panes: El) -> El {
     let lift = rune_kit::shell::TOOLBAR_HEIGHT;
     let mut stage = rune::col().key(format!("{key}-stage")).w_full();
     // As tall as the whole card (not shrunk to the room under the row).
@@ -1677,14 +1762,6 @@ pub fn card_stage(s: &UiState, k: &Kit, key: &str, panes: El) -> El {
         Some(h) => stage.h(h).min_h(h).offset(0.0, -lift),
         None => stage.h_full(),
     };
-    if look.glass {
-        stage = stage.child(look.light(
-            &format!("{key}-light"),
-            [0.3, -0.1],
-            [720.0, 340.0],
-            k.c.bg_accent,
-        ));
-    }
     // The shell sizes a page to the room under the toolbar row; the stage
     // inside keeps its own height past that.
     rune::col()

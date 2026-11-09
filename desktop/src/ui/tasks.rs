@@ -314,8 +314,6 @@ pub fn view(s: &UiState, k: &Kit) -> El {
         .children(error_line(s, k))
         .child(body);
     super::card_stage(
-        s,
-        k,
         "tasks",
         row()
             .key("tasks-centre")

@@ -1,9 +1,9 @@
 //! Settings → Themes: the themes on this computer and the published ones,
 //! as a grid of pictures one search filters, and the ways to import one.
 //!
-//! The current theme is lit (a glow behind its picture and a streak along
-//! its top), not outlined; a theme without a picture shows its light and
-//! dark colours as two small windows.
+//! The current theme sits on a faint step of the surface toward the accent,
+//! with an In use badge, not outlined or lit; a theme without a picture shows
+//! its light and dark colours as two small windows.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -163,7 +163,7 @@ fn tile(s: &UiState, k: &Kit, t: Tile, w: f32) -> El {
         .clip_rounded(radius)
         .child(t.picture);
     if t.current {
-        pic = pic.child(look.top_light("lit", k.c.bg_accent, 1.0)).child(
+        pic = pic.child(
             el().key("current")
                 .pin(None, Some(8.0), Some(8.0), None)
                 .child(
@@ -173,18 +173,14 @@ fn tile(s: &UiState, k: &Kit, t: Tile, w: f32) -> El {
                 ),
         );
     }
-    let pic = if t.current {
-        look.glow(pic, k.c.bg_accent, 0.75)
-    } else {
-        pic.box_shadow(rune::Shadow {
-            x: 0.0,
-            y: 4.0,
-            blur: 14.0,
-            spread: 0.0,
-            color: k.c.black.alpha(if s.dark { 0.35 } else { 0.10 }),
-            inset: false,
-        })
-    };
+    let pic = pic.box_shadow(rune::Shadow {
+        x: 0.0,
+        y: 4.0,
+        blur: 14.0,
+        spread: 0.0,
+        color: k.c.black.alpha(if s.dark { 0.35 } else { 0.10 }),
+        inset: false,
+    });
     let pic = match t.apply {
         Some(apply) => look
             .pressable(k, pic)
@@ -218,10 +214,20 @@ fn tile(s: &UiState, k: &Kit, t: Tile, w: f32) -> El {
                 .color(k.c.text_faint)
                 .truncate(),
         );
+    // The theme in use sits on a faint step of the surface toward the
+    // accent, a little wider than the tile: no rim, no light.
+    let backing = t.current.then(|| {
+        el().key("current-backing")
+            .pin(Some(-8.0), Some(-8.0), Some(-8.0), Some(-8.0))
+            .radius(radius + 6.0)
+            .fill(look.emphasis(look.panel_fill(k), k.c.bg_accent))
+            .a11y_hidden()
+    });
     col()
         .key(t.key)
         .w(w)
         .gap(10.0)
+        .children(backing)
         .transition(
             Transition::opacity()
                 .combined(Transition::offset(0.0, 10.0))

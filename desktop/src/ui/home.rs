@@ -779,7 +779,7 @@ fn quick_start(s: &UiState, k: &Kit, look: &Look, layer: &mut Vec<El>, size: [f3
         );
     card = card.child(actions);
     let card = look.panel(k, card, PANEL_RADIUS).motion(k.motion.control);
-    let card = composer::accent_state(k, look, card, s.start_draft.focused, false);
+    let card = composer::focus_tone(k, look, card, s.start_draft.focused);
     // A frame the pack drew to reach past the field sits over its edges.
     el().key("home-dock")
         .w_full()

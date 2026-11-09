@@ -158,28 +158,15 @@ pub(super) fn note_skill_args(s: &mut UiState, deliver: &Deliver) {
 
 /// Send the draft. While the agent works it steers the running turn, as on
 /// the App; [`queue_session`] (Alt+Enter) waits for the turn to end instead.
-/// A composer card's state in the theme's accent: lit while focused, a
-/// slow breathing rim while the agent works (held still without motion).
-pub fn accent_state(
-    k: &Kit,
-    look: &crate::theme::look::Look,
-    card: El,
-    focused: bool,
-    busy: bool,
-) -> El {
-    // Light from the top edge, not an outline: steady while the field has
-    // focus, breathing while the agent works.
-    let accent = k.c.bg_accent;
-    let card = if focused {
-        look.glow(card, accent, 0.22)
-            .child(look.top_light("composer-focus-light", accent, 0.8))
+/// A composer card (a [`Look::panel`](crate::theme::look::Look::panel))
+/// while its field has focus: the surface a faint step toward the accent,
+/// no light or rim. Working shows in the hint line under it, not on the card.
+pub fn focus_tone(k: &Kit, look: &crate::theme::look::Look, card: El, focused: bool) -> El {
+    if focused {
+        card.fill(look.emphasis(look.panel_fill(k), k.c.bg_accent))
     } else {
         card
-    };
-    if !busy {
-        return card;
     }
-    card.child(look.pulse(look.top_light("composer-working-light", accent, 0.6)))
 }
 
 /// The kit a composer's text field is built with: the field draws no box of
@@ -1496,12 +1483,11 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     }
     card = card.child(actions);
 
-    // The card is the one surface: a quiet rim at rest, the theme's accent
-    // lit along it while the field has focus, and while the agent works a
-    // slow breath of the accent (still under reduce motion).
+    // The card is the one surface: a quiet rim at rest, a faint step toward
+    // the accent while the field has focus.
     let radius = crate::theme::look::PANEL_RADIUS;
     let card = look.panel(k, card, radius).motion(k.motion.control);
-    let card = accent_state(k, &look, card, focused, busy);
+    let card = focus_tone(k, &look, card, focused);
 
     // The status line: what the keys do, and a word while the agent works.
     let mut hint = row()

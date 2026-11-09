@@ -162,7 +162,6 @@ fn head(s: &UiState, k: &Kit, id: &str, standing: Standing, version: Option<&str
     let language = s.cfg.general.language;
     let enabled = s.cfg.agents.enabled(id);
     let brand = crate::ui::agents::color(id, s.dark);
-    let look = s.look();
     let name = crate::ui::agents::name(id, &s.agents);
     let variant = match standing {
         Standing::Usable => BadgeVariant::Accent,
@@ -192,7 +191,7 @@ fn head(s: &UiState, k: &Kit, id: &str, standing: Standing, version: Option<&str
         .gap(12.0)
         .center_y()
         .pb(4.0)
-        .child(look.glow(mark, brand, if enabled { 0.35 } else { 0.0 }))
+        .child(mark)
         .child(
             col()
                 .key("words")

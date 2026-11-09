@@ -47,10 +47,9 @@ pub const CARD_RADIUS: f32 = 10.0;
 pub const ARRIVE: Spring = Spring::new(0.42, 0.18);
 /// A tight spring for things that move between places.
 pub const MOVE: Spring = Spring::new(0.36, 0.1);
-/// The unhurried spring a [`Look::top_light`] sweeps in on.
-const SWEEP: Spring = Spring::new(0.7, 0.0);
-/// How far a [`Look::top_light`]'s glow falls from its edge.
-const TOP_LIGHT_H: f32 = 64.0;
+/// How long emphasis takes to move between things (a split pane's focus):
+/// a short cross-fade, instant under reduce motion.
+const FOCUS_FADE: Spring = Spring::new(0.15, 0.0);
 
 /// Apply the owner's text size, density and corner profile to a kit: every
 /// type token scales, compact density tightens line heights, and the radii
@@ -176,25 +175,34 @@ impl Look {
     /// A translucent panel over the page (a frosted sheet over the theme's
     /// artwork when the window is within the blur budget, a translucent fill
     /// otherwise), with a top-lit rim. Solid under reduce transparency. At
-    /// most four blurred panels per frame read their backdrop; use
-    /// [`Look::card`] for the rest.
+    /// most four blurred panels per frame read their backdrop.
     pub fn panel(&self, k: &Kit, e: El, radius: f32) -> El {
-        let (top, bottom) = self.rim(k);
-        let e = e.radius(radius).clip_rounded(radius);
+        let e = e
+            .radius(radius)
+            .clip_rounded(radius)
+            .fill(self.panel_fill(k));
         if self.glass {
-            // Without the blur the fill carries the frost, so it is denser.
-            let tint = match (self.blur, self.dark) {
-                (true, true) => 0.62,
-                (true, false) => 0.70,
-                (false, true) => 0.86,
-                (false, false) => 0.90,
-            };
+            let (top, bottom) = self.rim(k);
             let e = if self.blur { e.backdrop_blur(18.0) } else { e };
-            e.fill(k.c.surface_raised_base.alpha(tint))
-                .border_gradient(1.0, top, bottom)
+            e.border_gradient(1.0, top, bottom)
         } else {
-            e.fill(k.c.surface_raised_base).border(1.0, k.c.border_base)
+            e.border(1.0, k.c.border_base)
         }
+    }
+
+    /// A [`Look::panel`]'s fill: the raised surface, translucent on glass
+    /// (denser without the blur, which then carries the frost).
+    pub fn panel_fill(&self, k: &Kit) -> rune::Color {
+        if !self.glass {
+            return k.c.surface_raised_base;
+        }
+        let tint = match (self.blur, self.dark) {
+            (true, true) => 0.62,
+            (true, false) => 0.70,
+            (false, true) => 0.86,
+            (false, false) => 0.90,
+        };
+        k.c.surface_raised_base.alpha(tint)
     }
 
     /// A quieter card for list items: the layer colour, hairline border.
@@ -234,44 +242,27 @@ impl Look {
         })
     }
 
-    /// Light falling from the top edge of what it is pinned in, `strength`
-    /// 0..=1: a bright streak along the edge, fading at its ends, and a glow
-    /// falling a little way down. The emphasis of what is focused or wants
-    /// the owner, in place of an outline. It sweeps in from the leading
-    /// edge as it appears and settles; under reduce motion it fades in.
-    pub fn top_light(&self, key: &str, color: rune::Color, strength: f32) -> El {
-        let glow = if self.dark { 0.15 } else { 0.11 } * strength;
-        let streak = if self.dark { 0.9 } else { 0.75 } * strength;
-        let light = el()
-            .key(key.to_string())
-            .pin(Some(0.0), Some(0.0), Some(0.0), None)
-            .h(TOP_LIGHT_H)
-            .linear_gradient(
-                std::f32::consts::PI,
-                [
-                    (0.0, color.alpha(glow)),
-                    (0.35, color.alpha(glow * 0.4)),
-                    (1.0, color.alpha(0.0)),
-                ],
-            )
-            .child(el().w_full().h(1.5).linear_gradient(
-                std::f32::consts::FRAC_PI_2,
-                [
-                    (0.0, color.alpha(0.0)),
-                    (0.3, color.alpha(streak)),
-                    (0.7, color.alpha(streak)),
-                    (1.0, color.alpha(0.0)),
-                ],
-            ))
-            .a11y_hidden();
+    /// The surface of something emphasised (the focused composer, a card
+    /// waiting on the owner, a selected item) given its resting `surface`:
+    /// a faint shift toward `tone` that keeps the surface's own alpha. No
+    /// light, rim or outline; the shift is the whole mark. Pass the accent
+    /// for focus and selection, a status colour for what wants the owner.
+    pub fn emphasis(&self, surface: rune::Color, tone: rune::Color) -> rune::Color {
+        // In OKLab, so the step is as faint over a dark surface as a light one.
+        let shift = if self.dark { 0.06 } else { 0.05 };
+        let [l, a, b, _] = surface.to_oklab();
+        let [tl, ta, tb, _] = tone.to_oklab();
+        let m = |x: f32, y: f32| x + (y - x) * shift;
+        rune::Color::from_oklab([m(l, tl), m(a, ta), m(b, tb), surface.a])
+    }
+
+    /// The spring emphasis moves between things on: a ~150 ms cross-fade,
+    /// none under reduce motion.
+    pub fn focus_fade(&self) -> Spring {
         if self.motion {
-            light.transition(
-                Transition::reveal(rune::Edge::Leading)
-                    .combined(Transition::opacity())
-                    .springs(rune::SpringPair::new(SWEEP, MOVE)),
-            )
+            FOCUS_FADE
         } else {
-            light.transition(Transition::opacity())
+            Spring::NONE
         }
     }
 
@@ -338,6 +329,15 @@ impl Look {
             return e;
         }
         e.looping(rune::LoopSpec::opacity(1.8, 0.0, 0.55, 1.0))
+    }
+
+    /// A slower, softer breath for a mark that waits (opacity 0.4..1 over
+    /// 2.8 s); still under reduce motion.
+    pub fn breathe(&self, e: El) -> El {
+        if !self.motion {
+            return e;
+        }
+        e.looping(rune::LoopSpec::opacity(2.8, 0.0, 0.4, 1.0))
     }
 
     /// The kit's hover and press overlays on a card, with a slight press

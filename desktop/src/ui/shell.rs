@@ -35,7 +35,12 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
             cx.layout_size("home-dock"),
             layer,
         ),
-        Mode::Session if s.in_split() => tiles::view(s, k, layer),
+        Mode::Session if s.in_split() => tiles::view(
+            s,
+            k,
+            tiles::toggle_clearance(s, crate::platform::titlebar_inset(cx.titlebar_inset())),
+            layer,
+        ),
         Mode::Session => session(s, k, &look, layer),
         Mode::Inbox => inbox::view(s, k),
         Mode::Tasks => tasks::view(s, k),
@@ -70,12 +75,13 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
     // Home has no toolbar of its own; its card still starts on the
     // sidebar's top row, as every page's does.
     // Settings, Inbox and Tasks have none either: their panes take the
-    // whole card.
+    // whole card. Nor has split view: each pane's header is its toolbar.
     split = split.toolbar(
         if matches!(
             s.mode,
             Mode::Home | Mode::Settings | Mode::Inbox | Mode::Tasks
-        ) {
+        ) || (s.mode == Mode::Session && s.in_split())
+        {
             Toolbar::new()
         } else {
             toolbar(s, k, &look, layer)
@@ -151,10 +157,16 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
     let mut chrome = k.clone();
     chrome.c.bg_deep = k.c.bg_deep.alpha(0.0);
     let window = cx.layout_size("shell");
+    // In split view the panes are the cards: the main card steps aside
+    // and each pane lays its own floor (`tiles.rs`).
+    let tiled = s.mode == Mode::Session && s.in_split();
     if look.see_through {
         // The desktop shows around the panels; each lays its own floor, the
         // main card with the theme's wallpaper in it.
         chrome.c.bg_base = k.c.bg_base.alpha(if home { 0.0 } else { CARD_ALPHA });
+        if tiled {
+            hide_card(&mut chrome);
+        }
         let root = el()
             .key("window-stage")
             .w_full()
@@ -164,7 +176,11 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
                 k,
                 SEE_THROUGH_FLOOR[usize::from(look.dark)],
             ))
-            .children(card_floor(s, k, &look, window, right_w))
+            .children(
+                (!tiled)
+                    .then(|| card_floor(s, k, &look, window, right_w))
+                    .flatten(),
+            )
             .child(split.build(&chrome));
         return root.on_layout(|s: &mut UiState, r| s.fits.window = r[2]);
     }
@@ -188,11 +204,37 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
             );
         }
     }
+    if tiled {
+        hide_card(&mut chrome);
+    }
     let root = stage
         .child(sidebar_panel(s, k, panel_wash))
         .child(split.build(&chrome));
     // The window's width bounds the right-hand panes (`UiState::fit_panes`).
     root.on_layout(|s: &mut UiState, r| s.fits.window = r[2])
+}
+
+/// The main card drawn by nothing: no floor, no hairline (split view, whose
+/// panes are the cards).
+fn hide_card(chrome: &mut Kit) {
+    chrome.c.bg_base = chrome.c.bg_base.alpha(0.0);
+    chrome.c.border_muted = chrome.c.border_muted.alpha(0.0);
+}
+
+/// A split-view pane's floor, as the main card's would be: the colour to
+/// fill it with, and on a see-through window the page colour to lay over
+/// that (the window floor first, then the card's surface).
+pub fn card_floor_colors(k: &Kit, look: &Look) -> (rune::Color, Option<rune::Color>) {
+    if look.see_through {
+        (
+            k.c.bg_deep.alpha(SEE_THROUGH_CARD[usize::from(look.dark)]),
+            Some(k.c.bg_base.alpha(CARD_ALPHA)),
+        )
+    } else if look.glass {
+        (k.c.bg_base.alpha(CARD_ALPHA), None)
+    } else {
+        (k.c.bg_base, None)
+    }
 }
 
 /// The least of the window floor that returns under the sidebar's lists,
@@ -596,12 +638,6 @@ fn toolbar(s: &UiState, k: &Kit, look: &Look, layer: &mut Vec<El>) -> Toolbar {
     let language = s.cfg.general.language;
     let mut bar = Toolbar::new();
     match s.mode {
-        Mode::Session if s.in_split() => {
-            bar = bar.leading(tiles::toolbar_title(s, k));
-            for action in tiles::toolbar_actions(s, k) {
-                bar = bar.trailing(action);
-            }
-        }
         Mode::Session => {
             bar = bar.leading(session_identity(s, k, look));
             let asid = s.selected.clone().unwrap_or_default();

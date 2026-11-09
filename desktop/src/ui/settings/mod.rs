@@ -670,14 +670,6 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         Some(h) => stage.h(h).offset(0.0, -lift),
         None => stage.h_full(),
     };
-    if look.glass {
-        stage = stage.child(look.light(
-            "settings-light",
-            [0.55, -0.1],
-            [720.0, 340.0],
-            k.c.bg_accent,
-        ));
-    }
     stage.child(
         hrow()
             .key("settings")

@@ -29,7 +29,7 @@ fn banner(s: &UiState, k: &Kit) -> El {
         .h(H)
         .radius(radius)
         .clip_rounded(radius)
-        .fill(k.c.layer_02);
+        .fill(look.emphasis(k.c.layer_02, k.c.bg_accent));
     if let (Some(images), Some(art)) = (s.images.as_ref(), art) {
         // A painting fills the far side, dissolving under the name; a
         // cut-out stands whole beside it.
@@ -94,10 +94,7 @@ fn banner(s: &UiState, k: &Kit) -> El {
                     .key("goto-themes"),
             ),
         );
-    let banner = banner
-        .child(copy.pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0)))
-        .child(look.top_light("theme-banner-light", k.c.bg_accent, 0.7));
-    look.glow(banner, k.c.bg_accent, 0.25)
+    banner.child(copy.pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0)))
 }
 
 pub(super) fn page(s: &UiState, k: &Kit) -> Vec<El> {

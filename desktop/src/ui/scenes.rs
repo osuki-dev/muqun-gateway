@@ -911,6 +911,25 @@ fn base_scenes() -> &'static [Scene] {
             home_busy(s);
             s.cfg.general.language = crate::config::Language::ZhCn;
         }),
+        // Split view with the focused composer's field in focus.
+        ("split2-typing", |s| {
+            split2(s);
+            s.draft = TextEdit::new("Run the tests again");
+            s.draft.focused = true;
+        }),
+        // Four panes (one tall, one above two) on an opaque window.
+        ("split4-plain", |s| {
+            split4(s);
+            s.cfg.appearance.reduced_motion = true;
+            s.cfg.appearance.reduced_transparency = true;
+        }),
+        // Split view on an opaque window without motion, sidebar closed.
+        ("split2-plain", |s| {
+            split2(s);
+            s.cfg.appearance.reduced_motion = true;
+            s.cfg.appearance.reduced_transparency = true;
+            s.sidebar.set_open(false);
+        }),
         ("split2-zh", |s| {
             split2(s);
             s.cfg.general.language = crate::config::Language::ZhCn;
@@ -1038,6 +1057,11 @@ fn base_scenes() -> &'static [Scene] {
         ("split2-akiba", |s| {
             with_pack(s, "akiba-overdrive");
             split2(s);
+        }),
+        ("settings-themes-akiba", |s| {
+            with_pack(s, "akiba-overdrive");
+            settings(s);
+            s.settings_tab = SettingsTab::Themes;
         }),
         ("splash-jade", |s| {
             with_pack(s, "jade-tempest");
