@@ -345,7 +345,8 @@ impl<'a> ToolCard<'a> {
     fn build_row(self, cx: &Tcx) -> El {
         let k = cx.k;
         let id = self.id.to_string();
-        let has_detail = self.body.is_some() || self.error.is_some() || !self.actions.is_empty();
+        let has_body = self.body.is_some() || self.error.is_some();
+        let open = has_body && cx.is_open(&id, self.open_default);
         let failed = self.state == CardState::Failed;
         let glyph_color = if failed {
             k.c.danger.icon
@@ -459,6 +460,20 @@ impl<'a> ToolCard<'a> {
             line = line.child(c.key(format!("chip-{i}")));
         }
         line = line.child(state_mark(cx, self.state));
+        if has_body {
+            let turn = if open {
+                0.0
+            } else {
+                -std::f32::consts::FRAC_PI_2
+            };
+            line = line.child(
+                icon(&glyphs::CHEVRON, 11.0)
+                    .key("chevron")
+                    .color(k.c.icon_faint)
+                    .rotate(turn)
+                    .a11y_hidden(),
+            );
+        }
         if selected {
             line = line.fill(k.c.surface_raised_hover);
         }
@@ -468,8 +483,9 @@ impl<'a> ToolCard<'a> {
             .cursor(Cursor::Pointer)
             .hover_group()
             .role("button")
+            .expanded(open)
             .on_press_tx(move |s: &mut UiState, tx: &mut rune::Tx| {
-                s.press_row(&asid, &open_id, has_detail, tx)
+                s.press_row_inline(&asid, &open_id, has_body, tx)
             });
         let asid = cx.asid.to_string();
         let menu_id = id.clone();
@@ -496,9 +512,28 @@ impl<'a> ToolCard<'a> {
                     .child(preview),
             );
         }
-        if self.open_default {
+        if open {
+            if let Some(err) = self.error {
+                block = block.child(
+                    col()
+                        .key("error")
+                        .w_full()
+                        .pl(27.0)
+                        .pr(6.0)
+                        .pb(4.0)
+                        .child(text(err).font(k.ty.small).color(k.c.danger.fg)),
+                );
+            }
             if let Some(body) = self.body {
-                block = block.child(col().key("body").w_full().pl(27.0).pb(4.0).child(body));
+                block = block.child(
+                    col()
+                        .key("body")
+                        .w_full()
+                        .pl(27.0)
+                        .pr(6.0)
+                        .pb(4.0)
+                        .child(body),
+                );
             }
         }
         block

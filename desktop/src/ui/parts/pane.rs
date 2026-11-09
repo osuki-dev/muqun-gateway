@@ -93,6 +93,7 @@ impl UiState {
 
     /// A row was pressed: it becomes the selection, and its details open in
     /// the pane (pressed again, they close).
+    #[allow(dead_code)]
     pub fn press_row(&mut self, asid: &str, id: &str, detail: bool, tx: &mut Tx) {
         tx.blur();
         self.draft.focused = false;
@@ -108,6 +109,26 @@ impl UiState {
         } else if detail {
             self.inspect = Some(this);
             self.inspect_pane.set_open(true);
+        }
+    }
+
+    /// A timeline row was pressed: it becomes the selection and flips its inline
+    /// body open or closed. If the detail pane is already open, it follows the selection.
+    pub fn press_row_inline(&mut self, asid: &str, id: &str, has_body: bool, tx: &mut Tx) {
+        tx.blur();
+        self.draft.focused = false;
+        if let Some(tl) = self.timelines.get_mut(asid) {
+            tl.selected = Some(id.to_string());
+            if has_body {
+                tl.flip(id);
+                tl.rev += 1;
+            }
+        }
+        if self.inspect.as_ref().is_some_and(|i| i.asid == asid) {
+            self.inspect = Some(Inspect {
+                asid: asid.to_string(),
+                id: id.to_string(),
+            });
         }
     }
 
@@ -422,4 +443,64 @@ pub fn view(s: &UiState, k: &Kit) -> Option<El> {
                     .scroll_bar(k),
             ),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rune::Tx;
+
+    #[test]
+    fn press_row_inline_toggles_flip_without_opening_inspect_pane() {
+        let (tx, _rx) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        let asid = "s1";
+        s.timelines
+            .insert(asid.to_string(), SessionTimeline::default());
+        let mut rune_tx = Tx::default();
+
+        // 1. Initial state: timeline not flipped, inspect is None
+        assert!(!s.timelines[asid].is_open("row-1", false));
+        assert_eq!(s.inspect, None);
+
+        // 2. Pressing row inline with has_body=true flips row open, but does NOT set inspect
+        s.press_row_inline(asid, "row-1", true, &mut rune_tx);
+        assert!(s.timelines[asid].is_open("row-1", false));
+        assert_eq!(s.timelines[asid].selected.as_deref(), Some("row-1"));
+        assert_eq!(s.inspect, None);
+
+        // 3. Pressing row inline again collapses it, inspect remains None
+        s.press_row_inline(asid, "row-1", true, &mut rune_tx);
+        assert!(!s.timelines[asid].is_open("row-1", false));
+        assert_eq!(s.inspect, None);
+    }
+
+    #[test]
+    fn press_row_inline_tracks_already_open_inspect_pane() {
+        let (tx, _rx) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        let asid = "s1";
+        s.timelines
+            .insert(asid.to_string(), SessionTimeline::default());
+        let mut rune_tx = Tx::default();
+
+        // Inspect pane was explicitly opened for row-1
+        s.inspect = Some(Inspect {
+            asid: asid.to_string(),
+            id: "row-1".to_string(),
+        });
+        s.inspect_pane.set_open(true);
+
+        // Clicking row-2 inline should flip row-2 AND update inspect selection
+        s.press_row_inline(asid, "row-2", true, &mut rune_tx);
+        assert!(s.timelines[asid].is_open("row-2", false));
+        assert_eq!(
+            s.inspect,
+            Some(Inspect {
+                asid: asid.to_string(),
+                id: "row-2".to_string(),
+            })
+        );
+        assert!(s.inspect_pane.is_open());
+    }
 }
