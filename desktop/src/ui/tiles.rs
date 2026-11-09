@@ -1,12 +1,13 @@
-//! Several sessions side by side: two to four tiles in one pane, each with
-//! its session's live timeline and composer. One tile is focused (lit edge,
-//! keyboard); a tile waiting on the owner pulses; tiles swap and close on
-//! springs and the first column resizes on a grip.
+//! Split view: two to four sessions side by side in the main card, each a
+//! pane with its live timeline and composer. The panes fill the card edge to
+//! edge with hairline dividers; the focused one's header is tinted and
+//! underlined in the accent, one waiting on the owner pulses its underline;
+//! panes swap and close on springs and the first column resizes on a grip.
 //!
-//! Keys: `Primary+1..4` focus a tile, `Primary+\` splits, `Primary+W` closes
-//! the focused tile.
+//! Keys: `Primary+1..4` and `Primary+Alt+arrows` focus a pane,
+//! `Primary+\` adds one, `Primary+W` removes the focused one.
 
-use rune::{col, el, row, text, Cursor, El, Phase, Tx};
+use rune::{col, el, row, text, Cursor, El, Key, KeyEvent, Phase, Tx};
 use rune_kit::glyphs::{ARROW_RIGHT, CLOSE, TRIANGLE_DOWN};
 use rune_kit::{
     Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, Kit, Menu, MenuItem,
@@ -14,15 +15,55 @@ use rune_kit::{
 
 use super::copy::{tr, tr_ref};
 use super::{
-    activity_pill, ago, composer, now_ms, timeline, title_of, Activity, Mode, OpenMenu, UiState,
+    activity_mark, activity_pill, ago, composer, now_ms, timeline, title_of, Activity, Mode,
+    OpenMenu, UiState,
 };
 use crate::model::commands::Command;
-use crate::theme::look::{Look, PANEL_RADIUS};
+use crate::theme::look::Look;
 
-/// Space between tiles.
-const GAP: f32 = 10.0;
-/// The resize grip's width (it sits inside the gap).
-const GRIP: f32 = 10.0;
+/// The resize grip's width; the divider line runs down its middle.
+const GRIP: f32 = 9.0;
+/// A pane header's height.
+const HEAD_H: f32 = 36.0;
+
+/// Which pane lies `key`-ward of pane `i` among `n`, as the panes sit: two
+/// side by side; three as one on the left beside two stacked; four in a
+/// two-by-two grid, numbered across then down.
+pub fn neighbour(n: usize, i: usize, key: &Key) -> Option<usize> {
+    // (column, row) of each pane; the lone left pane of three spans both rows.
+    let at = |j: usize| -> (usize, usize) {
+        match (n, j) {
+            (3, 0) => (0, 0),
+            (3, j) => (1, j - 1),
+            (_, j) => (j % 2, j / 2),
+        }
+    };
+    let (c, r) = at(i);
+    let want = match key {
+        Key::Left if c > 0 => (c - 1, r),
+        Key::Right if c == 0 => (1, r),
+        Key::Up if r > 0 => (c, r - 1),
+        Key::Down => (c, r + 1),
+        _ => return None,
+    };
+    (0..n).find(|&j| j != i && (at(j) == want || (n == 3 && j == 0 && want.0 == 0)))
+}
+
+/// `Primary+Alt+arrow` in split view: focus the pane that way. Text fields
+/// pass it here first (their own word moves take the plain chord).
+pub fn arrow_key(s: &mut UiState, ev: &KeyEvent) -> bool {
+    if !s.in_split() || !ev.mods.primary() || !ev.mods.alt || ev.mods.shift {
+        return false;
+    }
+    match neighbour(s.tiles.len(), s.focus, &ev.key) {
+        Some(j) => {
+            s.focus_tile(j);
+            true
+        }
+        // An arrow toward the edge is still ours: it must not move the caret.
+        None => matches!(ev.key, Key::Left | Key::Right | Key::Up | Key::Down),
+    }
+}
 /// Fewest sessions to show in an empty tile's picker.
 const PICK_ROWS: usize = 6;
 
@@ -47,7 +88,22 @@ fn fill_tile(s: &mut UiState, i: usize, asid: &str) {
     s.persist_tiles();
 }
 
-/// The tile's header: mark, title, status, and its actions.
+/// How to reach pane `i` from the keyboard, for its header's tooltip.
+fn reach(language: crate::config::Language, i: usize) -> String {
+    format!(
+        "{} · {} {}",
+        crate::platform::keys::label(&format!("Primary+{}", i + 1)),
+        crate::platform::keys::label("Primary+Alt"),
+        tr_ref(
+            language,
+            "+ arrows to move between panes",
+            "+ 方向键在窗格间切换"
+        ),
+    )
+}
+
+/// A pane's header, one line in the toolbar's style: mark, title, agent,
+/// status dot, and under the pointer its menu and close.
 fn header(s: &UiState, k: &Kit, look: &Look, i: usize, layer: &mut Vec<El>) -> El {
     let language = s.cfg.general.language;
     let focused = i == s.focus;
@@ -57,20 +113,25 @@ fn header(s: &UiState, k: &Kit, look: &Look, i: usize, layer: &mut Vec<El>) -> E
     let mut head = row()
         .key("tile-head")
         .w_full()
-        .h(40.0)
+        .h(HEAD_H)
         .pl(12.0)
         .pr(6.0)
         .gap(8.0)
         .center_y()
+        .help(reach(language, i))
         .hover_group();
+    if focused {
+        head = head.fill(k.c.bg_accent.alpha(0.07));
+    }
+    let title_font = if focused { k.ty.ui_medium } else { k.ty.ui };
     if let Some(info) = info {
         let activity = s.activity(info);
         head = head
-            .child(super::agents::mark(&info.agent_id, 16.0, s.dark).a11y_hidden())
+            .child(super::agents::mark(&info.agent_id, 14.0, s.dark).a11y_hidden())
             .child(
                 text(title_of(info))
                     .key("tile-title")
-                    .font(k.ty.ui_medium)
+                    .font(title_font)
                     .color(if focused {
                         k.c.text_base
                     } else {
@@ -81,65 +142,26 @@ fn header(s: &UiState, k: &Kit, look: &Look, i: usize, layer: &mut Vec<El>) -> E
                     .min_w(0.0),
             )
             .child(
-                text(format!(
-                    "{}{}",
-                    s.agent_name(&info.agent_id),
-                    info.model
-                        .as_ref()
-                        .map(|m| format!(" · {}", super::labels::format_model_name(m, "", None)))
-                        .unwrap_or_default()
-                ))
-                .key("tile-agent")
-                .font(k.ty.small)
-                .color(k.c.text_faint)
-                .truncate()
-                .shrink()
-                .min_w(0.0),
+                text(s.agent_name(&info.agent_id))
+                    .key("tile-agent")
+                    .font(k.ty.small)
+                    .color(k.c.text_faint)
+                    .truncate()
+                    .shrink()
+                    .min_w(0.0),
             );
         if activity != Activity::Idle {
-            head = head.child(activity_pill(k, look, activity, language));
+            head = head.child(activity_mark(k, look, activity, language, false));
         }
     } else {
         head = head.child(
             text(tr(language, "Pick a session", "选择一个会话"))
                 .key("tile-title")
-                .font(k.ty.ui_medium)
+                .font(title_font)
                 .color(k.c.text_muted),
         );
     }
     head = head.child(el().key("tile-spacer").grow(1.0).a11y_hidden());
-    // A keycap that says how to reach the tile.
-    head = head.child(
-        row()
-            .key("tile-key")
-            .h(18.0)
-            .px(5.0)
-            .center()
-            .radius(4.0)
-            .fill(if focused {
-                k.c.bg_accent.alpha(0.18)
-            } else {
-                k.c.layer_03
-            })
-            .border(
-                1.0,
-                if focused {
-                    k.c.bg_accent.alpha(0.4)
-                } else {
-                    k.c.border_muted
-                },
-            )
-            .child(
-                text(crate::platform::keys::label(&format!("Primary+{}", i + 1)))
-                    .font(k.ty.small_medium)
-                    .color(if focused {
-                        k.c.text_accent
-                    } else {
-                        k.c.text_faint
-                    }),
-            )
-            .a11y_hidden(),
-    );
     // Move and close: visible under the pointer, always reachable by menu.
     let menu_open = s.menu == Some(OpenMenu::Tile(i));
     let mut menu = Menu::new(format!("tile-menu-{i}"))
@@ -147,7 +169,7 @@ fn header(s: &UiState, k: &Kit, look: &Look, i: usize, layer: &mut Vec<El>) -> E
             IconButton::new(&TRIANGLE_DOWN)
                 .variant(IconButtonVariant::GhostMuted)
                 .control_size(ControlSize::Small)
-                .label(tr_ref(language, "Tile actions", "分屏操作"))
+                .label(tr_ref(language, "Pane actions", "窗格操作"))
                 .expanded(menu_open)
                 .on_press(move |s: &mut UiState| {
                     s.menu = (!menu_open).then_some(OpenMenu::Tile(i));
@@ -171,9 +193,9 @@ fn header(s: &UiState, k: &Kit, look: &Look, i: usize, layer: &mut Vec<El>) -> E
     }
     if let Some(a) = asid.clone() {
         menu = menu.item(
-            MenuItem::new(tr(language, "Fill the pane", "铺满窗格")).on_select(
+            MenuItem::new(tr(language, "Show only this one", "只留这一个")).on_select(
                 move |s: &mut UiState| {
-                    // Keep this session, drop the other tiles.
+                    // Keep this session, drop the other panes.
                     if let Some(at) = s.tile_of(&a) {
                         s.focus_tile(at);
                     }
@@ -192,7 +214,7 @@ fn header(s: &UiState, k: &Kit, look: &Look, i: usize, layer: &mut Vec<El>) -> E
         );
     }
     menu = menu.separator().item(
-        MenuItem::new(tr(language, "Close tile", "关闭分屏"))
+        MenuItem::new(tr(language, "Remove from split view", "移出分屏"))
             .on_select(move |s: &mut UiState| s.close_tile(i)),
     );
     let menu = menu.build(k, layer);
@@ -205,7 +227,7 @@ fn header(s: &UiState, k: &Kit, look: &Look, i: usize, layer: &mut Vec<El>) -> E
         IconButton::new(&CLOSE)
             .variant(IconButtonVariant::GhostMuted)
             .control_size(ControlSize::Small)
-            .label(tr_ref(language, "Close tile", "关闭分屏"))
+            .label(tr_ref(language, "Remove from split view", "移出分屏"))
             .shortcut(if focused { "Primary+W" } else { "" })
             .on_press(move |s: &mut UiState| s.close_tile(i))
             .build(k)
@@ -236,7 +258,7 @@ fn parked_composer(s: &UiState, k: &Kit, look: &Look, i: usize) -> El {
         .gap(8.0)
         .center_y()
         .role("button")
-        .label(tr_ref(language, "Focus this tile", "聚焦此分屏"))
+        .label(tr_ref(language, "Focus this pane", "聚焦此窗格"))
         .cursor(Cursor::Text)
         .on_press(move |s: &mut UiState| s.focus_tile(i))
         .child(
@@ -327,8 +349,8 @@ fn picker(s: &UiState, k: &Kit, look: &Look, i: usize) -> El {
         .child(
             text(tr(
                 language,
-                "Open a session in this tile",
-                "在这个分屏打开一个会话",
+                "Open a session in this pane",
+                "在这个窗格打开一个会话",
             ))
             .font(k.ty.body_medium)
             .color(k.c.text_base),
@@ -356,38 +378,26 @@ fn tile(s: &UiState, k: &Kit, look: &Look, i: usize, layer: &mut Vec<El>) -> El 
         .map_or_else(|| format!("tile-empty-{i}"), |a| format!("tile-{a}"));
     let info = t.asid.as_deref().and_then(|a| s.session_by_id(a));
     let activity = info.map_or(Activity::Idle, |i| s.activity(i));
-    let agent_color = info.map(|i| super::agents::color(&i.agent_id, s.dark));
 
     let mut body = col()
         .key(id.clone())
         .matched(id.clone())
         .grow(1.0)
-        .min_w(320.0)
+        // Panes share a cramped card by the split, rather than the first
+        // giving all its room up to the others' floors.
+        .min_w(0.0)
         .min_h(0.0)
-        .radius(PANEL_RADIUS)
-        .clip_rounded(PANEL_RADIUS)
-        .fill(k.c.bg_base)
+        .clip_soft(0.0)
         .motion(crate::theme::look::MOVE)
         .on_press(move |s: &mut UiState| s.focus_tile(i))
         .child(header(s, k, look, i, layer));
-    // A thin lit line under the header in the agent's colour.
-    if let Some(c) = agent_color {
-        body = body.child(
-            el().key("tile-rule")
-                .w_full()
-                .h(1.0)
-                .linear_gradient(
-                    std::f32::consts::FRAC_PI_2,
-                    [
-                        (0.0, c.alpha(0.0)),
-                        (0.3, c.alpha(if focused { 0.7 } else { 0.3 })),
-                        (0.7, c.alpha(if focused { 0.7 } else { 0.3 })),
-                        (1.0, c.alpha(0.0)),
-                    ],
-                )
-                .a11y_hidden(),
-        );
-    }
+    body = body.child(
+        el().key("tile-rule")
+            .w_full()
+            .h(1.0)
+            .fill(k.c.border_muted)
+            .a11y_hidden(),
+    );
     match (&t.asid, focused) {
         (None, _) => body = body.child(picker(s, k, look, i)),
         (Some(_), true) => {
@@ -404,37 +414,28 @@ fn tile(s: &UiState, k: &Kit, look: &Look, i: usize, layer: &mut Vec<El>) -> El 
                 .child(parked_composer(s, k, look, i));
         }
     }
-    // The edge: focused tiles are lit in the accent; a tile that needs the
-    // owner pulses in the warning colour; the rest keep a hairline.
-    body = if focused && s.fx_on() {
-        look.lit_edge(body, k.c.bg_accent)
-            .child(super::fx::glow_slot(
-                "tile-glow",
-                k.c.bg_accent,
-                0.8,
-                PANEL_RADIUS,
-            ))
-    } else if focused {
-        look.glow(look.lit_edge(body, k.c.bg_accent), k.c.bg_accent, 0.55)
-    } else {
-        body.border(1.0, k.c.border_muted)
-    };
+    // Emphasis is light from the pane's top edge, never an outline: the
+    // accent sweeping in on the focused pane, the warning colour breathing
+    // on one waiting on the owner.
     if activity == Activity::NeedsYou {
-        body = body.child(
-            look.pulse(
-                el().key("tile-attention")
-                    .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
-                    .radius(PANEL_RADIUS)
-                    .border(1.5, k.c.warning.icon.alpha(0.9)),
-            )
-            .a11y_hidden(),
-        );
+        body = body.child(look.pulse(look.top_light("tile-attention", k.c.warning.icon, 0.9)));
+    } else if focused {
+        body = body.child(look.top_light("tile-focus-light", k.c.bg_accent, 1.0));
     }
     body.role("region").label(format!(
         "{} {}",
-        tr_ref(s.cfg.general.language, "Tile", "分屏"),
+        tr_ref(s.cfg.general.language, "Pane", "窗格"),
         i + 1
     ))
+}
+
+/// A hairline between two stacked panes.
+fn divider(k: &Kit, key: &str) -> El {
+    el().key(key.to_string())
+        .w_full()
+        .h(1.0)
+        .fill(k.c.border_muted)
+        .a11y_hidden()
 }
 
 /// The grip between the first column and the rest: dragging it moves the split.
@@ -445,7 +446,11 @@ fn grip(s: &UiState, k: &Kit) -> El {
         .h_full()
         .cursor(Cursor::ResizeColumn)
         .role("separator")
-        .label(tr_ref(s.cfg.general.language, "Resize split", "调整分栏"))
+        .label(tr_ref(
+            s.cfg.general.language,
+            "Resize split view",
+            "调整分屏",
+        ))
         .a11y_value(format!("{:.0}%", split * 100.0))
         .hover_group()
         .on_drag(
@@ -459,14 +464,21 @@ fn grip(s: &UiState, k: &Kit) -> El {
                 Phase::Up => s.persist_tiles(),
             },
         )
+        // The divider, brightening under the pointer.
         .child(
             el().key("tile-grip-line")
-                .w(3.0)
-                .h(36.0)
-                .radius(1.5)
+                .w(1.0)
+                .h_full()
+                .fill(k.c.border_muted)
+                .a11y_hidden(),
+        )
+        .child(
+            el().key("tile-grip-lit")
+                .absolute((GRIP - 1.0) * 0.5, 0.0)
+                .w(1.0)
+                .h_full()
                 .fill(k.c.border_strong)
-                .self_center()
-                .group_opacity(0.35, 1.0)
+                .group_opacity(0.0, 1.0)
                 .a11y_hidden(),
         )
         .center()
@@ -477,78 +489,41 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     let n = s.tiles.len();
     let split = s.tile_split;
     let mut tiles: Vec<El> = (0..n).map(|i| tile(s, k, &look, i, layer)).collect();
-    // Columns: the first tile (or first two, stacked) take `split` of the width.
+    // Columns: the first pane (or first two, stacked) take `split` of the
+    // width; the panes meet on hairlines, the vertical one the grip.
     let first = |e: El| e.w_frac(split).shrink().min_w(0.0);
+    let stack = |key: &str, top: El, bottom: El| {
+        col()
+            .key(key.to_string())
+            .min_w(0.0)
+            .min_h(0.0)
+            .child(top)
+            .child(divider(k, &format!("{key}-divider")))
+            .child(bottom)
+    };
+    let line = row().key("tiles-row").w_full().grow(1.0).min_h(0.0);
     let body = match n {
         2 => {
             let b = tiles.pop().unwrap();
             let a = tiles.pop().unwrap();
-            row()
-                .key("tiles-row")
-                .w_full()
-                .grow(1.0)
-                .min_h(0.0)
-                .gap(GAP - GRIP)
-                .child(first(a))
-                .child(grip(s, k))
-                .child(b)
+            line.child(first(a)).child(grip(s, k)).child(b)
         }
         3 => {
             let c = tiles.pop().unwrap();
             let b = tiles.pop().unwrap();
             let a = tiles.pop().unwrap();
-            row()
-                .key("tiles-row")
-                .w_full()
-                .grow(1.0)
-                .min_h(0.0)
-                .gap(GAP - GRIP)
-                .child(first(a))
+            line.child(first(a))
                 .child(grip(s, k))
-                .child(
-                    col()
-                        .key("tiles-right")
-                        .grow(1.0)
-                        .min_w(0.0)
-                        .min_h(0.0)
-                        .gap(GAP)
-                        .child(b)
-                        .child(c),
-                )
+                .child(stack("tiles-right", b, c).grow(1.0))
         }
         _ => {
             let d = tiles.pop().unwrap();
             let c = tiles.pop().unwrap();
             let b = tiles.pop().unwrap();
             let a = tiles.pop().unwrap();
-            row()
-                .key("tiles-row")
-                .w_full()
-                .grow(1.0)
-                .min_h(0.0)
-                .gap(GAP - GRIP)
-                .child(
-                    col()
-                        .key("tiles-left")
-                        .w_frac(split)
-                        .shrink()
-                        .min_w(0.0)
-                        .min_h(0.0)
-                        .gap(GAP)
-                        .child(a)
-                        .child(c),
-                )
+            line.child(first(stack("tiles-left", a, c)))
                 .child(grip(s, k))
-                .child(
-                    col()
-                        .key("tiles-right")
-                        .grow(1.0)
-                        .min_w(0.0)
-                        .min_h(0.0)
-                        .gap(GAP)
-                        .child(b)
-                        .child(d),
-                )
+                .child(stack("tiles-right", b, d).grow(1.0))
         }
     };
     col()
@@ -556,8 +531,6 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         .w_full()
         .grow(1.0)
         .min_h(0.0)
-        .padding(GAP)
-        .fill(k.c.bg_deep.alpha(if look.glass { 0.5 } else { 1.0 }))
         .on_layout(|s: &mut UiState, rect: [f32; 4]| s.tile_grid_w = rect[2])
         .child(body)
 }
@@ -574,13 +547,9 @@ pub fn toolbar_title(s: &UiState, k: &Kit) -> El {
         .filter(|i| s.activity(i) == Activity::Working)
         .count();
     let mut line = row().key("split-title").gap(8.0).center_y().child(
-        text(format!(
-            "{} · {n} {}",
-            tr_ref(language, "Split view", "分屏"),
-            tr_ref(language, "sessions", "个会话")
-        ))
-        .font(k.ty.ui_medium)
-        .color(k.c.text_base),
+        text(format!("{} · {n}", tr_ref(language, "Split view", "分屏")))
+            .font(k.ty.ui_medium)
+            .color(k.c.text_base),
     );
     if working > 0 {
         line = line.child(
@@ -601,7 +570,7 @@ pub fn toolbar_actions(s: &UiState, k: &Kit) -> Vec<El> {
     let mut out = Vec::new();
     if s.tiles.len() < super::MAX_TILES {
         out.push(
-            Button::new(tr_ref(language, "Add tile", "添加分屏"))
+            Button::new(tr_ref(language, "Add to split view", "加入分屏"))
                 .variant(ButtonVariant::Ghost)
                 .control_size(ControlSize::Small)
                 .icon(&ARROW_RIGHT)
@@ -612,7 +581,7 @@ pub fn toolbar_actions(s: &UiState, k: &Kit) -> Vec<El> {
         );
     }
     out.push(
-        Button::new(tr_ref(language, "Unsplit", "取消分屏"))
+        Button::new(tr_ref(language, "Close split view", "退出分屏"))
             .variant(ButtonVariant::Ghost)
             .control_size(ControlSize::Small)
             .on_press(|s: &mut UiState| {
@@ -628,4 +597,35 @@ pub fn toolbar_actions(s: &UiState, k: &Kit) -> Vec<El> {
             .key("split-unsplit"),
     );
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn arrows_move_between_panes_as_they_sit() {
+        use Key::{Down, Left, Right, Up};
+        let cases = [
+            // Two side by side.
+            (2, 0, Right, Some(1)),
+            (2, 1, Left, Some(0)),
+            (2, 0, Down, None),
+            // One on the left beside two stacked.
+            (3, 0, Right, Some(1)),
+            (3, 2, Left, Some(0)),
+            (3, 1, Down, Some(2)),
+            (3, 2, Up, Some(1)),
+            (3, 0, Down, None),
+            // Two by two, numbered across then down.
+            (4, 0, Down, Some(2)),
+            (4, 2, Right, Some(3)),
+            (4, 3, Up, Some(1)),
+            (4, 1, Left, Some(0)),
+            (4, 3, Right, None),
+        ];
+        for (n, i, key, want) in cases {
+            assert_eq!(neighbour(n, i, &key), want, "{n} panes, from {i}, {key:?}");
+        }
+    }
 }

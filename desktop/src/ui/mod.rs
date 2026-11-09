@@ -1926,7 +1926,7 @@ pub fn on_key(s: &mut UiState, ev: &KeyEvent, tx: &mut Tx) -> bool {
         s.sidebar.toggle();
         return true;
     }
-    if s.timeline_key(ev, tx) {
+    if s.timeline_key(ev, tx) || tiles::arrow_key(s, ev) {
         return true;
     }
     // Shift+Insert pastes and Ctrl+Insert copies in every field, as Ctrl+V

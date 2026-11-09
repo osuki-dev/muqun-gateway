@@ -225,7 +225,7 @@ pub fn entries(s: &UiState) -> Vec<Entry> {
     let act = tr(language, "Action", "操作");
     if s.mode == Mode::Session && s.selected.is_some() {
         out.push(action(
-            tr(language, "Open split", "打开分屏"),
+            tr(language, "Add to split view", "加入分屏"),
             &crate::platform::keys::label("Primary+\\"),
             Act::Split,
         ));

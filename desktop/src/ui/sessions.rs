@@ -330,7 +330,7 @@ fn session_menu(s: &UiState, k: &Kit, layer: &mut Vec<El>, asid: &str) -> El {
                     s.edit(ConfigEdit::TogglePin(pin_id.clone()));
                 }),
             )
-            .item(MenuItem::new(t("Open in split", "在分屏中打开")).on_select(
+            .item(MenuItem::new(t("Add to split view", "加入分屏")).on_select(
                 move |s: &mut UiState| {
                     s.menu = None;
                     s.open_in_tile(&split_id);

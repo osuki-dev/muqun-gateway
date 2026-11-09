@@ -739,7 +739,7 @@ fn quick_start(s: &UiState, k: &Kit, look: &Look, layer: &mut Vec<El>, size: [f3
         actions = actions.child(
             rune_kit::Badge::new(format!(
                 "{} {}",
-                tr_ref(language, "into tile", "进入分屏"),
+                tr_ref(language, "into split view pane", "放入分屏窗格"),
                 i + 1
             ))
             .variant(rune_kit::BadgeVariant::Accent)
@@ -778,7 +778,7 @@ fn quick_start(s: &UiState, k: &Kit, look: &Look, layer: &mut Vec<El>, size: [f3
         );
     card = card.child(actions);
     let card = look.panel(k, card, PANEL_RADIUS).motion(k.motion.control);
-    let card = composer::accent_state(k, look, card, PANEL_RADIUS, s.start_draft.focused, false);
+    let card = composer::accent_state(k, look, card, s.start_draft.focused, false);
     // A frame the pack drew to reach past the field sits over its edges.
     el().key("home-dock")
         .w_full()

@@ -914,6 +914,18 @@ pub fn scenes() -> &'static [Scene] {
         ("session", session_scene),
         ("split2", split2),
         ("split4", split4),
+        // Three panes: one on the left beside two stacked.
+        ("split3", |s| {
+            split4(s);
+            s.tiles.pop();
+        }),
+        // Two panes with the terminal open on the right.
+        ("split2-terminal", |s| {
+            split2(s);
+            s.term.fixture = Some(shell_fixture);
+            s.term.open = true;
+            s.term.pane.set_open(true);
+        }),
         ("settings", settings),
         ("tasks", tasks),
         ("inbox", inbox),

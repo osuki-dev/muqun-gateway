@@ -80,7 +80,10 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
     let details = (s.mode == Mode::Session)
         .then(|| timeline::detail_pane(s, k))
         .flatten();
+    // The right-hand pane's width, for its floor on a see-through window.
+    let mut right_w = 0.0;
     if s.term.mounted() && (s.term.open || (details.is_none() && !inspector_here)) {
+        right_w = s.term.pane.shown_width();
         let scheme = if k.dark {
             crate::theme::color_scheme::ColorScheme::Dark
         } else {
@@ -92,8 +95,10 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
             super::terminal_panel::view(s, k, scheme, cx.env().scale, layer),
         );
     } else if let Some(pane) = details {
+        right_w = s.inspect_pane.shown_width();
         split = split.inspector(&s.inspect_pane, super::inspect_pane, pane);
     } else if inspector_here {
+        right_w = s.right.shown_width();
         split = split.inspector(&s.right, super::right_pane, inspector::view(s, k));
     }
     let mut split = split
@@ -113,9 +118,28 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
     let home = s.mode == Mode::Home;
     let mut chrome = k.clone();
     chrome.c.bg_deep = k.c.bg_deep.alpha(0.0);
+    let window = cx.layout_size("shell");
+    if look.see_through {
+        // The desktop shows around the panels; each lays its own floor, the
+        // main card with the theme's wallpaper in it.
+        chrome.c.bg_base = k.c.bg_base.alpha(if home { 0.0 } else { CARD_ALPHA });
+        let root = el()
+            .key("window-stage")
+            .w_full()
+            .h_full()
+            .child(sidebar_panel(
+                s,
+                k,
+                SEE_THROUGH_FLOOR[usize::from(look.dark)],
+            ))
+            .children(card_floor(s, k, &look, window, right_w))
+            .children(right_floor(k, &look, right_w))
+            .child(split.build(&chrome));
+        return root.on_layout(|s: &mut UiState, r| s.fits.window = r[2]);
+    }
     let mut stage = el().key("window-stage").w_full().h_full().fill(k.c.bg_deep);
     let mut panel_wash = 0.0;
-    if let Some((backdrop, wash)) = backdrop(s, k, &look, cx.layout_size("shell")) {
+    if let Some((backdrop, wash)) = backdrop(s, k, &look, window) {
         // The main card lets a breath of the wallpaper through (Home draws
         // its own stage over a clear card).
         chrome.c.bg_base = k.c.bg_base.alpha(if home { 0.0 } else { CARD_ALPHA });
@@ -147,6 +171,73 @@ const SIDEBAR_WASH: [f32; 2] = [0.62, 0.4];
 
 /// The main card's opacity over the window's wallpaper outside Home.
 const CARD_ALPHA: f32 = 0.9;
+
+/// On a see-through window, how much of the window floor each panel lays
+/// over the (compositor-blurred) desktop before its own surface (light,
+/// dark): enough that its words read over any desktop.
+const SEE_THROUGH_FLOOR: [f32; 2] = [0.82, 0.78];
+
+/// The main card's floor on a see-through window: the window floor, and the
+/// theme's wallpaper on it placed for the card, rounded as the card is.
+/// Rides the panes' spring as the sidebar and the right-hand pane open.
+fn card_floor(
+    s: &UiState,
+    k: &Kit,
+    look: &Look,
+    window: Option<[f32; 2]>,
+    right_w: f32,
+) -> Option<El> {
+    let [w, h] = window?;
+    let frame = super::panes::FRAME;
+    let left = if s.sidebar.is_open() {
+        s.sidebar.width()
+    } else {
+        frame
+    };
+    let right = if right_w > 0.0 { right_w } else { frame };
+    let (cw, ch) = ((w - left - right).max(0.0), (h - frame * 2.0).max(0.0));
+    let mut floor = el()
+        .key("card-floor")
+        .pin(Some(left), Some(frame), Some(right), Some(frame))
+        .radius(k.radius.lg)
+        .clip_rounded(k.radius.lg)
+        .fill(k.c.bg_deep.alpha(SEE_THROUGH_FLOOR[usize::from(look.dark)]))
+        .motion(super::panes::SPRING)
+        .a11y_hidden();
+    let wall = s.images.as_ref().and_then(|images| {
+        let art = crate::theme::apply::backdrop(s.scheme(), s.mode == Mode::Home)?;
+        (art.look.opacity > 0.01).then(|| {
+            art::place(images, &art, "window-backdrop", cw, ch)
+                .absolute(0.0, 0.0)
+                .opacity(art.look.opacity)
+                .opacity_motion(crate::theme::look::MOVE)
+        })
+    });
+    match wall {
+        Some(wall) => floor = floor.child(wall),
+        // No wallpaper: the card is the page colour through and through.
+        None => floor = floor.fill(k.c.bg_deep),
+    }
+    Some(floor)
+}
+
+/// The right-hand pane's floor on a see-through window, `w` points wide: a
+/// panel like the sidebar's, inset from the window's edges and a frame's
+/// width from the main card.
+fn right_floor(k: &Kit, look: &Look, w: f32) -> Option<El> {
+    let frame = super::panes::FRAME;
+    (w > 0.0).then(|| {
+        el().key("right-floor")
+            .pin(None, Some(frame), Some(frame), Some(frame))
+            .w((w - frame * 2.0).max(0.0))
+            .radius(k.radius.lg)
+            .clip_rounded(k.radius.lg)
+            .fill(k.c.bg_deep.alpha(SEE_THROUGH_FLOOR[usize::from(look.dark)]))
+            .border(1.0, k.c.border_muted)
+            .motion(super::panes::SPRING)
+            .a11y_hidden()
+    })
+}
 
 /// How much of the page colour the sidebar's panel lays over the window
 /// floor (light, dark): a half step between the floor and the main card,
@@ -494,7 +585,7 @@ fn toolbar(s: &UiState, k: &Kit, look: &Look, layer: &mut Vec<El>) -> Toolbar {
             }
             if fit == super::Fit::Wide {
                 bar = bar.trailing(
-                    Button::new(tr_ref(language, "Split", "分屏"))
+                    Button::new(tr_ref(language, "Split view", "分屏"))
                         .variant(ButtonVariant::Ghost)
                         .control_size(ControlSize::Small)
                         .disabled(asid.is_empty())

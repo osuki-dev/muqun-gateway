@@ -891,19 +891,28 @@ fn shortcuts(s: &UiState, k: &Kit) -> Vec<El> {
                 &[
                     (
                         key("Primary+\\"),
-                        "Open another session beside this one",
-                        "在旁边打开另一个会话",
+                        "Add to split view: another session beside this one",
+                        "加入分屏：在旁边打开另一个会话",
                     ),
                     (
                         key("Primary+1"),
-                        "Focus tile 1 (… Primary+4)",
-                        "聚焦第 1 个分屏（… Primary+4）",
+                        "Focus pane 1 (… Primary+4)",
+                        "聚焦第 1 个窗格（… Primary+4）",
                     ),
-                    (key("Primary+W"), "Close the focused tile", "关闭当前分屏"),
+                    (
+                        format!("{} ← ↑ → ↓", key("Primary+Alt")),
+                        "Focus the pane that way",
+                        "聚焦该方向的窗格",
+                    ),
+                    (
+                        key("Primary+W"),
+                        "Remove the focused pane from split view",
+                        "把当前窗格移出分屏",
+                    ),
                     (
                         format!("{} / Shift", key("Alt")),
-                        "Click a session to open it in a split",
-                        "点击会话时按住即可在分屏中打开",
+                        "Click a session to add it to split view",
+                        "点击会话时按住即可加入分屏",
                     ),
                 ],
             ),

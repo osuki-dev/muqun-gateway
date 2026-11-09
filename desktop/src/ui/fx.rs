@@ -26,9 +26,6 @@ pub const GLOW: u32 = 1;
 /// the flow (0 holds a polished, still surface that costs no frames).
 pub const METAL: u32 = 3;
 
-/// The reach a glow slot needs past its rect.
-pub const GLOW_BLEED: f32 = 48.0;
-
 impl UiState {
     /// Whether views may emit effect slots this frame.
     pub fn fx_on(&self) -> bool {
@@ -89,18 +86,6 @@ fn install_error_handler(device: &wgpu::Device) {
 /// Pack a kit colour and a parameter into a slot's payload.
 pub fn data(color: rune::Color, param: f32) -> [f32; 4] {
     [color.r, color.g, color.b, param]
-}
-
-/// A glow slot pinned over its parent's rect (the parent must be positioned).
-pub fn glow_slot(key: &str, color: rune::Color, intensity: f32, radius: f32) -> El {
-    rune::el()
-        .key(key.to_string())
-        .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
-        .radius(radius)
-        .effect(GLOW)
-        .effect_bleed(GLOW_BLEED)
-        .effect_data(data(color, intensity))
-        .a11y_hidden()
 }
 
 /// A liquid-metal slab of `size`, tinted toward `color`, flowing at `flow`.

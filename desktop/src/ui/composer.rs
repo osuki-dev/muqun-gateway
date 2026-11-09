@@ -164,33 +164,22 @@ pub fn accent_state(
     k: &Kit,
     look: &crate::theme::look::Look,
     card: El,
-    radius: f32,
     focused: bool,
     busy: bool,
 ) -> El {
+    // Light from the top edge, not an outline: steady while the field has
+    // focus, breathing while the agent works.
     let accent = k.c.bg_accent;
-    let card = if focused || busy {
-        look.accent_rim(k, card, accent)
-    } else {
-        card
-    };
     let card = if focused {
         look.glow(card, accent, 0.22)
+            .child(look.top_light("composer-focus-light", accent, 0.8))
     } else {
         card
     };
     if !busy {
         return card;
     }
-    card.child(
-        look.pulse(
-            el().key("composer-working-rim")
-                .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
-                .radius(radius)
-                .border_gradient(1.0, accent.alpha(0.7), accent.alpha(0.15)),
-        )
-        .a11y_hidden(),
-    )
+    card.child(look.pulse(look.top_light("composer-working-light", accent, 0.6)))
 }
 
 /// The kit a composer's text field is built with: the field draws no box of
@@ -1571,7 +1560,8 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
                     queue_session(s);
                     return true;
                 }
-                false
+                // Split view's pane keys, ahead of the field's word moves.
+                super::tiles::arrow_key(s, ev)
             })
             .on_submit(|s: &mut UiState, _: &mut Tx| submit_session(s))
             .on_input_paste(|s: &mut UiState, content, _: &mut Tx| take_paste(s, content))
@@ -1589,7 +1579,7 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     // slow breath of the accent (still under reduce motion).
     let radius = crate::theme::look::PANEL_RADIUS;
     let card = look.panel(k, card, radius).motion(k.motion.control);
-    let card = accent_state(k, &look, card, radius, focused, busy);
+    let card = accent_state(k, &look, card, focused, busy);
 
     // The status line: what the keys do, and a word while the agent works.
     let mut hint = row()

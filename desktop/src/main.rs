@@ -130,6 +130,10 @@ fn main() -> anyhow::Result<()> {
             ui::view,
         )
     })
+    .window_options(rune::WindowOptions {
+        transparent: platform::see_through_window(),
+        ..rune::WindowOptions::default()
+    })
     .compositor(ui::fx::Fx::default())
     .on_focus(|_, focused, _| platform::notify::set_window_focused(focused))
     // Closing keeps the app only when the owner asked for the tray and an

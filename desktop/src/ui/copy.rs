@@ -37,6 +37,7 @@ pub fn tr_ref(language: Language, en: &'static str, zh: &'static str) -> &'stati
 /// the views; the right side is the final Traditional form.
 const WORDS: &[(&str, &str)] = &[
     ("文件系统", "檔案系統"),
+    ("分屏", "分割畫面"),
     ("会话", "工作階段"),
     ("文件夹", "資料夾"),
     ("收件箱", "收件匣"),

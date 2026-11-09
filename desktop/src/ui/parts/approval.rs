@@ -189,16 +189,14 @@ pub fn permission_card(s: &UiState, k: &Kit, request: &PermissionRequest) -> El 
         .px(14.0)
         .py(12.0)
         .radius(k.radius.lg)
-        .border(
-            1.0,
-            if pending {
-                k.alpha(tone, 0.5)
-            } else {
-                k.c.border_weak
-            },
-        )
+        .clip_rounded(k.radius.lg)
+        .border(1.0, k.c.border_weak)
         .fill(k.c.surface_raised_base)
         .child(head);
+    // Waiting on the owner: lit from its top edge in its tone, not outlined.
+    if pending {
+        card = card.child(s.look().top_light("perm-light", tone, 0.9));
+    }
     if !pending {
         if !subject.is_empty() {
             card = card.child(

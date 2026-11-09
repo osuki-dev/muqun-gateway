@@ -16,8 +16,13 @@ use crate::config::Appearance;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Look {
     pub glass: bool,
-    /// Backdrop blur is allowed: glass, and the window is small enough that
-    /// Rune's blur textures stay within [`BLUR_PIXEL_BUDGET`].
+    /// The window is see-through: the frame around the sidebar and the
+    /// main card shows the desktop (glass on a platform that can).
+    pub see_through: bool,
+    /// Backdrop blur is allowed: glass, the window is small enough that
+    /// Rune's blur textures stay within [`BLUR_PIXEL_BUDGET`], and not
+    /// see-through (the compositor blurs the desktop behind it then, and the
+    /// app's own frost pass would be a second, paid one).
     pub blur: bool,
     pub motion: bool,
     pub dark: bool,
@@ -42,6 +47,10 @@ pub const CARD_RADIUS: f32 = 10.0;
 pub const ARRIVE: Spring = Spring::new(0.42, 0.18);
 /// A tight spring for things that move between places.
 pub const MOVE: Spring = Spring::new(0.36, 0.1);
+/// The unhurried spring a [`Look::top_light`] sweeps in on.
+const SWEEP: Spring = Spring::new(0.7, 0.0);
+/// How far a [`Look::top_light`]'s glow falls from its edge.
+const TOP_LIGHT_H: f32 = 64.0;
 
 /// Apply the owner's text size, density and corner profile to a kit: every
 /// type token scales, compact density tightens line heights, and the radii
@@ -145,9 +154,11 @@ impl Look {
         let lost = crate::ui::fx::gpu_lost();
         let pixels = crate::ui::fx::viewport_pixels();
         let glass = !appearance.reduced_transparency && !lost;
+        let see_through = glass && crate::platform::see_through_window();
         Self {
             glass,
-            blur: glass && pixels > 0.0 && pixels <= BLUR_PIXEL_BUDGET,
+            see_through,
+            blur: glass && !see_through && pixels > 0.0 && pixels <= BLUR_PIXEL_BUDGET,
             motion: !appearance.reduced_motion,
             dark,
         }
@@ -238,9 +249,45 @@ impl Look {
         })
     }
 
-    /// The focused element's edge: a lit rim in `color` over its border.
-    pub fn lit_edge(&self, e: El, color: rune::Color) -> El {
-        e.border_gradient(1.5, color.alpha(0.95), color.alpha(0.35))
+    /// Light falling from the top edge of what it is pinned in, `strength`
+    /// 0..=1: a bright streak along the edge, fading at its ends, and a glow
+    /// falling a little way down. The emphasis of what is focused or wants
+    /// the owner, in place of an outline. It sweeps in from the leading
+    /// edge as it appears and settles; under reduce motion it fades in.
+    pub fn top_light(&self, key: &str, color: rune::Color, strength: f32) -> El {
+        let glow = if self.dark { 0.15 } else { 0.11 } * strength;
+        let streak = if self.dark { 0.9 } else { 0.75 } * strength;
+        let light = el()
+            .key(key.to_string())
+            .pin(Some(0.0), Some(0.0), Some(0.0), None)
+            .h(TOP_LIGHT_H)
+            .linear_gradient(
+                std::f32::consts::PI,
+                [
+                    (0.0, color.alpha(glow)),
+                    (0.35, color.alpha(glow * 0.4)),
+                    (1.0, color.alpha(0.0)),
+                ],
+            )
+            .child(el().w_full().h(1.5).linear_gradient(
+                std::f32::consts::FRAC_PI_2,
+                [
+                    (0.0, color.alpha(0.0)),
+                    (0.3, color.alpha(streak)),
+                    (0.7, color.alpha(streak)),
+                    (1.0, color.alpha(0.0)),
+                ],
+            ))
+            .a11y_hidden();
+        if self.motion {
+            light.transition(
+                Transition::reveal(rune::Edge::Leading)
+                    .combined(Transition::opacity())
+                    .springs(rune::SpringPair::new(SWEEP, MOVE)),
+            )
+        } else {
+            light.transition(Transition::opacity())
+        }
     }
 
     /// A panel's rim with a hint of `color` along its top edge: lit, not
