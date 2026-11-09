@@ -863,12 +863,29 @@ fn changes_toolbar(s: &UiState, k: &Kit, asid: &str) -> El {
         .build(k)
         .key("btn-refresh");
 
+    let commit_btn = Button::new(tr_ref(language, "Commit with agent", "让 agent 提交"))
+        .variant(ButtonVariant::Ghost)
+        .control_size(ControlSize::Small)
+        .on_press(move |s: &mut UiState| {
+            let msg = if language == crate::config::Language::En {
+                "Commit the working tree changes with a descriptive conventional commit message"
+            } else {
+                "请使用规范的 commit message 提交当前工作区的修改"
+            };
+            s.draft = rune::TextEdit::new(msg);
+            s.draft.focused = true;
+            s.show_diff = false;
+        })
+        .build(k)
+        .key("btn-commit-agent");
+
     let right = row()
         .gap(6.0)
         .center_y()
         .child(unified_btn)
         .child(split_btn)
         .child(wrap_btn)
+        .child(commit_btn)
         .child(refresh_btn);
 
     row()
