@@ -845,6 +845,12 @@ pub fn scenes() -> &'static [Scene] {
             s.draft = TextEdit::new("Run the tests again");
             s.draft.focused = true;
         }),
+        // Four panes (one tall, one above two) on an opaque window.
+        ("split4-plain", |s| {
+            split4(s);
+            s.cfg.appearance.reduced_motion = true;
+            s.cfg.appearance.reduced_transparency = true;
+        }),
         // Split view on an opaque window without motion, sidebar closed.
         ("split2-plain", |s| {
             split2(s);

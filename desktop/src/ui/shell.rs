@@ -128,10 +128,16 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
     let mut chrome = k.clone();
     chrome.c.bg_deep = k.c.bg_deep.alpha(0.0);
     let window = cx.layout_size("shell");
+    // In split view the panes are the cards: the main card steps aside
+    // and each pane lays its own floor (`tiles.rs`).
+    let tiled = s.mode == Mode::Session && s.in_split();
     if look.see_through {
         // The desktop shows around the panels; each lays its own floor, the
         // main card with the theme's wallpaper in it.
         chrome.c.bg_base = k.c.bg_base.alpha(if home { 0.0 } else { CARD_ALPHA });
+        if tiled {
+            hide_card(&mut chrome);
+        }
         let root = el()
             .key("window-stage")
             .w_full()
@@ -141,7 +147,11 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
                 k,
                 SEE_THROUGH_FLOOR[usize::from(look.dark)],
             ))
-            .children(card_floor(s, k, &look, window, right_w))
+            .children(
+                (!tiled)
+                    .then(|| card_floor(s, k, &look, window, right_w))
+                    .flatten(),
+            )
             .children(right_floor(k, &look, right_w))
             .child(split.build(&chrome));
         return root.on_layout(|s: &mut UiState, r| s.fits.window = r[2]);
@@ -166,11 +176,37 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
             );
         }
     }
+    if tiled {
+        hide_card(&mut chrome);
+    }
     let root = stage
         .child(sidebar_panel(s, k, panel_wash))
         .child(split.build(&chrome));
     // The window's width bounds the right-hand panes (`UiState::fit_panes`).
     root.on_layout(|s: &mut UiState, r| s.fits.window = r[2])
+}
+
+/// The main card drawn by nothing: no floor, no hairline (split view, whose
+/// panes are the cards).
+fn hide_card(chrome: &mut Kit) {
+    chrome.c.bg_base = chrome.c.bg_base.alpha(0.0);
+    chrome.c.border_muted = chrome.c.border_muted.alpha(0.0);
+}
+
+/// A split-view pane's floor, as the main card's would be: the colour to
+/// fill it with, and on a see-through window the page colour to lay over
+/// that (the window floor first, then the card's surface).
+pub fn card_floor_colors(k: &Kit, look: &Look) -> (rune::Color, Option<rune::Color>) {
+    if look.see_through {
+        (
+            k.c.bg_deep.alpha(SEE_THROUGH_CARD[usize::from(look.dark)]),
+            Some(k.c.bg_base.alpha(CARD_ALPHA)),
+        )
+    } else if look.glass {
+        (k.c.bg_base.alpha(CARD_ALPHA), None)
+    } else {
+        (k.c.bg_base, None)
+    }
 }
 
 /// The least of the window floor that returns under the sidebar's lists,

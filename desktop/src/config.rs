@@ -379,12 +379,27 @@ pub struct UiPrefs {
     /// (`ui/tiles.rs`); empty when one session filled the pane.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tiles: Vec<String>,
-    /// Where the split's first column ends, 0.25..=0.75 of its width.
-    #[serde(default = "UiPrefs::tile_split_default")]
-    pub tile_split: f32,
+    /// How those panes tile (`ui/dwindle.rs`), its leaves indexing `tiles`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tile_layout: Option<TileNode>,
     /// The sidebar's Running list is open (`ui/running.rs`).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub running_open: bool,
+}
+
+/// A split view's tiling, as Hyprland's dwindle layout keeps it: a leaf is
+/// a pane (an index into the tile list), a split two subtrees side by side
+/// (`across`) or stacked, the first taking `ratio` of the room.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TileNode {
+    Leaf(usize),
+    Split {
+        across: bool,
+        ratio: f32,
+        a: Box<TileNode>,
+        b: Box<TileNode>,
+    },
 }
 
 impl UiPrefs {
@@ -420,19 +435,6 @@ impl UiPrefs {
         }
     }
 
-    fn tile_split_default() -> f32 {
-        0.5
-    }
-
-    /// The stored split, forced into range.
-    pub fn tile_split(&self) -> f32 {
-        if self.tile_split.is_finite() {
-            self.tile_split.clamp(0.25, 0.75)
-        } else {
-            0.5
-        }
-    }
-
     /// The stored width, forced into the range the layout allows (a hand
     /// edited or NaN value never yields a broken window).
     pub fn sidebar(&self) -> f32 {
@@ -463,7 +465,7 @@ impl Default for UiPrefs {
             projects: BTreeMap::new(),
             recent_commands: Vec::new(),
             tiles: Vec::new(),
-            tile_split: 0.5,
+            tile_layout: None,
             running_open: false,
         }
     }
@@ -479,10 +481,10 @@ pub enum ConfigEdit {
     SidebarWidth(f32),
     RightWidth(f32),
     TerminalWidth(f32),
-    /// The sessions open side by side and where the split sits.
+    /// The sessions open side by side and how they tile.
     Tiles {
         asids: Vec<String>,
-        split: f32,
+        layout: Option<TileNode>,
     },
     /// What the owner chose for one project (pin, hide, name), by root.
     Project {
@@ -545,9 +547,9 @@ impl DesktopConfig {
             ConfigEdit::SidebarWidth(width) => self.ui.sidebar_width = width,
             ConfigEdit::RightWidth(width) => self.ui.right_width = width,
             ConfigEdit::TerminalWidth(width) => self.ui.terminal_width = width,
-            ConfigEdit::Tiles { asids, split } => {
+            ConfigEdit::Tiles { asids, layout } => {
                 self.ui.tiles = asids;
-                self.ui.tile_split = split;
+                self.ui.tile_layout = layout;
             }
             ConfigEdit::Project { root, prefs } => {
                 if prefs.is_default() {

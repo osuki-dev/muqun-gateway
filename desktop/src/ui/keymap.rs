@@ -45,6 +45,7 @@ pub enum Action {
     RemoveSplit,
     FocusPane,
     FocusPaneToward,
+    SwapPaneToward,
     FocusComposer,
     Send,
     Queue,
@@ -346,6 +347,13 @@ pub static ENTRIES: &[Entry] = &[
         "Focus the pane that way",
         "聚焦该方向的窗格",
     ),
+    e(
+        A::SwapPaneToward,
+        G::Split,
+        "mod+alt+shift+left, mod+alt+shift+right, mod+alt+shift+up, mod+alt+shift+down",
+        "Swap the pane with the one that way",
+        "与该方向的窗格互换",
+    ),
     owned(
         on_mac(
             e(A::TermCopy, G::Terminal, "ctrl+shift+c", "Copy", "复制"),
@@ -420,6 +428,17 @@ pub fn label(action: Action) -> String {
         .first()
         .map(|c| c.label())
         .unwrap_or_default()
+}
+
+/// Every chord of `action`, in the keymap's order (the pane arrows: left,
+/// right, up, down).
+pub fn labels(action: Action) -> Vec<String> {
+    entry(action)
+        .keybind()
+        .chords()
+        .iter()
+        .map(|c| c.label())
+        .collect()
 }
 
 /// A button's tooltip: "Toggle sidebar (Ctrl+B)".
@@ -514,7 +533,12 @@ pub fn dispatch(s: &mut UiState, ev: &KeyEvent, tx: &mut Tx) -> bool {
 /// caret moves: Alt+↑/↓, the split's pane arrows, and Ctrl+End once the
 /// caret is already at the end.
 pub fn field_key(s: &mut UiState, ev: &KeyEvent, tx: &mut Tx, at_end: bool) -> bool {
-    for action in [A::PrevSession, A::NextSession, A::FocusPaneToward] {
+    for action in [
+        A::PrevSession,
+        A::NextSession,
+        A::FocusPaneToward,
+        A::SwapPaneToward,
+    ] {
         if entry(action).keybind().matches_tx(ev, tx) {
             return run(s, action, ev, tx);
         }
@@ -578,7 +602,7 @@ pub fn run(s: &mut UiState, action: Action, ev: &KeyEvent, tx: &mut Tx) -> bool 
             }
             s.focus_tile(n);
         }
-        A::FocusPaneToward => return super::tiles::arrow_key(s, ev),
+        A::FocusPaneToward | A::SwapPaneToward => return super::tiles::arrow_key(s, ev),
         A::FocusComposer => match s.mode {
             Mode::Session => s.draft.focused = true,
             Mode::Home => s.start_draft.focused = true,
@@ -740,12 +764,19 @@ mod tests {
             }
         }
         // Inside the terminal Ctrl+Shift+P is the palette's own chord, so
-        // Ctrl+P (quick open) can't borrow it there. Nothing else collides.
+        // Ctrl+P (quick open) can't borrow it there; the pane arrows arrive
+        // shifted too, and `tiles::arrow_key` only moves focus from there.
+        // Nothing else collides.
         for platform in [KeyPlatform::Windows, KeyPlatform::Linux] {
-            assert_eq!(
-                terminal_shadows(platform),
-                vec![(A::Palette, A::QuickOpen, "Ctrl+Shift+P".to_string())]
-            );
+            let mut want = vec![(A::Palette, A::QuickOpen, "Ctrl+Shift+P".to_string())];
+            for arrow in ["←", "→", "↑", "↓"] {
+                want.push((
+                    A::SwapPaneToward,
+                    A::FocusPaneToward,
+                    format!("Ctrl+Alt+Shift+{arrow}"),
+                ));
+            }
+            assert_eq!(terminal_shadows(platform), want);
         }
         assert!(terminal_shadows(KeyPlatform::Mac).is_empty());
     }

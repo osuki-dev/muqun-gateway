@@ -1,13 +1,14 @@
-//! Split view: two to four sessions side by side in the main card, each a
-//! pane with its live timeline and composer. The panes fill the card edge to
-//! edge with hairline dividers, each under its own one-line header; there is
-//! no toolbar over them. Focus is contrast, not decoration: the other panes
-//! sit a step back (a scrim of the card colour, titles muted) and focus
-//! cross-fades between them; a pane waiting on the owner breathes a small
-//! warning dot by its title. Panes swap and close on springs and the first
-//! column resizes on a grip.
+//! Split view: two to four sessions at once, each pane its own rounded
+//! card on the window (the main card steps aside), tiled as Hyprland's
+//! dwindle layout does (`dwindle.rs`) with the window showing through the
+//! gaps; dragging a gap moves that split. Each pane has a one-line header
+//! and there is no toolbar over them. Focus is contrast, not decoration:
+//! the other panes sit a step back (a scrim of the card colour, titles
+//! muted) and focus cross-fades between them; a pane waiting on the owner
+//! breathes a small warning dot by its title.
 //!
 //! Keys: `Primary+1..4` and `Primary+Alt+arrows` focus a pane,
+//! `Primary+Alt+Shift+arrows` swap it with the one that way,
 //! `Primary+\` adds one, `Primary+W` removes the focused one.
 
 use rune::{col, el, row, text, Cursor, El, Key, KeyEvent, Phase, Tx};
@@ -17,14 +18,17 @@ use rune_kit::{
 };
 
 use super::copy::{tr, tr_ref};
+use super::dwindle;
 use super::{
     activity_pill, ago, composer, now_ms, timeline, title_of, Activity, Mode, OpenMenu, UiState,
 };
+use crate::config::TileNode;
 use crate::model::commands::Command;
 use crate::theme::look::Look;
 
-/// The resize grip's width; the divider line runs down its middle.
-const GRIP: f32 = 9.0;
+/// The see-through gap between two panes: the frame around the window's
+/// panels.
+const GAP: f32 = super::panes::FRAME;
 /// A pane header's height.
 const HEAD_H: f32 = 36.0;
 /// How far an unfocused pane's content sits back: the alpha of the card
@@ -32,36 +36,22 @@ const HEAD_H: f32 = 36.0;
 /// way (blending is in linear light, so dark needs more).
 const UNFOCUSED_SCRIM: [f32; 2] = [0.12, 0.22];
 
-/// Which pane lies `key`-ward of pane `i` among `n`, as the panes sit: two
-/// side by side; three as one on the left beside two stacked; four in a
-/// two-by-two grid, numbered across then down.
-pub fn neighbour(n: usize, i: usize, key: &Key) -> Option<usize> {
-    // (column, row) of each pane; the lone left pane of three spans both rows.
-    let at = |j: usize| -> (usize, usize) {
-        match (n, j) {
-            (3, 0) => (0, 0),
-            (3, j) => (1, j - 1),
-            (_, j) => (j % 2, j / 2),
-        }
-    };
-    let (c, r) = at(i);
-    let want = match key {
-        Key::Left if c > 0 => (c - 1, r),
-        Key::Right if c == 0 => (1, r),
-        Key::Up if r > 0 => (c, r - 1),
-        Key::Down => (c, r + 1),
-        _ => return None,
-    };
-    (0..n).find(|&j| j != i && (at(j) == want || (n == 3 && j == 0 && want.0 == 0)))
-}
-
-/// `Primary+Alt+arrow` in split view: focus the pane that way. Text fields
-/// pass it here first (their own word moves take the plain chord).
+/// `Primary+Alt+arrow` in split view: focus the pane that way; with Shift,
+/// swap the focused pane's session with that pane's. Text fields pass it
+/// here first (their own word moves take the plain chord).
 pub fn arrow_key(s: &mut UiState, ev: &KeyEvent) -> bool {
-    if !s.in_split() || !ev.mods.primary() || !ev.mods.alt || ev.mods.shift {
+    if !s.in_split() || !ev.mods.primary() || !ev.mods.alt {
         return false;
     }
-    match neighbour(s.tiles.len(), s.focus, &ev.key) {
+    let toward = super::dwindle::neighbour(&s.tile_layout(), s.tile_grid, s.focus, &ev.key);
+    match toward {
+        // The terminal lends its Ctrl chords with Shift added (Windows and
+        // Linux), so from there the arrows only ever move focus.
+        Some(j) if ev.mods.shift && !s.term.sink.focused => {
+            let i = s.focus;
+            s.swap_tiles(i, j);
+            true
+        }
         Some(j) => {
             s.focus_tile(j);
             true
@@ -110,17 +100,16 @@ fn reach(language: crate::config::Language, i: usize) -> String {
 
 /// A pane's header, one line in the toolbar's style: mark, title, agent,
 /// status dot, and under the pointer its menu and close.
-fn header(s: &UiState, k: &Kit, look: &Look, i: usize, clear: f32, layer: &mut Vec<El>) -> El {
+fn header(s: &UiState, k: &Kit, look: &Look, i: usize, place: Place, layer: &mut Vec<El>) -> El {
     let language = s.cfg.general.language;
     let focused = i == s.focus;
-    let count = s.tiles.len();
     let asid = s.tiles[i].asid.clone();
     let info = asid.as_deref().and_then(|a| s.session_by_id(a));
     let mut head = row()
         .key("tile-head")
         .w_full()
         .h(HEAD_H)
-        .pl(12.0 + clear)
+        .pl(12.0 + place.clear)
         .motion(super::panes::SPRING)
         .pr(6.0)
         .gap(8.0)
@@ -195,17 +184,37 @@ fn header(s: &UiState, k: &Kit, look: &Look, i: usize, clear: f32, layer: &mut V
         )
         .open(menu_open)
         .on_close(|s: &mut UiState| s.menu = None);
-    if i > 0 {
-        menu = menu.item(
-            MenuItem::new(tr(language, "Move left / up", "左移 / 上移"))
-                .on_select(move |s: &mut UiState| s.swap_tiles(i, i - 1)),
-        );
-    }
-    if i + 1 < count {
-        menu = menu.item(
-            MenuItem::new(tr(language, "Move right / down", "右移 / 下移"))
-                .on_select(move |s: &mut UiState| s.swap_tiles(i, i + 1)),
-        );
+    // Swap places with a neighbour, as the panes sit.
+    let tree = s.tile_layout();
+    let chords = super::keymap::labels(super::keymap::Action::SwapPaneToward);
+    for (n, (key, en, zh)) in [
+        (
+            Key::Left,
+            "Swap with the pane on the left",
+            "与左侧窗格互换",
+        ),
+        (
+            Key::Right,
+            "Swap with the pane on the right",
+            "与右侧窗格互换",
+        ),
+        (Key::Up, "Swap with the pane above", "与上方窗格互换"),
+        (Key::Down, "Swap with the pane below", "与下方窗格互换"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if let Some(j) = super::dwindle::neighbour(&tree, s.tile_grid, i, &key) {
+            menu = menu.item(
+                MenuItem::new(tr(language, en, zh))
+                    .shortcut(if focused {
+                        chords.get(n).cloned().unwrap_or_default()
+                    } else {
+                        String::new()
+                    })
+                    .on_select(move |s: &mut UiState| s.swap_tiles(i, j)),
+            );
+        }
     }
     if let Some(a) = asid.clone() {
         menu = menu.item(
@@ -267,7 +276,7 @@ fn header(s: &UiState, k: &Kit, look: &Look, i: usize, clear: f32, layer: &mut V
     );
     // The split view has no toolbar: the top-right pane's header carries
     // what it held, adding a pane and the terminal, always in view.
-    if i == 1 {
+    if place.corner {
         head = head.child(window_actions(s, k));
     }
     head
@@ -502,27 +511,50 @@ fn picker(s: &UiState, k: &Kit, look: &Look, i: usize) -> El {
         )
 }
 
-fn tile(s: &UiState, k: &Kit, look: &Look, i: usize, clear: f32, layer: &mut Vec<El>) -> El {
+/// Where pane `i` sits among the others, for what its header carries.
+#[derive(Clone, Copy, Default)]
+struct Place {
+    /// Points its header keeps clear at the leading edge (the window's
+    /// corner controls, for the top-left pane).
+    clear: f32,
+    /// It is the top-right pane: its header holds the window's actions.
+    corner: bool,
+}
+
+/// Pane `i` as its own card: a rounded floor like the sidebar's, a header
+/// line, its timeline and composer.
+fn tile(s: &UiState, k: &Kit, look: &Look, i: usize, place: Place, layer: &mut Vec<El>) -> El {
     let focused = i == s.focus;
     let t = &s.tiles[i];
     let id = t
         .asid
         .clone()
         .map_or_else(|| format!("tile-empty-{i}"), |a| format!("tile-{a}"));
-
+    let radius = k.radius.lg;
+    let (under, over) = super::shell::card_floor_colors(k, look);
     let mut body = col()
         .key(id.clone())
         .matched(id.clone())
         .grow(1.0)
-        // Panes share a cramped card by the split, rather than the first
+        // Panes share a cramped window by the split, rather than the first
         // giving all its room up to the others' floors.
         .min_w(0.0)
         .min_h(0.0)
-        .clip_soft(0.0)
+        .radius(radius)
+        .clip_rounded(radius)
+        .fill(under)
+        .border(1.0, k.c.border_muted)
         .motion(crate::theme::look::MOVE)
-        .on_press(move |s: &mut UiState| s.focus_tile(i))
-        .child(header(s, k, look, i, clear, layer));
-    body = body.child(
+        .on_press(move |s: &mut UiState| s.focus_tile(i));
+    if let Some(over) = over {
+        body = body.child(
+            el().key("tile-floor")
+                .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
+                .fill(over)
+                .a11y_hidden(),
+        );
+    }
+    body = body.child(header(s, k, look, i, place, layer)).child(
         el().key("tile-rule")
             .w_full()
             .h(1.0)
@@ -564,67 +596,97 @@ fn tile(s: &UiState, k: &Kit, look: &Look, i: usize, clear: f32, layer: &mut Vec
     ))
 }
 
-/// A hairline between two stacked panes.
-fn divider(k: &Kit, key: &str) -> El {
-    el().key(key.to_string())
-        .w_full()
-        .h(1.0)
-        .fill(k.c.border_muted)
-        .a11y_hidden()
-}
-
-/// The grip between the first column and the rest: dragging it moves the split.
-fn grip(s: &UiState, k: &Kit) -> El {
-    let split = s.tile_split;
-    el().key("tile-grip")
-        .w(GRIP)
-        .h_full()
-        .cursor(Cursor::ResizeColumn)
+/// The gap between the two halves of the split at `path`: the window shows
+/// through it, and dragging it moves the split. `room` is the length the
+/// halves share along the split.
+fn gap(s: &UiState, path: &[bool], across: bool, ratio: f32, room: f32) -> El {
+    let key = path_key("tile-gap", path);
+    let path = path.to_vec();
+    let mut handle = el()
+        .key(key)
+        .cursor(if across {
+            Cursor::ResizeColumn
+        } else {
+            Cursor::ResizeRow
+        })
         .role("separator")
         .label(tr_ref(
             s.cfg.general.language,
             "Resize split view",
             "调整分屏",
         ))
-        .a11y_value(format!("{:.0}%", split * 100.0))
-        .hover_group()
+        .a11y_value(format!("{:.0}%", ratio * 100.0))
         .on_drag(
             move |s: &mut UiState, d: &mut rune::Drag, _: &mut Tx| match d.phase {
-                Phase::Down => d.data = s.tile_split,
-                Phase::Move => {
-                    if s.tile_grid_w > 0.0 {
-                        s.set_tile_split(d.data + d.dx / s.tile_grid_w);
-                    }
+                Phase::Down => d.data = ratio,
+                Phase::Move if room > 0.0 => {
+                    let moved = if across { d.dx } else { d.dy };
+                    s.set_tile_ratio(&path, d.data + moved / room);
                 }
                 Phase::Up => s.persist_tiles(),
+                _ => {}
             },
-        )
-        // The divider, brightening under the pointer.
-        .child(
-            el().key("tile-grip-line")
-                .w(1.0)
-                .h_full()
-                .fill(k.c.border_muted)
-                .a11y_hidden(),
-        )
-        .child(
-            el().key("tile-grip-lit")
-                .absolute((GRIP - 1.0) * 0.5, 0.0)
-                .w(1.0)
-                .h_full()
-                .fill(k.c.border_strong)
-                .group_opacity(0.0, 1.0)
-                .a11y_hidden(),
-        )
-        .center()
+        );
+    handle = if across {
+        handle.w(GAP).h_full()
+    } else {
+        handle.h(GAP).w_full()
+    };
+    handle
+}
+
+fn path_key(prefix: &str, path: &[bool]) -> String {
+    let bits: String = path.iter().map(|&b| if b { '1' } else { '0' }).collect();
+    format!("{prefix}-{bits}")
+}
+
+/// The tree at `path` as nested rows and columns of cards and gaps.
+fn arrange(
+    s: &UiState,
+    node: &TileNode,
+    path: &mut Vec<bool>,
+    rect: dwindle::Rect,
+    cards: &mut Vec<Option<El>>,
+) -> El {
+    match node {
+        TileNode::Leaf(i) => cards
+            .get_mut(*i)
+            .and_then(Option::take)
+            .unwrap_or_else(|| el().key(format!("tile-missing-{i}"))),
+        TileNode::Split {
+            across,
+            ratio,
+            a,
+            b,
+        } => {
+            let (ra, rb) = dwindle::cut(rect, *across, *ratio);
+            let room = if *across { rect[2] } else { rect[3] } - GAP;
+            let gap = gap(s, path, *across, *ratio, room);
+            path.push(false);
+            let first = arrange(s, a, path, ra, cards);
+            path.pop();
+            path.push(true);
+            let second = arrange(s, b, path, rb, cards);
+            path.pop();
+            let line = if *across { row() } else { col() };
+            line.key(path_key("tile-split", path))
+                .grow(1.0)
+                .min_w(0.0)
+                .min_h(0.0)
+                .child(first.grow(*ratio).min_w(0.0).min_h(0.0))
+                .child(gap)
+                .child(second.grow(1.0 - *ratio).min_w(0.0).min_h(0.0))
+        }
+    }
 }
 
 /// How far the top-left pane's header keeps clear of the window's corner
-/// (the traffic lights and the sidebar's toggle, which float over the card
-/// while the sidebar is closed), `inset` the lights' width. The kit's
-/// toolbar would clear them by its padding; the panes have none. Mirrors
+/// (the traffic lights and the sidebar's toggle, which float there while
+/// the sidebar is closed), `inset` the lights' width. The kit's toolbar
+/// would clear them by its padding; the panes have none. Mirrors
 /// `SplitView`: the lights (or 12 points of edge), 8 points, the Large
-/// toggle's 28, 8 points, less the frame the card starts at.
+/// toggle's 28, 8 points, less the frame the panes start at and the
+/// header's own 12.
 pub fn toggle_clearance(s: &UiState, inset: f32) -> f32 {
     if s.sidebar.is_open() {
         return 0.0;
@@ -633,54 +695,42 @@ pub fn toggle_clearance(s: &UiState, inset: f32) -> f32 {
     lights + 28.0 + 8.0 - super::panes::FRAME - 12.0
 }
 
-/// The panes; `clear` keeps the top-left header clear of the window's
-/// corner ([`toggle_clearance`]).
+/// The panes, each its own card on the window with gaps between (the
+/// main card steps aside for them); `clear` keeps the top-left header
+/// clear of the window's corner ([`toggle_clearance`]).
 pub fn view(s: &UiState, k: &Kit, clear: f32, layer: &mut Vec<El>) -> El {
     let look = s.look();
-    let n = s.tiles.len();
-    let split = s.tile_split;
-    let mut tiles: Vec<El> = (0..n)
-        .map(|i| tile(s, k, &look, i, if i == 0 { clear } else { 0.0 }, layer))
+    let tree = s.tile_layout();
+    let [w, h] = s.tile_grid;
+    let size = [w.max(1.0), h.max(1.0)];
+    let placed = dwindle::rects(&tree, [0.0, 0.0, size[0], size[1]]);
+    let top_left = placed
+        .iter()
+        .min_by(|x, y| (x.1[1] + x.1[0]).total_cmp(&(y.1[1] + y.1[0])))
+        .map(|p| p.0);
+    let top_right = placed
+        .iter()
+        .filter(|(_, r)| r[1] < 1.0)
+        .max_by(|x, y| x.1[0].total_cmp(&y.1[0]))
+        .map(|p| p.0);
+    let mut cards: Vec<Option<El>> = (0..s.tiles.len())
+        .map(|i| {
+            let place = Place {
+                clear: if Some(i) == top_left { clear } else { 0.0 },
+                corner: Some(i) == top_right,
+            };
+            Some(tile(s, k, &look, i, place, layer))
+        })
         .collect();
-    // Columns: the first pane (or first two, stacked) take `split` of the
-    // width; the panes meet on hairlines, the vertical one the grip.
-    let first = |e: El| e.w_frac(split).shrink().min_w(0.0);
-    let stack = |key: &str, top: El, bottom: El| {
-        col()
-            .key(key.to_string())
-            .min_w(0.0)
-            .min_h(0.0)
-            .child(top)
-            .child(divider(k, &format!("{key}-divider")))
-            .child(bottom)
-    };
-    let line = row().key("tiles-row").w_full().grow(1.0).min_h(0.0);
-    let body = match n {
-        2 => {
-            let b = tiles.pop().unwrap();
-            let a = tiles.pop().unwrap();
-            line.child(first(a)).child(grip(s, k)).child(b)
-        }
-        3 => {
-            let c = tiles.pop().unwrap();
-            let b = tiles.pop().unwrap();
-            let a = tiles.pop().unwrap();
-            line.child(first(a))
-                .child(grip(s, k))
-                .child(stack("tiles-right", b, c).grow(1.0))
-        }
-        _ => {
-            let d = tiles.pop().unwrap();
-            let c = tiles.pop().unwrap();
-            let b = tiles.pop().unwrap();
-            let a = tiles.pop().unwrap();
-            line.child(first(stack("tiles-left", a, c)))
-                .child(grip(s, k))
-                .child(stack("tiles-right", b, d).grow(1.0))
-        }
-    };
-    // No toolbar: the panes rise under the card's empty toolbar row, so
-    // their headers sit at the card's top edge.
+    let body = arrange(
+        s,
+        &tree,
+        &mut Vec::new(),
+        [0.0, 0.0, size[0], size[1]],
+        &mut cards,
+    );
+    // No toolbar: the panes rise under the window's empty toolbar row, so
+    // their headers sit at the top, a frame's width from the window's edge.
     el().key("tiles-frame").w_full().grow(1.0).min_h(0.0).child(
         col()
             .key("tiles")
@@ -695,38 +745,7 @@ pub fn view(s: &UiState, k: &Kit, clear: f32, layer: &mut Vec<El>) -> El {
                 Some(0.0),
                 Some(0.0),
             )
-            .on_layout(|s: &mut UiState, rect: [f32; 4]| s.tile_grid_w = rect[2])
+            .on_layout(|s: &mut UiState, rect: [f32; 4]| s.tile_grid = [rect[2], rect[3]])
             .child(body),
     )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn arrows_move_between_panes_as_they_sit() {
-        use Key::{Down, Left, Right, Up};
-        let cases = [
-            // Two side by side.
-            (2, 0, Right, Some(1)),
-            (2, 1, Left, Some(0)),
-            (2, 0, Down, None),
-            // One on the left beside two stacked.
-            (3, 0, Right, Some(1)),
-            (3, 2, Left, Some(0)),
-            (3, 1, Down, Some(2)),
-            (3, 2, Up, Some(1)),
-            (3, 0, Down, None),
-            // Two by two, numbered across then down.
-            (4, 0, Down, Some(2)),
-            (4, 2, Right, Some(3)),
-            (4, 3, Up, Some(1)),
-            (4, 1, Left, Some(0)),
-            (4, 3, Right, None),
-        ];
-        for (n, i, key, want) in cases {
-            assert_eq!(neighbour(n, i, &key), want, "{n} panes, from {i}, {key:?}");
-        }
-    }
 }
