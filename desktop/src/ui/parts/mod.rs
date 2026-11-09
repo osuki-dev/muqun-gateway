@@ -192,10 +192,33 @@ pub fn code(cx: &Tcx, key: &str, body: &str, language: Option<&str>, max_lines: 
     block
 }
 
+/// Open a URL or file path clicked from a Markdown link.
+/// - Web and mailto URLs (`http://`, `https://`, `mailto:`) open in the default external application.
+/// - Local file URLs (`file://...`) or workspace file paths open in the built-in file viewer.
+pub fn open_markdown_link(s: &mut UiState, url: &str, tx: &mut rune::Tx) {
+    let url = url.trim();
+    if url.is_empty() {
+        return;
+    }
+
+    if url.starts_with("http://") || url.starts_with("https://") || url.starts_with("mailto:") {
+        let _ = tx.open_url(url);
+        return;
+    }
+
+    let file_target = url.strip_prefix("file://").unwrap_or(url);
+    // Strip line fragment if present (e.g. #L10 or #L10-L20)
+    let path = file_target.split('#').next().unwrap_or(file_target);
+    s.open_timeline_file(path);
+}
+
 /// Prose an agent wrote, as Markdown.
 pub fn prose(cx: &Tcx, key: &str, body: &str) -> El {
     Markdown::new(body)
         .selectable(true)
+        .on_link_tx(|s: &mut UiState, url: &str, tx: &mut rune::Tx| {
+            open_markdown_link(s, url, tx);
+        })
         .build(cx.k)
         .key(format!("md-{key}"))
 }
@@ -855,4 +878,15 @@ pub fn plate(k: &Kit, key: String) -> El {
         .radius(k.radius.md)
         .border(1.0, k.c.border_weak)
         .fill(k.c.surface_raised_base)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn file_urls_strip_scheme_and_fragments() {
+        let raw = "file:///path/to/file.rs#L10-L25";
+        let target = raw.strip_prefix("file://").unwrap_or(raw);
+        let path = target.split('#').next().unwrap_or(target);
+        assert_eq!(path, "/path/to/file.rs");
+    }
 }

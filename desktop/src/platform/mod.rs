@@ -50,11 +50,16 @@ pub fn see_through_window() -> bool {
     cfg!(target_os = "linux")
 }
 
+/// Whether this build is running on macOS.
+pub fn is_macos() -> bool {
+    cfg!(target_os = "macos")
+}
+
 /// What the window's own controls take at the titlebar's leading edge:
 /// macOS's traffic lights, as Rune reports them. Elsewhere nothing sits
 /// there (a headless render still reports the Mac's, so ignore it).
 pub fn titlebar_inset(reported: f32) -> f32 {
-    if cfg!(target_os = "macos") {
+    if is_macos() {
         reported
     } else {
         0.0

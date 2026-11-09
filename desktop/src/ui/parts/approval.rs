@@ -321,7 +321,14 @@ pub fn what_block(k: &Kit, request: &PermissionRequest, subject: &str) -> Option
         any = true;
     }
     if let Some(message) = request.message.as_ref().filter(|m| !m.trim().is_empty()) {
-        what = what.child(Markdown::new(message).build(k));
+        what = what.child(
+            Markdown::new(message)
+                .selectable(true)
+                .on_link_tx(|s: &mut UiState, url: &str, tx: &mut rune::Tx| {
+                    super::open_markdown_link(s, url, tx);
+                })
+                .build(k),
+        );
         any = true;
     }
     any.then_some(what)

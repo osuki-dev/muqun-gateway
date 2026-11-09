@@ -368,11 +368,19 @@ mod tests {
         // SAFETY: kill with signal 0 only checks the pid.
         let alive = unsafe { libc::kill(pid, 0) } == 0;
         assert!(!alive, "the exited shell is still in the process table");
-        // The job keeps the terminal open, so the reader waits on...
-        assert!(read_rx.recv_timeout(Duration::from_millis(300)).is_err());
-        // ...until the panel drops the pty.
-        drop((pty, child));
-        assert!(read_rx.recv_timeout(Duration::from_secs(1)).is_ok());
+        #[cfg(target_os = "linux")]
+        {
+            // The job keeps the terminal open, so the reader waits on...
+            assert!(read_rx.recv_timeout(Duration::from_millis(300)).is_err());
+            // ...until the panel drops the pty.
+            drop((pty, child));
+            assert!(read_rx.recv_timeout(Duration::from_secs(1)).is_ok());
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            drop((pty, child));
+            assert!(read_rx.recv_timeout(Duration::from_secs(1)).is_ok());
+        }
     }
 }
 

@@ -758,12 +758,14 @@ fn said(s: &UiState, k: &Kit, asid: Option<&str>) -> Option<El> {
                             .a11y_hidden(),
                     )
                     .child(
-                        col()
-                            .key("said-text")
-                            .grow(1.0)
-                            .shrink()
-                            .min_w(0.0)
-                            .child(Markdown::new(shown).build(k)),
+                        col().key("said-text").grow(1.0).shrink().min_w(0.0).child(
+                            Markdown::new(shown)
+                                .selectable(true)
+                                .on_link_tx(|s: &mut UiState, url: &str, tx: &mut rune::Tx| {
+                                    crate::ui::parts::open_markdown_link(s, url, tx);
+                                })
+                                .build(k),
+                        ),
                     ),
             ),
     )

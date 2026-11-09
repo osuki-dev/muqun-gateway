@@ -1108,7 +1108,14 @@ mod tests {
         // An input method's commit goes to the shell as typed.
         rt.ime(Ime::Commit("中文".into()));
         rt.frame(1.0 / 60.0);
-        rt.key(key(Key::Command('k'), true, true));
+        if crate::platform::is_macos() {
+            let mut cmd_k = key(Key::Command('k'), false, false);
+            cmd_k.mods.logo = true;
+            cmd_k.mods.cmd = true;
+            rt.key(cmd_k);
+        } else {
+            rt.key(key(Key::Command('k'), true, true));
+        }
         rt.frame(1.0 / 60.0);
         let s = &rt.state;
         assert_eq!(
@@ -1122,7 +1129,7 @@ mod tests {
                 "text 中文",
             ]
         );
-        // Ctrl+Shift+K reached the app's Ctrl+K: the palette.
+        // Ctrl+Shift+K on Linux (Cmd+K on macOS) reached the app: the palette.
         assert!(s.palette.is_some());
         // The window's own Ctrl+Shift+H (Home) arrives as it is.
         for _ in 0..3 {

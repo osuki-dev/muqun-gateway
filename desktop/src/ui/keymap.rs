@@ -861,7 +861,11 @@ mod tests {
             key: k,
             mods: rune::Mods {
                 shift,
-                cmd: ctrl,
+                cmd: if crate::platform::is_macos() {
+                    false
+                } else {
+                    ctrl
+                },
                 ctrl,
                 ..Default::default()
             },

@@ -662,7 +662,14 @@ fn markdown(k: &Kit, source: &Arc<str>) -> El {
                     .max_w(760.0)
                     .px(32.0)
                     .py(24.0)
-                    .child(Markdown::new(source.to_string()).selectable(true).build(k)),
+                    .child(
+                        Markdown::new(source.to_string())
+                            .selectable(true)
+                            .on_link_tx(|s: &mut UiState, url: &str, tx: &mut rune::Tx| {
+                                crate::ui::parts::open_markdown_link(s, url, tx);
+                            })
+                            .build(k),
+                    ),
             ),
         )
         .scroll(rune::ScrollSpec {
