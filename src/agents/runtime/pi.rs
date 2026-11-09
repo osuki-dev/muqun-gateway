@@ -147,7 +147,19 @@ impl PiState {
     }
 
     pub(super) fn features(&self) -> crate::discovery::AgentFeatures {
-        pi_features(self.config.asks_approval())
+        let mut features = pi_features(self.config.asks_approval());
+        // Skills exist once a `get_commands` answer has listed one.
+        features.skills = self
+            .driver
+            .lock()
+            .ok()
+            .and_then(|driver| {
+                driver
+                    .as_ref()
+                    .map(|driver| crate::agents::ports::agent::AgentPort::skills_listed(&**driver))
+            })
+            .unwrap_or(false);
+        features
     }
 
     /// Write the bundled extension where `pi -e` can load it. Rewritten on

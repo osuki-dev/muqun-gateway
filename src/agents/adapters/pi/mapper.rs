@@ -17,8 +17,8 @@ use crate::agents::adapters::t3::client::ms_from_iso;
 use crate::agents::domain::{
     AgentCatalog, AgentErrorInfo, AgentPart, AgentSessionId, AgentSessionStatus, CatalogDefaults,
     CommandInfo, CompactionStatus, ModelInfo, ModelRef, ModelVariantInfo, PermissionDecision,
-    PermissionOption, PermissionRequest, SessionContextUsage, TimelineItem, TimelineRole,
-    TokensUsage, ToolCall, ToolCallStatus, ToolTime,
+    PermissionOption, PermissionRequest, SessionContextUsage, SkillInfo, TimelineItem,
+    TimelineRole, TokensUsage, ToolCall, ToolCallStatus, ToolTime,
 };
 
 /// The bundled Pi extension: approval gate plus the Muqun MCP server. Written
@@ -709,6 +709,38 @@ pub(super) fn commands(value: &Value) -> Vec<CommandInfo> {
                 description: text(command, "description").map(str::to_string),
                 mode: None,
                 template: None,
+            })
+        })
+        .collect()
+}
+
+/// The prefix Pi gives a skill's command (`get_commands`: a `"skill"`
+/// source is "named `skill:<name>`", run as `/skill:<name>`).
+pub(super) const SKILL_COMMAND_PREFIX: &str = "skill:";
+
+/// The skills among `get_commands`, by their `source`. The id is the bare
+/// name, what the App's `$` picker inserts; the command that runs one is
+/// `skill:<id>` and stays in the command list, so `slash` is off here (the
+/// slash form is already offered as that command).
+pub(super) fn skills(value: &Value) -> Vec<SkillInfo> {
+    value
+        .get("commands")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|command| text(command, "source") == Some("skill"))
+        .filter_map(|command| {
+            let name = text(command, "name")?;
+            let id = name.strip_prefix(SKILL_COMMAND_PREFIX).unwrap_or(name);
+            if id.is_empty() || id.chars().any(char::is_whitespace) || id.starts_with('/') {
+                return None;
+            }
+            Some(SkillInfo {
+                id: id.to_string(),
+                name: id.to_string(),
+                description: text(command, "description").unwrap_or_default().to_string(),
+                slash: false,
+                autoinvoke: false,
             })
         })
         .collect()
@@ -1796,5 +1828,43 @@ mod tests {
             "same text and timestamp must preserve two distinct native entries"
         );
         assert!(folder.messages.iter().all(|m| !is_provisional(&m.key)));
+    }
+
+    /// `get_commands` lists extension commands, prompt templates and skills
+    /// in one list; every one stays a command (`/name`), and the skills are
+    /// also offered by their bare name for the `$` picker.
+    #[test]
+    fn skills_are_the_skill_sourced_commands_by_their_bare_name() {
+        let listed = json!({"commands": [
+            {"name": "example", "source": "extension"},
+            {"name": "fix-tests", "description": "Fix failing tests", "source": "prompt"},
+            {"name": "skill:review", "description": "Review a change", "source": "skill"},
+            {"name": "unprefixed", "description": "Older spelling", "source": "skill"},
+            {"name": "skill:", "source": "skill"},
+            {"name": "/settings", "source": "extension"},
+        ]});
+        assert_eq!(
+            commands(&listed)
+                .iter()
+                .map(|command| command.name.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "example",
+                "fix-tests",
+                "skill:review",
+                "unprefixed",
+                "skill:"
+            ]
+        );
+        assert_eq!(
+            skills(&listed)
+                .iter()
+                .map(|skill| (skill.id.as_str(), skill.description.as_str(), skill.slash))
+                .collect::<Vec<_>>(),
+            [
+                ("review", "Review a change", false),
+                ("unprefixed", "Older spelling", false)
+            ]
+        );
     }
 }

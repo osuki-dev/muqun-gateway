@@ -8,3 +8,5 @@ pub use client::{AcpClient, AcpEvent};
 pub(crate) mod operations;
 
 pub(crate) mod recovery;
+
+pub(crate) mod skills;

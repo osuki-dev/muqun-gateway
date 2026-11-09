@@ -2,6 +2,25 @@
 
 ## Changes and fixes
 
+- **The agent catalog lists Claude Code's, Cursor's, Qoder's and Pi's
+  skills, so the App's and the desktop's `$` picker offers them.**
+  `GET /api/agent-catalog` answered `skills: []` for every agent but Codex,
+  OpenCode and T3: Claude Code (through `claude-agent-acp`), Cursor and
+  Qoder list their skills among the slash commands with nothing to tell
+  them apart, and Pi lists them as `skill:<name>` commands. A listed
+  command whose name a `SKILL.md` declares in the agent's skill directories
+  (`~/.claude/skills`, a checkout's `.claude/skills` and `.agents/skills`,
+  `$CLAUDE_CONFIG_DIR`, installed plugins as `<plugin>:<name>`; Cursor's and
+  Qoder's own directories) is now also a `skills` entry with that name as
+  its id, and Pi's `"skill"`-sourced commands are entries by their bare
+  name. The command stays in `commands`, so `/name args` keeps running the
+  skill with its arguments; `POST …/skill {skill}` runs it as `/name`
+  (Pi: `/skill:name`). Discovery's `features.skills` turns on for these
+  agents once a catalog has listed one. A skill the CLI bundles without a
+  file on disk (`claude-api`, `dataviz`, …) stays a command only, and
+  Antigravity, FX, DeepSeek and T3 are unchanged: the first two list no
+  skills; the others already did.
+
 - **Large videos can be uploaded in chunks, up to 1 GiB, without the Gateway
   buffering the file.** `POST /api/uploads` reads its whole body into memory
   (and a sealed body cannot be streamed), which is why it stops at 64 MiB.
