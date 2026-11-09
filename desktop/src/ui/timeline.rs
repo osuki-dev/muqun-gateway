@@ -796,13 +796,14 @@ fn changes_toolbar(s: &UiState, k: &Kit, asid: &str) -> El {
     .build(k)
     .key("changes-stats");
 
-    let left = row()
-        .gap(10.0)
+    let row_top = row()
+        .key("tb-top")
+        .w_full()
         .center_y()
-        .shrink()
-        .grow(1.0)
+        .gap(8.0)
         .child(back_btn)
         .child(title)
+        .child(col().grow(1.0))
         .child(stats_badge);
 
     let unified_active = mode == DiffMode::Unified;
@@ -879,24 +880,27 @@ fn changes_toolbar(s: &UiState, k: &Kit, asid: &str) -> El {
         .build(k)
         .key("btn-commit-agent");
 
-    let right = row()
-        .gap(6.0)
+    let row_bottom = row()
+        .key("tb-bottom")
+        .w_full()
         .center_y()
+        .gap(6.0)
         .child(unified_btn)
         .child(split_btn)
         .child(wrap_btn)
+        .child(col().grow(1.0))
         .child(commit_btn)
         .child(refresh_btn);
 
-    row()
+    col()
         .key("changes-toolbar")
         .w_full()
-        .px(16.0)
-        .py(8.0)
-        .center_y()
+        .px(12.0)
+        .py(6.0)
+        .gap(6.0)
         .fill(k.c.layer_01)
-        .child(left)
-        .child(right)
+        .child(row_top)
+        .child(row_bottom)
 }
 
 /// Horizontal selector pills for changed files when reviewing a multi-file diff.
@@ -1172,6 +1176,22 @@ pub fn changes(s: &UiState, k: &Kit) -> El {
                 .key("changes-diff")
                 .on_visible_file(|s: &mut UiState, file_idx| {
                     s.diff_active_file = file_idx;
+                })
+                .on_comment(|s: &mut UiState, lines, _tx| {
+                    if let Some(file) = s.diff.as_ref().and_then(|d| d.files().get(lines.file)) {
+                        let path = file.path();
+                        let target = if lines.start.line == lines.end.line {
+                            format!("Regarding `{}` line {}: ", path, lines.start.line)
+                        } else {
+                            format!(
+                                "Regarding `{}` lines {}-{}: ",
+                                path, lines.start.line, lines.end.line
+                            )
+                        };
+                        s.draft = rune::TextEdit::new(target);
+                        s.draft.focused = true;
+                        s.show_diff = false;
+                    }
                 })
                 .header_actions(move |s: &UiState, file_idx| diff_file_actions(s, &kit, file_idx))
                 .build(s, k),

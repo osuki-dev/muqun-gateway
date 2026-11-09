@@ -333,13 +333,31 @@ fn git(s: &UiState, k: &Kit) -> Vec<El> {
                 s.diff_stat.files, s.diff_stat.added, s.diff_stat.removed
             ),
         ));
-        for f in s.diff_stat.paths.iter().take(12) {
+        for (i, f) in s.diff_stat.paths.iter().take(12).enumerate() {
+            let p = f.path.clone();
+            let asid = s.selected.clone().unwrap_or_default();
+            let diff_btn = small(
+                k,
+                t("Diff", "差异"),
+                ButtonVariant::Ghost,
+                format!("open-diff-item-{i}"),
+                move |s| {
+                    if !asid.is_empty() {
+                        s.send(Command::OpenDiff {
+                            asid: AgentSessionId(asid.clone()),
+                            file: Some(p.clone()),
+                        });
+                    }
+                    s.mode = Mode::Session;
+                    s.show_diff = true;
+                },
+            );
             out.push(item(
                 k,
                 format!("gf-{}", f.path),
                 f.path.clone(),
                 format!("+{} −{}", f.added, f.removed),
-                None,
+                Some(diff_btn),
             ));
         }
         out.push(small(
