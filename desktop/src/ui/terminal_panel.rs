@@ -18,14 +18,15 @@ use std::path::PathBuf;
 
 use rune::{col, el, memo, row, text, text_input, Color, El, KeyEvent, TextEdit, TextStyle, Tx};
 use rune_kit::shell::PaneState;
-use rune_kit::{Badge, BadgeVariant, ControlSize, IconButton, IconButtonVariant, Kit, MenuItem};
+use rune_kit::{Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, Kit, MenuItem};
 
 use super::copy::tr_ref;
 use super::UiState;
+use crate::platform::pty::Exit;
 use crate::term::engine::{Colors, MouseInput, MousePhase, Size};
 use crate::term::grid::{CursorShape, Frame, Rgb, Row};
 use crate::term::input::{self, Mods, Route};
-use crate::term::session::{Msg, Session};
+use crate::term::session::{Ended, Msg, Session};
 use crate::theme::color_scheme::ColorScheme;
 
 pub static TERMINAL_WINDOW: rune::Icon = rune::Icon {
@@ -46,10 +47,14 @@ static RESTART: rune::Icon = rune::Icon {
 /// The grid's type: the mono slot (JetBrains Mono where installed).
 const FONT_SIZE: f32 = 13.0;
 const LINE: f32 = 17.0;
-/// Inside the grid's card, around the cells.
-const INSET: f32 = 6.0;
-/// The title strip's height: one dense desktop line.
-const HEAD: f32 = 34.0;
+/// Inside the panel, beside and below the cells.
+const INSET: f32 = 10.0;
+/// The title strip's height: the main card's toolbar row, so the two line up.
+const HEAD: f32 = rune_kit::shell::TOOLBAR_HEIGHT;
+/// A shell that fails this soon after it started did not start right: the
+/// panel stays to say so. Later, any exit is the owner's `exit` or Ctrl+D
+/// (whose status is only the last command's).
+const EARLY: std::time::Duration = std::time::Duration::from_secs(3);
 
 fn style() -> TextStyle {
     TextStyle::new(FONT_SIZE, 400.0).mono().lh(LINE)
@@ -82,6 +87,8 @@ pub struct TermPanel {
     /// Screenshot scenes: what a program would print at a size, replayed
     /// into a fresh emulator instead of a live shell.
     pub fixture: Option<fn(u16, u16) -> Vec<u8>>,
+    /// Screenshot scenes: how the fixture's shell ended.
+    pub fixture_ended: Option<Ended>,
     pub error: Option<String>,
     /// The grid's size the shell and emulator have, in cells.
     size: Option<Size>,
@@ -114,6 +121,7 @@ impl TermPanel {
             sink: TextEdit::new(""),
             waker: None,
             fixture: None,
+            fixture_ended: None,
             error: None,
             size: None,
             resize: Resizer::default(),
@@ -187,11 +195,12 @@ impl Resizer {
 }
 
 /// The grid's size in cells: across from the pane's settled width (the
-/// grid fills it, inside the body's inset), never its width mid-slide;
-/// down from the laid-out height.
+/// grid fills its panel, inside the panel's frame and the body's inset),
+/// never its width mid-slide; down from the laid-out height.
 fn grid_size(pane_width: f32, height: f32, m: Metrics, scale: f32) -> Size {
+    let across = pane_width - 2.0 * super::panes::FRAME - 2.0 * INSET;
     Size {
-        cols: (((pane_width - 2.0 * INSET) / m.cw).floor() as u16).max(2),
+        cols: ((across / m.cw).floor() as u16).max(2),
         rows: ((height / m.ch).floor() as u16).max(1),
         cell_w: (m.cw * scale).round().max(1.0) as u32,
         cell_h: (m.ch * scale).round().max(1.0) as u32,
@@ -212,6 +221,21 @@ fn color(c: Rgb) -> Color {
 fn to_rgb(c: Color) -> Rgb {
     let e = |v: f32| (rune::color::srgb_encode(v.clamp(0.0, 1.0)) * 255.0).round() as u8;
     Rgb(e(c.r), e(c.g), e(c.b))
+}
+
+/// The panel's floor: the terminal's background (a program may set its own).
+pub fn surface(s: &UiState, k: &Kit, scheme: ColorScheme) -> Color {
+    color(s.term.frame.as_ref().map_or(colors(k, scheme).bg, |f| f.bg))
+}
+
+/// Whether a session that ended so, `lived` after it started, ended as the
+/// owner meant it to: then the panel closes. Otherwise it stays to say how.
+fn ended_well(ended: Ended, lived: std::time::Duration) -> bool {
+    match ended {
+        Ended::Shell(Exit::Code(0)) => true,
+        Ended::Shell(Exit::Code(_)) => lived >= EARLY,
+        Ended::Shell(Exit::Signal(_)) | Ended::Broken => false,
+    }
 }
 
 /// The terminal's colours for this theme and scheme: the pack's own terminal
@@ -420,7 +444,27 @@ impl UiState {
             self.term.frame = Some(frame);
             changed = true;
         }
-        changed
+        self.settle_terminal() | changed
+    }
+
+    /// The shell ended as the owner meant it to (`exit`, Ctrl+D): close the
+    /// panel and drop the session, so the next Ctrl+` starts a fresh shell.
+    /// Ended otherwise, it stays with a notice and a Restart.
+    fn settle_terminal(&mut self) -> bool {
+        let Some(session) = &self.term.session else {
+            return false;
+        };
+        match session.ended() {
+            Some(ended) if ended_well(ended, session.started.elapsed()) => {
+                self.term.session = None;
+                self.term.frame = None;
+                if self.term.open {
+                    self.close_terminal();
+                }
+                true
+            }
+            _ => false,
+        }
     }
 
     /// A key while the terminal has the keyboard (the sink's key handler).
@@ -444,7 +488,12 @@ impl UiState {
                 }
             }
             Route::Terminal => {
-                if self.term.session.as_ref().is_some_and(Session::exited) {
+                if self
+                    .term
+                    .session
+                    .as_ref()
+                    .is_some_and(|x| x.ended().is_some())
+                {
                     if ev.key == rune::Key::Enter {
                         self.restart_terminal();
                     }
@@ -486,7 +535,12 @@ pub fn view(s: &UiState, k: &Kit, scheme: ColorScheme, scale: f32, layer: &mut V
     let m = metrics();
     let frame = s.term.frame.as_ref();
     let bg = color(frame.map_or(colors.bg, |f| f.bg));
-    let exited = s.term.session.as_ref().is_some_and(Session::exited);
+    let ended = s
+        .term
+        .session
+        .as_ref()
+        .and_then(Session::ended)
+        .or(s.term.fixture_ended);
 
     let title = frame
         .map(|f| f.title.clone())
@@ -500,12 +554,14 @@ pub fn view(s: &UiState, k: &Kit, scheme: ColorScheme, scale: f32, layer: &mut V
                 .unwrap_or_else(|| s.terminal_cwd());
             short_path(&cwd)
         });
-    // A desktop pane's title strip: one dense line, then the grid edge to edge.
-    let mut header = row()
+    // The title strip: on the panel's floor, as tall as the main card's
+    // toolbar so the two rows line up; then the grid, inset in the floor.
+    let header = row()
         .key("terminal-head")
         .w_full()
         .h(HEAD)
-        .px(10.0)
+        .pl(INSET + 4.0)
+        .pr(INSET)
         .gap(6.0)
         .center_y()
         .child(
@@ -522,16 +578,7 @@ pub fn view(s: &UiState, k: &Kit, scheme: ColorScheme, scale: f32, layer: &mut V
                 .shrink()
                 .min_w(0.0)
                 .grow(1.0),
-        );
-    if exited {
-        header = header.child(
-            Badge::new(tr_ref(language, "Exited", "已退出"))
-                .variant(BadgeVariant::Subtle)
-                .build(k)
-                .key("terminal-exited"),
-        );
-    }
-    header = header
+        )
         .child(
             IconButton::new(&RESTART)
                 .variant(IconButtonVariant::GhostMuted)
@@ -557,8 +604,9 @@ pub fn view(s: &UiState, k: &Kit, scheme: ColorScheme, scale: f32, layer: &mut V
         .w_full()
         .grow(1.0)
         .min_h(0.0)
-        .padding(INSET)
-        .fill(bg)
+        .px(INSET)
+        .pb(INSET)
+        .gap(8.0)
         .child(grid);
     if let Some(err) = &s.term.error {
         body = body.child(
@@ -568,17 +616,8 @@ pub fn view(s: &UiState, k: &Kit, scheme: ColorScheme, scale: f32, layer: &mut V
                 .color(k.c.danger.fg)
                 .wrap(),
         );
-    } else if exited {
-        body = body.child(
-            text(tr_ref(
-                language,
-                "The shell ended. Press Return for a new one.",
-                "Shell 已结束，按回车开一个新的。",
-            ))
-            .key("terminal-ended")
-            .font(k.ty.caption())
-            .color(k.c.text_muted),
-        );
+    } else if let Some(ended) = ended {
+        body = body.child(ended_notice(k, language, ended));
     }
     col()
         .key("terminal-panel")
@@ -586,13 +625,49 @@ pub fn view(s: &UiState, k: &Kit, scheme: ColorScheme, scale: f32, layer: &mut V
         .h_full()
         .min_h(0.0)
         .child(header)
-        .child(
-            el().key("terminal-rule")
-                .w_full()
-                .h(1.0)
-                .fill(k.c.border_muted),
-        )
         .child(body)
+}
+
+/// What a shell that ended badly says under its last screen: how it ended,
+/// and a new one a press (or Return) away.
+fn ended_notice(k: &Kit, language: crate::config::Language, ended: Ended) -> El {
+    use super::copy::tr;
+    let what = match ended {
+        Ended::Shell(Exit::Code(n)) => tr(
+            language,
+            &format!("Shell exited (code {n})"),
+            &format!("Shell 已退出（代码 {n}）"),
+        ),
+        Ended::Shell(Exit::Signal(n)) => tr(
+            language,
+            &format!("Shell exited (signal {n})"),
+            &format!("Shell 已退出（信号 {n}）"),
+        ),
+        Ended::Broken => tr(language, "The terminal stopped", "终端已停止"),
+    };
+    row()
+        .key("terminal-ended")
+        .w_full()
+        .gap(10.0)
+        .center_y()
+        .child(
+            text(what)
+                .key("terminal-ended-text")
+                .font(k.ty.caption())
+                .color(k.c.text_muted)
+                .truncate()
+                .shrink()
+                .min_w(0.0)
+                .grow(1.0),
+        )
+        .child(
+            Button::new(tr_ref(language, "Restart", "重新启动"))
+                .variant(ButtonVariant::Outline)
+                .control_size(ControlSize::Small)
+                .on_press(|s: &mut UiState| s.restart_terminal())
+                .build(k)
+                .key("terminal-ended-restart"),
+        )
 }
 
 /// Right-click: what a desktop terminal offers there.
@@ -731,7 +806,10 @@ fn grid(s: &UiState, k: &Kit, frame: Option<&Frame>, m: Metrics, bg: Color, scal
             draw_row(&key, &row, y, m)
         }));
     }
-    if let Some(cursor) = frame.cursor {
+    // A shell that ended takes no more keys: no cursor.
+    let ended = s.term.fixture_ended.is_some()
+        || s.term.session.as_ref().is_some_and(|x| x.ended().is_some());
+    if let Some(cursor) = frame.cursor.filter(|_| !ended) {
         let cells = if cursor.wide { 2.0 } else { 1.0 };
         let (x, y) = (f32::from(cursor.col) * m.cw, f32::from(cursor.row) * m.ch);
         let c = color(frame.cursor_color);
@@ -888,8 +966,9 @@ mod tests {
     #[test]
     fn the_grid_takes_the_settled_pane_width_and_a_drag_paces_its_resizes() {
         let m = Metrics { cw: 8.0, ch: 17.0 };
-        // 560 wide less the inset on each side: 68 columns, whatever the slide.
-        assert_eq!(grid_size(560.0, 850.0, m, 2.0).cols, 68);
+        // 560 wide less the panel's frame and the inset on each side: 65
+        // columns, whatever the slide.
+        assert_eq!(grid_size(560.0, 850.0, m, 2.0).cols, 65);
         assert_eq!(grid_size(560.0, 850.0, m, 2.0).rows, 50);
 
         let size = |cols| Size {
@@ -918,6 +997,73 @@ mod tests {
         assert!(r.wait(1.5).is_some());
         assert_eq!(r.due(1.5, false), Some(size(91)));
         assert_eq!(r.due(1.6, false), None);
+    }
+
+    /// The panel over a real pty running `/bin/sh -c script`, polled until
+    /// the shell has ended and the panel has settled.
+    #[cfg(unix)]
+    fn panel_after(script: &str) -> UiState {
+        let (tx, _rx) = commands::channel();
+        let mut s = UiState::new(tx);
+        s.open_terminal();
+        let size = grid_size(560.0, 340.0, Metrics { cw: 8.0, ch: 17.0 }, 1.0);
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.args(["-c", script]);
+        let session = Session::start_command(
+            cmd,
+            size,
+            colors(&Kit::neutral(false), ColorScheme::Light),
+            std::sync::Arc::new(|| {}),
+        )
+        .unwrap();
+        s.term.session = Some(session);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while s.term.session.as_ref().is_some_and(|x| x.ended().is_none()) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the shell never ended"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        s.settle_terminal();
+        s
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_shell_that_exits_closes_the_panel_and_one_that_fails_stays_to_say_so() {
+        // `exit` (status 0): the panel closes and the next open starts fresh.
+        let s = panel_after("echo bye; exit 0");
+        assert!(!s.term.open && !s.term.pane.is_open());
+        assert!(s.term.session.is_none() && s.term.frame.is_none());
+        assert!(!s.term.mounted());
+
+        // Failing at once: the panel stays, with the shell's last screen
+        // and how it ended.
+        let s = panel_after("echo 'no such rc file'; exit 3");
+        assert!(s.term.open);
+        let session = s.term.session.as_ref().unwrap();
+        assert_eq!(session.ended(), Some(Ended::Shell(Exit::Code(3))));
+        let frame = session.take_frame().expect("the last screen");
+        let screen: String = frame
+            .grid
+            .iter()
+            .flat_map(|r| &r.runs)
+            .map(|r| r.text.as_str())
+            .collect();
+        assert!(screen.contains("no such rc file"), "{screen:?}");
+    }
+
+    #[test]
+    fn a_late_nonzero_exit_is_the_owners_own() {
+        use std::time::Duration;
+        let late = EARLY + Duration::from_secs(1);
+        assert!(ended_well(Ended::Shell(Exit::Code(0)), Duration::ZERO));
+        assert!(!ended_well(Ended::Shell(Exit::Code(3)), Duration::ZERO));
+        // Ctrl+D after a failed command: the shell exits with its status.
+        assert!(ended_well(Ended::Shell(Exit::Code(1)), late));
+        assert!(!ended_well(Ended::Shell(Exit::Signal(9)), late));
+        assert!(!ended_well(Ended::Broken, late));
     }
 
     fn key(key: Key, ctrl: bool, shift: bool) -> KeyEvent {

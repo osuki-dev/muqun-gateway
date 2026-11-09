@@ -8,7 +8,6 @@
 
 use std::io::Read;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -16,13 +15,25 @@ use std::time::{Duration, Instant};
 use super::engine::{Colors, Engine, MouseInput, Size};
 use super::grid::Frame;
 use super::input::{KeyInput, Mods};
-use crate::platform::pty::{self, WinSize};
+use crate::platform::pty::{self, Exit, WinSize};
 
 /// The shortest time between two published frames.
 const FRAME_GAP: Duration = Duration::from_millis(8);
 /// Bytes read from the shell but not yet parsed, at most: past this the
 /// reader stops reading and the shell blocks on its writes.
 const MAX_IN_FLIGHT: usize = 4 << 20;
+/// Once the shell has ended, how long its last words may take to arrive
+/// (a job it left behind may hold the terminal open for good).
+const LAST_WORDS: Duration = Duration::from_millis(150);
+
+/// How a session ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ended {
+    /// The shell exited, or a signal killed it.
+    Shell(Exit),
+    /// The emulator could not start, or the shell stopped taking input.
+    Broken,
+}
 
 pub enum Msg {
     Key(KeyInput),
@@ -41,6 +52,8 @@ pub enum Msg {
     /// Drop the history and have the shell redraw its prompt (Ctrl+L).
     Clear,
     Eof,
+    /// The shell ended.
+    Exited(Exit),
     /// The panel closed: hang the shell up and stop.
     Shutdown,
 }
@@ -52,11 +65,24 @@ struct InFlight {
     drained: Condvar,
 }
 
+/// Lets the reader go, however full the pipe, when the emulator stops: it
+/// then finds its pty gone and ends too.
+struct Release(Arc<InFlight>);
+
+impl Drop for Release {
+    fn drop(&mut self) {
+        *self.0.bytes.lock().unwrap_or_else(|e| e.into_inner()) = 0;
+        self.0.drained.notify_all();
+    }
+}
+
 pub struct Session {
     tx: mpsc::Sender<Msg>,
     latest: Arc<Mutex<Option<Frame>>>,
-    exited: Arc<AtomicBool>,
+    ended: Arc<Mutex<Option<Ended>>>,
     pub cwd: PathBuf,
+    /// When the shell started.
+    pub started: Instant,
 }
 
 impl Session {
@@ -67,11 +93,46 @@ impl Session {
         colors: Colors,
         wake: rune::Waker,
     ) -> std::io::Result<Self> {
-        let (mut pty, child) = pty::spawn_shell(&cwd, winsize(size))?;
-        let mut reader = pty.reader()?;
+        Self::start_on(cwd, size, colors, wake, |cwd, ws, on_exit| {
+            pty::spawn_shell(cwd, ws, on_exit)
+        })
+    }
+
+    /// `cmd` instead of the owner's shell, through the same pty.
+    #[cfg(all(test, unix))]
+    pub fn start_command(
+        cmd: std::process::Command,
+        size: Size,
+        colors: Colors,
+        wake: rune::Waker,
+    ) -> std::io::Result<Self> {
+        Self::start_on(PathBuf::from("/"), size, colors, wake, |_, ws, on_exit| {
+            pty::spawn_command(cmd, ws, on_exit)
+        })
+    }
+
+    fn start_on(
+        cwd: PathBuf,
+        size: Size,
+        colors: Colors,
+        wake: rune::Waker,
+        spawn: impl FnOnce(
+            &std::path::Path,
+            WinSize,
+            pty::OnExit,
+        ) -> std::io::Result<(pty::Pty, pty::Child)>,
+    ) -> std::io::Result<Self> {
         let (tx, rx) = mpsc::channel::<Msg>();
+        let on_exit: pty::OnExit = {
+            let tx = tx.clone();
+            Box::new(move |exit| {
+                let _ = tx.send(Msg::Exited(exit));
+            })
+        };
+        let (mut pty, child) = spawn(&cwd, winsize(size), on_exit)?;
+        let mut reader = pty.reader()?;
         let latest = Arc::new(Mutex::new(None));
-        let exited = Arc::new(AtomicBool::new(false));
+        let ended = Arc::new(Mutex::new(None));
         let in_flight = Arc::new(InFlight::default());
 
         {
@@ -106,26 +167,56 @@ impl Session {
 
         {
             let latest = latest.clone();
-            let exited = exited.clone();
+            let ended = ended.clone();
             std::thread::Builder::new()
                 .name("muqun-term".into())
                 .spawn(move || {
-                    // Dropped with the thread: hangs the shell up.
+                    // Dropped with the thread: hangs up a shell still
+                    // running, and stops the reader.
                     let _child = child;
+                    let _release = Release(in_flight.clone());
+                    let end = |how: Ended| {
+                        *ended.lock().unwrap() = Some(how);
+                        wake();
+                    };
                     let mut engine = match Engine::new(size, colors) {
                         Ok(e) => e,
                         Err(err) => {
                             tracing::warn!("terminal: could not start the emulator: {err}");
-                            exited.store(true, Ordering::Release);
-                            wake();
+                            end(Ended::Broken);
                             return;
                         }
                     };
                     let mut last = Instant::now() - FRAME_GAP;
                     let mut pending = false;
+                    // How it ended, once it has; and whether all its output
+                    // is in, or until when it may still come.
+                    let mut how: Option<Ended> = None;
+                    let mut eof = false;
+                    let mut until = Instant::now();
                     loop {
-                        let msg = if pending {
-                            let wait = (last + FRAME_GAP).saturating_duration_since(Instant::now());
+                        if let Some(how) = how.filter(|_| eof || Instant::now() >= until) {
+                            // The last frame, then the news.
+                            if pending {
+                                if let Ok(Some(frame)) = engine.frame() {
+                                    *latest.lock().unwrap() = Some(frame);
+                                }
+                            }
+                            end(how);
+                            return;
+                        }
+                        let msg = if pending || how.is_some() {
+                            let mut wait =
+                                (last + FRAME_GAP).saturating_duration_since(Instant::now());
+                            if how.is_some() {
+                                wait = until.saturating_duration_since(Instant::now());
+                                if pending {
+                                    wait = wait.min(
+                                        (last + FRAME_GAP)
+                                            .saturating_duration_since(Instant::now()),
+                                    );
+                                }
+                            }
                             match rx.recv_timeout(wait) {
                                 Ok(m) => Some(m),
                                 Err(RecvTimeoutError::Timeout) => None,
@@ -170,16 +261,18 @@ impl Session {
                                 }
                                 Msg::Colors(c) => log(engine.set_colors(c)),
                                 Msg::Clear => log(engine.clear()),
-                                Msg::Eof => {
-                                    exited.store(true, Ordering::Release);
+                                Msg::Eof => eof = true,
+                                Msg::Exited(exit) => {
+                                    how = Some(Ended::Shell(exit));
+                                    until = Instant::now() + LAST_WORDS;
                                 }
                                 Msg::Shutdown => return,
                             }
                             pending = true;
                         }
                         let out = engine.take_output();
-                        if !out.is_empty() && pty.write_all(&out).is_err() {
-                            exited.store(true, Ordering::Release);
+                        if !out.is_empty() && how.is_none() && pty.write_all(&out).is_err() {
+                            how = Some(Ended::Broken);
                         }
                         if pending && last.elapsed() >= FRAME_GAP {
                             last = Instant::now();
@@ -192,10 +285,6 @@ impl Session {
                                 Ok(None) => {}
                                 Err(err) => tracing::warn!("terminal frame: {err}"),
                             }
-                            if exited.load(Ordering::Acquire) {
-                                wake();
-                                return;
-                            }
                         }
                     }
                 })?;
@@ -203,8 +292,9 @@ impl Session {
         Ok(Self {
             tx,
             latest,
-            exited,
+            ended,
             cwd,
+            started: Instant::now(),
         })
     }
 
@@ -217,9 +307,10 @@ impl Session {
         self.latest.lock().unwrap().take()
     }
 
-    /// The shell ended (or never started).
-    pub fn exited(&self) -> bool {
-        self.exited.load(Ordering::Acquire)
+    /// How the session ended, once it has (its last frame is published
+    /// before).
+    pub fn ended(&self) -> Option<Ended> {
+        *self.ended.lock().unwrap()
     }
 }
 

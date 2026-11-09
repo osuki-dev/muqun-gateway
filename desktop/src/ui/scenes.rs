@@ -987,6 +987,20 @@ fn base_scenes() -> &'static [Scene] {
         }),
         ("terminal", |s| terminal_scene(s, shell_fixture)),
         ("terminal-vim", |s| terminal_scene(s, vim_fixture)),
+        ("terminal-ended", |s| {
+            terminal_scene(s, shell_fixture);
+            s.term.fixture_ended = Some(crate::term::session::Ended::Shell(
+                crate::platform::pty::Exit::Code(3),
+            ));
+        }),
+        ("terminal-plain", |s| {
+            terminal_scene(s, shell_fixture);
+            s.cfg.appearance.reduced_transparency = true;
+        }),
+        ("timeline-detail-plain", |s| {
+            timeline_detail(s);
+            s.cfg.appearance.reduced_transparency = true;
+        }),
         ("terminal-menu", |s| {
             terminal_scene(s, shell_fixture);
             s.term.menu_at = Some(rune::PointerPress {

@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use rune::{col, el, row, text, Cx, El, SurfaceFit};
+use rune::{col, el, row, text, Color, Cx, El, SurfaceFit};
 use rune_kit::glyphs::TRIANGLE_DOWN;
 use rune_kit::shell::{SidebarToggle, SplitView, Toolbar, INSPECTOR};
 use rune_kit::{
@@ -80,8 +80,15 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
     let details = (s.mode == Mode::Session)
         .then(|| timeline::detail_pane(s, k))
         .flatten();
-    // The right-hand pane's width, for its floor on a see-through window.
+    // The right-hand pane's width, for the main card's floor on a
+    // see-through window.
     let mut right_w = 0.0;
+    // Each right-hand pane floats in its own panel, as the sidebar does.
+    let wash = if look.see_through {
+        SEE_THROUGH_FLOOR[usize::from(look.dark)]
+    } else {
+        0.0
+    };
     if s.term.mounted() && (s.term.open || (details.is_none() && !inspector_here)) {
         right_w = s.term.pane.shown_width();
         let scheme = if k.dark {
@@ -89,17 +96,34 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
         } else {
             crate::theme::color_scheme::ColorScheme::Light
         };
+        // The terminal's own background is its panel's floor, corner to
+        // corner, a breath of the desktop through it as the card has.
+        let alpha = if look.see_through {
+            SEE_THROUGH_CARD[usize::from(look.dark)]
+        } else {
+            1.0
+        };
+        let surface = super::terminal_panel::surface(s, k, scheme).alpha(alpha);
+        let view = super::terminal_panel::view(s, k, scheme, cx.env().scale, layer);
         split = split.inspector(
             &s.term.pane,
             super::terminal_pane,
-            super::terminal_panel::view(s, k, scheme, cx.env().scale, layer),
+            right_panel(k, wash, look.dark, Some(surface), view),
         );
     } else if let Some(pane) = details {
         right_w = s.inspect_pane.shown_width();
-        split = split.inspector(&s.inspect_pane, super::inspect_pane, pane);
+        split = split.inspector(
+            &s.inspect_pane,
+            super::inspect_pane,
+            right_panel(k, wash, look.dark, None, pane),
+        );
     } else if inspector_here {
         right_w = s.right.shown_width();
-        split = split.inspector(&s.right, super::right_pane, inspector::view(s, k));
+        split = split.inspector(
+            &s.right,
+            super::right_pane,
+            right_panel(k, wash, look.dark, None, inspector::view(s, k)),
+        );
     }
     let mut split = split
         .titlebar_inset(crate::platform::titlebar_inset(cx.titlebar_inset()))
@@ -134,7 +158,6 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
                 SEE_THROUGH_FLOOR[usize::from(look.dark)],
             ))
             .children(card_floor(s, k, &look, window, right_w))
-            .children(right_floor(k, &look, right_w))
             .child(split.build(&chrome));
         return root.on_layout(|s: &mut UiState, r| s.fits.window = r[2]);
     }
@@ -225,24 +248,6 @@ fn card_floor(
     Some(floor)
 }
 
-/// The right-hand pane's floor on a see-through window, `w` points wide: a
-/// panel like the sidebar's, inset from the window's edges and a frame's
-/// width from the main card.
-fn right_floor(k: &Kit, look: &Look, w: f32) -> Option<El> {
-    let frame = super::panes::FRAME;
-    (w > 0.0).then(|| {
-        el().key("right-floor")
-            .pin(None, Some(frame), Some(frame), Some(frame))
-            .w((w - frame * 2.0).max(0.0))
-            .radius(k.radius.lg)
-            .clip_rounded(k.radius.lg)
-            .fill(k.c.bg_deep.alpha(SEE_THROUGH_FLOOR[usize::from(look.dark)]))
-            .border(1.0, k.c.border_muted)
-            .motion(super::panes::SPRING)
-            .a11y_hidden()
-    })
-}
-
 /// How much of the page colour the sidebar's panel lays over the window
 /// floor (light, dark): a half step between the floor and the main card,
 /// so the card stays the one surface that leads.
@@ -260,24 +265,63 @@ fn sidebar_panel(s: &UiState, k: &Kit, wash: f32) -> El {
     } else {
         super::panes::SPRING
     };
-    let tint = SIDEBAR_TINT[usize::from(s.look().dark)];
-    let panel = el()
-        .key("sidebar-panel")
+    panel_surface(k, "sidebar-panel", wash, s.look().dark)
         .pin(Some(frame), Some(frame), None, Some(frame))
         .w((s.sidebar.width() - frame * 2.0).max(0.0))
+        .opacity(if open { 1.0 } else { 0.0 })
+        .opacity_motion(super::panes::SPRING)
+        .motion(motion)
+        .a11y_hidden()
+}
+
+/// A side panel's surface: the window floor at `wash`, the page colour over
+/// it at the sidebar's tint, with the main card's radius and hairline.
+fn panel_surface(k: &Kit, key: &str, wash: f32, dark: bool) -> El {
+    let tint = SIDEBAR_TINT[usize::from(dark)];
+    col()
+        .key(key.to_string())
         .radius(k.radius.lg)
         .fill(k.c.bg_deep.alpha(wash))
         .border(1.0, k.c.border_muted)
         .clip_rounded(k.radius.lg)
-        .opacity(if open { 1.0 } else { 0.0 })
-        .opacity_motion(super::panes::SPRING)
-        .motion(motion)
-        .a11y_hidden();
-    panel.child(
-        el().key("sidebar-panel-tint")
-            .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
-            .fill(k.c.bg_base.alpha(tint)),
-    )
+        .child(
+            el().key(format!("{key}-tint"))
+                .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
+                .fill(k.c.bg_base.alpha(tint))
+                .a11y_hidden(),
+        )
+}
+
+/// A right-hand pane in its own panel, as the sidebar's: a frame in from
+/// the window's edges and from the main card (the window shows in the gap),
+/// on its own floor (the sidebar's, or `surface` when the pane brings its
+/// own), its content held inside the rounded corners. The slot already
+/// starts a frame down, under the title strip.
+fn right_panel(k: &Kit, wash: f32, dark: bool, surface: Option<Color>, content: El) -> El {
+    let frame = super::panes::FRAME;
+    let mut panel = panel_surface(k, "right-panel", wash, dark);
+    if let Some(surface) = surface {
+        panel = col()
+            .key("right-panel")
+            .radius(k.radius.lg)
+            .fill(surface)
+            .border(1.0, k.c.border_muted)
+            .clip_rounded(k.radius.lg);
+    }
+    col()
+        .key("right-frame")
+        .w_full()
+        .h_full()
+        .pl(frame)
+        .pr(frame)
+        .pb(frame)
+        .child(
+            panel
+                .w_full()
+                .grow(1.0)
+                .min_h(0.0)
+                .child(content.w_full().h_full().min_h(0.0)),
+        )
 }
 
 /// The theme's wallpaper across the whole window, behind sidebar and card:
