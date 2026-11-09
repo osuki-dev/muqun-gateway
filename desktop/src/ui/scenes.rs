@@ -922,6 +922,14 @@ pub fn scenes() -> &'static [Scene] {
         ("timeline-expanded", timeline_expanded),
         ("timeline-running", timeline_running),
         ("timeline-detail", timeline_detail),
+        // A message's hover actions: hover it with `--script`, a
+        // `{"type": "move", "key": "item-a1"}` step (the owner's message is
+        // `"key": "user"`, on screen at `--size 1440x1600`).
+        ("message-actions", |s| {
+            session_scene(s);
+            s.right_open = false;
+            s.right.set_open(false);
+        }),
         ("session-narrow", |s| {
             // A wide right-hand pane squeezes the session column to ~360 pt
             // at 1440 (and ~240 pt at 1320).

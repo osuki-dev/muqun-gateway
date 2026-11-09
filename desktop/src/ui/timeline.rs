@@ -26,7 +26,10 @@ use muqun_gateway::agents::{
 };
 use rune::{col, row, text, El, GrowthSpec, ScrollSpec};
 use rune_kit::diff::{DiffState, DiffView, FileDiff};
-use rune_kit::{Badge, BadgeVariant, Button, ButtonVariant, ControlSize, Kit, ScrollBar, Spinner};
+use rune_kit::{
+    Badge, BadgeVariant, Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, Kit,
+    ScrollBar, Spinner,
+};
 
 use super::copy::tr_ref;
 use super::parts::{self, Tcx};
@@ -492,51 +495,54 @@ fn working_row(cx: &Tcx) -> El {
         )
 }
 
-/// Rollback and Fork from here, under a message's text, shown on hover.
+/// Roll back and Fork from here: two small icon buttons on a raised chip,
+/// shown while the pointer is on the message. Each names itself in a
+/// tooltip. The chip stays inside the message's own box, so while it is
+/// hidden the pointer can't reach it without showing it.
 fn message_actions(cx: &Tcx, it: &TimelineItem) -> El {
+    let k = cx.k;
     let asid = AgentSessionId(cx.asid.to_string());
     let (rollback_asid, rollback_id) = (asid.clone(), it.message_id.clone());
     let fork_id = it.message_id.clone();
-    let user = it.role == TimelineRole::User;
-    // A small floating bar over the message's top corner on hover: it
-    // takes no room when the reader is not pointing at it.
-    let line = row()
+    let action = |icon: &'static rune::Icon, label: &str| {
+        IconButton::new(icon)
+            .variant(IconButtonVariant::GhostMuted)
+            .control_size(ControlSize::Small)
+            .label(label)
+            .help(label)
+    };
+    let chip = row()
         .key(format!("actions-{}", it.id))
         .gap(2.0)
-        .px(2.0)
-        .py(2.0)
+        .padding(2.0)
         .center_y()
-        .radius(cx.k.radius.md)
-        .fill(cx.k.c.surface_float)
-        .border(1.0, cx.k.c.border_weak)
-        .group_opacity(0.0, 1.0);
-    let line = line.pin(None, Some(if user { -4.0 } else { -6.0 }), Some(0.0), None);
-    line.child(
-        Button::new(cx.t("Roll back to here", "回滚到这里"))
-            .variant(ButtonVariant::Ghost)
-            .control_size(ControlSize::Small)
-            .on_press(move |s: &mut UiState| {
-                s.send(Command::StageRevert {
-                    asid: rollback_asid.clone(),
-                    message_id: rollback_id.clone(),
+        .radius(k.radius.md)
+        .fill(k.c.bg_base)
+        .border(1.0, k.c.border_base)
+        .group_opacity(0.0, 1.0)
+        .child(
+            action(&super::icons::UNDO, cx.t("Roll back to here", "回滚到这里"))
+                .on_press(move |s: &mut UiState| {
+                    s.send(Command::StageRevert {
+                        asid: rollback_asid.clone(),
+                        message_id: rollback_id.clone(),
+                    })
                 })
-            })
-            .build(cx.k)
-            .key(format!("rollback-{}", it.id)),
-    )
-    .child(
-        Button::new(cx.t("Fork from here", "从这里分叉"))
-            .variant(ButtonVariant::Ghost)
-            .control_size(ControlSize::Small)
-            .on_press(move |s: &mut UiState| {
-                s.send(Command::ForkSession {
-                    asid: asid.clone(),
-                    message_id: Some(fork_id.clone()),
+                .build(k)
+                .key(format!("rollback-{}", it.id)),
+        )
+        .child(
+            action(&super::icons::FORK, cx.t("Fork from here", "从这里分叉"))
+                .on_press(move |s: &mut UiState| {
+                    s.send(Command::ForkSession {
+                        asid: asid.clone(),
+                        message_id: Some(fork_id.clone()),
+                    })
                 })
-            })
-            .build(cx.k)
-            .key(format!("fork-{}", it.id)),
-    )
+                .build(k)
+                .key(format!("fork-{}", it.id)),
+        );
+    k.elevate(chip, &k.elevation.floating)
 }
 
 fn item_row(cx: &Tcx, it: &TimelineItem) -> El {
@@ -552,16 +558,26 @@ fn item_row(cx: &Tcx, it: &TimelineItem) -> El {
             wrap = wrap.child(g.justify_end().key("user-imgs"));
         }
         if !body.is_empty() {
-            wrap = wrap.child(
-                col()
-                    .key("user")
-                    .self_end()
-                    .max_w(620.0)
-                    .px(14.0)
-                    .py(8.0)
-                    .radius(cx.k.radius.lg)
-                    .fill(cx.k.c.layer_02)
-                    .child(parts::message::rich_text(cx, &it.id, &body)),
+            let bubble = col()
+                .key("user")
+                .max_w(620.0)
+                .min_w(0.0)
+                .shrink()
+                .px(14.0)
+                .py(8.0)
+                .radius(cx.k.radius.lg)
+                .fill(cx.k.c.layer_02)
+                .child(parts::message::rich_text(cx, &it.id, &body));
+            // The actions sit beside the bubble, where they cover none of it.
+            wrap = wrap.hover_group().child(
+                row()
+                    .key("user-line")
+                    .w_full()
+                    .justify_end()
+                    .items_start()
+                    .gap(6.0)
+                    .child(message_actions(cx, it))
+                    .child(bubble),
             );
         }
     } else {
@@ -570,8 +586,9 @@ fn item_row(cx: &Tcx, it: &TimelineItem) -> El {
         }
         wrap = wrap.child(parts::part(cx, it));
     }
-    if is_text && matches!(it.role, TimelineRole::User | TimelineRole::Assistant) {
-        wrap = wrap.hover_group().child(message_actions(cx, it));
+    if is_text && it.role == TimelineRole::Assistant {
+        let actions = message_actions(cx, it).pin(None, Some(0.0), Some(0.0), None);
+        wrap = wrap.hover_group().child(actions);
     }
     wrap
 }

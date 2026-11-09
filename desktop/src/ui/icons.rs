@@ -38,3 +38,29 @@ pub static SETTINGS: Icon = Icon {
         r#" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>"#,
     ),
 };
+
+/// `undo.svg`: roll back to a message.
+pub static UNDO: Icon = Icon {
+    name: "undo",
+    view: 24.0,
+    body: concat!(
+        r#"<path d="m8 3-5 5 5 5M3 8h10a7 7 0 0 1 0 14""#,
+        r#" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>"#,
+    ),
+};
+
+/// `fork.svg`: fork a session from a message.
+pub static FORK: Icon = Icon {
+    name: "fork",
+    view: 24.0,
+    body: concat!(
+        r#"<circle cx="6" cy="5" r="2""#,
+        r#" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>"#,
+        r#"<circle cx="18" cy="5" r="2""#,
+        r#" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>"#,
+        r#"<circle cx="12" cy="19" r="2""#,
+        r#" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>"#,
+        r#"<path d="M6 7v2a6 6 0 0 0 12 0V7m-6 8v2""#,
+        r#" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>"#,
+    ),
+};
