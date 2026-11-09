@@ -21,6 +21,7 @@ mod panes;
 mod parts;
 mod running;
 pub mod scenes;
+mod search;
 mod sessions;
 mod settings;
 mod shell;
@@ -291,6 +292,12 @@ pub struct UiState {
     pub worktrees: Vec<WorktreeRow>,
 
     pub search: TextEdit,
+    /// The sidebar's "In messages" hits (`ui/search.rs`).
+    pub content: search::ContentSearch,
+    /// A hit being opened: its row is revealed once its session is loaded.
+    pub jump: Option<search::PendingJump>,
+    /// Why the link to the gateway is down, while it is.
+    pub hub_down: Option<String>,
     /// Inline rename of a session row (its asid) and the text being typed.
     pub rename_asid: Option<String>,
     pub rename_edit: TextEdit,
@@ -450,6 +457,9 @@ impl UiState {
             shells: Vec::new(),
             worktrees: Vec::new(),
             search: TextEdit::new(""),
+            content: Default::default(),
+            jump: None,
+            hub_down: None,
             rename_asid: None,
             rename_edit: TextEdit::new(""),
             rename_project: None,
@@ -546,7 +556,8 @@ impl UiState {
         let voice = self.poll_voice();
         let fit = self.fit_panes();
         let term = self.poll_terminal(t, tx);
-        self.poll_splash(t, tx) | voice | fit | term
+        let search = self.poll_search(tx);
+        self.poll_splash(t, tx) | voice | fit | term | search
     }
 
     pub fn poll_splash(&mut self, _: f64, _: &mut Tx) -> bool {
@@ -1233,6 +1244,11 @@ impl UiState {
                 Update::Shells(rows) => self.shells = rows,
                 Update::Worktrees(rows) => self.worktrees = rows,
                 Update::HubMode(mode) => self.hub_label = mode.to_string(),
+                Update::HubLink(down) => self.hub_down = down,
+                Update::Search {
+                    generation,
+                    outcome,
+                } => self.on_search(generation, outcome),
                 Update::Attention(attention) => self.on_attention(&attention),
                 Update::Voice(event) => self.on_voice(event),
             }

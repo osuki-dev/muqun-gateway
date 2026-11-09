@@ -218,6 +218,67 @@ pub enum TaskHubEvent {
     Resync,
 }
 
+/// One `GET /api/search` request (`docs/session-search.md`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SearchQuery {
+    pub q: String,
+    pub limit: usize,
+    /// The previous page's `next_cursor`.
+    pub cursor: Option<String>,
+}
+
+/// One matching row of a session: the gateway's `SearchItem`.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Deserialize)]
+pub struct SearchHit {
+    pub asid: String,
+    pub agent_id: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub directory: Option<String>,
+    #[serde(default)]
+    pub parent_asid: Option<String>,
+    /// The timeline row, as the session's own timeline names it.
+    #[serde(default)]
+    pub item_id: String,
+    #[serde(default)]
+    pub message_id: String,
+    /// `user` or `assistant`.
+    #[serde(default)]
+    pub role: String,
+    /// `text` (a prompt or reply) or `tool` (a tool call's headline).
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub time_ms: u64,
+    #[serde(default)]
+    pub snippet: String,
+    /// `[start, end)` into `snippet`, in UTF-16 code units.
+    #[serde(default)]
+    pub highlights: Vec<[usize; 2]>,
+    /// The session's matching rows, of which at most three are listed.
+    #[serde(default)]
+    pub session_hits: usize,
+}
+
+/// Sessions whose index is current, out of those known.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
+pub struct SearchIndexing {
+    pub done: usize,
+    pub total: usize,
+}
+
+/// One page of search results.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Deserialize)]
+pub struct SearchPage {
+    #[serde(default)]
+    pub items: Vec<SearchHit>,
+    #[serde(default)]
+    pub next_cursor: Option<String>,
+    #[serde(default)]
+    pub indexing: SearchIndexing,
+}
+
 /// Where a hub's sessions run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum HubMode {
@@ -492,8 +553,20 @@ pub trait SessionHub: Send + Sync {
     /// Computers `@` may name: this machine first, then linked fleet peers
     /// when the hub has them (App `GET /api/peers`).
     fn list_peers(&self) -> HubFuture<'_, Vec<PeerMention>>;
+    /// Full-text search over every session's content (`GET /api/search`).
+    /// `Unsupported` where there is no index: the in-process hub (the index
+    /// lives in the gateway service) and a gateway without
+    /// `session_search_v1`.
+    fn search<'a>(&'a self, _query: &'a SearchQuery) -> HubFuture<'a, SearchPage> {
+        Box::pin(async { Err(HubError::Agent(AgentError::Unsupported("search".into()))) })
+    }
     /// Every session event of every agent, in the order the runtime saw them.
     fn events(&self) -> broadcast::Receiver<AgentDomainEvent>;
+    /// Whether the hub's link to its gateway is up: `None` while it is, else
+    /// why not. `None` (no receiver) for a hub with no link to lose.
+    fn link(&self) -> Option<tokio::sync::watch::Receiver<Option<String>>> {
+        None
+    }
     /// Task changes as they happen, for a hub that is told of them; `None`
     /// when the hub has no task ledger to follow.
     fn task_events(&self) -> Option<broadcast::Receiver<TaskHubEvent>> {

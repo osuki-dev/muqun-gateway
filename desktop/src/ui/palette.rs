@@ -319,6 +319,7 @@ pub fn entries(s: &UiState) -> Vec<Entry> {
         Action::QuickOpen,
         Action::ToggleSidebar,
         Action::FocusSearch,
+        Action::SearchMessages,
         Action::ToggleTerminal,
         Action::NewShell,
     ] {

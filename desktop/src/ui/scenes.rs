@@ -609,6 +609,7 @@ fn inbox(s: &mut UiState) {
 
 include!("scenes_timeline.rs");
 include!("scenes_terminal.rs");
+include!("scenes_search.rs");
 const VIEWER_CODE: &str = r#"//! Retry a flaky request with capped exponential backoff.
 
 use std::time::Duration;
@@ -802,6 +803,15 @@ fn latest_scene(s: &mut UiState) {
 pub type Scene = (&'static str, fn(&mut UiState));
 
 pub fn scenes() -> &'static [Scene] {
+    static ALL: std::sync::OnceLock<Vec<Scene>> = std::sync::OnceLock::new();
+    ALL.get_or_init(|| {
+        let mut all = base_scenes().to_vec();
+        all.extend(search_scenes());
+        all
+    })
+}
+
+fn base_scenes() -> &'static [Scene] {
     &[
         ("home", home),
         ("home-busy", home_busy),

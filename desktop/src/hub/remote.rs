@@ -26,13 +26,19 @@ use tokio::sync::broadcast;
 
 use super::local::enrich_local_media;
 use super::{
-    CatalogView, HubError, HubFuture, HubMode, PeerMention, SavedPermission, SessionHub, ShellRow,
-    TaskDefaults, TaskHubEvent, TaskRow, TimelineCatchUp, WorktreeRow,
+    CatalogView, HubError, HubFuture, HubMode, PeerMention, SavedPermission, SearchPage,
+    SearchQuery, SessionHub, ShellRow, TaskDefaults, TaskHubEvent, TaskRow, TimelineCatchUp,
+    WorktreeRow,
 };
 
 const EVENT_CAPACITY: usize = 4096;
 const BACKOFF_START: Duration = Duration::from_millis(500);
 const BACKOFF_MAX: Duration = Duration::from_secs(15);
+/// How long an answer about the gateway's capabilities holds: a gateway
+/// upgraded under a running desktop is noticed within this.
+const CAPABILITIES_FRESH: Duration = Duration::from_secs(60);
+/// The capability `GET /api/search` comes with.
+const SEARCH_CAPABILITY: &str = "session_search_v1";
 
 /// What `local-client.json` holds.
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -95,6 +101,10 @@ pub struct RemoteHub {
     task_events: broadcast::Sender<TaskHubEvent>,
     /// Per session, the cursor of the next older history page.
     cursors: Mutex<HashMap<String, String>>,
+    /// `capabilities` of `GET /api/meta`, and when they were read.
+    capabilities: tokio::sync::Mutex<Option<(std::time::Instant, Vec<String>)>>,
+    /// Why the event socket is down (`None` while it is connected).
+    link: tokio::sync::watch::Sender<Option<String>>,
 }
 
 impl RemoteHub {
@@ -111,6 +121,8 @@ impl RemoteHub {
             events: broadcast::channel(EVENT_CAPACITY).0,
             task_events: broadcast::channel(EVENT_CAPACITY).0,
             cursors: Mutex::new(HashMap::new()),
+            capabilities: tokio::sync::Mutex::new(None),
+            link: tokio::sync::watch::channel(None).0,
         });
         tokio::spawn(event_socket(hub.clone()));
         Ok(hub)
@@ -212,6 +224,30 @@ impl RemoteHub {
         let mut snapshot: AgentSessionSnapshot = decode(data)?;
         enrich_local_media(&mut snapshot);
         Ok(snapshot)
+    }
+
+    /// Whether the gateway declares `capability` (`GET /api/meta`), read
+    /// at most once per [`CAPABILITIES_FRESH`].
+    async fn has_capability(&self, capability: &str) -> Result<bool, HubError> {
+        let mut known = self.capabilities.lock().await;
+        if known
+            .as_ref()
+            .is_none_or(|(at, _)| at.elapsed() > CAPABILITIES_FRESH)
+        {
+            let json = self.call(Method::GET, &["api", "meta"], &[], None).await?;
+            let list = json
+                .get("capabilities")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect();
+            *known = Some((std::time::Instant::now(), list));
+        }
+        Ok(known
+            .as_ref()
+            .is_some_and(|(_, list)| list.iter().any(|c| c == capability)))
     }
 
     fn unit(result: Result<Value, HubError>) -> Result<(), HubError> {
@@ -476,6 +512,25 @@ impl SessionHub for RemoteHub {
                 None,
             )
             .await
+        })
+    }
+
+    fn link(&self) -> Option<tokio::sync::watch::Receiver<Option<String>>> {
+        Some(self.link.subscribe())
+    }
+
+    fn search<'a>(&'a self, query: &'a SearchQuery) -> HubFuture<'a, SearchPage> {
+        Box::pin(async move {
+            if !self.has_capability(SEARCH_CAPABILITY).await? {
+                return Err(HubError::Agent(AgentError::Unsupported("search".into())));
+            }
+            let limit = query.limit.clamp(1, 50).to_string();
+            let mut params = vec![("q", query.q.as_str()), ("limit", limit.as_str())];
+            if let Some(cursor) = query.cursor.as_deref() {
+                params.push(("cursor", cursor));
+            }
+            self.data(Method::GET, &["api", "search"], &params, None)
+                .await
         })
     }
 
@@ -1339,10 +1394,17 @@ async fn event_socket(hub: Arc<RemoteHub>) {
     let mut first = true;
     loop {
         let started = tokio::time::Instant::now();
-        match run_socket(&hub, &mut first).await {
-            Ok(()) => tracing::info!("event socket closed"),
-            Err(why) => tracing::warn!("event socket: {why}"),
-        }
+        let why = match run_socket(&hub, &mut first).await {
+            Ok(()) => {
+                tracing::info!("event socket closed");
+                "the gateway closed the connection".to_string()
+            }
+            Err(why) => {
+                tracing::warn!("event socket: {why}");
+                why
+            }
+        };
+        hub.link.send_replace(Some(why));
         // A connection that lived a while starts the backoff over.
         if started.elapsed() > Duration::from_secs(30) {
             backoff = BACKOFF_START;
@@ -1382,6 +1444,7 @@ async fn run_socket(hub: &RemoteHub, first: &mut bool) -> Result<(), String> {
         .await
         .map_err(|e| e.to_string())?;
     tracing::info!("event socket connected");
+    hub.link.send_replace(None);
     if !std::mem::take(first) {
         let _ = hub.events.send(AgentDomainEvent::Resync {
             asid: AgentSessionId(String::new()),

@@ -83,6 +83,15 @@ pub enum UiAction {
     },
 }
 
+/// What a content search came back with.
+#[derive(Debug, Clone)]
+pub enum SearchOutcome {
+    Page(crate::hub::SearchPage),
+    /// No index behind this hub: the "In messages" group stays hidden.
+    Unsupported,
+    Failed,
+}
+
 #[derive(Debug, Clone)]
 pub enum Update {
     Agents(Vec<AgentDiscoveryInfo>),
@@ -142,6 +151,13 @@ pub enum Update {
     Diff(super::types::DiffStat),
     /// What the desktop keeps on disk, by folder (`Command::ScanStorage`).
     Storage(crate::model::storage::StorageReport),
+    /// The link to the gateway went down (why) or came back (`None`).
+    HubLink(Option<String>),
+    /// The answer to `Command::Search` `generation`.
+    Search {
+        generation: u64,
+        outcome: SearchOutcome,
+    },
     /// The delegated task list, replacing the last, with the folder a new
     /// task would run in.
     Tasks {

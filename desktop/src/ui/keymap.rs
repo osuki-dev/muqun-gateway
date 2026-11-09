@@ -39,6 +39,7 @@ pub enum Action {
     NewShell,
     ToggleInspector,
     FocusSearch,
+    SearchMessages,
     PrevSession,
     NextSession,
     AddSplit,
@@ -218,6 +219,13 @@ pub static ENTRIES: &[Entry] = &[
         "mod+f",
         "Search sessions",
         "搜索会话",
+    ),
+    e(
+        A::SearchMessages,
+        G::Panels,
+        "mod+shift+f",
+        "Search in messages",
+        "搜索消息内容",
     ),
     e(
         A::PrevSession,
@@ -559,10 +567,8 @@ pub fn run(s: &mut UiState, action: Action, ev: &KeyEvent, tx: &mut Tx) -> bool 
                 return false;
             }
         }
-        A::FocusSearch => {
-            s.sidebar.set_open(true);
-            s.search.focused = true;
-        }
+        A::FocusSearch => s.focus_search(false),
+        A::SearchMessages => s.focus_search(true),
         A::PrevSession | A::NextSession => {
             return step_session(s, action == A::NextSession);
         }
@@ -740,11 +746,19 @@ mod tests {
             }
         }
         // Inside the terminal Ctrl+Shift+P is the palette's own chord, so
-        // Ctrl+P (quick open) can't borrow it there. Nothing else collides.
+        // Ctrl+P (quick open) can't borrow it there, and Ctrl+Shift+F is the
+        // message search's, so Ctrl+F can't. Nothing else collides.
         for platform in [KeyPlatform::Windows, KeyPlatform::Linux] {
             assert_eq!(
                 terminal_shadows(platform),
-                vec![(A::Palette, A::QuickOpen, "Ctrl+Shift+P".to_string())]
+                vec![
+                    (A::Palette, A::QuickOpen, "Ctrl+Shift+P".to_string()),
+                    (
+                        A::SearchMessages,
+                        A::FocusSearch,
+                        "Ctrl+Shift+F".to_string()
+                    ),
+                ]
             );
         }
         assert!(terminal_shadows(KeyPlatform::Mac).is_empty());

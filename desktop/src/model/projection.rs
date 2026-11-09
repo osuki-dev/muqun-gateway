@@ -15,13 +15,15 @@ use tokio::sync::{broadcast, watch};
 
 use super::commands::{Command, CommandReceiver};
 use super::compose::{self, ComposeCommand, ComposerUpdate, Deliver, Target};
-use super::inbox::{Inbox, UiError, Update};
+use super::inbox::{Inbox, SearchOutcome, UiError, Update};
 use super::types::{DiffStat, SESSION_LIST_LIMIT};
 use crate::config::{ConfigEdit, DesktopConfig};
 use crate::hub::{HubError, SessionHub, TaskHubEvent, OPENCODE};
 
 /// How long the typed prefix must stand still before folders are listed.
 const COMPLETION_DEBOUNCE: Duration = Duration::from_millis(150);
+/// The quiet after the last keystroke before the sidebar searches message content.
+const SEARCH_DEBOUNCE: Duration = Duration::from_millis(200);
 /// How long the configuration must stand still before it is written.
 const SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
 /// One agent's session list, at most.
@@ -235,6 +237,15 @@ pub fn spawn(
     core.inbox.push(Update::HubMode(core.hub.mode()));
     tokio::spawn(core.clone().events());
     tokio::spawn(super::notify::watch(core.hub.clone(), core.inbox.clone()));
+    if let Some(mut link) = core.hub.link() {
+        let inbox = core.inbox.clone();
+        tokio::spawn(async move {
+            while link.changed().await.is_ok() {
+                let down = link.borrow_and_update().clone();
+                inbox.push(Update::HubLink(down));
+            }
+        });
+    }
     if let Some(tasks) = core.hub.task_events() {
         tokio::spawn(core.clone().task_events(tasks));
     }
@@ -249,9 +260,18 @@ pub fn spawn(
 
 impl Core {
     async fn commands(self: Arc<Self>, mut commands: CommandReceiver) {
+        // The content search in flight: a newer one cancels it.
+        let mut search: Option<tokio::task::AbortHandle> = None;
         while let Some(command) = commands.recv().await {
             let core = self.clone();
             match command {
+                Command::Search { generation, query } => {
+                    if let Some(stale) = search.take() {
+                        stale.abort();
+                    }
+                    let task = tokio::spawn(async move { core.search(generation, query).await });
+                    search = Some(task.abort_handle());
+                }
                 Command::CompleteDirectory { prefix } => {
                     let _ = self.completions.send(Some(prefix));
                 }
@@ -263,6 +283,25 @@ impl Core {
             }
         }
         tracing::debug!("the UI closed its command channel");
+    }
+
+    /// One content search; a first page waits out the typing first.
+    async fn search(&self, generation: u64, query: crate::hub::SearchQuery) {
+        if query.cursor.is_none() {
+            tokio::time::sleep(SEARCH_DEBOUNCE).await;
+        }
+        let outcome = match self.hub.search(&query).await {
+            Ok(page) => SearchOutcome::Page(page),
+            Err(HubError::Agent(AgentError::Unsupported(_))) => SearchOutcome::Unsupported,
+            Err(err) => {
+                tracing::debug!(%err, "content search failed");
+                SearchOutcome::Failed
+            }
+        };
+        self.inbox.push(Update::Search {
+            generation,
+            outcome,
+        });
     }
 
     async fn run(self: Arc<Self>, command: Command) {
@@ -324,6 +363,8 @@ impl Core {
                     self.fail(err);
                 }
             }
+            // Taken by the command loop, which cancels a stale one.
+            Command::Search { .. } => {}
             Command::Interrupt(asid) => {
                 if let Err(err) = self.hub.interrupt(&asid).await {
                     self.fail(err);

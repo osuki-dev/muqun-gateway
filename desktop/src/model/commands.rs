@@ -89,6 +89,12 @@ pub enum Command {
     /// The next older page of the session's history (architecture §3
     /// `earlier`).
     LoadEarlier(AgentSessionId),
+    /// Search every session's content (`Update::Search`). A first page waits
+    /// out the typing; a newer search cancels the one in flight.
+    Search {
+        generation: u64,
+        query: crate::hub::SearchQuery,
+    },
     ReplyForm {
         asid: AgentSessionId,
         id: String,

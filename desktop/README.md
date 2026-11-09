@@ -60,6 +60,9 @@ launch is its own (`src/platform/instance.rs`).
   pinned sessions.
 * **Sidebar** — every session, searchable, grouped by time, agent or folder, with agent filter
   chips; pin, rename, fork, delete, move to background; projects can be pinned, hidden and named.
+  Search (Ctrl/Cmd+F) filters titles at once and, on a gateway with `session_search_v1`, lists
+  hits inside messages below them (Ctrl/Cmd+Shift+F: messages only); ↑/↓ and Enter open one at
+  its row, lit for a moment. A warning row at the foot shows only while the gateway link is down.
 * **Session** — a streaming timeline (Markdown with highlighted code, tool calls, inline diffs,
   todos, images), approvals and questions answered in place, Stop. The composer sends with Enter
   (Shift+Enter for a newline), takes attachments (pick, paste an image, drop files; images and

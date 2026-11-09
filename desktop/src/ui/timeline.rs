@@ -114,6 +114,8 @@ pub struct SessionTimeline {
     pub away: bool,
     /// Messages that arrived while away, for the pill's "N new".
     pub unseen: usize,
+    /// The row a search hit opened, lit until a moment after `Instant`.
+    pub flash: Option<(String, std::time::Instant)>,
 }
 
 /// A folded group's key: its first item's.
@@ -411,7 +413,16 @@ pub fn session_view(s: &UiState, k: &Kit, asid: &str) -> El {
                 let mut cx = Tcx::new(s, &kit, &build_asid);
                 cx.narrow = narrow;
                 let mut tail = false;
-                let body = match row_at(s, &build_asid, i) {
+                let row = row_at(s, &build_asid, i);
+                let lit =
+                    cx.tl()
+                        .and_then(|t| t.flash.as_ref())
+                        .is_some_and(|(key, _)| match &row {
+                            Some(Row::Item(item)) => &item.id == key,
+                            Some(Row::Group(items)) => &group_key(&items[0]) == key,
+                            _ => false,
+                        });
+                let body = match row {
                     Some(Row::Top) => top_row(&cx),
                     Some(Row::Item(item)) => {
                         // The answer being written: Rune eases its growth.
@@ -425,13 +436,17 @@ pub fn session_view(s: &UiState, k: &Kit, asid: &str) -> El {
                     Some(Row::Working) | None => working_row(&cx),
                 };
                 // Rows space themselves with padding: virtual rows take no gaps.
+                let mut column = col().key("tl-column").w_full().max_w(FEED_MAX_W);
+                if lit {
+                    column = column.child(super::search::flash(s, &kit));
+                }
                 col()
                     .w_full()
                     .items_center()
                     .px(16.0)
                     .py(3.0)
                     .streaming(tail)
-                    .child(body.w_full().max_w(FEED_MAX_W))
+                    .child(column.child(body.w_full()))
             },
         )
         .virtual_rows_version((tl.rev, s.session_busy(asid)))

@@ -452,7 +452,7 @@ fn session_row(s: &UiState, k: &Kit, layer: &mut Vec<El>, asid: &str) -> El {
     .height(45.0)
     .avatar(avatar_with_state(s, k, &look, info, activity))
     .subtitle(subtitle)
-    .selected(s.mode == Mode::Session && s.selected.as_deref() == Some(asid));
+    .selected(super::search::row_selected(s, asid));
     if in_tile {
         row = row.detail(super::copy::tr(s.cfg.general.language, "split", "分屏"));
     }
@@ -504,13 +504,27 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
             .py(8.0),
         );
     }
-    for row in tree(s, k, layer) {
-        sidebar = sidebar.child(row);
+    let searching = !s.search.text.trim().is_empty();
+    if super::search::titles_shown(s) {
+        let rows = tree(s, k, layer);
+        if searching && !s.sessions.is_empty() && listed(s).is_empty() {
+            sidebar = sidebar.child(super::search::note(
+                k,
+                "no-titles",
+                super::copy::tr(language, "No session titles match", "没有标题匹配的会话"),
+            ));
+        }
+        for row in rows {
+            sidebar = sidebar.child(row);
+        }
+    }
+    if let Some(group) = super::search::group(s, k) {
+        sidebar = sidebar.child(group);
     }
     if let Some(running) = super::running::view(s, k) {
         sidebar = sidebar.footer(running);
     }
-    sidebar
+    let sidebar = sidebar
         .footer(nav(
             s,
             k,
@@ -531,31 +545,72 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
             super::copy::tr_ref(language, "Settings", "设置"),
             &SETTINGS,
             Mode::Settings,
-        ))
-        .footer(hub_line(s, k))
-        .build(k)
+        ));
+    match link_warning(s, k) {
+        Some(warning) => sidebar.footer(warning),
+        None => sidebar,
+    }
+    .build(k)
 }
 
 /// The search field: a quiet well the width of the rows, its icon on the
 /// rows' icon column, and a clear button only once there is something to clear.
 fn search(s: &UiState, k: &Kit) -> El {
     let language = s.cfg.general.language;
+    let only = s.content.only;
     let mut field = TextInput::new(&s.search)
-        .placeholder(super::copy::tr_ref(language, "Search sessions", "搜索会话"))
+        .placeholder(if only {
+            super::copy::tr_ref(language, "Search in messages", "搜索消息内容")
+        } else if s.content.supported {
+            super::copy::tr_ref(language, "Search sessions and messages", "搜索会话和消息")
+        } else {
+            super::copy::tr_ref(language, "Search sessions", "搜索会话")
+        })
         .leading_icon(&SEARCH)
         .leading_icon_size(14.0)
         .width(None)
         .plain()
-        .on_edit(|s: &mut UiState| &mut s.search);
+        .on_edit(|s: &mut UiState| &mut s.search)
+        .on_change(|s: &mut UiState, _: &mut Tx| s.search_changed())
+        .on_key(|s: &mut UiState, ev: &rune::KeyEvent, tx: &mut Tx| s.search_key(ev, tx));
     if !s.search.text.is_empty() {
         field = field.clear_button();
     }
-    let well = rune::row()
+    let mut well = rune::row()
         .key("search")
         .w_full()
+        .center_y()
         .radius(k.radius.md)
         .fill(k.c.text_base.alpha(0.06))
-        .child(field.build(k));
+        .child(field.build(k).grow(1.0).shrink().min_w(0.0));
+    if only {
+        // The scope, said in the well; a press widens it to titles again.
+        well = well.child(
+            k.interactive(
+                rune::row()
+                    .key("search-scope")
+                    .h(20.0)
+                    .px(7.0)
+                    .mr(4.0)
+                    .center_y()
+                    .radius(10.0)
+                    .fill(k.c.bg_accent.alpha(if s.dark { 0.22 } else { 0.14 }))
+                    .role("button")
+                    .label(super::copy::tr(language, "Messages only", "仅消息"))
+                    .help(super::keymap::tip(
+                        &super::keymap::entry(super::keymap::Action::FocusSearch).what(language),
+                        super::keymap::Action::FocusSearch,
+                    ))
+                    .child(
+                        rune::text(super::copy::tr(language, "Messages", "消息"))
+                            .font(k.ty.caption())
+                            .color(k.c.text_accent)
+                            .a11y_hidden(),
+                    ),
+            )
+            .on_press(|s: &mut UiState| s.content.only = false),
+        );
+    }
     if s.search.focused {
         well.border(1.0, k.c.border_base)
     } else {
@@ -563,51 +618,49 @@ fn search(s: &UiState, k: &Kit) -> El {
     }
 }
 
-/// Where the sessions come from, as a quiet caption under the navigation.
-fn hub_line(s: &UiState, k: &Kit) -> El {
+/// Nothing while the link to the gateway is fine; while it is down, one
+/// compact warning row (the reason in its tooltip) that retries on a click.
+fn link_warning(s: &UiState, k: &Kit) -> Option<El> {
+    let why = s.hub_down.as_ref()?;
     let language = s.cfg.general.language;
-    let (word, live) = match s.hub_label.as_str() {
-        "" => (super::copy::tr(language, "Connecting…", "连接中…"), false),
-        "local gateway" => (
-            super::copy::tr(language, "Local gateway", "本机 Gateway"),
-            true,
-        ),
-        "standalone" => (super::copy::tr(language, "Standalone", "独立运行"), true),
-        other => (other.to_string(), true),
-    };
-    let dot = el().size(6.0, 6.0).radius(3.0).fill(if live {
-        k.c.success.icon
-    } else {
-        k.c.text_faint
-    });
-    rune::row()
-        .key("hub-line")
-        .w_full()
-        .h(24.0)
-        .px(12.0)
-        .gap(6.0)
-        .center_y()
-        .role("status")
-        .label(word.clone())
-        .help(match s.hub_label.as_str() {
-            "local gateway" => super::copy::tr(
-                language,
-                "Sessions come from the Muqun gateway running on this computer; phones see the same ones.",
-                "会话来自这台电脑上运行的 Muqun Gateway，手机看到的是同一批。",
-            ),
-            "standalone" => super::copy::tr(
-                language,
-                "No gateway is running; this window talks to the agents directly.",
-                "没有运行中的 Gateway，此窗口直接连接各 Agent。",
-            ),
-            _ => super::copy::tr(language, "Looking for a local gateway…", "正在查找本机 Gateway…"),
-        })
-        .child(dot.a11y_hidden())
-        .child(
-            rune::text(word)
-                .font(k.ty.caption())
-                .color(k.c.text_faint)
-                .truncate()
-                .a11y_hidden(),
+    let word = super::copy::tr(language, "Gateway disconnected", "Gateway 已断开");
+    let dot = el().size(6.0, 6.0).radius(3.0).fill(k.c.warning.icon);
+    let look = s.look();
+    Some(
+        k.interactive(
+            rune::row()
+                .key("link-warning")
+                .w_full()
+                .h(26.0)
+                .px(12.0)
+                .gap(6.0)
+                .center_y()
+                .radius(k.radius.md)
+                .fill(k.c.warning.icon.alpha(0.10))
+                .role("button")
+                .label(word.clone())
+                .help(super::copy::tr(
+                    language,
+                    &format!("Reconnecting on its own. Click to retry now.\n{why}"),
+                    &format!("正在自动重连，点击立即重试。\n{why}"),
+                ))
+                .child(look.pulse(look.spark(dot, k.c.warning.icon)).a11y_hidden())
+                .child(
+                    rune::text(word)
+                        .font(k.ty.caption())
+                        .color(k.c.warning.fg)
+                        .truncate()
+                        .grow(1.0)
+                        .shrink()
+                        .a11y_hidden(),
+                )
+                .child(
+                    rune::text(super::copy::tr(language, "Retry", "重试"))
+                        .font(k.ty.caption())
+                        .color(k.c.text_muted)
+                        .a11y_hidden(),
+                ),
         )
+        .on_press(|s: &mut UiState| s.send(Command::Refresh)),
+    )
 }
