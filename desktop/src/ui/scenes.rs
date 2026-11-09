@@ -564,7 +564,65 @@ fn settings(s: &mut UiState) {
     base(s);
     s.mode = Mode::Settings;
     s.settings_tab = SettingsTab::Agents;
+    s.storage = Some(crate::model::storage::StorageReport {
+        previews: 9_500_000,
+        gallery: 88_000,
+        uploads: 20_000_000,
+        other: 1_200_000,
+        state_dir: Some("/home/demo/.local/share/muqun-desktop".into()),
+    });
+    settings_themes(s);
     s.demo = true;
+}
+
+/// The built-in packs as the library (with thumbnails made from their
+/// previews, as the theme service makes them) and again as the gallery.
+fn settings_themes(s: &mut UiState) {
+    use crate::theme::store::{builtin, Loaded, Origin, ThemeEntry, BUILTIN};
+    let dir = std::env::temp_dir().join("muqun-scene-thumbs");
+    let _ = std::fs::create_dir_all(&dir);
+    let mut library = Vec::new();
+    let mut gallery = Vec::new();
+    for b in BUILTIN {
+        let Some(pack) = builtin(b.id) else { continue };
+        let loaded = Loaded::Builtin(pack.clone());
+        let mut entry = ThemeEntry::from_manifest(&pack.manifest, Origin::Builtin);
+        let path = dir.join(format!("{}.jpg", b.id));
+        if !path.exists() {
+            if let Some(jpeg) = loaded
+                .preview()
+                .and_then(|p| crate::theme::gallery::thumbnail(&p).ok())
+            {
+                let _ = std::fs::write(&path, jpeg);
+            }
+        }
+        if path.exists() {
+            entry.thumbnail = Some(path.clone());
+            s.theme_previews.insert(b.id.to_string(), path);
+        }
+        gallery.push(crate::theme::gallery::IndexEntry {
+            id: entry.id.clone(),
+            name: entry.name.clone(),
+            version: entry.version.clone(),
+            author: entry.author.clone(),
+            license: entry.license.clone(),
+            description: entry.description.clone(),
+            tags: entry.tags.clone(),
+            package: format!("dist/{}.muqun-theme", b.id),
+            bytes: b.bytes.len() as u64,
+            sha256: None,
+            assets: None,
+            preview: None,
+        });
+        library.push(entry);
+    }
+    // The gallery also lists themes not installed here.
+    library.truncate(4);
+    s.theme_library = std::sync::Arc::new(library);
+    s.theme_gallery = std::sync::Arc::new(crate::theme::service::GalleryView {
+        entries: gallery,
+        ..Default::default()
+    });
 }
 
 fn tasks(s: &mut UiState) {
@@ -870,13 +928,6 @@ fn base_scenes() -> &'static [Scene] {
         ("settings-general", |s| {
             settings(s);
             s.settings_tab = SettingsTab::General;
-            s.storage = Some(crate::model::storage::StorageReport {
-                previews: 9_500_000,
-                gallery: 88_000,
-                uploads: 20_000_000,
-                other: 1_200_000,
-                state_dir: Some("/home/demo/.local/share/muqun-desktop".into()),
-            });
         }),
         ("settings-shortcuts", |s| {
             settings(s);
@@ -885,6 +936,62 @@ fn base_scenes() -> &'static [Scene] {
         ("settings-about", |s| {
             settings(s);
             s.settings_tab = SettingsTab::About;
+        }),
+        ("settings-themes", |s| {
+            settings(s);
+            s.settings_tab = SettingsTab::Themes;
+        }),
+        ("settings-themes-search", |s| {
+            settings(s);
+            s.settings_tab = SettingsTab::Themes;
+            s.theme_query = TextEdit::new("jade");
+        }),
+        ("settings-storage", |s| {
+            settings(s);
+            s.settings_tab = SettingsTab::Storage;
+        }),
+        ("settings-open-in", |s| {
+            settings(s);
+            s.settings_tab = SettingsTab::General;
+            s.menu = Some(super::OpenMenu::Setting("open-in".into()));
+        }),
+        ("settings-agents-zh", |s| {
+            settings(s);
+            s.cfg.general.language = crate::config::Language::ZhCn;
+        }),
+        ("settings-appearance-zh", |s| {
+            settings(s);
+            s.settings_tab = SettingsTab::Appearance;
+            s.cfg.general.language = crate::config::Language::ZhCn;
+        }),
+        ("settings-general-zh", |s| {
+            settings(s);
+            s.settings_tab = SettingsTab::General;
+            s.cfg.general.language = crate::config::Language::ZhCn;
+        }),
+        ("settings-themes-zh", |s| {
+            settings(s);
+            s.settings_tab = SettingsTab::Themes;
+            s.cfg.general.language = crate::config::Language::ZhCn;
+        }),
+        ("settings-shortcuts-zh", |s| {
+            settings(s);
+            s.settings_tab = SettingsTab::Shortcuts;
+            s.cfg.general.language = crate::config::Language::ZhCn;
+        }),
+        ("settings-storage-zh", |s| {
+            settings(s);
+            s.settings_tab = SettingsTab::Storage;
+            s.cfg.general.language = crate::config::Language::ZhCn;
+        }),
+        ("settings-about-zh", |s| {
+            settings(s);
+            s.settings_tab = SettingsTab::About;
+            s.cfg.general.language = crate::config::Language::ZhCn;
+        }),
+        ("voice-settings-zh", |s| {
+            voice_settings_scene(s);
+            s.cfg.general.language = crate::config::Language::ZhCn;
         }),
         ("home-big", |s| {
             home_busy(s);
