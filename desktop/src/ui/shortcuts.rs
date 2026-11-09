@@ -41,6 +41,50 @@ fn matches(entry: &Entry, language: Language, query: &str) -> bool {
         .any(|hay| hay.to_lowercase().contains(&query))
 }
 
+/// A chord as keycaps: each key a small raised cap in the window's own
+/// surface, so it reads as a key and not a tag. Every place that shows a
+/// chord in a sentence or list (this sheet, Settings) draws it so.
+pub(super) fn keycaps<S: AsRef<str>>(k: &Kit, keys: &[S]) -> El {
+    let label = keys.iter().map(AsRef::as_ref).collect::<Vec<_>>().join(" ");
+    let font = rune::TextStyle {
+        line_height: 14.0,
+        ..k.ty.small_medium
+    };
+    let mut line = row().role("group").label(label).gap(4.0).center_y();
+    for (i, key) in keys.iter().enumerate() {
+        let key = key.as_ref();
+        let upper = key.to_uppercase();
+        // Only when it maps back: Turkish "ı" would draw as "I", another key.
+        let cap = if key.chars().count() == 1 && upper.to_lowercase() == key {
+            upper
+        } else {
+            key.to_string()
+        };
+        line = line.child(
+            row()
+                .key(format!("cap{i}"))
+                .min_w(22.0)
+                .h(22.0)
+                .px(6.0)
+                .center()
+                .radius(k.radius.sm + 1.0)
+                .fill(k.c.bg_base)
+                .border(1.0, k.c.border_weak)
+                .box_shadow(rune::Shadow {
+                    x: 0.0,
+                    y: 1.0,
+                    blur: 0.0,
+                    spread: 0.0,
+                    color: k.c.border_base,
+                    inset: false,
+                })
+                .child(text(cap).font(font).color(k.c.text_muted))
+                .a11y_hidden(),
+        );
+    }
+    line
+}
+
 /// The keys of one row: each chord as keycaps, alternatives side by side.
 /// A run of chords that differ only in the key (Ctrl+1 … Ctrl+4, the four
 /// arrows) reads as one: the modifiers, then the keys.
@@ -72,7 +116,7 @@ fn keys(k: &Kit, language: Language, entry: &Entry) -> El {
                     .color(k.c.text_faint),
             );
         }
-        line = line.child(rune_kit::Keybind::new(caps).build(k));
+        line = line.child(keycaps(k, caps));
     }
     line
 }
@@ -385,6 +429,6 @@ fn hint(k: &Kit, key: &str, what: String) -> El {
     row()
         .gap(6.0)
         .center_y()
-        .child(rune_kit::Keybind::new(&[key]).build(k))
+        .child(keycaps(k, &[key]))
         .child(text(what).font(k.ty.small).color(k.c.text_faint))
 }

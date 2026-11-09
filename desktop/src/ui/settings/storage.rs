@@ -2,7 +2,7 @@
 //! kind, and a button for the part it can rebuild.
 
 use rune::{col, el, row as hrow, text, Color, El};
-use rune_kit::{Button, ButtonVariant, ControlSize, Kit};
+use rune_kit::{ButtonVariant, Kit};
 
 use super::{group, row};
 use crate::model::commands::Command;
@@ -115,13 +115,10 @@ pub(super) fn page(s: &UiState, k: &Kit) -> Vec<El> {
                 ),
         )
         .child(look.glow(bar, accent, 0.18))
-        .children((!state_dir.is_empty()).then(|| {
-            text(state_dir)
-                .key("storage-dir")
-                .font(k.ty.small)
-                .color(k.c.text_faint)
-                .wrap()
-        }));
+        .children(
+            (!state_dir.is_empty())
+                .then(|| super::long_text(k, "storage-dir", state_dir, k.ty.small)),
+        );
 
     let legend = kinds
         .iter()
@@ -137,10 +134,12 @@ pub(super) fn page(s: &UiState, k: &Kit) -> Vec<El> {
                     .center_y()
                     .child(dot(*color))
                     .child(
-                        text(size(*n))
-                            .font(k.ty.ui_medium)
-                            .color(k.c.text_base)
-                            .min_w(64.0),
+                        // Sizes line up on their last digit, at the column's edge.
+                        hrow()
+                            .key("n")
+                            .min_w(64.0)
+                            .justify_end()
+                            .child(text(size(*n)).font(k.ty.ui_medium).color(k.c.text_base)),
                     ),
             )
         })
@@ -167,9 +166,8 @@ pub(super) fn page(s: &UiState, k: &Kit) -> Vec<El> {
                     "Frees the cache now. Sessions, attachments and settings stay.",
                     "立即释放缓存。会话、附件与设置不受影响。",
                 ),
-                Button::new(tr_ref(language, "Clear cache", "清除缓存"))
+                super::button(tr_ref(language, "Clear cache", "清除缓存"))
                     .variant(ButtonVariant::Danger)
-                    .control_size(ControlSize::Small)
                     .disabled(!scanned || report.cache() == 0)
                     .on_press(|s: &mut UiState| {
                         s.storage = None;

@@ -77,6 +77,7 @@ pub(super) fn page(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Vec<El> {
                                     (!text.is_empty()).then(|| PathBuf::from(text)),
                                 ));
                             }),
+                        &s.cwd_input,
                         k,
                         "cwd",
                     ),
@@ -133,6 +134,7 @@ pub(super) fn page(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Vec<El> {
                                     (!text.trim().is_empty()).then_some(text),
                                 ));
                             }),
+                        &editor,
                         k,
                         "editor",
                     ),

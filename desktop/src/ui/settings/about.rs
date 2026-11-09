@@ -4,9 +4,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use rune::{col, el, row as hrow, text, El, SurfaceFit};
-use rune_kit::{Badge, BadgeVariant, Kit};
+use rune_kit::Kit;
 
-use super::{group, link_button, row, row_below};
+use super::{group, link_button, row};
 use crate::branding::{APP_MARK_PNG, APP_NAME};
 use crate::config::Language;
 use crate::ui::copy::{tr, tr_ref};
@@ -97,21 +97,23 @@ fn license_row(k: &Kit, name: &str, license: &str, detail: &str) -> El {
         &format!("lic-{}", name.replace([' ', ','], "-")),
         name,
         detail,
-        Badge::new(license).variant(BadgeVariant::Subtle).build(k),
+        text(license.to_string())
+            .font(k.ty.small_medium)
+            .color(k.c.text_muted),
     )
 }
 
 fn path_row(k: &Kit, key: &str, title: &str, path: String) -> El {
-    row_below(
+    row(
         k,
         &format!("path-{key}"),
         title,
         "",
-        text(path)
-            .font(k.ty.mono)
-            .color(k.c.text_muted)
-            .wrap()
-            .w_full(),
+        hrow()
+            .key("path")
+            .w(super::control_w())
+            .justify_end()
+            .child(super::long_text(k, "path-text", path, k.ty.mono)),
     )
 }
 

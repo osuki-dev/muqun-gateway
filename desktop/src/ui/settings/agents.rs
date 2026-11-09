@@ -2,7 +2,7 @@
 //! switch in the group's header and its own fields as rows.
 
 use rune::{col, el, row as hrow, text, El, TextEdit, Tx};
-use rune_kit::{Badge, BadgeVariant, Button, ButtonVariant, ControlSize, Kit, TextInput};
+use rune_kit::{Badge, BadgeVariant, Kit, TextInput};
 
 use super::{choice, edit_of, empty, flag, group_with, row, select, status, Tone};
 use crate::agent_fields::{fields, Field, Kind};
@@ -141,11 +141,11 @@ fn agent_field(s: &UiState, k: &Kit, layer: &mut Vec<El>, agent: &str, field: Fi
                         .unwrap_or_default();
                     set_field(s, &a, f, value);
                 });
-            let input = super::field(input, k, &slot);
+            let input = super::field(input, &edit, k, &slot);
             match s.agent_errors.get(&slot) {
                 Some(err) => col()
                     .key(format!("field-{slot}"))
-                    .w(super::CONTROL_W)
+                    .w(super::control_w())
                     .gap(6.0)
                     .child(input)
                     .child(status(k, "error", Tone::Bad, err.clone())),
@@ -223,9 +223,7 @@ fn head(s: &UiState, k: &Kit, id: &str, standing: Standing, version: Option<&str
 
 pub(super) fn actions(s: &UiState, k: &Kit) -> Vec<El> {
     let language = s.cfg.general.language;
-    vec![Button::new(tr_ref(language, "Look again", "重新发现"))
-        .variant(ButtonVariant::Outline)
-        .control_size(ControlSize::Small)
+    vec![super::button(tr_ref(language, "Look again", "重新发现"))
         .icon(&crate::ui::icons::REFRESH)
         .help(tr_ref(
             language,

@@ -817,7 +817,7 @@ fn voice_settings_scene(s: &mut UiState) {
     settings(s);
     s.settings_tab = SettingsTab::Voice;
     s.cfg.voice.mode = VoiceMode::Realtime;
-    s.cfg.voice.url = "wss://speech.example.com/v1/realtime".into();
+    s.cfg.voice.url = "wss://speech.example.com/v1/realtime?intent=transcription&model=live".into();
     s.voice_form = super::voice::VoiceForm::new(&s.cfg.voice);
     s.voice_form.key_saved = Some(crate::platform::secrets::Store::Keyring);
 }

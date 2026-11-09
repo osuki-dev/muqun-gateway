@@ -491,7 +491,10 @@ const LANGUAGES: [(&str, &str); 6] = [
 ];
 
 pub fn settings(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Vec<El> {
-    use super::settings::{field, group, row, select, status, Tone, CONTROL_W};
+    use super::settings::{
+        button, button_w, control_w, field, field_button, group, label, row, row_with, select,
+        status, Tone,
+    };
     let language = s.cfg.general.language;
     let voice = &s.cfg.voice;
     let mode_at = usize::from(voice.mode == VoiceMode::Realtime);
@@ -577,13 +580,13 @@ pub fn settings(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Vec<El> {
         ),
     };
     let url_control = if url_ok {
-        field(url, k, "voice-url")
+        field(url, &s.voice_form.url, k, "voice-url")
     } else {
         col()
             .key("voice-url-field")
-            .w(CONTROL_W)
+            .w(control_w())
             .gap(6.0)
-            .child(field(url, k, "voice-url"))
+            .child(field(url, &s.voice_form.url, k, "voice-url"))
             .child(status(
                 k,
                 "voice-url-error",
@@ -596,39 +599,53 @@ pub fn settings(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Vec<El> {
             ))
     };
 
-    // The key: typed, saved to the keyring, then shown only as saved.
+    // The key: typed, saved to the keyring, then shown only as saved. One
+    // button beside the field: Save what was typed, else Remove what is
+    // saved.
     let typed = !s.voice_form.key.text.trim().is_empty();
-    let mut key_field = col()
-        .key("voice-key-field")
-        .w(CONTROL_W)
-        .gap(8.0)
-        .child(row_of(
-            TextInput::new(&s.voice_form.key)
-                .secure()
-                .placeholder(if s.voice_form.key_saved.is_some() {
-                    "••••••••"
-                } else {
-                    "sk-…"
-                })
-                .label(tr_ref(language, "API key", "API 密钥"))
-                .width(Some(CONTROL_W - 64.0))
-                .on_edit(|s: &mut UiState| &mut s.voice_form.key)
-                .on_submit(|s: &mut UiState, _: &mut Tx| s.save_voice_key())
-                .build(k)
-                .key("in-voice-key"),
-            Button::new(tr_ref(language, "Save", "保存"))
-                .variant(if typed {
-                    ButtonVariant::Submit
-                } else {
-                    ButtonVariant::Outline
-                })
-                .control_size(ControlSize::Small)
-                .disabled(!typed)
-                .on_press(|s: &mut UiState| s.save_voice_key())
-                .build(k)
-                .key("voice-key-save"),
-        ));
-    if let Some(store) = s.voice_form.key_saved {
+    let saved = s.voice_form.key_saved;
+    let (save, remove) = (
+        tr_ref(language, "Save", "保存"),
+        tr_ref(language, "Remove", "删除"),
+    );
+    let key_button = if typed || saved.is_none() {
+        button(save)
+            .variant(ButtonVariant::Submit)
+            .disabled(!typed)
+            .on_press(|s: &mut UiState| s.save_voice_key())
+    } else {
+        button(remove).on_press(|s: &mut UiState| {
+            s.voice_form.key = TextEdit::new("");
+            s.save_voice_key();
+        })
+    };
+    let key_field = field_button(
+        TextInput::new(&s.voice_form.key)
+            .secure()
+            .placeholder(if saved.is_some() {
+                "••••••••"
+            } else {
+                "sk-…"
+            })
+            .label(tr_ref(language, "API key", "API 密钥"))
+            .on_edit(|s: &mut UiState| &mut s.voice_form.key)
+            .on_submit(|s: &mut UiState, _: &mut Tx| s.save_voice_key()),
+        &s.voice_form.key,
+        k,
+        "voice-key",
+        key_button,
+        button_w(k, save).max(button_w(k, remove)),
+    );
+    let mut key_label = label(
+        k,
+        tr_ref(language, "API key", "API 密钥"),
+        tr_ref(
+            language,
+            "Sent as a Bearer token. Kept in the system keyring, never in config.json.",
+            "以 Bearer 令牌发送。保存在系统钥匙串中，不写入 config.json。",
+        ),
+    );
+    if let Some(store) = saved {
         let words = match store {
             Store::Keyring => tr(
                 language,
@@ -641,21 +658,7 @@ pub fn settings(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Vec<El> {
                 "已保存在仅你可读的文件中",
             ),
         };
-        key_field = key_field.child(
-            row_of(
-                status(k, "voice-key-saved", Tone::Good, words),
-                Button::new(tr_ref(language, "Remove", "删除"))
-                    .variant(ButtonVariant::GhostMuted)
-                    .control_size(ControlSize::Small)
-                    .on_press(|s: &mut UiState| {
-                        s.voice_form.key = TextEdit::new("");
-                        s.save_voice_key();
-                    })
-                    .build(k)
-                    .key("voice-key-remove"),
-            )
-            .justify_between(),
-        );
+        key_label = key_label.child(status(k, "voice-key-saved", Tone::Good, words).pt(4.0));
     }
     // The keymap's own chord, drawn as keycaps the way this platform writes it.
     let caps = super::keymap::entry(super::keymap::Action::Dictation)
@@ -696,19 +699,9 @@ pub fn settings(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Vec<El> {
                         "Optional; empty uses the service's default.",
                         "可选；留空使用服务默认模型。",
                     ),
-                    field(model, k, "voice-model"),
+                    field(model, &s.voice_form.model, k, "voice-model"),
                 ),
-                row(
-                    k,
-                    "voice-key",
-                    tr_ref(language, "API key", "API 密钥"),
-                    tr_ref(
-                        language,
-                        "Sent as a Bearer token. Kept in the system keyring, never in config.json.",
-                        "以 Bearer 令牌发送。保存在系统钥匙串中，不写入 config.json。",
-                    ),
-                    key_field,
-                ),
+                row_with(k, "voice-key", key_label, key_field),
             ],
         ),
         group(
@@ -736,15 +729,11 @@ pub fn settings(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Vec<El> {
                         "Or the mic button. Escape cancels. The words land in the draft and are never sent on their own.",
                         "也可用麦克风按钮，Esc 取消。文字只放进草稿，不会自动发送。",
                     ),
-                    rune_kit::Keybind::new(&caps).build(k),
+                    super::shortcuts::keycaps(k, &caps),
                 ),
             ],
         ),
     ]
-}
-
-fn row_of(a: El, b: El) -> El {
-    row().w_full().gap(8.0).center_y().child(a).child(b)
 }
 
 /// What Settings → Voice says in its subtitle.

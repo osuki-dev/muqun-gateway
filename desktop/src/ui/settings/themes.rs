@@ -25,7 +25,7 @@ use crate::ui::copy::{tr, tr_ref};
 use crate::ui::UiState;
 
 /// The narrowest a tile gets before the grid drops a column.
-const TILE_MIN_W: f32 = 210.0;
+const TILE_MIN_W: f32 = 200.0;
 const GAP: f32 = 18.0;
 
 /// A thumbnail's bytes, read once per path: the view runs every frame and
@@ -423,6 +423,7 @@ pub(super) fn actions(s: &UiState, k: &Kit) -> Vec<El> {
         search.build(k).key("theme-search"),
         IconButton::new(&crate::ui::icons::REFRESH)
             .variant(IconButtonVariant::Ghost)
+            .control_size(super::CONTROL_SIZE)
             .label(tr_ref(language, "Refresh", "刷新"))
             .help(tr_ref(language, "Look for new themes", "查找新主题"))
             .on_press(|s: &mut UiState| s.send(Command::ThemeRefresh))
@@ -440,9 +441,9 @@ pub(super) fn page(s: &UiState, k: &Kit) -> Vec<El> {
     let query = s.theme_query.text.as_str();
     // Columns from the body's width as last laid out.
     let body_w = rune::memo::layout_with("settings-body-Themes", |r| r[2] - 2.0 * super::PAD_X)
-        .unwrap_or(super::WIDE_BODY_W - 2.0 * super::PAD_X)
+        .unwrap_or(super::BODY_MAX - 2.0 * super::PAD_X)
         .max(TILE_MIN_W);
-    let columns = (((body_w + GAP) / (TILE_MIN_W + GAP)).floor() as usize).clamp(1, 5);
+    let columns = (((body_w + GAP) / (TILE_MIN_W + GAP)).floor() as usize).clamp(1, 7);
     let w = ((body_w - GAP * (columns - 1) as f32) / columns as f32).floor();
 
     let library: Vec<&ThemeEntry> = s
@@ -525,9 +526,7 @@ pub(super) fn page(s: &UiState, k: &Kit) -> Vec<El> {
             "gallery-error",
             tr_ref(language, "The gallery is unavailable", "图库不可用"),
             err,
-            Button::new(tr_ref(language, "Try again", "重试"))
-                .variant(ButtonVariant::Outline)
-                .control_size(ControlSize::Small)
+            super::button(tr_ref(language, "Try again", "重试"))
                 .on_press(|s: &mut UiState| s.send(Command::ThemeRefresh))
                 .build(k)
                 .key("gallery-retry"),
@@ -592,6 +591,7 @@ pub(super) fn page(s: &UiState, k: &Kit) -> Vec<El> {
         rows,
     ));
 
+    let import = tr_ref(language, "Import", "导入");
     out.push(super::group(
         k,
         "themes-import",
@@ -606,29 +606,20 @@ pub(super) fn page(s: &UiState, k: &Kit) -> Vec<El> {
                     "A .muqun-theme address someone shared.",
                     "别人分享的 .muqun-theme 地址。",
                 ),
-                hrow()
-                    .key("import-link-controls")
-                    .gap(8.0)
-                    .center_y()
-                    .child(
-                        TextInput::new(&s.theme_url)
-                            .label(tr_ref(language, "Theme link", "主题链接"))
-                            .placeholder("https://… .muqun-theme")
-                            .width(Some(super::CONTROL_W - 76.0))
-                            .on_edit(|s: &mut UiState| &mut s.theme_url)
-                            .on_submit(import_url)
-                            .build(k)
-                            .key("theme-url"),
-                    )
-                    .child(
-                        Button::new(tr_ref(language, "Import", "导入"))
-                            .variant(ButtonVariant::Outline)
-                            .control_size(ControlSize::Small)
-                            .disabled(s.theme_url.text.trim().is_empty())
-                            .on_press(|s: &mut UiState| import_url(s, &mut Tx::default()))
-                            .build(k)
-                            .key("theme-import-url"),
-                    ),
+                super::field_button(
+                    TextInput::new(&s.theme_url)
+                        .label(tr_ref(language, "Theme link", "主题链接"))
+                        .placeholder("https://… .muqun-theme")
+                        .on_edit(|s: &mut UiState| &mut s.theme_url)
+                        .on_submit(import_url),
+                    &s.theme_url,
+                    k,
+                    "theme-url",
+                    super::button(import)
+                        .disabled(s.theme_url.text.trim().is_empty())
+                        .on_press(|s: &mut UiState| import_url(s, &mut Tx::default())),
+                    super::button_w(k, import),
+                ),
             ),
             row(
                 k,
@@ -639,9 +630,7 @@ pub(super) fn page(s: &UiState, k: &Kit) -> Vec<El> {
                     "A .muqun-theme package on this computer.",
                     "这台电脑上的 .muqun-theme 主题包。",
                 ),
-                Button::new(tr_ref(language, "Choose file…", "选择文件…"))
-                    .variant(ButtonVariant::Outline)
-                    .control_size(ControlSize::Small)
+                super::button(tr_ref(language, "Choose file…", "选择文件…"))
                     .on_press(|_: &mut UiState| crate::platform::dialogs::import_theme_file())
                     .build(k)
                     .key("theme-import-file"),
