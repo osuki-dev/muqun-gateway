@@ -407,7 +407,7 @@ fn replay_updates(chain: &[Chained]) -> Vec<Value> {
 }
 
 /// The timeline of a transcript another process is still writing, read-only.
-pub(super) async fn live_timeline(
+pub(crate) async fn live_timeline(
     directory: &str,
     id: &str,
     stop: &CancellationToken,

@@ -912,6 +912,7 @@ pub fn openapi_spec() -> Value {
     for (path, item) in tasks_fleet_mcp_paths() {
         spec["paths"][path] = item;
     }
+    spec["paths"]["/api/search"] = crate::search::routes::openapi();
     spec["paths"]["/api/assets/{assetId}/download"] = json!({"get": {
         "summary": "Save one authenticated asset, including binary files",
         "description": "Requires device authentication and asset_download capability. Rechecks the indexed directory boundary. Full reads keep a 32 MiB preview budget; bounded_file_ranges supports one Range up to 1 MiB, including larger files. Pin and echo X-Muqun-File-Version; changed files return 412, invalid ranges 416. Mutable files have a weak ETag, not an immutable original. Returns attachment content disposition.",
@@ -2555,6 +2556,7 @@ mod history_contract_tests {
             ("/api/tasks/{id}/cancel", "post"),
             ("/api/tasks/{id}/complete", "post"),
             ("/api/fleet/self", "get"),
+            ("/api/search", "get"),
             ("/api/history/storage", "get"),
             ("/api/mcp/tokens", "post"),
             ("/api/mcp/tokens", "get"),

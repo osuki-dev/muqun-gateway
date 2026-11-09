@@ -78,6 +78,8 @@ pub(crate) const API_CAPABILITIES: &[&str] = &[
     "agent_session_resume_v1",
     "agent_session_delete_scoped",
     "capabilities_discovery",
+    // `GET /api/search`: full-text search over agent session content.
+    crate::search::CAPABILITY,
     crate::fleet::home::CAPABILITY,
     crate::fleet::home::COLLECTOR_CAPABILITY,
     crate::fleet::home_overview::CAPABILITY,

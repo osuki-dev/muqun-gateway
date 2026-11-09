@@ -166,6 +166,10 @@ pub(crate) async fn run(config_path: Option<String>) -> anyhow::Result<()> {
     )));
     let state_directory = state_dir()?;
     let key = platform::store::db_key::key_for(&config.store, &state_directory)?;
+    let search = Arc::new(crate::search::SearchService::open(
+        &state_directory,
+        key.clone(),
+    ));
     let db = platform::store::sqlite::SqliteStore::open(
         &platform::store::store_db_path(&state_directory),
         key,
@@ -224,6 +228,7 @@ pub(crate) async fn run(config_path: Option<String>) -> anyhow::Result<()> {
         tasks,
         task_events,
         home_overview: Default::default(),
+        search,
         db,
     };
     // A registration handed to a session agent's service outlives a switch
@@ -259,6 +264,7 @@ pub(crate) async fn run(config_path: Option<String>) -> anyhow::Result<()> {
     crate::tasks::driver::spawn_follower(state.clone());
     crate::tasks::driver::spawn_instruction_cleanup(state.clone());
     crate::tasks::notices::spawn(state.clone());
+    crate::search::indexer::spawn(state.clone());
     crate::tasks::pane_agent::warm_claude_probe(&state);
 
     let app = Router::new();
@@ -272,6 +278,7 @@ pub(crate) async fn run(config_path: Option<String>) -> anyhow::Result<()> {
     let app = crate::fleet::routes::mount(app);
     let app = crate::fleet::peer_routes::mount(app);
     let app = crate::tasks::routes::mount(app);
+    let app = crate::search::routes::mount(app);
     let app = if state.config.mcp.enabled {
         crate::mcp::mount(app)
     } else {
@@ -1735,7 +1742,7 @@ fn spawn_memory_watchdog() {
 /// returns what is free at the top of each arena. Linux/glibc only -- musl
 /// has no arenas, and macOS has its own allocator, so neither needs this.
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
-fn trim_allocator() {
+pub(crate) fn trim_allocator() {
     // Safety: `malloc_trim` only walks the allocator's own free lists.
     unsafe {
         libc::malloc_trim(0);
@@ -1743,7 +1750,7 @@ fn trim_allocator() {
 }
 
 #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
-fn trim_allocator() {}
+pub(crate) fn trim_allocator() {}
 
 /// This process's current resident set, in MiB.
 #[cfg(target_os = "linux")]

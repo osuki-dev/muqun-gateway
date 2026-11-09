@@ -15,6 +15,7 @@ pub(crate) mod connectivity;
 pub(crate) mod fleet;
 pub(crate) mod mcp;
 pub(crate) mod platform;
+pub(crate) mod search;
 pub(crate) mod tasks;
 pub(crate) mod terminal;
 
@@ -106,6 +107,8 @@ pub(crate) struct AppState {
     /// Every task change the service records, for the event socket.
     pub(crate) task_events: tokio::sync::broadcast::Sender<tasks::events::TaskDomainEvent>,
     pub(crate) home_overview: Arc<fleet::home_overview::OverviewCache>,
+    /// Full-text search over agent session content. See `search`.
+    pub(crate) search: Arc<search::SearchService>,
 }
 
 /// A fresh instance generation. Opaque to clients: they compare it for
