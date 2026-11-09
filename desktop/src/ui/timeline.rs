@@ -24,8 +24,8 @@ use std::collections::{HashMap, HashSet};
 use muqun_gateway::agents::{
     AgentPart, AgentSessionId, AgentSessionStatus, TimelineItem, TimelineRole,
 };
-use rune::{col, row, text, El, GrowthSpec, ScrollSpec};
-use rune_kit::diff::{DiffState, DiffView, FileDiff};
+use rune::{col, el, icon, row, text, Cursor, El, GrowthSpec, ScrollSpec};
+use rune_kit::diff::{DiffMode, DiffState, DiffView, FileDiff, FileStatus};
 use rune_kit::{
     Badge, BadgeVariant, Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, Kit,
     ScrollBar, Spinner,
@@ -630,22 +630,28 @@ fn working_row(cx: &Tcx) -> El {
         )
 }
 
-/// Roll back and Fork from here: two small icon buttons on a raised chip,
-/// shown while the pointer is on the message. Each names itself in a
-/// tooltip. The chip stays inside the message's own box, so while it is
-/// hidden the pointer can't reach it without showing it.
+/// Copy message text, roll back to here, and fork from here: small icon buttons on a raised chip,
+/// shown while the pointer is on the message. No hover tooltip popovers.
 fn message_actions(cx: &Tcx, it: &TimelineItem) -> El {
     let k = cx.k;
     let asid = AgentSessionId(cx.asid.to_string());
     let (rollback_asid, rollback_id) = (asid.clone(), it.message_id.clone());
     let fork_id = it.message_id.clone();
-    let action = |icon: &'static rune::Icon, label: &str| {
-        IconButton::new(icon)
-            .variant(IconButtonVariant::GhostMuted)
-            .control_size(ControlSize::Small)
-            .label(label)
-            .help(label)
+    let text = match &it.part {
+        AgentPart::Text { text } => {
+            if it.role == TimelineRole::User {
+                muqun_gateway::agents::ports::agent::prompt_display_body(text).to_string()
+            } else {
+                text.clone()
+            }
+        }
+        _ => return el(),
     };
+    if text.is_empty() {
+        return el();
+    }
+    let copied_label = cx.t("Copied to clipboard", "已复制到剪贴板");
+    let copy_id = it.id.clone();
     let chip = row()
         .key(format!("actions-{}", it.id))
         .gap(2.0)
@@ -656,7 +662,22 @@ fn message_actions(cx: &Tcx, it: &TimelineItem) -> El {
         .border(1.0, k.c.border_base)
         .group_opacity(0.0, 1.0)
         .child(
-            action(&super::icons::UNDO, cx.t("Roll back to here", "回滚到这里"))
+            IconButton::new(&rune_kit::glyphs::COPY)
+                .variant(IconButtonVariant::GhostMuted)
+                .control_size(ControlSize::Small)
+                .label(cx.t("Copy", "复制"))
+                .on_press_tx(move |s: &mut UiState, tx: &mut rune::Tx| {
+                    tx.copy(text.clone());
+                    s.status = copied_label.to_string();
+                })
+                .build(k)
+                .key(format!("copy-{}", copy_id)),
+        )
+        .child(
+            IconButton::new(&super::icons::UNDO)
+                .variant(IconButtonVariant::GhostMuted)
+                .control_size(ControlSize::Small)
+                .label(cx.t("Roll back to here", "回滚到这里"))
                 .on_press(move |s: &mut UiState| {
                     s.send(Command::StageRevert {
                         asid: rollback_asid.clone(),
@@ -667,7 +688,10 @@ fn message_actions(cx: &Tcx, it: &TimelineItem) -> El {
                 .key(format!("rollback-{}", it.id)),
         )
         .child(
-            action(&super::icons::FORK, cx.t("Fork from here", "从这里分叉"))
+            IconButton::new(&super::icons::FORK)
+                .variant(IconButtonVariant::GhostMuted)
+                .control_size(ControlSize::Small)
+                .label(cx.t("Fork from here", "从这里分叉"))
                 .on_press(move |s: &mut UiState| {
                     s.send(Command::ForkSession {
                         asid: asid.clone(),
@@ -748,76 +772,470 @@ pub fn context_meter(s: &UiState, k: &Kit, asid: &str) -> Option<El> {
     parts::context::meter(s, k, asid)
 }
 
-/// The session's working-tree changes, full height.
+/// Toolbar for the changes review workspace: back to chat, stats, mode toggles, wrap, and refresh.
+fn changes_toolbar(s: &UiState, k: &Kit, asid: &str) -> El {
+    let language = s.cfg.general.language;
+    let mode = s
+        .diff
+        .as_ref()
+        .map(|d| d.mode())
+        .unwrap_or(DiffMode::Unified);
+    let wrap = s.diff.as_ref().map(|d| d.wrap()).unwrap_or(false);
+    let files_count = s
+        .diff
+        .as_ref()
+        .map(|d| d.files().len())
+        .unwrap_or(s.diff_stat.files);
+    let added = s
+        .diff
+        .as_ref()
+        .map(|d| d.files().iter().map(|f| f.additions()).sum::<usize>())
+        .unwrap_or(s.diff_stat.added);
+    let removed = s
+        .diff
+        .as_ref()
+        .map(|d| d.files().iter().map(|f| f.deletions()).sum::<usize>())
+        .unwrap_or(s.diff_stat.removed);
+
+    let back_btn = Button::new(tr_ref(language, "← Chat", "← 对话"))
+        .variant(ButtonVariant::Ghost)
+        .control_size(ControlSize::Small)
+        .on_press(|s: &mut UiState| s.show_diff = false)
+        .build(k)
+        .key("back-to-chat");
+
+    let title = text(tr_ref(language, "Working Tree Changes", "工作区改动"))
+        .font(k.ty.ui_medium)
+        .color(k.c.text_base)
+        .single_line();
+
+    let stats_badge = Badge::new(format!(
+        "{} {}  +{} −{}",
+        files_count,
+        tr_ref(language, "files", "个文件"),
+        added,
+        removed
+    ))
+    .variant(BadgeVariant::Subtle)
+    .build(k)
+    .key("changes-stats");
+
+    let row_top = row()
+        .key("tb-top")
+        .w_full()
+        .center_y()
+        .gap(8.0)
+        .child(back_btn)
+        .child(title)
+        .child(col().grow(1.0))
+        .child(stats_badge);
+
+    let unified_active = mode == DiffMode::Unified;
+    let unified_btn = Button::new(tr_ref(language, "Unified", "单栏"))
+        .variant(if unified_active {
+            ButtonVariant::Contrast
+        } else {
+            ButtonVariant::Ghost
+        })
+        .control_size(ControlSize::Small)
+        .on_press(|s: &mut UiState| {
+            if let Some(d) = &mut s.diff {
+                d.set_mode(DiffMode::Unified);
+            }
+        })
+        .build(k)
+        .key("btn-unified");
+
+    let split_btn = Button::new(tr_ref(language, "Split", "双栏"))
+        .variant(if !unified_active {
+            ButtonVariant::Contrast
+        } else {
+            ButtonVariant::Ghost
+        })
+        .control_size(ControlSize::Small)
+        .on_press(|s: &mut UiState| {
+            if let Some(d) = &mut s.diff {
+                d.set_mode(DiffMode::Split);
+            }
+        })
+        .build(k)
+        .key("btn-split");
+
+    let wrap_btn = Button::new(tr_ref(language, "Wrap", "换行"))
+        .variant(if wrap {
+            ButtonVariant::Contrast
+        } else {
+            ButtonVariant::Ghost
+        })
+        .control_size(ControlSize::Small)
+        .on_press(|s: &mut UiState| {
+            if let Some(d) = &mut s.diff {
+                d.set_wrap(!d.wrap());
+            }
+        })
+        .build(k)
+        .key("btn-wrap");
+
+    let asid_str = asid.to_string();
+    let refresh_btn = Button::new(tr_ref(language, "Refresh", "刷新"))
+        .variant(ButtonVariant::Ghost)
+        .control_size(ControlSize::Small)
+        .on_press(move |s: &mut UiState| {
+            if !asid_str.is_empty() {
+                s.send(Command::RefreshDiff(AgentSessionId(asid_str.clone())));
+            }
+        })
+        .build(k)
+        .key("btn-refresh");
+
+    let commit_btn = Button::new(tr_ref(language, "Commit with agent", "让 agent 提交"))
+        .variant(ButtonVariant::Ghost)
+        .control_size(ControlSize::Small)
+        .on_press(move |s: &mut UiState| {
+            let msg = if language == crate::config::Language::En {
+                "Commit the working tree changes with a descriptive conventional commit message"
+            } else {
+                "请使用规范的 commit message 提交当前工作区的修改"
+            };
+            s.draft = rune::TextEdit::new(msg);
+            s.draft.focused = true;
+            s.show_diff = false;
+        })
+        .build(k)
+        .key("btn-commit-agent");
+
+    let row_bottom = row()
+        .key("tb-bottom")
+        .w_full()
+        .center_y()
+        .gap(6.0)
+        .child(unified_btn)
+        .child(split_btn)
+        .child(wrap_btn)
+        .child(col().grow(1.0))
+        .child(commit_btn)
+        .child(refresh_btn);
+
+    col()
+        .key("changes-toolbar")
+        .w_full()
+        .px(12.0)
+        .py(6.0)
+        .gap(6.0)
+        .fill(k.c.layer_01)
+        .child(row_top)
+        .child(row_bottom)
+}
+
+/// Horizontal selector pills for changed files when reviewing a multi-file diff.
+fn changes_file_strip(s: &UiState, k: &Kit, files: &[FileDiff]) -> El {
+    let mut strip = row()
+        .key("file-strip")
+        .w_full()
+        .px(12.0)
+        .py(6.0)
+        .gap(6.0)
+        .center_y()
+        .fill(k.alpha(k.c.layer_02, 0.45));
+
+    for (fi, file) in files.iter().enumerate() {
+        let is_active = s.diff_active_file == fi;
+        let path = file.path().to_string();
+        let name = match path.rfind('/') {
+            Some(idx) => &path[idx + 1..],
+            None => path.as_str(),
+        };
+
+        let status_color = match file.status {
+            FileStatus::Added => k.c.success.fg,
+            FileStatus::Deleted => k.c.danger.fg,
+            _ => k.c.info.fg,
+        };
+        let status_letter = match file.status {
+            FileStatus::Added => "A",
+            FileStatus::Deleted => "D",
+            _ => "M",
+        };
+
+        let mut pill = row()
+            .gap(6.0)
+            .px(8.0)
+            .py(4.0)
+            .center_y()
+            .radius(k.radius.sm)
+            .child(
+                text(status_letter)
+                    .font(k.ty.small_medium)
+                    .color(status_color),
+            )
+            .child(
+                text(name.to_string())
+                    .font(if is_active {
+                        k.ty.small_medium
+                    } else {
+                        k.ty.small
+                    })
+                    .color(if is_active {
+                        k.c.text_base
+                    } else {
+                        k.c.text_muted
+                    })
+                    .single_line(),
+            )
+            .child(
+                text(format!("+{} −{}", file.additions(), file.deletions()))
+                    .font(k.ty.small)
+                    .color(k.c.text_faint),
+            );
+
+        if is_active {
+            pill = pill
+                .fill(k.c.surface_raised_base)
+                .border(1.0, k.c.border_strong);
+        } else {
+            pill = pill
+                .fill(k.c.layer_01)
+                .border(1.0, k.c.border_weak)
+                .hover(k.c.surface_raised_hover);
+        }
+
+        let idx = fi;
+        let interactive_pill = k
+            .interactive(pill)
+            .cursor(Cursor::Pointer)
+            .role("button")
+            .label(path.clone())
+            .key(format!("f-pill-{fi}"))
+            .on_press_tx(move |s: &mut UiState, tx: &mut rune::Tx| {
+                s.diff_active_file = idx;
+                if let Some(diff) = &mut s.diff {
+                    diff.scroll_to_file(idx, tx);
+                }
+            });
+
+        strip = strip.child(interactive_pill);
+    }
+
+    col()
+        .key("file-strip-container")
+        .w_full()
+        .child(
+            strip
+                .scroll(ScrollSpec {
+                    stick_bottom: false,
+                })
+                .scroll_bar(k),
+        )
+        .child(col().h(1.0).w_full().fill(k.c.border_weak))
+}
+
+/// Action buttons in each file's header within the DiffView.
+fn diff_file_actions(s: &UiState, k: &Kit, file_idx: usize) -> El {
+    let Some(file) = s.diff.as_ref().and_then(|d| d.files().get(file_idx)) else {
+        return row();
+    };
+    let path = file.path().to_string();
+    let copy_path = path.clone();
+
+    let copy_btn = k
+        .interactive(
+            row()
+                .size(22.0, 22.0)
+                .center()
+                .radius(k.radius.sm)
+                .hover(k.c.surface_raised_hover)
+                .child(
+                    icon(&rune_kit::glyphs::COPY, 12.0)
+                        .color(k.c.icon_faint)
+                        .a11y_hidden(),
+                ),
+        )
+        .cursor(Cursor::Pointer)
+        .role("button")
+        .label("Copy path".to_string())
+        .on_press_tx(move |_: &mut UiState, tx: &mut rune::Tx| tx.copy(copy_path.clone()))
+        .key(format!("hdr-copy-{file_idx}"));
+
+    let open_path = path.clone();
+    let open_btn = k
+        .interactive(
+            row()
+                .size(22.0, 22.0)
+                .center()
+                .radius(k.radius.sm)
+                .hover(k.c.surface_raised_hover)
+                .child(
+                    icon(&parts::glyphs::OPEN, 12.0)
+                        .color(k.c.icon_faint)
+                        .a11y_hidden(),
+                ),
+        )
+        .cursor(Cursor::Pointer)
+        .role("button")
+        .label("Open file".to_string())
+        .on_press(move |s: &mut UiState| s.open_timeline_file(&open_path))
+        .key(format!("hdr-open-{file_idx}"));
+
+    row()
+        .key(format!("hdr-actions-{file_idx}"))
+        .gap(4.0)
+        .center_y()
+        .child(copy_btn)
+        .child(open_btn)
+}
+
+fn empty_changes_placeholder(k: &Kit, language: crate::config::Language) -> El {
+    col()
+        .key("empty-changes")
+        .w_full()
+        .grow(1.0)
+        .center()
+        .gap(12.0)
+        .py(64.0)
+        .child(
+            icon(&parts::glyphs::DIFF, 36.0)
+                .color(k.c.icon_faint)
+                .a11y_hidden(),
+        )
+        .child(
+            text(tr_ref(
+                language,
+                "No working tree changes",
+                "工作区没有未提交的改动",
+            ))
+            .font(k.ty.ui_medium)
+            .color(k.c.text_muted),
+        )
+        .child(
+            text(tr_ref(
+                language,
+                "Changes made by the agent will appear here for review.",
+                "Agent 修改的文件差异将在此处展示以供审查。",
+            ))
+            .font(k.ty.small)
+            .color(k.c.text_faint),
+        )
+}
+
+fn changes_file_list(s: &UiState, k: &Kit, language: crate::config::Language, asid: &str) -> El {
+    let mut list = col()
+        .key("changes-list")
+        .gap(6.0)
+        .w_full()
+        .px(24.0)
+        .py(24.0);
+    list = list.child(muted(
+        k,
+        match language {
+            crate::config::Language::En => format!(
+                "{} changed file(s); the agent gave no patch.",
+                s.diff_stat.files
+            ),
+            _ => super::copy::tr(
+                language,
+                "",
+                &format!("{} 个文件有改动；agent 没有给出补丁。", s.diff_stat.files),
+            ),
+        },
+    ));
+    for f in &s.diff_stat.paths {
+        let (asid_c, path) = (asid.to_string(), f.path.clone());
+        list = list.child(
+            row()
+                .key(format!("chg-{}", f.path))
+                .gap(8.0)
+                .center_y()
+                .child(
+                    Button::new(f.path.clone())
+                        .variant(ButtonVariant::Ghost)
+                        .control_size(ControlSize::Small)
+                        .on_press(move |s: &mut UiState| {
+                            if !asid_c.is_empty() {
+                                s.send(Command::OpenDiff {
+                                    asid: AgentSessionId(asid_c.clone()),
+                                    file: Some(path.clone()),
+                                });
+                            }
+                        })
+                        .build(k)
+                        .key(format!("chg-open-{}", f.path))
+                        .grow(1.0),
+                )
+                .child(
+                    Badge::new(format!("+{} −{}", f.added, f.removed))
+                        .variant(BadgeVariant::Subtle)
+                        .build(k),
+                ),
+        );
+    }
+    list.scroll(ScrollSpec {
+        stick_bottom: false,
+    })
+    .grow(1.0)
+    .min_h(0.0)
+    .scroll_bar(k)
+}
+
+/// The session's working-tree changes, full height with review workspace.
 pub fn changes(s: &UiState, k: &Kit) -> El {
     let language = s.cfg.general.language;
-    if s.diff.is_none() {
-        let mut list = col()
-            .key("changes-list")
-            .gap(6.0)
-            .w_full()
-            .px(24.0)
-            .py(24.0);
-        list = list.child(muted(
-            k,
-            match language {
-                crate::config::Language::En => format!(
-                    "{} changed file(s); the agent gave no patch.",
-                    s.diff_stat.files
-                ),
-                _ => super::copy::tr(
-                    language,
-                    "",
-                    &format!("{} 个文件有改动；agent 没有给出补丁。", s.diff_stat.files),
-                ),
-            },
-        ));
-        for f in &s.diff_stat.paths {
-            let (asid, path) = (s.selected.clone(), f.path.clone());
-            list = list.child(
-                row()
-                    .key(format!("chg-{}", f.path))
-                    .gap(8.0)
-                    .center_y()
-                    .child(
-                        Button::new(f.path.clone())
-                            .variant(ButtonVariant::Ghost)
-                            .control_size(ControlSize::Small)
-                            .on_press(move |s: &mut UiState| {
-                                if let Some(asid) = asid.clone() {
-                                    s.send(Command::OpenDiff {
-                                        asid: AgentSessionId(asid),
-                                        file: Some(path.clone()),
-                                    });
-                                }
-                            })
-                            .build(k)
-                            .key(format!("chg-open-{}", f.path))
-                            .grow(1.0),
-                    )
-                    .child(
-                        Badge::new(format!("+{} −{}", f.added, f.removed))
-                            .variant(BadgeVariant::Subtle)
-                            .build(k),
-                    ),
+    let asid = s.selected.clone().unwrap_or_default();
+    let toolbar = changes_toolbar(s, k, &asid);
+
+    let content = if let Some(diff) = &s.diff {
+        let files = diff.files();
+        if files.is_empty() {
+            empty_changes_placeholder(k, language)
+        } else {
+            let mut view_col = col().key("diff-body").w_full().grow(1.0).min_h(0.0);
+            if files.len() > 1 {
+                view_col = view_col.child(changes_file_strip(s, k, files));
+            }
+            let kit = k.clone();
+            view_col = view_col.child(
+                DiffView::new(
+                    |s: &UiState| s.diff.as_ref().unwrap_or_else(|| empty_diff()),
+                    |s: &mut UiState| s.diff.get_or_insert_with(DiffState::default),
+                )
+                .key("changes-diff")
+                .on_visible_file(|s: &mut UiState, file_idx| {
+                    s.diff_active_file = file_idx;
+                })
+                .on_comment(|s: &mut UiState, lines, _tx| {
+                    if let Some(file) = s.diff.as_ref().and_then(|d| d.files().get(lines.file)) {
+                        let path = file.path();
+                        let target = if lines.start.line == lines.end.line {
+                            format!("Regarding `{}` line {}: ", path, lines.start.line)
+                        } else {
+                            format!(
+                                "Regarding `{}` lines {}-{}: ",
+                                path, lines.start.line, lines.end.line
+                            )
+                        };
+                        s.draft = rune::TextEdit::new(target);
+                        s.draft.focused = true;
+                        s.show_diff = false;
+                    }
+                })
+                .header_actions(move |s: &UiState, file_idx| diff_file_actions(s, &kit, file_idx))
+                .build(s, k),
             );
+            view_col
         }
-        return list
-            .scroll(ScrollSpec {
-                stick_bottom: false,
-            })
-            .grow(1.0)
-            .min_h(0.0)
-            .scroll_bar(k);
-    }
-    col().key("changes").w_full().grow(1.0).min_h(0.0).child(
-        DiffView::new(
-            |s: &UiState| s.diff.as_ref().unwrap_or_else(|| empty_diff()),
-            |s: &mut UiState| s.diff.get_or_insert_with(DiffState::default),
-        )
-        .key("changes-diff")
-        .build(s, k),
-    )
+    } else if s.diff_stat.files > 0 {
+        changes_file_list(s, k, language, &asid)
+    } else {
+        empty_changes_placeholder(k, language)
+    };
+
+    col()
+        .key("changes-workspace")
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .child(toolbar)
+        .child(col().h(1.0).w_full().fill(k.c.border_weak))
+        .child(content)
 }
 
 #[cfg(test)]
@@ -883,7 +1301,7 @@ mod tests {
         );
         let mut now = 0.0;
         let mut settle = |rt: &mut rune::Runtime<UiState>| {
-            for _ in 0..90 {
+            for _ in 0..30 {
                 now += 1.0 / 60.0;
                 rt.frame(now);
             }
@@ -959,18 +1377,29 @@ mod tests {
             upsert("b", "b-2", 2),
             upsert("z", "z-1", 2),
         ]);
-        let ids = |asid: &str| -> Vec<String> {
+        fn ids(s: &UiState, asid: &str) -> Vec<String> {
             s.timelines[asid]
                 .items
                 .iter()
                 .map(|i| i.id.clone())
                 .collect()
-        };
-        assert_eq!(ids("a"), ["a-1", "a-2"]);
-        assert_eq!(ids("b"), ["b-1", "b-2"]);
+        }
+        assert_eq!(ids(&s, "a"), ["a-1", "a-2"]);
+        assert_eq!(ids(&s, "b"), ["b-1", "b-2"]);
         assert!(
             !s.timelines.contains_key("z"),
             "a session not on screen keeps no rows"
         );
+
+        // Switching focus between tiles preserves selection and allows live streaming
+        s.focus_tile(0);
+        assert_eq!(s.selected.as_deref(), Some("a"));
+        s.apply_updates(vec![upsert("b", "b-3", 3)]);
+        assert_eq!(ids(&s, "b"), ["b-1", "b-2", "b-3"]);
+
+        s.focus_tile(1);
+        assert_eq!(s.selected.as_deref(), Some("b"));
+        s.apply_updates(vec![upsert("a", "a-3", 3)]);
+        assert_eq!(ids(&s, "a"), ["a-1", "a-2", "a-3"]);
     }
 }

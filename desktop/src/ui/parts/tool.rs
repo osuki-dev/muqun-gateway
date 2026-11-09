@@ -138,6 +138,9 @@ pub fn card(cx: &Tcx, item: &TimelineItem, call: &ToolCall) -> El {
         && !target.contains('\n')
     {
         card.open = Some(target.clone());
+        if matches!(kind, ToolKind::Edit | ToolKind::Write | ToolKind::Patch) {
+            card.diff = Some(target.clone());
+        }
     }
     let mut failed = false;
 

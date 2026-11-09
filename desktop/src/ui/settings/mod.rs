@@ -15,6 +15,7 @@ mod general;
 mod keys;
 mod storage;
 mod themes;
+pub use themes::ThemeTab;
 
 use rune::{col, el, row as hrow, text, El, TextEdit, Tx};
 use rune_kit::shell::SidebarRow;
@@ -230,6 +231,7 @@ pub(super) fn group(k: &Kit, key: &str, title: &str, rows: Vec<El>) -> El {
 }
 
 /// [`group`] with something at the header's trailing end.
+#[allow(dead_code)]
 pub(super) fn group_action(k: &Kit, key: &str, title: &str, action: El, rows: Vec<El>) -> El {
     group_with(k, key, group_head(k, title, Some(action)), rows)
 }
@@ -548,13 +550,20 @@ fn nav(s: &UiState, k: &Kit, rail: bool) -> El {
     list
 }
 
-/// The page's fixed header: its title, its line, and its own actions.
-fn header(k: &Kit, tab: SettingsTab, language: Language, actions: Vec<El>, max_w: f32) -> El {
+/// The page's fixed header: its title, its line, its own actions, and an optional sub-bar.
+fn header(
+    k: &Kit,
+    tab: SettingsTab,
+    language: Language,
+    actions: Vec<El>,
+    sub: Option<El>,
+    max_w: f32,
+) -> El {
     let name = tabs(language)
         .into_iter()
         .find(|(_, t)| *t == tab)
         .map_or("", |(n, _)| n);
-    col()
+    let mut head = col()
         .key("settings-head")
         .w_full()
         .max_w(max_w)
@@ -591,7 +600,11 @@ fn header(k: &Kit, tab: SettingsTab, language: Language, actions: Vec<El>, max_w
                 .color(k.c.text_muted)
                 .wrap()
                 .w_full(),
-        )
+        );
+    if let Some(sub) = sub {
+        head = head.child(el().key("head-sub-gap").h(10.0)).child(sub);
+    }
+    head
 }
 
 /// Where the nav and page sit in a card `card_w` wide: the margin before
@@ -617,15 +630,19 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     let nav_w = if rail { RAIL_W } else { NAV_W };
     let (lead, trail, max_w) = frame(card_w, nav_w, tab);
     INNER_W.set((card_w - lead - trail - nav_w).min(max_w) - 2.0 * PAD_X);
-    let (actions, body): (Vec<El>, Vec<El>) = match tab {
-        SettingsTab::General => (Vec::new(), general::page(s, k, layer)),
-        SettingsTab::Appearance => (Vec::new(), appearance::page(s, k)),
-        SettingsTab::Themes => (themes::actions(s, k), themes::page(s, k)),
-        SettingsTab::Agents => (agents::actions(s, k), agents::page(s, k, layer)),
-        SettingsTab::Voice => (Vec::new(), super::voice::settings(s, k, layer)),
-        SettingsTab::Shortcuts => (Vec::new(), keys::page(s, k)),
-        SettingsTab::Storage => (Vec::new(), storage::page(s, k)),
-        SettingsTab::About => (Vec::new(), about::page(s, k)),
+    let (actions, sub, body): (Vec<El>, Option<El>, Vec<El>) = match tab {
+        SettingsTab::General => (Vec::new(), None, general::page(s, k, layer)),
+        SettingsTab::Appearance => (Vec::new(), None, appearance::page(s, k)),
+        SettingsTab::Themes => (
+            themes::actions(s, k),
+            Some(themes::sub_header(s, k)),
+            themes::page(s, k),
+        ),
+        SettingsTab::Agents => (agents::actions(s, k), None, agents::page(s, k, layer)),
+        SettingsTab::Voice => (Vec::new(), None, super::voice::settings(s, k, layer)),
+        SettingsTab::Shortcuts => (Vec::new(), None, keys::page(s, k)),
+        SettingsTab::Storage => (Vec::new(), None, storage::page(s, k)),
+        SettingsTab::About => (Vec::new(), None, about::page(s, k)),
     };
     let mut page = col()
         .key(format!("settings-body-{tab:?}"))
@@ -639,6 +656,11 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         page = page.child(look.arrive(child, i.min(4)));
     }
     // The page starts right after the nav, not centred in what is left.
+    let scroll_key = if tab == SettingsTab::Themes {
+        format!("settings-scroll-Themes-{:?}", s.theme_tab)
+    } else {
+        format!("settings-scroll-{tab:?}")
+    };
     let content = col()
         .key("settings-content")
         .grow(1.0)
@@ -646,11 +668,11 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         .min_w(0.0)
         .h_full()
         .min_h(0.0)
-        .child(header(k, tab, language, actions, max_w))
+        .child(header(k, tab, language, actions, sub, max_w))
         .child(
             // The body scrolls under the fixed header, fading at its top.
             col()
-                .key(format!("settings-scroll-{tab:?}"))
+                .key(scroll_key)
                 .w_full()
                 .grow(1.0)
                 .min_h(0.0)

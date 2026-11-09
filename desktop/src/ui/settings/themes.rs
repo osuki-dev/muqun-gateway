@@ -12,10 +12,10 @@ use std::sync::Arc;
 use rune::{col, el, row as hrow, text, El, ImageCache, SurfaceFit, TextEdit, Transition, Tx};
 use rune_kit::{
     Badge, BadgeVariant, Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, Kit,
-    TextInput,
+    SegmentedControl, TextInput,
 };
 
-use super::{group_action, group_with, row, status, Tone};
+use super::{row, status, Tone};
 use crate::config::Language;
 use crate::model::commands::Command;
 use crate::theme::gallery::IndexEntry;
@@ -438,21 +438,18 @@ pub(super) fn actions(s: &UiState, k: &Kit) -> Vec<El> {
     ]
 }
 
-fn count(k: &Kit, n: usize) -> El {
-    text(n.to_string()).font(k.ty.small).color(k.c.text_faint)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ThemeTab {
+    #[default]
+    Installed,
+    Gallery,
 }
 
-pub(super) fn page(s: &UiState, k: &Kit) -> Vec<El> {
+pub(super) fn sub_header(s: &UiState, k: &Kit) -> El {
     let language = s.cfg.general.language;
     let query = s.theme_query.text.as_str();
-    // Columns from the body's width as last laid out.
-    let body_w = rune::memo::layout_with("settings-body-Themes", |r| r[2] - 2.0 * super::PAD_X)
-        .unwrap_or(super::BODY_MAX - 2.0 * super::PAD_X)
-        .max(TILE_MIN_W);
-    let columns = (((body_w + GAP) / (TILE_MIN_W + GAP)).floor() as usize).clamp(1, 7);
-    let w = ((body_w - GAP * (columns - 1) as f32) / columns as f32).floor();
 
-    let library: Vec<&ThemeEntry> = s
+    let library_count = s
         .theme_library
         .iter()
         .filter(|t| {
@@ -467,41 +464,10 @@ pub(super) fn page(s: &UiState, k: &Kit) -> Vec<El> {
                 ],
             )
         })
-        .collect();
-    let mut out = Vec::new();
-    let installed_rows = if s.theme_library.is_empty() {
-        vec![super::empty(
-            k,
-            "library-empty",
-            tr_ref(language, "No themes yet", "还没有主题"),
-            tr_ref(
-                language,
-                "Install one from the gallery below, or import a package.",
-                "从下方图库安装，或导入主题包。",
-            ),
-        )]
-    } else if library.is_empty() {
-        vec![nothing_found(k, language)]
-    } else {
-        vec![el().key("library-pad").w_full().pt(10.0).child(grid(
-            "library-grid",
-            library.iter().map(|t| library_tile(s, k, t, w)).collect(),
-            columns,
-        ))]
-    };
-    out.push(group_with(
-        k,
-        "themes-library",
-        super::group_head(
-            k,
-            tr_ref(language, "On this computer", "本机主题"),
-            Some(count(k, library.len())),
-        ),
-        installed_rows,
-    ));
+        .count();
 
     let gallery = &s.theme_gallery;
-    let found: Vec<&IndexEntry> = gallery
+    let gallery_count = gallery
         .entries
         .iter()
         .filter(|e| {
@@ -516,133 +482,243 @@ pub(super) fn page(s: &UiState, k: &Kit) -> Vec<El> {
                 ],
             )
         })
-        .collect();
-    let mut rows: Vec<El> = Vec::new();
-    if gallery.loading && gallery.entries.is_empty() {
-        rows.push(el().key("gallery-loading").py(12.0).child(status(
-            k,
-            "loading",
-            Tone::Quiet,
-            tr(language, "Loading the gallery…", "正在加载图库…"),
-        )));
-    }
-    if let Some(err) = &gallery.error {
-        rows.push(row(
-            k,
-            "gallery-error",
-            tr_ref(language, "The gallery is unavailable", "图库不可用"),
-            err,
-            super::button(tr_ref(language, "Try again", "重试"))
-                .on_press(|s: &mut UiState| s.send(Command::ThemeRefresh))
-                .build(k)
-                .key("gallery-retry"),
-        ));
-    }
-    if let Some(why) = &gallery.stale {
-        rows.push(el().key("gallery-stale").py(10.0).child(status(
-            k,
-            "stale",
-            Tone::Quiet,
-            tr(
-                language,
-                &format!("Showing the saved list: {why}"),
-                &format!("显示已保存的列表：{why}"),
-            ),
-        )));
-    }
-    if !found.is_empty() {
-        let mut block = col()
-            .key("gallery-pad")
-            .w_full()
-            .pt(10.0)
-            .gap(18.0)
-            .child(grid(
-                "gallery-grid",
-                found
-                    .iter()
-                    .take(s.gallery_limit)
-                    .map(|e| gallery_tile(s, k, e, w))
-                    .collect(),
-                columns,
-            ));
-        if found.len() > s.gallery_limit {
-            block = block.child(
-                hrow().key("more").w_full().justify_center().child(
-                    Button::new(tr_ref(language, "Show more", "显示更多"))
-                        .variant(ButtonVariant::Ghost)
-                        .control_size(ControlSize::Regular)
-                        .on_press(|s: &mut UiState| s.gallery_limit += 8)
-                        .build(k)
-                        .key("gallery-more"),
-                ),
-            );
-        }
-        rows.push(block);
-    } else if !gallery.entries.is_empty() {
-        rows.push(nothing_found(k, language));
-    }
-    out.push(group_action(
-        k,
-        "themes-gallery",
-        tr_ref(language, "Gallery", "图库"),
-        hrow()
-            .gap(10.0)
-            .center_y()
-            .child(
-                text(tr(language, "from muqun.dev", "来自 muqun.dev"))
-                    .font(k.ty.small)
-                    .color(k.c.text_faint),
-            )
-            .child(count(k, found.len())),
-        rows,
-    ));
+        .count();
 
-    let import = tr_ref(language, "Import", "导入");
-    out.push(super::group(
-        k,
-        "themes-import",
-        tr_ref(language, "Import", "导入"),
-        vec![
-            row(
-                k,
-                "import-link",
-                tr_ref(language, "From a link", "从链接导入"),
-                tr_ref(
-                    language,
-                    "A .muqun-theme address someone shared.",
-                    "别人分享的 .muqun-theme 地址。",
-                ),
-                super::field_button(
-                    TextInput::new(&s.theme_url)
-                        .label(tr_ref(language, "Theme link", "主题链接"))
-                        .placeholder("https://… .muqun-theme")
-                        .on_edit(|s: &mut UiState| &mut s.theme_url)
-                        .on_submit(import_url),
-                    &s.theme_url,
+    let at = match s.theme_tab {
+        ThemeTab::Installed => 0,
+        ThemeTab::Gallery => 1,
+    };
+
+    let gallery_label = if gallery.loading && gallery.entries.is_empty() {
+        tr_ref(language, "Gallery", "图库").to_string()
+    } else {
+        format!("{} ({gallery_count})", tr_ref(language, "Gallery", "图库"))
+    };
+
+    let labels = [
+        format!(
+            "{} ({library_count})",
+            tr_ref(language, "On this computer", "本机主题")
+        ),
+        gallery_label,
+    ];
+
+    let seg = SegmentedControl::new(&labels, Some(at))
+        .fit()
+        .label(tr_ref(language, "Theme sources", "主题来源"))
+        .on_pick(|s: &mut UiState, i, _: &mut Tx| {
+            s.theme_tab = match i {
+                0 => ThemeTab::Installed,
+                _ => {
+                    if s.theme_gallery.entries.is_empty() && !s.theme_gallery.loading {
+                        s.send(Command::ThemeRefresh);
+                    }
+                    ThemeTab::Gallery
+                }
+            };
+        })
+        .build(k)
+        .key("theme-tabs-segmented");
+
+    let mut bar = hrow().key("theme-tabs-bar").gap(14.0).center_y().child(seg);
+
+    if s.theme_tab == ThemeTab::Gallery {
+        bar = bar.child(
+            text(tr(language, "from muqun.dev", "来自 muqun.dev"))
+                .font(k.ty.small)
+                .color(k.c.text_faint),
+        );
+    }
+
+    bar
+}
+
+pub(super) fn page(s: &UiState, k: &Kit) -> Vec<El> {
+    let language = s.cfg.general.language;
+    let query = s.theme_query.text.as_str();
+    // Columns from the body's width as last laid out.
+    let body_w = rune::memo::layout_with("settings-body-Themes", |r| r[2] - 2.0 * super::PAD_X)
+        .unwrap_or(super::BODY_MAX - 2.0 * super::PAD_X)
+        .max(TILE_MIN_W);
+    let columns = (((body_w + GAP) / (TILE_MIN_W + GAP)).floor() as usize).clamp(1, 7);
+    let w = ((body_w - GAP * (columns - 1) as f32) / columns as f32).floor();
+
+    let mut out = Vec::new();
+
+    match s.theme_tab {
+        ThemeTab::Installed => {
+            let library: Vec<&ThemeEntry> = s
+                .theme_library
+                .iter()
+                .filter(|t| {
+                    matches(
+                        query,
+                        &[
+                            Some(&t.name),
+                            Some(&t.id),
+                            t.author.as_deref(),
+                            t.description.as_deref(),
+                            Some(&t.tags.join(" ")),
+                        ],
+                    )
+                })
+                .collect();
+
+            if s.theme_library.is_empty() {
+                out.push(super::empty(
                     k,
-                    "theme-url",
-                    super::button(import)
-                        .disabled(s.theme_url.text.trim().is_empty())
-                        .on_press(|s: &mut UiState| import_url(s, &mut Tx::default())),
-                    super::button_w(k, import),
-                ),
-            ),
-            row(
+                    "library-empty",
+                    tr_ref(language, "No themes yet", "还没有主题"),
+                    tr_ref(
+                        language,
+                        "Install one from the Gallery tab, or import a package.",
+                        "从“图库”标签页安装，或导入主题包。",
+                    ),
+                ));
+            } else if library.is_empty() {
+                out.push(nothing_found(k, language));
+            } else {
+                out.push(el().key("library-pad").w_full().pt(6.0).child(grid(
+                    "library-grid",
+                    library.iter().map(|t| library_tile(s, k, t, w)).collect(),
+                    columns,
+                )));
+            }
+
+            let import = tr_ref(language, "Import", "导入");
+            out.push(super::group(
                 k,
-                "import-file",
-                tr_ref(language, "From a file", "从文件导入"),
-                tr_ref(
-                    language,
-                    "A .muqun-theme package on this computer.",
-                    "这台电脑上的 .muqun-theme 主题包。",
-                ),
-                super::button(tr_ref(language, "Choose file…", "选择文件…"))
-                    .on_press(|_: &mut UiState| crate::platform::dialogs::import_theme_file())
-                    .build(k)
-                    .key("theme-import-file"),
-            ),
-        ],
-    ));
+                "themes-import",
+                tr_ref(language, "Import", "导入"),
+                vec![
+                    row(
+                        k,
+                        "import-link",
+                        tr_ref(language, "From a link", "从链接导入"),
+                        tr_ref(
+                            language,
+                            "A .muqun-theme address someone shared.",
+                            "别人分享的 .muqun-theme 地址。",
+                        ),
+                        super::field_button(
+                            TextInput::new(&s.theme_url)
+                                .label(tr_ref(language, "Theme link", "主题链接"))
+                                .placeholder("https://… .muqun-theme")
+                                .on_edit(|s: &mut UiState| &mut s.theme_url)
+                                .on_submit(import_url),
+                            &s.theme_url,
+                            k,
+                            "theme-url",
+                            super::button(import)
+                                .disabled(s.theme_url.text.trim().is_empty())
+                                .on_press(|s: &mut UiState| import_url(s, &mut Tx::default())),
+                            super::button_w(k, import),
+                        ),
+                    ),
+                    row(
+                        k,
+                        "import-file",
+                        tr_ref(language, "From a file", "从文件导入"),
+                        tr_ref(
+                            language,
+                            "A .muqun-theme package on this computer.",
+                            "这台电脑上的 .muqun-theme 主题包。",
+                        ),
+                        super::button(tr_ref(language, "Choose file…", "选择文件…"))
+                            .on_press(|_: &mut UiState| {
+                                crate::platform::dialogs::import_theme_file()
+                            })
+                            .build(k)
+                            .key("theme-import-file"),
+                    ),
+                ],
+            ));
+        }
+        ThemeTab::Gallery => {
+            let gallery = &s.theme_gallery;
+            let found: Vec<&IndexEntry> = gallery
+                .entries
+                .iter()
+                .filter(|e| {
+                    matches(
+                        query,
+                        &[
+                            Some(&e.name),
+                            Some(&e.id),
+                            e.author.as_deref(),
+                            e.description.as_deref(),
+                            Some(&e.tags.join(" ")),
+                        ],
+                    )
+                })
+                .collect();
+
+            if gallery.loading && gallery.entries.is_empty() {
+                out.push(el().key("gallery-loading").py(12.0).child(status(
+                    k,
+                    "loading",
+                    Tone::Quiet,
+                    tr(language, "Loading the gallery…", "正在加载图库…"),
+                )));
+            }
+            if let Some(err) = &gallery.error {
+                out.push(row(
+                    k,
+                    "gallery-error",
+                    tr_ref(language, "The gallery is unavailable", "图库不可用"),
+                    err,
+                    super::button(tr_ref(language, "Try again", "重试"))
+                        .on_press(|s: &mut UiState| s.send(Command::ThemeRefresh))
+                        .build(k)
+                        .key("gallery-retry"),
+                ));
+            }
+            if let Some(why) = &gallery.stale {
+                out.push(el().key("gallery-stale").py(10.0).child(status(
+                    k,
+                    "stale",
+                    Tone::Quiet,
+                    tr(
+                        language,
+                        &format!("Showing the saved list: {why}"),
+                        &format!("显示已保存的列表：{why}"),
+                    ),
+                )));
+            }
+            if !found.is_empty() {
+                let mut block = col()
+                    .key("gallery-pad")
+                    .w_full()
+                    .pt(6.0)
+                    .gap(18.0)
+                    .child(grid(
+                        "gallery-grid",
+                        found
+                            .iter()
+                            .take(s.gallery_limit)
+                            .map(|e| gallery_tile(s, k, e, w))
+                            .collect(),
+                        columns,
+                    ));
+                if found.len() > s.gallery_limit {
+                    block = block.child(
+                        hrow().key("more").w_full().justify_center().child(
+                            Button::new(tr_ref(language, "Show more", "显示更多"))
+                                .variant(ButtonVariant::Ghost)
+                                .control_size(ControlSize::Regular)
+                                .on_press(|s: &mut UiState| s.gallery_limit += 8)
+                                .build(k)
+                                .key("gallery-more"),
+                        ),
+                    );
+                }
+                out.push(block);
+            } else if !gallery.entries.is_empty() {
+                out.push(nothing_found(k, language));
+            }
+        }
+    }
+
     out
 }
 

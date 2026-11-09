@@ -15,7 +15,7 @@ use tokio::sync::{broadcast, watch};
 
 use super::commands::{Command, CommandReceiver};
 use super::compose::{self, ComposeCommand, ComposerUpdate, Deliver, Target};
-use super::inbox::{Inbox, SearchOutcome, UiError, Update};
+use super::inbox::{Inbox, SearchOutcome, UiError, Update, UpdateState};
 use super::types::{DiffStat, SESSION_LIST_LIMIT};
 use crate::config::{ConfigEdit, DesktopConfig};
 use crate::hub::{HubError, SessionHub, TaskHubEvent, OPENCODE};
@@ -340,6 +340,12 @@ impl Core {
                 }
                 self.open(&asid).await;
             }
+            Command::FocusSession(asid) => {
+                *self.active.lock().unwrap() = Some(asid.clone());
+                self.watch_viewed(&asid);
+                tokio::spawn(self.clone().diff(asid.clone()));
+                tokio::spawn(self.clone().descendants(asid.clone()));
+            }
             Command::WatchSessions(asids) => {
                 *self.watched.lock().unwrap() = asids;
             }
@@ -435,6 +441,9 @@ impl Core {
                     .inbox
                     .push(Update::Ui(super::inbox::UiAction::ToggleDiffPanel)),
             },
+            Command::RefreshDiff(asid) => {
+                tokio::spawn(self.clone().diff(asid));
+            }
             Command::StageRevert { asid, message_id } => {
                 if let Err(err) = self.hub.stage_revert(&asid, &message_id, true).await {
                     self.fail(err);
@@ -629,6 +638,37 @@ impl Core {
                     Ok(Err(err)) => tracing::debug!(task = %id, %err, "task history unavailable"),
                     Err(_) => tracing::debug!(task = %id, "task history timed out"),
                 }
+            }
+            Command::CheckUpdate { include_preview } => {
+                let inbox = self.inbox.clone();
+                inbox.push(Update::UpdateState(UpdateState::Checking));
+                tokio::spawn(async move {
+                    match crate::platform::update::check_latest(include_preview).await {
+                        Ok(Some(info)) => {
+                            inbox.push(Update::UpdateState(UpdateState::Available(Box::new(info))));
+                        }
+                        Ok(None) => {
+                            inbox.push(Update::UpdateState(UpdateState::UpToDate));
+                        }
+                        Err(err) => {
+                            inbox.push(Update::UpdateState(UpdateState::Failed(err.to_string())));
+                        }
+                    }
+                });
+            }
+            Command::InstallUpdate(info) => {
+                let inbox = self.inbox.clone();
+                inbox.push(Update::UpdateState(UpdateState::Downloading));
+                tokio::spawn(async move {
+                    match crate::platform::update::download_and_install(&info).await {
+                        Ok(()) => {
+                            inbox.push(Update::UpdateState(UpdateState::ReadyToRestart));
+                        }
+                        Err(err) => {
+                            inbox.push(Update::UpdateState(UpdateState::Failed(err.to_string())));
+                        }
+                    }
+                });
             }
             Command::CompleteDirectory { .. } | Command::Edit(_) => {
                 unreachable!("handled in the command loop")
@@ -1302,8 +1342,8 @@ impl Core {
         });
     }
 
-    /// Read the active session again when `asid` is it (or unnamed), else
-    /// -- or for an unnamed resync, also -- the lists.
+    /// Read the active and watched session(s) again when `asid` is open (or unnamed),
+    /// else -- or for an unnamed resync, also -- the lists.
     ///
     /// Re-reading never prepares the session: preparing a terminal-held ACP
     /// session starts another transcript follower, and every follower sends
@@ -1314,19 +1354,43 @@ impl Core {
     async fn resync(self: &Arc<Self>, asid: Option<&AgentSessionId>) {
         let named = asid.filter(|x| !x.0.is_empty());
         let active = self.active.lock().unwrap().clone();
-        let reread = active
-            .as_ref()
-            .is_some_and(|a| named.is_none_or(|x| x == a));
+        let watched = self.watched.lock().unwrap().clone();
+        let target_asids: Vec<AgentSessionId> = match named {
+            Some(target) => {
+                if active.as_ref() == Some(target) || watched.contains(target) {
+                    vec![target.clone()]
+                } else {
+                    vec![]
+                }
+            }
+            None => {
+                let mut list = Vec::new();
+                if let Some(ref a) = active {
+                    list.push(a.clone());
+                }
+                for w in &watched {
+                    if !list.contains(w) {
+                        list.push(w.clone());
+                    }
+                }
+                list
+            }
+        };
+        let reread = !target_asids.is_empty();
         if reread && self.reread.begin() {
             let core = self.clone();
             tokio::spawn(async move {
                 loop {
-                    let active = core.active.lock().unwrap().clone();
-                    if let Some(active) = active {
-                        if !core.catch_up(&active).await {
-                            match core.hub.snapshot(&active).await {
+                    for asid in &target_asids {
+                        if !core.is_open(asid) {
+                            continue;
+                        }
+                        if !core.catch_up(asid).await {
+                            match core.hub.snapshot(asid).await {
                                 Ok(snapshot) => core.push_snapshot(snapshot),
-                                Err(err) => tracing::debug!(%err, "resync read failed"),
+                                Err(err) => {
+                                    tracing::debug!(asid = %asid.0, %err, "resync read failed")
+                                }
                             }
                         }
                     }
@@ -1486,5 +1550,24 @@ mod tests {
             wanted(&resolved, Some(&id("open")), &[]),
             "the open session's forms"
         );
+    }
+
+    #[test]
+    fn split_tiles_all_stream_regardless_of_which_is_focused() {
+        let upsert = |asid: &str| AgentDomainEvent::TimelineUpsert {
+            asid: id(asid),
+            items: vec![],
+            seq: 1,
+        };
+        let tiles = vec![id("tile-a"), id("tile-b")];
+        // When tile-a is focused:
+        assert!(wanted(&upsert("tile-a"), Some(&id("tile-a")), &tiles));
+        assert!(wanted(&upsert("tile-b"), Some(&id("tile-a")), &tiles));
+        assert!(!wanted(&upsert("tile-c"), Some(&id("tile-a")), &tiles));
+
+        // When tile-b is focused:
+        assert!(wanted(&upsert("tile-a"), Some(&id("tile-b")), &tiles));
+        assert!(wanted(&upsert("tile-b"), Some(&id("tile-b")), &tiles));
+        assert!(!wanted(&upsert("tile-c"), Some(&id("tile-b")), &tiles));
     }
 }

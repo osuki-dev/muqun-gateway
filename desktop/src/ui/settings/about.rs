@@ -4,11 +4,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use rune::{col, el, row as hrow, text, El, SurfaceFit};
-use rune_kit::Kit;
+use rune_kit::{Button, ButtonVariant, ControlSize, Kit};
 
 use super::{group, link_button, row};
 use crate::branding::{APP_MARK_PNG, APP_NAME};
 use crate::config::Language;
+use crate::model::commands::Command;
+use crate::model::inbox::UpdateState;
 use crate::ui::copy::{tr, tr_ref};
 use crate::ui::UiState;
 
@@ -147,8 +149,175 @@ pub(super) fn page(s: &UiState, k: &Kit) -> Vec<El> {
         .map(|(name, _)| name)
         .unwrap_or_else(|| s.cfg.appearance.theme_id.clone());
     let repo = env!("CARGO_PKG_REPOSITORY");
+    let update_row = match &s.update_state {
+        UpdateState::Idle => {
+            let btn = Button::new(tr_ref(language, "Check for updates", "检查更新"))
+                .variant(ButtonVariant::Neutral)
+                .control_size(ControlSize::Small)
+                .on_press(|s: &mut UiState| {
+                    s.send(Command::CheckUpdate {
+                        include_preview: false,
+                    });
+                })
+                .build(k);
+            row(
+                k,
+                "update-check",
+                tr_ref(language, "Software updates", "软件更新"),
+                tr_ref(
+                    language,
+                    "Check official releases for updates.",
+                    "检查官方版本的更新。",
+                ),
+                btn,
+            )
+        }
+        UpdateState::Checking => {
+            let btn = Button::new(tr_ref(language, "Checking…", "正在检查…"))
+                .variant(ButtonVariant::Neutral)
+                .control_size(ControlSize::Small)
+                .disabled(true)
+                .build(k);
+            row(
+                k,
+                "update-check",
+                tr_ref(language, "Software updates", "软件更新"),
+                tr_ref(
+                    language,
+                    "Querying GitHub Releases…",
+                    "正在查询 GitHub Releases…",
+                ),
+                btn,
+            )
+        }
+        UpdateState::UpToDate => {
+            let btn = Button::new(tr_ref(language, "Check again", "重新检查"))
+                .variant(ButtonVariant::Neutral)
+                .control_size(ControlSize::Small)
+                .on_press(|s: &mut UiState| {
+                    s.send(Command::CheckUpdate {
+                        include_preview: false,
+                    });
+                })
+                .build(k);
+            let detail = tr(
+                language,
+                "You are using the latest version.",
+                "当前已是最新版本。",
+            );
+            row(
+                k,
+                "update-check",
+                tr_ref(language, "Software updates", "软件更新"),
+                &detail,
+                hrow()
+                    .gap(8.0)
+                    .center_y()
+                    .child(
+                        text(tr_ref(language, "Up to date", "已是最新"))
+                            .font(k.ty.small)
+                            .color(k.c.success.icon),
+                    )
+                    .child(btn),
+            )
+        }
+        UpdateState::Available(info) => {
+            let latest = info.latest_version.clone();
+            let to_install = info.clone();
+            let btn = Button::new(format!(
+                "{} {}",
+                tr_ref(language, "Update to", "更新至"),
+                latest
+            ))
+            .variant(ButtonVariant::Submit)
+            .control_size(ControlSize::Small)
+            .on_press(move |s: &mut UiState| {
+                s.send(Command::InstallUpdate(to_install.clone()));
+            })
+            .build(k);
+            let detail = format!(
+                "{} {}",
+                tr_ref(language, "New version available:", "发现新版本："),
+                latest
+            );
+            row(
+                k,
+                "update-check",
+                tr_ref(language, "Software updates", "软件更新"),
+                &detail,
+                btn,
+            )
+        }
+        UpdateState::Downloading => {
+            let btn = Button::new(tr_ref(language, "Downloading…", "正在下载…"))
+                .variant(ButtonVariant::Neutral)
+                .control_size(ControlSize::Small)
+                .disabled(true)
+                .build(k);
+            row(
+                k,
+                "update-check",
+                tr_ref(language, "Software updates", "软件更新"),
+                tr_ref(
+                    language,
+                    "Downloading and verifying update…",
+                    "正在下载并校验安装包…",
+                ),
+                btn,
+            )
+        }
+        UpdateState::ReadyToRestart => {
+            let btn = Button::new(tr_ref(language, "Restart now", "立即重启"))
+                .variant(ButtonVariant::Submit)
+                .control_size(ControlSize::Small)
+                .on_press(|_: &mut UiState| {
+                    crate::platform::shutdown::leave(0);
+                })
+                .build(k);
+            row(
+                k,
+                "update-check",
+                tr_ref(language, "Software updates", "软件更新"),
+                tr_ref(
+                    language,
+                    "Update installed. Restart application to complete.",
+                    "更新已安装完毕，重启后生效。",
+                ),
+                btn,
+            )
+        }
+        UpdateState::Failed(err) => {
+            let err_msg = err.clone();
+            let btn = Button::new(tr_ref(language, "Retry", "重试"))
+                .variant(ButtonVariant::Neutral)
+                .control_size(ControlSize::Small)
+                .on_press(|s: &mut UiState| {
+                    s.send(Command::CheckUpdate {
+                        include_preview: false,
+                    });
+                })
+                .build(k);
+            row(
+                k,
+                "update-check",
+                tr_ref(language, "Software updates", "软件更新"),
+                &format!(
+                    "{}: {}",
+                    tr_ref(language, "Check failed", "检查更新失败"),
+                    err_msg
+                ),
+                btn,
+            )
+        }
+    };
     vec![
         hero(s, k),
+        group(
+            k,
+            "about-updates",
+            tr_ref(language, "Updates", "软件更新"),
+            vec![update_row],
+        ),
         group(
             k,
             "about-status",

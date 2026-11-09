@@ -92,6 +92,18 @@ pub enum SearchOutcome {
     Failed,
 }
 
+/// In-app self-update progress and status.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpdateState {
+    Idle,
+    Checking,
+    Available(Box<crate::platform::update::UpdateInfo>),
+    UpToDate,
+    Downloading,
+    ReadyToRestart,
+    Failed(String),
+}
+
 #[derive(Debug, Clone)]
 pub enum Update {
     Agents(Vec<AgentDiscoveryInfo>),
@@ -158,6 +170,8 @@ pub enum Update {
         generation: u64,
         outcome: SearchOutcome,
     },
+    /// In-app self-update progress and availability.
+    UpdateState(UpdateState),
     /// The delegated task list, replacing the last, with the folder a new
     /// task would run in.
     Tasks {

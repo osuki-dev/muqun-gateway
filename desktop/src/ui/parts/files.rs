@@ -199,6 +199,9 @@ pub fn diff_part(cx: &Tcx, item: &TimelineItem, file: &str) -> El {
     let mut card = ToolCard::new(&item.id, &glyphs::EDIT_FILE, cx.t("Changed", "已更改"));
     card.title = tv::basename(file).to_string();
     card.caption = tv::dirname(file).to_string();
+    card.open = Some(file.to_string());
+    card.copy = Some(file.to_string());
+    card.diff = Some(file.to_string());
     if let Some((_, a, r)) = diff_rows(cx, &item.id) {
         card.chips = diff_chips(cx, a, r);
     }

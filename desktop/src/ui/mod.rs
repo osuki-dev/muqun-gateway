@@ -14,6 +14,7 @@ mod dwindle;
 mod echo;
 pub mod fx;
 mod home;
+pub mod i18n;
 mod icons;
 mod inbox;
 mod inspector;
@@ -185,6 +186,7 @@ pub struct SessionSlot {
     pub diff_stat: DiffStat,
     pub diff: Option<DiffState>,
     pub show_diff: bool,
+    pub diff_active_file: usize,
     pub revert_staged: bool,
     pub catalog: Option<Arc<CatalogView>>,
     pub descendants: Vec<AgentSessionInfo>,
@@ -298,6 +300,7 @@ pub struct UiState {
     pub diff_stat: DiffStat,
     pub diff: Option<DiffState>,
     pub show_diff: bool,
+    pub diff_active_file: usize,
     pub revert_staged: bool,
 
     pub tasks: Vec<TaskRow>,
@@ -350,6 +353,7 @@ pub struct UiState {
     pub theme_url: TextEdit,
     /// Settings → Themes: the search over both grids.
     pub theme_query: TextEdit,
+    pub theme_tab: settings::ThemeTab,
     pub gallery_limit: usize,
     pub toasts: Vec<ToastItem>,
     toast_seq: u64,
@@ -373,6 +377,8 @@ pub struct UiState {
     pub keys_sheet: Option<shortcuts::Sheet>,
     /// Dictation in progress (`ui/voice.rs`).
     pub voice: Option<voice::Dictation>,
+    /// In-app self-update status.
+    pub update_state: crate::model::inbox::UpdateState,
     /// Settings → Voice's fields.
     pub voice_form: voice::VoiceForm,
     /// The file viewer overlay ([`UiState::open_file`]).
@@ -474,6 +480,7 @@ impl UiState {
             diff_stat: DiffStat::default(),
             diff: None,
             show_diff: false,
+            diff_active_file: 0,
             revert_staged: false,
             tasks: Vec::new(),
             task_cwd: None,
@@ -508,6 +515,7 @@ impl UiState {
             theme_jobs: HashMap::new(),
             theme_url: TextEdit::new(""),
             theme_query: TextEdit::new(""),
+            theme_tab: settings::ThemeTab::Installed,
             gallery_limit: GALLERY_PAGE,
             toasts: Vec::new(),
             toast_seq: 0,
@@ -518,6 +526,7 @@ impl UiState {
             storage: None,
             viewer: None,
             voice: None,
+            update_state: crate::model::inbox::UpdateState::Idle,
             palette: None,
             keys_sheet: None,
             tray_shown: None,
@@ -715,6 +724,8 @@ impl UiState {
             self.staged.clear();
             self.diff_stat = DiffStat::default();
             self.diff = None;
+            self.diff_active_file = 0;
+            self.show_diff = false;
         }
         self.status = format!("Opening {asid}");
         self.send(Command::OpenSession(AgentSessionId(asid.to_string())));
@@ -914,6 +925,7 @@ impl UiState {
             diff_stat: std::mem::take(&mut self.diff_stat),
             diff: self.diff.take(),
             show_diff: std::mem::replace(&mut self.show_diff, false),
+            diff_active_file: std::mem::take(&mut self.diff_active_file),
             revert_staged: std::mem::replace(&mut self.revert_staged, false),
             catalog: self.catalog.take(),
             descendants: std::mem::take(&mut self.descendants),
@@ -929,6 +941,7 @@ impl UiState {
         self.diff_stat = slot.diff_stat;
         self.diff = slot.diff;
         self.show_diff = slot.show_diff;
+        self.diff_active_file = slot.diff_active_file;
         self.revert_staged = slot.revert_staged;
         self.catalog = slot.catalog;
         self.descendants = slot.descendants;
@@ -938,8 +951,21 @@ impl UiState {
     /// Give tile `i` the keyboard: its session becomes the one the top-level
     /// fields describe, the old focused tile keeps its state in its slot.
     pub fn focus_tile(&mut self, i: usize) {
-        if i >= self.tiles.len() || i == self.focus {
+        if i >= self.tiles.len() {
             self.mode = Mode::Session;
+            return;
+        }
+        if i == self.focus {
+            self.mode = Mode::Session;
+            if self.selected != self.tiles[i].asid {
+                self.selected = self.tiles[i].asid.clone();
+                self.sync_watch();
+                if self.catalog.is_none() {
+                    if let Some(info) = self.current().cloned() {
+                        self.session_opened(&info);
+                    }
+                }
+            }
             return;
         }
         let old = self.take_slot();
@@ -958,16 +984,17 @@ impl UiState {
         }
     }
 
-    /// Tell the core which sessions besides the focused one are on screen.
+    /// Tell the core which sessions are on screen in split tiles, and who is focused.
     fn sync_watch(&self) {
         let watched: Vec<AgentSessionId> = self
             .tiles
             .iter()
-            .enumerate()
-            .filter(|(i, _)| *i != self.focus)
-            .filter_map(|(_, t)| t.asid.clone().map(AgentSessionId))
+            .filter_map(|t| t.asid.clone().map(AgentSessionId))
             .collect();
         self.send(Command::WatchSessions(watched));
+        if let Some(ref asid) = self.selected {
+            self.send(Command::FocusSession(AgentSessionId(asid.clone())));
+        }
     }
 
     /// Open `asid` beside the current session(s): it fills an empty pane,
@@ -1365,6 +1392,7 @@ impl UiState {
                 } => self.on_search(generation, outcome),
                 Update::Attention(attention) => self.on_attention(&attention),
                 Update::Voice(event) => self.on_voice(event),
+                Update::UpdateState(state) => self.update_state = state,
             }
         }
         if LAYOUT_DIRTY.swap(false, Ordering::AcqRel) {
@@ -1495,8 +1523,8 @@ impl UiState {
         // A session started from an empty tile lands in it.
         if let Some(i) = self.pending_tile.take() {
             if self.tiles.get(i).is_some_and(|t| t.asid.is_none()) {
-                self.focus_tile(i);
                 self.tiles[i].asid = Some(asid.clone());
+                self.focus_tile(i);
                 self.sync_watch();
             }
         }
@@ -1526,6 +1554,7 @@ impl UiState {
             .replace(snapshot.timeline);
         self.echo_rows(&asid);
         if fresh {
+            self.sync_watch();
             self.retain_timelines();
         }
         self.waiting_perms
@@ -1660,6 +1689,11 @@ impl UiState {
             UiAction::OpenDiffFile { asid, path } => {
                 if self.selected.as_deref() == Some(asid.as_str()) {
                     self.show_diff = true;
+                    if let Some(diff) = &self.diff {
+                        if let Some(idx) = diff.file_index(&path) {
+                            self.diff_active_file = idx;
+                        }
+                    }
                     self.status = path;
                 }
             }
@@ -1916,7 +1950,7 @@ pub fn now_ms() -> u64 {
 
 /// `updated_ms` as a short relative time ("now", "4m", "3h", "2d").
 pub fn ago(updated_ms: u64, now: u64, language: crate::config::Language) -> String {
-    let zh = language == crate::config::Language::ZhCn;
+    let zh = language.is_zh();
     if updated_ms == 0 {
         return String::new();
     }

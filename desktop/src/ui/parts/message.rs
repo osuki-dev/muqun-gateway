@@ -151,18 +151,51 @@ fn reasoning(cx: &Tcx, item: &TimelineItem, body: &str, duration_ms: Option<u64>
                 .shrink()
                 .grow(1.0),
         );
+    let has_body = !body.trim().is_empty();
+    let is_open = has_body && cx.is_open(id, false);
+    if has_body {
+        let turn = if is_open {
+            0.0
+        } else {
+            -std::f32::consts::FRAC_PI_2
+        };
+        line = line.child(
+            icon(&glyphs::CHEVRON, 11.0)
+                .key("chevron")
+                .color(k.c.icon_faint)
+                .rotate(turn)
+                .a11y_hidden(),
+        );
+    }
     if cx.selected(id) {
         line = line.fill(k.c.surface_raised_hover);
     }
-    let (asid, open) = (cx.asid.to_string(), id.to_string());
-    let has_body = !body.trim().is_empty();
-    k.interactive(line)
+    let (asid, open_id) = (cx.asid.to_string(), id.to_string());
+    let line = k
+        .interactive(line)
         .key(format!("think-{id}"))
         .cursor(Cursor::Pointer)
         .role("button")
+        .expanded(is_open)
         .on_press_tx(move |s: &mut crate::ui::UiState, tx: &mut rune::Tx| {
-            s.press_row(&asid, &open, has_body, tx)
-        })
+            s.press_row_inline(&asid, &open_id, has_body, tx)
+        });
+    let mut block = col()
+        .key(format!("think-block-{id}"))
+        .w_full()
+        .gap(4.0)
+        .child(line);
+    if is_open {
+        block = block.child(
+            col()
+                .key("body")
+                .w_full()
+                .pl(27.0)
+                .pb(8.0)
+                .child(rich(cx, id, body)),
+        );
+    }
+    block
 }
 
 fn compaction(

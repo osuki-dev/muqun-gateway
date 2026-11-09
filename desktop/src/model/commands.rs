@@ -42,6 +42,9 @@ pub enum Command {
     /// Open a session into a split tile: read its snapshot and stream its
     /// events, without taking the active (focused) place.
     OpenTile(AgentSessionId),
+    /// Focus an already open session (e.g. switching between split tiles):
+    /// updates the active session and heartbeat without reloading snapshot.
+    FocusSession(AgentSessionId),
     /// The sessions on screen besides the active one (split tiles). Their
     /// events stream like the active session's; the rest are filtered.
     WatchSessions(Vec<AgentSessionId>),
@@ -68,6 +71,8 @@ pub enum Command {
         asid: AgentSessionId,
         file: Option<String>,
     },
+    /// Refresh the session's working tree diff from the gateway.
+    RefreshDiff(AgentSessionId),
     /// Stage a rollback to `message_id`, to be confirmed or cancelled
     /// (§6.1c item 9).
     StageRevert {
@@ -167,6 +172,12 @@ pub enum Command {
         id: String,
         directory: Option<String>,
     },
+    /// Check GitHub for desktop updates.
+    CheckUpdate {
+        include_preview: bool,
+    },
+    /// Download and install a found update.
+    InstallUpdate(Box<crate::platform::update::UpdateInfo>),
     /// Park the open session's current turn in the background.
     BackgroundSession {
         asid: AgentSessionId,

@@ -13,7 +13,7 @@ use rune_kit::{
 
 use super::art;
 use super::copy::tr_ref;
-use super::{muted, OpenMenu, Slot, UiState};
+use super::{OpenMenu, Slot, UiState};
 use crate::config::ConfigEdit;
 use crate::model::commands::Command;
 use crate::model::compose::{ComposeCommand, Deliver, Source, Target};
@@ -158,15 +158,107 @@ pub(super) fn note_skill_args(s: &mut UiState, deliver: &Deliver) {
 
 /// Send the draft. While the agent works it steers the running turn, as on
 /// the App; [`queue_session`] (Alt+Enter) waits for the turn to end instead.
-/// A composer card (a [`Look::panel`](crate::theme::look::Look::panel))
-/// while its field has focus: the surface a faint step toward the accent,
-/// no light or rim. Working shows in the hint line under it, not on the card.
-pub fn focus_tone(k: &Kit, look: &crate::theme::look::Look, card: El, focused: bool) -> El {
-    if focused {
-        card.fill(look.emphasis(look.panel_fill(k), k.c.bg_accent))
-    } else {
-        card
+/// The composer card surface: a floating theme-aware panel with a signature
+/// accent rim, elevation shadows, backdrop blur when glass is enabled, and
+/// an illuminated accent glow while focused or while the agent is running.
+pub fn composer_card(
+    k: &Kit,
+    look: &crate::theme::look::Look,
+    card: El,
+    focused: bool,
+    busy: bool,
+) -> El {
+    let radius = crate::theme::look::PANEL_RADIUS + 2.0;
+    let accent = k.c.bg_accent;
+    let dark = look.dark;
+
+    let mut e = card.radius(radius).clip_rounded(radius);
+
+    if look.glass && look.blur {
+        e = e.backdrop_blur(18.0);
     }
+
+    // Surface fill: follows theme surfaces, stepped toward accent on focus / busy
+    let fill = if focused {
+        look.emphasis(look.panel_fill(k), accent)
+    } else if busy {
+        look.emphasis(look.panel_fill(k), accent.alpha(0.4))
+    } else {
+        look.panel_fill(k)
+    };
+    e = e.fill(fill);
+
+    // Border: top edge catching theme accent light
+    if focused {
+        let top = accent.alpha(if dark { 0.85 } else { 0.75 });
+        let bottom = accent.alpha(if dark { 0.30 } else { 0.20 });
+        e = e.border_gradient(1.2, top, bottom);
+    } else if busy {
+        let top = accent.alpha(if dark { 0.65 } else { 0.55 });
+        let bottom = accent.alpha(if dark { 0.22 } else { 0.15 });
+        e = e.border_gradient(1.2, top, bottom);
+    } else if look.glass {
+        let top = accent
+            .mix(if dark { k.c.white } else { k.c.black }, 0.2)
+            .alpha(if dark { 0.40 } else { 0.26 });
+        let bottom = if dark {
+            k.c.white.alpha(0.04)
+        } else {
+            k.c.black.alpha(0.08)
+        };
+        e = e.border_gradient(1.0, top, bottom);
+    } else {
+        e = e.border(1.0, k.c.border_base);
+    }
+
+    // Elevation shadows & ambient theme glow
+    let shadow_alpha = if dark { 0.38 } else { 0.10 };
+    let mid_alpha = if dark { 0.20 } else { 0.05 };
+    e = e
+        .box_shadow(rune::Shadow {
+            x: 0.0,
+            y: 8.0,
+            blur: 24.0,
+            spread: 0.0,
+            color: k.c.black.alpha(shadow_alpha),
+            inset: false,
+        })
+        .box_shadow(rune::Shadow {
+            x: 0.0,
+            y: 2.0,
+            blur: 8.0,
+            spread: 0.0,
+            color: k.c.black.alpha(mid_alpha),
+            inset: false,
+        });
+
+    if focused {
+        e = e.box_shadow(rune::Shadow {
+            x: 0.0,
+            y: 0.0,
+            blur: 22.0,
+            spread: 1.0,
+            color: accent.alpha(if dark { 0.32 } else { 0.20 }),
+            inset: false,
+        });
+    } else if busy {
+        e = e.box_shadow(rune::Shadow {
+            x: 0.0,
+            y: 0.0,
+            blur: 16.0,
+            spread: 0.5,
+            color: accent.alpha(if dark { 0.26 } else { 0.16 }),
+            inset: false,
+        });
+    }
+
+    e.motion(k.motion.control)
+}
+
+/// A composer card (a [`Look::panel`](crate::theme::look::Look::panel))
+/// while its field has focus: the surface a faint step toward the accent.
+pub fn focus_tone(k: &Kit, look: &crate::theme::look::Look, card: El, focused: bool) -> El {
+    composer_card(k, look, card, focused, false)
 }
 
 /// The kit a composer's text field is built with: the field draws no box of
@@ -1290,10 +1382,6 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     let busy = s.busy();
     let has_session = s.selected.is_some();
     let focused = s.draft.focused && has_session;
-    let brand = s
-        .current()
-        .map(|i| super::agents::color(&i.agent_id, s.dark))
-        .unwrap_or(k.c.bg_accent);
     let start = s
         .current()
         .and_then(|i| i.directory.clone().map(PathBuf::from));
@@ -1301,7 +1389,6 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
 
     // The row under the field: the session's controls on the left (see
     // `composer_row`), the actions on the right.
-    let fit = super::Fit::of("composer");
     let attach_help = format!(
         "{} · {}",
         tr_ref(language, "Add files or an image", "添加文件或图片"),
@@ -1493,68 +1580,9 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     }
     card = card.child(actions);
 
-    // The card is the one surface: a quiet rim at rest, a faint step toward
-    // the accent while the field has focus.
-    let radius = crate::theme::look::PANEL_RADIUS;
-    let card = look.panel(k, card, radius).motion(k.motion.control);
-    let card = focus_tone(k, &look, card, focused);
-
-    // The status line: what the keys do, and a word while the agent works.
-    let mut hint = row()
-        .key("composer-hint")
-        .w_full()
-        .gap(8.0)
-        .center_y()
-        .px(4.0);
-    if busy {
-        // The whole sentence while it fits, then its gist; cut short last.
-        let room = inner + CARD_PAD - 8.0 - 18.0;
-        let queue_key = crate::platform::keys::label("Alt+Enter");
-        let long = format!(
-            "{} · {queue_key} {}",
-            tr_ref(
-                language,
-                "Agent is working; messages steer it",
-                "Agent 正在工作，消息会插话",
-            ),
-            tr_ref(language, "to queue", "排队"),
-        );
-        let line = if rune::text::measure(&long, &[], k.ty.small, None).0 <= room {
-            long
-        } else {
-            format!(
-                "{} · {queue_key} {}",
-                tr_ref(language, "Working", "工作中"),
-                tr_ref(language, "queues", "排队"),
-            )
-        };
-        hint = hint
-            .child(rune_kit::Spinner::new().size(10.0).color(brand).build(k))
-            .child(
-                rune::text(line)
-                    .font(k.ty.small)
-                    .color(k.c.text_muted)
-                    .truncate()
-                    .shrink()
-                    .min_w(0.0),
-            )
-            .child(el().grow(1.0));
-    } else {
-        hint = hint.child(el().grow(1.0));
-    }
-    // The keys are a wide column's footnote; a narrow one keeps the room.
-    if fit == super::Fit::Wide {
-        hint = hint.child(muted(
-            k,
-            format!(
-                "{} {} · {} {}",
-                crate::platform::keys::label("Primary+Enter"),
-                tr_ref(language, "to send", "发送"),
-                crate::platform::keys::label("Primary+V"),
-                tr_ref(language, "to paste files or an image", "粘贴文件或图片"),
-            ),
-        ));
-    }
+    // The floating card: theme-accent border rim, elevation shadows,
+    // and illuminated accent glow while focused or while the agent is busy.
+    let card = composer_card(k, &look, card, focused, busy);
 
     // The messages' reading column: as wide and as centred as they are on
     // a wide window, the whole width on a narrow one.
@@ -1564,9 +1592,7 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         .w_full()
         .items_center()
         .px(16.0)
-        .pt(8.0)
-        .pb(10.0)
-        .gap(6.0)
+        .pt(6.0)
+        .pb(14.0)
         .child(card.w_full().max_w(column))
-        .child(hint.max_w(column))
 }

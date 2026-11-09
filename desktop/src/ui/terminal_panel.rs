@@ -926,7 +926,7 @@ fn draw_row(key: &str, row: &Row, y: usize, m: Metrics) -> El {
 
 /// The transparent field on the cursor cell that holds the keyboard.
 fn sink(s: &UiState, k: &Kit, m: Metrics, col: u16, row: u16, bg: Color) -> El {
-    let composing = s.term.sink.preedit.is_some();
+    let composing = s.term.sink.is_composing();
     let mut field = text_input(&s.term.sink, style())
         .key("terminal-keys")
         .single_line()

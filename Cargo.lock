@@ -1581,6 +1581,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1c66915cc5391097de7a2b0b972e8505aa33c0df401fd3a6811dbdb32881ba48"
 
 [[package]]
+name = "fixed_decimal"
+version = "0.7.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2214fb00f669ee96bee5bb29dfb1ddabe058b2bc426817efc79afa03c9bc55ae"
+dependencies = [
+ "displaydoc",
+ "ryu",
+ "smallvec",
+ "writeable",
+]
+
+[[package]]
 name = "fixedbitset"
 version = "0.5.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1639,9 +1651,17 @@ dependencies = [
  "hashbrown 0.17.1",
  "linebender_resource_handle",
  "memmap2",
+ "objc2 0.6.5",
+ "objc2-core-foundation",
+ "objc2-core-text",
+ "objc2-foundation 0.3.2",
  "parlance",
  "read-fonts",
+ "roxmltree 0.21.2",
  "smallvec",
+ "windows",
+ "windows-core",
+ "yeslogic-fontconfig-sys",
 ]
 
 [[package]]
@@ -2140,6 +2160,64 @@ dependencies = [
 ]
 
 [[package]]
+name = "icu_decimal"
+version = "2.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1150ad5e272740670464934ee76facda43ef2e11f85c27b7ba76ccb33edf2d05"
+dependencies = [
+ "displaydoc",
+ "fixed_decimal",
+ "icu_decimal_data",
+ "icu_locale_core",
+ "icu_locale_fallback",
+ "icu_plurals",
+ "icu_provider",
+ "writeable",
+ "zerovec",
+]
+
+[[package]]
+name = "icu_decimal_data"
+version = "2.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5595ab78370d48abd24a062f3db115d5108dd0b65634352036cae532aebb0df8"
+
+[[package]]
+name = "icu_list"
+version = "2.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "61b7401916042e00e2ff603d4a1dd4767772ec361d341a03e549ed2879b56591"
+dependencies = [
+ "icu_list_data",
+ "icu_locale_fallback",
+ "icu_provider",
+ "regex-automata",
+ "writeable",
+ "zerovec",
+]
+
+[[package]]
+name = "icu_list_data"
+version = "2.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "22b55746bcc43fb7397bc6590980c78a4981d62c04bd7a0db1e3cbc1d2d63457"
+
+[[package]]
+name = "icu_locale"
+version = "2.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fe8fa57bcddc15cb921582ee5259c5b77da39f946f188ca5213fad24d9241236"
+dependencies = [
+ "icu_collections",
+ "icu_locale_core",
+ "icu_locale_data",
+ "icu_locale_fallback",
+ "icu_provider",
+ "tinystr",
+ "zerovec",
+]
+
+[[package]]
 name = "icu_locale_core"
 version = "2.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2152,6 +2230,12 @@ dependencies = [
  "writeable",
  "zerovec",
 ]
+
+[[package]]
+name = "icu_locale_data"
+version = "2.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a64014dac577a11d8d2cee48517c73c1984bd72ab11031e934269bd3cefb2ad9"
 
 [[package]]
 name = "icu_locale_fallback"
@@ -2192,6 +2276,25 @@ name = "icu_normalizer_data"
 version = "2.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "20f0088bfb7441f7a37fa0c9e20cb1e9cba1cac6b9ce8cd2a6dc44294f8e8cbc"
+
+[[package]]
+name = "icu_plurals"
+version = "2.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2ef046647b445acf95ce0f8083fa292467d3df649959fa9a20f3f8abfd957c5d"
+dependencies = [
+ "fixed_decimal",
+ "icu_locale_fallback",
+ "icu_plurals_data",
+ "icu_provider",
+ "zerovec",
+]
+
+[[package]]
+name = "icu_plurals_data"
+version = "2.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d43ff7df2c1a1d41588a6ddcba354d513d4a3e10eec22c06fe56d13c12a848ea"
 
 [[package]]
 name = "icu_properties"
@@ -2741,6 +2844,7 @@ dependencies = [
  "rfd",
  "rune",
  "rune-fx",
+ "rune-i18n",
  "rune-kit",
  "serde",
  "serde_json",
@@ -3143,6 +3247,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "objc2-core-text"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0cde0dfb48d25d2b4862161a4d5fcc0e3c24367869ad306b0c9ec0073bfed92d"
+dependencies = [
+ "bitflags 2.13.2",
+ "objc2-core-foundation",
+]
+
+[[package]]
 name = "objc2-core-video"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3410,7 +3524,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d8fae84b431384b68627d0f9b3b1245fcf9f46f6c0e3dc902e9dce64edd1967"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.45.0",
 ]
 
 [[package]]
@@ -4223,6 +4337,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6c20b6793b5c2fa6553b250154b78d6d0db37e72700ae35fad9387a46f487c97"
 
 [[package]]
+name = "roxmltree"
+version = "0.21.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9da7f59328b09405b181fee1018925fad50f157afb43c0c0f5c522c256dd5907"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
 name = "rsqlite-vfs"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4234,7 +4357,7 @@ dependencies = [
 [[package]]
 name = "rune"
 version = "0.0.1"
-source = "git+https://github.com/ryuhzk/rune?rev=a1fe7354ed53396558e4ab40385bfccb9bb617d3#a1fe7354ed53396558e4ab40385bfccb9bb617d3"
+source = "git+https://github.com/ryuhzk/rune?rev=030e916c5531a0defe6255fd2b29bfc2ae076827#030e916c5531a0defe6255fd2b29bfc2ae076827"
 dependencies = [
  "accesskit",
  "accesskit_macos",
@@ -4246,8 +4369,10 @@ dependencies = [
  "block2 0.6.2",
  "bytemuck",
  "console_error_panic_hook",
+ "fontique",
  "futures-util",
  "half",
+ "icu_properties",
  "image",
  "js-sys",
  "libc",
@@ -4310,7 +4435,7 @@ dependencies = [
 [[package]]
 name = "rune-fx"
 version = "0.0.1"
-source = "git+https://github.com/ryuhzk/rune?rev=a1fe7354ed53396558e4ab40385bfccb9bb617d3#a1fe7354ed53396558e4ab40385bfccb9bb617d3"
+source = "git+https://github.com/ryuhzk/rune?rev=030e916c5531a0defe6255fd2b29bfc2ae076827#030e916c5531a0defe6255fd2b29bfc2ae076827"
 dependencies = [
  "bytemuck",
  "rune-motion",
@@ -4319,9 +4444,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "rune-i18n"
+version = "0.1.0"
+source = "git+https://github.com/ryuhzk/rune?rev=030e916c5531a0defe6255fd2b29bfc2ae076827#030e916c5531a0defe6255fd2b29bfc2ae076827"
+dependencies = [
+ "fixed_decimal",
+ "icu_decimal",
+ "icu_list",
+ "icu_locale",
+ "icu_plurals",
+ "icu_provider",
+ "js-sys",
+ "objc2-foundation 0.3.2",
+ "serde_json",
+ "web-sys",
+ "windows",
+ "writeable",
+]
+
+[[package]]
 name = "rune-kit"
 version = "0.0.1"
-source = "git+https://github.com/ryuhzk/rune?rev=a1fe7354ed53396558e4ab40385bfccb9bb617d3#a1fe7354ed53396558e4ab40385bfccb9bb617d3"
+source = "git+https://github.com/ryuhzk/rune?rev=030e916c5531a0defe6255fd2b29bfc2ae076827#030e916c5531a0defe6255fd2b29bfc2ae076827"
 dependencies = [
  "pulldown-cmark",
  "rune",
@@ -4332,12 +4476,12 @@ dependencies = [
 [[package]]
 name = "rune-motion"
 version = "0.1.0"
-source = "git+https://github.com/ryuhzk/rune?rev=a1fe7354ed53396558e4ab40385bfccb9bb617d3#a1fe7354ed53396558e4ab40385bfccb9bb617d3"
+source = "git+https://github.com/ryuhzk/rune?rev=030e916c5531a0defe6255fd2b29bfc2ae076827#030e916c5531a0defe6255fd2b29bfc2ae076827"
 
 [[package]]
 name = "rune-staging"
 version = "0.0.1"
-source = "git+https://github.com/ryuhzk/rune?rev=a1fe7354ed53396558e4ab40385bfccb9bb617d3#a1fe7354ed53396558e4ab40385bfccb9bb617d3"
+source = "git+https://github.com/ryuhzk/rune?rev=030e916c5531a0defe6255fd2b29bfc2ae076827#030e916c5531a0defe6255fd2b29bfc2ae076827"
 dependencies = [
  "wgpu",
 ]
@@ -4345,7 +4489,7 @@ dependencies = [
 [[package]]
 name = "rune-taffy"
 version = "0.0.1"
-source = "git+https://github.com/ryuhzk/rune?rev=a1fe7354ed53396558e4ab40385bfccb9bb617d3#a1fe7354ed53396558e4ab40385bfccb9bb617d3"
+source = "git+https://github.com/ryuhzk/rune?rev=030e916c5531a0defe6255fd2b29bfc2ae076827#030e916c5531a0defe6255fd2b29bfc2ae076827"
 dependencies = [
  "taffy",
 ]
@@ -5655,7 +5799,7 @@ dependencies = [
  "kurbo",
  "log",
  "pico-args",
- "roxmltree",
+ "roxmltree 0.20.0",
  "simplecss",
  "siphasher",
  "strict-num",
@@ -6601,6 +6745,17 @@ name = "yazi"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ac366ea532fa8ee6a992cec9dea525b1dc284e69702f36c2ab5fbebadc81ec86"
+
+[[package]]
+name = "yeslogic-fontconfig-sys"
+version = "6.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d8b8abf912b9a29ff112e1671c97c33636903d13a69712037190e6805af4f76"
+dependencies = [
+ "dlib",
+ "once_cell",
+ "pkg-config",
+]
 
 [[package]]
 name = "yoke"
