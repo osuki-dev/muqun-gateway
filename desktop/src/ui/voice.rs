@@ -490,21 +490,12 @@ const LANGUAGES: [(&str, &str); 6] = [
     ("ko", "한국어"),
 ];
 
-pub fn settings(s: &UiState, k: &Kit) -> Vec<El> {
+pub fn settings(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Vec<El> {
+    use super::settings::{field, group, row, select, status, Tone, CONTROL_W};
     let language = s.cfg.general.language;
     let voice = &s.cfg.voice;
     let mode_at = usize::from(voice.mode == VoiceMode::Realtime);
     let (preset_url, preset_model) = VoiceConfig::preset(voice.mode);
-    let field = |key: &str, label: &str, detail: String, input: El| {
-        col()
-            .key(format!("voice-{key}"))
-            .w_full()
-            .gap(4.0)
-            .py(4.0)
-            .child(text(label.to_string()).font(k.ty.ui).color(k.c.text_base))
-            .child(input)
-            .child(text(detail).font(k.ty.small).color(k.c.text_muted).wrap())
-    };
     let mode = SegmentedControl::new(
         &[
             tr_ref(language, "After recording", "录完再转写"),
@@ -551,27 +542,20 @@ pub fn settings(s: &UiState, k: &Kit) -> Vec<El> {
             }
         })
         .collect();
-    let lang = SegmentedControl::new(&labels, Some(lang_at))
-        .fit()
-        .label(tr_ref(language, "Language", "语言"))
-        .on_pick(|s: &mut UiState, i, _: &mut Tx| {
-            s.edit_voice(|v| v.language = LANGUAGES[i].0.into())
-        })
-        .build(k)
-        .key("seg-voice-language");
+    let lang = select(s, k, layer, "voice-language", &labels, lang_at, |s, i| {
+        s.edit_voice(|v| v.language = LANGUAGES[i].0.into())
+    });
 
     let url_ok = voice.url.trim().is_empty() || voice.usable();
-    let mut url = TextInput::new(&s.voice_form.url)
+    let url = TextInput::new(&s.voice_form.url)
         .placeholder(preset_url)
         .label(tr_ref(language, "Service URL", "服务地址"))
+        .invalid(!url_ok)
         .on_edit(|s: &mut UiState| &mut s.voice_form.url)
         .on_change(|s: &mut UiState, _: &mut Tx| {
             let url = s.voice_form.url.text.trim().to_string();
             s.edit_voice(|v| v.url = url);
         });
-    if !url_ok {
-        url = url.invalid(true);
-    }
     let model = TextInput::new(&s.voice_form.model)
         .placeholder(preset_model)
         .label(tr_ref(language, "Model", "模型"))
@@ -580,29 +564,45 @@ pub fn settings(s: &UiState, k: &Kit) -> Vec<El> {
             let model = s.voice_form.model.text.trim().to_string();
             s.edit_voice(|v| v.model = model);
         });
-    let key_note = match s.voice_form.key_saved {
-        Some(Store::Keyring) => tr(
+    let url_detail = match voice.mode {
+        VoiceMode::File => tr_ref(
             language,
-            "A key is saved in the system keyring. Type a new one to replace it, or save an empty field to remove it.",
-            "密钥已保存在系统钥匙串中。输入新密钥可替换，保存空白可删除。",
+            "An OpenAI-compatible /v1/audio/transcriptions endpoint (https).",
+            "兼容 OpenAI 的 /v1/audio/transcriptions 地址（https）。",
         ),
-        Some(Store::File) => tr(
+        VoiceMode::Realtime => tr_ref(
             language,
-            "A key is saved in a file only you can read (no system keyring was available).",
-            "密钥已保存在仅你可读的文件中（系统钥匙串不可用）。",
-        ),
-        None => tr(
-            language,
-            "Sent as a Bearer token. Kept in the system keyring, never in config.json.",
-            "以 Bearer 令牌发送。保存在系统钥匙串中，不写入 config.json。",
+            "An OpenAI Realtime-compatible WebSocket in transcription mode (wss).",
+            "兼容 OpenAI Realtime 的转写 WebSocket（wss）。",
         ),
     };
-    let key = row()
-        .key("voice-key-row")
-        .w_full()
+    let url_control = if url_ok {
+        field(url, k, "voice-url")
+    } else {
+        col()
+            .key("voice-url-field")
+            .w(CONTROL_W)
+            .gap(6.0)
+            .child(field(url, k, "voice-url"))
+            .child(status(
+                k,
+                "voice-url-error",
+                Tone::Bad,
+                tr(
+                    language,
+                    "Needs https:// (after recording) or wss:// (realtime), with no credentials in it.",
+                    "需要 https://（录完再转写）或 wss://（实时），且地址中不能包含凭据。",
+                ),
+            ))
+    };
+
+    // The key: typed, saved to the keyring, then shown only as saved.
+    let typed = !s.voice_form.key.text.trim().is_empty();
+    let mut key_field = col()
+        .key("voice-key-field")
+        .w(CONTROL_W)
         .gap(8.0)
-        .center_y()
-        .child(
+        .child(row_of(
             TextInput::new(&s.voice_form.key)
                 .secure()
                 .placeholder(if s.voice_form.key_saved.is_some() {
@@ -611,92 +611,140 @@ pub fn settings(s: &UiState, k: &Kit) -> Vec<El> {
                     "sk-…"
                 })
                 .label(tr_ref(language, "API key", "API 密钥"))
+                .width(Some(CONTROL_W - 64.0))
                 .on_edit(|s: &mut UiState| &mut s.voice_form.key)
                 .on_submit(|s: &mut UiState, _: &mut Tx| s.save_voice_key())
                 .build(k)
-                .key("in-voice-key")
-                .grow(1.0),
-        )
-        .child(
-            Button::new(tr_ref(language, "Save key", "保存密钥"))
-                .variant(ButtonVariant::Outline)
+                .key("in-voice-key"),
+            Button::new(tr_ref(language, "Save", "保存"))
+                .variant(if typed {
+                    ButtonVariant::Submit
+                } else {
+                    ButtonVariant::Outline
+                })
+                .control_size(ControlSize::Small)
+                .disabled(!typed)
                 .on_press(|s: &mut UiState| s.save_voice_key())
                 .build(k)
                 .key("voice-key-save"),
+        ));
+    if let Some(store) = s.voice_form.key_saved {
+        let words = match store {
+            Store::Keyring => tr(
+                language,
+                "Saved in the system keyring",
+                "已保存在系统钥匙串",
+            ),
+            Store::File => tr(
+                language,
+                "Saved in a file only you can read",
+                "已保存在仅你可读的文件中",
+            ),
+        };
+        key_field = key_field.child(
+            row_of(
+                status(k, "voice-key-saved", Tone::Good, words),
+                Button::new(tr_ref(language, "Remove", "删除"))
+                    .variant(ButtonVariant::GhostMuted)
+                    .control_size(ControlSize::Small)
+                    .on_press(|s: &mut UiState| {
+                        s.voice_form.key = TextEdit::new("");
+                        s.save_voice_key();
+                    })
+                    .build(k)
+                    .key("voice-key-remove"),
+            )
+            .justify_between(),
         );
-    let url_detail = if url_ok {
-        match voice.mode {
-            VoiceMode::File => tr(
-                language,
-                "An OpenAI-compatible /v1/audio/transcriptions endpoint (https).",
-                "兼容 OpenAI 的 /v1/audio/transcriptions 地址（https）。",
-            ),
-            VoiceMode::Realtime => tr(
-                language,
-                "An OpenAI-Realtime-compatible WebSocket in transcription mode (wss).",
-                "兼容 OpenAI Realtime 的转写 WebSocket（wss）。",
-            ),
-        }
-    } else {
-        tr(
-            language,
-            "This mode needs an https:// (after recording) or wss:// (realtime) address without credentials in it.",
-            "此模式需要 https://（录完再转写）或 wss://（实时）地址，且地址中不能包含凭据。",
-        )
-    };
-    let card = |key: &str, title: &str, children: Vec<El>| {
-        let mut card = rune_kit::Card::new().title(title.to_string(), None);
-        for child in children {
-            card = card.child(child);
-        }
-        card.build(k).key(key.to_string())
-    };
+    }
+    // The keymap's own chord, drawn as keycaps the way this platform writes it.
+    let caps = super::keymap::entry(super::keymap::Action::Dictation)
+        .keycaps_on(rune::KeyPlatform::current())
+        .into_iter()
+        .next()
+        .unwrap_or_default();
     vec![
-        card(
+        group(
+            k,
             "voice-service",
             tr_ref(language, "Speech service", "语音服务"),
             vec![
-                field(
-                    "mode",
+                row(
+                    k,
+                    "voice-mode",
                     tr_ref(language, "Mode", "模式"),
-                    tr(
+                    tr_ref(
                         language,
-                        "Realtime shows the words as you speak; after recording sends the whole recording when you finish.",
+                        "Realtime shows the words as you speak; after recording sends the whole clip when you finish.",
                         "实时模式边说边显示文字；录完再转写会在结束后上传整段录音。",
                     ),
                     mode,
                 ),
-                field("url", tr_ref(language, "Service URL", "服务地址"), url_detail, url.build(k).key("in-voice-url").w_full()),
-                field(
-                    "model",
-                    tr_ref(language, "Model", "模型"),
-                    tr(language, "Optional; empty uses the service's default.", "可选；留空使用服务默认模型。"),
-                    model.build(k).key("in-voice-model").w_full(),
+                row(
+                    k,
+                    "voice-url",
+                    tr_ref(language, "Service URL", "服务地址"),
+                    url_detail,
+                    url_control,
                 ),
-                field("key", tr_ref(language, "API key", "API 密钥"), key_note, key),
+                row(
+                    k,
+                    "voice-model",
+                    tr_ref(language, "Model", "模型"),
+                    tr_ref(
+                        language,
+                        "Optional; empty uses the service's default.",
+                        "可选；留空使用服务默认模型。",
+                    ),
+                    field(model, k, "voice-model"),
+                ),
+                row(
+                    k,
+                    "voice-key",
+                    tr_ref(language, "API key", "API 密钥"),
+                    tr_ref(
+                        language,
+                        "Sent as a Bearer token. Kept in the system keyring, never in config.json.",
+                        "以 Bearer 令牌发送。保存在系统钥匙串中，不写入 config.json。",
+                    ),
+                    key_field,
+                ),
             ],
         ),
-        card(
-            "voice-language",
+        group(
+            k,
+            "voice-dictation",
             tr_ref(language, "Dictation", "听写"),
-            vec![field(
-                "lang",
-                tr_ref(language, "Spoken language", "说话语言"),
-                tr(
-                    language,
-                    &format!(
-                        "Auto lets the service decide. Start and finish with the mic button or {}; Escape cancels. Text lands in the draft and is never sent on its own.",
-                        crate::platform::keys::label("Primary+Shift+Space")
+            vec![
+                row(
+                    k,
+                    "voice-lang",
+                    tr_ref(language, "Spoken language", "说话语言"),
+                    tr_ref(
+                        language,
+                        "Auto lets the service decide.",
+                        "自动由服务判断。",
                     ),
-                    &format!(
-                        "自动由服务判断。用麦克风按钮或 {} 开始和结束，Esc 取消。文字只放进草稿，不会自动发送。",
-                        crate::platform::keys::label("Primary+Shift+Space")
-                    ),
+                    lang,
                 ),
-                lang,
-            )],
+                row(
+                    k,
+                    "voice-shortcut",
+                    tr_ref(language, "Start and finish", "开始与结束"),
+                    tr_ref(
+                        language,
+                        "Or the mic button. Escape cancels. The words land in the draft and are never sent on their own.",
+                        "也可用麦克风按钮，Esc 取消。文字只放进草稿，不会自动发送。",
+                    ),
+                    rune_kit::Keybind::new(&caps).build(k),
+                ),
+            ],
         ),
     ]
+}
+
+fn row_of(a: El, b: El) -> El {
+    row().w_full().gap(8.0).center_y().child(a).child(b)
 }
 
 /// What Settings → Voice says in its subtitle.

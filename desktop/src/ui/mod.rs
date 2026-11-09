@@ -158,6 +158,8 @@ pub enum OpenMenu {
     SessionMore,
     /// A split tile's menu (by tile index).
     Tile(usize),
+    /// A dropdown on a Settings page (by its key).
+    Setting(String),
 }
 
 /// The view state of one open session: what the timeline and composer read.
@@ -320,6 +322,8 @@ pub struct UiState {
     pub theme_previews: HashMap<String, PathBuf>,
     pub theme_jobs: HashMap<String, Job>,
     pub theme_url: TextEdit,
+    /// Settings → Themes: the search over both grids.
+    pub theme_query: TextEdit,
     pub gallery_limit: usize,
     pub toasts: Vec<ToastItem>,
     toast_seq: u64,
@@ -469,6 +473,7 @@ impl UiState {
             theme_previews: HashMap::new(),
             theme_jobs: HashMap::new(),
             theme_url: TextEdit::new(""),
+            theme_query: TextEdit::new(""),
             gallery_limit: GALLERY_PAGE,
             toasts: Vec::new(),
             toast_seq: 0,
@@ -1627,10 +1632,6 @@ pub fn muted(k: &Kit, s: impl Into<String>) -> El {
     rune::text(s).font(k.ty.small).color(k.c.text_muted).wrap()
 }
 
-pub fn heading(k: &Kit, s: impl Into<String>) -> El {
-    rune::text(s).font(k.ty.ui_medium).color(k.c.text_base)
-}
-
 /// Shared page chrome: centered column, title, optional subtitle.
 pub fn page_frame(k: &Kit, key: &str, title: &str, subtitle: Option<&str>) -> El {
     page_frame_w(k, key, title, subtitle, 760.0)
@@ -1756,6 +1757,7 @@ impl UiState {
             &self.folder_query,
             &self.task_goal,
             &self.theme_url,
+            &self.theme_query,
             &self.cwd_input,
             &self.rename_edit,
             &self.project_edit,
