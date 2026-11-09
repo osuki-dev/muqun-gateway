@@ -92,6 +92,12 @@ pub struct TaskRow {
     pub cwd: Option<String>,
     #[serde(default)]
     pub children: TaskChildren,
+    /// When it started working: its last reopening, else its creation.
+    #[serde(skip)]
+    pub started_ms: u64,
+    /// The computer a mirrored delegation runs on (`binding.peer_name`).
+    #[serde(skip)]
+    pub machine: Option<String>,
     /// Whether the user may confirm it is finished (`POST …/complete`):
     /// a device-opened task that is paused.
     #[serde(skip)]
@@ -116,6 +122,15 @@ impl TaskRow {
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_owned)
         });
+        let ms = |key: &str| value.get(key).and_then(serde_json::Value::as_u64);
+        row.started_ms = ms("reopened_ms").or_else(|| ms("created_ms")).unwrap_or(0);
+        if binding
+            .and_then(|b| b.get("kind"))
+            .and_then(serde_json::Value::as_str)
+            == Some("peer")
+        {
+            row.machine = text("peer_name").filter(|n| !n.is_empty());
+        }
         row.completable =
             row.origin == "device" && matches!(row.state.as_str(), "idle_unconfirmed" | "waiting");
         Ok(row)
@@ -484,41 +499,6 @@ pub trait SessionHub: Send + Sync {
     fn task_events(&self) -> Option<broadcast::Receiver<TaskHubEvent>> {
         None
     }
-    /// The terminal plane (Herdr / tmux panes) of the gateway this hub talks
-    /// to: the gateway's JSON answer, parsed by `model/terminals.rs`. Only a
-    /// gateway service has one; the in-process hub answers `Unsupported`.
-    fn terminal<'a>(&'a self, call: TerminalCall<'a>) -> HubFuture<'a, serde_json::Value> {
-        let _ = call;
-        Box::pin(async { Err(HubError::Unsupported("terminals")) })
-    }
-}
-
-/// One terminal-plane request (the App's `/api/sessions/...` routes). There
-/// is deliberately nothing here that focuses, closes or creates a pane.
-#[derive(Debug, Clone, Copy)]
-pub enum TerminalCall<'a> {
-    /// The terminal sessions (Herdr, tmux) the gateway serves.
-    Sessions,
-    /// One session's workspaces, tabs, panes and agents.
-    Snapshot { session: &'a str },
-    /// The pane's visible screen, with ANSI styling.
-    Screen {
-        session: &'a str,
-        pane: &'a str,
-        lines: u32,
-    },
-    /// Type `text` into the pane (as a paste).
-    SendText {
-        session: &'a str,
-        pane: &'a str,
-        text: &'a str,
-    },
-    /// Press `keys` (`enter`, `esc`, `ctrl+c`, …) in the pane.
-    SendKeys {
-        session: &'a str,
-        pane: &'a str,
-        keys: &'a [String],
-    },
 }
 
 /// Why a hub call did not happen.
@@ -536,8 +516,6 @@ pub enum HubError {
     Agent(AgentError),
     /// A file was not accepted as an attachment (the gateway's own words).
     Upload(muqun_gateway::platform::UploadRefusal),
-    /// This hub has no such plane (the in-process hub has no terminals).
-    Unsupported(&'static str),
 }
 
 impl From<AgentError> for HubError {
@@ -559,7 +537,6 @@ impl std::fmt::Display for HubError {
             Self::SessionNotFound(asid) => write!(f, "Agent session not found: {asid}"),
             Self::Agent(err) => err.fmt(f),
             Self::Upload(refusal) => f.write_str(&refusal.message()),
-            Self::Unsupported(what) => write!(f, "{what} need the Muqun gateway service"),
         }
     }
 }

@@ -859,8 +859,13 @@ fn shortcuts(s: &UiState, k: &Kit) -> Vec<El> {
                 &[
                     (
                         key("Primary+Enter"),
-                        "Send (queue while the agent works)",
-                        "发送（Agent 工作时排队）",
+                        "Send (steer the turn while the agent works)",
+                        "发送（Agent 工作时插话）",
+                    ),
+                    (
+                        key("Alt+Enter"),
+                        "Queue after the running turn",
+                        "排到当前回合之后",
                     ),
                     (key("Shift+Enter"), "New line in the message", "消息内换行"),
                     (key("Escape"), "Stop the running turn", "停止当前回合"),

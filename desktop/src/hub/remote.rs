@@ -1255,50 +1255,6 @@ impl SessionHub for RemoteHub {
         })
     }
 
-    fn terminal<'a>(&'a self, call: super::TerminalCall<'a>) -> HubFuture<'a, Value> {
-        use super::TerminalCall as T;
-        Box::pin(async move {
-            match call {
-                T::Sessions => {
-                    self.call(Method::GET, &["api", "sessions"], &[], None)
-                        .await
-                }
-                T::Snapshot { session } => {
-                    let path = ["api", "sessions", session, "snapshot"];
-                    self.call(Method::GET, &path, &[], None).await
-                }
-                T::Screen {
-                    session,
-                    pane,
-                    lines,
-                } => {
-                    let path = ["api", "sessions", session, "panes", pane, "output"];
-                    let lines = lines.to_string();
-                    let query = [("source", "visible"), ("format", "ansi"), ("lines", &lines)];
-                    self.call(Method::GET, &path, &query, None).await
-                }
-                T::SendText {
-                    session,
-                    pane,
-                    text,
-                } => {
-                    let path = ["api", "sessions", session, "panes", pane, "send-text"];
-                    let body = serde_json::json!({ "text": text });
-                    self.call(Method::POST, &path, &[], Some(body)).await
-                }
-                T::SendKeys {
-                    session,
-                    pane,
-                    keys,
-                } => {
-                    let path = ["api", "sessions", session, "panes", pane, "send-keys"];
-                    let body = serde_json::json!({ "keys": keys });
-                    self.call(Method::POST, &path, &[], Some(body)).await
-                }
-            }
-        })
-    }
-
     fn list_peers(&self) -> HubFuture<'_, Vec<PeerMention>> {
         Box::pin(async move {
             let mut peers = vec![PeerMention {
@@ -1545,9 +1501,13 @@ mod tests {
         }, {
             "task_id": "t_2", "state": "idle_unconfirmed", "goal": "g", "origin": "device",
             "binding": {"kind": "pane", "pane_id": "w1:p9", "agent_id": "codex"}
+        }, {
+            "task_id": "t_4", "state": "working", "goal": "g", "origin": "agent",
+            "created_ms": 100, "reopened_ms": 400,
+            "binding": {"kind": "peer", "peer_id": "p1", "remote_task_id": "r", "peer_name": "studio"}
         }]});
         let rows = task_rows(&json).unwrap();
-        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.len(), 3);
         assert_eq!(rows[0].id, "t_1");
         assert_eq!(rows[0].agent_id.as_deref(), Some("opencode"));
         assert_eq!(rows[0].asid.as_deref(), Some("ses_1"));
@@ -1555,6 +1515,10 @@ mod tests {
         assert!(!rows[0].completable && !rows[0].is_ended());
         assert!(rows[1].completable, "a paused device task can be confirmed");
         assert_eq!(rows[1].agent_id.as_deref(), Some("codex"));
+        assert_eq!(rows[1].machine, None);
+        // A mirror names the computer it runs on and counts from its reopening.
+        assert_eq!(rows[2].machine.as_deref(), Some("studio"));
+        assert_eq!(rows[2].started_ms, 400);
         assert!(task_rows(&json!({})).unwrap().is_empty());
         let created = task_row(&json!({"task_id": "t_3", "state": "working", "asid": "ses_3"}));
         assert_eq!(created.unwrap().asid.as_deref(), Some("ses_3"));

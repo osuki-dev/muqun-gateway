@@ -473,15 +473,7 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     let language = s.cfg.general.language;
     let mut sidebar = Sidebar::new()
         .label(super::copy::tr_ref(language, "Sessions", "会话"))
-        .header(
-            TextInput::new(&s.search)
-                .placeholder(super::copy::tr_ref(language, "Search sessions", "搜索会话"))
-                .leading_icon(&SEARCH)
-                .clear_button()
-                .on_edit(|s: &mut UiState| &mut s.search)
-                .build(k)
-                .key("search"),
-        );
+        .header(search(s, k));
     if s.sessions.is_empty() {
         sidebar = sidebar.child(
             rune::text(super::copy::tr_ref(
@@ -498,6 +490,9 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     }
     for row in tree(s, k, layer) {
         sidebar = sidebar.child(row);
+    }
+    if let Some(running) = super::running::view(s, k) {
+        sidebar = sidebar.footer(running);
     }
     sidebar
         .footer(nav(
@@ -517,19 +512,39 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         .footer(nav(
             s,
             k,
-            super::copy::tr_ref(language, "Terminals", "终端"),
-            &super::terminals::TERMINAL,
-            Mode::Terminals,
-        ))
-        .footer(nav(
-            s,
-            k,
             super::copy::tr_ref(language, "Settings", "设置"),
             &SETTINGS,
             Mode::Settings,
         ))
         .footer(hub_line(s, k))
         .build(k)
+}
+
+/// The search field: a quiet well the width of the rows, its icon on the
+/// rows' icon column, and a clear button only once there is something to clear.
+fn search(s: &UiState, k: &Kit) -> El {
+    let language = s.cfg.general.language;
+    let mut field = TextInput::new(&s.search)
+        .placeholder(super::copy::tr_ref(language, "Search sessions", "搜索会话"))
+        .leading_icon(&SEARCH)
+        .leading_icon_size(14.0)
+        .width(None)
+        .plain()
+        .on_edit(|s: &mut UiState| &mut s.search);
+    if !s.search.text.is_empty() {
+        field = field.clear_button();
+    }
+    let well = rune::row()
+        .key("search")
+        .w_full()
+        .radius(k.radius.md)
+        .fill(k.c.text_base.alpha(0.06))
+        .child(field.build(k));
+    if s.search.focused {
+        well.border(1.0, k.c.border_base)
+    } else {
+        well
+    }
 }
 
 /// Where the sessions come from, as a quiet caption under the navigation.

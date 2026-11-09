@@ -156,7 +156,18 @@ pub(super) fn note_skill_args(s: &mut UiState, deliver: &Deliver) {
     );
 }
 
+/// Send the draft. While the agent works it steers the running turn, as on
+/// the App; [`queue_session`] (Alt+Enter) waits for the turn to end instead.
 pub fn submit_session(s: &mut UiState) {
+    send_session(s, false);
+}
+
+/// Send the draft to run after the current turn (Alt+Enter while busy).
+pub fn queue_session(s: &mut UiState) {
+    send_session(s, true);
+}
+
+fn send_session(s: &mut UiState, queue: bool) {
     let text = s.draft.text.trim().to_string();
     if text.is_empty() {
         return;
@@ -168,7 +179,9 @@ pub fn submit_session(s: &mut UiState) {
     let attachments: Vec<String> = s.staged.iter().map(|f| f.path.clone()).collect();
     let deliver = deliver_of(catalog_of(s, Slot::Session), &text, !attachments.is_empty());
     note_skill_args(s, &deliver);
-    let delivery = s.busy().then(|| "queue".to_string());
+    let delivery = s
+        .busy()
+        .then(|| if queue { "queue" } else { "steer" }.to_string());
     let token = s.token(Slot::Session);
     s.status = "Sending…".into();
     s.send(Command::Compose(ComposeCommand::Submit {
@@ -1433,7 +1446,7 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         }
     }
     let send_label = if busy {
-        tr_ref(language, "Queue", "排队")
+        tr_ref(language, "Steer", "插话")
     } else {
         tr_ref(language, "Send", "发送")
     };
@@ -1442,6 +1455,16 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         .control_size(ControlSize::Regular)
         .disabled(!has_session || s.pending_submit.is_some())
         .shortcut("Primary+Enter")
+        .help(if busy {
+            format!(
+                "{} · {} {}",
+                tr_ref(language, "Steer the running turn", "对运行中的回合插话"),
+                crate::platform::keys::label("Alt+Enter"),
+                tr_ref(language, "queues it instead", "改为排队")
+            )
+        } else {
+            tr_ref(language, "Send", "发送").to_string()
+        })
         .on_press(submit_session)
         .build(k)
         .key("send");
@@ -1494,6 +1517,15 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
             })
             .on_edit(|s: &mut UiState| &mut s.draft)
             .on_change(|s: &mut UiState, _: &mut Tx| on_draft_change(s, Slot::Session))
+            .on_key(|s: &mut UiState, ev: &rune::KeyEvent, _: &mut Tx| {
+                // Alt+Enter while the agent works: queue after this turn.
+                let alt_enter = ev.key == rune::Key::Enter && ev.mods.alt && !ev.mods.cmd;
+                if alt_enter && s.busy() {
+                    queue_session(s);
+                    return true;
+                }
+                false
+            })
             .on_submit(|s: &mut UiState, _: &mut Tx| submit_session(s))
             .on_input_paste(|s: &mut UiState, content, _: &mut Tx| take_paste(s, content))
             .build(k)
@@ -1537,10 +1569,15 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         hint = hint
             .child(rune_kit::Spinner::new().size(10.0).color(brand).build(k))
             .child(
-                rune::text(tr_ref(
-                    language,
-                    "Agent is working; messages queue",
-                    "Agent 正在工作，消息会排队",
+                rune::text(format!(
+                    "{} · {} {}",
+                    tr_ref(
+                        language,
+                        "Agent is working; messages steer it",
+                        "Agent 正在工作，消息会插话",
+                    ),
+                    crate::platform::keys::label("Alt+Enter"),
+                    tr_ref(language, "to queue", "排队"),
                 ))
                 .font(k.ty.small)
                 .color(k.c.text_muted),

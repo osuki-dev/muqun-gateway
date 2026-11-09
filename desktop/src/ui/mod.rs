@@ -18,6 +18,7 @@ mod labels;
 mod palette;
 mod panes;
 mod parts;
+mod running;
 pub mod scenes;
 mod sessions;
 mod settings;
@@ -25,7 +26,6 @@ mod shell;
 mod splash;
 mod tasks;
 mod terminal_panel;
-mod terminals;
 mod tiles;
 mod timeline;
 mod tray;
@@ -72,7 +72,6 @@ pub enum Mode {
     Session,
     Inbox,
     Tasks,
-    Terminals,
     Settings,
 }
 
@@ -143,6 +142,10 @@ pub enum OpenMenu {
     StartModel,
     StartMode,
     StartBranch,
+    /// The start page's other agents.
+    StartAgents,
+    /// The start page's folder picker.
+    StartFolder,
     /// A session row's actions (by asid).
     Session(String),
     /// A project row's actions (by project id / root).
@@ -293,6 +296,10 @@ pub struct UiState {
     pub rename_project: Option<String>,
     pub project_edit: TextEdit,
     pub open_projects: HashMap<String, bool>,
+    /// When this window first saw each working session working (`ui/running.rs`).
+    pub busy_since: HashMap<String, u64>,
+    /// The start card's folder picker filter (`ui/home.rs`).
+    pub folder_query: TextEdit,
     pub full_projects: HashSet<String>,
 
     /// Pending prompts per session, from snapshots and events.
@@ -324,8 +331,6 @@ pub struct UiState {
     pub demo: bool,
     /// What the desktop keeps on disk (Settings → Storage), once scanned.
     pub storage: Option<crate::model::storage::StorageReport>,
-    /// The Terminals page (`ui/terminals.rs`).
-    pub terms: terminals::TermState,
     /// The terminal panel on the right (`ui/terminal_panel.rs`).
     pub term: terminal_panel::TermPanel,
     /// What the status icon last showed (`ui/tray.rs`).
@@ -446,6 +451,8 @@ impl UiState {
             rename_project: None,
             project_edit: TextEdit::new(""),
             open_projects: HashMap::new(),
+            busy_since: HashMap::new(),
+            folder_query: TextEdit::new(""),
             full_projects: HashSet::new(),
             waiting_perms: HashMap::new(),
             waiting_forms: HashMap::new(),
@@ -471,7 +478,6 @@ impl UiState {
             palette: None,
             tray_shown: None,
             voice_form: voice::VoiceForm::new(&cfg.voice),
-            terms: terminals::TermState::default(),
             term: terminal_panel::TermPanel::new(cfg.ui.terminal()),
             tiles: Vec::new(),
             focus: 0,
@@ -659,7 +665,6 @@ impl UiState {
         self.mode = mode;
         match mode {
             Mode::Tasks => self.send(Command::RefreshTasks),
-            Mode::Terminals => self.watch_terminals(),
             Mode::Home => {
                 self.send(Command::LoadProjects {
                     agent: self.start_agent.clone(),
@@ -1154,7 +1159,7 @@ impl UiState {
                     self.agent_projects.insert(agent, projects);
                 }
                 Update::Completions { prefix, entries } => {
-                    if prefix == self.start_cwd.text {
+                    if prefix == self.folder_query.text.trim() {
                         self.completions = entries;
                     }
                 }
@@ -1224,13 +1229,13 @@ impl UiState {
                 Update::Worktrees(rows) => self.worktrees = rows,
                 Update::HubMode(mode) => self.hub_label = mode.to_string(),
                 Update::Attention(attention) => self.on_attention(&attention),
-                Update::Terminals(update) => self.on_terminals(*update),
                 Update::Voice(event) => self.on_voice(event),
             }
         }
         if LAYOUT_DIRTY.swap(false, Ordering::AcqRel) {
             self.persist_layout();
         }
+        self.note_busy();
         self.sync_tray();
     }
 
@@ -1737,6 +1742,26 @@ impl UiState {
         }
     }
 
+    /// Start the clock of every session that began working, stop the rest.
+    fn note_busy(&mut self) {
+        let now = now_ms();
+        let working: HashSet<String> = self
+            .sessions
+            .iter()
+            .filter(|i| {
+                matches!(
+                    i.status,
+                    AgentSessionStatus::Busy | AgentSessionStatus::Retry
+                )
+            })
+            .map(|i| i.asid.0.clone())
+            .collect();
+        self.busy_since.retain(|asid, _| working.contains(asid));
+        for asid in working {
+            self.busy_since.entry(asid).or_insert(now);
+        }
+    }
+
     /// Sessions working right now, newest first.
     pub fn running(&self) -> Vec<&AgentSessionInfo> {
         self.sessions
@@ -1978,7 +2003,6 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>) -> El {
             layer.push(stage);
         }
     }
-    terminals::page_visible(s.mode);
     viewer::mount(s, &k, cx.env().scale, &mut layer);
     palette::mount(s, &k, &mut layer);
     if !s.toasts.is_empty() {

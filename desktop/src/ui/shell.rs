@@ -38,7 +38,6 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
         Mode::Session => session(s, k, &look, layer),
         Mode::Inbox => inbox::view(s, k),
         Mode::Tasks => tasks::view(s, k),
-        Mode::Terminals => super::terminals::view(s, k),
         Mode::Settings => settings::view(s, k),
     };
     let mut main = col().key("main").w_full().h_full().min_h(0.0);
@@ -52,7 +51,7 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
     // the hero. Settings / hub live in the sidebar footer there.
     let mut split = SplitView::new(main)
         .sidebar(&s.sidebar, super::sidebar_pane, sessions::view(s, k, layer))
-        .sidebar_leading(home_brand(s, k, &look));
+        .sidebar_leading(home_brand(s, k, &look, cx.titlebar_inset()));
     if s.mode != Mode::Home {
         split = split.toolbar(toolbar(s, k, &look, layer));
     }
@@ -172,7 +171,7 @@ fn backdrop(s: &UiState, k: &Kit, look: &Look, window: Option<[f32; 2]>) -> Opti
 
 /// Mark + name in the sidebar title bar; press returns to Home. The mark
 /// carries a soft accent glow: the one lit thing in the chrome.
-fn home_brand(s: &UiState, k: &Kit, look: &Look) -> El {
+fn home_brand(s: &UiState, k: &Kit, look: &Look, lights: f32) -> El {
     let language = s.cfg.general.language;
     // Keep a fixed cross-size: the titlebar row stretches children to its full
     // height, and a stretched text run top-aligns while the mark stays centred.
@@ -192,8 +191,12 @@ fn home_brand(s: &UiState, k: &Kit, look: &Look) -> El {
             .fill(k.c.bg_accent),
     };
     let mark = look.glow(mark, k.c.bg_accent, 0.35);
+    // With no window controls at the leading edge the mark lines up with
+    // the rows' icons below it; past traffic lights it keeps a small gap.
+    let lead = if lights > 0.0 { 6.0 } else { 16.0 };
     row()
         .key("home-brand")
+        .ml(lead)
         .gap(8.0)
         .h(MARK)
         .center_y()
@@ -219,7 +222,6 @@ fn page_title(s: &UiState) -> String {
         Mode::Home => tr(language, "New session", "新建会话"),
         Mode::Inbox => tr(language, "Inbox", "收件箱"),
         Mode::Tasks => tr(language, "Tasks", "任务"),
-        Mode::Terminals => tr(language, "Terminals", "终端"),
         Mode::Settings => tr(language, "Settings", "设置"),
         Mode::Session => s
             .current()

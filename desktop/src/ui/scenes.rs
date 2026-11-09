@@ -306,6 +306,106 @@ fn home_busy(s: &mut UiState) {
     s.demo = true;
 }
 
+/// Home on a well-used install: ten agents, a full recent grid, and the
+/// sidebar's Running list open on sessions and tasks, one on another computer.
+fn home_crowd(s: &mut UiState) {
+    home_busy(s);
+    s.agents = [
+        ("claude", "Claude Code"),
+        ("codex", "Codex"),
+        ("opencode", "OpenCode"),
+        ("cursor", "Cursor"),
+        ("deepseek", "DeepSeek"),
+        ("qoder", "Qoder"),
+        ("pi", "Pi"),
+        ("t3", "T3 Code"),
+        ("antigravity", "Antigravity"),
+        ("fx", "FX"),
+    ]
+    .iter()
+    .map(|(id, name)| agent(id, name, true))
+    .collect();
+    for (asid, title, agent_id, status, dir, age) in [
+        (
+            "s5",
+            "Rework the theme loader",
+            "claude",
+            "busy",
+            "/home/demo/gateway",
+            9_000,
+        ),
+        (
+            "s6",
+            "Tidy the release notes",
+            "claude",
+            "idle",
+            "/home/demo/rune",
+            7_200_000,
+        ),
+        (
+            "s7",
+            "Explain the sync protocol",
+            "deepseek",
+            "idle",
+            "/home/demo/gateway",
+            86_400_000,
+        ),
+        (
+            "s8",
+            "Speed up the session list",
+            "cursor",
+            "idle",
+            "/home/demo/rune",
+            90_000_000,
+        ),
+        (
+            "s9",
+            "Draft the install guide",
+            "claude",
+            "idle",
+            "/home/demo/site",
+            200_000_000,
+        ),
+    ] {
+        s.sessions
+            .push(session(asid, title, agent_id, status, dir, age));
+    }
+    let now = super::now_ms();
+    s.busy_since.insert("s4".into(), now - 4 * 60_000);
+    s.busy_since.insert("s5".into(), now - 38 * 60_000);
+    s.tasks = vec![
+        TaskRow {
+            id: "k1".into(),
+            state: "working".into(),
+            title: "Audit the release workflow".into(),
+            progress: Some("Reading .github/workflows/release.yml".into()),
+            agent_id: Some("codex".into()),
+            asid: Some("s1".into()),
+            started_ms: now - 12 * 60_000,
+            ..TaskRow::default()
+        },
+        TaskRow {
+            id: "k2".into(),
+            state: "working".into(),
+            title: "Run the device test matrix".into(),
+            progress: Some("iOS 3 of 8".into()),
+            agent_id: Some("claude".into()),
+            machine: Some("studio".into()),
+            started_ms: now - 71 * 60_000,
+            ..TaskRow::default()
+        },
+        TaskRow {
+            id: "k3".into(),
+            state: "working".into(),
+            kind: "command".into(),
+            title: "cargo build --release".into(),
+            started_ms: now - 2 * 60_000,
+            ..TaskRow::default()
+        },
+    ];
+    s.cfg.ui.running_open = true;
+}
+
 /// Home before the first session: the welcome.
 fn home_first(s: &mut UiState) {
     base(s);
@@ -615,125 +715,6 @@ fn viewer_video(s: &mut UiState) {
     }
 }
 
-fn terminals_scene(s: &mut UiState) {
-    use crate::model::terminals::{
-        parse_screen, Pane, PaneRef, SessionView, Tab, TerminalsView, Workspace,
-    };
-    use std::sync::Arc;
-    base(s);
-    s.mode = Mode::Terminals;
-    let pane = |id: &str, agent: Option<&str>, status: &str, cmd: &str, cwd: &str| Pane {
-        id: id.into(),
-        agent: agent.map(Into::into),
-        status: status.into(),
-        command: Some(cmd.into()),
-        cwd: Some(cwd.into()),
-        title: None,
-        focused: false,
-    };
-    let tab = |id: &str, label: &str, panes: Vec<Pane>| Tab {
-        id: id.into(),
-        label: label.into(),
-        panes,
-    };
-    let ws = |id: &str, n: u64, label: &str, status: &str, tabs: Vec<Tab>| Workspace {
-        id: id.into(),
-        label: label.into(),
-        number: Some(n),
-        focused: false,
-        status: status.into(),
-        tabs,
-    };
-    s.terms.view = Arc::new(TerminalsView {
-        sessions: vec![SessionView {
-            id: "herdr".into(),
-            label: "Herdr".into(),
-            connected: true,
-            error: None,
-            workspaces: vec![
-                ws(
-                    "w1",
-                    1,
-                    "gateway",
-                    "working",
-                    vec![tab(
-                        "w1:t1",
-                        "1",
-                        vec![
-                            pane(
-                                "w1:p1",
-                                Some("claude"),
-                                "working",
-                                "claude",
-                                "/home/demo/gateway",
-                            ),
-                            pane("w1:p2", None, "unknown", "bash", "/home/demo/gateway"),
-                        ],
-                    )],
-                ),
-                ws(
-                    "w2",
-                    2,
-                    "app",
-                    "blocked",
-                    vec![
-                        tab(
-                            "w2:t1",
-                            "agent",
-                            vec![pane(
-                                "w2:p1",
-                                Some("codex"),
-                                "blocked",
-                                "codex",
-                                "/home/demo/app",
-                            )],
-                        ),
-                        tab(
-                            "w2:t2",
-                            "logs",
-                            vec![pane("w2:p2", None, "unknown", "tail", "/home/demo/app")],
-                        ),
-                    ],
-                ),
-                ws(
-                    "w3",
-                    3,
-                    "notes",
-                    "idle",
-                    vec![tab(
-                        "w3:t1",
-                        "1",
-                        vec![pane("w3:p1", None, "unknown", "nvim", "/home/demo/notes")],
-                    )],
-                ),
-            ],
-        }],
-        error: None,
-    });
-    s.terms.loaded = true;
-    let at = PaneRef {
-        session: "herdr".into(),
-        pane: "w1:p2".into(),
-    };
-    let raw =
-        "\u{1b}[1;36m~/gateway\u{1b}[0m \u{1b}[1;36m❯\u{1b}[0m cargo test -p muqun-desktop\r\n\
-\u{1b}[1;32m   Compiling\u{1b}[0m muqun-desktop v0.1.0\r\n\
-\u{1b}[1;32m    Finished\u{1b}[0m `test` profile [unoptimized + debuginfo] in 14.2s\r\n\
-\u{1b}[1;32m     Running\u{1b}[0m unittests src/main.rs\r\n\r\n\
-running 131 tests\r\n\
-test model::terminals::tests::a_screen_keeps_its_colours ... \u{1b}[32mok\u{1b}[0m\r\n\
-test model::notify::tests::titles_follow_the_gateway_push_rule ... \u{1b}[32mok\u{1b}[0m\r\n\
-test ui::viewer::tests::the_gutter_numbers_every_line_once ... \u{1b}[32mok\u{1b}[0m\r\n\r\n\
-test result: \u{1b}[32mok\u{1b}[0m. 131 passed; 0 failed; 0 ignored\r\n\r\n\
-\u{1b}[1;36m~/gateway\u{1b}[0m \u{1b}[1;36m❯\u{1b}[0m git status --short\r\n\
-\u{1b}[31m M\u{1b}[0m desktop/src/ui/terminals.rs\r\n\
-\u{1b}[32m??\u{1b}[0m desktop/src/model/terminals.rs\r\n\r\n\
-\u{1b}[1;36m~/gateway\u{1b}[0m \u{1b}[1;36m❯\u{1b}[0m \r\n";
-    s.terms.screen = Some((at.clone(), Arc::new(parse_screen(raw))));
-    s.terms.selected = Some(at);
-    s.demo = true;
-}
-
 fn voice_meter() -> std::sync::Arc<crate::model::voice::Meter> {
     use crate::model::voice::Meter;
     let started = std::time::Instant::now() - std::time::Duration::from_secs_f64(6.3);
@@ -784,7 +765,7 @@ fn voice_settings_scene(s: &mut UiState) {
 
 fn palette_scene(s: &mut UiState) {
     session_scene(s);
-    s.cfg.ui.recent_commands = vec!["go:Terminals".into(), "session:s2".into()];
+    s.cfg.ui.recent_commands = vec!["go:Tasks".into(), "session:s2".into()];
     s.palette = Some(super::palette::Palette::new());
 }
 
@@ -813,6 +794,29 @@ pub fn scenes() -> &'static [Scene] {
     &[
         ("home", home),
         ("home-busy", home_busy),
+        ("home-crowd", home_crowd),
+        ("home-folders", |s| {
+            home_crowd(s);
+            for (dir, branch) in [
+                ("/home/demo/gateway", "main"),
+                ("/home/demo/rune", "desktop-polish"),
+            ] {
+                s.directories.insert(
+                    dir.into(),
+                    crate::model::projects::DirInfo {
+                        root: dir.into(),
+                        kind: crate::model::projects::ProjectKind::Git,
+                        branch: Some(branch.into()),
+                        exists: true,
+                    },
+                );
+            }
+            s.menu = Some(super::OpenMenu::StartFolder);
+        }),
+        ("home-crowd-zh", |s| {
+            home_crowd(s);
+            s.cfg.general.language = crate::config::Language::ZhCn;
+        }),
         ("home-first", home_first),
         ("splash", splash_scene),
         ("home-plain", |s| {
@@ -948,7 +952,6 @@ pub fn scenes() -> &'static [Scene] {
             timeline_detail(s);
             s.cfg.general.language = crate::config::Language::ZhCn;
         }),
-        ("terminals", terminals_scene),
         ("terminal", |s| terminal_scene(s, shell_fixture)),
         ("terminal-vim", |s| terminal_scene(s, vim_fixture)),
         ("terminal-menu", |s| {
@@ -965,10 +968,6 @@ pub fn scenes() -> &'static [Scene] {
         ("terminal-jade", |s| {
             with_pack(s, "jade-tempest");
             terminal_scene(s, shell_fixture);
-        }),
-        ("terminals-tw", |s| {
-            terminals_scene(s);
-            s.cfg.general.language = crate::config::Language::ZhTw;
         }),
         ("voice-settings-tw", |s| {
             voice_settings_scene(s);

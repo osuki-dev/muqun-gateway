@@ -64,3 +64,29 @@ pub static FORK: Icon = Icon {
         r#" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>"#,
     ),
 };
+
+/// `working-spinner.svg`: the sidebar's Running row, still (reduce motion).
+pub static RUNNING: Icon = Icon {
+    name: "working-spinner",
+    view: 24.0,
+    body: concat!(
+        r#"<path d="M12 3.4a8.6 8.6 0 1 1-8.6 8.6""#,
+        r#" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round"/>"#,
+    ),
+};
+
+/// `branch.svg`: a git branch (start card worktree and folder rows).
+pub static BRANCH: Icon = Icon {
+    name: "branch",
+    view: 24.0,
+    body: concat!(
+        r#"<circle cx="7" cy="5" r="2""#,
+        r#" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>"#,
+        r#"<circle cx="7" cy="19" r="2""#,
+        r#" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>"#,
+        r#"<circle cx="18" cy="7" r="2""#,
+        r#" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>"#,
+        r#"<path d="M7 7v10m0-5h5a6 6 0 0 0 6-3""#,
+        r#" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>"#,
+    ),
+};

@@ -557,9 +557,6 @@ impl Core {
                     );
                 }
             }
-            Command::Terminals(command) => {
-                super::terminals::run(self.hub.clone(), self.inbox.clone(), command).await
-            }
             Command::CreateTask { goal, agent, cwd } => {
                 let goal = goal.trim().to_string();
                 if goal.is_empty() {

@@ -249,7 +249,6 @@ pub fn entries(s: &UiState) -> Vec<Entry> {
         (tr_ref(language, "Home", "首页"), Mode::Home),
         (tr_ref(language, "Inbox", "收件箱"), Mode::Inbox),
         (tr_ref(language, "Tasks", "任务"), Mode::Tasks),
-        (tr_ref(language, "Terminals", "终端"), Mode::Terminals),
     ] {
         out.push(action(
             tr(language, &format!("Go to {label}"), &format!("前往{label}")),
@@ -633,7 +632,6 @@ fn glyph(act: &Act) -> &'static rune::Icon {
     match act {
         Act::Go(Mode::Inbox) => &super::icons::INBOX,
         Act::Go(Mode::Tasks) => &super::icons::TASK,
-        Act::Go(Mode::Terminals) => &super::terminals::TERMINAL,
         Act::Dictation => &super::voice::MIC,
         Act::Settings(_) | Act::Inspector | Act::Split => &super::icons::SETTINGS,
         Act::Theme(_) | Act::ToggleScheme => &rune_kit::glyphs::SPARKLE,

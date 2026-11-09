@@ -167,8 +167,6 @@ pub enum Update {
     /// A session wants the owner, or finished (`model/notify.rs`): the UI
     /// raises a system notification unless that session is on screen.
     Attention(super::notify::Attention),
-    /// The Terminals page's list, a pane's screen, or a failure.
-    Terminals(Box<super::terminals::TerminalUpdate>),
     /// Dictation's progress (`model/voice.rs`).
     Voice(super::voice::VoiceEvent),
 }

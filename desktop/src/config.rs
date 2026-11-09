@@ -382,6 +382,9 @@ pub struct UiPrefs {
     /// Where the split's first column ends, 0.25..=0.75 of its width.
     #[serde(default = "UiPrefs::tile_split_default")]
     pub tile_split: f32,
+    /// The sidebar's Running list is open (`ui/running.rs`).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub running_open: bool,
 }
 
 impl UiPrefs {
@@ -461,6 +464,7 @@ impl Default for UiPrefs {
             recent_commands: Vec::new(),
             tiles: Vec::new(),
             tile_split: 0.5,
+            running_open: false,
         }
     }
 }
@@ -517,6 +521,8 @@ pub enum ConfigEdit {
     },
     /// Pin the session, or unpin it when it is pinned.
     TogglePin(String),
+    /// Open or close the sidebar's Running list.
+    RunningOpen(bool),
     /// The unsent text under a draft key; empty removes it.
     Draft {
         key: String,
@@ -584,6 +590,7 @@ impl DesktopConfig {
                     None => g.last_mode.remove(&key),
                 };
             }
+            ConfigEdit::RunningOpen(open) => self.ui.running_open = open,
             ConfigEdit::TogglePin(asid) => {
                 let pinned = &mut self.general.pinned;
                 match pinned.iter().position(|p| *p == asid) {

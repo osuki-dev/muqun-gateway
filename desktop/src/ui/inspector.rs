@@ -1,10 +1,8 @@
 //! The right-hand inspector: Queue, Git (with worktrees), Subagents, Saved, Shells.
 
 use muqun_gateway::agents::AgentSessionId;
-use rune::{col, el, row, text, El, ScrollSpec, Tx};
-use rune_kit::{
-    Badge, BadgeVariant, Button, ButtonVariant, ControlSize, Kit, ScrollBar, SegmentedControl,
-};
+use rune::{col, el, row, text, El, ScrollSpec};
+use rune_kit::{Badge, BadgeVariant, Button, ButtonVariant, ControlSize, Kit, ScrollBar};
 
 use super::copy::{tr, tr_ref};
 use super::{muted, timeline, title_of, InspectorTab, Mode, UiState};
@@ -46,18 +44,59 @@ fn tab_label(language: Language, en: &'static str) -> &'static str {
     }
 }
 
-/// A quiet empty state: a word and a line under it, on its own sheet.
+/// The tab strip's height: the session toolbar's, so the two read as one line.
+const TOOLBAR_H: f32 = rune_kit::shell::TOOLBAR_HEIGHT;
+
+/// One inspector tab, drawn like the toolbar's own controls: ghost until
+/// hovered, the pressed tint when chosen, a faint count after the word.
+fn tab_button(k: &Kit, label: &str, count: Option<usize>, tab: InspectorTab, on: bool) -> El {
+    let ink = if on { k.c.text_base } else { k.c.text_muted };
+    let mut b = row()
+        .key(format!("tab-{tab:?}"))
+        .h(28.0)
+        .px(10.0)
+        .gap(6.0)
+        .center_y()
+        .shrink()
+        .min_w(0.0)
+        .radius(k.radius.md)
+        .role("tab")
+        .label(label.to_string())
+        .focusable(true)
+        .focus_selected(on)
+        .child(
+            text(label.to_string())
+                .font(if on { k.ty.ui_medium } else { k.ty.ui })
+                .color(ink)
+                .truncate()
+                .shrink()
+                .a11y_hidden(),
+        );
+    if let Some(n) = count {
+        b = b.child(
+            text(n.to_string())
+                .font(k.ty.small)
+                .color(k.c.text_faint)
+                .a11y_hidden(),
+        );
+    }
+    if on {
+        b = b.fill(k.c.pressed);
+    }
+    k.interactive(b).on_press(move |s: &mut UiState| {
+        s.inspector_tab = tab;
+        s.refresh_inspector();
+    })
+}
+
+/// A quiet empty state: a word and a line under it, no box.
 fn empty(k: &Kit, key: &str, title: &str, detail: &str) -> El {
     col()
         .key(format!("empty-{key}"))
         .w_full()
         .gap(2.0)
-        .px(12.0)
-        .py(12.0)
-        .radius(crate::theme::look::CARD_RADIUS)
-        .fill(k.c.layer_01.alpha(0.5))
-        .border(1.0, k.c.border_muted)
-        .border_dash(4.0, 4.0)
+        .px(4.0)
+        .py(8.0)
         .child(
             text(title.to_string())
                 .font(k.ty.ui_medium)
@@ -504,7 +543,7 @@ fn shells(s: &UiState, k: &Kit) -> Vec<El> {
         out.push(small(
             k,
             tr_ref(language, "Move turn to background", "把当前回合移到后台"),
-            ButtonVariant::Outline,
+            ButtonVariant::Ghost,
             "background".into(),
             move |s| {
                 s.send(Command::BackgroundSession {
@@ -522,32 +561,31 @@ pub fn view(s: &UiState, k: &Kit) -> El {
     let waiting = s.waiting_perms.get(&asid).map_or(0, Vec::len)
         + s.waiting_forms.get(&asid).map_or(0, Vec::len)
         + s.queue.len();
-    let labels: Vec<String> = TABS
-        .iter()
-        .map(|(label, tab)| {
-            let label = tab_label(language, label);
-            match tab {
-                InspectorTab::Queue if waiting > 0 => format!("{label} {waiting}"),
-                InspectorTab::Git if s.diff_stat.files > 0 => {
-                    format!("{label} {}", s.diff_stat.files)
-                }
-                InspectorTab::Shells if !s.shells.is_empty() => {
-                    format!("{label} {}", s.shells.len())
-                }
-                _ => label.to_string(),
-            }
-        })
-        .collect();
-    let at = TABS.iter().position(|(_, t)| *t == s.inspector_tab);
-    let tabs = SegmentedControl::new(&labels, at)
-        .width(None)
+    let count = |tab: InspectorTab| match tab {
+        InspectorTab::Queue if waiting > 0 => Some(waiting),
+        InspectorTab::Git if s.diff_stat.files > 0 => Some(s.diff_stat.files),
+        InspectorTab::Shells if !s.shells.is_empty() => Some(s.shells.len()),
+        _ => None,
+    };
+    let mut strip = row()
+        .key("inspector-tabs")
+        .role("tablist")
         .label(tr_ref(language, "Inspector", "检查器"))
-        .on_pick(move |s: &mut UiState, i, _: &mut Tx| {
-            s.inspector_tab = TABS[i].1;
-            s.refresh_inspector();
-        })
-        .build(k)
-        .key("inspector-tabs");
+        .w_full()
+        .h(TOOLBAR_H)
+        .px(8.0)
+        .gap(2.0)
+        .center_y()
+        .focus_group();
+    for (label, tab) in TABS {
+        strip = strip.child(tab_button(
+            k,
+            tab_label(language, label),
+            count(tab),
+            tab,
+            s.inspector_tab == tab,
+        ));
+    }
     let body = match s.inspector_tab {
         InspectorTab::Queue => queue(s, k),
         InspectorTab::Git => git(s, k),
@@ -560,15 +598,15 @@ pub fn view(s: &UiState, k: &Kit) -> El {
         .w_full()
         .h_full()
         .min_h(0.0)
-        .gap(12.0)
-        .px(12.0)
-        .py(12.0)
-        .child(tabs)
+        .child(strip)
         .child(
             col()
                 .key("inspector-body")
                 .w_full()
                 .gap(8.0)
+                .px(12.0)
+                .pt(4.0)
+                .pb(12.0)
                 .children(body)
                 .scroll(ScrollSpec {
                     stick_bottom: false,

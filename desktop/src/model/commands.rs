@@ -187,8 +187,6 @@ pub enum Command {
     ScanStorage,
     /// Delete the rebuildable caches (theme previews, gallery index), then measure again.
     ClearStorage,
-    /// The Terminals page (`model/terminals.rs`).
-    Terminals(super::terminals::TerminalCommand),
     /// Delegate `goal` as a task (`agent` / `cwd` default on the gateway).
     CreateTask {
         goal: String,
