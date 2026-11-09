@@ -947,8 +947,21 @@ impl UiState {
     /// Give tile `i` the keyboard: its session becomes the one the top-level
     /// fields describe, the old focused tile keeps its state in its slot.
     pub fn focus_tile(&mut self, i: usize) {
-        if i >= self.tiles.len() || i == self.focus {
+        if i >= self.tiles.len() {
             self.mode = Mode::Session;
+            return;
+        }
+        if i == self.focus {
+            self.mode = Mode::Session;
+            if self.selected != self.tiles[i].asid {
+                self.selected = self.tiles[i].asid.clone();
+                self.sync_watch();
+                if self.catalog.is_none() {
+                    if let Some(info) = self.current().cloned() {
+                        self.session_opened(&info);
+                    }
+                }
+            }
             return;
         }
         let old = self.take_slot();
@@ -967,16 +980,17 @@ impl UiState {
         }
     }
 
-    /// Tell the core which sessions besides the focused one are on screen.
+    /// Tell the core which sessions are on screen in split tiles, and who is focused.
     fn sync_watch(&self) {
         let watched: Vec<AgentSessionId> = self
             .tiles
             .iter()
-            .enumerate()
-            .filter(|(i, _)| *i != self.focus)
-            .filter_map(|(_, t)| t.asid.clone().map(AgentSessionId))
+            .filter_map(|t| t.asid.clone().map(AgentSessionId))
             .collect();
         self.send(Command::WatchSessions(watched));
+        if let Some(ref asid) = self.selected {
+            self.send(Command::FocusSession(AgentSessionId(asid.clone())));
+        }
     }
 
     /// Open `asid` beside the current session(s): it fills an empty pane,
@@ -1504,8 +1518,8 @@ impl UiState {
         // A session started from an empty tile lands in it.
         if let Some(i) = self.pending_tile.take() {
             if self.tiles.get(i).is_some_and(|t| t.asid.is_none()) {
-                self.focus_tile(i);
                 self.tiles[i].asid = Some(asid.clone());
+                self.focus_tile(i);
                 self.sync_watch();
             }
         }
@@ -1535,6 +1549,7 @@ impl UiState {
             .replace(snapshot.timeline);
         self.echo_rows(&asid);
         if fresh {
+            self.sync_watch();
             self.retain_timelines();
         }
         self.waiting_perms

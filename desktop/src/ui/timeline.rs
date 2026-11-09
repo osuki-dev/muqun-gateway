@@ -1353,18 +1353,29 @@ mod tests {
             upsert("b", "b-2", 2),
             upsert("z", "z-1", 2),
         ]);
-        let ids = |asid: &str| -> Vec<String> {
+        fn ids(s: &UiState, asid: &str) -> Vec<String> {
             s.timelines[asid]
                 .items
                 .iter()
                 .map(|i| i.id.clone())
                 .collect()
-        };
-        assert_eq!(ids("a"), ["a-1", "a-2"]);
-        assert_eq!(ids("b"), ["b-1", "b-2"]);
+        }
+        assert_eq!(ids(&s, "a"), ["a-1", "a-2"]);
+        assert_eq!(ids(&s, "b"), ["b-1", "b-2"]);
         assert!(
             !s.timelines.contains_key("z"),
             "a session not on screen keeps no rows"
         );
+
+        // Switching focus between tiles preserves selection and allows live streaming
+        s.focus_tile(0);
+        assert_eq!(s.selected.as_deref(), Some("a"));
+        s.apply_updates(vec![upsert("b", "b-3", 3)]);
+        assert_eq!(ids(&s, "b"), ["b-1", "b-2", "b-3"]);
+
+        s.focus_tile(1);
+        assert_eq!(s.selected.as_deref(), Some("b"));
+        s.apply_updates(vec![upsert("a", "a-3", 3)]);
+        assert_eq!(ids(&s, "a"), ["a-1", "a-2", "a-3"]);
     }
 }

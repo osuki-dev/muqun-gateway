@@ -81,6 +81,7 @@ fn fill_tile(s: &mut UiState, i: usize, asid: &str) {
         asid.to_string(),
     )));
     s.focus_tile(i);
+    s.sync_watch();
     s.persist_tiles();
 }
 

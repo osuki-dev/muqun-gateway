@@ -340,6 +340,12 @@ impl Core {
                 }
                 self.open(&asid).await;
             }
+            Command::FocusSession(asid) => {
+                *self.active.lock().unwrap() = Some(asid.clone());
+                self.watch_viewed(&asid);
+                tokio::spawn(self.clone().diff(asid.clone()));
+                tokio::spawn(self.clone().descendants(asid.clone()));
+            }
             Command::WatchSessions(asids) => {
                 *self.watched.lock().unwrap() = asids;
             }
@@ -1305,8 +1311,8 @@ impl Core {
         });
     }
 
-    /// Read the active session again when `asid` is it (or unnamed), else
-    /// -- or for an unnamed resync, also -- the lists.
+    /// Read the active and watched session(s) again when `asid` is open (or unnamed),
+    /// else -- or for an unnamed resync, also -- the lists.
     ///
     /// Re-reading never prepares the session: preparing a terminal-held ACP
     /// session starts another transcript follower, and every follower sends
@@ -1317,19 +1323,43 @@ impl Core {
     async fn resync(self: &Arc<Self>, asid: Option<&AgentSessionId>) {
         let named = asid.filter(|x| !x.0.is_empty());
         let active = self.active.lock().unwrap().clone();
-        let reread = active
-            .as_ref()
-            .is_some_and(|a| named.is_none_or(|x| x == a));
+        let watched = self.watched.lock().unwrap().clone();
+        let target_asids: Vec<AgentSessionId> = match named {
+            Some(target) => {
+                if active.as_ref() == Some(target) || watched.contains(target) {
+                    vec![target.clone()]
+                } else {
+                    vec![]
+                }
+            }
+            None => {
+                let mut list = Vec::new();
+                if let Some(ref a) = active {
+                    list.push(a.clone());
+                }
+                for w in &watched {
+                    if !list.contains(w) {
+                        list.push(w.clone());
+                    }
+                }
+                list
+            }
+        };
+        let reread = !target_asids.is_empty();
         if reread && self.reread.begin() {
             let core = self.clone();
             tokio::spawn(async move {
                 loop {
-                    let active = core.active.lock().unwrap().clone();
-                    if let Some(active) = active {
-                        if !core.catch_up(&active).await {
-                            match core.hub.snapshot(&active).await {
+                    for asid in &target_asids {
+                        if !core.is_open(asid) {
+                            continue;
+                        }
+                        if !core.catch_up(asid).await {
+                            match core.hub.snapshot(asid).await {
                                 Ok(snapshot) => core.push_snapshot(snapshot),
-                                Err(err) => tracing::debug!(%err, "resync read failed"),
+                                Err(err) => {
+                                    tracing::debug!(asid = %asid.0, %err, "resync read failed")
+                                }
                             }
                         }
                     }
@@ -1489,5 +1519,24 @@ mod tests {
             wanted(&resolved, Some(&id("open")), &[]),
             "the open session's forms"
         );
+    }
+
+    #[test]
+    fn split_tiles_all_stream_regardless_of_which_is_focused() {
+        let upsert = |asid: &str| AgentDomainEvent::TimelineUpsert {
+            asid: id(asid),
+            items: vec![],
+            seq: 1,
+        };
+        let tiles = vec![id("tile-a"), id("tile-b")];
+        // When tile-a is focused:
+        assert!(wanted(&upsert("tile-a"), Some(&id("tile-a")), &tiles));
+        assert!(wanted(&upsert("tile-b"), Some(&id("tile-a")), &tiles));
+        assert!(!wanted(&upsert("tile-c"), Some(&id("tile-a")), &tiles));
+
+        // When tile-b is focused:
+        assert!(wanted(&upsert("tile-a"), Some(&id("tile-b")), &tiles));
+        assert!(wanted(&upsert("tile-b"), Some(&id("tile-b")), &tiles));
+        assert!(!wanted(&upsert("tile-c"), Some(&id("tile-b")), &tiles));
     }
 }

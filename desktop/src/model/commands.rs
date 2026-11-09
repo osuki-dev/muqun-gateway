@@ -42,6 +42,9 @@ pub enum Command {
     /// Open a session into a split tile: read its snapshot and stream its
     /// events, without taking the active (focused) place.
     OpenTile(AgentSessionId),
+    /// Focus an already open session (e.g. switching between split tiles):
+    /// updates the active session and heartbeat without reloading snapshot.
+    FocusSession(AgentSessionId),
     /// The sessions on screen besides the active one (split tiles). Their
     /// events stream like the active session's; the rest are filtered.
     WatchSessions(Vec<AgentSessionId>),
