@@ -1446,6 +1446,50 @@ mod tests {
         assert_eq!(reread.stdout_tail, waited.stdout_tail);
     }
 
+    /// A command there whose end its own gateway could not read (its pane
+    /// restored at a prompt, the output gone) fails there with its exit
+    /// unknown, and the mirror here ends with it instead of staying working.
+    #[tokio::test]
+    async fn a_command_that_ended_unseen_there_ends_here_too() {
+        let herdr = FakeHerdr::start(vec!["$ "], None);
+        let mini = named(output_state(&herdr), "srv-mini", "mini");
+        mini.devices
+            .lock()
+            .unwrap()
+            .push(test_peer_device("coding-1", "peer-token"));
+        let url = serve(peer_router(mini.clone())).await;
+        let coding = named(output_state(&herdr), "srv-coding", "coding");
+        coding
+            .peers
+            .store_for_test(peer("srv-mini", "mini", &url, Some(now_ms())))
+            .await;
+        let ran = run_as(&coding, "mini", "sleep 600", 1).await.unwrap();
+        let mirror_id = TaskId(ran["task_id"].as_str().unwrap().into());
+        let mirror = coding.tasks.get_for_test(&mirror_id).await;
+        assert_eq!(mirror.state, TaskState::Working);
+        let TaskBinding::Peer { remote_task_id, .. } = &mirror.binding else {
+            panic!("{:?}", mirror.binding);
+        };
+        let there = mini
+            .tasks
+            .get_for_test(&TaskId(remote_task_id.clone()))
+            .await;
+
+        // Its shell is back in front with no marker on screen.
+        assert!(crate::tasks::run_command::settle_unreported(&mini, &there, Some(true)).await);
+        let by = owner(&coding, &mirror_id).await;
+        let waited = coding
+            .tasks
+            .wait(&coding, &by, &mirror_id, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(waited.task.state, TaskState::Failed);
+        assert_eq!(
+            waited.task.summary.as_deref(),
+            Some(crate::tasks::run_command::ENDED_UNREPORTED)
+        );
+    }
+
     /// A mirror reads as the task over there does: its goal's sentence until
     /// that one has a name of its own, then the name.
     #[tokio::test]

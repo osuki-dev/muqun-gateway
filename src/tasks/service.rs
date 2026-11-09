@@ -726,6 +726,19 @@ impl TaskService {
         Ok(now)
     }
 
+    /// The end task `id` was last reopened from by a new user turn.
+    pub(crate) async fn reopened_from(&self, id: &TaskId) -> Option<TaskState> {
+        self.store
+            .events(id)
+            .await
+            .ok()?
+            .into_iter()
+            .rev()
+            .find(|event| event.source == "new_user_turn")?
+            .from
+            .filter(|state| state.is_terminal())
+    }
+
     pub(crate) async fn reopen_note(&self, id: &TaskId) -> Option<String> {
         self.store
             .events(id)
@@ -735,6 +748,28 @@ impl TaskService {
             .rev()
             .find(|event| event.source == "new_user_turn")?
             .note
+    }
+
+    /// Whether session `asid` has run a turn after `since_ms`: running one
+    /// now (as the agent or this gateway's events say), or idle since a
+    /// time after it. A user row's own time is no evidence: an ACP agent
+    /// replays a loaded session's history as rows stamped with the load's
+    /// time, so after a gateway restart every old prompt looks new.
+    pub(crate) async fn ran_since(
+        &self,
+        manager: &AgentManager,
+        asid: &str,
+        since_ms: u64,
+    ) -> bool {
+        manager
+            .sessions()
+            .get_session(asid)
+            .await
+            .is_ok_and(|session| {
+                is_running(session.status)
+                    || self.is_busy(asid)
+                    || session.time_idle.is_some_and(|idle| idle > since_ms)
+            })
     }
 
     pub(crate) async fn reopen_session(
@@ -762,7 +797,7 @@ impl TaskService {
         let Some(manager) = state.agent_runtime.manager_for_agent(agent_id).await else {
             return false;
         };
-        if manager.sessions().get_session(asid).await.is_err() {
+        if !self.ran_since(&manager, asid, task.updated_ms).await {
             return false;
         }
         // Reconciliation may discover a turn after its answer already arrived.
@@ -4477,18 +4512,25 @@ mod tests {
 
     #[tokio::test]
     async fn a_new_user_turn_reopens_only_a_live_finished_session() {
-        for (ended, live, fresh, expected) in [
-            (TaskState::Done, true, true, true),
-            (TaskState::Failed, true, true, true),
-            (TaskState::Cancelled, true, true, false),
-            (TaskState::Done, false, true, false),
-            (TaskState::Done, true, false, false),
+        // `ran`: the session ran a turn after the task ended (idle since).
+        // Without one, a fresh user row is a replayed history: ACP stamps a
+        // loaded session's old rows with the load's time.
+        for (ended, live, fresh, ran, expected) in [
+            (TaskState::Done, true, true, true, true),
+            (TaskState::Failed, true, true, true, true),
+            (TaskState::Cancelled, true, true, true, false),
+            (TaskState::Done, false, true, true, false),
+            (TaskState::Done, true, false, true, false),
+            (TaskState::Done, true, true, false, false),
         ] {
-            let agent = FakeAgent::new("opencode");
             let (state, id) = if live {
+                let mut agent = FakeAgent::new("opencode").with_sessions(&[(ASID, 1)]);
+                if ran {
+                    agent.sessions[0].time_idle = Some(now_ms() + 60_000);
+                }
                 delegated(agent).await
             } else {
-                tracked(agent).await
+                tracked(FakeAgent::new("opencode")).await
             };
             let task = state
                 .tasks
