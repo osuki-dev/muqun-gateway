@@ -243,11 +243,19 @@ mod backend {
     }
 
     pub fn send(job: Job) {
-        if let Job::Show(notice) = job {
-            tracing::debug!(
-                title = %notice.title,
-                "system notifications are not implemented on this platform"
-            );
+        match job {
+            Job::Show(notice) => {
+                tracing::debug!(
+                    title = %notice.title,
+                    "system notifications are not implemented on this platform"
+                );
+            }
+            Job::Withdraw(tag) => {
+                tracing::trace!(
+                    %tag,
+                    "system notifications withdrawal not implemented on this platform"
+                );
+            }
         }
     }
 }
