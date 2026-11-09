@@ -13,6 +13,10 @@ impl AcpProvider for QoderProvider {
     }
     const REQUIRE_MESSAGE_ID: bool = false;
     const MODEL_SELECTION: bool = true;
+    // Skills are listed among the slash commands; the files on disk tell
+    // which they are.
+    const SKILL_LAYOUT: Option<&'static crate::agents::adapters::acp::skills::SkillLayout> =
+        Some(&crate::agents::adapters::acp::skills::QODER);
     const IDLE_RETIREMENT: bool = true;
     // qodercli 1.1.81 lists its permission modes as the session's ACP modes
     // (`default`, `acceptEdits`, `auto`, `dontAsk`, `yolo` "Bypass

@@ -23,6 +23,7 @@ use crate::agents::ports::agent::{
 };
 use crate::agents::ports::mirror::{AgentSessionSnapshot, SessionMirrorPort};
 use std::marker::PhantomData;
+use std::path::PathBuf;
 
 /// Native launch and verified differences; protocol lifecycle is shared.
 /// An agent whose bypass is a launch flag: the session's child is started
@@ -138,6 +139,11 @@ pub trait AcpProvider: Send + Sync + 'static {
     /// How long a successful global catalog is reused. Discovery asks on
     /// every refresh, and each lookup launches a native process.
     const CATALOG_TTL: Duration = Duration::from_secs(60);
+    /// Where the agent reads skills from on disk, so the skills among its
+    /// listed slash commands can be offered as skills too
+    /// ([`super::skills`]). `None` for an agent that lists no skills as
+    /// commands.
+    const SKILL_LAYOUT: Option<&'static super::skills::SkillLayout> = None;
     /// Cheap token that changes whenever the native saved-session store does.
     /// While it holds, a listing stays valid for `SESSION_STORE_MAX_AGE`, so
     /// periodic Home refreshes do not launch a process to learn nothing new.
@@ -285,6 +291,12 @@ const MAX_LIST_PAGES: usize = 64;
 const MAX_DEFERRED_REPLAY_BYTES: usize = 8 * 1024 * 1024;
 const MAX_DEFERRED_REPLAY_UPDATES: usize = 10_000;
 const SESSION_METADATA_TTL: Duration = Duration::from_secs(30);
+/// How long a workspace's skill names on disk are reused by the catalog.
+const SKILLS_TTL: Duration = Duration::from_secs(60);
+/// One workspace's skill names, and when they were read.
+type ScannedSkills = (tokio::time::Instant, Arc<HashSet<String>>);
+/// Workspaces whose skill names are kept.
+const MAX_SKILL_SCANS: usize = 64;
 const SESSION_LIST_TTL: Duration = SESSION_METADATA_TTL;
 const SESSION_STORE_MAX_AGE: Duration = Duration::from_secs(600);
 const MAX_LIST_SCOPES: usize = 4;
@@ -665,6 +677,11 @@ pub struct AcpDriver<P: AcpProvider> {
     metadata_revision: AtomicU64,
     native_capabilities: StdMutex<Value>,
     commands_observed: Arc<AtomicBool>,
+    /// The skill names on disk per workspace (`P::SKILL_LAYOUT`), reused for
+    /// `SKILLS_TTL` so catalog polling does not rescan the skill directories.
+    skill_names: StdMutex<HashMap<PathBuf, ScannedSkills>>,
+    /// Whether a catalog read has offered at least one skill.
+    skills_observed: AtomicBool,
     launch: StdMutex<Option<AcpLaunch>>,
     /// Sessions whose child is launched with the provider's bypass flag
     /// (`P::LAUNCH_BYPASS`). In memory: a restart of the Gateway forgets it.
@@ -795,6 +812,8 @@ impl<P: AcpProvider> AcpDriver<P> {
             metadata_revision: AtomicU64::new(0),
             native_capabilities: StdMutex::new(Value::Null),
             commands_observed: Arc::new(AtomicBool::new(false)),
+            skill_names: StdMutex::new(HashMap::new()),
+            skills_observed: AtomicBool::new(false),
             launch: StdMutex::new(None),
             launch_bypass: StdMutex::new(HashSet::new()),
             mcp_servers: StdMutex::new(json!([])),
@@ -1333,6 +1352,15 @@ impl<P: AcpProvider> AcpDriver<P> {
         &self,
         directory: Option<&str>,
     ) -> Result<AgentCatalog, AgentError> {
+        let mut catalog = self.available_catalog_without_skills(directory).await?;
+        self.attach_skills(&mut catalog, directory).await;
+        Ok(catalog)
+    }
+
+    async fn available_catalog_without_skills(
+        &self,
+        directory: Option<&str>,
+    ) -> Result<AgentCatalog, AgentError> {
         let mut observed = self.observed_catalog().await;
         if !P::MODEL_SELECTION {
             observed.models.clear();
@@ -1401,6 +1429,52 @@ impl<P: AcpProvider> AcpDriver<P> {
             }
             Err(_) if !observed.commands.is_empty() => Ok(observed),
             Err(error) => Err(error),
+        }
+    }
+
+    /// The skills among `catalog.commands`, by the skill files on disk for
+    /// `directory` (else the default workspace), as `catalog.skills`. The
+    /// commands stay: `/name args` is how the agent runs a skill.
+    async fn attach_skills(&self, catalog: &mut AgentCatalog, directory: Option<&str>) {
+        let Some(layout) = P::SKILL_LAYOUT else {
+            return;
+        };
+        if catalog.commands.is_empty() {
+            return;
+        }
+        let cwd = PathBuf::from(directory.unwrap_or(&self.default_directory));
+        let cached = self
+            .skill_names
+            .lock()
+            .unwrap()
+            .get(&cwd)
+            .and_then(|(at, names)| (at.elapsed() < SKILLS_TTL).then(|| names.clone()));
+        let names = match cached {
+            Some(names) => names,
+            None => {
+                let scan = cwd.clone();
+                let Ok(names) = tokio::task::spawn_blocking(move || {
+                    let home = dirs::home_dir();
+                    super::skills::skill_names(layout, &scan, home.as_deref(), |key| {
+                        std::env::var_os(key)
+                    })
+                })
+                .await
+                else {
+                    return;
+                };
+                let names = Arc::new(names);
+                let mut cache = self.skill_names.lock().unwrap();
+                if cache.len() >= MAX_SKILL_SCANS && !cache.contains_key(&cwd) {
+                    cache.clear();
+                }
+                cache.insert(cwd, (tokio::time::Instant::now(), names.clone()));
+                names
+            }
+        };
+        catalog.skills = super::skills::split(&catalog.commands, &names);
+        if !catalog.skills.is_empty() {
+            self.skills_observed.store(true, Ordering::Release);
         }
     }
 
@@ -4255,6 +4329,36 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
     fn slash_commands_listed(&self) -> bool {
         self.commands_observed.load(Ordering::Acquire)
     }
+    fn skills_listed(&self) -> bool {
+        self.skills_observed.load(Ordering::Acquire)
+    }
+    /// A skill runs as its slash command, `/name`, without arguments (the
+    /// skill route carries none). Only a skill this session's catalog lists.
+    fn activate_skill<'a>(
+        &'a self,
+        id: &'a str,
+        name: &'a str,
+        resume: Option<bool>,
+    ) -> AgentFuture<'a, ()> {
+        Box::pin(async move {
+            if resume == Some(false) {
+                return Err(AgentError::Unsupported(
+                    "ACP skill activation without a turn".into(),
+                ));
+            }
+            // A dormant session's skills are read for its own workspace.
+            let directory = self.get_session(id).await?.directory;
+            let catalog = self
+                .get_catalog_for_session(Some(id), directory.as_deref())
+                .await?;
+            if !catalog.skills.iter().any(|skill| skill.id == name) {
+                return Err(AgentError::InvalidRequest(
+                    "that skill is not offered by this session".into(),
+                ));
+            }
+            self.run_command(id, name, "", None).await
+        })
+    }
     fn signin_failure(&self) -> Option<u64> {
         *self.signin_failure.lock().unwrap()
     }
@@ -4656,7 +4760,10 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
                         "ACP generation changed during catalog observation".into(),
                     )
                 })?;
-                let mut catalog = session.state.lock().await.catalog.clone();
+                let (mut catalog, session_directory) = {
+                    let state = session.state.lock().await;
+                    (state.catalog.clone(), state.info.directory.clone())
+                };
                 if !P::MODEL_SELECTION {
                     catalog.models.clear();
                     catalog.defaults.model = None;
@@ -4668,6 +4775,8 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
                     catalog.modes.clear();
                     catalog.defaults.mode = None;
                 }
+                self.attach_skills(&mut catalog, session_directory.as_deref().or(directory))
+                    .await;
                 Ok(catalog)
             } else {
                 self.get_catalog(directory).await

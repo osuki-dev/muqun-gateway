@@ -239,11 +239,19 @@ pub struct PiDriver {
     spawn_lock: Arc<tokio::sync::Mutex<()>>,
     catalog: tokio::sync::Mutex<Option<(Instant, AgentCatalog)>>,
     commands_listed: std::sync::atomic::AtomicBool,
-    command_cache: Mutex<HashMap<PathBuf, (Instant, Vec<crate::agents::domain::CommandInfo>)>>,
+    skills_listed: std::sync::atomic::AtomicBool,
+    command_cache: Mutex<HashMap<PathBuf, (Instant, Listed)>>,
     probed: Mutex<Option<(Instant, bool)>>,
     failed: std::sync::atomic::AtomicBool,
     history: Mutex<HashMap<String, HistoryCursor>>,
     stop: CancellationToken,
+}
+
+/// What one `get_commands` answer offers.
+#[derive(Clone)]
+struct Listed {
+    commands: Vec<crate::agents::domain::CommandInfo>,
+    skills: Vec<crate::agents::domain::SkillInfo>,
 }
 
 #[derive(Clone)]
@@ -282,6 +290,7 @@ impl PiDriver {
             spawn_lock: Arc::new(tokio::sync::Mutex::new(())),
             catalog: tokio::sync::Mutex::new(None),
             commands_listed: std::sync::atomic::AtomicBool::new(false),
+            skills_listed: std::sync::atomic::AtomicBool::new(false),
             command_cache: Mutex::new(HashMap::new()),
             probed: Mutex::new(None),
             failed: std::sync::atomic::AtomicBool::new(false),
@@ -864,10 +873,22 @@ impl PiDriver {
         read
     }
 
-    async fn read_commands(
-        &self,
-        directory: Option<&str>,
-    ) -> Result<Vec<crate::agents::domain::CommandInfo>, AgentError> {
+    /// `get_commands`, read: the commands, and the skills among them.
+    fn listed(&self, value: &Value) -> Listed {
+        self.commands_listed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let listed = Listed {
+            commands: mapper::commands(value),
+            skills: mapper::skills(value),
+        };
+        if !listed.skills.is_empty() {
+            self.skills_listed
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        listed
+    }
+
+    async fn read_commands(&self, directory: Option<&str>) -> Result<Listed, AgentError> {
         let current = self.live.sessions.lock().ok().and_then(|sessions| {
             sessions.iter().find_map(|(id, s)| {
                 directory
@@ -877,9 +898,7 @@ impl PiDriver {
         });
         if let Some(child) = current {
             let value = child.request(json!({"type":"get_commands"})).await?;
-            self.commands_listed
-                .store(true, std::sync::atomic::Ordering::Relaxed);
-            return Ok(mapper::commands(&value));
+            return Ok(self.listed(&value));
         }
         let cwd = directory
             .map(PathBuf::from)
@@ -921,10 +940,7 @@ impl PiDriver {
         };
         child.close().await;
         owned.finish();
-        let result = result?;
-        self.commands_listed
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        let commands = mapper::commands(&result);
+        let commands = self.listed(&result?);
         if let Ok(mut cache) = self.command_cache.lock() {
             if cache.len() >= MAX_TRACKED_SESSIONS && !cache.contains_key(&cwd) {
                 if let Some(directory) = cache.keys().next().cloned() {
@@ -1235,6 +1251,34 @@ impl AgentPort for PiDriver {
 
     fn supports_earlier_timeline(&self) -> bool {
         true
+    }
+
+    fn skills_listed(&self) -> bool {
+        self.skills_listed
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// A skill runs as its command, `/skill:<id>`, without arguments (the
+    /// skill route carries none); `run_command` checks the live child still
+    /// lists it.
+    fn activate_skill<'a>(
+        &'a self,
+        session_id: &'a str,
+        name: &'a str,
+        resume: Option<bool>,
+    ) -> AgentFuture<'a, ()> {
+        Box::pin(async move {
+            if resume == Some(false) {
+                return Err(AgentError::Unsupported(
+                    "Pi skill activation without a turn".into(),
+                ));
+            }
+            if name.is_empty() || name.chars().any(char::is_whitespace) || name.starts_with('/') {
+                return Err(AgentError::InvalidRequest("invalid Pi skill name".into()));
+            }
+            let command = format!("{}{name}", mapper::SKILL_COMMAND_PREFIX);
+            self.run_command(session_id, &command, "", None).await
+        })
     }
 
     fn slash_commands_listed(&self) -> bool {
@@ -1605,7 +1649,9 @@ impl AgentPort for PiDriver {
                     catalog
                 }
             };
-            catalog.commands = self.read_commands(directory).await?;
+            let listed = self.read_commands(directory).await?;
+            catalog.commands = listed.commands;
+            catalog.skills = listed.skills;
             Ok(catalog)
         })
     }
