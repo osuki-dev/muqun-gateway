@@ -112,3 +112,11 @@ pub static KEYBOARD: Icon = Icon {
         r#" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>"#,
     ),
 };
+
+/// A plain plus in the kit's close-button weight: "Add to split view" beside
+/// a pane's ×.
+pub static PLUS: Icon = Icon {
+    name: "plus",
+    view: 16.0,
+    body: r#"<path d="M8 3.75V12.25M3.75 8H12.25" stroke="currentColor"/>"#,
+};

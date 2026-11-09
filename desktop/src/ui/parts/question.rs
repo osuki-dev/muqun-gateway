@@ -516,13 +516,15 @@ pub fn form_card(s: &UiState, k: &Kit, form: &FormRequest) -> El {
         .radius(k.radius.lg)
         .clip_rounded(k.radius.lg)
         .border(1.0, k.c.border_weak)
-        .fill(k.c.surface_raised_base)
+        // Waiting on the owner: the surface a faint step toward its tone.
+        .fill(if pending {
+            s.look().emphasis(k.c.surface_raised_base, k.c.info.icon)
+        } else {
+            k.c.surface_raised_base
+        })
         .child(head);
     if pending {
-        // Waiting on the owner: lit from its top edge, not outlined.
-        card = card
-            .child(form_fields(s, k, form, false))
-            .child(s.look().top_light("form-light", k.c.info.icon, 0.9));
+        card = card.child(form_fields(s, k, form, false));
     }
     card
 }

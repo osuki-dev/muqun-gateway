@@ -35,7 +35,12 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
             cx.layout_size("home-dock"),
             layer,
         ),
-        Mode::Session if s.in_split() => tiles::view(s, k, layer),
+        Mode::Session if s.in_split() => tiles::view(
+            s,
+            k,
+            tiles::toggle_clearance(s, crate::platform::titlebar_inset(cx.titlebar_inset())),
+            layer,
+        ),
         Mode::Session => session(s, k, &look, layer),
         Mode::Inbox => inbox::view(s, k),
         Mode::Tasks => tasks::view(s, k),
@@ -69,11 +74,14 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
         ));
     // Home has no toolbar of its own; its card still starts on the
     // sidebar's top row, as every page's does.
-    split = split.toolbar(if s.mode == Mode::Home {
-        Toolbar::new()
-    } else {
-        toolbar(s, k, &look, layer)
-    });
+    // Split view has none either: each pane's header is its toolbar.
+    split = split.toolbar(
+        if s.mode == Mode::Home || (s.mode == Mode::Session && s.in_split()) {
+            Toolbar::new()
+        } else {
+            toolbar(s, k, &look, layer)
+        },
+    );
     let inspector_here = s.right_open && s.mode == Mode::Session && !s.in_split();
     // A row's details take the right-hand slot while they are open; an open
     // terminal takes it over both, and the inspector comes last.
@@ -545,12 +553,6 @@ fn toolbar(s: &UiState, k: &Kit, look: &Look, layer: &mut Vec<El>) -> Toolbar {
     let language = s.cfg.general.language;
     let mut bar = Toolbar::new();
     match s.mode {
-        Mode::Session if s.in_split() => {
-            bar = bar.leading(tiles::toolbar_title(s, k));
-            for action in tiles::toolbar_actions(s, k) {
-                bar = bar.trailing(action);
-            }
-        }
         Mode::Session => {
             bar = bar.leading(session_identity(s, k, look));
             let asid = s.selected.clone().unwrap_or_default();

@@ -839,6 +839,19 @@ pub fn scenes() -> &'static [Scene] {
             home_busy(s);
             s.cfg.general.language = crate::config::Language::ZhCn;
         }),
+        // Split view with the focused composer's field in focus.
+        ("split2-typing", |s| {
+            split2(s);
+            s.draft = TextEdit::new("Run the tests again");
+            s.draft.focused = true;
+        }),
+        // Split view on an opaque window without motion, sidebar closed.
+        ("split2-plain", |s| {
+            split2(s);
+            s.cfg.appearance.reduced_motion = true;
+            s.cfg.appearance.reduced_transparency = true;
+            s.sidebar.set_open(false);
+        }),
         ("split2-zh", |s| {
             split2(s);
             s.cfg.general.language = crate::config::Language::ZhCn;

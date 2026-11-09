@@ -992,6 +992,17 @@ impl UiState {
         self.mode = Mode::Session;
     }
 
+    /// Leave split view: keep the focused pane's session, close the others.
+    pub fn unsplit(&mut self) {
+        let mut j = self.tiles.len();
+        while j > 0 {
+            j -= 1;
+            if j != self.focus && self.tiles.len() > 1 {
+                self.close_tile(j);
+            }
+        }
+    }
+
     /// Close tile `i`; one tile left means the pane goes back to one session.
     pub fn close_tile(&mut self, i: usize) {
         if i >= self.tiles.len() {

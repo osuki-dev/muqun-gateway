@@ -1,22 +1,24 @@
 //! Split view: two to four sessions side by side in the main card, each a
 //! pane with its live timeline and composer. The panes fill the card edge to
-//! edge with hairline dividers; the focused one's header is tinted and
-//! underlined in the accent, one waiting on the owner pulses its underline;
-//! panes swap and close on springs and the first column resizes on a grip.
+//! edge with hairline dividers, each under its own one-line header; there is
+//! no toolbar over them. Focus is contrast, not decoration: the other panes
+//! sit a step back (a scrim of the card colour, titles muted) and focus
+//! cross-fades between them; a pane waiting on the owner breathes a small
+//! warning dot by its title. Panes swap and close on springs and the first
+//! column resizes on a grip.
 //!
 //! Keys: `Primary+1..4` and `Primary+Alt+arrows` focus a pane,
 //! `Primary+\` adds one, `Primary+W` removes the focused one.
 
 use rune::{col, el, row, text, Cursor, El, Key, KeyEvent, Phase, Tx};
-use rune_kit::glyphs::{ARROW_RIGHT, CLOSE, TRIANGLE_DOWN};
+use rune_kit::glyphs::{CLOSE, TRIANGLE_DOWN};
 use rune_kit::{
     Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, Kit, Menu, MenuItem,
 };
 
 use super::copy::{tr, tr_ref};
 use super::{
-    activity_mark, activity_pill, ago, composer, now_ms, timeline, title_of, Activity, Mode,
-    OpenMenu, UiState,
+    activity_pill, ago, composer, now_ms, timeline, title_of, Activity, Mode, OpenMenu, UiState,
 };
 use crate::model::commands::Command;
 use crate::theme::look::Look;
@@ -25,6 +27,10 @@ use crate::theme::look::Look;
 const GRIP: f32 = 9.0;
 /// A pane header's height.
 const HEAD_H: f32 = 36.0;
+/// How far an unfocused pane's content sits back: the alpha of the card
+/// colour laid over it (light, dark), about a tenth of its contrast either
+/// way (blending is in linear light, so dark needs more).
+const UNFOCUSED_SCRIM: [f32; 2] = [0.12, 0.22];
 
 /// Which pane lies `key`-ward of pane `i` among `n`, as the panes sit: two
 /// side by side; three as one on the left beside two stacked; four in a
@@ -104,7 +110,7 @@ fn reach(language: crate::config::Language, i: usize) -> String {
 
 /// A pane's header, one line in the toolbar's style: mark, title, agent,
 /// status dot, and under the pointer its menu and close.
-fn header(s: &UiState, k: &Kit, look: &Look, i: usize, layer: &mut Vec<El>) -> El {
+fn header(s: &UiState, k: &Kit, look: &Look, i: usize, clear: f32, layer: &mut Vec<El>) -> El {
     let language = s.cfg.general.language;
     let focused = i == s.focus;
     let count = s.tiles.len();
@@ -114,16 +120,16 @@ fn header(s: &UiState, k: &Kit, look: &Look, i: usize, layer: &mut Vec<El>) -> E
         .key("tile-head")
         .w_full()
         .h(HEAD_H)
-        .pl(12.0)
+        .pl(12.0 + clear)
+        .motion(super::panes::SPRING)
         .pr(6.0)
         .gap(8.0)
         .center_y()
         .help(reach(language, i))
         .hover_group();
-    if focused {
-        head = head.fill(k.c.bg_accent.alpha(0.07));
-    }
-    let title_font = if focused { k.ty.ui_medium } else { k.ty.ui };
+    // One weight either way, so focus moving never reflows a title; only
+    // its ink changes, cross-fading with the pane's scrim.
+    let title_font = k.ty.ui_medium;
     if let Some(info) = info {
         let activity = s.activity(info);
         head = head
@@ -137,9 +143,11 @@ fn header(s: &UiState, k: &Kit, look: &Look, i: usize, layer: &mut Vec<El>) -> E
                     } else {
                         k.c.text_muted
                     })
+                    .motion(look.focus_fade())
                     .truncate()
                     .shrink()
-                    .min_w(0.0),
+                    // The agent's name gives way first in a narrow pane.
+                    .min_w(48.0),
             )
             .child(
                 text(s.agent_name(&info.agent_id))
@@ -150,8 +158,8 @@ fn header(s: &UiState, k: &Kit, look: &Look, i: usize, layer: &mut Vec<El>) -> E
                     .shrink()
                     .min_w(0.0),
             );
-        if activity != Activity::Idle {
-            head = head.child(activity_mark(k, look, activity, language, false));
+        if let Some(mark) = status_mark(k, look, activity, language) {
+            head = head.child(mark);
         }
     } else {
         head = head.child(
@@ -161,7 +169,15 @@ fn header(s: &UiState, k: &Kit, look: &Look, i: usize, layer: &mut Vec<El>) -> E
                 .color(k.c.text_muted),
         );
     }
-    head = head.child(el().key("tile-spacer").grow(1.0).a11y_hidden());
+    // The header row stands where a title bar would: its empty middle
+    // moves the window.
+    head = head.child(
+        el().key("tile-spacer")
+            .grow(1.0)
+            .h_full()
+            .window_drag()
+            .a11y_hidden(),
+    );
     // Move and close: visible under the pointer, always reachable by menu.
     let menu_open = s.menu == Some(OpenMenu::Tile(i));
     let mut menu = Menu::new(format!("tile-menu-{i}"))
@@ -213,17 +229,28 @@ fn header(s: &UiState, k: &Kit, look: &Look, i: usize, layer: &mut Vec<El>) -> E
             ),
         );
     }
-    menu = menu.separator().item(
-        MenuItem::new(tr(language, "Remove from split view", "移出分屏"))
-            .on_select(move |s: &mut UiState| s.close_tile(i)),
-    );
+    menu = menu
+        .separator()
+        .item(
+            MenuItem::new(tr(language, "Remove from split view", "移出分屏"))
+                .shortcut(if focused {
+                    super::keymap::label(super::keymap::Action::RemoveSplit)
+                } else {
+                    String::new()
+                })
+                .on_select(move |s: &mut UiState| s.close_tile(i)),
+        )
+        .item(
+            MenuItem::new(tr(language, "Close split view", "退出分屏"))
+                .on_select(|s: &mut UiState| s.unsplit()),
+        );
     let menu = menu.build(k, layer);
     head = head.child(if menu_open {
         menu
     } else {
         menu.group_opacity(0.0, 1.0)
     });
-    head.child(
+    head = head.child(
         IconButton::new(&CLOSE)
             .variant(IconButtonVariant::GhostMuted)
             .control_size(ControlSize::Small)
@@ -237,6 +264,108 @@ fn header(s: &UiState, k: &Kit, look: &Look, i: usize, layer: &mut Vec<El>) -> E
             .build(k)
             .key(format!("tile-close-{i}"))
             .group_opacity(if focused { 0.7 } else { 0.0 }, 1.0),
+    );
+    // The split view has no toolbar: the top-right pane's header carries
+    // what it held, adding a pane and the terminal, always in view.
+    if i == 1 {
+        head = head.child(window_actions(s, k));
+    }
+    head
+}
+
+/// Add to split view and the terminal toggle, at the trailing end of the
+/// top-right pane's header (the window's corner, where the toolbar had them).
+fn window_actions(s: &UiState, k: &Kit) -> El {
+    use super::keymap::{tip, Action};
+    let language = s.cfg.general.language;
+    let mut out = row()
+        .key("split-actions")
+        .gap(2.0)
+        .pl(6.0)
+        .center_y()
+        .child(
+            el().key("split-actions-rule")
+                .w(1.0)
+                .h(14.0)
+                .mr(4.0)
+                .fill(k.c.border_muted)
+                .a11y_hidden(),
+        );
+    if s.tiles.len() < super::MAX_TILES {
+        out = out.child(
+            IconButton::new(&super::icons::PLUS)
+                .variant(IconButtonVariant::GhostMuted)
+                .control_size(ControlSize::Small)
+                .label(tr_ref(language, "Add to split view", "加入分屏"))
+                .help(tip(
+                    tr_ref(language, "Add to split view", "加入分屏"),
+                    Action::AddSplit,
+                ))
+                .on_press(|s: &mut UiState| s.split())
+                .build(k)
+                .key("split-add"),
+        );
+    }
+    out.child(
+        IconButton::new(&super::terminal_panel::TERMINAL_WINDOW)
+            .variant(if s.term.open {
+                IconButtonVariant::Contrast
+            } else {
+                IconButtonVariant::GhostMuted
+            })
+            .control_size(ControlSize::Small)
+            .label(tr_ref(language, "Terminal", "终端"))
+            .help(tip(
+                tr_ref(language, "Terminal", "终端"),
+                Action::ToggleTerminal,
+            ))
+            .on_press(|s: &mut UiState| {
+                if s.term.open {
+                    s.close_terminal();
+                } else {
+                    s.open_terminal();
+                }
+            })
+            .build(k)
+            .key("terminal-toggle"),
+    )
+}
+
+/// What a pane's header says about its session, as a bare mark by the
+/// title: the spinner while it works, a warning dot breathing slowly while
+/// it waits on the owner (still under reduce motion), a danger dot when it
+/// failed. Nothing when idle.
+fn status_mark(
+    k: &Kit,
+    look: &Look,
+    activity: Activity,
+    language: crate::config::Language,
+) -> Option<El> {
+    let dot = |c: rune::Color| el().size(7.0, 7.0).radius(3.5).fill(c);
+    let (mark, word) = match activity {
+        Activity::Idle => return None,
+        Activity::Working => (
+            rune_kit::Spinner::new()
+                .size(10.0)
+                .color(k.c.text_accent)
+                .build(k),
+            tr(language, "Working", "工作中"),
+        ),
+        Activity::NeedsYou => (
+            look.breathe(dot(k.c.warning.icon)),
+            tr(language, "Needs you", "等你处理"),
+        ),
+        Activity::Failed => (dot(k.c.danger.icon), tr(language, "Failed", "失败")),
+    };
+    Some(
+        row()
+            .key("tile-status")
+            .size(14.0, 14.0)
+            .center()
+            .role("status")
+            .label(word.clone())
+            .help(word)
+            .child(mark.a11y_hidden()),
     )
 }
 
@@ -373,15 +502,13 @@ fn picker(s: &UiState, k: &Kit, look: &Look, i: usize) -> El {
         )
 }
 
-fn tile(s: &UiState, k: &Kit, look: &Look, i: usize, layer: &mut Vec<El>) -> El {
+fn tile(s: &UiState, k: &Kit, look: &Look, i: usize, clear: f32, layer: &mut Vec<El>) -> El {
     let focused = i == s.focus;
     let t = &s.tiles[i];
     let id = t
         .asid
         .clone()
         .map_or_else(|| format!("tile-empty-{i}"), |a| format!("tile-{a}"));
-    let info = t.asid.as_deref().and_then(|a| s.session_by_id(a));
-    let activity = info.map_or(Activity::Idle, |i| s.activity(i));
 
     let mut body = col()
         .key(id.clone())
@@ -394,7 +521,7 @@ fn tile(s: &UiState, k: &Kit, look: &Look, i: usize, layer: &mut Vec<El>) -> El 
         .clip_soft(0.0)
         .motion(crate::theme::look::MOVE)
         .on_press(move |s: &mut UiState| s.focus_tile(i))
-        .child(header(s, k, look, i, layer));
+        .child(header(s, k, look, i, clear, layer));
     body = body.child(
         el().key("tile-rule")
             .w_full()
@@ -418,14 +545,18 @@ fn tile(s: &UiState, k: &Kit, look: &Look, i: usize, layer: &mut Vec<El>) -> El 
                 .child(parked_composer(s, k, look, i));
         }
     }
-    // Emphasis is light from the pane's top edge, never an outline: the
-    // accent sweeping in on the focused pane, the warning colour breathing
-    // on one waiting on the owner.
-    if activity == Activity::NeedsYou {
-        body = body.child(look.pulse(look.top_light("tile-attention", k.c.warning.icon, 0.9)));
-    } else if focused {
-        body = body.child(look.top_light("tile-focus-light", k.c.bg_accent, 1.0));
-    }
+    // Focus is contrast: the other panes' content sits a step back under a
+    // scrim of the card's own colour (one quad, no layer, no blur) that
+    // cross-fades as focus moves. The header keeps clear of it; its title
+    // mutes instead.
+    body = body.child(
+        el().key("tile-scrim")
+            .pin(Some(0.0), Some(HEAD_H + 1.0), Some(0.0), Some(0.0))
+            .fill(k.c.bg_base.alpha(UNFOCUSED_SCRIM[usize::from(look.dark)]))
+            .opacity(if focused { 0.0 } else { 1.0 })
+            .opacity_motion(look.focus_fade())
+            .a11y_hidden(),
+    );
     body.role("region").label(format!(
         "{} {}",
         tr_ref(s.cfg.general.language, "Pane", "窗格"),
@@ -488,11 +619,29 @@ fn grip(s: &UiState, k: &Kit) -> El {
         .center()
 }
 
-pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
+/// How far the top-left pane's header keeps clear of the window's corner
+/// (the traffic lights and the sidebar's toggle, which float over the card
+/// while the sidebar is closed), `inset` the lights' width. The kit's
+/// toolbar would clear them by its padding; the panes have none. Mirrors
+/// `SplitView`: the lights (or 12 points of edge), 8 points, the Large
+/// toggle's 28, 8 points, less the frame the card starts at.
+pub fn toggle_clearance(s: &UiState, inset: f32) -> f32 {
+    if s.sidebar.is_open() {
+        return 0.0;
+    }
+    let lights = if inset > 0.0 { inset + 8.0 } else { 12.0 };
+    lights + 28.0 + 8.0 - super::panes::FRAME - 12.0
+}
+
+/// The panes; `clear` keeps the top-left header clear of the window's
+/// corner ([`toggle_clearance`]).
+pub fn view(s: &UiState, k: &Kit, clear: f32, layer: &mut Vec<El>) -> El {
     let look = s.look();
     let n = s.tiles.len();
     let split = s.tile_split;
-    let mut tiles: Vec<El> = (0..n).map(|i| tile(s, k, &look, i, layer)).collect();
+    let mut tiles: Vec<El> = (0..n)
+        .map(|i| tile(s, k, &look, i, if i == 0 { clear } else { 0.0 }, layer))
+        .collect();
     // Columns: the first pane (or first two, stacked) take `split` of the
     // width; the panes meet on hairlines, the vertical one the grip.
     let first = |e: El| e.w_frac(split).shrink().min_w(0.0);
@@ -530,77 +679,25 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
                 .child(stack("tiles-right", b, d).grow(1.0))
         }
     };
-    col()
-        .key("tiles")
-        .w_full()
-        .grow(1.0)
-        .min_h(0.0)
-        .on_layout(|s: &mut UiState, rect: [f32; 4]| s.tile_grid_w = rect[2])
-        .child(body)
-}
-
-/// The toolbar's leading content while the pane is split.
-pub fn toolbar_title(s: &UiState, k: &Kit) -> El {
-    let language = s.cfg.general.language;
-    let n = s.tiles.len();
-    let working = s
-        .tiles
-        .iter()
-        .filter_map(|t| t.asid.as_deref())
-        .filter_map(|a| s.session_by_id(a))
-        .filter(|i| s.activity(i) == Activity::Working)
-        .count();
-    let mut line = row().key("split-title").gap(8.0).center_y().child(
-        text(format!("{} · {n}", tr_ref(language, "Split view", "分屏")))
-            .font(k.ty.ui_medium)
-            .color(k.c.text_base),
-    );
-    if working > 0 {
-        line = line.child(
-            text(format!(
-                "{working} {}",
-                tr_ref(language, "working", "工作中")
-            ))
-            .font(k.ty.small)
-            .color(k.c.text_accent),
-        );
-    }
-    line
-}
-
-/// The toolbar's trailing actions while the pane is split.
-pub fn toolbar_actions(s: &UiState, k: &Kit) -> Vec<El> {
-    let language = s.cfg.general.language;
-    let mut out = Vec::new();
-    if s.tiles.len() < super::MAX_TILES {
-        out.push(
-            Button::new(tr_ref(language, "Add to split view", "加入分屏"))
-                .variant(ButtonVariant::Ghost)
-                .control_size(ControlSize::Small)
-                .icon(&ARROW_RIGHT)
-                .shortcut(super::keymap::label(super::keymap::Action::AddSplit))
-                .on_press(|s: &mut UiState| s.split())
-                .build(k)
-                .key("split-add"),
-        );
-    }
-    out.push(
-        Button::new(tr_ref(language, "Close split view", "退出分屏"))
-            .variant(ButtonVariant::Ghost)
-            .control_size(ControlSize::Small)
-            .on_press(|s: &mut UiState| {
-                let mut j = s.tiles.len();
-                while j > 0 {
-                    j -= 1;
-                    if j != s.focus && s.tiles.len() > 1 {
-                        s.close_tile(j);
-                    }
-                }
-            })
-            .build(k)
-            .key("split-unsplit"),
-    );
-    out
+    // No toolbar: the panes rise under the card's empty toolbar row, so
+    // their headers sit at the card's top edge.
+    el().key("tiles-frame").w_full().grow(1.0).min_h(0.0).child(
+        col()
+            .key("tiles")
+            .pin(
+                Some(0.0),
+                // An error card above them keeps the row's place.
+                Some(if s.error.is_some() {
+                    0.0
+                } else {
+                    -rune_kit::shell::TOOLBAR_HEIGHT
+                }),
+                Some(0.0),
+                Some(0.0),
+            )
+            .on_layout(|s: &mut UiState, rect: [f32; 4]| s.tile_grid_w = rect[2])
+            .child(body),
+    )
 }
 
 #[cfg(test)]

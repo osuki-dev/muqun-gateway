@@ -53,6 +53,7 @@ pub enum Act {
     Go(Mode),
     Settings(super::SettingsTab),
     Split,
+    Unsplit,
     Inspector,
     Theme(String),
     ToggleScheme,
@@ -94,6 +95,7 @@ impl Act {
             Self::Go(mode) => format!("go:{mode:?}"),
             Self::Settings(tab) => format!("settings:{tab:?}"),
             Self::Split => "split".into(),
+            Self::Unsplit => "unsplit".into(),
             Self::Inspector => "inspector".into(),
             Self::Theme(id) => format!("theme:{id}"),
             Self::ToggleScheme => "scheme".into(),
@@ -285,6 +287,11 @@ pub fn entries(s: &UiState) -> Vec<Entry> {
         }
         if s.in_split() {
             here.push(Action::RemoveSplit);
+            out.push(action(
+                tr(language, "Close split view", "退出分屏"),
+                &act,
+                Act::Unsplit,
+            ));
         }
         for a in here {
             out.push(action(
@@ -474,6 +481,7 @@ impl UiState {
                 self.settings_tab = tab;
             }
             Act::Split => self.split(),
+            Act::Unsplit => self.unsplit(),
             Act::Inspector => self.toggle_inspector(),
             Act::Theme(id) => self.send(Command::ThemeApply(id, self.cfg.appearance.scheme)),
             Act::ToggleScheme => self.set_scheme(if self.dark {
@@ -724,9 +732,11 @@ fn glyph(act: &Act) -> &'static rune::Icon {
         Act::Go(Mode::Inbox) => &super::icons::INBOX,
         Act::Go(Mode::Tasks) => &super::icons::TASK,
         Act::Dictation => &super::voice::MIC,
-        Act::Settings(_) | Act::Inspector | Act::Split | Act::Key(Action::Settings) => {
-            &super::icons::SETTINGS
-        }
+        Act::Settings(_)
+        | Act::Inspector
+        | Act::Split
+        | Act::Unsplit
+        | Act::Key(Action::Settings) => &super::icons::SETTINGS,
         Act::Theme(_) | Act::ToggleScheme => &rune_kit::glyphs::SPARKLE,
         _ => &rune_kit::glyphs::ARROW_RIGHT,
     }
