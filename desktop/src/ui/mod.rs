@@ -14,6 +14,7 @@ mod dwindle;
 mod echo;
 pub mod fx;
 mod home;
+pub mod i18n;
 mod icons;
 mod inbox;
 mod inspector;
@@ -1945,7 +1946,7 @@ pub fn now_ms() -> u64 {
 
 /// `updated_ms` as a short relative time ("now", "4m", "3h", "2d").
 pub fn ago(updated_ms: u64, now: u64, language: crate::config::Language) -> String {
-    let zh = language == crate::config::Language::ZhCn;
+    let zh = language.is_zh();
     if updated_ms == 0 {
         return String::new();
     }

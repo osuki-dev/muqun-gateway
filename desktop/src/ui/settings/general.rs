@@ -13,11 +13,10 @@ use crate::ui::UiState;
 
 pub(super) fn page(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Vec<El> {
     let language = s.cfg.general.language;
-    let lang_at = match language {
-        Language::En => 0,
-        Language::ZhCn => 1,
-        Language::ZhTw => 2,
-    };
+    let lang_at = Language::ALL
+        .iter()
+        .position(|&l| l == language)
+        .unwrap_or(0);
     let editor = edit_of(s, "editor", || {
         s.cfg.general.editor_command.clone().unwrap_or_default()
     });
@@ -42,12 +41,10 @@ pub(super) fn page(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Vec<El> {
                 choice(
                     k,
                     "language",
-                    &["English", "简体中文", "繁體中文"],
+                    Language::LABELS,
                     lang_at,
                     |s, i| {
-                        s.edit(ConfigEdit::Language(
-                            [Language::En, Language::ZhCn, Language::ZhTw][i],
-                        ));
+                        s.edit(ConfigEdit::Language(Language::ALL[i]));
                     },
                 ),
             )],

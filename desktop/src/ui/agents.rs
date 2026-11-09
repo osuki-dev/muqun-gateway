@@ -41,26 +41,16 @@ impl Standing {
     }
 
     pub fn word(self, language: Language) -> &'static str {
-        if language == Language::ZhTw {
-            return super::copy::zh_tw_ref(self.word(Language::ZhCn));
-        }
-        match (language, self) {
-            (Language::En, Self::Usable) => "Available",
-            (Language::En, Self::NeedsSetup) => "Needs setup",
-            (Language::En, Self::NotRunning) => "Not running",
-            (Language::En, Self::NotInstalled) => "Not installed",
-            (Language::En, Self::NeedsUpdate) => "Needs update",
-            (Language::En, Self::Disabled) => "Disabled",
-            (Language::En, Self::Checking) => "Checking…",
-            (Language::ZhCn, Self::Usable) => "可用",
-            (Language::ZhCn, Self::NeedsSetup) => "需要设置",
-            (Language::ZhCn, Self::NotRunning) => "未运行",
-            (Language::ZhCn, Self::NotInstalled) => "未安装",
-            (Language::ZhCn, Self::NeedsUpdate) => "需要更新",
-            (Language::ZhCn, Self::Disabled) => "已关闭",
-            (Language::ZhCn, Self::Checking) => "检查中…",
-            (Language::ZhTw, _) => unreachable!("derived above"),
-        }
+        let (en, zh) = match self {
+            Self::Usable => ("Available", "可用"),
+            Self::NeedsSetup => ("Needs setup", "需要设置"),
+            Self::NotRunning => ("Not running", "未运行"),
+            Self::NotInstalled => ("Not installed", "未安装"),
+            Self::NeedsUpdate => ("Needs update", "需要更新"),
+            Self::Disabled => ("Disabled", "已关闭"),
+            Self::Checking => ("Checking…", "检查中…"),
+        };
+        super::copy::tr_ref(language, en, zh)
     }
 }
 

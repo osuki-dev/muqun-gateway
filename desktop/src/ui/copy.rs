@@ -19,16 +19,26 @@ use crate::config::Language;
 pub fn tr(language: Language, en: &str, zh: &str) -> String {
     match language {
         Language::En => en.to_string(),
-        Language::ZhCn => zh.to_string(),
-        Language::ZhTw => zh_tw(zh),
+        Language::ZhCn => crate::ui::i18n::lookup(Language::ZhCn, en)
+            .unwrap_or(zh)
+            .to_string(),
+        Language::ZhTw => crate::ui::i18n::lookup(Language::ZhTw, en)
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| zh_tw(zh)),
+        other => crate::ui::i18n::lookup(other, en)
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| en.to_string()),
     }
 }
 
 pub fn tr_ref(language: Language, en: &'static str, zh: &'static str) -> &'static str {
     match language {
         Language::En => en,
-        Language::ZhCn => zh,
-        Language::ZhTw => zh_tw_ref(zh),
+        Language::ZhCn => crate::ui::i18n::lookup(Language::ZhCn, en).unwrap_or(zh),
+        Language::ZhTw => {
+            crate::ui::i18n::lookup(Language::ZhTw, en).unwrap_or_else(|| zh_tw_ref(zh))
+        }
+        other => crate::ui::i18n::lookup(other, en).unwrap_or(en),
     }
 }
 

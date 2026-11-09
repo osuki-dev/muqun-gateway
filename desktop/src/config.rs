@@ -210,14 +210,30 @@ impl General {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Language {
-    #[serde(rename = "zh-CN")]
-    ZhCn,
-    /// Traditional Chinese, Taiwan usage; derived from the zh-CN copy
-    /// (`ui/copy.rs`).
-    #[serde(rename = "zh-TW")]
-    ZhTw,
     #[serde(rename = "en")]
     En,
+    #[serde(rename = "zh-TW")]
+    ZhTw,
+    #[serde(rename = "zh-CN")]
+    ZhCn,
+    #[serde(rename = "ja")]
+    Ja,
+    #[serde(rename = "ko")]
+    Ko,
+    #[serde(rename = "de")]
+    De,
+    #[serde(rename = "fr")]
+    Fr,
+    #[serde(rename = "es")]
+    Es,
+    #[serde(rename = "pt")]
+    Pt,
+    #[serde(rename = "ru")]
+    Ru,
+    #[serde(rename = "vi")]
+    Vi,
+    #[serde(rename = "th")]
+    Th,
 }
 
 impl Default for Language {
@@ -227,6 +243,75 @@ impl Default for Language {
 }
 
 impl Language {
+    /// Every language, matching the App picker and website order.
+    pub const ALL: &'static [Language] = &[
+        Language::En,
+        Language::ZhTw,
+        Language::ZhCn,
+        Language::Ja,
+        Language::Ko,
+        Language::De,
+        Language::Fr,
+        Language::Es,
+        Language::Pt,
+        Language::Ru,
+        Language::Vi,
+        Language::Th,
+    ];
+
+    /// Native names for each language, matching App's `LOCALE_LABELS`.
+    pub const LABELS: &'static [&'static str] = &[
+        "English",
+        "繁體中文",
+        "简体中文",
+        "日本語",
+        "한국어",
+        "Deutsch",
+        "Français",
+        "Español",
+        "Português",
+        "Русский",
+        "Tiếng Việt",
+        "ไทย",
+    ];
+
+    /// Wire code matching App and Gateway (`en`, `zh-TW`, `zh-CN`, `ja`, ...).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::En => "en",
+            Self::ZhTw => "zh-TW",
+            Self::ZhCn => "zh-CN",
+            Self::Ja => "ja",
+            Self::Ko => "ko",
+            Self::De => "de",
+            Self::Fr => "fr",
+            Self::Es => "es",
+            Self::Pt => "pt",
+            Self::Ru => "ru",
+            Self::Vi => "vi",
+            Self::Th => "th",
+        }
+    }
+
+    /// Language name written in its own language.
+    #[allow(dead_code)]
+    pub fn native_label(self) -> &'static str {
+        match self {
+            Self::En => "English",
+            Self::ZhTw => "繁體中文",
+            Self::ZhCn => "简体中文",
+            Self::Ja => "日本語",
+            Self::Ko => "한국어",
+            Self::De => "Deutsch",
+            Self::Fr => "Français",
+            Self::Es => "Español",
+            Self::Pt => "Português",
+            Self::Ru => "Русский",
+            Self::Vi => "Tiếng Việt",
+            Self::Th => "ไทย",
+        }
+    }
+
     /// Chinese is Chinese: `zh` and the rest of the UI copy.
     pub fn is_zh(self) -> bool {
         matches!(self, Self::ZhCn | Self::ZhTw)
@@ -242,32 +327,44 @@ impl Language {
         Self::from_locale_tag(&lang)
     }
 
-    fn from_locale_tag(tag: &str) -> Self {
+    pub fn from_locale_tag(tag: &str) -> Self {
         let tag = tag.to_ascii_lowercase().replace('_', "-");
-        if !tag.starts_with("zh") {
-            return Self::En;
-        }
-        let traditional = ["zh-tw", "zh-hk", "zh-mo", "zh-hant"]
-            .iter()
-            .any(|t| tag.starts_with(t));
-        if traditional {
-            Self::ZhTw
+        if tag.starts_with("zh") {
+            let traditional = ["zh-tw", "zh-hk", "zh-mo", "zh-hant"]
+                .iter()
+                .any(|t| tag.starts_with(t));
+            if traditional {
+                Self::ZhTw
+            } else {
+                Self::ZhCn
+            }
+        } else if tag.starts_with("ja") {
+            Self::Ja
+        } else if tag.starts_with("ko") {
+            Self::Ko
+        } else if tag.starts_with("de") {
+            Self::De
+        } else if tag.starts_with("fr") {
+            Self::Fr
+        } else if tag.starts_with("es") {
+            Self::Es
+        } else if tag.starts_with("pt") {
+            Self::Pt
+        } else if tag.starts_with("ru") {
+            Self::Ru
+        } else if tag.starts_with("vi") {
+            Self::Vi
+        } else if tag.starts_with("th") {
+            Self::Th
         } else {
-            Self::ZhCn
+            Self::En
         }
     }
 
     /// The gateway's i18n locale for the same language.
     #[allow(dead_code)]
     pub fn locale(self) -> muqun_gateway::platform::i18n::Locale {
-        use muqun_gateway::platform::i18n::Locale;
-        match self {
-            Self::ZhCn => Locale::from_code("zh-CN").unwrap_or_default(),
-            Self::ZhTw => Locale::from_code("zh-TW")
-                .or_else(|| Locale::from_code("zh-CN"))
-                .unwrap_or_default(),
-            Self::En => Locale::default(),
-        }
+        muqun_gateway::platform::i18n::Locale::from_code(self.as_str()).unwrap_or_default()
     }
 }
 
@@ -867,11 +964,20 @@ mod tests {
     }
 
     #[test]
-    fn chinese_locales_pick_simplified_chinese() {
+    fn locale_tag_negotiation() {
         assert_eq!(Language::from_locale_tag("zh_CN.UTF-8"), Language::ZhCn);
         assert_eq!(Language::from_locale_tag("en_US.UTF-8"), Language::En);
         assert_eq!(Language::from_locale_tag("zh_TW.UTF-8"), Language::ZhTw);
         assert_eq!(Language::from_locale_tag("zh-Hant-HK"), Language::ZhTw);
+        assert_eq!(Language::from_locale_tag("ja_JP.UTF-8"), Language::Ja);
+        assert_eq!(Language::from_locale_tag("ko_KR.UTF-8"), Language::Ko);
+        assert_eq!(Language::from_locale_tag("de_DE.UTF-8"), Language::De);
+        assert_eq!(Language::from_locale_tag("fr_FR.UTF-8"), Language::Fr);
+        assert_eq!(Language::from_locale_tag("es_ES.UTF-8"), Language::Es);
+        assert_eq!(Language::from_locale_tag("pt_BR.UTF-8"), Language::Pt);
+        assert_eq!(Language::from_locale_tag("ru_RU.UTF-8"), Language::Ru);
+        assert_eq!(Language::from_locale_tag("vi_VN.UTF-8"), Language::Vi);
+        assert_eq!(Language::from_locale_tag("th_TH.UTF-8"), Language::Th);
         assert_eq!(Language::from_locale_tag(""), Language::En);
     }
 
