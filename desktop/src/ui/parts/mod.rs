@@ -290,6 +290,8 @@ pub struct ToolCard<'a> {
     pub copy: Option<String>,
     /// A file the row's Open shows in the viewer.
     pub open: Option<String>,
+    /// A file the row's Diff button shows in the session diff reviewer.
+    pub diff: Option<String>,
 }
 
 impl<'a> ToolCard<'a> {
@@ -311,6 +313,7 @@ impl<'a> ToolCard<'a> {
             attention: false,
             copy: None,
             open: None,
+            diff: None,
         }
     }
 
@@ -417,6 +420,21 @@ impl<'a> ToolCard<'a> {
                 &glyphs::OPEN,
                 cx.t("Open file", "打开文件"),
                 move |s: &mut UiState, _tx: &mut rune::Tx| s.open_timeline_file(&path),
+            ));
+        }
+        if let Some(path) = self.diff.clone().filter(|p| !p.is_empty()) {
+            let asid = cx.asid.to_string();
+            tray = tray.child(tray_button(
+                cx,
+                "diff",
+                &glyphs::DIFF,
+                cx.t("View in Diff", "查看差异"),
+                move |s: &mut UiState, _tx: &mut rune::Tx| {
+                    s.send(crate::model::commands::Command::OpenDiff {
+                        asid: muqun_gateway::agents::AgentSessionId(asid.clone()),
+                        file: Some(path.clone()),
+                    });
+                },
             ));
         }
         if let Some(copy) = self.copy.clone().filter(|c| !c.is_empty()) {
@@ -550,9 +568,25 @@ impl<'a> ToolCard<'a> {
         if let Some(body) = self.body {
             pane = pane.child(col().key("body").w_full().child(body));
         }
-        if !self.actions.is_empty() {
+        let mut actions = self.actions;
+        if let Some(path) = self.diff.clone().filter(|p| !p.is_empty()) {
+            let asid = cx.asid.to_string();
+            actions.push(
+                rune_kit::Button::new(cx.t("View in Diff", "查看差异"))
+                    .variant(rune_kit::ButtonVariant::Ghost)
+                    .control_size(rune_kit::ControlSize::Small)
+                    .on_press(move |s: &mut UiState| {
+                        s.send(crate::model::commands::Command::OpenDiff {
+                            asid: muqun_gateway::agents::AgentSessionId(asid.clone()),
+                            file: Some(path.clone()),
+                        });
+                    })
+                    .build(k),
+            );
+        }
+        if !actions.is_empty() {
             let mut line = row().key("actions").w_full().gap(6.0).wrap();
-            for (i, a) in self.actions.into_iter().enumerate() {
+            for (i, a) in actions.into_iter().enumerate() {
                 line = line.child(a.key(format!("act-{i}")));
             }
             pane = pane.child(line);

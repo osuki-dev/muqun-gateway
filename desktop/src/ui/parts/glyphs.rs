@@ -146,3 +146,9 @@ pub static ATTACH: Icon = Icon {
     view: 24.0,
     body: r#"<path d="m9 13 6-6a2.5 2.5 0 0 1 3.5 3.5l-8 8a4 4 0 0 1-5.7-5.7l8.5-8.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>"#,
 };
+
+pub static DIFF: Icon = Icon {
+    name: "tl-diff",
+    view: 24.0,
+    body: r#"<circle cx="6" cy="6" r="3" fill="none" stroke="currentColor" stroke-width="2"/><circle cx="18" cy="18" r="3" fill="none" stroke="currentColor" stroke-width="2"/><path d="M6 9v3a6 6 0 0 0 6 6h3" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>"#,
+};

@@ -3,12 +3,14 @@
 //! syntax colours, a folded gap between hunks. Plain rows rather than a diff
 //! view with its own scroll, so the wheel over a diff scrolls the timeline.
 
-use rune::{col, rich, row, text, Color, El, Span};
-use rune_kit::diff::{FileDiff, LineKind};
+use rune::{col, icon, rich, row, text, Color, Cursor, El, Span};
+use rune_kit::diff::{FileDiff, Hunk, LineKind};
 use rune_kit::syntax::{self, SyntaxTheme};
 use rune_kit::{Button, ButtonVariant, ControlSize, Kit};
 
-use super::{flip, Tcx};
+use super::{flip, glyphs, Tcx};
+use crate::model::commands::Command;
+use muqun_gateway::agents::AgentSessionId;
 
 /// Lines a card shows before "Show all".
 const LINES_SHOWN: usize = 80;
@@ -59,12 +61,155 @@ fn line_spans(
     spans
 }
 
-fn number(k: &Kit, n: Option<u32>) -> El {
-    text(n.map(|n| n.to_string()).unwrap_or_default())
-        .font(k.ty.mono)
-        .color(k.c.text_faint)
-        .w(30.0)
-        .single_line()
+fn number(k: &Kit, n: Option<u32>, color: Color) -> El {
+    row().w(30.0).justify_end().child(
+        text(n.map(|n| n.to_string()).unwrap_or_default())
+            .font(k.ty.mono)
+            .color(color)
+            .single_line(),
+    )
+}
+
+fn file_header(cx: &Tcx, fi: usize, file: &FileDiff) -> El {
+    let k = cx.k;
+    let path = file.path().to_string();
+    let asid = cx.asid.to_string();
+    let (dir, name) = match path.rfind('/') {
+        Some(idx) => (&path[..=idx], &path[idx + 1..]),
+        None => ("", path.as_str()),
+    };
+
+    let mut left = row().gap(6.0).center_y().shrink().grow(1.0).child(
+        icon(&glyphs::EDIT_FILE, 13.0)
+            .color(k.c.icon_faint)
+            .a11y_hidden(),
+    );
+
+    if !dir.is_empty() {
+        left = left.child(
+            text(dir.to_string())
+                .font(k.ty.small)
+                .color(k.c.text_faint)
+                .single_line()
+                .truncate_head(),
+        );
+    }
+    left = left.child(
+        text(name.to_string())
+            .font(k.ty.small_medium)
+            .color(k.c.text_base)
+            .single_line()
+            .truncate(),
+    );
+
+    let mut stats = row().gap(6.0).center_y();
+    if file.additions() > 0 {
+        stats = stats.child(
+            text(format!("+{}", file.additions()))
+                .font(k.ty.small_medium)
+                .color(k.c.success.fg),
+        );
+    }
+    if file.deletions() > 0 {
+        stats = stats.child(
+            text(format!("−{}", file.deletions()))
+                .font(k.ty.small_medium)
+                .color(k.c.danger.fg),
+        );
+    }
+
+    let p = path.clone();
+    let diff_btn = Button::new(cx.t("Diff", "差异"))
+        .variant(ButtonVariant::Ghost)
+        .control_size(ControlSize::Small)
+        .on_press(move |s: &mut crate::ui::UiState| {
+            s.send(Command::OpenDiff {
+                asid: AgentSessionId(asid.clone()),
+                file: Some(p.clone()),
+            });
+        })
+        .build(k)
+        .key(format!("diff-btn-{fi}"));
+
+    let copy_path = path.clone();
+    let copy_btn = k
+        .interactive(
+            row().size(20.0, 20.0).center().radius(k.radius.sm).child(
+                icon(&rune_kit::glyphs::COPY, 12.0)
+                    .color(k.c.icon_faint)
+                    .a11y_hidden(),
+            ),
+        )
+        .cursor(Cursor::Pointer)
+        .role("button")
+        .label(cx.t("Copy path", "复制路径").to_string())
+        .on_press_tx(move |_: &mut crate::ui::UiState, tx: &mut rune::Tx| {
+            tx.copy(copy_path.clone())
+        })
+        .key(format!("copy-path-{fi}"));
+
+    let bar = row()
+        .key(format!("f-bar-{fi}"))
+        .w_full()
+        .px(10.0)
+        .py(5.0)
+        .gap(8.0)
+        .center_y()
+        .fill(k.c.layer_01)
+        .child(left)
+        .child(stats)
+        .child(copy_btn)
+        .child(diff_btn);
+
+    let mut col_wrap = col().key(format!("f{fi}")).w_full();
+    if fi > 0 {
+        col_wrap = col_wrap.child(col().h(1.0).w_full().fill(k.c.border_weak));
+    }
+    col_wrap
+        .child(bar)
+        .child(col().h(1.0).w_full().fill(k.c.border_weak))
+}
+
+fn hunk_separator(k: &Kit, fi: usize, hi: usize, hunk: &Hunk) -> El {
+    let header_text = hunk.header();
+    let (hunk_range, section) = match header_text.split_once("@@ ") {
+        Some((prefix, rest)) => (format!("{prefix}@@"), rest.trim().to_string()),
+        None => (header_text, String::new()),
+    };
+
+    let mut bar = row()
+        .key(format!("gap-bar-{fi}-{hi}"))
+        .w_full()
+        .px(10.0)
+        .py(3.0)
+        .gap(8.0)
+        .center_y()
+        .fill(k.alpha(k.c.layer_02, 0.6))
+        .child(
+            text(hunk_range)
+                .font(k.ty.mono)
+                .color(k.c.text_accent)
+                .single_line(),
+        );
+
+    if !section.is_empty() {
+        bar = bar.child(
+            text(section)
+                .font(k.ty.mono)
+                .color(k.c.text_faint)
+                .single_line()
+                .truncate()
+                .shrink()
+                .grow(1.0),
+        );
+    }
+
+    col()
+        .key(format!("gap{fi}-{hi}"))
+        .w_full()
+        .child(col().h(1.0).w_full().fill(k.alpha(k.c.border_weak, 0.6)))
+        .child(bar)
+        .child(col().h(1.0).w_full().fill(k.alpha(k.c.border_weak, 0.6)))
 }
 
 /// The rows of `files`, at most [`LINES_SHOWN`] lines unless opened all.
@@ -93,68 +238,37 @@ pub fn rows(cx: &Tcx, id: &str, files: &[FileDiff]) -> El {
         .radius(k.radius.sm)
         .clip_rounded(k.radius.sm)
         .border(1.0, k.c.border_weak)
-        .fill(k.c.surface_raised_base)
-        .py(4.0);
+        .fill(k.c.surface_raised_base);
+
     'files: for (fi, file) in files.iter().enumerate() {
         let lang = file.language();
-        if files.len() > 1 {
-            block = block.child(
-                row()
-                    .key(format!("f{fi}"))
-                    .w_full()
-                    .gap(8.0)
-                    .px(10.0)
-                    .pt(if fi == 0 { 2.0 } else { 8.0 })
-                    .pb(4.0)
-                    .center_y()
-                    .child(
-                        text(file.path().to_string())
-                            .font(k.ty.small_medium)
-                            .color(k.c.text_base)
-                            .single_line()
-                            .truncate_head()
-                            .shrink()
-                            .grow(1.0),
-                    )
-                    .child(
-                        text(format!("+{}", file.additions()))
-                            .font(k.ty.small)
-                            .color(k.c.success.fg),
-                    )
-                    .child(
-                        text(format!("−{}", file.deletions()))
-                            .font(k.ty.small)
-                            .color(k.c.danger.fg),
-                    ),
-            );
-        }
+        block = block.child(file_header(cx, fi, file));
+
         for (hi, hunk) in file.hunks.iter().enumerate() {
-            if hi > 0 {
-                block = block.child(
-                    text(if hunk.section.is_empty() {
-                        "⋯".to_string()
-                    } else {
-                        format!("⋯  {}", hunk.section)
-                    })
-                    .key(format!("gap{fi}-{hi}"))
-                    .font(k.ty.small)
-                    .color(k.c.text_faint)
-                    .single_line()
-                    .truncate()
-                    .px(10.0)
-                    .py(2.0)
-                    .w_full(),
-                );
+            if hi > 0 || hunk.old_start > 1 || hunk.new_start > 1 || !hunk.section.is_empty() {
+                block = block.child(hunk_separator(k, fi, hi, hunk));
             }
             for (li, line) in hunk.lines.iter().enumerate() {
                 if shown >= budget {
                     break 'files;
                 }
                 shown += 1;
-                let (bg, bar, word, mark) = match line.kind {
-                    LineKind::Added => (Some(add_bg), Some(k.c.success.icon), add_word, "+"),
-                    LineKind::Removed => (Some(del_bg), Some(k.c.danger.icon), del_word, "−"),
-                    LineKind::Context => (None, None, add_word, " "),
+                let (bg, bar, word, mark, num_color) = match line.kind {
+                    LineKind::Added => (
+                        Some(add_bg),
+                        Some(k.c.success.icon),
+                        add_word,
+                        "+",
+                        k.alpha(k.c.success.fg, 0.85),
+                    ),
+                    LineKind::Removed => (
+                        Some(del_bg),
+                        Some(k.c.danger.icon),
+                        del_word,
+                        "−",
+                        k.alpha(k.c.danger.fg, 0.85),
+                    ),
+                    LineKind::Context => (None, None, add_word, " ", k.c.text_faint),
                 };
                 let spans = line_spans(&theme, lang, &line.text, &line.changes, word);
                 let mut r = row()
@@ -162,19 +276,22 @@ pub fn rows(cx: &Tcx, id: &str, files: &[FileDiff]) -> El {
                     .w_full()
                     .gap(6.0)
                     .pr(10.0)
+                    .min_h(20.0)
+                    .center_y()
                     .child(
                         col()
-                            .w(2.0)
+                            .w(3.0)
                             .self_stretch()
                             .fill(bar.unwrap_or(k.alpha(k.c.layer_01, 0.0))),
                     )
-                    .child(number(k, line.old))
-                    .child(number(k, line.new))
+                    .child(number(k, line.old, num_color))
+                    .child(number(k, line.new, num_color))
                     .child(
-                        text(mark)
-                            .font(k.ty.mono)
-                            .color(bar.unwrap_or(k.c.text_faint))
-                            .w(10.0),
+                        row().w(12.0).justify_center().child(
+                            text(mark)
+                                .font(k.ty.mono)
+                                .color(bar.unwrap_or(k.c.text_faint)),
+                        ),
                     )
                     .child(
                         rich(line.text.clone(), spans)
@@ -200,17 +317,28 @@ pub fn rows(cx: &Tcx, id: &str, files: &[FileDiff]) -> El {
         let label = if show_all {
             cx.t("Show less", "收起").to_string()
         } else if cx.zh() {
-            crate::ui::copy::localize(cx.lang, format!("显示全部 {total} 行"))
+            crate::ui::copy::localize(
+                cx.lang,
+                format!(
+                    "展开剩余 {} 行（共 {total} 行）",
+                    total.saturating_sub(shown)
+                ),
+            )
         } else {
-            format!("Show all {total} lines")
+            format!(
+                "Show remaining {} lines (total {total})",
+                total.saturating_sub(shown)
+            )
         };
         wrap = wrap.child(
-            Button::new(label)
-                .variant(ButtonVariant::Ghost)
-                .control_size(ControlSize::Small)
-                .on_press(flip(cx.asid, &all_key))
-                .build(k)
-                .key("all"),
+            row().w_full().justify_center().py(2.0).child(
+                Button::new(label)
+                    .variant(ButtonVariant::Ghost)
+                    .control_size(ControlSize::Small)
+                    .on_press(flip(cx.asid, &all_key))
+                    .build(k)
+                    .key("all"),
+            ),
         );
     }
     wrap

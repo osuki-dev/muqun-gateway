@@ -1099,6 +1099,15 @@ fn base_scenes() -> &'static [Scene] {
         ("tasks", tasks),
         ("inbox", inbox),
         ("diff", diff),
+        ("diff-card", |s| {
+            session_scene(s);
+            s.inspect = Some(super::Inspect {
+                asid: "s1".into(),
+                id: "t1".into(),
+            });
+            s.inspect_pane.set_open(true);
+            s.inspect_pane.set_width(550.0);
+        }),
         ("timeline-cards", timeline_cards),
         ("timeline-narrow", timeline_narrow),
         ("timeline-long", timeline_long),
