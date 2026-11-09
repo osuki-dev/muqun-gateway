@@ -353,7 +353,7 @@ it carries the blocked marker, and `idle_unconfirmed` with the last assistant
 text as a hint otherwise (a [blocked](#blocked) task stays `waiting`); a
 paused delegation whose session runs again is `working` (a blocked one, on a
 turn after the one that said so); a `working` delegation whose session has
-been idle for a minute, with no idle time from its agent and never seen busy
+been idle (or `unknown`: not loaded again since a restart) for a minute, with no idle time from its agent and never seen busy
 by this gateway (an ACP session whose process a gateway restart stopped mid-turn), is
 settled as a turn that ended -- done on the marker, else `idle_unconfirmed`
 -- and one that was reopened with no prompt after the agent's own
