@@ -61,10 +61,15 @@ async fn idless_echo_stream_followup_cancel_and_history_reuse_shared_lifecycle()
     resumed.prepare_selected_session(id).await.unwrap();
     assert_eq!(resumed.get_timeline(id, 100).await.unwrap().len(), 4);
     resumed.send_prompt(id, "hold", &[], None).await.unwrap();
-    assert!(matches!(
-        resumed.send_prompt(id, "duplicate", &[], None).await,
-        Err(AgentError::NotAvailable(_))
-    ));
+    // Sent during the turn without steering: first when the turn ends.
+    resumed
+        .send_prompt(id, "duplicate", &[], None)
+        .await
+        .unwrap();
+    assert_eq!(
+        resumed.get_inbox(id).await.unwrap()[0]["payload"]["text"],
+        "duplicate"
+    );
     resumed.interrupt(id).await.unwrap();
     status(&resumed, id, AgentSessionStatus::Interrupted).await;
     assert_eq!(

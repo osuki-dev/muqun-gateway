@@ -425,9 +425,10 @@ Secret questions, complex/URL MCP elicitation and client-executed dynamic tools
 are Unsupported, not disguised as ordinary forms.
 
 An interrupt acknowledgement is not completion: only observed upstream turn
-status makes the mirror Interrupted. Active-turn acknowledgements also prevent
-an ordinary idle prompt from accidentally steering work already in progress;
-active steering must be explicitly requested. A late
+status makes the mirror Interrupted. A prompt sent while a turn is active is
+Codex's own mid-turn input: `turn/steer` into that turn, after the prompts
+already queued for it (oldest first); only `delivery: "queue"` waits for the
+turn's end. A late
 acknowledgement cannot resurrect a turn whose completion was already observed.
 
 On disconnect, pending calls fail, callbacks expire, busy sessions become
@@ -562,8 +563,8 @@ array, and the answer is normal text inside the
 `send_user_message_question_reply` envelope. Gateway sends stable `turn/steer`
 with the exact `expectedTurnId`. It never invents a JSON-RPC question callback,
 resumes an unrelated runtime, starts a replacement turn after a race, or retries
-ambiguous delivery. Ordinary active-turn follow-ups also support `delivery:
-"steer"`, and `delivery: "queue"` waits in the Gateway's inbox until the turn
+ambiguous delivery. Ordinary active-turn follow-ups steer (`delivery: "steer"`
+or none), and `delivery: "queue"` waits in the Gateway's inbox until the turn
 completes normally. Discovery reports `promptSteering` and `asyncQuestions`,
 independently of `inbox`.
 

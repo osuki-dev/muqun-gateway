@@ -448,10 +448,17 @@ for line in sys.stdin:
             .send_prompt(id, "hold", &[], None)
             .await
             .unwrap();
-        assert!(matches!(
-            fixture.driver.send_prompt(id, "duplicate", &[], None).await,
-            Err(AgentError::NotAvailable(_))
-        ));
+        // Sent during the turn without steering: first when the turn ends,
+        // kept for the user when it is interrupted instead.
+        fixture
+            .driver
+            .send_prompt(id, "duplicate", &[], None)
+            .await
+            .unwrap();
+        assert_eq!(
+            fixture.driver.get_inbox(id).await.unwrap()[0]["payload"]["text"],
+            "duplicate"
+        );
         fixture.driver.interrupt(id).await.unwrap();
         fixture.status(id, AgentSessionStatus::Interrupted).await;
         let snapshot = fixture.mirror.get_snapshot(&session.asid).await.unwrap();

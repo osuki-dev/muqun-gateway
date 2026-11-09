@@ -1213,38 +1213,38 @@ mod tests {
             .send_prompt_with_display(&q.thread, steered, "steered user text", &[], Some("steer"))
             .await
             .unwrap();
-        let steer = q.sent.lock().unwrap()[1]["params"].clone();
+        // The steer takes the queued prompt into the turn first; both keep
+        // their full native input and their own client identity.
+        let (inbox, _) = q.publish().await;
+        assert!(inbox.is_empty());
+        let (queued_native, steer) = {
+            let sent = q.sent.lock().unwrap();
+            (sent[1]["params"].clone(), sent[2]["params"].clone())
+        };
+        assert_eq!(queued_native["input"][0]["text"], queued);
         assert_eq!(steer["input"][0]["text"], steered);
         assert!(steer["clientUserMessageId"].as_str().is_some());
-        let thread = q.thread.clone();
-        q.notify("item/started", json!({"threadId":thread,"turnId":"t1","item":{"id":"steered-user","type":"userMessage","clientId":steer["clientUserMessageId"],"content":steer["input"]}})).await;
-        let snapshot = q
-            .mirror
-            .get_snapshot(&AgentSessionId(thread.clone()))
-            .await
-            .unwrap();
-        assert!(snapshot
-            .timeline
-            .iter()
-            .any(|row| matches!(&row.part, AgentPart::Text {text} if text == "steered user text")));
-        q.turn_completed("t1", "completed").await;
-        q.wait_delivered(3).await;
-        let queued_native = q.sent.lock().unwrap()[2]["params"].clone();
-        assert_eq!(queued_native["input"][0]["text"], queued);
         assert_ne!(
             queued_native["clientUserMessageId"],
             steer["clientUserMessageId"]
         );
-        q.notify("item/started", json!({"threadId":thread,"turnId":"accepted","item":{"id":"queued-user","type":"userMessage","clientId":queued_native["clientUserMessageId"],"content":queued_native["input"]}})).await;
+        let thread = q.thread.clone();
+        q.notify("item/started", json!({"threadId":thread,"turnId":"t1","item":{"id":"queued-user","type":"userMessage","clientId":queued_native["clientUserMessageId"],"content":queued_native["input"]}})).await;
+        q.notify("item/started", json!({"threadId":thread,"turnId":"t1","item":{"id":"steered-user","type":"userMessage","clientId":steer["clientUserMessageId"],"content":steer["input"]}})).await;
         let snapshot = q
             .mirror
             .get_snapshot(&AgentSessionId(thread))
             .await
             .unwrap();
-        assert!(snapshot
-            .timeline
-            .iter()
-            .any(|row| matches!(&row.part, AgentPart::Text {text} if text == "queued user text")));
+        for text in ["queued user text", "steered user text"] {
+            assert!(
+                snapshot
+                    .timeline
+                    .iter()
+                    .any(|row| matches!(&row.part, AgentPart::Text {text: shown} if shown == text)),
+                "{text}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -2721,6 +2721,7 @@ mod tests {
         let mut fixture = Fixture::new(move |r| match r["method"].as_str().unwrap() {
             "thread/start" => json!({"thread":golden()["thread"]}),
             "turn/start" => json!({"turn":{"id":"synthetic-turn","status":"inProgress"}}),
+            "turn/steer" => json!({"turnId":"synthetic-turn"}),
             // A malformed/foreign response is a failed authoritative refresh.
             "thread/read" => {
                 if !recovery.load(std::sync::atomic::Ordering::Acquire) {
@@ -2765,11 +2766,12 @@ mod tests {
             .info
             .model
             .is_none());
-        assert!(manager
+        // A later prompt steers the accepted turn; nothing is replayed.
+        manager
             .prompts()
             .send_prompt(&initial.asid, "must not automatically replay", &[], None)
             .await
-            .is_err());
+            .unwrap();
         let requests: Vec<_> = std::iter::from_fn(|| fixture.requests.try_recv().ok()).collect();
         assert_eq!(
             requests

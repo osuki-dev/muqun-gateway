@@ -62,8 +62,15 @@ pub fn dispatch_mode(projection: &Value, delivery: Option<&str>) -> Result<Value
             if !has_active_run(projection) {
                 return Ok(json!({"type":"start_immediately"}));
             }
-            Ok(json!({"type":"steer_active","targetRunId":steer_target(projection)?}))
+            match steer_target(projection) {
+                Ok(target) => Ok(json!({"type":"steer_active","targetRunId":target})),
+                // A provider without active steering takes the prompt after
+                // the run, as every agent without steering does.
+                Err(AgentError::Unsupported(_)) => dispatch_mode(projection, Some("queue")),
+                Err(error) => Err(error),
+            }
         }
+        // T3's own default while a root run is active: never a silent steer.
         None | Some("queue") => {
             if !has_active_run(projection) {
                 return Ok(json!({"type":"start_immediately"}));

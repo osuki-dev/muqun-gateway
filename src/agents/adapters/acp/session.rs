@@ -3271,27 +3271,45 @@ impl<P: AcpProvider> AcpDriver<P> {
         delivery: Option<&str>,
         native_command: bool,
     ) -> Result<(), AgentError> {
+        // A prompt with no stated delivery is the agent's own mid-turn input,
+        // the same as "steer": steered into the running turn where the agent
+        // does that, else the next prompt the turn's end sends.
         let queued = match delivery {
-            None | Some("auto") => None,
-            Some("steer") if P::STEERING && !native_command => {
-                let running = self.retained(id).filter(|session| {
+            None | Some("auto" | "steer") => {
+                let session = self.retained(id);
+                if let Some(session) = &session {
+                    // Idle retirement holds `busy` while it inspects the
+                    // session; that is not a turn. Wait for its decision, as
+                    // `activate` does: a retired generation queues nothing.
+                    drop(session.retirement.lock().await);
+                }
+                let running = session.filter(|session| {
                     session.connected.load(Ordering::Acquire)
                         && session.busy.load(Ordering::Acquire)
                 });
-                if let Some(session) = running {
-                    let prepared =
-                        operations::prompt_parts(text, attachments, session.prompt_capabilities)
-                            .await?;
-                    if self.steer_queued(&session, id).await?
-                        && self.steer(&session, id, &prepared).await?
-                    {
-                        return Ok(());
+                match running {
+                    Some(session) if P::STEERING && !native_command => {
+                        let prepared = operations::prompt_parts(
+                            text,
+                            attachments,
+                            session.prompt_capabilities,
+                        )
+                        .await?;
+                        if self.steer_queued(&session, id).await?
+                            && self.steer(&session, id, &prepared).await?
+                        {
+                            return Ok(());
+                        }
+                        // The turn ended meanwhile: an ordinary prompt.
+                        None
                     }
+                    // A native command, or an agent without steering: it goes
+                    // first when the turn ends (`enqueue` sends it now when
+                    // no turn runs).
+                    Some(_) => Some(Delivery::Steer),
+                    None => None,
                 }
-                // No turn is running (any more): an ordinary prompt.
-                None
             }
-            // Without steering, "steer" is the next prompt the turn's end sends.
             Some(mode) => Some(Delivery::parse(mode).ok_or_else(|| {
                 AgentError::InvalidRequest("delivery must be steer or queue".into())
             })?),
@@ -6043,6 +6061,105 @@ mod inbox_tests {
         assert!(driver.get_inbox(id).await.unwrap().is_empty());
         assert!(mirror.inbox(asid).await.is_empty());
         driver.shutdown().await;
+    }
+
+    /// Idle, every delivery is an ordinary prompt. During a turn, a prompt
+    /// with no stated delivery is the agent's own mid-turn input, the same
+    /// as "steer": steered into the turn (after what was queued before it)
+    /// where the agent steers, else first when the turn ends; "queue" always
+    /// waits for the end. Nothing is refused, lost or reordered.
+    #[tokio::test]
+    async fn a_prompt_sent_during_a_turn_is_the_agents_own_mid_turn_input() {
+        async fn run<P: AcpProvider>(fixture: &Fixture, driver: &Arc<AcpDriver<P>>) {
+            let info = driver.create_session(None, None, None).await.unwrap();
+            let (id, asid) = (info.asid.0.as_str(), &info.asid);
+            let mut sent = Vec::new();
+            for (text, delivery) in [
+                ("idle-none", None),
+                ("idle-steer", Some("steer")),
+                ("idle-queue", Some("queue")),
+            ] {
+                driver.send_prompt(id, text, &[], delivery).await.unwrap();
+                sent.push(text);
+                until("idle prompt answered", async || {
+                    received(fixture, id) == sent
+                        && driver.get_session(id).await.unwrap().status == AgentSessionStatus::Idle
+                })
+                .await;
+            }
+            assert!(driver.get_inbox(id).await.unwrap().is_empty());
+            driver.send_prompt(id, "approval", &[], None).await.unwrap();
+            sent.push("approval");
+            until("permission asked", async || {
+                !driver.get_pending_permissions(id).await.unwrap().is_empty()
+            })
+            .await;
+            for (text, delivery) in [
+                ("queued", Some("queue")),
+                ("plain", None),
+                ("steered", Some("steer")),
+            ] {
+                driver.send_prompt(id, text, &[], delivery).await.unwrap();
+            }
+            let (now, inbox, end): (&[&str], &[(&str, &str)], &[&str]) = if P::STEERING {
+                (&["queued", "plain", "steered"], &[], &[])
+            } else {
+                (
+                    &[],
+                    &[
+                        ("queued", "queue"),
+                        ("plain", "steer"),
+                        ("steered", "steer"),
+                    ],
+                    &["plain", "steered", "queued"],
+                )
+            };
+            sent.extend(now);
+            assert_eq!(received(fixture, id), sent, "steering {}", P::STEERING);
+            let items = driver.get_inbox(id).await.unwrap();
+            assert_eq!(
+                items
+                    .iter()
+                    .map(|item| (
+                        item["payload"]["text"].as_str().unwrap(),
+                        item["delivery"].as_str().unwrap()
+                    ))
+                    .collect::<Vec<_>>(),
+                inbox,
+                "steering {}",
+                P::STEERING
+            );
+            assert_eq!(driver.mirror.inbox(asid).await, items);
+            let permission = driver.get_pending_permissions(id).await.unwrap();
+            driver
+                .reply_permission(id, &permission[0].id, PermissionDecision::Allow, None)
+                .await
+                .unwrap();
+            sent.extend(end);
+            until("turn ended and queue drained", async || {
+                received(fixture, id) == sent
+                    && driver.mirror.inbox(asid).await.is_empty()
+                    && driver.get_session(id).await.unwrap().status == AgentSessionStatus::Idle
+            })
+            .await;
+            assert!(driver.get_inbox(id).await.unwrap().is_empty());
+            driver.shutdown().await;
+        }
+        let fixture = Fixture::new().await;
+        run(&fixture, &fixture.driver.clone()).await;
+        let (tx, _) = broadcast::channel(256);
+        let steering = AcpDriver::<SteeringProvider>::new(
+            fixture
+                .directory
+                .join("mock-fx")
+                .to_string_lossy()
+                .into_owned(),
+            fixture.directory.to_string_lossy().into_owned(),
+            Arc::new(MemoryMirror::for_agent("fx")),
+            tx,
+        );
+        steering.set_session_store(|| None);
+        run(&fixture, &steering).await;
     }
 
     /// A mode switch publishes only the mode: a turn whose end was published
