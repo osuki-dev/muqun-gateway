@@ -365,9 +365,14 @@ async fn settle_delegation(state: &AppState, task: &Task, agent_id: &str, asid: 
         // A turn that ended where this gateway could not see it go idle: the
         // agent keeps no idle time (an ACP session, whose process a gateway
         // restart stops) and this gateway never saw the session busy. A
-        // working task whose session sits idle that long is not working.
+        // working task whose session sits idle that long is not working. A
+        // session not loaded since the restart says `unknown` rather than
+        // idle (a native listing proves no idle state): it runs no turn either.
         let ended_unseen = task.state == TaskState::Working
-            && session.status == AgentSessionStatus::Idle
+            && matches!(
+                session.status,
+                AgentSessionStatus::Idle | AgentSessionStatus::Unknown
+            )
             && !state.tasks.is_busy(asid)
             && older_than(task.updated_ms, ENDED_UNSEEN_AFTER);
         if !ended_unseen {
@@ -780,6 +785,9 @@ mod tests {
         ]
         .map(|asid| fake_session(asid, 1))
         .into();
+        // Never loaded again since the restart: an ACP native listing says
+        // `unknown`, not idle, until something opens the session.
+        agent.sessions[1].status = crate::agents::domain::AgentSessionStatus::Unknown;
         agent.session_timelines = [
             ("ses_cut", vec![goal.clone(), answer.clone()]),
             (
@@ -821,7 +829,8 @@ mod tests {
         };
         // Stopped mid-turn by the restart: paused, its last message the hint.
         let cut = stale("ses_cut", false).await;
-        // Reopened by the replay alone: done again, as the agent said.
+        // Reopened by the replay alone, its session dormant since: done
+        // again, as the agent said.
         let replayed = stale("ses_replayed", true).await;
         // Reopened by a real prompt after the agent's tasks.complete: paused.
         let asked = stale("ses_asked", true).await;
