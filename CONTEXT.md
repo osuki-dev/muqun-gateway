@@ -196,6 +196,16 @@ The retired `herdr.gateway` identifier remains only for migration compatibility.
   contract in `docs/mcp.md`. `McpConfig` denies unknown fields: a config.json
   that sets `mcp.inject_into_agents` does not load in a build from before
   it, so rolling back to such a binary means removing that key first.
+- `src/search/`: full-text search over agent session content
+  (`GET /api/search`, capability `session_search_v1`; contract in
+  `docs/session-search.md`). A trigram FTS5 index in its own
+  `store/search.sqlite3` (derived data, rebuilt when it does not open),
+  written by one background worker (`indexer.rs`) from each agent's own
+  store without waking a session (`sources.rs`: Claude transcripts, Codex
+  rollouts by byte offset, OpenCode's SQLite store read-only, Pi's session
+  files); other agents are indexed from domain events and the mirror. Rows
+  pass through `tasks::transcript::hide_in_items` first; tool output is
+  never indexed. Per-session watermarks survive restarts.
 - `src/platform/`: shared infrastructure.
   - `store/`: the shared SQLite store (`sqlite.rs`, one worker thread,
     migrations per domain) and its optional SQLCipher key file (`db_key.rs`);
