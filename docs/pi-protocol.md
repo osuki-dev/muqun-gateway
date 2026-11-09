@@ -244,7 +244,7 @@ the gateway sends is also folded, which resolves the pending approval.
 | `list_sessions` | session files (one bucket with a directory filter), newest first (`order=asc` reverses); title = latest `session_info.name`, else first user text (80 chars), else `New session`; model from the last `model_change`/`thinking_level_change`; status `Busy` while the live child runs, else `Idle`; `search` matches the title; a parent filter other than top-level matches nothing |
 | `get_session` | the same, one file; a fresh session without a file from live state |
 | `create_session(dir, model, _)` | new child in `dir`; `set_model` (+ `set_thinking_level` for a variant); `get_state` |
-| `send_prompt` | validated uploads as native `images` blocks plus embedded UTF-8 text; idle → `prompt`; running → `steer` for delivery `steer`, else `prompt` with `streamingBehavior:"followUp"`; failures are returned without replay |
+| `send_prompt` | validated uploads as native `images` blocks plus embedded UTF-8 text; idle → `prompt`; running → `prompt` with `streamingBehavior:"followUp"` for delivery `queue`, else `steer` (Pi's own Enter while it works); failures are returned without replay |
 | `interrupt` | `abort`; no child means no run. Pi may continue existing native queued messages after abort; the Gateway preserves those messages rather than clearing another client's queue |
 | `switch_model` | `set_model {provider, modelId}`; `variant` → `set_thinking_level {level}`; read `get_state` afterward and retain the actual normalized model/level, including before the first session-file write |
 | `reply_permission` | `extension_ui_response {id, confirmed}`; accepts only one reply while that generation's request is pending; persistent permission and reason text are refused |

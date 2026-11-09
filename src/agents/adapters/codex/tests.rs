@@ -691,6 +691,7 @@ async fn codex_new_thread_first_and_followup_turn_keep_exact_thread_ids() {
         "model/list" => {let mut catalog=golden()["modelList"].clone();catalog["data"][0]["model"]=json!("requested-model");catalog},
         "thread/start" => json!({"thread":golden()["thread"],"model":"actual-model","modelProvider":"openai","reasoningEffort":"medium"}),
         "turn/start" => json!({"turn":{"id":format!("019a0000-0000-7000-8000-{:012}",next_turn.fetch_add(1,std::sync::atomic::Ordering::Relaxed)),"status":"inProgress"}}),
+        "turn/steer" => json!({"turnId":r["params"]["expectedTurnId"]}),
         "thread/read" => {
             assert_eq!(r["params"],json!({"threadId":golden()["thread"]["id"],"includeTurns":false}));
             assert!(next_turn.load(std::sync::atomic::Ordering::Relaxed) >= 3,"metadata read follows turn acceptance");
@@ -762,10 +763,19 @@ async fn codex_new_thread_first_and_followup_turn_keep_exact_thread_ids() {
         assert!(
             matches!(refreshed,CodexEvent::Snapshot {thread,revision} if revision > 0 && thread["id"] == session.asid.0 && thread["model"] == "actual-model" && thread["modelProvider"] == "openai" && thread["reasoningEffort"] == "medium" && thread["status"]["type"] == "active")
         );
-        assert!(driver
-            .send_prompt(&session.asid.0, "must not steer an active turn", &[], None)
+        // A plain prompt during the turn is steered into it: no second
+        // turn, no metadata read, the exact thread id again.
+        driver
+            .send_prompt(&session.asid.0, "steered into the active turn", &[], None)
             .await
-            .is_err());
+            .unwrap();
+        let steer = fixture.next().await;
+        assert_eq!(steer["method"], "turn/steer");
+        assert_eq!(steer["params"]["threadId"], session.asid.0);
+        assert_eq!(
+            steer["params"]["expectedTurnId"],
+            format!("019a0000-0000-7000-8000-{:012}", index + 2)
+        );
         fixture.send(json!({"method":"turn/completed","params":{"threadId":session.asid.0,"turn":{"id":format!("019a0000-0000-7000-8000-{:012}",index+2),"status":"completed"}}})).await;
         let completed = tokio::time::timeout(
             Duration::from_secs(2),
@@ -1629,6 +1639,82 @@ async fn owned_active_thread_can_steer_queue_and_answer_async_questions_without_
         }
     }
     assert_eq!((starts, steers), (1, 2));
+}
+
+/// Idle, every delivery starts a turn. While a turn is active, a prompt with
+/// no stated delivery is Codex's own mid-turn input, the same as "steer":
+/// `turn/steer`, after the prompts queued before it; "queue" waits in the
+/// Gateway inbox for the turn's end.
+#[tokio::test]
+async fn a_prompt_during_an_active_turn_is_codexs_own_mid_turn_input() {
+    fn handler(request: &Value) -> Value {
+        match request["method"].as_str().unwrap() {
+            "thread/start" | "thread/read" => json!({"thread":golden()["thread"]}),
+            "turn/start" => json!({"turn":{"id":"active-turn","status":"inProgress"}}),
+            "turn/steer" => {
+                assert_eq!(request["params"]["expectedTurnId"], "active-turn");
+                json!({"turnId":"active-turn"})
+            }
+            method => panic!("unexpected {method}"),
+        }
+    }
+    /// The turn requests sent so far: `(method, text)`.
+    fn turns(fixture: &mut Fixture) -> Vec<(String, String)> {
+        let mut seen = Vec::new();
+        while let Ok(request) = fixture.requests.try_recv() {
+            if let Some(method @ ("turn/start" | "turn/steer")) = request["method"].as_str() {
+                let text = request["params"]["input"][0]["text"].as_str().unwrap();
+                seen.push((method.to_owned(), text.to_owned()));
+            }
+        }
+        seen
+    }
+    let pair = |method: &str, text: &str| (method.to_owned(), text.to_owned());
+    for delivery in [None, Some("steer"), Some("queue")] {
+        let mut fixture = Fixture::new(handler).await;
+        fixture.ready().await;
+        let driver = CodexDriver::new(fixture.client.clone());
+        let session = driver.create_session(None, None, None).await.unwrap();
+        driver
+            .send_prompt(&session.asid.0, "idle", &[], delivery)
+            .await
+            .unwrap();
+        assert_eq!(
+            turns(&mut fixture),
+            [pair("turn/start", "idle")],
+            "{delivery:?}"
+        );
+        assert!(driver.inbox_items(&session.asid.0).is_empty());
+    }
+    let mut fixture = Fixture::new(handler).await;
+    fixture.ready().await;
+    let driver = CodexDriver::new(fixture.client.clone());
+    let session = driver.create_session(None, None, None).await.unwrap();
+    let id = session.asid.0.as_str();
+    driver.send_prompt(id, "start", &[], None).await.unwrap();
+    driver
+        .send_prompt(id, "queued", &[], Some("queue"))
+        .await
+        .unwrap();
+    assert_eq!(driver.inbox_items(id).len(), 1);
+    driver.send_prompt(id, "plain", &[], None).await.unwrap();
+    assert!(
+        driver.inbox_items(id).is_empty(),
+        "the queued prompt went into the turn first"
+    );
+    driver
+        .send_prompt(id, "steered", &[], Some("steer"))
+        .await
+        .unwrap();
+    assert_eq!(
+        turns(&mut fixture),
+        [
+            pair("turn/start", "start"),
+            pair("turn/steer", "queued"),
+            pair("turn/steer", "plain"),
+            pair("turn/steer", "steered"),
+        ]
+    );
 }
 
 #[tokio::test]

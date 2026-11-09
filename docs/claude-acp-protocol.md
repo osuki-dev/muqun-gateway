@@ -119,7 +119,8 @@ plan-mode model); the App sees the new model in the session update.
 
 ## Prompts while a turn runs
 
-`delivery: "steer"` steers (`_session/steering`, above). The adapter also
+`delivery: "steer"`, or no delivery at all, steers (`_session/steering`,
+above): a prompt sent mid-turn is Claude Code's own mid-turn input. The adapter also
 accepts a second `session/prompt` during a turn and runs it after the turn
 (`agentCapabilities._meta.claudeCode.promptQueueing`, verified), but such a
 native queue cannot be listed, edited or cancelled item by item, so Gateway
