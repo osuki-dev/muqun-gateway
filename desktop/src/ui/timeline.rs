@@ -24,7 +24,7 @@ use std::collections::{HashMap, HashSet};
 use muqun_gateway::agents::{
     AgentPart, AgentSessionId, AgentSessionStatus, TimelineItem, TimelineRole,
 };
-use rune::{col, icon, row, text, Cursor, El, GrowthSpec, ScrollSpec};
+use rune::{col, el, icon, row, text, Cursor, El, GrowthSpec, ScrollSpec};
 use rune_kit::diff::{DiffMode, DiffState, DiffView, FileDiff, FileStatus};
 use rune_kit::{
     Badge, BadgeVariant, Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, Kit,
@@ -630,22 +630,25 @@ fn working_row(cx: &Tcx) -> El {
         )
 }
 
-/// Roll back and Fork from here: two small icon buttons on a raised chip,
-/// shown while the pointer is on the message. Each names itself in a
-/// tooltip. The chip stays inside the message's own box, so while it is
-/// hidden the pointer can't reach it without showing it.
+/// Copy message text: small icon button on a raised chip,
+/// shown while the pointer is on the message.
 fn message_actions(cx: &Tcx, it: &TimelineItem) -> El {
     let k = cx.k;
-    let asid = AgentSessionId(cx.asid.to_string());
-    let (rollback_asid, rollback_id) = (asid.clone(), it.message_id.clone());
-    let fork_id = it.message_id.clone();
-    let action = |icon: &'static rune::Icon, label: &str| {
-        IconButton::new(icon)
-            .variant(IconButtonVariant::GhostMuted)
-            .control_size(ControlSize::Small)
-            .label(label)
-            .help(label)
+    let text = match &it.part {
+        AgentPart::Text { text } => {
+            if it.role == TimelineRole::User {
+                muqun_gateway::agents::ports::agent::prompt_display_body(text).to_string()
+            } else {
+                text.clone()
+            }
+        }
+        _ => return el(),
     };
+    if text.is_empty() {
+        return el();
+    }
+    let copied_label = cx.t("Copied to clipboard", "已复制到剪贴板");
+    let copy_id = it.id.clone();
     let chip = row()
         .key(format!("actions-{}", it.id))
         .gap(2.0)
@@ -656,26 +659,17 @@ fn message_actions(cx: &Tcx, it: &TimelineItem) -> El {
         .border(1.0, k.c.border_base)
         .group_opacity(0.0, 1.0)
         .child(
-            action(&super::icons::UNDO, cx.t("Roll back to here", "回滚到这里"))
-                .on_press(move |s: &mut UiState| {
-                    s.send(Command::StageRevert {
-                        asid: rollback_asid.clone(),
-                        message_id: rollback_id.clone(),
-                    })
+            IconButton::new(&rune_kit::glyphs::COPY)
+                .variant(IconButtonVariant::GhostMuted)
+                .control_size(ControlSize::Small)
+                .label(cx.t("Copy", "复制"))
+                .help(cx.t("Copy message", "复制消息"))
+                .on_press_tx(move |s: &mut UiState, tx: &mut rune::Tx| {
+                    tx.copy(text.clone());
+                    s.status = copied_label.to_string();
                 })
                 .build(k)
-                .key(format!("rollback-{}", it.id)),
-        )
-        .child(
-            action(&super::icons::FORK, cx.t("Fork from here", "从这里分叉"))
-                .on_press(move |s: &mut UiState| {
-                    s.send(Command::ForkSession {
-                        asid: asid.clone(),
-                        message_id: Some(fork_id.clone()),
-                    })
-                })
-                .build(k)
-                .key(format!("fork-{}", it.id)),
+                .key(format!("copy-{}", copy_id)),
         );
     k.elevate(chip, &k.elevation.floating)
 }

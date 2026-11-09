@@ -40,6 +40,7 @@ pub static SETTINGS: Icon = Icon {
 };
 
 /// `undo.svg`: roll back to a message.
+#[allow(dead_code)]
 pub static UNDO: Icon = Icon {
     name: "undo",
     view: 24.0,
@@ -50,6 +51,7 @@ pub static UNDO: Icon = Icon {
 };
 
 /// `fork.svg`: fork a session from a message.
+#[allow(dead_code)]
 pub static FORK: Icon = Icon {
     name: "fork",
     view: 24.0,

@@ -75,6 +75,7 @@ pub enum Command {
     RefreshDiff(AgentSessionId),
     /// Stage a rollback to `message_id`, to be confirmed or cancelled
     /// (§6.1c item 9).
+    #[allow(dead_code)]
     StageRevert {
         asid: AgentSessionId,
         message_id: String,
