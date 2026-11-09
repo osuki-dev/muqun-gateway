@@ -668,6 +668,7 @@ fn inbox(s: &mut UiState) {
 include!("scenes_timeline.rs");
 include!("scenes_terminal.rs");
 include!("scenes_search.rs");
+include!("scenes_composer.rs");
 const VIEWER_CODE: &str = r#"//! Retry a flaky request with capped exponential backoff.
 
 use std::time::Duration;
@@ -865,6 +866,7 @@ pub fn scenes() -> &'static [Scene] {
     ALL.get_or_init(|| {
         let mut all = base_scenes().to_vec();
         all.extend(search_scenes());
+        all.extend(composer_scenes());
         all
     })
 }
