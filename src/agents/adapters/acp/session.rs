@@ -5876,8 +5876,7 @@ mod inbox_tests {
         .unwrap_or_else(|_| panic!("{what}"));
     }
 
-    /// The prompts the mock agent received for `id`, in order. Empty while
-    /// the mock is rewriting its store: callers poll until it settles.
+    /// The prompts the mock agent received for `id`, in order.
     fn received(fixture: &Fixture, id: &str) -> Vec<String> {
         let store: Value = std::fs::read(fixture.directory.join("sessions.json"))
             .ok()
