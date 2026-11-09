@@ -963,6 +963,12 @@ fn base_scenes() -> &'static [Scene] {
         ("settings-themes", |s| {
             settings(s);
             s.settings_tab = SettingsTab::Themes;
+            s.theme_tab = super::settings::ThemeTab::Installed;
+        }),
+        ("settings-themes-gallery", |s| {
+            settings(s);
+            s.settings_tab = SettingsTab::Themes;
+            s.theme_tab = super::settings::ThemeTab::Gallery;
         }),
         ("settings-themes-search", |s| {
             settings(s);
@@ -995,6 +1001,13 @@ fn base_scenes() -> &'static [Scene] {
         ("settings-themes-zh", |s| {
             settings(s);
             s.settings_tab = SettingsTab::Themes;
+            s.theme_tab = super::settings::ThemeTab::Installed;
+            s.cfg.general.language = crate::config::Language::ZhCn;
+        }),
+        ("settings-themes-gallery-zh", |s| {
+            settings(s);
+            s.settings_tab = SettingsTab::Themes;
+            s.theme_tab = super::settings::ThemeTab::Gallery;
             s.cfg.general.language = crate::config::Language::ZhCn;
         }),
         ("settings-shortcuts-zh", |s| {
@@ -1145,7 +1158,9 @@ fn base_scenes() -> &'static [Scene] {
         }),
         ("terminal-ime", |s| {
             terminal_scene(s, shell_fixture);
-            s.term.sink.preedit = Some(("ni hao".into(), Some((6, 6))));
+            s.term
+                .sink
+                .ime(&rune::Ime::Preedit("ni hao".into(), Some((6, 6))));
         }),
         ("terminal-jade", |s| {
             with_pack(s, "jade-tempest");

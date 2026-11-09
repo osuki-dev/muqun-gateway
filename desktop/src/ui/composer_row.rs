@@ -194,6 +194,7 @@ pub struct Controls {
     mode: Option<String>,
     asid: muqun_gateway::agents::AgentSessionId,
     auto_on: bool,
+    busy: bool,
 }
 
 impl Controls {
@@ -262,6 +263,7 @@ impl Controls {
             mode: info.mode.clone(),
             asid: info.asid.clone(),
             auto_on: s.auto_approve.get(&info.asid.0).copied().unwrap_or(false),
+            busy: s.busy(),
         })
     }
 
@@ -437,32 +439,55 @@ fn pill_button(
             b.label_with(move |_, ink| icon(glyph, GLYPH).color(tone.unwrap_or(ink)))
         }
     };
-    let e = b.build(k).key(key.to_string());
+    let mut e = b.build(k).key(key.to_string());
     if square {
-        e.px(3.0)
-    } else {
-        e
+        e = e.px(3.0);
     }
+    let chip_fill = if open {
+        k.c.bg_accent.alpha(0.14)
+    } else {
+        k.c.layer_01.alpha(0.35)
+    };
+    let chip_border = if open {
+        k.c.bg_accent.alpha(0.55)
+    } else {
+        k.c.border_muted.alpha(0.30)
+    };
+    e.radius(k.radius.xs)
+        .fill(chip_fill)
+        .border(0.5, chip_border)
 }
 
 fn agent_chip(c: &Controls, k: &Kit, f: Fold) -> El {
     let mark = super::agents::mark(&c.agent_id, 12.0, c.dark).a11y_hidden();
-    let chip = row()
+    let mut chip = row()
         .key("agent")
         .role("image")
         .label(c.agent_name.clone())
         .center_y()
-        .h(24.0)
+        .h(22.0)
+        .radius(k.radius.xs)
+        .fill(k.c.layer_01.alpha(0.35))
+        .border(0.5, k.c.border_muted.alpha(0.30))
         .child(mark);
     if f.agent_icon {
         return chip.w(ICON_PILL).center().help(c.agent_name.clone());
     }
-    chip.gap(6.0).px(8.0).child(
+    chip = chip.gap(5.0).px(7.0).child(
         text(c.agent_name.clone())
             .font(k.ty.small_medium)
             .color(k.c.text_muted)
             .a11y_hidden(),
-    )
+    );
+    if c.busy {
+        chip = chip.child(
+            rune_kit::Spinner::new()
+                .size(8.0)
+                .color(k.c.bg_accent)
+                .build(k),
+        );
+    }
+    chip
 }
 
 /// Model choices, then (when the model has them) its effort levels.
@@ -923,6 +948,7 @@ mod tests {
             mode: Some("bypassPermissions".into()),
             asid: muqun_gateway::agents::AgentSessionId("s".into()),
             auto_on: true,
+            busy: false,
         }
     }
 

@@ -350,6 +350,7 @@ pub struct UiState {
     pub theme_url: TextEdit,
     /// Settings → Themes: the search over both grids.
     pub theme_query: TextEdit,
+    pub theme_tab: settings::ThemeTab,
     pub gallery_limit: usize,
     pub toasts: Vec<ToastItem>,
     toast_seq: u64,
@@ -508,6 +509,7 @@ impl UiState {
             theme_jobs: HashMap::new(),
             theme_url: TextEdit::new(""),
             theme_query: TextEdit::new(""),
+            theme_tab: settings::ThemeTab::Installed,
             gallery_limit: GALLERY_PAGE,
             toasts: Vec::new(),
             toast_seq: 0,
