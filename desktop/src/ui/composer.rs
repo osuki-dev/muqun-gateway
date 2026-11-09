@@ -207,11 +207,19 @@ fn send_session(s: &mut UiState, queue: bool) {
     let attachments: Vec<String> = s.staged.iter().map(|f| f.path.clone()).collect();
     let deliver = deliver_of(catalog_of(s, Slot::Session), &text, !attachments.is_empty());
     note_skill_args(s, &deliver);
-    let delivery = s
-        .busy()
-        .then(|| if queue { "queue" } else { "steer" }.to_string());
+    let busy = s.busy();
+    let delivery = busy.then(|| if queue { "queue" } else { "steer" }.to_string());
     let token = s.token(Slot::Session);
     s.status = "Sending…".into();
+    // A prompt shows in the timeline at once and leaves the draft; a queued
+    // one is its inbox item in the queue strip, as before.
+    if let (Deliver::Prompt(words), false) = (&deliver, queue && busy) {
+        let staged = std::mem::take(&mut s.staged);
+        s.echo_sent(&asid, token, words.clone(), &staged, busy);
+        s.draft = TextEdit::new("");
+        s.draft.focused = true;
+        s.persist_draft(Slot::Session);
+    }
     s.send(Command::Compose(ComposeCommand::Submit {
         token,
         target: Target::Session(AgentSessionId(asid)),
@@ -638,14 +646,16 @@ fn queued_chip(
 }
 
 fn chips(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Option<El> {
-    if s.staged.is_empty() && s.queue.is_empty() {
+    // A steer the timeline already shows as its echo is not listed twice.
+    let queue: Vec<_> = s.queue.iter().filter(|q| !s.echoed(&q.id)).collect();
+    if s.staged.is_empty() && queue.is_empty() {
         return None;
     }
     let mut line = row().key("chips").w_full().gap(6.0).flex_wrap().center_y();
     for (i, file) in s.staged.iter().enumerate() {
         line = line.child(staged_chip(s, k, i, file));
     }
-    for item in &s.queue {
+    for item in queue {
         line = line.child(queued_chip(s, k, layer, item));
     }
     Some(line)

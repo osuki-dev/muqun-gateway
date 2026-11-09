@@ -70,8 +70,63 @@ fn zh(s: &mut UiState) {
     s.cfg.general.language = crate::config::Language::ZhCn;
 }
 
+/// A prompt just sent to the Claude session, before the gateway's row for
+/// it: `running` steers the turn, `picture` sends a pasted screenshot too.
+fn echo_scene(s: &mut UiState, running: bool, words: &str, picture: bool) -> u64 {
+    composer_session(s, running);
+    let staged = if picture {
+        vec![crate::model::compose::StagedFile {
+            path: SCENE_PICTURE.into(),
+            name: "screenshot.png".into(),
+            size: 1,
+            image: true,
+        }]
+    } else {
+        Vec::new()
+    };
+    let token = s.token(super::Slot::Session);
+    s.pending_submit = None;
+    s.echo_sent("s1", token, words.into(), &staged, running);
+    token
+}
+
 fn composer_scenes() -> Vec<Scene> {
     vec![
+        // Sent while the agent works: on its way.
+        ("echo-sending", |s| {
+            echo_scene(s, true, "Also keep the badge hidden while the count loads.", true);
+        }),
+        // The gateway holds the steer for the agent's next step; a queued
+        // prompt still waits in the strip.
+        ("echo-steered", |s| {
+            let token = echo_scene(s, true, "Also keep the badge hidden while the count loads.", false);
+            s.echo_submitted(token, true);
+            let inbox = vec![
+                InboxItem {
+                    id: "q1".into(),
+                    text: "Also keep the badge hidden while the count loads.".into(),
+                    steer: true,
+                    files: vec![],
+                },
+                InboxItem {
+                    id: "q2".into(),
+                    text: "Then update the changelog.".into(),
+                    steer: false,
+                    files: vec![],
+                },
+            ];
+            s.echo_inbox("s1", &inbox);
+            s.queue = inbox;
+        }),
+        ("echo-failed", |s| {
+            let token = echo_scene(s, false, "Run the full test suite again.", false);
+            s.echo_submitted(token, false);
+        }),
+        ("echo-failed-zh", |s| {
+            let token = echo_scene(s, false, "再跑一遍完整测试。", false);
+            s.echo_submitted(token, false);
+            zh(s);
+        }),
         ("composer", |s| composer_session(s, true)),
         ("composer-idle", |s| composer_session(s, false)),
         ("composer-zh", |s| {

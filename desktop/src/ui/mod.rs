@@ -11,6 +11,7 @@ mod composer;
 mod composer_row;
 pub mod copy;
 mod dwindle;
+mod echo;
 pub mod fx;
 mod home;
 mod icons;
@@ -285,6 +286,14 @@ pub struct UiState {
     pub auto_approve: HashMap<String, bool>,
     pub next_token: u64,
     pub pending_submit: Option<(u64, Slot)>,
+    /// Prompts shown before the gateway's row for them arrives, by session
+    /// (`ui/echo.rs`).
+    pub echoes: HashMap<String, Vec<echo::Echo>>,
+    /// Bumped when an echo comes, changes or goes (the timeline's version).
+    pub echo_rev: u64,
+    /// Echoed submits the gateway has not answered yet (their echo may
+    /// already be gone, its row arrived first).
+    pub echo_tokens: HashSet<u64>,
 
     pub diff_stat: DiffStat,
     pub diff: Option<DiffState>,
@@ -459,6 +468,9 @@ impl UiState {
             auto_approve: HashMap::new(),
             next_token: 1,
             pending_submit: None,
+            echoes: HashMap::new(),
+            echo_rev: 0,
+            echo_tokens: HashSet::new(),
             diff_stat: DiffStat::default(),
             diff: None,
             show_diff: false,
@@ -574,7 +586,8 @@ impl UiState {
         let fit = self.fit_panes();
         let term = self.poll_terminal(t, tx);
         let search = self.poll_search(tx);
-        self.poll_splash(t, tx) | voice | fit | term | search
+        let echoes = self.poll_echoes(tx);
+        self.poll_splash(t, tx) | voice | fit | term | search | echoes
     }
 
     pub fn poll_splash(&mut self, _: f64, _: &mut Tx) -> bool {
@@ -1469,10 +1482,12 @@ impl UiState {
                     .entry(asid.clone())
                     .or_default()
                     .replace(snapshot.timeline);
+                self.echo_rows(&asid);
                 self.waiting_perms
                     .insert(asid.clone(), snapshot.permissions);
                 self.waiting_forms.insert(asid.clone(), snapshot.forms);
                 let queue = InboxItem::list(&snapshot.inbox);
+                self.echo_inbox(&asid, &queue);
                 self.tiles[i].slot.queue = queue;
                 return;
             }
@@ -1509,13 +1524,16 @@ impl UiState {
             .entry(asid.clone())
             .or_default()
             .replace(snapshot.timeline);
+        self.echo_rows(&asid);
         if fresh {
             self.retain_timelines();
         }
         self.waiting_perms
             .insert(asid.clone(), snapshot.permissions);
         self.waiting_forms.insert(asid.clone(), snapshot.forms);
-        self.queue = InboxItem::list(&snapshot.inbox);
+        let queue = InboxItem::list(&snapshot.inbox);
+        self.echo_inbox(&asid, &queue);
+        self.queue = queue;
         self.status = format!("{count} messages");
         if self.error.as_ref().is_some_and(|e| e.unreachable) {
             self.error = None;
@@ -1549,6 +1567,7 @@ impl UiState {
                 if let Some(tl) = self.timelines.get_mut(&asid.0) {
                     tl.upsert(items);
                 }
+                self.echo_rows(&asid.0);
             }
             AgentDomainEvent::TimelineRemoved { asid, ids, .. } => {
                 if let Some(tl) = self.timelines.get_mut(&asid.0) {
@@ -1612,10 +1631,12 @@ impl UiState {
                 }
             }
             AgentDomainEvent::InboxChanged { asid, items, .. } => {
+                let items = InboxItem::list(&items);
+                self.echo_inbox(&asid.0, &items);
                 if current(self, &asid) {
-                    self.queue = InboxItem::list(&items);
+                    self.queue = items;
                 } else if let Some(slot) = self.parked_slot(&asid.0) {
-                    slot.queue = InboxItem::list(&items);
+                    slot.queue = items;
                 }
             }
             AgentDomainEvent::WorktreeChanged { .. } => {
@@ -1703,6 +1724,15 @@ impl UiState {
                 Err(err) => self.toast("Attachment failed", Some(err)),
             },
             ComposerUpdate::Submitted { token, ok } => {
+                // An echoed prompt left the draft when it was sent; its
+                // bubble says how the send went.
+                if self.echo_submitted(token, ok) {
+                    if self.pending_submit.is_some_and(|(p, _)| p == token) {
+                        self.pending_submit = None;
+                    }
+                    self.status = if ok { "Sent" } else { "Send failed" }.into();
+                    return;
+                }
                 let Some((pending, slot)) = self.pending_submit else {
                     return;
                 };
@@ -1726,6 +1756,7 @@ impl UiState {
                 }
             }
             ComposerUpdate::Inbox { asid, items } => {
+                self.echo_inbox(&asid, &items);
                 if self.selected.as_deref() == Some(asid.as_str()) {
                     self.queue = items;
                 } else if let Some(slot) = self.parked_slot(&asid) {

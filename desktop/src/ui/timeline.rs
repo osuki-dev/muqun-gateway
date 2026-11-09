@@ -346,6 +346,8 @@ enum Row<'a> {
     Top,
     Item(&'a TimelineItem),
     Group(&'a [TimelineItem]),
+    /// A prompt just sent, before its own row arrives (`echo.rs`).
+    Echo(&'a super::echo::Echo),
     Working,
 }
 
@@ -357,13 +359,16 @@ fn row_at<'a>(s: &'a UiState, asid: &str, i: usize) -> Option<Row<'a>> {
     match tl.blocks.get(i - 1) {
         Some(Block::Item(at)) => tl.items.get(*at).map(Row::Item),
         Some(Block::Group { start, end }) => tl.items.get(*start..*end).map(Row::Group),
-        None => Some(Row::Working),
+        None => match s.echoes_of(asid).get(i - 1 - tl.blocks.len()) {
+            Some(echo) => Some(Row::Echo(echo)),
+            None => Some(Row::Working),
+        },
     }
 }
 
 fn row_count(s: &UiState, asid: &str) -> usize {
     let n = s.timelines.get(asid).map_or(0, |t| t.blocks.len());
-    1 + n + usize::from(s.session_busy(asid))
+    1 + n + s.echoes_of(asid).len() + usize::from(s.session_busy(asid))
 }
 
 /// One session's timeline: a virtualised list that only builds the rows
@@ -406,6 +411,7 @@ pub fn session_view(s: &UiState, k: &Kit, asid: &str) -> El {
                     Some(Row::Item(item)) => Cow::Borrowed(item.id.as_str()),
                     Some(Row::Group(items)) => Cow::Owned(group_key(&items[0])),
                     Some(Row::Top) => Cow::Borrowed("tl-top"),
+                    Some(Row::Echo(echo)) => Cow::Owned(format!("echo-{}", echo.token)),
                     _ => Cow::Borrowed("tl-working"),
                 }
             },
@@ -433,6 +439,7 @@ pub fn session_view(s: &UiState, k: &Kit, asid: &str) -> El {
                         item_row(&cx, item)
                     }
                     Some(Row::Group(items)) => parts::group::view(&cx, items),
+                    Some(Row::Echo(echo)) => super::echo::view(&cx, echo),
                     Some(Row::Working) | None => working_row(&cx),
                 };
                 // Rows space themselves with padding: virtual rows take no gaps.
@@ -449,7 +456,7 @@ pub fn session_view(s: &UiState, k: &Kit, asid: &str) -> El {
                     .child(column.child(body.w_full()))
             },
         )
-        .virtual_rows_version((tl.rev, s.session_busy(asid)))
+        .virtual_rows_version((tl.rev, s.echo_rev, s.session_busy(asid)))
         .on_visible_rows(move |s: &mut UiState, range: std::ops::Range<usize>| {
             // Near the top with more history upstream: ask for the next page.
             if range.start > 2 {
