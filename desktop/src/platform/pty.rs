@@ -251,15 +251,23 @@ mod unix {
     fn spawn(mut cmd: Command, size: WinSize, on_exit: super::OnExit) -> io::Result<(Pty, Child)> {
         let mut master: libc::c_int = -1;
         let mut slave: libc::c_int = -1;
+        #[cfg(target_os = "macos")]
+        let mut ws = winsize(size);
+        #[cfg(not(target_os = "macos"))]
         let ws = winsize(size);
         // SAFETY: openpty writes two fds; name and termios may be null.
         let rc = unsafe {
+            #[cfg(target_os = "macos")]
+            let winp = &mut ws as *mut libc::winsize;
+            #[cfg(not(target_os = "macos"))]
+            let winp = &ws as *const libc::winsize;
+
             libc::openpty(
                 &mut master,
                 &mut slave,
                 std::ptr::null_mut(),
-                std::ptr::null(),
-                &ws,
+                std::ptr::null_mut(),
+                winp,
             )
         };
         if rc != 0 {
