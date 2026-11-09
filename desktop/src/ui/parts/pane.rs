@@ -369,7 +369,8 @@ pub fn view(s: &UiState, k: &Kit) -> Option<El> {
     let bar = row()
         .key("pane-bar")
         .w_full()
-        .h(36.0)
+        // The main card's toolbar row, so the two line up.
+        .h(rune_kit::shell::TOOLBAR_HEIGHT)
         .px(12.0)
         .gap(8.0)
         .center_y()
