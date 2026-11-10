@@ -371,12 +371,25 @@ fn git(s: &UiState, k: &Kit) -> Vec<El> {
                 ));
             }
         }
-        None => out.push(empty(
-            k,
-            "branch",
-            t("No repository"),
-            t("This folder is not a git checkout."),
-        )),
+        None => {
+            out.push(empty(
+                k,
+                "branch",
+                t("No repository"),
+                t("This folder is not a git checkout."),
+            ));
+            let cwd_path = info.and_then(|i| i.directory.clone()).map(PathBuf::from);
+            out.push(small(
+                k,
+                t("Initialize Git in Terminal"),
+                ButtonVariant::Outline,
+                "git-init-term".into(),
+                move |s| {
+                    let dir = cwd_path.clone().unwrap_or_else(|| s.terminal_cwd());
+                    s.term_new_tab_in(dir, Some("git init && git status\n".into()));
+                },
+            ));
+        }
     }
     out.push(heading(k, t("Changes")));
     if s.diff_stat.files == 0 {

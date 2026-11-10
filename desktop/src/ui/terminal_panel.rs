@@ -374,6 +374,10 @@ impl UiState {
         self.term.open = false;
         self.term.pane.set_open(false);
         self.term.sink.focused = false;
+        if self.term.tabs.is_empty() {
+            self.term.session = None;
+            self.term.frame = None;
+        }
         if self.mode == super::Mode::Session {
             self.draft.focused = true;
         }
@@ -477,12 +481,24 @@ impl UiState {
     pub fn term_close_tab(&mut self, index: usize) {
         if index >= self.term.tabs.len() {
             if self.term.tabs.is_empty() {
+                if let Some(session) = self.term.session.take() {
+                    session.send(Msg::Shutdown);
+                }
+                self.term.frame = None;
                 self.close_terminal();
             }
             return;
         }
         if self.term.tabs.len() <= 1 {
-            self.term.tabs.clear();
+            if let Some(session) = self.term.session.take() {
+                session.send(Msg::Shutdown);
+            }
+            for tab in self.term.tabs.drain(..) {
+                if let Some(s) = tab.session {
+                    s.send(Msg::Shutdown);
+                }
+            }
+            self.term.frame = None;
             self.close_terminal();
             return;
         }
@@ -718,7 +734,7 @@ impl UiState {
     }
 
     /// A key while the terminal has the keyboard (the sink's key handler).
-    fn terminal_key(&mut self, ev: &KeyEvent, tx: &mut Tx) -> bool {
+    pub(crate) fn terminal_key(&mut self, ev: &KeyEvent, tx: &mut Tx) -> bool {
         let mac = crate::platform::keys::Style::current() == crate::platform::keys::Style::Symbols;
         let letter =
             |c: char| matches!(&ev.key, rune::Key::Command(k) if k.eq_ignore_ascii_case(&c));
@@ -752,6 +768,7 @@ impl UiState {
                 }
             }
             Route::Terminal => {
+                let letter = |c: char| matches!(&ev.key, rune::Key::Command(k) if k.eq_ignore_ascii_case(&c));
                 if self
                     .term
                     .session
@@ -760,6 +777,10 @@ impl UiState {
                 {
                     if ev.key == rune::Key::Enter {
                         self.restart_terminal();
+                    } else if (ev.mods.ctrl && (letter('d') || letter('w')))
+                        || ev.key == rune::Key::Escape
+                    {
+                        self.term_close_tab(self.term.active_tab);
                     }
                     return true;
                 }
@@ -850,18 +871,32 @@ pub fn view(s: &UiState, k: &Kit, scheme: ColorScheme, scale: f32, layer: &mut V
             )
         };
 
-        let mut tab_pill = row()
+        let close_tab = IconButton::new(k.glyph.close)
+            .variant(IconButtonVariant::GhostMuted)
+            .control_size(ControlSize::Small)
+            .label(tr_ref(language, "Close tab"))
+            .on_press(move |s: &mut UiState| {
+                s.term_close_tab(i);
+                s.term.sink.focused = true;
+            })
+            .build(k)
+            .key(format!("terminal-tab-close-{i}"));
+
+        let tab_pill = row()
             .key(format!("terminal-tab-{i}"))
             .h(26.0)
             .pl(8.0)
-            .pr(if tab_count > 1 { 2.0 } else { 8.0 })
+            .pr(2.0)
             .gap(5.0)
             .center_y()
             .fill(bg_color)
             .border(1.0, border_color)
             .clip_rounded(6.0)
             .cursor(rune::Cursor::Pointer)
-            .on_press(move |s: &mut UiState| s.term_switch_tab(i))
+            .on_press(move |s: &mut UiState| {
+                s.term_switch_tab(i);
+                s.term.sink.focused = true;
+            })
             .child(
                 rune::icon(&TERMINAL_WINDOW, 12.0)
                     .color(if is_active {
@@ -878,18 +913,8 @@ pub fn view(s: &UiState, k: &Kit, scheme: ColorScheme, scale: f32, layer: &mut V
                     .truncate()
                     .shrink()
                     .max_w(130.0),
-            );
-
-        if tab_count > 1 {
-            let close_tab = IconButton::new(k.glyph.close)
-                .variant(IconButtonVariant::GhostMuted)
-                .control_size(ControlSize::Small)
-                .label(tr_ref(language, "Close tab"))
-                .on_press(move |s: &mut UiState| s.term_close_tab(i))
-                .build(k)
-                .key(format!("terminal-tab-close-{i}"));
-            tab_pill = tab_pill.child(close_tab);
-        }
+            )
+            .child(close_tab);
 
         tabs_strip = tabs_strip.child(tab_pill);
     }
@@ -1490,6 +1515,72 @@ mod tests {
             state.term.pending_command.as_deref(),
             Some("nvim '/tmp/test_file.rs'\n")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_multiple_tabs_closed_to_last_then_ctrl_d() {
+        let (tx, _rx) = commands::channel();
+        let mut s = UiState::new(tx);
+        s.open_terminal();
+        let size = grid_size(560.0, 340.0, Metrics { cw: 8.0, ch: 17.0 }, 1.0);
+        let make_session = |script: &str| {
+            let mut cmd = std::process::Command::new("/bin/sh");
+            cmd.args(["-c", script]);
+            Session::start_command(
+                cmd,
+                size,
+                colors(&Kit::neutral(false), ColorScheme::Light),
+                std::sync::Arc::new(|| {}),
+            )
+            .unwrap()
+        };
+        // Tab 0
+        let s0 = make_session("exit 0");
+        s.term.session = Some(s0.clone());
+        s.term.tabs.push(TermTab {
+            id: 1,
+            session: Some(s0.clone()),
+            frame: None,
+            cwd: PathBuf::from("/tmp"),
+            title: None,
+            pending_command: None,
+        });
+        s.term.active_tab = 0;
+
+        // Tab 1
+        let s1 = make_session("exit 0");
+        s.term.tabs.push(TermTab {
+            id: 2,
+            session: Some(s1.clone()),
+            frame: None,
+            cwd: PathBuf::from("/tmp"),
+            title: None,
+            pending_command: None,
+        });
+        s.term.active_tab = 1;
+        s.term.session = Some(s1);
+
+        // Wait for Tab 1 to exit
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while s.term.session.as_ref().is_some_and(|x| x.ended().is_none()) {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // Settle Tab 1
+        assert!(s.settle_terminal());
+        assert_eq!(s.term.tabs.len(), 1);
+        assert_eq!(s.term.active_tab, 0);
+
+        // Wait for Tab 0 to exit
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while s.term.session.as_ref().is_some_and(|x| x.ended().is_none()) {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(s.settle_terminal());
+        assert_eq!(s.term.tabs.len(), 0);
+        assert!(!s.term.open);
     }
 
     #[test]

@@ -55,6 +55,7 @@ pub enum Act {
     Split,
     Unsplit,
     Inspector,
+    Git,
     Theme(String),
     ToggleScheme,
     Dictation,
@@ -75,6 +76,7 @@ impl Act {
             Self::Go(Mode::Tasks) => Action::Tasks,
             Self::Split => Action::AddSplit,
             Self::Inspector => Action::ToggleInspector,
+            Self::Git => Action::ToggleGit,
             Self::Dictation => Action::Dictation,
             Self::Key(action) => *action,
             _ => return None,
@@ -97,6 +99,7 @@ impl Act {
             Self::Split => "split".into(),
             Self::Unsplit => "unsplit".into(),
             Self::Inspector => "inspector".into(),
+            Self::Git => "git".into(),
             Self::Theme(id) => format!("theme:{id}"),
             Self::ToggleScheme => "scheme".into(),
             Self::Dictation => "dictation".into(),
@@ -259,6 +262,11 @@ pub fn entries(s: &UiState) -> Vec<Entry> {
             tr(language, "Toggle inspector"),
             &keymap::label(Action::ToggleInspector),
             Act::Inspector,
+        ));
+        out.push(action(
+            tr(language, "Git"),
+            &keymap::label(Action::ToggleGit),
+            Act::Git,
         ));
         let dictating = s.voice.is_some();
         out.push(action(
@@ -456,6 +464,7 @@ impl UiState {
             Act::Split => self.split(),
             Act::Unsplit => self.unsplit(),
             Act::Inspector => self.toggle_inspector(),
+            Act::Git => self.toggle_git_inspector(),
             Act::Theme(id) => self.send(Command::ThemeApply(id, self.cfg.appearance.scheme)),
             Act::ToggleScheme => self.set_scheme(if self.dark {
                 Scheme::Light
@@ -690,6 +699,7 @@ fn glyph(act: &Act) -> &'static rune::Icon {
         Act::Go(Mode::Inbox) => &super::icons::INBOX,
         Act::Go(Mode::Tasks) => &super::icons::TASK,
         Act::Dictation => &super::voice::MIC,
+        Act::Git => &super::icons::BRANCH,
         Act::Settings(_)
         | Act::Inspector
         | Act::Split

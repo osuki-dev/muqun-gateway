@@ -37,6 +37,7 @@ pub enum Action {
     ToggleTerminal,
     NewShell,
     ToggleInspector,
+    ToggleGit,
     FocusSearch,
     SearchMessages,
     ToggleRecentSession,
@@ -190,6 +191,12 @@ pub static ENTRIES: &[Entry] = &[
         G::Panels,
         "mod+alt+b",
         "Show or hide the inspector or detail pane",
+    ),
+    e(
+        A::ToggleGit,
+        G::Panels,
+        "mod+alt+g",
+        "Show or hide Git inspector",
     ),
     e(A::FocusSearch, G::Panels, "mod+f", "Search sessions"),
     e(
@@ -466,6 +473,20 @@ pub fn dispatch(s: &mut UiState, ev: &KeyEvent, tx: &mut Tx) -> bool {
         s.toggle_terminal();
         return true;
     }
+    if s.term.open && !s.draft.focused && s.palette.is_none() && s.keys_sheet.is_none() {
+        let letter =
+            |c: char| matches!(&ev.key, rune::Key::Command(k) if k.eq_ignore_ascii_case(&c));
+        if ((ev.mods.ctrl && (letter('d') || letter('w'))) || ev.key == rune::Key::Escape)
+            && s.term.session.as_ref().is_some_and(|x| x.ended().is_some())
+        {
+            s.term_close_tab(s.term.active_tab);
+            return true;
+        }
+        if ev.mods.ctrl && letter('d') {
+            s.term.sink.focused = true;
+            return s.terminal_key(ev, tx);
+        }
+    }
     // The arrows step the Inbox's and Tasks' lists as j and k do.
     if matches!(s.mode, Mode::Inbox | Mode::Tasks)
         && matches!(ev.key, rune::Key::Up | rune::Key::Down)
@@ -538,6 +559,15 @@ pub fn run(s: &mut UiState, action: Action, ev: &KeyEvent, tx: &mut Tx) -> bool 
                 s.close_inspect();
             } else if session && !s.in_split() {
                 s.toggle_inspector();
+            } else {
+                return false;
+            }
+        }
+        A::ToggleGit => {
+            if session && !s.in_split() {
+                s.toggle_git_inspector();
+            } else if s.selected.is_some() {
+                s.open_git_inspector();
             } else {
                 return false;
             }

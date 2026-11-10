@@ -1391,6 +1391,31 @@ impl UiState {
         }
     }
 
+    pub fn open_git_inspector(&mut self) {
+        if self.mode != Mode::Session && self.selected.is_some() {
+            self.go(Mode::Session);
+        }
+        if self.term.open {
+            self.close_terminal();
+        }
+        self.inspector_tab = InspectorTab::Git;
+        self.right_open = true;
+        self.right.set_open(true);
+        self.refresh_inspector();
+    }
+
+    pub fn toggle_git_inspector(&mut self) {
+        if self.mode != Mode::Session && self.selected.is_some() {
+            self.go(Mode::Session);
+        }
+        if self.right_open && self.inspector_tab == InspectorTab::Git && !self.term.open {
+            self.right_open = false;
+            self.right.set_open(false);
+        } else {
+            self.open_git_inspector();
+        }
+    }
+
     /// The composer's catalogue, branch and bypass state for a freshly opened session.
     fn session_opened(&mut self, info: &AgentSessionInfo) {
         use crate::model::compose::ComposeCommand as C;

@@ -484,5 +484,8 @@
   "New version available:": "發現新版本：",
   "Restart now": "立即重啟",
   "Check failed": "檢查更新失敗",
-  "Updates": "軟體更新"
+  "Updates": "軟體更新",
+  "Git": "Git",
+  "Show or hide Git inspector": "顯示或隱藏 Git 審查面板",
+  "Initialize Git in Terminal": "在終端中初始化 Git"
 }

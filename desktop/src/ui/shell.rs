@@ -16,7 +16,7 @@ use rune_kit::{
 use super::copy::{tr, tr_ref};
 use super::{
     art, composer, home, inbox, inspector, sessions, settings, tasks, tiles, timeline, title_of,
-    Activity, OpenMenu,
+    Activity, InspectorTab, OpenMenu,
 };
 use super::{Mode, UiState};
 use crate::branding::{APP_MARK_PNG, APP_NAME};
@@ -503,10 +503,11 @@ fn session_identity(s: &UiState, k: &Kit, look: &Look) -> El {
             meta.push(name);
         }
     }
-    if let Some(branch) = s.branch_of(info) {
-        meta.push(branch);
-    } else if let Some(folder) = UiState::folder_name(info) {
-        meta.push(folder);
+    let branch = s.branch_of(info);
+    if branch.is_none() {
+        if let Some(folder) = UiState::folder_name(info) {
+            meta.push(folder);
+        }
     }
 
     line = line
@@ -540,13 +541,43 @@ fn session_identity(s: &UiState, k: &Kit, look: &Look) -> El {
                         .color(k.c.text_base)
                         .truncate(),
                 )
-                .child(
-                    text(meta.join(" · "))
-                        .key("session-meta")
-                        .font(k.ty.caption().lh(14.0))
-                        .color(k.c.text_faint)
-                        .truncate(),
-                ),
+                .child({
+                    let mut meta_row = row().gap(6.0).center_y();
+                    meta_row = meta_row.child(
+                        text(meta.join(" · "))
+                            .key("session-meta")
+                            .font(k.ty.caption().lh(14.0))
+                            .color(k.c.text_faint)
+                            .truncate(),
+                    );
+                    if let Some(b) = branch {
+                        meta_row = meta_row.child(
+                            row()
+                                .key("session-branch-chip")
+                                .gap(3.0)
+                                .center_y()
+                                .px(4.0)
+                                .py(1.0)
+                                .fill(k.c.layer_01)
+                                .border(1.0, k.c.border_muted)
+                                .clip_rounded(3.0)
+                                .cursor(rune::Cursor::Pointer)
+                                .help(tr_ref(language, "Git"))
+                                .on_press(|s: &mut UiState| s.open_git_inspector())
+                                .child(
+                                    rune::icon(&super::icons::BRANCH, 10.0).color(k.c.icon_muted),
+                                )
+                                .child(
+                                    text(b)
+                                        .font(k.ty.caption().lh(13.0))
+                                        .color(k.c.text_muted)
+                                        .truncate()
+                                        .max_w(140.0),
+                                ),
+                        );
+                    }
+                    meta_row
+                }),
         );
     if activity != Activity::Idle {
         let word = super::Fit::of("main") == super::Fit::Wide;
@@ -728,6 +759,23 @@ fn toolbar(s: &UiState, k: &Kit, look: &Look, layer: &mut Vec<El>) -> Toolbar {
         );
     }
     if s.mode == Mode::Session && !s.in_split() {
+        let is_git_open = s.right_open && !s.term.open && s.inspector_tab == InspectorTab::Git;
+        bar = bar.trailing(
+            IconButton::new(&super::icons::BRANCH)
+                .variant(if is_git_open {
+                    IconButtonVariant::Contrast
+                } else {
+                    IconButtonVariant::Ghost
+                })
+                .label(tr_ref(language, "Git"))
+                .help(super::keymap::tip(
+                    tr_ref(language, "Git"),
+                    super::keymap::Action::ToggleGit,
+                ))
+                .on_press(|s: &mut UiState| s.toggle_git_inspector())
+                .build(k)
+                .key("git-toggle"),
+        );
         bar = bar.trailing(
             IconButton::new(&INSPECTOR)
                 .variant(if s.right_open && !s.term.open {

@@ -76,9 +76,19 @@ impl Drop for Release {
     }
 }
 
+struct SessionInner {
+    tx: mpsc::Sender<Msg>,
+}
+
+impl Drop for SessionInner {
+    fn drop(&mut self) {
+        let _ = self.tx.send(Msg::Shutdown);
+    }
+}
+
 #[derive(Clone)]
 pub struct Session {
-    tx: mpsc::Sender<Msg>,
+    inner: Arc<SessionInner>,
     latest: Arc<Mutex<Option<Frame>>>,
     ended: Arc<Mutex<Option<Ended>>>,
     pub cwd: PathBuf,
@@ -300,7 +310,7 @@ impl Session {
                 })?;
         }
         Ok(Self {
-            tx,
+            inner: Arc::new(SessionInner { tx }),
             latest,
             ended,
             cwd,
@@ -309,7 +319,7 @@ impl Session {
     }
 
     pub fn send(&self, msg: Msg) {
-        let _ = self.tx.send(msg);
+        let _ = self.inner.tx.send(msg);
     }
 
     /// The newest frame since the last call.
@@ -321,12 +331,6 @@ impl Session {
     /// before).
     pub fn ended(&self) -> Option<Ended> {
         *self.ended.lock().unwrap()
-    }
-}
-
-impl Drop for Session {
-    fn drop(&mut self) {
-        let _ = self.tx.send(Msg::Shutdown);
     }
 }
 
