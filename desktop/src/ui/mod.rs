@@ -815,6 +815,7 @@ impl UiState {
         self.pairing_error = None;
         self.pairing_manual_token_mode = false;
         self.pairing_code_input.clear();
+        self.pairing_code_input.focused = true;
         self.pairing_token_input.clear();
         self.pairing_url_input = TextEdit::new(default_url);
     }
@@ -826,6 +827,7 @@ impl UiState {
         self.pairing_error = None;
         self.pairing_manual_token_mode = false;
         self.pairing_code_input.clear();
+        self.pairing_code_input.focused = true;
         self.pairing_token_input.clear();
     }
 
@@ -1567,6 +1569,7 @@ impl UiState {
                     self.pairing_request_id = Some(request_id);
                     self.pairing_transport_required = transport_required;
                     self.pairing_error = None;
+                    self.pairing_code_input.focused = true;
                     self.toast(
                         copy::tr(
                             self.cfg.general.language,
