@@ -169,8 +169,6 @@ pub enum OpenMenu {
     Tile(usize),
     /// A dropdown on a Settings page (by its key).
     Setting(String),
-    /// The computer/device switcher dropdown in the sidebar.
-    ComputerPicker,
 }
 
 /// The view state of one open session: what the timeline and composer read.
@@ -674,7 +672,9 @@ impl UiState {
 
     pub fn computer_name(&self, id: &str) -> String {
         let language = self.cfg.general.language;
-        if id == "local" || id == "self" {
+        if id == "all" {
+            copy::tr(language, "All computers", "全部电脑")
+        } else if id == "local" || id == "self" {
             copy::tr(language, "This computer", "本机")
         } else if let Some(peer) = self
             .peers
@@ -693,6 +693,7 @@ impl UiState {
         }
     }
 
+    #[allow(dead_code)]
     pub fn computer_color(&self, id: &str) -> rune::Color {
         if let Some(accent) = self.cfg.accent_for(id) {
             crate::theme::agents::computer_color(accent, self.dark)
@@ -752,7 +753,21 @@ impl UiState {
             };
             self.computer_data.insert(prev, data);
 
-            if let Some(restored) = self.computer_data.remove(&id) {
+            if id == "all" {
+                let mut all_sess = Vec::new();
+                for cdata in self.computer_data.values() {
+                    for sess in &cdata.sessions {
+                        if !all_sess
+                            .iter()
+                            .any(|s: &AgentSessionInfo| s.asid == sess.asid)
+                        {
+                            all_sess.push(sess.clone());
+                        }
+                    }
+                }
+                all_sess.sort_by_key(|a| std::cmp::Reverse(a.updated_ms));
+                self.sessions = all_sess;
+            } else if let Some(restored) = self.computer_data.remove(&id) {
                 self.sessions = restored.sessions;
                 self.directories = restored.directories;
                 self.known_projects = restored.known_projects;
@@ -771,17 +786,21 @@ impl UiState {
         self.agent_inputs.clear();
         self.agent_errors.clear();
 
-        let theme_id = self.cfg.theme_for(&id).to_string();
-        if theme_id != self.cfg.appearance.theme_id {
-            self.cfg.appearance.theme_id = theme_id.clone();
-            self.send(Command::ThemeApply(theme_id, self.cfg.appearance.scheme));
+        if id != "all" {
+            let theme_id = self.cfg.theme_for(&id).to_string();
+            if theme_id != self.cfg.appearance.theme_id {
+                self.cfg.appearance.theme_id = theme_id.clone();
+                self.send(Command::ThemeApply(theme_id, self.cfg.appearance.scheme));
+            }
         }
         for peer in &mut self.peers {
             peer.current = peer.server_id == id || (id == "local" && peer.server_id == "self");
         }
 
-        self.send(Command::SwitchComputer(id.clone()));
-        self.send(Command::Refresh);
+        if id != "all" {
+            self.send(Command::SwitchComputer(id.clone()));
+            self.send(Command::Refresh);
+        }
 
         let name = self.computer_name(&id);
         self.toast(format!("已切换到 {}", name), None);

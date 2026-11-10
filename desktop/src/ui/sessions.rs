@@ -485,80 +485,99 @@ fn session_row(s: &UiState, k: &Kit, layer: &mut Vec<El>, asid: &str) -> El {
     })
 }
 
-fn computer_switcher(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
-    let language = s.cfg.general.language;
-    let current_id = s.current_computer();
-    let current_name = s.computer_name(current_id);
-    let color = s.computer_color(current_id);
-    let open = s.menu == Some(OpenMenu::ComputerPicker);
-
-    let dot = el().key("comp-dot").size(8.0, 8.0).radius(4.0).fill(color);
-
-    let comp_pill = rune::row()
-        .key("computer-switcher-pill")
-        .w_full()
-        .h(30.0)
-        .px(10.0)
-        .gap(8.0)
-        .center_y()
-        .radius(7.0)
-        .fill(color.alpha(if s.dark { 0.12 } else { 0.08 }))
-        .border(1.0, color.alpha(if open { 0.45 } else { 0.18 }))
+fn segment_item(
+    k: &Kit,
+    key: &str,
+    label: &str,
+    active: bool,
+    press: impl Fn(&mut UiState) + 'static,
+) -> El {
+    let mut btn = rune::row()
+        .key(key)
+        .h(26.0)
+        .px(8.0)
+        .center()
+        .grow(1.0)
+        .radius(6.0)
         .cursor(rune::Cursor::Pointer)
-        .role("button")
-        .label(super::copy::tr_ref(language, "Switch computer", "切换电脑"))
-        .child(dot)
+        .role("tab")
         .child(
-            rune::text(current_name)
-                .font(k.ty.ui_medium)
-                .color(k.c.text_base)
-                .truncate()
-                .grow(1.0)
-                .min_w(0.0),
+            rune::text(label.to_string())
+                .font(if active { k.ty.ui_medium } else { k.ty.small })
+                .color(if active {
+                    k.c.text_base
+                } else {
+                    k.c.text_muted
+                })
+                .truncate(),
         )
-        .child(rune::text("▾").font(k.ty.small).color(k.c.text_muted));
+        .on_press(press);
 
-    let mut menu = Menu::new("computer-switcher-menu")
-        .trigger(comp_pill.on_press(|s: &mut UiState| {
-            let open = s.menu == Some(OpenMenu::ComputerPicker);
-            s.menu = (!open).then_some(OpenMenu::ComputerPicker);
-        }))
-        .open(open)
-        .on_close(|s: &mut UiState| s.menu = None);
-
-    for comp in s.all_computers() {
-        let cid = comp.server_id.clone();
-        let cname = comp.name.clone();
-        let is_current = cid == current_id || (current_id == "local" && cid == "self");
-        let reachable = comp.reachable;
-
-        let label = format!(
-            "{}{}{}",
-            if is_current { "✓ " } else { "    " },
-            cname,
-            if !reachable {
-                format!(" ({})", super::copy::tr(language, "offline", "离线"))
-            } else {
-                "".into()
-            }
-        );
-
-        let select_id = if cid == "self" {
-            "local".to_string()
-        } else {
-            cid
-        };
-        menu = menu.item(
-            MenuItem::new(label)
-                .disabled(!reachable && !is_current)
-                .on_select(move |s: &mut UiState| {
-                    s.menu = None;
-                    s.switch_computer(select_id.clone());
-                }),
-        );
+    if active {
+        btn = btn
+            .fill(k.c.surface_raised_base)
+            .border(1.0, k.c.border_base);
     }
 
-    menu.build(k, layer)
+    btn
+}
+
+fn computer_segmented_bar(s: &UiState, k: &Kit) -> El {
+    let language = s.cfg.general.language;
+    let curr = s.current_computer();
+
+    let mut segments = Vec::new();
+
+    // 1. All computers
+    let is_all = curr == "all";
+    segments.push(segment_item(
+        k,
+        "comp-tab-all",
+        &super::copy::tr(language, "All computers", "全部电脑"),
+        is_all,
+        |s| s.switch_computer("all".to_string()),
+    ));
+
+    // 2. This computer
+    let is_this = curr == "local" || curr == "self";
+    segments.push(segment_item(
+        k,
+        "comp-tab-local",
+        &super::copy::tr(language, "This computer", "本机"),
+        is_this,
+        |s| s.switch_computer("local".to_string()),
+    ));
+
+    // 3. Linked peers (e.g. mini)
+    for comp in s.all_computers() {
+        let cid = comp.server_id.clone();
+        if cid == "self" || cid == "local" || cid == "all" {
+            continue;
+        }
+        let is_curr = curr == cid || curr == comp.name;
+        let select_id = cid.clone();
+        let name = comp.name.clone();
+        segments.push(segment_item(
+            k,
+            &format!("comp-tab-{}", cid),
+            &name,
+            is_curr,
+            move |s| s.switch_computer(select_id.clone()),
+        ));
+    }
+
+    rune::row()
+        .key("computer-segmented-bar")
+        .w_full()
+        .h(30.0)
+        .px(2.0)
+        .py(2.0)
+        .gap(2.0)
+        .center_y()
+        .radius(7.0)
+        .fill(k.c.layer_01)
+        .border(1.0, k.c.border_muted)
+        .children(segments)
 }
 
 pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
@@ -567,7 +586,7 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         .key("sidebar-header-box")
         .w_full()
         .gap(8.0)
-        .child(computer_switcher(s, k, layer))
+        .child(computer_segmented_bar(s, k))
         .child(search(s, k));
 
     let mut sidebar = Sidebar::new()

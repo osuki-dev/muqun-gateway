@@ -507,26 +507,6 @@ fn session_identity(s: &UiState, k: &Kit, look: &Look) -> El {
     } else if let Some(folder) = UiState::folder_name(info) {
         meta.push(folder);
     }
-    let comp_id = s.current_computer();
-    let comp_name = s.computer_name(comp_id);
-    let comp_color = s.computer_color(comp_id);
-
-    let comp_badge = row()
-        .key("session-computer-badge")
-        .h(18.0)
-        .px(6.0)
-        .gap(4.0)
-        .center_y()
-        .radius(5.0)
-        .fill(comp_color.alpha(if s.dark { 0.16 } else { 0.10 }))
-        .border(0.5, comp_color.alpha(if s.dark { 0.35 } else { 0.22 }))
-        .child(
-            el().key("comp-dot")
-                .size(6.0, 6.0)
-                .radius(3.0)
-                .fill(comp_color),
-        )
-        .child(text(comp_name).font(k.ty.caption()).color(comp_color));
 
     line = line
         .child(
@@ -553,18 +533,11 @@ fn session_identity(s: &UiState, k: &Kit, look: &Look) -> El {
                 .shrink()
                 .min_w(0.0)
                 .child(
-                    row()
-                        .key("session-title-line")
-                        .gap(8.0)
-                        .center_y()
-                        .child(
-                            text(title_of(info))
-                                .key("session-title")
-                                .font(k.ty.ui_medium.lh(17.0))
-                                .color(k.c.text_base)
-                                .truncate(),
-                        )
-                        .child(comp_badge),
+                    text(title_of(info))
+                        .key("session-title")
+                        .font(k.ty.ui_medium.lh(17.0))
+                        .color(k.c.text_base)
+                        .truncate(),
                 )
                 .child(
                     text(meta.join(" · "))

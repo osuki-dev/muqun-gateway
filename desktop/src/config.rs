@@ -115,6 +115,7 @@ impl DesktopConfig {
     }
 
     /// Return the accent hue chosen for `computer`, if any.
+    #[allow(dead_code)]
     pub fn accent_for(&self, computer: &str) -> Option<&str> {
         self.computers
             .get(computer)
