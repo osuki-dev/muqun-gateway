@@ -599,6 +599,10 @@ impl Engine {
             None
         };
         let cursor_color = colors.cursor.map_or(self.colors.cursor, from_ghostty);
+        let alternate_screen = matches!(
+            self.term.active_screen(),
+            Ok(libghostty_vt::screen::Screen::Alternate)
+        );
         snapshot.set_dirty(Dirty::Clean)?;
         Ok(Some(Frame {
             cols,
@@ -610,6 +614,7 @@ impl Engine {
             title: self.title.clone(),
             scroll,
             mouse_tracking,
+            alternate_screen,
             selection: self.selection.clone(),
         }))
     }
@@ -663,9 +668,11 @@ mod tests {
         engine.feed(b"\x1b[?1049h\x1b[H\x1b[2Jvim");
         let frame = engine.frame().unwrap().unwrap();
         assert_eq!(frame.grid[0].runs[0].text, "vim");
+        assert!(frame.alternate_screen);
         engine.feed(b"\x1b[?1049l");
         let frame = engine.frame().unwrap().unwrap();
         assert_eq!(frame.grid[0].runs[0].text, "red");
+        assert!(!frame.alternate_screen);
         assert_eq!(frame.cursor.map(|c| (c.col, c.row)), Some((2, 1)));
     }
 }

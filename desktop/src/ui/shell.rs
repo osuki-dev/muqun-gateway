@@ -139,10 +139,15 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
             right_panel(k, wash, look.dark, None, inspector::view(s, k)),
         );
     }
+    let motion = if s.term.open && s.term.instant {
+        super::panes::instant()
+    } else {
+        super::panes::motion()
+    };
     let mut split = split
         .titlebar_inset(crate::platform::titlebar_inset(cx.titlebar_inset()))
         .frame_inset(frame)
-        .pane_motion(super::panes::motion())
+        .pane_motion(motion)
         .reduced_motion(!look.motion || cx.is_reduced_motion())
         .sidebar_toggle(
             SidebarToggle::new()

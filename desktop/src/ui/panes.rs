@@ -20,6 +20,11 @@ pub fn motion() -> PaneMotion {
     PaneMotion::new().spring(SPRING)
 }
 
+/// Instant pane motion without slide animation (e.g. for opening code editor in terminal).
+pub fn instant() -> PaneMotion {
+    PaneMotion::new().spring(Spring::NONE)
+}
+
 /// The spring [`motion`] moves the panes on, for what moves with them.
 pub const SPRING: Spring = Spring::new(0.15, 0.0);
 

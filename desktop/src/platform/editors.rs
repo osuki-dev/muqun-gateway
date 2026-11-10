@@ -206,6 +206,107 @@ pub fn is_terminal_editor(program: &str) -> bool {
     )
 }
 
+/// Detect the system's default terminal editor, if any (Omarchy defaults, $EDITOR, or nvim).
+pub fn detect_default_terminal_editor() -> Option<String> {
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        // 1. Omarchy Linux default editor
+        if let Some(home) = dirs::home_dir() {
+            let omarchy_file = home.join(".local/state/omarchy/defaults/editor");
+            if let Ok(content) = std::fs::read_to_string(omarchy_file) {
+                let name = content.trim();
+                if is_terminal_editor(name) {
+                    return Some(name.to_string());
+                }
+            }
+        }
+        // 2. $EDITOR environment variable
+        if let Ok(ed) = std::env::var("EDITOR") {
+            let first = ed.split_whitespace().next().unwrap_or("");
+            let name = Path::new(first)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
+            if is_terminal_editor(name) {
+                return Some(name.to_string());
+            }
+            if name == "omarchy-launch-editor" {
+                if let Some(home) = dirs::home_dir() {
+                    let omarchy_file = home.join(".local/state/omarchy/defaults/editor");
+                    if let Ok(content) = std::fs::read_to_string(omarchy_file) {
+                        let ed_name = content.trim();
+                        if is_terminal_editor(ed_name) {
+                            return Some(ed_name.to_string());
+                        }
+                    }
+                }
+                return Some("nvim".into());
+            }
+        }
+        // 3. $VISUAL environment variable
+        if let Ok(vis) = std::env::var("VISUAL") {
+            let first = vis.split_whitespace().next().unwrap_or("");
+            let name = Path::new(first)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
+            if is_terminal_editor(name) {
+                return Some(name.to_string());
+            }
+        }
+        // 4. Default to nvim if installed on PATH
+        if Command::new("which")
+            .arg("nvim")
+            .output()
+            .is_ok_and(|o| o.status.success())
+        {
+            return Some("nvim".into());
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(ed) = std::env::var("EDITOR") {
+            let first = ed.split_whitespace().next().unwrap_or("");
+            let name = Path::new(first)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
+            if is_terminal_editor(name) {
+                return Some(name.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Determine if the configured or default editor is a terminal editor (e.g. nvim).
+pub fn resolve_terminal_editor(
+    custom_command: Option<&str>,
+    choice: Option<Editor>,
+) -> Option<String> {
+    // 1. Custom command has highest priority
+    if let Some(cmd) = custom_command.filter(|c| !c.trim().is_empty()) {
+        let first = cmd.split_whitespace().next().unwrap_or("");
+        if is_terminal_editor(first) {
+            return Some(first.to_string());
+        }
+        return None;
+    }
+
+    // 2. Explicit choice of GUI editor
+    if let Some(c) = choice {
+        if matches!(c, Editor::VsCode | Editor::Zed | Editor::Cursor) {
+            return None;
+        }
+        if c == Editor::Terminal {
+            return detect_default_terminal_editor().or_else(|| Some("nvim".into()));
+        }
+    }
+
+    // 3. System default editor
+    detect_default_terminal_editor()
+}
+
 fn try_custom_command(cmd: &str, path: &Path) -> std::io::Result<bool> {
     let path_str = path.to_string_lossy();
     let full = if cmd.contains("{}") {
@@ -586,5 +687,16 @@ mod tests {
         assert!(!is_terminal_editor("code"));
         assert!(!is_terminal_editor("zed"));
         assert!(!is_terminal_editor("cursor"));
+    }
+
+    #[test]
+    fn test_resolve_terminal_editor() {
+        assert_eq!(
+            resolve_terminal_editor(Some("nvim"), None),
+            Some("nvim".into())
+        );
+        assert_eq!(resolve_terminal_editor(Some("code"), None), None);
+        assert_eq!(resolve_terminal_editor(None, Some(Editor::VsCode)), None);
+        assert_eq!(resolve_terminal_editor(None, Some(Editor::Cursor)), None);
     }
 }

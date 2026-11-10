@@ -218,6 +218,8 @@ pub struct Frame {
     pub scroll: Scroll,
     /// The program asked for mouse reports (vim with `mouse=a`, htop).
     pub mouse_tracking: bool,
+    /// True when on the alternate screen (vim/nvim, less, htop).
+    pub alternate_screen: bool,
     /// The selection's text, when there is one.
     pub selection: Option<String>,
 }

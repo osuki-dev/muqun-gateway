@@ -90,6 +90,10 @@ pub struct TermPanel {
     /// Screenshot scenes: how the fixture's shell ended.
     pub fixture_ended: Option<Ended>,
     pub error: Option<String>,
+    /// Instant layout without slide motion (used when launching code editors).
+    pub instant: bool,
+    /// A command queued to run as soon as the shell session starts.
+    pub pending_command: Option<String>,
     /// The grid's size the shell and emulator have, in cells.
     size: Option<Size>,
     /// New sizes on their way to the shell (paced while the divider drags).
@@ -123,6 +127,8 @@ impl TermPanel {
             fixture: None,
             fixture_ended: None,
             error: None,
+            instant: false,
+            pending_command: None,
             size: None,
             resize: Resizer::default(),
             now: 0.0,
@@ -330,11 +336,42 @@ impl UiState {
 
     /// Hide the panel; the shell keeps running.
     pub fn close_terminal(&mut self) {
+        self.term.instant = false;
         self.term.open = false;
         self.term.pane.set_open(false);
         self.term.sink.focused = false;
         if self.mode == super::Mode::Session {
             self.draft.focused = true;
+        }
+    }
+
+    /// Open a file in the embedded terminal using a terminal editor (e.g. nvim).
+    /// Opens the panel instantly without slide animation so it does not distract from editing.
+    pub fn open_file_in_terminal(&mut self, path: &std::path::Path, editor: &str) {
+        self.close_viewer();
+        self.term.instant = true;
+
+        let path_str = path.to_string_lossy();
+        let escaped_shell = format!("'{}'", path_str.replace('\'', "'\\''"));
+        let cmd = format!("{editor} {escaped_shell}\n");
+
+        self.open_terminal();
+
+        if let Some(session) = &self.term.session {
+            if session.ended().is_some() {
+                self.term.pending_command = Some(cmd);
+                self.restart_terminal();
+            } else if self.term.frame.as_ref().is_some_and(|f| f.alternate_screen) {
+                // If an editor (like nvim) is already running in alternate screen,
+                // send Esc to exit to normal mode and `:e <path>` to edit buffer.
+                let escaped_vim = path_str.replace(' ', "\\ ");
+                self.term.send(Msg::Text(format!("\x1b:e {escaped_vim}\r")));
+            } else {
+                // Shell is active: clear line with Ctrl+C, Ctrl+U and send command.
+                self.term.send(Msg::Text(format!("\x03\x15{cmd}")));
+            }
+        } else {
+            self.term.pending_command = Some(cmd);
         }
     }
 
@@ -369,6 +406,9 @@ impl UiState {
         };
         match Session::start(self.terminal_cwd(), size, colors, waker) {
             Ok(session) => {
+                if let Some(cmd) = self.term.pending_command.take() {
+                    session.send(Msg::Text(cmd));
+                }
                 self.term.session = Some(session);
                 self.term.sent = Some(colors);
                 self.term.error = None;
@@ -1140,5 +1180,22 @@ mod tests {
         let s = &rt.state;
         assert_eq!(s.mode, super::super::Mode::Home);
         assert!(s.palette.is_none(), "a command leaves the palette");
+    }
+
+    #[test]
+    fn open_file_in_terminal_sets_instant_and_queues_command() {
+        let (tx, _rx) = commands::channel();
+        let mut state = UiState::new(tx);
+        let test_path = std::path::Path::new("/tmp/test_file.rs");
+        state.open_file_in_terminal(test_path, "nvim");
+
+        assert!(state.term.open);
+        assert!(state.term.instant);
+        assert!(state.term.sink.focused);
+        assert!(state.viewer.is_none());
+        assert_eq!(
+            state.term.pending_command.as_deref(),
+            Some("nvim '/tmp/test_file.rs'\n")
+        );
     }
 }

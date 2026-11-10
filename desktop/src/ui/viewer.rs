@@ -149,6 +149,20 @@ impl UiState {
         self.viewer = None;
     }
 
+    /// Open a file with the configured editor. Terminal editors (such as nvim)
+    /// open directly in the embedded terminal without slide animations.
+    pub fn open_editor_file(&mut self, path: &Path) {
+        let custom = self.cfg.general.editor_command.clone();
+        let choice = Some(self.cfg.general.editor);
+        if let Some(editor) =
+            crate::platform::editors::resolve_terminal_editor(custom.as_deref(), choice)
+        {
+            self.open_file_in_terminal(path, &editor);
+        } else {
+            let _ = crate::platform::editors::open_file(path, custom.as_deref(), choice);
+        }
+    }
+
     /// The reader answered for `path` (ignored when the viewer moved on).
     pub fn viewer_loaded(&mut self, path: &Path, loaded: Loaded) {
         let Some(v) = self
@@ -450,11 +464,7 @@ fn header(v: &Viewer, k: &Kit, language: Language) -> El {
                 .icon(&OPEN_EXTERNAL)
                 .variant(ButtonVariant::Ghost)
                 .on_press(move |s: &mut UiState| {
-                    let _ = crate::platform::editors::open_file(
-                        &open,
-                        s.cfg.general.editor_command.as_deref(),
-                        Some(s.cfg.general.editor),
-                    );
+                    s.open_editor_file(&open);
                 })
                 .build(k)
                 .key("viewer-open"),
@@ -813,11 +823,7 @@ fn external(v: &Viewer, k: &Kit, language: Language) -> El {
             .icon(&OPEN_EXTERNAL)
             .variant(ButtonVariant::Contrast)
             .on_press(move |s: &mut UiState| {
-                let _ = crate::platform::editors::open_file(
-                    &path,
-                    s.cfg.general.editor_command.as_deref(),
-                    Some(s.cfg.general.editor),
-                );
+                s.open_editor_file(&path);
             })
             .build(k)
             .key("viewer-external-open")
